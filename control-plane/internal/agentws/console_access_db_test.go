@@ -215,3 +215,47 @@ func TestRestoredResetAuditSurvivesOversizedAgentText(t *testing.T) {
 		t.Fatalf("reason/request_id lengths = %d/%d, want both bounded to %d", reason, requestID, maxAuditAgentText)
 	}
 }
+
+// #1209 A3: Postgres' jsonb refuses \u0000, so an agent reason carrying a NUL
+// made the insert fail AFTER the console reset had committed: access was
+// restored and nothing recorded it. The NUL is replaced and the row says so.
+func TestRestoredResetAuditReplacesNULInAgentText(t *testing.T) {
+	h, pool, _ := consoleAccessHandler(t)
+	h.auditor = audit.NewStore(pool)
+	hostID := seedHost(t, pool)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `DELETE FROM admin_activity WHERE action = 'console.access.restored'`); err != nil {
+		t.Fatalf("clear activity: %v", err)
+	}
+	if err := h.consoleStore.Upsert(ctx, hostID, map[string]any{"enabled": true}, nil); err != nil {
+		t.Fatalf("seed console_config: %v", err)
+	}
+	h.applyConsoleAccessReport(ctx, hostID, console.Access{
+		// The request id is persisted by the reset itself and is not free text, so a
+		// NUL there fails the reset before any audit row exists (a separate path).
+		// The reason is the field that only ever reaches the audit details.
+		State: "restored", Target: abool(true), RequestID: astr("req-1"),
+		Reason: astr("agent said \x00 nope"), Summary: "restored",
+	})
+
+	var reason string
+	var sanitized bool
+	err := pool.QueryRow(ctx, `SELECT details->>'reason',
+		COALESCE((details->>'details_sanitized')::bool, false)
+		FROM admin_activity WHERE action = 'console.access.restored' AND target_id = $1`, hostID).
+		Scan(&reason, &sanitized)
+	if err != nil {
+		t.Fatalf("console.access.restored row missing after a NUL in the reason: %v", err)
+	}
+	if !sanitized {
+		t.Error("a row with a replaced NUL is not flagged details_sanitized")
+	}
+	for name, got := range map[string]string{"reason": reason} {
+		if strings.ContainsRune(got, 0) {
+			t.Errorf("%s still holds a NUL", name)
+		}
+		if !strings.ContainsRune(got, '\uFFFD') {
+			t.Errorf("%s = %q, want the NUL shown as U+FFFD", name, got)
+		}
+	}
+}

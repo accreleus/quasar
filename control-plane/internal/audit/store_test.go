@@ -59,13 +59,12 @@ func TestRecordAndPaginate(t *testing.T) {
 
 // #1209: an oversized row used to be refused, and TryRecord then only LOGGED
 // the refusal — the operation happened and nothing recorded it. The row is now
-// written cut down, flagged, inside the same bound.
+// written cut down, inside the same bound. The payload is NULs, which jsonb also
+// refuses on its own (A3), so this pins both halves of the guarantee at once.
 func TestWritesOversizedDetailsCutDown(t *testing.T) {
 	s := testStore(t)
-	// 5000 control characters encode to 30 000 bytes: \u0001 is six bytes each.
-	// (Not \x00: jsonb refuses a NUL outright, which is an insert error rather
-	// than a size one.)
-	value := strings.Repeat("\x01", 5000)
+	// 5000 NULs: 30 000 encoded bytes, and every one of them unstoreable as-is.
+	value := strings.Repeat("\x00", 5000)
 	if err := s.Record(context.Background(), "", "x", "host", "h",
 		map[string]any{"value": value, "count": 1}); err != nil {
 		t.Fatalf("an oversized row must be written, not refused: %v", err)
@@ -86,6 +85,19 @@ func TestWritesOversizedDetailsCutDown(t *testing.T) {
 	}
 	if got[detailsTruncatedKey] != true || got["value_truncated"] != true {
 		t.Errorf("cut row is not flagged: %#v", got)
+	}
+	if got[detailsSanitizedKey] != true || got["value_sanitized"] != true {
+		t.Errorf("row with NULs is not flagged sanitized: %#v", got)
+	}
+	stored, _ := got["value"].(string)
+	if stored == "" {
+		t.Fatal("the cut row lost its value entirely")
+	}
+	if strings.ContainsRune(stored, 0) {
+		t.Error("the stored value still holds a NUL")
+	}
+	if !strings.ContainsRune(stored, replacementRune) {
+		t.Error("the stored value does not show where the NULs were")
 	}
 	if got["count"] != float64(1) {
 		t.Errorf("a short field was lost: %#v", got)

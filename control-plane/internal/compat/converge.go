@@ -505,9 +505,9 @@ func (c *Converger) Closed(ctx context.Context, run jobs.Run) {
 		c.bindName(ctx, run, toolID, tag, sha, name)
 	}
 	// name and reason are the agent's own words: cap them here so the common case stays readable,
-	// and leave the guarantee to audit.TryRecord, which cuts the encoded row to fit rather than
-	// dropping it (#1183, #1209). A reason that is not text is dropped and flagged, never written
-	// as a structure.
+	// and leave the guarantee to boundedDetails, which Record and RecordTx both go through — it
+	// sanitizes a NUL and cuts the encoded row to fit rather than dropping it (#1183, #1209). A
+	// reason that is not text is dropped and flagged, never written as a structure.
 	details := map[string]any{
 		"tag": tag, "sha512": sha, "host_id": run.HostID, "state": string(run.State), "run_id": run.ID,
 	}

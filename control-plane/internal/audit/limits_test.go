@@ -9,6 +9,7 @@ package audit
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -132,5 +133,106 @@ func TestCapTextDropsAStructuredValue(t *testing.T) {
 	}
 	if n := renderedSize(b); n > maxDetailBytes {
 		t.Fatalf("row renders to %d bytes, over the bound", n)
+	}
+}
+
+// #1209 A3: jsonb refuses \u0000 outright, so one NUL anywhere in a detail made
+// the insert fail and the row was lost — independently of its size. The byte is
+// replaced, at any depth, and the row says so.
+func TestSanitizeDetailsReplacesNULs(t *testing.T) {
+	nested := map[string]any{"note": "a\x00b"}
+	details := map[string]any{
+		"reason": "said \x00 softly",
+		"ids":    []string{"ok", "b\x00d"},
+		"items":  []any{"fine", nested},
+		"count":  4,
+		"flag":   true,
+	}
+
+	clean, changed := sanitizeDetails(details)
+	if !changed {
+		t.Fatal("a NUL was not reported as sanitized")
+	}
+	if clean[detailsSanitizedKey] != true {
+		t.Errorf("row is not marked %s", detailsSanitizedKey)
+	}
+	for _, key := range []string{"reason", "ids", "items"} {
+		if clean[key+detailsSanitizedSuffix] != true {
+			t.Errorf("%s was sanitized but not flagged", key)
+		}
+	}
+	if clean["count"] != 4 || clean["flag"] != true {
+		t.Errorf("clean fields changed: %#v", clean)
+	}
+	if s := clean["reason"].(string); strings.ContainsRune(s, 0) || !strings.ContainsRune(s, replacementRune) {
+		t.Errorf("reason = %q, want the NUL replaced", s)
+	}
+	if s := clean["ids"].([]string)[1]; strings.ContainsRune(s, 0) || !strings.ContainsRune(s, replacementRune) {
+		t.Errorf("list entry = %q, want the NUL replaced", s)
+	}
+	inner := clean["items"].([]any)[1].(map[string]any)["note"].(string)
+	if strings.ContainsRune(inner, 0) || !strings.ContainsRune(inner, replacementRune) {
+		t.Errorf("nested value = %q, want the NUL replaced", inner)
+	}
+	// The caller's map is untouched: emitters reuse theirs.
+	if !strings.ContainsRune(details["reason"].(string), 0) {
+		t.Error("sanitizeDetails mutated the caller's details")
+	}
+
+	// Nothing to sanitize is the identity, and allocates no new flags.
+	other := map[string]any{"reason": "plain"}
+	if same, changed := sanitizeDetails(other); changed || len(same) != 1 {
+		t.Errorf("a clean row changed: %#v", same)
+	}
+}
+
+// The last resort keeps the counts and flags: they are what still says what
+// happened, and they are not what made the row big.
+func TestShrinkToFitKeepsCountsWhenOnlyScalarsRemain(t *testing.T) {
+	details := map[string]any{}
+	for i := 0; i < 600; i++ {
+		details[fmt.Sprintf("k%03d", i)] = i
+	}
+
+	b, err := boundedDetails(details)
+	if err != nil {
+		t.Fatalf("unexpected refusal: %v", err)
+	}
+	if n := renderedSize(b); n > maxDetailBytes {
+		t.Fatalf("row renders to %d bytes, over the %d-byte bound", n, maxDetailBytes)
+	}
+	got := decoded(t, b)
+	if got[detailsTruncatedKey] != true {
+		t.Errorf("row is not marked %s", detailsTruncatedKey)
+	}
+	kept := 0
+	for k := range got {
+		if !auxiliaryKey(k) {
+			kept++
+		}
+	}
+	if kept < 1 {
+		t.Errorf("the fallback kept no counts at all: %#v", got)
+	}
+}
+
+// A one-entry list is an id or a name; half of one is a different id. The list
+// empties instead, and the flag says so.
+func TestShrinkValueNeverFragmentsAListEntry(t *testing.T) {
+	one := []string{"a-fairly-long-identifier-that-would-halve"}
+	got, ok := shrinkValue(one)
+	if !ok || len(got.([]string)) != 0 {
+		t.Fatalf("shrinkValue(%v) = %#v, want the list emptied", one, got)
+	}
+
+	many := []string{"one", "two", "three", "four"}
+	got, ok = shrinkValue(many)
+	if !ok {
+		t.Fatal("a four-entry list did not shrink")
+	}
+	for _, s := range got.([]string) {
+		if s != "one" && s != "two" {
+			t.Errorf("shrinkValue fragmented an entry: %#v", got)
+		}
 	}
 }

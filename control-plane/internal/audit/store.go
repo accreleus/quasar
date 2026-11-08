@@ -143,13 +143,18 @@ const insertActivitySQL = `
 
 // boundedDetails marshals and bounds details, shared by Record and RecordTx.
 //
-// An oversized row is NOT refused: it is written cut down by shrinkToFit, and
-// marked details_truncated. Refusing it meant TryRecord only logged the loss,
-// so the operation happened with no audit row at all (#1209).
+// Two things used to lose a row here, and neither can now:
+//
+//   - A NUL byte, which Postgres' jsonb refuses whatever the row weighs, is
+//     replaced before anything is measured (sanitizeDetails, #1209 A3).
+//   - An oversized row is NOT refused: it is written cut down by shrinkToFit and
+//     marked details_truncated. Refusing it meant TryRecord only logged the
+//     loss, so the operation happened with no audit row at all (#1209).
 func boundedDetails(details map[string]any) ([]byte, error) {
 	if details == nil {
 		details = map[string]any{}
 	}
+	details, _ = sanitizeDetails(details)
 	b, err := json.Marshal(details)
 	if err != nil {
 		return nil, fmt.Errorf("marshal audit details: %w", err)

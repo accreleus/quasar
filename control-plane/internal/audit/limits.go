@@ -3,6 +3,7 @@ package audit
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -66,6 +67,112 @@ func CapText(details map[string]any, key string, v any) {
 // detailsTruncatedKey marks a row the encoded-size step had to cut (#1209).
 const detailsTruncatedKey = "details_truncated"
 
+// detailsSanitizedKey and detailsSanitizedSuffix flag a row whose text carried
+// a byte jsonb cannot store (see sanitizeDetails).
+const (
+	detailsSanitizedKey    = "details_sanitized"
+	detailsSanitizedSuffix = "_sanitized"
+)
+
+// replacementRune stands in for a NUL byte in reported text.
+//
+// Postgres' jsonb refuses \u0000 outright, whatever the row weighs, so a single
+// NUL in an agent's reason made the insert fail and TryRecord only log it: a
+// second way for an audit row to be lost, independent of the size bound (#1209,
+// reviewer A3). The byte is REPLACED rather than dropped, because dropping it
+// would silently join the text either side of it; U+FFFD is what a reader should
+// see where the reporter's text held something no text encoding has room for.
+const replacementRune = '\uFFFD'
+
+// sanitizeDetails makes details safe to store: every NUL byte, at any depth, is
+// replaced with U+FFFD. It flags the row and each top-level field it touched, so
+// a reader knows the text is not byte-for-byte what was reported.
+//
+// It returns the caller's map and false when there was nothing to sanitize, so
+// the ordinary path allocates nothing and never mutates an emitter's map.
+func sanitizeDetails(details map[string]any) (map[string]any, bool) {
+	var (
+		out     map[string]any
+		touched bool
+	)
+	for k, v := range details {
+		clean, changed := sanitizeValue(v)
+		if !changed {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]any, len(details)+1)
+			for k2, v2 := range details {
+				out[k2] = v2
+			}
+		}
+		out[k] = clean
+		out[k+detailsSanitizedSuffix] = true
+		touched = true
+	}
+	if !touched {
+		return details, false
+	}
+	out[detailsSanitizedKey] = true
+	return out, true
+}
+
+// sanitizeValue replaces the NULs in one value: a string, a list of them, or a
+// nested object. A shape it does not know is left exactly as the emitter wrote
+// it — the size step is what bounds that.
+func sanitizeValue(v any) (any, bool) {
+	switch t := v.(type) {
+	case string:
+		if !strings.ContainsRune(t, 0) {
+			return v, false
+		}
+		return strings.ReplaceAll(t, "\x00", string(replacementRune)), true
+	case []string:
+		out := make([]string, len(t))
+		changed := false
+		for i, s := range t {
+			if clean, ok := sanitizeValue(s); ok {
+				out[i], changed = clean.(string), true
+			} else {
+				out[i] = s
+			}
+		}
+		if !changed {
+			return v, false
+		}
+		return out, true
+	case []any:
+		out := make([]any, len(t))
+		changed := false
+		for i, item := range t {
+			if clean, ok := sanitizeValue(item); ok {
+				out[i], changed = clean, true
+			} else {
+				out[i] = item
+			}
+		}
+		if !changed {
+			return v, false
+		}
+		return out, true
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		changed := false
+		for k, item := range t {
+			if clean, ok := sanitizeValue(item); ok {
+				out[k], changed = clean, true
+			} else {
+				out[k] = item
+			}
+		}
+		if !changed {
+			return v, false
+		}
+		return out, true
+	}
+	return v, false
+}
+
 // cutMarker stands in for a value too large to keep and not shrinkable in place.
 const cutMarker = "[cut]"
 
@@ -119,14 +226,40 @@ func shrinkToFit(details map[string]any) ([]byte, error) {
 		work[key+"_truncated"] = true
 	}
 
-	// Nothing left to give way and the row still does not fit. Unreachable for
-	// the payloads this tree emits — what remains is scalars — but the row is
-	// still written, flagged, with the operation's identity in its own columns.
-	b, err := json.Marshal(map[string]any{detailsTruncatedKey: true})
+	// Nothing left to give way and the row still does not fit. That is reachable
+	// only if the row is made of many small fixed-width fields — every number and
+	// boolean here is one — so keep those and drop only the content that could not
+	// be cut in place. They are what still says what happened.
+	minimal := map[string]any{detailsTruncatedKey: true}
+	scalars := make([]string, 0, len(work))
+	for k, v := range work {
+		if !auxiliaryKey(k) && isScalar(v) {
+			scalars = append(scalars, k)
+		}
+	}
+	sort.Strings(scalars) // stable output for the same input
+	for _, k := range scalars {
+		minimal[k] = work[k]
+		b, err := json.Marshal(minimal)
+		if err != nil || renderedSize(b) > maxDetailBytes {
+			delete(minimal, k)
+		}
+	}
+	b, err := json.Marshal(minimal)
 	if err != nil {
 		return nil, fmt.Errorf("marshal audit details: %w", err)
 	}
 	return b, nil
+}
+
+// isScalar reports a value with no length to cut: a count, a flag, an id-like
+// number. These survive to the last resort above.
+func isScalar(v any) bool {
+	switch v.(type) {
+	case bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, json.Number:
+		return true
+	}
+	return false
 }
 
 // biggestShrinkable picks the largest field that can still give way, so a cut
@@ -170,10 +303,12 @@ func biggestCollection(work map[string]any) (string, bool) {
 	return key, size > len(cutMarker)+2
 }
 
-// auxiliaryKey reports a key shrinkToFit maintains itself, which must never be
+// auxiliaryKey reports a key the auditor maintains itself, which must never be
 // cut or counted as content.
 func auxiliaryKey(k string) bool {
-	return k == detailsTruncatedKey || strings.HasSuffix(k, "_truncated") || strings.HasSuffix(k, "_invalid")
+	return k == detailsTruncatedKey || k == detailsSanitizedKey ||
+		strings.HasSuffix(k, "_truncated") || strings.HasSuffix(k, "_invalid") ||
+		strings.HasSuffix(k, detailsSanitizedSuffix)
 }
 
 // encodedSize is what a value costs in the encoded row, which is how the CHECK
@@ -187,7 +322,9 @@ func encodedSize(v any) int {
 }
 
 // shrinkValue returns v cut roughly in half, and false when there is nothing
-// left to take. Lists lose whole entries and never a fragment of one.
+// left to take. A list never yields a fragment of an entry: an id cut in half
+// is a different id, so a one-entry list is emptied instead (the flag and the
+// caller's count still say it was cut).
 func shrinkValue(v any) (any, bool) {
 	switch t := v.(type) {
 	case string:
@@ -196,25 +333,21 @@ func shrinkValue(v any) (any, bool) {
 		}
 		return TruncateBytes(t, len(t)/2), true
 	case []string:
-		if len(t) > 1 {
-			return t[:len(t)/2], true
+		if len(t) == 0 {
+			return nil, false
 		}
 		if len(t) == 1 {
-			if smaller, ok := shrinkValue(t[0]); ok {
-				return []string{smaller.(string)}, true
-			}
 			return t[:0], true
 		}
+		return t[:len(t)/2], true
 	case []any:
-		if len(t) > 1 {
-			return t[:len(t)/2], true
+		if len(t) == 0 {
+			return nil, false
 		}
 		if len(t) == 1 {
-			if smaller, ok := shrinkValue(t[0]); ok {
-				return []any{smaller}, true
-			}
 			return t[:0], true
 		}
+		return t[:len(t)/2], true
 	}
 	return nil, false
 }
