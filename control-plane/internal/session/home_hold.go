@@ -20,6 +20,12 @@ type HomeHoldDecision struct {
 	SessionID string
 }
 
+// errSwapSharedHoldLost: a swap that shares would have been dispatched on a
+// capable connection without a hold on its Steam claim (an earlier epoch
+// downgrade released it). The swap is rejected so the user's retry re-enters
+// GuardHomeForSwapWithHold and takes the own and Steam holds together.
+var errSwapSharedHoldLost = errors.New("the swap's shared Steam hold was released before handoff")
+
 // ClearQualifiedHomeHolds consumes authenticated cleanup proof from the
 // current cleanup-capable reporting connection. A missing historical session
 // row is allowed; a present row must still belong to the reporting host.
@@ -237,10 +243,12 @@ func (s *Store) ClearNewSharedHomeHold(ctx context.Context, hold *HomeHoldDecisi
 // RefreshSwapHomeHold changes only an unstarted swap's capability decision
 // after its command epoch vanished before queue handoff. The session and claim
 // remain locked in global order; an older reused hold cannot be downgraded to
-// an unsupported connection. shared is the hold this swap took on the target's
-// shared Steam claim (nil when it shares nothing or already held one): it goes
-// with the own one, so nothing is left held by a session the control plane
-// cannot prove mounted it.
+// an unsupported connection. shared is the target's shared Steam identity: its
+// Created flag says whether this swap took that claim's hold, and AppID names
+// the home the dispatch mounts. A hold this swap took goes with the own one on a
+// downgrade, so nothing is left held by a session the control plane cannot prove
+// mounted it; an upgrade that would carry the Steam mount without that hold is
+// refused, so the retry re-enters the swap guard afresh.
 func (s *Store) RefreshSwapHomeHold(ctx context.Context, sessionID, userID, appID, hostID string, prior *HomeHoldDecision, capable bool, shared *HomeHoldDecision) (*HomeHoldDecision, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -284,7 +292,7 @@ func (s *Store) RefreshSwapHomeHold(ctx context.Context, sessionID, userID, appI
 			return nil, fmt.Errorf("release unstarted swap hold: %w", err)
 		}
 		pendingToken = nil
-		if shared != nil {
+		if shared != nil && shared.Created {
 			// Only the hold this swap took: a reused own hold under the same
 			// token carries its own, older proof.
 			if _, err := tx.Exec(ctx, `UPDATE managed_home_claims SET pending_home_session_id=NULL,
@@ -307,6 +315,23 @@ func (s *Store) RefreshSwapHomeHold(ctx context.Context, sessionID, userID, appI
 					return nil, err
 				}
 			}
+		}
+	}
+	// A capable connection would now dispatch the Steam mount. This swap still
+	// shares, so the claim must carry this session's hold: an earlier downgrade
+	// released it, and nothing here re-takes it (the own claim's hold is the only
+	// one this refresh may create). Refusing sends the retry through
+	// GuardHomeForSwapWithHold, which takes both holds together.
+	if capable && shared != nil {
+		var sharedHolder *string
+		err := tx.QueryRow(ctx, `SELECT pending_home_session_id::text FROM managed_home_claims
+			WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid FOR UPDATE`,
+			userID, shared.AppID).Scan(&sharedHolder)
+		if errors.Is(err, pgx.ErrNoRows) || (err == nil && (sharedHolder == nil || *sharedHolder != sessionID)) {
+			return nil, errSwapSharedHoldLost
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read shared swap hold: %w", err)
 		}
 	}
 	decision, err := setHomeDispatchHold(ctx, tx, userID, appID, sessionID, capable, pendingToken)

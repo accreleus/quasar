@@ -171,6 +171,63 @@ func TestUnqueuedSwapEpochRefreshReleasesTheSharedHold(t *testing.T) {
 	}
 }
 
+// A capability change that would dispatch a sharing swap WITHOUT its Steam hold
+// is refused: an earlier downgrade released that hold, and this refresh re-takes
+// only the target's own, so the retry must re-enter the swap guard afresh. An
+// unsupported epoch from the start is the same case — the guard took no holder
+// at all, and the Steam identity is what the refresh still has to reason about.
+func TestSwapEpochUpgradeWithoutTheSharedHoldIsRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		guardCapable bool
+		downgrade    bool
+	}{
+		{"downgraded then upgraded", true, true},
+		{"unsupported epoch then capable", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newWarmFixture(t, 8)
+			desktop := seedDesktop(t, f, true)
+			mine := seedDesktop(t, f, false)
+			sess := f.startedLaunch(t, mine)
+			ctx := context.Background()
+
+			app, err := f.store.GetLaunchApp(ctx, desktop)
+			must(t, err)
+			guard, err := f.store.GuardHomeForSwapWithHold(ctx, sess, f.userID, app, f.hostID,
+				tc.guardCapable, f.steam)
+			must(t, err)
+			if guard.sharedHold == nil || guard.sharedHold.AppID != f.steam {
+				t.Fatalf("guard = %+v, want the swap's Steam identity recorded", guard)
+			}
+
+			prior := guard.hold
+			if tc.downgrade {
+				prior, err = f.store.RefreshSwapHomeHold(ctx, sess, f.userID, desktop, f.hostID,
+					guard.hold, false, guard.sharedHold)
+				must(t, err)
+				if prior != nil {
+					t.Fatalf("downgrade kept a new hold: %+v", prior)
+				}
+			}
+
+			if _, err := f.store.RefreshSwapHomeHold(ctx, sess, f.userID, desktop, f.hostID,
+				prior, true, guard.sharedHold); !errors.Is(err, errSwapSharedHoldLost) {
+				t.Fatalf("upgrade to a capable epoch = %v, want the swap rejected", err)
+			}
+			// Nothing from that swap is left held by the session.
+			for _, appID := range []string{desktop, f.steam} {
+				var pending *string
+				must(t, f.pool.QueryRow(ctx, `SELECT pending_home_session_id::text FROM managed_home_claims
+					WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, f.userID, appID).Scan(&pending))
+				if pending != nil {
+					t.Errorf("app %s still held by %s after the refused upgrade", appID, *pending)
+				}
+			}
+		})
+	}
+}
+
 // A stop request can race the pending swap's agent callback. The target may
 // still be mounted until teardown reaches a terminal state, even though the
 // session's app_id still names the old app.

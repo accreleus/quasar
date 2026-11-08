@@ -723,6 +723,55 @@ func TestSwapThatNeverReachesTheAgentReleasesAnUnusedSteamClaim(t *testing.T) {
 	}
 }
 
+// A failed swap's unused-claim cleanup does not delete a Steam claim another of
+// the user's sessions may be about to mount: that session's swap target exists
+// only in memory until its commit, and on a connection that takes no holds
+// nothing on the claim itself marks it.
+func TestUnusedClaimCleanupKeepsAClaimASwappingSessionTargets(t *testing.T) {
+	f := newWarmFixture(t, 8)
+	sharing := seedDesktop(t, f, true)
+	mine := seedDesktop(t, f, false)
+	other := seedDesktop(t, f, false)
+	a := f.startedLaunch(t, mine)
+	b := f.startedLaunch(t, other)
+	ctx := context.Background()
+	// No Steam home: the claim exists only as a reservation, backed by nothing.
+	must(t, exec(t, f.pool, `DELETE FROM managed_home_claims WHERE canonical_app_id=$1::uuid`, f.steam))
+	must(t, exec(t, f.pool, `DELETE FROM user_homes WHERE app_id=$1::uuid`, f.steam))
+
+	// B's swap into the sharing desktop commits its guard and has not dispatched;
+	// the connection takes no holds, so only the durable `swapping` state marks it.
+	app, err := f.store.GetLaunchApp(ctx, sharing)
+	must(t, err)
+	if _, err := f.store.GuardHomeForSwapWithHold(ctx, b, f.userID, app, f.hostID, false, f.steam); err != nil {
+		t.Fatalf("guard B's swap: %v", err)
+	}
+	if n := f.steamClaimCount(t); n != 1 {
+		t.Fatalf("Steam claims = %d after B's guard, want the reservation it took", n)
+	}
+	if got := readRow(t, f.pool, b); got.Detail != swapDetailInProgress {
+		t.Fatalf("B detail = %q, want %q", got.Detail, swapDetailInProgress)
+	}
+
+	// A's own failed swap cleans up the same Steam claim: it survives while B's
+	// swap is unresolved.
+	if err := f.store.releaseUnusedSwapSharedClaim(ctx, a, f.steam); err != nil {
+		t.Fatalf("cleanup beside B's pending swap: %v", err)
+	}
+	if n := f.steamClaimCount(t); n != 1 {
+		t.Errorf("Steam claims = %d, want the claim B may mount kept", n)
+	}
+
+	// Resolved, the same cleanup deletes it: the guard is the only thing that held it.
+	must(t, exec(t, f.pool, `UPDATE sessions SET state_detail=NULL WHERE id=$1::uuid`, b))
+	if err := f.store.releaseUnusedSwapSharedClaim(ctx, a, f.steam); err != nil {
+		t.Fatalf("cleanup after B's swap resolved: %v", err)
+	}
+	if n := f.steamClaimCount(t); n != 0 {
+		t.Errorf("Steam claims = %d after B's swap resolved, want the unused claim released", n)
+	}
+}
+
 // A console auto-start that fails before the agent releases the unused Steam
 // claim it created, as the same failure does on a launch.
 func TestFailedConsoleAutoStartReleasesAnUnusedSteamClaim(t *testing.T) {

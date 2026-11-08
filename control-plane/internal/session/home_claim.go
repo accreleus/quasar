@@ -362,7 +362,7 @@ func (s *Store) releaseUnusedSharedClaim(ctx context.Context, sessionID string) 
 	if err != nil {
 		return fmt.Errorf("read failed session: %w", err)
 	}
-	return s.deleteUnusedSharedClaim(ctx, userID, *shared)
+	return s.deleteUnusedSharedClaim(ctx, userID, *shared, sessionID)
 }
 
 // releaseUnusedSwapSharedClaim is releaseUnusedSharedClaim for a swap whose
@@ -382,13 +382,19 @@ func (s *Store) releaseUnusedSwapSharedClaim(ctx context.Context, sessionID, sha
 	if err != nil {
 		return fmt.Errorf("read swap session: %w", err)
 	}
-	return s.deleteUnusedSharedClaim(ctx, userID, sharedApp)
+	return s.deleteUnusedSharedClaim(ctx, userID, sharedApp, sessionID)
 }
 
 // deleteUnusedSharedClaim deletes userID's claim on sharedApp if, and only if,
 // it is reserved with no hold, the family has no home row, and no live session
 // uses it. Under the user lock, as placement takes claims.
-func (s *Store) deleteUnusedSharedClaim(ctx context.Context, userID, sharedApp string) error {
+//
+// sessionID is the caller's session, and it is the one session excluded from
+// the last check: another session of the user in the durable `swapping` state
+// may have this home as the target of a swap whose dispatch is still in memory
+// (on a connection that takes no holds), so the claim is not provably unused
+// while that swap is unresolved.
+func (s *Store) deleteUnusedSharedClaim(ctx context.Context, userID, sharedApp, sessionID string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin shared claim release: %w", err)
@@ -404,8 +410,11 @@ func (s *Store) deleteUnusedSharedClaim(ctx context.Context, userID, sharedApp s
 		        WHERE uh.user_id=c.user_id AND COALESCE(a.parent_app_id,a.id)=c.canonical_app_id)
 		  AND NOT EXISTS (SELECT 1 FROM sessions s JOIN apps a ON a.id=s.app_id
 		        WHERE s.user_id=c.user_id AND s.state NOT IN ('stopped','failed')
-		          AND (COALESCE(a.parent_app_id,a.id)=c.canonical_app_id OR s.shared_home_app_id=c.canonical_app_id))`,
-		userID, sharedApp); err != nil {
+		          AND (COALESCE(a.parent_app_id,a.id)=c.canonical_app_id OR s.shared_home_app_id=c.canonical_app_id))
+		  AND NOT EXISTS (SELECT 1 FROM sessions w
+		        WHERE w.user_id=c.user_id AND w.id <> $3::uuid
+		          AND w.state = 'running' AND w.state_detail = $4)`,
+		userID, sharedApp, sessionID, swapDetailInProgress); err != nil {
 		return fmt.Errorf("release unused shared claim: %w", err)
 	}
 	return tx.Commit(ctx)
@@ -662,13 +671,17 @@ func (s *Store) GuardHomeForSwapWithHold(ctx context.Context, sessionID, userID 
 		if err != nil {
 			return swapHomeGuard{}, err
 		}
-		if created {
-			// Its own provenance: the own hold may be a reused one (Created
-			// false) while this Steam hold is new, and only this flag may
-			// release it on a proven pre-handoff failure.
-			sharedHold = &HomeHoldDecision{Token: decision.Token, Created: true,
-				UserID: userID, AppID: p.SharedHomeAppID, SessionID: sessionID}
+		// Recorded whenever the target shares, held by this guard or not: Created
+		// says whether THIS guard took the hold (only that may be released on a
+		// proven pre-handoff failure, and only that gives the epoch refresh a
+		// token), while the record itself is the swap's Steam identity, which an
+		// unsupported connection still needs.
+		token := ""
+		if decision != nil {
+			token = decision.Token
 		}
+		sharedHold = &HomeHoldDecision{Token: token, Created: created,
+			UserID: userID, AppID: p.SharedHomeAppID, SessionID: sessionID}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE sessions SET state_detail=$2, launch_progress=NULL WHERE id=$1::uuid`,
 		sessionID, swapDetailInProgress); err != nil {
