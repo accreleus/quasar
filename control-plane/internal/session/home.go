@@ -201,8 +201,10 @@ func sharedSteamMount(ref, target string) string {
 }
 
 // injectSharedHomeMount appends the shared Steam mount after the session's own
-// home mount, so it nests over it. EnsureHome creates the Steam home's row when
-// the user has none; the agent creates the directory.
+// home mount, so it nests over it. Every dispatch that mounts a shared home goes
+// through it — a launch, a swap target and a console auto-start alike, or the
+// hold those paths took on the Steam claim protects nothing. EnsureHome creates
+// the Steam home's row when the user has none; the agent creates the directory.
 func (c *Coordinator) injectSharedHomeMount(ctx context.Context, spec []byte, app LaunchApp, userID, sharedAppID, hostID string) ([]byte, error) {
 	// Only the home's ref is used; the target is this app's.
 	mount, err := c.homes.EnsureHome(ctx, userID, sharedAppID, hostID, app.HomeContainerPath)
@@ -216,7 +218,7 @@ func (c *Coordinator) injectSharedHomeMount(ctx context.Context, spec []byte, ap
 	return injectHomeMount(spec, sharedSteamMount(ref, app.HomeContainerPath))
 }
 
-// sharedSteamApp is the Steam parent a sharing launch mounts: exactly one
+// sharedSteamApp is the Steam parent a sharing dispatch mounts: exactly one
 // enabled, managed-home Steam provider app the user is entitled to, as
 // warmSteamApp picks it. "" when there is none or more than one.
 func (s *Store) sharedSteamApp(ctx context.Context, userID string) (string, error) {
@@ -241,4 +243,26 @@ func (s *Store) sharedSteamApp(ctx context.Context, userID string) (string, erro
 		return "", nil
 	}
 	return ids[0], err
+}
+
+// sharedHomeChoice is the SharedHomeAppID decision, made in one place for every
+// dispatch path — a launch (launcher.go), a swap target (swapper.go) and a
+// console auto-start (console_launch.go). Only a sharing, managed-home app
+// mounts a shared home, and only when exactly one Steam provider may be shared;
+// notice is the launch-side explanation when the app shares and nothing can be
+// shared. parked says the dispatch is a warm-Steam park, which never shares
+// (defensive: apps_share_steam_library_ck already refuses the switch on a Steam
+// provider or a tile).
+func (s *Store) sharedHomeChoice(ctx context.Context, app LaunchApp, userID string, parked bool) (shared, notice string, err error) {
+	if parked || !app.ShareSteamLibrary || !app.ManagedHome {
+		return "", "", nil
+	}
+	shared, err = s.sharedSteamApp(ctx, userID)
+	if err != nil {
+		return "", "", err
+	}
+	if shared == "" {
+		return "", noticeSharedUnavailable, nil
+	}
+	return shared, "", nil
 }

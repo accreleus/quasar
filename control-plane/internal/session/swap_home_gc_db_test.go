@@ -75,8 +75,9 @@ func TestCapableSwapTargetHoldOutlivesSyntheticTerminal(t *testing.T) {
 	ctx := context.Background()
 	app, err := store.GetLaunchApp(ctx, target)
 	must(t, err)
-	hold, err := store.GuardHomeForSwapWithHold(ctx, sess.ID, s.userID, app, s.hostID, true)
+	guard, err := store.GuardHomeForSwapWithHold(ctx, sess.ID, s.userID, app, s.hostID, true, "")
 	must(t, err)
+	hold := guard.hold
 	if hold == nil || !hold.Created {
 		t.Fatalf("capable target hold = %+v", hold)
 	}
@@ -106,12 +107,13 @@ func TestUnqueuedSwapEpochRefreshUsesNewCapability(t *testing.T) {
 	ctx := context.Background()
 	app, err := store.GetLaunchApp(ctx, target)
 	must(t, err)
-	hold, err := store.GuardHomeForSwapWithHold(ctx, sess.ID, s.userID, app, s.hostID, true)
+	guard, err := store.GuardHomeForSwapWithHold(ctx, sess.ID, s.userID, app, s.hostID, true, "")
 	must(t, err)
+	hold := guard.hold
 	if hold == nil || !hold.Created {
 		t.Fatalf("first epoch hold = %+v", hold)
 	}
-	decision, err := store.RefreshSwapHomeHold(ctx, sess.ID, s.userID, target, s.hostID, hold, false)
+	decision, err := store.RefreshSwapHomeHold(ctx, sess.ID, s.userID, target, s.hostID, hold, false, "")
 	must(t, err)
 	if decision != nil {
 		t.Fatalf("unsupported replacement epoch kept new hold: %+v", decision)
@@ -123,7 +125,7 @@ func TestUnqueuedSwapEpochRefreshUsesNewCapability(t *testing.T) {
 	if pending || !warning {
 		t.Fatalf("epoch refresh: pending=%t warning=%t", pending, warning)
 	}
-	decision, err = store.RefreshSwapHomeHold(ctx, sess.ID, s.userID, target, s.hostID, nil, true)
+	decision, err = store.RefreshSwapHomeHold(ctx, sess.ID, s.userID, target, s.hostID, nil, true, "")
 	must(t, err)
 	if decision == nil || !decision.Created {
 		t.Fatalf("later capable epoch hold = %+v", decision)
@@ -192,7 +194,7 @@ func TestUncertainManagedSwapAckRetainsHomeHold(t *testing.T) {
 	must(t, store.GuardHomeForSwap(context.Background(), sess.ID, s.userID, app, s.hostID))
 	disp := newFakeDispatcher(true)
 	disp.ackSendErr = errors.New("ack lost")
-	swap := newSwapper(store, disp, testLogger(), nil)
+	swap := newSwapper(store, disp, testLogger(), nil, nil)
 	swap.pendingSwaps[sess.ID] = target
 	swap.dispatchSwap(s.hostID, sess.ID, []byte(`{}`), true, false, s.userID, target, nil, nil)
 	if _, pending := swap.pendingSwaps[sess.ID]; !pending {

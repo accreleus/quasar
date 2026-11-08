@@ -296,7 +296,11 @@ func resolveSharedHome(ctx context.Context, tx pgx.Tx, p *CreateParams) (string,
 // claim, shared homes; schema.md 0090, amendment 53). A hold still in use or settling refuses the launch as
 // it would a launch of that home; a home needing operator review is dropped,
 // with the notice, inside a savepoint so nothing it wrote survives.
-func claimSharedHome(ctx context.Context, tx pgx.Tx, p *CreateParams, hostID string) (string, error) {
+//
+// sameSession is the swapping session on the swap path: it already holds this
+// claim when it was a Steam session, and its own hold is not a conflict with
+// itself. A launch passes none.
+func claimSharedHome(ctx context.Context, tx pgx.Tx, p *CreateParams, hostID string, sameSession ...string) (string, error) {
 	sp, err := tx.Begin(ctx)
 	if err != nil {
 		return "", fmt.Errorf("begin shared home claim: %w", err)
@@ -315,7 +319,7 @@ func claimSharedHome(ctx context.Context, tx pgx.Tx, p *CreateParams, hostID str
 			return noticeSharedUnavailable, nil
 		}
 	}
-	err = claimSelectedHome(ctx, sp, p.sharedParams(), hostID)
+	err = claimSelectedHome(ctx, sp, p.sharedParams(), hostID, sameSession...)
 	var settling *homeHoldSettlingError
 	var inUse *HomeInUseError
 	switch {
@@ -485,20 +489,40 @@ func (s *Store) persistHomeConflict(ctx context.Context, p CreateParams) error {
 // not move a home. A first claim committed here remains protective if a later
 // mount or agent operation fails, because that failure is not proof of absence.
 func (s *Store) GuardHomeForSwap(ctx context.Context, sessionID, userID string, app LaunchApp, hostID string) error {
-	_, err := s.GuardHomeForSwapWithHold(ctx, sessionID, userID, app, hostID, false)
+	_, err := s.GuardHomeForSwapWithHold(ctx, sessionID, userID, app, hostID, false, "")
 	return err
+}
+
+// swapHomeGuard is what GuardHomeForSwapWithHold took for a swap target: the
+// target's own hold, the Steam home the target also mounts (sharedID, "" when
+// it shares nothing), and why a requested shared home was not taken (notice, for
+// the log — a swap response carries no notice).
+type swapHomeGuard struct {
+	hold     *HomeHoldDecision
+	sharedID string
+	notice   string
 }
 
 // GuardHomeForSwapWithHold creates a cleanup-capable target hold in the same
 // transaction as the durable swap guard. A prior same-session hold is reused.
-func (s *Store) GuardHomeForSwapWithHold(ctx context.Context, sessionID, userID string, app LaunchApp, hostID string, capable bool) (*HomeHoldDecision, error) {
+//
+// sharedApp is the Steam parent the target's own shared_home_app_id should make
+// it mount (0 or 1). It is claimed and held here, in the same transaction and
+// the same lock order a launch takes (own claim, own homes, shared claim, shared
+// homes; schema.md 0090), so a swap into a sharing desktop is one Steam at a
+// time exactly as a launch of it is — a concurrent launch cannot slip between a
+// separate claim and the swap. The session is excluded from the shared claim's
+// hold refusal: a Steam-family session swapping into a sharing desktop already
+// holds that claim itself, and the shared home it mounts is the same library.
+func (s *Store) GuardHomeForSwapWithHold(ctx context.Context, sessionID, userID string, app LaunchApp, hostID string, capable bool, sharedApp string) (swapHomeGuard, error) {
 	if !app.ManagedHome {
-		return nil, nil
+		return swapHomeGuard{}, nil
 	}
-	p := CreateParams{UserID: userID, AppID: app.ID, HomeAppID: homeAppID(app), ManagedHome: true}
+	p := CreateParams{UserID: userID, AppID: app.ID, HomeAppID: homeAppID(app), ManagedHome: true,
+		SharedHomeAppID: sharedApp}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("begin swap home claim: %w", err)
+		return swapHomeGuard{}, fmt.Errorf("begin swap home claim: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	// Existing-session operations lock session before claim before home. This
@@ -509,14 +533,14 @@ func (s *Store) GuardHomeForSwapWithHold(ctx context.Context, sessionID, userID 
 	if err := tx.QueryRow(ctx, `SELECT user_id::text,host_id::text,state,state_detail
 		FROM sessions WHERE id=$1::uuid FOR UPDATE`, sessionID).
 		Scan(&lockedUser, &lockedHost, &lockedState, &lockedDetail); err != nil {
-		return nil, fmt.Errorf("lock swap session: %w", err)
+		return swapHomeGuard{}, fmt.Errorf("lock swap session: %w", err)
 	}
 	if lockedUser != userID || lockedHost != hostID || lockedState != "running" ||
 		(lockedDetail != nil && *lockedDetail == swapDetailInProgress) {
-		return nil, ErrSessionNotSwappable
+		return swapHomeGuard{}, ErrSessionNotSwappable
 	}
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, hashtext($2::text))`, lockNamespaceUser, userID); err != nil {
-		return nil, fmt.Errorf("lock swap user: %w", err)
+		return swapHomeGuard{}, fmt.Errorf("lock swap user: %w", err)
 	}
 	appIDs := []string{p.homeAppID()}
 	if p.AppID != p.homeAppID() {
@@ -525,46 +549,69 @@ func (s *Store) GuardHomeForSwapWithHold(ctx context.Context, sessionID, userID 
 	for _, appID := range appIDs {
 		var lockedID string
 		if err := tx.QueryRow(ctx, `SELECT id::text FROM apps WHERE id=$1::uuid FOR KEY SHARE`, appID).Scan(&lockedID); err != nil {
-			return nil, fmt.Errorf("lock swap app: %w", err)
+			return swapHomeGuard{}, fmt.Errorf("lock swap app: %w", err)
 		}
 	}
 	selected, err := placementSelectedForHost(ctx, tx, p.homeAppID(), hostID)
 	if err != nil {
-		return nil, fmt.Errorf("check swap placement: %w", err)
+		return swapHomeGuard{}, fmt.Errorf("check swap placement: %w", err)
 	}
 	if !selected {
-		return nil, ErrHomeConflict
+		return swapHomeGuard{}, ErrHomeConflict
 	}
 	owner, err := homeClaimOwner(ctx, tx, p, sessionID)
 	if err != nil {
-		return nil, s.finishRefusedSwapHome(ctx, tx, p, err)
+		return swapHomeGuard{}, s.finishRefusedSwapHome(ctx, tx, p, err)
 	}
 	if owner == "" && app.IsDerived() {
-		return nil, ErrHomeNotProvisioned
+		return swapHomeGuard{}, ErrHomeNotProvisioned
 	}
 	if owner != "" && owner != hostID {
-		return nil, ErrHomeNotProvisioned
+		return swapHomeGuard{}, ErrHomeNotProvisioned
 	}
 	if err := claimSelectedHome(ctx, tx, p, hostID, sessionID); err != nil {
-		return nil, s.finishRefusedSwapHome(ctx, tx, p, err)
+		return swapHomeGuard{}, s.finishRefusedSwapHome(ctx, tx, p, err)
+	}
+	// The target's shared home, beside its own. claimSharedHome drops the share
+	// (leaving p.SharedHomeAppID "") with the notice for a Steam home this host
+	// cannot mount; a live or settling holder is a refusal, which names the
+	// holder so the caller can say which session is in the way.
+	notice := ""
+	if p.SharedHomeAppID != "" {
+		if notice, err = claimSharedHome(ctx, tx, &p, hostID, sessionID); err != nil {
+			return swapHomeGuard{}, err
+		}
 	}
 	var priorToken *string
 	if err := tx.QueryRow(ctx, `SELECT pending_home_token::text FROM managed_home_claims
 		WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, userID, p.homeAppID()).Scan(&priorToken); err != nil {
-		return nil, fmt.Errorf("read swap home hold: %w", err)
+		return swapHomeGuard{}, fmt.Errorf("read swap home hold: %w", err)
 	}
 	decision, err := setHomeDispatchHold(ctx, tx, userID, p.homeAppID(), sessionID, capable, priorToken)
 	if err != nil {
-		return nil, err
+		return swapHomeGuard{}, err
+	}
+	if p.SharedHomeAppID != "" {
+		// Under the target's own token, as the dispatch binding holds it: one
+		// qualified terminal or one ClearNewHomeHold then releases both.
+		var pending *string
+		if err := tx.QueryRow(ctx, `SELECT pending_home_session_id::text FROM managed_home_claims
+			WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid FOR UPDATE`,
+			userID, p.SharedHomeAppID).Scan(&pending); err != nil {
+			return swapHomeGuard{}, fmt.Errorf("read shared swap home hold: %w", err)
+		}
+		if err := holdSharedHome(ctx, tx, userID, p.SharedHomeAppID, sessionID, decision, pending); err != nil {
+			return swapHomeGuard{}, err
+		}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE sessions SET state_detail=$2, launch_progress=NULL WHERE id=$1::uuid`,
 		sessionID, swapDetailInProgress); err != nil {
-		return nil, fmt.Errorf("persist pending swap guard: %w", err)
+		return swapHomeGuard{}, fmt.Errorf("persist pending swap guard: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, err
+		return swapHomeGuard{}, err
 	}
-	return decision, nil
+	return swapHomeGuard{hold: decision, sharedID: p.SharedHomeAppID, notice: notice}, nil
 }
 
 func (s *Store) finishRefusedSwapHome(ctx context.Context, tx pgx.Tx, p CreateParams, guardErr error) error {

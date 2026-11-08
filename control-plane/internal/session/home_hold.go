@@ -214,8 +214,11 @@ func (s *Store) ClearNewHomeHold(ctx context.Context, hold *HomeHoldDecision) er
 // RefreshSwapHomeHold changes only an unstarted swap's capability decision
 // after its command epoch vanished before queue handoff. The session and claim
 // remain locked in global order; an older reused hold cannot be downgraded to
-// an unsupported connection.
-func (s *Store) RefreshSwapHomeHold(ctx context.Context, sessionID, userID, appID, hostID string, prior *HomeHoldDecision, capable bool) (*HomeHoldDecision, error) {
+// an unsupported connection. sharedApp is the Steam home the swap's target also
+// mounted ("" when it shared nothing): a hold this swap took on it goes with the
+// own one, so nothing is left held by a session the control plane cannot prove
+// mounted it.
+func (s *Store) RefreshSwapHomeHold(ctx context.Context, sessionID, userID, appID, hostID string, prior *HomeHoldDecision, capable bool, sharedApp string) (*HomeHoldDecision, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin swap epoch refresh: %w", err)
@@ -258,6 +261,27 @@ func (s *Store) RefreshSwapHomeHold(ctx context.Context, sessionID, userID, appI
 			return nil, fmt.Errorf("release unstarted swap hold: %w", err)
 		}
 		pendingToken = nil
+		if sharedApp != "" {
+			if _, err := tx.Exec(ctx, `UPDATE managed_home_claims SET pending_home_session_id=NULL,
+				pending_home_token=NULL,pending_home_started_at=NULL
+				WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid AND pending_home_token=$3::uuid`,
+				userID, sharedApp, prior.Token); err != nil {
+				return nil, fmt.Errorf("release unstarted shared swap hold: %w", err)
+			}
+			// No hold left on the shared claim: record the unprotected dispatch
+			// exactly as holdSharedHome does for an unsupported connection.
+			var sharedPending *string
+			if err := tx.QueryRow(ctx, `SELECT pending_home_session_id::text FROM managed_home_claims
+				WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid FOR UPDATE`,
+				userID, sharedApp).Scan(&sharedPending); err != nil {
+				return nil, fmt.Errorf("read shared swap claim: %w", err)
+			}
+			if sharedPending == nil {
+				if err := holdSharedHome(ctx, tx, userID, sharedApp, sessionID, nil, sharedPending); err != nil {
+					return nil, err
+				}
+			}
+		}
 	}
 	decision, err := setHomeDispatchHold(ctx, tx, userID, appID, sessionID, capable, pendingToken)
 	if err != nil {

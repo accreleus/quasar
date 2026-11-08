@@ -314,13 +314,8 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		afterParkedRead()
 	}
 	notice := ""
-	if app.ShareSteamLibrary && app.ManagedHome && !lp.parked {
-		if p.SharedHomeAppID, err = c.store.sharedSteamApp(ctx, userID); err != nil {
-			return LaunchResult{}, err
-		}
-		if p.SharedHomeAppID == "" {
-			notice = noticeSharedUnavailable
-		}
+	if p.SharedHomeAppID, notice, err = c.store.sharedHomeChoice(ctx, app, userID, lp.parked); err != nil {
+		return LaunchResult{}, err
 	}
 
 	sess, err := c.store.ScheduleAndCreate(ctx, p)
