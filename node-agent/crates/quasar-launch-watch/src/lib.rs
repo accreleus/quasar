@@ -146,6 +146,8 @@ pub struct Watcher {
     windows_read: bool,
     /// The last window list read, for the helper's pin.
     last_windows: Vec<WindowInfo>,
+    /// Steam logged a `GameAction` for the target: it took the launch up (#1159).
+    action_seen: bool,
 }
 
 impl Watcher {
@@ -179,7 +181,19 @@ impl Watcher {
             focused: None,
             windows_read: false,
             last_windows: Vec::new(),
+            action_seen: false,
         }
+    }
+
+    /// Where the target is now, as last reported.
+    pub fn launch_state(&self) -> LaunchState {
+        self.state
+    }
+
+    /// Steam's log has shown a launch action for the target: a launch it ignored (mid
+    /// sign-in) leaves no such line, so a caller may send it again only while this is false.
+    pub fn launch_taken(&self) -> bool {
+        self.action_seen
     }
 
     /// The appid this watcher follows.
@@ -451,6 +465,7 @@ impl Watcher {
             if extract_appid(line) != Some(self.cfg.appid) {
                 return;
             }
+            self.action_seen = true;
             if let Some(task_at) = line.find("LaunchApp waiting for user response to") {
                 // The one log line that means Steam is actually stopped for
                 // the user. A bare `changed task to SynchronizingCloud` is a
