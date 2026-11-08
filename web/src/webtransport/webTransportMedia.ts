@@ -1,18 +1,23 @@
 // MediaTransport over WebTransport: protocol/transport-webtransport.md, wt_proto 1,
-// video only. Input, ping/pong, audio, NACK and feedback are later tickets (#1032,
-// #1033, #1039, #1040).
+// video, input, ping/pong, NACK, audio and the microphone. Feedback is a later ticket (#1040).
 
 import {
   base64Bytes,
+  CHANNEL_AUDIO,
   ControlDecoder,
   ControlProtocolError,
   encodeControl,
+  parseAudioDatagram,
   parseVideoDatagram,
 } from "./framing";
 import type { WebTransportCoords } from "../api/types";
-import { FrameAssembler } from "./reassembly";
+import type { InputWire } from "./inputSender";
+import { workerTicker, type Ticker } from "./pingTicker";
+import { FrameAssembler, type Reassembled } from "./reassembly";
 import {
   TransportError,
+  type AudioConfig,
+  type AudioStreams,
   type KeyframeReason,
   type MediaSink,
   type MediaTransport,
@@ -22,19 +27,31 @@ import {
 const WT_PROTO = 1;
 /** `session_not_ready`: retry the same token after this long (§Hello). */
 const NOT_READY_RETRY_MS = 250;
-/** How long connect keeps retrying an agent that is not ready or gives no answer. */
+/** How long connect keeps retrying an agent that says it is not ready. */
 export const CONNECT_DEADLINE_MS = 60_000;
+/** How long connect waits for the WebTransport handshake. A host that completed it is reachable,
+ *  so attempts after that (not ready, or an answer Chrome dropped) are not bounded by this: they
+ *  run to {@link CONNECT_DEADLINE_MS}. Well under the loader's give-up time, so the page can fall
+ *  back to WebRTC (control-api.md §Transport fallback) while the launch is still waiting. */
+export const HANDSHAKE_DEADLINE_MS = 10_000;
 /** One attempt's wait for its answer; the agent closes a connection with no `hello` at 5 s. */
 const ANSWER_TIMEOUT_MS = 10_000;
 /** How long a connection that failed without an answer gets to report its close code. */
 const CLOSE_CODE_WAIT_MS = 1_000;
 /** The agent forces at most one IDR per 150 ms (quasar-protocol#29, item 8); asking faster is noise. */
 export const KEYFRAME_SPACING_MS = 150;
+/** How often loss-recovery deadlines are checked when no datagram arrives. */
+export const RECOVERY_TICK_MS = 50;
 /** The control plane is asked for a fresh token at most this often. */
 export const REMINT_MIN_INTERVAL_MS = 10_000;
 /** A token held this long (TTL 60 s, control-api.md) is replaced after a failed attempt. Measured
  *  on this page's monotonic clock from its arrival, never against the server's `expires_at`. */
 export const TOKEN_REFRESH_AGE_MS = 45_000;
+
+/** The client pings once a second (§Ping and pong). */
+const PING_MS = 1_000;
+/** A datagram carries at least this much on any path (§Channels, "Datagram size"). */
+const MAX_INPUT_DATAGRAM = 1148;
 
 /** WebTransport close codes during connect (§Bye and error), as the refusal they stand for. */
 const CLOSE_REFUSALS: Record<number, string> = {
@@ -59,6 +76,8 @@ export interface WebTransportMediaOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Monotonic milliseconds. */
   now?: () => number;
+  /** The ping's clock; a Worker's by default, so a hidden tab keeps pinging. */
+  ticker?: Ticker;
 }
 
 /** `hello_ack.video` into a {@link VideoConfig}; throws on a shape it cannot use. */
@@ -94,12 +113,27 @@ export function videoConfigFrom(ack: Record<string, unknown>): VideoConfig {
   };
 }
 
+const audioConfigFrom = (a: unknown): AudioConfig | null => {
+  const o = a as Record<string, unknown> | null | undefined;
+  if (!o || o.codec !== "opus" || typeof o.channels !== "number" || typeof o.sample_rate !== "number") return null;
+  return { channels: o.channels, sampleRate: o.sample_rate, ptimeMs: typeof o.ptime_ms === "number" ? o.ptime_ms : 10 };
+};
+
+/** `hello_ack.audio` and `.mic`; null for a stream the host does not carry or one this client cannot use. */
+export const audioStreamsFrom = (ack: Record<string, unknown>): AudioStreams => ({
+  audio: audioConfigFrom(ack.audio),
+  mic: audioConfigFrom(ack.mic),
+});
+
 const refused = (code: string): Answer => ({ kind: "refused", code });
 const after = <T>(ms: number, value: T) => new Promise<T>((r) => setTimeout(() => r(value), ms));
 
 export class WebTransportMedia implements MediaTransport {
   private wt: WebTransport | null = null;
   private writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
+  private datagramWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
+  private stopTicker: (() => void) | null = null;
+  private pingId = 0;
   private closed = false;
   /** Closes the attempt in flight; null once one has connected or ended. */
   private abortAttempt: (() => void) | null = null;
@@ -110,9 +144,22 @@ export class WebTransportMedia implements MediaTransport {
   private lastMint = -Infinity;
   private lastKeyAt = -Infinity;
   private keyTimer: ReturnType<typeof setTimeout> | null = null;
+  /** §Loss recovery's tick: releases and late frames wait for no datagram. */
+  private recoveryTimer: ReturnType<typeof setInterval> | null = null;
   private pendingKey: KeyframeReason | null = null;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
+
+  /** Both paths are no-ops until connected. */
+  readonly input: InputWire = {
+    reliable: (event) => this.send({ type: "input", event }),
+    datagram: (bytes) => {
+      const cap = Math.min(this.wt?.datagrams.maxDatagramSize ?? MAX_INPUT_DATAGRAM, MAX_INPUT_DATAGRAM);
+      if (!this.datagramWriter || bytes.length > cap) return false;
+      void this.datagramWriter.write(bytes).catch(() => {});
+      return true;
+    },
+  };
 
   constructor(private readonly opts: WebTransportMediaOptions) {
     this.coords = opts.coords;
@@ -161,10 +208,22 @@ export class WebTransportMedia implements MediaTransport {
     }, wait);
   }
 
+  sendMic(datagram: Uint8Array): boolean {
+    return this.input.datagram(datagram);
+  }
+
+  private stopRecovery(): void {
+    if (this.recoveryTimer !== null) clearInterval(this.recoveryTimer);
+    this.recoveryTimer = null;
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
     if (this.keyTimer !== null) clearTimeout(this.keyTimer);
+    // Not left to `wt.closed`, which a connection that never finishes closing does not resolve.
+    this.stopRecovery();
+    this.stopPings();
     // An attempt still connecting is closed here; it sees `closed` at its next await.
     this.abortAttempt?.();
     if (this.connected) this.send({ type: "bye", reason: "client_closed" });
@@ -185,6 +244,11 @@ export class WebTransportMedia implements MediaTransport {
     }
     this.tokenAt = this.now();
     return true;
+  }
+
+  private stopPings(): void {
+    this.stopTicker?.();
+    this.stopTicker = null;
   }
 
   private send(message: object): void {
@@ -232,7 +296,13 @@ export class WebTransportMedia implements MediaTransport {
     };
 
     try {
-      await wt.ready;
+      // A blocked UDP port can leave the handshake pending for the browser's own, longer, timeout.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const ready = await Promise.race([
+        wt.ready.then(() => true),
+        new Promise<boolean>((r) => void (timer = setTimeout(() => r(false), HANDSHAKE_DEADLINE_MS))),
+      ]).finally(() => clearTimeout(timer));
+      if (!ready) return abandon(refused(this.closed ? "closed" : "connect_timeout"));
     } catch {
       // The handshake or the certificate failed (another try meets the same), or close() ended it.
       return abandon(refused(this.closed ? "closed" : "connect_failed"));
@@ -271,7 +341,8 @@ export class WebTransportMedia implements MediaTransport {
     };
 
     // Datagrams can overtake the hello_ack; the decode stage holds them by config_id.
-    void this.readDatagrams(wt, sink, live).catch(() => {});
+    const assembler = new FrameAssembler(this.now);
+    void this.readDatagrams(wt, sink, live, assembler).catch(() => {});
     let first: Record<string, unknown> | null;
     try {
       first = await Promise.race([next(), after(ANSWER_TIMEOUT_MS, null)]);
@@ -302,36 +373,73 @@ export class WebTransportMedia implements MediaTransport {
     this.wt = wt;
     this.writer = writer;
     this.connected = true;
+    this.datagramWriter = wt.datagrams.writable.getWriter();
+    sink.streams?.(audioStreamsFrom(first));
     sink.config(config);
+    const ping = () => this.send({ type: "ping", id: ++this.pingId, tc: this.now() });
+    ping();
+    this.stopTicker = (this.opts.ticker ?? workerTicker)(PING_MS, ping);
     void (async () => {
       try {
         for (let m = await next(); m && live.on; m = await next()) {
           // Unknown types are ignored (§Channels). bye is followed by the close.
           if (m.type === "hello_ack") sink.config(videoConfigFrom(m));
+          else if (m.type === "nack_miss" && typeof m.frame_seq === "number" && Array.isArray(m.frags)) {
+            this.recovered(assembler.miss(m.frame_seq, m.frags as [number, number][]), sink);
+          } else if (m.type === "pong" && typeof m.tc === "number") sink.rtt?.(Math.max(0, this.now() - m.tc));
+          else if (m.type === "ping") {
+            this.send({ type: "pong", id: m.id, ts: m.ts, tw: m.tw, tc: this.now() });
+          }
         }
       } catch (err) {
         // A malformed stream, or a re-sent hello_ack this page cannot use: the connection is over.
         wt.close({ closeCode: 4400, reason: err instanceof Error ? err.message.slice(0, 100) : "" });
       }
     })();
+    // Release and lateness must not wait for the next datagram: a still picture may send none.
+    this.recoveryTimer = setInterval(() => {
+      if (live.on && !this.closed) this.recovered(assembler.tick(), sink);
+    }, RECOVERY_TICK_MS);
     void wt.closed.then(
-      (info) => sink.end({ code: info.closeCode ?? null, reason: info.reason ?? "" }),
-      (err: unknown) => sink.end({ code: null, reason: err instanceof Error ? err.message : "" }),
+      (info) => {
+        this.stopRecovery();
+        this.stopPings();
+        sink.end({ code: info.closeCode ?? null, reason: info.reason ?? "" });
+      },
+      (err: unknown) => {
+        this.stopRecovery();
+        this.stopPings();
+        sink.end({ code: null, reason: err instanceof Error ? err.message : "" });
+      },
     );
     return { kind: "ack" };
   }
 
-  private async readDatagrams(wt: WebTransport, sink: MediaSink, live: { on: boolean }): Promise<void> {
+  private async readDatagrams(
+    wt: WebTransport,
+    sink: MediaSink,
+    live: { on: boolean },
+    assembler: FrameAssembler,
+  ): Promise<void> {
     const reader = wt.datagrams.readable.getReader();
-    const assembler = new FrameAssembler(this.now);
     for (;;) {
       const { value, done } = await reader.read();
       if (done || !live.on) return;
+      if ((value as Uint8Array)[0] === CHANNEL_AUDIO) {
+        const packet = parseAudioDatagram(value as Uint8Array);
+        if (packet) sink.audio?.(packet);
+        continue;
+      }
       const frag = parseVideoDatagram(value as Uint8Array);
       if (!frag) continue; // another channel, or malformed: dropped (§Channels)
-      const { unit, needKeyframe } = assembler.push(frag);
-      if (needKeyframe) this.requestKeyframe("loss");
-      if (unit) sink.unit(unit);
+      this.recovered(assembler.push(frag), sink);
     }
+  }
+
+  /** §Loss recovery: NACKs out, a keyframe asked for a late frame, whole units to the sink. */
+  private recovered({ units, nacks, needKeyframe }: Reassembled, sink: MediaSink): void {
+    for (const n of nacks) this.send({ type: "nack", frame_seq: n.frameSeq, frags: n.frags });
+    if (needKeyframe) this.requestKeyframe("late");
+    for (const u of units) sink.unit(u);
   }
 }

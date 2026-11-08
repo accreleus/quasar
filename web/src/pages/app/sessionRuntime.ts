@@ -36,6 +36,7 @@ import { mintSignalingToken } from "../../api/library";
 import { ApiError } from "../../api/client";
 import type { ICEServer } from "../../api/types";
 import { setupCapture, type GamepadIdentity } from "../../input/capture";
+import { dataChannelSender } from "../../input/inputSender";
 import { NEUTRAL_MOUSE, type MouseSettings } from "../../input/mouseScale";
 import { QuasarSession, type RebindOutcome, type TakeoverRefusal } from "../../webrtc/session";
 import type { RecoveryState } from "../../webrtc/recovery";
@@ -488,9 +489,7 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
     if (destroyed) return;
     set({ channelOpen: true });
 
-    const sendInput = (msg: Record<string, unknown>) => {
-      if (ch.readyState === "open") ch.send(JSON.stringify(msg));
-    };
+    const { send: sendInput } = dataChannelSender(ch);
 
     const capture = deps.setupCapture({
       videoEl: cfg.videoEl,
