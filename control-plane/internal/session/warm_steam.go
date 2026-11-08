@@ -190,6 +190,9 @@ func (c *Coordinator) SteamWarmHeartbeat(ctx context.Context, userID string, isA
 func (c *Coordinator) launchWouldPlanWebTransport(ctx context.Context, p CreateParams, hostID string,
 	chain profile.LaunchProfile, lp LaunchParams, ov StreamOverride, env ProbeEnvelope, source string,
 ) bool {
+	// shortcut: every GPU on the host must plan WebTransport, but the park is not pinned to a
+	// WebRTC-planning GPU, so a mixed-GPU host can still park on one a WebTransport launch
+	// cannot adopt. Upgrade with #1214 (transport-neutral parks) or a placement pin.
 	// planTransport can only answer WebTransport for these two; skip the reads for the rest.
 	if chain.Transport != transportWebTransport && chain.Transport != transportOptIn {
 		return false
@@ -202,12 +205,14 @@ func (c *Coordinator) launchWouldPlanWebTransport(ctx context.Context, p CreateP
 	var gpus []int32
 	for rows.Next() {
 		var idx int32
-		if rows.Scan(&idx) == nil {
-			gpus = append(gpus, idx)
+		if err := rows.Scan(&idx); err != nil {
+			rows.Close()
+			return false // a partial GPU list must not withhold the park
 		}
+		gpus = append(gpus, idx)
 	}
 	rows.Close()
-	if len(gpus) == 0 {
+	if rows.Err() != nil || len(gpus) == 0 {
 		return false
 	}
 	lp.parked = false
