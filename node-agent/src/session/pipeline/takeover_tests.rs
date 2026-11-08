@@ -966,10 +966,19 @@ fn start_webtransport(tag: &str) -> (Host, Arc<crate::webtransport::Media>, WtRe
     (host, media, guard)
 }
 
+/// Media keeps flowing to `peer`, video and audio.
+fn receives_media(host: &mut Host, peer: &mut Peer) -> bool {
+    let (video, audio) = (rtp(&peer.video), rtp(&peer.audio));
+    pump(host, peer, Duration::from_secs(2), |_, p| {
+        rtp(&p.video) > video + 20 && rtp(&p.audio) > audio + 10
+    })
+}
+
 /// `transport-webtransport.md` §Takeover across transports, through the runner's own calls: a
 /// WebTransport client takes the session from a streaming WebRTC peer (its media stops and
 /// the client holding signaling is told `taken_over`), and a new WebRTC peer takes it back
-/// (the WebTransport client is displaced when that peer's answer applies).
+/// (the WebTransport client is displaced when that peer's answer applies, and the peer gets
+/// video and audio).
 #[test]
 fn takeover_crosses_between_webrtc_and_webtransport() {
     if !live_webrtc_available() {
@@ -1003,15 +1012,51 @@ fn takeover_crosses_between_webrtc_and_webtransport() {
     );
     assert!(media.attached(), "the WebTransport client streams");
 
-    let _b = attach_as(&mut host, Peer::another_browser());
+    let mut b = attach_as(&mut host, Peer::another_browser());
     assert!(
         wt.gone.get().is_some(),
         "the WebTransport client was displaced"
     );
     assert!(!media.attached());
+    assert!(receives_media(&mut host, &mut b), "{}", describe(&b));
     assert_eq!(host.errors.len(), 1, "the new peer was told nothing");
     a.stop();
     assert_eq!(host.bus_errors, Vec::<String>::new());
+}
+
+/// Seat A A1: a WebTransport client displaces the WebRTC holder while a new WebRTC peer's
+/// replacement transport is still unanswered. The runner's tick stops only the transport whose
+/// peer was displaced, which is retired already, so the new peer's answer makes it the holder
+/// with video and audio, and nobody is told `taken_over`.
+#[test]
+fn a_new_peer_answering_after_a_webtransport_takeover_gets_media() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (mut host, media, _wt) = start_webtransport("pingpong");
+    let _a = first_attach(&mut host);
+    let wt = media.attach().expect("the WebTransport hello is accepted");
+
+    let mut b = Peer::another_browser();
+    request_offers(&mut host);
+    let replaced = pump(&mut host, &mut b, Duration::from_secs(10), |h, _| {
+        h.replaced.contains(&PcId::Video)
+    });
+    assert!(replaced, "the new peer got no transport: {:?}", host.errors);
+    // The runner's tick lands before the new peer's answer.
+    let stopped = host.transports.take_from_webrtc(&host.sig_tx);
+    let up = pump(&mut host, &mut b, Duration::from_secs(20), |_, p| {
+        streaming(p)
+    });
+    assert!(up, "the new peer got no media: {}", describe(&b));
+    assert!(receives_media(&mut host, &mut b));
+    assert!(
+        wt.gone.get().is_some(),
+        "the WebTransport client was displaced"
+    );
+    assert!(!stopped, "nothing current was stopped");
+    assert!(host.errors.is_empty(), "{:?}", host.errors);
 }
 
 /// #1193 through the runner's dispatch: the page fell back to WebRTC while the host still held
@@ -1039,9 +1084,10 @@ fn a_fallback_answer_displaces_the_webtransport_client_at_once() {
     assert!(host.errors.is_empty(), "{:?}", host.errors);
 }
 
-/// §Takeover's bound through the runner's dispatch: after 6 takeovers in 60 s, counted across
-/// both transports, a new WebRTC peer is refused `takeover_rate_limited` on each PC, gets no
-/// transport, and the WebTransport client keeps the stream.
+/// §Takeover's bound through the runner's dispatch (erratum 28). After 6 takeovers in 60 s a
+/// WebRTC peer answering while a WebTransport client holds is still let in (seat B F1), and
+/// counted; a further peer displacing that WebRTC holder is refused `takeover_rate_limited` on
+/// each PC and gets no transport, and the holder keeps the stream.
 #[test]
 fn a_seventh_takeover_by_a_webrtc_peer_is_refused() {
     if !live_webrtc_available() {
@@ -1052,13 +1098,26 @@ fn a_seventh_takeover_by_a_webrtc_peer_is_refused() {
     let _a = first_attach(&mut host);
     let mut clients = Vec::new();
     for n in 0..6 {
-        assert!(media.admit_hello(), "takeover {n} is admitted");
-        clients.push(media.attach().expect("the WebTransport hello is accepted"));
+        clients.push(
+            media
+                .attach()
+                .unwrap_or_else(|e| panic!("takeover {n}: {e:?}")),
+        );
     }
     assert!(host.transports.take_from_webrtc(&host.sig_tx));
-    assert!(!media.admit_hello(), "a 7th WebTransport hello is refused");
+    assert!(
+        media.attach().is_err(),
+        "a 7th WebTransport hello is refused"
+    );
 
-    let mut b = Peer::another_browser();
+    let mut b = attach_as(&mut host, Peer::another_browser());
+    assert!(
+        clients.last().unwrap().gone.get().is_some(),
+        "the peer displaced the WebTransport client"
+    );
+    let replaced = host.replaced.len();
+
+    let mut c = Peer::another_browser();
     request_offers(&mut host);
     let rate_limited = |h: &Host| {
         codes(&h.errors)
@@ -1067,17 +1126,19 @@ fn a_seventh_takeover_by_a_webrtc_peer_is_refused() {
             .map(|(_, pc)| pc as usize)
             .collect::<std::collections::BTreeSet<_>>()
     };
-    let refused = pump(&mut host, &mut b, Duration::from_secs(10), |h, _| {
+    let refused = pump(&mut host, &mut c, Duration::from_secs(10), |h, _| {
         rate_limited(h).len() == 2
     });
     assert!(refused, "errors: {:?}", host.errors);
     assert_eq!(
-        host.replaced,
-        Vec::<PcId>::new(),
-        "no transport for the 7th"
+        host.replaced.len(),
+        replaced,
+        "no transport for the refused peer"
     );
-    assert!(media.attached(), "the WebTransport client keeps the stream");
-    assert!(clients.last().unwrap().gone.get().is_none());
+    assert!(
+        receives_media(&mut host, &mut b),
+        "the holder keeps the stream"
+    );
 }
 
 /// The first page answered but its transport never connected (its loader is still up),

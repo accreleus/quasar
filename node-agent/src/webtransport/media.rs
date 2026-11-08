@@ -2,7 +2,6 @@
 //! encoded-frame boundary, and their packetizing into `0x01` datagrams
 //! (`protocol/transport-webtransport.md` §Video).
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -89,19 +88,23 @@ struct State {
 /// cannot grow the per-pad table.
 const MAX_PADS: u64 = 4;
 
-/// `Typing::client` while the session's WebRTC peer holds it (§Takeover: one media client
-/// across both transports).
-const WEBRTC: u64 = u64::MAX;
+/// The session's one media client across both transports (`transport-webtransport.md`
+/// §Takeover): a WebTransport client by its id, or the WebRTC peer of one video transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Holder {
+    #[default]
+    None,
+    Wt(u64),
+    WebRtc(u64),
+}
 
-/// The client whose input the devices take: none (`0`), a WebTransport client's id or
-/// [`WEBRTC`], and the buttons of its last reliable `gp` per pad, since a datagram `gp`
-/// carries axes only.
-#[derive(Default)]
-struct Typing {
-    client: u64,
-    pads: std::collections::HashMap<u64, serde_json::Value>,
-    /// When each recent takeover happened, on either transport.
-    takeovers: std::collections::VecDeque<Instant>,
+/// Why a WebTransport client did not take the session.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Refused {
+    Ended,
+    NotReady,
+    /// §Takeover's bound.
+    RateLimited,
 }
 
 /// §Takeover's bound: at most this many takeovers of a session in any [`TAKEOVER_WINDOW`],
@@ -109,9 +112,24 @@ struct Typing {
 const TAKEOVER_LIMIT: usize = 6;
 const TAKEOVER_WINDOW: Duration = Duration::from_secs(60);
 
-impl Typing {
-    /// The window holds [`TAKEOVER_LIMIT`] takeovers already.
-    fn takeovers_full(&mut self, now: Instant) -> bool {
+/// Everything a handover decides, under one lock: who holds the session, what its input
+/// holds, the takeover window, and the transport whose displaced peer the runner has yet
+/// to stop.
+#[derive(Default)]
+struct Hold {
+    holder: Holder,
+    /// The buttons of the holder's last reliable `gp` per pad: a datagram `gp` carries axes only.
+    pads: std::collections::HashMap<u64, serde_json::Value>,
+    /// When each recent takeover happened, on either transport.
+    takeovers: std::collections::VecDeque<Instant>,
+    /// The video transport whose peer a WebTransport client displaced.
+    to_mute: Option<u64>,
+    /// A refusal was logged since the window last had room.
+    refusing: bool,
+}
+
+impl Hold {
+    fn full(&mut self, now: Instant) -> bool {
         while self
             .takeovers
             .front()
@@ -121,6 +139,35 @@ impl Typing {
         }
         self.takeovers.len() >= TAKEOVER_LIMIT
     }
+
+    /// Displacing the holder now would pass the bound. Logged once per refusal window.
+    fn refused(&mut self) -> bool {
+        if self.holder == Holder::None || !self.full(Instant::now()) {
+            return false;
+        }
+        if !std::mem::replace(&mut self.refusing, true) {
+            tracing::warn!(
+                token = "takeover-rate-limited",
+                "{TAKEOVER_LIMIT} takeovers of this session in {} s across both transports: \
+                 a new client is refused until the window clears, and the current one keeps \
+                 the stream",
+                TAKEOVER_WINDOW.as_secs()
+            );
+        }
+        true
+    }
+
+    /// A takeover of the holder, if there is one, enters the window.
+    fn count(&mut self) {
+        if self.holder == Holder::None {
+            return;
+        }
+        let now = Instant::now();
+        if !self.full(now) {
+            self.refusing = false;
+        }
+        self.takeovers.push_back(now);
+    }
 }
 
 /// The tap's side of a session: fed by the GStreamer streaming thread, read by the
@@ -128,13 +175,10 @@ impl Typing {
 pub(crate) struct Media {
     state: Mutex<State>,
     input: super::Input,
-    /// Whose input reaches the devices. Held across the injection, so a client that stopped
-    /// being the attached one cannot slip an event in behind the release that ended it.
-    typing: Mutex<Typing>,
+    /// Taken before `state` when both are. Held across an injection, so a client that stopped
+    /// being the holder cannot slip an event in behind the release that ended it.
+    hold: Mutex<Hold>,
     encoder: glib::WeakRef<gst::Element>,
-    /// A WebTransport client took the session from the WebRTC peer; the runner has yet to
-    /// stop that peer's media and tell it (`take_webrtc_displaced`).
-    webrtc_displaced: AtomicBool,
 }
 
 /// The client half `Media::attach` hands back.
@@ -145,24 +189,68 @@ pub(crate) struct Attached {
     pub(crate) gone: Arc<OnceLock<Gone>>,
 }
 
+/// What one WebRTC transport's callbacks reach the session's media client through.
+/// `transport` is the video transport's id; `None` for the audio PC.
+#[derive(Clone)]
+pub(crate) struct WebRtcSide {
+    pub(crate) media: Arc<Media>,
+    pub(crate) transport: Option<u64>,
+}
+
+impl WebRtcSide {
+    /// One input event from this transport's peer, `inject`ed only while it holds the session.
+    pub(crate) fn input(&self, inject: impl FnOnce()) {
+        let hold = self.media.hold();
+        if self
+            .transport
+            .is_some_and(|t| hold.holder == Holder::WebRtc(t))
+        {
+            inject();
+        }
+    }
+
+    /// The peer's PC disconnected: what it held is lifted if it holds the session. `gone`
+    /// (failed or closed, not a transient disconnect) also ends its hold. The audio PC only
+    /// releases, for whichever WebRTC peer holds.
+    pub(crate) fn disconnected(&self, gone: bool) {
+        let mut hold = self.media.hold();
+        let Holder::WebRtc(holder) = hold.holder else {
+            return;
+        };
+        match self.transport {
+            Some(t) if t != holder => {}
+            Some(_) => {
+                self.media.release(&mut hold);
+                if gone {
+                    hold.holder = Holder::None;
+                }
+            }
+            None => self.media.release(&mut hold),
+        }
+    }
+}
+
 impl Media {
     pub(crate) fn new(encoder: &gst::Element, input: super::Input) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::default(),
             input,
-            typing: Mutex::default(),
+            hold: Mutex::default(),
             encoder: encoder.downgrade(),
-            webrtc_displaced: AtomicBool::new(false),
         })
     }
 
-    /// One `input.md` event from `client` to the devices; dropped unless it is the attached one.
+    fn hold(&self) -> std::sync::MutexGuard<'_, Hold> {
+        self.hold.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// One `input.md` event from `client` to the devices; dropped unless it holds the session.
     /// A datagram can arrive after a reliable event that followed it, so a datagram `gp` takes
     /// its buttons from the last reliable one and never changes them; one for a pad with none
     /// is dropped. Everything else passes through as sent.
     pub(crate) fn input_event(&self, client: u64, json: &str, datagram: bool) {
-        let mut typing = self.typing.lock().unwrap_or_else(|e| e.into_inner());
-        if typing.client != client {
+        let mut hold = self.hold();
+        if hold.holder != Holder::Wt(client) {
             return;
         }
         if !json.contains("\"gp\"") {
@@ -177,13 +265,12 @@ impl Media {
                 return;
             }
             if datagram {
-                let Some(buttons) = typing.pads.get(&pad) else {
+                let Some(buttons) = hold.pads.get(&pad) else {
                     return;
                 };
                 event["buttons"] = buttons.clone();
             } else {
-                typing
-                    .pads
+                hold.pads
                     .insert(pad, event.get("buttons").cloned().unwrap_or_default());
             }
         }
@@ -192,12 +279,17 @@ impl Media {
 
     #[cfg(test)]
     pub(crate) fn remembered_pads(&self) -> usize {
-        self.typing.lock().unwrap().pads.len()
+        self.hold().pads.len()
     }
 
-    /// Lift everything the devices hold and forget the pads. Called with `typing` locked.
-    fn release(&self, typing: &mut Typing) {
-        typing.pads.clear();
+    #[cfg(test)]
+    pub(crate) fn holder(&self) -> Holder {
+        self.hold().holder
+    }
+
+    /// Lift everything the devices hold and forget the pads. Called with `hold` locked.
+    fn release(&self, hold: &mut Hold) {
+        hold.pads.clear();
         (self.input.release_all)();
     }
 
@@ -206,20 +298,28 @@ impl Media {
     }
 
     /// A configuration exists, so a `hello_ack` can be sent.
+    #[cfg(test)]
     pub(crate) fn ready(&self) -> bool {
         self.lock().config.is_some()
     }
 
-    /// Make `self` stream to a new client, displacing the one before it. The new one
-    /// starts at a keyframe.
-    pub(crate) fn attach(&self) -> Option<Attached> {
+    /// A WebTransport client takes the session, displacing its holder unless that is past
+    /// §Takeover's bound. What the holder held is lifted now, before the new client can send;
+    /// a displaced WebRTC peer's transport is left for the runner to stop
+    /// (`take_to_mute`). The new client starts at a keyframe.
+    pub(crate) fn attach(&self) -> Result<Attached, Refused> {
         let (tx, rx) = mpsc::channel(CLIENT_QUEUE);
         let gone = Arc::new(OnceLock::new());
+        let mut hold = self.hold();
         let mut st = self.lock();
         if st.ended {
-            return None;
+            return Err(Refused::Ended);
         }
-        let config = st.config.clone()?;
+        let config = st.config.clone().ok_or(Refused::NotReady)?;
+        if hold.refused() {
+            return Err(Refused::RateLimited);
+        }
+        hold.count();
         st.next_client += 1;
         let id = st.next_client;
         let displaced = st.client.replace(Client {
@@ -233,22 +333,18 @@ impl Media {
         }
         st.want_key = true;
         drop(st);
-        {
-            // The new client's input starts from nothing held: what its predecessor held is
-            // lifted now, before the new client can send, and its late input is dropped.
-            let mut typing = self.typing.lock().unwrap_or_else(|e| e.into_inner());
-            // A predecessor that has not finished leaving (`detach` clears the client, then
-            // takes this lock) still owns the devices: whatever it holds is lifted either way.
-            if typing.client != 0 {
-                self.release(&mut typing);
+        match hold.holder {
+            Holder::None => {}
+            Holder::Wt(_) => self.release(&mut hold),
+            Holder::WebRtc(t) => {
+                self.release(&mut hold);
+                hold.to_mute = Some(t);
             }
-            if typing.client == WEBRTC {
-                self.webrtc_displaced.store(true, Ordering::SeqCst);
-            }
-            typing.client = id;
         }
+        hold.holder = Holder::Wt(id);
+        drop(hold);
         self.keyframe();
-        Some(Attached {
+        Ok(Attached {
             id,
             config,
             rx,
@@ -260,91 +356,81 @@ impl Media {
         self.lock().client.is_some()
     }
 
-    /// The host accepted a WebRTC peer (`transport-webtransport.md` §Takeover): it displaces
-    /// the WebTransport client, and what that client held is lifted now, before the peer can
-    /// send. That client's later detach, its 10 s silence included, then lifts nothing.
-    /// True when a client was attached. Displacing anyone, the WebRTC peer before it
-    /// included, counts as a takeover.
-    pub(crate) fn webrtc_attached(&self) -> bool {
+    /// The peer of video `transport` had its first answer applied: it takes the session
+    /// (§Takeover), counted and never refused (erratum 28: it displaces a WebTransport client
+    /// or nobody, a fallback among them). A WebTransport client is closed at once and what it
+    /// held lifted, so its later detach, its 10 s silence included, lifts nothing (#1193).
+    /// True when a WebTransport client was displaced.
+    pub(crate) fn webrtc_attached(&self, transport: u64) -> bool {
+        let mut hold = self.hold();
         let displaced = self.lock().client.take();
         if let Some(old) = &displaced {
             let _ = old.gone.set(Gone::TakenOver);
         }
-        let mut typing = self.typing.lock().unwrap_or_else(|e| e.into_inner());
-        if typing.client != 0 {
-            typing.takeovers.push_back(Instant::now());
+        hold.count();
+        if hold.holder != Holder::None {
+            self.release(&mut hold);
         }
-        if typing.client != 0 && typing.client != WEBRTC {
-            self.release(&mut typing);
-        }
-        typing.client = WEBRTC;
+        hold.holder = Holder::WebRtc(transport);
         displaced.is_some()
     }
 
-    /// A WebTransport `hello` may take the session: false past §Takeover's bound. One that
-    /// displaces a client is counted here, before its token is spent.
-    pub(crate) fn admit_hello(&self) -> bool {
-        let mut typing = self.typing.lock().unwrap_or_else(|e| e.into_inner());
-        if typing.client == 0 {
-            return true;
-        }
-        let now = Instant::now();
-        if typing.takeovers_full(now) {
+    /// A new WebRTC peer answered on video `transport` (amendment 27): may it be given a
+    /// transport of its own? When `transport`'s peer holds the session that is a takeover,
+    /// refused past §Takeover's bound, and otherwise counted, its holder's input lifted and
+    /// the hold ended. `admit_pc` is the PC's own amendment-27 budget, asked only if this
+    /// passes.
+    pub(crate) fn webrtc_replace(&self, transport: u64, admit_pc: impl FnOnce() -> bool) -> bool {
+        let mut hold = self.hold();
+        let live = hold.holder == Holder::WebRtc(transport);
+        if live && hold.refused() {
             return false;
         }
-        typing.takeovers.push_back(now);
+        if !admit_pc() {
+            return false;
+        }
+        if live {
+            hold.count();
+            self.release(&mut hold);
+            hold.holder = Holder::None;
+        }
         true
     }
 
-    /// A new WebRTC peer would be past §Takeover's bound. It is counted only when its answer
-    /// is applied (`webrtc_attached`), since both PCs ask before either is answered.
-    /// shortcut: a takeover in that round trip can pass the bound by one; reserve a slot
-    /// here if that ever matters.
-    pub(crate) fn takeovers_full(&self) -> bool {
-        let mut typing = self.typing.lock().unwrap_or_else(|e| e.into_inner());
-        typing.takeovers_full(Instant::now())
+    /// The audio PC's half of [`Self::webrtc_replace`]: refused when the video PC's would be.
+    pub(crate) fn webrtc_refuses(&self, transport: u64) -> bool {
+        let mut hold = self.hold();
+        hold.holder == Holder::WebRtc(transport) && hold.refused()
     }
 
-    /// One WebRTC input event, `inject`ed only while the WebRTC peer holds the session.
-    pub(crate) fn webrtc_input(&self, inject: impl FnOnce()) {
-        let typing = self.typing.lock().unwrap_or_else(|e| e.into_inner());
-        if typing.client == WEBRTC {
-            inject();
+    /// Video `transport` was retired with no peer taking it over (a restream): its hold ends.
+    pub(crate) fn webrtc_retired(&self, transport: u64) {
+        let mut hold = self.hold();
+        if hold.holder == Holder::WebRtc(transport) {
+            self.release(&mut hold);
+            hold.holder = Holder::None;
         }
     }
 
-    /// The WebRTC peer disconnected or its transport was retired: what it held is lifted,
-    /// unless a WebTransport client holds the session. The peer keeps it: a transient
-    /// disconnect can recover.
-    pub(crate) fn release_webrtc(&self) {
-        let mut typing = self.typing.lock().unwrap_or_else(|e| e.into_inner());
-        if typing.client == WEBRTC {
-            self.release(&mut typing);
-        }
+    /// The video transport whose peer a WebTransport client displaced since the last call.
+    pub(crate) fn take_to_mute(&self) -> Option<u64> {
+        self.hold().to_mute.take()
     }
 
-    /// Whether a WebTransport client took the session from the WebRTC peer since the last
-    /// call.
-    pub(crate) fn take_webrtc_displaced(&self) -> bool {
-        self.webrtc_displaced.swap(false, Ordering::SeqCst)
-    }
-
-    /// The client is gone. If it is still the one the devices take input from, what it held is
-    /// lifted; a displaced client's was lifted when its successor attached, and the successor's
+    /// The client is gone. If it still holds the session, what it held is lifted and the hold
+    /// ends; a displaced client's was lifted when its successor took over, and the successor's
     /// keys are not its to release.
     pub(crate) fn detach(&self, id: u64) {
+        let mut hold = self.hold();
         {
             let mut st = self.lock();
             if st.client.as_ref().is_some_and(|c| c.id == id) {
                 st.client = None;
             }
         }
-        #[cfg(test)]
-        crate::webtransport::tests::detach_gap();
-        let mut typing = self.typing.lock().unwrap_or_else(|e| e.into_inner());
-        if typing.client == id {
-            typing.client = 0;
-            self.release(&mut typing);
+        if hold.holder == Holder::Wt(id) {
+            self.release(&mut hold);
+            hold.holder = Holder::None;
         }
     }
 
@@ -666,9 +752,8 @@ mod tests {
         let media = Arc::new(Media {
             state: Mutex::default(),
             input: crate::webtransport::tests::no_input(),
-            typing: Mutex::default(),
+            hold: Mutex::default(),
             encoder: glib::WeakRef::new(),
-            webrtc_displaced: AtomicBool::new(false),
         });
         media.on_caps(&caps(1280, &avcc), "s");
         let mut client = media.attach().expect("ready after caps");
@@ -865,7 +950,7 @@ mod tests {
         media.end();
         assert_eq!(first.gone.get(), Some(&Gone::SessionEnded));
         assert!(
-            media.attach().is_none(),
+            media.attach().is_err(),
             "a hello racing the end gets nothing"
         );
     }

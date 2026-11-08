@@ -30,8 +30,8 @@ use web_transport_quinn::{quinn, RecvStream, Request, SendStream, Session};
 
 pub use cert::CertReport;
 use cert::{Cert, CertSet};
-pub(crate) use media::Media;
-use media::{Attached, Gone, Out};
+use media::{Attached, Gone, Out, Refused};
+pub(crate) use media::{Media, WebRtcSide};
 
 const WT_PROTO: u32 = 1;
 const HELLO_DEADLINE: Duration = Duration::from_secs(5);
@@ -261,9 +261,10 @@ impl Registry {
         }
     }
 
-    /// Check `hello` and consume its token. A refusal for a session not ready, or past the
-    /// takeover bound, keeps the token, so the client may retry with it.
-    fn redeem(&self, hello: &Hello, now: SystemTime) -> Result<Arc<Media>, Refusal> {
+    /// Check `hello`, attach its client and consume its token, in one step: two hellos racing
+    /// one token attach once. A refusal for a session not ready, or past the takeover bound,
+    /// keeps the token, so the client may retry with it.
+    fn redeem(&self, hello: &Hello, now: SystemTime) -> Result<(Arc<Media>, Attached), Refusal> {
         if hello.wt_proto < WT_PROTO {
             return Err(Refusal::UnsupportedVersion);
         }
@@ -283,14 +284,16 @@ impl Registry {
         else {
             return Err(Refusal::AuthFailed);
         };
-        let Some(media) = entry.media.clone().filter(|m| m.ready()) else {
+        let Some(media) = entry.media.clone() else {
             return Err(Refusal::NotReady);
         };
-        if !media.admit_hello() {
-            return Err(Refusal::RateLimited);
-        }
+        let attached = media.attach().map_err(|refused| match refused {
+            Refused::Ended => Refusal::SessionEnded,
+            Refused::NotReady => Refusal::NotReady,
+            Refused::RateLimited => Refusal::RateLimited,
+        })?;
         entry.tokens.remove(index);
-        Ok(media)
+        Ok((media, attached))
     }
 }
 
@@ -987,15 +990,7 @@ async fn authenticate(
         .await;
         return;
     }
-    let verdict = registry
-        .redeem(&hello, SystemTime::now())
-        // `end` may run between the redeem and the attach.
-        .and_then(|media| {
-            media
-                .attach()
-                .map(|c| (media, c))
-                .ok_or(Refusal::SessionEnded)
-        });
+    let verdict = registry.redeem(&hello, SystemTime::now());
     // The slot is held until `hello_ack` is written, or on a refusal until the close has
     // run: a peer stalling either counts against the caps like any unauthenticated one.
     let (media, client) = match verdict {

@@ -10,7 +10,7 @@
 //! ignores the `ice-restart` offer option, so a re-offer carries the same ICE credentials
 //! and the same DTLS association. A new peer therefore gets a new `webrtcbin`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -43,8 +43,12 @@ use crate::session::signaling::PcId;
 use crate::session::virtual_input::VirtualDevices;
 use crate::session::SessionConfig;
 
+/// Ids for video transports, unique in the process: the session's holder names one.
+static NEXT_TRANSPORT: AtomicU64 = AtomicU64::new(1);
+
 /// One video transport: the `webrtcbin` carrying video and the `"input"` DataChannel.
 pub struct VideoTransport {
+    pub id: u64,
     pub webrtc: gst::Element,
     /// Held alive with the transport.
     pub data_channel: Option<glib::Object>,
@@ -84,8 +88,8 @@ pub struct WebRtcSlot {
     lever: Arc<EncodeResolutionLever>,
     /// `QUASAR_DIAG_NO_OBS` unset.
     observe: bool,
-    /// The session's WebTransport side, when it has one: the WebRTC peer's input and
-    /// releases go through it, so one transport never lifts the other's keys (§Takeover).
+    /// The session's WebTransport media client, when it has one: each WebRTC transport's
+    /// input and releases go through it, keyed by that transport (§Takeover).
     webtransport: Option<Arc<crate::webtransport::Media>>,
 }
 
@@ -365,6 +369,14 @@ impl WebRtcSlot {
     ) -> Result<VideoTransport> {
         let cfg = &self.cfg.lock().unwrap().clone();
         let gate = Arc::new(Mutex::new(gate.or_else(|| self.hold_rtp())));
+        let id = NEXT_TRANSPORT.fetch_add(1, Ordering::Relaxed);
+        let side = self
+            .webtransport
+            .clone()
+            .map(|media| crate::webtransport::WebRtcSide {
+                media,
+                transport: Some(id),
+            });
         let webrtc = make_webrtcbin(cfg.stun.as_deref())?;
         // Signals webrtcbin emits while it builds its send session: connect them first.
         if cfg.rtp_mtu_shrink {
@@ -435,7 +447,7 @@ impl WebRtcSlot {
         connect_state_logging(
             &webrtc,
             self.devices.clone(),
-            self.webtransport.clone(),
+            side.clone(),
             Some(self.trace_tx.clone()),
             self.session_id.clone(),
         );
@@ -501,7 +513,7 @@ impl WebRtcSlot {
                 connect_data_channel_open(
                     dc,
                     input_sink,
-                    self.webtransport.clone(),
+                    side,
                     self.input_state.clone(),
                     cfg.stream.width,
                     cfg.stream.height,
@@ -531,6 +543,7 @@ impl WebRtcSlot {
                 .context("failed to link video into the replacement webrtcbin")?;
         }
         Ok(VideoTransport {
+            id,
             webrtc,
             data_channel,
             bin,
@@ -556,11 +569,13 @@ impl WebRtcSlot {
         // encode pipeline.
         let gate = self.hold_rtp();
         video.retire(&self.tail, &self.pipeline);
-        // A key the last peer held must not stay down for the next one. A WebTransport
-        // client holding the session keeps its keys: the new peer's answer displaces it.
-        if let Some(media) = &self.webtransport {
-            media.release_webrtc();
-        } else if let Some(devices) = &self.devices {
+        // A key the last peer held must not stay down for the next one. With a WebTransport
+        // side the caller's handover released it (`Media::webrtc_replace`, `webrtc_retired`).
+        if let Some(devices) = self
+            .devices
+            .as_ref()
+            .filter(|_| self.webtransport.is_none())
+        {
             match devices.release_all() {
                 Ok(()) => tracing::info!(
                     token = "transport-replaced-input-released",
@@ -684,7 +699,12 @@ impl WebRtcSlot {
         connect_state_logging(
             &audio_webrtc,
             self.devices.clone(),
-            self.webtransport.clone(),
+            self.webtransport
+                .clone()
+                .map(|media| crate::webtransport::WebRtcSide {
+                    media,
+                    transport: None,
+                }),
             None,
             String::new(),
         );

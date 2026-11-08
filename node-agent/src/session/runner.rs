@@ -1672,6 +1672,9 @@ impl SessionTransports {
                 displaced.remove(0);
             }
         }
+        if let Some(tap) = &self.webtransport {
+            tap.media().webrtc_retired(self.video.id);
+        }
         self.slot.restream(&mut self.video, to)?;
         self.unanswered[i] = true;
         Ok(())
@@ -1738,20 +1741,21 @@ impl SessionTransports {
                 return Ok(None);
             }
             server::Inbound::NewPeer(pc) => {
-                // Asked first, so a refusal here spends none of this PC's budget.
-                let session_full = self
-                    .webtransport
-                    .as_ref()
-                    .is_some_and(|tap| tap.media().takeovers_full());
-                if session_full {
-                    tracing::info!(
-                        token = "takeover-rate-limited",
-                        "{pc} PC: an answer from a new peer is past the session's takeover bound \
-                         across both transports; the current client keeps the stream"
-                    );
-                }
+                // With a WebTransport side the session's takeover bound is asked first, so a
+                // refusal there spends none of this PC's budget.
+                let video = self.video.id;
+                let budget = &mut self.budget[i];
+                let admitted = match (self.webtransport.as_ref().map(|tap| tap.media()), pc) {
+                    (Some(media), PcId::Video) => {
+                        media.webrtc_replace(video, || !over_budget(budget))
+                    }
+                    (Some(media), PcId::Audio) => {
+                        !media.webrtc_refuses(video) && !over_budget(budget)
+                    }
+                    (None, _) => !over_budget(budget),
+                };
                 // Not applied either: it would rebind the current peer's transport.
-                if session_full || over_budget(&mut self.budget[i]) {
+                if !admitted {
                     // To this answer's sender only; the streaming peer's late answers
                     // classify `ThisPeer` (same ufrag) and are told nothing (amendment 42).
                     let _ = out_tx.send(SignalMsg::takeover_error(
@@ -1853,7 +1857,7 @@ impl SessionTransports {
         let Some(tap) = &self.webtransport else {
             return;
         };
-        if tap.media().webrtc_attached() {
+        if tap.media().webrtc_attached(self.video.id) {
             tracing::info!(
                 token = "webtransport-taken-over-by-webrtc",
                 "a WebRTC peer took the session from its WebTransport client: that client is \
@@ -1862,16 +1866,18 @@ impl SessionTransports {
         }
     }
 
-    /// A WebTransport client took the session from the WebRTC peer since the last call:
-    /// that peer's media stops, and the client holding signaling is told `taken_over`
-    /// (`transport-webtransport.md` §Takeover). True when it happened, so the caller treats
-    /// that peer's transport as one whose viewer left.
+    /// A WebTransport client took the session from the peer of the current video transport
+    /// since the last call: that peer's media stops, and the client holding signaling is told
+    /// `taken_over` (`transport-webtransport.md` §Takeover). True when it happened, so the
+    /// caller treats that transport as one whose viewer left.
     pub(crate) fn take_from_webrtc(&self, out_tx: &pipeline::OutTx) -> bool {
-        if !self
+        let displaced = self
             .webtransport
             .as_ref()
-            .is_some_and(|tap| tap.media().take_webrtc_displaced())
-        {
+            .and_then(|tap| tap.media().take_to_mute());
+        // A transport retired since sends nothing already, and its signaling now belongs to
+        // the peer that replaced it.
+        if displaced != Some(self.video.id) {
             return false;
         }
         self.slot.mute(&self.video);
