@@ -296,14 +296,10 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		if owner == "" || !c.hostParks(owner) {
 			return LaunchResult{}, errParkRefused
 		}
-		// Every park is WebRTC-only (#1161), so a launch this device would plan on
-		// WebTransport supersedes it and cold-starts Steam behind a 503: park nothing (#1163).
-		// shortcut: a webtransport_opt_in profile asked via ?transport= is not seen here; #1214.
-		if launchProfile.Transport == transportWebTransport {
-			if sc, err := c.store.ResolveDeviceScope(ctx, userID, lp.DeviceID, scopeSiteWarmTransport); err == nil &&
-				sc.Probe != nil && sc.Probe.WebTransport {
-				return LaunchResult{}, errParkRefused
-			}
+		// Every park is WebRTC-only (#1161): a launch that would plan WebTransport supersedes it
+		// and cold-starts Steam behind a 503, so park nothing for that user (#1163).
+		if c.launchWouldPlanWebTransport(ctx, p, owner, launchProfile, lp, ov, env, source) {
+			return LaunchResult{}, errParkRefused
 		}
 		// A heartbeat never waits on a settling hold: it simply parks nothing.
 		p.Kind, p.PinHostID, p.NoHomeSettleWait = KindParked, owner, true
