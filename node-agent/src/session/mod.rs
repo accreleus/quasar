@@ -494,6 +494,9 @@ pub struct SessionConfig {
     /// Largest RTP packet the host sends, RTP header included, before SRTP/UDP/IP.
     /// Knob: `QUASAR_RTP_MTU`.
     pub rtp_mtu: u32,
+    /// Shrink `rtp_mtu` mid-session when the path drops full-size packets (#1134).
+    /// Knob: `QUASAR_RTP_MTU_SHRINK`.
+    pub rtp_mtu_shrink: bool,
     /// The host's console-mode config, snapshotted from the agent's latched
     /// `config_update.console_config`. A `local_only` session needs it enabled; a streamed
     /// session never reads it.
@@ -602,6 +605,9 @@ impl SessionConfig {
             fec_percentage: env_fec_percentage("QUASAR_FEC_PERCENTAGE"),
             fec_mode: resolve_fec_mode(env_fec_percentage("QUASAR_FEC_PERCENTAGE")),
             rtp_mtu: env_rtp_mtu("QUASAR_RTP_MTU"),
+            rtp_mtu_shrink: ladder::env_flag_default_true("QUASAR_RTP_MTU_SHRINK", &|k| {
+                std::env::var(k).ok()
+            }),
             console_config: None,
             video_topology: crate::messages::VideoTopology::StreamOnly,
             // env-direct: from_env has no settings overlay. The assign path snapshots
@@ -854,6 +860,9 @@ impl SessionConfig {
             fec_percentage: env_fec_percentage("QUASAR_FEC_PERCENTAGE"),
             fec_mode: resolve_fec_mode(env_fec_percentage("QUASAR_FEC_PERCENTAGE")),
             rtp_mtu: env_rtp_mtu("QUASAR_RTP_MTU"),
+            rtp_mtu_shrink: ladder::env_flag_default_true("QUASAR_RTP_MTU_SHRINK", &|k| {
+                std::env::var(k).ok()
+            }),
             console_config: None,
             video_topology: crate::messages::VideoTopology::StreamOnly,
             // Snapshot so provision + measurement use the value this session was
