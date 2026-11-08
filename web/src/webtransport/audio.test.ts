@@ -685,7 +685,11 @@ describe("WebTransportMedia audio", () => {
 // ── The runtime ────────────────────────────────────────────────────────────
 
 class IdleEncoder {
+  static made: IdleEncoder[] = [];
   state = "unconfigured";
+  constructor() {
+    IdleEncoder.made.push(this);
+  }
   configure() {
     this.state = "configured";
   }
@@ -759,6 +763,34 @@ describe("createWebTransportRuntime audio and microphone", () => {
     expect(audio.gains).toEqual([0, 1, 0]);
     rt.destroy();
     expect(audio.ctx.close).toHaveBeenCalled();
+  });
+
+  /** Each way the runtime ends, and the micro-task that ends it. */
+  const endings: [string, (s: ReturnType<typeof setup>) => void][] = [
+    ["destroy", ({ rt }) => rt.destroy()],
+    ["a takeover", ({ agent }) => agent.last.closeWith(4410)],
+    ["a session that ended", ({ agent }) => agent.last.closeWith(4404)],
+    ["a lost connection", ({ agent }) => agent.last.closeWith(1006)],
+  ];
+  it.each(endings)("on %s the microphone is stopped and the audio context closed, and neither restarts", async (_name, end) => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    IdleEncoder.made.length = 0;
+    const s = setup({ ...helloAck(0, avcC()), audio: OPUS, mic: MIC });
+    s.rt.start();
+    await vi.waitFor(() => expect(s.rt.getSnapshot().channelOpen).toBe(true));
+    await vi.waitFor(() => expect(s.audio.createContext).toHaveBeenCalled());
+    await s.rt.attachMicTrack({} as MediaStreamTrack);
+    expect(IdleEncoder.made).toHaveLength(1);
+    expect(IdleEncoder.made[0].state).toBe("configured");
+
+    end(s);
+    await vi.waitFor(() => expect(IdleEncoder.made[0].state).toBe("closed"));
+    await vi.waitFor(() => expect(s.audio.ctx.close).toHaveBeenCalled());
+    // The page may still hand over a track (its permission prompt was open): nothing starts.
+    await s.rt.attachMicTrack({} as MediaStreamTrack);
+    expect(IdleEncoder.made).toHaveLength(1);
+    expect(s.rt.hasMicSlot()).toBe(false);
+    s.rt.destroy();
   });
 
   it("a session without audio builds no audio context", async () => {

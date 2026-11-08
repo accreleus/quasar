@@ -619,6 +619,96 @@ async fn a_session_with_audio_and_a_microphone_sends_opus_and_takes_the_micropho
     .unwrap();
 }
 
+/// The next video datagram, as (frame_seq, frag_index, frag_count, datagram).
+async fn datagram(session: &Session) -> (u16, u16, u16, Bytes) {
+    let d = tokio::time::timeout(Duration::from_secs(10), session.read_datagram())
+        .await
+        .expect("video stalled")
+        .unwrap();
+    let at = |i: usize| u16::from_le_bytes([d[i], d[i + 1]]);
+    (at(7), at(9), at(11), d)
+}
+
+#[tokio::test]
+async fn a_nacked_fragment_is_resent_one_past_the_window_is_a_miss_and_late_gets_a_keyframe() {
+    let agent = agent().await;
+    let (session, mut send, mut recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["retransmit_window_ms"], 250);
+
+    let (frame_seq, _, _, original) = datagram(&session).await;
+    let index = u16::from_le_bytes([original[9], original[10]]);
+    let nack = json!({"type": "nack", "frame_seq": frame_seq, "frags": [[index, index]]});
+    write_message(&mut send, &nack).await.unwrap();
+    let mut resent = None;
+    for _ in 0..1000 {
+        let (_, _, _, d) = datagram(&session).await;
+        if d[5] & 4 != 0 {
+            resent = Some(d);
+            break;
+        }
+    }
+    let resent = resent.expect("no retransmission within 1000 datagrams");
+    assert_eq!(resent[6..], original[6..], "same header and payload");
+    assert_eq!(resent[5], original[5] | 4, "flags plus retransmit");
+    let seq = |d: &Bytes| u32::from_le_bytes(d[1..5].try_into().unwrap());
+    let ahead = seq(&resent).wrapping_sub(seq(&original));
+    assert!(ahead > 0 && ahead < 1 << 31, "a new pkt_seq");
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    write_message(&mut send, &nack).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), read_message(&mut recv))
+            .await
+            .expect("no nack_miss")
+            .unwrap(),
+        json!({"type": "nack_miss", "frame_seq": frame_seq, "frags": [[index, index]]}),
+        "past the 250 ms window the agent no longer holds it"
+    );
+
+    write_message(
+        &mut send,
+        &json!({"type": "keyframe_request", "reason": "late"}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        frames(&session, 15, false).await.iter().any(|f| f.keyframe),
+        "a late frame's keyframe request is answered"
+    );
+}
+
+#[tokio::test]
+async fn a_client_flooding_nacks_gets_only_its_budget_answered() {
+    let agent = agent().await;
+    let (_session, mut send, mut recv, _) = agent.hello(TOKEN).await;
+    // A frame the agent never held: every answered nack is one nack_miss.
+    let nack = json!({"type": "nack", "frame_seq": 40_000, "frags": [[0, 0]]});
+    const SENT: usize = 1000;
+    let started = std::time::Instant::now();
+    let write = async {
+        for _ in 0..SENT {
+            write_message(&mut send, &nack).await.unwrap();
+        }
+    };
+    let read = async {
+        let mut misses = 0;
+        while let Ok(Ok(m)) =
+            tokio::time::timeout(Duration::from_millis(500), read_message(&mut recv)).await
+        {
+            misses += usize::from(m["type"] == "nack_miss");
+        }
+        misses
+    };
+    let ((), misses) = tokio::join!(write, read);
+    // 100 at once, then 500 a second while the flood lasted.
+    let budget = 100 + (started.elapsed().as_secs_f64() * 500.0).ceil() as usize;
+    assert!(misses >= 100, "the burst is answered ({misses})");
+    assert!(
+        misses <= budget.min(SENT - 1),
+        "{misses} answered of {SENT}, budget {budget}"
+    );
+}
+
 /// The job `agent-live.yml` runs under `webtransport::`: one session from hello to a clean
 /// close, asserting outcomes only (what a browser would see), not the listener's internals.
 #[tokio::test]

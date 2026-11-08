@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -26,6 +27,14 @@ var (
 	// ErrExists: a tool with this tag (or this pin) exists (POST /v1/admin/compat-tools).
 	ErrExists = errors.New("compat tool exists")
 )
+
+// ToolMissingError: the launch's per-game mapped GE tool is not usable on its host any more
+// (control-api.md §Placement: never placed for a tool it will not be given).
+type ToolMissingError struct{ Tag string }
+
+func (e *ToolMissingError) Error() string {
+	return "compat tool " + e.Tag + " is not installed and enabled on the placed host"
+}
 
 // MaxMappings is the contract's cap on per-game mappings (control-api.md §Compatibility tools).
 const MaxMappings = 1000
@@ -53,6 +62,8 @@ type Store struct {
 	Auditor audit.Recorder
 	// Superseder runs in the transaction of every write that changes the effective mapping; nil does nothing.
 	Superseder ParkedSuperseder
+	// Stopper ends one session as an admin's DELETE /v1/sessions/{id} does; force-remove's stop step needs it.
+	Stopper func(ctx context.Context, sessionID string) error
 }
 
 // supersede runs the superseder in tx, after the mapping rows are written (lock order: sessions last).
@@ -391,11 +402,56 @@ type Entry struct {
 // SHA-512 under its bound Steam name). The caller drops both for a connection without
 // compat_tools_v1.
 func (s *Store) Entries(ctx context.Context, hostID string) ([]Entry, []string, error) {
-	mount, err := s.mountable(ctx, hostID)
+	return entries(ctx, s.pool, hostID)
+}
+
+// Assign is Entries for a launch, read and recorded under the tool rows' share locks: it takes
+// FOR SHARE on every catalogue row, so a disable or force-remove (FOR UPDATE) either committed
+// before the read, and the tool is left out, or waits until the session's compat_tool_names
+// holds the name, and force-remove's stop step finds the session (control-api.md §Usable).
+// shortcut: locks the whole catalogue (a few dozen rows) instead of only the rows it reads.
+func (s *Store) Assign(ctx context.Context, sessionID, hostID string) ([]Entry, []string, error) {
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-	rows, err := s.pool.Query(ctx, `
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := tx.Exec(ctx, `SELECT id FROM compat_tools ORDER BY id FOR SHARE`); err != nil {
+		return nil, nil, fmt.Errorf("lock compat tools: %w", err)
+	}
+	out, mount, err := entries(ctx, tx, hostID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if mount == nil {
+		mount = []string{}
+	}
+	var tag string
+	var name *string
+	err = tx.QueryRow(ctx, `SELECT t.tag, t.steam_name FROM sessions s
+		JOIN apps a ON a.id = s.app_id AND a.external_source = 'steam'
+		JOIN compat_tool_mappings m ON m.provider = 'steam' AND m.external_id = a.external_id
+		JOIN compat_tools t ON t.id = m.tool_id AND t.family = 'ge'
+		WHERE s.id = $1::uuid`, sessionID).Scan(&tag, &name)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+	case err != nil:
+		return nil, nil, fmt.Errorf("read the launch's mapped tool: %w", err)
+	case name == nil || !slices.Contains(mount, *name):
+		return nil, nil, &ToolMissingError{Tag: tag}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE sessions SET compat_tool_names = $2::text[] WHERE id = $1::uuid`, sessionID, mount); err != nil {
+		return nil, nil, fmt.Errorf("record mounted compat tools: %w", err)
+	}
+	return out, mount, tx.Commit(ctx)
+}
+
+func entries(ctx context.Context, q querier, hostID string) ([]Entry, []string, error) {
+	mount, err := mountable(ctx, q, hostID)
+	if err != nil {
+		return nil, nil, err
+	}
+	rows, err := q.Query(ctx, `
 		WITH usable AS (
 			SELECT t.id, t.steam_name FROM compat_tools t
 			WHERE t.enabled AND NOT t.name_conflict AND NOT t.pin_conflict
@@ -423,8 +479,8 @@ func (s *Store) Entries(ctx context.Context, hostID string) ([]Entry, []string, 
 	return out, mount, rows.Err()
 }
 
-func (s *Store) mountable(ctx context.Context, hostID string) ([]string, error) {
-	rows, err := s.pool.Query(ctx, `
+func mountable(ctx context.Context, q querier, hostID string) ([]string, error) {
+	rows, err := q.Query(ctx, `
 		SELECT t.steam_name FROM compat_tools t
 		JOIN host_compat_tools h ON h.host_id = $1::uuid AND h.sha512 = t.asset_sha512 AND h.name = t.steam_name
 		WHERE t.family = 'ge' AND t.enabled AND NOT t.name_conflict AND NOT t.pin_conflict

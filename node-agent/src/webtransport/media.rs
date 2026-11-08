@@ -336,8 +336,6 @@ impl Media {
     fn on_unit(&self, buffer: &gst::BufferRef) {
         let keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
         let mut st = self.lock();
-        let frame_seq = st.frame_seq;
-        st.frame_seq = frame_seq.wrapping_add(1);
         // openh264's second unit carries no PTS: it keeps the one before.
         let ts_90khz = buffer.pts().map_or(st.last_ts, |pts| {
             (pts.nseconds() as u128 * 90_000 / 1_000_000_000) as u32
@@ -388,10 +386,16 @@ impl Media {
                 }
             }
         }
-        st.want_key = false;
         let Ok(map) = buffer.map_readable() else {
+            // The client never gets this unit: the next one it is sent must not need it.
+            st.want_key = true;
             return;
         };
+        st.want_key = false;
+        // Only a unit the client is sent takes a number: a skipped one would read as a
+        // loss to NACK (§Loss recovery). A unit the full queue refuses gives it back.
+        let frame_seq = st.frame_seq;
+        st.frame_seq = frame_seq.wrapping_add(1);
         let unit = Unit {
             data: Bytes::copy_from_slice(&map),
             keyframe,
@@ -405,6 +409,7 @@ impl Media {
         let sent = st.client.as_ref().map(|c| c.tx.try_send(Out::Unit(unit)));
         match sent {
             Some(Err(mpsc::error::TrySendError::Full(_))) => {
+                st.frame_seq = frame_seq;
                 st.want_key = true;
                 drop(st);
                 self.keyframe();
@@ -711,6 +716,48 @@ mod tests {
             "the configuration goes ahead of the next keyframe"
         );
         assert!(client.gone.get().is_none(), "the client is still attached");
+    }
+
+    fn seqs(rx: &mut mpsc::Receiver<Out>) -> Vec<u16> {
+        let mut out = Vec::new();
+        while let Ok(o) = rx.try_recv() {
+            if let Out::Unit(u) = o {
+                out.push(u.frame_seq);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn units_skipped_for_a_keyframe_or_refused_by_a_full_queue_take_no_frame_seq() {
+        let (media, _encoder, _) = counted();
+        media.on_caps(&caps(1280), "s");
+        let mut client = media.attach().unwrap();
+        media.on_unit(&buffer(false)); // before the first keyframe: skipped
+        media.on_unit(&buffer(true));
+        media.on_unit(&buffer(false));
+        media.on_caps(&caps(960), "s");
+        media.on_unit(&buffer(false)); // under the new configuration, before its keyframe
+        media.on_unit(&buffer(true));
+        assert_eq!(
+            seqs(&mut client.rx),
+            [0, 1, 2],
+            "no gap for a unit never sent"
+        );
+
+        for _ in 0..=CLIENT_QUEUE {
+            media.on_unit(&buffer(false)); // the last one finds the queue full
+        }
+        media.on_unit(&buffer(true));
+        let got = seqs(&mut client.rx);
+        assert_eq!(got.len(), CLIENT_QUEUE, "the queue held its fill");
+        assert_eq!(got.last(), Some(&(2 + CLIENT_QUEUE as u16)));
+        media.on_unit(&buffer(true));
+        assert_eq!(
+            seqs(&mut client.rx),
+            [3 + CLIENT_QUEUE as u16],
+            "the refused unit gave its number back"
+        );
     }
 
     #[test]

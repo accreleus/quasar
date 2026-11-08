@@ -247,7 +247,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       await t.connect({
         streams: (streams) => {
           micSlot = streams.mic !== null;
-          if (!streams.audio) return;
+          if (!streams.audio || failed || destroyed) return;
           const out = (audioOut = new AudioOut(deps.audio));
           if (!audioHeld) out.release();
           // Audio must never end the session: a failure to start leaves the stream silent.
@@ -341,6 +341,8 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     cancelRecovery() {},
     hasMicSlot: () => micSlot && !failed && !destroyed,
     async attachMicTrack(track) {
+      // Nothing may start after stop(): the transport is closed and nobody would tear it down.
+      if (failed || destroyed) return;
       mic ??= new MicOut({ send: (d) => transport?.sendMic(d) ?? false, ...deps.mic });
       mic.start(track);
     },

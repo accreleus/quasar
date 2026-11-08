@@ -3,14 +3,14 @@
 //! session's client authenticates with a single-use token the control plane minted and
 //! then gets the session's video as datagrams.
 //!
-//! Not here yet, each a later ticket: NACK and its retransmit buffer, FEC, receiver
-//! feedback and congestion control, and takeover across transports (a new client replaces
-//! the last one; nothing bounds it).
+//! Not here yet, each a later ticket: FEC, receiver feedback and congestion control, and
+//! takeover across transports (a new client replaces the last one; nothing bounds it).
 
 mod audio;
 mod cert;
 mod media;
 mod mic_jitter;
+mod retransmit;
 #[cfg(test)]
 mod tests;
 
@@ -778,7 +778,46 @@ fn hello_ack(config: &media::VideoConfig, audio: &Audio) -> Value {
         "audio": stream_audio,
         "mic": mic,
         "fec": null,
+        "retransmit_window_ms": retransmit::WINDOW.as_millis() as u64,
     })
+}
+
+/// A `nack`'s `frame_seq` and its first 32 `frags` ranges; `None` when malformed.
+fn nack_of(message: &Value) -> Option<(u16, Vec<[u16; 2]>)> {
+    let frame_seq = u16::try_from(message.get("frame_seq")?.as_u64()?).ok()?;
+    let ranges = message
+        .get("frags")?
+        .as_array()?
+        .iter()
+        .take(32)
+        .filter_map(|r| {
+            let r = r.as_array()?;
+            let at = |i: usize| u16::try_from(r.get(i)?.as_u64()?).ok();
+            Some([at(0)?, at(1)?])
+        })
+        .collect();
+    Some((frame_seq, ranges))
+}
+
+/// How long sent video is held for a `nack`: [`retransmit::WINDOW`], or twice the
+/// smoothed RTT when that is longer (§Loss recovery).
+fn retransmit_window(session: &Session) -> Duration {
+    retransmit::WINDOW.max(quinn::Connection::rtt(session) * 2)
+}
+
+/// Send `nack` answers; false when the connection is gone. A resend the path's maximum
+/// datagram size has shrunk below is dropped and counted: the client gives that frame up.
+fn resend(session: &Session, datagrams: Vec<bytes::Bytes>, too_large: &mut u64) -> bool {
+    for d in datagrams {
+        match session.send_datagram(d) {
+            Ok(()) => {}
+            Err(web_transport_quinn::SessionError::SendDatagramError(
+                quinn::SendDatagramError::TooLarge,
+            )) => *too_large += 1,
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 /// Hand over the first bidirectional stream as the control stream and refuse every
@@ -1007,6 +1046,9 @@ async fn stream(
         }
     });
     let mut pkt_seq = 0u32;
+    let mut sent = retransmit::Retransmit::default();
+    let mut nack_budget = retransmit::NackBudget::new(std::time::Instant::now());
+    let (mut nacks_capped, mut resends_too_large) = (0u64, 0u64);
     let mut warned_oversized = false;
     // Nothing is sent before `hello_ack`: what queued up behind it is stale.
     while client.audio.try_recv().is_ok() {}
@@ -1050,6 +1092,8 @@ async fn stream(
                     if datagrams.is_empty() {
                         media.keyframe();
                     }
+                    let now = std::time::Instant::now();
+                    sent.keep(unit.frame_seq, &datagrams, now, retransmit_window(session));
                     if datagrams.into_iter().try_for_each(|d| session.send_datagram(d)).is_err() {
                         break QUIET;
                     }
@@ -1071,6 +1115,26 @@ async fn stream(
                     idle.as_mut().reset(Instant::now() + CONTROL_IDLE);
                     match message.get("type").and_then(Value::as_str) {
                         Some("keyframe_request") => media.keyframe(),
+                        Some("nack") if !nack_budget.take(std::time::Instant::now()) => nacks_capped += 1,
+                        Some("nack") => {
+                            let answer = nack_of(&message).map(|(frame_seq, ranges)| {
+                                let window = retransmit_window(session);
+                                let now = std::time::Instant::now();
+                                (frame_seq, sent.answer(frame_seq, &ranges, &mut pkt_seq, now, window))
+                            });
+                            if let Some((frame_seq, answer)) = answer {
+                                if !resend(session, answer.resend, &mut resends_too_large) {
+                                    break QUIET;
+                                }
+                                if !answer.missed.is_empty() {
+                                    let miss = json!({"type": "nack_miss", "frame_seq": frame_seq, "frags": answer.missed});
+                                    let write = write_message(&mut send, &miss);
+                                    if !matches!(tokio::time::timeout(CONTROL_WRITE, write).await, Ok(Ok(()))) {
+                                        break QUIET;
+                                    }
+                                }
+                            }
+                        }
                         Some("input") => {
                             if let Some(event) = message.get("event") {
                                 media.input_event(client.id, &event.to_string(), false);
@@ -1094,6 +1158,14 @@ async fn stream(
     };
     reader.abort();
     media.detach(client.id);
+    if nacks_capped + resends_too_large > 0 {
+        tracing::debug!(
+            token = "webtransport-nack-dropped",
+            nacks_capped,
+            resends_too_large,
+            "WebTransport left nacks unanswered or resends unsent"
+        );
+    }
     if let Some(message) = message {
         let _ = tokio::time::timeout(CONTROL_WRITE, write_message(&mut send, &message)).await;
         let _ = send.finish();
