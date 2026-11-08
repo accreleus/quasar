@@ -46,6 +46,7 @@ type RelayBus struct {
 	mu       sync.Mutex
 	log      *slog.Logger
 	pending  map[string][][]byte   // session_id → buffered frames (no browser yet)
+	dropped  map[string]int        // session_id → `ice` frames dropped from a full buffer
 	browsers map[string]browserReg // session_id → live browser registration
 }
 
@@ -54,6 +55,7 @@ func NewRelayBus(log *slog.Logger) *RelayBus {
 	return &RelayBus{
 		log:      log,
 		pending:  make(map[string][][]byte),
+		dropped:  make(map[string]int),
 		browsers: make(map[string]browserReg),
 	}
 }
@@ -86,7 +88,9 @@ func (b *RelayBus) Register(sessionID string, ch chan<- []byte) BrowserSignals {
 		}
 	}
 	delete(b.pending, sessionID)
+	dropped := b.takeDroppedLocked(sessionID)
 	b.mu.Unlock()
+	b.logDropped(sessionID, dropped)
 	if hadOld {
 		close(old.displaced)
 	}
@@ -100,11 +104,14 @@ func (b *RelayBus) Register(sessionID string, ch chan<- []byte) BrowserSignals {
 // registration it would have removed is already gone.
 func (b *RelayBus) Unregister(sessionID string, ch chan<- []byte) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	dropped := 0
 	if reg, ok := b.browsers[sessionID]; ok && reg.ch == ch {
 		delete(b.browsers, sessionID)
 		delete(b.pending, sessionID)
+		dropped = b.takeDroppedLocked(sessionID)
 	}
+	b.mu.Unlock()
+	b.logDropped(sessionID, dropped)
 }
 
 // Forget drops every trace of a session from the bus (#402). It is the
@@ -127,9 +134,11 @@ func (b *RelayBus) Unregister(sessionID string, ch chan<- []byte) {
 func (b *RelayBus) Forget(sessionID string) {
 	b.mu.Lock()
 	delete(b.pending, sessionID)
+	dropped := b.takeDroppedLocked(sessionID)
 	reg, hadBrowser := b.browsers[sessionID]
 	delete(b.browsers, sessionID)
 	b.mu.Unlock()
+	b.logDropped(sessionID, dropped)
 	if hadBrowser {
 		// #93: tell the still-attached socket, outside the lock. Deleting its
 		// registration silently left it deaf until its own transport failed.
@@ -139,8 +148,13 @@ func (b *RelayBus) Forget(sessionID string) {
 
 // Deliver routes a raw inner-message frame (the Phase 0 signaling JSON) to the
 // browser. If no browser is registered yet the frame is buffered up to
-// relayBufMax, except a coded `error`, which is dropped; frames beyond the
-// buffer are rejected with an error.
+// relayBufMax, except a coded `error`, which is dropped.
+//
+// A full buffer sheds `ice` before anything else: an incoming `ice` is dropped,
+// and any other frame evicts the oldest buffered `ice`. A WebTransport browser
+// never attaches, and a host with many addresses trickles hundreds of fallback
+// candidates; failing the session on them ended every such stream. Only a
+// buffer with no `ice` left to shed rejects a frame with an error.
 func (b *RelayBus) Deliver(sessionID string, frame []byte) error {
 	b.mu.Lock()
 	if reg, ok := b.browsers[sessionID]; ok {
@@ -161,15 +175,49 @@ func (b *RelayBus) Deliver(sessionID string, frame []byte) error {
 		return nil
 	}
 	// No browser yet — buffer.
-	if len(b.pending[sessionID]) >= relayBufMax {
-		b.mu.Unlock()
-		return fmt.Errorf("relay pending queue full for session %s", sessionID)
+	if p := b.pending[sessionID]; len(p) >= relayBufMax {
+		if msgType, _ := peekType(frame); msgType == "ice" {
+			b.dropped[sessionID]++
+			b.mu.Unlock()
+			return nil
+		}
+		i := oldestICE(p)
+		if i < 0 {
+			b.mu.Unlock()
+			return fmt.Errorf("relay pending queue full for session %s", sessionID)
+		}
+		b.pending[sessionID] = append(p[:i], p[i+1:]...)
+		b.dropped[sessionID]++
 	}
 	cp := make([]byte, len(frame))
 	copy(cp, frame)
 	b.pending[sessionID] = append(b.pending[sessionID], cp)
 	b.mu.Unlock()
 	return nil
+}
+
+// oldestICE is the index of the first buffered `ice` frame, or -1.
+func oldestICE(frames [][]byte) int {
+	for i, f := range frames {
+		if t, _ := peekType(f); t == "ice" {
+			return i
+		}
+	}
+	return -1
+}
+
+// takeDroppedLocked returns and clears the session's dropped-`ice` count. b.mu held.
+func (b *RelayBus) takeDroppedLocked(sessionID string) int {
+	n := b.dropped[sessionID]
+	delete(b.dropped, sessionID)
+	return n
+}
+
+// logDropped logs a session's dropped-`ice` total once, when its buffer is discarded.
+func (b *RelayBus) logDropped(sessionID string, n int) {
+	if n > 0 {
+		b.log.Info("relay-ice-dropped", "session_id", sessionID, "count", n)
+	}
 }
 
 // isCodedError reports whether frame is a host `error` carrying a `code`; the relay

@@ -33,12 +33,14 @@ mod caps;
 pub(crate) use caps::vulkan_image_transport;
 use caps::{caps_profile, raw_video_caps};
 mod codec_chain;
+pub(crate) use codec_chain::rtp_mtu_of;
 use codec_chain::{build_bitstream_chain, build_video_payloader, BitstreamChain};
 pub(crate) mod audio_branch;
 mod audio_health;
 mod rtp_ext;
 use audio_branch::add_audio_chain;
 pub(crate) mod mic_branch;
+mod mtu_shrink;
 mod probes;
 use probes::{
     attach_bitstream_capture, attach_encode_probes, attach_encoder_pts_trace, attach_queue_probes,
