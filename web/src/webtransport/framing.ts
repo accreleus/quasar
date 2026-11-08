@@ -4,9 +4,14 @@
 /** No control message is longer than this (§Channels); a longer length is a 4400. */
 export const MAX_CONTROL_MESSAGE = 65_536;
 export const CHANNEL_VIDEO = 0x01;
+export const CHANNEL_INPUT = 0x03;
+export const CHANNEL_AUDIO = 0x02;
+export const CHANNEL_MIC = 0x05;
 const VIDEO_HEADER = 25;
+const AUDIO_HEADER = 19;
 const FLAG_KEYFRAME = 1;
 const FLAG_DISCARDABLE = 2;
+const FLAG_RETRANSMIT = 4;
 
 /** u32 LE length, then UTF-8 JSON. */
 export function encodeControl(message: object): Uint8Array {
@@ -56,6 +61,8 @@ export interface VideoFragment {
   pktSeq: number;
   keyframe: boolean;
   discardable: boolean;
+  /** Re-sent in answer to a `nack` (§NACK). */
+  retransmit: boolean;
   configId: number;
   frameSeq: number;
   fragIndex: number;
@@ -78,6 +85,7 @@ export function parseVideoDatagram(d: Uint8Array): VideoFragment | null {
     pktSeq: v.getUint32(1, true),
     keyframe: (flags & FLAG_KEYFRAME) !== 0,
     discardable: (flags & FLAG_DISCARDABLE) !== 0,
+    retransmit: (flags & FLAG_RETRANSMIT) !== 0,
     configId: d[6],
     frameSeq: v.getUint16(7, true),
     fragIndex,
@@ -87,6 +95,38 @@ export function parseVideoDatagram(d: Uint8Array): VideoFragment | null {
     captureUs: Number(v.getBigUint64(17, true)),
     payload: d.subarray(VIDEO_HEADER),
   };
+}
+
+export interface AudioPacket {
+  packetSeq: number;
+  ts48k: number;
+  /** The agent's wall clock when the packet's 10 ms began, Unix µs. */
+  captureUs: number;
+  /** One Opus packet: a view into the datagram, not a copy. */
+  opus: Uint8Array;
+}
+
+/** A `0x02` datagram's header and Opus packet; null for another channel or a malformed one. */
+export function parseAudioDatagram(d: Uint8Array): AudioPacket | null {
+  if (d.length <= AUDIO_HEADER || d[0] !== CHANNEL_AUDIO) return null;
+  const v = new DataView(d.buffer, d.byteOffset, d.byteLength);
+  return {
+    packetSeq: v.getUint16(5, true),
+    ts48k: v.getUint32(7, true),
+    captureUs: Number(v.getBigUint64(11, true)),
+    opus: d.subarray(AUDIO_HEADER),
+  };
+}
+
+/** A `0x05` microphone datagram (§Microphone): channel, u16 packet_seq, u32 ts_48khz, Opus. */
+export function encodeMicDatagram(packetSeq: number, ts48k: number, opus: Uint8Array): Uint8Array {
+  const d = new Uint8Array(7 + opus.length);
+  const v = new DataView(d.buffer);
+  d[0] = CHANNEL_MIC;
+  v.setUint16(1, packetSeq & 0xffff, true);
+  v.setUint32(3, ts48k >>> 0, true);
+  d.set(opus, 7);
+  return d;
 }
 
 /** `a` is after `b` in `bits`-bit serial-number arithmetic (§Channels, "Wrap-around"). */

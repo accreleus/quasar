@@ -111,6 +111,13 @@ pub(super) fn set_rtp_mtu(payloader: &gst::Element, rtp_mtu: u32) {
     set_prop_u32(payloader, "mtu", payloader_mtu(rtp_mtu));
 }
 
+/// The `rtp_mtu` a payloader is set to: [`set_rtp_mtu`]'s inverse. `None` when it has no
+/// `mtu` property.
+pub(crate) fn rtp_mtu_of(payloader: &gst::Element) -> Option<u32> {
+    payloader.find_property("mtu")?;
+    Some(payloader.property::<u32>("mtu") + RTP_SEND_OVERHEAD)
+}
+
 fn set_prop_u32(el: &gst::Element, name: &str, v: u32) {
     if el.find_property(name).is_some() {
         el.set_property(name, v);
@@ -154,6 +161,12 @@ mod tests {
             assert_eq!(
                 payloader.property::<u32>("mtu"),
                 payloader_mtu(1000),
+                "{}",
+                codec.rtp_payloader()
+            );
+            assert_eq!(
+                rtp_mtu_of(&payloader),
+                Some(1000),
                 "{}",
                 codec.rtp_payloader()
             );

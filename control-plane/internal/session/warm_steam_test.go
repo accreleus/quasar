@@ -107,6 +107,9 @@ func TestDecideClaim(t *testing.T) {
 		{"transport after the codec gate", at(func(k *parkedFacts) { k.CodecGated = true }), with(wt), claimSupersede, causeCodecUnsupported, ""},
 		{"transport after fps", running, with(func(s *claimStream) { wt(s); s.FPS = 120 }), claimSupersede, causeFPSHigher, ""},
 		{"codec gated after fps", at(func(k *parkedFacts) { k.CodecGated = true }), with(func(s *claimStream) { s.FPS = 120 }), claimSupersede, causeFPSHigher, ""},
+		{"compat tool missing", at(func(k *parkedFacts) { k.ToolMissing = true }), park, claimSupersede, causeCompatTool, ""},
+		{"compat tool missing after fps", at(func(k *parkedFacts) { k.ToolMissing = true }), with(func(s *claimStream) { s.FPS = 120 }), claimSupersede, causeFPSHigher, ""},
+		{"compat tool missing on a warming session", at(func(k *parkedFacts) { k.State, k.ToolMissing = StateStarting, true }), park, claimSupersede, causeNotRunning, ""},
 		{"codec gated after expiry", at(func(k *parkedFacts) { k.CodecGated, k.InDeadline = true, false }), park, claimSupersede, causeExpired, ""},
 	}
 	for _, tc := range cases {
