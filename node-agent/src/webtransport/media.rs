@@ -11,6 +11,8 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use tokio::sync::mpsc;
 
+use super::audio::{self, Audio};
+
 pub(crate) const HEADER: usize = 25;
 /// The most a datagram may carry at the 1200-byte UDP budget (§Channels, "Datagram size").
 pub(crate) const MAX_DATAGRAM: usize = 1148;
@@ -110,6 +112,7 @@ struct Typing {
 /// connection task of the one client attached.
 pub(crate) struct Media {
     state: Mutex<State>,
+    audio: Arc<Audio>,
     input: super::Input,
     /// Whose input reaches the devices. Held across the injection, so a client that stopped
     /// being the attached one cannot slip an event in behind the release that ended it.
@@ -122,13 +125,15 @@ pub(crate) struct Attached {
     pub(crate) id: u64,
     pub(crate) config: Arc<VideoConfig>,
     pub(crate) rx: mpsc::Receiver<Out>,
+    pub(crate) audio: mpsc::Receiver<audio::Packet>,
     pub(crate) gone: Arc<OnceLock<Gone>>,
 }
 
 impl Media {
-    pub(crate) fn new(encoder: &gst::Element, input: super::Input) -> Arc<Self> {
+    pub(crate) fn new(encoder: &gst::Element, input: super::Input, audio: Arc<Audio>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::default(),
+            audio,
             input,
             typing: Mutex::default(),
             encoder: encoder.downgrade(),
@@ -184,6 +189,10 @@ impl Media {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    pub(crate) fn audio(&self) -> &Arc<Audio> {
+        &self.audio
+    }
+
     /// A configuration exists, so a `hello_ack` can be sent.
     pub(crate) fn ready(&self) -> bool {
         self.lock().config.is_some()
@@ -213,6 +222,7 @@ impl Media {
         st.want_key = true;
         st.refused_keyframes = 0;
         drop(st);
+        let audio = self.audio.attach(id);
         {
             // The new client's input starts from nothing held: what its predecessor held is
             // lifted now, before the new client can send, and its late input is dropped.
@@ -229,6 +239,7 @@ impl Media {
             id,
             config,
             rx,
+            audio,
             gone,
         })
     }
@@ -254,6 +265,7 @@ impl Media {
             typing.client = 0;
             self.release(&mut typing);
         }
+        self.audio.detach(id);
     }
 
     pub(crate) fn end(&self) {
@@ -262,6 +274,8 @@ impl Media {
         if let Some(old) = st.client.take() {
             let _ = old.gone.set(Gone::SessionEnded);
         }
+        drop(st);
+        self.audio.end();
     }
 
     /// The keyframe request: the force-key-unit event PLI sends. A client drives this,
@@ -699,6 +713,7 @@ mod tests {
         let avcc = [1u8, 0x42, 0xc0, 0x1f, 0xff, 0xe1, 0, 0];
         let media = Arc::new(Media {
             state: Mutex::default(),
+            audio: Audio::new(audio::Plan::default()),
             input: crate::webtransport::tests::no_input(),
             typing: Mutex::default(),
             encoder: glib::WeakRef::new(),
@@ -767,7 +782,11 @@ mod tests {
         // An element in NULL has inactive pads, which refuse every event.
         encoder.set_state(gst::State::Paused).unwrap();
         (
-            Media::new(&encoder, crate::webtransport::tests::no_input()),
+            Media::new(
+                &encoder,
+                crate::webtransport::tests::no_input(),
+                Audio::new(audio::Plan::default()),
+            ),
             encoder,
             forced,
         )
@@ -1081,6 +1100,7 @@ mod tests {
         gst::init().unwrap();
         let media = Arc::new(Media {
             state: Mutex::default(),
+            audio: Audio::new(audio::Plan::default()),
             input: crate::webtransport::tests::no_input(),
             typing: Mutex::default(),
             encoder: glib::WeakRef::new(),
@@ -1117,7 +1137,11 @@ mod tests {
             .downcast::<gst::Pipeline>()
             .unwrap();
         let parse = pipeline.by_name("parse").unwrap();
-        let media = Media::new(&parse, crate::webtransport::tests::no_input());
+        let media = Media::new(
+            &parse,
+            crate::webtransport::tests::no_input(),
+            Audio::new(audio::Plan::default()),
+        );
         tap(&parse.static_pad("src").unwrap(), &media, "s");
         pipeline.set_state(gst::State::Playing).unwrap();
         let src = pipeline
@@ -1233,6 +1257,7 @@ mod tests {
         gst::init().unwrap();
         Arc::new(Media {
             state: Mutex::default(),
+            audio: Audio::new(audio::Plan::default()),
             input: crate::webtransport::tests::no_input(),
             typing: Mutex::default(),
             encoder: glib::WeakRef::new(),

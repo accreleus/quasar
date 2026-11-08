@@ -11,7 +11,7 @@
 //! and the same DTLS association. A new peer therefore gets a new `webrtcbin`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -80,6 +80,9 @@ pub struct WebRtcSlot {
     lever: Arc<EncodeResolutionLever>,
     /// `QUASAR_DIAG_NO_OBS` unset.
     observe: bool,
+    /// The session's WebTransport audio: every audio pipeline this slot builds is tapped
+    /// at its Opus encoder (`build_audio`), the first and each replacement.
+    stream_audio: OnceLock<Arc<crate::webtransport::Audio>>,
 }
 
 /// Give a `webrtcbin` sink pad the MediaStream id this PC always uses. Left unset,
@@ -323,7 +326,13 @@ impl WebRtcSlot {
             capture_times,
             lever,
             observe,
+            stream_audio: OnceLock::new(),
         })
+    }
+
+    /// Tap the session's audio for its WebTransport client; before the first `build_audio`.
+    pub(crate) fn tap_audio_for_stream(&self, audio: Arc<crate::webtransport::Audio>) {
+        let _ = self.stream_audio.set(audio);
     }
 
     /// Build a video transport on the tail. `replacement` is false for the session's
@@ -619,6 +628,11 @@ impl WebRtcSlot {
         let audio_pipe = gst::Pipeline::new();
         audio_health::watch_bus(&audio_pipe, &self.session_id);
         let audio_tail = add_audio_chain(&audio_pipe, cfg, &self.session_id)?;
+        if let Some(audio) = self.stream_audio.get() {
+            if let Some(opus) = audio_pipe.by_name(super::audio_branch::OPUS_ENC_NAME) {
+                audio.tap(&opus);
+            }
+        }
         let audio_webrtc = make_webrtcbin(cfg.stun.as_deref())
             .context("failed to create audio webrtcbin (encode pipeline)")?;
         // #425: tune the mic receive-leg jitter buffer on the AUDIO PC only; the video

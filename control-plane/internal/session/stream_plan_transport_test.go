@@ -45,6 +45,8 @@ func TestPlanStreamTransport(t *testing.T) {
 	noH264.WebCodecs["h264"] = false
 	noWT := wtProbe()
 	noWT.WebTransport = false
+	// A record posted before the WebCodecs keys existed: it proves WebTransport and nothing else.
+	beforeWebCodecs := &DeviceProbe{WebTransport: true}
 
 	tests := []struct {
 		name       string
@@ -67,6 +69,7 @@ func TestPlanStreamTransport(t *testing.T) {
 		{"wanted but the device lacks webtransport", wtInputs("webtransport", "", true, noWT), "webrtc", "device_no_webtransport"},
 		{"wanted but the device cannot decode the codec", wtInputs("webtransport", "", true, noH264), "webrtc", "device_no_webcodecs"},
 		{"wanted but the device cannot decode opus", wtInputs("webtransport", "", true, noOpus), "webrtc", "device_no_webcodecs"},
+		{"wanted but the probe predates the webcodecs keys", wtInputs("webtransport", "", true, beforeWebCodecs), "webrtc", "device_no_webcodecs"},
 		{"endpoint is checked before the device", wtInputs("webtransport", "", false, noWT), "webrtc", "host_no_endpoint"},
 		{"a refused request on a webrtc profile reports the profile, not the host", wtInputs("webrtc", "webtransport", false, nil), "webrtc", "profile_disallows"},
 	}
