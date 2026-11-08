@@ -27,8 +27,8 @@ type warmDispatcher struct {
 	compat   bool // answers compat_tools_v1
 	restream bool // adopt_restream_v1
 	noEpoch  bool // the agent's socket is gone: no command epoch to send on
-	// reject answers one command kind: "assign" or "start" refused, or
-	// "assign-ack" queued with its ack lost.
+	// reject answers one command kind: "assign" or "start" refused, "assign-ack"
+	// queued with its ack lost, or "swap" refused.
 	reject  string
 	assigns []agentws.SessionAssignCmd
 	stops   []agentws.SessionStopCmd
@@ -114,12 +114,17 @@ func (e warmEpoch) SupportsCompatTools() bool    { return e.d.compat }
 func (e warmEpoch) Send(v any) (bool, error)     { e.d.record(v); return true, nil }
 func (e warmEpoch) SendWithAck(_ context.Context, _ string, v any) (agentws.AckResult, bool, error) {
 	e.d.record(v)
-	if _, ok := v.(agentws.SessionAssignCmd); ok {
+	switch v.(type) {
+	case agentws.SessionAssignCmd:
 		switch e.d.rejecting() {
 		case "assign":
 			return agentws.AckResult{OK: false, Error: "refused"}, true, nil
 		case "assign-ack":
 			return agentws.AckResult{}, true, errors.New("ack timeout")
+		}
+	case agentws.SessionSwapAppCmd:
+		if e.d.rejecting() == "swap" {
+			return agentws.AckResult{OK: false, Error: "refused"}, true, nil
 		}
 	}
 	return agentws.AckResult{OK: true}, true, nil
