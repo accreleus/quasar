@@ -3,6 +3,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createWebTransportRuntime } from "../pages/app/webTransportRuntime";
+import { mintTransportToken } from "../api/library";
 import { MicCaptureError } from "../webrtc/mic";
 import { AudioOut, LATE_RUN_RESET, type ContextLike } from "./audioOut";
 import { AudioRing, SLACK_FRAMES } from "./audioRing";
@@ -13,6 +14,12 @@ import type { Presenter } from "./presenter";
 import { avcC, COORDS, FakeAgent, FakeChunk, FakeDecoder, flush, helloAck } from "./testSupport";
 import { WebTransportMedia } from "./webTransportMedia";
 import type { AudioStreams, MediaSink } from "./transport";
+
+// Unset, a reconnect's mint fails and the runtime falls back, as with no server.
+vi.mock("../api/library", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../api/library")>()),
+  mintTransportToken: vi.fn(),
+}));
 
 const OPUS = { codec: "opus", channels: 2, sample_rate: 48000, ptime_ms: 10 };
 const MIC = { codec: "opus", channels: 1, sample_rate: 48000, ptime_ms: 10 };
@@ -710,7 +717,7 @@ describe("createWebTransportRuntime audio and microphone", () => {
       authToken: "auth",
       coords: COORDS,
       canvas: { dataset: {} } as unknown as HTMLCanvasElement,
-      callbacks: { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn() },
+      callbacks: { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn(), onFallback: vi.fn() },
       deps: {
         createTransport: (o) =>
           new WebTransportMedia({ ...o, createWebTransport: agent.create, sleep: async () => {}, ticker: () => () => {} } as ConstructorParameters<typeof WebTransportMedia>[0]),
@@ -791,6 +798,20 @@ describe("createWebTransportRuntime audio and microphone", () => {
     expect(IdleEncoder.made).toHaveLength(1);
     expect(s.rt.hasMicSlot()).toBe(false);
     s.rt.destroy();
+  });
+
+  it("a reconnect closes the previous connection's audio player before it starts the next", async () => {
+    vi.mocked(mintTransportToken).mockResolvedValueOnce({
+      transport_options: { webtransport: { ...COORDS, token: "tok-2" } },
+    } as never);
+    const { agent, rt, audio } = setup({ ...helloAck(0, avcC()), audio: OPUS, mic: null });
+    rt.start();
+    await vi.waitFor(() => expect(audio.createContext).toHaveBeenCalledTimes(1));
+    agent.last.closeWith(4400);
+    await vi.waitFor(() => expect(audio.createContext).toHaveBeenCalledTimes(2));
+    expect(rt.getSnapshot().channelOpen).toBe(true);
+    expect(audio.ctx.close).toHaveBeenCalledTimes(1);
+    rt.destroy();
   });
 
   it("a session without audio builds no audio context", async () => {
