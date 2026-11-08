@@ -42,16 +42,19 @@ func TestLaunchProfileDeleteAuditsATruncatedWidenedAllowList(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		apps    int
+		minKept int
 		appName func(i int) string
 	}{
 		// The count cap from erratum 25, then the encoded-size step: 40 of these
-		// render to about 4 KiB of escaped quotes.
-		{"forty-five quote-heavy names", 45, func(i int) string {
+		// render to about 4 KiB of escaped quotes, so the list is halved to fit.
+		{"forty-five quote-heavy names", 45, 1, func(i int) string {
 			return fmt.Sprintf("%s-%02d", strings.Repeat(`"`, 50), i)
 		}},
 		// Three names of 2001 control characters each: 12 KiB apiece once encoded,
-		// which used to drop the whole row.
-		{"names too long for the row", 3, func(i int) string {
+		// which used to drop the whole row. The last entry is dropped WHOLE rather
+		// than cut — half a name is a different name — so nothing of the list
+		// survives; the count and the flag are what is left.
+		{"names too long for the row", 3, 0, func(i int) string {
 			return strings.Repeat("\x01", 2001) + fmt.Sprint(i)
 		}},
 	} {
@@ -100,8 +103,8 @@ func TestLaunchProfileDeleteAuditsATruncatedWidenedAllowList(t *testing.T) {
 			if size > 4096 {
 				t.Errorf("row is %d bytes, over the 4096-byte CHECK", size)
 			}
-			if kept < 1 || kept >= tc.apps {
-				t.Errorf("kept %d of %d names, want some but not all", kept, tc.apps)
+			if kept < tc.minKept || kept >= tc.apps {
+				t.Errorf("kept %d of %d names, want at least %d and fewer than all", kept, tc.apps, tc.minKept)
 			}
 			if count != tc.apps {
 				t.Errorf("allow_list_widened_app_count = %d, want the true %d", count, tc.apps)
