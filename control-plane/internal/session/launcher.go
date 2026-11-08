@@ -296,6 +296,11 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		if owner == "" || !c.hostParks(owner) {
 			return LaunchResult{}, errParkRefused
 		}
+		// Every park is WebRTC-only (#1161): a launch that would plan WebTransport supersedes it
+		// and cold-starts Steam behind a 503, so park nothing for that user (#1163).
+		if c.launchWouldPlanWebTransport(ctx, p, owner, launchProfile, lp, ov, env, source) {
+			return LaunchResult{}, errParkRefused
+		}
 		// A heartbeat never waits on a settling hold: it simply parks nothing.
 		p.Kind, p.PinHostID, p.NoHomeSettleWait = KindParked, owner, true
 	} else if parked, err = c.store.liveParked(ctx, userID); err != nil {
@@ -316,13 +321,8 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		afterParkedRead()
 	}
 	notice := ""
-	if app.ShareSteamLibrary && app.ManagedHome && !lp.parked {
-		if p.SharedHomeAppID, err = c.store.sharedSteamApp(ctx, userID); err != nil {
-			return LaunchResult{}, err
-		}
-		if p.SharedHomeAppID == "" {
-			notice = noticeSharedUnavailable
-		}
+	if p.SharedHomeAppID, notice, err = c.store.sharedHomeChoice(ctx, app, userID, lp.parked); err != nil {
+		return LaunchResult{}, err
 	}
 
 	sess, err := c.store.ScheduleAndCreate(ctx, p)

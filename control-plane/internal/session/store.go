@@ -868,17 +868,52 @@ func (s *Store) SetStateDetail(ctx context.Context, id, detail string) error {
 	return nil
 }
 
-// CommitSwappedApp sets app_id and state_detail in one statement, leaving the
-// state `running` and the reservation unchanged. Applies only while `running`.
-func (s *Store) CommitSwappedApp(ctx context.Context, id, newAppID, detail string) error {
+// CommitSwappedApp commits the target an agent proved it swapped to: the row's
+// app_id, the Steam home the target mounts as its shared one (newSharedAppID,
+// "" for none), and the release of the hold on a shared Steam home the swap
+// away from. `swap complete` is reported only after the agent stopped the
+// outgoing container and the new app presented, so the Steam data dir the old
+// container mounted is unmounted by then: holding it until the session ends
+// would lock the user out of their library for a desktop they already left
+// (control-api.md §Storage, "A shared Steam library"). The state stays
+// `running` and the reservation is unchanged; it applies only while `running`.
+func (s *Store) CommitSwappedApp(ctx context.Context, id, newAppID, newSharedAppID, detail string) error {
 	if !isValidUUID(id) {
 		return nil // no such row to update; mirrors the 0-rows-affected no-op below
 	}
-	_, err := s.pool.Exec(ctx, `
-		UPDATE sessions SET app_id = $2::uuid, state_detail = $3, launch_progress = NULL
-		WHERE id = $1::uuid AND state = 'running'
-	`, id, newAppID, detail)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
+		return fmt.Errorf("begin swapped app commit: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var userID string
+	var oldShared *string
+	err = tx.QueryRow(ctx, `SELECT user_id::text,shared_home_app_id::text FROM sessions
+		WHERE id=$1::uuid AND state = 'running' FOR UPDATE`, id).Scan(&userID, &oldShared)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("lock swapped app: %w", err)
+	}
+	if oldShared != nil && (newSharedAppID == "" || *oldShared != newSharedAppID) {
+		// Only this session's hold, and only on the Steam home it is leaving:
+		// the CAS cannot release a hold taken by anyone else.
+		if _, err := tx.Exec(ctx, `UPDATE managed_home_claims SET pending_home_session_id=NULL,
+			pending_home_token=NULL,pending_home_started_at=NULL
+			WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid AND pending_home_session_id=$3::uuid`,
+			userID, *oldShared, id); err != nil {
+			return fmt.Errorf("release swapped-out shared home hold: %w", err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE sessions SET app_id = $2::uuid, shared_home_app_id = NULLIF($3, '')::uuid,
+			state_detail = $4, launch_progress = NULL
+		WHERE id = $1::uuid AND state = 'running'
+	`, id, newAppID, newSharedAppID, detail); err != nil {
+		return fmt.Errorf("commit swapped app: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit swapped app: %w", err)
 	}
 	return nil

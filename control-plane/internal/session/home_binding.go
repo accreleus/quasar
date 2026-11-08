@@ -220,7 +220,7 @@ func (s *Store) bindManagedHomeDispatchWithHold(ctx context.Context, sessionID s
 		return nil, err
 	}
 	if shared != nil {
-		if err := holdSharedHome(ctx, tx, userID, *shared, sessionID, decision, sharedPending); err != nil {
+		if _, err := holdSharedHome(ctx, tx, userID, *shared, sessionID, decision, sharedPending); err != nil {
 			return nil, err
 		}
 	}
@@ -263,32 +263,35 @@ func lockSharedHomeForDispatch(ctx context.Context, tx pgx.Tx, userID, sharedApp
 
 // holdSharedHome holds the shared claim under the same token as the session's
 // own hold, so one qualified terminal or one ClearNewHomeHold releases both.
-func holdSharedHome(ctx context.Context, tx pgx.Tx, userID, sharedApp, sessionID string, own *HomeHoldDecision, pending *string) error {
+// created reports that THIS call took the hold (the claim had none), which is
+// the only provenance a proven-no-side-effect path may release it on: a hold
+// the claim already carried belongs to an earlier dispatch.
+func holdSharedHome(ctx context.Context, tx pgx.Tx, userID, sharedApp, sessionID string, own *HomeHoldDecision, pending *string) (created bool, err error) {
 	if own == nil {
 		if pending != nil {
-			return ErrHomeConflict
+			return false, ErrHomeConflict
 		}
 		_, err := tx.Exec(ctx, `UPDATE managed_home_claims SET legacy_unprotected_dispatch=true
 			WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, userID, sharedApp)
 		if err != nil {
-			return fmt.Errorf("record unsupported shared home dispatch: %w", err)
+			return false, fmt.Errorf("record unsupported shared home dispatch: %w", err)
 		}
-		return nil
+		return false, nil
 	}
 	if pending != nil {
-		return nil
+		return false, nil
 	}
 	tag, err := tx.Exec(ctx, `UPDATE managed_home_claims SET pending_home_session_id=$3::uuid,
 		pending_home_token=$4::uuid,pending_home_started_at=now()
 		WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid AND pending_home_token IS NULL`,
 		userID, sharedApp, sessionID, own.Token)
 	if err != nil {
-		return fmt.Errorf("hold shared home dispatch: %w", err)
+		return false, fmt.Errorf("hold shared home dispatch: %w", err)
 	}
 	if tag.RowsAffected() != 1 {
-		return ErrHomeConflict
+		return false, ErrHomeConflict
 	}
-	return nil
+	return true, nil
 }
 
 // materializeRunningHome is called only on the first accepted agent running
