@@ -1,8 +1,9 @@
 //! #267 against PyroWave: building a device's function table while another thread creates
 //! Vulkan instances. On Vulkan-Loader before 1.4.345 the table's `vkGetDeviceQueue2` lookup
 //! walks every instance unlocked while `vkEnumeratePhysicalDevices` frees driver records:
-//! SIGSEGV in `libvulkan.so.1`. The image's volk is patched not to make that lookup
-//! (`deploy/patches/pyrowave/`). On a GPU host, in the image:
+//! SIGSEGV in `libvulkan.so.1`, as do lookups of device commands newer than the loader. The
+//! image ships Vulkan-Loader 1.4.345 (`deploy/pins.env` VULKAN_LOADER_REF), which locks that
+//! walk. On a GPU host, in the image:
 //! `QUASAR_REQUIRE_PYROWAVE=1 <test binary> --ignored --nocapture`; a crash is the failure.
 //! `QUASAR_RACE_SECS` sets the length (default 60).
 
