@@ -66,6 +66,9 @@ pub struct WebRtcSlot {
     pipeline: gst::Pipeline,
     /// The RTP capsfilter's src pad, where each `webrtcbin` transport is linked.
     tail: gst::Pad,
+    /// Outlives every transport, so a size [`super::mtu_shrink`] stepped down to does too: a
+    /// viewer reconnecting over the same path would black out again at the configured size.
+    payloader: gst::Element,
     encoder: gst::Element,
     out_tx: OutTx,
     devices: Option<Arc<VirtualDevices>>,
@@ -312,6 +315,7 @@ impl WebRtcSlot {
             tail: rtp_capsfilter
                 .static_pad("src")
                 .context("rtp capsfilter has no src pad")?,
+            payloader: pay,
             encoder,
             out_tx,
             devices,
@@ -345,6 +349,14 @@ impl WebRtcSlot {
         let gate = Arc::new(Mutex::new(gate.or_else(|| self.hold_rtp())));
         let webrtc = make_webrtcbin(cfg.stun.as_deref())?;
         // Signals webrtcbin emits while it builds its send session: connect them first.
+        if cfg.rtp_mtu_shrink {
+            super::mtu_shrink::attach(
+                &webrtc,
+                &self.payloader,
+                &self.encoder,
+                self.session_id.clone(),
+            );
+        }
         if self.observe {
             attach_abs_capture_time_egress_probe(
                 &webrtc,
