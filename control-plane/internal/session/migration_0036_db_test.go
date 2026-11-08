@@ -146,7 +146,8 @@ func newMigrator(t *testing.T, url string) *migrate.Migrate {
 // current store selects. Migrating up would rewrite the seeded data these tests compare.
 func addColumnsTheStoreReadsSince36(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
-	must(t, exec(t, pool, `ALTER TABLE launch_profiles ADD COLUMN transport TEXT NOT NULL DEFAULT 'webrtc'`))
+	must(t, exec(t, pool, `ALTER TABLE launch_profiles ADD COLUMN transport TEXT NOT NULL DEFAULT 'webrtc',
+		ADD COLUMN pyrowave_mode TEXT NOT NULL DEFAULT 'off', ADD COLUMN pyrowave_kbps INT NULL`))
 }
 
 func migrateTo(t *testing.T, m *migrate.Migrate, version uint) {

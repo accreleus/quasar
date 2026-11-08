@@ -13,7 +13,7 @@ import { AuthContext } from "../../../auth/context";
 import { ensureDeviceProbeForLaunch } from "../../../auth/deviceProbe";
 import { useToast } from "../../../components/Toast";
 import { playoutOverride } from "../../../webrtc/playoutOverride";
-import { transportPreference } from "../../../webtransport/transportSwitch";
+import { pyrowavePreference, transportPreference } from "../../../webtransport/transportSwitch";
 import {
   CLOSING_RETRY_DELAY_MS,
   MAX_CLOSING_RETRY_WAIT_MS,
@@ -161,6 +161,7 @@ export function useLaunch({
       if (streamCodec) req.stream = { codec: streamCodec };
       const transport = transportPreference();
       if (transport) req.transport = transport;
+      if (pyrowavePreference()) req.pyrowave = true;
 
       // #494: abort an in-flight POST /v1/sessions (or a pending retry wait) if
       // the page navigates away mid-launch. One controller per launchApp call;
@@ -216,6 +217,7 @@ export function useLaunch({
               playoutOverride: playoutOverride(),
               // Present only when the stream plan chose WebTransport.
               webtransport: transport_options?.webtransport,
+              pyrowave: session.pyrowave?.wanted === true,
             },
           });
           return;

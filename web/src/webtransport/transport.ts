@@ -5,19 +5,22 @@
 // still decodes inside the browser's <video> and does not go through this seam.
 
 import type { AudioPacket } from "./framing";
+import type { PyroWaveFrame } from "../pyrowave/receiver";
 import type { InputWire } from "./inputSender";
 
 /** A `hello_ack.video` (§Hello ack), the decoder configuration a `config_id` names. */
 export interface VideoConfig {
   configId: number;
-  /** Wire vocabulary: h264 | h265 | av1. */
+  /** Wire vocabulary: h264 | h265 | av1 | pyrowave. */
   codec: string;
-  /** avcC / hvcC / av1C. */
+  /** avcC / hvcC / av1C, or PyroWave's PWV1Header. */
   description: Uint8Array;
   width: number;
   height: number;
   fps: number;
   colorSpace?: VideoColorSpaceInit;
+  /** `hello_ack.codec_switch_reason` (codec-pyrowave.md §Switching codec). */
+  switchReason?: string;
 }
 
 /** A `hello_ack.audio` or `.mic` (§Hello ack): 10 ms Opus packets. */
@@ -62,6 +65,8 @@ export interface MediaSink {
   audio?(packet: AudioPacket): void;
   /** Reassembled units, in completion order. */
   unit(unit: AccessUnit): void;
+  /** PyroWave frames, complete or at their deadline, in frame_seq order. */
+  pyrowave(frame: PyroWaveFrame): void;
   /** Called once, after connect resolved, when the transport is gone. */
   end(end: TransportEnd): void;
   /** A ping's round trip in ms, once a second while connected (§Ping and pong). */
@@ -74,6 +79,8 @@ export interface MediaTransport {
   requestKeyframe(reason: KeyframeReason): void;
   /** Sends one `0x05` microphone datagram; false when it was not sent (not connected, too large). */
   sendMic(datagram: Uint8Array): boolean;
+  /** `codec_fallback`: this client cannot go on decoding PyroWave (codec-pyrowave.md). */
+  codecFallback(reason: string): void;
   /** Where client input goes once connected (§Input). */
   readonly input: InputWire;
   /** Says `bye` when connected; idempotent. */

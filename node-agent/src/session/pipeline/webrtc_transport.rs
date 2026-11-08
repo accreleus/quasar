@@ -242,6 +242,7 @@ impl WebRtcSlot {
             trace_tx,
             session_id,
             observe,
+            pyrowave_feed: _,
         } = session;
         let codec = cfg.stream.codec;
         let pay = build_video_payloader(codec, cfg.rtp_mtu)?;
