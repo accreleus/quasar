@@ -57,6 +57,9 @@ const STEAM: &str = "/usr/bin/steam";
 /// no sign of taking is sent again this often, for this long. 120 s is past the 90 s reveal cap.
 const RELAUNCH_EVERY: Duration = Duration::from_secs(5);
 const RELAUNCH_FOR: Duration = Duration::from_secs(120);
+/// The retry waits out a need for the user (a sign-in), which does not count against
+/// [`RELAUNCH_FOR`], but never beyond this after the launch.
+const RELAUNCH_MAX: Duration = Duration::from_secs(600);
 /// X keysym `Return`.
 const XK_RETURN: u32 = 0xff0d;
 
@@ -139,7 +142,12 @@ struct Helper {
 struct Relaunch {
     appid: u32,
     next: Instant,
+    /// The end of the retry window; it moves out while Steam needs the user.
     until: Instant,
+    /// The hard end, however long Steam needed the user.
+    last: Instant,
+    /// The previous step, to count how long Steam needed the user.
+    stepped: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,7 +195,7 @@ impl Helper {
         self.watch_with(appid, launched, Box::<X11Windows>::default());
     }
 
-    fn watch_with(&mut self, appid: u32, launched: bool, windows: Box<dyn Windows + Send>) {
+    fn new_watcher(&self, appid: u32, windows: Box<dyn Windows + Send>) -> Watcher {
         let mut watcher = Watcher::new(
             WatchConfig {
                 proc_root: self.proc_root.clone(),
@@ -199,6 +207,15 @@ impl Helper {
         if self.dismiss {
             watcher.answer_notice();
         }
+        watcher
+    }
+
+    fn watch_with(&mut self, appid: u32, launched: bool, windows: Box<dyn Windows + Send>) {
+        let watcher = self.new_watcher(appid, windows);
+        self.arm(watcher, appid, launched);
+    }
+
+    fn arm(&mut self, watcher: Watcher, appid: u32, launched: bool) {
         self.watcher = Some(watcher);
         self.exit_sync = Some((appid, CloudSync::new(&self.log_dir, appid)));
         self.game_exited = false;
@@ -210,16 +227,25 @@ impl Helper {
     fn command(&mut self, command: Command, agent: &mut Agent) {
         match command {
             Command::Launch(appid) => {
+                // A launch that does not run leaves no retry of an earlier target behind.
+                self.relaunch = None;
+                // The watcher's baseline in Steam's logs is taken before Steam can write
+                // anything for this launch, or the first thing it logs would be skipped.
+                let mut watcher = self.new_watcher(appid, Box::<X11Windows>::default());
+                let now = Instant::now();
+                let baseline = watcher.poll_at(now);
                 let ok = self.run_steam(&["-applaunch", &appid.to_string()]);
                 if ok {
                     eprintln!("quasar-launch-helper: launched Steam app {appid}");
                     agent.forget_game();
-                    self.watch(appid, true);
-                    let now = Instant::now();
+                    self.arm(watcher, appid, true);
+                    self.forward(baseline, agent);
                     self.relaunch = Some(Relaunch {
                         appid,
                         next: now + RELAUNCH_EVERY,
                         until: now + RELAUNCH_FOR,
+                        last: now + RELAUNCH_MAX,
+                        stepped: now,
                     });
                 }
                 agent.done(Done::Launch { appid, ok });
@@ -302,28 +328,38 @@ impl Helper {
         self.step_quit(now, agent);
     }
 
-    /// Send the armed `launch` again while Steam shows no sign of having taken it. Never once
-    /// the game runs or exited, Steam logged an action for it, it needs the user, a quit runs,
-    /// the target changed, or the window is over: a retry cannot start a second copy.
+    /// Send the armed `launch` again while Steam shows no sign of having taken it. The helper
+    /// relaunches only on positive evidence the launch was not taken, and never against what
+    /// the user is doing now: not once the game runs or exited, Steam logged progress for it,
+    /// another game or launch showed up, a quit runs, the target changed, or the window is over.
+    /// While Steam needs the user (a sign-in) it waits, and that time is not counted, up to
+    /// [`RELAUNCH_MAX`] in all.
     fn step_relaunch(&mut self, now: Instant) {
-        let Some(relaunch) = self.relaunch else {
+        let Some(mut relaunch) = self.relaunch else {
             return;
         };
-        let waiting = self.watcher.as_ref().is_some_and(|watcher| {
-            watcher.appid() == relaunch.appid
-                && !watcher.launch_taken()
-                && matches!(
-                    watcher.launch_state(),
-                    LaunchState::Starting | LaunchState::ClientOnly
-                )
-        });
-        if !waiting || self.needs_user || self.quit.is_some() || now >= relaunch.until {
+        let Some(watcher) = self.watcher.as_ref() else {
             self.relaunch = None;
-        } else if now >= relaunch.next {
-            self.relaunch = Some(Relaunch {
-                next: now + RELAUNCH_EVERY,
-                ..relaunch
-            });
+            return;
+        };
+        let live = watcher.appid() == relaunch.appid
+            && !watcher.launch_taken()
+            && !watcher.elsewhere()
+            && matches!(
+                watcher.launch_state(),
+                LaunchState::Starting | LaunchState::ClientOnly
+            );
+        let paused = watcher.needs_now().is_some();
+        if paused {
+            relaunch.until += now.saturating_duration_since(relaunch.stepped);
+        }
+        relaunch.stepped = now;
+        if !live || self.quit.is_some() || now >= relaunch.until.min(relaunch.last) {
+            self.relaunch = None;
+            return;
+        }
+        if !paused && now >= relaunch.next {
+            relaunch.next = now + RELAUNCH_EVERY;
             if self.run_steam(&["-applaunch", &relaunch.appid.to_string()]) {
                 eprintln!(
                     "quasar-launch-helper: Steam has not taken up app {}; launched it again",
@@ -331,6 +367,7 @@ impl Helper {
                 );
             }
         }
+        self.relaunch = Some(relaunch);
     }
 
     /// Poll the watcher and forward its reports, noting the ones the helper acts on.
@@ -338,7 +375,13 @@ impl Helper {
         let Some(watcher) = &mut self.watcher else {
             return;
         };
-        for report in watcher.poll_at(now) {
+        let reports = watcher.poll_at(now);
+        self.forward(reports, agent);
+    }
+
+    /// Send the watcher's reports on, noting the ones the helper acts on.
+    fn forward(&mut self, reports: Vec<Report>, agent: &mut Agent) {
+        for report in reports {
             if matches!(report, Report::SteamNeedsUser(_)) {
                 self.needs_user = true;
             }
@@ -1448,9 +1491,7 @@ mod tests {
         helper.steam = fake_steam(dir);
         let mut agent = Agent::new(dir.join("none.sock"));
         helper.command(Command::Launch(1145360), &mut agent);
-        let t0 = Instant::now();
-        helper.pass(t0, &mut agent); // the watcher's first pass: the logs are read from here
-        (helper, agent, t0)
+        (helper, agent, Instant::now())
     }
 
     /// Wait for the stand-in `steam` to have run `n` times, then for any extra run to show.
@@ -1508,36 +1549,63 @@ mod tests {
         assert!(helper.relaunch.is_none());
     }
 
+    const PROGRESS: &str =
+        "GameAction [AppID 1145360, ActionID 1] : LaunchApp changed task to CreatingProcess";
+
     #[test]
-    fn a_launch_is_not_sent_again_once_the_game_runs_it_needs_the_user_a_quit_or_the_window_is_over(
-    ) {
+    fn a_launch_is_not_sent_again_once_it_is_no_longer_the_users_to_repeat() {
         let _scripts = scripts();
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
         let after = Duration::from_secs(6);
         type Stop<'a> = Box<dyn Fn(&mut Helper, &mut Agent) + 'a>;
-        let stops: [(&str, Stop); 4] = [
+        let stops: [(&str, Stop); 6] = [
             (
                 "the game runs",
-                Box::new(|_, _| {
-                    log_line(dir.path(), "Game process added : AppID 1145360 \"x\"");
-                }),
+                Box::new(|_, _| log_line(dir.path(), "Game process added : AppID 1145360 \"x\"")),
             ),
-            ("it needs the user", Box::new(|h, _| h.needs_user = true)),
             (
                 "a quit runs",
                 Box::new(|h, a| h.command(Command::Quit(1145360), a)),
             ),
             (
                 "the window is over",
-                Box::new(|h, _| {
-                    h.relaunch.as_mut().unwrap().until = Instant::now();
+                Box::new(|h, _| h.relaunch.as_mut().unwrap().until = Instant::now()),
+            ),
+            (
+                "another game runs",
+                Box::new(|_, _| {
+                    let proc = dir.path().join("proc/42");
+                    std::fs::create_dir_all(&proc).unwrap();
+                    std::fs::write(
+                        proc.join("cmdline"),
+                        b"/steam/reaper\0SteamLaunch\0AppId=620\0--\0game\0",
+                    )
+                    .unwrap();
+                }),
+            ),
+            (
+                "Steam launches another app",
+                Box::new(|_, _| {
+                    log_line(
+                        dir.path(),
+                        "GameAction [AppID 620, ActionID 1] : LaunchApp changed task to CreatingProcess",
+                    )
+                }),
+            ),
+            (
+                "another launch cannot run",
+                Box::new(|h, a| {
+                    h.steam = dir.path().join("missing");
+                    h.command(Command::Launch(620), a);
                 }),
             ),
         ];
         for (why, stop) in stops {
+            let _ = std::fs::remove_dir_all(dir.path().join("proc"));
             let _ = std::fs::remove_file(dir.path().join("argv.txt"));
             let _ = std::fs::remove_file(dir.path().join("logs/console_log.txt"));
+            std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+            std::fs::write(dir.path().join("logs/console_log.txt"), "old\n").unwrap();
             let (mut helper, mut agent, t0) = launched(dir.path());
             assert_eq!(runs(dir.path(), 1), 1);
             stop(&mut helper, &mut agent);
@@ -1545,6 +1613,93 @@ mod tests {
             helper.pass(t0 + after * 2, &mut agent);
             assert_eq!(runs(dir.path(), 2), 1, "no second launch once {why}");
         }
+    }
+
+    #[test]
+    fn a_launch_that_cannot_run_clears_the_retry_of_the_one_before() {
+        let _scripts = scripts();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut helper, mut agent, _) = launched(dir.path());
+        assert!(helper.relaunch.is_some());
+        helper.steam = dir.path().join("missing");
+        helper.command(Command::Launch(620), &mut agent);
+        assert!(helper.relaunch.is_none());
+    }
+
+    #[test]
+    fn what_steam_logs_right_after_the_launch_counts_as_the_launch_taken() {
+        let _scripts = scripts();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        std::fs::write(
+            dir.path().join("logs/console_log.txt"),
+            "an earlier session\n",
+        )
+        .unwrap();
+        let (mut helper, mut agent, t0) = launched(dir.path());
+        // Steam took the launch and wrote this before the helper's first pass.
+        log_line(dir.path(), PROGRESS);
+        helper.pass(t0, &mut agent);
+        helper.pass(t0 + Duration::from_secs(6), &mut agent);
+        helper.pass(t0 + Duration::from_secs(12), &mut agent);
+        assert_eq!(runs(dir.path(), 2), 1, "no retry of a launch Steam took");
+    }
+
+    #[test]
+    fn a_line_that_is_not_progress_does_not_count_as_the_launch_taken() {
+        let _scripts = scripts();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let (mut helper, mut agent, t0) = launched(dir.path());
+        log_line(
+            dir.path(),
+            "GameAction [AppID 1145360, ActionID 1] : LaunchApp failed with \"x\"",
+        );
+        helper.pass(t0 + Duration::from_secs(6), &mut agent);
+        assert_eq!(runs(dir.path(), 2), 2);
+    }
+
+    #[test]
+    fn the_retry_waits_while_steam_needs_a_sign_in_and_resumes_when_it_is_done() {
+        let _scripts = scripts();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let (mut helper, mut agent, t0) = launched(dir.path());
+        assert_eq!(runs(dir.path(), 1), 1);
+        // X is absent here, and an unreadable window list never clears a need: use a list.
+        let mut watcher = helper.new_watcher(1145360, Box::new(Fake(vec![])));
+        watcher.poll_at(t0);
+        helper.watcher = Some(watcher);
+        let at = |secs| t0 + Duration::from_secs(secs);
+        std::fs::write(
+            dir.path().join("logs/steamui_login.txt"),
+            "SetLoginState: WaitingForCredentials\n",
+        )
+        .unwrap();
+        helper.pass(at(6), &mut agent);
+        helper.pass(at(200), &mut agent);
+        assert_eq!(runs(dir.path(), 2), 1, "nothing is sent at a sign-in");
+        assert!(helper.relaunch.is_some(), "and the retry is kept");
+        std::fs::write(
+            dir.path().join("logs/steamui_login.txt"),
+            "SetLoginState: WaitingForCredentials\nSetLoginState: LoggedIn\n",
+        )
+        .unwrap();
+        helper.pass(at(205), &mut agent);
+        assert_eq!(
+            runs(dir.path(), 2),
+            2,
+            "signed in: the launch is sent again"
+        );
+        // A sign-in that never ends does not hold the retry past its hard end.
+        std::fs::write(
+            dir.path().join("logs/steamui_login.txt"),
+            "SetLoginState: WaitingForCredentials\nSetLoginState: LoggedIn\nSetLoginState: WaitingForCredentials\n",
+        )
+        .unwrap();
+        helper.pass(at(210), &mut agent);
+        helper.pass(at(RELAUNCH_MAX.as_secs() + 1), &mut agent);
+        assert!(helper.relaunch.is_none());
     }
 
     #[test]
