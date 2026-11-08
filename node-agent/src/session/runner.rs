@@ -1955,10 +1955,10 @@ fn idle_reap_reason(
         if booting {
             return None;
         }
-        return (running_for >= window).then_some("idle: WebRTC transport never established");
+        return (running_for >= window).then_some("idle: transport never established");
     }
     match unhealthy_for {
-        Some(d) if d >= window => Some("idle: WebRTC transport lost"),
+        Some(d) if d >= window => Some("idle: transport lost"),
         _ => None,
     }
 }
@@ -4294,7 +4294,7 @@ pub const REASON_APP_EXITED_EARLY: &str = "app_exited_early";
 /// #484 reason code: the app container is alive but never presented a frame within
 /// `QUASAR_APP_BOOT_TIMEOUT_SECS`. Same `AppFailed` shape as
 /// [`REASON_APP_EXITED_EARLY`]; this case used to surface as a mute
-/// `idle: WebRTC transport never established` reap.
+/// `idle: transport never established` reap.
 pub const REASON_APP_NEVER_PRESENTED: &str = "app_never_presented";
 
 /// The terminal event for a `fail`-policy app-container exit.
@@ -5815,7 +5815,7 @@ mod tests {
 
     // ── #484 app-boot visibility ──────────────────────────────────────────────
     // A cold app boot is 30–50 s, and charging it against the never-connected idle budget
-    // killed real sessions at 120 s with `idle: WebRTC transport never established`.
+    // killed real sessions at 120 s with `idle: transport never established`.
 
     #[test]
     fn booting_defers_the_never_connected_reap_at_every_age() {
