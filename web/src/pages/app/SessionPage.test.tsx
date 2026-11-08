@@ -102,8 +102,42 @@ vi.mock("../../webrtc/traceEvents", () => ({
     emitPlayoutChanged() {}
     emitWebRtcStateChanged() {}
     emitFreezeDetected() {}
+    emitTransportFallback(reason: string) {
+      emitTransportFallback(reason);
+    }
   },
 }));
+const emitTransportFallback = vi.fn();
+
+/** The WebTransport runtime's callbacks, so a test plays its verdict without a QUIC connection. */
+let lastWtCallbacks: { onFallback(reason: string): void } | null = null;
+vi.mock("./webTransportRuntime", async () => {
+  const { IDLE_SNAPSHOT } = await import("./sessionRuntime");
+  return {
+    createWebTransportRuntime: (cfg: { callbacks: { onFallback(reason: string): void } }) => {
+      lastWtCallbacks = cfg.callbacks;
+      return {
+        getSnapshot: () => IDLE_SNAPSHOT,
+        subscribe: () => () => {},
+        start() {},
+        destroy() {},
+        engage: () => null,
+        release() {},
+        syncKeyboardLock() {},
+        setMouse() {},
+        isCaptured: () => false,
+        cancelRecovery() {},
+        hasMicSlot: () => false,
+        attachMicTrack: () => Promise.resolve(),
+        detachMicTrack: () => Promise.resolve(),
+        registerTelemetry: () => () => {},
+        summary: () => ({ elapsedMs: 0, fps: [], latency: [] }),
+        releaseAudio() {},
+        holdAudio() {},
+      };
+    },
+  };
+});
 
 /** Captured from the last QuasarSession constructor call so tests can flip
  *  channelOpen by hand — exactly the ondatachannel/onopen path SessionPage
@@ -222,7 +256,7 @@ function SummaryProbe() {
   return <pre data-testid="summary">{JSON.stringify(state?.sessionSummary ?? null)}</pre>;
 }
 
-function renderPage() {
+function renderPage(extra: Record<string, unknown> = {}) {
   return render(
     <MemoryRouter
       initialEntries={[
@@ -234,6 +268,7 @@ function renderPage() {
             appName: "Portal 2",
             appId: "a1",
             tier: "1920×1080@60",
+            ...extra,
           },
         },
       ]}
@@ -259,6 +294,8 @@ beforeEach(() => {
   sessionStorage.clear();
   lastOnChannel = null;
   lastOnRecovery = null;
+  lastTransport = null;
+  lastWtCallbacks = null;
   lastDrawerProps = null;
   lastStripProps = null;
   updateSessionDisplay.mockResolvedValue({ session: makeSession({ state: "running" }) });
@@ -1307,5 +1344,75 @@ describe("SessionPage — post-session summary", () => {
     const summary = JSON.parse(screen.getByTestId("summary").textContent ?? "null");
     expect(summary.durationSeconds).toBe(42);
     expect(summary.endReason).toBe("Stopped by user");
+  });
+});
+
+describe("SessionPage — WebTransport falls back to WebRTC (A11)", () => {
+  const wt = { url: "https://agent/wt", token: "w", expires_at: "2026-11-06T12:01:00Z", cert_hashes: [] };
+
+  it("reports the reason, mints a fresh signaling token and carries on over WebRTC", async () => {
+    mintSignalingToken.mockResolvedValue({ signaling: { url: "wss://fresh", token: "fresh", ice_servers: [] } });
+    renderPage({ webtransport: wt });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    expect(lastTransport).toBeNull(); // the launch's signaling token is not used while WebTransport has the session
+    expect((lastDrawerProps as Record<string, unknown>).transport).toBe("webtransport");
+
+    await act(async () => {
+      lastWtCallbacks!.onFallback("connect_timeout");
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    expect(emitTransportFallback).toHaveBeenCalledWith("connect_timeout");
+    expect(mintSignalingToken).toHaveBeenCalledWith("t", "s1");
+    expect(lastTransport).not.toBeNull(); // QuasarSession was built
+    const hud = lastDrawerProps as Record<string, unknown>;
+    expect(hud.transport).toBe("webrtc");
+    expect(hud.transportFallbackReason).toBe("connect_timeout");
+  });
+
+  it("says the stream is unreachable when no signaling token can be minted", async () => {
+    mintSignalingToken.mockRejectedValue(new Error("offline"));
+    renderPage({ webtransport: wt });
+    await act(async () => {
+      lastWtCallbacks!.onFallback("connect_failed");
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    expect(lastTransport).toBeNull();
+    expect((lastDrawerProps as Record<string, unknown>).transportFallbackReason).toBeNull();
+  });
+
+  it("keeps the status line on \"Switching to WebRTC…\" until the new signaling is minted, and remembers the fallback", async () => {
+    let release!: (v: unknown) => void;
+    mintSignalingToken.mockReturnValue(new Promise((r) => (release = r)));
+    renderPage({ webtransport: wt });
+    await act(async () => {
+      lastWtCallbacks!.onFallback("connect_timeout");
+    });
+    expect(screen.getAllByText("Switching to WebRTC…").length).toBeGreaterThan(0);
+    expect(sessionStorage.getItem("quasar.wt-fallback.s1")).toBe("connect_timeout");
+    await act(async () => {
+      release({ signaling: { url: "wss://fresh", token: "fresh" } });
+    });
+    expect(lastTransport).not.toBeNull();
+  });
+
+  it("goes straight to WebRTC on a reload after a fallback: no WebTransport, no second report, a fresh token", async () => {
+    sessionStorage.setItem("quasar.wt-fallback.s1", "connect_timeout");
+    renderPage({ webtransport: wt });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    expect(lastWtCallbacks).toBeNull();
+    expect(emitTransportFallback).not.toHaveBeenCalled();
+    expect(mintSignalingToken).toHaveBeenCalledWith("t", "s1");
+    expect(lastTransport).not.toBeNull();
+    const hud = lastDrawerProps as Record<string, unknown>;
+    expect(hud.transport).toBe("webrtc");
+    expect(hud.transportFallbackReason).toBe("connect_timeout");
   });
 });

@@ -108,9 +108,13 @@ const (
 	reasonCodecUnsupported     = "codec_unsupported_on_transport"
 )
 
-// webTransportCodecs are the codecs this build's WebTransport media path carries. A18 (#1043)
-// adds hevc and av1 here once the agent and the web client can carry them.
-var webTransportCodecs = map[profile.Codec]bool{profile.CodecH264: true}
+// webTransportCodecs are the codecs this build's WebTransport media path carries. A codec the
+// agent or the web client cannot carry yet stays out, and reasonCodecUnsupported keeps it on WebRTC.
+var webTransportCodecs = map[profile.Codec]bool{
+	profile.CodecH264: true,
+	profile.CodecHEVC: true,
+	profile.CodecAV1:  true,
+}
 
 // certIdentity is the encode path a cert row must describe to be applicable to this
 // launch. Assembled from two reads that fail independently, either of which can be

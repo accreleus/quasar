@@ -175,6 +175,14 @@ describe("the WebTransport input sender", () => {
     });
   });
 
+  it("sends nothing once disposed", () => {
+    const { log, sender } = recordingWire();
+    sender.dispose();
+    sender.send({ t: "k", c: "KeyA", d: 1 } as InputMsg);
+    sender.send({ t: "mm", dx: 1, dy: 1 });
+    expect(log).toHaveLength(0);
+  });
+
   it("falls back to the control stream when the datagram does not fit", () => {
     const { log, sender } = recordingWire(false);
     sender.send({ t: "mm", dx: 1, dy: 1 });
@@ -389,7 +397,7 @@ describe("input through the WebTransport runtime", () => {
     agent.replies = [[helloAck(0, avcC())]];
     const canvas = document.createElement("canvas");
     const presenter: Presenter = { present: () => true, destroy: () => {} };
-    const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn() };
+    const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn(), onFallback: vi.fn() };
     const rt = createWebTransportRuntime({
       sessionId: "s1",
       authToken: "auth",

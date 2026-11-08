@@ -28,6 +28,7 @@ vi.mock("../webrtc/capability", () => ({
   getOrCreateDeviceKey: () => "dev-key",
   probeCapabilities: vi.fn().mockResolvedValue({ codecs: { h264: true } }),
   probeH264Decodable: vi.fn().mockResolvedValue(true),
+  probeWebGpu: vi.fn().mockResolvedValue({ available: false, features: [] }),
   deviceProbeIsFresh: vi.fn(() => true),
   markDeviceProbePosted: vi.fn(),
 }));
