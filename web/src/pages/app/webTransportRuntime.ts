@@ -242,6 +242,9 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       await t.connect({
         streams: (streams) => {
           micSlot = streams.mic !== null;
+          // A reconnect's streams replace the previous connection's player.
+          audioOut?.close();
+          audioOut = null;
           if (!streams.audio || failed || destroyed) return;
           const out = (audioOut = new AudioOut(deps.audio));
           if (!audioHeld) out.release();
