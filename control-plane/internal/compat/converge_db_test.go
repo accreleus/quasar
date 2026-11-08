@@ -263,39 +263,84 @@ func TestAFailedInstallHoldsUntilAnAdminReleasesIt(t *testing.T) {
 	}
 }
 
-// A converge run's name and reason are the agent's own words, and both were written into the
-// audit row verbatim. A long pair renders the row past admin_activity's 4096-byte bound, so
-// boundedDetails refused it and TryRecord only logged the loss: the install and removal were
-// unaudited. Both fields must be cut to 512 bytes, on a UTF-8 boundary, and say so (erratum 25).
-func TestAConvergeAuditRowCapsTheAgentNameAndReason(t *testing.T) {
+// The agent's name and reason are its own words and were written into the audit row verbatim,
+// so a long one rendered the row past admin_activity's 4096-byte bound and the row was dropped.
+// Escape-heavy text is the worst case: Go writes & < > " \ and a control character as two to six
+// bytes each, so a raw-byte cap is no guarantee at all (#1209). Both fields here are 1600 raw
+// bytes, about 6000 encoded each, and the row must still be written, cut down and flagged.
+func TestAConvergeAuditRowSurvivesEscapeHeavyAgentText(t *testing.T) {
 	h := newHarness(t)
 	a := h.host("a", true)
 	id, _, _ := h.ge()
 	h.enable(id, true)
 	run := h.claim("a")[0]
 
-	// Long enough together to overflow the audit row, small enough that the run's own summary
-	// (itself capped at 4096) is still accepted: 2000 + 1998 bytes plus the JSON around them.
-	name, reason := strings.Repeat("é", 1000), strings.Repeat("€", 666)
-	h.report("a", run["run_id"].(string), "failed", map[string]any{"name": name, "reason": reason})
+	// Small enough that the run's own summary (capped at 4096 by its own CHECK, which
+	// measures jsonb's rendering of the text) is accepted; large enough that the audit row
+	// is not.
+	long := strings.Repeat("&<>\"\\\x01é", 100)
+	h.report("a", run["run_id"].(string), "failed", map[string]any{"name": long, "reason": long})
 
-	var gotName, gotReason string
-	var nameCut, reasonCut bool
-	if err := h.pool.QueryRow(context.Background(), `SELECT details->>'name', details->>'reason',
-		COALESCE((details->>'name_truncated')::bool, false), COALESCE((details->>'reason_truncated')::bool, false)
+	var name, reason string
+	var size int
+	var nameCut, rowCut bool
+	if err := h.pool.QueryRow(context.Background(), `SELECT COALESCE(details->>'name',''),
+		COALESCE(details->>'reason',''), octet_length(details::text),
+		COALESCE((details->>'name_truncated')::bool, false),
+		COALESCE((details->>'details_truncated')::bool, false)
 		FROM admin_activity WHERE action = 'compat_tool.install' AND target_id = $1`, a).
-		Scan(&gotName, &gotReason, &nameCut, &reasonCut); err != nil {
+		Scan(&name, &reason, &size, &nameCut, &rowCut); err != nil {
 		t.Fatalf("no install audit row: %v", err)
 	}
-	if !nameCut || !reasonCut {
-		t.Errorf("truncated flags = %v/%v, want both true", nameCut, reasonCut)
+	if !nameCut || !rowCut {
+		t.Errorf("truncated flags = name:%v row:%v, want both true", nameCut, rowCut)
 	}
-	if len(gotName) != 512 {
-		t.Errorf("name is %d bytes, want it cut to 512", len(gotName))
+	if size > 4096 {
+		t.Errorf("row is %d bytes, over the 4096-byte CHECK", size)
 	}
-	// 512 is not a multiple of the 3-byte euro sign, so the cut must step back to 510 bytes.
-	if len(gotReason) != 510 {
-		t.Errorf("reason is %d bytes, want 510 (the last whole rune under 512)", len(gotReason))
+	if name == "" || reason == "" {
+		t.Errorf("cut row lost its text: name %d bytes, reason %d bytes", len(name), len(reason))
+	}
+	if !strings.HasPrefix(long, name) || !strings.HasPrefix(long, reason) {
+		t.Error("a cut field is not a prefix of what the agent reported")
+	}
+}
+
+// A reason that arrives as a structure is not text. Before #1209 it was written through as
+// reported, so its nested string counted against the row and dropped it; now it is omitted and
+// flagged, and the row lands.
+func TestAConvergeAuditRowDropsAStructuredReason(t *testing.T) {
+	h := newHarness(t)
+	a := h.host("a", true)
+	id, _, _ := h.ge()
+	h.enable(id, true)
+	run := h.claim("a")[0]
+
+	h.report("a", run["run_id"].(string), "failed", map[string]any{
+		"reason": map[string]any{"nested": strings.Repeat("&", 2000)},
+	})
+
+	var size int
+	var invalid bool
+	if err := h.pool.QueryRow(context.Background(), `SELECT octet_length(details::text),
+		COALESCE((details->>'reason_invalid')::bool, false)
+		FROM admin_activity WHERE action = 'compat_tool.install' AND target_id = $1`, a).
+		Scan(&size, &invalid); err != nil {
+		t.Fatalf("no install audit row: %v", err)
+	}
+	if !invalid {
+		t.Error("a structured reason was not flagged reason_invalid")
+	}
+	if size > 4096 {
+		t.Errorf("row is %d bytes, over the 4096-byte CHECK", size)
+	}
+	var present bool
+	if err := h.pool.QueryRow(context.Background(), `SELECT details ? 'reason' FROM admin_activity
+		WHERE action = 'compat_tool.install' AND target_id = $1`, a).Scan(&present); err != nil {
+		t.Fatal(err)
+	}
+	if present {
+		t.Error("a structured reason was written as if it were text")
 	}
 }
 

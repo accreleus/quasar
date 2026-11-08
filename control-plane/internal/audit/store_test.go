@@ -2,7 +2,9 @@ package audit
 
 import (
 	"context"
+	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/accreleus/quasar/control-plane/internal/migrate"
@@ -55,9 +57,35 @@ func TestRecordAndPaginate(t *testing.T) {
 	}
 }
 
-func TestRejectsOversizedDetails(t *testing.T) {
+// #1209: an oversized row used to be refused, and TryRecord then only LOGGED
+// the refusal — the operation happened and nothing recorded it. The row is now
+// written cut down, flagged, inside the same bound.
+func TestWritesOversizedDetailsCutDown(t *testing.T) {
 	s := testStore(t)
-	if err := s.Record(context.Background(), "", "x", "host", "h", map[string]any{"value": string(make([]byte, 5000))}); err == nil {
-		t.Fatal("expected oversized details rejection")
+	// 5000 NULs encode to 30 000 bytes: &#92;u0000 is six bytes each.
+	value := strings.Repeat("\x00", 5000)
+	if err := s.Record(context.Background(), "", "x", "host", "h",
+		map[string]any{"value": value, "count": 1}); err != nil {
+		t.Fatalf("an oversized row must be written, not refused: %v", err)
+	}
+
+	var raw []byte
+	var size int
+	if err := s.pool.QueryRow(context.Background(),
+		`SELECT details, octet_length(details::text) FROM admin_activity WHERE action = 'x'`).Scan(&raw, &size); err != nil {
+		t.Fatalf("no audit row for an oversized payload: %v", err)
+	}
+	if size > maxDetailBytes {
+		t.Fatalf("row is %d bytes, over the %d-byte CHECK", size, maxDetailBytes)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("details are not a JSON object: %v", err)
+	}
+	if got[detailsTruncatedKey] != true || got["value_truncated"] != true {
+		t.Errorf("cut row is not flagged: %#v", got)
+	}
+	if got["count"] != float64(1) {
+		t.Errorf("a short field was lost: %#v", got)
 	}
 }

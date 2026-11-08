@@ -1,12 +1,12 @@
 package session
 
-// launch_profile_delete_audit_db_test.go — #1183: deleting a launch profile
-// records every app whose menu the delete widens (an emptied allow-list is
-// unrestricted again). That list grows with the catalogue, and past
-// admin_activity's 4096-byte bound boundedDetails refused the whole delete row,
-// which TryRecord only logged. The row must be written, cut to 40 names and to
-// 2 KiB of them, with the true count beside it. DB-gated like the rest
-// (make test-db).
+// launch_profile_delete_audit_db_test.go — #1183 / #1209: deleting a launch
+// profile records every app whose menu the delete widens (an emptied allow-list
+// is unrestricted again). That list grows with the catalogue, and its entries
+// are admin-supplied names, so neither the count nor a raw byte count can bound
+// the row: admin_activity's CHECK measures the ENCODED details, where a quote
+// costs two bytes and a control character six. The row must be written, cut
+// down and flagged, never dropped. DB-gated like the rest (make test-db).
 
 import (
 	"context"
@@ -43,14 +43,17 @@ func TestLaunchProfileDeleteAuditsATruncatedWidenedAllowList(t *testing.T) {
 		name    string
 		apps    int
 		appName func(i int) string
-		want    int
 	}{
-		// The count cap, from erratum 25: 45 apps, 40 kept.
-		{"forty-five apps", 45, func(i int) string { return fmt.Sprintf("Widened app %02d", i) }, 40},
-		// The byte budget. Three names this long render to about 6 KiB, which used
-		// to drop the whole row; one of them fits, cut to that one, and the row is
-		// still written.
-		{"names too long for the row", 3, func(i int) string { return strings.Repeat("n", 2000) + fmt.Sprint(i) }, 1},
+		// The count cap from erratum 25, then the encoded-size step: 40 of these
+		// render to about 4 KiB of escaped quotes.
+		{"forty-five quote-heavy names", 45, func(i int) string {
+			return fmt.Sprintf("%s-%02d", strings.Repeat(`"`, 50), i)
+		}},
+		// Three names of 2001 control characters each: 12 KiB apiece once encoded,
+		// which used to drop the whole row.
+		{"names too long for the row", 3, func(i int) string {
+			return strings.Repeat("\x01", 2001) + fmt.Sprint(i)
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// A chain of this test's own: the seeded ones are shared with every other
@@ -75,18 +78,33 @@ func TestLaunchProfileDeleteAuditsATruncatedWidenedAllowList(t *testing.T) {
 				t.Fatalf("DELETE: %d, want 204", resp.StatusCode)
 			}
 
-			var n int
-			if err := pool.QueryRow(ctx, `SELECT count(*) FROM admin_activity
-				WHERE action = 'launch_profile.delete' AND target_id = $1
-				AND jsonb_array_length(details->'allow_list_widened_apps') = $2
-				AND details->>'allow_list_widened_apps_truncated' = 'true'
-				AND (details->>'allow_list_widened_app_count')::int = $3`,
-				profileID, tc.want, tc.apps).Scan(&n); err != nil {
-				t.Fatalf("read the delete audit row: %v", err)
+			var (
+				kept   int
+				size   int
+				list   bool
+				count  int
+				rowCut bool
+			)
+			if err := pool.QueryRow(ctx, `SELECT jsonb_array_length(details->'allow_list_widened_apps'),
+				octet_length(details::text),
+				COALESCE((details->>'allow_list_widened_apps_truncated')::bool, false),
+				(details->>'allow_list_widened_app_count')::int,
+				COALESCE((details->>'details_truncated')::bool, false)
+				FROM admin_activity WHERE action = 'launch_profile.delete' AND target_id = $1`,
+				profileID).Scan(&kept, &size, &list, &count, &rowCut); err != nil {
+				t.Fatalf("no launch_profile.delete audit row: %v", err)
 			}
-			if n != 1 {
-				t.Errorf("%d launch_profile.delete rows with %d of %d names and the true count, want 1",
-					n, tc.want, tc.apps)
+			if !list || !rowCut {
+				t.Errorf("truncated flags = list:%v row:%v, want both true", list, rowCut)
+			}
+			if size > 4096 {
+				t.Errorf("row is %d bytes, over the 4096-byte CHECK", size)
+			}
+			if kept < 1 || kept >= tc.apps {
+				t.Errorf("kept %d of %d names, want some but not all", kept, tc.apps)
+			}
+			if count != tc.apps {
+				t.Errorf("allow_list_widened_app_count = %d, want the true %d", count, tc.apps)
 			}
 		})
 	}

@@ -96,8 +96,8 @@ const maxDetailBytes = 4096
 // that fits here can still violate the constraint and turn an audit write into
 // a 500 on the operation it was describing. Counting those two characters over
 // the whole marshalled blob OVERCOUNTS (it also counts ones inside strings),
-// which is the direction to be wrong in: we reject a little early rather than
-// let the database reject at insert time.
+// which is the direction to be wrong in: shrinkToFit cuts a little early rather
+// than let the database reject at insert time.
 func renderedSize(marshalled []byte) int {
 	return len(marshalled) +
 		bytes.Count(marshalled, []byte{':'}) +
@@ -142,6 +142,10 @@ const insertActivitySQL = `
 `
 
 // boundedDetails marshals and bounds details, shared by Record and RecordTx.
+//
+// An oversized row is NOT refused: it is written cut down by shrinkToFit, and
+// marked details_truncated. Refusing it meant TryRecord only logged the loss,
+// so the operation happened with no audit row at all (#1209).
 func boundedDetails(details map[string]any) ([]byte, error) {
 	if details == nil {
 		details = map[string]any{}
@@ -150,10 +154,10 @@ func boundedDetails(details map[string]any) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("marshal audit details: %w", err)
 	}
-	if n := renderedSize(b); n > maxDetailBytes {
-		return nil, fmt.Errorf("audit details render to %d bytes, over the %d-byte limit", n, maxDetailBytes)
+	if renderedSize(b) <= maxDetailBytes {
+		return b, nil
 	}
-	return b, nil
+	return shrinkToFit(details)
 }
 
 func (s *Store) List(ctx context.Context, cursor int64, limit int, f ListFilter) ([]Item, *int64, error) {

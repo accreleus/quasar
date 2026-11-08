@@ -504,8 +504,10 @@ func (c *Converger) Closed(ctx context.Context, run jobs.Run) {
 	if action == "install" && run.State == jobs.StateSucceeded && p["expected_name"] == nil && toolID != "" {
 		c.bindName(ctx, run, toolID, tag, sha, name)
 	}
-	// name and reason are the agent's own words and unbounded: a long one used to push the row
-	// past the 4096-byte details bound, which drops the whole row and logs it (erratum 25).
+	// name and reason are the agent's own words: cap them here so the common case stays readable,
+	// and leave the guarantee to audit.TryRecord, which cuts the encoded row to fit rather than
+	// dropping it (#1183, #1209). A reason that is not text is dropped and flagged, never written
+	// as a structure.
 	details := map[string]any{
 		"tag": tag, "sha512": sha, "host_id": run.HostID, "state": string(run.State), "run_id": run.ID,
 	}
