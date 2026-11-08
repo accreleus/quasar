@@ -10,6 +10,7 @@ import {
   markDeviceProbePosted,
   probeCapabilities,
   probeH264Decodable,
+  probeWebGpu,
 } from "../webrtc/capability";
 
 /** One probe-and-post is abandoned after this, so a hung post cannot leave `inFlight` set for good. */
@@ -35,13 +36,13 @@ let inFlight: Promise<void> | null = null;
 export function ensureDeviceProbe(token: string, userId: string): Promise<void> {
   inFlight ??= withBound(
     (async () => {
-      if (deviceProbeIsFresh(userId, await probeH264Decodable())) return;
+      if (deviceProbeIsFresh(userId, await probeH264Decodable(), (await probeWebGpu()).available)) return;
       const caps = await probeCapabilities();
       await authApi.postDevice(token, getOrCreateDeviceKey(), caps);
       // A step that timed out leaves its key out, which the planner reads as "cannot":
       // post what there is, but ask again soon rather than pin WebRTC for a day.
       const incomplete = caps.webcodecs === undefined || caps.webgpu === undefined;
-      markDeviceProbePosted(userId, caps.codecs.h264, Date.now(), incomplete ? INCOMPLETE_PROBE_RETRY_MS : undefined);
+      markDeviceProbePosted(userId, caps.codecs.h264, caps.webgpu?.available === true, Date.now(), incomplete ? INCOMPLETE_PROBE_RETRY_MS : undefined);
     })(),
   ).finally(() => {
     inFlight = null;

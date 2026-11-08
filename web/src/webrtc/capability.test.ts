@@ -10,9 +10,8 @@ import {
   markDeviceProbePosted,
   probeCapabilities,
   probeRegion,
-  probeFeatures,
   probeWebCodecs,
-  probeWebGpu,
+  probeFeatures,
   type DeviceCapabilities,
   type NativeCapabilities,
 } from "./capability";
@@ -295,71 +294,137 @@ describe("probeRegion", () => {
   });
 });
 
+describe("probeWebCodecs (#1043)", () => {
+  type Config = { codec: string; codedWidth?: number; codedHeight?: number };
+  const stub = (video: (c: Config) => unknown, audio: unknown = { supported: true }) => {
+    const seen: Config[] = [];
+    const decoder = (isConfigSupported: unknown) => Object.assign(function Decoder() {}, { isConfigSupported });
+    vi.stubGlobal("VideoDecoder", decoder((c: Config) => (seen.push(c), video(c))));
+    vi.stubGlobal("AudioDecoder", decoder(async () => audio));
+    vi.stubGlobal("AudioEncoder", decoder(async () => audio));
+    return seen;
+  };
+  const all = { h264: true, hevc: true, av1: true, opus_decode: true, opus_encode: true };
+
+  it("reports every codec the browser proves, with the strings and sizes the client uses", async () => {
+    const seen = stub(async () => ({ supported: true }));
+    expect(await probeWebCodecs()).toEqual(all);
+    expect(seen.map((c) => `${c.codec} ${c.codedWidth}x${c.codedHeight}`).sort()).toEqual([
+      "av01.0.13M.08 1920x1080",
+      "av01.0.13M.08 3840x2160",
+      "avc1.42e01f 1920x1080",
+      "hvc1.1.6.L153.B0 1920x1080",
+      "hvc1.1.6.L153.B0 3840x2160",
+    ]);
+  });
+
+  it("reports a codec the browser refuses as false, and leaves the others", async () => {
+    stub(async (c) => ({ supported: !c.codec.startsWith("hvc1") }));
+    expect(await probeWebCodecs()).toEqual({ ...all, hevc: false });
+  });
+
+  it("needs every size: a device that decodes AV1 at 1080p but not 4K stays false", async () => {
+    stub(async (c) => ({ supported: !(c.codec.startsWith("av01") && c.codedHeight === 2160) }));
+    expect(await probeWebCodecs()).toEqual({ ...all, av1: false });
+  });
+
+  it("reads a rejected or thrown probe as false, never an error", async () => {
+    stub((c) => {
+      if (c.codec.startsWith("hvc1")) return Promise.reject(new Error("NotSupportedError"));
+      if (c.codec.startsWith("av01")) throw new TypeError("bad config");
+      return Promise.resolve({ supported: true });
+    });
+    expect(await probeWebCodecs()).toEqual({ ...all, hevc: false, av1: false });
+  });
+
+  it("reports nothing where WebCodecs does not exist", async () => {
+    vi.stubGlobal("VideoDecoder", undefined);
+    vi.stubGlobal("AudioDecoder", undefined);
+    vi.stubGlobal("AudioEncoder", undefined);
+    expect(await probeWebCodecs()).toEqual({ h264: false, hevc: false, av1: false, opus_decode: false, opus_encode: false });
+  });
+
+  it("does not take a missing 'supported' for true", async () => {
+    stub(async () => ({}), {});
+    expect(await probeWebCodecs()).toEqual({ h264: false, hevc: false, av1: false, opus_decode: false, opus_encode: false });
+  });
+});
+
 describe("device capability post freshness", () => {
   const DAY = 24 * 60 * 60 * 1000;
 
   it("is stale with nothing recorded", () => {
     localStorage.clear();
-    expect(deviceProbeIsFresh("u1", true)).toBe(false);
+    expect(deviceProbeIsFresh("u1", true, false)).toBe(false);
   });
 
   it("stays fresh for a day and goes stale after it", () => {
     localStorage.clear();
-    markDeviceProbePosted("u1", true, 1_000_000);
-    expect(deviceProbeIsFresh("u1", true, 1_000_000)).toBe(true);
-    expect(deviceProbeIsFresh("u1", true, 1_000_000 + DAY - 1)).toBe(true);
-    expect(deviceProbeIsFresh("u1", true, 1_000_000 + DAY)).toBe(false);
+    markDeviceProbePosted("u1", true, false, 1_000_000);
+    expect(deviceProbeIsFresh("u1", true, false, 1_000_000)).toBe(true);
+    expect(deviceProbeIsFresh("u1", true, false, 1_000_000 + DAY - 1)).toBe(true);
+    expect(deviceProbeIsFresh("u1", true, false, 1_000_000 + DAY)).toBe(false);
   });
 
   it("is stale once the H.264 verdict differs from the posted one, and for a stamp without one (#688)", () => {
     localStorage.clear();
-    markDeviceProbePosted("u1", false, 1_000_000);
-    expect(deviceProbeIsFresh("u1", false, 1_000_000)).toBe(true);
-    expect(deviceProbeIsFresh("u1", true, 1_000_000)).toBe(false);
+    markDeviceProbePosted("u1", false, false, 1_000_000);
+    expect(deviceProbeIsFresh("u1", false, false, 1_000_000)).toBe(true);
+    expect(deviceProbeIsFresh("u1", true, false, 1_000_000)).toBe(false);
     localStorage.setItem("quasar_device_posted_v2", JSON.stringify({ user: "u1", at: 1_000_000 }));
-    expect(deviceProbeIsFresh("u1", true, 1_000_000)).toBe(false);
+    expect(deviceProbeIsFresh("u1", true, false, 1_000_000)).toBe(false);
+  });
+
+  it("ignores a stamp under the previous key, so a browser posts once for the new webcodecs keys (#1043)", () => {
+    localStorage.clear();
+    markDeviceProbePosted("u1", true, false, 1_000_000);
+    const [key] = Object.keys(localStorage);
+    const stamp = localStorage.getItem(key)!;
+    localStorage.clear();
+    localStorage.setItem("quasar_device_posted_v4", stamp);
+    expect(deviceProbeIsFresh("u1", true, false, 1_000_000)).toBe(false);
   });
 
   it("is per user, so a second account on the browser still posts", () => {
     localStorage.clear();
-    markDeviceProbePosted("u1", true, 1_000_000);
-    expect(deviceProbeIsFresh("u2", true, 1_000_000)).toBe(false);
+    markDeviceProbePosted("u1", true, false, 1_000_000);
+    expect(deviceProbeIsFresh("u2", true, false, 1_000_000)).toBe(false);
   });
 
   it("treats unreadable storage as stale rather than throwing", () => {
     localStorage.setItem("quasar_device_posted_v2", "not json");
-    expect(deviceProbeIsFresh("u1", true)).toBe(false);
+    expect(deviceProbeIsFresh("u1", true, false)).toBe(false);
   });
 
   it("is stale once the browser's zone or language differs from the posted one (amendment 49)", () => {
     localStorage.clear();
-    markDeviceProbePosted("u1", true, 1_000_000);
-    expect(deviceProbeIsFresh("u1", true, 1_000_000)).toBe(true);
+    markDeviceProbePosted("u1", true, false, 1_000_000);
+    expect(deviceProbeIsFresh("u1", true, false, 1_000_000)).toBe(true);
     const real = Intl.DateTimeFormat;
     vi.spyOn(Intl, "DateTimeFormat").mockImplementation(
       () => ({ resolvedOptions: () => ({ ...real().resolvedOptions(), timeZone: "Pacific/Chatham" }) }) as Intl.DateTimeFormat,
     );
-    expect(deviceProbeIsFresh("u1", true, 1_000_000)).toBe(false);
+    expect(deviceProbeIsFresh("u1", true, false, 1_000_000)).toBe(false);
   });
 
   it("ignores a stamp posted before the WebCodecs and WebGPU keys, so those devices post again (A11)", () => {
     localStorage.clear();
     // Exactly what v3 stored for this browser: only the key differs from a current stamp.
-    markDeviceProbePosted("u1", true, 1_000_000);
+    markDeviceProbePosted("u1", true, false, 1_000_000);
     const [[key, stamp]] = Object.entries(localStorage);
     localStorage.clear();
-    localStorage.setItem(key.replace("_v4", "_v3"), stamp);
-    expect(deviceProbeIsFresh("u1", true, 1_000_000)).toBe(false);
+    localStorage.setItem(key.replace("_v5", "_v3"), stamp);
+    expect(deviceProbeIsFresh("u1", true, false, 1_000_000)).toBe(false);
   });
 
   it("ignores a stamp from before the Safari refresh change, so that probe is posted again (#632)", () => {
     localStorage.clear();
     localStorage.setItem("quasar_device_posted", JSON.stringify({ user: "u1", at: 1_000_000 }));
-    expect(deviceProbeIsFresh("u1", true, 1_000_000)).toBe(false);
+    expect(deviceProbeIsFresh("u1", true, false, 1_000_000)).toBe(false);
   });
 });
 
-describe("probeWebCodecs and probeWebGpu (amendment 54)", () => {
+describe("probeWebCodecs (amendment 54)", () => {
   it("proves each codec with isConfigSupported and reports false for what the browser lacks", async () => {
     const ctor = (isConfigSupported: unknown) => Object.assign(function () {}, { isConfigSupported });
     vi.stubGlobal("VideoDecoder", ctor(async ({ codec }: { codec: string }) => ({ supported: !codec.startsWith("av01") })));
@@ -371,18 +436,6 @@ describe("probeWebCodecs and probeWebGpu (amendment 54)", () => {
   it("reports false for every key in a browser with no WebCodecs, and a throwing check", async () => {
     vi.stubGlobal("VideoDecoder", Object.assign(function () {}, { isConfigSupported: () => Promise.reject(new Error("x")) }));
     expect(await probeWebCodecs()).toEqual({ h264: false, hevc: false, av1: false, opus_decode: false, opus_encode: false });
-  });
-
-  it("lists only the WebGPU features the adapter has", async () => {
-    vi.stubGlobal("navigator", { gpu: { requestAdapter: async () => ({ features: new Set(["subgroups", "other"]) }) } });
-    expect(await probeWebGpu()).toEqual({ available: true, features: ["subgroups"] });
-  });
-
-  it("reports WebGPU unavailable with no adapter or no API", async () => {
-    vi.stubGlobal("navigator", { gpu: { requestAdapter: async () => null } });
-    expect(await probeWebGpu()).toEqual({ available: false, features: [] });
-    vi.stubGlobal("navigator", {});
-    expect(await probeWebGpu()).toEqual({ available: false, features: [] });
   });
 });
 
@@ -403,7 +456,8 @@ describe("probeCapabilities on a link or browser where a step hangs", () => {
     expect(caps.rtt_ms).toBeNull();
     expect(caps.bandwidth_kbps).toBeNull();
     expect(caps.webcodecs).toBeUndefined();
-    expect(caps.webgpu).toBeUndefined();
+    // probeWebGpu bounds requestAdapter itself (1.5 s): a hang reads as not available (#1189).
+    expect(caps.webgpu).toEqual({ available: false, features: [] });
     expect(caps.display.refresh_hz).toBeUndefined();
     expect(caps.display.width).toBe(screen.width);
   });

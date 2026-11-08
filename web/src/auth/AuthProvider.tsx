@@ -118,7 +118,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         const deviceKey = getOrCreateDeviceKey();
         const caps = await probeCapabilities();
         await authApi.postDevice(tok, deviceKey, caps);
-        markDeviceProbePosted(res.user.id, caps.codecs.h264);
+        markDeviceProbePosted(res.user.id, caps.codecs.h264, caps.webgpu?.available === true);
       } catch (err) {
         // Intentionally silent — capability data is best-effort and must never
         // degrade the login experience (P4-08: "failures silent/logged, not fatal").
@@ -149,7 +149,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         try {
           const caps = await probeCapabilities();
           await authApi.postDevice(tok, deviceKey, caps);
-          markDeviceProbePosted(res.user.id, caps.codecs.h264);
+          markDeviceProbePosted(res.user.id, caps.codecs.h264, caps.webgpu?.available === true);
         } catch (err) {
           reportBestEffortFailure("silent-debug", "auth: claim device capability post", err);
         }
