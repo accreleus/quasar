@@ -53,6 +53,26 @@ describe("probeWebGpu", () => {
     expect(await probeWebGpu()).toEqual({ available: true, features: [] });
   });
 
+  it("reports not available for a fallback (software) adapter: info.isFallbackAdapter", async () => {
+    stubGpu(async () => ({ ...adapter("subgroups", "shader-f16"), info: { isFallbackAdapter: true } }));
+    const { probeWebGpu } = await load();
+    expect(await probeWebGpu()).toEqual({ available: false, features: [] });
+  });
+
+  it("reports not available for a fallback adapter on older browsers: adapter.isFallbackAdapter", async () => {
+    stubGpu(async () => ({ ...adapter("subgroups"), isFallbackAdapter: true }));
+    const { probeWebGpu } = await load();
+    expect(await probeWebGpu()).toEqual({ available: false, features: [] });
+  });
+
+  it("treats a hardware adapter with info.isFallbackAdapter false, or no info at all, as available", async () => {
+    stubGpu(async () => ({ ...adapter(), info: { isFallbackAdapter: false } }));
+    const first = await (await load()).probeWebGpu();
+    stubGpu(async () => adapter());
+    const second = await (await load()).probeWebGpu();
+    expect([first.available, second.available]).toEqual([true, true]);
+  });
+
   it("does not hang the probe on a request that never answers", async () => {
     stubGpu(() => new Promise(() => {}));
     const { probeWebGpu } = await load();
@@ -78,5 +98,26 @@ describe("the device record", () => {
     stubGpu(async () => adapter("subgroups"));
     const { probeCapabilities } = await load();
     expect((await probeCapabilities()).webgpu).toEqual({ available: true, features: ["subgroups"] });
+  });
+});
+
+describe("the freshness stamp holds the WebGPU verdict (quasar-protocol#29 item 26)", () => {
+  it("a timeout is not settled for a day: the next load's real answer re-posts", async () => {
+    localStorage.clear();
+    stubGpu(() => new Promise(() => {}));
+    const first = await load();
+    const timedOut = first.probeWebGpu();
+    await vi.advanceTimersByTimeAsync(2000);
+    const verdict = (await timedOut).available;
+    expect(verdict).toBe(false);
+    first.markDeviceProbePosted("u1", true, verdict, 1_000_000);
+    expect(first.deviceProbeIsFresh("u1", true, verdict, 1_000_000)).toBe(true);
+
+    // A later page load: the adapter answers.
+    stubGpu(async () => adapter("subgroups"));
+    const second = await load();
+    const now = (await second.probeWebGpu()).available;
+    expect(now).toBe(true);
+    expect(second.deviceProbeIsFresh("u1", true, now, 1_000_000)).toBe(false);
   });
 });

@@ -52,32 +52,36 @@ export function getOrCreateDeviceKey(): string {
  * H.264 verdict it posted: the server refuses H.264 rungs for a device whose record
  * says no, so a changed verdict (plugin installed) is posted at once, not tomorrow (#688).
  * It holds the zone and language too: launches read them from the record (amendment 49).
+ * And the WebGPU verdict: a probe that timed out or got a transient null posts `false`, and the
+ * next load's real answer differs from the stamp, so it re-posts instead of settling for a day
+ * (quasar-protocol#29 item 26).
  */
 const DEVICE_POST_STORAGE_KEY = "quasar_device_posted_v4"; // v4: the probe gained `webgpu` (#1189)
 const DEVICE_POST_TTL_MS = 24 * 60 * 60 * 1000;
 
-export function deviceProbeIsFresh(userId: string, h264: boolean, now: number = Date.now()): boolean {
+export function deviceProbeIsFresh(userId: string, h264: boolean, webgpu: boolean, now: number = Date.now()): boolean {
   try {
     const raw = localStorage.getItem(DEVICE_POST_STORAGE_KEY);
     if (!raw) return false;
-    const { user, at, h264: posted, region } = JSON.parse(raw) as {
+    const { user, at, h264: posted, webgpu: postedGpu, region } = JSON.parse(raw) as {
       user?: string;
       at?: number;
       h264?: boolean;
+      webgpu?: boolean;
       region?: string;
     };
-    if (user !== userId || typeof at !== "number" || posted !== h264 || region !== regionStamp()) return false;
+    if (user !== userId || typeof at !== "number" || posted !== h264 || postedGpu !== webgpu || region !== regionStamp()) return false;
     return now - at >= 0 && now - at < DEVICE_POST_TTL_MS;
   } catch {
     return false;
   }
 }
 
-export function markDeviceProbePosted(userId: string, h264: boolean, now: number = Date.now()): void {
+export function markDeviceProbePosted(userId: string, h264: boolean, webgpu: boolean, now: number = Date.now()): void {
   try {
     localStorage.setItem(
       DEVICE_POST_STORAGE_KEY,
-      JSON.stringify({ user: userId, at: now, h264, region: regionStamp() }),
+      JSON.stringify({ user: userId, at: now, h264, webgpu, region: regionStamp() }),
     );
   } catch {
     /* Storage full or blocked: the only cost is posting again next load. */
@@ -208,7 +212,7 @@ const WEBGPU_REPORTED_FEATURES = ["subgroups", "shader-f16"];
 
 /**
  * Amendment 54/55's `webgpu` key: `available` is true when `navigator.gpu.requestAdapter()`
- * resolves to an adapter, `features` lists which of the decoder's optional features it has.
+ * resolves to a hardware adapter, `features` lists which of the decoder's optional features it has.
  * Never throws or hangs: no `navigator.gpu`, a null adapter, a rejection or a timeout all
  * report `{available: false, features: []}`. Once per page, like the H.264 verdict.
  */
@@ -224,8 +228,12 @@ export function probeWebGpu(): Promise<{ available: boolean; features: string[] 
           timer = setTimeout(() => resolve(null), WEBGPU_ADAPTER_TIMEOUT_MS);
         }),
       ]);
-      if (!adapter) return none;
-      return { available: true, features: WEBGPU_REPORTED_FEATURES.filter((f) => adapter.features.has(f)) };
+      // A software rasteriser (SwiftShader) cannot decode PyroWave at a frame's deadline
+      // (quasar-protocol#29 item 26). `info.isFallbackAdapter` is current; older Chromium
+      // exposes `adapter.isFallbackAdapter`; neither present means a hardware adapter.
+      const a = adapter as (typeof adapter & { info?: { isFallbackAdapter?: boolean }; isFallbackAdapter?: boolean }) | null;
+      if (!a || (a.info?.isFallbackAdapter ?? a.isFallbackAdapter) === true) return none;
+      return { available: true, features: WEBGPU_REPORTED_FEATURES.filter((f) => a.features.has(f)) };
     } catch {
       return none;
     } finally {
