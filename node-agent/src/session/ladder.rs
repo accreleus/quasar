@@ -322,7 +322,7 @@ fn env_flag(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
 
 /// A boolean env knob whose default is **on** — only an explicit `0`/`false` turns it off
 /// (the `QUASAR_ABR_LADDER` convention, not `env_flag`'s opt-in one).
-fn env_flag_default_true(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
+pub(crate) fn env_flag_default_true(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
     !matches!(
         lookup(var).as_deref(),
         Some("0") | Some("false") | Some("FALSE")
