@@ -90,6 +90,10 @@ type errorBody struct {
 // admin clears it, so a client does not auto-retry it.
 const ReasonHomeHostUnavailable = "home_host_unavailable"
 
+// ReasonCompatToolMissing is the `reason` on a 503 no_host_available when the only thing
+// missing is the GE compatibility tool the launched game's mapping names.
+const ReasonCompatToolMissing = "compat_tool_missing"
+
 // ReasonSteamRestarting is the `reason` on a 503 capacity_exhausted while the
 // caller's parked Steam is stopping or its released runtime holds the home.
 // semantics: control-api.md §Warm Steam "Claim" (amendment 59)

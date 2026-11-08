@@ -997,6 +997,15 @@ func writeHomeInUse(w http.ResponseWriter, err error, message string) {
 // clears it. Every other refusal omits the reason.
 // semantics: control-api.md §Admission control (amendment 40)
 func writeNoHostAvailable(w http.ResponseWriter, err error) {
+	var ct *CompatToolRejection
+	if errors.As(err, &ct) {
+		msg := fmt.Sprintf("no host can run the compatibility tool %s this game needs yet; hosts install it in the background, so try again shortly, and if it persists ask your administrator to check Library > Compatibility", ct.Tool)
+		if !ct.Usable {
+			msg = fmt.Sprintf("the compatibility tool %s this game needs is disabled or marked unusable; ask your administrator", ct.Tool)
+		}
+		httpx.WriteErrorReason(w, http.StatusServiceUnavailable, httpx.CodeNoHostAvailable, httpx.ReasonCompatToolMissing, msg)
+		return
+	}
 	var off *HomeHostOfflineRejection
 	if errors.As(err, &off) {
 		httpx.WriteErrorReason(w, http.StatusServiceUnavailable, httpx.CodeNoHostAvailable,

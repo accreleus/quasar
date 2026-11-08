@@ -325,6 +325,7 @@ const (
 	causeTransportDiffers = "transport_differs"
 	causeStreamDiffers    = "stream_differs"
 	causeNoRoom           = "no_room"
+	causeCompatTool       = "compat_tool"
 )
 
 // claimStream is the part of a stream that claim check 4 compares. Codec is
@@ -347,7 +348,10 @@ type parkedFacts struct {
 	Restream   bool // adopt_restream_v1 on that connection
 	// CodecGated: that GPU cannot encode the launch's codec (part of check 4).
 	CodecGated bool
-	Stream     claimStream
+	// ToolMissing: check 6 fails, the launch's mapped GE tool is not mounted in the parked
+	// Steam or a tool it was started with is no longer usable.
+	ToolMissing bool
+	Stream      claimStream
 }
 
 type claimOutcome int
@@ -366,7 +370,8 @@ type claimVerdict struct {
 	Restream []string // claimAdopt: what differs from the parked stream
 }
 
-// decideClaim is claim checks 1–4 (control-api.md §Warm Steam "Claim").
+// decideClaim is claim checks 1–4 and 6 (control-api.md §Warm Steam "Claim"); check 5 is the
+// pinned placement that follows.
 func decideClaim(k parkedFacts, launch claimStream) claimVerdict {
 	if k.State.IsTerminal() && k.Claimed {
 		return claimVerdict{Outcome: claimLost}
@@ -376,7 +381,7 @@ func decideClaim(k parkedFacts, launch claimStream) claimVerdict {
 	switch {
 	case !k.Family:
 		return claimVerdict{Outcome: claimSupersede}
-	case k.InDeadline && k.HostUp && cause4 == "" && warmingState:
+	case k.InDeadline && k.HostUp && cause4 == "" && !k.ToolMissing && warmingState:
 		// Only check 2 failing on a session still warming leaves it to finish.
 		return claimVerdict{Outcome: claimWarming}
 	case k.State != StateRunning:
@@ -387,6 +392,8 @@ func decideClaim(k parkedFacts, launch claimStream) claimVerdict {
 		return claimVerdict{Outcome: claimSupersede, Cause: causeHostUnavailable}
 	case cause4 != "":
 		return claimVerdict{Outcome: claimSupersede, Cause: cause4}
+	case k.ToolMissing:
+		return claimVerdict{Outcome: claimSupersede, Cause: causeCompatTool}
 	}
 	return claimVerdict{Outcome: claimAdopt, Restream: restream}
 }
@@ -432,13 +439,17 @@ func claimCheck4(parked, launch claimStream, restream, codecGated bool) (cause s
 // supersede; the launch is answered by the home guard (claimLostAnswer).
 var errClaimLost = fmt.Errorf("parked session already claimed: %w", ErrCapacityExhausted)
 
-// claimParked locks the parked row and runs claim checks 1–4 (decideClaim); on
+// claimParked share-locks the compat tools, locks the parked row and runs claim checks 1–4 and 6 (decideClaim); on
 // success it moves the row to stopped "claimed", releasing its reservation, so
 // check 5 is the pinned placement that follows in the same transaction. The
 // checks do not read steam_warm_enabled: with the switch off a claim still
 // adopts, and the expiry job stops whatever is left within 60 s.
 func claimParked(ctx context.Context, tx pgx.Tx, p CreateParams) (*claimedParked, error) {
 	k := claimedParked{id: p.claim.id}
+	toolMissing, err := claimToolMissing(ctx, tx, p)
+	if err != nil {
+		return nil, err
+	}
 	f, err := readParkedFacts(ctx, tx, &k, p, true)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, &ParkedClaimRefusedError{HolderID: k.id}
@@ -447,7 +458,7 @@ func claimParked(ctx context.Context, tx pgx.Tx, p CreateParams) (*claimedParked
 		return nil, fmt.Errorf("lock parked session: %w", err)
 	}
 	f.HostUp = f.HostUp && p.claim.hostParks
-	f.Restream = p.claim.restream
+	f.Restream, f.ToolMissing = p.claim.restream, toolMissing
 	v := decideClaim(f, launchClaimStream(p))
 	switch v.Outcome {
 	case claimLost:
@@ -463,6 +474,69 @@ func claimParked(ctx context.Context, tx pgx.Tx, p CreateParams) (*claimedParked
 	}
 	k.restream = v.Restream
 	return &k, nil
+}
+
+// claimToolMissing is claim check 6. It share-locks, by id and before any session lock, the
+// compat_tools rows the parked session mounted and the one the launched game's mapping names, then
+// reports whether a mounted tool is gone or unusable or the mapped GE tool was not mounted. A
+// mapped tool that is not usable names no tool (the launch maps nothing to it).
+// A park still warming whose names are not recorded yet (NULL: its dispatch writes them) is not
+// known to lack anything, so check 6 passes and the warming rule leaves it to finish; a running
+// park with NULL names mounts nothing.
+// Check 6 runs before check 5 (the placement), so a launch failing both logs compat_tool.
+// The parked names are read unlocked: a running session's never change.
+// semantics: control-api.md §Compatibility tools, "Hot Loading"; lock order §Usable.
+func claimToolMissing(ctx context.Context, tx pgx.Tx, p CreateParams) (bool, error) {
+	var names []string
+	var mappedID *string
+	var unrecorded bool
+	err := tx.QueryRow(ctx, `
+		SELECT COALESCE(k.compat_tool_names, '{}'), m.tool_id::text,
+		       k.compat_tool_names IS NULL AND k.state IN ('pending','assigned','starting') AND k.parked_until > now()
+		FROM sessions k
+		LEFT JOIN apps a ON a.id = $2::uuid AND a.parent_app_id IS NOT NULL AND a.external_source = 'steam'
+		LEFT JOIN compat_tool_mappings m ON m.provider = 'steam' AND m.external_id = a.external_id
+		WHERE k.id = $1::uuid`, p.claim.id, p.AppID).Scan(&names, &mappedID, &unrecorded)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil // claimParked's locked read answers a missing row
+	}
+	if err != nil {
+		return false, fmt.Errorf("read parked compat tools: %w", err)
+	}
+	if unrecorded {
+		return false, nil
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT steam_name, family, enabled AND NOT name_conflict AND NOT pin_conflict
+		FROM compat_tools WHERE id = $1::uuid OR steam_name = ANY($2::text[]) ORDER BY id FOR SHARE`, mappedID, names)
+	if err != nil {
+		return false, fmt.Errorf("lock compat tools: %w", err)
+	}
+	defer rows.Close()
+	mounted := make(map[string]bool, len(names))
+	for _, n := range names {
+		mounted[n] = true
+	}
+	found, missing := 0, false
+	for rows.Next() {
+		var name *string
+		var family string
+		var usable bool
+		if err := rows.Scan(&name, &family, &usable); err != nil {
+			return false, fmt.Errorf("read compat tool: %w", err)
+		}
+		switch {
+		case name != nil && mounted[*name]:
+			found++
+			missing = missing || !usable
+		case usable && family == "ge": // the mapped GE tool, not mounted (or never installed)
+			missing = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("read compat tools: %w", err)
+	}
+	return missing || found < len(names), nil
 }
 
 // readParkedFacts reads what claim checks 1–4 compare, locking the row for a claim.
@@ -535,12 +609,13 @@ func (s *Store) adoptedByLive(ctx context.Context, id string) bool {
 }
 
 // adoptRuntime records that row `to` adopts the runtime of `from` and copies
-// its managed-home binding, in the caller's transaction. The hold stays on
+// its managed-home binding and mounted compat tools, in the caller's transaction. The hold stays on
 // `from` until `to`'s first agent report (transition) or `from`'s cleanup
 // proof (clearQualifiedHomeHolds): an assign alone adopts nothing.
 func adoptRuntime(ctx context.Context, tx pgx.Tx, from, to string) error {
 	if _, err := tx.Exec(ctx, `UPDATE sessions t SET adopt_session_id = f.id,
-		    managed_home_id = f.managed_home_id, managed_home_mount_sha256 = f.managed_home_mount_sha256
+		    managed_home_id = f.managed_home_id, managed_home_mount_sha256 = f.managed_home_mount_sha256,
+		    compat_tool_names = f.compat_tool_names
 		FROM sessions f WHERE f.id = $1::uuid AND t.id = $2::uuid`, from, to); err != nil {
 		return fmt.Errorf("record adoption: %w", err)
 	}
