@@ -309,6 +309,23 @@ pub fn apply_assign(
     }
 }
 
+/// A session's compatibility tools follow it to the app a swap brings in: `session_assign` sends
+/// them once and `session_swap_app` carries none, so without this the replacement runs with no
+/// `QUASAR_COMPAT_TOOLS` (a Windows game cannot start) and is never "the same app but its flags".
+/// The holds are the session's and last until it ends, so the same tools stay mounted.
+pub fn carry(
+    from: &crate::session::container::ContainerSpec,
+    to: &mut crate::session::container::ContainerSpec,
+) {
+    for key in [ENV_ENTRIES, ENV_TOOLS_PATH] {
+        match from.env.get(key) {
+            Some(value) => to.env.insert(key.to_string(), value.clone()),
+            None => to.env.remove(key),
+        };
+    }
+    to.compat_tools = from.compat_tools.clone();
+}
+
 /// Sets `QUASAR_COMPAT_TOOLS` from the valid entries, replacing whatever `app.env` carried, and
 /// the tools path only when a tool is mounted. An entry naming neither a Valve build nor a tool in
 /// `mounted` is dropped and logged, never an assignment failure.

@@ -882,6 +882,14 @@ fn same_container_but_flags(
     strip(from) == strip(to)
 }
 
+/// `session_swap_app` carries no compatibility tools, so the swap target gets the session's
+/// (`compat_tools::carry`) before anything compares or launches it.
+fn inherit_session_tools(current: Option<&super::container::ContainerSpec>, req: &mut SwapRequest) {
+    if let (Some(current), Some(next)) = (current, req.container.as_mut()) {
+        crate::compat_tools::carry(current, next);
+    }
+}
+
 /// The games an in-place swap moves between, `(A, B)`, or `None` for today's container
 /// swap: it needs the session's launch helper connected, and the two apps differing in
 /// `STEAM_STARTUP_FLAGS` alone, each naming its game (amendment 39).
@@ -3660,7 +3668,7 @@ pub fn run_blocking(
         // untouched on the old compositor until the single `listen-to` switch, so they are
         // never starved and never renegotiate. `SwapDone` is not emitted until the new app
         // is on screen (`perform_swap`), which is the client's reveal signal.
-        while let Ok(req) = swap_rx.try_recv() {
+        while let Ok(mut req) = swap_rx.try_recv() {
             // The session has ended; the control plane's unresolved-swap limit answers it.
             if held_since.is_some() {
                 tracing::info!(
@@ -3676,6 +3684,7 @@ pub fn run_blocking(
                 );
                 continue;
             }
+            inherit_session_tools(current_app.as_ref(), &mut req);
             let reports = res
                 .launch()
                 .map(super::launch_helper::LaunchSocket::reports);
@@ -4726,8 +4735,8 @@ mod tests {
         REASON_APP_EXITED_EARLY, VULKAN_DEVICE_CONTEXT,
     };
     use super::{
-        in_place_plan, InPlaceAction, InPlaceStep, ProgressThrottle, SwapRequest,
-        IN_PLACE_LAUNCH_BOUND, IN_PLACE_QUIT_BOUND,
+        in_place_plan, inherit_session_tools, InPlaceAction, InPlaceStep, ProgressThrottle,
+        SwapRequest, IN_PLACE_LAUNCH_BOUND, IN_PLACE_QUIT_BOUND,
     };
     use gstreamer::prelude::*;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -6099,6 +6108,37 @@ mod tests {
             mounts: vec!["/homes/u1:/home/quasar".into()],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_swap_target_gets_the_sessions_compat_tools_and_stays_in_place() {
+        use crate::compat_tools::{ENV_ENTRIES, ENV_TOOLS_PATH};
+        use crate::session::launch_helper::LaunchReports;
+        let connected = Some(LaunchReports {
+            helper_connected: true,
+            ..Default::default()
+        });
+        // As `session_assign` leaves the running game: the tools env and the mounted tool.
+        let mut running = steam_app("-silent -applaunch 620");
+        running.env.insert(ENV_ENTRIES.into(), "0=proton_10".into());
+        running
+            .env
+            .insert(ENV_TOOLS_PATH.into(), "/quasar/compat".into());
+        running.compat_tools = vec!["GE-Proton11-12-x86_64".into()];
+        // As `session_swap_app` hands the target over: no compat tools at all.
+        let mut req = SwapRequest {
+            container: Some(steam_app("-silent -applaunch 730")),
+            in_place: true,
+        };
+        assert_eq!(in_place_plan(Some(&running), &req, connected), None);
+        inherit_session_tools(Some(&running), &mut req);
+        assert_eq!(
+            in_place_plan(Some(&running), &req, connected),
+            Some((620, 730))
+        );
+        let next = req.container.unwrap();
+        assert_eq!(next.env[ENV_ENTRIES], "0=proton_10");
+        assert_eq!(next.compat_tools, running.compat_tools);
     }
 
     #[test]
