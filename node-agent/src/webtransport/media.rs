@@ -84,10 +84,26 @@ struct State {
     pending_key: bool,
 }
 
+/// The Gamepad API exposes at most four slots; a `gp` for a higher `i` is dropped, so a client
+/// cannot grow the per-pad table.
+const MAX_PADS: u64 = 4;
+
+/// The client whose input the devices take: none (`0`) or its id, and the buttons of its last
+/// reliable `gp` per pad, since a datagram `gp` carries axes only.
+#[derive(Default)]
+struct Typing {
+    client: u64,
+    pads: std::collections::HashMap<u64, serde_json::Value>,
+}
+
 /// The tap's side of a session: fed by the GStreamer streaming thread, read by the
 /// connection task of the one client attached.
 pub(crate) struct Media {
     state: Mutex<State>,
+    input: super::Input,
+    /// Whose input reaches the devices. Held across the injection, so a client that stopped
+    /// being the attached one cannot slip an event in behind the release that ended it.
+    typing: Mutex<Typing>,
     encoder: glib::WeakRef<gst::Element>,
 }
 
@@ -100,11 +116,58 @@ pub(crate) struct Attached {
 }
 
 impl Media {
-    pub(crate) fn new(encoder: &gst::Element) -> Arc<Self> {
+    pub(crate) fn new(encoder: &gst::Element, input: super::Input) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::default(),
+            input,
+            typing: Mutex::default(),
             encoder: encoder.downgrade(),
         })
+    }
+
+    /// One `input.md` event from `client` to the devices; dropped unless it is the attached one.
+    /// A datagram can arrive after a reliable event that followed it, so a datagram `gp` takes
+    /// its buttons from the last reliable one and never changes them; one for a pad with none
+    /// is dropped. Everything else passes through as sent.
+    pub(crate) fn input_event(&self, client: u64, json: &str, datagram: bool) {
+        let mut typing = self.typing.lock().unwrap_or_else(|e| e.into_inner());
+        if typing.client != client {
+            return;
+        }
+        if !json.contains("\"gp\"") {
+            return (self.input.event)(json);
+        }
+        let Ok(mut event) = serde_json::from_str::<serde_json::Value>(json) else {
+            return (self.input.event)(json);
+        };
+        if event.get("t").and_then(|t| t.as_str()) == Some("gp") {
+            let pad = event.get("i").and_then(|i| i.as_u64()).unwrap_or(0);
+            if pad >= MAX_PADS {
+                return;
+            }
+            if datagram {
+                let Some(buttons) = typing.pads.get(&pad) else {
+                    return;
+                };
+                event["buttons"] = buttons.clone();
+            } else {
+                typing
+                    .pads
+                    .insert(pad, event.get("buttons").cloned().unwrap_or_default());
+            }
+        }
+        (self.input.event)(&event.to_string());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remembered_pads(&self) -> usize {
+        self.typing.lock().unwrap().pads.len()
+    }
+
+    /// Lift everything the devices hold and forget the pads. Called with `typing` locked.
+    fn release(&self, typing: &mut Typing) {
+        typing.pads.clear();
+        (self.input.release_all)();
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -128,16 +191,28 @@ impl Media {
         let config = st.config.clone()?;
         st.next_client += 1;
         let id = st.next_client;
-        if let Some(old) = st.client.replace(Client {
+        let displaced = st.client.replace(Client {
             id,
             tx,
             gone: gone.clone(),
             resync: false,
-        }) {
+        });
+        if let Some(old) = displaced {
             let _ = old.gone.set(Gone::TakenOver);
         }
         st.want_key = true;
         drop(st);
+        {
+            // The new client's input starts from nothing held: what its predecessor held is
+            // lifted now, before the new client can send, and its late input is dropped.
+            let mut typing = self.typing.lock().unwrap_or_else(|e| e.into_inner());
+            // A predecessor that has not finished leaving (`detach` clears the client, then
+            // takes this lock) still owns the devices: whatever it holds is lifted either way.
+            if typing.client != 0 {
+                self.release(&mut typing);
+            }
+            typing.client = id;
+        }
         self.keyframe();
         Some(Attached {
             id,
@@ -151,10 +226,22 @@ impl Media {
         self.lock().client.is_some()
     }
 
+    /// The client is gone. If it is still the one the devices take input from, what it held is
+    /// lifted; a displaced client's was lifted when its successor attached, and the successor's
+    /// keys are not its to release.
     pub(crate) fn detach(&self, id: u64) {
-        let mut st = self.lock();
-        if st.client.as_ref().is_some_and(|c| c.id == id) {
-            st.client = None;
+        {
+            let mut st = self.lock();
+            if st.client.as_ref().is_some_and(|c| c.id == id) {
+                st.client = None;
+            }
+        }
+        #[cfg(test)]
+        crate::webtransport::tests::detach_gap();
+        let mut typing = self.typing.lock().unwrap_or_else(|e| e.into_inner());
+        if typing.client == id {
+            typing.client = 0;
+            self.release(&mut typing);
         }
     }
 
@@ -470,6 +557,8 @@ mod tests {
         let avcc = [1u8, 0x42, 0xc0, 0x1f, 0xff, 0xe1, 0, 0];
         let media = Arc::new(Media {
             state: Mutex::default(),
+            input: crate::webtransport::tests::no_input(),
+            typing: Mutex::default(),
             encoder: glib::WeakRef::new(),
         });
         media.on_caps(&caps(1280, &avcc), "s");
@@ -535,7 +624,11 @@ mod tests {
         );
         // An element in NULL has inactive pads, which refuse every event.
         encoder.set_state(gst::State::Paused).unwrap();
-        (Media::new(&encoder), encoder, forced)
+        (
+            Media::new(&encoder, crate::webtransport::tests::no_input()),
+            encoder,
+            forced,
+        )
     }
 
     fn units(rx: &mut mpsc::Receiver<Out>) -> Vec<(bool, u8)> {
