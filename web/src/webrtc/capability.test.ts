@@ -309,8 +309,8 @@ describe("probeWebCodecs (#1043)", () => {
     const seen = stub(async () => ({ supported: true }));
     expect(await probeWebCodecs()).toEqual(all);
     expect(seen.map((c) => `${c.codec} ${c.codedWidth}x${c.codedHeight}`).sort()).toEqual([
-      "av01.0.12M.08 1920x1080",
-      "av01.0.12M.08 3840x2160",
+      "av01.0.13M.08 1920x1080",
+      "av01.0.13M.08 3840x2160",
       "avc1.42e01f 1920x1080",
       "hvc1.1.6.L153.B0 1920x1080",
       "hvc1.1.6.L153.B0 3840x2160",

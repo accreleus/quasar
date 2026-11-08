@@ -492,6 +492,8 @@ enum Stream {
     H264,
     H265,
     Av1,
+    /// An AV1 encoder whose keyframes carry no sequence header.
+    Av1NoSequenceHeader,
 }
 
 /// A stand-in for an encoder and parser the image does not have: one unit every 33 ms,
@@ -528,6 +530,7 @@ fn synthetic(stream: Stream) -> gst::Pipeline {
             let body = if key { 3000 } else { 400 };
             let data = match stream {
                 Stream::H265 => streams::hevc_au(key.then_some(if n == 0 { 19 } else { 21 }), body),
+                Stream::Av1NoSequenceHeader => streams::av1_tu(false, body),
                 _ => streams::av1_tu(key, body),
             };
             let mut buffer = gst::Buffer::from_slice(data);
@@ -838,7 +841,7 @@ fn carries_random_access(stream: Stream, data: &[u8]) -> bool {
         Stream::H265 => streams::hevc_types(data)
             .iter()
             .any(|t| (16..=23).contains(t)),
-        Stream::Av1 => streams::obu_types(data).contains(&1),
+        Stream::Av1 | Stream::Av1NoSequenceHeader => streams::obu_types(data).contains(&1),
     }
 }
 
@@ -898,6 +901,25 @@ async fn an_h265_session_sends_length_prefixed_access_units_with_irap_keyframes(
 async fn an_av1_session_sends_obu_temporal_units_without_delimiters_and_sequence_header_keyframes()
 {
     codec_session(Stream::Av1, "av1").await;
+}
+
+#[tokio::test]
+async fn an_encoder_with_no_usable_keyframe_ends_the_session_with_an_internal_error() {
+    let agent = agent_for(Stream::Av1NoSequenceHeader, Limits::default()).await;
+    let (session, _send, mut recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+    let error = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let message = read_message(&mut recv).await.unwrap();
+            if message["type"] == "error" {
+                break message;
+            }
+        }
+    })
+    .await
+    .expect("no error: the agent kept forcing keyframes for good");
+    assert_eq!(error["code"], "internal", "the client falls back to WebRTC");
+    assert_eq!(close_code(&session).await, Some(CLOSE_NORMAL));
 }
 
 /// The next video datagram, as (frame_seq, frag_index, frag_count, datagram).

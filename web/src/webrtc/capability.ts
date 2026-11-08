@@ -203,7 +203,7 @@ export function probeWebTransport(): { available: boolean; datagrams: boolean } 
 const WEBCODECS_PROBES = {
   h264: ["avc1.42e01f", [[1920, 1080]]],
   hevc: ["hvc1.1.6.L153.B0", [[1920, 1080], [3840, 2160]]],
-  av1: ["av01.0.12M.08", [[1920, 1080], [3840, 2160]]],
+  av1: ["av01.0.13M.08", [[1920, 1080], [3840, 2160]]],
 } as const;
 
 /** Amendment 54's `webcodecs` key, in the catalog codec spelling: `true` only when

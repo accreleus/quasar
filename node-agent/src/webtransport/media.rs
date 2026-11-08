@@ -20,6 +20,9 @@ const FLAG_KEYFRAME: u8 = 1;
 const CLIENT_QUEUE: usize = 32;
 /// Forced keyframes closer together than this are coalesced into the last one.
 const KEYFRAME_SPACING: Duration = Duration::from_millis(150);
+/// Keyframes in a row that `wire_unit` refuses before the session gives up on this transport:
+/// about 2 s of forced keyframes at `KEYFRAME_SPACING`.
+const UNUSABLE_KEYFRAMES: u32 = 13;
 
 /// The decoder configuration a `hello_ack` names.
 #[derive(Debug, Clone, PartialEq)]
@@ -56,6 +59,8 @@ pub(crate) enum Out {
 pub(crate) enum Gone {
     TakenOver,
     SessionEnded,
+    /// The encoder never produced a keyframe this transport can carry.
+    Unusable,
 }
 
 struct Client {
@@ -78,6 +83,10 @@ struct State {
     frame_seq: u16,
     last_ts: u32,
     warned_format: bool,
+    warned_keyframe: bool,
+    /// Keyframes the parser flagged that `wire_unit` refused, since the last one sent.
+    refused_keyframes: u32,
+    session_id: String,
     /// Set by `end`: no client attaches after it.
     ended: bool,
     last_forced: Option<Instant>,
@@ -202,6 +211,7 @@ impl Media {
             let _ = old.gone.set(Gone::TakenOver);
         }
         st.want_key = true;
+        st.refused_keyframes = 0;
         drop(st);
         {
             // The new client's input starts from nothing held: what its predecessor held is
@@ -283,6 +293,9 @@ impl Media {
 
     pub(super) fn on_caps(&self, caps: &gst::CapsRef, session_id: &str) {
         let mut st = self.lock();
+        if st.session_id.is_empty() {
+            st.session_id = session_id.to_string();
+        }
         let Some(mut config) = video_config(caps) else {
             if !st.warned_format {
                 st.warned_format = true;
@@ -320,17 +333,63 @@ impl Media {
         }
     }
 
+    /// A keyframe the parser flagged that cannot go out. True once there have been
+    /// `UNUSABLE_KEYFRAMES` in a row: the client is let go with `Gone::Unusable`.
+    fn refuse_keyframe(&self, st: &mut State) -> bool {
+        st.refused_keyframes += 1;
+        let codec = st.config.as_ref().map_or("", |c| c.codec);
+        if !st.warned_keyframe {
+            st.warned_keyframe = true;
+            tracing::warn!(
+                token = "webtransport-keyframe-refused",
+                session_id = %st.session_id,
+                codec,
+                "a keyframe the encoder flagged is not one WebTransport can carry (H.265: no IRAP slice; AV1: no sequence header, or a malformed OBU)"
+            );
+        }
+        if st.refused_keyframes < UNUSABLE_KEYFRAMES {
+            return false;
+        }
+        tracing::error!(
+            token = "webtransport-keyframe-unusable",
+            session_id = %st.session_id,
+            codec,
+            refused = st.refused_keyframes,
+            "no usable keyframe from the encoder; ending the WebTransport session so the client falls back"
+        );
+        if let Some(client) = st.client.take() {
+            let _ = client.gone.set(Gone::Unusable);
+        }
+        true
+    }
+
     fn on_unit(&self, buffer: &gst::BufferRef) {
         let flagged = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
-        let mut keyframe = flagged;
         let mut st = self.lock();
         // openh264's second unit carries no PTS: it keeps the one before.
         let ts_90khz = buffer.pts().map_or(st.last_ts, |pts| {
             (pts.nseconds() as u128 * 90_000 / 1_000_000_000) as u32
         });
         st.last_ts = ts_90khz;
+        // With a client attached a keyframe is the unit as it would be sent: flagged and, for
+        // H.265 and AV1, holding a random access point. With none, the parser's flag is all
+        // there is.
+        let attached = st.config.clone().filter(|_| st.client.is_some());
+        let map = attached.as_ref().and_then(|_| buffer.map_readable().ok());
+        let wire = attached
+            .as_ref()
+            .zip(map.as_ref())
+            .and_then(|(c, m)| wire_unit(c.codec, m, flagged));
+        let keyframe = if attached.is_some() {
+            wire.as_ref().is_some_and(|(_, key)| *key)
+        } else {
+            flagged
+        };
         if keyframe {
             st.pending_key = false;
+            st.refused_keyframes = 0;
+        } else if flagged && attached.is_some() && self.refuse_keyframe(&mut st) {
+            return;
         }
         let due = st.pending_key
             && st
@@ -344,16 +403,11 @@ impl Media {
         let (Some(config), Some(_)) = (st.config.clone(), st.client.as_ref()) else {
             return;
         };
-        let Ok(map) = buffer.map_readable() else {
+        let Some((data, _)) = wire else {
             // The client never gets this unit: the next one it is sent must not need it.
             st.want_key = true;
             return;
         };
-        let Some((data, key)) = wire_unit(config.codec, &map, flagged) else {
-            st.want_key = true;
-            return;
-        };
-        keyframe = key;
         if st.want_key && !keyframe {
             // Only an attached client waiting on a keyframe asks for one, so the WebRTC
             // stream gets no IDR of ours at a caps change nobody here needs.
@@ -1166,5 +1220,80 @@ mod tests {
         assert!(unit.keyframe);
         let types = streams::obu_types(&unit.data);
         assert!(types.contains(&1) && !types.contains(&2), "{types:?}");
+    }
+    fn av1_unit_buffer(sequence_header: bool, flagged_key: bool) -> gst::Buffer {
+        let mut b = gst::Buffer::from_slice(streams::av1_tu(sequence_header, 20));
+        if !flagged_key {
+            b.get_mut().unwrap().set_flags(gst::BufferFlags::DELTA_UNIT);
+        }
+        b
+    }
+
+    fn bare_media() -> Arc<Media> {
+        gst::init().unwrap();
+        Arc::new(Media {
+            state: Mutex::default(),
+            input: crate::webtransport::tests::no_input(),
+            typing: Mutex::default(),
+            encoder: glib::WeakRef::new(),
+        })
+    }
+
+    #[test]
+    fn keyframes_the_transport_cannot_carry_end_the_client_after_about_two_seconds() {
+        let media = bare_media();
+        media.on_caps(&streams::av1_caps(640), "s");
+        let mut client = media.attach().unwrap();
+        // Flagged as keyframes by the parser, with no sequence header in them.
+        let refused = |n| {
+            for _ in 0..n {
+                media.on_unit(&av1_unit_buffer(false, true));
+            }
+        };
+        refused(UNUSABLE_KEYFRAMES - 1);
+        assert!(
+            media.attached() && client.gone.get().is_none(),
+            "one short of the limit"
+        );
+
+        media.on_unit(&av1_unit_buffer(true, true));
+        assert_eq!(
+            units(&mut client.rx),
+            [(true, 0)],
+            "a usable keyframe goes out"
+        );
+        refused(UNUSABLE_KEYFRAMES - 1);
+        assert!(media.attached(), "a keyframe that went out reset the count");
+
+        refused(1);
+        assert_eq!(client.gone.get(), Some(&Gone::Unusable));
+        assert!(!media.attached(), "the client is let go, not left black");
+        // What was queued before (the refused ones went out as deltas) drains, then the queue ends.
+        while let Ok(out) = client.rx.try_recv() {
+            assert!(matches!(out, Out::Unit(ref u) if !u.keyframe));
+        }
+        assert!(matches!(
+            client.rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn a_coalesced_keyframe_request_stays_until_a_keyframe_actually_goes_out() {
+        let (media, _encoder, _forced) = counted();
+        media.on_caps(&streams::av1_caps(640), "s");
+        let _client = media.attach().unwrap();
+        // Past the attach's wait for a keyframe, so a refused unit asks for nothing itself.
+        media.on_unit(&av1_unit_buffer(true, true));
+        assert!(!media.lock().want_key);
+        media.keyframe();
+        assert!(media.lock().pending_key, "coalesced into the attach's");
+        media.on_unit(&av1_unit_buffer(false, true));
+        assert!(
+            media.lock().pending_key,
+            "a unit refused as a keyframe satisfies nothing"
+        );
+        media.on_unit(&av1_unit_buffer(true, true));
+        assert!(!media.lock().pending_key);
     }
 }

@@ -1075,6 +1075,11 @@ async fn stream(
                 }
                 None => break match client.gone.get() {
                     Some(Gone::TakenOver) => (Some(json!({"type": "bye", "reason": "taken_over"})), CLOSE_TAKEN_OVER, ""),
+                    Some(Gone::Unusable) => (
+                        Some(json!({"type": "error", "code": "internal", "message": "the encoder sent no usable keyframe"})),
+                        CLOSE_NORMAL,
+                        "",
+                    ),
                     _ => (Some(json!({"type": "bye", "reason": "session_ended"})), CLOSE_ENDED, ""),
                 },
             },
