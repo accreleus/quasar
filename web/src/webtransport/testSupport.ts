@@ -41,6 +41,80 @@ export function packetize(u: UnitSpec, pktSeq = { n: 0 }): Uint8Array[] {
   });
 }
 
+/**
+ * `pyrowave::pack` (node-agent/src/webtransport/pyrowave.rs): one PyroWave frame's datagram
+ * payloads, 12-byte PyroWave header first, packets packed greedily into `room` bytes, an
+ * oversized block alone in filled parts, each datagram's coverage range partitioning [0, n).
+ */
+export function packPyroWave(frame: Uint8Array, n: number, room = MAX_DATAGRAM - HEADER): Uint8Array[] {
+  const fit = room - 12;
+  const v = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
+  type Draft = { first: number; parts: boolean; bytes: Uint8Array[]; used: number };
+  const drafts: Draft[] = [];
+  for (let o = 0; o < frame.byteLength; ) {
+    const w0 = v.getUint32(o, true);
+    const len = w0 >>> 31 ? 8 : ((w0 >>> 16) & 0xfff) * 4;
+    const start = w0 >>> 31 ? 0 : v.getUint32(o + 4, true) >>> 8;
+    const p = frame.subarray(o, o + len);
+    o += len;
+    const last = drafts[drafts.length - 1];
+    if (len > fit) drafts.push({ first: start, parts: true, bytes: [p], used: len });
+    else if (last && !last.parts && last.used + len <= fit) {
+      last.bytes.push(p);
+      last.used += len;
+    } else drafts.push({ first: drafts.length ? start : 0, parts: false, bytes: [p], used: len });
+  }
+  const out: Uint8Array[] = [];
+  const head = (kind: number, part: number, count: number, first: number, end: number) => {
+    const h = new Uint8Array(12);
+    const hv = new DataView(h.buffer);
+    h.set([kind, part, count]);
+    hv.setUint32(4, first, true);
+    hv.setUint32(8, end, true);
+    return h;
+  };
+  const join = (...b: Uint8Array[]) => {
+    const r = new Uint8Array(b.reduce((a, x) => a + x.length, 0));
+    let at = 0;
+    for (const x of b) (r.set(x, at), (at += x.length));
+    return r;
+  };
+  drafts.forEach((d, i) => {
+    const end = drafts[i + 1]?.first ?? n;
+    if (!d.parts) {
+      out.push(join(head(0, 0, 0, d.first, end), ...d.bytes));
+      return;
+    }
+    const block = d.bytes[0];
+    const count = Math.ceil(block.length / fit);
+    for (let j = 0; j < count; j++) out.push(join(head(1, j, count, d.first, end), block.subarray(j * fit, (j + 1) * fit)));
+  });
+  return out;
+}
+
+/** `media::packetize` for a PyroWave unit: every frame keyframe + discardable, payloads from {@link packPyroWave}. */
+export function pyroWaveDatagrams(
+  u: { configId: number; frameSeq: number; captureUs?: number },
+  payloads: Uint8Array[],
+  pktSeq = { n: 0 },
+): Uint8Array[] {
+  return payloads.map((frag, index) => {
+    const d = new Uint8Array(HEADER + frag.length);
+    const v = new DataView(d.buffer);
+    d[0] = 0x01;
+    v.setUint32(1, pktSeq.n++, true);
+    d[5] = 3;
+    d[6] = u.configId;
+    v.setUint16(7, u.frameSeq, true);
+    v.setUint16(9, index, true);
+    v.setUint16(11, payloads.length, true);
+    v.setUint32(13, u.frameSeq * 1500, true);
+    v.setBigUint64(17, BigInt(u.captureUs ?? 1_762_400_000_000_000 + u.frameSeq * 16_667), true);
+    d.set(frag, HEADER);
+    return d;
+  });
+}
+
 export function bytes(n: number, seed: number): Uint8Array {
   return Uint8Array.from({ length: n }, (_, i) => (i * 7 + seed) & 0xff);
 }

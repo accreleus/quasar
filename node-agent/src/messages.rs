@@ -1148,6 +1148,9 @@ pub enum ControlMsg {
         /// an agent that advertised `compat_tools_v1`.
         #[serde(default)]
         compat_tools: Option<serde_json::Value>,
+        /// Amendment 55: the grant to send this session's WebTransport client PyroWave.
+        #[serde(default)]
+        pyrowave: Option<crate::webtransport::PyroWaveGrant>,
     },
     /// Amendment 54: a further transport token for a WebTransport session.
     SessionTransportToken {
@@ -1658,6 +1661,39 @@ mod tests {
                 "{retired}"
             );
         }
+    }
+
+    #[test]
+    fn session_assign_carries_the_pyrowave_grant_when_present() {
+        let mut msg = serde_json::json!({
+            "type": "session_assign", "id": "c1", "session_id": "s1",
+            "stream": {"width": 1920, "height": 1080, "fps": 60,
+                "bitrate_kbps": 15000, "h264_profile": "constrained-baseline"}
+        });
+        let parsed: ControlMsg = serde_json::from_value(msg.clone()).unwrap();
+        assert!(matches!(
+            parsed,
+            ControlMsg::SessionAssign { pyrowave: None, .. }
+        ));
+        msg["pyrowave"] = serde_json::json!(
+            {"wanted": true, "target_kbps": 200000, "floor_kbps": 100000, "max_rtt_ms": 5}
+        );
+        let ControlMsg::SessionAssign {
+            pyrowave: Some(grant),
+            ..
+        } = serde_json::from_value(msg).unwrap()
+        else {
+            panic!("the grant parses");
+        };
+        assert_eq!(
+            grant,
+            crate::webtransport::PyroWaveGrant {
+                wanted: true,
+                target_kbps: 200_000,
+                floor_kbps: 100_000,
+                max_rtt_ms: 5
+            }
+        );
     }
 
     #[test]

@@ -160,7 +160,7 @@ fn miss(ranges: &mut Vec<[u16; 2]>, i: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::webtransport::media::{packetize, Unit, MAX_DATAGRAM};
+    use crate::webtransport::media::{packetize, Unit, VideoConfig, MAX_DATAGRAM};
 
     fn frame(frame_seq: u16, len: usize, pkt_seq: &mut u32) -> Vec<Bytes> {
         let unit = Unit {
@@ -170,8 +170,18 @@ mod tests {
             frame_seq,
             ts_90khz: 0,
             capture_us: 0,
+            pyrowave: false,
         };
-        packetize(&unit, MAX_DATAGRAM, pkt_seq)
+        let config = VideoConfig {
+            config_id: 0,
+            codec: "h264",
+            description: Vec::new(),
+            width: 64,
+            height: 64,
+            fps: 60,
+            full_range: false,
+        };
+        packetize(&unit, &config, MAX_DATAGRAM, pkt_seq).unwrap()
     }
 
     #[test]

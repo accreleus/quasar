@@ -1535,15 +1535,17 @@ pub(crate) struct SessionTransports {
 }
 
 impl pipeline::Transport for SessionTransports {
-    fn attach(session: pipeline::EncodedSession) -> anyhow::Result<Self> {
+    fn attach(mut session: pipeline::EncodedSession) -> anyhow::Result<Self> {
         let webtransport = crate::webtransport::listener()
             .filter(|_| session.cfg.webtransport)
             .and_then(|l| {
+                let feed = session.pyrowave_feed.take();
                 crate::webtransport::Tap::attach(
                     l.registry(),
                     &session.video,
                     &session.encoder,
                     &session.session_id,
+                    Some(session.trace_tx.clone()),
                     crate::webtransport::Input::devices(
                         session.devices.clone(),
                         session.input_state.clone(),
@@ -1551,6 +1553,10 @@ impl pipeline::Transport for SessionTransports {
                         session.cfg.stream.height,
                     ),
                     crate::webtransport::Tap::plan(&session.cfg),
+                    session
+                        .cfg
+                        .pyrowave
+                        .map(|grant| (&session.cfg, grant, feed)),
                 )
             });
         let slot = pipeline::WebRtcSlot::new(session)?;

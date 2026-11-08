@@ -619,6 +619,10 @@ type SessionStreamUpdate struct {
 	// leaves both columns unchanged.
 	Transport       string
 	TransportReason string
+	// PyroWave is the session's sessions.pyrowave record; nil leaves it and the slot
+	// unchanged. Otherwise the slot is kept only with KeepPyroWaveSlot (§The PyroWave ceiling).
+	PyroWave         json.RawMessage
+	KeepPyroWaveSlot bool
 }
 
 // UpdateSessionStream applies a SessionStreamUpdate, called once post-schedule
@@ -638,6 +642,10 @@ func (s *Store) UpdateSessionStream(ctx context.Context, sessionID string, u Ses
 	if len(u.CodecDecision) > 0 {
 		decisionArg = []byte(u.CodecDecision)
 	}
+	var pyrowaveArg any
+	if len(u.PyroWave) > 0 {
+		pyrowaveArg = []byte(u.PyroWave)
+	}
 	_, err := s.pool.Exec(ctx, `
 		UPDATE sessions
 		SET width             = $2,
@@ -651,12 +659,15 @@ func (s *Store) UpdateSessionStream(ctx context.Context, sessionID string, u Ses
 		    stream_profile_id = COALESCE($10, stream_profile_id),
 		    codec_decision    = COALESCE($11, codec_decision),
 		    transport_reason  = CASE WHEN $12::text IS NULL THEN transport_reason ELSE $13 END,
-		    transport         = COALESCE($12, transport)
+		    transport         = COALESCE($12, transport),
+		    pyrowave_slot     = CASE WHEN $14::jsonb IS NULL THEN pyrowave_slot ELSE pyrowave_slot AND $15 END,
+		    pyrowave          = COALESCE($14::jsonb, pyrowave)
 		WHERE id::text = $1
 	`, sessionID, u.Width, u.Height, u.FPS, u.BitrateKbps,
 		nilIfEmpty(u.H264Profile), nilIfEmpty(u.Codec), playoutArg,
 		nilIfEmpty(u.ProfileID), nilIfEmpty(u.StreamProfileID), decisionArg,
-		nilIfEmpty(u.Transport), nilIfEmpty(u.TransportReason))
+		nilIfEmpty(u.Transport), nilIfEmpty(u.TransportReason),
+		pyrowaveArg, u.KeepPyroWaveSlot)
 	if err != nil {
 		return fmt.Errorf("update session stream: %w", err)
 	}

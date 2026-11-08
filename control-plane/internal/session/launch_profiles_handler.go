@@ -6,6 +6,7 @@ package session
 // disabled Delete button on a referenced profile is UX only, the 409 is the gate.
 
 import (
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -37,27 +38,31 @@ type launchProfileRungJSON struct {
 }
 
 type launchProfileJSON struct {
-	ID          string                  `json:"id"`
-	DisplayName string                  `json:"display_name"`
-	Description string                  `json:"description"`
-	Visibility  string                  `json:"visibility"`
-	SortOrder   int32                   `json:"sort_order"`
-	Transport   string                  `json:"transport"`
-	Rungs       []launchProfileRungJSON `json:"rungs"`
-	UsedBy      *LaunchProfileUsedBy    `json:"used_by,omitempty"`
-	Warnings    []writeWarning          `json:"warnings"`
+	ID           string                  `json:"id"`
+	DisplayName  string                  `json:"display_name"`
+	Description  string                  `json:"description"`
+	Visibility   string                  `json:"visibility"`
+	SortOrder    int32                   `json:"sort_order"`
+	Transport    string                  `json:"transport"`
+	PyroWaveMode string                  `json:"pyrowave_mode"`
+	PyroWaveKbps *int32                  `json:"pyrowave_kbps"`
+	Rungs        []launchProfileRungJSON `json:"rungs"`
+	UsedBy       *LaunchProfileUsedBy    `json:"used_by,omitempty"`
+	Warnings     []writeWarning          `json:"warnings"`
 }
 
 func toLaunchProfileJSON(lp profile.LaunchProfile) launchProfileJSON {
 	out := launchProfileJSON{
-		ID:          lp.ID,
-		DisplayName: lp.DisplayName,
-		Description: lp.Description,
-		Visibility:  string(lp.Visibility),
-		SortOrder:   lp.SortOrder,
-		Transport:   lp.Transport,
-		Rungs:       make([]launchProfileRungJSON, 0, len(lp.Rungs)),
-		Warnings:    []writeWarning{},
+		ID:           lp.ID,
+		DisplayName:  lp.DisplayName,
+		Description:  lp.Description,
+		Visibility:   string(lp.Visibility),
+		SortOrder:    lp.SortOrder,
+		Transport:    lp.Transport,
+		PyroWaveMode: pyrowaveMode(lp),
+		PyroWaveKbps: lp.PyroWaveKbps,
+		Rungs:        make([]launchProfileRungJSON, 0, len(lp.Rungs)),
+		Warnings:     []writeWarning{},
 	}
 	for i, r := range lp.Rungs {
 		out.Rungs = append(out.Rungs, launchProfileRungJSON{
@@ -66,6 +71,10 @@ func toLaunchProfileJSON(lp profile.LaunchProfile) launchProfileJSON {
 		})
 	}
 	out.Warnings = launchProfileWarnings(lp.Rungs)
+	if out.PyroWaveMode != pyrowaveOff && (lp.Transport == "" || lp.Transport == transportWebRTC) {
+		out.Warnings = append(out.Warnings, writeWarning{warnPyroWaveNeedsWebTransport,
+			"pyrowave_mode is " + out.PyroWaveMode + " but transport is webrtc, so PyroWave can never be offered"})
+	}
 	return out
 }
 
@@ -162,13 +171,41 @@ func (h *Handler) handleAdminGetLaunchProfile(w http.ResponseWriter, r *http.Req
 // an absent field falls to the schema default on create, unchanged on patch,
 // never a zero value clobbering a column.
 type launchProfileReq struct {
-	ID          *string   `json:"id"`
-	DisplayName *string   `json:"display_name"`
-	Description *string   `json:"description"`
-	Visibility  *string   `json:"visibility"`
-	SortOrder   *int32    `json:"sort_order"`
-	Transport   *string   `json:"transport"`
-	Rungs       *[]string `json:"rungs"`
+	ID          *string `json:"id"`
+	DisplayName *string `json:"display_name"`
+	Description *string `json:"description"`
+	Visibility  *string `json:"visibility"`
+	SortOrder   *int32  `json:"sort_order"`
+	Transport   *string `json:"transport"`
+	// Raw, so that null is told from absent: a null mode is refused, a null kbps is no cap.
+	PyroWaveMode json.RawMessage `json:"pyrowave_mode"`
+	PyroWaveKbps json.RawMessage `json:"pyrowave_kbps"`
+	Rungs        *[]string       `json:"rungs"`
+}
+
+// pyrowaveWrite validates the request's PyroWave fields into w; the message on a refusal.
+// semantics: control-api.md §The launch profile's pyrowave_mode and pyrowave_kbps
+func (req launchProfileReq) pyrowaveWrite(w *LaunchProfileWrite) string {
+	if req.PyroWaveMode != nil {
+		var m string
+		if json.Unmarshal(req.PyroWaveMode, &m) != nil || (m != pyrowaveOff && m != pyrowaveAllow && m != pyrowavePrefer) {
+			return "pyrowave_mode must be off, allow, or prefer"
+		}
+		w.PyroWaveMode = &m
+	}
+	if req.PyroWaveKbps == nil {
+		return ""
+	}
+	w.PyroWaveKbpsSet = true
+	if string(req.PyroWaveKbps) == "null" {
+		return ""
+	}
+	var kbps int32
+	if err := json.Unmarshal(req.PyroWaveKbps, &kbps); err != nil || kbps < 50_000 || kbps > 1_000_000 {
+		return "pyrowave_kbps must be null or an integer from 50000 to 1000000"
+	}
+	w.PyroWaveKbps = &kbps
+	return ""
 }
 
 func (h *Handler) handleAdminCreateLaunchProfile(w http.ResponseWriter, r *http.Request) {
@@ -204,7 +241,7 @@ func (h *Handler) handleAdminCreateLaunchProfile(w http.ResponseWriter, r *http.
 	}
 
 	name := strings.TrimSpace(*req.DisplayName)
-	created, err := h.store.CreateLaunchProfile(r.Context(), LaunchProfileWrite{
+	write := LaunchProfileWrite{
 		ID:          strings.TrimSpace(*req.ID),
 		DisplayName: &name,
 		Description: req.Description,
@@ -212,7 +249,12 @@ func (h *Handler) handleAdminCreateLaunchProfile(w http.ResponseWriter, r *http.
 		SortOrder:   req.SortOrder,
 		Transport:   req.Transport,
 		Rungs:       rungIDs(rungs),
-	})
+	}
+	if msg := req.pyrowaveWrite(&write); msg != "" {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, msg)
+		return
+	}
+	created, err := h.store.CreateLaunchProfile(r.Context(), write)
 	if errors.Is(err, ErrLaunchProfileExists) {
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "a launch profile with that id already exists")
 		return
@@ -250,6 +292,10 @@ func (h *Handler) handleAdminPatchLaunchProfile(w http.ResponseWriter, r *http.R
 		Visibility:  req.Visibility,
 		SortOrder:   req.SortOrder,
 		Transport:   req.Transport,
+	}
+	if msg := req.pyrowaveWrite(&write); msg != "" {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, msg)
+		return
 	}
 	if req.DisplayName != nil {
 		name := strings.TrimSpace(*req.DisplayName)

@@ -195,7 +195,7 @@ describe("the WebTransport input sender", () => {
 });
 
 describe("WebTransportMedia input and ping", () => {
-  const NO_SINK: MediaSink = { config: () => {}, unit: () => {}, end: () => {} };
+  const NO_SINK: MediaSink = { config: () => {}, unit: () => {}, pyrowave: () => {}, end: () => {} };
   function connected(sink: MediaSink = NO_SINK, now?: () => number) {
     const agent = new FakeAgent();
     agent.replies = [[helloAck(0, avcC())]];
@@ -296,7 +296,7 @@ describe("the ping clock", () => {
       sleep: async () => {},
       now: () => clock,
     });
-    await t.connect({ config: () => {}, unit: () => {}, end: () => {} });
+    await t.connect({ config: () => {}, unit: () => {}, pyrowave: () => {}, end: () => {} });
     await flush();
     expect(made).toHaveLength(1);
     expect(made[0].url.pathname).toMatch(/pingWorker/);
