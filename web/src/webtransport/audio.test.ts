@@ -717,7 +717,7 @@ describe("createWebTransportRuntime audio and microphone", () => {
       authToken: "auth",
       coords: COORDS,
       canvas: { dataset: {} } as unknown as HTMLCanvasElement,
-      callbacks: { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn() },
+      callbacks: { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn(), onFallback: vi.fn() },
       deps: {
         createTransport: (o) =>
           new WebTransportMedia({ ...o, createWebTransport: agent.create, sleep: async () => {}, ticker: () => () => {} } as ConstructorParameters<typeof WebTransportMedia>[0]),
