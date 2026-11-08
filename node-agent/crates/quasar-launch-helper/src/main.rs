@@ -378,7 +378,10 @@ impl Helper {
             relaunch.until += now.saturating_duration_since(relaunch.stepped);
         }
         relaunch.stepped = now;
-        if !live || self.quit.is_some() || now >= relaunch.until.min(relaunch.last) {
+        // The soft window ends the sending, not the watch: while the launch is taken the retry
+        // stays armed until the hard end, so a failure Steam logs later still gets it sent again.
+        let over = now >= relaunch.last || (!taken && now >= relaunch.until);
+        if !live || self.quit.is_some() || over {
             self.relaunch = None;
             return;
         }
@@ -1733,6 +1736,9 @@ mod tests {
             "GameAction [AppID 1145360, ActionID 1] : LaunchApp changed task to RequestingLicense with \"\"\n",
         );
         helper.pass(at(1), &mut agent);
+        // The production loop keeps polling past the first soft window while the launch stands.
+        helper.pass(at(121), &mut agent);
+        helper.pass(at(300), &mut agent);
         log_raw(
             dir.path(),
             "GameAction [AppID 1145360, ActionID 1] : LaunchApp failed with AppError_5 with \"\"\n",
