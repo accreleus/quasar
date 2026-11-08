@@ -9,9 +9,12 @@
 //! nothing is gathered and then thrown away. STUN/TURN and mDNS are unaffected (they
 //! derive from the host candidates that remain).
 //!
-//! Defaults: skip loopback, link-local (169.254/16, fe80::/10), and interfaces named like
-//! container/VM bridges ([`DEFAULT_EXCLUDED`]). The interface carrying a default route is
-//! never excluded by name. `QUASAR_ICE_INTERFACES` (comma-separated globs) replaces the
+//! Defaults: skip loopback, link-local (169.254/16, fe80::/10), and interfaces we can
+//! positively identify as container/VM plumbing ([`DEFAULT_EXCLUDED`], Docker's generated
+//! `br-<12 hex>` bridges), never a name a user might have chosen. libnice's own built-in
+//! skip list (`docker*`, `veth*`, `virbr*`, `vnet*`) stops applying once an address is added,
+//! so [`DEFAULT_EXCLUDED`] covers it. The interface carrying a default route is never
+//! excluded by name. `QUASAR_ICE_INTERFACES` (comma-separated globs) replaces the
 //! name rule: only matching interfaces gather (`*` = every name). If the result would be
 //! empty the filter is dropped and libnice gathers everywhere, logged.
 
@@ -22,11 +25,20 @@ use gstreamer::prelude::*;
 
 use crate::session::signaling::PcId;
 
-/// Interface-name globs excluded by default (`*` and `?` only).
+/// Interface-name globs excluded by default (`*` and `?` only): libnice's built-in list
+/// (`docker*`, `veth*`, `virbr*`, `vnet*`) plus product-specific generated prefixes.
 const DEFAULT_EXCLUDED: &[&str] = &[
-    "docker0", "br-*", "veth*", "virbr*", "cni*", "flannel*", "cali*", "podman*", "lxcbr*",
+    "docker*", "veth*", "virbr*", "vnet*", "cni*", "flannel*", "cali*", "podman*", "lxcbr*",
     "lxdbr*",
 ];
+
+/// Docker's generated bridge name: `br-` and the first 12 hex digits of the network id.
+/// A user's `br-media` or `br-lan` is not one.
+fn is_docker_bridge(name: &str) -> bool {
+    name.strip_prefix("br-").is_some_and(|id| {
+        id.len() == 12 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
 
 /// One address on one host interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,7 +67,11 @@ impl IceInterfaces {
     fn name_allowed(&self, name: &str, on_default_route: bool) -> bool {
         match &self.0 {
             Some(allow) => allow.iter().any(|g| glob_match(g, name)),
-            None => on_default_route || !DEFAULT_EXCLUDED.iter().any(|g| glob_match(g, name)),
+            None => {
+                on_default_route
+                    || !(is_docker_bridge(name)
+                        || DEFAULT_EXCLUDED.iter().any(|g| glob_match(g, name)))
+            }
         }
     }
 }
@@ -151,7 +167,7 @@ fn default_route_ifaces() -> Vec<String> {
     out
 }
 
-/// Every address on every UP, non-loopback host interface (`getifaddrs`).
+/// Every address on every UP and RUNNING, non-loopback host interface (`getifaddrs`).
 fn host_addrs() -> Vec<IfAddr> {
     let mut out = Vec::new();
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
@@ -164,7 +180,9 @@ fn host_addrs() -> Vec<IfAddr> {
         // SAFETY: `cur` is a live node of the list getifaddrs returned.
         let ifa = unsafe { &*cur };
         cur = ifa.ifa_next;
-        let up = ifa.ifa_flags & libc::IFF_UP as u32 != 0;
+        // An unplugged NIC keeps its static IP but gives unusable candidates.
+        let up = ifa.ifa_flags & (libc::IFF_UP | libc::IFF_RUNNING) as u32
+            == (libc::IFF_UP | libc::IFF_RUNNING) as u32;
         let lo = ifa.ifa_flags & libc::IFF_LOOPBACK as u32 != 0;
         if !up || lo || ifa.ifa_addr.is_null() {
             continue;
@@ -214,8 +232,10 @@ fn summary(addrs: &[IfAddr]) -> String {
 
 /// Restrict `webrtc`'s ICE agent to the selected host addresses. Call right after the
 /// webrtcbin is built and before any offer/answer (gathering starts at
-/// set-local-description). Fails open: any problem leaves libnice gathering everywhere.
-/// Logged once per video PC, i.e. once per session (the audio PC applies the same set).
+/// set-local-description). Fails open: a missing `ice-agent` or `add-local-ip-address`
+/// signal leaves libnice gathering everywhere, with a warning. Logs once per video
+/// connection built (so again after a takeover or restream); the audio PC applies the same
+/// set silently.
 pub(super) fn restrict_ice_gathering(webrtc: &gst::Element, pc: PcId) {
     let raw = std::env::var("QUASAR_ICE_INTERFACES").ok();
     let sel = select(
@@ -234,10 +254,16 @@ pub(super) fn restrict_ice_gathering(webrtc: &gst::Element, pc: PcId) {
         }
         return;
     }
-    let Some(ice) = webrtc.property::<Option<gst::Object>>("ice-agent") else {
+    let ice = webrtc
+        .find_property("ice-agent")
+        .and_then(|_| webrtc.property::<Option<gst::Object>>("ice-agent"))
+        .filter(|ice| {
+            glib::subclass::signal::SignalId::lookup("add-local-ip-address", ice.type_()).is_some()
+        });
+    let Some(ice) = ice else {
         tracing::warn!(
             token = "ice-interfaces-unavailable",
-            "webrtcbin has no ice-agent — gathering on every host address"
+            "webrtcbin has no ice-agent with add-local-ip-address — gathering on every host address"
         );
         return;
     };
@@ -283,7 +309,10 @@ mod tests {
             a("lo", "127.0.0.1"),
             a("lo", "::1"),
             a("docker0", "172.17.0.1"),
-            a("br-1a2b3c", "172.18.0.1"),
+            a("br-0123456789ab", "172.18.0.1"),
+            a("docker_gwbridge", "172.19.0.1"),
+            a("vnet3", "fe80::3"),
+            a("vnet4", "192.0.2.99"),
             a("veth9f", "fe80::2"),
             a("virbr0", "192.168.122.1"),
             a("cni0", "10.244.0.1"),
@@ -293,14 +322,48 @@ mod tests {
         let s = select(&addrs, &IceInterfaces::default(), &[]);
         assert_eq!(names(&s.kept), ["eth0", "eth0", "br0"]);
         assert_eq!(s.excluded.len(), addrs.len() - 3);
+        assert!(s
+            .excluded
+            .iter()
+            .any(|x| x.name == "docker_gwbridge" || x.name == "vnet4"));
         assert!(!s.fell_back);
+    }
+
+    /// A user-named bridge is not plumbing: `br-media` carries a client LAN even though the
+    /// default route is on `eth0` (so the fallback never fires to save it).
+    #[test]
+    fn a_user_named_bridge_is_kept_and_docker_s_generated_one_is_not() {
+        let addrs = [
+            a("eth0", "192.0.2.10"),
+            a("br-media", "198.51.100.5"),
+            a("br-lan", "203.0.113.5"),
+            a("br-0123456789ab", "172.18.0.1"),
+            a("br-0123456789AB", "172.19.0.1"),
+            a("br-0123456789a", "172.20.0.1"),
+        ];
+        let s = select(&addrs, &IceInterfaces::default(), &["eth0".into()]);
+        assert_eq!(
+            names(&s.kept),
+            [
+                "eth0",
+                "br-media",
+                "br-lan",
+                "br-0123456789AB",
+                "br-0123456789a"
+            ]
+        );
+        assert_eq!(names(&s.excluded), ["br-0123456789ab"]);
     }
 
     #[test]
     fn default_route_interface_survives_a_bridge_name() {
-        let addrs = [a("br-lan", "192.0.2.5"), a("br-other", "172.18.0.1")];
-        let s = select(&addrs, &IceInterfaces::default(), &["br-lan".into()]);
-        assert_eq!(names(&s.kept), ["br-lan"]);
+        let addrs = [a("br-0123456789ab", "192.0.2.5"), a("veth1", "172.18.0.1")];
+        let s = select(
+            &addrs,
+            &IceInterfaces::default(),
+            &["br-0123456789ab".into()],
+        );
+        assert_eq!(names(&s.kept), ["br-0123456789ab"]);
     }
 
     #[test]
@@ -355,6 +418,7 @@ mod tests {
     fn globs() {
         assert!(glob_match("br-*", "br-1a2b"));
         assert!(!glob_match("br-*", "br0"));
+        assert!(glob_match("docker*", "docker_gwbridge"));
         assert!(glob_match("eth?", "eth0"));
         assert!(!glob_match("eth?", "eth10"));
         assert!(glob_match("*", ""));

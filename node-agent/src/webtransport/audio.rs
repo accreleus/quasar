@@ -596,6 +596,24 @@ mod tests {
         }
     }
 
+    /// The delivered count once it has stopped moving for 200 ms (at most 5 s).
+    fn settled_delivered(audio: &Audio) -> u64 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut last = audio.mic_delivered();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let now = audio.mic_delivered();
+            if now == last {
+                return now;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the delivered count never settled"
+            );
+            last = now;
+        }
+    }
+
     fn wait_delivered(audio: &Audio, at_least: u64) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while audio.mic_delivered() < at_least {
@@ -626,8 +644,10 @@ mod tests {
         let _b = audio.attach(8);
         send(&audio, 8, &packets, 0, 12);
         wait_delivered(&audio, before + 11);
+        // Read the count only once client 8's last packet (and any concealment after it) has
+        // drained: reading it mid-flight made this test flaky.
+        let after = settled_delivered(&audio);
         // The first client is no longer the one heard.
-        let after = audio.mic_delivered();
         send(&audio, 7, &packets, 1_025, 5);
         std::thread::sleep(std::time::Duration::from_millis(150));
         assert_eq!(audio.mic_delivered(), after);
