@@ -4,8 +4,7 @@
 //! then gets the session's video as datagrams.
 //!
 //! Not here yet, each a later ticket: audio, microphone, FEC, receiver feedback and
-//! congestion control, and the takeover bound (§Takeover's 6 in 60 s: a new client replaces
-//! the last one, on either transport, and nothing bounds it).
+//! congestion control.
 
 mod cert;
 mod media;
@@ -140,6 +139,8 @@ enum Refusal {
     NotReady,
     SessionEnded,
     UnsupportedVersion,
+    /// §Takeover's bound; the token is kept.
+    RateLimited,
 }
 
 impl Refusal {
@@ -149,6 +150,7 @@ impl Refusal {
             Self::NotReady => ("session_not_ready", CLOSE_NORMAL),
             Self::SessionEnded => ("session_ended", CLOSE_ENDED),
             Self::UnsupportedVersion => ("unsupported_version", CLOSE_NORMAL),
+            Self::RateLimited => ("takeover_rate_limited", CLOSE_NORMAL),
         }
     }
 }
@@ -259,8 +261,8 @@ impl Registry {
         }
     }
 
-    /// Check `hello` and consume its token. A refusal for a session not ready keeps the
-    /// token, so the client may retry with it.
+    /// Check `hello` and consume its token. A refusal for a session not ready, or past the
+    /// takeover bound, keeps the token, so the client may retry with it.
     fn redeem(&self, hello: &Hello, now: SystemTime) -> Result<Arc<Media>, Refusal> {
         if hello.wt_proto < WT_PROTO {
             return Err(Refusal::UnsupportedVersion);
@@ -284,6 +286,9 @@ impl Registry {
         let Some(media) = entry.media.clone().filter(|m| m.ready()) else {
             return Err(Refusal::NotReady);
         };
+        if !media.admit_hello() {
+            return Err(Refusal::RateLimited);
+        }
         entry.tokens.remove(index);
         Ok(media)
     }

@@ -1169,6 +1169,49 @@ async fn a_reload_reconnects_with_a_fresh_token_and_resumes_from_a_keyframe() {
     );
 }
 
+/// §Takeover's bound: 6 takeovers of a session in any 60 s, counted across both transports.
+/// The 7th is refused on either; a refused `hello` keeps its token, and the connected client
+/// streams on.
+#[tokio::test]
+async fn a_seventh_takeover_inside_60_s_is_refused_on_either_transport() {
+    let agent = agent().await;
+    let registry = agent.listener.registry();
+    let tap = agent.tap.as_ref().unwrap();
+    let expires = SystemTime::now() + TOKEN_TTL;
+    // Nobody to displace: no takeover.
+    let mut clients = vec![agent.hello(TOKEN).await];
+    for n in 0..6 {
+        if n % 2 == 0 {
+            assert!(tap.media().webrtc_attached(), "takeover {n} is WebRTC's");
+            continue;
+        }
+        let token = format!("takeover-{n}");
+        assert!(registry.add_token(SESSION, &token_hash(&token), expires));
+        let client = agent.hello(&token).await;
+        assert_eq!(
+            client.3["type"], "hello_ack",
+            "takeover {n} is WebTransport's"
+        );
+        clients.push(client);
+    }
+    assert!(tap.media().takeovers_full(), "a 7th over WebRTC is refused");
+
+    assert!(registry.add_token(SESSION, &token_hash("seventh"), expires));
+    let (refused, _send, _recv, reply) = agent.hello("seventh").await;
+    assert_eq!(reply["code"], "takeover_rate_limited", "{reply}");
+    assert_eq!(close_code(&refused).await, Some(CLOSE_NORMAL));
+    assert!(
+        registry.lock()[SESSION]
+            .tokens
+            .iter()
+            .any(|t| t.hash == token_hash("seventh")),
+        "a refused hello keeps its token"
+    );
+    let streaming = &clients.last().unwrap().0;
+    frames(streaming, 1, false).await;
+    assert!(tap.attached(), "the connected client keeps streaming");
+}
+
 #[tokio::test]
 async fn past_64_unauthenticated_connections_new_sessions_are_refused() {
     let agent = agent_with(Limits {

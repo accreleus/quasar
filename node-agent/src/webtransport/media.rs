@@ -100,6 +100,27 @@ const WEBRTC: u64 = u64::MAX;
 struct Typing {
     client: u64,
     pads: std::collections::HashMap<u64, serde_json::Value>,
+    /// When each recent takeover happened, on either transport.
+    takeovers: std::collections::VecDeque<Instant>,
+}
+
+/// §Takeover's bound: at most this many takeovers of a session in any [`TAKEOVER_WINDOW`],
+/// counted across both transports.
+const TAKEOVER_LIMIT: usize = 6;
+const TAKEOVER_WINDOW: Duration = Duration::from_secs(60);
+
+impl Typing {
+    /// The window holds [`TAKEOVER_LIMIT`] takeovers already.
+    fn takeovers_full(&mut self, now: Instant) -> bool {
+        while self
+            .takeovers
+            .front()
+            .is_some_and(|at| now.duration_since(*at) >= TAKEOVER_WINDOW)
+        {
+            self.takeovers.pop_front();
+        }
+        self.takeovers.len() >= TAKEOVER_LIMIT
+    }
 }
 
 /// The tap's side of a session: fed by the GStreamer streaming thread, read by the
@@ -242,18 +263,46 @@ impl Media {
     /// The host accepted a WebRTC peer (`transport-webtransport.md` §Takeover): it displaces
     /// the WebTransport client, and what that client held is lifted now, before the peer can
     /// send. That client's later detach, its 10 s silence included, then lifts nothing.
-    /// True when a client was attached.
+    /// True when a client was attached. Displacing anyone, the WebRTC peer before it
+    /// included, counts as a takeover.
     pub(crate) fn webrtc_attached(&self) -> bool {
         let displaced = self.lock().client.take();
         if let Some(old) = &displaced {
             let _ = old.gone.set(Gone::TakenOver);
         }
         let mut typing = self.typing.lock().unwrap_or_else(|e| e.into_inner());
+        if typing.client != 0 {
+            typing.takeovers.push_back(Instant::now());
+        }
         if typing.client != 0 && typing.client != WEBRTC {
             self.release(&mut typing);
         }
         typing.client = WEBRTC;
         displaced.is_some()
+    }
+
+    /// A WebTransport `hello` may take the session: false past §Takeover's bound. One that
+    /// displaces a client is counted here, before its token is spent.
+    pub(crate) fn admit_hello(&self) -> bool {
+        let mut typing = self.typing.lock().unwrap_or_else(|e| e.into_inner());
+        if typing.client == 0 {
+            return true;
+        }
+        let now = Instant::now();
+        if typing.takeovers_full(now) {
+            return false;
+        }
+        typing.takeovers.push_back(now);
+        true
+    }
+
+    /// A new WebRTC peer would be past §Takeover's bound. It is counted only when its answer
+    /// is applied (`webrtc_attached`), since both PCs ask before either is answered.
+    /// shortcut: a takeover in that round trip can pass the bound by one; reserve a slot
+    /// here if that ever matters.
+    pub(crate) fn takeovers_full(&self) -> bool {
+        let mut typing = self.typing.lock().unwrap_or_else(|e| e.into_inner());
+        typing.takeovers_full(Instant::now())
     }
 
     /// One WebRTC input event, `inject`ed only while the WebRTC peer holds the session.

@@ -1039,6 +1039,47 @@ fn a_fallback_answer_displaces_the_webtransport_client_at_once() {
     assert!(host.errors.is_empty(), "{:?}", host.errors);
 }
 
+/// §Takeover's bound through the runner's dispatch: after 6 takeovers in 60 s, counted across
+/// both transports, a new WebRTC peer is refused `takeover_rate_limited` on each PC, gets no
+/// transport, and the WebTransport client keeps the stream.
+#[test]
+fn a_seventh_takeover_by_a_webrtc_peer_is_refused() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (mut host, media, _wt) = start_webtransport("bound");
+    let _a = first_attach(&mut host);
+    let mut clients = Vec::new();
+    for n in 0..6 {
+        assert!(media.admit_hello(), "takeover {n} is admitted");
+        clients.push(media.attach().expect("the WebTransport hello is accepted"));
+    }
+    assert!(host.transports.take_from_webrtc(&host.sig_tx));
+    assert!(!media.admit_hello(), "a 7th WebTransport hello is refused");
+
+    let mut b = Peer::another_browser();
+    request_offers(&mut host);
+    let rate_limited = |h: &Host| {
+        codes(&h.errors)
+            .into_iter()
+            .filter(|(code, _)| code == TAKEOVER_RATE_LIMITED)
+            .map(|(_, pc)| pc as usize)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let refused = pump(&mut host, &mut b, Duration::from_secs(10), |h, _| {
+        rate_limited(h).len() == 2
+    });
+    assert!(refused, "errors: {:?}", host.errors);
+    assert_eq!(
+        host.replaced,
+        Vec::<PcId>::new(),
+        "no transport for the 7th"
+    );
+    assert!(media.attached(), "the WebTransport client keeps the stream");
+    assert!(clients.last().unwrap().gone.get().is_none());
+}
+
 /// The first page answered but its transport never connected (its loader is still up),
 /// and a second page attaches.
 fn takeover_while_connecting(tag: &str, another_browser: bool) -> (Host, Peer) {

@@ -1738,8 +1738,20 @@ impl SessionTransports {
                 return Ok(None);
             }
             server::Inbound::NewPeer(pc) => {
+                // Asked first, so a refusal here spends none of this PC's budget.
+                let session_full = self
+                    .webtransport
+                    .as_ref()
+                    .is_some_and(|tap| tap.media().takeovers_full());
+                if session_full {
+                    tracing::info!(
+                        token = "takeover-rate-limited",
+                        "{pc} PC: an answer from a new peer is past the session's takeover bound \
+                         across both transports; the current client keeps the stream"
+                    );
+                }
                 // Not applied either: it would rebind the current peer's transport.
-                if over_budget(&mut self.budget[i]) {
+                if session_full || over_budget(&mut self.budget[i]) {
                     // To this answer's sender only; the streaming peer's late answers
                     // classify `ThisPeer` (same ufrag) and are told nothing (amendment 42).
                     let _ = out_tx.send(SignalMsg::takeover_error(
