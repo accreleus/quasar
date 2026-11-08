@@ -74,6 +74,40 @@ describe("useLaunch waiting toast", () => {
   });
 });
 
+describe("useLaunch while the parked Steam restarts (#1163)", () => {
+  afterEach(() => vi.resetAllMocks());
+
+  it("retries quietly in the ordinary launching state, with no toast, until accepted", async () => {
+    const launched = {
+      session: { id: "new-1", stream: { width: 1920, height: 1080, fps: 60, codec: "h264" } },
+      signaling: { url: "ws://x", token: "t" },
+    } as never;
+    vi.mocked(libraryApi.launchSession)
+      .mockRejectedValueOnce(
+        new ApiError(503, "capacity_exhausted", "restarting", undefined, undefined, 0, "steam_restarting"),
+      )
+      .mockResolvedValueOnce(launched);
+    const { result } = renderLaunch();
+
+    act(() => {
+      void result.current.launchApp(app, "1080p60");
+    });
+
+    await waitFor(() => expect(libraryApi.launchSession).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(result.current.launching).toBe(true));
+    expect(result.current.waitingForSlot).toBe(false);
+    expect(result.current.waitingReason).toBeNull();
+    expect(screen.queryByText(/Waiting for a slot/)).toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
+
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith("/app/session/new-1", expect.anything()), {
+      timeout: 3000,
+    });
+    expect(libraryApi.launchSession).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText(/Waiting for a slot/)).toBeNull();
+  });
+});
+
 describe("useLaunch when the home is on an offline host (#602)", () => {
   afterEach(() => vi.resetAllMocks());
 

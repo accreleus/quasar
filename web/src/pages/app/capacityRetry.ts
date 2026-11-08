@@ -45,6 +45,10 @@ export const HOME_HOST_UNAVAILABLE = "home_host_unavailable";
  *  minutes, past the quiet-retry budget, so the user is told and tries again later. */
 export const COMPAT_TOOL_MISSING = "compat_tool_missing";
 
+/** `error.reason` on a `capacity_exhausted` while the caller's parked Steam is being stopped
+ *  for this launch (amendment 59, #1133). No slot is short, so the retry shows nothing (#1163). */
+export const STEAM_RESTARTING = "steam_restarting";
+
 /** Whether a launch refusal is worth the quiet retry: `capacity_exhausted` and
  *  `no_host_available`, except a home on a host that is offline or gone (no
  *  amount of waiting brings that host back) and a compatibility tool still missing. */

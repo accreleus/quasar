@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/accreleus/quasar/control-plane/internal/agentws"
+	"github.com/accreleus/quasar/control-plane/internal/profile"
 )
 
 const (
@@ -175,6 +176,62 @@ func (c *Coordinator) SteamWarmHeartbeat(ctx context.Context, userID string, isA
 		userID, w.IdleMinutes); err != nil {
 		c.log.Warn("warm steam: parked_until extend failed", "user_id", userID, "err", err)
 	}
+}
+
+// launchWouldPlanWebTransport is the heartbeat's "would a launch for this user adopt a park?":
+// it runs the launch's own stream plan (gatherStreamInputs + planStream, so planTransport and the
+// PyroWave intent) as a play on the home's host, once per GPU, and is true only when every GPU
+// plans WebTransport. A WebRTC-only park is useless to such a launch (#1163); anything that fails
+// to plan is "no", so a park is only ever withheld on a positive answer. The PyroWave slot is
+// assumed free, as for a claim (claimCandidate).
+// shortcut: the profile resolved is the Steam parent's default; a tile pinned to another profile
+// is not seen, and a WebTransport-planned user still gets no warm. The real fix is #1214
+// (transport-neutral parks).
+func (c *Coordinator) launchWouldPlanWebTransport(ctx context.Context, p CreateParams, hostID string,
+	chain profile.LaunchProfile, lp LaunchParams, ov StreamOverride, env ProbeEnvelope, source string,
+) bool {
+	// shortcut: every GPU on the host must plan WebTransport, but the park is not pinned to a
+	// WebRTC-planning GPU, so a mixed-GPU host can still park on one a WebTransport launch
+	// cannot adopt. Upgrade with #1214 (transport-neutral parks) or a placement pin.
+	// planTransport can only answer WebTransport for these two; skip the reads for the rest.
+	if chain.Transport != transportWebTransport && chain.Transport != transportOptIn {
+		return false
+	}
+	rows, err := c.store.pool.Query(ctx, `SELECT index FROM gpus WHERE host_id = $1::uuid ORDER BY index`, hostID)
+	if err != nil {
+		c.log.Warn("warm steam: gpu list read failed, parking without a transport check", "host_id", hostID, "err", err)
+		return false
+	}
+	var gpus []int32
+	for rows.Next() {
+		var idx int32
+		if err := rows.Scan(&idx); err != nil {
+			rows.Close()
+			return false // a partial GPU list must not withhold the park
+		}
+		gpus = append(gpus, idx)
+	}
+	rows.Close()
+	if rows.Err() != nil || len(gpus) == 0 {
+		return false
+	}
+	lp.parked = false
+	for _, idx := range gpus {
+		prov := Session{
+			UserID: p.UserID, AppID: p.AppID, HostID: &hostID, GPUIndex: &idx,
+			Width: p.Width, Height: p.Height, FPS: p.FPS, BitrateKbps: p.BitrateKbps,
+			H264Profile: p.H264Profile, Codec: wireCodecH264, Playout0Ms: p.Playout0Ms,
+			PyroWaveSlot: true,
+		}
+		if lp.DeviceID != "" {
+			prov.DeviceID = &lp.DeviceID
+		}
+		plan, err := planStream(c.gatherStreamInputs(ctx, &prov, chain, lp, ov, env, source))
+		if err != nil || plan.Update.Transport != transportWebTransport {
+			return false
+		}
+	}
+	return true
 }
 
 // warmSteamApp is the Steam parent app a heartbeat would warm for this user,

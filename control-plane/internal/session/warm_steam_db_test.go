@@ -976,6 +976,23 @@ func TestParkOnExitIsWebRTCOnly(t *testing.T) {
 func (f *warmFixture) runningWebTransportTile(t *testing.T) string {
 	t.Helper()
 	ctx := context.Background()
+	f.enableWebTransport(t)
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID})
+	if err != nil {
+		t.Fatalf("WebTransport launch: %v", err)
+	}
+	if res.Session.Transport != transportWebTransport {
+		t.Fatalf("launch transport %q, want %s", res.Session.Transport, transportWebTransport)
+	}
+	f.disp.waitFor(t, "start")
+	f.running(t, res.Session.ID)
+	return res.Session.ID
+}
+
+// enableWebTransport makes the fixture's device and host able to stream on
+// WebTransport and every launch profile ask for it.
+func (f *warmFixture) enableWebTransport(t *testing.T) {
+	t.Helper()
 	caps := `{"bandwidth_kbps":50000,"rtt_ms":5,"max_decode_height":2160,"measured_at":"` +
 		time.Now().UTC().Format(time.RFC3339) + `","codecs":{"h264":true},
 		"webtransport":{"available":true,"datagrams":true},
@@ -987,16 +1004,62 @@ func (f *warmFixture) runningWebTransportTile(t *testing.T) string {
 		wt_certificates = jsonb_build_array(jsonb_build_object('sha256', $2::text,
 			'not_before', now() - interval '1 day', 'not_after', now() + interval '10 days'))
 		WHERE id = $1::uuid`, f.hostID, wtCertA))
-	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID})
-	if err != nil {
-		t.Fatalf("WebTransport launch: %v", err)
+}
+
+// A library-open heartbeat parks nothing exactly when the launch it warms for would plan
+// WebTransport, by the launch's own transport decision: every park is WebRTC-only, so such a
+// launch would supersede it and cold-start Steam behind a 503 (#1163). Every arm where the
+// launch plans WebRTC still parks.
+func TestHeartbeatSkipsAUserWhoseLaunchWouldBeWebTransport(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name   string
+		setup  func(t *testing.T, f *warmFixture)
+		parked int
+	}{
+		{"a WebTransport-capable device on a webtransport profile", func(t *testing.T, f *warmFixture) {}, 0},
+		{"a device without WebTransport still parks", func(t *testing.T, f *warmFixture) {
+			must(t, exec(t, f.pool, `UPDATE user_devices SET capabilities = capabilities - 'webtransport' WHERE id = $1::uuid`, f.deviceID))
+		}, 1},
+		{"a host with no WebTransport endpoint still parks", func(t *testing.T, f *warmFixture) {
+			must(t, exec(t, f.pool, `UPDATE hosts SET transports = '["webrtc"]' WHERE id = $1::uuid`, f.hostID))
+		}, 1},
+		{"a device that cannot decode the codec over WebCodecs still parks", func(t *testing.T, f *warmFixture) {
+			must(t, exec(t, f.pool, `UPDATE user_devices SET capabilities = capabilities || '{"webcodecs":{"opus_decode":true}}'
+				WHERE id = $1::uuid`, f.deviceID))
+		}, 1},
+		{"an opt-in profile still parks", func(t *testing.T, f *warmFixture) {
+			must(t, exec(t, f.pool, `UPDATE launch_profiles SET transport = 'webtransport_opt_in'`))
+		}, 1},
+		{"an opt-in profile on PyroWave prefer, with PyroWave eligible, parks nothing", func(t *testing.T, f *warmFixture) {
+			f.enablePyroWavePrefer(t)
+		}, 0},
+		{"the same with PyroWave off still parks", func(t *testing.T, f *warmFixture) {
+			f.enablePyroWavePrefer(t)
+			must(t, exec(t, f.pool, `UPDATE launch_profiles SET pyrowave_mode = 'off'`))
+		}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newWarmFixture(t, 4)
+			f.enableWebTransport(t)
+			tc.setup(t, f)
+			f.coord.SteamWarmHeartbeat(ctx, f.userID, false, f.deviceID)
+			if n := countParked(t, f.pool); n != tc.parked {
+				t.Fatalf("parked rows = %d, want %d", n, tc.parked)
+			}
+		})
 	}
-	if res.Session.Transport != transportWebTransport {
-		t.Fatalf("launch transport %q, want %s", res.Session.Transport, transportWebTransport)
-	}
-	f.disp.waitFor(t, "start")
-	f.running(t, res.Session.ID)
-	return res.Session.ID
+}
+
+// enablePyroWavePrefer makes an Auto launch pick PyroWave, hence WebTransport, with no request
+// switch: an opt-in profile on prefer, a GPU that passed its probe, a WebGPU device with a fresh
+// fast link.
+func (f *warmFixture) enablePyroWavePrefer(t *testing.T) {
+	t.Helper()
+	must(t, exec(t, f.pool, `UPDATE launch_profiles SET transport = 'webtransport_opt_in', pyrowave_mode = 'prefer'`))
+	must(t, exec(t, f.pool, `UPDATE gpus SET codecs = '["h264","pyrowave"]' WHERE host_id = $1::uuid`, f.hostID))
+	must(t, exec(t, f.pool, `UPDATE user_devices SET capabilities = capabilities ||
+		'{"webgpu":{"available":true},"bandwidth_kbps":900000,"rtt_ms":2}' WHERE id = $1::uuid`, f.deviceID))
 }
 
 func TestParkOnExitReleasesWhenARuleSaysNo(t *testing.T) {

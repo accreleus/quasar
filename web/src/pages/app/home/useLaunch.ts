@@ -23,6 +23,7 @@ import {
   closingToastCopy,
   decideCapacityRetry,
   isCapacityRetryable,
+  STEAM_RESTARTING,
   waitingToastCopy,
 } from "../capacityRetry";
 import { isRecommendationEligible } from "../launchOptions";
@@ -280,23 +281,31 @@ export function useLaunch({
             }
             if (decision.kind === "retry") {
               if (!mountedRef.current) return;
-              setWaitingForSlot(true);
-              setWaitingReason(reason);
-              // Replace a showing toast if the reason changed since it was
-              // raised — otherwise a no_host_available→capacity_exhausted (or
-              // reverse) flip leaves stale copy up for the rest of the wait.
-              if (waitingToastId !== null && waitingToastReason !== reason) {
-                removeToast(waitingToastId);
-                waitingToastId = null;
-              }
-              if (waitingToastId === null) {
-                waitingToastId = addToast({
-                  variant: "info",
-                  ...(closingName !== null
-                    ? closingToastCopy(closingName, app.name)
-                    : waitingToastCopy(reason as "slot" | "host", app.name, streamCodec)),
-                });
-                waitingToastReason = reason;
+              if (err instanceof ApiError && err.reason === STEAM_RESTARTING) {
+                // Not a wait for capacity: the parked Steam is restarting, so the launch just
+                // takes a few seconds longer. Stay in the ordinary "Launching…" state (#1163).
+                dismissWaitingToast();
+                setWaitingForSlot(false);
+                setWaitingReason(null);
+              } else {
+                setWaitingForSlot(true);
+                setWaitingReason(reason);
+                // Replace a showing toast if the reason changed since it was
+                // raised — otherwise a no_host_available→capacity_exhausted (or
+                // reverse) flip leaves stale copy up for the rest of the wait.
+                if (waitingToastId !== null && waitingToastReason !== reason) {
+                  removeToast(waitingToastId);
+                  waitingToastId = null;
+                }
+                if (waitingToastId === null) {
+                  waitingToastId = addToast({
+                    variant: "info",
+                    ...(closingName !== null
+                      ? closingToastCopy(closingName, app.name)
+                      : waitingToastCopy(reason as "slot" | "host", app.name, streamCodec)),
+                  });
+                  waitingToastReason = reason;
+                }
               }
               try {
                 await abortableSleep(decision.delayMs, controller.signal, retryTimeoutRef);
