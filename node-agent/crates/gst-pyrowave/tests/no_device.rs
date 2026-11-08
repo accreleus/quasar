@@ -14,7 +14,7 @@ fn init() {
 }
 
 #[test]
-fn the_sink_pad_accepts_only_bt709_4_2_0_yuv() {
+fn the_sink_pad_accepts_only_bt709_4_2_0_yuv_and_vulkan_nv12() {
     init();
     let enc = gst::ElementFactory::make("pyrowaveenc").build().unwrap();
     let sink = enc.static_pad("sink").unwrap();
@@ -26,12 +26,17 @@ fn the_sink_pad_accepts_only_bt709_4_2_0_yuv() {
     assert!(accepts(&format!(
         "video/x-raw,format=NV12,{size},colorimetry=1:3:5:1"
     )));
+    // #1104: the compositor's NV12 images, encoded on their own device.
+    assert!(accepts(&format!(
+        "video/x-raw(memory:VulkanImage),format=NV12,{size},colorimetry=bt709"
+    )));
     for refused in [
         format!("video/x-raw,format=Y444,{size},colorimetry=bt709"),
         format!("video/x-raw,format=RGBA,{size},colorimetry=bt709"),
         format!("video/x-raw,format=I420_10LE,{size},colorimetry=bt709"),
         format!("video/x-raw,format=I420,{size},colorimetry=bt601"),
-        format!("video/x-raw(memory:VulkanImage),format=NV12,{size},colorimetry=bt709"),
+        format!("video/x-raw(memory:VulkanImage),format=I420,{size},colorimetry=bt709"),
+        format!("video/x-raw(memory:VulkanImage),format=NV12,{size},colorimetry=bt601"),
     ] {
         assert!(!accepts(&refused), "{refused}");
     }

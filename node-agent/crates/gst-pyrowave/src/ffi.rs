@@ -1,12 +1,15 @@
 //! The few PyroWave C API calls Quasar uses (`pyrowave/pyrowave.h` at the pin in
 //! `docs/third-party-pins.md`), loaded at run time so a build without the library works.
 
+use std::collections::HashMap;
 use std::ffi::{c_int, c_void, CStr};
 use std::path::Path;
 use std::ptr::{self, NonNull};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use ash::vk;
+
+use crate::gpu::{self, Shared};
 
 const SONAME: &CStr = c"libpyrowave-shared.so.1";
 /// The pin's API version. The structs below mirror pyrowave.h by hand, so a library with
@@ -45,6 +48,28 @@ struct CpuBuffer {
     format: c_int,
 }
 
+/// `pyrowave_image_view`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ImageView {
+    image: vk::Image,
+    width: u32,
+    height: u32,
+    image_format: vk::Format,
+    view_format: vk::Format,
+    mip_level: u32,
+    layer: u32,
+    aspect: vk::ImageAspectFlags,
+    swizzle: vk::ComponentSwizzle,
+    layout: vk::ImageLayout,
+}
+
+/// `pyrowave_gpu_buffers`: Y, Cb, Cr.
+#[repr(C)]
+struct GpuBuffers {
+    planes: [ImageView; 3],
+}
+
 #[repr(C)]
 struct RateControl {
     maximum_bitstream_size: usize,
@@ -62,6 +87,8 @@ type Raw = *mut c_void;
 struct Api {
     get_api_version: unsafe extern "C" fn(*mut u32, *mut u32, *mut u32),
     create_default_device: unsafe extern "C" fn(*mut Raw) -> c_int,
+    create_device: unsafe extern "C" fn(*const gpu::DeviceCreateInfo, *mut Raw) -> c_int,
+    device_set_command_buffer: unsafe extern "C" fn(Raw, vk::CommandBuffer),
     create_device_by_compat: unsafe extern "C" fn(
         u32,
         u32,
@@ -74,6 +101,13 @@ struct Api {
     device_destroy: unsafe extern "C" fn(Raw),
     encoder_create: unsafe extern "C" fn(*const EncoderCreateInfo, *mut Raw) -> c_int,
     encoder_encode_cpu: unsafe extern "C" fn(Raw, *const CpuBuffer, *const RateControl) -> c_int,
+    encoder_encode_gpu: unsafe extern "C" fn(
+        Raw,
+        *const c_void,
+        *const c_void,
+        *const GpuBuffers,
+        *const RateControl,
+    ) -> c_int,
     encoder_compute_num_packets: unsafe extern "C" fn(Raw, usize, *mut usize) -> c_int,
     encoder_packetize:
         unsafe extern "C" fn(Raw, *mut Packet, usize, *mut usize, *mut c_void, usize) -> c_int,
@@ -111,10 +145,13 @@ fn load() -> Result<Api, String> {
         let api = Api {
             get_api_version: sym!("pyrowave_get_api_version"),
             create_default_device: sym!("pyrowave_create_default_device"),
+            create_device: sym!("pyrowave_create_device"),
+            device_set_command_buffer: sym!("pyrowave_device_set_command_buffer"),
             create_device_by_compat: sym!("pyrowave_create_device_by_compat"),
             device_destroy: sym!("pyrowave_device_destroy"),
             encoder_create: sym!("pyrowave_encoder_create"),
             encoder_encode_cpu: sym!("pyrowave_encoder_encode_cpu"),
+            encoder_encode_gpu: sym!("pyrowave_encoder_encode_gpu"),
             encoder_compute_num_packets: sym!("pyrowave_encoder_compute_num_packets"),
             encoder_packetize: sym!("pyrowave_encoder_packetize"),
             encoder_destroy: sym!("pyrowave_encoder_destroy"),
@@ -200,8 +237,13 @@ fn device_lock() -> std::sync::MutexGuard<'static, ()> {
     DEVICE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A PyroWave Vulkan device: PyroWave's own VkDevice on the chosen GPU.
-pub struct Device(NonNull<c_void>);
+/// A PyroWave Vulkan device: PyroWave's own VkDevice on the chosen GPU, or a borrowed
+/// GStreamer one (`shared`).
+pub struct Device {
+    raw: NonNull<c_void>,
+    /// Declared after `raw`: dropped once PyroWave's device is destroyed.
+    shared: Option<Shared>,
+}
 
 // SAFETY: create and destroy, and those of every encoder and decoder on it, run under
 // DEVICE_LOCK; between them the handle is only passed to those creations. Nothing more is
@@ -238,8 +280,33 @@ impl Device {
             }
         }
         NonNull::new(raw)
-            .map(|p| Arc::new(Device(p)))
+            .map(|raw| Arc::new(Device { raw, shared: None }))
             .ok_or_else(|| "pyrowave returned no device".into())
+    }
+
+    /// PyroWave on the `GstVulkanDevice` `frame`'s images belong to: no instance or device
+    /// of its own (#1104). Fails, with the reason, where that device lacks what PyroWave needs.
+    pub fn share(frame: &gpu::Frame) -> Result<Arc<Device>, String> {
+        let api = api()?;
+        let shared = Shared::new(frame.device)?;
+        let _lock = device_lock();
+        let mut raw = ptr::null_mut();
+        check("pyrowave_create_device", unsafe {
+            (api.create_device)(shared.device_create_info(), &mut raw)
+        })?;
+        NonNull::new(raw)
+            .map(|raw| {
+                Arc::new(Device {
+                    raw,
+                    shared: Some(shared),
+                })
+            })
+            .ok_or_else(|| "pyrowave returned no device".into())
+    }
+
+    /// The `GstVulkanDevice` a shared device borrows, as an identity.
+    pub fn shared_key(&self) -> Option<usize> {
+        self.shared.as_ref().map(Shared::device_key)
     }
 }
 
@@ -247,7 +314,7 @@ impl Drop for Device {
     fn drop(&mut self) {
         if let Ok(api) = api() {
             let _lock = device_lock();
-            unsafe { (api.device_destroy)(self.0.as_ptr()) }
+            unsafe { (api.device_destroy)(self.raw.as_ptr()) }
         }
     }
 }
@@ -300,9 +367,22 @@ fn pick_uuid(devices: &[VkGpu], minor: u32) -> Result<[u8; 16], String> {
 }
 
 /// `VkPhysicalDeviceIDProperties::deviceUUID` of the Vulkan device on render minor `minor`,
-/// matched through `VK_EXT_physical_device_drm`. Instance-level calls only: never
-/// `ash::Device::load` (the #267 loader race, `.claude/rules/gstreamer-gotchas.md`).
+/// looked up once per minor: each lookup is a Vulkan instance of its own.
 fn device_uuid(minor: u32) -> Result<[u8; 16], String> {
+    static CACHE: Mutex<Option<HashMap<u32, [u8; 16]>>> = Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(uuid) = cache.get_or_insert_with(HashMap::new).get(&minor) {
+        return Ok(*uuid);
+    }
+    let uuid = lookup_device_uuid(minor)?;
+    cache.get_or_insert_with(HashMap::new).insert(minor, uuid);
+    Ok(uuid)
+}
+
+/// [`device_uuid`] uncached, matched through `VK_EXT_physical_device_drm`. Instance-level
+/// calls only: never `ash::Device::load` (the #267 loader race,
+/// `.claude/rules/gstreamer-gotchas.md`).
+fn lookup_device_uuid(minor: u32) -> Result<[u8; 16], String> {
     let entry = unsafe { ash::Entry::load() }.map_err(|e| format!("Vulkan loader: {e}"))?;
     let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
     let instance = unsafe {
@@ -417,7 +497,7 @@ impl Encoder {
     pub fn new(device: Arc<Device>, width: u32, height: u32) -> Result<Encoder, String> {
         let api = api()?;
         let info = EncoderCreateInfo {
-            device: device.0.as_ptr(),
+            device: device.raw.as_ptr(),
             width: width as c_int,
             height: height as c_int,
             chroma: CHROMA_420,
@@ -458,6 +538,99 @@ impl Encoder {
         check("pyrowave_encoder_encode_cpu", unsafe {
             (api.encoder_encode_cpu)(raw, &buf, &rc)
         })?;
+        self.packetize(out)
+    }
+
+    pub fn device(&self) -> &Arc<Device> {
+        &self._device
+    }
+
+    /// As [`Encoder::encode`], from Vulkan images on the device this encoder's (shared)
+    /// device borrows: no copy through system memory.
+    pub fn encode_gpu(
+        &mut self,
+        frame: &gpu::Frame,
+        budget: usize,
+        out: &mut [u8],
+    ) -> Result<usize, String> {
+        let api = api()?;
+        let device = &self._device;
+        let shared = device
+            .shared
+            .as_ref()
+            .ok_or("Vulkan input on a device of PyroWave's own")?;
+        if shared.device_key() != frame.device_key() {
+            return Err("the frame is on another Vulkan device".into());
+        }
+        let size = (self.width, self.height);
+        let view = |p: &gpu::Plane, view_format, aspect, swizzle| ImageView {
+            image: p.image,
+            // pyrowave.h: a plane view of a 2-plane image gives the luma size.
+            width: if frame.planes.len() == 1 {
+                size.0
+            } else {
+                p.extent.width
+            },
+            height: if frame.planes.len() == 1 {
+                size.1
+            } else {
+                p.extent.height
+            },
+            image_format: p.format,
+            view_format,
+            mip_level: 0,
+            layer: 0,
+            aspect,
+            swizzle,
+            layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        };
+        let (y, c, aspects) = match frame.planes.as_slice() {
+            [p] => (
+                p,
+                p,
+                [vk::ImageAspectFlags::PLANE_0, vk::ImageAspectFlags::PLANE_1],
+            ),
+            [y, c] => (y, c, [vk::ImageAspectFlags::COLOR; 2]),
+            _ => return Err(format!("{} planes, need 1 or 2", frame.planes.len())),
+        };
+        // pyrowave.h: NV12 passes the CbCr plane twice, with swizzles picking Cb and Cr.
+        let identity = vk::ComponentSwizzle::IDENTITY;
+        let buffers = GpuBuffers {
+            planes: [
+                view(y, vk::Format::R8_UNORM, aspects[0], identity),
+                view(
+                    c,
+                    vk::Format::R8G8_UNORM,
+                    aspects[1],
+                    vk::ComponentSwizzle::R,
+                ),
+                view(
+                    c,
+                    vk::Format::R8G8_UNORM,
+                    aspects[1],
+                    vk::ComponentSwizzle::G,
+                ),
+            ],
+        };
+        let rc = RateControl {
+            maximum_bitstream_size: budget,
+        };
+        let (raw, pw_device) = (self.raw.as_ptr(), device.raw.as_ptr());
+        shared.submit(&frame.planes, |cmd| unsafe {
+            (api.device_set_command_buffer)(pw_device, cmd);
+            let r = check("pyrowave_encoder_encode_gpu", {
+                (api.encoder_encode_gpu)(raw, ptr::null(), ptr::null(), &buffers, &rc)
+            });
+            (api.device_set_command_buffer)(pw_device, vk::CommandBuffer::null());
+            r
+        })?;
+        self.packetize(out)
+    }
+
+    /// The last encoded frame into `out`: its length, the SOF then the blocks.
+    fn packetize(&mut self, out: &mut [u8]) -> Result<usize, String> {
+        let api = api()?;
+        let raw = self.raw.as_ptr();
         // One packet as large as the buffer: the whole frame, contiguous. Datagram
         // packing (codec-pyrowave.md §Packing) is the transport's.
         let mut count = 0;
@@ -515,7 +688,7 @@ impl Decoder {
     pub fn new(device: Arc<Device>, width: u32, height: u32) -> Result<Decoder, String> {
         let api = api()?;
         let info = DecoderCreateInfo {
-            device: device.0.as_ptr(),
+            device: device.raw.as_ptr(),
             width: width as c_int,
             height: height as c_int,
             chroma: CHROMA_420,

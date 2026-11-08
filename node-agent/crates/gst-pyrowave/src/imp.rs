@@ -12,6 +12,8 @@ use gstreamer_video::subclass::prelude::*;
 
 use crate::ffi::{Device, Encoder, Picture, BITSTREAM_SLACK};
 
+const VULKAN_IMAGE: &str = "memory:VulkanImage";
+
 static CAT: LazyLock<gst::DebugCategory> = LazyLock::new(|| {
     gst::DebugCategory::new(
         "pyrowaveenc",
@@ -29,9 +31,13 @@ struct Settings {
 }
 
 struct State {
-    device: Arc<Device>,
+    /// PyroWave's own device, for system-memory input. Opened at start unless upstream may
+    /// send Vulkan images, so a Vulkan-fed element never makes an instance of its own.
+    device: Option<Arc<Device>>,
+    /// Made on the first frame from its images' device when the input is Vulkan.
     encoder: Option<Encoder>,
     info: Option<gst_video::VideoInfo>,
+    vulkan: bool,
 }
 
 pub struct PyroWaveEnc {
@@ -125,9 +131,13 @@ impl ElementImpl for PyroWaveEnc {
             // BT.709 only, limited or full range: PyroWave has no BT.601 matrix
             // (codec-pyrowave.md §hello_ack), so upstream converts to this. No chroma-site
             // here: a template naming it refuses every upstream that leaves it unset;
-            // set_format refuses a non-centre one instead.
+            // set_format refuses a non-centre one instead. Vulkan images are NV12 only.
             let sink = gst::Caps::from_str(
                 "video/x-raw, format=(string){ I420, NV12 }, \
+                 width=(int)[ 2, 16384 ], height=(int)[ 2, 16384 ], \
+                 framerate=(fraction)[ 0/1, 2147483647/1 ], \
+                 colorimetry=(string){ bt709, 1:3:5:1 }; \
+                 video/x-raw(memory:VulkanImage), format=(string)NV12, \
                  width=(int)[ 2, 16384 ], height=(int)[ 2, 16384 ], \
                  framerate=(fraction)[ 0/1, 2147483647/1 ], \
                  colorimetry=(string){ bt709, 1:3:5:1 }",
@@ -161,6 +171,21 @@ impl ElementImpl for PyroWaveEnc {
 }
 
 impl PyroWaveEnc {
+    fn open_device(&self) -> Result<Arc<Device>, String> {
+        let node = self.settings.lock().unwrap().device.clone();
+        Device::open(node.as_deref().map(Path::new)).map_err(|e| format!("PyroWave device: {e}"))
+    }
+
+    /// Upstream may send `memory:VulkanImage` (or has not said what it sends).
+    fn vulkan_upstream(&self) -> bool {
+        let vulkan = gst::Caps::builder("video/x-raw")
+            .features([VULKAN_IMAGE])
+            .build();
+        self.obj()
+            .static_pad("sink")
+            .is_some_and(|pad| pad.peer_query_caps(None).can_intersect(&vulkan))
+    }
+
     /// A `set_format` refusal, on the bus as well: a LoggableError alone reaches only the
     /// debug log, and the bus would then carry only upstream's "not-negotiated".
     fn refuse(
@@ -175,13 +200,19 @@ impl PyroWaveEnc {
 
 impl VideoEncoderImpl for PyroWaveEnc {
     fn start(&self) -> Result<(), gst::ErrorMessage> {
-        let node = self.settings.lock().unwrap().device.clone();
-        let device = Device::open(node.as_deref().map(Path::new))
-            .map_err(|e| gst::error_msg!(gst::LibraryError::Init, ["PyroWave device: {e}"]))?;
+        let device = if self.vulkan_upstream() {
+            None
+        } else {
+            let device = self
+                .open_device()
+                .map_err(|e| gst::error_msg!(gst::LibraryError::Init, ["{e}"]))?;
+            Some(device)
+        };
         *self.state.lock().unwrap() = Some(State {
             device,
             encoder: None,
             info: None,
+            vulkan: false,
         });
         Ok(())
     }
@@ -202,16 +233,28 @@ impl VideoEncoderImpl for PyroWaveEnc {
             .ok_or_else(|| negotiation(&"input state without caps"))?;
         let info = crate::check_input(caps).map_err(|e| negotiation(&e))?;
         let (w, h) = (info.width(), info.height());
+        let vulkan = caps.features(0).is_some_and(|f| f.contains(VULKAN_IMAGE));
         let mut guard = self.state.lock().unwrap();
         let state = guard
             .as_mut()
             .ok_or_else(|| negotiation(&"caps before start"))?;
         state.encoder = None;
-        // The ffi text carries ffi::RESOURCE_TAG on a memory shortage, so the probe can
-        // tell an out-of-memory here (device memory at 4K) from a refusal.
-        let encoder = Encoder::new(state.device.clone(), w, h)
-            .map_err(|e| self.refuse(gst::LibraryError::Init, &format!("PyroWave encoder: {e}")))?;
-        state.encoder = Some(encoder);
+        state.vulkan = vulkan;
+        if !vulkan {
+            if state.device.is_none() {
+                let device = self
+                    .open_device()
+                    .map_err(|e| self.refuse(gst::LibraryError::Init, &e))?;
+                state.device = Some(device);
+            }
+            let device = state.device.clone().expect("opened above");
+            // The ffi text carries ffi::RESOURCE_TAG on a memory shortage, so the probe can
+            // tell an out-of-memory here (device memory at 4K) from a refusal.
+            let encoder = Encoder::new(device, w, h).map_err(|e| {
+                self.refuse(gst::LibraryError::Init, &format!("PyroWave encoder: {e}"))
+            })?;
+            state.encoder = Some(encoder);
+        }
         state.info = Some(info);
         drop(guard);
 
@@ -229,20 +272,38 @@ impl VideoEncoderImpl for PyroWaveEnc {
 
     fn handle_frame(
         &self,
-        mut frame: gst_video::VideoCodecFrame,
+        frame: gst_video::VideoCodecFrame,
     ) -> Result<gst::FlowSuccess, gst::FlowError> {
         let kbps = self.settings.lock().unwrap().bitrate_kbps;
         let mut guard = self.state.lock().unwrap();
-        let State { encoder, info, .. } = guard.as_mut().ok_or(gst::FlowError::Flushing)?;
-        let (Some(encoder), Some(info)) = (encoder.as_mut(), info.as_ref()) else {
+        let state = guard.as_mut().ok_or(gst::FlowError::Flushing)?;
+        let Some(info) = state.info.clone() else {
             return Err(gst::FlowError::NotNegotiated);
         };
         let fps = info.fps();
         let raw = info.width() as usize * info.height() as usize * 3 / 2;
         let budget = crate::frame_budget(kbps, fps.numer(), fps.denom(), raw);
         let full_range = info.colorimetry().range() == gst_video::VideoColorRange::Range0_255;
-
         let input = frame.input_buffer().ok_or(gst::FlowError::Error)?;
+        let mut out =
+            gst::Buffer::with_size(budget + BITSTREAM_SLACK).map_err(|_| gst::FlowError::Error)?;
+
+        if state.vulkan {
+            let encoded = {
+                let out = out.get_mut().unwrap();
+                let mut map = out.map_writable().map_err(|_| gst::FlowError::Error)?;
+                self.encode_vulkan(state, input, &info, budget, &mut map)
+                    .and_then(|len| {
+                        crate::write_sof_colour(&mut map[..len], full_range).map(|_| len)
+                    })
+            };
+            drop(guard);
+            return self.finish(frame, out, encoded);
+        }
+        let Some(encoder) = state.encoder.as_mut() else {
+            return Err(gst::FlowError::NotNegotiated);
+        };
+        let info = &info;
         let vframe = gst_video::VideoFrameRef::from_buffer_ref_readable(input, info)
             .map_err(|_| gst::FlowError::Error)?;
         let nv12 = info.format() == gst_video::VideoFormat::Nv12;
@@ -263,8 +324,6 @@ impl VideoEncoderImpl for PyroWaveEnc {
             strides: [stride(0), stride(1), stride(2)],
         };
 
-        let mut out =
-            gst::Buffer::with_size(budget + BITSTREAM_SLACK).map_err(|_| gst::FlowError::Error)?;
         let encoded = {
             let out = out.get_mut().unwrap();
             let mut map = out.map_writable().map_err(|_| gst::FlowError::Error)?;
@@ -274,6 +333,48 @@ impl VideoEncoderImpl for PyroWaveEnc {
         };
         drop(vframe);
         drop(guard);
+        self.finish(frame, out, encoded)
+    }
+}
+
+impl PyroWaveEnc {
+    /// Encode a `memory:VulkanImage` frame on its images' device, making (or remaking, when
+    /// the device changes) the shared device and encoder first.
+    fn encode_vulkan(
+        &self,
+        state: &mut State,
+        input: &gst::BufferRef,
+        info: &gst_video::VideoInfo,
+        budget: usize,
+        out: &mut [u8],
+    ) -> Result<usize, String> {
+        let (w, h) = (info.width(), info.height());
+        let frame = crate::gpu::frame(input, w, h)?;
+        let current = state.encoder.as_ref().and_then(|e| e.device().shared_key());
+        if current != Some(frame.device_key()) {
+            state.encoder = None;
+            let device = Device::share(&frame)
+                .map_err(|e| format!("PyroWave on the frames' Vulkan device: {e}"))?;
+            gst::info!(
+                CAT,
+                imp = self,
+                "encoding on the upstream Vulkan device, no copy"
+            );
+            state.encoder = Some(Encoder::new(device, w, h).map_err(|e| format!("encoder: {e}"))?);
+        }
+        state
+            .encoder
+            .as_mut()
+            .expect("made above")
+            .encode_gpu(&frame, budget, out)
+    }
+
+    fn finish(
+        &self,
+        mut frame: gst_video::VideoCodecFrame,
+        mut out: gst::Buffer,
+        encoded: Result<usize, String>,
+    ) -> Result<gst::FlowSuccess, gst::FlowError> {
         let len = encoded.map_err(|e| {
             gst::element_imp_error!(self, gst::StreamError::Encode, ["PyroWave encode: {e}"]);
             gst::FlowError::Error
