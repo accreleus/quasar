@@ -1531,7 +1531,7 @@ pub(crate) struct SessionTransports {
     negotiation: [Negotiation; 2],
     budget: [ReplacementBudget; 2],
     /// The session's WebTransport client, beside its WebRTC fallback (amendment 54).
-    _webtransport: Option<crate::webtransport::Tap>,
+    webtransport: Option<crate::webtransport::Tap>,
 }
 
 impl pipeline::Transport for SessionTransports {
@@ -1551,7 +1551,7 @@ impl pipeline::Transport for SessionTransports {
         let (audio_webrtc, audio_pipeline) = slot.build_audio()?;
         let video = slot.attach_video(false, None)?;
         let mut transports = Self::new(slot, video, audio_webrtc, audio_pipeline);
-        transports._webtransport = webtransport;
+        transports.webtransport = webtransport;
         Ok(transports)
     }
 
@@ -1583,7 +1583,7 @@ impl SessionTransports {
                 ReplacementBudget::new(MAX_REPLACEMENTS_PER_WINDOW),
                 ReplacementBudget::new(MAX_REPLACEMENTS_PER_WINDOW),
             ],
-            _webtransport: None,
+            webtransport: None,
         }
     }
 
@@ -1961,6 +1961,23 @@ fn idle_reap_reason(
         Some(d) if d >= window => Some("idle: WebRTC transport lost"),
         _ => None,
     }
+}
+
+/// The session's media client this tick, for the idle reap: `Some(true)` connected,
+/// `Some(false)` gone, `None` still connecting. A WebTransport client counts while it is
+/// attached; it is detached once its connection closes or goes silent
+/// (`transport-webtransport.md` §Bye and error). A session that streamed only on
+/// WebTransport never had a WebRTC peer, so its ICE stays `New` after that client leaves.
+fn client_link(
+    ice: gstreamer_webrtc::WebRTCICEConnectionState,
+    wt_attached: bool,
+    ever_connected: bool,
+) -> Option<bool> {
+    use gstreamer_webrtc::WebRTCICEConnectionState as S;
+    if wt_attached || ice_is_connected(ice) {
+        return Some(true);
+    }
+    (ice_is_dead(ice) || (ever_connected && ice == S::New)).then_some(false)
 }
 
 /// Was `msg` posted by an element that is still in `pipeline`?
@@ -2436,7 +2453,7 @@ fn rebuild_encode(
     if let Some((step, why)) = rebuild_refused(
         cfg.encoder,
         next.encoder,
-        old_transports._webtransport.is_some(),
+        old_transports.webtransport.is_some(),
     ) {
         return Err(RestreamFailure::new(step, why));
     }
@@ -3792,7 +3809,7 @@ pub fn run_blocking(
             }
         }
 
-        // Idle reap: watch the live transport on the encode webrtcbin. A parked or held
+        // Idle reap: watch the media client on either transport. A parked or held
         // runtime has no viewer to wait for.
         let watched = held_since.is_none() && kind != Some(SessionKind::Parked);
         if let Some(since) = running_since.filter(|_| watched) {
@@ -3800,14 +3817,20 @@ pub fn run_blocking(
                 .video
                 .webrtc
                 .property::<gstreamer_webrtc::WebRTCICEConnectionState>("ice-connection-state");
-            if ice_is_connected(ice) {
-                ever_connected = true;
-                streamed = true;
-                unhealthy_since = None;
-            } else if ice_is_dead(ice) {
-                unhealthy_since.get_or_insert_with(Instant::now);
-            } else {
-                unhealthy_since = None;
+            let wt_attached = transports
+                .webtransport
+                .as_ref()
+                .is_some_and(|tap| tap.attached());
+            match client_link(ice, wt_attached, ever_connected) {
+                Some(true) => {
+                    ever_connected = true;
+                    streamed = true;
+                    unhealthy_since = None;
+                }
+                Some(false) => {
+                    unhealthy_since.get_or_insert_with(Instant::now);
+                }
+                None => unhealthy_since = None,
             }
             let reap_window = cfg.idle_timeout;
             // #484: charge the never-connected window from the app-presented instant, not
@@ -4661,12 +4684,13 @@ fn roll_back_stopped_app(
 #[cfg(test)]
 mod tests {
     use super::{
-        app_exit_event, audio_path_label, context_object_identity, effective_encoder_device_path,
-        fold_display_update, idle_reap_reason, is_sctp_association_error, mic_state_label,
-        running_report, stop_requested_for_transport_error, swap_source_ready,
-        validate_display_update, AppBootGate, AppBootStep, AppExitStatus, AudioPipelineGuard,
-        DiagnosticEventTx, DisplayUpdateRequest, Negotiation, SessionEvent, TraceEvent,
-        VulkanContextBridge, REASON_APP_EXITED_EARLY, VULKAN_DEVICE_CONTEXT,
+        app_exit_event, audio_path_label, client_link, context_object_identity,
+        effective_encoder_device_path, fold_display_update, idle_reap_reason,
+        is_sctp_association_error, mic_state_label, running_report,
+        stop_requested_for_transport_error, swap_source_ready, validate_display_update,
+        AppBootGate, AppBootStep, AppExitStatus, AudioPipelineGuard, DiagnosticEventTx,
+        DisplayUpdateRequest, Negotiation, SessionEvent, TraceEvent, VulkanContextBridge,
+        REASON_APP_EXITED_EARLY, VULKAN_DEVICE_CONTEXT,
     };
     use super::{
         in_place_plan, InPlaceAction, InPlaceStep, ProgressThrottle, SwapRequest,
@@ -5707,6 +5731,86 @@ mod tests {
             idle_reap_reason(WINDOW, Duration::from_secs(9999), true, Some(WINDOW), false)
                 .is_some()
         );
+    }
+
+    // ── #1179 the client on either transport ───────────────────────────────────
+    use gstreamer_webrtc::WebRTCICEConnectionState as Ice;
+
+    /// The runner's idle-reap bookkeeping over 1 s ticks of (ICE state, WebTransport client
+    /// attached): the second it reaps at, if any.
+    fn reaped_at(ticks: impl IntoIterator<Item = (Ice, bool)>) -> Option<u64> {
+        let (mut ever_connected, mut lost_since) = (false, None::<u64>);
+        for (t, (ice, wt_attached)) in (0u64..).zip(ticks) {
+            match client_link(ice, wt_attached, ever_connected) {
+                Some(true) => {
+                    ever_connected = true;
+                    lost_since = None;
+                }
+                Some(false) => {
+                    lost_since.get_or_insert(t);
+                }
+                None => lost_since = None,
+            }
+            let unhealthy_for = lost_since.map(|s| Duration::from_secs(t - s));
+            let running_for = Duration::from_secs(t);
+            if idle_reap_reason(WINDOW, running_for, ever_connected, unhealthy_for, false).is_some()
+            {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    fn secs(n: u64, tick: (Ice, bool)) -> impl Iterator<Item = (Ice, bool)> {
+        std::iter::repeat_n(tick, n as usize)
+    }
+
+    #[test]
+    fn a_streaming_webtransport_session_is_never_reaped() {
+        // Its WebRTC fallback is never answered, so ICE stays `New` for the whole session.
+        let ticks = secs(5, (Ice::New, false)).chain(secs(600, (Ice::New, true)));
+        assert_eq!(reaped_at(ticks), None);
+    }
+
+    #[test]
+    fn a_webtransport_client_that_never_attaches_is_reaped_after_the_window() {
+        assert_eq!(reaped_at(secs(600, (Ice::New, false))), Some(120));
+    }
+
+    #[test]
+    fn a_webtransport_client_that_leaves_is_reaped_a_window_later() {
+        let ticks = secs(300, (Ice::New, true)).chain(secs(600, (Ice::New, false)));
+        assert_eq!(reaped_at(ticks), Some(300 + 120));
+    }
+
+    #[test]
+    fn a_webtransport_reconnect_inside_the_window_keeps_the_session() {
+        let ticks = secs(300, (Ice::New, true))
+            .chain(secs(100, (Ice::New, false)))
+            .chain(secs(600, (Ice::New, true)));
+        assert_eq!(reaped_at(ticks), None);
+    }
+
+    #[test]
+    fn a_webtransport_client_that_falls_back_to_webrtc_keeps_the_session() {
+        let ticks = secs(300, (Ice::New, true))
+            .chain(secs(10, (Ice::New, false)))
+            .chain(secs(5, (Ice::Checking, false)))
+            .chain(secs(600, (Ice::Connected, false)));
+        assert_eq!(reaped_at(ticks), None);
+    }
+
+    #[test]
+    fn webrtc_links_read_as_before() {
+        assert_eq!(client_link(Ice::Connected, false, false), Some(true));
+        assert_eq!(client_link(Ice::Completed, false, true), Some(true));
+        assert_eq!(client_link(Ice::Disconnected, false, true), Some(false));
+        assert_eq!(client_link(Ice::Failed, false, false), Some(false));
+        assert_eq!(client_link(Ice::New, false, false), None);
+        // An ICE restart after a connection gets a fresh clock, as it always did.
+        assert_eq!(client_link(Ice::Checking, false, true), None);
+        // A WebTransport client attached is connected whatever ICE says.
+        assert_eq!(client_link(Ice::Failed, true, true), Some(true));
     }
 
     // ── #484 app-boot visibility ──────────────────────────────────────────────
