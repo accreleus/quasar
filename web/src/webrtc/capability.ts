@@ -53,7 +53,7 @@ export function getOrCreateDeviceKey(): string {
  * says no, so a changed verdict (plugin installed) is posted at once, not tomorrow (#688).
  * It holds the zone and language too: launches read them from the record (amendment 49).
  */
-const DEVICE_POST_STORAGE_KEY = "quasar_device_posted_v3";
+const DEVICE_POST_STORAGE_KEY = "quasar_device_posted_v4"; // v4: the probe gained `webgpu` (#1189)
 const DEVICE_POST_TTL_MS = 24 * 60 * 60 * 1000;
 
 export function deviceProbeIsFresh(userId: string, h264: boolean, now: number = Date.now()): boolean {
@@ -196,6 +196,43 @@ export function probeH264Decodable(): Promise<boolean> {
 export function probeWebTransport(): { available: boolean; datagrams: boolean } {
   const available = typeof WebTransport === "function";
   return { available, datagrams: available && "datagrams" in WebTransport.prototype };
+}
+
+let webGpuProbe: Promise<{ available: boolean; features: string[] }> | undefined;
+
+// requestAdapter normally answers in milliseconds; this only bounds a browser that never does.
+const WEBGPU_ADAPTER_TIMEOUT_MS = 1500;
+
+/** The features the PyroWave decoder uses when present (`pyroWaveDeviceFeatures`); it needs neither. */
+const WEBGPU_REPORTED_FEATURES = ["subgroups", "shader-f16"];
+
+/**
+ * Amendment 54/55's `webgpu` key: `available` is true when `navigator.gpu.requestAdapter()`
+ * resolves to an adapter, `features` lists which of the decoder's optional features it has.
+ * Never throws or hangs: no `navigator.gpu`, a null adapter, a rejection or a timeout all
+ * report `{available: false, features: []}`. Once per page, like the H.264 verdict.
+ */
+export function probeWebGpu(): Promise<{ available: boolean; features: string[] }> {
+  webGpuProbe ??= (async () => {
+    const none = { available: false, features: [] };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      if (typeof navigator === "undefined" || !navigator.gpu) return none;
+      const adapter = await Promise.race([
+        navigator.gpu.requestAdapter(),
+        new Promise<null>((resolve) => {
+          timer = setTimeout(() => resolve(null), WEBGPU_ADAPTER_TIMEOUT_MS);
+        }),
+      ]);
+      if (!adapter) return none;
+      return { available: true, features: WEBGPU_REPORTED_FEATURES.filter((f) => adapter.features.has(f)) };
+    } catch {
+      return none;
+    } finally {
+      clearTimeout(timer);
+    }
+  })();
+  return webGpuProbe;
 }
 
 /** Amendment 54's `webcodecs` key, for the configurations the WebTransport path uses.
@@ -565,6 +602,8 @@ export interface DeviceCapabilities {
   /** Amendment 54. */
   webtransport?: { available: boolean; datagrams: boolean };
   webcodecs?: { h264: boolean; opus_decode: boolean };
+  /** Amendment 55: `available` gates PyroWave. */
+  webgpu?: { available: boolean; features: string[] };
   /** Amendment 49: the browser's zone and language, read at launch. */
   timezone?: string;
   language?: string;
@@ -662,13 +701,14 @@ export interface NativeCapabilities extends Omit<DeviceCapabilities, "client_typ
 
 /** All measurements are best-effort; null values are valid (JSONB column). */
 export async function probeCapabilities(): Promise<DeviceCapabilities> {
-  const [h264Decodable, rttMs, bandwidthKbps, display, codecsDetail, webcodecs] = await Promise.all([
+  const [h264Decodable, rttMs, bandwidthKbps, display, codecsDetail, webcodecs, webgpu] = await Promise.all([
     probeH264Decodable(),
     probeRttMs(),
     probeBandwidthKbps(),
     probeDisplay(),
     probeCodecsDetail(),
     probeWebCodecs(),
+    probeWebGpu(),
   ]);
 
   return {
@@ -687,6 +727,7 @@ export async function probeCapabilities(): Promise<DeviceCapabilities> {
     rtt_ms:            rttMs,
     webtransport:      probeWebTransport(),
     webcodecs,
+    webgpu,
     ...probeRegion(),
   };
 }
