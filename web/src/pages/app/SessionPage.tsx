@@ -32,6 +32,8 @@ import {
   type SessionRuntimeSnapshot,
 } from "./sessionRuntime";
 import { createWebTransportRuntime } from "./webTransportRuntime";
+import { TraceEventEmitter } from "../../webrtc/traceEvents";
+import { rememberedFallback, rememberFallback } from "../../webtransport/fallback";
 import { MicCapture, MicCaptureError, withUntrustedCertContext } from "../../webrtc/mic";
 import { probeCertificateTrust, type CertTrust } from "../../lib/certTrust";
 import { useToast } from "../../components/Toast";
@@ -72,6 +74,8 @@ import { reportBestEffortFailure } from "../../lib/reportBestEffortFailure";
 import { useScreenWakeLock } from "../../lib/screenWakeLock";
 import { useDarkLock } from "../../settings/ThemeContext";
 import { percentileFraction, recommendation } from "./sessionSummary";
+
+const SWITCHING_STATUS = "Switching to WebRTC…";
 
 /**
  * Stream size out of the tier string ("1920×1080@60" → {w:1920,h:1080}).
@@ -144,7 +148,13 @@ function SessionPageBody() {
   const videoRef = useRef<HTMLVideoElement>(null);
   // WebTransport draws here; the <video> stays mounted and empty.
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const webtransport = state?.webtransport;
+  // Set when WebTransport gave up and the session carries on over WebRTC.
+  // A reload of a session that already fell back goes straight to WebRTC.
+  const [remembered] = useState(() => rememberedFallback(sessionId));
+  const [fallbackReason, setFallbackReason] = useState<string | null>(remembered);
+  // The status line from the moment WebTransport gives up until WebRTC's signaling is open.
+  const [switching, setSwitching] = useState(false);
+  const webtransport = fallbackReason ? undefined : state?.webtransport;
   const containerRef = useRef<HTMLDivElement>(null);
   // The HUD owns whether it is open and on which section; this page only asks
   // it to open (summon chord, stage click, touch button) and to collapse.
@@ -161,8 +171,10 @@ function SessionPageBody() {
   const telemetrySubsRef = useRef<Set<(snap: TelemetrySnapshot) => void>>(new Set());
 
   const [signalCoords, setSignalCoords] = useState(() => ({
-    url: state?.signalingUrl ?? "",
-    token: state?.signalingToken ?? "",
+    // Empty after a remembered fallback: the launch token was meant for WebTransport's fallback
+    // only once, so the resume path below mints a fresh one.
+    url: remembered ? "" : state?.signalingUrl ?? "",
+    token: remembered ? "" : state?.signalingToken ?? "",
     replacement: false,
     // #509 — kept in the same state object as its url/token so re-seating
     // coords can never leave a stale ICE list behind.
@@ -406,6 +418,26 @@ function SessionPageBody() {
     runtimeRef.current?.setMouse(mouse);
   }, [mouse]);
 
+  // The runtime has already closed WebTransport (control-api.md §Transport fallback, "Close first").
+  // The launch's signaling token may have expired, so a fresh one is minted.
+  const fallBackToWebRtc = async (reason: string) => {
+    setSwitching(true);
+    // Capture went with the WebTransport connection: ask for it again once WebRTC is up.
+    autoArmedRef.current = true;
+    rememberFallback(sessionId ?? "", reason);
+    new TraceEventEmitter(sessionId ?? "", authToken ?? "").emitTransportFallback(reason);
+    try {
+      const { signaling } = await mintSignalingToken(authToken ?? "", sessionId ?? "");
+      if (!signaling?.url || !signaling?.token) throw new Error("no signaling coordinates");
+      setFallbackReason(reason);
+      setSignalCoords({ url: signaling.url, token: signaling.token, replacement: true, iceServers: signaling.ice_servers ?? [] });
+    } catch (err) {
+      setSwitching(false);
+      noteFailure(unreachableFailure(err instanceof ApiError ? err.message : undefined));
+      void pollEndReason();
+    }
+  };
+
   useEffect(() => {
     if (!signalCoords.url || !signalCoords.token || !videoRef.current) return;
 
@@ -462,6 +494,7 @@ function SessionPageBody() {
             onSessionTakenOver: () => noteFailure(takenOverFailure()),
             // A poll verdict about the session's end outranks this one (settleFailure).
             onTransportFailed: (detail) => noteFailure(unreachableFailure(detail)),
+            onFallback: (reason) => void fallBackToWebRtc(reason),
           },
         })
       : createSessionRuntime({
@@ -498,7 +531,11 @@ function SessionPageBody() {
     const unsubscribeTelemetry = rt.registerTelemetry((snap) => {
       for (const fn of telemetrySubsRef.current) fn(snap);
     });
-    const unsubscribe = rt.subscribe(() => setRuntimeSnap(rt.getSnapshot()));
+    const unsubscribe = rt.subscribe(() => {
+      const snap = rt.getSnapshot();
+      setRuntimeSnap(snap);
+      if (snap.wsOpen || snap.recovery?.phase === "failed") setSwitching(false);
+    });
     rt.start();
     setRuntimeSnap(rt.getSnapshot());
 
@@ -913,8 +950,15 @@ function SessionPageBody() {
   const [immersive] = useState(launchImmersive);
   const autoArmedRef = useRef(immersive);
   const [clickToPlay, setClickToPlay] = useState(false);
+  // A WebTransport connection lost and rebuilt takes capture with it: arm again for the new one.
+  const wasOpenRef = useRef(false);
   useEffect(() => {
-    if (!autoArmedRef.current || !loaderInert || swapScreenUp || sessionOver) return;
+    if (webtransport && wasOpenRef.current && !channelOpen) autoArmedRef.current = true;
+    wasOpenRef.current = channelOpen;
+  }, [channelOpen, webtransport]);
+  useEffect(() => {
+    // A channel that is not open has nothing to capture for yet; stays armed.
+    if (!autoArmedRef.current || !loaderInert || !channelOpen || swapScreenUp || sessionOver) return;
     const rt = runtimeRef.current;
     if (!rt || !videoRef.current) return; // stays armed for the runtime to arrive
     autoArmedRef.current = false;
@@ -936,7 +980,7 @@ function SessionPageBody() {
       noteRawUnavailable(result);
       if (result.mode === "failed") setClickToPlay(true);
     });
-  }, [loaderInert, swapScreenUp, sessionOver, runtimeSnap, unmute, noteRawUnavailable]);
+  }, [loaderInert, channelOpen, swapScreenUp, sessionOver, runtimeSnap, unmute, noteRawUnavailable]);
   useEffect(() => {
     if (inputCaptured) setClickToPlay(false);
   }, [inputCaptured]);
@@ -1068,7 +1112,7 @@ function SessionPageBody() {
 
       {/* The launch/status line stays bottom-anchored and click-through. */}
       <div className="session-bottom-stack">
-        {!channelOpen && <div className="session-hint muted">{status}</div>}
+        {!channelOpen && <div className="session-hint muted">{switching ? SWITCHING_STATUS : status}</div>}
       </div>
 
       {/* Actionable notices: full-width at the top, stacked so two live ones
@@ -1179,6 +1223,7 @@ function SessionPageBody() {
       {!loaderDone && (
         <SessionLoader
           statusMsg={launchDetail ?? status}
+          notice={switching ? SWITCHING_STATUS : undefined}
           streaming={revealReady}
           appName={state?.appName}
           failure={launchFailure}
@@ -1198,6 +1243,7 @@ function SessionPageBody() {
           hostAssigned={hostAssigned}
           sessionRunning={sessionRunning}
           iceState={iceState}
+          transport={webtransport ? "webtransport" : "webrtc"}
           takeoverRefused={takeoverRefused}
           // handleStop tears the session down server-side so "Back to
           // library" from a dead launch never orphans a session. Not for a
@@ -1242,6 +1288,7 @@ function SessionPageBody() {
             tier={state?.tier}
             resolvedCodec={state?.resolvedCodec}
             transport={webtransport ? "webtransport" : "webrtc"}
+            transportFallbackReason={fallbackReason}
             sessionId={sessionId}
             inputCaptured={inputCaptured}
             onGrab={handleGrab}

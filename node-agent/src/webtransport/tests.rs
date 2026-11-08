@@ -57,7 +57,7 @@ fn ready_media() -> Arc<Media> {
 fn ready_media_with(input: Input) -> Arc<Media> {
     gst::init().unwrap();
     let encoder = gst::ElementFactory::make("identity").build().unwrap();
-    let media = Media::new(&encoder, input);
+    let media = Media::new(&encoder, input, Audio::new(audio::Plan::default()));
     let caps = gst::Caps::builder("video/x-h264")
         .field("stream-format", "avc")
         .field("width", 64)
@@ -138,6 +138,326 @@ fn a_token_is_single_use_lives_its_expiry_plus_15_s_and_never_crosses() {
     assert!(!registry.add_token("b", &token_hash("late"), at(60)));
 }
 
+/// Hand-made access units for the codecs the image has no encoder for. The tap and the
+/// framing read NAL and OBU headers only, never slice data.
+pub(super) mod streams {
+    use super::*;
+
+    pub(in crate::webtransport) fn hevc_caps(width: i32) -> gst::Caps {
+        // hvcC: profile 1 (Main), compat 0x60000000, level 93, 4-byte NAL lengths.
+        let mut hvcc = vec![0u8; 23];
+        hvcc[..2].copy_from_slice(&[1, 0x01]);
+        hvcc[2..6].copy_from_slice(&0x6000_0000u32.to_be_bytes());
+        hvcc[12] = 93;
+        hvcc[21] = 0x03;
+        gst::Caps::builder("video/x-h265")
+            .field("stream-format", "hvc1")
+            .field("alignment", "au")
+            .field("width", width)
+            .field("height", 360)
+            .field("framerate", gst::Fraction::new(30, 1))
+            .field("codec_data", gst::Buffer::from_slice(hvcc))
+            .build()
+    }
+
+    pub(in crate::webtransport) fn av1_caps(width: i32) -> gst::Caps {
+        gst::Caps::builder("video/x-av1")
+            .field("parsed", true)
+            .field("stream-format", "obu-stream")
+            .field("alignment", "tu")
+            .field("width", width)
+            .field("height", 360)
+            .field("framerate", gst::Fraction::new(30, 1))
+            .field(
+                "codec_data",
+                gst::Buffer::from_slice(vec![0x81, 0x08, 0x0c, 0]),
+            )
+            .build()
+    }
+
+    fn length_prefixed(nals: &[(u8, usize)]) -> Vec<u8> {
+        let mut au = Vec::new();
+        for &(header, len) in nals {
+            au.extend_from_slice(&(len as u32 + 2).to_be_bytes());
+            au.extend_from_slice(&[header << 1, 1]);
+            au.extend(std::iter::repeat_n(0x55, len));
+        }
+        au
+    }
+
+    /// An H.265 access unit: with `irap`, VPS, SPS, PPS and an IRAP slice of that NAL type
+    /// (19 IDR_W_RADL, 21 CRA), otherwise a TRAIL_R slice.
+    pub(in crate::webtransport) fn hevc_au(irap: Option<u8>, body: usize) -> Vec<u8> {
+        match irap {
+            Some(t) => length_prefixed(&[(32, 10), (33, 20), (34, 5), (t, body)]),
+            None => length_prefixed(&[(1, body)]),
+        }
+    }
+
+    fn obu(kind: u8, len: usize) -> Vec<u8> {
+        let mut o = vec![kind << 3 | 0x02];
+        let mut n = len;
+        loop {
+            let byte = (n & 0x7f) as u8;
+            n >>= 7;
+            o.push(if n > 0 { byte | 0x80 } else { byte });
+            if n == 0 {
+                break;
+            }
+        }
+        o.extend(std::iter::repeat_n(0x55, len));
+        o
+    }
+
+    /// An AV1 temporal unit as `av1parse` hands it on: temporal delimiter first, a sequence
+    /// header when `sequence_header`, then one frame OBU.
+    pub(in crate::webtransport) fn av1_tu(sequence_header: bool, body: usize) -> Vec<u8> {
+        let mut tu = obu(2, 0);
+        if sequence_header {
+            tu.extend(obu(1, 10));
+        }
+        tu.extend(obu(6, body));
+        tu
+    }
+
+    /// MSB-first bit writer with Exp-Golomb, for parameter sets a real parser accepts.
+    #[derive(Default)]
+    struct Bits {
+        bytes: Vec<u8>,
+        used: u8,
+    }
+
+    impl Bits {
+        fn u(&mut self, bits: u32, value: u64) -> &mut Self {
+            for i in (0..bits).rev() {
+                if self.used == 0 {
+                    self.bytes.push(0);
+                }
+                let last = self.bytes.len() - 1;
+                self.bytes[last] |= (((value >> i) & 1) as u8) << (7 - self.used);
+                self.used = (self.used + 1) % 8;
+            }
+            self
+        }
+
+        fn ue(&mut self, value: u64) -> &mut Self {
+            let v = value + 1;
+            let len = 64 - v.leading_zeros();
+            self.u(len - 1, 0).u(len, v)
+        }
+
+        fn se(&mut self, value: i64) -> &mut Self {
+            self.ue(if value > 0 {
+                value as u64 * 2 - 1
+            } else {
+                value.unsigned_abs() * 2
+            })
+        }
+
+        /// rbsp_trailing_bits, then emulation prevention, behind the 2-byte NAL header.
+        fn nal(&mut self, kind: u8) -> Vec<u8> {
+            self.u(1, 1);
+            while self.used != 0 {
+                self.u(1, 0);
+            }
+            let mut nal = vec![kind << 1, 1];
+            let mut zeros = 0;
+            for &b in &self.bytes {
+                if zeros >= 2 && b <= 3 {
+                    nal.push(3);
+                    zeros = 0;
+                }
+                zeros = if b == 0 { zeros + 1 } else { 0 };
+                nal.push(b);
+            }
+            nal
+        }
+    }
+
+    fn profile_tier_level(b: &mut Bits) {
+        // Main, compat bit 1 and 2, progressive, frame-only, level 93 (3.1).
+        b.u(2, 0)
+            .u(1, 0)
+            .u(5, 1)
+            .u(32, 0x6000_0000)
+            .u(1, 1)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 1);
+        b.u(32, 0).u(12, 0).u(8, 93);
+    }
+
+    /// An H.265 Annex-B access unit a real `h265parse` accepts: 64x64 Main, VPS, SPS, PPS, then
+    /// (`irap`) an IDR_W_RADL slice or a TRAIL_R slice with POC `poc`. The slice data is junk.
+    pub(in crate::webtransport) fn hevc_byte_stream(irap: bool, poc: u8) -> Vec<u8> {
+        let mut vps = Bits::default();
+        vps.u(4, 0)
+            .u(1, 1)
+            .u(1, 1)
+            .u(6, 0)
+            .u(3, 0)
+            .u(1, 1)
+            .u(16, 0xffff);
+        profile_tier_level(&mut vps);
+        vps.u(1, 1).ue(0).ue(0).ue(0).u(6, 0).ue(0).u(1, 0).u(1, 0);
+        let mut sps = Bits::default();
+        sps.u(4, 0).u(3, 0).u(1, 1);
+        profile_tier_level(&mut sps);
+        sps.ue(0).ue(1).ue(64).ue(64).u(1, 0).ue(0).ue(0).ue(4);
+        sps.u(1, 1).ue(0).ue(0).ue(0);
+        sps.ue(0).ue(3).ue(0).ue(3).ue(0).ue(0);
+        sps.u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .ue(0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0);
+        let mut pps = Bits::default();
+        pps.ue(0)
+            .ue(0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(3, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .ue(0)
+            .ue(0)
+            .se(0);
+        pps.u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .se(0)
+            .se(0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0);
+        pps.u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .ue(0)
+            .u(1, 0)
+            .u(1, 0);
+        let mut slice = Bits::default();
+        slice.u(1, 1);
+        if irap {
+            slice.u(1, 0);
+        }
+        slice.ue(0).ue(if irap { 2 } else { 1 });
+        if !irap {
+            // POC lsb, an explicit short-term set of one picture back, then P-slice fields.
+            slice
+                .u(8, poc as u64)
+                .u(1, 0)
+                .ue(1)
+                .ue(0)
+                .ue(0)
+                .u(1, 1)
+                .u(1, 0)
+                .ue(0);
+        }
+        slice.se(0);
+        let mut au = Vec::new();
+        let nals: Vec<Vec<u8>> = if irap {
+            vec![vps.nal(32), sps.nal(33), pps.nal(34), slice.nal(19)]
+        } else {
+            vec![slice.nal(1)]
+        };
+        for (i, mut nal) in nals.into_iter().enumerate() {
+            if i + 1 == if irap { 4 } else { 1 } {
+                nal.extend(std::iter::repeat_n(0x55, 40));
+            }
+            au.extend_from_slice(&[0, 0, 0, 1]);
+            au.extend(nal);
+        }
+        au
+    }
+
+    /// An AV1 temporal unit a real `av1parse` accepts: a 64x64 still-picture (reduced header)
+    /// sequence header, then one lossless key frame OBU whose tile data is junk.
+    pub(in crate::webtransport) fn av1_key_tu() -> Vec<u8> {
+        let mut seq = Bits::default();
+        seq.u(3, 0)
+            .u(1, 1)
+            .u(1, 1)
+            .u(5, 8)
+            .u(4, 7)
+            .u(4, 7)
+            .u(8, 63)
+            .u(8, 63);
+        seq.u(1, 0).u(1, 0).u(1, 0); // 128x128 superblocks, filter intra, intra edge
+        seq.u(1, 0).u(1, 0).u(1, 0); // superres, cdef, restoration
+        seq.u(1, 0).u(1, 0).u(1, 0).u(1, 0).u(2, 0).u(1, 0); // color config
+        seq.u(1, 0); // film grain params
+        seq.u(1, 1);
+        while seq.used != 0 {
+            seq.u(1, 0);
+        }
+        let mut frame = Bits::default();
+        frame.u(1, 0).u(1, 0).u(1, 0).u(1, 1); // cdf update, screen content, render size, uniform tiles
+        frame.u(8, 0).u(3, 0).u(1, 0).u(1, 0).u(1, 0); // base_q_idx 0, delta q, qmatrix, segmentation, tx set
+        let mut obu_frame = frame.bytes.clone();
+        obu_frame.extend(std::iter::repeat_n(0x55, 40));
+        let mut tu = obu(2, 0);
+        tu.extend(wrap(1, &seq.bytes));
+        tu.extend(wrap(6, &obu_frame));
+        tu
+    }
+
+    fn wrap(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let mut o = obu(kind, 0);
+        o.pop();
+        o.push(payload.len() as u8);
+        o.extend_from_slice(payload);
+        o
+    }
+
+    /// The OBU types of a temporal unit, panicking on one without a size field.
+    pub(in crate::webtransport) fn obu_types(tu: &[u8]) -> Vec<u8> {
+        let mut types = Vec::new();
+        let mut at = 0;
+        while at < tu.len() {
+            let h = tu[at];
+            assert!(h & 0x02 != 0, "an OBU without a size field");
+            types.push(h >> 3 & 0x0f);
+            let (mut size, mut shift) = (0usize, 0);
+            at += 1;
+            loop {
+                let b = tu[at];
+                at += 1;
+                size |= usize::from(b & 0x7f) << shift;
+                shift += 7;
+                if b & 0x80 == 0 {
+                    break;
+                }
+            }
+            at += size;
+        }
+        assert_eq!(at, tu.len(), "an OBU past the end");
+        types
+    }
+
+    /// The NAL types of a length-prefixed H.265 access unit.
+    pub(in crate::webtransport) fn hevc_types(au: &[u8]) -> Vec<u8> {
+        let mut types = Vec::new();
+        let mut rest = au;
+        while !rest.is_empty() {
+            let len = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;
+            assert!(len > 0 && 4 + len <= rest.len(), "bad NAL length {len}");
+            types.push(rest[4] >> 1 & 0x3f);
+            rest = &rest[4 + len..];
+        }
+        types
+    }
+}
+
 /// An agent with one WebTransport session, encoding a live test picture through the
 /// same parser → payloader boundary the WebRTC transport builds.
 struct Agent {
@@ -146,6 +466,8 @@ struct Agent {
     hash: Vec<u8>,
     pipeline: gst::Pipeline,
     tap: Option<Tap>,
+    /// The session's audio pipeline, when the test gave it one.
+    audio_pipeline: Option<gst::Pipeline>,
     /// Every input event the agent's devices were given, as JSON text.
     input: Arc<Mutex<Vec<String>>>,
     /// How many times a departing client's inputs were lifted.
@@ -156,6 +478,9 @@ impl Drop for Agent {
     fn drop(&mut self) {
         self.tap.take();
         let _ = self.pipeline.set_state(gst::State::Null);
+        if let Some(audio) = &self.audio_pipeline {
+            let _ = audio.set_state(gst::State::Null);
+        }
     }
 }
 
@@ -164,22 +489,100 @@ async fn agent() -> Agent {
 }
 
 async fn agent_with(limits: Limits) -> Agent {
-    gst::init().unwrap();
-    assert!(
-        gst::ElementFactory::find("openh264enc").is_some(),
-        "the conformance test needs openh264enc (gstreamer1.0-plugins-bad)"
-    );
-    let registry = Arc::new(Registry::default());
-    registry.assign(SESSION, &token_hash(TOKEN), SystemTime::now() + TOKEN_TTL);
+    agent_for(Stream::H264, limits).await
+}
+
+async fn agent_with_plan(limits: Limits, plan: audio::Plan) -> Agent {
+    agent_built(Stream::H264, limits, plan).await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Stream {
+    H264,
+    H265,
+    Av1,
+    /// An AV1 encoder whose keyframes carry no sequence header.
+    Av1NoSequenceHeader,
+}
+
+/// A stand-in for an encoder and parser the image does not have: one unit every 33 ms,
+/// a keyframe first and on each force-key-unit request, as the parser's src pad would
+/// hand them on (`DELTA_UNIT` on every other).
+fn synthetic(stream: Stream) -> gst::Pipeline {
     let pipeline = gst::parse::launch(
-        "videotestsrc is-live=true pattern=ball ! video/x-raw,width=640,height=360,framerate=30/1 \
-         ! openh264enc name=enc gop-size=1000 bitrate=4000000 \
-         ! video/x-h264,profile=constrained-baseline ! h264parse name=parse \
-         ! rtph264pay config-interval=-1 pt=96 ! fakesink sync=false",
+        "appsrc name=src is-live=true format=time do-timestamp=true \
+         ! identity name=enc ! identity name=parse ! fakesink sync=false",
     )
     .unwrap()
     .downcast::<gst::Pipeline>()
     .unwrap();
+    let src = pipeline
+        .by_name("src")
+        .unwrap()
+        .downcast::<gstreamer_app::AppSrc>()
+        .unwrap();
+    src.set_caps(Some(&match stream {
+        Stream::H265 => streams::hevc_caps(640),
+        _ => streams::av1_caps(640),
+    }));
+    let forced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = forced.clone();
+    src.static_pad("src")
+        .unwrap()
+        .add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_, _| {
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            gst::PadProbeReturn::Ok
+        });
+    std::thread::spawn(move || {
+        for n in 0u64.. {
+            let key = n == 0 || forced.swap(false, std::sync::atomic::Ordering::SeqCst);
+            let body = if key { 3000 } else { 400 };
+            let data = match stream {
+                Stream::H265 => streams::hevc_au(key.then_some(if n == 0 { 19 } else { 21 }), body),
+                Stream::Av1NoSequenceHeader => streams::av1_tu(false, body),
+                _ => streams::av1_tu(key, body),
+            };
+            let mut buffer = gst::Buffer::from_slice(data);
+            if !key {
+                buffer
+                    .get_mut()
+                    .unwrap()
+                    .set_flags(gst::BufferFlags::DELTA_UNIT);
+            }
+            if src.push_buffer(buffer).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(33));
+        }
+    });
+    pipeline
+}
+
+async fn agent_for(stream: Stream, limits: Limits) -> Agent {
+    agent_built(stream, limits, audio::Plan::default()).await
+}
+
+async fn agent_built(stream: Stream, limits: Limits, plan: audio::Plan) -> Agent {
+    gst::init().unwrap();
+    let registry = Arc::new(Registry::default());
+    registry.assign(SESSION, &token_hash(TOKEN), SystemTime::now() + TOKEN_TTL);
+    let pipeline = if stream == Stream::H264 {
+        assert!(
+            gst::ElementFactory::find("openh264enc").is_some(),
+            "the conformance test needs openh264enc (gstreamer1.0-plugins-bad)"
+        );
+        gst::parse::launch(
+            "videotestsrc is-live=true pattern=ball ! video/x-raw,width=640,height=360,framerate=30/1 \
+             ! openh264enc name=enc gop-size=1000 bitrate=4000000 \
+             ! video/x-h264,profile=constrained-baseline ! h264parse name=parse \
+             ! rtph264pay config-interval=-1 pt=96 ! fakesink sync=false",
+        )
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap()
+    } else {
+        synthetic(stream)
+    };
     let parse = pipeline.by_name("parse").unwrap();
     let encoder = pipeline.by_name("enc").unwrap();
     let (input, events, released) = recorded();
@@ -189,6 +592,7 @@ async fn agent_with(limits: Limits) -> Agent {
         &encoder,
         SESSION,
         input,
+        plan,
     );
     assert!(tap.is_some(), "an assigned session takes the tap");
     pipeline.set_state(gst::State::Playing).unwrap();
@@ -217,9 +621,45 @@ async fn agent_with(limits: Limits) -> Agent {
         hash,
         pipeline,
         tap,
+        audio_pipeline: None,
         input: events,
         released,
     }
+}
+
+/// An audio pipeline made the way the session's is (`add_opus_encode`, on silence), tapped
+/// at its Opus encoder for the agent's one session.
+fn tap_session_audio(agent: &mut Agent) {
+    use crate::session::settings::RuntimeSettings;
+    use crate::session::StreamParams;
+    let stream = StreamParams {
+        width: 640,
+        height: 360,
+        fps: 30,
+        bitrate_kbps: 4000,
+        h264_profile: "constrained-baseline".to_string(),
+        codec: crate::session::Codec::H264,
+        abr_floor_kbps: 0,
+        mic: true,
+    };
+    let mut cfg = crate::session::SessionConfig::for_assignment_with(
+        &RuntimeSettings::baseline_with(&|_| None),
+        stream,
+        None,
+    );
+    cfg.use_test_audio = true;
+    let pipeline = gst::Pipeline::new();
+    let (_, opus) = crate::session::pipeline::audio_branch::add_opus_encode(&pipeline, &cfg)
+        .expect("the session's Opus encode builds");
+    let sink = gst::ElementFactory::make("fakesink")
+        .property("sync", false)
+        .build()
+        .unwrap();
+    pipeline.add(&sink).unwrap();
+    opus.link(&sink).unwrap();
+    agent.tap.as_ref().unwrap().audio().tap(&opus);
+    pipeline.set_state(gst::State::Playing).unwrap();
+    agent.audio_pipeline = Some(pipeline);
 }
 
 impl Agent {
@@ -444,6 +884,223 @@ async fn a_browser_like_client_gets_h264_access_units_after_its_token() {
     assert_eq!(close_code(&reused).await, Some(CLOSE_AUTH));
 }
 
+/// An audio datagram as a client parses it (§Audio).
+#[derive(Debug)]
+struct AudioPacket {
+    pkt_seq: u32,
+    packet_seq: u16,
+    ts_48khz: u32,
+    capture_us: u64,
+    opus: Vec<u8>,
+}
+
+/// Every datagram from `session` for `span`, in arrival order: audio parsed, and the video
+/// ones counted. Asserts that one `pkt_seq` counts both channels without a gap.
+async fn audio_for(session: &Session, span: Duration) -> (Vec<AudioPacket>, usize) {
+    let (mut audio, mut video) = (Vec::new(), 0);
+    let mut last: Option<u32> = None;
+    let until = Instant::now() + span;
+    while let Ok(Ok(d)) = tokio::time::timeout_at(until, session.read_datagram()).await {
+        assert!(
+            d.len() <= media::MAX_DATAGRAM,
+            "a {} byte datagram",
+            d.len()
+        );
+        let pkt_seq = u32::from_le_bytes(d[1..5].try_into().unwrap());
+        if let Some(last) = last {
+            assert_eq!(
+                pkt_seq,
+                last.wrapping_add(1),
+                "one pkt_seq for video and audio"
+            );
+        }
+        last = Some(pkt_seq);
+        match d[0] {
+            0x01 => video += 1,
+            0x02 => audio.push(AudioPacket {
+                pkt_seq,
+                packet_seq: u16::from_le_bytes([d[5], d[6]]),
+                ts_48khz: u32::from_le_bytes(d[7..11].try_into().unwrap()),
+                capture_us: u64::from_le_bytes(d[11..19].try_into().unwrap()),
+                opus: d[audio::AUDIO_HEADER..].to_vec(),
+            }),
+            other => panic!("channel {other:#x} is not sent to a client"),
+        }
+    }
+    (audio, video)
+}
+
+#[tokio::test]
+async fn a_session_with_audio_and_a_microphone_sends_opus_and_takes_the_microphone() {
+    let plan = audio::Plan {
+        audio: true,
+        mic: true,
+        pulse_server: None,
+        jitter_ms: 40,
+    };
+    let mut agent = agent_with_plan(Limits::default(), plan).await;
+    tap_session_audio(&mut agent);
+    let (session, mut send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(
+        ack["audio"],
+        json!({"codec": "opus", "channels": 2, "sample_rate": 48000, "ptime_ms": 10})
+    );
+    assert_eq!(
+        ack["mic"],
+        json!({"codec": "opus", "channels": 1, "sample_rate": 48000, "ptime_ms": 10})
+    );
+
+    let started = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64;
+    let (got, video) = audio_for(&session, Duration::from_millis(1500)).await;
+    assert!(video > 10, "video still flows beside audio ({video})");
+    assert!(got.len() >= 80, "10 ms packets over 1.5 s: {}", got.len());
+    for pair in got.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        assert_eq!(
+            b.packet_seq,
+            a.packet_seq.wrapping_add(1),
+            "none lost on a clean path"
+        );
+        assert_eq!(b.ts_48khz.wrapping_sub(a.ts_48khz), 480, "10 ms at 48 kHz");
+        assert!(b.pkt_seq != a.pkt_seq);
+        assert!(b.capture_us > a.capture_us, "capture time rises");
+    }
+    // Packets leave the encoder in bursts; capture time follows the audio's own clock.
+    for pair in got.windows(2) {
+        let step = pair[1].capture_us - pair[0].capture_us;
+        assert!(
+            step.abs_diff(10_000) < 3_000,
+            "capture time steps by 10 ms, not by arrival: {step} µs"
+        );
+    }
+    for p in &got {
+        assert!(
+            p.capture_us.abs_diff(started) < 10_000_000,
+            "capture_us is wall-clock µs"
+        );
+        // TOC byte: CELT-only, fullband, one 10 ms frame (RFC 6716 §3.1): low-delay, 10 ms.
+        assert_eq!(p.opus[0] >> 3, 30, "the session's low-delay 10 ms Opus");
+    }
+
+    // The microphone: real 10 ms Opus packets in §Microphone framing reach the sink decoded.
+    let packets = audio::test_opus_packets(30);
+    let audio_hub = agent.tap.as_ref().unwrap().audio();
+    for (i, opus) in packets.iter().enumerate() {
+        let mut d = vec![0x05];
+        d.extend_from_slice(&(i as u16).to_le_bytes());
+        d.extend_from_slice(&(i as u32 * 480).to_le_bytes());
+        d.extend_from_slice(opus);
+        session.send_datagram(Bytes::from(d)).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while audio_hub.mic_delivered() < 20 {
+        assert!(
+            Instant::now() < deadline,
+            "{} decoded microphone buffers reached the sink",
+            audio_hub.mic_delivered()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    write_message(
+        &mut send,
+        &json!({"type": "bye", "reason": "client_closed"}),
+    )
+    .await
+    .unwrap();
+}
+
+/// What a codec's access unit must contain for the keyframe flag to be true.
+fn carries_random_access(stream: Stream, data: &[u8]) -> bool {
+    match stream {
+        Stream::H264 => nal_types(data).contains(&5),
+        Stream::H265 => streams::hevc_types(data)
+            .iter()
+            .any(|t| (16..=23).contains(t)),
+        Stream::Av1 | Stream::Av1NoSequenceHeader => streams::obu_types(data).contains(&1),
+    }
+}
+
+async fn codec_session(stream: Stream, codec: &str) {
+    let agent = agent_for(stream, Limits::default()).await;
+    let (session, mut send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+    assert_eq!(ack["video"]["codec"], codec);
+    let description = base64::engine::general_purpose::STANDARD
+        .decode(ack["video"]["description_b64"].as_str().unwrap())
+        .unwrap();
+    match stream {
+        Stream::H265 => assert_eq!(
+            (description[1], description[12], description[21] & 3),
+            (1, 93, 3),
+            "hvcC: Main, level 93, 4-byte NAL lengths"
+        ),
+        _ => assert_eq!(description[0], 0x81, "av1C"),
+    }
+
+    let got = frames(&session, 40, true).await;
+    assert!(got[0].keyframe, "the client starts at a keyframe");
+    assert!(got[0].data.len() > 2 * 1123, "a keyframe spans fragments");
+    for f in &got {
+        assert_eq!(
+            f.keyframe,
+            carries_random_access(stream, &f.data),
+            "the keyframe flag matches the bitstream"
+        );
+        if stream == Stream::Av1 {
+            assert!(
+                !streams::obu_types(&f.data).contains(&2),
+                "no temporal delimiter"
+            );
+        }
+    }
+
+    write_message(
+        &mut send,
+        &json!({"type": "keyframe_request", "reason": "startup"}),
+    )
+    .await
+    .unwrap();
+    let after = frames(&session, 20, false).await;
+    assert!(
+        after.iter().any(|f| f.keyframe),
+        "a keyframe follows the request"
+    );
+}
+
+#[tokio::test]
+async fn an_h265_session_sends_length_prefixed_access_units_with_irap_keyframes() {
+    codec_session(Stream::H265, "h265").await;
+}
+
+#[tokio::test]
+async fn an_av1_session_sends_obu_temporal_units_without_delimiters_and_sequence_header_keyframes()
+{
+    codec_session(Stream::Av1, "av1").await;
+}
+
+#[tokio::test]
+async fn an_encoder_with_no_usable_keyframe_ends_the_session_with_an_internal_error() {
+    let agent = agent_for(Stream::Av1NoSequenceHeader, Limits::default()).await;
+    let (session, _send, mut recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+    let error = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let message = read_message(&mut recv).await.unwrap();
+            if message["type"] == "error" {
+                break message;
+            }
+        }
+    })
+    .await
+    .expect("no error: the agent kept forcing keyframes for good");
+    assert_eq!(error["code"], "internal", "the client falls back to WebRTC");
+    assert_eq!(close_code(&session).await, Some(CLOSE_NORMAL));
+}
+
 /// The next video datagram, as (frame_seq, frag_index, frag_count, datagram).
 async fn datagram(session: &Session) -> (u16, u16, u16, Bytes) {
     let d = tokio::time::timeout(Duration::from_secs(10), session.read_datagram())
@@ -456,7 +1113,21 @@ async fn datagram(session: &Session) -> (u16, u16, u16, Bytes) {
 
 #[tokio::test]
 async fn a_nacked_fragment_is_resent_one_past_the_window_is_a_miss_and_late_gets_a_keyframe() {
-    let agent = agent().await;
+    nack_and_late(Stream::H264).await;
+}
+
+#[tokio::test]
+async fn nack_and_late_keyframe_recovery_work_for_h265() {
+    nack_and_late(Stream::H265).await;
+}
+
+#[tokio::test]
+async fn nack_and_late_keyframe_recovery_work_for_av1() {
+    nack_and_late(Stream::Av1).await;
+}
+
+async fn nack_and_late(stream: Stream) {
+    let agent = agent_for(stream, Limits::default()).await;
     let (session, mut send, mut recv, ack) = agent.hello(TOKEN).await;
     assert_eq!(ack["retransmit_window_ms"], 250);
 
@@ -560,6 +1231,21 @@ async fn a_session_runs_from_hello_through_decodable_frames_to_a_clean_close() {
     .await
     .unwrap();
     assert_eq!(close_code(&session).await, Some(CLOSE_NORMAL));
+}
+
+#[tokio::test]
+async fn a_session_without_audio_or_a_microphone_says_so_and_ignores_both() {
+    let agent = agent().await;
+    let (session, _send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(
+        (ack["audio"].clone(), ack["mic"].clone()),
+        (Value::Null, Value::Null)
+    );
+    session
+        .send_datagram(Bytes::from_static(&[0x05, 0, 0, 0, 0, 0, 0, 1, 2, 3]))
+        .unwrap();
+    // Video alone, so the one-channel `frames` check holds.
+    assert_eq!(frames(&session, 5, true).await.len(), 5);
 }
 
 #[tokio::test]
