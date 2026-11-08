@@ -28,8 +28,11 @@ type swapper struct {
 	// pendingShared is the Steam home each in-flight swap's target mounts, ""
 	// when it shares nothing. It is the one thing the agent's "swap complete"
 	// cannot tell us, and the commit needs it to record (and release) the
-	// session's shared home.
-	pendingShared map[string]string
+	// session's shared home. pendingSharedHold is that Steam claim's hold when
+	// THIS swap took it — the only case a proven pre-handoff failure may release
+	// it in; the own hold's Created flag says nothing about it.
+	pendingShared     map[string]string
+	pendingSharedHold map[string]*HomeHoldDecision
 	// swapSince is when this process last began writing each session's durable
 	// `swapping` guard; see unresolved. Kept until the session ends (forget): a
 	// rejected or rolled-back swap clears its pending entry before the row leaves
@@ -40,7 +43,8 @@ type swapper struct {
 func newSwapper(store *Store, dispatcher Dispatcher, log *slog.Logger, resolveSpec func(context.Context, LaunchApp, Session) ([]byte, error),
 	supersede func(context.Context, string, string, string)) *swapper {
 	return &swapper{store: store, dispatcher: dispatcher, log: log, resolveSpec: resolveSpec, supersede: supersede,
-		pendingSwaps: make(map[string]string), pendingShared: make(map[string]string), swapSince: make(map[string]time.Time)}
+		pendingSwaps: make(map[string]string), pendingShared: make(map[string]string),
+		pendingSharedHold: make(map[string]*HomeHoldDecision), swapSince: make(map[string]time.Time)}
 }
 
 // noteSwapStart must run before the durable `swapping` guard is written, or a
@@ -126,26 +130,15 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 	var homeEpoch agentws.HomeCommandEpoch
 	var homeHold *HomeHoldDecision
 	var sharedHome string
+	var sharedHold *HomeHoldDecision
 	// A swap target shares the user's Steam library exactly as a launch does
 	// (control-api.md §Storage, "A shared Steam library"): the same single-Steam
-	// choice, the same one-Steam-at-a-time guard, the same claim and hold.
+	// choice, and — inside the guard transaction below — the same claim, the same
+	// one-Steam-at-a-time check and the same hold, so the decision, the check and
+	// the claim are one step.
 	sharedApp, sharedNotice, err := s.store.sharedHomeChoice(ctx, app, sess.UserID, false)
 	if err != nil {
 		return Session{}, err
-	}
-	if sharedApp != "" {
-		// Refused while another Steam-family session is live, naming it
-		// (reason steam_game_running). The session being swapped excludes
-		// itself, except that a session already mounting this home as its shared
-		// one is never excluded: nothing yet proves its container let go of the
-		// mount (liveHomeSessionSQL, note 3).
-		conflict, err := s.store.HasLiveUserAppSession(ctx, sess.UserID, sharedApp, sessionID)
-		if err != nil {
-			return Session{}, fmt.Errorf("shared home in use check: %w", err)
-		}
-		if conflict != nil {
-			return Session{}, s.sharedHomeBusy(ctx, sess.UserID, conflict)
-		}
 	}
 	if app.ManagedHome {
 		var epoch agentws.HomeCommandEpoch
@@ -171,8 +164,8 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 		if err != nil {
 			// The target's own home is only ever held by a named session (the
 			// pre-check above catches it first), so an UNNAMED holder here is the
-			// Steam claim the target's shared home needed: answered exactly as
-			// the pre-check would.
+			// Steam claim the target's shared home needed: answered as a launch
+			// answers a parked Steam.
 			var inUse *HomeInUseError
 			if sharedApp != "" && errors.As(err, &inUse) && (inUse.parkedID != "" || inUse.releasedID != "") {
 				return Session{}, s.sharedHomeBusy(ctx, sess.UserID, inUse)
@@ -182,6 +175,7 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 		homeEpoch = epoch
 		homeHold = guard.hold
 		sharedHome = guard.sharedID
+		sharedHold = guard.sharedHold
 		if sharedApp != "" && sharedHome == "" {
 			sharedNotice = guard.notice
 		}
@@ -214,8 +208,14 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 	if err != nil {
 		if app.ManagedHome {
 			_ = s.store.ClearNewHomeHold(ctx, homeHold)
-			// No target payload has left the control plane. Clearing here is
-			// safe; a failed clear retains conservative GC protection.
+			// The Steam hold and the Steam claim this swap took go too: no
+			// target payload has left the control plane, so the home the claim
+			// pins this host to was never mounted. A failed release retains
+			// conservative GC protection.
+			_ = s.store.ClearNewSharedHomeHold(ctx, sharedHold)
+			if relErr := s.store.releaseUnusedSwapSharedClaim(ctx, sessionID, sharedHome); relErr != nil {
+				s.log.Warn("releasing an unused swap shared home claim failed", "session_id", sessionID, "err", relErr)
+			}
 			_ = s.store.SetStateDetail(ctx, sessionID, swapDetailRejected)
 		}
 		return Session{}, fmt.Errorf("home mount: %w", err)
@@ -231,6 +231,7 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 	s.mu.Lock()
 	s.pendingSwaps[sessionID] = newAppID
 	s.pendingShared[sessionID] = sharedHome
+	s.pendingSharedHold[sessionID] = sharedHold
 	s.mu.Unlock()
 
 	go s.dispatchSwap(*sess.HostID, sessionID, dispatchSpec, app.ManagedHome, inPlace,
@@ -313,7 +314,7 @@ func (s *swapper) dispatchSwap(hostID, sessionID string, runtimeSpec []byte, man
 			break
 		}
 		refreshed, refreshErr := s.store.RefreshSwapHomeHold(context.Background(), sessionID,
-			userID, canonicalAppID, hostID, hold, next.SupportsHomeCleanup(), s.pendingSharedFor(sessionID))
+			userID, canonicalAppID, hostID, hold, next.SupportsHomeCleanup(), s.pendingSharedHoldFor(sessionID))
 		if refreshErr != nil {
 			s.log.Warn("swap home epoch refresh failed", "err", refreshErr)
 			break
@@ -337,6 +338,16 @@ func (s *swapper) dispatchSwap(hostID, sessionID string, runtimeSpec []byte, man
 			if clearErr := s.store.ClearNewHomeHold(context.Background(), hold); clearErr != nil {
 				s.log.Warn("unstarted swap home hold release failed", "err", clearErr)
 			}
+			// The Steam hold this swap newly took, and the Steam claim it would
+			// have mounted: the target never ran, so neither may outlive it. A
+			// hold the session already carried stays — it belongs to the app the
+			// session still runs.
+			if clearErr := s.store.ClearNewSharedHomeHold(context.Background(), s.pendingSharedHoldFor(sessionID)); clearErr != nil {
+				s.log.Warn("unstarted swap shared home hold release failed", "err", clearErr)
+			}
+			if relErr := s.store.releaseUnusedSwapSharedClaim(context.Background(), sessionID, s.pendingSharedFor(sessionID)); relErr != nil {
+				s.log.Warn("releasing an unused swap shared home claim failed", "session_id", sessionID, "err", relErr)
+			}
 		}
 		s.clearPendingSwap(sessionID)
 		if e := s.store.SetStateDetail(context.Background(), sessionID, swapDetailRejected); e != nil {
@@ -357,6 +368,7 @@ func (s *swapper) forget(sessionID string) {
 	s.mu.Lock()
 	delete(s.pendingSwaps, sessionID)
 	delete(s.pendingShared, sessionID)
+	delete(s.pendingSharedHold, sessionID)
 	delete(s.swapSince, sessionID)
 	s.mu.Unlock()
 }
@@ -365,6 +377,7 @@ func (s *swapper) clearPendingSwap(sessionID string) {
 	s.mu.Lock()
 	delete(s.pendingSwaps, sessionID)
 	delete(s.pendingShared, sessionID)
+	delete(s.pendingSharedHold, sessionID)
 	s.mu.Unlock()
 }
 
@@ -374,6 +387,14 @@ func (s *swapper) pendingSharedFor(sessionID string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.pendingShared[sessionID]
+}
+
+// pendingSharedHoldFor is the hold this session's in-flight swap newly took on
+// its shared Steam claim, nil when it took none.
+func (s *swapper) pendingSharedHoldFor(sessionID string) *HomeHoldDecision {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pendingSharedHold[sessionID]
 }
 
 // handleSwapCallback processes an agent session_state callback for a session

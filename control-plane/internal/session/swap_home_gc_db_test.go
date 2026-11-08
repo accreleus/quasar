@@ -113,7 +113,7 @@ func TestUnqueuedSwapEpochRefreshUsesNewCapability(t *testing.T) {
 	if hold == nil || !hold.Created {
 		t.Fatalf("first epoch hold = %+v", hold)
 	}
-	decision, err := store.RefreshSwapHomeHold(ctx, sess.ID, s.userID, target, s.hostID, hold, false, "")
+	decision, err := store.RefreshSwapHomeHold(ctx, sess.ID, s.userID, target, s.hostID, hold, false, nil)
 	must(t, err)
 	if decision != nil {
 		t.Fatalf("unsupported replacement epoch kept new hold: %+v", decision)
@@ -125,12 +125,50 @@ func TestUnqueuedSwapEpochRefreshUsesNewCapability(t *testing.T) {
 	if pending || !warning {
 		t.Fatalf("epoch refresh: pending=%t warning=%t", pending, warning)
 	}
-	decision, err = store.RefreshSwapHomeHold(ctx, sess.ID, s.userID, target, s.hostID, nil, true, "")
+	decision, err = store.RefreshSwapHomeHold(ctx, sess.ID, s.userID, target, s.hostID, nil, true, nil)
 	must(t, err)
 	if decision == nil || !decision.Created {
 		t.Fatalf("later capable epoch hold = %+v", decision)
 	}
 	must(t, store.ClearNewHomeHold(ctx, decision))
+}
+
+// A capability downgrade before handoff releases the Steam hold this swap took
+// as well as its own, and records the unprotected dispatch on both claims: the
+// frame has not left the control plane, so nothing may stay held for it.
+func TestUnqueuedSwapEpochRefreshReleasesTheSharedHold(t *testing.T) {
+	f := newWarmFixture(t, 8)
+	desktop := seedDesktop(t, f, true)
+	mine := seedDesktop(t, f, false)
+	sess := f.startedLaunch(t, mine)
+	ctx := context.Background()
+
+	app, err := f.store.GetLaunchApp(ctx, desktop)
+	must(t, err)
+	guard, err := f.store.GuardHomeForSwapWithHold(ctx, sess, f.userID, app, f.hostID, true, f.steam)
+	must(t, err)
+	if guard.hold == nil || !guard.hold.Created || guard.sharedHold == nil || !guard.sharedHold.Created {
+		t.Fatalf("guard = %+v, want a new own hold and a new shared hold", guard)
+	}
+	if h, _ := f.claimHolder(t, f.steam); h != sess {
+		t.Fatalf("Steam hold = %q, want the swap's own %s", h, sess)
+	}
+
+	decision, err := f.store.RefreshSwapHomeHold(ctx, sess, f.userID, desktop, f.hostID,
+		guard.hold, false, guard.sharedHold)
+	must(t, err)
+	if decision != nil {
+		t.Fatalf("unsupported replacement epoch kept new hold: %+v", decision)
+	}
+	for _, appID := range []string{desktop, f.steam} {
+		var pending, warning bool
+		must(t, f.pool.QueryRow(ctx, `SELECT pending_home_token IS NOT NULL,legacy_unprotected_dispatch
+			FROM managed_home_claims WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, f.userID, appID).
+			Scan(&pending, &warning))
+		if pending || !warning {
+			t.Errorf("app %s after the epoch refresh: pending=%t warning=%t, want released and recorded", appID, pending, warning)
+		}
+	}
 }
 
 // A stop request can race the pending swap's agent callback. The target may

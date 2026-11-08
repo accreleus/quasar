@@ -211,14 +211,37 @@ func (s *Store) ClearNewHomeHold(ctx context.Context, hold *HomeHoldDecision) er
 	return nil
 }
 
+// ClearNewSharedHomeHold releases a hold THIS dispatch newly took on a swap
+// target's shared Steam claim, and nothing else. It is separate from
+// ClearNewHomeHold on purpose: that one is gated on the OWN hold's Created flag,
+// and a swap back into a sharing app the session already holds reuses the own
+// hold (Created=false) while taking a NEW Steam hold — under the same token, so
+// a release by token alone would also drop the reused own hold, which no proof
+// covers. The CAS is (session, token) on that one claim, so a hold it did not
+// take, or one another dispatch has since moved, is left alone.
+func (s *Store) ClearNewSharedHomeHold(ctx context.Context, hold *HomeHoldDecision) error {
+	if hold == nil || !hold.Created {
+		return nil
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE managed_home_claims SET
+		pending_home_session_id=NULL,pending_home_token=NULL,pending_home_started_at=NULL
+		WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid
+		  AND pending_home_session_id=$3::uuid AND pending_home_token=$4::uuid`,
+		hold.UserID, hold.AppID, hold.SessionID, hold.Token)
+	if err != nil {
+		return fmt.Errorf("release unstarted shared home operation: %w", err)
+	}
+	return nil
+}
+
 // RefreshSwapHomeHold changes only an unstarted swap's capability decision
 // after its command epoch vanished before queue handoff. The session and claim
 // remain locked in global order; an older reused hold cannot be downgraded to
-// an unsupported connection. sharedApp is the Steam home the swap's target also
-// mounted ("" when it shared nothing): a hold this swap took on it goes with the
-// own one, so nothing is left held by a session the control plane cannot prove
-// mounted it.
-func (s *Store) RefreshSwapHomeHold(ctx context.Context, sessionID, userID, appID, hostID string, prior *HomeHoldDecision, capable bool, sharedApp string) (*HomeHoldDecision, error) {
+// an unsupported connection. shared is the hold this swap took on the target's
+// shared Steam claim (nil when it shares nothing or already held one): it goes
+// with the own one, so nothing is left held by a session the control plane
+// cannot prove mounted it.
+func (s *Store) RefreshSwapHomeHold(ctx context.Context, sessionID, userID, appID, hostID string, prior *HomeHoldDecision, capable bool, shared *HomeHoldDecision) (*HomeHoldDecision, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin swap epoch refresh: %w", err)
@@ -261,11 +284,14 @@ func (s *Store) RefreshSwapHomeHold(ctx context.Context, sessionID, userID, appI
 			return nil, fmt.Errorf("release unstarted swap hold: %w", err)
 		}
 		pendingToken = nil
-		if sharedApp != "" {
+		if shared != nil {
+			// Only the hold this swap took: a reused own hold under the same
+			// token carries its own, older proof.
 			if _, err := tx.Exec(ctx, `UPDATE managed_home_claims SET pending_home_session_id=NULL,
 				pending_home_token=NULL,pending_home_started_at=NULL
-				WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid AND pending_home_token=$3::uuid`,
-				userID, sharedApp, prior.Token); err != nil {
+				WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid
+				  AND pending_home_session_id=$3::uuid AND pending_home_token=$4::uuid`,
+				userID, shared.AppID, sessionID, shared.Token); err != nil {
 				return nil, fmt.Errorf("release unstarted shared swap hold: %w", err)
 			}
 			// No hold left on the shared claim: record the unprotected dispatch
@@ -273,11 +299,11 @@ func (s *Store) RefreshSwapHomeHold(ctx context.Context, sessionID, userID, appI
 			var sharedPending *string
 			if err := tx.QueryRow(ctx, `SELECT pending_home_session_id::text FROM managed_home_claims
 				WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid FOR UPDATE`,
-				userID, sharedApp).Scan(&sharedPending); err != nil {
+				userID, shared.AppID).Scan(&sharedPending); err != nil {
 				return nil, fmt.Errorf("read shared swap claim: %w", err)
 			}
 			if sharedPending == nil {
-				if err := holdSharedHome(ctx, tx, userID, sharedApp, sessionID, nil, sharedPending); err != nil {
+				if _, err := holdSharedHome(ctx, tx, userID, shared.AppID, sessionID, nil, sharedPending); err != nil {
 					return nil, err
 				}
 			}

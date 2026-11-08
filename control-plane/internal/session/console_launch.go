@@ -153,7 +153,7 @@ func (c *Coordinator) LaunchConsoleSession(ctx context.Context, hostID, userID, 
 	dispatchSpec := app.RuntimeSpec
 	if app.ManagedHome || app.IsDerived() {
 		if sess.HostID == nil {
-			c.failSession(sess.ID, "app scheduled without a host")
+			c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, "app scheduled without a host")
 			return "", fmt.Errorf("console auto-start: app scheduled without a host")
 		}
 		dispatchSpec, err = c.resolveHomeSpec(ctx, app, userID, *sess.HostID)
@@ -163,14 +163,18 @@ func (c *Coordinator) LaunchConsoleSession(ctx context.Context, hostID, userID, 
 			dispatchSpec, err = c.injectSharedHomeMount(ctx, dispatchSpec, app, userID, *sess.SharedHomeAppID, *sess.HostID)
 		}
 		if err != nil {
-			c.failSession(sess.ID, fmt.Sprintf("home mount: %v", err))
+			// failBeforeAgent, not failSession: the schedule may have created the
+			// Steam claim on this host for the shared mount, and a claim left
+			// behind pins the user's Steam here with no data (as it would for a
+			// launch failing the same way).
+			c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, fmt.Sprintf("home mount: %v", err))
 			return "", fmt.Errorf("console auto-start: home mount: %w", err)
 		}
 	}
 
 	dispatchSpec, err = c.applyRegionInput(ctx, dispatchSpec, userID, sess.DeviceID)
 	if err != nil {
-		c.failSession(sess.ID, fmt.Sprintf("region and input values: %v", err))
+		c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, fmt.Sprintf("region and input values: %v", err))
 		return "", fmt.Errorf("console auto-start: region and input values: %w", err)
 	}
 
