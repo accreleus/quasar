@@ -10,7 +10,7 @@ use crate::session::container::ContainerSpec;
 use crate::session::virtual_input::VirtualDevices;
 use crate::session::{EncoderChoice, SessionConfig};
 
-use super::caps::{dmabuf_zerocopy_format, raw_video_caps, vulkan_image_transport};
+use super::caps::{dmabuf_zerocopy_format, source_caps, vulkan_image_transport};
 use super::encoders::va_device_element_prefix;
 
 /// Self-heal the compositor's Vulkan encode-src ring-slot tiling defect by pinning the
@@ -118,7 +118,7 @@ pub(crate) fn build_video_source(
 
     // The caps that cross the interpipe boundary. The framerate field is load-bearing:
     // without it waylanddisplaysrc produces 1 fps.
-    let tail_caps = raw_video_caps(cfg);
+    let tail_caps = source_caps(cfg);
     let tail = gst::ElementFactory::make("capsfilter")
         .name("source-caps")
         .property("caps", &tail_caps)

@@ -92,6 +92,26 @@ pub(crate) fn raw_video_caps(cfg: &SessionConfig) -> gst::Caps {
     )
 }
 
+/// The compositor's output caps: [`raw_video_caps`], plus `colorimetry=bt709` for a PyroWave
+/// grant on the Vulkan path, so the compositor converts with the BT.709 matrix and PyroWave
+/// encodes its frames with no copy (#1104). Only the source asks: the encode side's
+/// interpipesrc keeps [`raw_video_caps`], so a compositor built without the grant still
+/// connects, and PyroWave then converts on the CPU.
+pub(super) fn source_caps(cfg: &SessionConfig) -> gst::Caps {
+    source_caps_for(
+        raw_video_caps(cfg),
+        cfg.encoder,
+        cfg.webtransport && cfg.pyrowave.is_some(),
+    )
+}
+
+fn source_caps_for(mut caps: gst::Caps, encoder: EncoderChoice, pyrowave: bool) -> gst::Caps {
+    if pyrowave && encoder == EncoderChoice::Vulkan {
+        caps.make_mut().set("colorimetry", "bt709");
+    }
+    caps
+}
+
 /// ZC-03: the DMABuf `drm-format` (`fourcc:modifier`) the compositor should emit so
 /// `vapostproc` can import it zero-copy; `None` falls the VA path back to ZC-01
 /// system RGBx. Deterministic (same element caps), so [`raw_video_caps`] and
@@ -420,6 +440,23 @@ mod tests {
             feats.contains("memory:VulkanImage"),
             "Vulkan interpipe must carry memory:VulkanImage, got {caps}"
         );
+    }
+
+    #[test]
+    fn only_a_pyrowave_grant_on_vulkan_asks_the_compositor_for_bt709() {
+        gstreamer::init().unwrap();
+        let colorimetry = |encoder, pyrowave| {
+            let raw = raw_video_caps_for(encoder, 1920, 1080, 60, None);
+            super::source_caps_for(raw, encoder, pyrowave)
+                .structure(0)
+                .and_then(|s| s.get::<String>("colorimetry").ok())
+        };
+        assert_eq!(
+            colorimetry(EncoderChoice::Vulkan, true).as_deref(),
+            Some("bt709")
+        );
+        assert_eq!(colorimetry(EncoderChoice::Vulkan, false), None);
+        assert_eq!(colorimetry(EncoderChoice::Openh264, true), None);
     }
 
     // `vulkanh264enc`'s src pad template advertises all three profiles.

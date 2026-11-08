@@ -10,14 +10,16 @@
 //! - At most one compositor frame is held for PyroWave: the probe admits none while one is
 //!   anywhere in the PyroWave pipeline, up to the encoder's output (the 2-slot ring when HEVC
 //!   is on), and a client's detach flushes what that pipeline holds.
-//! - Download, convert and `pyrowaveenc` run in a pipeline of their own, started off the
-//!   encode thread with the encode pipeline's GPU contexts; its errors switch PyroWave off.
-//!   `vulkandownload` adopts only the instance through `set_context` and asks its neighbours
-//!   for the device, so the appsrc answers that query with the encode pipeline's device, and
-//!   the download's resolved device is checked against it before any frame is copied.
-//!
-//! shortcut: frames cross the CPU (download + convert) before a CPU-input encoder; zero-copy
-//! Vulkan input is #1104.
+//! - `pyrowaveenc` runs in a pipeline of its own, started off the encode thread with the
+//!   encode pipeline's GPU contexts; its errors switch PyroWave off.
+//! - Zero copy (#1104): when the frames are BT.709 NV12 Vulkan images (the compositor
+//!   converts with that matrix for a PyroWave grant, `caps::source_caps`), `pyrowaveenc`
+//!   takes them as they are and encodes on their own device.
+//! - Otherwise (a compositor that predates the grant, CUDA or system memory) frames are
+//!   downloaded and converted on the CPU first. `vulkandownload` adopts only the instance
+//!   through `set_context` and asks its neighbours for the device, so the appsrc answers that
+//!   query with the encode pipeline's device, and the download's resolved device is checked
+//!   against it before any frame is copied.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -51,6 +53,44 @@ impl InFlight {
 
     fn clear(&self) {
         self.0.store(0, Ordering::Release);
+    }
+
+    /// Clear, and return when the frame was admitted (0 when none was).
+    fn take(&self) -> u64 {
+        self.0.swap(0, Ordering::AcqRel)
+    }
+}
+
+/// How often the encode summary is logged.
+const STATS_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Admission-to-encoded times of one window: frames, the window, the times in ns.
+struct EncodeStats {
+    since: std::time::Instant,
+    times: Vec<u64>,
+}
+
+impl EncodeStats {
+    /// Add one frame's time; every [`STATS_EVERY`] log the window and start a new one.
+    fn add(&mut self, ns: u64) {
+        self.times.push(ns);
+        let span = self.since.elapsed();
+        if span < STATS_EVERY {
+            return;
+        }
+        self.times.sort_unstable();
+        let at = |q: f64| self.times[((self.times.len() - 1) as f64 * q) as usize] as f64 / 1e6;
+        tracing::info!(
+            token = "pyrowave-encode-stats",
+            frames = self.times.len(),
+            fps = format!("{:.1}", self.times.len() as f64 / span.as_secs_f64()),
+            p50_ms = format!("{:.2}", at(0.5)),
+            p95_ms = format!("{:.2}", at(0.95)),
+            max_ms = format!("{:.2}", at(1.0)),
+            "PyroWave frames, admission to encoded"
+        );
+        self.times.clear();
+        self.since = std::time::Instant::now();
     }
 }
 
@@ -110,9 +150,24 @@ impl Drop for Encoder {
 
 type OnError = Arc<dyn Fn(String) + Send + Sync>;
 
-/// appsrc → [download] → videoconvert → BT.709 centre-sited I420 → `pyrowaveenc` at `kbps`
-/// → fakesink, fed while `open` says so. `on_frame` gets each encoded frame, `on_error` each
-/// error.
+/// The frames `pyrowaveenc` can take with no copy: NV12 Vulkan images it accepts as they are
+/// (BT.709, centre-sited). The colorimetry must be stated: untagged NV12 reads as BT.709 at
+/// HD sizes, but an untagged compositor converts with BT.601.
+fn zero_copy(caps: Option<&gst::Caps>) -> bool {
+    caps.is_some_and(|caps| {
+        caps.features(0)
+            .is_some_and(|f| f.contains("memory:VulkanImage"))
+            && caps.structure(0).is_some_and(|s| {
+                s.get::<&str>("format") == Ok("NV12") && s.has_field("colorimetry")
+            })
+            && gstpyrowave::check_input(caps).is_ok()
+    })
+}
+
+/// appsrc → `pyrowaveenc` at `kbps` → fakesink when the frames are [`zero_copy`], else
+/// appsrc → [download] → videoconvert → BT.709 centre-sited I420 → `pyrowaveenc`; fed while
+/// `open` says so. Which, is decided on the first frame: this runs at pipeline build, before
+/// the caps are known. `on_frame` gets each encoded frame, `on_error` each error.
 pub(crate) fn start_encoder(
     cfg: &SessionConfig,
     feed: Feed,
@@ -171,6 +226,8 @@ fn start_with(
     if src.find_property("leaky-type").is_some() {
         src.set_property_from_str("leaky-type", "downstream");
     }
+    // The CPU path's elements, added and linked by the start thread only if needed.
+    let mut cpu: Vec<gst::Element> = download.iter().cloned().collect();
     let convert = gst::ElementFactory::make("videoconvert").build()?;
     if convert.find_property("n-threads").is_some() {
         convert.set_property("n-threads", convert_threads());
@@ -185,15 +242,13 @@ fn start_with(
     let filter = gst::ElementFactory::make("capsfilter")
         .property("caps", &caps)
         .build()?;
+    cpu.extend([convert, filter]);
     let sink = gst::ElementFactory::make("fakesink")
         .property("sync", false)
         .property("async", false)
         .build()?;
-    let mut chain: Vec<&gst::Element> = vec![src.upcast_ref()];
-    chain.extend(download.as_ref());
-    chain.extend([&convert, &filter, enc, &sink]);
-    pipeline.add_many(chain.iter().copied())?;
-    gst::Element::link_many(chain.iter().copied())?;
+    pipeline.add_many([src.upcast_ref(), enc, &sink])?;
+    enc.link(&sink)?;
 
     // The next frame is admitted once this one is encoded: until then it, or its copy, is
     // still in this pipeline, and admitting another would leave it waiting in appsrc on a
@@ -202,12 +257,25 @@ fn start_with(
     let cleared = in_flight.clone();
     enc.static_pad("src")
         .context("the encoder has no src pad")?
-        .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
-            cleared.clear();
-            if let Some(buffer) = info.buffer() {
-                on_frame(buffer);
+        .add_probe(gst::PadProbeType::BUFFER, {
+            let stats = Mutex::new(EncodeStats {
+                since: std::time::Instant::now(),
+                times: Vec::new(),
+            });
+            move |_, info| {
+                let admitted = cleared.take();
+                if admitted > 0 {
+                    let now = gst::get_timestamp().nseconds();
+                    stats
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .add(now.saturating_sub(admitted));
+                }
+                if let Some(buffer) = info.buffer() {
+                    on_frame(buffer);
+                }
+                gst::PadProbeReturn::Ok
             }
-            gst::PadProbeReturn::Ok
         });
     let on_error: OnError = Arc::new(on_error);
     let bus_error = on_error.clone();
@@ -249,6 +317,7 @@ fn start_with(
         })
         .context("could not answer context queries")?;
     let download = download.map(|d| d.downgrade());
+    let weak_enc = enc.downgrade();
     let starting = Arc::new(AtomicBool::new(false));
     let started = Arc::new(AtomicBool::new(false));
     let was_open = AtomicBool::new(false);
@@ -271,13 +340,16 @@ fn start_with(
                 if !starting.swap(true, Ordering::AcqRel) {
                     let start = Start {
                         pipeline: weak.clone(),
+                        src: weak_src.clone(),
+                        enc: weak_enc.clone(),
+                        cpu: cpu.clone(),
                         download: download.clone(),
                         contexts: contexts.clone(),
                         started: started.clone(),
                         stopped: start_stopped.clone(),
                         on_error: on_error.clone(),
                     };
-                    start_off_thread(pad, start);
+                    start_off_thread(pad, pad.current_caps(), start);
                 }
                 return gst::PadProbeReturn::Ok;
             }
@@ -373,6 +445,11 @@ fn check_download_device(download: &gst::Element, contexts: &[gst::Context]) -> 
 /// What the start thread needs.
 struct Start {
     pipeline: glib::WeakRef<gst::Pipeline>,
+    src: glib::WeakRef<gst_app::AppSrc>,
+    enc: glib::WeakRef<gst::Element>,
+    /// [download →] convert → caps, linked between `src` and `enc` unless the frames are
+    /// [`zero_copy`].
+    cpu: Vec<gst::Element>,
     download: Option<glib::WeakRef<gst::Element>>,
     contexts: Arc<Mutex<Vec<gst::Context>>>,
     started: Arc<AtomicBool>,
@@ -383,7 +460,7 @@ struct Start {
 /// Start the PyroWave pipeline on a thread of its own: a state change and a device open must
 /// not hold the encode thread. PAUSED first, so the download's device is checked before any
 /// frame reaches it.
-fn start_off_thread(pad: &gst::Pad, start: Start) {
+fn start_off_thread(pad: &gst::Pad, caps: Option<gst::Caps>, start: Start) {
     let (Some(pipeline), encode) = (start.pipeline.upgrade(), pipeline_of(pad)) else {
         return;
     };
@@ -400,13 +477,19 @@ fn start_off_thread(pad: &gst::Pad, start: Start) {
             if *stopped {
                 return;
             }
-            let checked = pipeline
-                .set_state(gst::State::Paused)
-                .map_err(|e| format!("the PyroWave pipeline did not start: {e}"))
+            // QUASAR_PYROWAVE_CPU_INPUT=1 keeps the CPU path: an escape hatch, and an A/B.
+            let zero =
+                zero_copy(caps.as_ref()) && !crate::session::env_bool("QUASAR_PYROWAVE_CPU_INPUT");
+            let checked = link_chain(&pipeline, &start, zero)
+                .and_then(|()| {
+                    pipeline
+                        .set_state(gst::State::Paused)
+                        .map_err(|e| format!("the PyroWave pipeline did not start: {e}"))
+                })
                 .and_then(
                     |_| match start.download.as_ref().and_then(|d| d.upgrade()) {
-                        Some(download) => check_download_device(&download, &copied),
-                        None => Ok(()),
+                        Some(download) if !zero => check_download_device(&download, &copied),
+                        _ => Ok(()),
                     },
                 )
                 .and_then(|()| {
@@ -415,7 +498,14 @@ fn start_off_thread(pad: &gst::Pad, start: Start) {
                         .map_err(|e| format!("the PyroWave pipeline did not start: {e}"))
                 });
             match checked {
-                Ok(_) => start.started.store(true, Ordering::Release),
+                Ok(_) => {
+                    tracing::info!(
+                        zero_copy = zero,
+                        caps = ?caps,
+                        "PyroWave pipeline started"
+                    );
+                    start.started.store(true, Ordering::Release)
+                }
                 Err(e) => {
                     let _ = pipeline.set_state(gst::State::Null);
                     (start.on_error)(e);
@@ -425,6 +515,22 @@ fn start_off_thread(pad: &gst::Pad, start: Start) {
     if let Err(e) = spawned {
         fail(format!("no thread to start the PyroWave pipeline: {e}"));
     }
+}
+
+/// appsrc → `pyrowaveenc` for [`zero_copy`] frames, else appsrc → the CPU path → encoder.
+fn link_chain(pipeline: &gst::Pipeline, start: &Start, zero: bool) -> Result<(), String> {
+    let (Some(src), Some(enc)) = (start.src.upgrade(), start.enc.upgrade()) else {
+        return Err("the PyroWave pipeline is gone".into());
+    };
+    let mut chain = vec![src.upcast::<gst::Element>()];
+    if !zero {
+        pipeline
+            .add_many(&start.cpu)
+            .map_err(|e| format!("the CPU path: {e}"))?;
+        chain.extend(start.cpu.iter().cloned());
+    }
+    chain.push(enc);
+    gst::Element::link_many(&chain).map_err(|e| format!("cannot link the PyroWave pipeline: {e}"))
 }
 
 #[cfg(test)]
@@ -453,6 +559,43 @@ mod tests {
             Some("cudadownload")
         );
         assert!(download_for(&caps(Some("memory:DMABuf"))).is_err());
+    }
+
+    #[test]
+    fn only_bt709_nv12_vulkan_images_skip_the_cpu() {
+        gst::init().unwrap();
+        let caps = |features: &str, format: &str, colorimetry: Option<&str>| {
+            let mut b = gst::Caps::builder("video/x-raw")
+                .features([features])
+                .field("format", format)
+                .field("width", 1920)
+                .field("height", 1080)
+                .field("framerate", gst::Fraction::new(60, 1));
+            if let Some(c) = colorimetry {
+                b = b.field("colorimetry", c);
+            }
+            b.build()
+        };
+        let vk = "memory:VulkanImage";
+        assert!(zero_copy(Some(&caps(vk, "NV12", Some("bt709")))));
+        // The compositor's BT.601 default, and HDR P010, take the CPU path.
+        assert!(!zero_copy(Some(&caps(vk, "NV12", Some("bt601")))));
+        assert!(
+            !zero_copy(Some(&caps(vk, "NV12", None))),
+            "untagged is BT.601 here"
+        );
+        assert!(!zero_copy(Some(&caps(vk, "P010_10LE", Some("bt709")))));
+        assert!(!zero_copy(Some(&caps(
+            "memory:SystemMemory",
+            "NV12",
+            Some("bt709")
+        ))));
+        assert!(!zero_copy(Some(&caps(
+            "memory:CUDAMemory",
+            "NV12",
+            Some("bt709")
+        ))));
+        assert!(!zero_copy(None), "not negotiated yet");
     }
 
     #[test]

@@ -1,13 +1,15 @@
 //! `pyrowaveenc`: PyroWave encode as a GStreamer element (#1056, spec #1048, contract
-//! `protocol/codec-pyrowave.md`). Input is 8-bit 4:2:0 YCbCr in system memory; each output
-//! buffer is one whole frame of bitstream v1 (the SOF, then the 32×32 blocks, every packet
-//! self-delimiting) and every frame is a keyframe.
+//! `protocol/codec-pyrowave.md`). Input is 8-bit 4:2:0 YCbCr in system memory, or NV12 in
+//! `memory:VulkanImage`, encoded on that image's own device with no copy (#1104, `gpu`);
+//! each output buffer is one whole frame of bitstream v1 (the SOF, then the 32×32 blocks,
+//! every packet self-delimiting) and every frame is a keyframe.
 
 use gstreamer as gst;
 use gstreamer::glib;
 use gstreamer::prelude::*;
 
 pub mod ffi;
+pub mod gpu;
 mod imp;
 
 glib::wrapper! {
