@@ -194,8 +194,9 @@ func (s *Store) Reconcile(ctx context.Context) error {
 			map[string]any{"tag": m.tag, "sha512": m.sha, "shipped_sha512": m.shipped})
 	}
 	for _, h := range helds {
-		audit.TryRecord(ctx, s.Auditor, "", "compat_tool.name_conflict", "compat_tool", h.id,
-			map[string]any{"tag": h.tag, "sha512": h.sha, "name": h.name, "shipped_tag": h.shipped})
+		details := map[string]any{"tag": h.tag, "sha512": h.sha, "shipped_tag": h.shipped}
+		audit.CapText(details, "name", h.name)
+		audit.TryRecord(ctx, s.Auditor, "", "compat_tool.name_conflict", "compat_tool", h.id, details)
 	}
 	return nil
 }
