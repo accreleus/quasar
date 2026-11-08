@@ -4,6 +4,8 @@
 // (protocol/transport-webtransport.md) is the first implementation here; WebRTC
 // still decodes inside the browser's <video> and does not go through this seam.
 
+import type { InputWire } from "./inputSender";
+
 /** A `hello_ack.video` (§Hello ack), the decoder configuration a `config_id` names. */
 export interface VideoConfig {
   configId: number;
@@ -44,12 +46,16 @@ export interface MediaSink {
   unit(unit: AccessUnit): void;
   /** Called once, after connect resolved, when the transport is gone. */
   end(end: TransportEnd): void;
+  /** A ping's round trip in ms, once a second while connected (§Ping and pong). */
+  rtt?(ms: number): void;
 }
 
 export interface MediaTransport {
   /** Resolves at the first `hello_ack`; rejects with a {@link TransportError}. */
   connect(sink: MediaSink): Promise<void>;
   requestKeyframe(reason: KeyframeReason): void;
+  /** Where client input goes once connected (§Input). */
+  readonly input: InputWire;
   /** Says `bye` when connected; idempotent. */
   close(): void;
 }

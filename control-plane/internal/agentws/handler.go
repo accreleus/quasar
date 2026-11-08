@@ -938,6 +938,11 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	ac.parkedSessionsV1 = caps.ParkedSessionsV1
 	ac.adoptRestreamV1 = caps.AdoptRestreamV1
 	ac.compatToolsV1 = caps.CompatToolsV1
+	if !caps.CompatToolsV1 {
+		if err := h.store.forgetHostCompatTools(bg, hostID); err != nil {
+			h.log.Warn("host compat tools clear failed", "host_id", hostID, "err", err)
+		}
+	}
 	ac.policyTyped = policyTyped
 	ac.policyAccepted = acceptedGroups
 	ac.policyIdle = slices.Contains(acceptedGroups, "hardware")

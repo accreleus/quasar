@@ -265,7 +265,7 @@ describe("createWebTransportRuntime", () => {
       sessionId: "s1",
       authToken: "auth",
       coords: COORDS,
-      canvas: {} as HTMLCanvasElement,
+      canvas: document.createElement("canvas"),
       callbacks,
       deps: {
         createTransport: (o) => new WebTransportMedia({ ...o, createWebTransport: agent.create, sleep: async () => {} }),
@@ -415,7 +415,7 @@ describe("createWebTransportRuntime", () => {
       sessionId: "s1",
       authToken: "auth",
       coords: COORDS,
-      canvas: {} as HTMLCanvasElement,
+      canvas: document.createElement("canvas"),
       callbacks,
       deps: { createTransport, createPresenter: () => Promise.reject(new Error("requestDevice failed")) },
     });
@@ -435,7 +435,7 @@ describe("createWebTransportRuntime", () => {
       sessionId: "s1",
       authToken: "auth",
       coords: COORDS,
-      canvas: {} as HTMLCanvasElement,
+      canvas: document.createElement("canvas"),
       callbacks,
       deps: {
         createTransport,
@@ -461,6 +461,7 @@ describe("createWebTransportRuntime", () => {
         return new Promise((_, reject) => (refuse = reject));
       },
       requestKeyframe: () => {},
+      input: { reliable: () => {}, datagram: () => false },
       close: () => {},
     };
     const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn() };
@@ -470,7 +471,7 @@ describe("createWebTransportRuntime", () => {
         sessionId: "s1",
         authToken: "auth",
         coords: COORDS,
-        canvas: {} as HTMLCanvasElement,
+        canvas: document.createElement("canvas"),
         callbacks,
         deps: { createTransport: () => fake, createPresenter: async () => presenter },
       });
@@ -499,7 +500,7 @@ describe("createWebTransportRuntime", () => {
       sessionId: "s1",
       authToken: "auth",
       coords: COORDS,
-      canvas: {} as HTMLCanvasElement,
+      canvas: document.createElement("canvas"),
       callbacks,
       deps: {
         createTransport: (o) => new WebTransportMedia({ ...o, createWebTransport: agent.create, sleep: async () => {} }),
