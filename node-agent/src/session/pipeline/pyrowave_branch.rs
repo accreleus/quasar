@@ -461,6 +461,9 @@ fn start_with(
     let was_open = AtomicBool::new(false);
     let gave_up = AtomicBool::new(false);
     let first_released = AtomicBool::new(false);
+    // Diagnostic only: QUASAR_PYROWAVE_UNORDERED=1 skips the hand-off, bringing back the race
+    // it closes, so a lab can count Xids before and after on one build.
+    let ordered = !crate::session::env_bool("QUASAR_PYROWAVE_UNORDERED");
     let held = handoff.clone();
     let held_error = on_error.clone();
     let stopped = Arc::new(Mutex::new(false));
@@ -511,10 +514,11 @@ fn start_with(
             if let Some(caps) = &caps {
                 sample = sample.caps(caps);
             }
-            let vulkan = caps
-                .as_ref()
-                .and_then(|c| c.features(0))
-                .is_some_and(|f| f.contains("memory:VulkanImage"));
+            let vulkan = ordered
+                && caps
+                    .as_ref()
+                    .and_then(|c| c.features(0))
+                    .is_some_and(|f| f.contains("memory:VulkanImage"));
             if vulkan {
                 held.hold();
             }
