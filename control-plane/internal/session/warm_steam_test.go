@@ -63,7 +63,8 @@ func TestValidLaunchProgress(t *testing.T) {
 }
 
 func TestDecideClaim(t *testing.T) {
-	park := claimStream{Codec: "av1", Width: 2560, Height: 1440, FPS: 60, BitrateKbps: 7000, H264Profile: "main", Mic: true}
+	park := claimStream{Codec: "av1", Transport: "webrtc", Width: 2560, Height: 1440, FPS: 60, BitrateKbps: 7000, H264Profile: "main", Mic: true}
+	wt := func(s *claimStream) { s.Transport = "webtransport" }
 	with := func(f func(*claimStream)) claimStream { s := park; f(&s); return s }
 	p1080 := with(func(s *claimStream) { s.Width, s.Height, s.BitrateKbps = 1920, 1080, 5000 })
 	running := parkedFacts{Family: true, State: StateRunning, InDeadline: true, HostUp: true, Restream: true, Stream: park}
@@ -101,6 +102,10 @@ func TestDecideClaim(t *testing.T) {
 		{"claimed by a racing launch", at(func(k *parkedFacts) { k.State, k.Claimed = StateStopped, true }), park, claimLost, "", ""},
 		{"stopped by expiry or eviction", at(func(k *parkedFacts) { k.State = StateStopped }), park, claimSupersede, causeNotRunning, ""},
 		{"codec gated", at(func(k *parkedFacts) { k.CodecGated = true }), park, claimSupersede, causeCodecUnsupported, ""},
+		{"webtransport launch on a webrtc park (#1161)", running, with(wt), claimSupersede, causeTransportDiffers, ""},
+		{"webtransport launch, old agent", old, with(wt), claimSupersede, causeTransportDiffers, ""},
+		{"transport after the codec gate", at(func(k *parkedFacts) { k.CodecGated = true }), with(wt), claimSupersede, causeCodecUnsupported, ""},
+		{"transport after fps", running, with(func(s *claimStream) { wt(s); s.FPS = 120 }), claimSupersede, causeFPSHigher, ""},
 		{"codec gated after fps", at(func(k *parkedFacts) { k.CodecGated = true }), with(func(s *claimStream) { s.FPS = 120 }), claimSupersede, causeFPSHigher, ""},
 		{"compat tool missing", at(func(k *parkedFacts) { k.ToolMissing = true }), park, claimSupersede, causeCompatTool, ""},
 		{"compat tool missing after fps", at(func(k *parkedFacts) { k.ToolMissing = true }), with(func(s *claimStream) { s.FPS = 120 }), claimSupersede, causeFPSHigher, ""},

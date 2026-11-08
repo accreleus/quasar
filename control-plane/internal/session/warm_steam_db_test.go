@@ -687,6 +687,55 @@ func TestADeclinedClaimsReparkTakesThePlaysOwnSize(t *testing.T) {
 	}
 }
 
+// #1161: a park is always WebRTC and no restream moves a runtime between transports, so a
+// claim the stream plan sends over WebTransport supersedes the park (transport_differs), and
+// the client's retry launches cold on WebTransport.
+func TestAWebTransportClaimOnAWebRTCParkLaunchesCold(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	ctx := context.Background()
+	f.disp.setRestream(true)
+	// The park is made with the device the launch probes from, so only the transport differs.
+	caps := `{"bandwidth_kbps":50000,"rtt_ms":5,"max_decode_height":2160,"measured_at":"` +
+		time.Now().UTC().Format(time.RFC3339) + `","codecs":{"h264":true},
+		"webtransport":{"available":true,"datagrams":true},
+		"webcodecs":{"h264":true,"opus_decode":true,"opus_encode":true}}`
+	must(t, exec(t, f.pool, `UPDATE user_devices SET capabilities = $2::jsonb WHERE id = $1::uuid`, f.deviceID, caps))
+	k := f.park(t)
+	var parkTransport string
+	must(t, f.pool.QueryRow(ctx, `SELECT transport FROM sessions WHERE id = $1::uuid`, k).Scan(&parkTransport))
+	if parkTransport != transportWebRTC {
+		t.Fatalf("park transport %q, want webrtc", parkTransport)
+	}
+	must(t, exec(t, f.pool, `UPDATE launch_profiles SET transport = 'webtransport'`))
+	must(t, exec(t, f.pool, `UPDATE hosts SET transports = '["webrtc","webtransport"]', wt_port = 4433,
+		wt_addresses = '["192.0.2.10"]',
+		wt_certificates = jsonb_build_array(jsonb_build_object('sha256', $2::text,
+			'not_before', now() - interval '1 day', 'not_after', now() + interval '10 days'))
+		WHERE id = $1::uuid`, f.hostID, wtCertA))
+
+	_, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID, Mic: true})
+	var refused *ParkedClaimRefusedError
+	if !errors.As(err, &refused) || refused.Cause != causeTransportDiffers {
+		t.Fatalf("err = %v, want a refused claim with cause transport_differs", err)
+	}
+	if r := f.disp.stopReason(k); r != StopReasonParkedSuperseded {
+		t.Errorf("session_stop reason = %q, want parked_superseded", r)
+	}
+
+	// The retry, once the parked Steam has stopped: a cold launch on WebTransport.
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: k, State: "stopped", HomeCleanupQualified: true})
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID, Mic: true})
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if res.Session.Transport != transportWebTransport {
+		t.Errorf("retry transport %q, want webtransport", res.Session.Transport)
+	}
+	if a := f.disp.assignFor(t, res.Session.ID); a.AdoptSessionID != "" {
+		t.Errorf("retry adopts %q, want a cold launch", a.AdoptSessionID)
+	}
+}
+
 // Only a parked row a racing launch claimed reads as a lost claim (409 home_in_use);
 // one stopped by expiry or eviction in the window is a Steam restart (503).
 func TestAParkStoppedByExpiryInTheWindowIsASteamRestartNotHomeInUse(t *testing.T) {

@@ -12,25 +12,9 @@ import (
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/compat"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const geName = "GE-Proton9-99"
-
-// seedGETool inserts an enabled GE tool bound to geName and maps game 1145360 to it.
-func seedGETool(t *testing.T, pool *pgxpool.Pool) {
-	t.Helper()
-	must(t, exec(t, pool, `DELETE FROM compat_tool_mappings`))
-	must(t, exec(t, pool, `INSERT INTO compat_tools (family, source, tag, steam_name, display_name, enabled,
-		first_enabled_at, asset_name, asset_size_bytes, asset_sha512)
-		VALUES ('ge', 'tag', $1, $1, $1, true, now(), $1 || '.tar.gz', 1, repeat('a', 128))`, geName))
-	must(t, exec(t, pool, `INSERT INTO compat_tool_mappings (provider, external_id, tool_id, forced)
-		SELECT 'steam', '1145360', id, false FROM compat_tools WHERE tag = $1`, geName))
-	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(), `DELETE FROM compat_tool_mappings`)
-		_, _ = pool.Exec(context.Background(), `DELETE FROM compat_tools WHERE tag = $1`, geName)
-	})
-}
+const geName = compatSteamNm
 
 func parkedMountedWith(t *testing.T, f *warmFixture, names ...string) string {
 	t.Helper()
@@ -42,7 +26,7 @@ func parkedMountedWith(t *testing.T, f *warmFixture, names ...string) string {
 func TestClaimFailsWhenTheParkedSteamLacksTheMappedGETool(t *testing.T) {
 	f := newWarmFixture(t, 4)
 	ctx := context.Background()
-	tile := seedTile(t, f.pool, f.steam, "Hades", "1145360")
+	tile := seedTile(t, f.pool, f.steam, "Hades", compatGameID)
 	seedGETool(t, f.pool)
 	k := parkedMountedWith(t, f) // started before the host had the tool
 
@@ -60,8 +44,9 @@ func TestClaimAdoptsAndCopiesTheParkedToolNames(t *testing.T) {
 	f := newWarmFixture(t, 4)
 	f.disp.compat = true
 	ctx := context.Background()
-	tile := seedTile(t, f.pool, f.steam, "Hades", "1145360")
+	tile := seedTile(t, f.pool, f.steam, "Hades", compatGameID)
 	seedGETool(t, f.pool)
+	hostHasTool(t, f.pool, f.hostID, true)
 	k := parkedMountedWith(t, f, geName)
 
 	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: tile, DeviceID: f.deviceID, Mic: true})
@@ -82,11 +67,11 @@ func TestClaimAdoptsAndCopiesTheParkedToolNames(t *testing.T) {
 func TestClaimFailsWhenAToolTheParkedSteamHoldsIsNoLongerUsable(t *testing.T) {
 	f := newWarmFixture(t, 4)
 	ctx := context.Background()
-	tile := seedTile(t, f.pool, f.steam, "Hades", "1145360")
+	tile := seedTile(t, f.pool, f.steam, "Hades", compatGameID)
 	seedGETool(t, f.pool)
 	k := parkedMountedWith(t, f, geName)
 	must(t, exec(t, f.pool, `DELETE FROM compat_tool_mappings`))
-	must(t, exec(t, f.pool, `UPDATE compat_tools SET enabled = false WHERE tag = $1`, geName))
+	must(t, exec(t, f.pool, `UPDATE compat_tools SET enabled = false WHERE steam_name = $1`, geName))
 
 	_, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: tile, DeviceID: f.deviceID, Mic: true})
 	var refused *ParkedClaimRefusedError
@@ -103,14 +88,14 @@ func TestClaimFailsWhenAToolTheParkedSteamHoldsIsNoLongerUsable(t *testing.T) {
 func TestClaimTakesTheToolShareLockBeforeAnySessionLock(t *testing.T) {
 	f := newWarmFixture(t, 4)
 	ctx := context.Background()
-	tile := seedTile(t, f.pool, f.steam, "Hades", "1145360")
+	tile := seedTile(t, f.pool, f.steam, "Hades", compatGameID)
 	seedGETool(t, f.pool)
 	k := parkedMountedWith(t, f, geName)
 
 	disable, err := f.pool.Begin(ctx)
 	must(t, err)
 	defer disable.Rollback(ctx)
-	_, err = disable.Exec(ctx, `UPDATE compat_tools SET enabled = false WHERE tag = $1`, geName)
+	_, err = disable.Exec(ctx, `UPDATE compat_tools SET enabled = false WHERE steam_name = $1`, geName)
 	must(t, err)
 
 	done := make(chan error, 1)
@@ -136,7 +121,7 @@ func TestClaimTakesTheToolShareLockBeforeAnySessionLock(t *testing.T) {
 func TestClaimIgnoresAMappingToAValveBuild(t *testing.T) {
 	f := newWarmFixture(t, 4)
 	ctx := context.Background()
-	tile := seedTile(t, f.pool, f.steam, "Hades", "1145360")
+	tile := seedTile(t, f.pool, f.steam, "Hades", compatGameID)
 	seedGETool(t, f.pool)
 	must(t, compat.NewStore(f.pool).Reconcile(ctx))
 	must(t, exec(t, f.pool, `UPDATE compat_tools SET enabled = true WHERE steam_name = 'proton_hotfix'`))

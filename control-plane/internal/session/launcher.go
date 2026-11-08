@@ -249,6 +249,9 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		// it is an installed catalog entry.
 		AppImage: app.Image(),
 	}
+	if app.IsDerived() && app.ExternalSource == "steam" {
+		p.CompatGameID = app.ExternalID
+	}
 	if p.RequireCodec, err = codecConstraint(launchProfile, ov); err != nil {
 		return LaunchResult{}, err
 	}
@@ -642,7 +645,8 @@ func (c *Coordinator) claimCandidate(ctx context.Context, p *CreateParams, k par
 	ps.applyTo(&prov)
 	p.Width, p.Height, p.FPS, p.BitrateKbps = prov.Width, prov.Height, prov.FPS, prov.BitrateKbps
 	p.Codec, p.Playout0Ms = prov.Codec, prov.Playout0Ms
-	p.claim = &parkedClaim{id: k.ID, hostParks: c.hostParks(k.HostID), restream: c.hostRestreams(k.HostID)}
+	p.claim = &parkedClaim{id: k.ID, hostParks: c.hostParks(k.HostID), restream: c.hostRestreams(k.HostID),
+		transport: transportOrWebRTC(prov.Transport)}
 	return ps, nil
 }
 
@@ -1110,7 +1114,11 @@ func (c *Coordinator) sendHomeBoundAssign(hostID, sessionID string, app []byte, 
 				"assign dispatch failed: the agent connection cannot take a parked session or an adoption")
 			return false
 		}
-		wire = c.fitCompatTools(wire, epoch)
+		wire, err := c.fitCompatTools(wire, epoch, hostID)
+		if err != nil {
+			c.failBeforeAgent(sessionID, assign.AdoptSessionID, &hostID, "compat_tool_missing: "+err.Error())
+			return false
+		}
 		capable := epoch != nil && epoch.SupportsHomeCleanup()
 		hold, err := c.store.bindManagedHomeDispatchWithHold(c.ctx, sessionID, app, capable, expected)
 		if errors.Is(err, errSessionNotAssigned) {
