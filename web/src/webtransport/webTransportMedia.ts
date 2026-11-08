@@ -1,5 +1,5 @@
 // MediaTransport over WebTransport: protocol/transport-webtransport.md, wt_proto 1,
-// video, input and ping/pong. Audio, NACK and feedback are later tickets (#1033, #1039, #1040).
+// video, input, ping/pong and NACK. Audio and feedback are later tickets (#1033, #1040).
 
 import {
   base64Bytes,
@@ -11,7 +11,7 @@ import {
 import type { WebTransportCoords } from "../api/types";
 import type { InputWire } from "./inputSender";
 import { workerTicker, type Ticker } from "./pingTicker";
-import { FrameAssembler } from "./reassembly";
+import { FrameAssembler, type Reassembled } from "./reassembly";
 import {
   TransportError,
   type KeyframeReason,
@@ -31,6 +31,8 @@ const ANSWER_TIMEOUT_MS = 10_000;
 const CLOSE_CODE_WAIT_MS = 1_000;
 /** The agent forces at most one IDR per 150 ms (quasar-protocol#29, item 8); asking faster is noise. */
 export const KEYFRAME_SPACING_MS = 150;
+/** How often loss-recovery deadlines are checked when no datagram arrives. */
+export const RECOVERY_TICK_MS = 50;
 /** The control plane is asked for a fresh token at most this often. */
 export const REMINT_MIN_INTERVAL_MS = 10_000;
 /** A token held this long (TTL 60 s, control-api.md) is replaced after a failed attempt. Measured
@@ -299,7 +301,8 @@ export class WebTransportMedia implements MediaTransport {
     };
 
     // Datagrams can overtake the hello_ack; the decode stage holds them by config_id.
-    void this.readDatagrams(wt, sink, live).catch(() => {});
+    const assembler = new FrameAssembler(this.now);
+    void this.readDatagrams(wt, sink, live, assembler).catch(() => {});
     let first: Record<string, unknown> | null;
     try {
       first = await Promise.race([next(), after(ANSWER_TIMEOUT_MS, null)]);
@@ -340,7 +343,9 @@ export class WebTransportMedia implements MediaTransport {
         for (let m = await next(); m && live.on; m = await next()) {
           // Unknown types are ignored (§Channels). bye is followed by the close.
           if (m.type === "hello_ack") sink.config(videoConfigFrom(m));
-          else if (m.type === "pong" && typeof m.tc === "number") sink.rtt?.(Math.max(0, this.now() - m.tc));
+          else if (m.type === "nack_miss" && typeof m.frame_seq === "number" && Array.isArray(m.frags)) {
+            this.recovered(assembler.miss(m.frame_seq, m.frags as [number, number][]), sink);
+          } else if (m.type === "pong" && typeof m.tc === "number") sink.rtt?.(Math.max(0, this.now() - m.tc));
           else if (m.type === "ping") {
             this.send({ type: "pong", id: m.id, ts: m.ts, tw: m.tw, tc: this.now() });
           }
@@ -350,12 +355,18 @@ export class WebTransportMedia implements MediaTransport {
         wt.close({ closeCode: 4400, reason: err instanceof Error ? err.message.slice(0, 100) : "" });
       }
     })();
+    // Release and lateness must not wait for the next datagram: a still picture may send none.
+    const tick = setInterval(() => {
+      if (live.on) this.recovered(assembler.tick(), sink);
+    }, RECOVERY_TICK_MS);
     void wt.closed.then(
       (info) => {
+        clearInterval(tick);
         this.stopPings();
         sink.end({ code: info.closeCode ?? null, reason: info.reason ?? "" });
       },
       (err: unknown) => {
+        clearInterval(tick);
         this.stopPings();
         sink.end({ code: null, reason: err instanceof Error ? err.message : "" });
       },
@@ -363,17 +374,26 @@ export class WebTransportMedia implements MediaTransport {
     return { kind: "ack" };
   }
 
-  private async readDatagrams(wt: WebTransport, sink: MediaSink, live: { on: boolean }): Promise<void> {
+  private async readDatagrams(
+    wt: WebTransport,
+    sink: MediaSink,
+    live: { on: boolean },
+    assembler: FrameAssembler,
+  ): Promise<void> {
     const reader = wt.datagrams.readable.getReader();
-    const assembler = new FrameAssembler(this.now);
     for (;;) {
       const { value, done } = await reader.read();
       if (done || !live.on) return;
       const frag = parseVideoDatagram(value as Uint8Array);
       if (!frag) continue; // another channel, or malformed: dropped (§Channels)
-      const { unit, needKeyframe } = assembler.push(frag);
-      if (needKeyframe) this.requestKeyframe("loss");
-      if (unit) sink.unit(unit);
+      this.recovered(assembler.push(frag), sink);
     }
+  }
+
+  /** §Loss recovery: NACKs out, a keyframe asked for a late frame, whole units to the sink. */
+  private recovered({ units, nacks, needKeyframe }: Reassembled, sink: MediaSink): void {
+    for (const n of nacks) this.send({ type: "nack", frame_seq: n.frameSeq, frags: n.frags });
+    if (needKeyframe) this.requestKeyframe("late");
+    for (const u of units) sink.unit(u);
   }
 }
