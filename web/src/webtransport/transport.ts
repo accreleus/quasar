@@ -5,6 +5,7 @@
 // still decodes inside the browser's <video> and does not go through this seam.
 
 import type { PyroWaveFrame } from "../pyrowave/receiver";
+import type { InputWire } from "./inputSender";
 
 /** A `hello_ack.video` (§Hello ack), the decoder configuration a `config_id` names. */
 export interface VideoConfig {
@@ -50,6 +51,8 @@ export interface MediaSink {
   pyrowave(frame: PyroWaveFrame): void;
   /** Called once, after connect resolved, when the transport is gone. */
   end(end: TransportEnd): void;
+  /** A ping's round trip in ms, once a second while connected (§Ping and pong). */
+  rtt?(ms: number): void;
 }
 
 export interface MediaTransport {
@@ -58,6 +61,8 @@ export interface MediaTransport {
   requestKeyframe(reason: KeyframeReason): void;
   /** `codec_fallback`: this client cannot go on decoding PyroWave (codec-pyrowave.md). */
   codecFallback(reason: string): void;
+  /** Where client input goes once connected (§Input). */
+  readonly input: InputWire;
   /** Says `bye` when connected; idempotent. */
   close(): void;
 }

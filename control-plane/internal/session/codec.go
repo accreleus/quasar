@@ -69,6 +69,14 @@ func deviceAccepts(wire string, dp *DeviceProbe) bool {
 	return false
 }
 
+// transportOrWebRTC reads an unset transport as webrtc, as the sessions column defaults.
+func transportOrWebRTC(t string) string {
+	if t == "" {
+		return transportWebRTC
+	}
+	return t
+}
+
 // codecOrH264 reads an unset wire codec as the h264 floor.
 func codecOrH264(c string) string {
 	if c == "" {

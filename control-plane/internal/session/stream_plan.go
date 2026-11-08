@@ -108,7 +108,12 @@ const (
 	reasonHostNoEndpoint       = "host_no_endpoint"
 	reasonDeviceNoWebTransport = "device_no_webtransport"
 	reasonDeviceNoWebCodecs    = "device_no_webcodecs"
+	reasonCodecUnsupported     = "codec_unsupported_on_transport"
 )
+
+// webTransportCodecs are the codecs this build's WebTransport media path carries. A18 (#1043)
+// adds hevc and av1 here once the agent and the web client can carry them.
+var webTransportCodecs = map[profile.Codec]bool{profile.CodecH264: true}
 
 // certIdentity is the encode path a cert row must describe to be applicable to this
 // launch. Assembled from two reads that fail independently, either of which can be
@@ -291,6 +296,8 @@ func (in StreamInputs) planTransport(codec profile.Codec, wantsPyroWave bool) (t
 		return transportWebRTC, reasonHostNoEndpoint
 	case in.Probe == nil || !in.Probe.WebTransport:
 		return transportWebRTC, reasonDeviceNoWebTransport
+	case !webTransportCodecs[codec]:
+		return transportWebRTC, reasonCodecUnsupported
 	case !in.Probe.WebCodecs[string(codec)] || !in.Probe.WebCodecs["opus_decode"]:
 		return transportWebRTC, reasonDeviceNoWebCodecs
 	}

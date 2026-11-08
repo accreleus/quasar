@@ -28,6 +28,7 @@ import {
   createSessionRuntime,
   IDLE_SNAPSHOT,
   type SessionRuntime,
+  type SessionRuntimeCallbacks,
   type SessionRuntimeSnapshot,
 } from "./sessionRuntime";
 import { createWebTransportRuntime } from "./webTransportRuntime";
@@ -410,6 +411,46 @@ function SessionPageBody() {
   useEffect(() => {
     if (!signalCoords.url || !signalCoords.token || !videoRef.current) return;
 
+    const inputCallbacks: Pick<
+      SessionRuntimeCallbacks,
+      "onSummonOverlay" | "onKeyboardLockRefused" | "onNonStandardGamepad"
+    > = {
+      // capture.ts owns the chord while the pointer is locked: it releases
+      // the lock, swallows the key, then calls back here. The HUD's own
+      // listener answers the unlocked case (hudKeys.ts).
+      onSummonOverlay: () => hudRef.current?.open(),
+      // Never silently degrade: a refused lock means Esc quits the game, so
+      // say it before the user finds out the hard way. The bypassed-cert case
+      // does NOT arrive here — lock() resolves there (lib/certTrust.ts).
+      onKeyboardLockRefused: (error) => {
+        reportBestEffortFailure("silent-debug", "session: keyboard.lock", error);
+        setKbLockRefused(true);
+        addToast({
+          variant: "danger",
+          title: "Esc will leave the game",
+          body:
+            certTrustRef.current === "untrusted-cert"
+              ? "The browser refused to hand Esc to the game — this address uses " +
+                "a certificate your device doesn't trust. Download the server " +
+                "certificate from /v1/tls/certificate.pem, trust it, then reload."
+              : "The browser refused to hand Esc to the game (Keyboard Lock), so " +
+                "pressing Esc releases input instead of reaching the game. " +
+                "Re-entering fullscreen usually restores it.",
+        });
+      },
+      // quasar#348: the browser didn't recognise this pad, so its raw
+      // button order is going out as if it were the standard layout. Say so
+      // once per pad; the Controller & input pane repeats it under the pad.
+      onNonStandardGamepad: (pad) => {
+        addToast({
+          variant: "info",
+          title: "Controller not recognised by your browser",
+          body: `${shortGamepadLabel(pad.id)}: ${NON_STANDARD_PAD_ADVICE}`,
+          duration: 10000,
+        });
+      },
+    };
+
     // A replacement re-seat is WebRTC's recovery; it never comes back here as WebTransport.
     const rt = webtransport && canvasRef.current && !signalCoords.replacement
       ? createWebTransportRuntime({
@@ -419,6 +460,7 @@ function SessionPageBody() {
           canvas: canvasRef.current,
           pyrowave: state?.pyrowave === true,
           callbacks: {
+            ...inputCallbacks,
             onDisconnectSuspected: () => void pollEndReason(),
             onSessionTakenOver: () => noteFailure(takenOverFailure()),
             // A poll verdict about the session's end outranks this one (settleFailure).
@@ -436,40 +478,7 @@ function SessionPageBody() {
       // Parsed from tier "W×H@fps"; undefined falls back to an absolute decode ceiling.
       tierFps: state?.tier ? parseInt(state.tier.split("@")[1] ?? "", 10) || undefined : undefined,
       callbacks: {
-        // capture.ts owns the chord while the pointer is locked: it releases
-        // the lock, swallows the key, then calls back here. The HUD's own
-        // listener answers the unlocked case (hudKeys.ts).
-        onSummonOverlay: () => hudRef.current?.open(),
-        // Never silently degrade: a refused lock means Esc quits the game, so
-        // say it before the user finds out the hard way. The bypassed-cert case
-        // does NOT arrive here — lock() resolves there (lib/certTrust.ts).
-        onKeyboardLockRefused: (error) => {
-          reportBestEffortFailure("silent-debug", "session: keyboard.lock", error);
-          setKbLockRefused(true);
-          addToast({
-            variant: "danger",
-            title: "Esc will leave the game",
-            body:
-              certTrustRef.current === "untrusted-cert"
-                ? "The browser refused to hand Esc to the game — this address uses " +
-                  "a certificate your device doesn't trust. Download the server " +
-                  "certificate from /v1/tls/certificate.pem, trust it, then reload."
-                : "The browser refused to hand Esc to the game (Keyboard Lock), so " +
-                  "pressing Esc releases input instead of reaching the game. " +
-                  "Re-entering fullscreen usually restores it.",
-          });
-        },
-        // quasar#348: the browser didn't recognise this pad, so its raw
-        // button order is going out as if it were the standard layout. Say so
-        // once per pad; the Controller & input pane repeats it under the pad.
-        onNonStandardGamepad: (pad) => {
-          addToast({
-            variant: "info",
-            title: "Controller not recognised by your browser",
-            body: `${shortGamepadLabel(pad.id)}: ${NON_STANDARD_PAD_ADVICE}`,
-            duration: 10000,
-          });
-        },
+        ...inputCallbacks,
         onDisconnectSuspected: () => void pollEndReason(),
         onReplacementSignaling: ({ url, token, iceServers }) =>
           setSignalCoords({ url, token, replacement: true, iceServers }),
@@ -1050,7 +1059,14 @@ function SessionPageBody() {
           autoPlay
           hidden={webtransport !== undefined}
         />
-        {webtransport && <canvas ref={canvasRef} className="session-video" />}
+        {webtransport && (
+          <canvas
+            ref={canvasRef}
+            className="session-video"
+            data-compositor-w={compositorSize?.w}
+            data-compositor-h={compositorSize?.h}
+          />
+        )}
       </div>
 
       {/* The launch/status line stays bottom-anchored and click-through. */}

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/accreleus/quasar/control-plane/internal/outbound"
 )
 
 // Every test here runs against a STUBBED HTTP server. Nothing in this package
@@ -506,5 +508,13 @@ func TestSearchSurvivesThumbLookupFailure(t *testing.T) {
 	}
 	if len(got) != 2 || got[0].ThumbURL != "" || got[1].ThumbURL != "" {
 		t.Fatalf("candidates must survive unfilled: %+v", got)
+	}
+}
+
+// A provider built with no injected client gets the shared outbound client (#1107).
+func TestNewSteamGridDBClientDefaultsToTheGuardedClient(t *testing.T) {
+	c := NewSteamGridDBClient("k", "", nil)
+	if _, ok := c.http.(*outbound.Client); !ok {
+		t.Fatalf("http is %T, want *outbound.Client", c.http)
 	}
 }

@@ -73,7 +73,7 @@ function setup(opts: { offer?: boolean; warm?: boolean } = {}) {
     sessionId: "s1",
     authToken: "auth",
     coords: COORDS,
-    canvas: {} as HTMLCanvasElement,
+    canvas: document.createElement("canvas"),
     pyrowave: opts.offer ?? true,
     callbacks: { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn() },
     deps: {
@@ -99,7 +99,7 @@ function setup(opts: { offer?: boolean; warm?: boolean } = {}) {
 const datagrams = (configId: number, frameSeq: number) => pyroWaveDatagrams({ configId, frameSeq }, packPyroWave(frames[0], N));
 
 describe("a PyroWave session in the WebTransport runtime", () => {
-  it("offers PyroWave, decodes each frame with its coverage and draws it, asking for no keyframe", async () => {
+  it("offers PyroWave, decodes each frame with its coverage and draws it; a lost datagram is concealed, not NACKed", async () => {
     const { agent, rt, decodes, textures, clock } = setup();
     rt.start();
     await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
@@ -116,7 +116,9 @@ describe("a PyroWave session in the WebTransport runtime", () => {
     clock.now += 17;
     await vi.waitFor(() => expect(textures).toHaveLength(2));
     expect(decodes[1].covered.some((c) => c === 0)).toBe(true);
+    // codec-pyrowave.md §Loss: PyroWave loss is concealed, never NACKed or answered with a keyframe.
     expect(agent.sent("keyframe_request")).toEqual([]);
+    expect(agent.sent("nack")).toEqual([]);
     rt.destroy();
   });
 

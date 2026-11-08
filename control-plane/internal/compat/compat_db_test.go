@@ -6,6 +6,7 @@ package compat
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -42,6 +43,8 @@ func testDB(t *testing.T) *pgxpool.Pool {
 	}
 	if _, err := pool.Exec(ctx, `
 		UPDATE instance_settings SET compat_tool_default_id = NULL, compat_tools_max_enabled = 8;
+		DELETE FROM sessions WHERE app_id IN (SELECT id FROM apps WHERE name = 'compat-app');
+		DELETE FROM apps WHERE name = 'compat-app';
 		DELETE FROM job_runs WHERE job_id = 'compat_tools.converge';
 		DELETE FROM host_compat_tools; DELETE FROM hosts WHERE node_name LIKE 'compat-%';
 		DELETE FROM compat_tool_mappings; DELETE FROM compat_tools;
@@ -114,6 +117,10 @@ type harness struct {
 	conv  *Converger
 	disp  *jobs.Dispatcher
 	gh    *fakeGitHub // serves 404 until a test sets gh.serve
+	store *Store
+	// stopped is the sessions the store's Stopper was asked to stop, in order; stopErr fails it.
+	stopped []string
+	stopErr error
 	// supported is each host's compat_tools_v1, as the agent registry would answer.
 	mu        sync.Mutex
 	supported map[string]bool
@@ -159,14 +166,25 @@ func newHarness(t *testing.T) *harness {
 	disp := jobs.New(jobStore, reg, jobs.DefaultConfig(), quiet)
 	conv.Disp = disp
 	fake, gh := newFakeGitHub(t, func(_ string, w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
-	NewHandler(NewStore(pool), audit.NewStore(pool), conv, gh).Register(mux, func(next http.Handler) http.Handler {
+	store := NewStore(pool)
+	NewHandler(store, audit.NewStore(pool), conv, gh).Register(mux, func(next http.Handler) http.Handler {
 		return ah.RequireAuth(ah.RequireAdmin(next))
 	})
 	jobs.NewAgentHandler(jobStore, disp, nodeSecrets{pool}, quiet).Register(mux)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	h := &harness{t: t, pool: pool, srv: srv, admin: login("cadmin", "admin"), user: login("cuser", "user"),
-		id: map[string]string{}, conv: conv, disp: disp, gh: fake, supported: map[string]bool{}}
+		id: map[string]string{}, conv: conv, disp: disp, gh: fake, supported: map[string]bool{}, store: store}
+	store.Stopper = func(ctx context.Context, sessionID string) error {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if h.stopErr != nil {
+			return h.stopErr
+		}
+		h.stopped = append(h.stopped, sessionID)
+		_, err := pool.Exec(ctx, `UPDATE sessions SET state = 'stopped' WHERE id = $1::uuid`, sessionID)
+		return err
+	}
 	conv.Supported = func(host string) bool {
 		h.mu.Lock()
 		defer h.mu.Unlock()
@@ -515,5 +533,23 @@ func TestMappingRefusals(t *testing.T) {
 	}
 	if a := h.mappingAudit(); len(a) != 1 {
 		t.Errorf("audit rows = %q, want only the accepted replace", a)
+	}
+}
+
+// 150 hosts make the enable row's host list exceed the 4096-byte audit bound; the row must
+// still be written, cut to 40 ids and say so.
+func TestEnableOnManyHostsStillWritesItsAuditRow(t *testing.T) {
+	h := newHarness(t)
+	for i := 0; i < 150; i++ {
+		h.host(fmt.Sprintf("m%d", i), true)
+	}
+	id, _, _ := h.ge()
+	if code, tool := h.enable(id, true); code != http.StatusOK || tool["enabled"] != true {
+		t.Fatalf("enable: %d %v", code, tool)
+	}
+	if n := h.count(`SELECT count(*) FROM admin_activity WHERE action = 'compat_tool.enable' AND target_id = $1
+		AND jsonb_array_length(details->'host_ids') = 40 AND details->>'host_ids_truncated' = 'true'
+		AND (details->>'host_count')::int = (SELECT count(*) FROM hosts)`, id); n != 1 {
+		t.Errorf("%d enable audit rows, want 1 (40 ids, truncated, host_count = every host)", n)
 	}
 }

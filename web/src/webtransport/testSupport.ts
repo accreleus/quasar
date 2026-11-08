@@ -163,6 +163,8 @@ export interface FakeConnection {
 export class FakeAgent {
   conns: FakeConnection[] = [];
   received: Record<string, unknown>[] = [];
+  /** Every datagram the client sent, across connections. */
+  datagramsSent: Uint8Array[] = [];
   /** What the agent answers each hello with, in order; the last repeats. */
   replies: Step[][] = [];
   /** `ready` rejects: the handshake or the certificate failed. */
@@ -247,7 +249,10 @@ export class FakeAgent {
     const wt = {
       ready,
       closed,
-      datagrams: { readable: new ReadableStream<Uint8Array>({ start: (c) => void (dgram = c) }) },
+      datagrams: {
+        readable: new ReadableStream<Uint8Array>({ start: (c) => void (dgram = c) }),
+        writable: new WritableStream<Uint8Array>({ write: (chunk) => void agent.datagramsSent.push(chunk) }),
+      },
       async createBidirectionalStream() {
         await agent.parked("stream");
         return {

@@ -7,6 +7,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"testing"
 	"time"
@@ -179,60 +180,66 @@ func prepareWarmForPyroWave(t *testing.T, f *warmFixture) {
 		  "webcodecs":{"h264":true,"opus_decode":true}}`))
 }
 
-// Seat B S1: a Hot Loading claim plans like any launch and takes the parked GPU's slot.
-func TestAHotLoadingClaimGetsPyroWaveWithTheSlot(t *testing.T) {
+// A PyroWave launch is planned on WebTransport, and a park is always WebRTC, so a Hot Loading
+// claim for it supersedes the park (#1161, transport_differs) and the client's retry launches
+// cold. `otherSlot` first gives the GPU's only PyroWave slot to another user's session.
+func pyrowaveAfterAPark(t *testing.T, otherSlot bool) Session {
+	t.Helper()
 	f := newWarmFixture(t, 4)
+	ctx := context.Background()
 	prepareWarmForPyroWave(t, f)
 	tile := seedTile(t, f.pool, f.steam, "Hades", "1145360")
 	k := f.park(t)
-
-	res, err := f.coord.LaunchByProfile(context.Background(), f.userID,
-		LaunchParams{AppID: tile, DeviceID: f.deviceID, PyroWave: true})
+	if otherSlot {
+		var other string
+		must(t, f.pool.QueryRow(ctx, `INSERT INTO users (email, username, password_hash)
+			VALUES ('pw-other@test.local','pwother','x') RETURNING id::text`).Scan(&other))
+		must(t, exec(t, f.pool, `INSERT INTO sessions (user_id, app_id, host_id, gpu_id, state, width, height, fps,
+			bitrate_kbps, pyrowave_slot)
+			SELECT $1::uuid, $2::uuid, g.host_id, g.id, 'running', 1280, 720, 60, 6000, true
+			FROM gpus g WHERE g.host_id = $3::uuid`, other, f.steam, f.hostID))
+	}
+	launch := func() (LaunchResult, error) {
+		return f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: tile, DeviceID: f.deviceID, PyroWave: true})
+	}
+	_, err := launch()
+	var refused *ParkedClaimRefusedError
+	if !errors.As(err, &refused) || refused.Cause != causeTransportDiffers {
+		t.Fatalf("err = %v, want a refused claim with cause transport_differs", err)
+	}
+	var held int
+	must(t, f.pool.QueryRow(ctx, `SELECT count(*) FROM sessions WHERE pyrowave_slot AND user_id = $1::uuid`, f.userID).Scan(&held))
+	if held != 0 {
+		t.Fatalf("the refused claim left %d PyroWave slots held", held)
+	}
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: k, State: "stopped", HomeCleanupQualified: true})
+	res, err := launch()
 	if err != nil {
-		t.Fatalf("claim launch: %v", err)
+		t.Fatalf("retry: %v", err)
 	}
-	play := res.Session
-	if play.AdoptSessionID != k {
-		t.Fatalf("the play session adopts %q, want the park %s", play.AdoptSessionID, k)
+	if a := f.disp.assignFor(t, res.Session.ID); a.AdoptSessionID != "" {
+		t.Errorf("retry adopts %q, want a cold launch", a.AdoptSessionID)
+	} else if (a.PyroWave != nil) == otherSlot {
+		t.Errorf("assign.pyrowave = %+v with the slot taken = %v", a.PyroWave, otherSlot)
 	}
-	got, err := f.store.Get(context.Background(), play.ID)
-	if err != nil || got.PyroWave == nil || !got.PyroWave.Allowed || !got.PyroWave.Wanted || !got.PyroWaveSlot ||
-		got.Transport != "webtransport" {
-		t.Fatalf("claimed session: transport %q slot %v record %+v (%v)", got.Transport, got.PyroWaveSlot, got.PyroWave, err)
+	got, err := f.store.Get(ctx, res.Session.ID)
+	if err != nil || got.PyroWave == nil {
+		t.Fatalf("retry session: %+v (%v)", got.PyroWave, err)
 	}
-	if a := f.disp.assignFor(t, play.ID); a.PyroWave == nil || !a.PyroWave.Wanted {
-		t.Errorf("assign.pyrowave = %+v", a.PyroWave)
+	return got
+}
+
+func TestAPyroWaveLaunchSupersedesAParkAndItsRetryTakesTheSlot(t *testing.T) {
+	got := pyrowaveAfterAPark(t, false)
+	if !got.PyroWave.Allowed || !got.PyroWave.Wanted || !got.PyroWaveSlot || got.Transport != "webtransport" {
+		t.Errorf("retry: transport %q slot %v record %+v", got.Transport, got.PyroWaveSlot, got.PyroWave)
 	}
 }
 
-// A claim whose INSERT finds the GPU's only slot taken is planned again as busy, onto WebRTC.
-func TestAHotLoadingClaimWithTheSlotTakenIsBusy(t *testing.T) {
-	f := newWarmFixture(t, 4)
-	prepareWarmForPyroWave(t, f)
-	tile := seedTile(t, f.pool, f.steam, "Hades", "1145360")
-	k := f.park(t)
-	var other string
-	must(t, f.pool.QueryRow(context.Background(), `INSERT INTO users (email, username, password_hash)
-		VALUES ('pw-other@test.local','pwother','x') RETURNING id::text`).Scan(&other))
-	must(t, exec(t, f.pool, `INSERT INTO sessions (user_id, app_id, host_id, gpu_id, state, width, height, fps,
-		bitrate_kbps, pyrowave_slot)
-		SELECT $1::uuid, $2::uuid, g.host_id, g.id, 'running', 1280, 720, 60, 6000, true
-		FROM gpus g WHERE g.host_id = $3::uuid`, other, f.steam, f.hostID))
-
-	res, err := f.coord.LaunchByProfile(context.Background(), f.userID,
-		LaunchParams{AppID: tile, DeviceID: f.deviceID, PyroWave: true})
-	if err != nil {
-		t.Fatalf("claim launch: %v", err)
-	}
-	if res.Session.AdoptSessionID != k {
-		t.Fatalf("the play session adopts %q, want the park %s", res.Session.AdoptSessionID, k)
-	}
-	got, err := f.store.Get(context.Background(), res.Session.ID)
-	if err != nil || got.PyroWave == nil || got.PyroWave.Allowed || got.PyroWave.Reason == nil ||
-		*got.PyroWave.Reason != "gpu_pyrowave_busy" || got.PyroWaveSlot || got.Transport != "webrtc" {
-		t.Fatalf("busy claim: transport %q slot %v record %+v (%v)", got.Transport, got.PyroWaveSlot, got.PyroWave, err)
-	}
-	if a := f.disp.assignFor(t, res.Session.ID); a.PyroWave != nil {
-		t.Errorf("a busy claim was granted: %+v", a.PyroWave)
+func TestAPyroWaveRetryAfterAParkWithTheSlotTakenIsBusy(t *testing.T) {
+	got := pyrowaveAfterAPark(t, true)
+	if got.PyroWave.Allowed || got.PyroWave.Reason == nil || *got.PyroWave.Reason != "gpu_pyrowave_busy" ||
+		got.PyroWaveSlot || got.Transport != "webrtc" {
+		t.Errorf("busy retry: transport %q slot %v record %+v", got.Transport, got.PyroWaveSlot, got.PyroWave)
 	}
 }
