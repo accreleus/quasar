@@ -236,3 +236,43 @@ func TestShrinkValueNeverFragmentsAListEntry(t *testing.T) {
 		}
 	}
 }
+
+func TestSanitizeDetailsReplacesNULsInKeys(t *testing.T) {
+	inner := map[string]any{"bad\x00key": "v"}
+	details := map[string]any{"top\x00key": "v", "outer": inner}
+	clean, changed := sanitizeDetails(details)
+	if !changed {
+		t.Fatal("a NUL key was not reported as sanitized")
+	}
+	b, err := json.Marshal(clean)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), `\u0000`) {
+		t.Errorf("encoded details still carry a NUL: %s", b)
+	}
+	if _, ok := inner["bad\x00key"]; !ok {
+		t.Error("the caller's nested map was mutated")
+	}
+	if _, ok := details["top\x00key"]; !ok {
+		t.Error("the caller's map was mutated")
+	}
+}
+
+func TestShrinkToFitKeepsTheSanitizedMarkInTheFallback(t *testing.T) {
+	details := map[string]any{"reason": "a\x00b"}
+	for i := 0; i < 600; i++ {
+		details[fmt.Sprintf("n%03d", i)] = i
+	}
+	b, err := boundedDetails(details)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got[detailsSanitizedKey] != true {
+		t.Errorf("the fallback dropped %s: %s", detailsSanitizedKey, b)
+	}
+}

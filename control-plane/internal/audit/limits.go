@@ -97,7 +97,8 @@ func sanitizeDetails(details map[string]any) (map[string]any, bool) {
 	)
 	for k, v := range details {
 		clean, changed := sanitizeValue(v)
-		if !changed {
+		key, keyChanged := cleanKey(k)
+		if !changed && !keyChanged {
 			continue
 		}
 		if out == nil {
@@ -106,8 +107,12 @@ func sanitizeDetails(details map[string]any) (map[string]any, bool) {
 				out[k2] = v2
 			}
 		}
-		out[k] = clean
-		out[k+detailsSanitizedSuffix] = true
+		if keyChanged {
+			// jsonb refuses a NUL in an object key as well as in a value.
+			delete(out, k)
+		}
+		out[key] = clean
+		out[key+detailsSanitizedSuffix] = true
 		touched = true
 	}
 	if !touched {
@@ -115,6 +120,14 @@ func sanitizeDetails(details map[string]any) (map[string]any, bool) {
 	}
 	out[detailsSanitizedKey] = true
 	return out, true
+}
+
+// cleanKey replaces the NULs in an object key, as sanitizeValue does for a value.
+func cleanKey(k string) (string, bool) {
+	if !strings.ContainsRune(k, 0) {
+		return k, false
+	}
+	return strings.ReplaceAll(k, "\x00", string(replacementRune)), true
 }
 
 // sanitizeValue replaces the NULs in one value: a string, a list of them, or a
@@ -159,11 +172,10 @@ func sanitizeValue(v any) (any, bool) {
 		out := make(map[string]any, len(t))
 		changed := false
 		for k, item := range t {
-			if clean, ok := sanitizeValue(item); ok {
-				out[k], changed = clean, true
-			} else {
-				out[k] = item
-			}
+			key, keyChanged := cleanKey(k)
+			clean, ok := sanitizeValue(item)
+			out[key] = clean
+			changed = changed || ok || keyChanged
 		}
 		if !changed {
 			return v, false
@@ -231,6 +243,10 @@ func shrinkToFit(details map[string]any) ([]byte, error) {
 	// boolean here is one — so keep those and drop only the content that could not
 	// be cut in place. They are what still says what happened.
 	minimal := map[string]any{detailsTruncatedKey: true}
+	if work[detailsSanitizedKey] == true {
+		// What survives may be text sanitizeDetails changed; keep saying so.
+		minimal[detailsSanitizedKey] = true
+	}
 	scalars := make([]string, 0, len(work))
 	for k, v := range work {
 		if !auxiliaryKey(k) && isScalar(v) {
