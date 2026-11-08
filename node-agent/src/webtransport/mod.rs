@@ -292,6 +292,7 @@ impl Registry {
 pub(crate) struct Tap {
     registry: Arc<Registry>,
     session_id: String,
+    media: Arc<Media>,
 }
 
 impl Tap {
@@ -311,7 +312,13 @@ impl Tap {
         Some(Self {
             registry: registry.clone(),
             session_id: session_id.to_string(),
+            media,
         })
+    }
+
+    /// A client is attached and being sent video: the session's idle reap counts it.
+    pub(crate) fn attached(&self) -> bool {
+        self.media.attached()
     }
 }
 

@@ -444,6 +444,34 @@ async fn a_browser_like_client_gets_h264_access_units_after_its_token() {
     assert_eq!(close_code(&reused).await, Some(CLOSE_AUTH));
 }
 
+/// The job `agent-live.yml` runs under `webtransport::`: one session from hello to a clean
+/// close, asserting outcomes only (what a browser would see), not the listener's internals.
+#[tokio::test]
+async fn a_session_runs_from_hello_through_decodable_frames_to_a_clean_close() {
+    let agent = agent().await;
+    let (session, mut send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+
+    let got = frames(&session, 60, false).await;
+    assert!(got[0].keyframe, "the client starts at a keyframe");
+    for f in &got {
+        let types = nal_types(&f.data);
+        assert_eq!(
+            f.keyframe,
+            types.contains(&5),
+            "keyframe flag matches the bitstream"
+        );
+    }
+
+    write_message(
+        &mut send,
+        &json!({"type": "bye", "reason": "client_closed"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(close_code(&session).await, Some(CLOSE_NORMAL));
+}
+
 #[tokio::test]
 async fn before_hello_the_agent_reads_one_stream_and_waits_five_seconds() {
     let agent = agent().await;
@@ -804,6 +832,8 @@ async fn a_client_silent_on_the_control_stream_for_10_s_is_gone_and_its_inputs_l
     let agent = agent().await;
     let (session, _send, _recv, ack) = agent.hello(TOKEN).await;
     assert_eq!(ack["type"], "hello_ack");
+    let tap = agent.tap.as_ref().unwrap();
+    assert!(tap.attached());
     let silent = Instant::now();
     close_code_within(&session, Duration::from_secs(14)).await;
     assert!(
@@ -812,6 +842,11 @@ async fn a_client_silent_on_the_control_stream_for_10_s_is_gone_and_its_inputs_l
         silent.elapsed()
     );
     assert_eq!(agent.released.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // The idle reap reads the same client field this close clears (#1179).
+    assert!(
+        !tap.attached(),
+        "a client closed for silence no longer counts"
+    );
 }
 
 #[tokio::test]
@@ -841,6 +876,42 @@ async fn the_newest_client_takes_over_and_an_ended_session_says_so() {
     let (late, _send, _recv, reply) = agent.hello("too-late").await;
     assert_eq!(reply["code"], "session_ended");
     assert_eq!(close_code(&late).await, Some(CLOSE_ENDED));
+}
+
+/// What the session's idle reap reads (#1179): a client counts from its `hello_ack` while it
+/// streams, across a takeover, and stops counting once it leaves.
+#[tokio::test]
+async fn the_tap_counts_a_streaming_client_until_it_leaves() {
+    let agent = agent().await;
+    let tap = agent.tap.as_ref().unwrap();
+    assert!(!tap.attached(), "no client has said hello");
+
+    let (first, _send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+    frames(&first, 1, true).await;
+    assert!(tap.attached());
+
+    let expires = SystemTime::now() + TOKEN_TTL;
+    assert!(agent
+        .listener
+        .registry()
+        .add_token(SESSION, &token_hash("reconnect"), expires));
+    let (second, mut send, _recv2, _) = agent.hello("reconnect").await;
+    assert_eq!(close_code(&first).await, Some(CLOSE_TAKEN_OVER));
+    frames(&second, 1, true).await;
+    assert!(tap.attached(), "the client that took over counts");
+
+    write_message(
+        &mut send,
+        &json!({"type": "bye", "reason": "client_closed"}),
+    )
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while tap.attached() {
+        assert!(Instant::now() < deadline, "a client that left still counts");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]

@@ -241,16 +241,28 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		if *req.Enabled {
 			action = "compat_tool.enable"
 		}
-		details := map[string]any{"tag": res.Tag, "sha512": res.SHA512, "host_ids": res.HostIDs}
-		if len(res.HostIDs) > 100 {
-			details["host_ids"], details["host_ids_truncated"] = res.HostIDs[:100], true
-		}
+		details := map[string]any{"tag": res.Tag, "sha512": res.SHA512, "host_count": len(res.HostIDs)}
+		capIDs(details, "host_ids", res.HostIDs)
 		audit.TryRecord(r.Context(), h.auditor, user.ID, action, "compat_tool", id, details)
 		if h.conv != nil {
 			h.conv.All(r.Context(), true)
 		}
 	}
 	h.writeTool(w, r, id, http.StatusOK)
+}
+
+// auditIDs is the most ids of one list an audit row carries (lists share the 4096-byte bound).
+const auditIDs = 40
+
+// capIDs sets details[key] to ids, cut at auditIDs with key+"_truncated" past that.
+func capIDs(details map[string]any, key string, ids []string) {
+	if ids == nil {
+		ids = []string{}
+	}
+	if len(ids) > auditIDs {
+		ids, details[key+"_truncated"] = ids[:auditIDs], true
+	}
+	details[key] = ids
 }
 
 // listCounted is the catalogue with each GE tool's per-host counts.
