@@ -474,7 +474,7 @@ func TestLaunchProfileTransport(t *testing.T) {
 	if got := transportOf(resp); got != "default" {
 		t.Errorf("transport after patch to default = %q", got)
 	}
-	resp = doJSON(t, "PATCH", base+"/v1/admin/launch-profiles/wt-opt", adminTok, map[string]any{"transport": "webtransport"})
+	_ = doJSON(t, "PATCH", base+"/v1/admin/launch-profiles/wt-opt", adminTok, map[string]any{"transport": "webtransport"}).Body.Close()
 	resp = doJSON(t, "PATCH", base+"/v1/admin/launch-profiles/wt-opt", adminTok, map[string]any{"transport": "udp"})
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("bad transport on patch: %d, want 400", resp.StatusCode)
