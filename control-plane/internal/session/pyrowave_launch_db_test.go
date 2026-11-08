@@ -129,6 +129,9 @@ func TestLaunchGrantsPyroWaveAndTheCeilingRefusesTheNext(t *testing.T) {
 func TestPyroWaveFollowsTheInstanceDefaultTransport(t *testing.T) {
 	f := newPyroWaveFixture(t)
 	must(t, exec(t, f.pool, `UPDATE launch_profiles SET transport = 'default' WHERE id = '1080p60'`))
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), `UPDATE instance_settings SET default_transport = 'webrtc'`)
+	})
 	must(t, exec(t, f.pool, `INSERT INTO instance_settings (id, default_transport) VALUES (true, 'webtransport')
 		ON CONFLICT (id) DO UPDATE SET default_transport = EXCLUDED.default_transport`))
 	status, body := f.launch(t, map[string]any{"pyrowave": true})

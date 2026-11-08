@@ -38,7 +38,7 @@ func TestDefaultTransportReadPatchAndAudit(t *testing.T) {
 	if code := patch(`{"registration_mode":"open"}`); code != http.StatusOK {
 		t.Fatalf("unrelated PATCH: %d", code)
 	}
-	for _, bad := range []string{`{"default_transport":"default"}`, `{"default_transport":""}`, `{"default_transport":"udp"}`, `{"default_transport":1}`} {
+	for _, bad := range []string{`{"default_transport":"default"}`, `{"default_transport":""}`, `{"default_transport":"udp"}`, `{"default_transport":1}`, `{"default_transport":null}`} {
 		if code := patch(bad); code != http.StatusBadRequest {
 			t.Errorf("PATCH %s: %d, want 400", bad, code)
 		}

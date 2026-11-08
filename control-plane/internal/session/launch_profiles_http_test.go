@@ -566,6 +566,9 @@ func TestLaunchProfilePyroWave(t *testing.T) {
 		setting    string
 		wantWarned bool
 	}{{"webrtc", true}, {"webtransport", false}} {
+		t.Cleanup(func() {
+			_, _ = pool.Exec(context.Background(), `UPDATE instance_settings SET default_transport = 'webrtc'`)
+		})
 		must(t, exec(t, pool, `INSERT INTO instance_settings (id, default_transport) VALUES (true, $1)
 			ON CONFLICT (id) DO UPDATE SET default_transport = EXCLUDED.default_transport`, tc.setting))
 		if got := warned(read(doJSON(t, "GET", base+"/v1/admin/launch-profiles/pw", adminTok, nil))); got != tc.wantWarned {

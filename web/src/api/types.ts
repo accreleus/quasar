@@ -65,9 +65,9 @@ export type RegistrationMode = Schemas["RegistrationMode"];
  *  because the enum lives in frozen `protocol/openapi.yaml` — as does its stale doc. */
 export type StorageProvider = Schemas["StorageProvider"];
 
+export type DefaultTransport = NonNullable<InstanceSettings["default_transport"]>;
 /** `library/ImagesTab.tsx` defaults it to `"notify"` when absent, matching the column's
  *  `DEFAULT 'notify'` (migration 0054); optional for pre-P3 servers. */
-export type DefaultTransport = NonNullable<InstanceSettings["default_transport"]>;
 export type ImageUpdatePolicy = NonNullable<InstanceSettings["image_update_policy"]>;
 
 /** `library_discovery_enabled` (migration 0045) and `image_update_policy`
