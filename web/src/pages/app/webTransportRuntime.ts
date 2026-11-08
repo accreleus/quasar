@@ -1,7 +1,6 @@
-// The session runtime for a WebTransport session (#1031, video only):
-// transport -> DecodeStage -> presenter, behind the same SessionRuntime surface
-// the page drives for WebRTC, with input capture on the transport's input paths.
-// Audio and the mic are not carried yet (#1033): those methods are inert.
+// The session runtime for a WebTransport session (#1031, #1032, #1033): transport -> DecodeStage ->
+// presenter, with input capture on the transport's input paths, game audio through AudioOut and
+// the microphone through MicOut, behind the same SessionRuntime surface the page drives for WebRTC.
 
 import { mintTransportToken } from "../../api/library";
 import type { WebTransportCoords } from "../../api/types";
@@ -9,6 +8,8 @@ import { setupCapture } from "../../input/capture";
 import { NEUTRAL_MOUSE, type MouseSettings } from "../../input/mouseScale";
 import { median, percentile } from "../../lib/stats";
 import { EMPTY_SNAPSHOT, type TelemetrySnapshot } from "../../webrtc/telemetry";
+import { AudioOut, type AudioOutDeps } from "../../webtransport/audioOut";
+import { MicOut, type MicOutDeps } from "../../webtransport/micOut";
 import { DecodeStage, type DecodeFailure, type DecodeStageOptions } from "../../webtransport/decodeStage";
 import { fallbackReason } from "../../webtransport/fallback";
 import { createWebGpuPresenter, type Presenter } from "../../webtransport/presenter";
@@ -40,6 +41,8 @@ export interface WebTransportRuntimeDeps {
   createTransport(opts: { sessionId: string; coords: WebTransportCoords; mintToken(): Promise<WebTransportCoords> }): MediaTransport;
   createPresenter(canvas: HTMLCanvasElement, onFatal: (message: string) => void): Promise<Presenter | null>;
   decoder?: Pick<DecodeStageOptions, "createDecoder" | "isConfigSupported">;
+  audio?: AudioOutDeps;
+  mic?: Partial<Omit<MicOutDeps, "send">>;
   setupCapture: typeof setupCapture;
 }
 
@@ -90,6 +93,11 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   let mouse: MouseSettings = NEUTRAL_MOUSE;
   let rttMs: number | null = null;
   let negotiatedCodec: string | null = null;
+  let audioOut: AudioOut | null = null;
+  /** The sound starts muted (webrtc/sessionRuntime holdAudio): nothing the app plays before the reveal is heard. */
+  let audioHeld = true;
+  let micSlot = false;
+  let mic: MicOut | null = null;
   const startedAt = performance.now();
 
   let framesTotal = 0;
@@ -110,6 +118,8 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     timer = null;
     document.removeEventListener("visibilitychange", onVisible);
     teardownInput();
+    mic?.stop();
+    audioOut?.close();
     transport?.close();
     stage?.close();
     presenter?.destroy();
@@ -153,6 +163,12 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       framesDecodedTotal: framesTotal,
       bytesReceivedTotal: bytesTotal,
     };
+    const audio = audioOut?.stats();
+    if (audio?.avOffsetMs != null) {
+      // Read by the bench and the hardware pass: how much later than its video the sound is heard.
+      cfg.canvas.dataset.avOffsetMs = audio.avOffsetMs.toFixed(1);
+      cfg.canvas.dataset.audioUnderrunMs = audio.underrunMs.toFixed(0);
+    }
     fpsSeries.push(snap.fps);
     if (g2gMs != null) latencySeries.push(g2gMs);
     framesInWindow = 0;
@@ -196,8 +212,10 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       onFrame: (frame) => {
         // shortcut: assumes the agent's and this machine's clocks agree (true with the
         // browser on the host); the pong's clock offset is #1035.
-        const sample = Date.now() - frame.timestamp / 1000;
+        const captureUs = frame.timestamp;
+        const sample = Date.now() - captureUs / 1000;
         if (!p.present(frame)) return;
+        audioOut?.noteVideo(captureUs);
         framesTotal += 1;
         framesInWindow += 1;
         if (sample >= 0 && sample < 5000) {
@@ -222,6 +240,15 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     transport = t;
     try {
       await t.connect({
+        streams: (streams) => {
+          micSlot = streams.mic !== null;
+          if (!streams.audio || failed || destroyed) return;
+          const out = (audioOut = new AudioOut(deps.audio));
+          if (!audioHeld) out.release();
+          // Audio must never end the session: a failure to start leaves the stream silent.
+          void out.start(streams.audio).catch((err: unknown) => console.warn("audio:", err));
+        },
+        audio: (packet) => audioOut?.packet(packet),
         config: (c) => {
           if (destroyed || failed || t !== transport) return;
           negotiatedCodec = CODEC_MIME[c.codec] ?? c.codec;
@@ -345,9 +372,16 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     },
     isCaptured: () => captured,
     cancelRecovery() {},
-    hasMicSlot: () => false,
-    attachMicTrack: () => Promise.resolve(),
-    detachMicTrack: () => Promise.resolve(),
+    hasMicSlot: () => micSlot && !failed && !destroyed,
+    async attachMicTrack(track) {
+      // Nothing may start after stop(): the transport is closed and nobody would tear it down.
+      if (failed || destroyed) return;
+      mic ??= new MicOut({ send: (d) => transport?.sendMic(d) ?? false, ...deps.mic });
+      mic.start(track);
+    },
+    async detachMicTrack() {
+      mic?.stop();
+    },
     registerTelemetry(fn) {
       telemetrySubs.add(fn);
       return () => telemetrySubs.delete(fn);
@@ -357,7 +391,13 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       fps: fpsSeries,
       latency: latencySeries,
     }),
-    releaseAudio() {},
-    holdAudio() {},
+    releaseAudio() {
+      audioHeld = false;
+      audioOut?.release();
+    },
+    holdAudio() {
+      audioHeld = true;
+      audioOut?.hold();
+    },
   };
 }

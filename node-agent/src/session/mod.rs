@@ -494,6 +494,9 @@ pub struct SessionConfig {
     /// Largest RTP packet the host sends, RTP header included, before SRTP/UDP/IP.
     /// Knob: `QUASAR_RTP_MTU`.
     pub rtp_mtu: u32,
+    /// Shrink `rtp_mtu` mid-session when the path drops full-size packets (#1134).
+    /// Knob: `QUASAR_RTP_MTU_SHRINK`.
+    pub rtp_mtu_shrink: bool,
     /// The host's console-mode config, snapshotted from the agent's latched
     /// `config_update.console_config`. A `local_only` session needs it enabled; a streamed
     /// session never reads it.
@@ -602,6 +605,9 @@ impl SessionConfig {
             fec_percentage: env_fec_percentage("QUASAR_FEC_PERCENTAGE"),
             fec_mode: resolve_fec_mode(env_fec_percentage("QUASAR_FEC_PERCENTAGE")),
             rtp_mtu: env_rtp_mtu("QUASAR_RTP_MTU"),
+            rtp_mtu_shrink: ladder::env_flag_default_true("QUASAR_RTP_MTU_SHRINK", &|k| {
+                std::env::var(k).ok()
+            }),
             console_config: None,
             video_topology: crate::messages::VideoTopology::StreamOnly,
             // env-direct: from_env has no settings overlay. The assign path snapshots
@@ -854,6 +860,9 @@ impl SessionConfig {
             fec_percentage: env_fec_percentage("QUASAR_FEC_PERCENTAGE"),
             fec_mode: resolve_fec_mode(env_fec_percentage("QUASAR_FEC_PERCENTAGE")),
             rtp_mtu: env_rtp_mtu("QUASAR_RTP_MTU"),
+            rtp_mtu_shrink: ladder::env_flag_default_true("QUASAR_RTP_MTU_SHRINK", &|k| {
+                std::env::var(k).ok()
+            }),
             console_config: None,
             video_topology: crate::messages::VideoTopology::StreamOnly,
             // Snapshot so provision + measurement use the value this session was
@@ -1179,9 +1188,14 @@ fn rtp_mtu_from(var: &str, raw: Option<&str>) -> u32 {
     }
 }
 
+/// The deepest microphone jitter buffer accepted. The WebTransport microphone queues at most
+/// 100 packets (1 s), and a buffer that fills that before it primes resets on every push and
+/// plays nothing: half of it leaves room.
+pub(crate) const MIC_JITTER_MAX_MS: u32 = 500;
+
 /// Parse `QUASAR_MIC_JITTER_MS`: unset/empty ⇒ 60 ms. Unparseable or `0` ⇒ warn and use
 /// the default; a 0 ms jitter buffer turns any reorder or late arrival into an audible
-/// gap.
+/// gap. Over [`MIC_JITTER_MAX_MS`] ⇒ warn and use that.
 fn env_mic_jitter_ms(var: &str) -> u32 {
     mic_jitter_ms_from(var, std::env::var(var).ok().as_deref())
 }
@@ -1193,6 +1207,14 @@ fn mic_jitter_ms_from(var: &str, raw: Option<&str>) -> u32 {
     match raw {
         None | Some("") => DEFAULT_MIC_JITTER_MS,
         Some(s) => match s.parse::<u32>() {
+            Ok(n) if n > MIC_JITTER_MAX_MS => {
+                tracing::warn!(
+                    token = "knob-clamped-mic-jitter-ms",
+                    "{var}={s:?} is over the {MIC_JITTER_MAX_MS} ms the microphone buffer can hold \
+                     — using {MIC_JITTER_MAX_MS} ms"
+                );
+                MIC_JITTER_MAX_MS
+            }
             Ok(n) if n > 0 => n,
             _ => {
                 tracing::warn!(
@@ -1543,6 +1565,24 @@ mod tests {
         assert_eq!(mic_jitter_ms_from(VAR, Some("75")), 75, "\"75\" ⇒ 75");
 
         assert_eq!(mic_jitter_ms_from(VAR, Some("50")), 50, "\"50\" ⇒ 50");
+
+        assert_eq!(
+            mic_jitter_ms_from(VAR, Some("500")),
+            500,
+            "the largest value is kept"
+        );
+        for over in ["501", "1000", "60000", "4294967295"] {
+            assert_eq!(
+                mic_jitter_ms_from(VAR, Some(over)),
+                MIC_JITTER_MAX_MS,
+                "{over} ⇒ clamped"
+            );
+        }
+        assert_eq!(
+            mic_jitter_ms_from(VAR, Some("4294967296")),
+            60,
+            "past u32 does not parse: default"
+        );
 
         assert_eq!(
             mic_jitter_ms_from(VAR, Some("junk")),
