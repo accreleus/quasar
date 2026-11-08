@@ -62,8 +62,10 @@ func TestRecordAndPaginate(t *testing.T) {
 // written cut down, flagged, inside the same bound.
 func TestWritesOversizedDetailsCutDown(t *testing.T) {
 	s := testStore(t)
-	// 5000 NULs encode to 30 000 bytes: &#92;u0000 is six bytes each.
-	value := strings.Repeat("\x00", 5000)
+	// 5000 control characters encode to 30 000 bytes: \u0001 is six bytes each.
+	// (Not \x00: jsonb refuses a NUL outright, which is an insert error rather
+	// than a size one.)
+	value := strings.Repeat("\x01", 5000)
 	if err := s.Record(context.Background(), "", "x", "host", "h",
 		map[string]any{"value": value, "count": 1}); err != nil {
 		t.Fatalf("an oversized row must be written, not refused: %v", err)

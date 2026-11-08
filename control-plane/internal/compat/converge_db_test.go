@@ -266,8 +266,11 @@ func TestAFailedInstallHoldsUntilAnAdminReleasesIt(t *testing.T) {
 // The agent's name and reason are its own words and were written into the audit row verbatim,
 // so a long one rendered the row past admin_activity's 4096-byte bound and the row was dropped.
 // Escape-heavy text is the worst case: Go writes & < > " \ and a control character as two to six
-// bytes each, so a raw-byte cap is no guarantee at all (#1209). Both fields here are 1600 raw
-// bytes, about 6000 encoded each, and the row must still be written, cut down and flagged.
+// bytes each, so a raw-byte cap is no guarantee at all (#1209).
+//
+// The run summary is capped at 4096 ENCODED bytes too, so the payload has to sit in the window
+// where the summary is accepted but the audit row — the same text plus the tag, the digest and
+// the ids — is not. The premise is asserted below rather than assumed.
 func TestAConvergeAuditRowSurvivesEscapeHeavyAgentText(t *testing.T) {
 	h := newHarness(t)
 	a := h.host("a", true)
@@ -275,33 +278,38 @@ func TestAConvergeAuditRowSurvivesEscapeHeavyAgentText(t *testing.T) {
 	h.enable(id, true)
 	run := h.claim("a")[0]
 
-	// Small enough that the run's own summary (capped at 4096 by its own CHECK, which
-	// measures jsonb's rendering of the text) is accepted; large enough that the audit row
-	// is not.
-	long := strings.Repeat("&<>\"\\\x01é", 100)
-	h.report("a", run["run_id"].(string), "failed", map[string]any{"name": long, "reason": long})
+	name := strings.Repeat("&<>\"\\\x01é", 30) // 240 raw bytes, 900 encoded
+	reason := strings.Repeat("\x01", 500)      // 500 raw bytes, 3000 encoded
+	summary, err := json.Marshal(map[string]any{"name": name, "reason": reason})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary) > 4000 {
+		t.Fatalf("test premise: the run summary is %d encoded bytes and would be refused", len(summary))
+	}
+	h.report("a", run["run_id"].(string), "failed", map[string]any{"name": name, "reason": reason})
 
-	var name, reason string
+	var gotName, gotReason string
 	var size int
-	var nameCut, rowCut bool
+	var reasonCut, rowCut bool
 	if err := h.pool.QueryRow(context.Background(), `SELECT COALESCE(details->>'name',''),
 		COALESCE(details->>'reason',''), octet_length(details::text),
-		COALESCE((details->>'name_truncated')::bool, false),
+		COALESCE((details->>'reason_truncated')::bool, false),
 		COALESCE((details->>'details_truncated')::bool, false)
 		FROM admin_activity WHERE action = 'compat_tool.install' AND target_id = $1`, a).
-		Scan(&name, &reason, &size, &nameCut, &rowCut); err != nil {
+		Scan(&gotName, &gotReason, &size, &reasonCut, &rowCut); err != nil {
 		t.Fatalf("no install audit row: %v", err)
 	}
-	if !nameCut || !rowCut {
-		t.Errorf("truncated flags = name:%v row:%v, want both true", nameCut, rowCut)
+	if !reasonCut || !rowCut {
+		t.Errorf("truncated flags = reason:%v row:%v, want both true", reasonCut, rowCut)
 	}
 	if size > 4096 {
 		t.Errorf("row is %d bytes, over the 4096-byte CHECK", size)
 	}
-	if name == "" || reason == "" {
-		t.Errorf("cut row lost its text: name %d bytes, reason %d bytes", len(name), len(reason))
+	if gotName == "" || gotReason == "" {
+		t.Errorf("cut row lost its text: name %d bytes, reason %d bytes", len(gotName), len(gotReason))
 	}
-	if !strings.HasPrefix(long, name) || !strings.HasPrefix(long, reason) {
+	if !strings.HasPrefix(name, gotName) || !strings.HasPrefix(reason, gotReason) {
 		t.Error("a cut field is not a prefix of what the agent reported")
 	}
 }
@@ -317,7 +325,7 @@ func TestAConvergeAuditRowDropsAStructuredReason(t *testing.T) {
 	run := h.claim("a")[0]
 
 	h.report("a", run["run_id"].(string), "failed", map[string]any{
-		"reason": map[string]any{"nested": strings.Repeat("&", 2000)},
+		"reason": map[string]any{"nested": strings.Repeat("&", 660)},
 	})
 
 	var size int
