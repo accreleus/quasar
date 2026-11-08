@@ -1,14 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CONNECT_DEADLINE_MS,
+  HANDSHAKE_DEADLINE_MS,
   KEYFRAME_SPACING_MS,
   REMINT_MIN_INTERVAL_MS,
   TOKEN_REFRESH_AGE_MS,
   WebTransportMedia,
 } from "./webTransportMedia";
+import type { InputMsg } from "../input/inputSender";
 import type { Presenter } from "./presenter";
 import { TransportError, type MediaSink, type MediaTransport } from "./transport";
 import { createWebTransportRuntime } from "../pages/app/webTransportRuntime";
+import { mintTransportToken } from "../api/library";
 import {
   avcC,
   b64,
@@ -31,6 +34,11 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
+
+vi.mock("../api/library", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../api/library")>()),
+  mintTransportToken: vi.fn(),
+}));
 
 const NO_SINK: MediaSink = { config: () => {}, unit: () => {}, end: () => {} };
 
@@ -260,7 +268,7 @@ describe("createWebTransportRuntime", () => {
       },
       destroy: vi.fn(),
     };
-    const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn() };
+    const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn(), onFallback: vi.fn() };
     const rt = createWebTransportRuntime({
       sessionId: "s1",
       authToken: "auth",
@@ -360,16 +368,8 @@ describe("createWebTransportRuntime", () => {
     agent.last.closeWith(4410);
     await vi.waitFor(() => expect(callbacks.onSessionTakenOver).toHaveBeenCalled());
     expect(callbacks.onTransportFailed).not.toHaveBeenCalled();
+    expect(callbacks.onFallback).not.toHaveBeenCalled();
     expect(rt.getSnapshot().channelOpen).toBe(false);
-  });
-
-  it("puts a terminal refusal on the page's failure UI", async () => {
-    const { agent, callbacks, rt } = setup();
-    agent.replies = [[{ type: "error", code: "auth_failed" }]];
-    rt.start();
-    await vi.waitFor(() => expect(callbacks.onTransportFailed).toHaveBeenCalledTimes(1));
-    expect(callbacks.onTransportFailed.mock.calls[0][0]).toMatch(/refused this device's WebTransport token.*WebRTC/);
-    expect(rt.getSnapshot().recovery).toMatchObject({ phase: "failed" });
   });
 
   it("ends the view with its reason when the session ends mid-stream (close 4404)", async () => {
@@ -382,15 +382,15 @@ describe("createWebTransportRuntime", () => {
     await vi.waitFor(() => expect(callbacks.onTransportFailed).toHaveBeenCalledTimes(1));
     expect(callbacks.onDisconnectSuspected).toHaveBeenCalled();
     expect(callbacks.onTransportFailed.mock.calls[0][0]).toMatch(/session ended/);
+    expect(callbacks.onFallback).not.toHaveBeenCalled();
     expect(rt.getSnapshot()).toMatchObject({ channelOpen: false, recovery: { phase: "failed" } });
   });
 
   it("reports a browser with no WebGPU adapter", async () => {
     const { callbacks, rt } = setup({ noWebGpu: true });
     rt.start();
-    await vi.waitFor(() => expect(callbacks.onTransportFailed).toHaveBeenCalledTimes(1));
-    expect(callbacks.onTransportFailed.mock.calls[0][0]).toMatch(/WebGPU/);
-    expect(rt.getSnapshot().clientUnsupported).toBe(true);
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("decoder_unsupported"));
+    expect(callbacks.onTransportFailed).not.toHaveBeenCalled();
   });
 
   it("reports a presenter failure, and counts no frame it did not draw", async () => {
@@ -402,13 +402,12 @@ describe("createWebTransportRuntime", () => {
     expect(rt.getSnapshot().firstFrame).toBe(false);
     vi.spyOn(console, "warn").mockImplementation(() => {});
     presenterFatal()("the GPU device was lost");
-    expect(callbacks.onTransportFailed).toHaveBeenCalledTimes(1);
-    expect(callbacks.onTransportFailed.mock.calls[0][0]).toMatch(/GPU/);
+    expect(callbacks.onFallback).toHaveBeenCalledWith("internal");
   });
 
   it("reports a presenter that cannot be made, and builds no transport", async () => {
     const agent = new FakeAgent();
-    const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn() };
+    const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn(), onFallback: vi.fn() };
     vi.spyOn(console, "warn").mockImplementation(() => {});
     const createTransport = vi.fn();
     const rt = createWebTransportRuntime({
@@ -420,14 +419,13 @@ describe("createWebTransportRuntime", () => {
       deps: { createTransport, createPresenter: () => Promise.reject(new Error("requestDevice failed")) },
     });
     rt.start();
-    await vi.waitFor(() => expect(callbacks.onTransportFailed).toHaveBeenCalledTimes(1));
-    expect(callbacks.onTransportFailed.mock.calls[0][0]).toMatch(/GPU/);
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("internal"));
     expect(createTransport).not.toHaveBeenCalled();
     expect(agent.conns).toHaveLength(0);
   });
 
   it("does not connect when the presenter fails while it is being made", async () => {
-    const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn() };
+    const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn(), onFallback: vi.fn() };
     vi.spyOn(console, "warn").mockImplementation(() => {});
     const createTransport = vi.fn();
     const destroy = vi.fn();
@@ -446,7 +444,7 @@ describe("createWebTransportRuntime", () => {
       },
     });
     rt.start();
-    await vi.waitFor(() => expect(callbacks.onTransportFailed).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledTimes(1));
     await flush();
     expect(createTransport).not.toHaveBeenCalled();
     expect(destroy).toHaveBeenCalled();
@@ -465,7 +463,7 @@ describe("createWebTransportRuntime", () => {
       input: { reliable: () => {}, datagram: () => false },
       close: () => {},
     };
-    const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn() };
+    const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn(), onFallback: vi.fn() };
     const presenter: Presenter = { present: () => true, destroy: () => {} };
     const make = () =>
       createWebTransportRuntime({
@@ -490,12 +488,13 @@ describe("createWebTransportRuntime", () => {
     expect(callbacks.onSessionTakenOver).not.toHaveBeenCalled();
     expect(callbacks.onDisconnectSuspected).not.toHaveBeenCalled();
     expect(callbacks.onTransportFailed).not.toHaveBeenCalled();
+    expect(callbacks.onFallback).not.toHaveBeenCalled();
   });
 
-  it("shows only the unsupported banner when the browser cannot decode the stream", async () => {
+  it("falls back, not fails, when the browser cannot decode the stream", async () => {
     const agent = new FakeAgent();
     agent.replies = [[helloAck(0, avcC())]];
-    const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn() };
+    const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn(), onFallback: vi.fn() };
     const presenter: Presenter = { present: () => true, destroy: () => {} };
     const rt = createWebTransportRuntime({
       sessionId: "s1",
@@ -510,8 +509,8 @@ describe("createWebTransportRuntime", () => {
       },
     });
     rt.start();
-    await vi.waitFor(() => expect(callbacks.onTransportFailed).toHaveBeenCalledTimes(1));
-    expect(rt.getSnapshot()).toMatchObject({ clientUnsupported: true, recovery: null });
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("decoder_unsupported"));
+    expect(callbacks.onTransportFailed).not.toHaveBeenCalled();
   });
 
   it("asks for one keyframe when the tab becomes visible again", async () => {
@@ -525,5 +524,329 @@ describe("createWebTransportRuntime", () => {
     document.dispatchEvent(new Event("visibilitychange"));
     await vi.waitFor(() => expect(agent.sent("keyframe_request")).toEqual([{ type: "keyframe_request", reason: "loss" }]));
     rt.destroy();
+  });
+});
+
+// ── Fallback to WebRTC (control-api.md §Transport fallback) ─────────────────
+
+describe("WebTransportMedia loss-recovery timer", () => {
+  /** Connects with only the recovery tick as an interval, and returns the handle of that tick. */
+  async function connected(agent: FakeAgent) {
+    vi.useFakeTimers();
+    agent.replies = [[helloAck(0, avcC())]];
+    const set = vi.spyOn(globalThis, "setInterval");
+    const cleared = vi.spyOn(globalThis, "clearInterval");
+    const t = transport(agent, { ticker: () => () => {} });
+    await t.connect(NO_SINK);
+    expect(set).toHaveBeenCalledTimes(1);
+    return { t, tick: set.mock.results[0].value, cleared };
+  }
+
+  it("is stopped by close(), not left to a `closed` that a connection may never report", async () => {
+    const agent = new FakeAgent();
+    agent.closeNeverSettles = true;
+    const { t, tick, cleared } = await connected(agent);
+    t.close();
+    expect(cleared).toHaveBeenCalledWith(tick);
+  });
+
+  it("is stopped when the connection closes by itself", async () => {
+    const agent = new FakeAgent();
+    const { tick, cleared } = await connected(agent);
+    agent.last.closeWith(4400);
+    await vi.waitFor(() => expect(cleared).toHaveBeenCalledWith(tick));
+  });
+});
+
+describe("WebTransportMedia unreachable agent", () => {
+  it("gives up on a handshake that never finishes, well before the connect deadline", async () => {
+    vi.useFakeTimers();
+    const agent = new FakeAgent();
+    agent.hold = "ready";
+    const result = transport(agent).connect(NO_SINK).catch((e: TransportError) => e);
+    await vi.advanceTimersByTimeAsync(HANDSHAKE_DEADLINE_MS + 1);
+    expect(await result).toMatchObject({ code: "connect_timeout" });
+    expect(HANDSHAKE_DEADLINE_MS).toBeLessThan(CONNECT_DEADLINE_MS);
+    expect(agent.conns[0].closes).toHaveLength(1);
+  });
+
+  it("keeps retrying a host that completed the handshake, up to the connect deadline", async () => {
+    // Not ready, or an answer Chrome dropped: both are a reachable host, so neither counts toward
+    // the handshake bound.
+    const agent = new FakeAgent();
+    agent.replies = [[{ type: "teardown" }]];
+    let now = 0;
+    const clock = { sleep: async (ms: number) => void (now += ms * 40), now: () => now };
+    await expect(transport(agent, clock).connect(NO_SINK)).rejects.toMatchObject({ code: "connect_timeout" });
+    expect(now).toBeGreaterThanOrEqual(CONNECT_DEADLINE_MS);
+  });
+});
+
+describe("createWebTransportRuntime fallback", () => {
+  function setup() {
+    /** One per connection the runtime brought up; `sendInput` is what that capture sends with. */
+    const captures: { sendInput: (m: InputMsg) => void; cleanup: ReturnType<typeof vi.fn>; engage: ReturnType<typeof vi.fn> }[] = [];
+    const agent = new FakeAgent();
+    agent.replies = [[helloAck(0, avcC())]];
+    const presenter: Presenter = { present: (f) => (f.close(), true), destroy: vi.fn() };
+    const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn(), onFallback: vi.fn() };
+    const rt = createWebTransportRuntime({
+      sessionId: "s1",
+      authToken: "auth",
+      coords: COORDS,
+      canvas: document.createElement("canvas"),
+      callbacks,
+      deps: {
+        createTransport: (o) => new WebTransportMedia({ ...o, createWebTransport: agent.create, sleep: async () => {} }),
+        createPresenter: async () => presenter,
+        decoder: {
+          createDecoder: (init) => new FakeDecoder(init) as unknown as VideoDecoder,
+          isConfigSupported: async (c) => ({ supported: true, config: c }),
+        },
+        setupCapture: ((o: { sendInput: (m: InputMsg) => void }) => {
+          const c = { sendInput: o.sendInput, cleanup: vi.fn(), engage: vi.fn(() => null), release: vi.fn(), syncKeyboardLock: vi.fn(), setMouse: vi.fn() };
+          captures.push(c);
+          return c;
+        }) as never,
+      },
+    });
+    return { agent, callbacks, rt, captures };
+  }
+
+  beforeEach(() => {
+    vi.mocked(mintTransportToken).mockReset();
+    vi.mocked(mintTransportToken).mockResolvedValue({
+      transport_options: { webtransport: { ...COORDS, token: "tok-2" } },
+    } as never);
+  });
+
+  it("connect refused: falls back with connect_failed and the connection closed", async () => {
+    const { agent, callbacks, rt } = setup();
+    agent.refuseHandshake = true;
+    rt.start();
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("connect_failed"));
+    expect(agent.conns).toHaveLength(1);
+    expect(agent.sent("hello")).toHaveLength(0);
+    expect(callbacks.onTransportFailed).not.toHaveBeenCalled();
+    expect(rt.getSnapshot().status).toMatch(/falling back to WebRTC/);
+  });
+
+  it("connect timeout: falls back with connect_timeout", async () => {
+    vi.useFakeTimers();
+    const { agent, callbacks, rt } = setup();
+    agent.hold = "ready";
+    rt.start();
+    await vi.advanceTimersByTimeAsync(HANDSHAKE_DEADLINE_MS + 1);
+    expect(callbacks.onFallback).toHaveBeenCalledWith("connect_timeout");
+    expect(callbacks.onFallback).toHaveBeenCalledTimes(1);
+  });
+
+  it("handshake version mismatch: falls back with unsupported_version", async () => {
+    const { agent, callbacks, rt } = setup();
+    agent.replies = [[{ ...helloAck(0, avcC()), wt_proto: 2 }]];
+    rt.start();
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("unsupported_version"));
+    expect(agent.conns[0].closes).toHaveLength(1);
+  });
+
+  it("hello refused: falls back with the agent's reason, after one re-mint for auth_failed", async () => {
+    const { agent, callbacks, rt } = setup();
+    agent.replies = [[{ type: "error", code: "auth_failed" }]];
+    rt.start();
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("auth_failed"));
+    expect(agent.sent("hello").map((h) => h.token)).toEqual(["tok-1", "tok-2"]);
+
+    const other = setup();
+    other.agent.replies = [[{ type: "error", code: "takeover_rate_limited" }]];
+    other.rt.start();
+    await vi.waitFor(() => expect(other.callbacks.onFallback).toHaveBeenCalledWith("takeover_rate_limited"));
+  });
+
+  it("a code outside the contract's vocabulary is reported as internal", async () => {
+    const { agent, callbacks, rt } = setup();
+    agent.replies = [[{ type: "error", code: "bad_request" }]];
+    rt.start();
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("internal"));
+  });
+
+  it("mid-session loss: one reconnect on a fresh token, then falls back with stream_lost", async () => {
+    const { agent, callbacks, rt } = setup();
+    rt.start();
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    agent.last.closeWith(4400);
+    await vi.waitFor(() => expect(agent.sent("hello").map((h) => h.token)).toEqual(["tok-1", "tok-2"]));
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    expect(callbacks.onFallback).not.toHaveBeenCalled();
+    agent.last.closeWith(4400);
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost"));
+    expect(callbacks.onFallback).toHaveBeenCalledTimes(1);
+  });
+
+  it("a reconnect that cannot be made reports stream_lost, whatever refused it", async () => {
+    const { agent, callbacks, rt } = setup();
+    vi.mocked(mintTransportToken).mockRejectedValue(new Error("409"));
+    rt.start();
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    agent.last.closeWith(4400);
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost"));
+
+    const refused = setup();
+    refused.rt.start();
+    await vi.waitFor(() => expect(refused.rt.getSnapshot().channelOpen).toBe(true));
+    refused.agent.replies = [[{ type: "error", code: "takeover_rate_limited" }]];
+    refused.agent.last.closeWith(4400);
+    await vi.waitFor(() => expect(refused.callbacks.onFallback).toHaveBeenCalledWith("stream_lost"));
+    expect(refused.callbacks.onFallback).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens no connection from a reconnect whose mint was in flight when the view was destroyed", async () => {
+    const { agent, callbacks, rt } = setup();
+    let release!: () => void;
+    rt.start();
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    vi.mocked(mintTransportToken).mockReturnValue(
+      new Promise((r) => (release = () => r({ transport_options: { webtransport: { ...COORDS, token: "tok-2" } } } as never))),
+    );
+    agent.last.closeWith(4400);
+    await vi.waitFor(() => expect(release).toBeDefined());
+    rt.destroy();
+    release();
+    await flush();
+    expect(agent.conns).toHaveLength(1);
+    expect(callbacks.onFallback).not.toHaveBeenCalled();
+  });
+
+  it("opens no connection from a reconnect whose mint was in flight when the view failed", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const agent = new FakeAgent();
+    agent.replies = [[helloAck(0, avcC())]];
+    let fatal!: (m: string) => void;
+    const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn(), onFallback: vi.fn() };
+    const rt = createWebTransportRuntime({
+      sessionId: "s1",
+      authToken: "auth",
+      coords: COORDS,
+      canvas: document.createElement("canvas"),
+      callbacks,
+      deps: {
+        createTransport: (o) => new WebTransportMedia({ ...o, createWebTransport: agent.create, sleep: async () => {} }),
+        createPresenter: async (_c, onFatal) => ((fatal = onFatal), { present: () => true, destroy: () => {} }),
+        decoder: {
+          createDecoder: (init) => new FakeDecoder(init) as unknown as VideoDecoder,
+          isConfigSupported: async (c) => ({ supported: true, config: c }),
+        },
+      },
+    });
+    let release!: () => void;
+    rt.start();
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    vi.mocked(mintTransportToken).mockReturnValue(
+      new Promise((r) => (release = () => r({ transport_options: { webtransport: COORDS } } as never))),
+    );
+    agent.last.closeWith(4400);
+    await vi.waitFor(() => expect(release).toBeDefined());
+    fatal("the GPU device was lost");
+    expect(callbacks.onFallback).toHaveBeenCalledWith("internal");
+    release();
+    await flush();
+    expect(agent.conns).toHaveLength(1);
+    expect(callbacks.onFallback).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes WebTransport before it asks the page to fall back", async () => {
+    let sink!: MediaSink;
+    const order: string[] = [];
+    const fake: MediaTransport = {
+      connect: async (s) => void (sink = s),
+      requestKeyframe: () => {},
+      input: { reliable: () => {}, datagram: () => false },
+      close: () => void order.push("close"),
+    };
+    const rt = createWebTransportRuntime({
+      sessionId: "s1",
+      authToken: "auth",
+      coords: COORDS,
+      canvas: document.createElement("canvas"),
+      callbacks: {
+        onDisconnectSuspected: () => {},
+        onSessionTakenOver: () => {},
+        onTransportFailed: () => {},
+        onFallback: () => void order.push("fallback"),
+      },
+      deps: { createTransport: () => fake, createPresenter: async () => ({ present: () => true, destroy: () => {} }) },
+    });
+    rt.start();
+    await vi.waitFor(() => expect(sink).toBeDefined());
+    vi.mocked(mintTransportToken).mockRejectedValue(new Error("409"));
+    sink.end({ code: null, reason: "" });
+    await vi.waitFor(() => expect(order).toContain("fallback"));
+    expect(order.indexOf("close")).toBeLessThan(order.indexOf("fallback"));
+  });
+
+  it("does not fall back when the session ended or another device took it", async () => {
+    for (const code of [4404, 4410]) {
+      const { agent, callbacks, rt } = setup();
+      rt.start();
+      await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+      agent.last.closeWith(code);
+      await vi.waitFor(() => expect(callbacks.onTransportFailed.mock.calls.length + callbacks.onSessionTakenOver.mock.calls.length).toBe(1));
+      expect(callbacks.onFallback).not.toHaveBeenCalled();
+    }
+  });
+
+  const key = { t: "k", c: "KeyA", d: 1 } as InputMsg;
+  const inputs = (agent: FakeAgent) => agent.received.filter((m) => m.type === "input");
+
+  it("rebuilds input capture on a reconnect: the old one is released, the new one sends on the new connection", async () => {
+    const { agent, rt, captures } = setup();
+    rt.start();
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    expect(captures).toHaveLength(1);
+    captures[0].sendInput(key);
+    await vi.waitFor(() => expect(inputs(agent)).toHaveLength(1));
+
+    agent.last.closeWith(4400);
+    await vi.waitFor(() => expect(captures).toHaveLength(2));
+    expect(captures[0].cleanup).toHaveBeenCalledTimes(1);
+    expect(captures[1].cleanup).not.toHaveBeenCalled();
+    expect(agent.conns).toHaveLength(2);
+
+    // A late handler of the old capture reaches nothing; the new one reaches the new connection.
+    captures[0].sendInput(key);
+    await flush();
+    expect(inputs(agent)).toHaveLength(1);
+    captures[1].sendInput({ t: "k", c: "KeyB", d: 1 } as InputMsg);
+    await vi.waitFor(() => expect(inputs(agent)).toHaveLength(2));
+    expect(inputs(agent)[1]).toEqual({ type: "input", event: { t: "k", c: "KeyB", d: 1 } });
+    expect(rt.engage()).toBeNull();
+    expect(captures[1].engage).toHaveBeenCalled();
+    expect(captures[0].engage).not.toHaveBeenCalled();
+  });
+
+  it("tears input capture down on fallback: nothing is sent over the dead connection and the page sees no capture", async () => {
+    const { agent, callbacks, rt, captures } = setup();
+    rt.start();
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    agent.last.closeWith(4400); // first loss: one reconnect
+    await vi.waitFor(() => expect(captures).toHaveLength(2));
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    agent.last.closeWith(4400); // second loss: fallback, from a connection with a live capture
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost"));
+    expect(captures[1].cleanup).toHaveBeenCalledTimes(1);
+    const before = inputs(agent).length;
+    captures[1].sendInput(key);
+    await flush();
+    expect(inputs(agent)).toHaveLength(before);
+    expect(rt.engage()).toBeNull();
+    expect(captures[1].engage).not.toHaveBeenCalled();
+    expect(rt.getSnapshot()).toMatchObject({ inputCaptured: false, pointerLocked: false, channelOpen: false });
+  });
+
+  it("builds no capture for a connection that never came up", async () => {
+    const { agent, callbacks, rt, captures } = setup();
+    agent.refuseHandshake = true;
+    rt.start();
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("connect_failed"));
+    expect(captures).toHaveLength(0);
   });
 });

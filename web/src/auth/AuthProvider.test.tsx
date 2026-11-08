@@ -21,7 +21,8 @@ vi.mock("../api/auth", () => ({
 }));
 vi.mock("../webrtc/capability", () => ({
   getOrCreateDeviceKey: () => "dev-key",
-  probeCapabilities: vi.fn().mockResolvedValue({ codecs: { h264: true } }),
+  probeCapabilities: vi.fn().mockResolvedValue({ codecs: { h264: true }, webcodecs: {}, webgpu: {} }),
+  INCOMPLETE_PROBE_RETRY_MS: 300_000,
   probeH264Decodable: vi.fn().mockResolvedValue(true),
   deviceProbeIsFresh: vi.fn(() => false),
   markDeviceProbePosted: vi.fn(),
@@ -99,7 +100,7 @@ describe("AuthProvider device capability re-post", () => {
     );
 
     await waitFor(() => expect(authApi.postDevice).toHaveBeenCalledTimes(1));
-    expect(markDeviceProbePosted).toHaveBeenCalledWith("u1", true);
+    expect(markDeviceProbePosted).toHaveBeenCalledWith("u1", true, expect.any(Number), undefined);
   });
 
   it("skips the post while the stored probe is still fresh", async () => {
@@ -144,7 +145,7 @@ describe("AuthProvider device capability re-post", () => {
 
     it("stamps the verdict the posted record carries, so the next load does not post again", async () => {
       vi.mocked(probeH264Decodable).mockResolvedValue(false);
-      vi.mocked(probeCapabilities).mockResolvedValueOnce({ codecs: { h264: false } } as never);
+      vi.mocked(probeCapabilities).mockResolvedValueOnce({ codecs: { h264: false }, webcodecs: {}, webgpu: {} } as never);
       render(<AuthProvider><Probe /></AuthProvider>);
       await waitFor(() => expect(authApi.postDevice).toHaveBeenCalledTimes(1));
       await waitFor(() => expect(actual.deviceProbeIsFresh("u1", false)).toBe(true));

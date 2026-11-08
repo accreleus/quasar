@@ -4,11 +4,13 @@
 // Lifted out of AppHomeNext.tsx verbatim when the v3 home split the page into
 // components — the page composes, this owns the launch.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import * as libraryApi from "../../../api/library";
 import { ApiError } from "../../../api/client";
 import type { App, ProfilesResponse, Session } from "../../../api/types";
+import { AuthContext } from "../../../auth/context";
+import { ensureDeviceProbeForLaunch } from "../../../auth/deviceProbe";
 import { useToast } from "../../../components/Toast";
 import { playoutOverride } from "../../../webrtc/playoutOverride";
 import { transportPreference } from "../../../webtransport/transportSwitch";
@@ -108,6 +110,7 @@ export function useLaunch({
 }: UseLaunchOptions): UseLaunch {
   const navigate = useNavigate();
   const { addToast, removeToast } = useToast();
+  const userId = useContext(AuthContext)?.user?.id;
   const [launching, setLaunching] = useState(false);
   const [waitingForSlot, setWaitingForSlot] = useState(false);
   const [waitingReason, setWaitingReason] = useState<WaitingReason | null>(null);
@@ -184,6 +187,8 @@ export function useLaunch({
           waitingToastReason = null;
         }
       };
+      // The plan reads the stored probe; a stale one must not downgrade a capable browser.
+      if (token && userId) await ensureDeviceProbeForLaunch(token, userId);
       for (;;) {
         try {
           const { session, signaling, notice, transport_options } = await libraryApi.launchSession(
@@ -343,7 +348,7 @@ export function useLaunch({
         }
       }
     },
-    [token, launching, navigate, addToast, removeToast, apps],
+    [token, userId, launching, navigate, addToast, removeToast, apps],
   );
 
   // ── One-click launch, gated on the eligibility warning (#385 item 2) ──────

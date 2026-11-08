@@ -11,6 +11,8 @@ import {
   probeCapabilities,
   probeRegion,
   probeFeatures,
+  probeWebCodecs,
+  probeWebGpu,
   type DeviceCapabilities,
   type NativeCapabilities,
 } from "./capability";
@@ -340,9 +342,69 @@ describe("device capability post freshness", () => {
     expect(deviceProbeIsFresh("u1", true, 1_000_000)).toBe(false);
   });
 
+  it("ignores a stamp posted before the WebCodecs and WebGPU keys, so those devices post again (A11)", () => {
+    localStorage.clear();
+    // Exactly what v3 stored for this browser: only the key differs from a current stamp.
+    markDeviceProbePosted("u1", true, 1_000_000);
+    const [[key, stamp]] = Object.entries(localStorage);
+    localStorage.clear();
+    localStorage.setItem(key.replace("_v4", "_v3"), stamp);
+    expect(deviceProbeIsFresh("u1", true, 1_000_000)).toBe(false);
+  });
+
   it("ignores a stamp from before the Safari refresh change, so that probe is posted again (#632)", () => {
     localStorage.clear();
     localStorage.setItem("quasar_device_posted", JSON.stringify({ user: "u1", at: 1_000_000 }));
     expect(deviceProbeIsFresh("u1", true, 1_000_000)).toBe(false);
+  });
+});
+
+describe("probeWebCodecs and probeWebGpu (amendment 54)", () => {
+  it("proves each codec with isConfigSupported and reports false for what the browser lacks", async () => {
+    const ctor = (isConfigSupported: unknown) => Object.assign(function () {}, { isConfigSupported });
+    vi.stubGlobal("VideoDecoder", ctor(async ({ codec }: { codec: string }) => ({ supported: !codec.startsWith("av01") })));
+    vi.stubGlobal("AudioDecoder", ctor(async () => ({ supported: true })));
+    // no AudioEncoder in this browser
+    expect(await probeWebCodecs()).toEqual({ h264: true, hevc: true, av1: false, opus_decode: true, opus_encode: false });
+  });
+
+  it("reports false for every key in a browser with no WebCodecs, and a throwing check", async () => {
+    vi.stubGlobal("VideoDecoder", Object.assign(function () {}, { isConfigSupported: () => Promise.reject(new Error("x")) }));
+    expect(await probeWebCodecs()).toEqual({ h264: false, hevc: false, av1: false, opus_decode: false, opus_encode: false });
+  });
+
+  it("lists only the WebGPU features the adapter has", async () => {
+    vi.stubGlobal("navigator", { gpu: { requestAdapter: async () => ({ features: new Set(["subgroups", "other"]) }) } });
+    expect(await probeWebGpu()).toEqual({ available: true, features: ["subgroups"] });
+  });
+
+  it("reports WebGPU unavailable with no adapter or no API", async () => {
+    vi.stubGlobal("navigator", { gpu: { requestAdapter: async () => null } });
+    expect(await probeWebGpu()).toEqual({ available: false, features: [] });
+    vi.stubGlobal("navigator", {});
+    expect(await probeWebGpu()).toEqual({ available: false, features: [] });
+  });
+});
+
+describe("probeCapabilities on a link or browser where a step hangs", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("resolves within the bounds, with the hung steps unknown", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", () => new Promise(() => {}));
+    vi.stubGlobal("requestAnimationFrame", () => 0); // a background tab never draws a frame
+    vi.stubGlobal("navigator", { ...navigator, gpu: { requestAdapter: () => new Promise(() => {}) } });
+    vi.stubGlobal("VideoDecoder", Object.assign(function () {}, { isConfigSupported: () => new Promise(() => {}) }));
+    const done = vi.fn();
+    const result = probeCapabilities().then((c) => (done(), c));
+    await vi.advanceTimersByTimeAsync(9_500);
+    expect(done).toHaveBeenCalled();
+    const caps = await result;
+    expect(caps.rtt_ms).toBeNull();
+    expect(caps.bandwidth_kbps).toBeNull();
+    expect(caps.webcodecs).toBeUndefined();
+    expect(caps.webgpu).toBeUndefined();
+    expect(caps.display.refresh_hz).toBeUndefined();
+    expect(caps.display.width).toBe(screen.width);
   });
 });
