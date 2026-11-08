@@ -489,6 +489,7 @@ export type RuntimePresetsResponse = Schemas["RuntimePresetsResponse"];
 export type CompatTool = Schemas["CompatTool"];
 export type CompatToolList = Schemas["CompatToolList"];
 export type CompatToolMapping = Schemas["CompatToolMapping"];
+export type HostCompatTools = Schemas["HostCompatTools"];
 export type CompatToolMappingWrite = Schemas["CompatToolMappingWrite"];
 
 /** Only `name` is required; an absent field takes the server default on create

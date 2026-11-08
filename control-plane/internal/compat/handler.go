@@ -243,10 +243,8 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		if *req.Enabled {
 			action = "compat_tool.enable"
 		}
-		details := map[string]any{"tag": res.Tag, "sha512": res.SHA512, "host_ids": res.HostIDs}
-		if len(res.HostIDs) > 100 {
-			details["host_ids"], details["host_ids_truncated"] = res.HostIDs[:100], true
-		}
+		details := map[string]any{"tag": res.Tag, "sha512": res.SHA512, "host_count": len(res.HostIDs)}
+		capIDs(details, "host_ids", res.HostIDs)
 		audit.TryRecord(r.Context(), h.auditor, user.ID, action, "compat_tool", id, details)
 		if h.conv != nil {
 			h.conv.All(r.Context(), true)
@@ -311,8 +309,7 @@ func (h *Handler) handleForceRemove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	details := map[string]any{"tag": res.Tag, "sha512": res.SHA512, "mappings_cleared": res.MappingsCleared,
-		"default_cleared": res.DefaultCleared, "sessions_stopped": res.SessionsStopped}
-	// Two id lists must fit the 4096-byte details bound together, so each is cut at auditIDs.
+		"default_cleared": res.DefaultCleared, "sessions_stopped": res.SessionsStopped, "host_count": len(res.HostIDs)}
 	capIDs(details, "host_ids", res.HostIDs)
 	capIDs(details, "stopped_session_ids", res.StoppedIDs)
 	audit.TryRecord(r.Context(), h.auditor, user.ID, "compat_tool.force_remove", "compat_tool", id, details)
@@ -334,7 +331,7 @@ func (h *Handler) handleForceRemove(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "no such compatibility tool")
 }
 
-// auditIDs is the most ids of one list a force-remove audit row carries (two lists share 4096 bytes).
+// auditIDs is the most ids of one list an audit row carries (lists share the 4096-byte bound).
 const auditIDs = 40
 
 // capIDs sets details[key] to ids, cut at auditIDs with key+"_truncated" past that.

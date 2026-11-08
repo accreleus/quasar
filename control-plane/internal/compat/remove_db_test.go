@@ -81,7 +81,7 @@ func TestForceRemoveClearsMappingsAndDefaultStopsHoldersAndAudits(t *testing.T) 
 	}
 	if n := h.count(`SELECT count(*) FROM admin_activity WHERE action = 'compat_tool.force_remove' AND target_id = $1
 		AND (details->>'mappings_cleared')::int = 2 AND (details->>'sessions_stopped')::int = 1 AND details->>'default_cleared' = 'true'
-		AND details->'stopped_session_ids' = to_jsonb(ARRAY[$2::text]) AND jsonb_typeof(details->'host_ids') = 'array'`, id, holder); n != 1 {
+		AND details->'stopped_session_ids' = to_jsonb(ARRAY[$2::text]) AND jsonb_typeof(details->'host_ids') = 'array' AND (details->>'host_count')::int = (SELECT count(*) FROM hosts)`, id, holder); n != 1 {
 		t.Errorf("%d force_remove audit rows with the counts, the stopped session ids and a host list, want 1", n)
 	}
 
@@ -299,8 +299,8 @@ func TestAForceRemoveOfManySessionsStillWritesItsAuditRow(t *testing.T) {
 	}
 	if n := h.count(`SELECT count(*) FROM admin_activity WHERE action = 'compat_tool.force_remove' AND target_id = $1
 		AND jsonb_array_length(details->'stopped_session_ids') <= 100 AND details->>'stopped_session_ids_truncated' = 'true'
-		AND details->>'host_ids_truncated' = 'true'`, id); n != 1 {
-		t.Errorf("%d force_remove audit rows for 120 sessions and 120 hosts, want 1 (truncated)", n)
+		AND details->>'host_ids_truncated' = 'true' AND (details->>'host_count')::int = (SELECT count(*) FROM hosts)`, id); n != 1 {
+		t.Errorf("%d force_remove audit rows for 120 sessions and 120 hosts, want 1 (truncated, host_count = every host)", n)
 	}
 }
 

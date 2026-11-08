@@ -131,7 +131,7 @@ func (s *Store) ForceRemove(ctx context.Context, id string) (Removed, error) {
 	if _, err := tx.Exec(ctx, `UPDATE compat_tools SET force_remove_pending_at = clock_timestamp() WHERE id = $1::uuid`, id); err != nil {
 		return out, err
 	}
-	rows, err := tx.Query(ctx, `SELECT id::text FROM hosts ORDER BY id LIMIT 101`)
+	rows, err := tx.Query(ctx, `SELECT id::text FROM hosts ORDER BY id`)
 	if err != nil {
 		return out, err
 	}

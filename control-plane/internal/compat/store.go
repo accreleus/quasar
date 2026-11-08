@@ -378,7 +378,7 @@ func (s *Store) SetEnabled(ctx context.Context, id string, enabled bool) (Toggle
 		return out, err
 	}
 	if family == "ge" {
-		rows, err := tx.Query(ctx, `SELECT id::text FROM hosts ORDER BY id LIMIT 101`)
+		rows, err := tx.Query(ctx, `SELECT id::text FROM hosts ORDER BY id`)
 		if err != nil {
 			return out, err
 		}

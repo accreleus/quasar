@@ -6,6 +6,7 @@ package compat
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -532,5 +533,23 @@ func TestMappingRefusals(t *testing.T) {
 	}
 	if a := h.mappingAudit(); len(a) != 1 {
 		t.Errorf("audit rows = %q, want only the accepted replace", a)
+	}
+}
+
+// 150 hosts make the enable row's host list exceed the 4096-byte audit bound; the row must
+// still be written, cut to 40 ids and say so.
+func TestEnableOnManyHostsStillWritesItsAuditRow(t *testing.T) {
+	h := newHarness(t)
+	for i := 0; i < 150; i++ {
+		h.host(fmt.Sprintf("m%d", i), true)
+	}
+	id, _, _ := h.ge()
+	if code, tool := h.enable(id, true); code != http.StatusOK || tool["enabled"] != true {
+		t.Fatalf("enable: %d %v", code, tool)
+	}
+	if n := h.count(`SELECT count(*) FROM admin_activity WHERE action = 'compat_tool.enable' AND target_id = $1
+		AND jsonb_array_length(details->'host_ids') = 40 AND details->>'host_ids_truncated' = 'true'
+		AND (details->>'host_count')::int = (SELECT count(*) FROM hosts)`, id); n != 1 {
+		t.Errorf("%d enable audit rows, want 1 (40 ids, truncated, host_count = every host)", n)
 	}
 }

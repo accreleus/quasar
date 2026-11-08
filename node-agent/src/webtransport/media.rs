@@ -147,6 +147,10 @@ impl Media {
         })
     }
 
+    pub(crate) fn attached(&self) -> bool {
+        self.lock().client.is_some()
+    }
+
     pub(crate) fn detach(&self, id: u64) {
         let mut st = self.lock();
         if st.client.as_ref().is_some_and(|c| c.id == id) {

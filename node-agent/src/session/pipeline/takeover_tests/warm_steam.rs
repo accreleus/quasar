@@ -1092,6 +1092,33 @@ fn ten_encoder_rebuilds_on_one_runtime_each_stream() {
         return;
     }
     let _serial = serial();
+    // In its own process: the suite's other threads allocate while it runs, and their memory
+    // is in this process's RSS (#1184).
+    if std::env::var_os("QUASAR_REBUILD_RSS_CHILD").is_none() {
+        // This process may already hold the container-ownership lease; the child needs its own.
+        let state = tempfile::tempdir().unwrap();
+        let name = "session::pipeline::takeover_tests::warm_steam::ten_encoder_rebuilds_on_one_runtime_each_stream";
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env("QUASAR_REBUILD_RSS_CHILD", "1")
+            .env("NODE_SECRET_PATH", state.path().join("secret"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        eprint!("{stdout}{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "the rebuild series failed: {}",
+            out.status
+        );
+        // `--exact` on a stale name runs nothing and exits 0.
+        assert!(
+            stdout.contains(&format!("test {name} ... "))
+                && stdout.contains("test result: ok. 1 passed;"),
+            "the child did not run {name}"
+        );
+        return;
+    }
     let (runtime, mut session) = steam_session(
         "rebuild10",
         SessionKind::Play,
@@ -1105,11 +1132,12 @@ fn ten_encoder_rebuilds_on_one_runtime_each_stream() {
     // A leaked encode pipeline keeps its streaming threads, its fds and its memory.
     let threads = || std::fs::read_dir("/proc/self/task").map_or(0, |d| d.count());
     let fds = || std::fs::read_dir("/proc/self/fd").map_or(0, |d| d.count());
+    // glibc keeps freed memory in its arenas: untrimmed, RSS climbed 0.6-2.7 MiB per rebuild
+    // through 30 rebuilds while live heap grew ~70 KiB per rebuild (#1184). Trimmed, it
+    // counts only pages still in use.
     let rss_mib = || {
-        std::fs::read_to_string("/proc/self/statm")
-            .ok()
-            .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
-            .map_or(0, |pages| pages * 4096 / (1 << 20))
+        crate::memstat::trim();
+        crate::memstat::rss_kib().unwrap_or(0) / 1024
     };
     let mut counts = Vec::new();
     let mut open = Vec::new();
@@ -1146,7 +1174,7 @@ fn ten_encoder_rebuilds_on_one_runtime_each_stream() {
     let ms: Vec<u128> = took.iter().map(Duration::as_millis).collect();
     eprintln!(
         "encoder rebuild times (ms): {ms:?}; after each: threads {counts:?}, fds {open:?}, \
-         RSS MiB {rss:?}"
+         trimmed RSS MiB {rss:?}"
     );
     // The first flips settle thread pools; past that the count must not climb per flip.
     let (early, late) = (counts[2], counts[9]);
@@ -1158,7 +1186,9 @@ fn ten_encoder_rebuilds_on_one_runtime_each_stream() {
         open[9] <= open[2] + 8,
         "fds climb across rebuilds: {open:?}"
     );
-    assert!(rss[9] <= rss[2] + 48, "RSS climbs across rebuilds: {rss:?}");
+    // Measured 2-6 MiB from rebuild 2 to 9 over 20 runs, idle and under stress-ng; a leak at
+    // 3.5 MiB per rebuild or more crosses 24.
+    assert!(rss[9] <= rss[2] + 24, "RSS climbs across rebuilds: {rss:?}");
     end(session, &mut viewer);
 }
 

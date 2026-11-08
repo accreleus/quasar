@@ -107,6 +107,8 @@ type parkedClaim struct {
 	id        string
 	hostParks bool
 	restream  bool
+	// transport is what the launch's stream plan chose on the parked GPU.
+	transport string
 }
 
 // sameHolder is the session whose home hold a launch may pass: the parked
