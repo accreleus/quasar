@@ -656,6 +656,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	invitesHandler := invites.NewHandler(invites.NewStore(pool), cfg.PublicBaseURL, auditStore)
 	compatStore := compat.NewStore(pool)
 	compatStore.Auditor = auditStore
+	compatStore.Superseder = coordinator.SupersedeParked
 	compatCtx, compatCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	if err := compatStore.Reconcile(compatCtx); err != nil {
 		log.Error("compat tools: reconciling the catalogue failed", "err", err)

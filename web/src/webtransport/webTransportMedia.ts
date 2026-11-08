@@ -1,6 +1,6 @@
 // MediaTransport over WebTransport: protocol/transport-webtransport.md, wt_proto 1,
-// video, audio and the microphone. Input, ping/pong, NACK and feedback are later tickets
-// (#1032, #1039, #1040).
+// video, input, ping/pong, audio and the microphone. NACK and feedback are later tickets
+// (#1039, #1040).
 
 import {
   base64Bytes,
@@ -12,6 +12,8 @@ import {
   parseVideoDatagram,
 } from "./framing";
 import type { WebTransportCoords } from "../api/types";
+import type { InputWire } from "./inputSender";
+import { workerTicker, type Ticker } from "./pingTicker";
 import { FrameAssembler } from "./reassembly";
 import {
   TransportError,
@@ -40,8 +42,10 @@ export const REMINT_MIN_INTERVAL_MS = 10_000;
  *  on this page's monotonic clock from its arrival, never against the server's `expires_at`. */
 export const TOKEN_REFRESH_AGE_MS = 45_000;
 
+/** The client pings once a second (§Ping and pong). */
+const PING_MS = 1_000;
 /** A datagram carries at least this much on any path (§Channels, "Datagram size"). */
-const MAX_DATAGRAM = 1148;
+const MAX_INPUT_DATAGRAM = 1148;
 
 /** WebTransport close codes during connect (§Bye and error), as the refusal they stand for. */
 const CLOSE_REFUSALS: Record<number, string> = {
@@ -66,6 +70,8 @@ export interface WebTransportMediaOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Monotonic milliseconds. */
   now?: () => number;
+  /** The ping's clock; a Worker's by default, so a hidden tab keeps pinging. */
+  ticker?: Ticker;
 }
 
 /** `hello_ack.video` into a {@link VideoConfig}; throws on a shape it cannot use. */
@@ -120,6 +126,8 @@ export class WebTransportMedia implements MediaTransport {
   private wt: WebTransport | null = null;
   private writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
   private datagramWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
+  private stopTicker: (() => void) | null = null;
+  private pingId = 0;
   private closed = false;
   /** Closes the attempt in flight; null once one has connected or ended. */
   private abortAttempt: (() => void) | null = null;
@@ -133,6 +141,17 @@ export class WebTransportMedia implements MediaTransport {
   private pendingKey: KeyframeReason | null = null;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
+
+  /** Both paths are no-ops until connected. */
+  readonly input: InputWire = {
+    reliable: (event) => this.send({ type: "input", event }),
+    datagram: (bytes) => {
+      const cap = Math.min(this.wt?.datagrams.maxDatagramSize ?? MAX_INPUT_DATAGRAM, MAX_INPUT_DATAGRAM);
+      if (!this.datagramWriter || bytes.length > cap) return false;
+      void this.datagramWriter.write(bytes).catch(() => {});
+      return true;
+    },
+  };
 
   constructor(private readonly opts: WebTransportMediaOptions) {
     this.coords = opts.coords;
@@ -182,16 +201,14 @@ export class WebTransportMedia implements MediaTransport {
   }
 
   sendMic(datagram: Uint8Array): boolean {
-    const cap = Math.min(this.wt?.datagrams.maxDatagramSize ?? MAX_DATAGRAM, MAX_DATAGRAM);
-    if (!this.datagramWriter || datagram.length > cap) return false;
-    void this.datagramWriter.write(datagram).catch(() => {});
-    return true;
+    return this.input.datagram(datagram);
   }
 
   close(): void {
     if (this.closed) return;
     this.closed = true;
     if (this.keyTimer !== null) clearTimeout(this.keyTimer);
+    this.stopPings();
     // An attempt still connecting is closed here; it sees `closed` at its next await.
     this.abortAttempt?.();
     if (this.connected) this.send({ type: "bye", reason: "client_closed" });
@@ -212,6 +229,11 @@ export class WebTransportMedia implements MediaTransport {
     }
     this.tokenAt = this.now();
     return true;
+  }
+
+  private stopPings(): void {
+    this.stopTicker?.();
+    this.stopTicker = null;
   }
 
   private send(message: object): void {
@@ -332,11 +354,18 @@ export class WebTransportMedia implements MediaTransport {
     this.datagramWriter = wt.datagrams.writable.getWriter();
     sink.streams?.(audioStreamsFrom(first));
     sink.config(config);
+    const ping = () => this.send({ type: "ping", id: ++this.pingId, tc: this.now() });
+    ping();
+    this.stopTicker = (this.opts.ticker ?? workerTicker)(PING_MS, ping);
     void (async () => {
       try {
         for (let m = await next(); m && live.on; m = await next()) {
           // Unknown types are ignored (§Channels). bye is followed by the close.
           if (m.type === "hello_ack") sink.config(videoConfigFrom(m));
+          else if (m.type === "pong" && typeof m.tc === "number") sink.rtt?.(Math.max(0, this.now() - m.tc));
+          else if (m.type === "ping") {
+            this.send({ type: "pong", id: m.id, ts: m.ts, tw: m.tw, tc: this.now() });
+          }
         }
       } catch (err) {
         // A malformed stream, or a re-sent hello_ack this page cannot use: the connection is over.
@@ -344,8 +373,14 @@ export class WebTransportMedia implements MediaTransport {
       }
     })();
     void wt.closed.then(
-      (info) => sink.end({ code: info.closeCode ?? null, reason: info.reason ?? "" }),
-      (err: unknown) => sink.end({ code: null, reason: err instanceof Error ? err.message : "" }),
+      (info) => {
+        this.stopPings();
+        sink.end({ code: info.closeCode ?? null, reason: info.reason ?? "" });
+      },
+      (err: unknown) => {
+        this.stopPings();
+        sink.end({ code: null, reason: err instanceof Error ? err.message : "" });
+      },
     );
     return { kind: "ack" };
   }

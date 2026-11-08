@@ -26,6 +26,14 @@ type compatToolsReport struct {
 	} `json:"tools"`
 }
 
+// forgetHostCompatTools drops the host's installed set. A connection without compat_tools_v1 can
+// never replace it, and §Usable counts a tool only on a connection that advertised the
+// capability, so rows left by an earlier v1 connection would still place launches.
+func (s *agentStore) forgetHostCompatTools(ctx context.Context, hostID string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM host_compat_tools WHERE host_id = $1::uuid`, hostID)
+	return err
+}
+
 // upsertHostCompatTools replaces the host's installed set wholesale and reports whether it
 // changed. A report without the field keeps the stored set.
 func (s *agentStore) upsertHostCompatTools(ctx context.Context, hostID string, raw json.RawMessage) (bool, error) {

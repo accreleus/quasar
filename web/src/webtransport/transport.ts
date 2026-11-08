@@ -5,6 +5,7 @@
 // still decodes inside the browser's <video> and does not go through this seam.
 
 import type { AudioPacket } from "./framing";
+import type { InputWire } from "./inputSender";
 
 /** A `hello_ack.video` (§Hello ack), the decoder configuration a `config_id` names. */
 export interface VideoConfig {
@@ -63,6 +64,8 @@ export interface MediaSink {
   unit(unit: AccessUnit): void;
   /** Called once, after connect resolved, when the transport is gone. */
   end(end: TransportEnd): void;
+  /** A ping's round trip in ms, once a second while connected (§Ping and pong). */
+  rtt?(ms: number): void;
 }
 
 export interface MediaTransport {
@@ -71,6 +74,8 @@ export interface MediaTransport {
   requestKeyframe(reason: KeyframeReason): void;
   /** Sends one `0x05` microphone datagram; false when it was not sent (not connected, too large). */
   sendMic(datagram: Uint8Array): boolean;
+  /** Where client input goes once connected (§Input). */
+  readonly input: InputWire;
   /** Says `bye` when connected; idempotent. */
   close(): void;
 }

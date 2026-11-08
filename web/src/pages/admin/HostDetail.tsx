@@ -31,6 +31,7 @@ import { elapsedWords, relativeTime } from "../../lib/format/relativeTime";
 import { useAdminAction } from "../../lib/resource/action";
 import { useResource } from "../../lib/resource/react";
 import { ImageCleanupModal } from "./library/ImageCleanupModal";
+import { CompatToolsCard } from "./fleet/hostDetail/CompatToolsCard";
 import { CapacityCard } from "./fleet/hostDetail/CapacityCard";
 import { FloorNote } from "./fleet/hostDetail/FloorNote";
 import { ServicesCard } from "./fleet/hostDetail/ServicesCard";
@@ -411,6 +412,8 @@ export function HostDetail() {
           }}
         />
       )}
+
+      <CompatToolsCard hostId={host.id} />
 
       <WebTransportCard hostId={host.id} now={now} />
 

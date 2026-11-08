@@ -4,6 +4,7 @@
 /** No control message is longer than this (§Channels); a longer length is a 4400. */
 export const MAX_CONTROL_MESSAGE = 65_536;
 export const CHANNEL_VIDEO = 0x01;
+export const CHANNEL_INPUT = 0x03;
 export const CHANNEL_AUDIO = 0x02;
 export const CHANNEL_MIC = 0x05;
 const VIDEO_HEADER = 25;
