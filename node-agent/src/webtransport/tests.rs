@@ -1004,6 +1004,171 @@ async fn the_tap_counts_a_streaming_client_until_it_leaves() {
     }
 }
 
+fn key_input(code: u32) -> Value {
+    json!({"type": "input", "event": {"t": "k", "code": code, "pressed": true}})
+}
+
+/// What the WebRTC data channel hands the devices, through the session's media client.
+fn webrtc_key(agent: &Agent, code: u32) {
+    let input = agent.input.clone();
+    agent.tap.as_ref().unwrap().media().webrtc_input(move || {
+        input
+            .lock()
+            .unwrap()
+            .push(json!({"t": "k", "code": code, "pressed": true}).to_string())
+    });
+}
+
+fn codes_seen(agent: &Agent) -> Vec<u64> {
+    agent
+        .input
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            serde_json::from_str::<Value>(e).unwrap()["code"]
+                .as_u64()
+                .unwrap()
+        })
+        .collect()
+}
+
+/// §Takeover, WebRTC takes over WebTransport: the client gets `bye taken_over` and `4410` at
+/// once, what it held is lifted then, once, and nothing it sends after reaches the devices.
+#[tokio::test]
+async fn a_webrtc_peer_takes_over_the_webtransport_client() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let agent = agent().await;
+    let tap = agent.tap.as_ref().unwrap();
+    let (session, mut send, mut recv, _) = agent.hello(TOKEN).await;
+    write_message(&mut send, &key_input(30)).await.unwrap();
+    assert_eq!(input_events(&agent, 1).await.len(), 1);
+
+    assert!(tap.media().webrtc_attached(), "a client was attached");
+    assert_eq!(agent.released.load(SeqCst), 1, "lifted at the takeover");
+    assert!(!tap.attached(), "the idle reap no longer counts it");
+    let _ = write_message(&mut send, &key_input(31)).await;
+    webrtc_key(&agent, 32);
+    assert_eq!(
+        read_message(&mut recv).await.unwrap(),
+        json!({"type": "bye", "reason": "taken_over"})
+    );
+    assert_eq!(close_code(&session).await, Some(CLOSE_TAKEN_OVER));
+    assert_eq!(
+        codes_seen(&agent),
+        [30, 32],
+        "the old client's late key is dropped"
+    );
+    assert_eq!(
+        agent.released.load(SeqCst),
+        1,
+        "its own close lifted nothing of the WebRTC peer's"
+    );
+}
+
+/// §Takeover, WebTransport takes over WebRTC: the peer's key is lifted before the client's
+/// `hello_ack`, the runner is told once to stop the peer's media, and the peer's late input
+/// and its disconnect reach nothing of the client's.
+#[tokio::test]
+async fn a_webtransport_client_takes_over_the_webrtc_peer() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let agent = agent().await;
+    let media = agent.tap.as_ref().unwrap().media().clone();
+    webrtc_key(&agent, 1);
+    assert!(
+        agent.input.lock().unwrap().is_empty(),
+        "no WebRTC peer accepted yet"
+    );
+    assert!(!media.webrtc_attached(), "no client to displace");
+    webrtc_key(&agent, 30);
+    assert!(!media.take_webrtc_displaced());
+
+    let (session, mut send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+    assert_eq!(agent.released.load(SeqCst), 1, "lifted before the ack");
+    assert!(media.take_webrtc_displaced(), "the runner stops the peer");
+    assert!(!media.take_webrtc_displaced(), "once");
+
+    webrtc_key(&agent, 31);
+    media.release_webrtc();
+    write_message(&mut send, &key_input(32)).await.unwrap();
+    assert_eq!(input_events(&agent, 2).await.len(), 2);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(codes_seen(&agent), [30, 32]);
+    assert_eq!(
+        agent.released.load(SeqCst),
+        1,
+        "the peer's disconnect lifted the client's key"
+    );
+    assert!(frames(&session, 1, true).await[0].keyframe);
+}
+
+/// #1193: the host missed the WebTransport close on a fallback. The WebRTC attach displaces the
+/// client then, so its control-stream silence 10 s later lifts nothing the WebRTC peer holds.
+#[tokio::test]
+async fn a_key_held_over_webrtc_after_a_fallback_without_a_webtransport_close_stays_held() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let agent = agent().await;
+    let media = agent.tap.as_ref().unwrap().media().clone();
+    // Never closed by the client, and silent from here on.
+    let (session, mut send, _recv, _) = agent.hello(TOKEN).await;
+    write_message(&mut send, &key_input(30)).await.unwrap();
+    assert_eq!(input_events(&agent, 1).await.len(), 1);
+
+    media.webrtc_attached();
+    webrtc_key(&agent, 30);
+    assert_eq!(codes_seen(&agent), [30, 30], "held again over WebRTC");
+    let released = agent.released.load(SeqCst);
+    tokio::time::sleep(CONTROL_IDLE + Duration::from_secs(1)).await;
+    assert_eq!(
+        agent.released.load(SeqCst),
+        released,
+        "a release after the WebRTC press lifted the key the WebRTC peer holds"
+    );
+    assert_eq!(
+        released, 1,
+        "the client's key was lifted once, at the attach"
+    );
+    assert_eq!(close_code(&session).await, Some(CLOSE_TAKEN_OVER));
+}
+
+/// §Authentication and tokens, "Reconnect": a reload's fresh token resumes the same session
+/// with nothing restarted (the same decoder configuration, frame numbers carrying on), from a
+/// keyframe.
+#[tokio::test]
+async fn a_reload_reconnects_with_a_fresh_token_and_resumes_from_a_keyframe() {
+    let agent = agent().await;
+    let tap = agent.tap.as_ref().unwrap();
+    let (first, mut send, _recv, ack) = agent.hello(TOKEN).await;
+    let last = frames(&first, 5, true).await.last().unwrap().frame_seq;
+    write_message(
+        &mut send,
+        &json!({"type": "bye", "reason": "client_closed"}),
+    )
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while tap.attached() {
+        assert!(Instant::now() < deadline, "the reloaded page never left");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert!(agent.listener.registry().add_token(
+        SESSION,
+        &token_hash("reload"),
+        SystemTime::now() + TOKEN_TTL
+    ));
+    let (second, _send, _recv, again) = agent.hello("reload").await;
+    assert_eq!(again, ack, "the same session's configuration");
+    let next = &frames(&second, 1, true).await[0];
+    assert!(next.keyframe, "the reconnected client starts at a keyframe");
+    assert!(
+        next.frame_seq > last,
+        "frame numbers carry on: {} after {last}",
+        next.frame_seq
+    );
+}
+
 #[tokio::test]
 async fn past_64_unauthenticated_connections_new_sessions_are_refused() {
     let agent = agent_with(Limits {

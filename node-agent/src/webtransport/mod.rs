@@ -4,8 +4,8 @@
 //! then gets the session's video as datagrams.
 //!
 //! Not here yet, each a later ticket: audio, microphone, FEC, receiver feedback and
-//! congestion control, and takeover across transports (a new client replaces the last
-//! one; nothing bounds it).
+//! congestion control, and the takeover bound (§Takeover's 6 in 60 s: a new client replaces
+//! the last one, on either transport, and nothing bounds it).
 
 mod cert;
 mod media;
@@ -31,7 +31,8 @@ use web_transport_quinn::{quinn, RecvStream, Request, SendStream, Session};
 
 pub use cert::CertReport;
 use cert::{Cert, CertSet};
-use media::{Attached, Gone, Media, Out};
+pub(crate) use media::Media;
+use media::{Attached, Gone, Out};
 
 const WT_PROTO: u32 = 1;
 const HELLO_DEADLINE: Duration = Duration::from_secs(5);
@@ -288,6 +289,18 @@ impl Registry {
     }
 }
 
+/// The registry a session's transports use when no listener runs: a test's own.
+#[cfg(test)]
+pub(crate) static TEST_REGISTRY: Mutex<Option<Arc<Registry>>> = Mutex::new(None);
+
+/// The registry the session's transports attach to: the listener's.
+pub(crate) fn registry() -> Option<Arc<Registry>> {
+    let registry = listener().map(|l| l.registry().clone());
+    #[cfg(test)]
+    let registry = registry.or_else(|| TEST_REGISTRY.lock().unwrap().clone());
+    registry
+}
+
 /// Takes the session's video off the encoded-frame boundary for its WebTransport
 /// client, and forgets the session when dropped with the transport.
 pub(crate) struct Tap {
@@ -320,6 +333,12 @@ impl Tap {
     /// A client is attached and being sent video: the session's idle reap counts it.
     pub(crate) fn attached(&self) -> bool {
         self.media.attached()
+    }
+
+    /// The session's one media client across both transports, which the WebRTC side
+    /// injects and releases through.
+    pub(crate) fn media(&self) -> &Arc<Media> {
+        &self.media
     }
 }
 

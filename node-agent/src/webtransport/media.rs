@@ -2,6 +2,7 @@
 //! encoded-frame boundary, and their packetizing into `0x01` datagrams
 //! (`protocol/transport-webtransport.md` §Video).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -88,8 +89,13 @@ struct State {
 /// cannot grow the per-pad table.
 const MAX_PADS: u64 = 4;
 
-/// The client whose input the devices take: none (`0`) or its id, and the buttons of its last
-/// reliable `gp` per pad, since a datagram `gp` carries axes only.
+/// `Typing::client` while the session's WebRTC peer holds it (§Takeover: one media client
+/// across both transports).
+const WEBRTC: u64 = u64::MAX;
+
+/// The client whose input the devices take: none (`0`), a WebTransport client's id or
+/// [`WEBRTC`], and the buttons of its last reliable `gp` per pad, since a datagram `gp`
+/// carries axes only.
 #[derive(Default)]
 struct Typing {
     client: u64,
@@ -105,6 +111,9 @@ pub(crate) struct Media {
     /// being the attached one cannot slip an event in behind the release that ended it.
     typing: Mutex<Typing>,
     encoder: glib::WeakRef<gst::Element>,
+    /// A WebTransport client took the session from the WebRTC peer; the runner has yet to
+    /// stop that peer's media and tell it (`take_webrtc_displaced`).
+    webrtc_displaced: AtomicBool,
 }
 
 /// The client half `Media::attach` hands back.
@@ -122,6 +131,7 @@ impl Media {
             input,
             typing: Mutex::default(),
             encoder: encoder.downgrade(),
+            webrtc_displaced: AtomicBool::new(false),
         })
     }
 
@@ -211,6 +221,9 @@ impl Media {
             if typing.client != 0 {
                 self.release(&mut typing);
             }
+            if typing.client == WEBRTC {
+                self.webrtc_displaced.store(true, Ordering::SeqCst);
+            }
             typing.client = id;
         }
         self.keyframe();
@@ -224,6 +237,47 @@ impl Media {
 
     pub(crate) fn attached(&self) -> bool {
         self.lock().client.is_some()
+    }
+
+    /// The host accepted a WebRTC peer (`transport-webtransport.md` §Takeover): it displaces
+    /// the WebTransport client, and what that client held is lifted now, before the peer can
+    /// send. That client's later detach, its 10 s silence included, then lifts nothing.
+    /// True when a client was attached.
+    pub(crate) fn webrtc_attached(&self) -> bool {
+        let displaced = self.lock().client.take();
+        if let Some(old) = &displaced {
+            let _ = old.gone.set(Gone::TakenOver);
+        }
+        let mut typing = self.typing.lock().unwrap_or_else(|e| e.into_inner());
+        if typing.client != 0 && typing.client != WEBRTC {
+            self.release(&mut typing);
+        }
+        typing.client = WEBRTC;
+        displaced.is_some()
+    }
+
+    /// One WebRTC input event, `inject`ed only while the WebRTC peer holds the session.
+    pub(crate) fn webrtc_input(&self, inject: impl FnOnce()) {
+        let typing = self.typing.lock().unwrap_or_else(|e| e.into_inner());
+        if typing.client == WEBRTC {
+            inject();
+        }
+    }
+
+    /// The WebRTC peer disconnected or its transport was retired: what it held is lifted,
+    /// unless a WebTransport client holds the session. The peer keeps it: a transient
+    /// disconnect can recover.
+    pub(crate) fn release_webrtc(&self) {
+        let mut typing = self.typing.lock().unwrap_or_else(|e| e.into_inner());
+        if typing.client == WEBRTC {
+            self.release(&mut typing);
+        }
+    }
+
+    /// Whether a WebTransport client took the session from the WebRTC peer since the last
+    /// call.
+    pub(crate) fn take_webrtc_displaced(&self) -> bool {
+        self.webrtc_displaced.swap(false, Ordering::SeqCst)
     }
 
     /// The client is gone. If it is still the one the devices take input from, what it held is
@@ -565,6 +619,7 @@ mod tests {
             input: crate::webtransport::tests::no_input(),
             typing: Mutex::default(),
             encoder: glib::WeakRef::new(),
+            webrtc_displaced: AtomicBool::new(false),
         });
         media.on_caps(&caps(1280, &avcc), "s");
         let mut client = media.attach().expect("ready after caps");

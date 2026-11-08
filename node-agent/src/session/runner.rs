@@ -1499,13 +1499,14 @@ impl Negotiation {
     }
 
     /// `answer` was handed to the transport. One that names no peer is not what the next
-    /// answer is read against: the transport has negotiated with nobody through it.
-    fn applied(&mut self, answer: String) {
+    /// answer is read against: the transport has negotiated with nobody through it. True
+    /// when it is the transport's first: a peer the host has just accepted.
+    fn applied(&mut self, answer: String) -> bool {
         if !pipeline::names_a_peer(&answer) {
-            return;
+            return false;
         }
         self.reoffered = false;
-        self.answer = Some(answer);
+        self.answer.replace(answer).is_none()
     }
 
     /// The transport is being replaced. Returns the ICE ufrag of the peer it leaves.
@@ -1536,11 +1537,11 @@ pub(crate) struct SessionTransports {
 
 impl pipeline::Transport for SessionTransports {
     fn attach(session: pipeline::EncodedSession) -> anyhow::Result<Self> {
-        let webtransport = crate::webtransport::listener()
+        let webtransport = crate::webtransport::registry()
             .filter(|_| session.cfg.webtransport)
-            .and_then(|l| {
+            .and_then(|registry| {
                 crate::webtransport::Tap::attach(
-                    l.registry(),
+                    &registry,
                     &session.video,
                     &session.encoder,
                     &session.session_id,
@@ -1552,7 +1553,10 @@ impl pipeline::Transport for SessionTransports {
                     ),
                 )
             });
-        let slot = pipeline::WebRtcSlot::new(session)?;
+        let mut slot = pipeline::WebRtcSlot::new(session)?;
+        if let Some(tap) = &webtransport {
+            slot.share_input(tap.media().clone());
+        }
         // Audio first: `attach_video` takes the encode pipeline to READY.
         let (audio_webrtc, audio_pipeline) = slot.build_audio()?;
         let video = slot.attach_video(false, None)?;
@@ -1591,6 +1595,11 @@ impl SessionTransports {
             ],
             webtransport: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn webtransport_media(&self) -> Option<Arc<crate::webtransport::Media>> {
+        self.webtransport.as_ref().map(|tap| tap.media().clone())
     }
 
     /// Is `pc`'s transport one built for a peer that took the session over, not the one
@@ -1812,8 +1821,9 @@ impl SessionTransports {
             // Recorded only now: an answer that does not parse was handed to nothing, and
             // must not stand for the peer the next answer is read against.
             Ok(()) => {
-                if let Some(answer) = answer {
-                    self.negotiation[i].applied(answer);
+                let accepted = answer.is_some_and(|a| self.negotiation[i].applied(a));
+                if accepted && matches!(pc, PcId::Video) {
+                    self.webrtc_attached();
                 }
             }
             Err(e) => tracing::warn!(
@@ -1822,6 +1832,56 @@ impl SessionTransports {
             ),
         }
         Ok(None)
+    }
+
+    /// A WebRTC peer's first answer was applied: it takes the session from a WebTransport
+    /// client (`transport-webtransport.md` §Takeover), at once, so that client's delayed
+    /// silence release cannot lift what the peer holds (#1193).
+    fn webrtc_attached(&self) {
+        let Some(tap) = &self.webtransport else {
+            return;
+        };
+        if tap.media().webrtc_attached() {
+            tracing::info!(
+                token = "webtransport-taken-over-by-webrtc",
+                "a WebRTC peer took the session from its WebTransport client: that client is \
+                 closed 4410 and its keys and buttons are released"
+            );
+        }
+    }
+
+    /// A WebTransport client took the session from the WebRTC peer since the last call:
+    /// that peer's media stops, and the client holding signaling is told `taken_over`
+    /// (`transport-webtransport.md` §Takeover). True when it happened, so the caller treats
+    /// that peer's transport as one whose viewer left.
+    pub(crate) fn take_from_webrtc(&self, out_tx: &pipeline::OutTx) -> bool {
+        if !self
+            .webtransport
+            .as_ref()
+            .is_some_and(|tap| tap.media().take_webrtc_displaced())
+        {
+            return false;
+        }
+        self.slot.mute(&self.video);
+        // Its audio transport is replaced too when a new WebRTC peer answers, so the probes
+        // go with it.
+        for pad in self.audio_webrtc.iter().flat_map(|a| a.sink_pads()) {
+            pad.add_probe(
+                gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+                |_, _| gst::PadProbeReturn::Drop,
+            );
+        }
+        let _ = out_tx.send(SignalMsg::Error {
+            message: "the session was taken over by another client".to_string(),
+            code: Some(signaling::TAKEN_OVER.to_string()),
+            pc: None,
+        });
+        tracing::info!(
+            token = "webtransport-took-over-webrtc",
+            "a WebTransport client took the session from its WebRTC peer: that peer's media \
+             stopped and it was told taken_over"
+        );
+        true
     }
 }
 
@@ -3459,6 +3519,12 @@ pub fn run_blocking(
                     payload: report.payload,
                 });
             }
+        }
+
+        // Before the inbound answers: a WebRTC peer accepted after the WebTransport client
+        // must not have its new transport muted.
+        if transports.take_from_webrtc(&sig_tx) {
+            stale_transport = true;
         }
 
         // Inbound relay signaling (answer/ICE from the browser). A held runtime has no
@@ -6425,6 +6491,21 @@ mod tests {
         negotiation.applied(answer_sdp("aaaa", "AA:01"));
         negotiation.applied("not sdp".to_string());
         assert_eq!(negotiation.replaced(), Some("aaaa".to_string()));
+    }
+
+    /// A WebRTC peer the host accepts takes the session from a WebTransport client
+    /// (`SessionTransports::webrtc_attached`): only a transport's first answer is one.
+    #[test]
+    fn only_a_transports_first_answer_is_a_peer_the_host_accepts() {
+        let mut negotiation = Negotiation::default();
+        assert!(!negotiation.applied(String::new()), "it names no peer");
+        assert!(negotiation.applied(answer_sdp("aaaa", "AA:01")));
+        assert!(
+            !negotiation.applied(answer_sdp("bbbb", "AA:01")),
+            "the same peer correcting"
+        );
+        negotiation.replaced();
+        assert!(negotiation.applied(answer_sdp("cccc", "CC:03")));
     }
 
     #[test]

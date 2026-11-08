@@ -931,6 +931,114 @@ fn a_takeover_mid_stream_moves_the_stream_to_the_new_peer() {
     );
 }
 
+/// Forgets the test's WebTransport registry.
+struct WtRegistry;
+
+impl Drop for WtRegistry {
+    fn drop(&mut self) {
+        *crate::webtransport::TEST_REGISTRY.lock().unwrap() = None;
+    }
+}
+
+/// A host whose session was assigned WebTransport (amendment 54), and its media client,
+/// ready for a WebTransport `hello`.
+fn start_webtransport(tag: &str) -> (Host, Arc<crate::webtransport::Media>, WtRegistry) {
+    let registry = Arc::new(crate::webtransport::Registry::default());
+    registry.assign(
+        &format!("takeover-{tag}"),
+        "00",
+        std::time::SystemTime::now() + Duration::from_secs(60),
+    );
+    *crate::webtransport::TEST_REGISTRY.lock().unwrap() = Some(registry);
+    let guard = WtRegistry;
+    let mut cfg = host_cfg(false);
+    cfg.webtransport = true;
+    let host = Host::start_cfg(tag, cfg);
+    let media = host
+        .transports
+        .webtransport_media()
+        .expect("the session took a WebTransport tap");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !media.ready() {
+        assert!(Instant::now() < deadline, "no caps reached the tap");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (host, media, guard)
+}
+
+/// `transport-webtransport.md` §Takeover across transports, through the runner's own calls: a
+/// WebTransport client takes the session from a streaming WebRTC peer (its media stops and
+/// the client holding signaling is told `taken_over`), and a new WebRTC peer takes it back
+/// (the WebTransport client is displaced when that peer's answer applies).
+#[test]
+fn takeover_crosses_between_webrtc_and_webtransport() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (mut host, media, _wt) = start_webtransport("cross");
+    let mut a = first_attach(&mut host);
+
+    let wt = media.attach().expect("the WebTransport hello is accepted");
+    assert!(
+        host.transports.take_from_webrtc(&host.sig_tx),
+        "the runner's tick sees the takeover"
+    );
+    assert!(!host.transports.take_from_webrtc(&host.sig_tx), "once");
+    pump(&mut host, &mut a, Duration::from_millis(300), |_, _| false);
+    let (video, audio) = (rtp(&a.video), rtp(&a.audio));
+    pump(&mut host, &mut a, Duration::from_secs(1), |_, _| false);
+    assert_eq!(
+        (rtp(&a.video), rtp(&a.audio)),
+        (video, audio),
+        "the displaced WebRTC peer still receives media"
+    );
+    assert!(
+        matches!(
+            host.errors.as_slice(),
+            [SignalMsg::Error { code: Some(code), pc: None, .. }] if code == "taken_over"
+        ),
+        "{:?}",
+        host.errors
+    );
+    assert!(media.attached(), "the WebTransport client streams");
+
+    let _b = attach_as(&mut host, Peer::another_browser());
+    assert!(
+        wt.gone.get().is_some(),
+        "the WebTransport client was displaced"
+    );
+    assert!(!media.attached());
+    assert_eq!(host.errors.len(), 1, "the new peer was told nothing");
+    a.stop();
+    assert_eq!(host.bus_errors, Vec::<String>::new());
+}
+
+/// #1193 through the runner's dispatch: the page fell back to WebRTC while the host still held
+/// its WebTransport client. The launch transport's first answer displaces that client at once,
+/// so its control-stream silence later releases nothing, and the page is told nothing.
+#[test]
+fn a_fallback_answer_displaces_the_webtransport_client_at_once() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (mut host, media, _wt) = start_webtransport("fallback");
+    let wt = media.attach().expect("the WebTransport hello is accepted");
+    assert!(
+        !host.transports.take_from_webrtc(&host.sig_tx),
+        "no WebRTC peer held the session"
+    );
+
+    let _a = first_attach(&mut host);
+    assert!(
+        wt.gone.get().is_some(),
+        "the WebTransport client was displaced"
+    );
+    assert!(!media.attached());
+    assert!(host.errors.is_empty(), "{:?}", host.errors);
+}
+
 /// The first page answered but its transport never connected (its loader is still up),
 /// and a second page attaches.
 fn takeover_while_connecting(tag: &str, another_browser: bool) -> (Host, Peer) {

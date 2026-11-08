@@ -104,6 +104,8 @@ pub enum SignalMsg {
 /// Amendment 42 `code`s.
 pub const TAKEOVER_ABANDONED: &str = "takeover_abandoned";
 pub const TAKEOVER_RATE_LIMITED: &str = "takeover_rate_limited";
+/// A WebTransport client took the session (amendment 54); the control plane closes `4410`.
+pub const TAKEN_OVER: &str = "taken_over";
 
 impl SignalMsg {
     /// The `error` that tells the client holding signaling why it gets no media on `pc`.

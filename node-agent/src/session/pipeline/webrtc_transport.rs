@@ -55,6 +55,10 @@ pub struct VideoTransport {
     /// chain's streaming thread: anything serialized behind it (the allocation query of a
     /// size step or an app swap) then waits for a peer that may never come.
     gate: Arc<Mutex<Option<gst::PadProbeId>>>,
+    /// The probe dropping RTP at the tail since a WebTransport client took the session
+    /// from this transport's peer. Kept apart from `gate`, which the peer reconnecting
+    /// would lift.
+    muted: Mutex<Option<gst::PadProbeId>>,
 }
 
 /// What it takes to put a transport on the RTP tail, kept for the session so it can be
@@ -77,6 +81,9 @@ pub struct WebRtcSlot {
     lever: Arc<EncodeResolutionLever>,
     /// `QUASAR_DIAG_NO_OBS` unset.
     observe: bool,
+    /// The session's WebTransport side, when it has one: the WebRTC peer's input and
+    /// releases go through it, so one transport never lifts the other's keys (§Takeover).
+    webtransport: Option<Arc<crate::webtransport::Media>>,
 }
 
 /// Give a `webrtcbin` sink pad the MediaStream id this PC always uses. Left unset,
@@ -205,8 +212,12 @@ impl VideoTransport {
     fn retire(&self, tail: &gst::Pad, pipeline: &gst::Pipeline) {
         self.retired.store(true, Ordering::SeqCst);
         // Its replacement brings its own.
-        if let Some(gate) = self.gate.lock().unwrap().take() {
-            tail.remove_probe(gate);
+        let probes = [
+            self.gate.lock().unwrap().take(),
+            self.muted.lock().unwrap().take(),
+        ];
+        for probe in probes.into_iter().flatten() {
+            tail.remove_probe(probe);
         }
         // Out of the pipeline first: the dying SCTP association must not reach the
         // session's bus, where it reads as the peer leaving and ends the session.
@@ -319,7 +330,23 @@ impl WebRtcSlot {
             capture_times,
             lever,
             observe,
+            webtransport: None,
         })
+    }
+
+    /// Route this session's WebRTC input and releases through its WebTransport side. Set
+    /// before the first transport is attached.
+    pub(crate) fn share_input(&mut self, media: Arc<crate::webtransport::Media>) {
+        self.webtransport = Some(media);
+    }
+
+    /// A WebTransport client took the session: `video`'s peer gets no more media. The
+    /// transport stays until a new WebRTC peer replaces it.
+    pub(crate) fn mute(&self, video: &VideoTransport) {
+        let mut muted = video.muted.lock().unwrap();
+        if muted.is_none() {
+            *muted = self.hold_rtp();
+        }
     }
 
     /// Build a video transport on the tail. `replacement` is false for the session's
@@ -396,6 +423,7 @@ impl WebRtcSlot {
         connect_state_logging(
             &webrtc,
             self.devices.clone(),
+            self.webtransport.clone(),
             Some(self.trace_tx.clone()),
             self.session_id.clone(),
         );
@@ -461,6 +489,7 @@ impl WebRtcSlot {
                 connect_data_channel_open(
                     dc,
                     input_sink,
+                    self.webtransport.clone(),
                     self.input_state.clone(),
                     cfg.stream.width,
                     cfg.stream.height,
@@ -495,6 +524,7 @@ impl WebRtcSlot {
             bin,
             retired,
             gate,
+            muted: Mutex::new(None),
         })
     }
 
@@ -514,8 +544,11 @@ impl WebRtcSlot {
         // encode pipeline.
         let gate = self.hold_rtp();
         video.retire(&self.tail, &self.pipeline);
-        // A key the last peer held must not stay down for the next one.
-        if let Some(devices) = &self.devices {
+        // A key the last peer held must not stay down for the next one. A WebTransport
+        // client holding the session keeps its keys: the new peer's answer displaces it.
+        if let Some(media) = &self.webtransport {
+            media.release_webrtc();
+        } else if let Some(devices) = &self.devices {
             match devices.release_all() {
                 Ok(()) => tracing::info!(
                     token = "transport-replaced-input-released",
@@ -636,7 +669,13 @@ impl WebRtcSlot {
         // The audio webrtcbin gets its own negotiation/ICE/state callbacks (PcId::Audio).
         connect_ice_candidate(&audio_webrtc, self.out_tx.clone(), PcId::Audio);
         // Pass devices so release_all fires on audio-PC disconnect too.
-        connect_state_logging(&audio_webrtc, self.devices.clone(), None, String::new());
+        connect_state_logging(
+            &audio_webrtc,
+            self.devices.clone(),
+            self.webtransport.clone(),
+            None,
+            String::new(),
+        );
         // There is one `offer created` per PC (video + audio), so a harness asserting
         // "exactly one offer" must count the VIDEO PC's line, not grep the session. Both
         // lines carry the session id.
