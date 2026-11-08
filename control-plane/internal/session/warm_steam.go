@@ -480,22 +480,31 @@ func claimParked(ctx context.Context, tx pgx.Tx, p CreateParams) (*claimedParked
 // compat_tools rows the parked session mounted and the one the launched game's mapping names, then
 // reports whether a mounted tool is gone or unusable or the mapped GE tool was not mounted. A
 // mapped tool that is not usable names no tool (the launch maps nothing to it).
+// A park still warming whose names are not recorded yet (NULL: its dispatch writes them) is not
+// known to lack anything, so check 6 passes and the warming rule leaves it to finish; a running
+// park with NULL names mounts nothing.
+// Check 6 runs before check 5 (the placement), so a launch failing both logs compat_tool.
 // The parked names are read unlocked: a running session's never change.
 // semantics: control-api.md §Compatibility tools, "Hot Loading"; lock order §Usable.
 func claimToolMissing(ctx context.Context, tx pgx.Tx, p CreateParams) (bool, error) {
 	var names []string
 	var mappedID *string
+	var unrecorded bool
 	err := tx.QueryRow(ctx, `
-		SELECT COALESCE(k.compat_tool_names, '{}'), m.tool_id::text
+		SELECT COALESCE(k.compat_tool_names, '{}'), m.tool_id::text,
+		       k.compat_tool_names IS NULL AND k.state IN ('pending','assigned','starting') AND k.parked_until > now()
 		FROM sessions k
 		LEFT JOIN apps a ON a.id = $2::uuid AND a.parent_app_id IS NOT NULL AND a.external_source = 'steam'
 		LEFT JOIN compat_tool_mappings m ON m.provider = 'steam' AND m.external_id = a.external_id
-		WHERE k.id = $1::uuid`, p.claim.id, p.AppID).Scan(&names, &mappedID)
+		WHERE k.id = $1::uuid`, p.claim.id, p.AppID).Scan(&names, &mappedID, &unrecorded)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil // claimParked's locked read answers a missing row
 	}
 	if err != nil {
 		return false, fmt.Errorf("read parked compat tools: %w", err)
+	}
+	if unrecorded {
+		return false, nil
 	}
 	rows, err := tx.Query(ctx, `
 		SELECT steam_name, family, enabled AND NOT name_conflict AND NOT pin_conflict
