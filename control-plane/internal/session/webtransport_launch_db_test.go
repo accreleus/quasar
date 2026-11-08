@@ -186,6 +186,58 @@ func TestLaunchChoosesWebTransport(t *testing.T) {
 	}
 }
 
+// A "default" profile launches on the instance setting, read once per launch (amendment 61):
+// webtransport follows it, a request for WebTransport on a webrtc instance is refused with
+// instance_default_disallows, and changing the setting moves the next launch only.
+func TestLaunchFollowsTheInstanceDefaultTransport(t *testing.T) {
+	setDefault := func(t *testing.T, f *wtFixture, v string) {
+		t.Helper()
+		must(t, exec(t, f.pool, `INSERT INTO instance_settings (id, default_transport) VALUES (true, $1)
+			ON CONFLICT (id) DO UPDATE SET default_transport = EXCLUDED.default_transport`, v))
+	}
+	tests := []struct {
+		name, setting string
+		request       map[string]any
+		wantTransport string
+		wantReason    any
+	}{
+		{"webtransport instance, no request", "webtransport", map[string]any{}, "webtransport", nil},
+		{"webtransport instance, asked for webrtc", "webtransport", map[string]any{"transport": "webrtc"}, "webrtc", nil},
+		{"webrtc instance, no request", "webrtc", map[string]any{}, "webrtc", nil},
+		{"webrtc instance, asked for webtransport", "webrtc", map[string]any{"transport": "webtransport"}, "webrtc", "instance_default_disallows"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newWTFixture(t, "default")
+			setDefault(t, f, tc.setting)
+			status, body := f.launch(t, tc.request)
+			if status != http.StatusCreated {
+				t.Fatalf("launch: %d %v", status, body)
+			}
+			f.waitDispatched(t)
+			sess := body["session"].(map[string]any)
+			if sess["transport"] != tc.wantTransport || sess["transport_reason"] != tc.wantReason {
+				t.Errorf("transport = %v (reason %v), want %s (%v)", sess["transport"], sess["transport_reason"], tc.wantTransport, tc.wantReason)
+			}
+		})
+	}
+
+	t.Run("a running session keeps its transport", func(t *testing.T) {
+		f := newWTFixture(t, "default")
+		setDefault(t, f, "webtransport")
+		_, body := f.launch(t, map[string]any{})
+		id := body["session"].(map[string]any)["id"].(string)
+		setDefault(t, f, "webrtc")
+		if got, err := f.store.Get(context.Background(), id); err != nil || got.Transport != "webtransport" {
+			t.Errorf("running session transport = %q (%v)", got.Transport, err)
+		}
+		_, next := f.launch(t, map[string]any{})
+		if next["session"].(map[string]any)["transport"] != "webrtc" {
+			t.Errorf("next launch = %v, want webrtc", next["session"])
+		}
+	})
+}
+
 func TestLaunchFallsBackToWebRTCWithAReason(t *testing.T) {
 	tests := []struct {
 		name       string

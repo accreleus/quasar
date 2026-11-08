@@ -378,6 +378,22 @@ describe("LaunchTab", () => {
     expect(screen.getByRole("combobox", { name: "Transport for Balanced" })).toHaveValue("webtransport");
   });
 
+  it("offers Use instance default and saves it as the value default", async () => {
+    mocked.listLaunchProfiles.mockResolvedValue({ items: [launchProfile({ transport: "webtransport" })] });
+    mocked.updateLaunchProfile.mockResolvedValue(launchProfile({ transport: "default" }));
+    renderPage();
+    await act(async () => {});
+
+    const select = screen.getByRole("combobox", { name: "Transport for Balanced" });
+    expect(within(select).getByRole("option", { name: "Use instance default" })).toHaveValue("default");
+    await act(async () => {
+      fireEvent.change(select, { target: { value: "default" } });
+    });
+
+    expect(mocked.updateLaunchProfile.mock.calls[0][2]).toMatchObject({ transport: "default" });
+    expect(screen.getByRole("combobox", { name: "Transport for Balanced" })).toHaveValue("default");
+  });
+
   it("keeps a developer opt-in profile visible, and a rung edit leaves its transport alone", async () => {
     mocked.listLaunchProfiles.mockResolvedValue({ items: [launchProfile({ transport: "webtransport_opt_in" })] });
     mocked.listStreamProfiles.mockResolvedValue({

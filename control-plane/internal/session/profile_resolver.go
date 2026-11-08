@@ -24,6 +24,16 @@ func (c *Coordinator) resolveLaunchProfile(ctx context.Context, userID string, l
 	if err != nil {
 		return profile.LaunchProfile{}, ErrProfileUnknown
 	}
+	// The one read of the instance default per launch: every later step sees the effective
+	// transport. A failed read plans WebRTC, which every host and client can do.
+	if p.Transport == transportDefault {
+		def, err := c.store.DefaultTransport(ctx)
+		if err != nil {
+			c.log.Warn("transport: instance default load failed, planning WebRTC", "err", err)
+			def = transportWebRTC
+		}
+		p.Transport, p.TransportInherited = def, true
+	}
 	if lp.IsAdmin || lp.Override.any() {
 		return p, nil // operator override — skip the eligibility gate
 	}

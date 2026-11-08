@@ -115,6 +115,8 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		SteamWarmEnabled     *bool   `json:"steam_warm_enabled"`
 		SteamWarmRewarm      *string `json:"steam_warm_rewarm"`
 		SteamWarmIdleMinutes *int    `json:"steam_warm_idle_minutes"`
+		// Instance default transport (control-api.md §Transport ▸ The instance default).
+		DefaultTransport *string `json:"default_transport"`
 		// Region and Input defaults (control-api.md §Region and Input settings).
 		regionInputRequest
 	}
@@ -182,6 +184,11 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 			"release_channel must be stable, beta, edge, or preview")
 		return
 	}
+	if req.DefaultTransport != nil && !ValidDefaultTransport(*req.DefaultTransport) {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed,
+			"default_transport must be webrtc or webtransport")
+		return
+	}
 	var releaseCheck *string
 	if len(req.ReleaseCheck) > 0 && string(req.ReleaseCheck) != "null" {
 		var v string
@@ -246,6 +253,7 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		SteamWarmEnabled:                  req.SteamWarmEnabled,
 		SteamWarmRewarm:                   req.SteamWarmRewarm,
 		SteamWarmIdleMinutes:              req.SteamWarmIdleMinutes,
+		DefaultTransport:                  req.DefaultTransport,
 		RegionInput:                       regionInput,
 	}
 	// Clearing the URL disables the webhook in the same write: "enabled, with

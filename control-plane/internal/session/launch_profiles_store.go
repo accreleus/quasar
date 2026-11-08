@@ -51,6 +51,18 @@ type AppRef struct {
 	Name string `json:"name"`
 }
 
+// DefaultTransport is instance_settings.default_transport, the transport of every launch
+// profile whose transport is "default". A missing row reads webrtc.
+// semantics: control-api.md §Transport ▸ The instance default
+func (s *Store) DefaultTransport(ctx context.Context) (string, error) {
+	var t string
+	err := s.pool.QueryRow(ctx, `SELECT default_transport FROM instance_settings WHERE id = true`).Scan(&t)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return transportWebRTC, nil
+	}
+	return t, err
+}
+
 // ListLaunchProfiles returns launch profiles with their rungs resolved, in
 // sort_order. userFacingOnly filters to visibility='user' (GET /v1/me/profiles
 // and the launch path); debug/internal chains are never offered there.

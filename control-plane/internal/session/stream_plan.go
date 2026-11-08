@@ -103,8 +103,10 @@ const (
 	transportWebRTC       = "webrtc"
 	transportWebTransport = "webtransport"
 	transportOptIn        = "webtransport_opt_in"
+	transportDefault      = "default"
 
 	reasonProfileDisallows     = "profile_disallows"
+	reasonInstanceDisallows    = "instance_default_disallows"
 	reasonHostNoEndpoint       = "host_no_endpoint"
 	reasonDeviceNoWebTransport = "device_no_webtransport"
 	reasonDeviceNoWebCodecs    = "device_no_webcodecs"
@@ -290,6 +292,9 @@ func (in StreamInputs) planTransport(codec profile.Codec, wantsPyroWave bool) (t
 		wanted = req == transportWebTransport || wantsPyroWave
 	default: // webrtc, or a chain that never set one
 		if req == transportWebTransport {
+			if in.Chain.TransportInherited {
+				return transportWebRTC, reasonInstanceDisallows
+			}
 			return transportWebRTC, reasonProfileDisallows
 		}
 	}

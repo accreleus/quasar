@@ -67,6 +67,7 @@ export type StorageProvider = Schemas["StorageProvider"];
 
 /** `library/ImagesTab.tsx` defaults it to `"notify"` when absent, matching the column's
  *  `DEFAULT 'notify'` (migration 0054); optional for pre-P3 servers. */
+export type DefaultTransport = NonNullable<InstanceSettings["default_transport"]>;
 export type ImageUpdatePolicy = NonNullable<InstanceSettings["image_update_policy"]>;
 
 /** `library_discovery_enabled` (migration 0045) and `image_update_policy`

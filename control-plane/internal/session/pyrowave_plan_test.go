@@ -175,6 +175,25 @@ func TestPyroWaveWantedSessionWantsWebTransportOnAnOptInProfile(t *testing.T) {
 	}
 }
 
+// An inherited transport is the effective one: a default profile on a webtransport instance
+// can offer PyroWave, on a webrtc instance it cannot.
+func TestPyroWaveFollowsAnInheritedTransport(t *testing.T) {
+	for _, tc := range []struct {
+		setting     string
+		wantAllowed bool
+	}{{"webtransport", true}, {"webrtc", false}} {
+		in := pwInputs("allow", tc.setting, true)
+		in.Chain.TransportInherited = true
+		if got := pyrowaveCandidate(in.Chain, in.Params); got != tc.wantAllowed {
+			t.Errorf("%s: candidate = %v, want %v", tc.setting, got, tc.wantAllowed)
+		}
+		plan, _ := planStream(in)
+		if plan.PyroWave.Allowed != tc.wantAllowed {
+			t.Errorf("%s: allowed = %v, want %v", tc.setting, plan.PyroWave.Allowed, tc.wantAllowed)
+		}
+	}
+}
+
 func TestPyroWaveTargetKbps(t *testing.T) {
 	cap := int32(250_000)
 	for _, tc := range []struct {

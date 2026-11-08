@@ -26,7 +26,7 @@ import { moveRung, RungEditor } from "./RungEditor";
 import { useSectionHead } from "../../../components/shell/sectionHead";
 import { SettingRow } from "../settings/SettingRow";
 
-const KNOWN_TRANSPORTS: string[] = ["webrtc", "webtransport", "webtransport_opt_in"];
+const KNOWN_TRANSPORTS: string[] = ["default", "webrtc", "webtransport", "webtransport_opt_in"];
 
 const DEFAULT_POLICY: ProfilePolicyResponse = { global_default_profile_id: null, user_overrides_allowed: true };
 
@@ -258,7 +258,7 @@ function LaunchProfileCard({
         <div className="eyebrow lp-group">Delivery</div>
         <SettingRow
           label="Transport"
-          hint="WebRTC is the default and the fallback. WebTransport is experimental: if it can’t connect, the session starts on WebRTC."
+          hint="Use instance default follows Settings ▸ Streaming. WebRTC is the fallback. WebTransport is experimental: if it can’t connect, the session starts on WebRTC."
         >
           <select
             className="select"
@@ -268,6 +268,7 @@ function LaunchProfileCard({
             disabled={busy || !KNOWN_TRANSPORTS.includes(transport)}
             onChange={(e) => void persist(rungs.map((r) => r.id), e.target.value as LaunchProfileTransport)}
           >
+            <option value="default">Use instance default</option>
             <option value="webrtc">WebRTC</option>
             <option value="webtransport">WebTransport (experimental)</option>
             {/* Set through the API for the developer URL switch; kept visible so it is never silently overwritten. */}
