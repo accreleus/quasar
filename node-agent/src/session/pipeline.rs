@@ -83,7 +83,9 @@ mod abr_glue;
 // `session_display_update` path with it.
 pub(crate) use abr_glue::resolution_lever_with_echo;
 pub use abr_glue::{trigger, EncodeResolutionLever, ResolutionLever};
+mod ice_interfaces;
 mod webrtc;
+use ice_interfaces::restrict_ice_gathering;
 pub(crate) use webrtc::restart_ice;
 pub(crate) use webrtc::{
     answer_from, apply_remote_description, build_answerer_pipeline, dtls_started, has_offered,
@@ -437,6 +439,7 @@ pub fn build_session_pipeline(
         .context("capsfilter not found")?;
 
     let webrtc = make_webrtcbin(cfg.stun.as_deref())?;
+    restrict_ice_gathering(&webrtc, PcId::Video);
 
     pipeline.add_many([
         &encoder,
@@ -498,6 +501,7 @@ pub fn build_session_pipeline(
         let audio_pipe = gst::Pipeline::new();
         let audio_webrtc =
             make_webrtcbin(cfg.stun.as_deref()).context("failed to create audio webrtcbin")?;
+        restrict_ice_gathering(&audio_webrtc, PcId::Audio);
         audio_pipe.add(&audio_webrtc)?;
         drop(audio_pipe);
         let audio_src_pad = audio_tail
