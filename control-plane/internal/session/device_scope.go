@@ -23,6 +23,8 @@ const (
 	scopeSiteRung        = "launch.rung"
 	scopeSitePreference  = "launch.codec_preference"
 	scopeSiteHealth      = "health.outcome"
+
+	scopeSiteWarmTransport = "warm.transport"
 )
 
 // DeviceScope is one client's stored identity: the device_key its certification

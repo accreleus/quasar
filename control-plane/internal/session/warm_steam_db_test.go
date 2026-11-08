@@ -976,6 +976,23 @@ func TestParkOnExitIsWebRTCOnly(t *testing.T) {
 func (f *warmFixture) runningWebTransportTile(t *testing.T) string {
 	t.Helper()
 	ctx := context.Background()
+	f.enableWebTransport(t)
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID})
+	if err != nil {
+		t.Fatalf("WebTransport launch: %v", err)
+	}
+	if res.Session.Transport != transportWebTransport {
+		t.Fatalf("launch transport %q, want %s", res.Session.Transport, transportWebTransport)
+	}
+	f.disp.waitFor(t, "start")
+	f.running(t, res.Session.ID)
+	return res.Session.ID
+}
+
+// enableWebTransport makes the fixture's device and host able to stream on
+// WebTransport and every launch profile ask for it.
+func (f *warmFixture) enableWebTransport(t *testing.T) {
+	t.Helper()
 	caps := `{"bandwidth_kbps":50000,"rtt_ms":5,"max_decode_height":2160,"measured_at":"` +
 		time.Now().UTC().Format(time.RFC3339) + `","codecs":{"h264":true},
 		"webtransport":{"available":true,"datagrams":true},
@@ -987,16 +1004,31 @@ func (f *warmFixture) runningWebTransportTile(t *testing.T) string {
 		wt_certificates = jsonb_build_array(jsonb_build_object('sha256', $2::text,
 			'not_before', now() - interval '1 day', 'not_after', now() + interval '10 days'))
 		WHERE id = $1::uuid`, f.hostID, wtCertA))
-	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID})
-	if err != nil {
-		t.Fatalf("WebTransport launch: %v", err)
-	}
-	if res.Session.Transport != transportWebTransport {
-		t.Fatalf("launch transport %q, want %s", res.Session.Transport, transportWebTransport)
-	}
-	f.disp.waitFor(t, "start")
-	f.running(t, res.Session.ID)
-	return res.Session.ID
+}
+
+// A library-open heartbeat parks nothing for a user whose next launch would be
+// WebTransport: every park is WebRTC-only, so the launch would supersede it and
+// cold-start Steam behind a 503 (#1163). A device that cannot do WebTransport
+// plans WebRTC, so it still parks.
+func TestHeartbeatSkipsAUserWhoseLaunchWouldBeWebTransport(t *testing.T) {
+	ctx := context.Background()
+	t.Run("a WebTransport-capable device on a webtransport profile", func(t *testing.T) {
+		f := newWarmFixture(t, 4)
+		f.enableWebTransport(t)
+		f.coord.SteamWarmHeartbeat(ctx, f.userID, false, f.deviceID)
+		if n := countParked(t, f.pool); n != 0 {
+			t.Fatalf("parked rows = %d, want none", n)
+		}
+	})
+	t.Run("a device without WebTransport still parks", func(t *testing.T) {
+		f := newWarmFixture(t, 4)
+		f.enableWebTransport(t)
+		must(t, exec(t, f.pool, `UPDATE user_devices SET capabilities = capabilities - 'webtransport' WHERE id = $1::uuid`, f.deviceID))
+		f.coord.SteamWarmHeartbeat(ctx, f.userID, false, f.deviceID)
+		if n := countParked(t, f.pool); n != 1 {
+			t.Fatalf("parked rows = %d, want 1", n)
+		}
+	})
 }
 
 func TestParkOnExitReleasesWhenARuleSaysNo(t *testing.T) {
