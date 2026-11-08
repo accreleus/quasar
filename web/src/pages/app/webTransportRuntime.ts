@@ -1,6 +1,7 @@
-// The session runtime for a WebTransport session (#1031, #1032, #1033): transport -> DecodeStage ->
-// presenter, with input capture on the transport's input paths, game audio through AudioOut and
-// the microphone through MicOut, behind the same SessionRuntime surface the page drives for WebRTC.
+// The session runtime for a WebTransport session (#1031, #1032, #1033): transport -> DecodeStage
+// (or PyroWaveStage) -> presenter, with input capture on the transport's input paths, game audio
+// through AudioOut and the microphone through MicOut, behind the same SessionRuntime surface the
+// page drives for WebRTC.
 
 import { mintTransportToken } from "../../api/library";
 import type { WebTransportCoords } from "../../api/types";
@@ -13,6 +14,7 @@ import { MicOut, type MicOutDeps } from "../../webtransport/micOut";
 import { DecodeStage, type DecodeFailure, type DecodeStageOptions } from "../../webtransport/decodeStage";
 import { fallbackReason } from "../../webtransport/fallback";
 import { createWebGpuPresenter, type Presenter } from "../../webtransport/presenter";
+import { PyroWaveStage, warmPyroWave, type PyroWaveStageOptions } from "../../pyrowave/stage";
 import { TransportError, type MediaTransport, type TransportEnd } from "../../webtransport/transport";
 import { webTransportInputSender } from "../../webtransport/inputSender";
 import { WebTransportMedia } from "../../webtransport/webTransportMedia";
@@ -30,7 +32,7 @@ const TELEMETRY_MS = 1_000;
 /** capture→present samples kept for the median and p95. */
 const G2G_WINDOW = 600;
 /** The mime form telemetry's negotiatedCodec uses, from the hello_ack's wire codec. */
-const CODEC_MIME: Record<string, string> = { h264: "video/H264", h265: "video/H265", av1: "video/AV1" };
+const CODEC_MIME: Record<string, string> = { h264: "video/H264", h265: "video/H265", av1: "video/AV1", pyrowave: "video/pyrowave" };
 /** The failure card's sentence for a failure that stops the view. Every other failure falls back
  *  to WebRTC (fallbackReason) and never reaches the card. */
 export function transportFailureDetail(code: string): string {
@@ -38,11 +40,19 @@ export function transportFailureDetail(code: string): string {
 }
 
 export interface WebTransportRuntimeDeps {
-  createTransport(opts: { sessionId: string; coords: WebTransportCoords; mintToken(): Promise<WebTransportCoords> }): MediaTransport;
-  createPresenter(canvas: HTMLCanvasElement, onFatal: (message: string) => void): Promise<Presenter | null>;
+  createTransport(opts: {
+    sessionId: string;
+    coords: WebTransportCoords;
+    mintToken(): Promise<WebTransportCoords>;
+    pyrowave?: boolean;
+  }): MediaTransport;
+  createPresenter(canvas: HTMLCanvasElement, onFatal: (message: string) => void, opts?: { pyrowave?: boolean }): Promise<Presenter | null>;
   decoder?: Pick<DecodeStageOptions, "createDecoder" | "isConfigSupported">;
   audio?: AudioOutDeps;
   mic?: Partial<Omit<MicOutDeps, "send">>;
+  /** Builds the PyroWave decoder's pipelines on the presenter's device; false: do not offer it. */
+  warmPyroWave(device: GPUDevice): Promise<boolean>;
+  loadPyroWave?: PyroWaveStageOptions["load"];
   setupCapture: typeof setupCapture;
 }
 
@@ -51,6 +61,8 @@ export interface WebTransportRuntimeConfig {
   authToken: string;
   coords: WebTransportCoords;
   canvas: HTMLCanvasElement;
+  /** The session wants PyroWave (`session.pyrowave.wanted`): offer it in `hello` if this browser can decode it. */
+  pyrowave?: boolean;
   callbacks: Pick<SessionRuntimeCallbacks, "onDisconnectSuspected" | "onSessionTakenOver"> &
     Partial<Pick<SessionRuntimeCallbacks, "onSummonOverlay" | "onKeyboardLockRefused" | "onNonStandardGamepad">> & {
     /** Terminal and not a fallback: the session ended or WebTransport cannot be used. `detail` is
@@ -66,6 +78,7 @@ export interface WebTransportRuntimeConfig {
 const productionDeps: WebTransportRuntimeDeps = {
   createTransport: (o) => new WebTransportMedia(o),
   createPresenter: createWebGpuPresenter,
+  warmPyroWave: (device) => warmPyroWave(device),
   setupCapture,
 };
 
@@ -86,6 +99,9 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   let transport: MediaTransport | null = null;
   let presenter: Presenter | null = null;
   let stage: DecodeStage | null = null;
+  let pyroStage: PyroWaveStage | null = null;
+  /** Whether `hello` offers PyroWave; decided once, so a reconnect offers the same. */
+  let pyroOffer = false;
   let timer: ReturnType<typeof setInterval> | null = null;
   let capture: ReturnType<typeof setupCapture> | null = null;
   let inputSender: ReturnType<typeof webTransportInputSender> | null = null;
@@ -122,6 +138,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     audioOut?.close();
     transport?.close();
     stage?.close();
+    pyroStage?.close();
     presenter?.destroy();
   };
 
@@ -187,10 +204,14 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   async function run(): Promise<void> {
     let p: Presenter | null;
     try {
-      p = await deps.createPresenter(cfg.canvas, (message) => {
-        console.warn("presenter:", message);
-        fail("gpu_failed");
-      });
+      p = await deps.createPresenter(
+        cfg.canvas,
+        (message) => {
+          console.warn("presenter:", message);
+          fail("gpu_failed");
+        },
+        { pyrowave: cfg.pyrowave === true },
+      );
     } catch (err) {
       // requestAdapter, requestDevice or configure refused.
       console.warn("presenter:", err);
@@ -207,22 +228,36 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       return;
     }
     presenter = p;
+    const device = p.device;
+    pyroOffer =
+      cfg.pyrowave === true && device !== undefined && p.presentTexture !== undefined && (await deps.warmPyroWave(device));
+    if (destroyed || failed) return;
+    // shortcut: assumes the agent's and this machine's clocks agree (true with the
+    // browser on the host); the pong's clock offset is #1035.
+    const presented = (captureUs: number, sample = Date.now() - captureUs / 1000) => {
+      audioOut?.noteVideo(captureUs);
+      framesTotal += 1;
+      framesInWindow += 1;
+      if (sample >= 0 && sample < 5000) {
+        g2g.push(sample);
+        if (g2g.length > G2G_WINDOW) g2g.shift();
+      }
+      if (!snapshot.firstFrame) set({ firstFrame: true, status: "streaming over WebTransport" });
+    };
+    if (pyroOffer && device) {
+      pyroStage = new PyroWaveStage({
+        device,
+        present: (texture) => p.presentTexture?.(texture) ?? false,
+        onPresented: (captureUs) => presented(captureUs),
+        fallback: (reason) => transport?.codecFallback(reason),
+        load: deps.loadPyroWave,
+      });
+    }
     const s = new DecodeStage({
       ...deps.decoder,
       onFrame: (frame) => {
-        // shortcut: assumes the agent's and this machine's clocks agree (true with the
-        // browser on the host); the pong's clock offset is #1035.
-        const captureUs = frame.timestamp;
-        const sample = Date.now() - captureUs / 1000;
-        if (!p.present(frame)) return;
-        audioOut?.noteVideo(captureUs);
-        framesTotal += 1;
-        framesInWindow += 1;
-        if (sample >= 0 && sample < 5000) {
-          g2g.push(sample);
-          if (g2g.length > G2G_WINDOW) g2g.shift();
-        }
-        if (!snapshot.firstFrame) set({ firstFrame: true, status: "streaming over WebTransport" });
+        const sample = Date.now() - frame.timestamp / 1000;
+        if (p.present(frame)) presented(frame.timestamp, sample);
       },
       requestKeyframe: (reason) => transport?.requestKeyframe(reason),
       onFatal: (reason: DecodeFailure) => fail(reason),
@@ -236,7 +271,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   async function connectTransport(coords: WebTransportCoords, reconnecting: boolean): Promise<void> {
     // A mint that was in flight when the view ended must not open a connection.
     if (destroyed || failed) return;
-    const t = deps.createTransport({ sessionId: cfg.sessionId, coords, mintToken: mintCoords });
+    const t = deps.createTransport({ sessionId: cfg.sessionId, coords, mintToken: mintCoords, pyrowave: pyroOffer });
     transport = t;
     try {
       await t.connect({
@@ -255,15 +290,29 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
         config: (c) => {
           if (destroyed || failed || t !== transport) return;
           negotiatedCodec = CODEC_MIME[c.codec] ?? c.codec;
+          if (c.switchReason) console.info(`WebTransport codec ${c.codec}: ${c.switchReason}`);
           // capture.ts scales the mouse by the stream size, which a canvas does not know.
           cfg.canvas.dataset.streamW = String(c.width);
           cfg.canvas.dataset.streamH = String(c.height);
-          stage?.config(c);
+          if (c.codec !== "pyrowave") {
+            pyroStage?.leave();
+            stage?.config(c);
+          } else if (pyroStage) {
+            pyroStage.config(c);
+          } else {
+            // Never offered, so never expected: say so, and the agent sends the standard codec.
+            t.codecFallback("decode_error");
+          }
         },
         unit: (u) => {
           if (destroyed || failed || t !== transport) return;
           bytesTotal += u.data.length;
           stage?.unit(u);
+        },
+        pyrowave: (f) => {
+          if (destroyed || failed || t !== transport) return;
+          for (const b of f.packets) bytesTotal += b.byteLength;
+          pyroStage?.frame(f);
         },
         rtt: (ms) => {
           if (t === transport) rttMs = ms;

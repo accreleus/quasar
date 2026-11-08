@@ -537,6 +537,8 @@ pub struct SessionConfig {
     /// `session_assign.transport` is `"webtransport"` (amendment 54): the encode chain
     /// also feeds the agent's WebTransport listener. WebRTC stays available as fallback.
     pub webtransport: bool,
+    /// `session_assign.pyrowave` (amendment 55), kept only for a served WebTransport session.
+    pub pyrowave: Option<crate::webtransport::PyroWaveGrant>,
 }
 
 /// Default `XDG_RUNTIME_DIR` for the Wayland socket. Matches the deploy run scripts.
@@ -623,6 +625,7 @@ impl SessionConfig {
             mic_jitter_ms: env_mic_jitter_ms("QUASAR_MIC_JITTER_MS"),
             kind: None,
             webtransport: false,
+            pyrowave: None,
         }
     }
 
@@ -879,6 +882,7 @@ impl SessionConfig {
             mic_jitter_ms: env_mic_jitter_ms("QUASAR_MIC_JITTER_MS"),
             kind: None,
             webtransport: false,
+            pyrowave: None,
         }
     }
 

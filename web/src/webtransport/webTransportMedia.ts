@@ -1,5 +1,6 @@
 // MediaTransport over WebTransport: protocol/transport-webtransport.md, wt_proto 1,
-// video, input, ping/pong, NACK, audio and the microphone. Feedback is a later ticket (#1040).
+// video, input, ping/pong, NACK, audio and the microphone, with PyroWave (codec-pyrowave.md) for a
+// client that offers it. Feedback is a later ticket (#1040).
 
 import {
   base64Bytes,
@@ -9,7 +10,11 @@ import {
   encodeControl,
   parseAudioDatagram,
   parseVideoDatagram,
+  serialAfter,
+  type VideoFragment,
 } from "./framing";
+import { blockLayout } from "../pyrowave/bitstream";
+import { PyroWaveReceiver } from "../pyrowave/receiver";
 import type { WebTransportCoords } from "../api/types";
 import type { InputWire } from "./inputSender";
 import { workerTicker, type Ticker } from "./pingTicker";
@@ -44,6 +49,10 @@ export const KEYFRAME_SPACING_MS = 150;
 export const RECOVERY_TICK_MS = 50;
 /** The control plane is asked for a fresh token at most this often. */
 export const REMINT_MIN_INTERVAL_MS = 10_000;
+/** How long a fragment of a configuration not acknowledged yet is held (the decode stage's hold). */
+export const FRAGMENT_HOLD_MS = 1_000;
+/** Fragments held at once for configurations not acknowledged yet: a few PyroWave frames. */
+export const MAX_HELD_FRAGMENTS = 4_096;
 /** A token held this long (TTL 60 s, control-api.md) is replaced after a failed attempt. Measured
  *  on this page's monotonic clock from its arrival, never against the server's `expires_at`. */
 export const TOKEN_REFRESH_AGE_MS = 45_000;
@@ -71,6 +80,8 @@ export interface WebTransportMediaOptions {
   coords: WebTransportCoords;
   /** `POST /v1/sessions/{id}/transport-token`. */
   mintToken(): Promise<WebTransportCoords>;
+  /** `hello.pyrowave`: this client's WebGPU device is up and its PyroWave decoder is built. */
+  pyrowave?: boolean;
   /** Test seam; the browser's WebTransport otherwise. */
   createWebTransport?: (url: string, options: WebTransportOptions) => WebTransport;
   sleep?: (ms: number) => Promise<void>;
@@ -110,6 +121,7 @@ export function videoConfigFrom(ack: Record<string, unknown>): VideoConfig {
           fullRange: cs.full_range === true,
         }
       : undefined,
+    ...(typeof ack.codec_switch_reason === "string" ? { switchReason: ack.codec_switch_reason } : {}),
   };
 }
 
@@ -124,6 +136,18 @@ export const audioStreamsFrom = (ack: Record<string, unknown>): AudioStreams => 
   audio: audioConfigFrom(ack.audio),
   mic: audioConfigFrom(ack.mic),
 });
+
+/** Routes one connection's video fragments: PyroWave frames to their receiver, the rest to the
+ *  access-unit assembler. Also the order of configurations for both. */
+interface Router {
+  datagram(f: VideoFragment): void;
+  config(c: VideoConfig): void;
+  /** `nack_miss`: the agent no longer holds those fragments. */
+  miss(frameSeq: number, frags: [number, number][]): void;
+  /** The assembler's release and lateness pass, with no datagram to drive it. */
+  tick(): void;
+  stop(): void;
+}
 
 const refused = (code: string): Answer => ({ kind: "refused", code });
 const after = <T>(ms: number, value: T) => new Promise<T>((r) => setTimeout(() => r(value), ms));
@@ -147,6 +171,7 @@ export class WebTransportMedia implements MediaTransport {
   /** §Loss recovery's tick: releases and late frames wait for no datagram. */
   private recoveryTimer: ReturnType<typeof setInterval> | null = null;
   private pendingKey: KeyframeReason | null = null;
+  private router: Router | null = null;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
 
@@ -212,6 +237,11 @@ export class WebTransportMedia implements MediaTransport {
     return this.input.datagram(datagram);
   }
 
+  codecFallback(reason: string): void {
+    if (this.closed || !this.connected) return;
+    this.send({ type: "codec_fallback", reason });
+  }
+
   private stopRecovery(): void {
     if (this.recoveryTimer !== null) clearInterval(this.recoveryTimer);
     this.recoveryTimer = null;
@@ -223,6 +253,7 @@ export class WebTransportMedia implements MediaTransport {
     if (this.keyTimer !== null) clearTimeout(this.keyTimer);
     // Not left to `wt.closed`, which a connection that never finishes closing does not resolve.
     this.stopRecovery();
+    this.router?.stop();
     this.stopPings();
     // An attempt still connecting is closed here; it sees `closed` at its next await.
     this.abortAttempt?.();
@@ -322,6 +353,7 @@ export class WebTransportMedia implements MediaTransport {
           token: this.coords.token,
           session_id: this.opts.sessionId,
           client: "browser",
+          ...(this.opts.pyrowave ? { pyrowave: true } : {}),
         }),
       );
     } catch {
@@ -340,9 +372,10 @@ export class WebTransportMedia implements MediaTransport {
       return queue.shift() as Record<string, unknown>;
     };
 
-    // Datagrams can overtake the hello_ack; the decode stage holds them by config_id.
-    const assembler = new FrameAssembler(this.now);
-    void this.readDatagrams(wt, sink, live, assembler).catch(() => {});
+    // Datagrams can overtake the hello_ack; the decode stage holds units by config_id, the
+    // router PyroWave fragments.
+    const router = this.makeRouter(sink, live);
+    void this.readDatagrams(wt, sink, router, live).catch(() => {});
     let first: Record<string, unknown> | null;
     try {
       first = await Promise.race([next(), after(ANSWER_TIMEOUT_MS, null)]);
@@ -373,9 +406,10 @@ export class WebTransportMedia implements MediaTransport {
     this.wt = wt;
     this.writer = writer;
     this.connected = true;
+    this.router = router;
     this.datagramWriter = wt.datagrams.writable.getWriter();
     sink.streams?.(audioStreamsFrom(first));
-    sink.config(config);
+    router.config(config);
     const ping = () => this.send({ type: "ping", id: ++this.pingId, tc: this.now() });
     ping();
     this.stopTicker = (this.opts.ticker ?? workerTicker)(PING_MS, ping);
@@ -383,9 +417,9 @@ export class WebTransportMedia implements MediaTransport {
       try {
         for (let m = await next(); m && live.on; m = await next()) {
           // Unknown types are ignored (§Channels). bye is followed by the close.
-          if (m.type === "hello_ack") sink.config(videoConfigFrom(m));
+          if (m.type === "hello_ack") router.config(videoConfigFrom(m));
           else if (m.type === "nack_miss" && typeof m.frame_seq === "number" && Array.isArray(m.frags)) {
-            this.recovered(assembler.miss(m.frame_seq, m.frags as [number, number][]), sink);
+            router.miss(m.frame_seq, m.frags as [number, number][]);
           } else if (m.type === "pong" && typeof m.tc === "number") sink.rtt?.(Math.max(0, this.now() - m.tc));
           else if (m.type === "ping") {
             this.send({ type: "pong", id: m.id, ts: m.ts, tw: m.tw, tc: this.now() });
@@ -398,7 +432,7 @@ export class WebTransportMedia implements MediaTransport {
     })();
     // Release and lateness must not wait for the next datagram: a still picture may send none.
     this.recoveryTimer = setInterval(() => {
-      if (live.on && !this.closed) this.recovered(assembler.tick(), sink);
+      if (live.on && !this.closed) router.tick();
     }, RECOVERY_TICK_MS);
     void wt.closed.then(
       (info) => {
@@ -415,16 +449,14 @@ export class WebTransportMedia implements MediaTransport {
     return { kind: "ack" };
   }
 
-  private async readDatagrams(
-    wt: WebTransport,
-    sink: MediaSink,
-    live: { on: boolean },
-    assembler: FrameAssembler,
-  ): Promise<void> {
+  private async readDatagrams(wt: WebTransport, sink: MediaSink, router: Router, live: { on: boolean }): Promise<void> {
     const reader = wt.datagrams.readable.getReader();
     for (;;) {
       const { value, done } = await reader.read();
-      if (done || !live.on) return;
+      if (done || !live.on) {
+        router.stop();
+        return;
+      }
       if ((value as Uint8Array)[0] === CHANNEL_AUDIO) {
         const packet = parseAudioDatagram(value as Uint8Array);
         if (packet) sink.audio?.(packet);
@@ -432,8 +464,79 @@ export class WebTransportMedia implements MediaTransport {
       }
       const frag = parseVideoDatagram(value as Uint8Array);
       if (!frag) continue; // another channel, or malformed: dropped (§Channels)
-      this.recovered(assembler.push(frag), sink);
+      router.datagram(frag);
     }
+  }
+
+  private makeRouter(sink: MediaSink, live: { on: boolean }): Router {
+    const assembler = new FrameAssembler(this.now);
+    const configs = new Map<number, VideoConfig>();
+    let latest: number | null = null;
+    let pyro: PyroWaveReceiver | null = null;
+    let held: { f: VideoFragment; at: number }[] = [];
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let armedAt: number | null = null;
+    const stop = () => {
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+      armedAt = null;
+    };
+    // One timer, at the PyroWave receiver's next frame deadline; re-armed only when that moves,
+    // not per datagram (a 1080p frame is ~380 of them).
+    const arm = () => {
+      const at = pyro?.nextDeadline() ?? null;
+      if (at === armedAt) return;
+      stop();
+      if (at === null || !live.on) return;
+      armedAt = at;
+      timer = setTimeout(() => {
+        timer = null;
+        armedAt = null;
+        const frame = live.on ? pyro?.due(this.now()) : null;
+        if (frame) sink.pyrowave(frame);
+        arm();
+      }, Math.max(0, at - this.now()));
+    };
+    // codec-pyrowave.md §Loss: a PyroWave frame never reaches the assembler, so it is never
+    // NACKed or declared late; its losses are concealed by the decoder.
+    const datagram = (f: VideoFragment) => {
+      const c = configs.get(f.configId);
+      if (c?.codec === "pyrowave") {
+        const r =
+          pyro?.configId === c.configId
+            ? pyro
+            : (pyro = new PyroWaveReceiver(c.configId, blockLayout(c.width, c.height).totalBlocks, 1000 / (c.fps || 60)));
+        const now = this.now();
+        const due = r.due(now);
+        if (due) sink.pyrowave(due);
+        const done = r.push(f, now);
+        if (done) sink.pyrowave(done);
+        arm();
+        return;
+      }
+      // A PyroWave fragment must never reach the assembler, so a client that offered PyroWave
+      // holds the fragments of a configuration it has no hello_ack for yet.
+      if (!c && this.opts.pyrowave && (latest === null || serialAfter(f.configId, latest, 8))) {
+        const at = this.now();
+        held = held.filter((h) => at - h.at < FRAGMENT_HOLD_MS);
+        if (held.length < MAX_HELD_FRAGMENTS) held.push({ f, at });
+        return;
+      }
+      this.recovered(assembler.push(f), sink);
+    };
+    const config = (c: VideoConfig) => {
+      configs.delete(c.configId);
+      configs.set(c.configId, c);
+      if (configs.size > 16) configs.delete(configs.keys().next().value as number);
+      latest = c.configId;
+      sink.config(c);
+      const replay = held.filter((h) => h.f.configId === c.configId);
+      held = held.filter((h) => serialAfter(h.f.configId, c.configId, 8));
+      for (const h of replay) datagram(h.f);
+    };
+    const miss = (frameSeq: number, frags: [number, number][]) => this.recovered(assembler.miss(frameSeq, frags), sink);
+    const tick = () => this.recovered(assembler.tick(), sink);
+    return { datagram, config, miss, tick, stop };
   }
 
   /** §Loss recovery: NACKs out, a keyframe asked for a late frame, whole units to the sink. */

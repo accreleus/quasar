@@ -21,6 +21,7 @@ use gstreamer::prelude::*;
 use super::abr_glue::{self, EncodeResolutionLever, ResolutionLever};
 use super::audio_branch::add_audio_chain;
 use super::codec_chain::build_video_payloader;
+use super::ice_interfaces::restrict_ice_gathering;
 use super::mic_branch::add_mic_branch;
 use super::probes::{attach_rtp_marker_trace, attach_rtp_out_probe, attach_rtp_ts_trace};
 use super::rtp_ext::{
@@ -241,6 +242,7 @@ impl WebRtcSlot {
             trace_tx,
             session_id,
             observe,
+            pyrowave_feed: _,
         } = session;
         let codec = cfg.stream.codec;
         let pay = build_video_payloader(codec, cfg.rtp_mtu)?;
@@ -348,6 +350,7 @@ impl WebRtcSlot {
         let cfg = &self.cfg.lock().unwrap().clone();
         let gate = Arc::new(Mutex::new(gate.or_else(|| self.hold_rtp())));
         let webrtc = make_webrtcbin(cfg.stun.as_deref())?;
+        restrict_ice_gathering(&webrtc, PcId::Video);
         // Signals webrtcbin emits while it builds its send session: connect them first.
         if cfg.rtp_mtu_shrink {
             super::mtu_shrink::attach(
@@ -635,6 +638,7 @@ impl WebRtcSlot {
         }
         let audio_webrtc = make_webrtcbin(cfg.stun.as_deref())
             .context("failed to create audio webrtcbin (encode pipeline)")?;
+        restrict_ice_gathering(&audio_webrtc, PcId::Audio);
         // #425: tune the mic receive-leg jitter buffer on the AUDIO PC only; the video
         // webrtcbin is never touched here.
         set_audio_receive_latency(&audio_webrtc, cfg.mic_jitter_ms);

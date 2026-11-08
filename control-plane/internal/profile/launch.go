@@ -31,6 +31,11 @@ type LaunchProfile struct {
 	// Transport is webrtc | webtransport_opt_in | webtransport; empty reads as webrtc.
 	// semantics: control-api.md §The launch profile's transport
 	Transport string
+	// PyroWaveMode is off | allow | prefer; empty reads as off. PyroWaveKbps is the maximum
+	// PyroWave bitrate, nil for no cap below 1 000 000.
+	// semantics: control-api.md §Ultra-low latency (PyroWave)
+	PyroWaveMode string
+	PyroWaveKbps *int32
 	// Rungs are the stream profiles this launch profile walks, best first.
 	Rungs []Profile
 }

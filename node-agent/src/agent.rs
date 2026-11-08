@@ -4098,6 +4098,7 @@ impl SessionManager {
                 wt_token_hash,
                 wt_token_expires_at,
                 compat_tools,
+                pyrowave,
             } => {
                 if kind == Some(SessionKind::Unknown) {
                     warn!(
@@ -4306,6 +4307,7 @@ impl SessionManager {
                         (Some(listener), Some(hash), Some(expires)) => {
                             listener.registry().assign(&session_id, &hash, expires);
                             cfg.webtransport = true;
+                            cfg.pyrowave = pyrowave;
                         }
                         // The session is sound; its client falls back to WebRTC (agent-api.md).
                         _ => warn!(

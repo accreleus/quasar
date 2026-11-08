@@ -214,3 +214,38 @@ func TestAuditDetails_AppAndHostDelete(t *testing.T) {
 		t.Errorf("host.delete details = %#v, want node_name=\"doomed-node\"", hostDetails)
 	}
 }
+
+// #1209: an agent sets its own node_name and nothing bounds its length, so a
+// pathological one used to render the host.delete row past the CHECK and the
+// row was dropped — a host deleted with no record of which one. The row is
+// written cut down and flagged instead.
+func TestAuditDetails_HostDeleteSurvivesAPathologicalNodeName(t *testing.T) {
+	pool := testDB(t)
+	srv, authSvc := newAuditedTestServer(t, pool)
+	ctx := context.Background()
+	bearer := adminBearer(t, ctx, pool, authSvc, "audit@longnode.test", "auditlongnode")
+
+	nodeName := strings.Repeat("&", 5000) // 30 000 bytes once encoded
+	var hostID string
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO hosts (node_name, status) VALUES ($1, 'offline') RETURNING id::text`, nodeName,
+	).Scan(&hostID); err != nil {
+		t.Fatalf("seed host: %v", err)
+	}
+	if r := deleteReq(t, srv.URL+"/v1/hosts/"+hostID, bearer); r.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete host: want 204, got %d", r.StatusCode)
+	}
+
+	// auditDetails fails the test itself if the row is over the CHECK.
+	details, size := auditDetails(t, pool, "host.delete")
+	if details["details_truncated"] != true || details["node_name_truncated"] != true {
+		t.Errorf("cut row is not flagged: %#v", details)
+	}
+	stamped, _ := details["node_name"].(string)
+	if stamped == "" || !strings.HasPrefix(nodeName, stamped) {
+		t.Errorf("node_name is %d bytes, want a non-empty prefix of the reported name", len(stamped))
+	}
+	if size >= len(nodeName) {
+		t.Errorf("row is %d bytes for a %d-byte name; nothing was cut", size, len(nodeName))
+	}
+}

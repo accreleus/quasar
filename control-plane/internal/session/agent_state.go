@@ -289,6 +289,18 @@ func (c *Coordinator) AgentTraceEvent(ctx context.Context, hostID string, m agen
 			"session_id", m.SessionID, "event", m.Event, "err", err)
 		return
 	}
+	if m.Event == "codec.switched" {
+		var p struct {
+			To     string `json:"to"`
+			Reason string `json:"reason"`
+		}
+		if json.Unmarshal(m.Payload, &p) != nil || !fallbackReasonRE.MatchString(p.Reason) {
+			return
+		}
+		if err := c.store.ApplyPyroWaveSwitch(ctx, m.SessionID, p.To == wireCodecPyroWave, p.Reason); err != nil {
+			c.log.Warn("pyrowave: recording codec.switched failed", "session_id", m.SessionID, "err", err)
+		}
+	}
 }
 
 // buildAgentMetrics flattens an agent session_metrics message into the schema.md
