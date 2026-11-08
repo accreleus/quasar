@@ -10,12 +10,11 @@ import type { User } from "../api/types";
 import { AuthContext, type AuthStatus, type AuthContextValue } from "./context";
 import { clearSession, isRemembered, loadSession, saveSession } from "./storage";
 import {
-  deviceProbeIsFresh,
   getOrCreateDeviceKey,
   markDeviceProbePosted,
   probeCapabilities,
-  probeH264Decodable,
 } from "../webrtc/capability";
+import { ensureDeviceProbe } from "./deviceProbe";
 import { reportBestEffortFailure } from "../lib/reportBestEffortFailure";
 
 export function AuthProvider({ children }: { children: ReactNode }) {
@@ -57,18 +56,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         // unthrottled it rate-limited /v1/me/devices (429). Best-effort:
         // failures are silent (same posture as the login path).
         // A changed H.264 verdict (plugin installed) posts at once (#688).
-        const tok = persisted.token;
-        void (async () => {
-          try {
-            if (deviceProbeIsFresh(fresh.id, await probeH264Decodable())) return;
-            const deviceKey = getOrCreateDeviceKey();
-            const caps = await probeCapabilities();
-            await authApi.postDevice(tok, deviceKey, caps);
-            markDeviceProbePosted(fresh.id, caps.codecs.h264);
-          } catch (err) {
-            reportBestEffortFailure("silent-debug", "auth: rehydrate device capability post", err);
-          }
-        })();
+        void ensureDeviceProbe(persisted.token, fresh.id).catch((err) =>
+          reportBestEffortFailure("silent-debug", "auth: rehydrate device capability post", err),
+        );
       })
       .catch((err: unknown) => {
         if (cancelled) return;
@@ -128,7 +118,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         const deviceKey = getOrCreateDeviceKey();
         const caps = await probeCapabilities();
         await authApi.postDevice(tok, deviceKey, caps);
-        markDeviceProbePosted(res.user.id, caps.codecs.h264);
+        markDeviceProbePosted(res.user.id, caps.codecs.h264, caps.webgpu?.available === true);
       } catch (err) {
         // Intentionally silent — capability data is best-effort and must never
         // degrade the login experience (P4-08: "failures silent/logged, not fatal").
@@ -159,7 +149,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         try {
           const caps = await probeCapabilities();
           await authApi.postDevice(tok, deviceKey, caps);
-          markDeviceProbePosted(res.user.id, caps.codecs.h264);
+          markDeviceProbePosted(res.user.id, caps.codecs.h264, caps.webgpu?.available === true);
         } catch (err) {
           reportBestEffortFailure("silent-debug", "auth: claim device capability post", err);
         }

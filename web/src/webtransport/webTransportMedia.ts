@@ -1,12 +1,14 @@
 // MediaTransport over WebTransport: protocol/transport-webtransport.md, wt_proto 1,
-// video, input, ping/pong and NACK, with PyroWave (codec-pyrowave.md) for a client that
-// offers it. Audio and feedback are later tickets (#1033, #1040).
+// video, input, ping/pong, NACK, audio and the microphone, with PyroWave (codec-pyrowave.md) for a
+// client that offers it. Feedback is a later ticket (#1040).
 
 import {
   base64Bytes,
+  CHANNEL_AUDIO,
   ControlDecoder,
   ControlProtocolError,
   encodeControl,
+  parseAudioDatagram,
   parseVideoDatagram,
   serialAfter,
   type VideoFragment,
@@ -19,6 +21,8 @@ import { workerTicker, type Ticker } from "./pingTicker";
 import { FrameAssembler, type Reassembled } from "./reassembly";
 import {
   TransportError,
+  type AudioConfig,
+  type AudioStreams,
   type KeyframeReason,
   type MediaSink,
   type MediaTransport,
@@ -28,8 +32,13 @@ import {
 const WT_PROTO = 1;
 /** `session_not_ready`: retry the same token after this long (§Hello). */
 const NOT_READY_RETRY_MS = 250;
-/** How long connect keeps retrying an agent that is not ready or gives no answer. */
+/** How long connect keeps retrying an agent that says it is not ready. */
 export const CONNECT_DEADLINE_MS = 60_000;
+/** How long connect waits for the WebTransport handshake. A host that completed it is reachable,
+ *  so attempts after that (not ready, or an answer Chrome dropped) are not bounded by this: they
+ *  run to {@link CONNECT_DEADLINE_MS}. Well under the loader's give-up time, so the page can fall
+ *  back to WebRTC (control-api.md §Transport fallback) while the launch is still waiting. */
+export const HANDSHAKE_DEADLINE_MS = 10_000;
 /** One attempt's wait for its answer; the agent closes a connection with no `hello` at 5 s. */
 const ANSWER_TIMEOUT_MS = 10_000;
 /** How long a connection that failed without an answer gets to report its close code. */
@@ -116,6 +125,18 @@ export function videoConfigFrom(ack: Record<string, unknown>): VideoConfig {
   };
 }
 
+const audioConfigFrom = (a: unknown): AudioConfig | null => {
+  const o = a as Record<string, unknown> | null | undefined;
+  if (!o || o.codec !== "opus" || typeof o.channels !== "number" || typeof o.sample_rate !== "number") return null;
+  return { channels: o.channels, sampleRate: o.sample_rate, ptimeMs: typeof o.ptime_ms === "number" ? o.ptime_ms : 10 };
+};
+
+/** `hello_ack.audio` and `.mic`; null for a stream the host does not carry or one this client cannot use. */
+export const audioStreamsFrom = (ack: Record<string, unknown>): AudioStreams => ({
+  audio: audioConfigFrom(ack.audio),
+  mic: audioConfigFrom(ack.mic),
+});
+
 /** Routes one connection's video fragments: PyroWave frames to their receiver, the rest to the
  *  access-unit assembler. Also the order of configurations for both. */
 interface Router {
@@ -147,6 +168,8 @@ export class WebTransportMedia implements MediaTransport {
   private lastMint = -Infinity;
   private lastKeyAt = -Infinity;
   private keyTimer: ReturnType<typeof setTimeout> | null = null;
+  /** §Loss recovery's tick: releases and late frames wait for no datagram. */
+  private recoveryTimer: ReturnType<typeof setInterval> | null = null;
   private pendingKey: KeyframeReason | null = null;
   private router: Router | null = null;
   private readonly sleep: (ms: number) => Promise<void>;
@@ -210,15 +233,26 @@ export class WebTransportMedia implements MediaTransport {
     }, wait);
   }
 
+  sendMic(datagram: Uint8Array): boolean {
+    return this.input.datagram(datagram);
+  }
+
   codecFallback(reason: string): void {
     if (this.closed || !this.connected) return;
     this.send({ type: "codec_fallback", reason });
+  }
+
+  private stopRecovery(): void {
+    if (this.recoveryTimer !== null) clearInterval(this.recoveryTimer);
+    this.recoveryTimer = null;
   }
 
   close(): void {
     if (this.closed) return;
     this.closed = true;
     if (this.keyTimer !== null) clearTimeout(this.keyTimer);
+    // Not left to `wt.closed`, which a connection that never finishes closing does not resolve.
+    this.stopRecovery();
     this.router?.stop();
     this.stopPings();
     // An attempt still connecting is closed here; it sees `closed` at its next await.
@@ -293,7 +327,13 @@ export class WebTransportMedia implements MediaTransport {
     };
 
     try {
-      await wt.ready;
+      // A blocked UDP port can leave the handshake pending for the browser's own, longer, timeout.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const ready = await Promise.race([
+        wt.ready.then(() => true),
+        new Promise<boolean>((r) => void (timer = setTimeout(() => r(false), HANDSHAKE_DEADLINE_MS))),
+      ]).finally(() => clearTimeout(timer));
+      if (!ready) return abandon(refused(this.closed ? "closed" : "connect_timeout"));
     } catch {
       // The handshake or the certificate failed (another try meets the same), or close() ended it.
       return abandon(refused(this.closed ? "closed" : "connect_failed"));
@@ -335,7 +375,7 @@ export class WebTransportMedia implements MediaTransport {
     // Datagrams can overtake the hello_ack; the decode stage holds units by config_id, the
     // router PyroWave fragments.
     const router = this.makeRouter(sink, live);
-    void this.readDatagrams(wt, router, live).catch(() => {});
+    void this.readDatagrams(wt, sink, router, live).catch(() => {});
     let first: Record<string, unknown> | null;
     try {
       first = await Promise.race([next(), after(ANSWER_TIMEOUT_MS, null)]);
@@ -368,6 +408,7 @@ export class WebTransportMedia implements MediaTransport {
     this.connected = true;
     this.router = router;
     this.datagramWriter = wt.datagrams.writable.getWriter();
+    sink.streams?.(audioStreamsFrom(first));
     router.config(config);
     const ping = () => this.send({ type: "ping", id: ++this.pingId, tc: this.now() });
     ping();
@@ -390,17 +431,17 @@ export class WebTransportMedia implements MediaTransport {
       }
     })();
     // Release and lateness must not wait for the next datagram: a still picture may send none.
-    const tick = setInterval(() => {
-      if (live.on) router.tick();
+    this.recoveryTimer = setInterval(() => {
+      if (live.on && !this.closed) router.tick();
     }, RECOVERY_TICK_MS);
     void wt.closed.then(
       (info) => {
-        clearInterval(tick);
+        this.stopRecovery();
         this.stopPings();
         sink.end({ code: info.closeCode ?? null, reason: info.reason ?? "" });
       },
       (err: unknown) => {
-        clearInterval(tick);
+        this.stopRecovery();
         this.stopPings();
         sink.end({ code: null, reason: err instanceof Error ? err.message : "" });
       },
@@ -408,13 +449,18 @@ export class WebTransportMedia implements MediaTransport {
     return { kind: "ack" };
   }
 
-  private async readDatagrams(wt: WebTransport, router: Router, live: { on: boolean }): Promise<void> {
+  private async readDatagrams(wt: WebTransport, sink: MediaSink, router: Router, live: { on: boolean }): Promise<void> {
     const reader = wt.datagrams.readable.getReader();
     for (;;) {
       const { value, done } = await reader.read();
       if (done || !live.on) {
         router.stop();
         return;
+      }
+      if ((value as Uint8Array)[0] === CHANNEL_AUDIO) {
+        const packet = parseAudioDatagram(value as Uint8Array);
+        if (packet) sink.audio?.(packet);
+        continue;
       }
       const frag = parseVideoDatagram(value as Uint8Array);
       if (!frag) continue; // another channel, or malformed: dropped (§Channels)

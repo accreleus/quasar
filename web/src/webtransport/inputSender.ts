@@ -24,6 +24,7 @@ export function webTransportInputSender(wire: InputWire, settleMs = SETTLE_MS): 
   const pads = new Map<number, number[]>();
   /** The latest state of what was last sent as a datagram, until it has been repeated reliably. */
   const settling = new Map<string, { msg: InputMsg; timer: ReturnType<typeof setTimeout> }>();
+  let disposed = false;
   const scratch = new Uint8Array(1200);
   scratch[0] = CHANNEL_INPUT;
 
@@ -68,6 +69,8 @@ export function webTransportInputSender(wire: InputWire, settleMs = SETTLE_MS): 
 
   return {
     send(msg) {
+      // A stale capture handler must not reach a connection that is gone or replaced.
+      if (disposed) return;
       if (lossy(msg)) {
         const json = JSON.stringify(msg);
         const { read, written } = encoder.encodeInto(json, scratch.subarray(1));
@@ -92,6 +95,7 @@ export function webTransportInputSender(wire: InputWire, settleMs = SETTLE_MS): 
     bufferedAmount: 0,
     /** Forgets what was waiting to settle: the connection is going, and the host releases what it held. */
     dispose() {
+      disposed = true;
       for (const key of [...settling.keys()]) drop(key);
     },
   };

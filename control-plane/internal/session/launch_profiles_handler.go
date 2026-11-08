@@ -358,14 +358,20 @@ func (h *Handler) handleAdminDeleteLaunchProfile(w http.ResponseWriter, r *http.
 	case err == nil:
 		details := map[string]any{}
 		if name != "" {
-			details["name"] = name
+			// name is the admin-supplied display name, with no length bound of its own.
+			audit.CapText(details, "name", name)
 		}
 		if len(widened) > 0 {
 			names := make([]string, 0, len(widened))
 			for _, a := range widened {
 				names = append(names, a.Name)
 			}
-			details["allow_list_widened_apps"] = names
+			// Account-wide and per-app menus both allow-list a profile, so this
+			// list grows with the catalogue; a long one used to push the row past
+			// admin_activity's 4096-byte bound, which drops it. The count keeps the
+			// true width readable past the cap.
+			details["allow_list_widened_app_count"] = len(names)
+			audit.CapIDs(details, "allow_list_widened_apps", names)
 		}
 		h.recordActivity(r.Context(), actorFromRequest(r), "launch_profile.delete", "launch_profile", id, details)
 		w.WriteHeader(http.StatusNoContent)

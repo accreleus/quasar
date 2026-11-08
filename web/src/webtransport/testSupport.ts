@@ -169,6 +169,8 @@ export class FakeAgent {
   replies: Step[][] = [];
   /** `ready` rejects: the handshake or the certificate failed. */
   refuseHandshake = false;
+  /** `close()` does not settle `closed`, as a connection that never finishes closing. */
+  closeNeverSettles = false;
   /** Park the client at one await of its connect until `release()`; `answer` means no reply. */
   hold: "ready" | "stream" | "write" | "answer" | null = null;
   /** Off: datagrams already in flight still arrive after close(), the case a stale attempt must ignore. */
@@ -272,7 +274,7 @@ export class FakeAgent {
       close(info?: WebTransportCloseInfo) {
         conn.closes.push(info);
         rejectReady(new Error("closed"));
-        settle.resolve(info ?? { closeCode: 0, reason: "" });
+        if (!agent.closeNeverSettles) settle.resolve(info ?? { closeCode: 0, reason: "" });
         for (const c of agent.closeEndsDatagrams ? [ctl, dgram] : [ctl]) {
           try {
             c?.close();
