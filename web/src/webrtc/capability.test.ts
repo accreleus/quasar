@@ -413,7 +413,7 @@ describe("device capability post freshness", () => {
     markDeviceProbePosted("u1", true, false, 1_000_000);
     const [[key, stamp]] = Object.entries(localStorage);
     localStorage.clear();
-    localStorage.setItem(key.replace("_v4", "_v3"), stamp);
+    localStorage.setItem(key.replace("_v5", "_v3"), stamp);
     expect(deviceProbeIsFresh("u1", true, false, 1_000_000)).toBe(false);
   });
 

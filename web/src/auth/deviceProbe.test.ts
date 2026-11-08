@@ -26,7 +26,7 @@ describe("ensureDeviceProbe", () => {
     markDeviceProbePosted("u1", true, true);
     const [[key, stamp]] = Object.entries(localStorage);
     localStorage.clear();
-    localStorage.setItem(key.replace("_v4", "_v3"), stamp);
+    localStorage.setItem(key.replace("_v5", "_v3"), stamp);
     await ensureDeviceProbe("tok", "u1");
     expect(authApi.postDevice).toHaveBeenCalledTimes(1);
     await ensureDeviceProbe("tok", "u1");
