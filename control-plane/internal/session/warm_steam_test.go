@@ -45,6 +45,9 @@ func TestLaunchClaimStreamDefaultsTransportToWebRTC(t *testing.T) {
 	if got := launchClaimStream(CreateParams{}).Transport; got != transportWebRTC {
 		t.Errorf("nil claim: transport = %q, want %q", got, transportWebRTC)
 	}
+	if got := launchClaimStream(CreateParams{claim: &parkedClaim{}}).Transport; got != transportWebRTC {
+		t.Errorf("empty claim: transport = %q, want %q", got, transportWebRTC)
+	}
 	p := CreateParams{claim: &parkedClaim{transport: transportWebTransport}}
 	if got := launchClaimStream(p).Transport; got != transportWebTransport {
 		t.Errorf("claimed transport = %q, want %q", got, transportWebTransport)

@@ -964,7 +964,7 @@ func (s *Store) endHeldPlay(ctx context.Context, hostID, sessionID string, detai
 	// launch could ever adopt it (#1163). The runtime is released and Steam stops with it.
 	parkable := w.Enabled && hostParks && cur == StateRunning && kind == KindPlay && parkOnEnd
 	if parkable && transport == transportWebTransport {
-		slog.Info("warm steam: not parking a WebTransport play; no launch can adopt a WebRTC-only park",
+		slog.Info("warm steam: not parking a WebTransport play; no WebTransport launch can adopt a WebRTC-only park",
 			"session_id", sessionID)
 		parkable = false
 	}
