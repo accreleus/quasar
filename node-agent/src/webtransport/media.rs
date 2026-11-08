@@ -1100,6 +1100,7 @@ mod tests {
         gst::init().unwrap();
         let media = Arc::new(Media {
             state: Mutex::default(),
+            audio: Audio::new(audio::Plan::default()),
             input: crate::webtransport::tests::no_input(),
             typing: Mutex::default(),
             encoder: glib::WeakRef::new(),
@@ -1136,7 +1137,11 @@ mod tests {
             .downcast::<gst::Pipeline>()
             .unwrap();
         let parse = pipeline.by_name("parse").unwrap();
-        let media = Media::new(&parse, crate::webtransport::tests::no_input());
+        let media = Media::new(
+            &parse,
+            crate::webtransport::tests::no_input(),
+            Audio::new(audio::Plan::default()),
+        );
         tap(&parse.static_pad("src").unwrap(), &media, "s");
         pipeline.set_state(gst::State::Playing).unwrap();
         let src = pipeline
@@ -1252,6 +1257,7 @@ mod tests {
         gst::init().unwrap();
         Arc::new(Media {
             state: Mutex::default(),
+            audio: Audio::new(audio::Plan::default()),
             input: crate::webtransport::tests::no_input(),
             typing: Mutex::default(),
             encoder: glib::WeakRef::new(),
