@@ -146,8 +146,12 @@ pub struct Watcher {
     windows_read: bool,
     /// The last window list read, for the helper's pin.
     last_windows: Vec<WindowInfo>,
-    /// Steam logged progress on a `LaunchApp` for the target: it took the launch up (#1159).
-    action_seen: bool,
+    /// The target's latest `LaunchApp` action in Steam's log, by ActionID, and whether it
+    /// failed (#1159). Progress on an action means Steam took the launch up; a failure of that
+    /// same action wins over its earlier progress, and a later action's progress counts anew.
+    action: Option<(u32, bool)>,
+    /// The last window-derived need, kept across a pass whose window list could not be read.
+    window_need: Option<NeedsUser>,
     /// Another game's reaper was seen, or Steam logged a launch of another app: the user is
     /// doing something else (#1159). Latched.
     elsewhere: bool,
@@ -184,7 +188,8 @@ impl Watcher {
             focused: None,
             windows_read: false,
             last_windows: Vec::new(),
-            action_seen: false,
+            action: None,
+            window_need: None,
             elsewhere: false,
         }
     }
@@ -195,10 +200,11 @@ impl Watcher {
     }
 
     /// Steam's log has shown a `LaunchApp` making progress for the target (a task change, a
-    /// wait for the user, or the answer to one): a launch it ignored (mid sign-in) leaves no
-    /// such line, so a caller may send it again only while this is false.
+    /// wait for the user, or the answer to one) and has not since failed that action: a launch
+    /// it ignored (mid sign-in) leaves no such line, so a caller may send it again only while
+    /// this is false.
     pub fn launch_taken(&self) -> bool {
-        self.action_seen
+        matches!(self.action, Some((_, false)))
     }
 
     /// Why Steam needs the user right now, if it does; it clears when the need does.
@@ -284,23 +290,23 @@ impl Watcher {
         match mapped {
             Ok(windows) => {
                 // The higher-ranked of the window and log reasons wins.
-                let desired = [
-                    classify_windows(&windows, self.cfg.appid),
-                    self.held_log_needs(now),
-                ]
-                .into_iter()
-                .flatten()
-                .min_by_key(|reason| needs_rank(*reason));
+                self.window_need = classify_windows(&windows, self.cfg.appid);
+                let desired = [self.window_need, self.held_log_needs(now)]
+                    .into_iter()
+                    .flatten()
+                    .min_by_key(|reason| needs_rank(*reason));
                 self.update_needs(desired, &mut reports);
                 self.last_windows = windows;
             }
             Err(_) => {
-                // The mapped list is skipped for this pass: no window-derived
-                // reason changes, but a log-derived wait-for-user can still
-                // be reported.
-                if let Some(reason) = self.held_log_needs(now) {
-                    self.update_needs(Some(reason), &mut reports);
-                }
+                // The mapped list is skipped for this pass: the window-derived reason
+                // stands as it was, but the log-derived one is read afresh, so a sign-in
+                // that finished clears even when the windows cannot be read.
+                let desired = [self.window_need, self.held_log_needs(now)]
+                    .into_iter()
+                    .flatten()
+                    .min_by_key(|reason| needs_rank(*reason));
+                self.update_needs(desired, &mut reports);
             }
         }
 
@@ -478,16 +484,30 @@ impl Watcher {
                 self.interstitial_since = None;
             }
         } else if line.contains("GameAction") {
-            // Only a line that shows a launch moving: anything else Steam writes about an
-            // action (a failure, a cancel) is not evidence it took the launch.
-            let progress = line.contains("LaunchApp changed task to")
-                || line.contains("LaunchApp waiting for user response to")
-                || line.contains("LaunchApp continues with user response");
+            // A refusal logs progress, then `failed with AppError_n` and `changed task to
+            // Failed` for the same ActionID (#1159): the failure is the terminal word.
+            let failed = line.contains("LaunchApp failed with")
+                || line.contains("LaunchApp changed task to Failed");
+            let progress = !failed
+                && (line.contains("LaunchApp changed task to")
+                    || line.contains("LaunchApp waiting for user response to")
+                    || line.contains("LaunchApp continues with user response"));
             if extract_appid(line) != Some(self.cfg.appid) {
                 self.elsewhere |= progress && line.contains("LaunchApp");
                 return;
             }
-            self.action_seen |= progress;
+            if let Some(id) = extract_action_id(line) {
+                match self.action {
+                    Some((current, _)) if current == id => {
+                        if failed {
+                            self.action = Some((id, true));
+                        }
+                    }
+                    // A later action: its progress is a new launch taken up.
+                    _ if progress => self.action = Some((id, false)),
+                    _ => {}
+                }
+            }
             if let Some(task_at) = line.find("LaunchApp waiting for user response to") {
                 // The one log line that means Steam is actually stopped for
                 // the user. A bare `changed task to SynchronizingCloud` is a
@@ -693,6 +713,12 @@ impl LogTail {
         self.pending.clear();
         self.discarding = false;
     }
+}
+
+fn extract_action_id(line: &str) -> Option<u32> {
+    let rest = line.get(line.find("ActionID ")? + "ActionID ".len()..)?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
 }
 
 fn extract_appid(line: &str) -> Option<u32> {
