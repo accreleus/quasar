@@ -157,6 +157,32 @@ fn miss(ranges: &mut Vec<[u16; 2]>, i: u16) {
     }
 }
 
+/// PyroWave frame_seqs remembered for ignoring NACKs: well past the retransmit window at 60 fps.
+const PYROWAVE_FRAMES_REMEMBERED: usize = 64;
+
+/// The frame_seqs of recent PyroWave frames: a NACK naming one is ignored (codec-pyrowave.md
+/// §Loss: never retransmitted, no `nack_miss`). Forgotten when the client leaves PyroWave:
+/// frame_seq keeps counting and wraps, and a standard frame reusing an id must be answered.
+#[derive(Default)]
+pub(crate) struct PyroWaveFrames(VecDeque<u16>);
+
+impl PyroWaveFrames {
+    pub(crate) fn remember(&mut self, frame_seq: u16) {
+        if self.0.len() == PYROWAVE_FRAMES_REMEMBERED {
+            self.0.pop_front();
+        }
+        self.0.push_back(frame_seq);
+    }
+
+    pub(crate) fn ignores(&self, frame_seq: u16) -> bool {
+        self.0.contains(&frame_seq)
+    }
+
+    pub(crate) fn forget(&mut self) {
+        self.0.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,5 +293,39 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// Both seats: after a step-down, a standard frame that reuses a remembered PyroWave id
+    /// (frame_seq wraps) is NACKable again and gets its resend.
+    #[test]
+    fn a_standard_frame_reusing_a_pyrowave_id_after_a_step_down_is_resent() {
+        let now = Instant::now();
+        let mut pyrowave = PyroWaveFrames::default();
+        for seq in 10..20 {
+            pyrowave.remember(seq);
+        }
+        assert!(pyrowave.ignores(12), "a PyroWave frame's NACK is ignored");
+        pyrowave.forget(); // the switch to the standard codec
+
+        let mut sent = Retransmit::default();
+        let mut pkt_seq = 0;
+        sent.keep(12, &frame(12, 3000, &mut pkt_seq), now, WINDOW);
+        assert!(
+            !pyrowave.ignores(12),
+            "the reused id is a standard frame now"
+        );
+        let answer = sent.answer(12, &[[1, 1]], &mut pkt_seq, now, WINDOW);
+        assert_eq!(answer.resend.len(), 1, "its NACK gets a resend");
+        assert!(answer.missed.is_empty());
+    }
+
+    #[test]
+    fn only_the_last_64_pyrowave_frames_are_remembered() {
+        let mut pyrowave = PyroWaveFrames::default();
+        for seq in 0..65 {
+            pyrowave.remember(seq);
+        }
+        assert!(!pyrowave.ignores(0));
+        assert!(pyrowave.ignores(1) && pyrowave.ignores(64));
     }
 }

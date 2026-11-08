@@ -44,8 +44,6 @@ const MAX_UNAUTHENTICATED: usize = 64;
 const DEFAULT_PER_SOURCE: usize = 4;
 /// Below this the 1200-byte datagram budget cannot be met (§Channels, "Datagram size").
 const MIN_DATAGRAM: usize = 1100;
-/// PyroWave frame_seqs remembered for ignoring NACKs: well past the retransmit window at 60 fps.
-const PYROWAVE_FRAMES_REMEMBERED: usize = 64;
 /// How long an authenticated client may hold up one write on its control stream.
 const CONTROL_WRITE: Duration = Duration::from_secs(2);
 /// Nothing received on the control stream for this long means the client is gone
@@ -1114,8 +1112,7 @@ async fn stream(
     });
     let mut pkt_seq = 0u32;
     let mut sent = retransmit::Retransmit::default();
-    // The frame_seqs of recent PyroWave frames: a NACK naming one is ignored.
-    let mut pyrowave_frames = std::collections::VecDeque::with_capacity(PYROWAVE_FRAMES_REMEMBERED);
+    let mut pyrowave_frames = retransmit::PyroWaveFrames::default();
     let mut nack_budget = retransmit::NackBudget::new(std::time::Instant::now());
     let (mut nacks_capped, mut resends_too_large) = (0u64, 0u64);
     let mut warned_oversized = false;
@@ -1157,10 +1154,7 @@ async fn stream(
                     // codec-pyrowave.md §Loss: a PyroWave frame is never retransmitted, so it is
                     // never kept; a NACK naming it is ignored (`pyrowave_frames`).
                     if unit.pyrowave {
-                        if pyrowave_frames.len() == PYROWAVE_FRAMES_REMEMBERED {
-                            pyrowave_frames.pop_front();
-                        }
-                        pyrowave_frames.push_back(unit.frame_seq);
+                        pyrowave_frames.remember(unit.frame_seq);
                     } else {
                         let now = std::time::Instant::now();
                         sent.keep(unit.frame_seq, &datagrams, now, retransmit_window(session));
@@ -1172,6 +1166,9 @@ async fn stream(
                     }
                 }
                 Some(Out::Config(config, reason)) => {
+                    if config.codec != "pyrowave" {
+                        pyrowave_frames.forget();
+                    }
                     current = config.clone();
                     let ack = hello_ack(&config, reason);
                     let write = write_message(&mut send, &ack);
@@ -1193,7 +1190,7 @@ async fn stream(
                         Some("codec_fallback") => media.switch_off(Some(client.id), "client_decode_error"),
                         // codec-pyrowave.md §Loss: a NACK for a PyroWave frame is ignored: no
                         // retransmission and no nack_miss.
-                        Some("nack") if nack_of(&message).is_some_and(|(seq, _)| pyrowave_frames.contains(&seq)) => {}
+                        Some("nack") if nack_of(&message).is_some_and(|(seq, _)| pyrowave_frames.ignores(seq)) => {}
                         Some("nack") if !nack_budget.take(std::time::Instant::now()) => nacks_capped += 1,
                         Some("nack") => {
                             let answer = nack_of(&message).map(|(frame_seq, ranges)| {
