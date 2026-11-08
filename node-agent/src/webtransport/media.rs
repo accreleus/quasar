@@ -1408,6 +1408,7 @@ mod tests {
             input: crate::webtransport::tests::no_input(),
             typing: Mutex::default(),
             encoder: glib::WeakRef::new(),
+            trace: None,
         });
         media.on_caps(&streams::hevc_caps(640), "s");
         let mut client = media.attach(false, Duration::ZERO).unwrap();
@@ -1445,6 +1446,7 @@ mod tests {
             &parse,
             crate::webtransport::tests::no_input(),
             Audio::new(audio::Plan::default()),
+            None,
         );
         tap(&parse.static_pad("src").unwrap(), &media, "s");
         pipeline.set_state(gst::State::Playing).unwrap();
@@ -1565,6 +1567,7 @@ mod tests {
             input: crate::webtransport::tests::no_input(),
             typing: Mutex::default(),
             encoder: glib::WeakRef::new(),
+            trace: None,
         })
     }
 
