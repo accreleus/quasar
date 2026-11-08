@@ -64,6 +64,10 @@ impl InFlight {
 /// The most the encode thread waits for PyroWave to release a frame. Over it PyroWave is
 /// switched off: a GPU that slow is not one to stream PyroWave from.
 const HANDOFF_MAX: std::time::Duration = std::time::Duration::from_millis(200);
+/// The same for the first frame, which also opens PyroWave on the frames' device and makes the
+/// encoder (about 230 ms on an RTX 5090). The client is already on PyroWave by then, so the
+/// standard stream it pauses once is not the one on screen.
+const HANDOFF_FIRST_MAX: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The ordered hand-off of a Vulkan frame between PyroWave and the standard encoder, which
 /// read the same image and each move its layout (#1104 review). The encode thread holds the
@@ -456,6 +460,7 @@ fn start_with(
     let started = Arc::new(AtomicBool::new(false));
     let was_open = AtomicBool::new(false);
     let gave_up = AtomicBool::new(false);
+    let first_released = AtomicBool::new(false);
     let held = handoff.clone();
     let held_error = on_error.clone();
     let stopped = Arc::new(Mutex::new(false));
@@ -520,10 +525,18 @@ fn start_with(
                 return gst::PadProbeReturn::Ok;
             }
             // The standard encoder reads this image next: not before PyroWave is done with it.
-            if vulkan && !held.wait(HANDOFF_MAX) && !gave_up.swap(true, Ordering::AcqRel) {
-                held_error(format!(
-                    "PyroWave held a frame over {HANDOFF_MAX:?}; the standard stream goes on"
-                ));
+            if vulkan {
+                let max = match first_released.load(Ordering::Acquire) {
+                    true => HANDOFF_MAX,
+                    false => HANDOFF_FIRST_MAX,
+                };
+                if held.wait(max) {
+                    first_released.store(true, Ordering::Release);
+                } else if !gave_up.swap(true, Ordering::AcqRel) {
+                    held_error(format!(
+                        "PyroWave held a frame over {max:?}; the standard stream goes on"
+                    ));
+                }
             }
             gst::PadProbeReturn::Ok
         })
