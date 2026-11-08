@@ -1550,6 +1550,14 @@ impl pipeline::Transport for SessionTransports {
                         session.cfg.stream.width,
                         session.cfg.stream.height,
                     ),
+                    pipeline::feedback_abr(
+                        &session.encoder,
+                        &session.cfg,
+                        session.metrics.clone(),
+                        session.trace_tx.clone(),
+                        session.session_id.clone(),
+                        Some(session.lever.clone()),
+                    ),
                 )
             });
         let slot = pipeline::WebRtcSlot::new(session)?;

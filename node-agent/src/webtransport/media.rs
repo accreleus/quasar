@@ -105,6 +105,7 @@ pub(crate) struct Media {
     /// being the attached one cannot slip an event in behind the release that ended it.
     typing: Mutex<Typing>,
     encoder: glib::WeakRef<gst::Element>,
+    rate: Option<super::Rate>,
 }
 
 /// The client half `Media::attach` hands back.
@@ -116,13 +117,23 @@ pub(crate) struct Attached {
 }
 
 impl Media {
-    pub(crate) fn new(encoder: &gst::Element, input: super::Input) -> Arc<Self> {
+    pub(crate) fn new(
+        encoder: &gst::Element,
+        input: super::Input,
+        rate: Option<super::Rate>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::default(),
             input,
             typing: Mutex::default(),
             encoder: encoder.downgrade(),
+            rate,
         })
+    }
+
+    /// Where this session's clients' rate estimates go; `None` when its ABR is not armed.
+    pub(crate) fn rate(&self) -> Option<&super::Rate> {
+        self.rate.as_ref()
     }
 
     /// One `input.md` event from `client` to the devices; dropped unless it is the attached one.
@@ -565,6 +576,7 @@ mod tests {
             input: crate::webtransport::tests::no_input(),
             typing: Mutex::default(),
             encoder: glib::WeakRef::new(),
+            rate: None,
         });
         media.on_caps(&caps(1280, &avcc), "s");
         let mut client = media.attach().expect("ready after caps");
@@ -630,7 +642,7 @@ mod tests {
         // An element in NULL has inactive pads, which refuse every event.
         encoder.set_state(gst::State::Paused).unwrap();
         (
-            Media::new(&encoder, crate::webtransport::tests::no_input()),
+            Media::new(&encoder, crate::webtransport::tests::no_input(), None),
             encoder,
             forced,
         )

@@ -243,6 +243,22 @@ describe("WebTransportMedia loss recovery", () => {
   });
 });
 
+describe("WebTransportMedia receiver feedback", () => {
+  it("reports the datagrams that arrived on the control stream, in the contract's shape", async () => {
+    const agent = new FakeAgent();
+    agent.replies = [[helloAck(0, avcC())]];
+    const t = transport(agent);
+    await t.connect(NO_SINK);
+    const pkt = { n: 7 };
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(3000, 0) }, pkt));
+    await vi.waitFor(() => expect(agent.sent("feedback")).toHaveLength(1));
+    const [fb] = agent.sent("feedback");
+    expect(fb).toMatchObject({ seq: 1, first_pkt_seq: 7, count: pkt.n - 7, lost: 0 });
+    expect(typeof fb.arrivals_b64).toBe("string");
+    t.close();
+  });
+});
+
 // ── The runtime, end to end against the fake agent ─────────────────────────
 
 describe("createWebTransportRuntime", () => {

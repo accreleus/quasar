@@ -3,11 +3,11 @@
 //! session's client authenticates with a single-use token the control plane minted and
 //! then gets the session's video as datagrams.
 //!
-//! Not here yet, each a later ticket: audio, microphone, FEC, receiver feedback and
-//! congestion control, and takeover across transports (a new client replaces the last
-//! one; nothing bounds it).
+//! Not here yet, each a later ticket: audio, microphone, FEC, and takeover across
+//! transports (a new client replaces the last one; nothing bounds it).
 
 mod cert;
+mod congestion;
 mod media;
 mod retransmit;
 #[cfg(test)]
@@ -93,6 +93,14 @@ impl Input {
             }),
         }
     }
+}
+
+/// Where a client's rate estimate goes: the session's ABR, as `rtpgccbwe`'s estimate does on
+/// WebRTC (§Feedback: there is no second bitrate controller).
+pub(crate) struct Rate {
+    /// The estimate never goes above this: the ABR's ceiling.
+    pub(crate) ceiling_kbps: f64,
+    pub(crate) observe: Box<dyn Fn(f64) + Send + Sync>,
 }
 
 /// `capacity.transports` and `capacity.webtransport` (`agent-api.md`, amendment 54).
@@ -304,8 +312,9 @@ impl Tap {
         encoder: &gst::Element,
         session_id: &str,
         input: Input,
+        rate: Option<Rate>,
     ) -> Option<Self> {
-        let media = Media::new(encoder, input);
+        let media = Media::new(encoder, input, rate);
         if !registry.set_media(session_id, media.clone()) {
             return None;
         }
@@ -793,8 +802,14 @@ fn retransmit_window(session: &Session) -> Duration {
 
 /// Send `nack` answers; false when the connection is gone. A resend the path's maximum
 /// datagram size has shrunk below is dropped and counted: the client gives that frame up.
-fn resend(session: &Session, datagrams: Vec<bytes::Bytes>, too_large: &mut u64) -> bool {
+fn resend(
+    session: &Session,
+    datagrams: Vec<bytes::Bytes>,
+    log: &mut congestion::SendLog,
+    too_large: &mut u64,
+) -> bool {
     for d in datagrams {
+        log.record(&d, std::time::Instant::now());
         match session.send_datagram(d) {
             Ok(()) => {}
             Err(web_transport_quinn::SessionError::SendDatagramError(
@@ -1032,6 +1047,10 @@ async fn stream(
     let mut nack_budget = retransmit::NackBudget::new(std::time::Instant::now());
     let (mut nacks_capped, mut resends_too_large) = (0u64, 0u64);
     let mut warned_oversized = false;
+    let mut log = congestion::SendLog::new(std::time::Instant::now());
+    let mut estimator = media
+        .rate()
+        .map(|r| congestion::Estimator::new(r.ceiling_kbps, std::time::Instant::now()));
     // What ends the stream: an optional last message, the close code and its reason.
     const QUIET: (Option<Value>, u32, &str) = (None, CLOSE_NORMAL, "");
     let mut idle = pin!(tokio::time::sleep(CONTROL_IDLE));
@@ -1062,7 +1081,11 @@ async fn stream(
                     }
                     let now = std::time::Instant::now();
                     sent.keep(unit.frame_seq, &datagrams, now, retransmit_window(session));
-                    if datagrams.into_iter().try_for_each(|d| session.send_datagram(d)).is_err() {
+                    let sent = datagrams.into_iter().try_for_each(|d| {
+                        log.record(&d, now);
+                        session.send_datagram(d)
+                    });
+                    if sent.is_err() {
                         break QUIET;
                     }
                 }
@@ -1091,7 +1114,7 @@ async fn stream(
                                 (frame_seq, sent.answer(frame_seq, &ranges, &mut pkt_seq, now, window))
                             });
                             if let Some((frame_seq, answer)) = answer {
-                                if !resend(session, answer.resend, &mut resends_too_large) {
+                                if !resend(session, answer.resend, &mut log, &mut resends_too_large) {
                                     break QUIET;
                                 }
                                 if !answer.missed.is_empty() {
@@ -1101,6 +1124,14 @@ async fn stream(
                                         break QUIET;
                                     }
                                 }
+                            }
+                        }
+                        Some("feedback") => {
+                            let fed = estimator.as_mut().zip(congestion::feedback_of(&message)).and_then(|(est, fb)| {
+                                est.on_feedback(&fb, &log, std::time::Instant::now(), quinn::Connection::rtt(session))
+                            });
+                            if let (Some(kbps), Some(rate)) = (fed, media.rate()) {
+                                (rate.observe)(kbps);
                             }
                         }
                         Some("input") => {

@@ -1,5 +1,5 @@
 // MediaTransport over WebTransport: protocol/transport-webtransport.md, wt_proto 1,
-// video, input, ping/pong and NACK. Audio and feedback are later tickets (#1033, #1040).
+// video, input, ping/pong, NACK and receiver feedback. Audio is a later ticket (#1033).
 
 import {
   base64Bytes,
@@ -9,6 +9,7 @@ import {
   parseVideoDatagram,
 } from "./framing";
 import type { WebTransportCoords } from "../api/types";
+import { FEEDBACK_MS, FeedbackRecorder } from "./feedback";
 import type { InputWire } from "./inputSender";
 import { workerTicker, type Ticker } from "./pingTicker";
 import { FrameAssembler, type Reassembled } from "./reassembly";
@@ -31,8 +32,8 @@ const ANSWER_TIMEOUT_MS = 10_000;
 const CLOSE_CODE_WAIT_MS = 1_000;
 /** The agent forces at most one IDR per 150 ms (quasar-protocol#29, item 8); asking faster is noise. */
 export const KEYFRAME_SPACING_MS = 150;
-/** How often loss-recovery deadlines are checked when no datagram arrives. */
-export const RECOVERY_TICK_MS = 50;
+/** How often loss-recovery deadlines are checked when no datagram arrives, and feedback sent. */
+export const RECOVERY_TICK_MS = FEEDBACK_MS;
 /** The control plane is asked for a fresh token at most this often. */
 export const REMINT_MIN_INTERVAL_MS = 10_000;
 /** A token held this long (TTL 60 s, control-api.md) is replaced after a failed attempt. Measured
@@ -302,7 +303,8 @@ export class WebTransportMedia implements MediaTransport {
 
     // Datagrams can overtake the hello_ack; the decode stage holds them by config_id.
     const assembler = new FrameAssembler(this.now);
-    void this.readDatagrams(wt, sink, live, assembler).catch(() => {});
+    const feedback = new FeedbackRecorder(this.now());
+    void this.readDatagrams(wt, sink, live, assembler, feedback).catch(() => {});
     let first: Record<string, unknown> | null;
     try {
       first = await Promise.race([next(), after(ANSWER_TIMEOUT_MS, null)]);
@@ -357,7 +359,10 @@ export class WebTransportMedia implements MediaTransport {
     })();
     // Release and lateness must not wait for the next datagram: a still picture may send none.
     const tick = setInterval(() => {
-      if (live.on) this.recovered(assembler.tick(), sink);
+      if (!live.on) return;
+      this.recovered(assembler.tick(), sink);
+      const report = feedback.take(this.now());
+      if (report) this.send(report);
     }, RECOVERY_TICK_MS);
     void wt.closed.then(
       (info) => {
@@ -379,11 +384,13 @@ export class WebTransportMedia implements MediaTransport {
     sink: MediaSink,
     live: { on: boolean },
     assembler: FrameAssembler,
+    feedback: FeedbackRecorder,
   ): Promise<void> {
     const reader = wt.datagrams.readable.getReader();
     for (;;) {
       const { value, done } = await reader.read();
       if (done || !live.on) return;
+      feedback.record(value as Uint8Array, this.now());
       const frag = parseVideoDatagram(value as Uint8Array);
       if (!frag) continue; // another channel, or malformed: dropped (§Channels)
       this.recovered(assembler.push(frag), sink);

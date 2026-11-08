@@ -79,7 +79,7 @@ pub use scale_stage::ScaleStage;
 mod abr_glue;
 // The interface the ABR ladder's resolution rung drives, and the runner's manual
 // `session_display_update` path with it.
-pub(crate) use abr_glue::resolution_lever_with_echo;
+pub(crate) use abr_glue::{feedback_abr, resolution_lever_with_echo};
 pub use abr_glue::{trigger, EncodeResolutionLever, ResolutionLever};
 mod webrtc;
 pub(crate) use webrtc::restart_ice;
