@@ -77,8 +77,9 @@ export function getOrCreateDeviceKey(): string {
  * And the WebGPU verdict: a probe that timed out or got a transient null posts `false`, and the
  * next load's real answer differs from the stamp, so it re-posts instead of settling for a day
  * (quasar-protocol#29 item 26).
+ * v5 (#1043): the WebCodecs verdict proves HEVC and AV1 at 4K too, so every v4 stamp posts once.
  */
-const DEVICE_POST_STORAGE_KEY = "quasar_device_posted_v4";
+const DEVICE_POST_STORAGE_KEY = "quasar_device_posted_v5";
 const DEVICE_POST_TTL_MS = 24 * 60 * 60 * 1000;
 
 export function deviceProbeIsFresh(userId: string, h264: boolean, webgpu: boolean, now: number = Date.now()): boolean {
@@ -237,8 +238,18 @@ export interface WebCodecsProbe {
   opus_encode: boolean;
 }
 
-/** Amendment 54's `webcodecs` key: `true` only when `isConfigSupported` proved the
- *  configuration the WebTransport path would use. */
+/** The decoder strings the WebTransport path configures with (`decodeStage.ts`): what the agent's
+ *  descriptions yield for a Main-profile stream, at the top level each can carry. */
+const WEBCODECS_PROBES = {
+  h264: ["avc1.42e01f", [[1920, 1080]]],
+  hevc: ["hvc1.1.6.L153.B0", [[1920, 1080], [3840, 2160]]],
+  av1: ["av01.0.13M.08", [[1920, 1080], [3840, 2160]]],
+} as const;
+
+/** Amendment 54's `webcodecs` key, in the catalog codec spelling: `true` only when
+ *  `isConfigSupported` passes for every size the planner can pick for that codec, so a device
+ *  that decodes 1080p but not 4K stays on WebRTC for HEVC and AV1. Any throw or absent API is
+ *  `false`. */
 export async function probeWebCodecs(): Promise<WebCodecsProbe> {
   const supported = async (check: () => Promise<{ supported?: boolean }> | undefined) => {
     try {
@@ -247,15 +258,24 @@ export async function probeWebCodecs(): Promise<WebCodecsProbe> {
       return false;
     }
   };
-  const video = (codec: string) => () =>
-    typeof VideoDecoder === "function"
-      ? VideoDecoder.isConfigSupported({ codec, codedWidth: 1920, codedHeight: 1080 })
-      : undefined;
+  const video = async (codec: keyof typeof WEBCODECS_PROBES) => {
+    const [string, sizes] = WEBCODECS_PROBES[codec];
+    const each = await Promise.all(
+      sizes.map(([codedWidth, codedHeight]) =>
+        supported(() =>
+          typeof VideoDecoder === "function"
+            ? VideoDecoder.isConfigSupported({ codec: string, codedWidth, codedHeight })
+            : undefined,
+        ),
+      ),
+    );
+    return each.every(Boolean);
+  };
   const opus = { codec: "opus", sampleRate: 48000, numberOfChannels: 2 };
   const [h264, hevc, av1, opus_decode, opus_encode] = await Promise.all([
-    supported(video("avc1.42e01f")),
-    supported(video("hvc1.1.6.L93.B0")),
-    supported(video("av01.0.08M.08")),
+    video("h264"),
+    video("hevc"),
+    video("av1"),
     supported(() => (typeof AudioDecoder === "function" ? AudioDecoder.isConfigSupported(opus) : undefined)),
     supported(() => (typeof AudioEncoder === "function" ? AudioEncoder.isConfigSupported(opus) : undefined)),
   ]);

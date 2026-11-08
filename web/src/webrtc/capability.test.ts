@@ -10,8 +10,8 @@ import {
   markDeviceProbePosted,
   probeCapabilities,
   probeRegion,
-  probeFeatures,
   probeWebCodecs,
+  probeFeatures,
   type DeviceCapabilities,
   type NativeCapabilities,
 } from "./capability";
@@ -294,6 +294,62 @@ describe("probeRegion", () => {
   });
 });
 
+describe("probeWebCodecs (#1043)", () => {
+  type Config = { codec: string; codedWidth?: number; codedHeight?: number };
+  const stub = (video: (c: Config) => unknown, audio: unknown = { supported: true }) => {
+    const seen: Config[] = [];
+    const decoder = (isConfigSupported: unknown) => Object.assign(function Decoder() {}, { isConfigSupported });
+    vi.stubGlobal("VideoDecoder", decoder((c: Config) => (seen.push(c), video(c))));
+    vi.stubGlobal("AudioDecoder", decoder(async () => audio));
+    vi.stubGlobal("AudioEncoder", decoder(async () => audio));
+    return seen;
+  };
+  const all = { h264: true, hevc: true, av1: true, opus_decode: true, opus_encode: true };
+
+  it("reports every codec the browser proves, with the strings and sizes the client uses", async () => {
+    const seen = stub(async () => ({ supported: true }));
+    expect(await probeWebCodecs()).toEqual(all);
+    expect(seen.map((c) => `${c.codec} ${c.codedWidth}x${c.codedHeight}`).sort()).toEqual([
+      "av01.0.13M.08 1920x1080",
+      "av01.0.13M.08 3840x2160",
+      "avc1.42e01f 1920x1080",
+      "hvc1.1.6.L153.B0 1920x1080",
+      "hvc1.1.6.L153.B0 3840x2160",
+    ]);
+  });
+
+  it("reports a codec the browser refuses as false, and leaves the others", async () => {
+    stub(async (c) => ({ supported: !c.codec.startsWith("hvc1") }));
+    expect(await probeWebCodecs()).toEqual({ ...all, hevc: false });
+  });
+
+  it("needs every size: a device that decodes AV1 at 1080p but not 4K stays false", async () => {
+    stub(async (c) => ({ supported: !(c.codec.startsWith("av01") && c.codedHeight === 2160) }));
+    expect(await probeWebCodecs()).toEqual({ ...all, av1: false });
+  });
+
+  it("reads a rejected or thrown probe as false, never an error", async () => {
+    stub((c) => {
+      if (c.codec.startsWith("hvc1")) return Promise.reject(new Error("NotSupportedError"));
+      if (c.codec.startsWith("av01")) throw new TypeError("bad config");
+      return Promise.resolve({ supported: true });
+    });
+    expect(await probeWebCodecs()).toEqual({ ...all, hevc: false, av1: false });
+  });
+
+  it("reports nothing where WebCodecs does not exist", async () => {
+    vi.stubGlobal("VideoDecoder", undefined);
+    vi.stubGlobal("AudioDecoder", undefined);
+    vi.stubGlobal("AudioEncoder", undefined);
+    expect(await probeWebCodecs()).toEqual({ h264: false, hevc: false, av1: false, opus_decode: false, opus_encode: false });
+  });
+
+  it("does not take a missing 'supported' for true", async () => {
+    stub(async () => ({}), {});
+    expect(await probeWebCodecs()).toEqual({ h264: false, hevc: false, av1: false, opus_decode: false, opus_encode: false });
+  });
+});
+
 describe("device capability post freshness", () => {
   const DAY = 24 * 60 * 60 * 1000;
 
@@ -316,6 +372,16 @@ describe("device capability post freshness", () => {
     expect(deviceProbeIsFresh("u1", false, false, 1_000_000)).toBe(true);
     expect(deviceProbeIsFresh("u1", true, false, 1_000_000)).toBe(false);
     localStorage.setItem("quasar_device_posted_v2", JSON.stringify({ user: "u1", at: 1_000_000 }));
+    expect(deviceProbeIsFresh("u1", true, false, 1_000_000)).toBe(false);
+  });
+
+  it("ignores a stamp under the previous key, so a browser posts once for the new webcodecs keys (#1043)", () => {
+    localStorage.clear();
+    markDeviceProbePosted("u1", true, false, 1_000_000);
+    const [key] = Object.keys(localStorage);
+    const stamp = localStorage.getItem(key)!;
+    localStorage.clear();
+    localStorage.setItem("quasar_device_posted_v4", stamp);
     expect(deviceProbeIsFresh("u1", true, false, 1_000_000)).toBe(false);
   });
 

@@ -8,7 +8,10 @@ import {
   MAX_DECODE_QUEUE,
   MAX_DECODE_QUEUE_HARD,
   MAX_DECODER_RESTARTS,
+  av1CodecString,
   avcCodecString,
+  codecString,
+  hevcCodecString,
 } from "./decodeStage";
 import { containRect, createWebGpuPresenter } from "./presenter";
 import { avcC, bytes, FakeChunk, FakeDecoder, fakeFrame, flush, packetize, type FakeFrame, type UnitSpec } from "./testSupport";
@@ -364,6 +367,52 @@ describe("DecodeStage", () => {
 
   it("names the H.264 codec from the avcC", () => {
     expect(avcCodecString(avcC(0x34))).toBe("avc1.42e034");
+  });
+
+  /** An hvcC record: profile space/tier/idc byte, compat flags, six constraint bytes, level. */
+  const hvcC = (profileByte: number, compat: number, constraint0: number, level: number) => {
+    const r = new Uint8Array(23);
+    r[0] = 1;
+    r[1] = profileByte;
+    new DataView(r.buffer).setUint32(2, compat);
+    r[6] = constraint0;
+    r[12] = level;
+    r[21] = 0x03;
+    return r;
+  };
+
+  it("names the HEVC codec from the hvcC", () => {
+    expect(hevcCodecString(hvcC(0x01, 0x60000000, 0xb0, 93))).toBe("hvc1.1.6.L93.B0");
+    expect(hevcCodecString(hvcC(0x02, 0x20000000, 0xb0, 120))).toBe("hvc1.2.4.L120.B0");
+    expect(hevcCodecString(hvcC(0x21, 0x60000000, 0, 153))).toBe("hvc1.1.6.H153");
+    expect(codecString({ codec: "h265", description: hvcC(0x01, 0x60000000, 0xb0, 93) })).toBe("hvc1.1.6.L93.B0");
+  });
+
+  it("names the AV1 codec from the av1C, or the vetted Main 8-bit level 5.1 string without one", () => {
+    expect(av1CodecString(Uint8Array.of(0x81, 0x08, 0x0c, 0))).toBe("av01.0.08M.08");
+    expect(av1CodecString(Uint8Array.of(0x81, 0x4d, 0x6c, 0))).toBe("av01.2.13M.12");
+    expect(av1CodecString(Uint8Array.of(0x81, 0x11, 0x4c, 0))).toBe("av01.0.17M.10");
+    expect(av1CodecString(Uint8Array.of(0x81, 0x11, 0x8c, 0))).toBe("av01.0.17H.08");
+    expect(codecString({ codec: "av1", description: new Uint8Array(0) })).toBe("av01.0.13M.08");
+    expect(codecString({ codec: "h264", description: avcC(0x34) })).toBe("avc1.42e034");
+    expect(codecString({ codec: "vp9", description: new Uint8Array(0) })).toBe("vp9");
+  });
+
+  it("configures the decoder with the negotiated codec's string, and no description for an AV1 without one", async () => {
+    const hevc = stage();
+    const description = hvcC(0x01, 0x60000000, 0xb0, 93);
+    hevc.s.config({ ...config(0), codec: "h265", description });
+    await flush();
+    expect(hevc.decoders[0].configs[0]).toMatchObject({ codec: "hvc1.1.6.L93.B0", codedWidth: 1280 });
+    expect(Array.from(hevc.decoders[0].configs[0].description as Uint8Array)).toEqual(Array.from(description));
+
+    const av1 = stage();
+    av1.s.config({ ...config(0), codec: "av1", description: new Uint8Array(0) });
+    await flush();
+    expect(av1.decoders[0].configs[0]).toMatchObject({ codec: "av01.0.13M.08" });
+    expect("description" in av1.decoders[0].configs[0]).toBe(false);
+    av1.s.unit(unit(0, 1, true));
+    expect(av1.decoders[0].chunks).toHaveLength(1);
   });
 
   it("drops a delta before the first keyframe and asks for one, once", async () => {
