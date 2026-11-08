@@ -124,6 +124,10 @@ pub(crate) fn build_video_source(
         .property("caps", &tail_caps)
         .build()
         .context("capsfilter not found")?;
+    // The encode pipeline cannot see this colorimetry in its own caps: it asks (#1104).
+    if let Some(pad) = tail.static_pad("src") {
+        super::pyrowave_branch::answer_colorimetry_queries(&pad);
+    }
 
     match cfg.encoder {
         // NVENC N-A: the compositor emits memory:CUDAMemory BGRA at the session WxH (it

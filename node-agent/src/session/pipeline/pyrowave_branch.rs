@@ -150,6 +150,60 @@ impl Drop for Encoder {
 
 type OnError = Arc<dyn Fn(String) + Send + Sync>;
 
+/// The context query the encode pipeline asks across the interpipe for the colorimetry the
+/// source negotiated: the encode pipeline's own caps are the interpipesrc's, which say none.
+pub(crate) const SOURCE_COLORIMETRY: &str = "quasar.source-colorimetry";
+
+/// Answer [`SOURCE_COLORIMETRY`] queries reaching `pad` (the source's last src pad) with its
+/// negotiated colorimetry.
+pub(crate) fn answer_colorimetry_queries(pad: &gst::Pad) {
+    pad.add_probe(gst::PadProbeType::QUERY_UPSTREAM, |pad, info| {
+        let Some(gst::PadProbeData::Query(q)) = info.data.as_mut() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let gst::QueryViewMut::Context(q) = q.view_mut() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        if q.context_type() != SOURCE_COLORIMETRY {
+            return gst::PadProbeReturn::Ok;
+        }
+        let colorimetry = pad
+            .current_caps()
+            .and_then(|c| c.structure(0)?.get::<String>("colorimetry").ok());
+        let mut context = gst::Context::new(SOURCE_COLORIMETRY, false);
+        if let Some(c) = colorimetry {
+            context
+                .get_mut()
+                .unwrap()
+                .structure_mut()
+                .set("colorimetry", c);
+        }
+        q.set_context(&context);
+        gst::PadProbeReturn::Handled
+    });
+}
+
+/// The colorimetry of the source `pad`'s frames come from, when it says.
+fn source_colorimetry(pad: &gst::Pad) -> Option<String> {
+    let mut q = gst::query::Context::new(SOURCE_COLORIMETRY);
+    if !pad.query(&mut q) {
+        return None;
+    }
+    q.context()?.structure().get::<String>("colorimetry").ok()
+}
+
+/// `caps` with the source's colorimetry, when it said one.
+fn with_colorimetry(caps: gst::Caps, colorimetry: Option<String>) -> gst::Caps {
+    match colorimetry {
+        Some(c) => {
+            let mut caps = caps;
+            caps.make_mut().set("colorimetry", c);
+            caps
+        }
+        None => caps,
+    }
+}
+
 /// The frames `pyrowaveenc` can take with no copy: NV12 Vulkan images it accepts as they are
 /// (BT.709, centre-sited). The colorimetry must be stated: untagged NV12 reads as BT.709 at
 /// HD sizes, but an untagged compositor converts with BT.601.
@@ -318,6 +372,8 @@ fn start_with(
         .context("could not answer context queries")?;
     let download = download.map(|d| d.downgrade());
     let weak_enc = enc.downgrade();
+    // The frames' caps with the source's colorimetry, decided by the start thread.
+    let sample_caps: Arc<Mutex<Option<gst::Caps>>> = Arc::default();
     let starting = Arc::new(AtomicBool::new(false));
     let started = Arc::new(AtomicBool::new(false));
     let was_open = AtomicBool::new(false);
@@ -348,8 +404,9 @@ fn start_with(
                         started: started.clone(),
                         stopped: start_stopped.clone(),
                         on_error: on_error.clone(),
+                        sample_caps: sample_caps.clone(),
                     };
-                    start_off_thread(pad, pad.current_caps(), start);
+                    start_off_thread(pad, start);
                 }
                 return gst::PadProbeReturn::Ok;
             }
@@ -360,7 +417,11 @@ fn start_with(
                 return gst::PadProbeReturn::Ok;
             }
             let mut sample = gst::Sample::builder().buffer(buffer);
-            let caps = pad.current_caps();
+            let decided = sample_caps
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let caps = decided.or_else(|| pad.current_caps());
             if let Some(caps) = &caps {
                 sample = sample.caps(caps);
             }
@@ -450,6 +511,7 @@ struct Start {
     /// [download →] convert → caps, linked between `src` and `enc` unless the frames are
     /// [`zero_copy`].
     cpu: Vec<gst::Element>,
+    sample_caps: Arc<Mutex<Option<gst::Caps>>>,
     download: Option<glib::WeakRef<gst::Element>>,
     contexts: Arc<Mutex<Vec<gst::Context>>>,
     started: Arc<AtomicBool>,
@@ -460,10 +522,11 @@ struct Start {
 /// Start the PyroWave pipeline on a thread of its own: a state change and a device open must
 /// not hold the encode thread. PAUSED first, so the download's device is checked before any
 /// frame reaches it.
-fn start_off_thread(pad: &gst::Pad, caps: Option<gst::Caps>, start: Start) {
+fn start_off_thread(pad: &gst::Pad, start: Start) {
     let (Some(pipeline), encode) = (start.pipeline.upgrade(), pipeline_of(pad)) else {
         return;
     };
+    let pad = pad.clone();
     let fail = start.on_error.clone();
     let spawned = std::thread::Builder::new()
         .name("quasar-pw-start".into())
@@ -477,6 +540,10 @@ fn start_off_thread(pad: &gst::Pad, caps: Option<gst::Caps>, start: Start) {
             if *stopped {
                 return;
             }
+            let caps = pad
+                .current_caps()
+                .map(|c| with_colorimetry(c, source_colorimetry(&pad)));
+            *start.sample_caps.lock().unwrap_or_else(|e| e.into_inner()) = caps.clone();
             // QUASAR_PYROWAVE_CPU_INPUT=1 keeps the CPU path: an escape hatch, and an A/B.
             let zero =
                 zero_copy(caps.as_ref()) && !crate::session::env_bool("QUASAR_PYROWAVE_CPU_INPUT");
@@ -538,6 +605,32 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_feed_learns_the_colorimetry_the_source_negotiated() {
+        gst::init().unwrap();
+        let p = gst::parse::launch(
+            "videotestsrc is-live=true ! capsfilter name=tail \
+             caps=video/x-raw,format=NV12,width=64,height=48,colorimetry=bt601 ! \
+             capsfilter caps=video/x-raw,format=NV12,width=64,height=48 ! queue name=q ! \
+             fakesink",
+        )
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let bin = p.upcast_ref::<gst::Bin>();
+        let tail = bin.by_name("tail").unwrap().static_pad("src").unwrap();
+        let feed = bin.by_name("q").unwrap().static_pad("src").unwrap();
+        assert_eq!(source_colorimetry(&feed), None, "nobody answers yet");
+        answer_colorimetry_queries(&tail);
+        p.set_state(gst::State::Playing).unwrap();
+        wait_until("negotiated", || feed.current_caps().is_some());
+        let said = source_colorimetry(&feed);
+        p.set_state(gst::State::Null).unwrap();
+        assert_eq!(said.as_deref(), Some("bt601"));
+        let caps = with_colorimetry(feed.current_caps().unwrap_or_else(raw), said);
+        assert!(!zero_copy(Some(&caps)), "BT.601 takes the CPU path");
+    }
 
     #[test]
     fn the_feed_downloads_gpu_memory_and_refuses_what_it_cannot() {
