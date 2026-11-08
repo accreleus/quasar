@@ -932,6 +932,68 @@ func TestParkOnExitParksTheHeldRuntime(t *testing.T) {
 	}
 }
 
+// #1163: only WebRTC plays park on exit. Every park is inserted with the
+// transport column's WebRTC default, and no restream moves a runtime between
+// transports (#1161), so a WebTransport launch could never adopt a park a
+// WebTransport play left behind. Such a play releases its runtime instead, and
+// Steam stops with it; a WebRTC play still parks.
+func TestParkOnExitIsWebRTCOnly(t *testing.T) {
+	t.Run("a WebRTC play still parks", func(t *testing.T) {
+		f := newWarmFixture(t, 4)
+		play := f.runningTile(t)
+		f.coord.AgentState(context.Background(), f.hostID, heldStop(play))
+		if n := countParked(t, f.pool); n != 1 {
+			t.Fatalf("parked rows = %d, want the WebRTC play's park", n)
+		}
+		if k := f.parkedID(t); k == "" || f.disp.assignFor(t, k).AdoptSessionID != play {
+			t.Fatalf("park = %q, want a parked row adopting %s", k, play)
+		}
+	})
+
+	t.Run("a WebTransport play does not park", func(t *testing.T) {
+		f := newWarmFixture(t, 4)
+		play := f.runningWebTransportTile(t)
+		f.coord.AgentState(context.Background(), f.hostID, heldStop(play))
+		if got := readRow(t, f.pool, play); got.State != "stopped" || got.StopReason != stopReasonRuntimeReleased {
+			t.Fatalf("play row %+v, want stopped / %s", got, stopReasonRuntimeReleased)
+		}
+		if n := countParked(t, f.pool); n != 0 {
+			t.Fatalf("parked rows = %d, want none: no launch can adopt a WebTransport play's park", n)
+		}
+		if r := f.disp.stopReason(play); r != "user_requested" {
+			t.Errorf("session_stop reason = %q, want user_requested (the runtime is released, Steam stops)", r)
+		}
+	})
+}
+
+// runningWebTransportTile launches the Steam app on a WebTransport profile and
+// reports it running, as the agent would.
+func (f *warmFixture) runningWebTransportTile(t *testing.T) string {
+	t.Helper()
+	ctx := context.Background()
+	caps := `{"bandwidth_kbps":50000,"rtt_ms":5,"max_decode_height":2160,"measured_at":"` +
+		time.Now().UTC().Format(time.RFC3339) + `","codecs":{"h264":true},
+		"webtransport":{"available":true,"datagrams":true},
+		"webcodecs":{"h264":true,"opus_decode":true,"opus_encode":true}}`
+	must(t, exec(t, f.pool, `UPDATE user_devices SET capabilities = $2::jsonb WHERE id = $1::uuid`, f.deviceID, caps))
+	must(t, exec(t, f.pool, `UPDATE launch_profiles SET transport = 'webtransport'`))
+	must(t, exec(t, f.pool, `UPDATE hosts SET transports = '["webrtc","webtransport"]', wt_port = 4433,
+		wt_addresses = '["192.0.2.10"]',
+		wt_certificates = jsonb_build_array(jsonb_build_object('sha256', $2::text,
+			'not_before', now() - interval '1 day', 'not_after', now() + interval '10 days'))
+		WHERE id = $1::uuid`, f.hostID, wtCertA))
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID})
+	if err != nil {
+		t.Fatalf("WebTransport launch: %v", err)
+	}
+	if res.Session.Transport != transportWebTransport {
+		t.Fatalf("launch transport %q, want %s", res.Session.Transport, transportWebTransport)
+	}
+	f.disp.waitFor(t, "start")
+	f.running(t, res.Session.ID)
+	return res.Session.ID
+}
+
 func TestParkOnExitReleasesWhenARuleSaysNo(t *testing.T) {
 	cases := []struct {
 		name  string

@@ -41,6 +41,19 @@ func TestWireAssign(t *testing.T) {
 	}
 }
 
+func TestLaunchClaimStreamDefaultsTransportToWebRTC(t *testing.T) {
+	if got := launchClaimStream(CreateParams{}).Transport; got != transportWebRTC {
+		t.Errorf("nil claim: transport = %q, want %q", got, transportWebRTC)
+	}
+	if got := launchClaimStream(CreateParams{claim: &parkedClaim{}}).Transport; got != transportWebRTC {
+		t.Errorf("empty claim: transport = %q, want %q", got, transportWebRTC)
+	}
+	p := CreateParams{claim: &parkedClaim{transport: transportWebTransport}}
+	if got := launchClaimStream(p).Transport; got != transportWebTransport {
+		t.Errorf("claimed transport = %q, want %q", got, transportWebTransport)
+	}
+}
+
 func TestValidLaunchProgress(t *testing.T) {
 	for raw, want := range map[string]bool{
 		`{"step":"shaders","percent":0}`:       true,
@@ -105,6 +118,7 @@ func TestDecideClaim(t *testing.T) {
 		{"webtransport launch on a webrtc park (#1161)", running, with(wt), claimSupersede, causeTransportDiffers, ""},
 		{"webtransport launch, old agent", old, with(wt), claimSupersede, causeTransportDiffers, ""},
 		{"transport after the codec gate", at(func(k *parkedFacts) { k.CodecGated = true }), with(wt), claimSupersede, causeCodecUnsupported, ""},
+		{"transport before stream differs, old agent", old, with(func(s *claimStream) { wt(s); s.BitrateKbps++ }), claimSupersede, causeTransportDiffers, ""},
 		{"transport after fps", running, with(func(s *claimStream) { wt(s); s.FPS = 120 }), claimSupersede, causeFPSHigher, ""},
 		{"codec gated after fps", at(func(k *parkedFacts) { k.CodecGated = true }), with(func(s *claimStream) { s.FPS = 120 }), claimSupersede, causeFPSHigher, ""},
 		{"compat tool missing", at(func(k *parkedFacts) { k.ToolMissing = true }), park, claimSupersede, causeCompatTool, ""},
