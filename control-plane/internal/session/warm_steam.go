@@ -562,9 +562,9 @@ func readParkedFacts(ctx context.Context, q rowQuerier, k *claimedParked, p Crea
 }
 
 func launchClaimStream(p CreateParams) claimStream {
-	s := claimStream{Codec: codecOrH264(p.Codec), Width: p.Width, Height: p.Height, FPS: p.FPS,
+	s := claimStream{Codec: codecOrH264(p.Codec), Transport: transportWebRTC, Width: p.Width, Height: p.Height, FPS: p.FPS,
 		BitrateKbps: p.BitrateKbps, H264Profile: p.H264Profile, Mic: p.Mic}
-	if p.claim != nil {
+	if p.claim != nil && p.claim.transport != "" {
 		s.Transport = p.claim.transport
 	}
 	return s
@@ -903,7 +903,8 @@ func (c *Coordinator) dispatchParked(k Session) {
 // transaction: a parked row for the Steam parent on the same GPU, taking the
 // ended session's reservation and home binding (the hold follows at its first
 // report, adoptRuntime). ended is nil when the row was already terminal;
-// parked is nil for a release. With restream (adopt_restream_v1) the parked
+// parked is nil for a release, including every WebTransport play (a park is
+// WebRTC-only). With restream (adopt_restream_v1) the parked
 // row keeps the size and fps of the row the ended session adopted, the size
 // the runtime was built with (amendment 59).
 func (s *Store) endHeldPlay(ctx context.Context, hostID, sessionID string, detail *string, hostParks, restream bool) (ended, parked *Session, err error) {
@@ -932,8 +933,9 @@ func (s *Store) endHeldPlay(ctx context.Context, hostID, sessionID string, detai
 	var kind string
 	var host *string
 	var parkOnEnd bool
-	if err := tx.QueryRow(ctx, `SELECT state, kind, host_id::text, park_on_end FROM sessions WHERE id = $1::uuid FOR UPDATE`,
-		sessionID).Scan(&cur, &kind, &host, &parkOnEnd); err != nil {
+	var transport string
+	if err := tx.QueryRow(ctx, `SELECT state, kind, host_id::text, park_on_end, transport FROM sessions WHERE id = $1::uuid FOR UPDATE`,
+		sessionID).Scan(&cur, &kind, &host, &parkOnEnd, &transport); err != nil {
 		return nil, nil, fmt.Errorf("lock held session: %w", err)
 	}
 	if host == nil || *host != hostID {
@@ -956,7 +958,17 @@ func (s *Store) endHeldPlay(ctx context.Context, hostID, sessionID string, detai
 	}
 	// A stopping row was stopped by the control plane: never parked. The agent sends no stopping
 	// before a held stop (agent-api.md §session_state). park_on_end is cleared by SupersedeParked.
-	if !(w.Enabled && hostParks && cur == StateRunning && kind == KindPlay && parkOnEnd) {
+	//
+	// A WebTransport play never parks: every park is inserted with the transport column's WebRTC
+	// default and no restream moves a runtime between transports (#1161), so no WebTransport
+	// launch could ever adopt it (#1163). The runtime is released and Steam stops with it.
+	parkable := w.Enabled && hostParks && cur == StateRunning && kind == KindPlay && parkOnEnd
+	if parkable && transport == transportWebTransport {
+		slog.Info("warm steam: not parking a WebTransport play; no launch can adopt a WebRTC-only park",
+			"session_id", sessionID)
+		parkable = false
+	}
+	if !parkable {
 		if err := releaseHeld(ctx, tx, sessionID); err != nil {
 			return nil, nil, err
 		}
