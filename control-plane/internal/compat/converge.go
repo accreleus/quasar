@@ -504,10 +504,14 @@ func (c *Converger) Closed(ctx context.Context, run jobs.Run) {
 	if action == "install" && run.State == jobs.StateSucceeded && p["expected_name"] == nil && toolID != "" {
 		c.bindName(ctx, run, toolID, tag, sha, name)
 	}
-	audit.TryRecord(ctx, c.auditor, actor, "compat_tool."+action, "host", run.HostID, map[string]any{
-		"tag": tag, "sha512": sha, "host_id": run.HostID, "name": name, "state": string(run.State),
-		"reason": s["reason"], "run_id": run.ID,
-	})
+	// name and reason are the agent's own words and unbounded: a long one used to push the row
+	// past the 4096-byte details bound, which drops the whole row and logs it (erratum 25).
+	details := map[string]any{
+		"tag": tag, "sha512": sha, "host_id": run.HostID, "state": string(run.State), "run_id": run.ID,
+	}
+	audit.CapText(details, "name", name)
+	audit.CapText(details, "reason", s["reason"])
+	audit.TryRecord(ctx, c.auditor, actor, "compat_tool."+action, "host", run.HostID, details)
 }
 
 // bindName binds a tag's Steam name at its first succeeded install, in the statement that checks
@@ -543,8 +547,9 @@ func (c *Converger) bindName(ctx context.Context, run jobs.Run, toolID, tag, sha
 		return
 	}
 	if ct.RowsAffected() == 1 {
-		audit.TryRecord(ctx, c.auditor, "", "compat_tool.name_conflict", "compat_tool", toolID, map[string]any{
-			"tag": tag, "sha512": sha, "name": name, "host_id": run.HostID, "run_id": run.ID})
+		details := map[string]any{"tag": tag, "sha512": sha, "host_id": run.HostID, "run_id": run.ID}
+		audit.CapText(details, "name", name)
+		audit.TryRecord(ctx, c.auditor, "", "compat_tool.name_conflict", "compat_tool", toolID, details)
 		c.All(ctx, true)
 	}
 }

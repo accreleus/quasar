@@ -263,6 +263,42 @@ func TestAFailedInstallHoldsUntilAnAdminReleasesIt(t *testing.T) {
 	}
 }
 
+// A converge run's name and reason are the agent's own words, and both were written into the
+// audit row verbatim. A long pair renders the row past admin_activity's 4096-byte bound, so
+// boundedDetails refused it and TryRecord only logged the loss: the install and removal were
+// unaudited. Both fields must be cut to 512 bytes, on a UTF-8 boundary, and say so (erratum 25).
+func TestAConvergeAuditRowCapsTheAgentNameAndReason(t *testing.T) {
+	h := newHarness(t)
+	a := h.host("a", true)
+	id, _, _ := h.ge()
+	h.enable(id, true)
+	run := h.claim("a")[0]
+
+	// Long enough together to overflow the audit row, small enough that the run's own summary
+	// (itself capped at 4096) is still accepted: 2000 + 1998 bytes plus the JSON around them.
+	name, reason := strings.Repeat("é", 1000), strings.Repeat("€", 666)
+	h.report("a", run["run_id"].(string), "failed", map[string]any{"name": name, "reason": reason})
+
+	var gotName, gotReason string
+	var nameCut, reasonCut bool
+	if err := h.pool.QueryRow(context.Background(), `SELECT details->>'name', details->>'reason',
+		COALESCE((details->>'name_truncated')::bool, false), COALESCE((details->>'reason_truncated')::bool, false)
+		FROM admin_activity WHERE action = 'compat_tool.install' AND target_id = $1`, a).
+		Scan(&gotName, &gotReason, &nameCut, &reasonCut); err != nil {
+		t.Fatalf("no install audit row: %v", err)
+	}
+	if !nameCut || !reasonCut {
+		t.Errorf("truncated flags = %v/%v, want both true", nameCut, reasonCut)
+	}
+	if len(gotName) != 512 {
+		t.Errorf("name is %d bytes, want it cut to 512", len(gotName))
+	}
+	// 512 is not a multiple of the 3-byte euro sign, so the cut must step back to 510 bytes.
+	if len(gotReason) != 510 {
+		t.Errorf("reason is %d bytes, want 510 (the last whole rune under 512)", len(gotReason))
+	}
+}
+
 func TestATransientFailureRetriesAfterAnHour(t *testing.T) {
 	h := newHarness(t)
 	b := h.host("b", true)
