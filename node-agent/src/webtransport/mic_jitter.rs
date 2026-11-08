@@ -238,6 +238,43 @@ mod tests {
     }
 
     #[test]
+    fn the_deepest_accepted_depth_primes_and_plays_before_the_queue_limit() {
+        let t0 = Instant::now();
+        let depth = crate::session::MIC_JITTER_MAX_MS;
+        assert!(
+            (depth as usize / 10) * 2 <= MAX_QUEUED,
+            "the cap leaves the queue room to spare"
+        );
+        let mut j = Jitter::new(depth);
+        // A client sending one packet per 10 ms through the whole wait.
+        let sent = depth / 10;
+        for i in 0..sent {
+            assert!(j.push(
+                i as u16,
+                p(1),
+                t0 + Duration::from_millis(u64::from(i) * 10)
+            ));
+        }
+        assert_eq!(
+            j.tick(t0 + Duration::from_millis(u64::from(depth))),
+            Out::Packet(p(1)),
+            "primed, and nothing was thrown away"
+        );
+        assert_eq!(j.queue.len(), sent as usize - 1);
+    }
+
+    #[test]
+    fn a_depth_past_the_queue_limit_never_primes_which_is_why_the_knob_is_capped() {
+        let t0 = Instant::now();
+        let mut j = Jitter::new(2_000);
+        // 150 packets in 1.5 s: the 102nd is "far ahead" of the one nothing has played yet.
+        for i in 0..150u16 {
+            j.push(i, p(1), t0 + Duration::from_millis(u64::from(i) * 10));
+        }
+        assert_eq!(j.tick(t0 + Duration::from_millis(1_500)), Out::Wait);
+    }
+
+    #[test]
     fn a_number_far_ahead_is_a_restart_not_a_wait() {
         let t0 = Instant::now();
         let mut j = Jitter::new(20);

@@ -1179,9 +1179,14 @@ fn rtp_mtu_from(var: &str, raw: Option<&str>) -> u32 {
     }
 }
 
+/// The deepest microphone jitter buffer accepted. The WebTransport microphone queues at most
+/// 100 packets (1 s), and a buffer that fills that before it primes resets on every push and
+/// plays nothing: half of it leaves room.
+pub(crate) const MIC_JITTER_MAX_MS: u32 = 500;
+
 /// Parse `QUASAR_MIC_JITTER_MS`: unset/empty ⇒ 60 ms. Unparseable or `0` ⇒ warn and use
 /// the default; a 0 ms jitter buffer turns any reorder or late arrival into an audible
-/// gap.
+/// gap. Over [`MIC_JITTER_MAX_MS`] ⇒ warn and use that.
 fn env_mic_jitter_ms(var: &str) -> u32 {
     mic_jitter_ms_from(var, std::env::var(var).ok().as_deref())
 }
@@ -1193,6 +1198,14 @@ fn mic_jitter_ms_from(var: &str, raw: Option<&str>) -> u32 {
     match raw {
         None | Some("") => DEFAULT_MIC_JITTER_MS,
         Some(s) => match s.parse::<u32>() {
+            Ok(n) if n > MIC_JITTER_MAX_MS => {
+                tracing::warn!(
+                    token = "knob-clamped-mic-jitter-ms",
+                    "{var}={s:?} is over the {MIC_JITTER_MAX_MS} ms the microphone buffer can hold \
+                     — using {MIC_JITTER_MAX_MS} ms"
+                );
+                MIC_JITTER_MAX_MS
+            }
             Ok(n) if n > 0 => n,
             _ => {
                 tracing::warn!(
@@ -1543,6 +1556,24 @@ mod tests {
         assert_eq!(mic_jitter_ms_from(VAR, Some("75")), 75, "\"75\" ⇒ 75");
 
         assert_eq!(mic_jitter_ms_from(VAR, Some("50")), 50, "\"50\" ⇒ 50");
+
+        assert_eq!(
+            mic_jitter_ms_from(VAR, Some("500")),
+            500,
+            "the largest value is kept"
+        );
+        for over in ["501", "1000", "60000", "4294967295"] {
+            assert_eq!(
+                mic_jitter_ms_from(VAR, Some(over)),
+                MIC_JITTER_MAX_MS,
+                "{over} ⇒ clamped"
+            );
+        }
+        assert_eq!(
+            mic_jitter_ms_from(VAR, Some("4294967296")),
+            60,
+            "past u32 does not parse: default"
+        );
 
         assert_eq!(
             mic_jitter_ms_from(VAR, Some("junk")),
