@@ -422,6 +422,8 @@ function SessionPageBody() {
   // The launch's signaling token may have expired, so a fresh one is minted.
   const fallBackToWebRtc = async (reason: string) => {
     setSwitching(true);
+    // Capture went with the WebTransport connection: ask for it again once WebRTC is up.
+    autoArmedRef.current = true;
     rememberFallback(sessionId ?? "", reason);
     new TraceEventEmitter(sessionId ?? "", authToken ?? "").emitTransportFallback(reason);
     try {
@@ -948,8 +950,15 @@ function SessionPageBody() {
   const [immersive] = useState(launchImmersive);
   const autoArmedRef = useRef(immersive);
   const [clickToPlay, setClickToPlay] = useState(false);
+  // A WebTransport connection lost and rebuilt takes capture with it: arm again for the new one.
+  const wasOpenRef = useRef(false);
   useEffect(() => {
-    if (!autoArmedRef.current || !loaderInert || swapScreenUp || sessionOver) return;
+    if (webtransport && wasOpenRef.current && !channelOpen) autoArmedRef.current = true;
+    wasOpenRef.current = channelOpen;
+  }, [channelOpen, webtransport]);
+  useEffect(() => {
+    // A channel that is not open has nothing to capture for yet; stays armed.
+    if (!autoArmedRef.current || !loaderInert || !channelOpen || swapScreenUp || sessionOver) return;
     const rt = runtimeRef.current;
     if (!rt || !videoRef.current) return; // stays armed for the runtime to arrive
     autoArmedRef.current = false;
@@ -971,7 +980,7 @@ function SessionPageBody() {
       noteRawUnavailable(result);
       if (result.mode === "failed") setClickToPlay(true);
     });
-  }, [loaderInert, swapScreenUp, sessionOver, runtimeSnap, unmute, noteRawUnavailable]);
+  }, [loaderInert, channelOpen, swapScreenUp, sessionOver, runtimeSnap, unmute, noteRawUnavailable]);
   useEffect(() => {
     if (inputCaptured) setClickToPlay(false);
   }, [inputCaptured]);
