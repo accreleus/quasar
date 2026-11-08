@@ -121,6 +121,11 @@ const adminPages = {
       default: m.SourcesTab,
     }))
   ),
+  Compatibility: lazyPage(() =>
+    import("./pages/admin/library/CompatibilityTab").then((m) => ({
+      default: m.CompatibilityTab,
+    }))
+  ),
   Images: lazyPage(() =>
     import("./pages/admin/library/ImagesTab").then((m) => ({ default: m.ImagesTab }))
   ),
@@ -462,6 +467,14 @@ export function App() {
                 element={
                   <Suspended>
                     <adminPages.Sources />
+                  </Suspended>
+                }
+              />
+              <Route
+                path="compatibility"
+                element={
+                  <Suspended>
+                    <adminPages.Compatibility />
                   </Suspended>
                 }
               />

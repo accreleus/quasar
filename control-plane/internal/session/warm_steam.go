@@ -322,6 +322,7 @@ const (
 	causeSizeLarger       = "size_larger"
 	causeFPSHigher        = "fps_higher"
 	causeCodecUnsupported = "codec_unsupported"
+	causeTransportDiffers = "transport_differs"
 	causeStreamDiffers    = "stream_differs"
 	causeNoRoom           = "no_room"
 )
@@ -330,6 +331,7 @@ const (
 // never "": callers normalise the h264 default.
 type claimStream struct {
 	Codec                           string
+	Transport                       string // webrtc | webtransport
 	Width, Height, FPS, BitrateKbps int32
 	H264Profile                     string
 	Mic                             bool
@@ -402,6 +404,9 @@ func claimCheck4(parked, launch claimStream, restream, codecGated bool) (cause s
 		return causeFPSHigher, nil
 	case codecGated:
 		return causeCodecUnsupported, nil
+	// No restream moves a runtime between transports (#1161).
+	case launch.Transport != parked.Transport:
+		return causeTransportDiffers, nil
 	}
 	for _, d := range []struct {
 		name string
@@ -469,7 +474,7 @@ func readParkedFacts(ctx context.Context, q rowQuerier, k *claimedParked, p Crea
 		       k.user_id = $2::uuid AND k.app_id = $3::uuid AND k.kind = 'parked',
 		       h.status = 'online' AND h.agent_disconnected_at IS NULL
 		       AND NOT EXISTS (SELECT 1 FROM host_admission_restrictions ar WHERE ar.host_id = h.id),
-		       k.codec, k.width, k.height, k.fps, k.bitrate_kbps, k.h264_profile, k.mic
+		       k.codec, k.width, k.height, k.fps, k.bitrate_kbps, k.h264_profile, k.mic, k.transport
 		FROM sessions k JOIN gpus g ON g.id = k.gpu_id JOIN hosts h ON h.id = k.host_id
 		WHERE k.id = $1::uuid`
 	if lock {
@@ -478,13 +483,17 @@ func readParkedFacts(ctx context.Context, q rowQuerier, k *claimedParked, p Crea
 	err := q.QueryRow(ctx, sql, k.id, p.UserID, p.homeAppID(), claimedDetail).
 		Scan(&k.hostID, &k.gpuIndex, &f.State, &f.Claimed, &f.InDeadline, &f.Family, &f.HostUp,
 			&f.Stream.Codec, &f.Stream.Width, &f.Stream.Height, &f.Stream.FPS, &f.Stream.BitrateKbps,
-			&f.Stream.H264Profile, &f.Stream.Mic)
+			&f.Stream.H264Profile, &f.Stream.Mic, &f.Stream.Transport)
 	return f, err
 }
 
 func launchClaimStream(p CreateParams) claimStream {
-	return claimStream{Codec: codecOrH264(p.Codec), Width: p.Width, Height: p.Height, FPS: p.FPS,
+	s := claimStream{Codec: codecOrH264(p.Codec), Width: p.Width, Height: p.Height, FPS: p.FPS,
 		BitrateKbps: p.BitrateKbps, H264Profile: p.H264Profile, Mic: p.Mic}
+	if p.claim != nil {
+		s.Transport = p.claim.transport
+	}
+	return s
 }
 
 // codecGatedCause is the cause a launch whose codec the parked GPU cannot encode
@@ -564,8 +573,17 @@ func orNil(v string) any {
 // stopParkedWhere moves the matching live parked rows to `stopping` with
 // reason, in one statement.
 func (s *Store) stopParkedWhere(ctx context.Context, reason string, f parkedFilter) ([]parkedStop, error) {
-	rows, err := s.pool.Query(ctx, `UPDATE sessions SET state = 'stopping', state_detail = 'stop requested',
-		    stop_reason = COALESCE(stop_reason, $1), launch_progress = NULL
+	return stopParkedIn(ctx, s.pool, reason, f)
+}
+
+// querier is the Query half of a pool or a transaction.
+type querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+func stopParkedIn(ctx context.Context, q querier, reason string, f parkedFilter) ([]parkedStop, error) {
+	// The CTE locks the rows in id order, so two writers stopping overlapping sets cannot deadlock.
+	rows, err := q.Query(ctx, `WITH t AS (SELECT id FROM sessions
 		WHERE kind = 'parked' AND state IN ('pending','assigned','starting','running')
 		  AND ($2::uuid IS NULL OR id = $2::uuid)
 		  AND ($3::uuid IS NULL OR host_id = $3::uuid)
@@ -579,7 +597,11 @@ func (s *Store) stopParkedWhere(ctx context.Context, reason string, f parkedFilt
 		          AND u.max_concurrent_sessions > 0
 		          AND EXISTS (SELECT 1 FROM entitlements e WHERE e.app_id = a.id
 		                AND (e.subject_type = 'all' OR (e.subject_type = 'user' AND e.subject_id = sessions.user_id)))))
-		RETURNING id::text, COALESCE(host_id::text, ''), user_id::text`,
+		ORDER BY id FOR UPDATE)
+		UPDATE sessions SET state = 'stopping', state_detail = 'stop requested',
+		    stop_reason = COALESCE(stop_reason, $1), launch_progress = NULL
+		FROM t WHERE sessions.id = t.id
+		RETURNING sessions.id::text, COALESCE(sessions.host_id::text, ''), sessions.user_id::text`,
 		reason, orNil(f.ID), orNil(f.HostID), orNil(f.UserID), orNil(f.ExceptApp), f.Expired, f.Unqualified)
 	if err != nil {
 		return nil, fmt.Errorf("stop parked sessions: %w", err)
@@ -630,6 +652,42 @@ func (c *Coordinator) ExpireParked(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	return c.stopParked(ctx, StopReasonParkedExpired, parkedFilter{Expired: w.Enabled})
+}
+
+// betweenParkOnEndClears is a test seam: it runs after the first clear, before the parked stop, where a claim can still commit.
+var betweenParkOnEndClears func()
+
+// SupersedeParked makes sure no Steam that predates an effective mapping change survives it, inside
+// tx: it clears park_on_end on the live play sessions, stops every live parked session, then clears
+// park_on_end again. A park made from a play session that ends, and a play that claims a parked
+// session, are each caught by the statement that starts after they commit. The returned func sends
+// the stops after the commit; there is no warm-start suppression, so the next heartbeat re-parks on
+// the new mapping. semantics: control-api.md §Compatibility tools, "Hot Loading".
+func (c *Coordinator) SupersedeParked(ctx context.Context, tx pgx.Tx) (func(), error) {
+	if err := noParkOnEnd(ctx, tx); err != nil {
+		return nil, err
+	}
+	if betweenParkOnEndClears != nil {
+		betweenParkOnEndClears()
+	}
+	stops, err := stopParkedIn(ctx, tx, StopReasonParkedSuperseded, parkedFilter{})
+	if err != nil {
+		return nil, err
+	}
+	if err := noParkOnEnd(ctx, tx); err != nil {
+		return nil, err
+	}
+	return func() { c.sendParkedStops(stops, StopReasonParkedSuperseded) }, nil
+}
+
+// noParkOnEnd locks the live play sessions in id order and stops endHeldPlay from parking them.
+func noParkOnEnd(ctx context.Context, tx pgx.Tx) error {
+	if _, err := tx.Exec(ctx, `WITH t AS (SELECT id FROM sessions
+		WHERE kind = 'play' AND park_on_end AND state NOT IN ('stopped','failed') ORDER BY id FOR UPDATE)
+		UPDATE sessions SET park_on_end = false FROM t WHERE sessions.id = t.id`); err != nil {
+		return fmt.Errorf("clear park on end: %w", err)
+	}
+	return nil
 }
 
 // StopParkedOnHost stops a host's parked sessions as a drain or an apply
@@ -798,8 +856,9 @@ func (s *Store) endHeldPlay(ctx context.Context, hostID, sessionID string, detai
 	var cur State
 	var kind string
 	var host *string
-	if err := tx.QueryRow(ctx, `SELECT state, kind, host_id::text FROM sessions WHERE id = $1::uuid FOR UPDATE`,
-		sessionID).Scan(&cur, &kind, &host); err != nil {
+	var parkOnEnd bool
+	if err := tx.QueryRow(ctx, `SELECT state, kind, host_id::text, park_on_end FROM sessions WHERE id = $1::uuid FOR UPDATE`,
+		sessionID).Scan(&cur, &kind, &host, &parkOnEnd); err != nil {
 		return nil, nil, fmt.Errorf("lock held session: %w", err)
 	}
 	if host == nil || *host != hostID {
@@ -820,9 +879,9 @@ func (s *Store) endHeldPlay(ctx context.Context, hostID, sessionID string, detai
 	if err != nil {
 		return nil, nil, err
 	}
-	// A stopping row was stopped by the control plane: never parked. The agent
-	// sends no stopping before a held stop (agent-api.md §session_state).
-	if !(w.Enabled && hostParks && cur == StateRunning && kind == KindPlay) {
+	// A stopping row was stopped by the control plane: never parked. The agent sends no stopping
+	// before a held stop (agent-api.md §session_state). park_on_end is cleared by SupersedeParked.
+	if !(w.Enabled && hostParks && cur == StateRunning && kind == KindPlay && parkOnEnd) {
 		if err := releaseHeld(ctx, tx, sessionID); err != nil {
 			return nil, nil, err
 		}

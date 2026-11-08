@@ -7,6 +7,7 @@ import {
   TOKEN_REFRESH_AGE_MS,
   WebTransportMedia,
 } from "./webTransportMedia";
+import type { InputMsg } from "../input/inputSender";
 import type { Presenter } from "./presenter";
 import { TransportError, type MediaSink, type MediaTransport } from "./transport";
 import { createWebTransportRuntime } from "../pages/app/webTransportRuntime";
@@ -255,7 +256,7 @@ describe("createWebTransportRuntime", () => {
       sessionId: "s1",
       authToken: "auth",
       coords: COORDS,
-      canvas: {} as HTMLCanvasElement,
+      canvas: document.createElement("canvas"),
       callbacks,
       deps: {
         createTransport: (o) => new WebTransportMedia({ ...o, createWebTransport: agent.create, sleep: async () => {} }),
@@ -383,7 +384,7 @@ describe("createWebTransportRuntime", () => {
       sessionId: "s1",
       authToken: "auth",
       coords: COORDS,
-      canvas: {} as HTMLCanvasElement,
+      canvas: document.createElement("canvas"),
       callbacks,
       deps: { createTransport, createPresenter: () => Promise.reject(new Error("requestDevice failed")) },
     });
@@ -402,7 +403,7 @@ describe("createWebTransportRuntime", () => {
       sessionId: "s1",
       authToken: "auth",
       coords: COORDS,
-      canvas: {} as HTMLCanvasElement,
+      canvas: document.createElement("canvas"),
       callbacks,
       deps: {
         createTransport,
@@ -428,6 +429,7 @@ describe("createWebTransportRuntime", () => {
         return new Promise((_, reject) => (refuse = reject));
       },
       requestKeyframe: () => {},
+      input: { reliable: () => {}, datagram: () => false },
       close: () => {},
     };
     const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn(), onFallback: vi.fn() };
@@ -437,7 +439,7 @@ describe("createWebTransportRuntime", () => {
         sessionId: "s1",
         authToken: "auth",
         coords: COORDS,
-        canvas: {} as HTMLCanvasElement,
+        canvas: document.createElement("canvas"),
         callbacks,
         deps: { createTransport: () => fake, createPresenter: async () => presenter },
       });
@@ -467,7 +469,7 @@ describe("createWebTransportRuntime", () => {
       sessionId: "s1",
       authToken: "auth",
       coords: COORDS,
-      canvas: {} as HTMLCanvasElement,
+      canvas: document.createElement("canvas"),
       callbacks,
       deps: {
         createTransport: (o) => new WebTransportMedia({ ...o, createWebTransport: agent.create, sleep: async () => {} }),
@@ -522,6 +524,8 @@ describe("WebTransportMedia unreachable agent", () => {
 
 describe("createWebTransportRuntime fallback", () => {
   function setup() {
+    /** One per connection the runtime brought up; `sendInput` is what that capture sends with. */
+    const captures: { sendInput: (m: InputMsg) => void; cleanup: ReturnType<typeof vi.fn>; engage: ReturnType<typeof vi.fn> }[] = [];
     const agent = new FakeAgent();
     agent.replies = [[helloAck(0, avcC())]];
     const presenter: Presenter = { present: (f) => (f.close(), true), destroy: vi.fn() };
@@ -530,7 +534,7 @@ describe("createWebTransportRuntime fallback", () => {
       sessionId: "s1",
       authToken: "auth",
       coords: COORDS,
-      canvas: {} as HTMLCanvasElement,
+      canvas: document.createElement("canvas"),
       callbacks,
       deps: {
         createTransport: (o) => new WebTransportMedia({ ...o, createWebTransport: agent.create, sleep: async () => {} }),
@@ -539,9 +543,14 @@ describe("createWebTransportRuntime fallback", () => {
           createDecoder: (init) => new FakeDecoder(init) as unknown as VideoDecoder,
           isConfigSupported: async (c) => ({ supported: true, config: c }),
         },
+        setupCapture: ((o: { sendInput: (m: InputMsg) => void }) => {
+          const c = { sendInput: o.sendInput, cleanup: vi.fn(), engage: vi.fn(() => null), release: vi.fn(), syncKeyboardLock: vi.fn(), setMouse: vi.fn() };
+          captures.push(c);
+          return c;
+        }) as never,
       },
     });
-    return { agent, callbacks, rt };
+    return { agent, callbacks, rt, captures };
   }
 
   beforeEach(() => {
@@ -657,7 +666,7 @@ describe("createWebTransportRuntime fallback", () => {
       sessionId: "s1",
       authToken: "auth",
       coords: COORDS,
-      canvas: {} as HTMLCanvasElement,
+      canvas: document.createElement("canvas"),
       callbacks,
       deps: {
         createTransport: (o) => new WebTransportMedia({ ...o, createWebTransport: agent.create, sleep: async () => {} }),
@@ -690,13 +699,14 @@ describe("createWebTransportRuntime fallback", () => {
     const fake: MediaTransport = {
       connect: async (s) => void (sink = s),
       requestKeyframe: () => {},
+      input: { reliable: () => {}, datagram: () => false },
       close: () => void order.push("close"),
     };
     const rt = createWebTransportRuntime({
       sessionId: "s1",
       authToken: "auth",
       coords: COORDS,
-      canvas: {} as HTMLCanvasElement,
+      canvas: document.createElement("canvas"),
       callbacks: {
         onDisconnectSuspected: () => {},
         onSessionTakenOver: () => {},
@@ -722,5 +732,61 @@ describe("createWebTransportRuntime fallback", () => {
       await vi.waitFor(() => expect(callbacks.onTransportFailed.mock.calls.length + callbacks.onSessionTakenOver.mock.calls.length).toBe(1));
       expect(callbacks.onFallback).not.toHaveBeenCalled();
     }
+  });
+
+  const key = { t: "k", c: "KeyA", d: 1 } as InputMsg;
+  const inputs = (agent: FakeAgent) => agent.received.filter((m) => m.type === "input");
+
+  it("rebuilds input capture on a reconnect: the old one is released, the new one sends on the new connection", async () => {
+    const { agent, rt, captures } = setup();
+    rt.start();
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    expect(captures).toHaveLength(1);
+    captures[0].sendInput(key);
+    await vi.waitFor(() => expect(inputs(agent)).toHaveLength(1));
+
+    agent.last.closeWith(4400);
+    await vi.waitFor(() => expect(captures).toHaveLength(2));
+    expect(captures[0].cleanup).toHaveBeenCalledTimes(1);
+    expect(captures[1].cleanup).not.toHaveBeenCalled();
+    expect(agent.conns).toHaveLength(2);
+
+    // A late handler of the old capture reaches nothing; the new one reaches the new connection.
+    captures[0].sendInput(key);
+    await flush();
+    expect(inputs(agent)).toHaveLength(1);
+    captures[1].sendInput({ t: "k", c: "KeyB", d: 1 } as InputMsg);
+    await vi.waitFor(() => expect(inputs(agent)).toHaveLength(2));
+    expect(inputs(agent)[1]).toEqual({ type: "input", event: { t: "k", c: "KeyB", d: 1 } });
+    expect(rt.engage()).toBeNull();
+    expect(captures[1].engage).toHaveBeenCalled();
+    expect(captures[0].engage).not.toHaveBeenCalled();
+  });
+
+  it("tears input capture down on fallback: nothing is sent over the dead connection and the page sees no capture", async () => {
+    const { agent, callbacks, rt, captures } = setup();
+    rt.start();
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    agent.last.closeWith(4400); // first loss: one reconnect
+    await vi.waitFor(() => expect(captures).toHaveLength(2));
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    agent.last.closeWith(4400); // second loss: fallback, from a connection with a live capture
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost"));
+    expect(captures[1].cleanup).toHaveBeenCalledTimes(1);
+    const before = inputs(agent).length;
+    captures[1].sendInput(key);
+    await flush();
+    expect(inputs(agent)).toHaveLength(before);
+    expect(rt.engage()).toBeNull();
+    expect(captures[1].engage).not.toHaveBeenCalled();
+    expect(rt.getSnapshot()).toMatchObject({ inputCaptured: false, pointerLocked: false, channelOpen: false });
+  });
+
+  it("builds no capture for a connection that never came up", async () => {
+    const { agent, callbacks, rt, captures } = setup();
+    agent.refuseHandshake = true;
+    rt.start();
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("connect_failed"));
+    expect(captures).toHaveLength(0);
   });
 });

@@ -3,9 +3,9 @@
 //! session's client authenticates with a single-use token the control plane minted and
 //! then gets the session's video as datagrams.
 //!
-//! Not here yet, each a later ticket: audio, microphone and input datagrams, ping and
-//! pong, NACK and its retransmit buffer, FEC, receiver feedback and congestion control,
-//! and takeover across transports (a new client replaces the last one; nothing bounds it).
+//! Not here yet, each a later ticket: audio, microphone, NACK and its retransmit buffer,
+//! FEC, receiver feedback and congestion control, and takeover across transports (a new
+//! client replaces the last one; nothing bounds it).
 
 mod cert;
 mod media;
@@ -14,6 +14,7 @@ mod tests;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
@@ -42,6 +43,11 @@ const DEFAULT_PER_SOURCE: usize = 4;
 const MIN_DATAGRAM: usize = 1100;
 /// How long an authenticated client may hold up one write on its control stream.
 const CONTROL_WRITE: Duration = Duration::from_secs(2);
+/// Nothing received on the control stream for this long means the client is gone
+/// (§Bye and error); the client pings once a second.
+const CONTROL_IDLE: Duration = Duration::from_secs(10);
+/// The input datagram channel (§Channels).
+const CHANNEL_INPUT: u8 = 0x03;
 /// The longest prefix of a client-supplied id that reaches a log line.
 const LOGGED_ID: usize = 64;
 const TOKEN_SKEW: Duration = Duration::from_secs(15);
@@ -54,6 +60,39 @@ const CLOSE_PROTOCOL: u32 = 4400;
 const CLOSE_AUTH: u32 = 4401;
 const CLOSE_ENDED: u32 = 4404;
 const CLOSE_TAKEN_OVER: u32 = 4410;
+
+/// Where a session's client input goes: the same `input::handle` the WebRTC data channel
+/// feeds, so both transports inject identically. A seam so a test can watch what arrives.
+#[derive(Clone)]
+pub(crate) struct Input {
+    /// One `input.md` event as JSON text, from a datagram or the control stream.
+    pub(crate) event: Arc<dyn Fn(&str) + Send + Sync>,
+    /// The client left: lift every key, button and stick it held.
+    pub(crate) release_all: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl Input {
+    pub(crate) fn devices(
+        devices: Option<Arc<crate::session::virtual_input::VirtualDevices>>,
+        state: Arc<crate::session::input::InputState>,
+        width: i32,
+        height: i32,
+    ) -> Self {
+        use crate::session::input::{handle, InputSink};
+        let sink = devices.clone().map_or(InputSink::None, InputSink::Virtual);
+        Self {
+            event: Arc::new(move |json| handle(json, &sink, &state, width, height)),
+            release_all: Arc::new(move || {
+                if let Some(Err(e)) = devices.as_ref().map(|d| d.release_all()) {
+                    tracing::warn!(
+                        token = "webtransport-release-all-failed",
+                        "release_all on disconnect failed: {e:#}"
+                    );
+                }
+            }),
+        }
+    }
+}
 
 /// `capacity.transports` and `capacity.webtransport` (`agent-api.md`, amendment 54).
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -253,6 +292,7 @@ impl Registry {
 pub(crate) struct Tap {
     registry: Arc<Registry>,
     session_id: String,
+    media: Arc<Media>,
 }
 
 impl Tap {
@@ -262,8 +302,9 @@ impl Tap {
         video: &gst::Pad,
         encoder: &gst::Element,
         session_id: &str,
+        input: Input,
     ) -> Option<Self> {
-        let media = Media::new(encoder);
+        let media = Media::new(encoder, input);
         if !registry.set_media(session_id, media.clone()) {
             return None;
         }
@@ -271,7 +312,13 @@ impl Tap {
         Some(Self {
             registry: registry.clone(),
             session_id: session_id.to_string(),
+            media,
         })
+    }
+
+    /// A client is attached and being sent video: the session's idle reap counts it.
+    pub(crate) fn attached(&self) -> bool {
+        self.media.attached()
     }
 }
 
@@ -684,6 +731,23 @@ enum Violation {
     Protocol(&'static str),
 }
 
+/// The answer to a client `ping` (§Ping and pong): its fields echoed, with this agent's
+/// monotonic clock and its wall clock at the same instant.
+fn pong(ping: &Value) -> Value {
+    let wall_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+        * 1000.0;
+    json!({
+        "type": "pong",
+        "id": ping.get("id"),
+        "tc": ping.get("tc"),
+        "ts": crate::session::input::host_monotonic_ms(),
+        "tw": wall_ms,
+    })
+}
+
 fn hello_ack(config: &media::VideoConfig) -> Value {
     json!({
         "type": "hello_ack",
@@ -731,10 +795,19 @@ async fn streams(session: Session, control: oneshot::Sender<(SendStream, RecvStr
     }
 }
 
-/// Input (`0x03`) and microphone (`0x05`) are later tickets: every datagram is dropped,
-/// which is also the rule before `hello_ack`.
-async fn drop_datagrams(session: Session) {
-    while session.read_datagram().await.is_ok() {}
+/// Before `hello_ack` every datagram is dropped (§Before `hello`); after it, input
+/// (`0x03`) goes to the session's devices. Microphone (`0x05`) is a later ticket.
+async fn datagrams(session: Session, authed: Arc<OnceLock<(Arc<Media>, u64)>>) {
+    while let Ok(datagram) = session.read_datagram().await {
+        let Some((media, client)) = authed.get() else {
+            continue;
+        };
+        if let Some((&CHANNEL_INPUT, body)) = datagram.split_first() {
+            if let Ok(json) = std::str::from_utf8(body) {
+                media.input_event(*client, json, true);
+            }
+        }
+    }
 }
 
 /// One connection, from QUIC accept. The 5 s hello deadline runs from here, over the
@@ -759,7 +832,8 @@ async fn connection(incoming: quinn::Incoming, registry: Arc<Registry>, slot: Sl
     };
     let (control_tx, control_rx) = oneshot::channel();
     let others = tokio::spawn(streams(session.clone(), control_tx));
-    let datagrams = tokio::spawn(drop_datagrams(session.clone()));
+    let authed = Arc::new(OnceLock::new());
+    let datagrams = tokio::spawn(datagrams(session.clone(), authed.clone()));
     let hello = async {
         let (send, mut recv) = control_rx.await.map_err(|_| Violation::Gone)?;
         let message = read_message(&mut recv).await?;
@@ -773,7 +847,10 @@ async fn connection(incoming: quinn::Incoming, registry: Arc<Registry>, slot: Sl
         }
         Ok(Ok((send, recv, message))) => match serde_json::from_value::<Hello>(message) {
             Ok(hello) if hello.kind == "hello" => {
-                authenticate(&session, send, recv, &registry, hello, slot, deadline).await;
+                authenticate(
+                    &session, send, recv, &registry, hello, slot, deadline, &authed,
+                )
+                .await;
             }
             _ => {
                 close_session(
@@ -823,6 +900,7 @@ fn log_refusal(session_id: &str, code: &str) {
 
 /// Every write here is bounded by `deadline`, the hello deadline: a peer that grants no
 /// stream credit must not hold a slot, or an attachment, past it.
+#[allow(clippy::too_many_arguments)]
 async fn authenticate(
     session: &Session,
     mut send: SendStream,
@@ -831,6 +909,7 @@ async fn authenticate(
     hello: Hello,
     slot: Slot,
     deadline: Instant,
+    authed: &OnceLock<(Arc<Media>, u64)>,
 ) {
     // Checked before the token is spent: a peer that cannot take 1200-byte-budget
     // datagrams (or none) could never be sent video.
@@ -886,6 +965,7 @@ async fn authenticate(
         return;
     }
     drop(slot);
+    let _ = authed.set((media.clone(), client.id));
     stream(session, send, recv, &media, client).await;
 }
 
@@ -911,8 +991,16 @@ async fn stream(
     let mut warned_oversized = false;
     // What ends the stream: an optional last message, the close code and its reason.
     const QUIET: (Option<Value>, u32, &str) = (None, CLOSE_NORMAL, "");
+    let mut idle = pin!(tokio::time::sleep(CONTROL_IDLE));
     let (message, code, why) = loop {
         tokio::select! {
+            () = &mut idle => {
+                tracing::info!(
+                    token = "webtransport-client-idle",
+                    "WebTransport client sent nothing on the control stream for {CONTROL_IDLE:?}"
+                );
+                break QUIET;
+            }
             out = client.rx.recv() => match out {
                 Some(Out::Unit(unit)) => {
                     let max = session.max_datagram_size().min(media::MAX_DATAGRAM);
@@ -946,11 +1034,26 @@ async fn stream(
                 },
             },
             message = control_rx.recv() => match message {
-                Some(Ok(message)) => match message.get("type").and_then(Value::as_str) {
-                    Some("keyframe_request") => media.keyframe(),
-                    Some("bye") => break QUIET,
-                    _ => {}
-                },
+                Some(Ok(message)) => {
+                    idle.as_mut().reset(Instant::now() + CONTROL_IDLE);
+                    match message.get("type").and_then(Value::as_str) {
+                        Some("keyframe_request") => media.keyframe(),
+                        Some("input") => {
+                            if let Some(event) = message.get("event") {
+                                media.input_event(client.id, &event.to_string(), false);
+                            }
+                        }
+                        Some("ping") => {
+                            let pong = pong(&message);
+                            let write = write_message(&mut send, &pong);
+                            if !matches!(tokio::time::timeout(CONTROL_WRITE, write).await, Ok(Ok(()))) {
+                                break QUIET;
+                            }
+                        }
+                        Some("bye") => break QUIET,
+                        _ => {}
+                    }
+                }
                 Some(Err(Violation::Protocol(why))) => break (None, CLOSE_PROTOCOL, why),
                 Some(Err(Violation::Gone)) | None => break QUIET,
             },
