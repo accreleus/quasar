@@ -1550,9 +1550,13 @@ impl pipeline::Transport for SessionTransports {
                         session.cfg.stream.width,
                         session.cfg.stream.height,
                     ),
+                    crate::webtransport::Tap::plan(&session.cfg),
                 )
             });
         let slot = pipeline::WebRtcSlot::new(session)?;
+        if let Some(tap) = &webtransport {
+            slot.tap_audio_for_stream(tap.audio());
+        }
         // Audio first: `attach_video` takes the encode pipeline to READY.
         let (audio_webrtc, audio_pipeline) = slot.build_audio()?;
         let video = slot.attach_video(false, None)?;
