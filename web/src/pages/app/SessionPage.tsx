@@ -15,7 +15,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import "../../styles/session.css";
 import "../../styles/hud.css";
-import { getSession, mintSignalingToken, stopSession } from "../../api/library";
+import { getSession, listApps, mintSignalingToken, stopSession } from "../../api/library";
 import { ApiError } from "../../api/client";
 import type { ICEServer, WebTransportCoords } from "../../api/types";
 import { useAuth } from "../../auth/context";
@@ -376,6 +376,7 @@ function SessionPageBody() {
     health,
     startedAt,
     polledStreamSize,
+    polledAppId,
     externalSize,
     setExternalSize,
     streamRungs,
@@ -391,6 +392,25 @@ function SessionPageBody() {
     sessionRunning,
     pollEndReason,
   } = useSessionStatus(authToken, sessionId, stopping, revealStartedRef);
+
+  // The server's app_id is the truth for the current app: router state survives a
+  // reload and a swap's own poll can end unseen, so reconcile when the poll's value
+  // changes (not on every currentApp change, which would let a stale read undo a commit).
+  const currentAppIdRef = useRef(currentApp.id);
+  currentAppIdRef.current = currentApp.id;
+  useEffect(() => {
+    if (!authToken || !polledAppId || polledAppId === currentAppIdRef.current) return;
+    let live = true;
+    void (async () => {
+      const apps = await listApps(authToken).catch(() => null);
+      if (!live) return;
+      const name = apps?.items.find((a) => a.id === polledAppId)?.name ?? "Session";
+      setCurrentApp({ id: polledAppId, name });
+    })();
+    return () => {
+      live = false;
+    };
+  }, [authToken, polledAppId]);
 
   // sessionRuntime.ts: one runtime instance per transport generation (law L1)
   // — a replacement token re-seats signalCoords, destroying this runtime and

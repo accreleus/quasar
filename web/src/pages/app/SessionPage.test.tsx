@@ -28,8 +28,10 @@ const getSession = vi.fn();
 const stopSession = vi.fn();
 const mintSignalingToken = vi.fn();
 const updateSessionDisplay = vi.fn();
+const listApps = vi.fn();
 vi.mock("../../api/library", () => ({
   getSession: (...a: unknown[]) => getSession(...a),
+  listApps: (...a: unknown[]) => listApps(...a),
   stopSession: (...a: unknown[]) => stopSession(...a),
   mintSignalingToken: (...a: unknown[]) => mintSignalingToken(...a),
   updateSessionDisplay: (...a: unknown[]) => updateSessionDisplay(...a),
@@ -190,15 +192,19 @@ vi.mock("../../webrtc/session", () => ({
 
 /** The page's callback for the swap screen going up or down, so a test can play the controller. */
 let lastScreenChange: ((up: boolean) => void) | undefined;
+let lastCurrentApp: { id?: string; name: string } | undefined;
 vi.mock("./SessionSwapController", () => ({
   SessionSwapController: ({
     children,
     onScreenChange,
+    currentApp,
   }: {
     children: (p: { quickSwitch: null; swappingTo: null }) => React.ReactNode;
     onScreenChange?: (up: boolean) => void;
+    currentApp: { id?: string; name: string };
   }) => {
     lastScreenChange = onScreenChange;
+    lastCurrentApp = currentApp;
     return children({ quickSwitch: null, swappingTo: null });
   },
 }));
@@ -298,6 +304,13 @@ beforeEach(() => {
   lastWtCallbacks = null;
   lastDrawerProps = null;
   lastStripProps = null;
+  lastCurrentApp = undefined;
+  listApps.mockResolvedValue({
+    items: [
+      { id: "a1", name: "Portal 2" },
+      { id: "a2", name: "Desktop" },
+    ],
+  });
   updateSessionDisplay.mockResolvedValue({ session: makeSession({ state: "running" }) });
   currentSession = makeSession();
   getSession.mockImplementation(async () => ({ session: currentSession }));
@@ -1414,5 +1427,32 @@ describe("SessionPage — WebTransport falls back to WebRTC (A11)", () => {
     const hud = lastDrawerProps as Record<string, unknown>;
     expect(hud.transport).toBe("webrtc");
     expect(hud.transportFallbackReason).toBe("connect_timeout");
+  });
+});
+
+describe("SessionPage — the server's app_id is the current app (#1230)", () => {
+  // Router state survives a reload, and a swap's own poll can end unseen (timeout),
+  // so a launch's appId must not outlive the server's committed one.
+  it("seats the committed app when the launch's router state names the old one", async () => {
+    currentSession = makeSession({ app_id: "a2", state: "running", state_detail: "swap complete" });
+    renderPage();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(lastCurrentApp).toEqual({ id: "a2", name: "Desktop" });
+  });
+
+  it("follows a later server app_id change without a commit the page saw", async () => {
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    renderPage();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(lastCurrentApp).toEqual({ id: "a1", name: "Portal 2" });
+    currentSession = makeSession({ app_id: "a2", state: "running", state_detail: "swap complete" });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6_000);
+    });
+    expect(lastCurrentApp).toEqual({ id: "a2", name: "Desktop" });
   });
 });
