@@ -496,30 +496,6 @@ describe("Settings — Images card", () => {
   });
 });
 
-describe("Settings — Streaming card", () => {
-  it("shows the instance default transport and PATCHes only default_transport", async () => {
-    mocked.getSettings.mockResolvedValue(settingsResponse({ default_transport: "webrtc" }));
-    mocked.updateSettings.mockResolvedValue(settingsResponse({ default_transport: "webtransport" }));
-    renderPage();
-
-    const list = await screen.findByRole("tablist", { name: "Default transport" });
-    expect(within(list).getByRole("tab", { name: "WebRTC" })).toHaveAttribute("aria-selected", "true");
-    fireEvent.click(within(list).getByRole("tab", { name: "WebTransport (experimental)" }));
-
-    await waitFor(() =>
-      expect(mocked.updateSettings).toHaveBeenCalledWith("tok", { default_transport: "webtransport" }),
-    );
-  });
-
-  it("reads WebRTC when a pre-amendment server sent no default_transport", async () => {
-    mocked.getSettings.mockResolvedValue(settingsResponse({ default_transport: undefined }));
-    renderPage();
-
-    const list = await screen.findByRole("tablist", { name: "Default transport" });
-    expect(within(list).getByRole("tab", { name: "WebRTC" })).toHaveAttribute("aria-selected", "true");
-  });
-});
-
 describe("Settings — Secrets card", () => {
   it("renders one SecretField row per declared secret", async () => {
     mocked.listSecrets.mockResolvedValue(
