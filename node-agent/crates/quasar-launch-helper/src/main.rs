@@ -21,8 +21,9 @@ use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use quasar_launch_watch::{
-    appid_from_flags, parse_command, CloudEnd, CloudSync, Command, LaunchState, NeedsUser, Quit,
-    QuitAction, Report, WatchConfig, Watcher, WindowInfo, Windows, STEAM_CLIENT_APPID,
+    appid_from_flags, parse_command, steam_client_running, CloudEnd, CloudSync, Command,
+    LaunchState, NeedsUser, Quit, QuitAction, Report, WatchConfig, Watcher, WindowInfo, Windows,
+    STEAM_CLIENT_APPID,
 };
 use x11rb::connection::Connection;
 use x11rb::cookie::Cookie;
@@ -128,6 +129,10 @@ struct Helper {
     quit: Option<Quit>,
     /// A `launch` Steam has not yet been seen to take up; sent again until it is.
     relaunch: Option<Relaunch>,
+    /// A `launch` waiting for the entrypoint's own `steam -silent` to start: one that ran
+    /// `steam -applaunch` before a client exists would start a second Steam, and the Steam
+    /// image starts its client only after this helper's `ready`.
+    pending: Option<u32>,
     /// The watched game's cloud log, read from when the watch began, and whether this watch has
     /// reported the game's exit. Only a quit after that exit waits on it for the exit sync (#810).
     exit_sync: Option<(u32, CloudSync)>,
@@ -182,6 +187,7 @@ impl Helper {
             notice: Notice::Waiting,
             quit: None,
             relaunch: None,
+            pending: None,
             exit_sync: None,
             game_exited: false,
             children: Vec::new(),
@@ -234,29 +240,18 @@ impl Helper {
     fn command(&mut self, command: Command, agent: &mut Agent) {
         match command {
             Command::Launch(appid) => {
-                // A launch that does not run leaves no retry of an earlier target behind.
+                // A launch that does not run leaves no retry of an earlier target behind,
+                // and no earlier held launch either.
                 self.relaunch = None;
-                // The watcher's baseline in Steam's logs is taken before Steam can write
-                // anything for this launch, or the first thing it logs would be skipped.
-                let mut watcher = self.new_watcher(appid, Box::<X11Windows>::default());
-                let now = Instant::now();
-                let baseline = watcher.poll_at(now);
-                let ok = self.run_steam(&["-applaunch", &appid.to_string()]);
-                if ok {
-                    eprintln!("quasar-launch-helper: launched Steam app {appid}");
-                    agent.forget_game();
-                    self.arm(watcher, appid, true);
-                    self.forward(baseline, agent);
-                    self.relaunch = Some(Relaunch {
-                        appid,
-                        next: now + RELAUNCH_EVERY,
-                        until: now + RELAUNCH_FOR,
-                        last: now + RELAUNCH_MAX,
-                        stepped: now,
-                        taken: false,
-                    });
+                self.pending = None;
+                if !self.steam_running() {
+                    eprintln!(
+                        "quasar-launch-helper: no Steam client yet; app {appid} waits for it"
+                    );
+                    self.pending = Some(appid);
+                    return;
                 }
-                agent.done(Done::Launch { appid, ok });
+                self.launch(appid, agent);
             }
             Command::BigPicture => {
                 let ok = self.run_steam(&["steam://open/bigpicture"]);
@@ -276,6 +271,8 @@ impl Helper {
                     return;
                 }
                 self.relaunch = None;
+                // A held launch of the game being quit must never run after it (#1243).
+                self.pending = None;
                 match self.screen.close(appid) {
                     Ok(sent) => eprintln!(
                         "quasar-launch-helper: asked {sent} window(s) of Steam app {appid} to close"
@@ -298,6 +295,38 @@ impl Helper {
                 ));
             }
         }
+    }
+
+    /// Whether a Steam client process exists yet. An unreadable `/proc` never holds a
+    /// launch back: the helper runs inside the container's own pid namespace, where it is
+    /// always there.
+    fn steam_running(&self) -> bool {
+        steam_client_running(&self.proc_root) != Some(false)
+    }
+
+    /// Run the target game through the client that is already up.
+    fn launch(&mut self, appid: u32, agent: &mut Agent) {
+        // The watcher's baseline in Steam's logs is taken before Steam can write
+        // anything for this launch, or the first thing it logs would be skipped.
+        let mut watcher = self.new_watcher(appid, Box::<X11Windows>::default());
+        let now = Instant::now();
+        let baseline = watcher.poll_at(now);
+        let ok = self.run_steam(&["-applaunch", &appid.to_string()]);
+        if ok {
+            eprintln!("quasar-launch-helper: launched Steam app {appid}");
+            agent.forget_game();
+            self.arm(watcher, appid, true);
+            self.forward(baseline, agent);
+            self.relaunch = Some(Relaunch {
+                appid,
+                next: now + RELAUNCH_EVERY,
+                until: now + RELAUNCH_FOR,
+                last: now + RELAUNCH_MAX,
+                stepped: now,
+                taken: false,
+            });
+        }
+        agent.done(Done::Launch { appid, ok });
     }
 
     /// `steam` with fixed argv, as this user, detached from our stdio.
@@ -337,6 +366,12 @@ impl Helper {
     fn pass(&mut self, now: Instant, agent: &mut Agent) {
         self.children
             .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+        if let Some(appid) = self.pending {
+            if self.steam_running() {
+                self.pending = None;
+                self.launch(appid, agent);
+            }
+        }
         self.poll_watcher(now, agent);
         self.step_relaunch(now);
         self.answer_notice(now);
@@ -1512,6 +1547,51 @@ mod tests {
             agent.latest[COMMAND_DONE].as_deref(),
             Some("{\"type\":\"command_done\",\"v\":1,\"command\":\"launch\",\"appid\":1145360,\"ok\":true}\n")
         );
+    }
+
+    /// A Steam client process, as the helper's `/proc` scan reads it: the entrypoint's own
+    /// `steam -silent`.
+    fn steam_client(proc: &std::path::Path) {
+        let pid = proc.join("7");
+        std::fs::create_dir_all(&pid).unwrap();
+        std::fs::write(pid.join("cmdline"), b"/usr/bin/steam\0-silent\0").unwrap();
+        std::fs::write(pid.join("stat"), "7 (steam) S 1 7 7 0 -1").unwrap();
+    }
+
+    /// #1243: the Steam image starts its client only after this helper printed `ready`, so
+    /// a `launch` queued before that waits for a Steam process instead of starting a second
+    /// Steam. `ready` itself is never held back by the wait.
+    #[test]
+    fn a_launch_waits_for_a_steam_client_before_running_steam() {
+        let _scripts = scripts();
+        let dir = tempfile::tempdir().unwrap();
+        let proc = dir.path().join("proc");
+        std::fs::create_dir_all(&proc).unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let mut helper = Helper::new(proc.clone(), dir.path().join("logs"), false);
+        helper.steam = fake_steam(dir.path());
+        helper.wait_for_steam = true;
+        let mut agent = Agent::new(dir.path().join("none.sock"));
+        let t = Instant::now();
+        helper.command(Command::Launch(1145360), &mut agent);
+        helper.pass(t, &mut agent);
+        assert!(
+            !dir.path().join("argv.txt").exists(),
+            "no steam before a client runs"
+        );
+        assert!(
+            agent.latest[COMMAND_DONE].is_none(),
+            "and the launch is not answered yet"
+        );
+        // A newer launch replaces the held one: only the latest game ever runs.
+        helper.command(Command::Launch(620), &mut agent);
+        steam_client(&proc);
+        helper.pass(t + PASS, &mut agent);
+        assert_eq!(argv(dir.path()), "-applaunch|620|");
+        assert!(agent.latest[COMMAND_DONE]
+            .as_deref()
+            .unwrap()
+            .contains("\"ok\":true"));
     }
 
     /// A helper whose `launch 1145360` has been sent to the stand-in `steam`, and its clock.

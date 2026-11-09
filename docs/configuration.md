@@ -1128,7 +1128,8 @@ read-only. The helper reports the game's launch state there, which the agent put
 `session_metrics.app_launch_state` and the `app.launch_state` trace event. No other app
 gets either, and neither is an operator knob. The session's stream is shown once the game
 is on screen, or Steam needs the user, or `QUASAR_STEAM_REVEAL_CAP_SECS` runs out, or a
-swap starts.
+swap starts. A game reached by a quick switch starts Steam with `-silent` and is launched
+through the launch helper.
 
 ---
 

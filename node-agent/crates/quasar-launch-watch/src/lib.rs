@@ -1055,6 +1055,13 @@ pub fn game_running(proc_root: &Path, appid: u32) -> Option<bool> {
     scan.readable.then_some(scan.reaper_alive)
 }
 
+/// Whether a Steam client process runs under `proc_root`; `None` when `/proc` could not be
+/// read in full, which never counts as gone.
+pub fn steam_client_running(proc_root: &Path) -> Option<bool> {
+    let scan = scan_proc(proc_root, 0);
+    scan.readable.then_some(scan.steam_client)
+}
+
 /// The pids of `appid`'s launch reaper and every process under it, at most 4096. Parents
 /// come from `/proc/<pid>/stat`; a pid that vanishes mid-read is skipped.
 pub fn game_tree(proc_root: &Path, appid: u32) -> Vec<u32> {
