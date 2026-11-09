@@ -342,22 +342,55 @@ func (f *warmFixture) startedLaunch(t *testing.T, appID string) string {
 	return res.Session.ID
 }
 
-func TestSwapFromASharingDesktopIntoSteamIsRefused(t *testing.T) {
-	f := newWarmFixture(t, 8)
-	desktop := seedDesktop(t, f, true)
-	must(t, exec(t, f.pool, `UPDATE apps SET default_encode_slots=2 WHERE id=$1::uuid`, desktop))
-	tile := seedTile(t, f.pool, f.steam, "Hades", "1145360")
-	sess := f.startedLaunch(t, desktop)
+// #1232, amendment 62: a sharing desktop swaps back into the Steam family, and
+// the commit keeps the Steam hold the target now mounts as its own home.
+func TestSwapFromASharingDesktopIntoSteamKeepsTheSteamHold(t *testing.T) {
+	for _, name := range []string{"parent", "tile"} {
+		t.Run(name, func(t *testing.T) {
+			f := newWarmFixture(t, 8)
+			desktop := seedDesktop(t, f, true)
+			must(t, exec(t, f.pool, `UPDATE apps SET default_encode_slots=2 WHERE id=$1::uuid`, desktop))
+			target := f.steam
+			if name == "tile" {
+				target = seedTile(t, f.pool, f.steam, "Hades", "1145360")
+			}
+			sess := f.startedLaunch(t, desktop)
 
-	for _, target := range []string{f.steam, tile} {
+			if _, err := f.coord.Swap(context.Background(), sess, target); err != nil {
+				t.Fatalf("swap of a sharing desktop into the Steam family: %v", err)
+			}
+			f.disp.waitFor(t, "swap")
+			f.commitSwap(t, sess)
+			if h, _ := f.claimHolder(t, f.steam); h != sess {
+				t.Errorf("Steam hold = %q after the swap completed, want kept by %s", h, sess)
+			}
+			if got := f.sharingOf(t, sess); got != "" {
+				t.Errorf("shared_home_app_id = %q after swapping into Steam, want NULL", got)
+			}
+		})
+	}
+}
+
+// Another session's open library still refuses a swap into the Steam family or
+// into a sharing app; only the swapping session is exempt from itself.
+func TestSwapIsRefusedWhileAnotherSessionSharesTheLibrary(t *testing.T) {
+	f := newWarmFixture(t, 8)
+	sharing := seedDesktop(t, f, true)
+	second := seedDesktop(t, f, true)
+	mine := seedDesktop(t, f, false)
+	must(t, exec(t, f.pool, `UPDATE apps SET default_encode_slots=2 WHERE id=$1::uuid`, mine))
+	holder := f.startedLaunch(t, sharing)
+	sess := f.startedLaunch(t, mine)
+
+	for _, target := range []string{f.steam, second} {
 		_, err := f.coord.Swap(context.Background(), sess, target)
 		var inUse *HomeInUseError
-		if !errors.As(err, &inUse) || inUse.SessionID != sess || homeInUseReason(err) != "steam_library_open_in_desktop" {
-			t.Fatalf("swap of a sharing desktop into %s = %v, want home_in_use steam_library_open_in_desktop naming itself", target, err)
+		if !errors.As(err, &inUse) || inUse.SessionID != holder || homeInUseReason(err) != "steam_library_open_in_desktop" {
+			t.Fatalf("swap into %s beside a sharing desktop = %v, want home_in_use steam_library_open_in_desktop naming %s", target, err, holder)
 		}
-	}
-	if got := readRow(t, f.pool, sess); got.Detail == swapDetailInProgress {
-		t.Error("a refused swap left the session marked swapping")
+		if got := readRow(t, f.pool, sess); got.Detail == swapDetailInProgress {
+			t.Error("a refused swap left the session marked swapping")
+		}
 	}
 }
 
@@ -796,29 +829,27 @@ func TestFailedConsoleAutoStartReleasesAnUnusedSteamClaim(t *testing.T) {
 	}
 }
 
-// A sharing session swapping into another sharing app is refused, naming
-// itself: nothing yet proves its old container let go of the library.
-func TestSwapIntoAnotherSharingDesktopIsRefusedNamingItself(t *testing.T) {
+// #1232, amendment 62: a sharing session swaps into another sharing app and
+// keeps its Steam hold.
+func TestSwapIntoAnotherSharingDesktopKeepsTheSteamHold(t *testing.T) {
 	f := newWarmFixture(t, 8)
 	first := seedDesktop(t, f, true)
 	second := seedDesktop(t, f, true)
 	sess := f.startedLaunch(t, first)
 
-	_, err := f.coord.Swap(context.Background(), sess, second)
-	var inUse *HomeInUseError
-	if !errors.As(err, &inUse) || inUse.SessionID != sess || homeInUseReason(err) != "steam_library_open_in_desktop" {
-		t.Fatalf("swap into a second sharing desktop = %v, want home_in_use steam_library_open_in_desktop naming itself", err)
+	if _, err := f.coord.Swap(context.Background(), sess, second); err != nil {
+		t.Fatalf("swap into a second sharing desktop: %v", err)
 	}
-	if msg := homeInUseMessage(err, "live"); msg != "Your Steam library is open in the desktop. Close the desktop first." {
-		t.Errorf("message = %q", msg)
+	f.disp.waitFor(t, "swap")
+	if got := f.swapMounts(t); !strings.Contains(strings.Join(got, " "), ".local/share/Steam") {
+		t.Fatalf("swap mounts = %v, want the Steam data dir", got)
 	}
-	if got := readRow(t, f.pool, sess); got.Detail == swapDetailInProgress {
-		t.Error("a refused swap left the session marked swapping")
+	f.commitSwap(t, sess)
+	if h, _ := f.claimHolder(t, f.steam); h != sess {
+		t.Errorf("Steam hold = %q after the swap completed, want kept by %s", h, sess)
 	}
-	var n int
-	must(t, f.pool.QueryRow(context.Background(), `SELECT count(*) FROM sessions WHERE app_id=$1::uuid`, second).Scan(&n))
-	if n != 0 {
-		t.Errorf("refused swap left %d second-desktop session rows", n)
+	if got := f.sharingOf(t, sess); got != f.steam {
+		t.Errorf("shared_home_app_id = %q, want %s", got, f.steam)
 	}
 }
 

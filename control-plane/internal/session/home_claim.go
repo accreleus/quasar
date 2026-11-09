@@ -635,9 +635,7 @@ func (s *Store) GuardHomeForSwapWithHold(ctx context.Context, sessionID, userID 
 	}
 	// One Steam at a time, as a launch guards it in its placement transaction:
 	// only for a share that applies here, and only after claimSharedHome decided
-	// it does. The session counts against its own shared home (the exclusion in
-	// liveHomeSessionSQL never covers it), so a sharing session swapping into
-	// another sharing app is refused naming itself.
+	// it does. The swapping session never counts against itself.
 	if p.SharedHomeAppID != "" {
 		conflict, err := homeInUse(ctx, tx, userID, p.SharedHomeAppID, sessionID)
 		if err != nil {
