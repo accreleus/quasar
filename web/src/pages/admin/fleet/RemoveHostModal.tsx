@@ -16,6 +16,8 @@ export interface RemoveHostModalProps {
   liveSessions: number;
   onClose: () => void;
   onConfirm: () => void;
+  /** Forget a host that is not connected (`DELETE /v1/hosts/{id}`, #1237). */
+  onForget: () => void;
   pending?: boolean;
   now: number;
 }
@@ -25,6 +27,7 @@ export function RemoveHostModal({
   liveSessions,
   onClose,
   onConfirm,
+  onForget,
   pending,
   now,
 }: RemoveHostModalProps) {
@@ -40,9 +43,9 @@ export function RemoveHostModal({
           <Button variant="ghost" onClick={onClose}>
             {offline ? "Close" : "Cancel"}
           </Button>
-          <Button variant="danger" disabled={offline || pending} onClick={onConfirm}>
+          <Button variant="danger" disabled={pending} onClick={offline ? onForget : onConfirm}>
             <IconTrash />
-            Remove host
+            {offline ? "Forget host" : "Remove host"}
           </Button>
         </>
       }
@@ -56,8 +59,9 @@ export function RemoveHostModal({
             containers.
           </div>
           <p className="rm-host-copy">
-            Reconnect it and try again. If the machine is gone, you can leave it: an offline host
-            takes no sessions, and a new machine can be added under the same node name.
+            Reconnect it and try again. If the machine is gone for good, forget it: Quasar drops
+            its record, its GPUs and its finished sessions, and touches nothing on the machine. A
+            new machine can be added under the same node name.
           </p>
         </>
       ) : (

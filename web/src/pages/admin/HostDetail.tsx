@@ -410,6 +410,10 @@ export function HostDetail() {
             setRemoveOpen(false);
             removal.start(host, sessions.length);
           }}
+          onForget={() => {
+            setRemoveOpen(false);
+            void forget.run(host);
+          }}
         />
       )}
 
