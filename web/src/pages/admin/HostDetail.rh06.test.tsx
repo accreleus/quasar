@@ -323,7 +323,7 @@ describe("HostDetail — remove host (#366)", () => {
     await waitFor(() => expect(mocked.removePlatformHost).toHaveBeenCalledTimes(2));
   });
 
-  it("explains a host that is not connected, and does not offer the removal", async () => {
+  it("explains a host that is not connected, and offers to forget it instead (#1237)", async () => {
     mocked.getHost.mockResolvedValue({
       host: host({ status: "offline", last_heartbeat_at: new Date(NOW - 3 * 86400_000).toISOString() }),
     } as never);
@@ -332,7 +332,10 @@ describe("HostDetail — remove host (#366)", () => {
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByText("gpu-host-4 is not connected")).toBeTruthy();
     expect(within(dialog).getByText(/last seen 3 days ago/)).toBeTruthy();
-    expect((within(dialog).getByRole("button", { name: /Remove host/ }) as HTMLButtonElement).disabled).toBe(true);
+    expect(within(dialog).queryByRole("button", { name: /Remove host/ })).toBeNull();
+    fireEvent.click(within(dialog).getByRole("button", { name: /Forget host/ }));
+    await waitFor(() => expect(mocked.deleteHost).toHaveBeenCalledWith("tok", ID));
+    expect(mocked.removePlatformHost).not.toHaveBeenCalled();
   });
 
   it("reads a disconnected owned host that an admission hold keeps 'draining' as not connected", async () => {
@@ -349,7 +352,7 @@ describe("HostDetail — remove host (#366)", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Remove host/ }));
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByText("gpu-host-4 is not connected")).toBeTruthy();
-    expect((within(dialog).getByRole("button", { name: /Remove host/ }) as HTMLButtonElement).disabled).toBe(true);
+    expect(within(dialog).getByRole("button", { name: /Forget host/ })).toBeTruthy();
   });
 
   it("says a host that went away before the removal was sent is not connected", async () => {
@@ -404,6 +407,40 @@ describe("HostDetail — remove host (#366)", () => {
     renderDetail();
     await card();
     expect(screen.getByText(/run the uninstall command on the machine/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Remove host/ })).toBeNull();
+  });
+  it("opens no removal for the control plane's own machine from ?remove=1, even disconnected", async () => {
+    mocked.getPlatformReleases.mockResolvedValue({
+      faults: [],
+      installed: {
+        control_plane: {
+          version: "0.5.2",
+          source_commit: COMMIT,
+          built_at: null,
+          schema_version: 96,
+          machine_role: "combined",
+          machine_node_name: "gpu-host-4",
+        },
+        hosts: [],
+      },
+    } as never);
+    mocked.getHost.mockResolvedValue({
+      host: host({ status: "offline", last_heartbeat_at: new Date(NOW - 3 * 86400_000).toISOString() }),
+    } as never);
+    renderDetail(`/admin/fleet/hosts/${ID}?remove=1`);
+    await card();
+    expect(screen.queryByText("Remove gpu-host-4?")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Forget host/ })).toBeNull();
+  });
+
+  it("offers no removal while the control plane's identity is unknown (#1239 review)", async () => {
+    mocked.getPlatformReleases.mockRejectedValue(new Error("unavailable"));
+    mocked.getHost.mockResolvedValue({
+      host: host({ status: "offline", last_heartbeat_at: new Date(NOW - 3 * 86400_000).toISOString() }),
+    } as never);
+    renderDetail(`/admin/fleet/hosts/${ID}?remove=1`);
+    await card();
+    expect(screen.queryByText("Remove gpu-host-4?")).toBeNull();
     expect(screen.queryByRole("button", { name: /Remove host/ })).toBeNull();
   });
 });

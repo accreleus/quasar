@@ -18,7 +18,6 @@ import * as adminApi from "../../api/admin";
 import { ApiError } from "../../api/client";
 import {
   ARTWORK_API_KEY_SECRET,
-  type DefaultTransport,
   type ImageUpdatePolicy,
   type LibraryStatus,
   type RegistrationMode,
@@ -47,11 +46,6 @@ const REGISTRATION_OPTIONS: { value: RegistrationMode; label: string }[] = [
   { value: "closed", label: "Closed" },
   { value: "invite_only", label: "Invite only" },
   { value: "open", label: "Open" },
-];
-
-const TRANSPORT_OPTIONS: { value: DefaultTransport; label: string }[] = [
-  { value: "webrtc", label: "WebRTC" },
-  { value: "webtransport", label: "WebTransport (experimental)" },
 ];
 
 const IMAGE_POLICY_OPTIONS: { value: ImageUpdatePolicy; label: string }[] = [
@@ -303,25 +297,6 @@ export function Settings() {
               />
             </SettingRow>
           </>
-        )}
-      </SettingsSection>
-
-      <SettingsSection title="Streaming" hint="Applies to launch profiles set to Use instance default">
-        <ResourceStates loading={settings.loading} error={settings.error} />
-        {!settings.loading && !settings.error && s && (
-          <SettingRow
-            label="Default transport"
-            hint="The transport every launch profile set to Use instance default streams over. Applies from the next launch; a running session keeps its transport. WebTransport is experimental: if it can’t connect, the session starts on WebRTC."
-          >
-            <SegmentedControl<DefaultTransport>
-              aria-label="Default transport"
-              value={s.default_transport ?? "webrtc"}
-              onChange={(v) => void settings.patch("default_transport", v)}
-              disabled={settings.pending === "default_transport"}
-              activation="manual"
-              options={TRANSPORT_OPTIONS}
-            />
-          </SettingRow>
         )}
       </SettingsSection>
 
