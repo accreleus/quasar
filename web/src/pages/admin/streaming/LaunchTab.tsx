@@ -41,6 +41,7 @@ function DefaultsCard({
   onChangeDefault,
   onChangeOverridesAllowed,
   transport,
+  transportError,
   transportBusy,
   onChangeTransport,
 }: {
@@ -51,6 +52,8 @@ function DefaultsCard({
   onChangeOverridesAllowed: (checked: boolean) => void;
   /** The instance default transport; null until the settings load. */
   transport: DefaultTransport | null;
+  /** Why the settings did not load, when they did not. */
+  transportError: string | null;
   transportBusy: boolean;
   onChangeTransport: (t: DefaultTransport) => void;
 }) {
@@ -76,19 +79,24 @@ function DefaultsCard({
           ))}
         </select>
       </div>
-      {transport && (
+      {(transport || transportError) && (
         <div>
           <div className="eyebrow">Default transport</div>
-          <select
-            className="select mt2"
-            value={transport}
-            disabled={transportBusy}
-            aria-label="Default transport"
-            onChange={(e) => onChangeTransport(e.target.value as DefaultTransport)}
-          >
-            <option value="webrtc">WebRTC</option>
-            <option value="webtransport">WebTransport (experimental)</option>
-          </select>
+          {/* This is the only place to set it, so a failed load says so instead of hiding it. */}
+          <ResourceStates loading={false} error={transport ? null : transportError} />
+          {transport && (
+            <select
+              className="select mt2"
+              value={transport}
+              disabled={transportBusy}
+              aria-label="Default transport"
+              onChange={(e) => onChangeTransport(e.target.value as DefaultTransport)}
+            >
+              <option value="webrtc">WebRTC</option>
+              <option value="webtransport">WebTransport (experimental)</option>
+            </select>
+          )}
+          <div className="hint mt2">For profiles set to Use instance default, from the next launch</div>
         </div>
       )}
       <div style={{ maxWidth: 420 }}>
@@ -394,6 +402,7 @@ export function LaunchTab() {
           onChangeOverridesAllowed={(checked) => void savePolicy.run({ user_overrides_allowed: checked })}
           // A pre-amendment-61 server sends none: it streams WebRTC.
           transport={settings.settings ? (settings.settings.default_transport ?? "webrtc") : null}
+          transportError={settings.error}
           transportBusy={settings.pending === "default_transport"}
           onChangeTransport={(t) => void settings.patch("default_transport", t)}
         />

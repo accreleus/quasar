@@ -101,6 +101,16 @@ describe("LaunchTab — default transport", () => {
 
     expect(screen.getByRole("combobox", { name: "Default transport" })).toHaveValue("webrtc");
   });
+
+  it("says the settings did not load rather than hiding the only transport control", async () => {
+    mocked.getSettings.mockRejectedValue(new ApiError(502, "internal", "gateway"));
+    renderPage();
+    await act(async () => {});
+
+    expect(screen.getByText("Default transport")).toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "Default transport" })).toBeNull();
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+  });
 });
 
 describe("LaunchTab", () => {
