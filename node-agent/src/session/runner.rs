@@ -3033,7 +3033,8 @@ pub fn run_blocking(
     let mut app_boot_budget = cfg.app_boot_timeout;
     let mut app_boot_started_at: Option<Instant> = None;
     let mut app_presented_at: Option<Instant> = None;
-    let cap_for = |budget: Option<Duration>| {
+    // Takes `res` rather than capturing it: a swap may give the session its launch helper.
+    let cap_for = |res: &SessionResources, budget: Option<Duration>| {
         res.launch().map(|_| {
             super::launch_helper::reveal_cap(
                 std::env::var("QUASAR_STEAM_REVEAL_CAP_SECS").ok(),
@@ -3041,7 +3042,7 @@ pub fn run_blocking(
             )
         })
     };
-    let mut reveal_cap = cap_for(app_boot_budget);
+    let mut reveal_cap = cap_for(&res, app_boot_budget);
     let mut app_boot = AppBootGate::new(reveal_cap, app_boot_budget);
     // Amendment 39 (#759): what this runtime is now and what it is doing.
     let mut kind = cfg.kind;
@@ -3230,7 +3231,7 @@ pub fn run_blocking(
             cfg.idle_timeout = req.idle_timeout;
             cfg.app_boot_timeout = req.app_boot_timeout;
             app_boot_budget = req.app_boot_timeout;
-            reveal_cap = cap_for(app_boot_budget);
+            reveal_cap = cap_for(&res, app_boot_budget);
             current_app = req.container;
             follow_app(&mut current_source, &res, current_app.as_ref());
             tracing::info!(
@@ -3733,6 +3734,27 @@ pub fn run_blocking(
                     "in-place swap not possible (no connected launch helper, or the apps \
                      differ beyond STEAM_STARTUP_FLAGS); swapping the container"
                 );
+            }
+            // The helper is opened only for a session that starts on a Steam game. One that
+            // started on another app (a desktop) gets it for the first Steam game it swaps
+            // to, so that game's start-up is held like a launch's (#1241) and later
+            // game-to-game swaps can go in place.
+            if res.launch().is_none()
+                && req
+                    .container
+                    .as_ref()
+                    .and_then(|c| super::launch_helper::appid_from_env(&c.env))
+                    .is_some()
+            {
+                res.set_launch(super::launch_helper::LaunchSocket::open(
+                    &cfg.runtime_dir,
+                    &session_id,
+                    req.container.as_ref().map(|c| &c.env),
+                    false,
+                    session_metrics.clone(),
+                    diagnostic_tx.clone(),
+                ));
+                reveal_cap = cap_for(&res, app_boot_budget);
             }
             let next_app = req.container.clone();
             gen += 1;
