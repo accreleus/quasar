@@ -2167,6 +2167,23 @@ impl AppBootGate {
     }
 }
 
+/// A container swap's ready wait, one tick after its `AppBootGate` (#1234): why to show the
+/// replacement now, or `None` to keep holding. A held app that exits is shown so the normal
+/// exit policy takes it; the swap's budget ends any other hold. Pure.
+fn swap_reveal(
+    step: AppBootStep,
+    drawn: bool,
+    exited: bool,
+    past_deadline: bool,
+) -> Option<&'static str> {
+    match step {
+        AppBootStep::Present(reveal) => Some(reveal),
+        _ if drawn && exited => Some("app exited while held"),
+        _ if drawn && past_deadline => Some("swap budget reached"),
+        _ => None,
+    }
+}
+
 /// Why a swap did not complete, and whether the session survived it.
 ///
 /// `fatal = false` is the ordinary rollback: the previous app runs again and the session
@@ -4560,8 +4577,9 @@ fn perform_swap(
     let deadline = started + budget;
     let mut frames_at_first_commit: Option<u64> = None;
     // A Steam game the helper follows is held like a launch (#727): a new container's first
-    // draw is Steam starting, so the switch screen stays up until the game is on screen,
-    // never past this budget. Any other app, or no helper, is shown on its first draw.
+    // draw is Steam starting, so the switch screen stays up until the game is on screen.
+    // This budget, not the reveal cap (90 s by default), is what ends a long hold. Any other
+    // app, or no helper, is shown on its first draw.
     let mut gate = AppBootGate::new(
         res.launch().map(|_| {
             super::launch_helper::reveal_cap(
@@ -4588,20 +4606,22 @@ fn perform_swap(
                 .launch()
                 .map(super::launch_helper::LaunchSocket::reports)
                 .unwrap_or_default();
-            match gate.tick(Instant::now(), started, commits, frames, reports) {
-                AppBootStep::Present(reveal) => Some(reveal),
-                AppBootStep::Held => {
-                    tracing::info!(
-                        "swap: first frame after {} ms; holding the switch for the game",
-                        started.elapsed().as_millis()
-                    );
-                    None
-                }
-                _ if gate.drawn_at.is_some() && Instant::now() >= deadline => {
-                    Some("swap budget reached")
-                }
-                _ => None,
+            let step = gate.tick(Instant::now(), started, commits, frames, reports);
+            if step == AppBootStep::Held {
+                tracing::info!(
+                    session_id = %session_id,
+                    "swap: first frame after {} ms; holding the switch for the game (up to {}s)",
+                    started.elapsed().as_millis(),
+                    budget.as_secs()
+                );
             }
+            let drawn = gate.drawn_at.is_some();
+            swap_reveal(
+                step,
+                drawn,
+                drawn && new_source.container_exited(),
+                Instant::now() >= deadline,
+            )
         } else {
             swap_source_ready(false, commits, frames, &mut frames_at_first_commit)
                 .then_some("first frame")
@@ -4621,8 +4641,7 @@ fn perform_swap(
         // A replacement that exits before it ever presents: its own generation's observer
         // reports the exit with its final lines, so the swap fails NOW with the real cause
         // rather than sitting out the budget and reporting "no frame". Not once it has drawn
-        // (a held game): an app that drew and then exited is adopted and handled by the
-        // normal exit policy, never rolled back as "never presented".
+        // (a held game): `swap_reveal` adopts that one, and the normal exit policy takes it.
         if gate.drawn_at.is_some() {
             std::thread::sleep(SWAP_POLL);
             continue;
@@ -4770,10 +4789,10 @@ mod tests {
         app_exit_event, audio_path_label, client_link, context_object_identity,
         effective_encoder_device_path, fold_display_update, idle_reap_reason,
         is_sctp_association_error, mic_state_label, running_report,
-        stop_requested_for_transport_error, swap_source_ready, validate_display_update,
-        AppBootGate, AppBootStep, AppExitStatus, AudioPipelineGuard, DiagnosticEventTx,
-        DisplayUpdateRequest, Negotiation, SessionEvent, TraceEvent, VulkanContextBridge,
-        REASON_APP_EXITED_EARLY, VULKAN_DEVICE_CONTEXT,
+        stop_requested_for_transport_error, swap_reveal, swap_source_ready,
+        validate_display_update, AppBootGate, AppBootStep, AppExitStatus, AudioPipelineGuard,
+        DiagnosticEventTx, DisplayUpdateRequest, Negotiation, SessionEvent, TraceEvent,
+        VulkanContextBridge, REASON_APP_EXITED_EARLY, VULKAN_DEVICE_CONTEXT,
     };
     use super::{
         in_place_plan, inherit_session_tools, InPlaceAction, InPlaceStep, ProgressThrottle,
@@ -5958,6 +5977,31 @@ mod tests {
         assert!(
             idle_reap_reason(WINDOW, Duration::from_secs(9999), true, Some(WINDOW), true).is_some()
         );
+    }
+
+    #[test]
+    fn swap_reveal_holds_a_drawn_game_until_shown_exited_or_out_of_budget() {
+        use AppBootStep::*;
+        // The gate's own answer wins.
+        assert_eq!(
+            swap_reveal(Present("first frame"), true, false, false),
+            Some("first frame")
+        );
+        // Held, nothing else: keep the switch screen up.
+        assert_eq!(swap_reveal(Held, true, false, false), None);
+        assert_eq!(swap_reveal(Wait, true, false, false), None);
+        // A held app that died is shown at once, so the exit policy takes it (#1234 review).
+        assert_eq!(
+            swap_reveal(Wait, true, true, false),
+            Some("app exited while held")
+        );
+        // The swap budget ends a hold, even on the tick the draw is first held.
+        assert_eq!(
+            swap_reveal(Held, true, false, true),
+            Some("swap budget reached")
+        );
+        // Nothing drawn: no hold to end, the caller's exit and deadline checks decide.
+        assert_eq!(swap_reveal(Wait, false, true, true), None);
     }
 
     /// Ticks for an app that commits its first surface at `t` and has a frame after it at
