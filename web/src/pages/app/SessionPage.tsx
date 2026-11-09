@@ -394,21 +394,30 @@ function SessionPageBody() {
   } = useSessionStatus(authToken, sessionId, stopping, revealStartedRef);
 
   // The server's app_id is the truth for the current app: router state survives a
-  // reload and a swap's own poll can end unseen, so reconcile when the poll's value
-  // changes (not on every currentApp change, which would let a stale read undo a commit).
+  // reload and a swap's own poll can end unseen.
   const currentAppIdRef = useRef(currentApp.id);
   currentAppIdRef.current = currentApp.id;
   useEffect(() => {
     if (!authToken || !polledAppId || polledAppId === currentAppIdRef.current) return;
+    const from = currentAppIdRef.current;
     let live = true;
-    void (async () => {
-      const apps = await listApps(authToken).catch(() => null);
-      if (!live) return;
-      const name = apps?.items.find((a) => a.id === polledAppId)?.name ?? "Session";
-      setCurrentApp({ id: polledAppId, name });
-    })();
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    const seat = () =>
+      listApps(authToken).then(
+        (apps) => {
+          if (!live) return;
+          const name = apps.items.find((a) => a.id === polledAppId)?.name ?? "Session";
+          // A swap commit the page saw while the lookup ran wins.
+          setCurrentApp((prev) => (prev.id === from ? { id: polledAppId, name } : prev));
+        },
+        () => {
+          if (live) retry = setTimeout(() => void seat(), 5_000);
+        },
+      );
+    void seat();
     return () => {
       live = false;
+      clearTimeout(retry);
     };
   }, [authToken, polledAppId]);
 

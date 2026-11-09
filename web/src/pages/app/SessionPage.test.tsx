@@ -193,16 +193,20 @@ vi.mock("../../webrtc/session", () => ({
 /** The page's callback for the swap screen going up or down, so a test can play the controller. */
 let lastScreenChange: ((up: boolean) => void) | undefined;
 let lastCurrentApp: { id?: string; name: string } | undefined;
+let lastOnCommitted: ((appId: string, appName: string) => void) | undefined;
 vi.mock("./SessionSwapController", () => ({
   SessionSwapController: ({
     children,
     onScreenChange,
     currentApp,
+    onCommitted,
   }: {
     children: (p: { quickSwitch: null; swappingTo: null }) => React.ReactNode;
     onScreenChange?: (up: boolean) => void;
     currentApp: { id?: string; name: string };
+    onCommitted: (appId: string, appName: string) => void;
   }) => {
+    lastOnCommitted = onCommitted;
     lastScreenChange = onScreenChange;
     lastCurrentApp = currentApp;
     return children({ quickSwitch: null, swappingTo: null });
@@ -1452,6 +1456,72 @@ describe("SessionPage — the server's app_id is the current app (#1230)", () =>
     currentSession = makeSession({ app_id: "a2", state: "running", state_detail: "swap complete" });
     await act(async () => {
       await vi.advanceTimersByTimeAsync(6_000);
+    });
+    expect(lastCurrentApp).toEqual({ id: "a2", name: "Desktop" });
+  });
+
+  it("retries a failed name lookup", async () => {
+    currentSession = makeSession({ app_id: "a2", state: "running", state_detail: "swap complete" });
+    let failing = true;
+    const apps = { items: [{ id: "a2", name: "Desktop" }] };
+    listApps.mockImplementation(async () => {
+      if (failing) throw new Error("offline");
+      return apps;
+    });
+    renderPage();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(lastCurrentApp?.id).toBe("a1");
+    failing = false;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(lastCurrentApp).toEqual({ id: "a2", name: "Desktop" });
+  });
+
+  it("keeps a swap commit the page saw while a name lookup was in flight", async () => {
+    currentSession = makeSession({ app_id: "a2", state: "running", state_detail: "swap complete" });
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    listApps.mockImplementation(async () => {
+      await gate;
+      return { items: [{ id: "a2", name: "Desktop" }] };
+    });
+    renderPage();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    await act(async () => {
+      lastOnCommitted?.("a3", "Other");
+      release();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(lastCurrentApp).toEqual({ id: "a3", name: "Other" });
+  });
+
+  it("ignores a poll answer older than one already applied", async () => {
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    renderPage();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    // Every read from here on hangs until released, newest released first.
+    const held: Array<(v: unknown) => void> = [];
+    getSession.mockImplementation(() => new Promise((r) => held.push(r)));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(held.length).toBeGreaterThanOrEqual(2);
+    const newest = held.pop()!;
+    await act(async () => {
+      newest({ session: makeSession({ app_id: "a2", state: "running", state_detail: "swap complete" }) });
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(lastCurrentApp).toEqual({ id: "a2", name: "Desktop" });
+    await act(async () => {
+      for (const r of held) r({ session: makeSession({ state: "running", state_detail: "app presented" }) });
+      await vi.advanceTimersByTimeAsync(0);
     });
     expect(lastCurrentApp).toEqual({ id: "a2", name: "Desktop" });
   });

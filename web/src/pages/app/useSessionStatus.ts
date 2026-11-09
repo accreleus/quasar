@@ -30,7 +30,8 @@ export interface SessionStatus {
   startedAt: string | null;
   /** The session's pinned stream WxH, from the 5s poll. Null until the first poll answers. */
   polledStreamSize: { w: number; h: number } | null;
-  /** The server's `app_id` from the health poll; null until it answers. */
+  /** The server's `app_id` from the health poll; null until it answers. Never from an
+   *  answer older than one already applied. */
   polledAppId: string | null;
   /** Adaptive external resolution (§D5/§D6): what is ENCODED right now; null = still at launch size. */
   externalSize: { w: number; h: number } | null;
@@ -157,10 +158,19 @@ export function useSessionStatus(
   useEffect(() => {
     if (!authToken || !sessionId) return;
     let cancelled = false;
+    // The interval does not wait for a slow answer: an answer older than one already
+    // applied must not move the app back (a pre-swap read landing after the commit).
+    let issued = 0;
+    let applied = 0;
     const poll = async () => {
+      const seq = ++issued;
       try {
         const { session } = await getSession(authToken, sessionId);
         if (cancelled) return;
+        if (seq > applied) {
+          applied = seq;
+          setPolledAppId(session.app_id);
+        }
         if (session.state === "failed" && session.state_detail === "host_lost") {
           setHostLost(true);
           return;
@@ -174,7 +184,6 @@ export function useSessionStatus(
         // presented — healthBanner() itself decides which kinds that covers.
         setHealth(healthBanner(session as Session, appPresented));
         setStartedAt(session.started_at);
-        setPolledAppId(session.app_id);
         // Stream WxH ceiling for `PATCH /v1/sessions/{id}/display` validation.
         // Read from `session.stream` (contract: "always the truth"), not the
         // router-state tier string (absent on a resumed/deep-linked session).
