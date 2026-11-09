@@ -448,8 +448,8 @@ func TestLaunchProfileTransport(t *testing.T) {
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create: %d", resp.StatusCode)
 	}
-	if got := transportOf(resp); got != "webrtc" {
-		t.Errorf("default transport = %q, want webrtc", got)
+	if got := transportOf(resp); got != "default" {
+		t.Errorf("default transport = %q, want default (amendment 61)", got)
 	}
 
 	resp = doJSON(t, "POST", base+"/v1/admin/launch-profiles", adminTok,
@@ -470,6 +470,11 @@ func TestLaunchProfileTransport(t *testing.T) {
 	if got := transportOf(resp); got != "webtransport" {
 		t.Errorf("transport after patch = %q", got)
 	}
+	resp = doJSON(t, "PATCH", base+"/v1/admin/launch-profiles/wt-opt", adminTok, map[string]any{"transport": "default"})
+	if got := transportOf(resp); got != "default" {
+		t.Errorf("transport after patch to default = %q", got)
+	}
+	_ = doJSON(t, "PATCH", base+"/v1/admin/launch-profiles/wt-opt", adminTok, map[string]any{"transport": "webtransport"}).Body.Close()
 	resp = doJSON(t, "PATCH", base+"/v1/admin/launch-profiles/wt-opt", adminTok, map[string]any{"transport": "udp"})
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("bad transport on patch: %d, want 400", resp.StatusCode)
@@ -552,6 +557,22 @@ func TestLaunchProfilePyroWave(t *testing.T) {
 	} {
 		if got := status("PATCH", "/v1/admin/launch-profiles/pw", body, adminTok); got != http.StatusBadRequest {
 			t.Errorf("%s: %d, want 400", name, got)
+		}
+	}
+	// A default profile warns by the EFFECTIVE transport, so the instance setting moves it
+	// (amendment 61).
+	read(doJSON(t, "PATCH", base+"/v1/admin/launch-profiles/pw", adminTok, map[string]any{"transport": "default"}))
+	for _, tc := range []struct {
+		setting    string
+		wantWarned bool
+	}{{"webrtc", true}, {"webtransport", false}} {
+		t.Cleanup(func() {
+			_, _ = pool.Exec(context.Background(), `UPDATE instance_settings SET default_transport = 'webrtc'`)
+		})
+		must(t, exec(t, pool, `INSERT INTO instance_settings (id, default_transport) VALUES (true, $1)
+			ON CONFLICT (id) DO UPDATE SET default_transport = EXCLUDED.default_transport`, tc.setting))
+		if got := warned(read(doJSON(t, "GET", base+"/v1/admin/launch-profiles/pw", adminTok, nil))); got != tc.wantWarned {
+			t.Errorf("default profile on a %s instance: warned = %v, want %v", tc.setting, got, tc.wantWarned)
 		}
 	}
 	if got := status("PATCH", "/v1/admin/launch-profiles/pw", map[string]any{"pyrowave_mode": "prefer"}, userTok); got != http.StatusForbidden {

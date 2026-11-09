@@ -6,6 +6,7 @@ package session
 // disabled Delete button on a referenced profile is UX only, the 409 is the gate.
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -51,7 +52,10 @@ type launchProfileJSON struct {
 	Warnings     []writeWarning          `json:"warnings"`
 }
 
-func toLaunchProfileJSON(lp profile.LaunchProfile) launchProfileJSON {
+// toLaunchProfileJSON serializes lp. instanceDefault is the instance's default_transport; the
+// pyrowave_needs_webtransport warning reads the EFFECTIVE transport, so a "default" profile
+// follows it.
+func toLaunchProfileJSON(lp profile.LaunchProfile, instanceDefault string) launchProfileJSON {
 	out := launchProfileJSON{
 		ID:           lp.ID,
 		DisplayName:  lp.DisplayName,
@@ -71,7 +75,11 @@ func toLaunchProfileJSON(lp profile.LaunchProfile) launchProfileJSON {
 		})
 	}
 	out.Warnings = launchProfileWarnings(lp.Rungs)
-	if out.PyroWaveMode != pyrowaveOff && (lp.Transport == "" || lp.Transport == transportWebRTC) {
+	effective := lp.Transport
+	if effective == transportDefault {
+		effective = instanceDefault
+	}
+	if out.PyroWaveMode != pyrowaveOff && (effective == "" || effective == transportWebRTC) {
 		out.Warnings = append(out.Warnings, writeWarning{warnPyroWaveNeedsWebTransport,
 			"pyrowave_mode is " + out.PyroWaveMode + " but transport is webrtc, so PyroWave can never be offered"})
 	}
@@ -129,6 +137,14 @@ func launchProfileWarnings(rungs []profile.Profile) []writeWarning {
 	return out
 }
 
+// instanceDefaultTransport is one settings read for the warnings; a failed read says webrtc.
+func (h *Handler) instanceDefaultTransport(ctx context.Context) string {
+	if t, err := h.store.DefaultTransport(ctx); err == nil {
+		return t
+	}
+	return transportWebRTC
+}
+
 func (h *Handler) handleAdminListLaunchProfiles(w http.ResponseWriter, r *http.Request) {
 	lps, err := h.store.ListLaunchProfiles(r.Context(), false)
 	if err != nil {
@@ -136,8 +152,9 @@ func (h *Handler) handleAdminListLaunchProfiles(w http.ResponseWriter, r *http.R
 		return
 	}
 	items := make([]launchProfileJSON, 0, len(lps))
+	def := h.instanceDefaultTransport(r.Context())
 	for _, lp := range lps {
-		j := toLaunchProfileJSON(lp)
+		j := toLaunchProfileJSON(lp, def)
 		if usedBy, err := h.store.LaunchProfileUsedByFor(r.Context(), lp.ID); err == nil {
 			u := usedBy
 			j.UsedBy = &u
@@ -157,7 +174,7 @@ func (h *Handler) handleAdminGetLaunchProfile(w http.ResponseWriter, r *http.Req
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not load launch profile")
 		return
 	}
-	j := toLaunchProfileJSON(lp)
+	j := toLaunchProfileJSON(lp, h.instanceDefaultTransport(r.Context()))
 	if usedBy, err := h.store.LaunchProfileUsedByFor(r.Context(), lp.ID); err == nil {
 		u := usedBy
 		j.UsedBy = &u
@@ -265,7 +282,7 @@ func (h *Handler) handleAdminCreateLaunchProfile(w http.ResponseWriter, r *http.
 	}
 	h.recordActivity(r.Context(), actorFromRequest(r), "launch_profile.create", "launch_profile", created.ID,
 		map[string]any{"name": created.DisplayName})
-	httpx.WriteJSON(w, http.StatusCreated, toLaunchProfileJSON(created))
+	httpx.WriteJSON(w, http.StatusCreated, toLaunchProfileJSON(created, h.instanceDefaultTransport(r.Context())))
 }
 
 func (h *Handler) handleAdminPatchLaunchProfile(w http.ResponseWriter, r *http.Request) {
@@ -326,7 +343,7 @@ func (h *Handler) handleAdminPatchLaunchProfile(w http.ResponseWriter, r *http.R
 	// `id` excluded: the PATCH handler never applies it (the id comes from the path).
 	h.recordActivity(r.Context(), actorFromRequest(r), "launch_profile.update", "launch_profile", updated.ID,
 		map[string]any{"keys": audit.ChangedKeys(req, "id")})
-	httpx.WriteJSON(w, http.StatusOK, toLaunchProfileJSON(updated))
+	httpx.WriteJSON(w, http.StatusOK, toLaunchProfileJSON(updated, h.instanceDefaultTransport(r.Context())))
 }
 
 // handleAdminDeleteLaunchProfile removes a launch profile. Refuse-if-referenced:
@@ -446,8 +463,8 @@ func validProfileVisibility(v string) bool {
 	return false
 }
 
-const errTransportValue = "transport must be webrtc, webtransport_opt_in, or webtransport"
+const errTransportValue = "transport must be default, webrtc, webtransport_opt_in, or webtransport"
 
 func validLaunchProfileTransport(v string) bool {
-	return v == transportWebRTC || v == transportOptIn || v == transportWebTransport
+	return v == transportDefault || v == transportWebRTC || v == transportOptIn || v == transportWebTransport
 }

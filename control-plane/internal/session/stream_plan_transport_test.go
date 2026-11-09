@@ -90,6 +90,42 @@ func TestPlanStreamTransport(t *testing.T) {
 	}
 }
 
+// A "default" profile reaches the plan already resolved (resolveLaunchProfile): Transport is the
+// instance setting and TransportInherited says so. The setting behaves exactly as the profile
+// value of the same name, and the only difference is the reason a request for WebTransport is
+// refused (amendment 61).
+func TestPlanStreamTransportInheritedDefault(t *testing.T) {
+	for _, tc := range []struct {
+		setting, requested string
+		want, wantReason   string
+	}{
+		{"webrtc", "", "webrtc", ""},
+		{"webrtc", "webrtc", "webrtc", ""},
+		{"webrtc", "webtransport", "webrtc", "instance_default_disallows"},
+		{"webtransport", "", "webtransport", ""},
+		{"webtransport", "webrtc", "webrtc", ""},
+		{"webtransport", "webtransport", "webtransport", ""},
+	} {
+		t.Run(tc.setting+"/"+tc.requested, func(t *testing.T) {
+			in := wtInputs(tc.setting, tc.requested, true, wtProbe())
+			in.Chain.TransportInherited = true
+			plan, err := planStream(in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if plan.Update.Transport != tc.want || plan.Update.TransportReason != tc.wantReason {
+				t.Errorf("transport = %q (reason %q), want %q (reason %q)",
+					plan.Update.Transport, plan.Update.TransportReason, tc.want, tc.wantReason)
+			}
+		})
+	}
+	// An explicit webrtc profile keeps its own reason.
+	in := wtInputs("webrtc", "webtransport", true, wtProbe())
+	if plan, _ := planStream(in); plan.Update.TransportReason != "profile_disallows" {
+		t.Errorf("explicit webrtc reason = %q", plan.Update.TransportReason)
+	}
+}
+
 // WebTransport carries h264, hevc and av1 (A18, #1043): the resolved codec no longer sends a
 // session to WebRTC, and the device's own WebCodecs probe for that codec decides instead. The
 // transport check never changes the codec. codec_unsupported_on_transport stays for a codec

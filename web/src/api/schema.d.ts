@@ -4368,6 +4368,11 @@ export interface paths {
                         compat_tools_max_enabled?: number;
                         /** @description Amendment 58 (accreleus/quasar#1059). How many sessions on one GPU may hold a PyroWave slot at once (control-api.md §The PyroWave ceiling). Default 1. Absent = unchanged; outside 1-4 is 400 validation_failed. Lowering it ends no session. */
                         pyrowave_max_per_gpu?: number;
+                        /**
+                         * @description Amendment 61 (accreleus/quasar#1217). The transport of every launch profile whose transport is default (control-api.md §Transport ▸ The instance default). Default webrtc. Absent = unchanged; any other value is 400 validation_failed. Applies to launches that start afterwards; a running session keeps its transport.
+                         * @enum {string}
+                         */
+                        default_transport?: "webrtc" | "webtransport";
                         /** @description Amendment 56. Free GiB a tool install must leave on a host beyond the asset and the 4 GiB unpacked cap (trust rule T7). Default 10. Absent = unchanged. */
                         compat_tools_disk_reserve_gib?: number;
                         /** @description Amendment 49 (#845). As RegionSettings.timezone. Default UTC. Absent = unchanged. */
@@ -9236,7 +9241,7 @@ export interface components {
         /** @description UI-P4: a non-fatal advisory returned on an admin profile write. A warning NEVER fails the request - it reports a configuration that is legal but almost certainly not what the operator meant. */
         WriteWarning: {
             /**
-             * @description h264_floor_not_last - every rung after the H.264 rung is unreachable, because H.264 passes every clamp. floor_not_least_demanding - the H.264 rung has a higher min_offer_bandwidth_kbps or min_decode_height than a rung above it, or requires a hardware encoder while a rung above it does not; a floor harder to satisfy than the rung above it is a misconfiguration. pyrowave_needs_webtransport (amendments 55, 58) - pyrowave_mode is allow or prefer on a launch profile whose transport is webrtc, so PyroWave can never be offered.
+             * @description h264_floor_not_last - every rung after the H.264 rung is unreachable, because H.264 passes every clamp. floor_not_least_demanding - the H.264 rung has a higher min_offer_bandwidth_kbps or min_decode_height than a rung above it, or requires a hardware encoder while a rung above it does not; a floor harder to satisfy than the rung above it is a misconfiguration. pyrowave_needs_webtransport (amendments 55, 58) - pyrowave_mode is allow or prefer on a launch profile whose transport is webrtc (amendment 61: whose effective transport is webrtc, so it also follows default_transport), so PyroWave can never be offered.
              * @enum {string}
              */
             code: "h264_floor_not_last" | "floor_not_least_demanding" | "pyrowave_needs_webtransport";
@@ -9798,7 +9803,7 @@ export interface components {
             shared_home_app_id: string | null;
             /** @description Amendment 54: the transport the stream plan chose. Always serialized by a server implementing the amendment; absent from an older one, read as webrtc. */
             transport?: components["schemas"]["Transport"];
-            /** @description Amendment 54: why a wanted WebTransport was not chosen (profile_disallows, host_no_endpoint, device_no_webtransport, device_no_webcodecs; an open string), else null. Absent from an older server. */
+            /** @description Amendment 54: why a wanted WebTransport was not chosen (profile_disallows, amendment 61's instance_default_disallows, host_no_endpoint, device_no_webtransport, device_no_webcodecs; an open string), else null. Absent from an older server. */
             transport_reason?: string | null;
             /** @description Amendment 54: the reason in the latest transport.fallback trace event the client posted, else null. Observability only. Absent from an older server. */
             transport_fallback_reason?: string | null;
@@ -9919,10 +9924,10 @@ export interface components {
          */
         Transport: "webrtc" | "webtransport";
         /**
-         * @description Amendment 54: whether a launch profile's sessions may use WebTransport. webrtc = never; webtransport_opt_in = only when the launch request asks for it (the developer URL switch) or, amendment 58, the stream plan wants PyroWave; webtransport = unless the launch request asks for webrtc (or, amendment 58, the plan wants PyroWave).
+         * @description Amendment 54: whether a launch profile's sessions may use WebTransport. webrtc = never; webtransport_opt_in = only when the launch request asks for it (the developer URL switch) or, amendment 58, the stream plan wants PyroWave; webtransport = unless the launch request asks for webrtc (or, amendment 58, the plan wants PyroWave). Amendment 61 (accreleus/quasar#1217): default = follow the instance setting default_transport, which behaves as webrtc or webtransport above. Wherever a description here reads a launch profile's transport, it means this effective transport.
          * @enum {string}
          */
-        LaunchProfileTransport: "webrtc" | "webtransport_opt_in" | "webtransport";
+        LaunchProfileTransport: "default" | "webrtc" | "webtransport_opt_in" | "webtransport";
         /**
          * @description Amendment 58 (accreleus/quasar#1059): a launch profile's Ultra-low latency (PyroWave) setting. off = never; allow = only when the user picks it in the Launch options Codec list; prefer = as allow, and an Auto launch gets it when the launch-time Auto rule holds (device probe shows WebGPU; within the 10-minute network-figure window, probe rtt_ms <= 5 and probe bandwidth_kbps >= the PyroWave target; the figures are unauthenticated hints; control-api.md §Ultra-low latency (PyroWave)). Either way subject to the per-GPU ceiling pyrowave_max_per_gpu.
          * @enum {string}
@@ -10565,6 +10570,11 @@ export interface components {
                 compat_tools_disk_reserve_gib?: number;
                 /** @description Amendment 58 (accreleus/quasar#1059). The per-GPU PyroWave ceiling. Default 1. Optional in the envelope so a pre-amendment server stays conformant. */
                 pyrowave_max_per_gpu?: number;
+                /**
+                 * @description Amendment 61 (accreleus/quasar#1217). The instance default transport. Default webrtc. Optional in the envelope so a pre-amendment server stays conformant; absent reads as webrtc.
+                 * @enum {string}
+                 */
+                default_transport?: "webrtc" | "webtransport";
                 /** @description Amendment 49 (#845). Default UTC. Optional in the envelope so a pre-amendment server stays conformant. */
                 default_timezone?: string;
                 /** @description Amendment 49. Default en-US. */
@@ -11622,7 +11632,7 @@ export interface components {
             visibility: "user" | "debug" | "internal";
             sort_order: number;
             rungs: components["schemas"]["LaunchProfileRung"][];
-            /** @description Amendment 54. Always serialized by a server implementing the amendment; absent from an older one, read as webrtc. */
+            /** @description Amendment 54. Always serialized by a server implementing the amendment; absent from an older one, read as webrtc. Amendment 61: default on every profile that read webrtc before migration 0116. */
             transport?: components["schemas"]["LaunchProfileTransport"];
             /** @description Amendment 58 (amendment 55's pyrowave_allowed is deleted): Ultra-low latency (PyroWave) for this profile. Always serialized by a server implementing the amendment; absent from an older one, read as off. */
             pyrowave_mode?: components["schemas"]["LaunchProfilePyroWaveMode"];
@@ -11640,7 +11650,7 @@ export interface components {
             /** @enum {string} */
             visibility?: "user" | "debug" | "internal";
             sort_order?: number;
-            /** @description Amendment 54. Absent on POST = webrtc; absent on PATCH = unchanged. */
+            /** @description Amendment 54. Absent on POST = default (amendment 61; it was webrtc); absent on PATCH = unchanged. */
             transport?: components["schemas"]["LaunchProfileTransport"];
             /** @description Amendment 58. Absent on POST = off; absent on PATCH = unchanged; any other value = 400 validation_failed. allow or prefer with transport webrtc draws the warning pyrowave_needs_webtransport. Amendment 55's pyrowave_allowed is deleted: sent, it is an unknown key, 400 validation_failed like any other on this decoder. */
             pyrowave_mode?: components["schemas"]["LaunchProfilePyroWaveMode"];

@@ -124,6 +124,25 @@ func TestLaunchGrantsPyroWaveAndTheCeilingRefusesTheNext(t *testing.T) {
 }
 
 // N3: a session that ends gives its slot back by leaving the active set.
+// PyroWave reads the effective transport: a default profile on a webtransport instance can be
+// granted it, with no explicit transport on the profile (amendment 61).
+func TestPyroWaveFollowsTheInstanceDefaultTransport(t *testing.T) {
+	f := newPyroWaveFixture(t)
+	must(t, exec(t, f.pool, `UPDATE launch_profiles SET transport = 'default' WHERE id = '1080p60'`))
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), `UPDATE instance_settings SET default_transport = 'webrtc'`)
+	})
+	must(t, exec(t, f.pool, `INSERT INTO instance_settings (id, default_transport) VALUES (true, 'webtransport')
+		ON CONFLICT (id) DO UPDATE SET default_transport = EXCLUDED.default_transport`))
+	status, body := f.launch(t, map[string]any{"pyrowave": true})
+	if status != http.StatusCreated {
+		t.Fatalf("launch: %d %v", status, body)
+	}
+	if pw := pyrowaveOf(t, body); pw["allowed"] != true || body["session"].(map[string]any)["transport"] != "webtransport" {
+		t.Errorf("session = %v", body["session"])
+	}
+}
+
 func TestAStoppedSessionFreesItsPyroWaveSlot(t *testing.T) {
 	f := newPyroWaveFixture(t)
 	_, body := f.launch(t, map[string]any{"pyrowave": true})
