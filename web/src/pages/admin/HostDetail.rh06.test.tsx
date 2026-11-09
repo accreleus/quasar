@@ -432,4 +432,15 @@ describe("HostDetail — remove host (#366)", () => {
     expect(screen.queryByText("Remove gpu-host-4?")).toBeNull();
     expect(screen.queryByRole("button", { name: /Forget host/ })).toBeNull();
   });
+
+  it("offers no removal while the control plane's identity is unknown (#1239 review)", async () => {
+    mocked.getPlatformReleases.mockRejectedValue(new Error("unavailable"));
+    mocked.getHost.mockResolvedValue({
+      host: host({ status: "offline", last_heartbeat_at: new Date(NOW - 3 * 86400_000).toISOString() }),
+    } as never);
+    renderDetail(`/admin/fleet/hosts/${ID}?remove=1`);
+    await card();
+    expect(screen.queryByText("Remove gpu-host-4?")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Remove host/ })).toBeNull();
+  });
 });

@@ -246,7 +246,9 @@ export function HostDetail() {
     floor,
   });
   const inFlight = removal.removal;
+  // An unknown control-plane identity (the release read failed) could be this very machine.
   const canRemove =
+    machine != null &&
     removable(host, machine) &&
     !conflict &&
     services != null &&
