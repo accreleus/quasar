@@ -246,7 +246,9 @@ export function HostDetail() {
     floor,
   });
   const inFlight = removal.removal;
+  // An unknown control-plane identity (the release read failed) could be this very machine.
   const canRemove =
+    machine != null &&
     removable(host, machine) &&
     !conflict &&
     services != null &&
@@ -399,7 +401,9 @@ export function HostDetail() {
         />
       )}
 
-      {removeOpen && (
+      {/* `?remove=1` opens it too: never for a host this page would not offer removal of
+          (the control plane's own machine), whose Forget would drop its own row. */}
+      {removeOpen && canRemove && (
         <RemoveHostModal
           host={host}
           liveSessions={sessions.length}
@@ -409,6 +413,10 @@ export function HostDetail() {
           onConfirm={() => {
             setRemoveOpen(false);
             removal.start(host, sessions.length);
+          }}
+          onForget={() => {
+            setRemoveOpen(false);
+            void forget.run(host);
           }}
         />
       )}
