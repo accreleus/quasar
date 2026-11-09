@@ -409,4 +409,27 @@ describe("HostDetail — remove host (#366)", () => {
     expect(screen.getByText(/run the uninstall command on the machine/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: /Remove host/ })).toBeNull();
   });
+  it("opens no removal for the control plane's own machine from ?remove=1, even disconnected", async () => {
+    mocked.getPlatformReleases.mockResolvedValue({
+      faults: [],
+      installed: {
+        control_plane: {
+          version: "0.5.2",
+          source_commit: COMMIT,
+          built_at: null,
+          schema_version: 96,
+          machine_role: "combined",
+          machine_node_name: "gpu-host-4",
+        },
+        hosts: [],
+      },
+    } as never);
+    mocked.getHost.mockResolvedValue({
+      host: host({ status: "offline", last_heartbeat_at: new Date(NOW - 3 * 86400_000).toISOString() }),
+    } as never);
+    renderDetail(`/admin/fleet/hosts/${ID}?remove=1`);
+    await card();
+    expect(screen.queryByText("Remove gpu-host-4?")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Forget host/ })).toBeNull();
+  });
 });

@@ -399,7 +399,9 @@ export function HostDetail() {
         />
       )}
 
-      {removeOpen && (
+      {/* `?remove=1` opens it too: never for a host this page would not offer removal of
+          (the control plane's own machine), whose Forget would drop its own row. */}
+      {removeOpen && canRemove && (
         <RemoveHostModal
           host={host}
           liveSessions={sessions.length}
