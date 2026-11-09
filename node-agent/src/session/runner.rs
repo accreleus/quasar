@@ -4682,10 +4682,15 @@ fn perform_swap(
             ));
         }
         if Instant::now() >= deadline {
-            // A parked Steam draws nothing until its game does (#1243). One still starting at
-            // the budget (an update, a slow sign-in) is switched to, not rolled back: its
-            // helper is up, and what Steam shows next is for the player.
-            if expects_app && res.launch().is_some_and(|l| l.reports().helper_connected) {
+            // A parked Steam draws nothing until its game does (#1243). One whose helper has
+            // launched the game (it reports a launch state) and whose container still runs is
+            // switched to at the budget (an update, a slow sign-in), not rolled back. A Steam
+            // that never came up still rolls back.
+            let launched = res.launch().is_some_and(|l| {
+                let r = l.reports();
+                r.helper_connected && r.launch_state.is_some()
+            });
+            if expects_app && launched && !new_source.container_exited() {
                 tracing::info!(
                     session_id = %session_id,
                     "swap: Steam is still starting at the {budget:?} budget; switching to it"

@@ -240,8 +240,10 @@ impl Helper {
     fn command(&mut self, command: Command, agent: &mut Agent) {
         match command {
             Command::Launch(appid) => {
-                // A launch that does not run leaves no retry of an earlier target behind.
+                // A launch that does not run leaves no retry of an earlier target behind,
+                // and no earlier held launch either.
                 self.relaunch = None;
+                self.pending = None;
                 if !self.steam_running() {
                     eprintln!(
                         "quasar-launch-helper: no Steam client yet; app {appid} waits for it"
@@ -269,6 +271,8 @@ impl Helper {
                     return;
                 }
                 self.relaunch = None;
+                // A held launch of the game being quit must never run after it (#1243).
+                self.pending = None;
                 match self.screen.close(appid) {
                     Ok(sent) => eprintln!(
                         "quasar-launch-helper: asked {sent} window(s) of Steam app {appid} to close"
@@ -1579,9 +1583,11 @@ mod tests {
             agent.latest[COMMAND_DONE].is_none(),
             "and the launch is not answered yet"
         );
+        // A newer launch replaces the held one: only the latest game ever runs.
+        helper.command(Command::Launch(620), &mut agent);
         steam_client(&proc);
         helper.pass(t + PASS, &mut agent);
-        assert_eq!(argv(dir.path()), "-applaunch|1145360|");
+        assert_eq!(argv(dir.path()), "-applaunch|620|");
         assert!(agent.latest[COMMAND_DONE]
             .as_deref()
             .unwrap()
