@@ -32,6 +32,7 @@ vi.mock("react-router-dom", async (importOriginal) => {
 const getSession = vi.fn();
 vi.mock("../../api/library", () => ({
   getSession: (...a: unknown[]) => getSession(...a),
+  listApps: () => Promise.resolve({ items: [] }),
   stopSession: (...a: unknown[]) => stopSession(...a),
   mintSignalingToken: (...a: unknown[]) => mintSignalingToken(...a),
   updateSessionDisplay: vi.fn(),

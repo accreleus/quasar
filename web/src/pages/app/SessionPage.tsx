@@ -15,7 +15,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import "../../styles/session.css";
 import "../../styles/hud.css";
-import { getSession, mintSignalingToken, stopSession } from "../../api/library";
+import { getSession, listApps, mintSignalingToken, stopSession } from "../../api/library";
 import { ApiError } from "../../api/client";
 import type { ICEServer, WebTransportCoords } from "../../api/types";
 import { useAuth } from "../../auth/context";
@@ -376,6 +376,7 @@ function SessionPageBody() {
     health,
     startedAt,
     polledStreamSize,
+    polledAppId,
     externalSize,
     setExternalSize,
     streamRungs,
@@ -391,6 +392,34 @@ function SessionPageBody() {
     sessionRunning,
     pollEndReason,
   } = useSessionStatus(authToken, sessionId, stopping, revealStartedRef);
+
+  // The server's app_id is the truth for the current app: router state survives a
+  // reload and a swap's own poll can end unseen.
+  const currentAppIdRef = useRef(currentApp.id);
+  currentAppIdRef.current = currentApp.id;
+  useEffect(() => {
+    if (!authToken || !polledAppId || polledAppId === currentAppIdRef.current) return;
+    const from = currentAppIdRef.current;
+    let live = true;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    const seat = () =>
+      listApps(authToken).then(
+        (apps) => {
+          if (!live) return;
+          const name = apps.items.find((a) => a.id === polledAppId)?.name ?? "Session";
+          // A swap commit the page saw while the lookup ran wins.
+          setCurrentApp((prev) => (prev.id === from ? { id: polledAppId, name } : prev));
+        },
+        () => {
+          if (live) retry = setTimeout(() => void seat(), 5_000);
+        },
+      );
+    void seat();
+    return () => {
+      live = false;
+      clearTimeout(retry);
+    };
+  }, [authToken, polledAppId]);
 
   // sessionRuntime.ts: one runtime instance per transport generation (law L1)
   // — a replacement token re-seats signalCoords, destroying this runtime and
