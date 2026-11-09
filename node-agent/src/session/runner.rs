@@ -4556,8 +4556,21 @@ fn perform_swap(
         emit(SessionEvent::AppBooting);
     }
     let budget = swap_app_ready_timeout();
-    let deadline = Instant::now() + budget;
+    let started = Instant::now();
+    let deadline = started + budget;
     let mut frames_at_first_commit: Option<u64> = None;
+    // A Steam game the helper follows is held like a launch (#727): a new container's first
+    // draw is Steam starting, so the switch screen stays up until the game is on screen,
+    // never past this budget. Any other app, or no helper, is shown on its first draw.
+    let mut gate = AppBootGate::new(
+        res.launch().map(|_| {
+            super::launch_helper::reveal_cap(
+                std::env::var("QUASAR_STEAM_REVEAL_CAP_SECS").ok(),
+                cfg.app_boot_timeout,
+            )
+        }),
+        None,
+    );
     let ready = loop {
         if let Err(e) = pump_new_source_bus(&new_bus, &mut new_source) {
             break Err(e);
@@ -4570,10 +4583,34 @@ fn perform_swap(
         // Order matters: commits first, then frames — see `swap_source_ready`.
         let commits = new_source.app_surface_commits();
         let frames = new_source.sink_frames();
-        if swap_source_ready(expects_app, commits, frames, &mut frames_at_first_commit) {
+        let shown = if expects_app {
+            let reports = res
+                .launch()
+                .map(super::launch_helper::LaunchSocket::reports)
+                .unwrap_or_default();
+            match gate.tick(Instant::now(), started, commits, frames, reports) {
+                AppBootStep::Present(reveal) => Some(reveal),
+                AppBootStep::Held => {
+                    tracing::info!(
+                        "swap: first frame after {} ms; holding the switch for the game",
+                        started.elapsed().as_millis()
+                    );
+                    None
+                }
+                _ if gate.drawn_at.is_some() && Instant::now() >= deadline => {
+                    Some("swap budget reached")
+                }
+                _ => None,
+            }
+        } else {
+            swap_source_ready(false, commits, frames, &mut frames_at_first_commit)
+                .then_some("first frame")
+        };
+        if let Some(reveal) = shown {
             tracing::info!(
                 app_surface_commits = commits.unwrap_or(0),
                 sink_frames = frames,
+                reveal,
                 "swap: replacement app has presented its first frame"
             );
             if expects_app {
@@ -4583,9 +4620,13 @@ fn perform_swap(
         }
         // A replacement that exits before it ever presents: its own generation's observer
         // reports the exit with its final lines, so the swap fails NOW with the real cause
-        // rather than sitting out the budget and reporting "no frame". Checked AFTER the
-        // readiness gate so an app that presented and then exited is adopted and handled
-        // by the normal exit policy, never rolled back as "never presented".
+        // rather than sitting out the budget and reporting "no frame". Not once it has drawn
+        // (a held game): an app that drew and then exited is adopted and handled by the
+        // normal exit policy, never rolled back as "never presented".
+        if gate.drawn_at.is_some() {
+            std::thread::sleep(SWAP_POLL);
+            continue;
+        }
         if let Some(status) = new_source.take_container_exit() {
             let tail = new_source.app_log_tail();
             tracing::warn!(
