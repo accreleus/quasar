@@ -843,6 +843,10 @@ impl Reader {
                     let mut state = self.shared.state();
                     if state.active {
                         state.reports.helper_connected = true;
+                        // What is on screen is this helper's to report: a dead helper's
+                        // queued lines must not reveal the next game (#1234).
+                        state.reports.game_window_on_screen = None;
+                        state.reports.needs_user = None;
                     }
                     drop(state);
                     self.shared.metrics.set_launch_helper_connected();
@@ -1460,7 +1464,8 @@ mod tests {
             "every window once set"
         );
 
-        // A dropped connection keeps the state; the helper's reconnect carries on.
+        // A dropped connection keeps the launch state; the helper's reconnect carries on.
+        // The window and Steam's ask are the new helper's to report (#1234).
         drop(helper);
         let mut helper = s.connect();
         writeln!(
@@ -1469,6 +1474,8 @@ mod tests {
         )
         .unwrap();
         s.wait_for(|r| r.launch_state == Some(LaunchState::GameExited));
+        assert_eq!(s.socket().reports().game_window_on_screen, None);
+        assert_eq!(s.socket().reports().needs_user, None);
         assert_eq!(s.wire_state().as_deref(), Some("game_exited"));
         let states: Vec<_> = s.traces().iter().map(|p| p["state"].clone()).collect();
         assert_eq!(

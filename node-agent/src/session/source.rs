@@ -497,6 +497,15 @@ impl GenerationObservation {
         Some(status)
     }
 
+    /// An exit is waiting for `take_exit`; leaves it there.
+    pub(crate) fn has_exit(&self) -> bool {
+        let guard = match self.exit_result.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.is_some()
+    }
+
     pub(crate) fn log_tail(&self) -> Vec<String> {
         self.logs.tail()
     }
@@ -952,6 +961,11 @@ impl AppSource {
     /// [`Self::take_launch_error`]: the runner must act on a given exit exactly once.
     pub fn take_container_exit(&self) -> Option<AppExitStatus> {
         self.observation.take_exit()
+    }
+
+    /// The container has exited and [`Self::take_container_exit`] has not yet taken it.
+    pub fn container_exited(&self) -> bool {
+        self.observation.has_exit()
     }
 
     /// Whether the CURRENT app container has presented a frame. Built on
