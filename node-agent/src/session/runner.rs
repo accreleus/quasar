@@ -4682,6 +4682,17 @@ fn perform_swap(
             ));
         }
         if Instant::now() >= deadline {
+            // A parked Steam draws nothing until its game does (#1243). One still starting at
+            // the budget (an update, a slow sign-in) is switched to, not rolled back: its
+            // helper is up, and what Steam shows next is for the player.
+            if expects_app && res.launch().is_some_and(|l| l.reports().helper_connected) {
+                tracing::info!(
+                    session_id = %session_id,
+                    "swap: Steam is still starting at the {budget:?} budget; switching to it"
+                );
+                emit(SessionEvent::AppPresented);
+                break Ok(());
+            }
             break Err(format!(
                 "replacement app produced no frame within {budget:?} \
                  (app_surface_commits={commits:?})"

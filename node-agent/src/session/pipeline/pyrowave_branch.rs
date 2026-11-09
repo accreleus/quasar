@@ -1161,7 +1161,8 @@ mod tests {
         let (a, e, w) = (admitted.clone(), encoded.clone(), worst.clone());
         queue_src.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
             if info.buffer().is_some_and(|b| !b.is_writable()) {
-                let held = a.fetch_add(1, Ordering::SeqCst) + 1 - e.load(Ordering::SeqCst);
+                let held =
+                    (a.fetch_add(1, Ordering::SeqCst) + 1).saturating_sub(e.load(Ordering::SeqCst));
                 w.fetch_max(held, Ordering::SeqCst);
             }
             gst::PadProbeReturn::Ok
