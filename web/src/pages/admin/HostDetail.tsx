@@ -188,6 +188,8 @@ export function HostDetail() {
   // The last report in which the recovery actor answered, kept for when it stops
   // answering (mock rh06/inv-error): the contract keeps no last report of its own.
   const lastReport = useRef<LastReport | null>(null);
+  /** The open Remove dialog was offered under a known identity (see `showRemove`). */
+  const removeOffered = useRef(false);
   useEffect(() => {
     if (host?.updater_present === true) lastReport.current = { host, at: Date.now() };
   }, [host]);
@@ -254,8 +256,12 @@ export function HostDetail() {
     services != null &&
     (services.report === "reported" || services.report === "offline");
   // Not left open for a later poll to show: the offer it confirmed is gone. Only on a definite
-  // answer: a poll whose release read failed (no `machine`) must not close a dialog mid-confirm.
+  // answer: a poll whose release read failed (no `machine`) says nothing either way, so a dialog
+  // that was offered stays on screen through it instead of vanishing mid-confirm and coming back.
   if (removeOpen && machine != null && !canRemove) setRemoveOpen(false);
+  if (!removeOpen) removeOffered.current = false;
+  else if (canRemove) removeOffered.current = true;
+  const showRemove = removeOpen && (canRemove || (machine == null && removeOffered.current));
   const servicesFoot =
     inFlight?.phase === "waiting" ? (
       <>
@@ -406,7 +412,7 @@ export function HostDetail() {
 
       {/* `?remove=1` opens it too: never for a host this page would not offer removal of
           (the control plane's own machine), whose Forget would drop its own row. */}
-      {removeOpen && canRemove && (
+      {showRemove && (
         <RemoveHostModal
           host={host}
           liveSessions={sessions.length}
