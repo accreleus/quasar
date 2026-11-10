@@ -33,18 +33,19 @@ A directory, zipped when it is handed between machines.
 | `network.json` | `path` facts, and `shaping` (`null` when none was applied) |
 | `<scenario>/scenario.json` | the scenario as run: `id`, `params`, `status`, `reason` when skipped or in error, `sessions`, `clock_offset_ms`, `criteria` |
 | `<scenario>/timeline.jsonl` | one step or event per line: `ts_unix_ms`, `clock`, `ev` |
-| `<scenario>/metrics.jsonl`, `trace.json`, `session.json`, `conditions.json`, `summary.json` | the series and events, in the run-directory shape `scripts/dx/bench_submit.py` reads, so a scenario posts to quasar-bench as it is |
+| `<scenario>/metrics.jsonl`, `trace.json`, `session.json`, `conditions.json`, `summary.json` | the series and events, in the run-directory shape `scripts/dx/bench_submit.py` reads. Posting (`e2e-post`, #1276) adds what that script does not take from the directory: the verdict from `status`, and `scenario.json` and `timeline.jsonl` as artifacts |
 | anything else in a scenario directory | pictures, per-frame records, input records, logs, the session's diagnostic bundle |
 
 ### Rules the validator enforces
 
+- **Shape.** The four top-level files and every `scenario.json` are JSON objects with the fields in the table; `scenarios` lists directory names (no path); a scenario that was not skipped has a `timeline.jsonl`; every line of a `.jsonl` file is an object.
 - **Status** is `pass`, `fail`, `error` or `skipped`. `skipped` and `error` carry a `reason`.
 - **A criterion** has `id`, `pass` (`true`, `false`, or `null` for "not judged"), `observed` and `expected`.
-- **Not measured is `null`, never `0`.** A criterion that was not judged has `observed: null`. A fact listed in `not_recorded` has no value anywhere in the bundle.
-- **Keys are the metric manifest's.** An `agent` or `browser` sample key must be in `docs/session-trace/metrics.json` (bench-mode keys ride in `browser` samples). Sample sources are the five quasar-bench accepts: `agent`, `browser`, `app`, `netem`, `harness`.
+- **Not measured is `null`, never `0`.** A criterion that was not judged has `observed: null`. A fact listed in `not_recorded` has no value as a criterion or as a sample.
+- **Keys are the metric manifest's.** An `agent` or `browser` sample key must be in `docs/session-trace/metrics.json` (bench-mode keys ride in `browser` samples, with the six keys `scripts/dx/bench_app_samples.py` derives: `bench_n`, `bench_decoded`, `i2p_p50_ms`, `i2p_max_ms`, `i2p_n`, `ts_nudged`). Sample sources are the five quasar-bench accepts: `agent`, `browser`, `app`, `netem`, `harness`.
 - **Every timestamp names its clock.** A timeline row says `client` or `host`; a sample's clock is its key's clock in the metric manifest. `clock_offset_ms` is the measured client-to-host offset, or `null`.
 - **A missing build has a reason.**
-- **No address, token, password or home path** in any text file. Documentation addresses (RFC 5737) pass. The check knows IPv4 only: `scripts/dev/leak-scan.sh` with the operator's patterns still runs before a bundle goes anywhere public.
+- **No address, token or password** in any `.json`, `.jsonl`, `.md`, `.txt`, `.log` or `.html` file. Documentation addresses (RFC 5737) pass. The check knows IPv4 only, and does not look for host names or home paths (a session container's own home is a real path in app logs): `scripts/dev/leak-scan.sh` with the operator's patterns still runs before a bundle goes anywhere public.
 
-The test (`node --test scripts/validate/stream/bundle.test.mjs`, part of `make verify`) holds one
-broken bundle per rule.
+The test (`node --test scripts/validate/stream/bundle.test.mjs`, part of `make verify`) breaks the
+fixture once per rule above.

@@ -389,6 +389,7 @@ model in the loop: a stream hold, a transport fallback, an input pass. It takes
 parameters (transport, codec, profile). Also the name quasar-bench files its run under.
 
 **Plan** — an ordered list of scenarios with their parameters, run as one command.
+Not the *stream plan* (a session's post-placement decision).
 
 **Criterion** — one named, checkable part of a scenario's pass rule, recorded with the
 observed and the expected value; `pass` is true, false, or null when it could not be

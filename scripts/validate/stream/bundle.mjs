@@ -17,16 +17,16 @@ export const STATUSES = ["pass", "fail", "error", "skipped"];
 export const SOURCES = ["agent", "browser", "app", "netem", "harness"];
 export const CLOCKS = ["client", "host"];
 
-// Addresses, tokens and home paths never belong in a bundle, whoever made it.
-// shortcut: IPv4 only, IPv6 and bare host names are not caught; scripts/dev/leak-scan.sh
-// with the operator's patterns runs before a bundle is posted anywhere public.
+// Addresses and tokens never belong in a bundle, whoever made it.
+// shortcut: IPv4 only; IPv6, bare host names and home paths (a session container's own
+// home is a real path in app logs) are left to scripts/dev/leak-scan.sh with the
+// operator's patterns, which runs before a bundle is posted anywhere public.
 const IPV4 = /(?<![\d.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?![\d.])/g;
 const DOC_NETS = ["192.0.2.", "198.51.100.", "203.0.113."]; // RFC 5737
 const SECRETS = [
   [/\beyJ[\w-]{10,}\.[\w-]{10,}\./, "a JWT"],
   [/\bBearer\s+[\w.~+/-]{8,}/i, "a bearer token"],
   [/"(password|access_token|refresh_token|sig_token)"\s*:\s*"[^"]+"/i, "a credential"],
-  [/(\/home\/|\/Users\/)[\w.-]+/, "a home path"],
 ];
 
 function leaks(text) {
@@ -42,9 +42,13 @@ function leaks(text) {
   return found;
 }
 
+// What scripts/dx/bench_app_samples.py writes into a browser sample beside the manifest's
+// bench keys: two renames, the input-to-photon roll-up and its own flag.
+const FOLD_KEYS = ["bench_n", "bench_decoded", "i2p_p50_ms", "i2p_max_ms", "i2p_n", "ts_nudged"];
+
 /** Metric keys the product defines, per source. A bench-mode key rides in a browser sample. */
 export function manifestKeys(file = path.join(ROOT, "docs/session-trace/metrics.json")) {
-  const keys = { agent: new Set(), browser: new Set() };
+  const keys = { agent: new Set(), browser: new Set(FOLD_KEYS) };
   for (const m of JSON.parse(fs.readFileSync(file, "utf8")).metrics) {
     if (m.source === "agent") keys.agent.add(m.key);
     else keys.browser.add(m.key); // browser and bench
@@ -60,11 +64,13 @@ export function validateBundle(dir, { keys = manifestKeys() } = {}) {
   const err = (where, what) => errors.push(`${where}: ${what}`);
   const readJson = (rel) => {
     try {
-      return JSON.parse(fs.readFileSync(path.join(dir, rel), "utf8"));
+      const v = JSON.parse(fs.readFileSync(path.join(dir, rel), "utf8"));
+      if (isObj(v)) return v;
+      err(rel, "not an object");
     } catch (e) {
       err(rel, e.code === "ENOENT" ? "missing" : `not JSON (${e.message})`);
-      return null;
     }
+    return null;
   };
   const readJsonl = (rel) => {
     const file = path.join(dir, rel);
@@ -73,7 +79,9 @@ export function validateBundle(dir, { keys = manifestKeys() } = {}) {
     fs.readFileSync(file, "utf8").split("\n").forEach((line, i) => {
       if (!line.trim()) return;
       try {
-        rows.push(JSON.parse(line));
+        const v = JSON.parse(line);
+        if (isObj(v)) rows.push(v);
+        else err(`${rel}:${i + 1}`, "not an object");
       } catch {
         err(`${rel}:${i + 1}`, "not JSON");
       }
@@ -91,7 +99,16 @@ export function validateBundle(dir, { keys = manifestKeys() } = {}) {
     for (const k of ["suite_run_id", "plan", "started_at_ms", "ended_at_ms", "runner", "halves", "scenarios", "not_recorded"]) {
       if (manifest[k] === undefined) err("manifest.json", `no ${k}`);
     }
-    for (const n of manifest.not_recorded ?? []) {
+    // A name is one directory inside the bundle, never a path out of it.
+    if (!Array.isArray(manifest.scenarios) || manifest.scenarios.some((n) => typeof n !== "string" || !/^\w[\w.-]*$/.test(n))) {
+      err("manifest.json", "scenarios must be a list of directory names");
+      manifest.scenarios = [];
+    }
+    if (!Array.isArray(manifest.not_recorded)) {
+      err("manifest.json", "not_recorded must be a list");
+      manifest.not_recorded = [];
+    }
+    for (const n of manifest.not_recorded) {
       if (!n?.fact || !n?.why) err("manifest.json", "a not_recorded entry needs fact and why");
     }
   }
@@ -105,7 +122,7 @@ export function validateBundle(dir, { keys = manifestKeys() } = {}) {
   if (network && !("shaping" in network)) err("network.json", "no shaping (null when none was applied)");
 
   const notRecorded = new Set((manifest?.not_recorded ?? []).map((n) => n?.fact));
-  for (const name of Array.isArray(manifest?.scenarios) ? manifest.scenarios : []) {
+  for (const name of manifest?.scenarios ?? []) {
     const sc = readJson(`${name}/scenario.json`);
     if (!sc) continue;
     const at = `${name}/scenario.json`;
@@ -114,7 +131,7 @@ export function validateBundle(dir, { keys = manifestKeys() } = {}) {
     if (["skipped", "error"].includes(sc.status) && !sc.reason) err(at, `status ${sc.status} needs a reason`);
     if (!("clock_offset_ms" in sc)) err(at, "no clock_offset_ms (null when the offset was not measured)");
     if (!Array.isArray(sc.criteria)) err(at, "no criteria");
-    for (const c of sc.criteria ?? []) {
+    for (const c of Array.isArray(sc.criteria) ? sc.criteria : []) {
       if (!c?.id || !("observed" in c) || !("expected" in c) || ![true, false, null].includes(c.pass)) {
         err(at, `criterion ${c?.id ?? "?"} needs id, pass (true, false or null), observed and expected`);
       } else if (c.pass === null && c.observed !== null) {
