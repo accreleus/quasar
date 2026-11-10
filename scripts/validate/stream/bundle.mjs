@@ -133,6 +133,12 @@ function check(dir, errors, { keys = manifestKeys() } = {}) {
       err("manifest.json", "not_recorded must be a list");
       manifest.not_recorded = [];
     }
+    // A name is one run of one scenario: a repeat would be reviewed and counted twice.
+    const names = new Set();
+    for (const n of Array.isArray(manifest.scenarios) ? manifest.scenarios : []) {
+      if (names.has(n)) err("manifest.json", `scenario ${n} is listed twice`);
+      names.add(n);
+    }
     for (const n of manifest.not_recorded ?? []) {
       if (!n?.fact || !n?.why) err("manifest.json", "a not_recorded entry needs fact and why");
     }
@@ -156,8 +162,33 @@ function check(dir, errors, { keys = manifestKeys() } = {}) {
     if (["skipped", "error"].includes(sc.status) && !sc.reason) err(at, `status ${sc.status} needs a reason`);
     if (!("clock_offset_ms" in sc)) err(at, "no clock_offset_ms (null when the offset was not measured)");
     if (!Array.isArray(sc.criteria)) err(at, "no criteria");
+    // Criterion ids name the rows of the review's table: two ids a reader cannot tell
+    // apart make two rows one fact. So an id is an identifier, not text: ASCII letters,
+    // digits, "_", "." and "-", which leaves nothing that prints like something else
+    // (a number beside its string, a composed letter beside a decomposed one, a
+    // character that does not print at all).
+    const ids = new Set();
     for (const c of Array.isArray(sc.criteria) ? sc.criteria : []) {
-      if (!c?.id || !("observed" in c) || !("expected" in c) || ![true, false, null].includes(c.pass)) {
+      if (c?.id === undefined) continue; // reported below as a criterion with no id
+      if (typeof c.id !== "string" || !/^[A-Za-z0-9_.-]{1,64}$/.test(c.id)) {
+        err(at, `criterion id ${JSON.stringify(c.id).slice(0, 80)} must be an identifier (letters, digits, _ . -, at most 64)`);
+        continue;
+      }
+      if (ids.has(c.id)) err(at, `criterion id ${c.id} is not unique`);
+      ids.add(c.id);
+    }
+    // The review derives a scenario's verdict from its status and its criteria; a pass
+    // with a failed criterion is the two disagreeing, so it is not a bundle.
+    if (sc.status === "pass" && (Array.isArray(sc.criteria) ? sc.criteria : []).some((c) => c?.pass === false)) {
+      err(at, "a pass status with a criterion that failed");
+    }
+    // A pass rests on something: a scenario that passed judged at least one criterion, and
+    // judged it a pass. A short bundle is never a success (spec #1271, story 3).
+    if (sc.status === "pass" && Array.isArray(sc.criteria) && !sc.criteria.some((c) => c?.pass === true)) {
+      err(at, "a pass status with no criterion that passed");
+    }
+    for (const c of Array.isArray(sc.criteria) ? sc.criteria : []) {
+      if (c?.id === undefined || !("observed" in c) || !("expected" in c) || ![true, false, null].includes(c.pass)) {
         err(at, `criterion ${c?.id ?? "?"} needs id, pass (true, false or null), observed and expected`);
       } else if (c.pass === null && c.observed !== null) {
         err(at, `criterion ${c.id} was not judged, so observed must be null`);
