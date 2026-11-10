@@ -10,7 +10,8 @@ import {
 import type { InputMsg } from "../input/inputSender";
 import type { Presenter } from "./presenter";
 import { TransportError, type MediaSink, type MediaTransport } from "./transport";
-import { createWebTransportRuntime } from "../pages/app/webTransportRuntime";
+import { createWebTransportRuntime, type WebTransportRuntimeDeps } from "../pages/app/webTransportRuntime";
+import type { BenchDeps } from "../bench/benchController";
 import { mintTransportToken } from "../api/library";
 import {
   avcC,
@@ -254,7 +255,7 @@ describe("WebTransportMedia loss recovery", () => {
 // ── The runtime, end to end against the fake agent ─────────────────────────
 
 describe("createWebTransportRuntime", () => {
-  function setup(opts: { draws?: boolean; noWebGpu?: boolean } = {}) {
+  function setup(opts: { draws?: boolean; noWebGpu?: boolean; deps?: Partial<WebTransportRuntimeDeps> } = {}) {
     const agent = new FakeAgent();
     agent.replies = [[helloAck(0, avcC())]];
     const decoders: FakeDecoder[] = [];
@@ -289,10 +290,64 @@ describe("createWebTransportRuntime", () => {
           },
           isConfigSupported: async (c) => ({ supported: true, config: c }),
         },
+        // No network from a unit test: the trace and the stats posts go nowhere.
+        createTracer: () => ({ start() {}, stop() {}, emitBenchWindow() {} }),
+        telemetry: { fetch: async () => new Response("{}") },
+        ...opts.deps,
       },
     });
     return { agent, decoders, presented, presenter, callbacks, rt, presenterFatal: () => presenterFatal! };
   }
+
+  it("in bench mode gives the marker reader each decoded frame before the presenter takes it, and posts its windows through the trace (#1035)", async () => {
+    const read: { width: number; closed: boolean }[] = [];
+    const windows: unknown[] = [];
+    const tracer = { start: vi.fn(), stop: vi.fn(), emitBenchWindow: (p: unknown) => void windows.push(p) };
+    class FakeBench {
+      constructor(private readonly deps: BenchDeps) {}
+      start() {}
+      // The real one flushes its last window on stop.
+      stop() {
+        this.deps.emitWindow({ n: read.length } as never);
+      }
+      handle() {
+        return { enabled: true };
+      }
+      onFrame() {
+        const src = this.deps.source!()!;
+        read.push({ width: src.width, closed: (src.image as unknown as FakeFrame).closed });
+      }
+    }
+    const { agent, presented, rt } = setup({
+      deps: {
+        isBenchModeEnabled: () => true,
+        loadBench: async () => ({ BenchController: FakeBench as never }),
+        createTracer: () => tracer,
+      },
+    });
+    rt.start();
+    await vi.waitFor(() => expect((window as unknown as Record<string, unknown>).__qBench).toEqual({ enabled: true }));
+    const pkt = { n: 0 };
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(900, 0) }, pkt));
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 1, keyframe: false, data: bytes(900, 1) }, pkt));
+    await vi.waitFor(() => expect(presented).toHaveLength(2));
+    // Read at the frame's own size while it was still open; the presenter closed it afterwards.
+    expect(read).toEqual([{ width: 1920, closed: false }, { width: 1920, closed: false }]);
+    expect(tracer.start).toHaveBeenCalledTimes(1);
+    rt.destroy();
+    expect(windows).toEqual([{ n: 2 }]);
+    expect(tracer.stop).toHaveBeenCalledTimes(1);
+    delete (window as unknown as Record<string, unknown>).__qBench;
+  });
+
+  it("starts no bench instrument for an ordinary session", async () => {
+    const loadBench = vi.fn();
+    const { rt } = setup({ deps: { loadBench } });
+    rt.start();
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    expect(loadBench).not.toHaveBeenCalled();
+    rt.destroy();
+  });
 
   it("connects with the contract's hello, decodes reassembled frames and presents each one", async () => {
     const { agent, decoders, presented, rt } = setup();

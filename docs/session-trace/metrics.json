@@ -978,6 +978,32 @@
       "rvfc_qualified": true
     },
     {
+      "key": "wt_capture_to_present_ms",
+      "source": "browser",
+      "taxonomy": "client.wt_capture_to_present_ms",
+      "unit": "ms",
+      "clock": "host_wall",
+      "window": "rolling_600",
+      "estimator": "median",
+      "n_key": null,
+      "deprecated_for": null,
+      "since": "0.6 (#1035)",
+      "why": "A WebTransport session's counterpart of rvfc_capture_to_display_ms: the agent's capture_us to the moment the frame is handed to the WebGPU presenter, median over a rolling ring of up to 600 frames. capture_us is stamped at ENCODER OUTPUT (quasar-protocol#29 item 13), as abs-capture-time is on WebRTC, so capture and encode are not in it; the bench marker is the number that includes them. Compared on the agent's clock through the control-stream ping/pong offset, so it is absent until that offset is stable. It ends at present submission, not at display scan-out, and is not RVFC-qualified: do not read it against the RVFC key as if the two ended at the same instant."
+    },
+    {
+      "key": "wt_keyframe_requests",
+      "source": "browser",
+      "taxonomy": "transport.wt_keyframe_requests",
+      "unit": "count",
+      "clock": "none",
+      "window": "1s",
+      "estimator": "sum",
+      "n_key": null,
+      "deprecated_for": null,
+      "since": "0.6 (#1035)",
+      "why": "Keyframes the WebTransport client asked the agent for in the window (a late frame, a decoder restart or backlog skip, a tab shown again). Each one is a recovery the NACK path did not cover, so a steady non-zero rate on a clean link means loss recovery or the decoder is struggling."
+    },
+    {
       "key": "network_pacing_ms",
       "source": "browser",
       "taxonomy": "transport.network_pacing_ms",

@@ -88,7 +88,7 @@ document records (§8, §9) were estimator confusion, one level apart.
 <!-- GENERATED from docs/session-trace/metrics.json by scripts/dx/gen_trace_docs.py.
      Do not edit between these markers; edit the manifest and run `make docs-trace`. -->
 
-*Manifest version `2026-08-24.1` — 46 curated series of 125 documented keys.*
+*Manifest version `2026-08-24.1` — 48 curated series of 127 documented keys.*
 
 | taxonomy name | source | raw key | unit | clock | window | estimator | n | meaning / the trap it avoids |
 |---|---|---|---|---|---|---|---|---|
@@ -134,10 +134,12 @@ document records (§8, §9) were estimator confusion, one level apart.
 | `client.present_n` | browser/native | `present_n` | count | `none` | `1s` | `count` | — | How many intervals the window actually held. Below 5 every other present_* key is OMITTED rather than computed from a fragment — this is the key that tells 'quiet' from 'unmeasured'. |
 | `client.rvfc_capture_time_available` | browser/native | `rvfc_capture_time_available` | bool | `none` | `snapshot` | `last` | — | This browser is currently surfacing a valid RVFC captureTime (0/1). NOT proof the RTP extension was negotiated — that is abs_capture_time_negotiated, and the two differ on Chrome. |
 | `client.rvfc_capture_to_display_ms` | browser/native | `rvfc_capture_to_display_ms` | ms | `client_wall` | `rolling_600` | `median` | — | The same number as glass_to_glass_ms under a name that does not overclaim: RTP capture-time to browser present, median over a rolling ring of up to 600 RVFC samples. Posted alongside the old key this release so no stored series breaks. |
+| `client.wt_capture_to_present_ms` | browser/native | `wt_capture_to_present_ms` | ms | `host_wall` | `rolling_600` | `median` | — | A WebTransport session's counterpart of rvfc_capture_to_display_ms: the agent's capture_us to the moment the frame is handed to the WebGPU presenter, median over a rolling ring of up to 600 frames. capture_us is stamped at ENCODER OUTPUT (quasar-protocol#29 item 13), as abs-capture-time is on WebRTC, so capture and encode are not in it; the bench marker is the number that includes them. Compared on the agent's clock through the control-stream ping/pong offset, so it is absent until that offset is stable. It ends at present submission, not at display scan-out, and is not RVFC-qualified: do not read it against the RVFC key as if the two ended at the same instant. |
 | `transport.jitter_buffer_ms` | browser/native | `jitter_buffer_ms` | ms | `client_wall` | `1s` | `mean` | — | Receiver jitter-buffer depth for this window. The buffer the playout controller is steering, not the target it is steering toward. |
 | `transport.network_pacing_ms` | browser/native | `network_pacing_ms` | ms | `client_wall` | `1s` | `last` | — | rtt_ms / 2 — a one-way estimate, not a measured pacing delay, and from THIS 1 s window rather than the rolling ring the g2g median comes from. |
 | `transport.packets_lost` | browser/native | `packets_lost` | count | `none` | `cumulative` | `raw` | — | CUMULATIVE receiver packet loss, posted raw. Every rule that uses it takes a delta across the window (falsifier estimator 'delta'); a single sample cannot produce one and reports 'no samples' rather than 0. |
 | `transport.rtt_ms` | browser/native | `rtt_ms` | ms | `client_wall` | `1s` | `last` | — | candidate-pair currentRoundTripTime at poll time. Half of it is what network_pacing_ms uses as the one-way estimate. |
+| `transport.wt_keyframe_requests` | browser/native | `wt_keyframe_requests` | count | `none` | `1s` | `sum` | — | Keyframes the WebTransport client asked the agent for in the window (a late frame, a decoder restart or backlog skip, a tab shown again). Each one is a recovery the NACK path did not cover, so a steady non-zero rate on a clean link means loss recovery or the decoder is struggling. |
 
 <!-- metrics:end -->
 

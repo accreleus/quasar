@@ -70,7 +70,8 @@ export interface MediaSink {
   /** Called once, after connect resolved, when the transport is gone. */
   end(end: TransportEnd): void;
   /** A ping's round trip in ms, once a second while connected (§Ping and pong). */
-  rtt?(ms: number): void;
+  /** A pong: the round trip, and the agent's wall clock (`tw`, Unix ms) when it answered. */
+  rtt?(ms: number, agentWallMs?: number): void;
 }
 
 export interface MediaTransport {
