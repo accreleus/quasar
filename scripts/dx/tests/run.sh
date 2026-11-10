@@ -3687,6 +3687,9 @@ else
   fail "manifest:bench-keys-not-drifted" "$BENCH_KEYS_OUT"
 fi
 
+# The end-to-end suite's run bundle (#1272): the fixture is valid, each rule has a bundle that breaks it.
+rc_of 0 "e2e:bundle-format" -- node --test "$ROOT/scripts/validate/stream/bundle.test.mjs"
+
 # Release publication must wait for every image its manifest names.
 rc_of 0 "release:publication-dependencies" -- bash "$ROOT/scripts/release/test-release-publication-gate.sh"
 

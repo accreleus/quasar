@@ -1,0 +1,13 @@
+{
+  "id": "01-stream-hold",
+  "scenario": "stream-hold",
+  "params": { "transport": "webrtc", "codec": "h264", "profile": "1080p60", "hold_s": 240 },
+  "status": "pass",
+  "sessions": ["11111111-2222-3333-4444-555555555555"],
+  "clock_offset_ms": 3,
+  "criteria": [
+    { "id": "first_frame_s", "pass": true, "observed": 4.2, "expected": "<= 20" },
+    { "id": "freeze_count", "pass": true, "observed": 0, "expected": "0" },
+    { "id": "audio_latency_ms", "pass": null, "observed": null, "expected": "<= 80" }
+  ]
+}

@@ -382,6 +382,33 @@ no numbering and no stability guarantee to any client — it is for humans and
 agents reading logs, never for a wire contract), "log tag" (that reads like the
 tracing `target`, which is the module path and a different axis).
 
+## The end-to-end test suite
+
+**Scenario** — one scripted exercise of a stream with its own pass rule, run with no
+model in the loop: a stream hold, a transport fallback, an input pass. It takes
+parameters (transport, codec, profile). Also the name quasar-bench files its run under.
+
+**Plan** — an ordered list of scenarios with their parameters, run as one command.
+
+**Criterion** — one named, checkable part of a scenario's pass rule, recorded with the
+observed and the expected value; `pass` is true, false, or null when it could not be
+judged. Not a *verdict* (the stream-health judgement) and not a *readiness check*.
+
+**Suite run** — one execution of a plan against one stack from one test client.
+
+**Run bundle** — the self-describing directory a suite run leaves: what was run, on
+which builds, from which client, and everything recorded, in a versioned format
+(`docs/testing-e2e-suite.md`). It has a client half and a host half, joined by session
+id. Not the *diagnostic bundle*, which is one session's trace and which it contains.
+_Avoid_: bare "bundle".
+
+**Test client** — the machine and client software (a browser now, the native client
+later) that receives the stream in a suite run. Distinct from the host that sends it.
+
+**Reference app** — the app a scenario streams when the picture must be attributable
+and repeatable: it stamps a machine-readable marker into every frame (today the bench
+app described in `docs/testing-bench-mode.md`).
+
 ## Images
 
 **Platform image** — a container image that runs Quasar itself, or builds it:
