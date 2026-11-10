@@ -13,6 +13,9 @@ export const MISSING_RATE_LIMIT = 0.01;
 const SHOT_EVERY_S = 10;
 const TERMINAL = ["stopped", "failed"];
 
+// Steam's sign-in QR, as fractions of the 16:9 picture (measured on the lab; the same box the lab proofs cover).
+const QR = { x: 0.14, y: 0.185, w: 0.22, h: 0.545 };
+
 const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
 const sd = (xs) => Math.sqrt(mean(xs.map((x) => (x - mean(xs)) ** 2)));
 const crit = (id, pass, observed, expected) => ({ id, pass, observed: pass === null ? null : observed, expected });
@@ -64,10 +67,44 @@ export function judge({ params, session, windows, frames, firstFrameS, located, 
     crit("transport_as_asked", session ? session.transport === params.transport : null, session?.transport ?? null, params.transport),
     crit("codec_as_asked", codec ? codec === params.codec : null, codec, params.codec),
     crit("profile_as_asked", stream && h ? stream.height === +h && stream.fps === +fps : null, stream ? `${stream.height}p${stream.fps}` : null, params.profile),
-    crit("freeze_count", judged ? freezes(obs) === 0 : null, judged ? freezes(obs) : null, "0 after the warm-up"),
+    crit("freeze_count", obs.length ? freezes(obs) === 0 : null, obs.length ? freezes(obs) : null, "0 after the warm-up"),
     crit("missing_indices_rate", judged && rate !== null ? rate <= MISSING_RATE_LIMIT : null, rate, `<= ${MISSING_RATE_LIMIT} after the warm-up`),
     crit("present_cadence", cadence !== null ? cadence < minHitch : null, cadence, `< ${minHitch} windows with present-interval sd >= ${hitchSd} ms`),
   ];
+}
+
+/** pass needs a criterion that held and none that failed; if nothing could be judged the run says so rather than pass. */
+export function verdict({ status, reason, criteria = [] }) {
+  if (status) return { status, ...(reason ? { reason } : {}) };
+  if (criteria.some((c) => c.pass === false)) return { status: "fail" };
+  if (criteria.some((c) => c.pass === true)) return { status: "pass" };
+  return { status: "error", reason: "nothing could be judged" };
+}
+
+/** A screenshot with a black box over the QR a launcher shows; no stream surface to place it on means no shot at all. */
+export async function shotCovered(page, rec, label, cover) {
+  if (!cover) return rec.shot(page, label);
+  const placed = await page.evaluate((q) => {
+    const el = [...document.querySelectorAll(".session-video")].find((e) => e.videoWidth || e.tagName === "CANVAS");
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    const ar = 16 / 9;
+    const mode = el.dataset.scalingMode || "contain";
+    const k = mode === "stretch" ? null : mode === "cover" ? Math.max(r.width / ar, r.height) : Math.min(r.width / ar, r.height);
+    const pw = k ? k * ar : r.width;
+    const ph = k ?? r.height;
+    const d = document.createElement("div");
+    d.id = "__qrcover";
+    d.style.cssText = `position:fixed;z-index:2147483647;pointer-events:none;background:#000;left:${Math.floor(r.left + (r.width - pw) / 2 + pw * q.x)}px;top:${Math.floor(r.top + (r.height - ph) / 2 + ph * q.y)}px;width:${Math.ceil(pw * q.w)}px;height:${Math.ceil(ph * q.h)}px`;
+    document.documentElement.appendChild(d);
+    return true;
+  }, QR);
+  try {
+    if (placed) await rec.shot(page, label);
+    else rec.step("shot-skipped", { label, why: "no stream surface to place the QR cover on" });
+  } finally {
+    await page.evaluate(() => document.getElementById("__qrcover")?.remove()).catch(() => {});
+  }
 }
 
 export default {
@@ -80,9 +117,20 @@ export default {
       return skipped(`this client cannot decode ${params.codec}`);
     }
 
+    const cover = params.cover_qr ?? params.app === "Steam";
+    const shot = (label) => shotCovered(page, rec, label, cover);
+    ctx.refused = null;
+    page.on("response", async (r) => {
+      const { pathname } = new URL(r.url());
+      if (r.status() < 400 || !pathname.startsWith("/v1/")) return;
+      const body = (await r.text().catch(() => "")).slice(0, 300);
+      rec.step("api-error", { method: r.request().method(), path: pathname, status: r.status(), body });
+      if (r.request().method() === "POST" && pathname === "/v1/sessions") ctx.refused = `the launch was refused: ${r.status()} ${body.trim()}`;
+    });
     const sessions = new Set();
     const before = new Set((await api.liveSessions().catch(() => [])).map((s) => s.id));
     let sid = null;
+    let wasClassic = true;
     let result;
     try {
       await signIn(page, ctx);
@@ -93,8 +141,10 @@ export default {
 
       const switches = [params.transport === "webtransport" && "transport=webtransport", params.codec === "pyrowave" && "codec=pyrowave"].filter(Boolean);
       await page.goto(`${ctx.baseUrl}/app${switches.length ? `?${switches.join("&")}` : ""}`, { waitUntil: "domcontentloaded" });
-      const tClick = now();
-      await page.locator(`button[aria-label="Play ${params.app}"]`).first().evaluate((el) => el.click());
+      const tClick = await pickAndPlay(page, ctx, async () => {
+        wasClassic = await api.classicLayout();
+        if (!wasClassic) await api.setClassicLayout(true);
+      });
       rec.step("play-clicked", { app: params.app });
       sid = await waitForSession(page, ctx);
       sessions.add(sid);
@@ -116,7 +166,7 @@ export default {
       }
       const firstFrameS = firstFrameAt === null ? null : (firstFrameAt - tClick) / 1000;
       rec.step("first-frame", { first_frame_s: firstFrameS });
-      if (firstFrameAt !== null) await rec.shot(page, "first-frame");
+      if (firstFrameAt !== null) await shot("first-frame");
 
       const holdUntil = (firstFrameAt ?? now()) + params.hold_s * 1000;
       let nextShot = (firstFrameAt ?? now()) + SHOT_EVERY_S * 1000;
@@ -124,13 +174,13 @@ export default {
         await sleep(Math.min(1000, holdUntil - now()));
         if (now() >= nextShot) {
           nextShot += SHOT_EVERY_S * 1000;
-          await rec.shot(page, `t${Math.round((now() - firstFrameAt) / 1000)}s`);
+          await shot(`t${Math.round((now() - firstFrameAt) / 1000)}s`);
           await pullFrames();
           rec.step("held", { stats: await probe(page) });
         }
       }
       const dump = await pullFrames();
-      await rec.shot(page, "end");
+      await shot("end");
       const windows = dump?.windows ?? [];
       const stats = await page.evaluate(() => window.__qBench?.stats() ?? null);
       rec.json("bench-windows.json", { windows });
@@ -149,6 +199,7 @@ export default {
       rec.step("error", { message: String(err?.message ?? err) });
       result = { status: "error", reason: String(err?.message ?? err), criteria: [], clock_offset_ms: null };
     } finally {
+      if (!wasClassic) await api.setClassicLayout(false).catch((e) => rec.step("layout-restore-failed", { message: String(e?.message ?? e) }));
       // Every exit path: the session this run started is stopped, whatever else went wrong.
       const started = [...sessions, ...(await api.liveSessions().catch(() => [])).map((s) => s.id).filter((id) => !before.has(id))];
       for (const id of new Set(started)) {
@@ -157,23 +208,55 @@ export default {
         rec.step("stopped", { session: id });
       }
     }
-    const failed = result.criteria?.some((c) => c.pass === false);
-    return { status: result.status ?? (failed ? "fail" : "pass"), sessions: [...sessions], ...result };
+    return { sessions: [...sessions], ...result, ...verdict(result) };
   },
 };
 
 async function signIn(page, ctx) {
   await page.goto(ctx.baseUrl, { waitUntil: "domcontentloaded" });
-  await page.evaluate(() => {
+  await page.evaluate((bench) => {
     for (const k of Object.keys(localStorage)) if (k.startsWith("quasar.auth.")) localStorage.removeItem(k);
-    sessionStorage.clear();
-    localStorage.setItem("quasar.bench", "1");
-  });
+    if (bench) localStorage.setItem("quasar.bench", "1");
+  }, ctx.params.bench !== false);
   await page.goto(`${ctx.baseUrl}/login`, { waitUntil: "domcontentloaded" });
   await page.fill("#login-email", ctx.creds.email);
   await page.fill("#login-password", ctx.creds.password);
   await page.click('button[type="submit"]');
   await page.waitForURL((u) => !new URL(u).pathname.startsWith("/login"), { timeout: 20000 });
+}
+
+const CODEC_LABEL = { h264: "H.264", h265: "HEVC", av1: "AV1", pyrowave: "Auto" };
+
+/** Click as a script, not as a pointer: an untrusted click cannot start full screen or take the pointer lock. Waits for the element to be enabled. */
+async function press(locator, ctx, what) {
+  const stop = ctx.now() + 30000;
+  for (;;) {
+    const ready = await locator.first().evaluate((el) => !el.disabled && el.getAttribute("aria-disabled") !== "true").catch(() => false);
+    if (ready) return locator.first().evaluate((el) => el.click());
+    if (ctx.now() > stop) throw new Error(`${what} never became available on the page`);
+    await ctx.sleep(300);
+  }
+}
+
+/**
+ * Asks for the codec, frame rate and resolution through the page's own Launch options (the classic library
+ * layout, a per-user setting that `enableClassic` turns on and the caller puts back), then Play now.
+ * Returns the time of the Play click.
+ */
+async function pickAndPlay(page, ctx, enableClassic) {
+  const { params } = ctx;
+  const [, height, fps] = /^(\d+)p(\d+)/.exec(params.profile ?? "") ?? [];
+  if (!height || !CODEC_LABEL[params.codec]) throw new Error(`cannot ask the page for codec ${params.codec} at ${params.profile}`);
+  await enableClassic();
+  await page.goto(page.url(), { waitUntil: "domcontentloaded" });
+  await press(page.locator(`button[aria-label="${params.app}"]`), ctx, `the ${params.app} tile`);
+  await press(page.getByRole("button", { name: /^Adjust/ }), ctx, "Adjust (Launch options)");
+  for (const [group, label] of [["Codec", CODEC_LABEL[params.codec]], ["Frame rate", `${fps} fps`], ["Resolution", `${height}p`]]) {
+    await press(page.getByRole("radiogroup", { name: group }).getByRole("radio", { name: new RegExp(`^${label.replace(/\./g, "\\.")}`) }), ctx, `${group} "${label}"`);
+  }
+  const t = ctx.now();
+  await press(page.getByRole("button", { name: /^Play now/ }), ctx, "Play now");
+  return t;
 }
 
 async function waitForSession(page, ctx) {
@@ -182,6 +265,7 @@ async function waitForSession(page, ctx) {
     const url = page.url();
     const m = /\/app\/session\/([0-9a-f-]{36})/.exec(url);
     if (m) return m[1];
+    if (ctx.refused) throw new Error(ctx.refused);
     if (/\/app\/game\//.test(url)) await page.getByRole("button", { name: /^(play|resume)\b/i }).first().evaluate((el) => el.click()).catch(() => {});
     await ctx.sleep(300);
   }
@@ -192,4 +276,6 @@ const probe = (page) =>
   page.evaluate(() => ({
     frames: window.__qBench?.stats().frames ?? 0,
     videoFrames: document.querySelector("video")?.getVideoPlaybackQuality?.().totalVideoFrames ?? 0,
+    visible: document.visibilityState,
+    focused: document.hasFocus?.(),
   }));

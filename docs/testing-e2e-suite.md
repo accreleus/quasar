@@ -26,7 +26,9 @@ make e2e-run TARGET=<stack url> PLAN=smoke [CDP=<DevTools http endpoint>] [OUT=<
 runner attaches to a browser that is already running (the Mac test client), uses its default
 context and a real window, and closes only the pages it opened. Without it, it launches `CHROME=`
 (or Playwright's Chromium). Each `stream-hold` signs in through the login form, launches the
-reference app from the library with the product's `?transport=` and `?codec=` switches and bench
+reference app through the page's own Launch options (codec, frame rate and resolution; that dialog
+exists only in the classic library layout, so the runner turns the test user's `classic_layout`
+setting on and puts it back) with the product's `?transport=` and `?codec=pyrowave` switches and bench
 mode on, holds, and stops the session; the session is stopped on every exit path, `Ctrl-C`
 included. The run ends with one line:
 
@@ -44,7 +46,15 @@ Exit 0 when no scenario failed or errored (skipped ones are counted, never hidde
 at most 1 % and `present_cadence` (fewer than `classifier.hitch_min_samples` seconds whose
 present-interval sd reaches `classifier.hitch_sd_ms`) over the stream after its first 10 s. The
 profile is not a control the user has (the Launch options pick a codec, frame rate and resolution),
-so `profile_as_asked` compares the asked profile with the stream the session got. A scenario the
+so `profile_as_asked` compares the asked profile with the stream the session got. `freeze_count` is
+judged from the bench windows with or without a marker; the other two bench criteria need one.
+A scenario is `pass` only when at least one criterion held and none failed; if nothing could be
+judged it is `error` ("nothing could be judged"). `params.bench: false` leaves bench mode off. In attach mode the runner
+puts the stack origin's `localStorage` back as it found it after each scenario, on every exit path.
+**Use a fresh test user for each run.** A client that cannot keep up at a profile is refused it
+afterwards (`historical_client_performance_failed`; the scenario ends `error: the launch was
+refused: 409 ...`), and on the Mac test client one bench-armed 60 s hold at 1080p60 was enough (a hold with
+`bench: false` was not). A scenario the
 client cannot run (no WebTransport, a codec it cannot decode, the app not in the catalog) is
 `skipped` with the reason.
 

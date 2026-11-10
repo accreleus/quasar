@@ -71,6 +71,11 @@ export function makeApi(baseUrl, creds, { fetchFn = fetch, sleep = (ms) => new P
   const session = async (id) => (await call("GET", `/v1/sessions/${id}`)).body.session;
   return {
     session,
+    classicLayout: async () => (await call("GET", "/v1/me/ui-preferences")).body.classic_layout === true,
+    setClassicLayout: async (on) => {
+      const r = await call("PATCH", "/v1/me/ui-preferences", { classic_layout: on });
+      if (r.status !== 200) throw new Error(`PATCH ui-preferences returned ${r.status}`);
+    },
     apps: async () => (await call("GET", "/v1/apps")).body.items ?? [],
     liveSessions: async () => ((await call("GET", "/v1/sessions")).body.items ?? []).filter((s) => !TERMINAL.includes(s.state)),
     async stop(id) {
@@ -134,6 +139,29 @@ export async function probeClient(page, codecs) {
   }, codecs);
 }
 
+/**
+ * The runner arms bench mode and signs in through localStorage on the stack's origin, and the page writes
+ * its own keys as it runs. In attach mode that is someone else's profile: the origin's storage is read before
+ * and put back exactly after. Returns the function that restores it; it never throws.
+ */
+export async function guardStorage(page, baseUrl, note = () => {}) {
+  const origin = new URL(baseUrl).origin;
+  const onOrigin = async () => { if (!page.url().startsWith(origin)) await page.goto(baseUrl, { waitUntil: "domcontentloaded" }); };
+  await onOrigin();
+  const before = await page.evaluate(() => Object.fromEntries(Object.keys(localStorage).map((k) => [k, localStorage.getItem(k)])));
+  return async () => {
+    try {
+      await onOrigin();
+      await page.evaluate((keep) => {
+        for (const k of Object.keys(localStorage)) if (!(k in keep)) localStorage.removeItem(k);
+        for (const [k, v] of Object.entries(keep)) localStorage.setItem(k, v);
+      }, before);
+    } catch (e) {
+      note(`storage restore failed: ${e?.message ?? e}`);
+    }
+  };
+}
+
 const nn = (i) => String(i + 1).padStart(2, "0");
 
 /**
@@ -151,9 +179,13 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
   const codecs = [...new Set(entries.map((e) => e.params.codec))];
 
   const probePage = await host.newPage();
-  await probePage.goto(baseUrl, { waitUntil: "domcontentloaded" });
-  const client = await host.probeClient(probePage, codecs);
-  await host.closePage(probePage);
+  let client;
+  try {
+    await probePage.goto(baseUrl, { waitUntil: "domcontentloaded" });
+    client = await host.probeClient(probePage, codecs);
+  } finally {
+    await host.closePage(probePage).catch(() => {});
+  }
   bundle.json("client.json", client);
 
   const counts = { pass: 0, fail: 0, error: 0, skipped: 0 };
@@ -170,18 +202,21 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
       const { default: scenario } = await import(pathToFileURL(path.join(HERE, "scenarios", `${e.scenario}.mjs`)).href);
       const page = await host.newPage();
       const sink = { consoleErrors: [], networkFailures: [] };
-      rec.put("console.log", "");
-      attachEvidenceListeners(page, baseUrl, sink);
-      page.on("console", (m) => bundle.append(`${e.id}/console.log`, `${new Date(now()).toISOString()} [${m.type()}] ${m.text()}\n`));
-      page.on("pageerror", (err) => bundle.append(`${e.id}/console.log`, `${new Date(now()).toISOString()} [pageerror] ${err.message}\n`));
+      let restore = async () => {};
       try {
+        rec.put("console.log", "");
+        attachEvidenceListeners(page, baseUrl, sink);
+        page.on("console", (m) => bundle.append(`${e.id}/console.log`, `${new Date(now()).toISOString()} [${m.type()}] ${m.text()}\n`));
+        page.on("pageerror", (err) => bundle.append(`${e.id}/console.log`, `${new Date(now()).toISOString()} [pageerror] ${err.message}\n`));
+        restore = await guardStorage(page, baseUrl, (msg) => rec.step("storage-restore-failed", { message: msg }));
         out = await scenario.run(page, { baseUrl, params: e.params, rec, api, creds, client, thresholds, now, sleep: racedSleep });
       } catch (err) {
         out = { status: "error", reason: String(err?.message ?? err), criteria: [], sessions: [], clock_offset_ms: null };
+      } finally {
+        await restore();
+        rec.json("failed-requests.json", { console_errors: sink.consoleErrors, network_failures: sink.networkFailures });
+        await host.closePage(page).catch(() => {});
       }
-      rec.json("failed-requests.json", { console_errors: sink.consoleErrors, network_failures: sink.networkFailures });
-      await page.evaluate(() => { for (const k of Object.keys(localStorage)) if (k === "quasar.bench" || k.startsWith("quasar.auth.")) localStorage.removeItem(k); }).catch(() => {});
-      await host.closePage(page).catch(() => {});
     }
     counts[out.status === "pass" ? "pass" : out.status === "fail" ? "fail" : out.status === "skipped" ? "skipped" : "error"] += 1;
     rec.json("scenario.json", { id: e.id, scenario: e.scenario, params: e.params, status: out.status, ...(out.reason ? { reason: out.reason } : {}), sessions: out.sessions ?? [], clock_offset_ms: out.clock_offset_ms ?? null, criteria: out.criteria ?? [] });
