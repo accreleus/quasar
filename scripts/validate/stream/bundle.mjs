@@ -172,8 +172,9 @@ function check(dir, errors, { keys = manifestKeys() } = {}) {
         err(at, `criterion id ${JSON.stringify(c.id)} must be a non-empty string`);
         continue;
       }
-      if (ids.has(c.id)) err(at, `criterion id ${c.id} is not unique`);
-      ids.add(c.id);
+      const key = c.id.normalize("NFC"); // "é" composed and decomposed print the same
+      if (ids.has(key)) err(at, `criterion id ${c.id} is not unique`);
+      ids.add(key);
     }
     // The review derives a scenario's verdict from its status and its criteria; a pass
     // with a failed criterion is the two disagreeing, so it is not a bundle.

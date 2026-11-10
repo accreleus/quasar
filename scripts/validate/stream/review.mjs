@@ -186,9 +186,7 @@ const thresholdValue = (thresholds, key) => {
   // Absent, null (JSON has no NaN) and anything that is not a finite number is a key the
   // file does not state; a rule that needs it is not checked, never given a default.
   const raw = thresholds?.thresholds?.[key]?.value;
-  if (raw === null || raw === undefined) return null;
-  const value = Number(raw);
-  return Number.isFinite(value) ? value : null;
+  return typeof raw === "number" && Number.isFinite(raw) ? raw : null;
 };
 
 // A criterion is listed fail, then not judged, then pass; an unjudged one is neither a
@@ -293,10 +291,6 @@ function anomalies(rows, thresholds) {
       notChecked.push({ rule: rule.threshold, why: `the thresholds file has no ${missing[0]}` });
       continue;
     }
-    if (!samples.some((s) => Number.isFinite(s.metrics[rule.key]))) {
-      notChecked.push({ rule: rule.threshold, why: `no sample carries ${rule.key}` });
-      continue;
-    }
     const limit = thresholdValue(thresholds, rule.threshold);
     let pool = samples;
     // The client judges no sample from a hidden tab: it classifies it
@@ -310,6 +304,12 @@ function anomalies(rows, thresholds) {
       let first = Infinity;
       for (const s of samples) if (s.ts_unix_ms < first) first = s.ts_unix_ms;
       pool = pool.filter((s) => s.ts_unix_ms >= first + warmup * 1000);
+    }
+    // Checked means compared: a rule whose filters leave no sample with its key compared nothing.
+    if (!pool.some((s) => Number.isFinite(s.metrics[rule.key]))) {
+      const carried = samples.some((s) => Number.isFinite(s.metrics[rule.key]));
+      notChecked.push({ rule: rule.threshold, why: carried ? `no sample it judges carries ${rule.key}` : `no sample carries ${rule.key}` });
+      continue;
     }
     const byTs = new Map();
     for (const s of pool) {
@@ -593,6 +593,9 @@ const TEMPORARY = /^\.(?:REVIEW\.md|summary\.json)\.tmp-\d+-\d+$/;
 function clearReview(dir) {
   const out = path.join(dir, REVIEW_DIR);
   const stat = fs.lstatSync(out, { throwIfNoEntry: false });
+  // A link is never followed (its target is not ours to empty), but a page read through it
+  // would be an old one: say so.
+  if (stat?.isSymbolicLink()) throw new CannotWrite("review is a link", path.join(REVIEW_DIR, MARKDOWN_FILE));
   if (!stat || !stat.isDirectory()) return; // nothing can be stale in there
   let entries;
   try {

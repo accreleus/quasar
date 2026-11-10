@@ -415,10 +415,11 @@ test("a hidden tab is not a sample the client judges, whether the flag is 1 or t
 
 test("a rule the thresholds file cannot state is not checked, and no value is guessed for it", () => {
   const dir = bundle();
-  // Two clean samples that carry every key the rules read: a stream that crossed nothing.
+  // Two clean samples that carry every key the rules read, the second after the warm-up
+  // (a rule left with no sample by its own filters is not checked): a stream that crossed nothing.
   metrics(dir, [
     browser(1000, { present_interval_sd_ms: 5, present_interval_p95_ms: 5 }),
-    browser(2000, { present_interval_sd_ms: 5, present_interval_p95_ms: 5 }),
+    browser(25000, { present_interval_sd_ms: 5, present_interval_p95_ms: 5 }),
   ]);
   const write = (name, thresholds) => {
     const file = path.join(TMP, name);
@@ -768,4 +769,42 @@ test("the worst realistic four-scenario bundle fits in 150 lines", () => {
   // The failed and not-judged criteria are rows; the five passed ones are one line.
   assert.equal(md.split("\n").filter((l) => /^\| `[a-h]\d` \|/.test(l)).length, 12);
   assert.equal(md.split("\n").filter((l) => /^Passed: /.test(l)).length, 4);
+});
+
+// ── round 3, seat A ─────────────────────────────────────────────────────────
+test("a review/ that is a link is not followed, and the old page behind it is named", () => {
+  const dir = bundle();
+  const outside = fs.mkdtempSync(path.join(TMP, "outside-"));
+  fs.writeFileSync(path.join(outside, "REVIEW.md"), "# REVIEW\n\n- Result: ok\n");
+  fs.symlinkSync(outside, path.join(dir, "review"));
+  const r = run(dir);
+  assert.equal(r.status, 2);
+  assert.match(r.stdout, /^review\/REVIEW\.md may be stale and could not be removed$/m);
+  assert.match(r.stdout, /RESULT status=error target=e2e-review reason=cannot-write\n$/);
+  assert.equal(fs.readFileSync(path.join(outside, "REVIEW.md"), "utf8"), "# REVIEW\n\n- Result: ok\n", "the link's target is untouched");
+});
+
+test("a rule whose own filters leave it no sample is not checked", () => {
+  const thresholds = path.join(TMP, "thresholds-a22.json");
+  const full = JSON.parse(fs.readFileSync(path.join(ROOT, "docs/session-trace/thresholds.json"), "utf8"));
+  fs.writeFileSync(thresholds, JSON.stringify(full));
+  const dir = bundle();
+  // Every sample is from a hidden tab: the two present_* rules compare nothing.
+  metrics(dir, [1000, 2000].map((ts) => browser(ts, { is_hidden: 1, present_interval_sd_ms: 5, present_interval_p95_ms: 5 })));
+  const a = review(dir, { thresholdsFile: thresholds }).scenarios[0].anomalies;
+  const unchecked = a.not_checked.map((n) => n.rule);
+  assert.ok(unchecked.includes("web.client_health.present_sd_degraded_ms"), JSON.stringify(a));
+  assert.ok(unchecked.includes("web.client_health.present_p95_degraded_ms"));
+  assert.deepEqual(a.rows, []);
+});
+
+test("a threshold written as a string is not a threshold", () => {
+  const thresholds = path.join(TMP, "thresholds-a23.json");
+  const full = JSON.parse(fs.readFileSync(path.join(ROOT, "docs/session-trace/thresholds.json"), "utf8"));
+  full.thresholds["web.client_health.present_sd_degraded_ms"].value = "28";
+  fs.writeFileSync(thresholds, JSON.stringify(full));
+  const dir = bundle();
+  metrics(dir, [1000, 2000].map((ts) => browser(ts, { is_hidden: 0, present_interval_sd_ms: 5, present_interval_p95_ms: 5 })));
+  const a = review(dir, { thresholdsFile: thresholds }).scenarios[0].anomalies;
+  assert.ok(a.not_checked.some((n) => n.rule === "web.client_health.present_sd_degraded_ms" && /thresholds file has no/.test(n.why)), JSON.stringify(a));
 });

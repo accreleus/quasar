@@ -89,6 +89,7 @@ const RULES = [
   ["builds with no components", (d) => edit(d, "builds.json", () => ({ unknown: {} })), /builds.json: no components/],
   ["a scenario with no sessions", (d) => edit(d, `${SC}/scenario.json`, ({ sessions, ...s }) => s), /scenario.json: no sessions/],
   ["a sample row with no metrics", (d) => append(d, `${SC}/metrics.jsonl`, { kind: "metric", source: "agent", ts_unix_ms: 1 }), /needs ts_unix_ms and metrics/],
+  ["two criterion ids that print the same", (d) => edit(d, `${SC}/scenario.json`, (s) => ({ ...s, status: "fail", reason: "x", criteria: [{ id: "\u00e9", pass: false, observed: 0, expected: 1 }, { id: "e\u0301", pass: true, observed: 1, expected: 1 }] })), /criterion id .* is not unique/],
   ["a status outside the four", (d) => edit(d, `${SC}/scenario.json`, (s) => ({ ...s, status: "ok" })), /status must be one of/],
   ["a pass status with a failed criterion", (d) => edit(d, `${SC}/scenario.json`, (s) => ({ ...s, criteria: [...s.criteria, { id: "x", pass: false, observed: 1, expected: "0" }] })), /a pass status with a criterion that failed/],
   ["a pass status with no criterion that passed", (d) => edit(d, `${SC}/scenario.json`, (s) => ({ ...s, criteria: [] })), /a pass status with no criterion that passed/],
