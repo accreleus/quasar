@@ -36,8 +36,9 @@ use crate::session::audio::QUASAR_MIC_SINK_NAME;
 /// (the ref-cycle rule, `.claude/rules/gstreamer-gotchas.md`).
 pub(super) const MIC_BIN_NAME: &str = "quasar-mic-branch";
 
-/// The terminal `pulsesink`'s name, for `verify_mic_routing` to find post-link.
-const MIC_SINK_NAME: &str = "quasar-mic-sink";
+/// The terminal sink's name: `verify_mic_routing` finds the `pulsesink` by it, and the
+/// WebTransport microphone counts what reaches either terminal.
+pub(crate) const MIC_SINK_NAME: &str = "quasar-mic-sink";
 
 /// The mic m-line's RTP payload type. Matches the send-side `rtpopuspay pt=111`
 /// (`audio_branch.rs`) and the browser's default, so the answer never has to remap.
@@ -60,15 +61,16 @@ fn mic_rtp_caps() -> gst::Caps {
 
 /// The mic receive chain's factories, in link order. No `pulse_server` degrades the
 /// terminal to `fakesink`: the m-line still negotiates and the client's mic is discarded
-/// rather than failing the session. Pure, so the chain shape is testable with no registry.
-fn mic_chain_factories(has_pulse: bool) -> Vec<&'static str> {
-    vec![
-        "rtpopusdepay",
-        "opusdec",
-        "audioconvert",
-        "audioresample",
-        if has_pulse { "pulsesink" } else { "fakesink" },
-    ]
+/// rather than failing the session. `rtp`: the WebRTC chain, which starts at the depayloader;
+/// WebTransport hands over bare Opus packets. Pure, so the chain shape is testable with no
+/// registry.
+fn mic_chain_factories(has_pulse: bool, rtp: bool) -> Vec<&'static str> {
+    let mut chain = vec!["opusdec", "audioconvert", "audioresample"];
+    if rtp {
+        chain.insert(0, "rtpopusdepay");
+    }
+    chain.push(if has_pulse { "pulsesink" } else { "fakesink" });
+    chain
 }
 
 /// Add the `recvonly` mic transceiver to `webrtc` and the decode bin to `pipeline`, and
@@ -82,7 +84,7 @@ pub(super) fn add_mic_branch(
     webrtc: &gst::Element,
     pulse_server: Option<&str>,
 ) -> Result<()> {
-    let bin = build_mic_bin(pulse_server)?;
+    let bin = build_mic_bin(pulse_server, true)?;
     pipeline
         .add(&bin)
         .context("failed to add the microphone bin to the audio pipeline")?;
@@ -250,15 +252,15 @@ fn verify_mic_routing(pipeline: &gst::Pipeline) {
         .expect("failed to spawn the mic routing check thread");
 }
 
-/// Build the mic decode bin with a `sink` ghost pad over the depayloader's sink.
-fn build_mic_bin(pulse_server: Option<&str>) -> Result<gst::Bin> {
+/// Build the mic decode bin with a `sink` ghost pad over its first element's sink.
+fn build_mic_bin(pulse_server: Option<&str>, rtp: bool) -> Result<gst::Bin> {
     let bin = gst::Bin::builder().name(MIC_BIN_NAME).build();
 
     let mut elements: Vec<gst::Element> = Vec::new();
-    for factory in mic_chain_factories(pulse_server.is_some()) {
+    for factory in mic_chain_factories(pulse_server.is_some(), rtp) {
         let mut builder = gst::ElementFactory::make(factory);
-        if factory == "pulsesink" {
-            // `verify_mic_routing` finds it by name (`by_name` recurses into bins).
+        if factory == "pulsesink" || factory == "fakesink" {
+            // `verify_mic_routing` finds the pulsesink by name (`by_name` recurses into bins).
             builder = builder.name(MIC_SINK_NAME);
         }
         let element = builder
@@ -269,7 +271,10 @@ fn build_mic_bin(pulse_server: Option<&str>) -> Result<gst::Bin> {
 
     // Packet-loss concealment: the mic rides the same lossy client uplink, and a concealed
     // 20 ms gap beats a hard dropout in voice. Guarded — an unknown property panics.
-    let decoder = &elements[1];
+    let decoder = elements
+        .iter()
+        .find(|e| e.factory().is_some_and(|f| f.name() == "opusdec"))
+        .expect("the chain has an opusdec");
     if decoder.find_property("plc").is_some() {
         decoder.set_property("plc", true);
     } else {
@@ -312,10 +317,10 @@ fn build_mic_bin(pulse_server: Option<&str>) -> Result<gst::Bin> {
         .context("failed to add microphone elements to the bin")?;
     gst::Element::link_many(&elements).context("failed to link the microphone chain")?;
 
-    let depay_sink = elements[0]
+    let first_sink = elements[0]
         .static_pad("sink")
-        .context("rtpopusdepay has no sink pad")?;
-    let ghost = gst::GhostPad::with_target(&depay_sink)
+        .context("the microphone chain's first element has no sink pad")?;
+    let ghost = gst::GhostPad::with_target(&first_sink)
         .context("failed to ghost the microphone bin's sink pad")?;
     ghost
         .set_active(true)
@@ -326,6 +331,45 @@ fn build_mic_bin(pulse_server: Option<&str>) -> Result<gst::Bin> {
     Ok(bin)
 }
 
+/// The WebTransport microphone (`protocol/transport-webtransport.md` §Microphone): bare Opus
+/// packets into an `appsrc`, then the same decode chain and sink as the WebRTC mic.
+/// Returned in READY, with the sink's routing check armed once it plays.
+pub(crate) fn build_stream_mic(
+    pulse_server: Option<&str>,
+) -> Result<(gst::Pipeline, gstreamer_app::AppSrc)> {
+    let pipeline = gst::Pipeline::new();
+    let src = gstreamer_app::AppSrc::builder()
+        .caps(
+            &gst::Caps::builder("audio/x-opus")
+                .field("rate", 48_000_i32)
+                .field("channels", 1_i32)
+                .field("channel-mapping-family", 0_i32)
+                .build(),
+        )
+        .format(gst::Format::Time)
+        .is_live(true)
+        .do_timestamp(true)
+        .block(false)
+        .max_bytes(16_384)
+        .build();
+    if src.find_property("leaky-type").is_some() {
+        src.set_property_from_str("leaky-type", "downstream");
+    }
+    let bin = build_mic_bin(pulse_server, false)?;
+    pipeline.add_many([src.upcast_ref::<gst::Element>(), bin.upcast_ref()])?;
+    src.link(&bin)
+        .context("failed to link the microphone source")?;
+    pipeline
+        .set_state(gst::State::Ready)
+        .context("the microphone pipeline failed to reach READY")?;
+    Ok((pipeline, src))
+}
+
+/// Check the sink's routing once the stream mic plays; see [`verify_mic_routing`].
+pub(crate) fn verify_stream_mic(pipeline: &gst::Pipeline) {
+    verify_mic_routing(pipeline);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,7 +377,7 @@ mod tests {
     #[test]
     fn chain_terminates_in_pulsesink_only_with_a_sidecar() {
         assert_eq!(
-            mic_chain_factories(true),
+            mic_chain_factories(true, true),
             [
                 "rtpopusdepay",
                 "opusdec",
@@ -343,10 +387,18 @@ mod tests {
             ]
         );
         // No sidecar: received and discarded, never a build failure.
-        assert_eq!(*mic_chain_factories(false).last().unwrap(), "fakesink");
         assert_eq!(
-            mic_chain_factories(true)[..4],
-            mic_chain_factories(false)[..4]
+            *mic_chain_factories(false, true).last().unwrap(),
+            "fakesink"
+        );
+        assert_eq!(
+            mic_chain_factories(true, true)[..4],
+            mic_chain_factories(false, true)[..4]
+        );
+        // WebTransport hands over bare Opus: the same chain, minus the depayloader.
+        assert_eq!(
+            mic_chain_factories(true, false),
+            ["opusdec", "audioconvert", "audioresample", "pulsesink"]
         );
     }
 

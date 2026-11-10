@@ -248,6 +248,8 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		// The effective runtime app's image; engages the placement filter only when
 		// it is an installed catalog entry.
 		AppImage: app.Image(),
+		// A PyroWave slot is taken under the scheduler's locks (§The PyroWave ceiling).
+		PyroWaveCandidate: pyrowaveCandidate(launchProfile, lp),
 	}
 	if app.IsDerived() && app.ExternalSource == "steam" {
 		p.CompatGameID = app.ExternalID
@@ -294,6 +296,11 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		if owner == "" || !c.hostParks(owner) {
 			return LaunchResult{}, errParkRefused
 		}
+		// Every park is WebRTC-only (#1161): a launch that would plan WebTransport supersedes it
+		// and cold-starts Steam behind a 503, so park nothing for that user (#1163).
+		if c.launchWouldPlanWebTransport(ctx, p, owner, launchProfile, lp, ov, env, source) {
+			return LaunchResult{}, errParkRefused
+		}
 		// A heartbeat never waits on a settling hold: it simply parks nothing.
 		p.Kind, p.PinHostID, p.NoHomeSettleWait = KindParked, owner, true
 	} else if parked, err = c.store.liveParked(ctx, userID); err != nil {
@@ -314,13 +321,8 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		afterParkedRead()
 	}
 	notice := ""
-	if app.ShareSteamLibrary && app.ManagedHome && !lp.parked {
-		if p.SharedHomeAppID, err = c.store.sharedSteamApp(ctx, userID); err != nil {
-			return LaunchResult{}, err
-		}
-		if p.SharedHomeAppID == "" {
-			notice = noticeSharedUnavailable
-		}
+	if p.SharedHomeAppID, notice, err = c.store.sharedHomeChoice(ctx, app, userID, lp.parked); err != nil {
+		return LaunchResult{}, err
 	}
 
 	sess, err := c.store.ScheduleAndCreate(ctx, p)
@@ -383,6 +385,17 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	// known. A claim resolved it on the parked session's GPU before placement.
 	placed := claimStream
 	if p.claim != nil {
+		// Planned as holding a PyroWave slot the INSERT found taken: plan it again as busy.
+		// PyroWave moves no standard-stream field claim check 4 compared.
+		if ps := claimStream.plan; ps != nil && ps.Update.KeepPyroWaveSlot && !sess.PyroWaveSlot {
+			again, err := c.planPostPlacement(ctx, &sess, launchProfile, lp, ov, env, source)
+			if err != nil {
+				c.log.Warn("pyrowave: re-planning a claim without a slot failed, planning it busy on WebRTC",
+					"session_id", sess.ID, "err", err)
+			}
+			claimStream = claimWithoutSlot(claimStream, again, err)
+			placed = claimStream
+		}
 		c.persistPlacedStream(ctx, &sess, claimStream)
 	} else if placed, err = c.applyPostPlacement(ctx, &sess, launchProfile, lp, ov, env, source); err != nil {
 		// The codec constraint pre-empts both codec refusals; this stays the
@@ -634,6 +647,8 @@ func (c *Coordinator) claimCandidate(ctx context.Context, p *CreateParams, k par
 		ID: k.ID, UserID: p.UserID, AppID: p.AppID, HostID: &k.HostID, GPUIndex: &k.GPUIndex,
 		Width: p.Width, Height: p.Height, FPS: p.FPS, BitrateKbps: p.BitrateKbps,
 		H264Profile: p.H264Profile, Codec: wireCodecH264, Playout0Ms: p.Playout0Ms,
+		// A claim plans like any launch: as holding the slot its INSERT will try to take.
+		PyroWaveSlot: p.PyroWaveCandidate,
 	}
 	if lp.DeviceID != "" {
 		prov.DeviceID = &lp.DeviceID
@@ -719,6 +734,8 @@ func (c *Coordinator) gatherStreamInputs(
 		CertMaxAge:  CertStaleness,
 		Now:         time.Now(),
 		Transport:   TransportInputs{Requested: lp.Transport},
+
+		HoldsPyroWaveSlot: sess.PyroWaveSlot,
 	}
 	// Only a profile that can want WebTransport pays for the endpoint read.
 	if sess.HostID != nil && (chain.Transport == transportWebTransport || chain.Transport == transportOptIn) {
@@ -1075,6 +1092,7 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 	if sess.wt != nil {
 		exp := sess.wt.ExpiresAt
 		assign.Transport, assign.WTTokenHash, assign.WTTokenExpiresAt = transportWebTransport, sess.wt.Hash, &exp
+		assign.PyroWave = sess.PyroWave.grant()
 	}
 	if !c.sendHomeBoundAssign(hostID, sess.ID, runtimeSpec, assign, expected) {
 		return

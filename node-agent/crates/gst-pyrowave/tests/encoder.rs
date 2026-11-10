@@ -44,8 +44,14 @@ fn device() -> Option<Arc<Device>> {
 
 /// Push `frames` through `appsrc ! pyrowaveenc ! appsink` and return the output buffers.
 fn encode(caps: &str, kbps: u32, frames: &[Vec<u8>]) -> Vec<gst::Buffer> {
+    encode_through(caps, "", kbps, frames)
+}
+
+/// As [`encode`], with `through` (elements ending in `!`) between appsrc and the encoder.
+fn encode_through(caps: &str, through: &str, kbps: u32, frames: &[Vec<u8>]) -> Vec<gst::Buffer> {
     let mut desc = format!(
-        "appsrc name=src format=time caps=\"{caps}\" ! pyrowaveenc name=enc bitrate={kbps} "
+        "appsrc name=src format=time caps=\"{caps}\" ! {through} \
+         pyrowaveenc name=enc bitrate={kbps} "
     );
     if let Some(node) = device_node() {
         desc += &format!("device={node} ");
@@ -162,6 +168,70 @@ fn every_fixture_meets_the_encoder_bar_with_the_configured_sof_colour() {
             );
         }
         println!("{line}");
+    }
+}
+
+/// I420 fixture planes as NV12.
+fn to_nv12(src: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let (y, c) = src.split_at(w * h);
+    let (cb, cr) = c.split_at(w * h / 4);
+    let mut nv12 = y.to_vec();
+    for (u, v) in cb.iter().zip(cr) {
+        nv12.extend([*u, *v]);
+    }
+    nv12
+}
+
+/// #1104: NV12 Vulkan images (here from `vulkanupload`, on GStreamer's own device) encode
+/// on that device with no copy, to the same bar as system-memory input.
+#[test]
+fn vulkan_images_meet_the_encoder_bar_on_their_own_device() {
+    let Some(device) = device() else { return };
+    if gst::ElementFactory::find("vulkanupload").is_none() {
+        eprintln!("skipping: no vulkanupload in this GStreamer");
+        return;
+    }
+    let (w, h) = (320usize, 192usize);
+    let src = std::fs::read(fixtures().join("detail_320x192.src.yuv")).unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixtures().join("manifest.json")).unwrap()).unwrap();
+    let fx = manifest["fixtures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["name"] == "detail_320x192_hi")
+        .unwrap();
+    let budget = fx["budget_bytes"].as_u64().unwrap();
+    let caps =
+        format!("video/x-raw,format=NV12,width={w},height={h},framerate=60/1,colorimetry=bt709");
+    let out = encode_through(
+        &caps,
+        "vulkanupload ! video/x-raw(memory:VulkanImage),format=NV12 !",
+        (budget * 8 * 60 / 1000) as u32,
+        &[to_nv12(&src, w, h), to_nv12(&src, w, h)],
+    );
+    for buf in &out {
+        let frame = buf.map_readable().unwrap();
+        assert!(
+            frame.len() as u64 <= budget,
+            "{} over {budget}",
+            frame.len()
+        );
+        assert_eq!(
+            sof_words(&frame).1 >> 30 & 3,
+            1,
+            "limited range, centre siting"
+        );
+        let decoded = Decoder::new(device.clone(), w as u32, h as u32)
+            .unwrap()
+            .decode_i420(&frame)
+            .unwrap();
+        let (ysz, csz) = (w * h, w * h / 4);
+        for (off, len, plane) in [(0, ysz, "y"), (ysz, csz, "cb"), (ysz + csz, csz, "cr")] {
+            let got = gstpyrowave::psnr(&src[off..off + len], &decoded[off..off + len]);
+            let bar = fx["encoder_bar"]["min_psnr_db"][plane].as_f64().unwrap();
+            assert!(got >= bar, "{plane}: {got:.2} dB under the bar {bar:.2}");
+        }
     }
 }
 

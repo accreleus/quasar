@@ -882,6 +882,14 @@ fn same_container_but_flags(
     strip(from) == strip(to)
 }
 
+/// `session_swap_app` carries no compatibility tools, so the swap target gets the session's
+/// (`compat_tools::carry`) before anything compares or launches it.
+fn inherit_session_tools(current: Option<&super::container::ContainerSpec>, req: &mut SwapRequest) {
+    if let (Some(current), Some(next)) = (current, req.container.as_mut()) {
+        crate::compat_tools::carry(current, next);
+    }
+}
+
 /// The games an in-place swap moves between, `(A, B)`, or `None` for today's container
 /// swap: it needs the session's launch helper connected, and the two apps differing in
 /// `STEAM_STARTUP_FLAGS` alone, each naming its game (amendment 39).
@@ -1535,21 +1543,28 @@ pub(crate) struct SessionTransports {
 }
 
 impl pipeline::Transport for SessionTransports {
-    fn attach(session: pipeline::EncodedSession) -> anyhow::Result<Self> {
+    fn attach(mut session: pipeline::EncodedSession) -> anyhow::Result<Self> {
         let webtransport = crate::webtransport::listener()
             .filter(|_| session.cfg.webtransport)
             .and_then(|l| {
+                let feed = session.pyrowave_feed.take();
                 crate::webtransport::Tap::attach(
                     l.registry(),
                     &session.video,
                     &session.encoder,
                     &session.session_id,
+                    Some(session.trace_tx.clone()),
                     crate::webtransport::Input::devices(
                         session.devices.clone(),
                         session.input_state.clone(),
                         session.cfg.stream.width,
                         session.cfg.stream.height,
                     ),
+                    crate::webtransport::Tap::plan(&session.cfg),
+                    session
+                        .cfg
+                        .pyrowave
+                        .map(|grant| (&session.cfg, grant, feed)),
                     pipeline::feedback_abr(
                         &session.encoder,
                         &session.cfg,
@@ -1561,6 +1576,9 @@ impl pipeline::Transport for SessionTransports {
                 )
             });
         let slot = pipeline::WebRtcSlot::new(session)?;
+        if let Some(tap) = &webtransport {
+            slot.tap_audio_for_stream(tap.audio());
+        }
         // Audio first: `attach_video` takes the encode pipeline to READY.
         let (audio_webrtc, audio_pipeline) = slot.build_audio()?;
         let video = slot.attach_video(false, None)?;
@@ -1571,6 +1589,9 @@ impl pipeline::Transport for SessionTransports {
 
     fn release(&self) {
         self.video.release();
+        if let Some(tap) = &self.webtransport {
+            tap.release();
+        }
         if let Some(audio) = &self.audio_webrtc {
             let _ = audio.set_state(gst::State::Null);
         }
@@ -1969,10 +1990,10 @@ fn idle_reap_reason(
         if booting {
             return None;
         }
-        return (running_for >= window).then_some("idle: WebRTC transport never established");
+        return (running_for >= window).then_some("idle: transport never established");
     }
     match unhealthy_for {
-        Some(d) if d >= window => Some("idle: WebRTC transport lost"),
+        Some(d) if d >= window => Some("idle: transport lost"),
         _ => None,
     }
 }
@@ -2154,6 +2175,23 @@ impl AppBootGate {
             None if drew => AppBootStep::Held,
             None => AppBootStep::Wait,
         }
+    }
+}
+
+/// A container swap's ready wait, one tick after its `AppBootGate` (#1234): why to show the
+/// replacement now, or `None` to keep holding. A held app that exits is shown so the normal
+/// exit policy takes it; the swap's budget ends any other hold. Pure.
+fn swap_reveal(
+    step: AppBootStep,
+    drawn: bool,
+    exited: bool,
+    past_deadline: bool,
+) -> Option<&'static str> {
+    match step {
+        AppBootStep::Present(reveal) => Some(reveal),
+        _ if drawn && exited => Some("app exited while held"),
+        _ if drawn && past_deadline => Some("swap budget reached"),
+        _ => None,
     }
 }
 
@@ -3006,7 +3044,8 @@ pub fn run_blocking(
     let mut app_boot_budget = cfg.app_boot_timeout;
     let mut app_boot_started_at: Option<Instant> = None;
     let mut app_presented_at: Option<Instant> = None;
-    let cap_for = |budget: Option<Duration>| {
+    // Takes `res` rather than capturing it: a swap may give the session its launch helper.
+    let cap_for = |res: &SessionResources, budget: Option<Duration>| {
         res.launch().map(|_| {
             super::launch_helper::reveal_cap(
                 std::env::var("QUASAR_STEAM_REVEAL_CAP_SECS").ok(),
@@ -3014,7 +3053,7 @@ pub fn run_blocking(
             )
         })
     };
-    let mut reveal_cap = cap_for(app_boot_budget);
+    let mut reveal_cap = cap_for(&res, app_boot_budget);
     let mut app_boot = AppBootGate::new(reveal_cap, app_boot_budget);
     // Amendment 39 (#759): what this runtime is now and what it is doing.
     let mut kind = cfg.kind;
@@ -3203,7 +3242,7 @@ pub fn run_blocking(
             cfg.idle_timeout = req.idle_timeout;
             cfg.app_boot_timeout = req.app_boot_timeout;
             app_boot_budget = req.app_boot_timeout;
-            reveal_cap = cap_for(app_boot_budget);
+            reveal_cap = cap_for(&res, app_boot_budget);
             current_app = req.container;
             follow_app(&mut current_source, &res, current_app.as_ref());
             tracing::info!(
@@ -3658,7 +3697,7 @@ pub fn run_blocking(
         // untouched on the old compositor until the single `listen-to` switch, so they are
         // never starved and never renegotiate. `SwapDone` is not emitted until the new app
         // is on screen (`perform_swap`), which is the client's reveal signal.
-        while let Ok(req) = swap_rx.try_recv() {
+        while let Ok(mut req) = swap_rx.try_recv() {
             // The session has ended; the control plane's unresolved-swap limit answers it.
             if held_since.is_some() {
                 tracing::info!(
@@ -3674,6 +3713,7 @@ pub fn run_blocking(
                 );
                 continue;
             }
+            inherit_session_tools(current_app.as_ref(), &mut req);
             let reports = res
                 .launch()
                 .map(super::launch_helper::LaunchSocket::reports);
@@ -3705,6 +3745,27 @@ pub fn run_blocking(
                     "in-place swap not possible (no connected launch helper, or the apps \
                      differ beyond STEAM_STARTUP_FLAGS); swapping the container"
                 );
+            }
+            // The helper is opened only for a session that starts on a Steam game. One that
+            // started on another app (a desktop) gets it for the first Steam game it swaps
+            // to, so that game's start-up is held like a launch's (#1241) and later
+            // game-to-game swaps can go in place.
+            if res.launch().is_none()
+                && req
+                    .container
+                    .as_ref()
+                    .and_then(|c| super::launch_helper::appid_from_env(&c.env))
+                    .is_some()
+            {
+                res.set_launch(super::launch_helper::LaunchSocket::open(
+                    &cfg.runtime_dir,
+                    &session_id,
+                    req.container.as_ref().map(|c| &c.env),
+                    false,
+                    session_metrics.clone(),
+                    diagnostic_tx.clone(),
+                ));
+                reveal_cap = cap_for(&res, app_boot_budget);
             }
             let next_app = req.container.clone();
             gen += 1;
@@ -4325,7 +4386,7 @@ pub const REASON_APP_EXITED_EARLY: &str = "app_exited_early";
 /// #484 reason code: the app container is alive but never presented a frame within
 /// `QUASAR_APP_BOOT_TIMEOUT_SECS`. Same `AppFailed` shape as
 /// [`REASON_APP_EXITED_EARLY`]; this case used to surface as a mute
-/// `idle: WebRTC transport never established` reap.
+/// `idle: transport never established` reap.
 pub const REASON_APP_NEVER_PRESENTED: &str = "app_never_presented";
 
 /// The terminal event for a `fail`-policy app-container exit.
@@ -4545,8 +4606,22 @@ fn perform_swap(
         emit(SessionEvent::AppBooting);
     }
     let budget = swap_app_ready_timeout();
-    let deadline = Instant::now() + budget;
+    let started = Instant::now();
+    let deadline = started + budget;
     let mut frames_at_first_commit: Option<u64> = None;
+    // A Steam game the helper follows is held like a launch (#727): a new container's first
+    // draw is Steam starting, so the switch screen stays up until the game is on screen.
+    // This budget, not the reveal cap (90 s by default), is what ends a long hold. Any other
+    // app, or no helper, is shown on its first draw.
+    let mut gate = AppBootGate::new(
+        res.launch().map(|_| {
+            super::launch_helper::reveal_cap(
+                std::env::var("QUASAR_STEAM_REVEAL_CAP_SECS").ok(),
+                cfg.app_boot_timeout,
+            )
+        }),
+        None,
+    );
     let ready = loop {
         if let Err(e) = pump_new_source_bus(&new_bus, &mut new_source) {
             break Err(e);
@@ -4559,10 +4634,36 @@ fn perform_swap(
         // Order matters: commits first, then frames — see `swap_source_ready`.
         let commits = new_source.app_surface_commits();
         let frames = new_source.sink_frames();
-        if swap_source_ready(expects_app, commits, frames, &mut frames_at_first_commit) {
+        let shown = if expects_app {
+            let reports = res
+                .launch()
+                .map(super::launch_helper::LaunchSocket::reports)
+                .unwrap_or_default();
+            let step = gate.tick(Instant::now(), started, commits, frames, reports);
+            if step == AppBootStep::Held {
+                tracing::info!(
+                    session_id = %session_id,
+                    "swap: first frame after {} ms; holding the switch for the game (up to {}s)",
+                    started.elapsed().as_millis(),
+                    budget.as_secs()
+                );
+            }
+            let drawn = gate.drawn_at.is_some();
+            swap_reveal(
+                step,
+                drawn,
+                drawn && new_source.container_exited(),
+                Instant::now() >= deadline,
+            )
+        } else {
+            swap_source_ready(false, commits, frames, &mut frames_at_first_commit)
+                .then_some("first frame")
+        };
+        if let Some(reveal) = shown {
             tracing::info!(
                 app_surface_commits = commits.unwrap_or(0),
                 sink_frames = frames,
+                reveal,
                 "swap: replacement app has presented its first frame"
             );
             if expects_app {
@@ -4572,9 +4673,12 @@ fn perform_swap(
         }
         // A replacement that exits before it ever presents: its own generation's observer
         // reports the exit with its final lines, so the swap fails NOW with the real cause
-        // rather than sitting out the budget and reporting "no frame". Checked AFTER the
-        // readiness gate so an app that presented and then exited is adopted and handled
-        // by the normal exit policy, never rolled back as "never presented".
+        // rather than sitting out the budget and reporting "no frame". Not once it has drawn
+        // (a held game): `swap_reveal` adopts that one, and the normal exit policy takes it.
+        if gate.drawn_at.is_some() {
+            std::thread::sleep(SWAP_POLL);
+            continue;
+        }
         if let Some(status) = new_source.take_container_exit() {
             let tail = new_source.app_log_tail();
             tracing::warn!(
@@ -4589,6 +4693,22 @@ fn perform_swap(
             ));
         }
         if Instant::now() >= deadline {
+            // A parked Steam draws nothing until its game does (#1243). One whose helper has
+            // launched the game (it reports a launch state) and whose container still runs is
+            // switched to at the budget (an update, a slow sign-in), not rolled back. A Steam
+            // that never came up still rolls back.
+            let launched = res.launch().is_some_and(|l| {
+                let r = l.reports();
+                r.helper_connected && r.launch_state.is_some()
+            });
+            if expects_app && launched && !new_source.container_exited() {
+                tracing::info!(
+                    session_id = %session_id,
+                    "swap: Steam is still starting at the {budget:?} budget; switching to it"
+                );
+                emit(SessionEvent::AppPresented);
+                break Ok(());
+            }
             break Err(format!(
                 "replacement app produced no frame within {budget:?} \
                  (app_surface_commits={commits:?})"
@@ -4718,14 +4838,14 @@ mod tests {
         app_exit_event, audio_path_label, client_link, context_object_identity,
         effective_encoder_device_path, fold_display_update, idle_reap_reason,
         is_sctp_association_error, mic_state_label, running_report,
-        stop_requested_for_transport_error, swap_source_ready, validate_display_update,
-        AppBootGate, AppBootStep, AppExitStatus, AudioPipelineGuard, DiagnosticEventTx,
-        DisplayUpdateRequest, Negotiation, SessionEvent, TraceEvent, VulkanContextBridge,
-        REASON_APP_EXITED_EARLY, VULKAN_DEVICE_CONTEXT,
+        stop_requested_for_transport_error, swap_reveal, swap_source_ready,
+        validate_display_update, AppBootGate, AppBootStep, AppExitStatus, AudioPipelineGuard,
+        DiagnosticEventTx, DisplayUpdateRequest, Negotiation, SessionEvent, TraceEvent,
+        VulkanContextBridge, REASON_APP_EXITED_EARLY, VULKAN_DEVICE_CONTEXT,
     };
     use super::{
-        in_place_plan, InPlaceAction, InPlaceStep, ProgressThrottle, SwapRequest,
-        IN_PLACE_LAUNCH_BOUND, IN_PLACE_QUIT_BOUND,
+        in_place_plan, inherit_session_tools, InPlaceAction, InPlaceStep, ProgressThrottle,
+        SwapRequest, IN_PLACE_LAUNCH_BOUND, IN_PLACE_QUIT_BOUND,
     };
     use gstreamer::prelude::*;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -5887,7 +6007,7 @@ mod tests {
 
     // ── #484 app-boot visibility ──────────────────────────────────────────────
     // A cold app boot is 30–50 s, and charging it against the never-connected idle budget
-    // killed real sessions at 120 s with `idle: WebRTC transport never established`.
+    // killed real sessions at 120 s with `idle: transport never established`.
 
     #[test]
     fn booting_defers_the_never_connected_reap_at_every_age() {
@@ -5906,6 +6026,31 @@ mod tests {
         assert!(
             idle_reap_reason(WINDOW, Duration::from_secs(9999), true, Some(WINDOW), true).is_some()
         );
+    }
+
+    #[test]
+    fn swap_reveal_holds_a_drawn_game_until_shown_exited_or_out_of_budget() {
+        use AppBootStep::*;
+        // The gate's own answer wins.
+        assert_eq!(
+            swap_reveal(Present("first frame"), true, false, false),
+            Some("first frame")
+        );
+        // Held, nothing else: keep the switch screen up.
+        assert_eq!(swap_reveal(Held, true, false, false), None);
+        assert_eq!(swap_reveal(Wait, true, false, false), None);
+        // A held app that died is shown at once, so the exit policy takes it (#1234 review).
+        assert_eq!(
+            swap_reveal(Wait, true, true, false),
+            Some("app exited while held")
+        );
+        // The swap budget ends a hold, even on the tick the draw is first held.
+        assert_eq!(
+            swap_reveal(Held, true, false, true),
+            Some("swap budget reached")
+        );
+        // Nothing drawn: no hold to end, the caller's exit and deadline checks decide.
+        assert_eq!(swap_reveal(Wait, false, true, true), None);
     }
 
     /// Ticks for an app that commits its first surface at `t` and has a frame after it at
@@ -6097,6 +6242,37 @@ mod tests {
             mounts: vec!["/homes/u1:/home/quasar".into()],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_swap_target_gets_the_sessions_compat_tools_and_stays_in_place() {
+        use crate::compat_tools::{ENV_ENTRIES, ENV_TOOLS_PATH};
+        use crate::session::launch_helper::LaunchReports;
+        let connected = Some(LaunchReports {
+            helper_connected: true,
+            ..Default::default()
+        });
+        // As `session_assign` leaves the running game: the tools env and the mounted tool.
+        let mut running = steam_app("-silent -applaunch 620");
+        running.env.insert(ENV_ENTRIES.into(), "0=proton_10".into());
+        running
+            .env
+            .insert(ENV_TOOLS_PATH.into(), "/quasar/compat".into());
+        running.compat_tools = vec!["GE-Proton11-12-x86_64".into()];
+        // As `session_swap_app` hands the target over: no compat tools at all.
+        let mut req = SwapRequest {
+            container: Some(steam_app("-silent -applaunch 730")),
+            in_place: true,
+        };
+        assert_eq!(in_place_plan(Some(&running), &req, connected), None);
+        inherit_session_tools(Some(&running), &mut req);
+        assert_eq!(
+            in_place_plan(Some(&running), &req, connected),
+            Some((620, 730))
+        );
+        let next = req.container.unwrap();
+        assert_eq!(next.env[ENV_ENTRIES], "0=proton_10");
+        assert_eq!(next.compat_tools, running.compat_tools);
     }
 
     #[test]

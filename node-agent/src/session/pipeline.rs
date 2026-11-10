@@ -35,11 +35,11 @@ use caps::{caps_profile, raw_video_caps};
 mod codec_chain;
 pub(crate) use codec_chain::rtp_mtu_of;
 use codec_chain::{build_bitstream_chain, build_video_payloader, BitstreamChain};
-mod audio_branch;
+pub(crate) mod audio_branch;
 mod audio_health;
 mod rtp_ext;
 use audio_branch::add_audio_chain;
-mod mic_branch;
+pub(crate) mod mic_branch;
 mod mtu_shrink;
 mod probes;
 use probes::{
@@ -83,7 +83,9 @@ mod abr_glue;
 // `session_display_update` path with it.
 pub(crate) use abr_glue::{feedback_abr, resolution_lever_with_echo};
 pub use abr_glue::{trigger, EncodeResolutionLever, ResolutionLever};
+mod ice_interfaces;
 mod webrtc;
+use ice_interfaces::restrict_ice_gathering;
 pub(crate) use webrtc::restart_ice;
 pub(crate) use webrtc::{
     answer_from, apply_remote_description, build_answerer_pipeline, dtls_started, has_offered,
@@ -94,6 +96,7 @@ use webrtc::{
     connect_data_channel_open, connect_ice_candidate, connect_negotiation_needed,
     connect_state_logging, enable_video_fec, enable_video_rtx, make_webrtcbin,
 };
+pub(crate) mod pyrowave_branch;
 mod transport;
 pub use transport::{EncodedSession, Transport};
 mod webrtc_transport;
@@ -437,6 +440,7 @@ pub fn build_session_pipeline(
         .context("capsfilter not found")?;
 
     let webrtc = make_webrtcbin(cfg.stun.as_deref())?;
+    restrict_ice_gathering(&webrtc, PcId::Video);
 
     pipeline.add_many([
         &encoder,
@@ -498,6 +502,7 @@ pub fn build_session_pipeline(
         let audio_pipe = gst::Pipeline::new();
         let audio_webrtc =
             make_webrtcbin(cfg.stun.as_deref()).context("failed to create audio webrtcbin")?;
+        restrict_ice_gathering(&audio_webrtc, PcId::Audio);
         audio_pipe.add(&audio_webrtc)?;
         drop(audio_pipe);
         let audio_src_pad = audio_tail
@@ -731,6 +736,13 @@ pub fn build_encode_pipeline<T: Transport>(
         .property("caps", &raw_caps)
         .build()
         .context("interpipesrc not found — is gst-interpipe installed in the image?")?;
+    // A PyroWave grant asks the compositor for BT.709; the encoder input says so too, read
+    // from the source actually listened to (an adopted compositor may say BT.601).
+    if cfg.webtransport && cfg.pyrowave.is_some() {
+        if let Some(pad) = interpipesrc.static_pad("src") {
+            pyrowave_branch::tag_caps_with_source_colorimetry(&pad);
+        }
+    }
     // A short leaky queue decouples the interpipe pull from the encoder thread and drops
     // stale frames across a switch rather than building latency.
     let queue = gst::ElementFactory::make("queue")
@@ -819,6 +831,20 @@ pub fn build_encode_pipeline<T: Transport>(
     // needs it at arm time. One `Arc`, two owners: the runner's manual PATCH path and the
     // ladder's `on_window` closure.
     let resolution_lever = resolution_lever_with_echo(scale, encoder.clone(), &session_metrics);
+    // A PyroWave grant takes the raw frames, at the launch stream size, off the queue ahead
+    // of the scale stage, by a probe: the encode graph is the same with or without it.
+    let pyrowave_feed = (cfg.webtransport && cfg.pyrowave.is_some())
+        .then_some(())
+        .and_then(|()| {
+            pyrowave_branch::feed_at(queue.static_pad("src")?, &raw_caps)
+                .map_err(|e| {
+                    tracing::warn!(
+                        token = "pyrowave-feed-unavailable",
+                        "no PyroWave for this session on this encode path: {e:#}"
+                    )
+                })
+                .ok()
+        });
     let transport = T::attach(EncodedSession {
         cfg: cfg.clone(),
         pipeline: pipeline.clone(),
@@ -832,6 +858,7 @@ pub fn build_encode_pipeline<T: Transport>(
         trace_tx,
         session_id,
         observe: !diag_no_obs,
+        pyrowave_feed,
     })?;
 
     Ok(EncodePipeline {

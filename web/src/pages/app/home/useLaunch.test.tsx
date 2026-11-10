@@ -74,6 +74,40 @@ describe("useLaunch waiting toast", () => {
   });
 });
 
+describe("useLaunch while the parked Steam restarts (#1163)", () => {
+  afterEach(() => vi.resetAllMocks());
+
+  it("retries quietly in the ordinary launching state, with no toast, until accepted", async () => {
+    const launched = {
+      session: { id: "new-1", stream: { width: 1920, height: 1080, fps: 60, codec: "h264" } },
+      signaling: { url: "ws://x", token: "t" },
+    } as never;
+    vi.mocked(libraryApi.launchSession)
+      .mockRejectedValueOnce(
+        new ApiError(503, "capacity_exhausted", "restarting", undefined, undefined, 0, "steam_restarting"),
+      )
+      .mockResolvedValueOnce(launched);
+    const { result } = renderLaunch();
+
+    act(() => {
+      void result.current.launchApp(app, "1080p60");
+    });
+
+    await waitFor(() => expect(libraryApi.launchSession).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(result.current.launching).toBe(true));
+    expect(result.current.waitingForSlot).toBe(false);
+    expect(result.current.waitingReason).toBeNull();
+    expect(screen.queryByText(/Waiting for a slot/)).toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
+
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith("/app/session/new-1", expect.anything()), {
+      timeout: 3000,
+    });
+    expect(libraryApi.launchSession).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText(/Waiting for a slot/)).toBeNull();
+  });
+});
+
 describe("useLaunch when the home is on an offline host (#602)", () => {
   afterEach(() => vi.resetAllMocks());
 
@@ -396,5 +430,78 @@ describe("useLaunch full screen on Play (#647)", () => {
     });
     expect(document.documentElement.requestFullscreen).not.toHaveBeenCalled();
     expect(order).toEqual([]);
+  });
+});
+
+describe("useLaunch carries the URL switches from the library to a game page (#1216)", () => {
+  const launched = {
+    session: { id: "new-1", stream: { width: 1920, height: 1080, fps: 60, codec: "h264" } },
+    signaling: { url: "ws://x", token: "t" },
+  } as never;
+
+  // The switches are read from window.location at launch and remembered from the router's
+  // location, so a page at `url` sets both, as the browser router does.
+  function atUrl(url: string) {
+    window.history.replaceState({}, "", url);
+    const { result, unmount } = renderHook(
+      () =>
+        useLaunch({
+          token: "tok",
+          apps: [app],
+          liveSession: null,
+          canDecodeH264: true,
+          fetchProfiles: async () => null,
+          revealDetail: () => {},
+        }),
+      {
+        wrapper: ({ children }: { children: ReactNode }) => (
+          <MemoryRouter initialEntries={[url]}>
+            <ToastProvider>{children}</ToastProvider>
+          </MemoryRouter>
+        ),
+      },
+    );
+    return { result, unmount };
+  }
+
+  async function launchedRequest(url: string) {
+    const page = atUrl(url);
+    await act(async () => {
+      await page.result.current.launchApp(app, "1080p60");
+    });
+    page.unmount();
+    return vi.mocked(libraryApi.launchSession).mock.lastCall?.[1];
+  }
+
+  beforeEach(() => {
+    sessionStorage.clear();
+    vi.mocked(libraryApi.launchSession).mockResolvedValue(launched);
+  });
+  afterEach(() => {
+    vi.resetAllMocks();
+    window.history.replaceState({}, "", "/");
+  });
+
+  it("keeps ?codec=pyrowave set on the library page for a launch from the game page", async () => {
+    atUrl("/app?codec=pyrowave").unmount();
+    expect(await launchedRequest("/app/game/app-1")).toMatchObject({ pyrowave: true });
+  });
+
+  it("keeps ?transport= set on the library page for a launch from the game page", async () => {
+    atUrl("/app?transport=webtransport").unmount();
+    expect(await launchedRequest("/app/game/app-1")).toMatchObject({ transport: "webtransport" });
+  });
+
+  it("lets an explicit value in the game page URL replace the remembered one", async () => {
+    atUrl("/app?codec=pyrowave&transport=webtransport").unmount();
+    const req = await launchedRequest("/app/game/app-1?codec=h264&transport=webrtc");
+    expect(req).toMatchObject({ transport: "webrtc" });
+    expect(req).not.toHaveProperty("pyrowave");
+  });
+
+  it("sends neither switch from a fresh tab", async () => {
+    const req = await launchedRequest("/app/game/app-1");
+    expect(req).not.toHaveProperty("pyrowave");
+    expect(req).not.toHaveProperty("transport");
   });
 });

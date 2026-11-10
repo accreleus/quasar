@@ -74,6 +74,9 @@ func ValidImageUpdatePolicy(p string) bool {
 	return p == ImagePolicyManual || p == ImagePolicyNotify || p == ImagePolicyAuto
 }
 
+// ValidDefaultTransport mirrors the instance_settings CHECK (migration 0116).
+func ValidDefaultTransport(t string) bool { return t == "webrtc" || t == "webtransport" }
+
 // Settings is the instance_settings singleton row.
 type Settings struct {
 	SteamPreparationEnabled  bool   `json:"steam_preparation_enabled"`
@@ -135,6 +138,10 @@ type Settings struct {
 	// beside it: unattended apply fires on a successful platform.release_detect
 	// pass, so the detection job's own schedule is the window.
 	PlatformAutoApply bool `json:"platform_auto_apply"`
+
+	// The transport of every launch profile whose transport is "default"
+	// (amendment 61, migration 0116). Read once per launch by the session package.
+	DefaultTransport string `json:"default_transport"`
 
 	// Warm Steam (amendment 39, migration 0105), read per request by the
 	// session package. Default off: a parked session holds a full reservation.
@@ -324,6 +331,7 @@ func (s *Store) Get(ctx context.Context) (Settings, error) {
 			PlatformAutoApply:     false,
 			SteamWarmRewarm:       SteamWarmRewarmLibraryOpen,
 			SteamWarmIdleMinutes:  DefaultSteamWarmIdleMinutes,
+			DefaultTransport:      "webrtc",
 			RegionInputDefaults:   BuiltInRegionInputDefaults,
 			UpdatedAt:             time.Now().UTC(),
 		}, nil
@@ -497,7 +505,7 @@ const settingsColumns = `registration_mode, storage_provider, library_discovery_
 	release_channel, release_edge_branch, release_check,
 	release_webhook_enabled, release_webhook_url, platform_auto_apply,
 	steam_preparation_enabled, steam_preparation_revision::text,
-	steam_warm_enabled, steam_warm_rewarm, steam_warm_idle_minutes,
+	steam_warm_enabled, steam_warm_rewarm, steam_warm_idle_minutes, default_transport,
 	` + RegionInputDefaultsColumns + `, updated_by::text, updated_at`
 
 // scanner is the shared surface of pgx.Row and pgx.Rows.
@@ -511,7 +519,7 @@ func scanSettings(row scanner) (Settings, error) {
 		&st.ReleaseChannel, &st.ReleaseEdgeBranch, &st.ReleaseCheck,
 		&st.ReleaseWebhookEnabled, &st.ReleaseWebhookURL, &st.PlatformAutoApply,
 		&st.SteamPreparationEnabled, &st.SteamPreparationRevision,
-		&st.SteamWarmEnabled, &st.SteamWarmRewarm, &st.SteamWarmIdleMinutes}
+		&st.SteamWarmEnabled, &st.SteamWarmRewarm, &st.SteamWarmIdleMinutes, &st.DefaultTransport}
 	dest = append(dest, regionInputDefaultsDest(&st.RegionInputDefaults)...)
 	err := row.Scan(append(dest, &st.UpdatedBy, &st.UpdatedAt)...)
 	if err != nil {
@@ -552,6 +560,7 @@ type Patch struct {
 	SteamWarmEnabled     *bool
 	SteamWarmRewarm      *string
 	SteamWarmIdleMinutes *int
+	DefaultTransport     *string
 	RegionInput          RegionInputPatch
 }
 
@@ -581,6 +590,7 @@ func (p Patch) ChangedKeys() []string {
 		{"steam_warm_enabled", p.SteamWarmEnabled != nil},
 		{"steam_warm_rewarm", p.SteamWarmRewarm != nil},
 		{"steam_warm_idle_minutes", p.SteamWarmIdleMinutes != nil},
+		{"default_transport", p.DefaultTransport != nil},
 	} {
 		if f.set {
 			keys = append(keys, f.name)
@@ -598,7 +608,7 @@ func (p Patch) Empty() bool {
 		p.ReleaseWebhookEnabled == nil && p.ReleaseWebhookURL == nil && !p.ReleaseCheckSet &&
 		p.PlatformAutoApply == nil &&
 		p.SteamWarmEnabled == nil && p.SteamWarmRewarm == nil && p.SteamWarmIdleMinutes == nil &&
-		p.RegionInput.empty()
+		p.DefaultTransport == nil && p.RegionInput.empty()
 }
 
 // Apply writes every provided field in one statement inside one transaction —
@@ -667,6 +677,7 @@ func (s *Store) Apply(ctx context.Context, p Patch, updatedBy string) (st Settin
 		    steam_warm_enabled                   = COALESCE($16::boolean, s.steam_warm_enabled),
 		    steam_warm_rewarm                    = COALESCE($17::text,    s.steam_warm_rewarm),
 		    steam_warm_idle_minutes              = COALESCE($18::int,     s.steam_warm_idle_minutes),
+		    default_transport                    = COALESCE($32::text,    s.default_transport),
 		    default_timezone          = COALESCE($21::text,    s.default_timezone),
 		    default_language          = COALESCE($22::text,    s.default_language),
 		    default_region_format     = CASE WHEN $23::boolean THEN $24::text ELSE s.default_region_format END,
@@ -690,7 +701,8 @@ func (s *Store) Apply(ctx context.Context, p Patch, updatedBy string) (st Settin
 		p.SteamWarmEnabled, p.SteamWarmRewarm, p.SteamWarmIdleMinutes,
 		p.ReleaseCheckSet, p.ReleaseCheck,
 		ri.Timezone, ri.Language, ri.RegionFormatSet, ri.RegionFormat, kbLayout, kbVariant,
-		ri.MatchCursor, ri.MouseSensitivity, ri.RawMouse, ri.FlipScroll, ri.NintendoLayout))
+		ri.MatchCursor, ri.MouseSensitivity, ri.RawMouse, ri.FlipScroll, ri.NintendoLayout,
+		p.DefaultTransport))
 	if err != nil {
 		return Settings{}, false, fmt.Errorf("update instance_settings: %w", err)
 	}

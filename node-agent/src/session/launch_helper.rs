@@ -461,17 +461,22 @@ pub struct LaunchMount {
 
 impl LaunchMount {
     /// The mount for a generation that runs `env`: the app the socket was opened for gets it
-    /// and re-arms the reader on what its flags launch. Any other app gets none, the reports
+    /// and re-arms the reader on what its flags launch; a socket opened for a Steam game also
+    /// serves any other Steam game's tile. Any other app gets none, the reports
     /// go back to unknown and the reader drops lines (a dead helper's may still be queued)
     /// until that app is back. The socket stays, so a rollback finds its bind source.
     pub fn for_app(&self, env: &BTreeMap<String, String>) -> Option<&Self> {
         let (appid, flags) = self.shared.state().app.clone();
-        let ours = match appid {
-            Some(appid) => appid_from_env(env) == Some(appid),
-            None => env.get("STEAM_STARTUP_FLAGS") == flags.as_ref(),
+        // A socket opened for a Steam game follows the session to any other game (a container
+        // swap between two tiles), armed on the game it launches.
+        let target = appid.and(appid_from_env(env));
+        let ours = if appid.is_some() {
+            target.is_some()
+        } else {
+            env.get("STEAM_STARTUP_FLAGS") == flags.as_ref()
         };
         if ours {
-            self.arm(appid);
+            self.arm(target.or(appid));
         } else {
             self.set_active(false);
         }
@@ -838,6 +843,10 @@ impl Reader {
                     let mut state = self.shared.state();
                     if state.active {
                         state.reports.helper_connected = true;
+                        // What is on screen is this helper's to report: a dead helper's
+                        // queued lines must not reveal the next game (#1234).
+                        state.reports.game_window_on_screen = None;
+                        state.reports.needs_user = None;
                     }
                     drop(state);
                     self.shared.metrics.set_launch_helper_connected();
@@ -1455,7 +1464,8 @@ mod tests {
             "every window once set"
         );
 
-        // A dropped connection keeps the state; the helper's reconnect carries on.
+        // A dropped connection keeps the launch state; the helper's reconnect carries on.
+        // The window and Steam's ask are the new helper's to report (#1234).
         drop(helper);
         let mut helper = s.connect();
         writeln!(
@@ -1464,6 +1474,8 @@ mod tests {
         )
         .unwrap();
         s.wait_for(|r| r.launch_state == Some(LaunchState::GameExited));
+        assert_eq!(s.socket().reports().game_window_on_screen, None);
+        assert_eq!(s.socket().reports().needs_user, None);
         assert_eq!(s.wire_state().as_deref(), Some("game_exited"));
         let states: Vec<_> = s.traces().iter().map(|p| p["state"].clone()).collect();
         assert_eq!(
@@ -1679,6 +1691,23 @@ mod tests {
     }
 
     #[test]
+    fn a_container_swap_to_another_steam_game_arms_the_helper_on_it() {
+        let s = Session::open(620);
+        let mount = s.socket().mount().clone();
+        let mut helper = s.connect();
+        helper.write_all(&state_line("game_running")).unwrap();
+        s.wait_for(|r| r.launch_state.is_some());
+        // The swap mutes the outgoing game, then launches the replacement container.
+        mount.mute();
+        assert!(mount.for_app(&env("-silent -applaunch 730")).is_some());
+        assert_eq!(mount.target(), Some(730), "listening for the new game");
+        assert_eq!(s.socket().reports().launch_state, None);
+        // A rollback relaunches the first game and gets the helper back on it.
+        assert!(mount.for_app(&env("-silent -applaunch 620")).is_some());
+        assert_eq!(mount.target(), Some(620));
+    }
+
+    #[test]
     fn a_swap_away_from_the_tile_clears_the_reports_until_it_is_back() {
         let s = Session::open(620);
         let mount = s.socket().mount().clone();
@@ -1686,8 +1715,8 @@ mod tests {
         helper.write_all(&state_line("game_running")).unwrap();
         s.wait_for(|r| r.launch_state.is_some());
 
-        // Another tile, the plain Steam app or a non-Steam app: no mount for any of them.
-        for other in [env("-applaunch 730"), env("-bigpicture"), BTreeMap::new()] {
+        // The plain Steam app or a non-Steam app: no mount for either.
+        for other in [env("-bigpicture"), BTreeMap::new()] {
             assert!(mount.for_app(&other).is_none());
         }
         assert_eq!(s.socket().reports(), LaunchReports::default());
@@ -2124,7 +2153,7 @@ mod tests {
         assert!(mount.for_app(&env("-silent")).is_none());
         // An in-place swap to 440, then back to a parked Steam.
         mount.rebase(&env("-silent -applaunch 440"));
-        assert!(mount.for_app(&env("-applaunch 730")).is_none());
+        assert!(mount.for_app(&env("-silent")).is_none());
         assert!(mount.for_app(&env("-silent -applaunch 440")).is_some());
         assert_eq!(mount.target(), Some(440));
         mount.rebase(&env("-silent"));

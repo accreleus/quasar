@@ -82,6 +82,9 @@ type StreamInputs struct {
 	// Transport is the transport choice's inputs; the profile's own setting rides on Chain.
 	Transport TransportInputs
 
+	// HoldsPyroWaveSlot: the scheduler gave the session one of its GPU's PyroWave slots.
+	HoldsPyroWaveSlot bool
+
 	// Now is the clock the staleness check reads, so a test can pin it.
 	Now time.Time
 }
@@ -100,17 +103,23 @@ const (
 	transportWebRTC       = "webrtc"
 	transportWebTransport = "webtransport"
 	transportOptIn        = "webtransport_opt_in"
+	transportDefault      = "default"
 
 	reasonProfileDisallows     = "profile_disallows"
+	reasonInstanceDisallows    = "instance_default_disallows"
 	reasonHostNoEndpoint       = "host_no_endpoint"
 	reasonDeviceNoWebTransport = "device_no_webtransport"
 	reasonDeviceNoWebCodecs    = "device_no_webcodecs"
 	reasonCodecUnsupported     = "codec_unsupported_on_transport"
 )
 
-// webTransportCodecs are the codecs this build's WebTransport media path carries. A18 (#1043)
-// adds hevc and av1 here once the agent and the web client can carry them.
-var webTransportCodecs = map[profile.Codec]bool{profile.CodecH264: true}
+// webTransportCodecs are the codecs this build's WebTransport media path carries. A codec the
+// agent or the web client cannot carry yet stays out, and reasonCodecUnsupported keeps it on WebRTC.
+var webTransportCodecs = map[profile.Codec]bool{
+	profile.CodecH264: true,
+	profile.CodecHEVC: true,
+	profile.CodecAV1:  true,
+}
 
 // certIdentity is the encode path a cert row must describe to be applicable to this
 // launch. Assembled from two reads that fail independently, either of which can be
@@ -176,6 +185,9 @@ type StreamPlan struct {
 	// Endpoint is the WebTransport endpoint the session was planned onto, set only when
 	// Update.Transport is webtransport.
 	Endpoint *wtendpoint.Endpoint
+
+	// PyroWave is the session's PyroWave record, as Update.PyroWave persists it.
+	PyroWave PyroWaveRecord
 }
 
 // planStream resolves the rung a placed session starts at, applies the cert cap,
@@ -226,10 +238,13 @@ func planStream(in StreamInputs) (StreamPlan, error) {
 		codec = wireCodecH264
 	}
 
-	transport, transportReason := in.planTransport(rung.Codec)
+	pyrowave := in.pyrowaveIntent(stream.height, stream.fps)
+	transport, transportReason := in.planTransport(rung.Codec, pyrowave.wanted)
 	if transport == transportWebTransport {
 		plan.Endpoint = in.Transport.Endpoint
 	}
+	var keepSlot bool
+	plan.PyroWave, keepSlot = pyrowave.record(transport)
 
 	plan.ChainID, plan.RungID, plan.Rung = chain.ID, rung.ID, rung
 	plan.Decision = decision
@@ -253,15 +268,18 @@ func planStream(in StreamInputs) (StreamPlan, error) {
 
 		Transport:       transport,
 		TransportReason: transportReason,
+
+		PyroWave:         marshalPyroWave(plan.PyroWave),
+		KeepPyroWaveSlot: keepSlot,
 	}
 	return plan, nil
 }
 
 // planTransport decides the session's transport after the codec is known and never changes
-// it. WebTransport is chosen only when the profile and the request want it and the host and the
-// device can do it; the reason names the first check that failed.
-// semantics: control-api.md §POST /v1/sessions — transport
-func (in StreamInputs) planTransport(codec profile.Codec) (transport, reason string) {
+// it. WebTransport is chosen only when the profile and the request want it, or the session
+// wants PyroWave, and the host and the device can do it; the reason names the first check
+// that failed. semantics: control-api.md §POST /v1/sessions — transport
+func (in StreamInputs) planTransport(codec profile.Codec, wantsPyroWave bool) (transport, reason string) {
 	req := in.Transport.Requested
 	if in.Params.parked {
 		return transportWebRTC, ""
@@ -269,11 +287,14 @@ func (in StreamInputs) planTransport(codec profile.Codec) (transport, reason str
 	wanted := false
 	switch in.Chain.Transport {
 	case transportWebTransport:
-		wanted = req != transportWebRTC
+		wanted = req != transportWebRTC || wantsPyroWave
 	case transportOptIn:
-		wanted = req == transportWebTransport
+		wanted = req == transportWebTransport || wantsPyroWave
 	default: // webrtc, or a chain that never set one
 		if req == transportWebTransport {
+			if in.Chain.TransportInherited {
+				return transportWebRTC, reasonInstanceDisallows
+			}
 			return transportWebRTC, reasonProfileDisallows
 		}
 	}
@@ -424,6 +445,9 @@ func (p StreamPlan) applyTo(sess *Session) {
 	sess.StreamProfileID = &rungID
 	sess.CodecDecision = p.Update.CodecDecision
 	sess.Transport = p.Update.Transport
+	pyrowave := p.PyroWave
+	sess.PyroWave = &pyrowave
+	sess.PyroWaveSlot = sess.PyroWaveSlot && p.Update.KeepPyroWaveSlot
 	sess.TransportReason = nil
 	if p.Update.TransportReason != "" {
 		reason := p.Update.TransportReason

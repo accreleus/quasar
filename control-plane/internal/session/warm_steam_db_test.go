@@ -27,8 +27,8 @@ type warmDispatcher struct {
 	compat   bool // answers compat_tools_v1
 	restream bool // adopt_restream_v1
 	noEpoch  bool // the agent's socket is gone: no command epoch to send on
-	// reject answers one command kind: "assign" or "start" refused, or
-	// "assign-ack" queued with its ack lost.
+	// reject answers one command kind: "assign" or "start" refused, "assign-ack"
+	// queued with its ack lost, or "swap" refused.
 	reject  string
 	assigns []agentws.SessionAssignCmd
 	stops   []agentws.SessionStopCmd
@@ -114,12 +114,17 @@ func (e warmEpoch) SupportsCompatTools() bool    { return e.d.compat }
 func (e warmEpoch) Send(v any) (bool, error)     { e.d.record(v); return true, nil }
 func (e warmEpoch) SendWithAck(_ context.Context, _ string, v any) (agentws.AckResult, bool, error) {
 	e.d.record(v)
-	if _, ok := v.(agentws.SessionAssignCmd); ok {
+	switch v.(type) {
+	case agentws.SessionAssignCmd:
 		switch e.d.rejecting() {
 		case "assign":
 			return agentws.AckResult{OK: false, Error: "refused"}, true, nil
 		case "assign-ack":
 			return agentws.AckResult{}, true, errors.New("ack timeout")
+		}
+	case agentws.SessionSwapAppCmd:
+		if e.d.rejecting() == "swap" {
+			return agentws.AckResult{OK: false, Error: "refused"}, true, nil
 		}
 	}
 	return agentws.AckResult{OK: true}, true, nil
@@ -930,6 +935,131 @@ func TestParkOnExitParksTheHeldRuntime(t *testing.T) {
 	if got := f.holder(t); got != k {
 		t.Errorf("hold = %s after the parked session's first report, want %s", got, k)
 	}
+}
+
+// #1163: only WebRTC plays park on exit. Every park is inserted with the
+// transport column's WebRTC default, and no restream moves a runtime between
+// transports (#1161), so a WebTransport launch could never adopt a park a
+// WebTransport play left behind. Such a play releases its runtime instead, and
+// Steam stops with it; a WebRTC play still parks.
+func TestParkOnExitIsWebRTCOnly(t *testing.T) {
+	t.Run("a WebRTC play still parks", func(t *testing.T) {
+		f := newWarmFixture(t, 4)
+		play := f.runningTile(t)
+		f.coord.AgentState(context.Background(), f.hostID, heldStop(play))
+		if n := countParked(t, f.pool); n != 1 {
+			t.Fatalf("parked rows = %d, want the WebRTC play's park", n)
+		}
+		if k := f.parkedID(t); k == "" || f.disp.assignFor(t, k).AdoptSessionID != play {
+			t.Fatalf("park = %q, want a parked row adopting %s", k, play)
+		}
+	})
+
+	t.Run("a WebTransport play does not park", func(t *testing.T) {
+		f := newWarmFixture(t, 4)
+		play := f.runningWebTransportTile(t)
+		f.coord.AgentState(context.Background(), f.hostID, heldStop(play))
+		if got := readRow(t, f.pool, play); got.State != "stopped" || got.StopReason != stopReasonRuntimeReleased {
+			t.Fatalf("play row %+v, want stopped / %s", got, stopReasonRuntimeReleased)
+		}
+		if n := countParked(t, f.pool); n != 0 {
+			t.Fatalf("parked rows = %d, want none: no launch can adopt a WebTransport play's park", n)
+		}
+		if r := f.disp.stopReason(play); r != "user_requested" {
+			t.Errorf("session_stop reason = %q, want user_requested (the runtime is released, Steam stops)", r)
+		}
+	})
+}
+
+// runningWebTransportTile launches the Steam app on a WebTransport profile and
+// reports it running, as the agent would.
+func (f *warmFixture) runningWebTransportTile(t *testing.T) string {
+	t.Helper()
+	ctx := context.Background()
+	f.enableWebTransport(t)
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID})
+	if err != nil {
+		t.Fatalf("WebTransport launch: %v", err)
+	}
+	if res.Session.Transport != transportWebTransport {
+		t.Fatalf("launch transport %q, want %s", res.Session.Transport, transportWebTransport)
+	}
+	f.disp.waitFor(t, "start")
+	f.running(t, res.Session.ID)
+	return res.Session.ID
+}
+
+// enableWebTransport makes the fixture's device and host able to stream on
+// WebTransport and every launch profile ask for it.
+func (f *warmFixture) enableWebTransport(t *testing.T) {
+	t.Helper()
+	caps := `{"bandwidth_kbps":50000,"rtt_ms":5,"max_decode_height":2160,"measured_at":"` +
+		time.Now().UTC().Format(time.RFC3339) + `","codecs":{"h264":true},
+		"webtransport":{"available":true,"datagrams":true},
+		"webcodecs":{"h264":true,"opus_decode":true,"opus_encode":true}}`
+	must(t, exec(t, f.pool, `UPDATE user_devices SET capabilities = $2::jsonb WHERE id = $1::uuid`, f.deviceID, caps))
+	must(t, exec(t, f.pool, `UPDATE launch_profiles SET transport = 'webtransport'`))
+	must(t, exec(t, f.pool, `UPDATE hosts SET transports = '["webrtc","webtransport"]', wt_port = 4433,
+		wt_addresses = '["192.0.2.10"]',
+		wt_certificates = jsonb_build_array(jsonb_build_object('sha256', $2::text,
+			'not_before', now() - interval '1 day', 'not_after', now() + interval '10 days'))
+		WHERE id = $1::uuid`, f.hostID, wtCertA))
+}
+
+// A library-open heartbeat parks nothing exactly when the launch it warms for would plan
+// WebTransport, by the launch's own transport decision: every park is WebRTC-only, so such a
+// launch would supersede it and cold-start Steam behind a 503 (#1163). Every arm where the
+// launch plans WebRTC still parks.
+func TestHeartbeatSkipsAUserWhoseLaunchWouldBeWebTransport(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name   string
+		setup  func(t *testing.T, f *warmFixture)
+		parked int
+	}{
+		{"a WebTransport-capable device on a webtransport profile", func(t *testing.T, f *warmFixture) {}, 0},
+		{"a device without WebTransport still parks", func(t *testing.T, f *warmFixture) {
+			must(t, exec(t, f.pool, `UPDATE user_devices SET capabilities = capabilities - 'webtransport' WHERE id = $1::uuid`, f.deviceID))
+		}, 1},
+		{"a host with no WebTransport endpoint still parks", func(t *testing.T, f *warmFixture) {
+			must(t, exec(t, f.pool, `UPDATE hosts SET transports = '["webrtc"]' WHERE id = $1::uuid`, f.hostID))
+		}, 1},
+		{"a device that cannot decode the codec over WebCodecs still parks", func(t *testing.T, f *warmFixture) {
+			must(t, exec(t, f.pool, `UPDATE user_devices SET capabilities = capabilities || '{"webcodecs":{"opus_decode":true}}'
+				WHERE id = $1::uuid`, f.deviceID))
+		}, 1},
+		{"an opt-in profile still parks", func(t *testing.T, f *warmFixture) {
+			must(t, exec(t, f.pool, `UPDATE launch_profiles SET transport = 'webtransport_opt_in'`))
+		}, 1},
+		{"an opt-in profile on PyroWave prefer, with PyroWave eligible, parks nothing", func(t *testing.T, f *warmFixture) {
+			f.enablePyroWavePrefer(t)
+		}, 0},
+		{"the same with PyroWave off still parks", func(t *testing.T, f *warmFixture) {
+			f.enablePyroWavePrefer(t)
+			must(t, exec(t, f.pool, `UPDATE launch_profiles SET pyrowave_mode = 'off'`))
+		}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newWarmFixture(t, 4)
+			f.enableWebTransport(t)
+			tc.setup(t, f)
+			f.coord.SteamWarmHeartbeat(ctx, f.userID, false, f.deviceID)
+			if n := countParked(t, f.pool); n != tc.parked {
+				t.Fatalf("parked rows = %d, want %d", n, tc.parked)
+			}
+		})
+	}
+}
+
+// enablePyroWavePrefer makes an Auto launch pick PyroWave, hence WebTransport, with no request
+// switch: an opt-in profile on prefer, a GPU that passed its probe, a WebGPU device with a fresh
+// fast link.
+func (f *warmFixture) enablePyroWavePrefer(t *testing.T) {
+	t.Helper()
+	must(t, exec(t, f.pool, `UPDATE launch_profiles SET transport = 'webtransport_opt_in', pyrowave_mode = 'prefer'`))
+	must(t, exec(t, f.pool, `UPDATE gpus SET codecs = '["h264","pyrowave"]' WHERE host_id = $1::uuid`, f.hostID))
+	must(t, exec(t, f.pool, `UPDATE user_devices SET capabilities = capabilities ||
+		'{"webgpu":{"available":true},"bandwidth_kbps":900000,"rtt_ms":2}' WHERE id = $1::uuid`, f.deviceID))
 }
 
 func TestParkOnExitReleasesWhenARuleSaysNo(t *testing.T) {

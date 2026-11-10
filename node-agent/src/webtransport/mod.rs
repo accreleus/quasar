@@ -3,12 +3,15 @@
 //! session's client authenticates with a single-use token the control plane minted and
 //! then gets the session's video as datagrams.
 //!
-//! Not here yet, each a later ticket: audio, microphone, FEC, and takeover across
-//! transports (a new client replaces the last one; nothing bounds it).
+//! Not here yet, each a later ticket: FEC, and takeover across transports (a new client
+//! replaces the last one; nothing bounds it).
 
+mod audio;
 mod cert;
 mod congestion;
 mod media;
+mod mic_jitter;
+mod pyrowave;
 mod retransmit;
 #[cfg(test)]
 mod tests;
@@ -29,8 +32,10 @@ use tokio::sync::oneshot;
 use tokio::time::{timeout_at, Instant};
 use web_transport_quinn::{quinn, RecvStream, Request, SendStream, Session};
 
+pub(crate) use audio::Audio;
 pub use cert::CertReport;
 use cert::{Cert, CertSet};
+pub use media::PyroWaveGrant;
 use media::{Attached, Gone, Media, Out};
 
 const WT_PROTO: u32 = 1;
@@ -231,6 +236,9 @@ struct Hello {
     wt_proto: u32,
     token: String,
     session_id: String,
+    /// Amendment 55: this connection can decode PyroWave.
+    #[serde(default)]
+    pyrowave: bool,
 }
 
 fn token_hash(token: &str) -> String {
@@ -365,29 +373,60 @@ impl Registry {
 pub(crate) struct Tap {
     registry: Arc<Registry>,
     session_id: String,
+    /// The PyroWave encoder of a granted session; dropped after the session is ended here.
+    /// Behind a lock so `release` can stop it through `&self`, ahead of the source teardown.
+    pyrowave: Mutex<Option<crate::session::pipeline::pyrowave_branch::Encoder>>,
     media: Arc<Media>,
 }
 
 impl Tap {
     /// `None` when no listener runs or the session was not assigned WebTransport.
+    /// `pyrowave`: the session's config, its grant and the feed off the encode pipeline.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn attach(
         registry: &Arc<Registry>,
         video: &gst::Pad,
         encoder: &gst::Element,
         session_id: &str,
+        trace: Option<crate::session::pipeline::TraceTx>,
         input: Input,
+        audio: audio::Plan,
+        pyrowave: Option<(
+            &crate::session::SessionConfig,
+            PyroWaveGrant,
+            Option<crate::session::pipeline::pyrowave_branch::Feed>,
+        )>,
         rate: Option<Rate>,
     ) -> Option<Self> {
-        let media = Media::new(encoder, input, rate);
+        let media = Media::new(
+            encoder,
+            input,
+            Audio::new(audio),
+            trace.map(|tx| (tx, session_id.to_string())),
+            rate,
+        );
         if !registry.set_media(session_id, media.clone()) {
             return None;
         }
         media::tap(video, &media, session_id);
+        let pyrowave =
+            pyrowave.and_then(|(cfg, grant, feed)| pyrowave_branch(cfg, grant, feed, &media));
         Some(Self {
             registry: registry.clone(),
             session_id: session_id.to_string(),
+            pyrowave: Mutex::new(pyrowave),
             media,
         })
+    }
+
+    /// The session's audio, for the audio pipeline to tap at its Opus encoder.
+    pub(crate) fn audio(&self) -> Arc<Audio> {
+        self.media.audio().clone()
+    }
+
+    /// What the runner offers this session's client.
+    pub(crate) fn plan(cfg: &crate::session::SessionConfig) -> audio::Plan {
+        audio::Plan::for_session(cfg)
     }
 
     /// A client is attached and being sent video: the session's idle reap counts it.
@@ -396,9 +435,78 @@ impl Tap {
     }
 }
 
+/// Start the PyroWave encode of a granted session, gated on a PyroWave client. With no feed
+/// or encoder the grant still stands, unusable, so a `hello` reads `encoder_error`.
+fn pyrowave_branch(
+    cfg: &crate::session::SessionConfig,
+    grant: PyroWaveGrant,
+    feed: Option<crate::session::pipeline::pyrowave_branch::Feed>,
+    media: &Arc<Media>,
+) -> Option<crate::session::pipeline::pyrowave_branch::Encoder> {
+    let size = (cfg.stream.width, cfg.stream.height, cfg.stream.fps);
+    let Some(feed) = feed else {
+        media.grant_pyrowave(grant, size, false);
+        return None;
+    };
+    media.grant_pyrowave(grant, size, true);
+    let (gate, frames, errors) = (
+        Arc::downgrade(media),
+        Arc::downgrade(media),
+        Arc::downgrade(media),
+    );
+    // Rate: the encoder budgets `bitrate` / fps per frame; B09 (#1058) drives it live from
+    // the clamp of codec-pyrowave.md §Rate.
+    let started = crate::session::pipeline::pyrowave_branch::start_encoder(
+        cfg,
+        feed,
+        grant.target_kbps,
+        move || gate.upgrade().is_some_and(|m| m.pyrowave_active()),
+        move |buffer| {
+            if let Some(media) = frames.upgrade() {
+                media.on_pyrowave_frame(buffer);
+            }
+        },
+        move |error| {
+            tracing::warn!(
+                token = "pyrowave-encoder-failed",
+                "PyroWave encoder failed: {error}"
+            );
+            if let Some(media) = errors.upgrade() {
+                media.switch_off(None, "encoder_error");
+            }
+        },
+    );
+    match started {
+        Ok(encoder) => Some(encoder),
+        Err(error) => {
+            tracing::warn!(
+                token = "pyrowave-encoder-start-failed",
+                "PyroWave encoder did not start: {error:#}"
+            );
+            media.switch_off(None, "encoder_error");
+            None
+        }
+    }
+}
+
+impl Tap {
+    /// Stops the PyroWave encoder now (idempotent; a no-op without one). It shares the GPU
+    /// queue and a compositor ring frame with the source, so a session stop calls this before
+    /// the source teardown (`Transport::release`, #535, #1228).
+    pub(crate) fn release(&self) {
+        let encoder = self
+            .pyrowave
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        drop(encoder);
+    }
+}
+
 impl Drop for Tap {
     fn drop(&mut self) {
         self.registry.end(&self.session_id);
+        self.release();
     }
 }
 
@@ -822,8 +930,9 @@ fn pong(ping: &Value) -> Value {
     })
 }
 
-fn hello_ack(config: &media::VideoConfig) -> Value {
-    json!({
+fn hello_ack(config: &media::VideoConfig, audio: &Audio, switch_reason: Option<&str>) -> Value {
+    let (stream_audio, mic) = audio.describe();
+    let mut ack = json!({
         "type": "hello_ack",
         "wt_proto": WT_PROTO,
         "config_id": config.config_id,
@@ -834,11 +943,22 @@ fn hello_ack(config: &media::VideoConfig) -> Value {
             "height": config.height,
             "fps": config.fps,
         },
-        "audio": null,
-        "mic": null,
+        "audio": stream_audio,
+        "mic": mic,
         "fec": null,
         "retransmit_window_ms": retransmit::WINDOW.as_millis() as u64,
-    })
+    });
+    // codec-pyrowave.md §`hello_ack`: required for PyroWave, and always BT.709.
+    if config.codec == "pyrowave" {
+        ack["video"]["color_space"] = json!({
+            "primaries": "bt709", "transfer": "bt709", "matrix": "bt709",
+            "full_range": config.full_range,
+        });
+    }
+    if let Some(reason) = switch_reason {
+        ack["codec_switch_reason"] = json!(reason);
+    }
+    ack
 }
 
 /// A `nack`'s `frame_seq` and its first 32 `frags` ranges; `None` when malformed.
@@ -915,16 +1035,20 @@ async fn streams(session: Session, control: oneshot::Sender<(SendStream, RecvStr
 }
 
 /// Before `hello_ack` every datagram is dropped (§Before `hello`); after it, input
-/// (`0x03`) goes to the session's devices. Microphone (`0x05`) is a later ticket.
+/// (`0x03`) goes to the session's devices and the microphone (`0x05`) to its mic sink.
 async fn datagrams(session: Session, authed: Arc<OnceLock<(Arc<Media>, u64)>>) {
     while let Ok(datagram) = session.read_datagram().await {
         let Some((media, client)) = authed.get() else {
             continue;
         };
-        if let Some((&CHANNEL_INPUT, body)) = datagram.split_first() {
-            if let Ok(json) = std::str::from_utf8(body) {
-                media.input_event(*client, json, true);
+        match datagram.split_first() {
+            Some((&CHANNEL_INPUT, body)) => {
+                if let Ok(json) = std::str::from_utf8(body) {
+                    media.input_event(*client, json, true);
+                }
             }
+            Some((&audio::CHANNEL_MIC, body)) => media.audio().mic_packet(*client, body),
+            _ => {}
         }
     }
 }
@@ -1047,7 +1171,7 @@ async fn authenticate(
         // `end` may run between the redeem and the attach.
         .and_then(|media| {
             media
-                .attach()
+                .attach(hello.pyrowave, session.rtt())
                 .map(|c| (media, c))
                 .ok_or(Refusal::SessionEnded)
         });
@@ -1074,7 +1198,10 @@ async fn authenticate(
     if !matches!(
         timeout_at(
             deadline,
-            write_message(&mut send, &hello_ack(&client.config))
+            write_message(
+                &mut send,
+                &hello_ack(&client.config, media.audio(), client.reason)
+            )
         )
         .await,
         Ok(Ok(()))
@@ -1108,6 +1235,7 @@ async fn stream(
     });
     let mut pkt_seq = 0u32;
     let mut sent = retransmit::Retransmit::default();
+    let mut pyrowave_frames = retransmit::PyroWaveFrames::default();
     let mut nack_budget = retransmit::NackBudget::new(std::time::Instant::now());
     let (mut nacks_capped, mut resends_too_large) = (0u64, 0u64);
     let mut warned_oversized = false;
@@ -1115,16 +1243,38 @@ async fn stream(
     let mut control = media.rate().map(Control::new);
     let mut control_tick = tokio::time::interval(congestion::REPORT_EVERY);
     control_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Nothing is sent before `hello_ack`: what queued up behind it is stale.
+    while client.audio.try_recv().is_ok() {}
+    let mut audio_open = true;
+    // The configuration the client was last sent: a PyroWave unit packs for its size.
+    let mut current = client.config.clone();
     // What ends the stream: an optional last message, the close code and its reason.
     const QUIET: (Option<Value>, u32, &str) = (None, CLOSE_NORMAL, "");
     let mut idle = pin!(tokio::time::sleep(CONTROL_IDLE));
     let (message, code, why) = loop {
         tokio::select! {
-            _ = control_tick.tick(), if control.is_some() => {
+            // §Feedback: while PyroWave is active its own rate controller stands in for the
+            // ABR (B09, #1058), so nothing sent then is logged, and no estimate is fed.
+            _ = control_tick.tick(), if control.is_some() && current.codec != "pyrowave" => {
                 if let Some(control) = control.as_mut() {
                     control.tick(&log, session);
                 }
             }
+            packet = client.audio.recv(), if audio_open => match packet {
+                Some(packet) => {
+                    let seq = pkt_seq;
+                    pkt_seq = pkt_seq.wrapping_add(1);
+                    let datagram = audio::datagram(&packet, seq);
+                    if current.codec != "pyrowave" {
+                        log.record(&datagram, std::time::Instant::now(), false);
+                    }
+                    if session.send_datagram(datagram).is_err() {
+                        break QUIET;
+                    }
+                }
+                // Displaced or ended: the video queue says which, next.
+                None => audio_open = false,
+            },
             () = &mut idle => {
                 tracing::info!(
                     token = "webtransport-client-idle",
@@ -1133,33 +1283,52 @@ async fn stream(
                 break QUIET;
             }
             out = client.rx.recv() => match out {
+                Some(Out::Unit(unit)) if unit.config_id != current.config_id => {}
                 Some(Out::Unit(unit)) => {
                     let max = session.max_datagram_size().min(media::MAX_DATAGRAM);
-                    let datagrams = media::packetize(&unit, max, &mut pkt_seq);
-                    if datagrams.is_empty() && !warned_oversized {
-                        warned_oversized = true;
-                        tracing::warn!(
-                            token = "webtransport-unit-too-large",
-                            "a {} byte access unit needs more than 65535 fragments; dropped, \
-                             and a keyframe requested",
-                            unit.data.len()
-                        );
-                    }
-                    if datagrams.is_empty() {
-                        media.keyframe();
-                    }
+                    let Some(datagrams) = media::packetize(&unit, &current, max, &mut pkt_seq) else {
+                        if !warned_oversized {
+                            warned_oversized = true;
+                            tracing::warn!(
+                                token = "webtransport-unit-too-large",
+                                "a {} byte {} frame cannot be sent (over 65535 fragments, or a \
+                                 PyroWave frame the packing refuses); dropped",
+                                unit.data.len(),
+                                current.codec
+                            );
+                        }
+                        // A PyroWave frame needs no keyframe: the next one repairs everything.
+                        if !unit.pyrowave {
+                            media.keyframe();
+                        }
+                        continue;
+                    };
+                    // codec-pyrowave.md §Loss: a PyroWave frame is never retransmitted, so it is
+                    // never kept; a NACK naming it is ignored (`pyrowave_frames`).
                     let now = std::time::Instant::now();
-                    sent.keep(unit.frame_seq, &datagrams, now, retransmit_window(session));
+                    if unit.pyrowave {
+                        pyrowave_frames.remember(unit.frame_seq);
+                    } else {
+                        sent.keep(unit.frame_seq, &datagrams, now, retransmit_window(session));
+                    }
+                    // shortcut: a PyroWave frame (~380 datagrams at 1080p/200) goes as one burst;
+                    // §Rate's SHOULD pace over half a frame interval is B09 (#1058).
                     let sent = datagrams.into_iter().try_for_each(|d| {
-                        log.record(&d, now, false);
+                        if !unit.pyrowave {
+                            log.record(&d, now, false);
+                        }
                         session.send_datagram(d)
                     });
                     if sent.is_err() {
                         break QUIET;
                     }
                 }
-                Some(Out::Config(config)) => {
-                    let ack = hello_ack(&config);
+                Some(Out::Config(config, reason)) => {
+                    if config.codec != "pyrowave" {
+                        pyrowave_frames.forget();
+                    }
+                    current = config.clone();
+                    let ack = hello_ack(&config, media.audio(), reason);
                     let write = write_message(&mut send, &ack);
                     if !matches!(tokio::time::timeout(CONTROL_WRITE, write).await, Ok(Ok(()))) {
                         break QUIET;
@@ -1167,6 +1336,11 @@ async fn stream(
                 }
                 None => break match client.gone.get() {
                     Some(Gone::TakenOver) => (Some(json!({"type": "bye", "reason": "taken_over"})), CLOSE_TAKEN_OVER, ""),
+                    Some(Gone::Unusable) => (
+                        Some(json!({"type": "error", "code": "internal", "message": "the encoder sent no usable keyframe"})),
+                        CLOSE_NORMAL,
+                        "",
+                    ),
                     _ => (Some(json!({"type": "bye", "reason": "session_ended"})), CLOSE_ENDED, ""),
                 },
             },
@@ -1174,7 +1348,12 @@ async fn stream(
                 Some(Ok(message)) => {
                     idle.as_mut().reset(Instant::now() + CONTROL_IDLE);
                     match message.get("type").and_then(Value::as_str) {
-                        Some("keyframe_request") => media.keyframe(),
+                        // codec-pyrowave.md §Loss: no keyframe request for a PyroWave frame.
+                        Some("keyframe_request") if current.codec != "pyrowave" => media.keyframe(),
+                        Some("codec_fallback") => media.switch_off(Some(client.id), "client_decode_error"),
+                        // codec-pyrowave.md §Loss: a NACK for a PyroWave frame is ignored: no
+                        // retransmission and no nack_miss.
+                        Some("nack") if nack_of(&message).is_some_and(|(seq, _)| pyrowave_frames.ignores(seq)) => {}
                         Some("nack") if !nack_budget.take(std::time::Instant::now()) => nacks_capped += 1,
                         Some("nack") => {
                             let answer = nack_of(&message).map(|(frame_seq, ranges)| {
@@ -1195,7 +1374,7 @@ async fn stream(
                                 }
                             }
                         }
-                        Some("feedback") => {
+                        Some("feedback") if current.codec != "pyrowave" => {
                             if let Some(control) = control.as_mut() {
                                 control.feedback(&message, &mut log, session);
                             }

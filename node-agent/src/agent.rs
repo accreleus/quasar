@@ -3549,8 +3549,11 @@ struct Restreaming {
 }
 
 /// Tear a runtime down as a declined one: its reports from here are the release, under its
-/// own id.
-fn decline(h: &mut RunningHandle) {
+/// own id. A restream's claim moved the runtime's tool hold to the play id, so the runtime holds
+/// its tools again under its own id until that release (`drop_running`): the container still
+/// bind-mounts them while it stops (#1160).
+fn decline(owner: u64, id: &str, h: &mut RunningHandle) {
+    crate::compat_tools::rehold(id, h.compat_tools.clone(), false, owner);
     h.stop.store(true, Ordering::Relaxed);
     h.held = Some(Held {
         since: h.held.map_or_else(Instant::now, |held| held.since),
@@ -4018,7 +4021,6 @@ impl SessionManager {
     ) {
         let dropped = self.pending.len();
         self.pending.clear();
-        crate::compat_tools::retain_holds(self.hold_owner, &|sid| self.running.contains_key(sid));
         self.failed_rebuilds.clear();
         // As a pending start is dropped: the control plane may have reaped the play id, so
         // a restream in flight relabels nothing and builds nothing. The runtime, already
@@ -4031,9 +4033,12 @@ impl SessionManager {
                      stream; the runtime is torn down and nothing is built",
                     r.session_id
                 );
-                decline(h);
+                decline(self.hold_owner, id, h);
             }
         }
+        // After the loop: a declined runtime holds its tools under its own id by now, and the
+        // dropped play id's hold goes.
+        crate::compat_tools::retain_holds(self.hold_owner, &|sid| self.running.contains_key(sid));
         self.gpu_inventory = gpu_inventory;
         self.vram_targets = vram_targets;
         // The cache indexes by position over the inventory, so it must be
@@ -4093,6 +4098,7 @@ impl SessionManager {
                 wt_token_hash,
                 wt_token_expires_at,
                 compat_tools,
+                pyrowave,
             } => {
                 if kind == Some(SessionKind::Unknown) {
                     warn!(
@@ -4301,6 +4307,7 @@ impl SessionManager {
                         (Some(listener), Some(hash), Some(expires)) => {
                             listener.registry().assign(&session_id, &hash, expires);
                             cfg.webtransport = true;
+                            cfg.pyrowave = pyrowave;
                         }
                         // The session is sound; its client falls back to WebRTC (agent-api.md).
                         _ => warn!(
@@ -5600,7 +5607,7 @@ impl SessionManager {
             }
         }
         if let Some(h) = self.running.get_mut(runtime_id) {
-            decline(h);
+            decline(self.hold_owner, runtime_id, h);
         }
         let session_id = r.session_id;
         unclaim_runtime(self.hold_owner, &session_id, &r.assignment.cfg);
@@ -5647,7 +5654,7 @@ impl SessionManager {
         if let Some(runtime) = self.restreaming_for(session_id) {
             if let Some(h) = self.running.get_mut(&runtime) {
                 h.restreaming = None;
-                decline(h);
+                decline(self.hold_owner, &runtime, h);
             }
             // The play session ends here: its hold (claimed from the runtime) goes with it.
             crate::compat_tools::release(session_id);
@@ -12633,7 +12640,7 @@ mod tests {
     fn test_tools_store() -> &'static Arc<crate::compat_tools::install::ToolStore> {
         crate::compat_tools::test_store(|| {
             let root = tempfile::tempdir().unwrap().keep();
-            let tools: Vec<serde_json::Value> = ["GE-Proton9-99", "GE-Proton9-98"]
+            let tools: Vec<serde_json::Value> = ["GE-Proton9-99", "GE-Proton9-98", "GE-Proton9-97"]
                 .iter()
                 .map(|t| {
                     std::fs::create_dir_all(root.join("tools").join(t)).unwrap();
@@ -12650,6 +12657,10 @@ mod tests {
     /// A `compat_tools.converge` removal of `tool` from [`test_tools_store`].
     fn remove_test_tool(tool: &str) -> crate::jobs::JobOutcome {
         use crate::jobs::JobRunner as _;
+        // The store's record update is not atomic across threads (production runs one converge
+        // job at a time), so tests sharing the process's one store remove one at a time.
+        static ONE_REMOVAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _one = ONE_REMOVAL.lock().unwrap_or_else(|e| e.into_inner());
         struct NoSource;
         impl crate::compat_tools::fetch::Source for NoSource {
             fn get(
@@ -12720,6 +12731,54 @@ mod tests {
             "the adopted play session runs with its tool held"
         );
         crate::compat_tools::release("p1073");
+        assert!(matches!(
+            remove_test_tool(TOOL),
+            crate::jobs::JobOutcome::Succeeded(_)
+        ));
+    }
+
+    /// A restream's claim moves the hold to the play id, so declining the runtime (a reconnect,
+    /// a stop, a failed restream) must give it its own hold back: a tool removed while the
+    /// declined runtime stops would delete files its container still bind-mounts (#1160).
+    #[test]
+    fn a_declined_restreaming_runtime_holds_its_tools_until_it_is_gone() {
+        const TOOL: &str = "GE-Proton9-97";
+        test_tools_store();
+        let (mut mgr, warm) = warm_manager();
+        let hold = |mgr: &SessionManager, sid: &str, parked: bool| {
+            let mut env = BTreeMap::new();
+            let sent = serde_json::json!({"mount": [TOOL], "entries": []});
+            crate::compat_tools::apply_assign(&mut env, Some(&sent), sid, parked, mgr.hold_owner)
+        };
+        // Ids no other test uses: holds live in the process's one store, released by session id.
+        let mut cfg = steam_cfg(SessionKind::Parked, "-silent", (1920, 1080));
+        cfg.container.as_mut().unwrap().compat_tools = hold(&mgr, "k1160", true);
+        assert!(acked(start(&mut mgr, &warm, "k1160", cfg, None)));
+        warm.started.recv_timeout(WAIT).unwrap();
+        mgr.on_event("k1160", SessionEvent::Running);
+        mgr.running["k1160"].metrics.set_launch_helper_connected();
+        let mut play = steam_cfg(SessionKind::Play, "-applaunch 730", (1920, 1080));
+        play.container.as_mut().unwrap().compat_tools = hold(&mgr, "p1160", false);
+        play.stream.bitrate_kbps = mgr.running["k1160"].stream.bitrate_kbps / 2;
+        assert!(acked(start(&mut mgr, &warm, "p1160", play, Some("k1160"))));
+        assert!(warm
+            .adopted
+            .recv_timeout(WAIT)
+            .unwrap()
+            .1
+            .restream
+            .is_some());
+        // Reconnect: the play id is dropped, the runtime is declined and starts stopping.
+        mgr.begin_connection(Vec::new(), Vec::new());
+        assert!(mgr.running["k1160"].stop.load(Ordering::Relaxed));
+        mgr.note_session_count();
+        assert_eq!(
+            remove_test_tool(TOOL),
+            crate::jobs::JobOutcome::Deferred("in_use".into()),
+            "the stopping runtime still mounts its tool"
+        );
+        // Its terminal report drops it: the hold goes with it.
+        mgr.drop_running("k1160");
         assert!(matches!(
             remove_test_tool(TOOL),
             crate::jobs::JobOutcome::Succeeded(_)
