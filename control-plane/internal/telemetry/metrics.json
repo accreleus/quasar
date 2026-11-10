@@ -1736,7 +1736,7 @@
         "target_kbps"
       ],
       "clock": "host_wall",
-      "why": "The codec sent to the session's media client changed between PyroWave and the standard codec (amendment 55), or a wanted PyroWave was not started at a hello. NOT IMPLEMENTED YET: the contract is pinned (codec-pyrowave.md) and nothing emits this."
+      "why": "The codec sent to the session's media client changed between PyroWave and the standard codec (amendment 55), or a wanted PyroWave was not started at a hello. The control plane records it on the session's `pyrowave` (`active`, `used`, `switch_reason`), and a step-down reason (`rtt_too_high`, `congestion`, `client_decode_error`, `encoder_error`) gives the GPU's PyroWave slot back."
     },
     {
       "type": "sdp.answer_applied",
