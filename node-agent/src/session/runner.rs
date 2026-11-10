@@ -1571,6 +1571,14 @@ impl pipeline::Transport for SessionTransports {
                         .cfg
                         .pyrowave
                         .map(|grant| (&session.cfg, grant, feed)),
+                    pipeline::feedback_abr(
+                        &session.encoder,
+                        &session.cfg,
+                        session.metrics.clone(),
+                        session.trace_tx.clone(),
+                        session.session_id.clone(),
+                        Some(session.lever.clone()),
+                    ),
                 )
             });
         let mut slot = pipeline::WebRtcSlot::new(session)?;

@@ -58,7 +58,13 @@ fn ready_media() -> Arc<Media> {
 fn ready_media_with(input: Input) -> Arc<Media> {
     gst::init().unwrap();
     let encoder = gst::ElementFactory::make("identity").build().unwrap();
-    let media = Media::new(&encoder, input, Audio::new(audio::Plan::default()), None);
+    let media = Media::new(
+        &encoder,
+        input,
+        Audio::new(audio::Plan::default()),
+        None,
+        None,
+    );
     let caps = gst::Caps::builder("video/x-h264")
         .field("stream-format", "avc")
         .field("width", 64)
@@ -508,7 +514,7 @@ async fn agent_with(limits: Limits) -> Agent {
 }
 
 async fn agent_with_plan(limits: Limits, plan: audio::Plan) -> Agent {
-    agent_built(Stream::H264, limits, plan).await
+    agent_built(Stream::H264, limits, plan, "ball", |_| None).await
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -574,10 +580,17 @@ fn synthetic(stream: Stream) -> gst::Pipeline {
 }
 
 async fn agent_for(stream: Stream, limits: Limits) -> Agent {
-    agent_built(stream, limits, audio::Plan::default()).await
+    agent_built(stream, limits, audio::Plan::default(), "ball", |_| None).await
 }
 
-async fn agent_built(stream: Stream, limits: Limits, plan: audio::Plan) -> Agent {
+/// `pattern` is the H.264 test picture's; `rate` arms the session's ABR on its encoder.
+async fn agent_built(
+    stream: Stream,
+    limits: Limits,
+    plan: audio::Plan,
+    pattern: &str,
+    rate: impl FnOnce(&gst::Element) -> Option<Rate>,
+) -> Agent {
     gst::init().unwrap();
     let registry = Arc::new(Registry::default());
     registry.assign(SESSION, &token_hash(TOKEN), SystemTime::now() + TOKEN_TTL);
@@ -586,12 +599,13 @@ async fn agent_built(stream: Stream, limits: Limits, plan: audio::Plan) -> Agent
             gst::ElementFactory::find("openh264enc").is_some(),
             "the conformance test needs openh264enc (gstreamer1.0-plugins-bad)"
         );
-        gst::parse::launch(
-            "videotestsrc is-live=true pattern=ball ! video/x-raw,width=640,height=360,framerate=30/1 \
+        gst::parse::launch(&format!(
+            "videotestsrc is-live=true pattern={pattern} \
+             ! video/x-raw,width=640,height=360,framerate=30/1 \
              ! openh264enc name=enc gop-size=1000 bitrate=4000000 \
              ! video/x-h264,profile=constrained-baseline ! h264parse name=parse \
              ! rtph264pay config-interval=-1 pt=96 ! fakesink sync=false",
-        )
+        ))
         .unwrap()
         .downcast::<gst::Pipeline>()
         .unwrap()
@@ -610,6 +624,7 @@ async fn agent_built(stream: Stream, limits: Limits, plan: audio::Plan) -> Agent
         input,
         plan,
         None,
+        rate(&encoder),
     );
     assert!(tap.is_some(), "an assigned session takes the tap");
     pipeline.set_state(gst::State::Playing).unwrap();
@@ -1176,6 +1191,354 @@ async fn nack_and_late(stream: Stream) {
         frames(&session, 15, false).await.iter().any(|f| f.keyframe),
         "a late frame's keyframe request is answered"
     );
+}
+
+/// The receiving side of a `tc tbf` shape, simulated: each datagram is timed through a
+/// `cap_kbps` bottleneck with a drop-tail queue, and reported with the contract's
+/// `feedback` (§Feedback) as a browser client would.
+struct Bottleneck {
+    start: std::time::Instant,
+    cap_kbps: f64,
+    queue_bytes: f64,
+    /// When the bottleneck is next free, seconds after `start`.
+    free_at: f64,
+    /// (`pkt_seq`, arrival in seconds, or `None` dropped), not reported yet.
+    pending: Vec<(u32, Option<f64>)>,
+    next: Option<u32>,
+    seq: u64,
+}
+
+impl Bottleneck {
+    fn new(cap_kbps: f64) -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            cap_kbps,
+            queue_bytes: 64.0 * 1024.0,
+            free_at: 0.0,
+            pending: Vec::new(),
+            next: None,
+            seq: 0,
+        }
+    }
+
+    fn now(&self) -> f64 {
+        self.start.elapsed().as_secs_f64()
+    }
+
+    fn receive(&mut self, d: &[u8]) {
+        let seq = u32::from_le_bytes(d[1..5].try_into().unwrap());
+        let next = *self.next.get_or_insert(seq);
+        // Missing from loopback: dropped before the bottleneck.
+        for gap in 0..seq.wrapping_sub(next).min(8192) {
+            self.pending.push((next.wrapping_add(gap), None));
+        }
+        self.next = Some(seq.wrapping_add(1));
+        let (now, service) = (self.now(), d.len() as f64 * 8.0 / (self.cap_kbps * 1000.0));
+        let backlog = (self.free_at - now).max(0.0) / service * d.len() as f64;
+        let arrival = (backlog + d.len() as f64 <= self.queue_bytes).then(|| {
+            self.free_at = self.free_at.max(now) + service;
+            self.free_at
+        });
+        self.pending.push((seq, arrival));
+    }
+
+    /// The `feedback` for everything up to the last datagram arrived by now.
+    fn feedback(&mut self) -> Option<Value> {
+        let now = self.now();
+        let last = self
+            .pending
+            .iter()
+            .take(8192)
+            .rposition(|&(_, a)| a.is_some_and(|a| a <= now))?;
+        let batch: Vec<_> = self.pending.drain(..=last).collect();
+        let first_pkt_seq = batch[0].0;
+        let ref_s = batch
+            .iter()
+            .filter_map(|&(_, a)| a)
+            .fold(f64::MAX, f64::min);
+        let mut bytes = Vec::new();
+        let mut lost = 0;
+        for &(_, a) in &batch {
+            let unit = match a {
+                Some(a) if a <= now => (((a - ref_s) * 20_000.0) as u64).min(0xFFFE) as u16,
+                _ => {
+                    lost += 1;
+                    0xFFFF
+                }
+            };
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        self.seq += 1;
+        Some(json!({
+            "type": "feedback", "seq": self.seq,
+            "first_pkt_seq": first_pkt_seq, "count": batch.len(),
+            "ref_us": (ref_s * 1e6) as u64,
+            "arrivals_b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+            "recv_kbps": 0, "lost": lost, "interval_ms": 50,
+        }))
+    }
+}
+
+/// #1040: receiver feedback from a rate-capped client drives the session's real ABR
+/// (governor, classifier, smooth mode) until the encoder sends below the cap. Below it
+/// within 10 s needs the #68 emergency drop: smooth's capped steps (−12.5 % per 7 s
+/// dwell) take over 30 s.
+#[tokio::test]
+async fn a_rate_capped_client_steps_the_encoder_below_the_cap() {
+    const CAP_KBPS: f64 = 1500.0;
+    let metrics = Arc::new(crate::session::metrics::SessionMetrics::new("smooth", 30));
+    let (trace_tx, _trace_rx) = tokio::sync::mpsc::channel(256);
+    let trace_tx =
+        crate::session::runner::DiagnosticEventTx::new(trace_tx, Arc::default(), Arc::default());
+    let cfg = {
+        let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
+        settings.encoder = crate::session::EncoderChoice::Openh264;
+        settings.abr_mode = crate::session::AbrMode::Smooth;
+        let stream = crate::session::StreamParams {
+            width: 640,
+            height: 360,
+            fps: 30,
+            bitrate_kbps: 4000,
+            h264_profile: "constrained-baseline".to_string(),
+            codec: crate::session::Codec::H264,
+            abr_floor_kbps: 0,
+            mic: false,
+        };
+        crate::session::SessionConfig::for_assignment_with(&settings, stream, None)
+    };
+    let abr_metrics = metrics.clone();
+    // Snow does not compress: the encoder really sends its setpoint, over the cap.
+    let agent = agent_built(
+        Stream::H264,
+        Limits::default(),
+        audio::Plan::default(),
+        "snow",
+        move |encoder| {
+            crate::session::pipeline::feedback_abr(
+                encoder,
+                &cfg,
+                abr_metrics,
+                trace_tx,
+                SESSION.to_string(),
+                None,
+            )
+        },
+    )
+    .await;
+    let encoder = agent.pipeline.by_name("enc").unwrap();
+    // What the session's encoder probes feed: the classifier's "sending at the cap".
+    let sent = metrics.clone();
+    encoder
+        .static_pad("src")
+        .unwrap()
+        .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(b) = info.buffer() {
+                sent.record_encode_out(std::time::Instant::now(), b.size() as u64);
+            }
+            gst::PadProbeReturn::Ok
+        });
+    let (session, mut send, _recv, _) = agent.hello(TOKEN).await;
+
+    let mut path = Bottleneck::new(CAP_KBPS);
+    let mut report = tokio::time::interval(Duration::from_millis(50));
+    let mut drain = tokio::time::interval(Duration::from_secs(1));
+    let mut congested = false;
+    let deadline = tokio::time::sleep(Duration::from_secs(10));
+    tokio::pin!(deadline);
+    let kbps = loop {
+        tokio::select! {
+            d = session.read_datagram() => path.receive(&d.unwrap()),
+            _ = report.tick() => {
+                if let Some(fb) = path.feedback() {
+                    write_message(&mut send, &fb).await.unwrap();
+                }
+            }
+            _ = drain.tick() => {
+                // The runner's heartbeat drains a window every ~5 s; faster here.
+                let window = metrics.drain_window(std::time::Instant::now());
+                congested |= window.adaptation_state == "network_congested";
+                let kbps = encoder.property::<u32>("bitrate") / 1000;
+                if (kbps as f64) < CAP_KBPS {
+                    break kbps;
+                }
+            }
+            () = &mut deadline => panic!(
+                "the encoder still at {} kbps after 10 s behind a {CAP_KBPS} kbps cap",
+                encoder.property::<u32>("bitrate") / 1000
+            ),
+        }
+    };
+    assert!(congested, "the drop came through the congestion classifier");
+    assert!(kbps >= 500, "never below the ABR floor ({kbps} kbps)");
+}
+
+/// §Feedback: while PyroWave is active its own rate controller stands in for the ABR, so a
+/// PyroWave client's feedback feeds no estimate; after its fallback to H.264 it does.
+#[tokio::test]
+async fn feedback_while_pyrowave_is_active_feeds_no_estimate() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let fed = Arc::new(AtomicUsize::new(0));
+    let count = fed.clone();
+    let agent = agent_built(
+        Stream::H264,
+        Limits::default(),
+        audio::Plan::default(),
+        "ball",
+        move |_| {
+            Some(Rate {
+                ceiling_kbps: 4000.0,
+                start: Box::new(|| {}),
+                observe: Box::new(move |_| {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }),
+            })
+        },
+    )
+    .await;
+    let media = agent.listener.registry().lock()[SESSION]
+        .media
+        .clone()
+        .unwrap();
+    media.grant_pyrowave(
+        PyroWaveGrant {
+            wanted: true,
+            target_kbps: 200_000,
+            floor_kbps: 100_000,
+            max_rtt_ms: 1_000,
+        },
+        (320, 192, 60),
+        true,
+    );
+    let raw = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../testdata/pyrowave/detail_320x192_xhi.pwv1"
+    ))
+    .unwrap();
+    let session = agent.connect().await;
+    let (mut send, mut recv) = session.open_bi().await.unwrap();
+    let hello = json!({"type": "hello", "wt_proto": 1, "token": TOKEN, "session_id": SESSION,
+                       "client": "browser", "pyrowave": true});
+    write_message(&mut send, &hello).await.unwrap();
+    assert_eq!(
+        read_message(&mut recv).await.unwrap()["video"]["codec"],
+        "pyrowave"
+    );
+
+    // A path with room: every datagram is reported as arrived, as a browser would.
+    let mut path = Bottleneck::new(1e6);
+    media.on_pyrowave_frame(&gst::Buffer::from_slice(raw[28..].to_vec()));
+    path.receive(&session.read_datagram().await.unwrap());
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let feedback = path.feedback().expect("a datagram to report");
+    write_message(&mut send, &feedback).await.unwrap();
+    // The fallback's hello_ack comes after the agent read that feedback: the control
+    // stream is in order.
+    let fallback = json!({"type": "codec_fallback", "reason": "decode_error"});
+    write_message(&mut send, &fallback).await.unwrap();
+    assert_eq!(
+        read_message(&mut recv).await.unwrap()["video"]["codec"],
+        "h264"
+    );
+    assert_eq!(
+        fed.load(Ordering::SeqCst),
+        0,
+        "a PyroWave client's feedback fed the ABR"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fed.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "H.264 feedback never fed the ABR"
+        );
+        if let Ok(d) =
+            tokio::time::timeout(Duration::from_millis(50), session.read_datagram()).await
+        {
+            path.receive(&d.unwrap());
+        }
+        if let Some(feedback) = path.feedback() {
+            write_message(&mut send, &feedback).await.unwrap();
+        }
+    }
+}
+
+/// #1040: the estimate is the video ABR's, and on WebRTC audio is a peer connection GCC
+/// never sees. A still screen with music: only audio flows, and feedback that reports it
+/// arriving later and later, as behind a queue, moves no estimate.
+#[tokio::test]
+async fn audio_alone_never_moves_the_video_estimate() {
+    let fed = Arc::new(Mutex::new(Vec::new()));
+    let seen = fed.clone();
+    let plan = audio::Plan {
+        audio: true,
+        mic: false,
+        pulse_server: None,
+        jitter_ms: 40,
+    };
+    let mut agent = agent_built(Stream::H264, Limits::default(), plan, "ball", move |_| {
+        Some(Rate {
+            ceiling_kbps: 4000.0,
+            start: Box::new(|| {}),
+            observe: Box::new(move |kbps| seen.lock().unwrap().push(kbps)),
+        })
+    })
+    .await;
+    tap_session_audio(&mut agent);
+    let (session, mut send, _recv, _) = agent.hello(TOKEN).await;
+    // Video reached the client, then the screen goes still.
+    while session.read_datagram().await.unwrap()[0] != 0x01 {}
+    agent.pipeline.set_state(gst::State::Paused).unwrap();
+
+    let mut path = Bottleneck::new(1e6);
+    let (mut audio, mut late) = (0, 0.0);
+    let until = Instant::now() + Duration::from_secs(2);
+    while let Ok(d) = tokio::time::timeout_at(until, session.read_datagram()).await {
+        let d = d.unwrap();
+        // Each audio datagram waits 10 ms longer than the one before it.
+        if d[0] == 0x02 {
+            audio += 1;
+            late += 0.010;
+        }
+        let pkt_seq = u32::from_le_bytes(d[1..5].try_into().unwrap());
+        path.pending.push((pkt_seq, Some(path.now() + late)));
+        if let Some(feedback) = path.feedback() {
+            write_message(&mut send, &feedback).await.unwrap();
+        }
+    }
+    assert!(audio >= 100, "10 ms audio for 2 s: {audio} datagrams");
+    let fed = fed.lock().unwrap();
+    assert!(!fed.is_empty(), "the feedback was read");
+    assert!(
+        fed.iter().all(|&kbps| kbps == 4000.0),
+        "audio alone moved the video estimate: {fed:?}"
+    );
+}
+
+/// A client displaced, or told the session ended, neither starts nor feeds the ABR: the
+/// encoder is its successor's, and a start after the session ended would register hooks
+/// that keep the encoder alive.
+#[test]
+fn a_client_that_is_gone_neither_starts_nor_feeds_the_abr() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (started, fed) = (calls.clone(), calls.clone());
+    let rate = Rate {
+        ceiling_kbps: 4000.0,
+        start: Box::new(move || {
+            started.fetch_add(1, SeqCst);
+        }),
+        observe: Box::new(move |_| {
+            fed.fetch_add(1, SeqCst);
+        }),
+    };
+    let gone = Arc::new(OnceLock::new());
+    let mut control = Control::new(&rate, gone.clone());
+    control.feed(3000.0);
+    assert_eq!(calls.load(SeqCst), 2, "a live client starts and feeds");
+    gone.set(Gone::TakenOver).unwrap();
+    control.feed(3000.0);
+    Control::new(&rate, gone).feed(3000.0);
+    assert_eq!(calls.load(SeqCst), 2);
 }
 
 #[tokio::test]
@@ -3261,6 +3624,7 @@ fn a_tap_dropped_after_its_session_was_assigned_again_ends_its_own_media() {
         no_input(),
         audio::Plan::default(),
         None,
+        None,
     )
     .unwrap();
     tap.media().on_caps(&streams::av1_caps(640), SESSION);
@@ -3293,6 +3657,7 @@ fn releasing_the_tap_stops_its_pyrowave_encoder_and_keeps_the_tap() {
         None,
         no_input(),
         audio::Plan::default(),
+        None,
         None,
     )
     .unwrap();
