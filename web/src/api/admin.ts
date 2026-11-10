@@ -90,6 +90,7 @@ import type {
   HostImageCleanupRequest,
   HostImageCleanupAttempt,
   ImageUpdatePolicy,
+  DefaultTransport,
   Job,
   JobsResponse,
   JobRunsResponse,
@@ -224,6 +225,8 @@ export function updateSettings(
     default_raw_mouse?: boolean;
     default_flip_scroll?: boolean;
     default_nintendo_layout?: boolean;
+    /** Amendment 61: the transport of every launch profile set to "default". */
+    default_transport?: DefaultTransport;
   },
 ): Promise<SettingsResponse> {
   return apiFetch<SettingsResponse>("/admin/settings", {

@@ -109,9 +109,10 @@ ARG GST_VERSION=1.28.8
 ARG GST_PLUGINS_RS_REF=cee45224cb2d10e1523af4f256d0dd64c8b29491
 ARG GST_INTERPIPE_REF=0c454917
 ARG GST_WAYLAND_DISPLAY_REPO=https://github.com/salty2011/gst-wayland-display.git
-ARG GST_WAYLAND_DISPLAY_REF=e650cf7f7f038fbc6f23422190787b5086f8bdc7
+ARG GST_WAYLAND_DISPLAY_REF=05bc3c99c3e0f54ebebc021bd4ccc2c0a23418ea
 ARG PYROWAVE_REF=7fe0e2667cd3076b8b2bf04bcb80bc8d691b800b
 ARG GRANITE_REF=53090429539bf3404250d18fe58db971f0907c04
+ARG VULKAN_LOADER_REF=363f465abadab0a8dcfc5c85d2c691e9b0b788d6
 ARG RUST_VERSION=1.94.0
 ARG CARGO_C_VERSION=0.10.23
 ARG RUSTUP_VERSION=1.29.0
@@ -804,6 +805,34 @@ RUN cd /src/node-agent \
     && cargo build --release --locked -p quasar-launch-helper \
     && install -Dm0755 target/release/quasar-launch-helper /out/quasar-launch-helper
 
+# ══ Vulkan-Loader stage (#1104 review, #267) ════════════════════════════════════════
+# Fedora 43's vulkan-loader (1.4.341, nothing newer even in updates-testing) walks every
+# instance without the lock instance creation holds when a vkGetDeviceProcAddr lookup reaches
+# its terminator: vkGetDeviceQueue2 and any device command newer than the loader. Another
+# thread's vkCreateInstance/vkEnumeratePhysicalDevices then frees what it reads: SIGSEGV in
+# loader_get_icd_and_device. 1.4.345 takes loader_lock there. The runtime stage keeps the RPM
+# (the contract and its dependants want it) and points libvulkan.so.1 at this build. No X11/XCB
+# WSI: nothing in the agent presents to an X server.
+FROM ${TOOLCHAIN_IMAGE} AS vulkan-loader
+ARG VULKAN_LOADER_REF
+RUN set -eu; \
+    git clone https://github.com/KhronosGroup/Vulkan-Loader.git /opt/vkl-src \
+    && cd /opt/vkl-src \
+    && git checkout ${VULKAN_LOADER_REF} \
+    && cmake -S . -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DUPDATE_DEPS=ON \
+        -DBUILD_TESTS=OFF \
+        -DBUILD_WSI_XCB_SUPPORT=OFF \
+        -DBUILD_WSI_XLIB_SUPPORT=OFF \
+        -DBUILD_WSI_WAYLAND_SUPPORT=ON \
+        -DCMAKE_INSTALL_PREFIX=/opt/vulkan-loader \
+        -DCMAKE_INSTALL_LIBDIR=lib64 \
+    && cmake --build build \
+    && cmake --install build \
+    && install -Dm644 LICENSE.txt /opt/vulkan-loader/share/licenses/vulkan-loader/LICENSE.txt \
+    && ls -l /opt/vulkan-loader/lib64
+
 # ══ Runtime stage (target: runtime → quasar-node-agent:latest) ════════════════════
 # The VA/Vulkan node-agent image, unchanged from the VK-01 image. NOT the default build result:
 # the #367 dev/nv targets live below this stage, and Docker builds the LAST stage (`nv`) when no
@@ -981,6 +1010,16 @@ COPY deploy/audio/wireplumber-quasar-session.conf /etc/wireplumber/wireplumber.c
 # /opt/gst. Measured: runtime step 3/9 CACHED with a changed agent binary.
 COPY --from=build /opt/gst /opt/gst
 RUN echo /opt/gst/lib64 > /etc/ld.so.conf.d/gst-vulkan.conf && ldconfig
+# The pinned Vulkan-Loader over the RPM's (the stage above says why). ldconfig would re-point
+# libvulkan.so.1 at the highest version on its own; the explicit link and the check make a
+# build that lost the file fail here.
+COPY --from=vulkan-loader /opt/vulkan-loader/lib64/libvulkan.so.1.* /usr/lib64/
+COPY --from=vulkan-loader /opt/vulkan-loader/share/licenses/vulkan-loader /usr/share/licenses/vulkan-loader-quasar
+RUN set -eu; \
+    real="$(cd /usr/lib64 && ls libvulkan.so.1.4.* | sort -V | tail -1)"; \
+    ln -sf "$real" /usr/lib64/libvulkan.so.1 && ldconfig; \
+    echo "libvulkan.so.1 -> $(readlink /usr/lib64/libvulkan.so.1)"; \
+    [ "$(readlink -f /usr/lib64/libvulkan.so.1)" = /usr/lib64/libvulkan.so.1.4.345 ]
 
 ENV GST_PLUGIN_PATH=/opt/gst/lib64/gstreamer-1.0
 ENV PATH=/opt/gst/bin:$PATH

@@ -13,7 +13,7 @@ import { ToastProvider } from "../../../components/Toast";
 import { SectionHeadProvider } from "../../../components/shell/sectionHead";
 import * as adminApi from "../../../api/admin";
 import { ApiError } from "../../../api/client";
-import type { LaunchProfile, StreamProfile } from "../../../api/types";
+import type { InstanceSettings, LaunchProfile, SettingsResponse, StreamProfile } from "../../../api/types";
 
 vi.mock("../../../auth/context", () => ({ useAuth: () => ({ token: "tok" }) }));
 vi.mock("../../../api/admin");
@@ -70,6 +70,46 @@ beforeEach(() => {
   mocked.getProfilePolicy.mockResolvedValue({
     global_default_profile_id: null,
     user_overrides_allowed: true,
+  });
+  mocked.getSettings.mockResolvedValue(settingsWith({ default_transport: "webrtc" }));
+});
+
+// Only the field the tab reads; the rest of the envelope is the Settings page's.
+function settingsWith(over: Partial<InstanceSettings>): SettingsResponse {
+  return { settings: over as InstanceSettings };
+}
+
+describe("LaunchTab — default transport", () => {
+  it("shows the instance default transport and PATCHes only default_transport", async () => {
+    mocked.updateSettings.mockResolvedValue(settingsWith({ default_transport: "webtransport" }));
+    renderPage();
+    await act(async () => {});
+
+    const select = screen.getByRole("combobox", { name: "Default transport" });
+    expect(select).toHaveValue("webrtc");
+    await act(async () => {
+      fireEvent.change(select, { target: { value: "webtransport" } });
+    });
+
+    expect(mocked.updateSettings).toHaveBeenCalledWith("tok", { default_transport: "webtransport" });
+  });
+
+  it("reads WebRTC when a pre-amendment server sent no default_transport", async () => {
+    mocked.getSettings.mockResolvedValue(settingsWith({ default_transport: undefined }));
+    renderPage();
+    await act(async () => {});
+
+    expect(screen.getByRole("combobox", { name: "Default transport" })).toHaveValue("webrtc");
+  });
+
+  it("says the settings did not load rather than hiding the only transport control", async () => {
+    mocked.getSettings.mockRejectedValue(new ApiError(502, "internal", "gateway"));
+    renderPage();
+    await act(async () => {});
+
+    expect(screen.getByText("Default transport")).toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "Default transport" })).toBeNull();
+    expect(screen.getByRole("alert")).toBeInTheDocument();
   });
 });
 
@@ -376,6 +416,22 @@ describe("LaunchTab", () => {
       transport: "webtransport",
     });
     expect(screen.getByRole("combobox", { name: "Transport for Balanced" })).toHaveValue("webtransport");
+  });
+
+  it("offers Use instance default and saves it as the value default", async () => {
+    mocked.listLaunchProfiles.mockResolvedValue({ items: [launchProfile({ transport: "webtransport" })] });
+    mocked.updateLaunchProfile.mockResolvedValue(launchProfile({ transport: "default" }));
+    renderPage();
+    await act(async () => {});
+
+    const select = screen.getByRole("combobox", { name: "Transport for Balanced" });
+    expect(within(select).getByRole("option", { name: "Use instance default" })).toHaveValue("default");
+    await act(async () => {
+      fireEvent.change(select, { target: { value: "default" } });
+    });
+
+    expect(mocked.updateLaunchProfile.mock.calls[0][2]).toMatchObject({ transport: "default" });
+    expect(screen.getByRole("combobox", { name: "Transport for Balanced" })).toHaveValue("default");
   });
 
   it("keeps a developer opt-in profile visible, and a rung edit leaves its transport alone", async () => {

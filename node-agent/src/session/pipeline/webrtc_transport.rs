@@ -11,7 +11,7 @@
 //! and the same DTLS association. A new peer therefore gets a new `webrtcbin`.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -21,6 +21,7 @@ use gstreamer::prelude::*;
 use super::abr_glue::{self, EncodeResolutionLever, ResolutionLever};
 use super::audio_branch::add_audio_chain;
 use super::codec_chain::build_video_payloader;
+use super::ice_interfaces::restrict_ice_gathering;
 use super::mic_branch::add_mic_branch;
 use super::probes::{attach_rtp_marker_trace, attach_rtp_out_probe, attach_rtp_ts_trace};
 use super::rtp_ext::{
@@ -91,6 +92,9 @@ pub struct WebRtcSlot {
     /// The session's WebTransport media client, when it has one: each WebRTC transport's
     /// input and releases go through it, keyed by that transport (§Takeover).
     webtransport: Option<Arc<crate::webtransport::Media>>,
+    /// The session's WebTransport audio: every audio pipeline this slot builds is tapped
+    /// at its Opus encoder (`build_audio`), the first and each replacement.
+    stream_audio: OnceLock<Arc<crate::webtransport::Audio>>,
 }
 
 /// Give a `webrtcbin` sink pad the MediaStream id this PC always uses. Left unset,
@@ -253,6 +257,7 @@ impl WebRtcSlot {
             trace_tx,
             session_id,
             observe,
+            pyrowave_feed: _,
         } = session;
         let codec = cfg.stream.codec;
         let pay = build_video_payloader(codec, cfg.rtp_mtu)?;
@@ -339,6 +344,7 @@ impl WebRtcSlot {
             lever,
             observe,
             webtransport: None,
+            stream_audio: OnceLock::new(),
         })
     }
 
@@ -355,6 +361,11 @@ impl WebRtcSlot {
         if muted.is_none() {
             *muted = self.hold_rtp();
         }
+    }
+
+    /// Tap the session's audio for its WebTransport client; before the first `build_audio`.
+    pub(crate) fn tap_audio_for_stream(&self, audio: Arc<crate::webtransport::Audio>) {
+        let _ = self.stream_audio.set(audio);
     }
 
     /// Build a video transport on the tail. `replacement` is false for the session's
@@ -378,6 +389,7 @@ impl WebRtcSlot {
                 transport: Some(id),
             });
         let webrtc = make_webrtcbin(cfg.stun.as_deref())?;
+        restrict_ice_gathering(&webrtc, PcId::Video);
         // Signals webrtcbin emits while it builds its send session: connect them first.
         if cfg.rtp_mtu_shrink {
             super::mtu_shrink::attach(
@@ -667,8 +679,14 @@ impl WebRtcSlot {
         let audio_pipe = gst::Pipeline::new();
         audio_health::watch_bus(&audio_pipe, &self.session_id);
         let audio_tail = add_audio_chain(&audio_pipe, cfg, &self.session_id)?;
+        if let Some(audio) = self.stream_audio.get() {
+            if let Some(opus) = audio_pipe.by_name(super::audio_branch::OPUS_ENC_NAME) {
+                audio.tap(&opus);
+            }
+        }
         let audio_webrtc = make_webrtcbin(cfg.stun.as_deref())
             .context("failed to create audio webrtcbin (encode pipeline)")?;
+        restrict_ice_gathering(&audio_webrtc, PcId::Audio);
         // #425: tune the mic receive-leg jitter buffer on the AUDIO PC only; the video
         // webrtcbin is never touched here.
         set_audio_receive_latency(&audio_webrtc, cfg.mic_jitter_ms);

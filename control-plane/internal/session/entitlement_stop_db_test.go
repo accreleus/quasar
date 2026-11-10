@@ -172,7 +172,7 @@ func TestStopIsConditionalOnTheEvaluatedApp(t *testing.T) {
 		t.Fatalf("stop against an app the session no longer runs: %v, want errSessionMoved", err)
 	}
 	// Listed as swapping, then the commit landed: the row reads "swap complete".
-	must(t, store.CommitSwappedApp(ctx, sid, evaluated, swapDetailComplete))
+	must(t, store.CommitSwappedApp(ctx, sid, evaluated, "", swapDetailComplete))
 	if _, err := coord.stop(ctx, sid, stillSwapping, "error", false); !errors.Is(err, errSessionMoved) {
 		t.Fatalf("unresolved-swap stop on a swap that resolved: %v, want errSessionMoved", err)
 	}
@@ -442,7 +442,7 @@ func TestUncertainUnmanagedSwapAckKeepsTheSwapPending(t *testing.T) {
 			ctx := context.Background()
 			sess := runningSession(t, store, s)
 			target := insertApp(t, pool, "target", 512, 1) // unmanaged
-			swap := newSwapper(store, tc.dispatch(newFakeDispatcher(true)), testLogger(), nil)
+			swap := newSwapper(store, tc.dispatch(newFakeDispatcher(true)), testLogger(), nil, nil)
 
 			// What Swap has done by the time it dispatches.
 			swap.noteSwapStart(sess.ID)

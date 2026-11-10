@@ -91,6 +91,15 @@ func (c *Coordinator) LaunchConsoleSession(ctx context.Context, hostID, userID, 
 		// Mic unset: local_only console launches have no WebRTC pipeline
 		// (agent-api.md), so capture never applies regardless of the setting.
 	}
+	// A console auto-start shares the user's Steam library exactly as a launch
+	// does: the same single-Steam decision, claim and hold, so the desktop that
+	// comes up on the display is the signed-in Steam the user expected
+	// (control-api.md §Storage, "A shared Steam library").
+	sharedHome, notice, err := c.store.sharedHomeChoice(ctx, app, userID, false)
+	if err != nil {
+		return "", fmt.Errorf("console auto-start: shared home: %w", err)
+	}
+	p.SharedHomeAppID = sharedHome
 	if app.ManagedHome {
 		owner, err := c.store.HomeHostForApp(ctx, userID, homeAppID(app))
 		if err != nil {
@@ -120,6 +129,15 @@ func (c *Coordinator) LaunchConsoleSession(ctx context.Context, hostID, userID, 
 	}
 	c.log.Info("console auto-start: session scheduled",
 		"session_id", sess.ID, "host_id", hostID, "user_id", userID, "app_id", appID)
+	// A sharing auto-start that had to open without the library says why in the
+	// log: the console has no response to carry a notice.
+	if sess.notice != "" {
+		notice = sess.notice
+	}
+	if notice != "" {
+		c.log.Info("console auto-start: running without the Steam library",
+			"session_id", sess.ID, "app_id", appID, "notice", notice)
+	}
 	c.afterLaunchAdmitted(ctx, userID, app)
 
 	// Resolve the dispatchable spec: the per-(user, app) home mount for a
@@ -135,19 +153,28 @@ func (c *Coordinator) LaunchConsoleSession(ctx context.Context, hostID, userID, 
 	dispatchSpec := app.RuntimeSpec
 	if app.ManagedHome || app.IsDerived() {
 		if sess.HostID == nil {
-			c.failSession(sess.ID, "app scheduled without a host")
+			c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, "app scheduled without a host")
 			return "", fmt.Errorf("console auto-start: app scheduled without a host")
 		}
 		dispatchSpec, err = c.resolveHomeSpec(ctx, app, userID, *sess.HostID)
+		if err == nil && sess.SharedHomeAppID != nil {
+			// The shared mount nests over the own home, so it goes last — the
+			// order the launch dispatch and the home binding both expect.
+			dispatchSpec, err = c.injectSharedHomeMount(ctx, dispatchSpec, app, userID, *sess.SharedHomeAppID, *sess.HostID)
+		}
 		if err != nil {
-			c.failSession(sess.ID, fmt.Sprintf("home mount: %v", err))
+			// failBeforeAgent, not failSession: the schedule may have created the
+			// Steam claim on this host for the shared mount, and a claim left
+			// behind pins the user's Steam here with no data (as it would for a
+			// launch failing the same way).
+			c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, fmt.Sprintf("home mount: %v", err))
 			return "", fmt.Errorf("console auto-start: home mount: %w", err)
 		}
 	}
 
 	dispatchSpec, err = c.applyRegionInput(ctx, dispatchSpec, userID, sess.DeviceID)
 	if err != nil {
-		c.failSession(sess.ID, fmt.Sprintf("region and input values: %v", err))
+		c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, fmt.Sprintf("region and input values: %v", err))
 		return "", fmt.Errorf("console auto-start: region and input values: %w", err)
 	}
 

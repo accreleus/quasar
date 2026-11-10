@@ -988,7 +988,9 @@ fn takeover_crosses_between_webrtc_and_webtransport() {
     let (mut host, media, _wt) = start_webtransport("cross");
     let mut a = first_attach(&mut host);
 
-    let wt = media.attach().expect("the WebTransport hello is accepted");
+    let wt = media
+        .attach(false, Duration::ZERO)
+        .expect("the WebTransport hello is accepted");
     assert!(
         host.transports.take_from_webrtc(&host.sig_tx),
         "the runner's tick sees the takeover"
@@ -1036,7 +1038,9 @@ fn a_new_peer_answering_after_a_webtransport_takeover_gets_media() {
     let _serial = serial();
     let (mut host, media, _wt) = start_webtransport("pingpong");
     let _a = first_attach(&mut host);
-    let wt = media.attach().expect("the WebTransport hello is accepted");
+    let wt = media
+        .attach(false, Duration::ZERO)
+        .expect("the WebTransport hello is accepted");
 
     let mut b = Peer::another_browser();
     request_offers(&mut host);
@@ -1069,7 +1073,9 @@ fn a_fallback_answer_displaces_the_webtransport_client_at_once() {
     }
     let _serial = serial();
     let (mut host, media, _wt) = start_webtransport("fallback");
-    let wt = media.attach().expect("the WebTransport hello is accepted");
+    let wt = media
+        .attach(false, Duration::ZERO)
+        .expect("the WebTransport hello is accepted");
     assert!(
         !host.transports.take_from_webrtc(&host.sig_tx),
         "no WebRTC peer held the session"
@@ -1100,13 +1106,13 @@ fn a_seventh_takeover_by_a_webrtc_peer_is_refused() {
     for n in 0..6 {
         clients.push(
             media
-                .attach()
+                .attach(false, Duration::ZERO)
                 .unwrap_or_else(|e| panic!("takeover {n}: {e:?}")),
         );
     }
     assert!(host.transports.take_from_webrtc(&host.sig_tx));
     assert!(
-        media.attach().is_err(),
+        media.attach(false, Duration::ZERO).is_err(),
         "a 7th WebTransport hello is refused"
     );
 

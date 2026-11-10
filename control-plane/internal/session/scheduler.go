@@ -51,6 +51,9 @@ type CreateParams struct {
 	NoHomeSettleWait bool
 	TokenHash        string
 	TokenExpires     time.Time
+	// PyroWaveCandidate: the launch may want PyroWave, so the INSERT takes one of the GPU's
+	// PyroWave slots when one is free (control-api.md §The PyroWave ceiling).
+	PyroWaveCandidate bool
 	// The EFFECTIVE runtime app's opt-in to persistent home storage (P5-02); true
 	// makes scheduleAttempt enforce the P5-04 single-writer guard. Must come from
 	// LaunchApp.ManagedHome, never apps.managed_home: a tile's own column is false
@@ -538,7 +541,8 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		    device_id,
 		    assigned_at,
 		    kind, parked_until,
-		    shared_home_app_id
+		    shared_home_app_id,
+		    pyrowave_slot
 		) VALUES (
 		    $1, $2, $3, $4, 'assigned',
 		    $5, $6, $7, $8, $9,
@@ -552,7 +556,13 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		    now(),
 		    COALESCE(NULLIF($18, ''), 'play'),
 		    CASE WHEN $18 = 'parked' THEN now() + make_interval(mins => $19::int) END,
-		    NULLIF($20, '')::uuid
+		    NULLIF($20, '')::uuid,
+		    -- Counted under the GPU row lock the recheck took: two launches cannot both
+		    -- take the last slot.
+		    $21::bool AND $4::uuid IS NOT NULL AND (
+		        SELECT count(*) FROM sessions x
+		        WHERE x.gpu_id = $4::uuid AND x.pyrowave_slot AND x.state IN `+activeStatesSQL+`
+		    ) < COALESCE((SELECT pyrowave_max_per_gpu FROM instance_settings WHERE id = true), 1)
 		)
 		RETURNING `+sessionCols,
 		p.UserID, p.AppID, hostID, gpuID,
@@ -566,6 +576,7 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		deviceID,
 		p.Kind, parkedMinutes,
 		p.SharedHomeAppID,
+		p.PyroWaveCandidate,
 	))
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.ConstraintName == "sessions_one_parked_per_user" {
