@@ -62,14 +62,13 @@ describe("SessionTelemetry cumulative counters", () => {
     ]);
   });
 
-  it("never falls when the receiver's counters start again, under one telemetry or a replacement's", async () => {
+  it("never falls when the receiver's count dips (a resent packet arrived), and counts no loss twice on the way back up", async () => {
     const counters = newPostedCounters();
     const totals = { now: { packetsLost: 8, framesDropped: 4, freezeCount: 2 } };
     const first = telemetry(totals, counters);
     await vi.advanceTimersByTimeAsync(1_000);
-    // The same telemetry, its receiver's counters back near 0.
-    await second(totals, { packetsLost: 1, framesDropped: 0, freezeCount: 0 });
-    await second(totals, { packetsLost: 3, framesDropped: 1, freezeCount: 0 });
+    await second(totals, { packetsLost: 6, framesDropped: 4, freezeCount: 2 });
+    await second(totals, { packetsLost: 10, framesDropped: 6, freezeCount: 3 });
     await vi.advanceTimersByTimeAsync(2_000);
     first.t.stop();
     expect(posted("packets_lost").slice(0, 3)).toEqual([8, 8, 10]);
@@ -81,7 +80,7 @@ describe("SessionTelemetry cumulative counters", () => {
     await vi.advanceTimersByTimeAsync(5_000);
     replacement.t.stop();
     expect(posted("packets_lost")[0]).toBe(12);
-    expect(posted("frames_dropped")[0]).toBe(6);
-    expect(posted("freeze_count")[0]).toBe(3);
+    expect(posted("frames_dropped")[0]).toBe(7);
+    expect(posted("freeze_count")[0]).toBe(4);
   });
 });

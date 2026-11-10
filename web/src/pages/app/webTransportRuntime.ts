@@ -141,6 +141,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   const startedAt = performance.now();
   /** When video last arrived; null until the stream has started. */
   let lastVideoAt: number | null = null;
+  let lastTickAt = performance.now();
 
   const fpsSeries: number[] = [];
   const latencySeries: number[] = [];
@@ -209,13 +210,17 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   }
 
   const tick = () => {
+    // A late tick is a stalled page, not a silent connection: its datagrams are still queued.
+    const now = performance.now();
+    if (lastVideoAt !== null && now - lastTickAt > 2 * TELEMETRY_MS) lastVideoAt = now;
+    lastTickAt = now;
     // A connection that is up and carries no media never ends by itself.
     if (
       transport &&
       snapshot.channelOpen &&
       lastVideoAt !== null &&
       document.visibilityState === "visible" &&
-      performance.now() - lastVideoAt > MEDIA_SILENCE_MS
+      now - lastVideoAt > MEDIA_SILENCE_MS
     ) {
       onEnd(transport, { code: null, reason: "media_silent" });
       if (failed) return;

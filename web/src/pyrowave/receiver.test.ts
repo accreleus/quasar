@@ -100,6 +100,10 @@ describe("PyroWaveReceiver", () => {
     // Pushed out by a fifth pending frame, three short.
     for (const seq of [5, 6, 7, 8, 9]) feed(r, fragments(seq).slice(3), FRAME_MS);
     expect(r.lost).toBe(6);
+    // A late datagram of the frame pushed out does not reopen it: nothing is counted twice.
+    feed(r, fragments(5).slice(0, 1), FRAME_MS);
+    for (const seq of [10, 11, 12, 13]) feed(r, fragments(seq), FRAME_MS);
+    expect(r.lost).toBe(6 + 4 * 3);
   });
 
   it("the fixture's real oversized blocks rejoin, and a lost part loses only its block", () => {

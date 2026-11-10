@@ -456,7 +456,8 @@ function SessionPageBody() {
   const fallBackToWebRtc = async (reason: string) => {
     setSwitching(true);
     // Capture went with the WebTransport connection: ask for it again once WebRTC is up.
-    autoArmedRef.current = "resume";
+    // `||`: a first reveal still owed keeps its "Click to play".
+    autoArmedRef.current ||= "resume";
     rememberFallback(sessionId ?? "", reason);
     new TraceEventEmitter(sessionId ?? "", authToken ?? "").emitTransportFallback(reason);
     try {
@@ -992,7 +993,7 @@ function SessionPageBody() {
   // A WebTransport connection lost and rebuilt takes capture with it: arm again for the new one.
   const wasOpenRef = useRef(false);
   useEffect(() => {
-    if (webtransport && wasOpenRef.current && !channelOpen) autoArmedRef.current = "resume";
+    if (webtransport && wasOpenRef.current && !channelOpen) autoArmedRef.current ||= "resume";
     wasOpenRef.current = channelOpen;
   }, [channelOpen, webtransport]);
   useEffect(() => {

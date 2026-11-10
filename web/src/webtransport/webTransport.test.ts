@@ -951,6 +951,19 @@ describe("createWebTransportRuntime fallback", () => {
       idle.rt.destroy();
     });
 
+    it("does not fire on a tick that ran late: a stalled page has its datagrams still queued", async () => {
+      const { agent, rt } = await streaming();
+      const real = performance.now.bind(performance);
+      const stall = vi.spyOn(performance, "now").mockImplementation(() => real() + MEDIA_SILENCE_MS + 1_000);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(agent.sent("hello")).toHaveLength(1);
+      // Still silent a whole bound after the stall: that is a lost stream.
+      await vi.advanceTimersByTimeAsync(SILENT);
+      expect(agent.sent("hello")).toHaveLength(2);
+      stall.mockRestore();
+      rt.destroy();
+    });
+
     it("does not fire in a hidden tab, and gives a tab that shows again the whole bound", async () => {
       const { agent, rt } = await streaming();
       const vis = vi.spyOn(document, "visibilityState", "get");

@@ -221,6 +221,8 @@ export class SessionTelemetry {
   private prevBytesReceived = 0;
   private prevBytesTsMs = 0;
   private prevPacketsLost = 0;
+  /** The page view's total before this receiver's own count. */
+  private lostBase = 0;
   private prevFramesDropped = 0;
   private prevFreezeCount = 0;
 
@@ -297,6 +299,7 @@ export class SessionTelemetry {
     getAbsCaptureTimeNegotiated?: () => boolean,
     private readonly posted: PostedCounters = newPostedCounters(),
   ) {
+    this.lostBase = posted.packetsLost;
     this.video = video;
     this.getStatsFn = getStatsFn;
     this.channel = channel;
@@ -551,8 +554,8 @@ export class SessionTelemetry {
     this.prevPacketsLost = totalLost;
     this.prevFramesDropped = totalDropped;
     this.prevFreezeCount = totalFreezes;
-    // Sums of the clamped deltas, not the raw counters: those can dip or start again.
-    this.posted.packetsLost += this.packetsLost;
+    // packets_lost dips when a resent packet arrives: follow the raw counter, never falling.
+    this.posted.packetsLost = Math.max(this.posted.packetsLost, this.lostBase + totalLost);
     this.posted.framesDropped += this.framesDropped;
     this.posted.freezeCount += this.freezeCount;
 

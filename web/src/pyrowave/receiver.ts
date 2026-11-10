@@ -135,6 +135,8 @@ export class PyroWaveReceiver {
     const p = this.pending.get(oldest) as Pending;
     this.lost += p.fragCount - p.have;
     this.pending.delete(oldest);
+    // Closed: a late datagram must not reopen it and have its gaps counted again.
+    this.lastDone = oldest;
   }
 
   /** Validates one datagram and records what it carries; an invalid one adds nothing. */
