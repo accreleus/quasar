@@ -4596,6 +4596,18 @@ fn perform_swap(
         );
     }
 
+    // A stop that landed during the two waits above: do not start the replacement (a Steam
+    // container on the managed home) only to kill it a moment later. Nothing of it runs yet
+    // and the helper is already muted, so there is nothing to roll back.
+    if stop.load(Ordering::Relaxed) {
+        tracing::info!(
+            token = "swap-stopped",
+            "swap: the session was stopped before the replacement was launched; not launching it"
+        );
+        drop(new_source);
+        return Ok(SwapOutcome::Stopped);
+    }
+
     // ── Step 3: launch the replacement app ───────────────────────────────────
     new_source.launch_deferred_app();
 
