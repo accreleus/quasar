@@ -3,8 +3,7 @@
 //! session's client authenticates with a single-use token the control plane minted and
 //! then gets the session's video as datagrams.
 //!
-//! Not here yet, each a later ticket: FEC, and takeover across transports (a new client
-//! replaces the last one; nothing bounds it).
+//! Not here yet: FEC.
 
 mod audio;
 mod cert;
@@ -36,7 +35,8 @@ pub(crate) use audio::Audio;
 pub use cert::CertReport;
 use cert::{Cert, CertSet};
 pub use media::PyroWaveGrant;
-use media::{Attached, Gone, Media, Out};
+use media::{Attached, Gone, Out, Refused};
+pub(crate) use media::{Media, WebRtcSide};
 
 const WT_PROTO: u32 = 1;
 const HELLO_DEADLINE: Duration = Duration::from_secs(5);
@@ -216,6 +216,8 @@ enum Refusal {
     NotReady,
     SessionEnded,
     UnsupportedVersion,
+    /// §Takeover's bound; the token is kept.
+    RateLimited,
 }
 
 impl Refusal {
@@ -225,6 +227,7 @@ impl Refusal {
             Self::NotReady => ("session_not_ready", CLOSE_NORMAL),
             Self::SessionEnded => ("session_ended", CLOSE_ENDED),
             Self::UnsupportedVersion => ("unsupported_version", CLOSE_NORMAL),
+            Self::RateLimited => ("takeover_rate_limited", CLOSE_NORMAL),
         }
     }
 }
@@ -338,9 +341,16 @@ impl Registry {
         }
     }
 
-    /// Check `hello` and consume its token. A refusal for a session not ready keeps the
-    /// token, so the client may retry with it.
-    fn redeem(&self, hello: &Hello, now: SystemTime) -> Result<Arc<Media>, Refusal> {
+    /// Check `hello`, attach its client and consume its token, in one step: two hellos racing
+    /// one token attach once. A refusal for a session not ready, or past the takeover bound,
+    /// keeps the token, so the client may retry with it.
+    /// `rtt` is the connection's round trip, for the PyroWave gate.
+    fn redeem(
+        &self,
+        hello: &Hello,
+        now: SystemTime,
+        rtt: Duration,
+    ) -> Result<(Arc<Media>, Attached), Refusal> {
         if hello.wt_proto < WT_PROTO {
             return Err(Refusal::UnsupportedVersion);
         }
@@ -360,12 +370,31 @@ impl Registry {
         else {
             return Err(Refusal::AuthFailed);
         };
-        let Some(media) = entry.media.clone().filter(|m| m.ready()) else {
+        let Some(media) = entry.media.clone() else {
             return Err(Refusal::NotReady);
         };
+        let attached = media
+            .attach(hello.pyrowave, rtt)
+            .map_err(|refused| match refused {
+                Refused::Ended => Refusal::SessionEnded,
+                Refused::NotReady => Refusal::NotReady,
+                Refused::RateLimited => Refusal::RateLimited,
+            })?;
         entry.tokens.remove(index);
-        Ok(media)
+        Ok((media, attached))
     }
+}
+
+/// The registry a session's transports use when no listener runs: a test's own.
+#[cfg(test)]
+pub(crate) static TEST_REGISTRY: Mutex<Option<Arc<Registry>>> = Mutex::new(None);
+
+/// The registry the session's transports attach to: the listener's.
+pub(crate) fn registry() -> Option<Arc<Registry>> {
+    let registry = listener().map(|l| l.registry().clone());
+    #[cfg(test)]
+    let registry = registry.or_else(|| TEST_REGISTRY.lock().unwrap().clone());
+    registry
 }
 
 /// Takes the session's video off the encoded-frame boundary for its WebTransport
@@ -432,6 +461,12 @@ impl Tap {
     /// A client is attached and being sent video: the session's idle reap counts it.
     pub(crate) fn attached(&self) -> bool {
         self.media.attached()
+    }
+
+    /// The session's one media client across both transports, which the WebRTC side
+    /// injects and releases through.
+    pub(crate) fn media(&self) -> &Arc<Media> {
+        &self.media
     }
 }
 
@@ -506,6 +541,8 @@ impl Tap {
 impl Drop for Tap {
     fn drop(&mut self) {
         self.registry.end(&self.session_id);
+        // Its own media too: an id assigned again got a fresh entry that no longer names it.
+        self.media.end();
         self.release();
     }
 }
@@ -1166,15 +1203,7 @@ async fn authenticate(
         .await;
         return;
     }
-    let verdict = registry
-        .redeem(&hello, SystemTime::now())
-        // `end` may run between the redeem and the attach.
-        .and_then(|media| {
-            media
-                .attach(hello.pyrowave, session.rtt())
-                .map(|c| (media, c))
-                .ok_or(Refusal::SessionEnded)
-        });
+    let verdict = registry.redeem(&hello, SystemTime::now(), session.rtt());
     // The slot is held until `hello_ack` is written, or on a refusal until the close has
     // run: a peer stalling either counts against the caps like any unauthenticated one.
     let (media, client) = match verdict {

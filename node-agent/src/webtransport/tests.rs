@@ -86,33 +86,45 @@ fn a_token_is_single_use_lives_its_expiry_plus_15_s_and_never_crosses() {
     registry.assign(SESSION, &token_hash(TOKEN), now);
 
     assert_eq!(
-        registry.redeem(&hello_for("other", TOKEN, 1), now).err(),
+        registry
+            .redeem(&hello_for("other", TOKEN, 1), now, Duration::ZERO)
+            .err(),
         Some(Refusal::NotReady),
         "a session this agent does not hold yet"
     );
     assert_eq!(
-        registry.redeem(&hello_for(SESSION, TOKEN, 1), now).err(),
+        registry
+            .redeem(&hello_for(SESSION, TOKEN, 1), now, Duration::ZERO)
+            .err(),
         Some(Refusal::NotReady),
         "no encode chain yet"
     );
     assert_eq!(
-        registry.redeem(&hello_for(SESSION, TOKEN, 0), now).err(),
+        registry
+            .redeem(&hello_for(SESSION, TOKEN, 0), now, Duration::ZERO)
+            .err(),
         Some(Refusal::UnsupportedVersion)
     );
     assert!(registry.set_media(SESSION, ready_media()));
     // Kind separation: a signaling token's hash never reaches the agent.
     assert_eq!(
         registry
-            .redeem(&hello_for(SESSION, "a-signaling-token", 1), now)
+            .redeem(
+                &hello_for(SESSION, "a-signaling-token", 1),
+                now,
+                Duration::ZERO
+            )
             .err(),
         Some(Refusal::AuthFailed)
     );
     // The token refused as not ready was kept, and is good until expiry + 15 s.
     assert!(registry
-        .redeem(&hello_for(SESSION, TOKEN, 2), at(15))
+        .redeem(&hello_for(SESSION, TOKEN, 2), at(15), Duration::ZERO)
         .is_ok());
     assert_eq!(
-        registry.redeem(&hello_for(SESSION, TOKEN, 1), at(15)).err(),
+        registry
+            .redeem(&hello_for(SESSION, TOKEN, 1), at(15), Duration::ZERO)
+            .err(),
         Some(Refusal::AuthFailed),
         "consumed"
     );
@@ -120,7 +132,7 @@ fn a_token_is_single_use_lives_its_expiry_plus_15_s_and_never_crosses() {
     assert!(registry.add_token(SESSION, &token_hash("second"), now));
     assert_eq!(
         registry
-            .redeem(&hello_for(SESSION, "second", 1), at(16))
+            .redeem(&hello_for(SESSION, "second", 1), at(16), Duration::ZERO)
             .err(),
         Some(Refusal::AuthFailed),
         "expired past the skew"
@@ -131,7 +143,7 @@ fn a_token_is_single_use_lives_its_expiry_plus_15_s_and_never_crosses() {
     assert!(registry.set_media("b", ready_media()));
     assert_eq!(
         registry
-            .redeem(&hello_for(SESSION, "token-of-b", 1), now)
+            .redeem(&hello_for(SESSION, "token-of-b", 1), now, Duration::ZERO)
             .err(),
         Some(Refusal::AuthFailed),
         "another session's token"
@@ -139,7 +151,9 @@ fn a_token_is_single_use_lives_its_expiry_plus_15_s_and_never_crosses() {
 
     registry.end("b");
     assert_eq!(
-        registry.redeem(&hello_for("b", "token-of-b", 1), now).err(),
+        registry
+            .redeem(&hello_for("b", "token-of-b", 1), now, Duration::ZERO)
+            .err(),
         Some(Refusal::SessionEnded)
     );
     assert!(!registry.add_token("b", &token_hash("late"), at(60)));
@@ -699,18 +713,6 @@ impl Agent {
         write_message(&mut send, &hello).await.unwrap();
         let reply = read_message(&mut recv).await.unwrap();
         (session, send, recv, reply)
-    }
-}
-
-thread_local! {
-    /// Run once by `Media::detach` between clearing the client and taking the input lock.
-    static DETACH_GAP: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
-}
-
-/// `Media::detach`'s seam: the moment a test can attach a successor into the gap.
-pub(super) fn detach_gap() {
-    if let Some(run) = DETACH_GAP.with(|g| g.borrow_mut().take()) {
-        run();
     }
 }
 
@@ -1774,42 +1776,6 @@ fn only_the_attached_clients_input_reaches_the_devices() {
 }
 
 #[test]
-fn a_client_attaching_while_its_predecessor_is_still_leaving_starts_from_clean_devices() {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-    use std::sync::atomic::Ordering::SeqCst;
-    let (input, events, released) = recorded();
-    let media = ready_media_with(input);
-    let key =
-        |code: u32, pressed: bool| json!({"t": "k", "code": code, "pressed": pressed}).to_string();
-
-    let a = media.attach(false, Duration::ZERO).unwrap();
-    media.input_event(a.id, &key(30, true), false);
-
-    // B attaches after A's detach cleared the client and before it took the input lock.
-    let b: Rc<RefCell<Option<media::Attached>>> = Rc::default();
-    let (m, slot) = (media.clone(), b.clone());
-    DETACH_GAP.with(|g| {
-        *g.borrow_mut() = Some(Box::new(move || {
-            *slot.borrow_mut() = m.attach(false, Duration::ZERO)
-        }))
-    });
-    media.detach(a.id);
-    let b = b.borrow_mut().take().expect("B attached in the gap");
-    assert_eq!(
-        released.load(SeqCst),
-        1,
-        "A's held key was lifted when B attached"
-    );
-
-    // A's late detach step lifts nothing of B's.
-    media.input_event(b.id, &key(32, true), false);
-    assert_eq!(events.lock().unwrap().len(), 2);
-    media.detach(b.id);
-    assert_eq!(released.load(SeqCst), 2);
-}
-
-#[test]
 fn a_gamepad_slot_beyond_the_api_limit_is_dropped() {
     let (input, events, _) = recorded();
     let media = ready_media_with(input);
@@ -2024,6 +1990,353 @@ async fn the_tap_counts_a_streaming_client_until_it_leaves() {
     while tap.attached() {
         assert!(Instant::now() < deadline, "a client that left still counts");
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn key_input(code: u32) -> Value {
+    json!({"type": "input", "event": {"t": "k", "code": code, "pressed": true}})
+}
+
+/// The video transport ids these tests give the WebRTC side.
+const T1: u64 = 101;
+const T2: u64 = 102;
+
+fn webrtc(agent: &Agent, transport: u64) -> WebRtcSide {
+    WebRtcSide {
+        media: agent.tap.as_ref().unwrap().media().clone(),
+        transport: Some(transport),
+    }
+}
+
+/// What `transport`'s data channel hands the devices, through the session's media client.
+fn webrtc_key(agent: &Agent, transport: u64, code: u32) {
+    let input = agent.input.clone();
+    webrtc(agent, transport).input(move || {
+        input
+            .lock()
+            .unwrap()
+            .push(json!({"t": "k", "code": code, "pressed": true}).to_string())
+    });
+}
+
+fn codes_seen(agent: &Agent) -> Vec<u64> {
+    agent
+        .input
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            serde_json::from_str::<Value>(e).unwrap()["code"]
+                .as_u64()
+                .unwrap()
+        })
+        .collect()
+}
+
+/// A WebTransport client takes the session by `token`, which is added first.
+async fn take_over(agent: &Agent, token: &str) -> (Session, SendStream, RecvStream, Value) {
+    let expires = SystemTime::now() + TOKEN_TTL;
+    assert!(agent
+        .listener
+        .registry()
+        .add_token(SESSION, &token_hash(token), expires));
+    agent.hello(token).await
+}
+
+/// §Takeover, WebRTC takes over WebTransport: the client gets `bye taken_over` and `4410` at
+/// once, what it held is lifted then, once, and nothing it sends after reaches the devices.
+#[tokio::test]
+async fn a_webrtc_peer_takes_over_the_webtransport_client() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let agent = agent().await;
+    let tap = agent.tap.as_ref().unwrap();
+    let (session, mut send, mut recv, _) = agent.hello(TOKEN).await;
+    write_message(&mut send, &key_input(30)).await.unwrap();
+    assert_eq!(input_events(&agent, 1).await.len(), 1);
+
+    assert!(tap.media().webrtc_attached(T1), "a client was attached");
+    assert_eq!(agent.released.load(SeqCst), 1, "lifted at the takeover");
+    assert!(!tap.attached(), "the idle reap no longer counts it");
+    let _ = write_message(&mut send, &key_input(31)).await;
+    webrtc_key(&agent, T2, 33);
+    webrtc_key(&agent, T1, 32);
+    assert_eq!(
+        read_message(&mut recv).await.unwrap(),
+        json!({"type": "bye", "reason": "taken_over"})
+    );
+    assert_eq!(close_code(&session).await, Some(CLOSE_TAKEN_OVER));
+    assert_eq!(
+        codes_seen(&agent),
+        [30, 32],
+        "the old client's late key and another transport's are dropped"
+    );
+    assert_eq!(
+        agent.released.load(SeqCst),
+        1,
+        "its own close lifted nothing of the WebRTC peer's"
+    );
+    assert_eq!(tap.media().take_to_mute(), None, "nothing to stop");
+}
+
+/// §Takeover, WebTransport takes over WebRTC: the peer's key is lifted before the client's
+/// `hello_ack`, the runner is told once which transport to stop, and that peer's late input
+/// and its disconnect reach nothing of the client's.
+#[tokio::test]
+async fn a_webtransport_client_takes_over_the_webrtc_peer() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let agent = agent().await;
+    let media = agent.tap.as_ref().unwrap().media().clone();
+    webrtc_key(&agent, T1, 1);
+    assert!(
+        agent.input.lock().unwrap().is_empty(),
+        "no WebRTC peer accepted yet"
+    );
+    assert!(!media.webrtc_attached(T1), "no client to displace");
+    webrtc_key(&agent, T1, 30);
+    assert_eq!(media.take_to_mute(), None);
+
+    let (session, mut send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+    assert_eq!(agent.released.load(SeqCst), 1, "lifted before the ack");
+    assert_eq!(
+        media.take_to_mute(),
+        Some(T1),
+        "the runner stops that transport"
+    );
+    assert_eq!(media.take_to_mute(), None, "once");
+
+    webrtc_key(&agent, T1, 31);
+    webrtc(&agent, T1).disconnected(true);
+    write_message(&mut send, &key_input(32)).await.unwrap();
+    assert_eq!(input_events(&agent, 2).await.len(), 2);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(codes_seen(&agent), [30, 32]);
+    assert_eq!(
+        agent.released.load(SeqCst),
+        1,
+        "the peer's disconnect lifted the client's key"
+    );
+    assert!(frames(&session, 1, true).await[0].keyframe);
+}
+
+/// #1193: the host missed the WebTransport close on a fallback. The WebRTC attach displaces the
+/// client then, so its control-stream silence 10 s later lifts nothing the WebRTC peer holds.
+#[tokio::test]
+async fn a_key_held_over_webrtc_after_a_fallback_without_a_webtransport_close_stays_held() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let agent = agent().await;
+    let media = agent.tap.as_ref().unwrap().media().clone();
+    // Never closed by the client, and silent from here on.
+    let (session, mut send, _recv, _) = agent.hello(TOKEN).await;
+    write_message(&mut send, &key_input(30)).await.unwrap();
+    assert_eq!(input_events(&agent, 1).await.len(), 1);
+
+    media.webrtc_attached(T1);
+    webrtc_key(&agent, T1, 30);
+    assert_eq!(codes_seen(&agent), [30, 30], "held again over WebRTC");
+    let released = agent.released.load(SeqCst);
+    tokio::time::sleep(CONTROL_IDLE + Duration::from_secs(1)).await;
+    assert_eq!(
+        agent.released.load(SeqCst),
+        released,
+        "a release after the WebRTC press lifted the key the WebRTC peer holds"
+    );
+    assert_eq!(
+        released, 1,
+        "the client's key was lifted once, at the attach"
+    );
+    assert_eq!(close_code(&session).await, Some(CLOSE_TAKEN_OVER));
+}
+
+/// §Authentication and tokens, "Reconnect": a reload's fresh token resumes the same session
+/// with nothing restarted (the same decoder configuration, frame numbers carrying on), from a
+/// keyframe.
+#[tokio::test]
+async fn a_reload_reconnects_with_a_fresh_token_and_resumes_from_a_keyframe() {
+    let agent = agent().await;
+    let tap = agent.tap.as_ref().unwrap();
+    let (first, mut send, _recv, ack) = agent.hello(TOKEN).await;
+    let last = frames(&first, 5, true).await.last().unwrap().frame_seq;
+    write_message(
+        &mut send,
+        &json!({"type": "bye", "reason": "client_closed"}),
+    )
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while tap.attached() {
+        assert!(Instant::now() < deadline, "the reloaded page never left");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let (second, _send, _recv, again) = take_over(&agent, "reload").await;
+    assert_eq!(again, ack, "the same session's configuration");
+    let next = &frames(&second, 1, true).await[0];
+    assert!(next.keyframe, "the reconnected client starts at a keyframe");
+    assert!(
+        next.frame_seq > last,
+        "frame numbers carry on: {} after {last}",
+        next.frame_seq
+    );
+}
+
+/// §Takeover's bound (erratum 28): 6 takeovers of a session in any 60 s, counted across both
+/// transports. A 7th WebTransport `hello` is refused, keeping its token, and the connected
+/// client streams on. A WebRTC answer while a WebTransport client holds is counted and never
+/// refused; a new WebRTC peer displacing the WebRTC holder is refused, on both PCs.
+#[tokio::test]
+async fn a_seventh_takeover_inside_60_s_is_refused_on_either_transport() {
+    let agent = agent().await;
+    let registry = agent.listener.registry();
+    let tap = agent.tap.as_ref().unwrap();
+    let media = tap.media();
+    // Nobody to displace: no takeover.
+    let mut clients = vec![agent.hello(TOKEN).await];
+    for n in 0..6u64 {
+        if n % 2 == 0 {
+            assert!(media.webrtc_attached(T1 + n), "takeover {n} is WebRTC's");
+            continue;
+        }
+        let client = take_over(&agent, &format!("takeover-{n}")).await;
+        assert_eq!(
+            client.3["type"], "hello_ack",
+            "takeover {n} is WebTransport's"
+        );
+        clients.push(client);
+    }
+
+    let (refused, _send, _recv, reply) = take_over(&agent, "seventh").await;
+    assert_eq!(reply["code"], "takeover_rate_limited", "{reply}");
+    assert_eq!(close_code(&refused).await, Some(CLOSE_NORMAL));
+    assert!(
+        registry.lock()[SESSION]
+            .tokens
+            .iter()
+            .any(|t| t.hash == token_hash("seventh")),
+        "a refused hello keeps its token"
+    );
+    let streaming = &clients.last().unwrap().0;
+    frames(streaming, 1, false).await;
+    assert!(tap.attached(), "the connected client keeps streaming");
+
+    assert!(media.webrtc_attached(T2 + 10), "over the bound, and let in");
+    let mut asked = false;
+    assert!(
+        !media.webrtc_replace(T2 + 10, || {
+            asked = true;
+            true
+        }),
+        "a new peer displacing the WebRTC holder is refused"
+    );
+    assert!(!asked, "the PC's own budget was not spent");
+    assert!(media.webrtc_refuses(T2 + 10), "and on its audio PC");
+}
+
+/// Seat B F1: a page that streamed over WebRTC, then over WebTransport through six reloads
+/// that each displaced the last tab, falls back to WebRTC. Its answer on the old transport is a
+/// new peer's, and it displaces a WebTransport client, not the WebRTC holder: let in, given a
+/// transport of its own, and counted.
+#[tokio::test]
+async fn a_fallback_after_six_reloads_is_not_refused() {
+    let agent = agent().await;
+    let media = agent.tap.as_ref().unwrap().media().clone();
+    assert!(
+        !media.webrtc_attached(T1),
+        "the page first streams over WebRTC"
+    );
+    let mut clients = Vec::new();
+    for n in 0..6 {
+        let client = take_over(&agent, &format!("reload-{n}")).await;
+        assert_eq!(client.3["type"], "hello_ack");
+        clients.push(client);
+    }
+    let mut asked = false;
+    assert!(
+        media.webrtc_replace(T1, || {
+            asked = true;
+            true
+        }),
+        "the falling-back page gets a transport"
+    );
+    assert!(asked, "only the PC's own budget decides");
+    assert!(
+        media.webrtc_attached(T2),
+        "its answer displaces the WebTransport client"
+    );
+    webrtc_key(&agent, T2, 30);
+    assert_eq!(
+        codes_seen(&agent),
+        [30],
+        "the falling-back page holds the session"
+    );
+}
+
+/// Seat B F3: a WebRTC peer whose PC failed or closed holds nothing. A WebTransport client
+/// after it displaces nobody: it is not counted, so not refused, and no transport is stopped.
+#[tokio::test]
+async fn a_webtransport_hello_after_the_webrtc_tab_closed_is_not_counted() {
+    let agent = agent().await;
+    let media = agent.tap.as_ref().unwrap().media().clone();
+    let mut clients = vec![agent.hello(TOKEN).await];
+    for n in 0..5 {
+        clients.push(take_over(&agent, &format!("reload-{n}")).await);
+    }
+    assert!(media.webrtc_attached(T1), "the 6th takeover");
+    webrtc(&agent, T1).disconnected(false);
+    assert_eq!(
+        media.holder(),
+        media::Holder::WebRtc(T1),
+        "a transient disconnect keeps it"
+    );
+    webrtc(&agent, T1).disconnected(true);
+
+    let (_session, _send, _recv, reply) = take_over(&agent, "after-the-tab").await;
+    assert_eq!(reply["type"], "hello_ack", "{reply}");
+    assert_eq!(media.take_to_mute(), None, "nobody to stop or tell");
+}
+
+/// Two takeovers at once, a WebTransport `hello` and a WebRTC first answer, end with one
+/// holder, and exactly one client is displaced: the one that lost.
+#[test]
+fn a_hello_racing_a_webrtc_first_answer_leaves_one_holder_and_one_displaced() {
+    for _ in 0..500 {
+        let media = ready_media();
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let wt = {
+            let (media, start) = (media.clone(), start.clone());
+            std::thread::spawn(move || {
+                start.wait();
+                media.attach(false, Duration::ZERO).unwrap()
+            })
+        };
+        let rtc = {
+            let (media, start) = (media.clone(), start.clone());
+            std::thread::spawn(move || {
+                start.wait();
+                media.webrtc_attached(T1)
+            })
+        };
+        let wt = wt.join().unwrap();
+        let displaced_wt = rtc.join().unwrap();
+        let displaced_rtc = media.take_to_mute() == Some(T1);
+        assert_eq!(
+            displaced_wt,
+            wt.gone.get().is_some(),
+            "what the WebRTC attach reports is what happened to the client"
+        );
+        assert!(
+            displaced_wt ^ displaced_rtc,
+            "exactly one is displaced: client {displaced_wt}, peer {displaced_rtc}"
+        );
+        let holder = media.holder();
+        assert_eq!(
+            holder,
+            if displaced_wt {
+                media::Holder::WebRtc(T1)
+            } else {
+                media::Holder::Wt(wt.id)
+            }
+        );
     }
 }
 
@@ -2321,7 +2634,11 @@ fn two_hellos_racing_one_token_redeem_it_once() {
                 std::thread::spawn(move || {
                     start.wait();
                     registry
-                        .redeem(&hello_for(SESSION, TOKEN, 1), SystemTime::now())
+                        .redeem(
+                            &hello_for(SESSION, TOKEN, 1),
+                            SystemTime::now(),
+                            Duration::ZERO,
+                        )
                         .is_ok()
                 })
             })
@@ -3203,6 +3520,40 @@ async fn a_pyrowave_client_gets_frames_that_rejoin_byte_for_byte_and_can_fall_ba
         "a keyframe first"
     );
     assert_eq!(nal_types(&first.data).last(), Some(&5));
+}
+
+/// A session id assigned again while its tap runs gets a fresh registry entry, which no longer
+/// names that tap's media: the tap still ends its own when it drops, so the client on it is
+/// told the session ended.
+#[test]
+fn a_tap_dropped_after_its_session_was_assigned_again_ends_its_own_media() {
+    gst::init().unwrap();
+    let registry = Arc::new(Registry::default());
+    let assign = || registry.assign(SESSION, &token_hash(TOKEN), SystemTime::now() + TOKEN_TTL);
+    assign();
+    let pipeline = synthetic(Stream::Av1);
+    let tap = Tap::attach(
+        &registry,
+        &pipeline
+            .by_name("parse")
+            .unwrap()
+            .static_pad("src")
+            .unwrap(),
+        &pipeline.by_name("enc").unwrap(),
+        SESSION,
+        None,
+        no_input(),
+        audio::Plan::default(),
+        None,
+        None,
+    )
+    .unwrap();
+    tap.media().on_caps(&streams::av1_caps(640), SESSION);
+    let client = tap.media().attach(false, Duration::ZERO).unwrap();
+
+    assign();
+    drop(tap);
+    assert_eq!(client.gone.get(), Some(&Gone::SessionEnded));
 }
 
 /// #1228: a session stop releases the tap's PyroWave encoder before the source goes (it shares
