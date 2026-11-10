@@ -74,8 +74,13 @@ const RULES = [
   ["a link", (d) => fs.symlinkSync("/nonexistent/x.json", path.join(d, SC, "x.json")), /x.json: is not a regular file/],
   // Opening a named pipe waits for ever: it must be refused before anything is read.
   ["a named pipe where a file is read", (d) => { fs.rmSync(path.join(d, SC, "metrics.jsonl")); execFileSync("mkfifo", [path.join(d, SC, "metrics.jsonl")]); }, /metrics.jsonl: is not a regular file/],
-  ["a token in a UTF-16 log", (d) => fs.writeFileSync(path.join(d, SC, "agent.log"), Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from("Authorization: Bearer abcdefgh12345678\n", "utf16le")])), /agent.log: holds a bearer token/],
+  // One case per byte-order mark: the file is refused, whatever it holds.
+  ...[["UTF-16LE", [0xff, 0xfe], "utf16le"], ["UTF-16BE", [0xfe, 0xff], "utf16le"], ["UTF-32LE", [0xff, 0xfe, 0, 0], "utf16le"], ["UTF-32BE", [0, 0, 0xfe, 0xff], "utf16le"]].map(([name, bom, enc]) => [
+    `a ${name} log`, (d) => fs.writeFileSync(path.join(d, SC, "agent.log"), Buffer.concat([Buffer.from(bom), Buffer.from("Authorization: Bearer abcdefgh12345678\n", enc)])), /agent.log: is UTF-16 or UTF-32/,
+  ]),
   ["a token in a file with no extension", (d) => fs.writeFileSync(path.join(d, SC, "agent-stdout"), "Authorization: Bearer abcdefgh12345678\n"), /agent-stdout: holds a bearer token/],
+  ["a password that only starts like 'none'", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "password: none-of-your-business1\n"), /x.log: holds a credential/],
+  ["a password that only starts like 'null'", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "password: nullify\n"), /x.log: holds a credential/],
   ["a password in a log", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "login password=hunter2\n"), /x.log: holds a credential/],
   ["no timeline for a scenario that ran", (d) => fs.rmSync(path.join(d, SC, "timeline.jsonl")), /timeline.jsonl: missing/],
   ["a client of no known kind", (d) => edit(d, "client.json", (c) => ({ ...c, kind: "tv" })), /kind must be web or native/],
