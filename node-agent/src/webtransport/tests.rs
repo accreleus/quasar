@@ -1945,6 +1945,52 @@ async fn the_newest_client_takes_over_and_an_ended_session_says_so() {
     assert_eq!(close_code(&late).await, Some(CLOSE_ENDED));
 }
 
+/// The agent's half of the WebTransport → WebRTC fallback (control-api.md §Transport fallback,
+/// "Close first"): the client that falls back says `bye` while it holds a key. The agent closes
+/// normally, lifts what it held, counts no client, and the session is still there for the
+/// WebRTC peer that follows (and for a later WebTransport client with a fresh token).
+#[tokio::test]
+async fn a_client_that_falls_back_leaves_no_client_no_held_key_and_a_live_session() {
+    let agent = agent().await;
+    let tap = agent.tap.as_ref().unwrap();
+    let (session, mut send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+    frames(&session, 1, true).await;
+    session
+        .send_datagram(Bytes::from_static(
+            b"\x03{\"t\":\"k\",\"code\":17,\"pressed\":true}",
+        ))
+        .unwrap();
+    assert_eq!(input_events(&agent, 1).await.len(), 1, "the key is held");
+    assert_eq!(agent.released.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    write_message(
+        &mut send,
+        &json!({"type": "bye", "reason": "client_closed"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(close_code(&session).await, Some(CLOSE_NORMAL));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while tap.attached() || agent.released.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the client that fell back still counts, or its key is still held"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Not ended: a fresh token for the same session still gets a `hello_ack` and frames.
+    assert!(agent.listener.registry().add_token(
+        SESSION,
+        &token_hash("after-fallback"),
+        SystemTime::now() + TOKEN_TTL
+    ));
+    let (again, _send, _recv, ack) = agent.hello("after-fallback").await;
+    assert_eq!(ack["type"], "hello_ack");
+    assert!(frames(&again, 1, true).await[0].keyframe);
+}
+
 /// What the session's idle reap reads (#1179): a client counts from its `hello_ack` while it
 /// streams, across a takeover, and stops counting once it leaves.
 #[tokio::test]
