@@ -59,13 +59,7 @@ fn ready_media() -> Arc<Media> {
 fn ready_media_with(input: Input) -> Arc<Media> {
     gst::init().unwrap();
     let encoder = gst::ElementFactory::make("identity").build().unwrap();
-    let media = Media::new(
-        &encoder,
-        input,
-        Audio::new(audio::Plan::default()),
-        None,
-        None,
-    );
+    let media = Media::new(&encoder, input, Audio::new(audio::Plan::default()), None);
     let caps = gst::Caps::builder("video/x-h264")
         .field("stream-format", "avc")
         .field("width", 64)
@@ -621,7 +615,6 @@ async fn agent_built(
         &parse.static_pad("src").unwrap(),
         &encoder,
         SESSION,
-        None,
         input,
         plan,
         None,
@@ -4056,7 +4049,6 @@ fn a_tap_dropped_after_its_session_was_assigned_again_ends_its_own_media() {
             .unwrap(),
         &pipeline.by_name("enc").unwrap(),
         SESSION,
-        None,
         no_input(),
         audio::Plan::default(),
         None,
@@ -4090,7 +4082,6 @@ fn releasing_the_tap_stops_its_pyrowave_encoder_and_keeps_the_tap() {
             .unwrap(),
         &pipeline.by_name("enc").unwrap(),
         SESSION,
-        None,
         no_input(),
         audio::Plan::default(),
         None,

@@ -116,6 +116,8 @@ struct State {
     /// client never sees two configurations under one `config_id` across a codec switch.
     next_id: u8,
     pyro: Option<Pyro>,
+    /// `codec.switched` payloads the runner has yet to report.
+    switches: Vec<serde_json::Value>,
     client: Option<Client>,
     next_client: u64,
     /// Skip delta units until a keyframe: a client joined, its queue overflowed, or the
@@ -231,8 +233,6 @@ pub(crate) struct Media {
     /// being the holder cannot slip an event in behind the release that ended it.
     hold: Mutex<Hold>,
     encoder: glib::WeakRef<gst::Element>,
-    /// Where `codec.switched` goes, and the session it names.
-    trace: Option<(crate::session::pipeline::TraceTx, String)>,
     rate: Option<super::Rate>,
 }
 
@@ -301,7 +301,6 @@ impl Media {
         encoder: &gst::Element,
         input: super::Input,
         audio: Arc<Audio>,
-        trace: Option<(crate::session::pipeline::TraceTx, String)>,
         rate: Option<super::Rate>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -310,7 +309,6 @@ impl Media {
             input,
             hold: Mutex::default(),
             encoder: encoder.downgrade(),
-            trace,
             rate,
         })
     }
@@ -392,35 +390,34 @@ impl Media {
         });
     }
 
-    /// `codec.switched` (agent-api.md, amendment 55).
+    /// `codec.switched` (agent-api.md, amendment 55), queued for [`Self::take_switched`].
     fn switched(
         &self,
         from: Option<&str>,
         to: &str,
         reason: &str,
-        config_id: u8,
+        config_id: Option<u8>,
         kbps: Option<u32>,
     ) {
         tracing::info!(
             token = "webtransport-codec-switched",
-            "WebTransport codec {} -> {to} (reason {reason}, config {config_id})",
+            "codec {} -> {to} (reason {reason}, config {config_id:?})",
             from.unwrap_or("none")
         );
-        if let Some((tx, session_id)) = &self.trace {
-            tx.try_emit(
-                session_id.clone(),
-                crate::session::runner::TraceEvent {
-                    ts_unix_ms: SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_millis() as i64),
-                    event: "codec.switched",
-                    payload: serde_json::json!({
-                        "from": from, "to": to, "reason": reason,
-                        "config_id": config_id, "target_kbps": kbps,
-                    }),
-                },
-            );
+        self.lock().switches.push(serde_json::json!({
+            "from": from, "to": to, "reason": reason,
+            "config_id": config_id, "target_kbps": kbps,
+        }));
+    }
+
+    /// The switches since the last call, for the runner's reliable lane, in order. None
+    /// before the session reported `running`: the control plane drops a trace event for a
+    /// session that is not (agent-api.md §session_trace_event), and a `hello` can come first.
+    pub(crate) fn take_switched(&self, running: bool) -> Vec<serde_json::Value> {
+        if !running {
+            return Vec::new();
         }
+        std::mem::take(&mut self.lock().switches)
     }
 
     /// A PyroWave client is attached: the encode branch has work.
@@ -526,7 +523,7 @@ impl Media {
         let audio = self.audio.attach(id);
         if let Some(reason) = reason {
             let kbps = (config.codec == "pyrowave").then_some(kbps).flatten();
-            self.switched(None, config.codec, reason, config.config_id, kbps);
+            self.switched(None, config.codec, reason, Some(config.config_id), kbps);
         }
         match hold.holder {
             Holder::None => {}
@@ -663,7 +660,7 @@ impl Media {
             Some("pyrowave"),
             config.codec,
             reason,
-            config.config_id,
+            Some(config.config_id),
             None,
         );
         self.keyframe();
@@ -1215,7 +1212,6 @@ mod tests {
             input: crate::webtransport::tests::no_input(),
             hold: Mutex::default(),
             encoder: glib::WeakRef::new(),
-            trace: None,
             rate: None,
         });
         media.on_caps(&caps(1280, &avcc), "s");
@@ -1288,7 +1284,6 @@ mod tests {
                 &encoder,
                 crate::webtransport::tests::no_input(),
                 Audio::new(audio::Plan::default()),
-                None,
                 None,
             ),
             encoder,
@@ -1608,7 +1603,6 @@ mod tests {
             input: crate::webtransport::tests::no_input(),
             hold: Mutex::default(),
             encoder: glib::WeakRef::new(),
-            trace: None,
             rate: None,
         });
         media.on_caps(&streams::hevc_caps(640), "s");
@@ -1647,7 +1641,6 @@ mod tests {
             &parse,
             crate::webtransport::tests::no_input(),
             Audio::new(audio::Plan::default()),
-            None,
             None,
         );
         tap(&parse.static_pad("src").unwrap(), &media, "s");
@@ -1769,7 +1762,6 @@ mod tests {
             input: crate::webtransport::tests::no_input(),
             hold: Mutex::default(),
             encoder: glib::WeakRef::new(),
-            trace: None,
             rate: None,
         })
     }
@@ -1903,6 +1895,24 @@ mod tests {
             ["unit 1 pyrowave key"],
             "no standard unit or configuration reaches a PyroWave client"
         );
+    }
+
+    /// #1299: the client's `hello` comes while the session is `starting` (it retries from
+    /// the launch on), ahead of the runner's `running` report.
+    #[test]
+    fn a_switch_at_a_hello_before_running_is_reported_once_the_session_runs() {
+        let (media, _encoder, _) = granted();
+        let _client = media.attach(true, LAN).unwrap();
+        assert!(media.take_switched(false).is_empty(), "not before running");
+        let switched = media.take_switched(true);
+        assert_eq!(
+            switched,
+            [serde_json::json!({
+                "from": null, "to": "pyrowave", "reason": "launch",
+                "config_id": 1, "target_kbps": GRANT.target_kbps,
+            })]
+        );
+        assert!(media.take_switched(true).is_empty(), "reported once");
     }
 
     #[test]

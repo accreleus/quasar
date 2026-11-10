@@ -1559,7 +1559,6 @@ impl pipeline::Transport for SessionTransports {
                     &session.video,
                     &session.encoder,
                     &session.session_id,
-                    Some(session.trace_tx.clone()),
                     crate::webtransport::Input::devices(
                         session.devices.clone(),
                         session.input_state.clone(),
@@ -3470,6 +3469,16 @@ pub fn run_blocking(
                 });
             }
             emit(SessionEvent::Signaling(msg));
+        }
+
+        // After the offer above, so a `hello` that beat it is reported behind `running`.
+        if let Some(tap) = &transports.webtransport {
+            for payload in tap.media().take_switched(running) {
+                emit(SessionEvent::Trace {
+                    event: "codec.switched",
+                    payload,
+                });
+            }
         }
 
         // Apply-only: the agent loop already validated the numbers. See

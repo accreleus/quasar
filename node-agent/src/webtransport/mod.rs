@@ -490,7 +490,6 @@ impl Tap {
         video: &gst::Pad,
         encoder: &gst::Element,
         session_id: &str,
-        trace: Option<crate::session::pipeline::TraceTx>,
         input: Input,
         audio: audio::Plan,
         pyrowave: Option<(
@@ -500,13 +499,7 @@ impl Tap {
         )>,
         rate: Option<Rate>,
     ) -> Option<Self> {
-        let media = Media::new(
-            encoder,
-            input,
-            Audio::new(audio),
-            trace.map(|tx| (tx, session_id.to_string())),
-            rate,
-        );
+        let media = Media::new(encoder, input, Audio::new(audio), rate);
         if !registry.set_media(session_id, media.clone()) {
             return None;
         }
