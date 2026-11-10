@@ -943,6 +943,13 @@ impl Drop for WtRegistry {
 /// A host whose session was assigned WebTransport (amendment 54), and its media client,
 /// ready for a WebTransport `hello`.
 fn start_webtransport(tag: &str) -> (Host, Arc<crate::webtransport::Media>, WtRegistry) {
+    start_webtransport_cfg(tag, host_cfg(false))
+}
+
+fn start_webtransport_cfg(
+    tag: &str,
+    mut cfg: SessionConfig,
+) -> (Host, Arc<crate::webtransport::Media>, WtRegistry) {
     let registry = Arc::new(crate::webtransport::Registry::default());
     registry.assign(
         &format!("takeover-{tag}"),
@@ -951,7 +958,6 @@ fn start_webtransport(tag: &str) -> (Host, Arc<crate::webtransport::Media>, WtRe
     );
     *crate::webtransport::TEST_REGISTRY.lock().unwrap() = Some(registry);
     let guard = WtRegistry;
-    let mut cfg = host_cfg(false);
     cfg.webtransport = true;
     let host = Host::start_cfg(tag, cfg);
     let media = host
@@ -1061,6 +1067,55 @@ fn a_new_peer_answering_after_a_webtransport_takeover_gets_media() {
     );
     assert!(!stopped, "nothing current was stopped");
     assert!(host.errors.is_empty(), "{:?}", host.errors);
+}
+
+/// #1040: a new WebRTC peer's answer replaces the video transport under a streaming
+/// WebTransport client, which puts the encoder back at launch with no ABR owner, and that
+/// peer never connects. The client still holds the session: its next estimates drive the
+/// encoder again.
+#[test]
+fn a_webtransport_client_keeps_its_abr_through_an_abandoned_webrtc_takeover() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut cfg = host_cfg(false);
+    cfg.abr_governor.min_interval_ms = 1;
+    let (mut host, media, _wt) = start_webtransport_cfg("orphan", cfg);
+    let _a = first_attach(&mut host);
+    let wt = media
+        .attach(false, Duration::ZERO)
+        .expect("the WebTransport hello is accepted");
+    host.transports.take_from_webrtc(&host.sig_tx);
+    let launch = host.cfg.stream.bitrate_kbps;
+    let bitrate = |host: &Host| host.encoder.property::<u32>("bitrate") / 1000;
+    // As `webtransport::Control` feeds it: one start per client, then its estimates.
+    let rate = media.rate().expect("the session's ABR is armed");
+    let congested = || {
+        (rate.observe)(f64::from(launch) / 4.0);
+        std::thread::sleep(Duration::from_millis(5));
+        (rate.observe)(f64::from(launch) / 4.0);
+    };
+    (rate.start)();
+    congested();
+    assert!(
+        bitrate(&host) < launch,
+        "the client's estimate never moved the encoder"
+    );
+
+    abandon_a_takeover(&mut host);
+    assert!(
+        wt.gone.get().is_none() && media.attached(),
+        "the client still holds the session"
+    );
+    assert_eq!(bitrate(&host), launch, "the replacement starts at launch");
+
+    congested();
+    assert!(
+        bitrate(&host) < launch,
+        "the abandoned takeover left the client with no ABR"
+    );
+    assert_eq!(host.bus_errors, Vec::<String>::new());
 }
 
 /// #1193 through the runner's dispatch: the page fell back to WebRTC while the host still held

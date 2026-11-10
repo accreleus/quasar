@@ -1,6 +1,6 @@
 // MediaTransport over WebTransport: protocol/transport-webtransport.md, wt_proto 1,
-// video, input, ping/pong, NACK, audio and the microphone, with PyroWave (codec-pyrowave.md) for a
-// client that offers it. Feedback is a later ticket (#1040).
+// video, input, ping/pong, NACK, receiver feedback, audio and the microphone, with PyroWave
+// (codec-pyrowave.md) for a client that offers it.
 
 import {
   base64Bytes,
@@ -16,6 +16,7 @@ import {
 import { blockLayout } from "../pyrowave/bitstream";
 import { PyroWaveReceiver } from "../pyrowave/receiver";
 import type { WebTransportCoords } from "../api/types";
+import { FEEDBACK_MS, FeedbackRecorder } from "./feedback";
 import type { InputWire } from "./inputSender";
 import { workerTicker, type Ticker } from "./pingTicker";
 import { FrameAssembler, type Reassembled } from "./reassembly";
@@ -165,7 +166,7 @@ export class WebTransportMedia implements MediaTransport {
   private wt: WebTransport | null = null;
   private writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
   private datagramWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
-  private stopTicker: (() => void) | null = null;
+  private stopTickers: (() => void)[] = [];
   private pingId = 0;
   /** The sink of the current connect, for what is reported outside a read loop. */
   private sink: MediaSink | null = null;
@@ -299,9 +300,9 @@ export class WebTransportMedia implements MediaTransport {
     return true;
   }
 
+  /** Stops the ping and feedback tickers. */
   private stopPings(): void {
-    this.stopTicker?.();
-    this.stopTicker = null;
+    for (const stop of this.stopTickers.splice(0)) stop();
   }
 
   private send(message: object): void {
@@ -397,7 +398,8 @@ export class WebTransportMedia implements MediaTransport {
     // Datagrams can overtake the hello_ack; the decode stage holds units by config_id, the
     // router PyroWave fragments.
     const router = this.makeRouter(sink, live);
-    void this.readDatagrams(wt, sink, router, live).catch((err: unknown) => {
+    const feedback = new FeedbackRecorder(this.now());
+    void this.readDatagrams(wt, sink, router, live, feedback).catch((err: unknown) => {
       // No more video would arrive on this connection: end it, as a malformed control stream does.
       if (live.on) wt.close({ closeCode: 4400, reason: err instanceof Error ? err.message.slice(0, 100) : "" });
     });
@@ -438,7 +440,14 @@ export class WebTransportMedia implements MediaTransport {
     router.config(config);
     const ping = () => this.send({ type: "ping", id: ++this.pingId, tc: this.now() });
     ping();
-    this.stopTicker = (this.opts.ticker ?? workerTicker)(PING_MS, ping);
+    const ticker = this.opts.ticker ?? workerTicker;
+    // On the Worker clock too: the agent reads feedback that stops while it sends media as
+    // congestion, so a hidden tab must keep reporting.
+    const report = () => {
+      const message = live.on ? feedback.take(this.now()) : null;
+      if (message) this.send(message);
+    };
+    this.stopTickers.push(ticker(PING_MS, ping), ticker(FEEDBACK_MS, report));
     void (async () => {
       try {
         for (let m = await next(); m && live.on; m = await next()) {
@@ -475,7 +484,13 @@ export class WebTransportMedia implements MediaTransport {
     return { kind: "ack" };
   }
 
-  private async readDatagrams(wt: WebTransport, sink: MediaSink, router: Router, live: { on: boolean }): Promise<void> {
+  private async readDatagrams(
+    wt: WebTransport,
+    sink: MediaSink,
+    router: Router,
+    live: { on: boolean },
+    feedback: FeedbackRecorder,
+  ): Promise<void> {
     const reader = wt.datagrams.readable.getReader();
     for (;;) {
       const { value, done } = await reader.read();
@@ -483,6 +498,7 @@ export class WebTransportMedia implements MediaTransport {
         router.stop();
         return;
       }
+      feedback.record(value as Uint8Array, this.now());
       if ((value as Uint8Array)[0] === CHANNEL_AUDIO) {
         const packet = parseAudioDatagram(value as Uint8Array);
         if (packet) sink.audio?.(packet);
