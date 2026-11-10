@@ -13,7 +13,7 @@ import {
   codecString,
   hevcCodecString,
 } from "./decodeStage";
-import { containRect, createWebGpuPresenter } from "./presenter";
+import { containRect, createWebGpuPresenter, presentGeometry } from "./presenter";
 import { avcC, bytes, FakeChunk, FakeDecoder, fakeFrame, flush, packetize, type FakeFrame, type UnitSpec } from "./testSupport";
 
 beforeEach(() => {
@@ -204,10 +204,12 @@ describe("FrameAssembler", () => {
     const two = unitOf(2, false, 3000); // three fragments; the middle one is lost
     a.push(two[0]);
     expect(a.push(two[2])).toEqual({ ...NONE, nacks: [{ frameSeq: 2, frags: [[1, 1]] }] });
+    expect(a.lost).toBe(1);
     expect(a.push(unitOf(3, false)[0])).toEqual(NONE); // whole, but after the hole; asked once already
     t = 20;
     expect(seqs(a.push({ ...two[1], retransmit: true }))).toEqual([2, 3]);
     expect(a.rttMs).toBe(20);
+    expect(a.lost).toBe(1); // counted once, when first found missing
   });
 
   it("NACKs fragment 0 of a frame lost whole, then the rest once its count is known", () => {
@@ -523,6 +525,38 @@ describe("DecodeStage", () => {
     expect(av1.decoders[0].chunks).toHaveLength(1);
   });
 
+  it("gives the decoder the signalled colour space (BT.601 or BT.709), and none when hello_ack has none", async () => {
+    const bt601 = { primaries: "smpte170m", transfer: "smpte170m", matrix: "smpte170m", fullRange: false } as const;
+    const a = stage();
+    a.s.config({ ...config(0), colorSpace: bt601 });
+    await flush();
+    expect(a.decoders[0].configs[0].colorSpace).toEqual(bt601);
+
+    const b = stage();
+    b.s.config(config(0));
+    await flush();
+    // Absent: the decoder reads what the bitstream signals.
+    expect("colorSpace" in b.decoders[0].configs[0]).toBe(false);
+  });
+
+  it("reconfigures the same decoder for a stream-resolution change and carries on at its keyframe (#1034)", async () => {
+    const { s, decoders, keyframes, fatal } = stage();
+    s.config(config(0));
+    await flush();
+    s.unit(unit(0, 1, true));
+    // An ABR rung or the stream-size lever: a new config_id with a new size.
+    s.config({ ...config(1), width: 1920, height: 1080 });
+    await flush();
+    s.unit(unit(1, 2, false)); // a delta of the new stream ahead of its keyframe is no use
+    s.unit(unit(1, 3, true));
+    s.unit(unit(1, 4, false));
+    expect(decoders).toHaveLength(1);
+    expect(decoders[0].configs.map((c) => [c.codedWidth, c.codedHeight])).toEqual([[1280, 720], [1920, 1080]]);
+    expect(decoders[0].chunks.map((c) => c.type)).toEqual(["key", "key", "delta"]);
+    expect(fatal).toEqual([]);
+    expect(keyframes.length).toBeLessThanOrEqual(1);
+  });
+
   it("drops a delta before the first keyframe and asks for one, once", async () => {
     const { s, decoders, keyframes } = stage();
     s.config(config(0));
@@ -571,6 +605,13 @@ describe("DecodeStage", () => {
     for (let i = 0; i < 5; i++) s.unit(unit(0, i, i === 0));
     expect(fatal).toEqual(["decoder_unsupported"]);
     expect(keyframes).toEqual([]);
+  });
+
+  it("reports a configuration whose description cannot be read as unsupported", async () => {
+    const { s, fatal } = stage();
+    s.config({ ...config(0, new Uint8Array(3)), codec: "h265" });
+    await flush();
+    expect(fatal).toEqual(["decoder_unsupported"]);
   });
 
   it("does not skip after a short burst of decoder backlog", async () => {
@@ -673,21 +714,29 @@ describe("createWebGpuPresenter", () => {
     const calls: string[] = [];
     let lose!: (info: { reason: string; message: string }) => void;
     const listeners: Record<string, (e: unknown) => void> = {};
-    const pass = { setPipeline() {}, setBindGroup() {}, setViewport() {}, draw() {}, end() {} };
+    const viewports: number[][] = [];
+    const crops: number[][] = [];
+    const samplers: string[] = [];
+    const pass = { setPipeline() {}, setBindGroup() {}, setViewport: (...v: number[]) => void viewports.push(v.slice(0, 4)), draw() {}, end() {} };
     const device = {
       lost: new Promise((r) => (lose = r)),
       addEventListener: (type: string, fn: (e: unknown) => void) => void (listeners[type] = fn),
-      queue: { submit: () => calls.push("submit"), copyExternalImageToTexture: () => calls.push("copy") },
+      queue: {
+        submit: () => calls.push("submit"),
+        copyExternalImageToTexture: () => calls.push("copy"),
+        writeBuffer: (_b: unknown, _o: number, d: Float32Array) => void crops.push([...d]),
+      },
+      createBuffer: () => ({}),
       createShaderModule: () => ({}),
       createRenderPipeline: () => ({ getBindGroupLayout: () => ({}) }),
-      createSampler: () => ({}),
+      createSampler: (d: { magFilter: string }) => d.magFilter,
       importExternalTexture: () => {
         calls.push("import");
         if (importFails) throw new Error("Failed to import texture from video");
         return {};
       },
       createTexture: (d: { size: number[] }) => ({ width: d.size[0], height: d.size[1], createView: () => ({}), destroy() {} }),
-      createBindGroup: () => ({}),
+      createBindGroup: (d: { entries: { resource: unknown }[] }) => void samplers.push(d.entries[0].resource as string),
       createCommandEncoder: () => ({ beginRenderPass: () => pass, finish: () => ({}) }),
       destroy() {},
     };
@@ -695,14 +744,16 @@ describe("createWebGpuPresenter", () => {
       gpu: { requestAdapter: async () => ({ requestDevice: async () => device }), getPreferredCanvasFormat: () => "bgra8unorm" },
     });
     vi.stubGlobal("GPUTextureUsage", { TEXTURE_BINDING: 4, COPY_DST: 2, RENDER_ATTACHMENT: 16 });
+    vi.stubGlobal("GPUBufferUsage", { UNIFORM: 64, COPY_DST: 8 });
     vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
     vi.spyOn(console, "warn").mockImplementation(() => {});
     const canvas = {
       width: 1600,
       height: 1000,
+      dataset: {} as Record<string, string>,
       getContext: () => ({ configure() {}, getCurrentTexture: () => ({ createView: () => ({}) }) }),
     } as unknown as HTMLCanvasElement;
-    return { calls, canvas, lose, uncaptured: (message: string) => listeners.uncapturederror({ error: { message } }) };
+    return { calls, canvas, lose, viewports, crops, samplers, uncaptured: (message: string) => listeners.uncapturederror({ error: { message } }) };
   }
 
   it("falls back to copying each frame once an import fails, and closes every frame", async () => {
@@ -737,6 +788,50 @@ describe("createWebGpuPresenter", () => {
     g.uncaptured("validation failed");
     expect(p.present(fakeFrame() as unknown as VideoFrame)).toBe(false);
     expect(fatal).toEqual(["WebGPU error: validation failed"]);
+  });
+
+  describe("the presenter's scaling modes (#1034)", () => {
+    // A 16:9 frame in a 16:10 canvas, the fake's 1600x1000.
+    const draw = async (mode?: string) => {
+      const g = fakeGpu(false);
+      if (mode) g.canvas.dataset.scalingMode = mode;
+      const p = (await createWebGpuPresenter(g.canvas, () => {}))!;
+      expect(p.present(fakeFrame() as unknown as VideoFrame)).toBe(true);
+      return { viewport: g.viewports[0], crop: g.crops[0], sampler: g.samplers[0] };
+    };
+
+    it("contain letterboxes the whole frame, and is the default", async () => {
+      const want = { viewport: [0, 50, 1600, 900], crop: [1, 1, 0, 0], sampler: "linear" };
+      expect(await draw("contain")).toEqual(want);
+      expect(await draw()).toEqual(want);
+    });
+
+    it("cover fills the canvas and crops the frame's sides evenly", async () => {
+      const d = await draw("cover");
+      expect(d.viewport).toEqual([0, 0, 1600, 1000]);
+      expect(d.crop.map((v) => +v.toFixed(4))).toEqual([0.9, 1, 0.05, 0]);
+    });
+
+    it("stretch fills the canvas with the whole frame", async () => {
+      expect(await draw("stretch")).toEqual({ viewport: [0, 0, 1600, 1000], crop: [1, 1, 0, 0], sampler: "linear" });
+    });
+
+    it("integer is contain with nearest sampling, as the <video> draws it", async () => {
+      expect(await draw("integer")).toEqual({ viewport: [0, 50, 1600, 900], crop: [1, 1, 0, 0], sampler: "nearest" });
+    });
+
+    it("follows a mode change between two frames", async () => {
+      const g = fakeGpu(false);
+      const p = (await createWebGpuPresenter(g.canvas, () => {}))!;
+      p.present(fakeFrame() as unknown as VideoFrame);
+      g.canvas.dataset.scalingMode = "stretch";
+      p.present(fakeFrame() as unknown as VideoFrame);
+      expect(g.viewports).toEqual([[0, 50, 1600, 900], [0, 0, 1600, 1000]]);
+    });
+
+    it("crops top and bottom when the frame is taller than the canvas", () => {
+      expect(presentGeometry("cover", 1000, 500, 1000, 1000).crop).toEqual([1, 0.5, 0, 0.25]);
+    });
   });
 });
 

@@ -32,11 +32,21 @@ function withBound(p: Promise<void>): Promise<void> {
 
 let inFlight: Promise<void> | null = null;
 
-/** Posts the probe unless this browser's last post is current. One post at a time; rejects when it fails. */
-export function ensureDeviceProbe(token: string, userId: string): Promise<void> {
+/**
+ * Posts the probe unless this browser's last post is current. One post at a time; rejects when it fails.
+ *
+ * `force` posts whatever the local stamp says, after any post already running. A sign-in uses
+ * it: the server may hold no record for this browser any more (a revoked device signs in to a
+ * fresh device row, control-api.md §DELETE /v1/me/devices/{id}), and the stamp cannot know.
+ */
+export function ensureDeviceProbe(token: string, userId: string, opts: { force?: boolean } = {}): Promise<void> {
+  if (opts.force && inFlight) {
+    // That post may be another account's, or one that then finds its stamp fresh.
+    return inFlight.catch(() => {}).then(() => ensureDeviceProbe(token, userId, opts));
+  }
   inFlight ??= withBound(
     (async () => {
-      if (deviceProbeIsFresh(userId, await probeH264Decodable(), (await probeWebGpu()).available)) return;
+      if (!opts.force && deviceProbeIsFresh(userId, await probeH264Decodable(), (await probeWebGpu()).available)) return;
       const caps = await probeCapabilities();
       await authApi.postDevice(token, getOrCreateDeviceKey(), caps);
       // A step that timed out leaves its key out, which the planner reads as "cannot":

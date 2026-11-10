@@ -520,6 +520,7 @@ function SessionPageBody() {
           coords: webtransport,
           canvas: canvasRef.current,
           pyrowave: state?.pyrowave === true,
+          tierFps: state?.tier ? parseInt(state.tier.split("@")[1] ?? "", 10) || undefined : undefined,
           callbacks: {
             ...inputCallbacks,
             onDisconnectSuspected: () => void pollEndReason(),
@@ -1136,6 +1137,7 @@ function SessionPageBody() {
           <canvas
             ref={canvasRef}
             className="session-video"
+            data-scaling-mode={scalingMode}
             data-compositor-w={compositorSize?.w}
             data-compositor-h={compositorSize?.h}
           />

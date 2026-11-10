@@ -115,7 +115,7 @@ export function CompatToolsCard({ hostId }: { hostId: string }) {
                               <Link
                                 className="cap-link"
                                 to="/admin/fleet/jobs"
-                                aria-label={`See the Compatibility tools job for ${t.tag}`}
+                                aria-label={`See the job for ${t.tag}`}
                               >
                                 See the job
                               </Link>

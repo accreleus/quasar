@@ -848,6 +848,11 @@ pub(crate) static REBUILD_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 pub(crate) static RESTREAM_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
 
+/// Test hook: a swap's replacement is never taken as shown, as a held game's is not, so a
+/// test can stop the session while the swap waits.
+#[cfg(test)]
+pub(crate) static SWAP_HOLD: AtomicBool = AtomicBool::new(false);
+
 /// A `session_assign` that adopts this runner's runtime (amendment 39, `adopt_session_id`).
 /// The agent has already checked that it may, and re-labels the runtime's reports.
 #[derive(Debug, Clone)]
@@ -1507,13 +1512,14 @@ impl Negotiation {
     }
 
     /// `answer` was handed to the transport. One that names no peer is not what the next
-    /// answer is read against: the transport has negotiated with nobody through it.
-    fn applied(&mut self, answer: String) {
+    /// answer is read against: the transport has negotiated with nobody through it. True
+    /// when it is the transport's first: a peer the host has just accepted.
+    fn applied(&mut self, answer: String) -> bool {
         if !pipeline::names_a_peer(&answer) {
-            return;
+            return false;
         }
         self.reoffered = false;
-        self.answer = Some(answer);
+        self.answer.replace(answer).is_none()
     }
 
     /// The transport is being replaced. Returns the ICE ufrag of the peer it leaves.
@@ -1544,12 +1550,12 @@ pub(crate) struct SessionTransports {
 
 impl pipeline::Transport for SessionTransports {
     fn attach(mut session: pipeline::EncodedSession) -> anyhow::Result<Self> {
-        let webtransport = crate::webtransport::listener()
+        let webtransport = crate::webtransport::registry()
             .filter(|_| session.cfg.webtransport)
-            .and_then(|l| {
+            .and_then(|registry| {
                 let feed = session.pyrowave_feed.take();
                 crate::webtransport::Tap::attach(
-                    l.registry(),
+                    &registry,
                     &session.video,
                     &session.encoder,
                     &session.session_id,
@@ -1565,10 +1571,19 @@ impl pipeline::Transport for SessionTransports {
                         .cfg
                         .pyrowave
                         .map(|grant| (&session.cfg, grant, feed)),
+                    pipeline::feedback_abr(
+                        &session.encoder,
+                        &session.cfg,
+                        session.metrics.clone(),
+                        session.trace_tx.clone(),
+                        session.session_id.clone(),
+                        Some(session.lever.clone()),
+                    ),
                 )
             });
-        let slot = pipeline::WebRtcSlot::new(session)?;
+        let mut slot = pipeline::WebRtcSlot::new(session)?;
         if let Some(tap) = &webtransport {
+            slot.share_input(tap.media().clone());
             slot.tap_audio_for_stream(tap.audio());
         }
         // Audio first: `attach_video` takes the encode pipeline to READY.
@@ -1612,6 +1627,11 @@ impl SessionTransports {
             ],
             webtransport: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn webtransport_media(&self) -> Option<Arc<crate::webtransport::Media>> {
+        self.webtransport.as_ref().map(|tap| tap.media().clone())
     }
 
     /// Is `pc`'s transport one built for a peer that took the session over, not the one
@@ -1684,6 +1704,9 @@ impl SessionTransports {
                 displaced.remove(0);
             }
         }
+        if let Some(tap) = &self.webtransport {
+            tap.media().webrtc_retired(self.video.id);
+        }
         self.slot.restream(&mut self.video, to)?;
         self.unanswered[i] = true;
         Ok(())
@@ -1750,8 +1773,21 @@ impl SessionTransports {
                 return Ok(None);
             }
             server::Inbound::NewPeer(pc) => {
+                // With a WebTransport side the session's takeover bound is asked first, so a
+                // refusal there spends none of this PC's budget.
+                let video = self.video.id;
+                let budget = &mut self.budget[i];
+                let admitted = match (self.webtransport.as_ref().map(|tap| tap.media()), pc) {
+                    (Some(media), PcId::Video) => {
+                        media.webrtc_replace(video, || !over_budget(budget))
+                    }
+                    (Some(media), PcId::Audio) => {
+                        !media.webrtc_refuses(video) && !over_budget(budget)
+                    }
+                    (None, _) => !over_budget(budget),
+                };
                 // Not applied either: it would rebind the current peer's transport.
-                if over_budget(&mut self.budget[i]) {
+                if !admitted {
                     // To this answer's sender only; the streaming peer's late answers
                     // classify `ThisPeer` (same ufrag) and are told nothing (amendment 42).
                     let _ = out_tx.send(SignalMsg::takeover_error(
@@ -1833,8 +1869,9 @@ impl SessionTransports {
             // Recorded only now: an answer that does not parse was handed to nothing, and
             // must not stand for the peer the next answer is read against.
             Ok(()) => {
-                if let Some(answer) = answer {
-                    self.negotiation[i].applied(answer);
+                let accepted = answer.is_some_and(|a| self.negotiation[i].applied(a));
+                if accepted && matches!(pc, PcId::Video) {
+                    self.webrtc_attached();
                 }
             }
             Err(e) => tracing::warn!(
@@ -1843,6 +1880,54 @@ impl SessionTransports {
             ),
         }
         Ok(None)
+    }
+
+    /// A WebRTC peer's first answer was applied: it takes the session from a WebTransport
+    /// client (`transport-webtransport.md` §Takeover), at once, so that client's delayed
+    /// silence release cannot lift what the peer holds (#1193).
+    fn webrtc_attached(&self) {
+        let Some(tap) = &self.webtransport else {
+            return;
+        };
+        if tap.media().webrtc_attached(self.video.id) {
+            tracing::info!(
+                token = "webtransport-taken-over-by-webrtc",
+                "a WebRTC peer took the session from its WebTransport client: that client is \
+                 closed 4410 and its keys and buttons are released"
+            );
+        }
+    }
+
+    /// A WebTransport client took the session from the peer of the current video transport
+    /// since the last call: that peer's media stops, and the client holding signaling is told
+    /// `taken_over` (`transport-webtransport.md` §Takeover). True when it happened, so the
+    /// caller treats that transport as one whose viewer left.
+    pub(crate) fn take_from_webrtc(&self, out_tx: &pipeline::OutTx) -> bool {
+        let displaced = self
+            .webtransport
+            .as_ref()
+            .and_then(|tap| tap.media().take_to_mute());
+        // A transport retired since sends nothing already, and its signaling now belongs to
+        // the peer that replaced it.
+        if displaced != Some(self.video.id) {
+            return false;
+        }
+        self.slot.mute(&self.video);
+        // Its audio transport is replaced too when a new WebRTC peer answers, so the probes
+        // go with it.
+        for pad in self.audio_webrtc.iter().flat_map(|a| a.sink_pads()) {
+            pad.add_probe(
+                gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+                |_, _| gst::PadProbeReturn::Drop,
+            );
+        }
+        let _ = out_tx.send(SignalMsg::taken_over());
+        tracing::info!(
+            token = "webtransport-took-over-webrtc",
+            "a WebTransport client took the session from its WebRTC peer: that peer's media \
+             stopped and it was told taken_over"
+        );
+        true
     }
 }
 
@@ -2185,6 +2270,15 @@ fn swap_reveal(
         _ if drawn && past_deadline => Some("swap budget reached"),
         _ => None,
     }
+}
+
+/// How a swap that did not fail ended.
+enum SwapOutcome {
+    /// The encoder is on the replacement.
+    Done,
+    /// The session was stopped while the replacement was awaited (#1249): the replacement is
+    /// gone, nothing was rolled back, and the caller's stop path tears the rest down.
+    Stopped,
 }
 
 /// Why a swap did not complete, and whether the session survived it.
@@ -3517,6 +3611,12 @@ pub fn run_blocking(
             }
         }
 
+        // Before the inbound answers: a WebRTC peer accepted after the WebTransport client
+        // must not have its new transport muted.
+        if transports.take_from_webrtc(&sig_tx) {
+            stale_transport = true;
+        }
+
         // Inbound relay signaling (answer/ICE from the browser). A held runtime has no
         // viewer: what its old one still sends is dropped.
         while let Ok(msg) = sig_in_rx.try_recv() {
@@ -3787,9 +3887,12 @@ pub fn run_blocking(
                 vulkan_contexts.as_ref(),
                 session_metrics.clone(),
                 (current_render, current_ui_scale),
+                &stop,
                 &emit,
             ) {
-                Ok(()) => {
+                // No `SwapDone`, no rollback: the stop path at the top of the tick ends it.
+                Ok(SwapOutcome::Stopped) => continue 'tick,
+                Ok(SwapOutcome::Done) => {
                     emit(SessionEvent::SwapDone);
                     current_app = next_app;
                     let ts = std::time::SystemTime::now()
@@ -4465,8 +4568,9 @@ fn perform_swap(
     // The live render size (`None` is the pinned encode size) and UI scale, pushed onto
     // the new compositor BEFORE it boots; see the apply site below.
     display: (Option<(i32, i32)>, f64),
+    stop: &AtomicBool,
     emit: &dyn Fn(SessionEvent),
-) -> Result<(), SwapFailure> {
+) -> Result<SwapOutcome, SwapFailure> {
     let sink = ipsink_name(session_id, gen);
     let cname = app_container_name(session_id, gen);
     let mut new_source = AppSource::new(cfg, session_id, &sink, &cname, res, req.container)
@@ -4578,6 +4682,18 @@ fn perform_swap(
         );
     }
 
+    // A stop that landed during the two waits above: do not start the replacement (a Steam
+    // container on the managed home) only to kill it a moment later. Nothing of it runs yet
+    // and the helper is already muted, so there is nothing to roll back.
+    if stop.load(Ordering::Relaxed) {
+        tracing::info!(
+            token = "swap-stopped",
+            "swap: the session was stopped before the replacement was launched; not launching it"
+        );
+        drop(new_source);
+        return Ok(SwapOutcome::Stopped);
+    }
+
     // ── Step 3: launch the replacement app ───────────────────────────────────
     new_source.launch_deferred_app();
 
@@ -4615,6 +4731,20 @@ fn perform_swap(
         None,
     );
     let ready = loop {
+        // Before the reveal below: a stopped session gets no `AppPresented`.
+        if stop.load(Ordering::Relaxed) {
+            tracing::info!(
+                token = "swap-stopped",
+                "swap: the session was stopped while the replacement was awaited; dropping it"
+            );
+            // The replacement's helper dies with its container: without this the session
+            // end's quit would wait `END_QUIT_BOUND` on a game it reported running.
+            if let Some(launch) = res.launch() {
+                launch.mount().mute();
+            }
+            drop(new_source);
+            return Ok(SwapOutcome::Stopped);
+        }
         if let Err(e) = pump_new_source_bus(&new_bus, &mut new_source) {
             break Err(e);
         }
@@ -4651,6 +4781,8 @@ fn perform_swap(
             swap_source_ready(false, commits, frames, &mut frames_at_first_commit)
                 .then_some("first frame")
         };
+        #[cfg(test)]
+        let shown = shown.filter(|_| !SWAP_HOLD.load(Ordering::Relaxed));
         if let Some(reveal) = shown {
             tracing::info!(
                 app_surface_commits = commits.unwrap_or(0),
@@ -4756,7 +4888,7 @@ fn perform_swap(
     // ever sees the new generation. The old app container is already gone (step 2), so
     // this drop only NULLs its compositor; application cleanup remains an owned durable API obligation.
     *current_source = new_source;
-    Ok(())
+    Ok(SwapOutcome::Done)
 }
 
 /// Drain the new generation's bus into its [`AppSource`], turning a pipeline
@@ -6659,6 +6791,21 @@ mod tests {
         negotiation.applied(answer_sdp("aaaa", "AA:01"));
         negotiation.applied("not sdp".to_string());
         assert_eq!(negotiation.replaced(), Some("aaaa".to_string()));
+    }
+
+    /// A WebRTC peer the host accepts takes the session from a WebTransport client
+    /// (`SessionTransports::webrtc_attached`): only a transport's first answer is one.
+    #[test]
+    fn only_a_transports_first_answer_is_a_peer_the_host_accepts() {
+        let mut negotiation = Negotiation::default();
+        assert!(!negotiation.applied(String::new()), "it names no peer");
+        assert!(negotiation.applied(answer_sdp("aaaa", "AA:01")));
+        assert!(
+            !negotiation.applied(answer_sdp("bbbb", "AA:01")),
+            "the same peer correcting"
+        );
+        negotiation.replaced();
+        assert!(negotiation.applied(answer_sdp("cccc", "CC:03")));
     }
 
     #[test]

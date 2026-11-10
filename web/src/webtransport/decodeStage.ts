@@ -117,6 +117,9 @@ export class DecodeStage {
         if (h.unit.configId === config.configId) this.unit(h.unit);
         else if (serialAfter(h.unit.configId, config.configId, 8)) this.held.push(h);
       }
+    }, () => {
+      // A configuration no decoder can be given at all (a description too short to read).
+      if (generation === this.generation && !this.stopped) this.fatal("decoder_unsupported", config);
     });
   }
 

@@ -11967,6 +11967,7 @@ export interface components {
             rtt_ms?: number;
             jitter_buffer_ms?: number;
             decode_ms?: number;
+            /** @description CUMULATIVE receiver loss. WebRTC: getStats packetsLost. WebTransport (amendment 63): video fragments the client found missing, each counted once when first NACKed, whether or not the resend arrived. */
             packets_lost?: number;
             frames_dropped?: number;
             /** @description Presentation fps derived from the MEAN RVFC interval. DEPRECATED as a headline: at source fps == display Hz a single missed vsync doubles one interval and drags the mean (a healthy 1440p120 session read 88-108 on 2026-08-22). Read present_fps_median. Retained unchanged for series continuity. */
@@ -11998,6 +11999,10 @@ export interface components {
             glass_to_glass_ms?: number;
             /** @description RTP capture-time to browser present (ms), median over a rolling ring of up to 600 RVFC samples. Identical in value to glass_to_glass_ms, which it replaces; both are posted this release so no stored series breaks. Additive, approved by Michael 2026-08-23. */
             rvfc_capture_to_display_ms?: number;
+            /** @description Amendment 63 (accreleus/quasar#1035), additive. A WebTransport session's counterpart of rvfc_capture_to_display_ms: the agent's capture_us (transport-webtransport.md Clocks) to the moment the client hands the frame to its presenter, in ms, median over a rolling ring of up to 600 frames, compared on the agent's clock through the control-stream ping/pong offset. Absent until that offset is stable. It ends at present submission, not display scan-out, and is not RVFC-qualified. A WebRTC session never posts it. */
+            wt_capture_to_present_ms?: number;
+            /** @description Amendment 63 (accreleus/quasar#1035), additive. keyframe_request messages a WebTransport client put on the wire in the sample's window (transport-webtransport.md Loss recovery), whoever asked: the decoder, a frame given up as late, a tab shown again. Requests merged by the client's spacing window count once. A WebRTC session never posts it. */
+            wt_keyframe_requests?: number;
             /** @description Accepted by the browser ingest allow-list and declared here, but no client has ever posted it — the browser cannot observe host encode time. Kept declared so the ingest contract does not change. */
             encode_ms?: number;
             network_pacing_ms?: number;

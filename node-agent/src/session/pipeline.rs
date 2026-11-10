@@ -81,7 +81,7 @@ pub use scale_stage::ScaleStage;
 mod abr_glue;
 // The interface the ABR ladder's resolution rung drives, and the runner's manual
 // `session_display_update` path with it.
-pub(crate) use abr_glue::resolution_lever_with_echo;
+pub(crate) use abr_glue::{feedback_abr, resolution_lever_with_echo};
 pub use abr_glue::{trigger, EncodeResolutionLever, ResolutionLever};
 mod ice_interfaces;
 mod webrtc;
@@ -522,7 +522,7 @@ pub fn build_session_pipeline(
     // Wire the video callbacks before any state change, or negotiation-needed is missed.
     connect_ice_candidate(&webrtc, out_tx.clone(), PcId::Video);
     // Demo path: no virtual devices and no trace_tx (no control-plane WS to relay to).
-    connect_state_logging(&webrtc, None, None, String::new());
+    connect_state_logging(&webrtc, None, None, None, String::new());
     connect_negotiation_needed(&webrtc, out_tx, PcId::Video, String::new());
 
     // webrtcbin must be at least READY before create-data-channel (it is "closed" in
@@ -555,6 +555,7 @@ pub fn build_session_pipeline(
             connect_data_channel_open(
                 dc,
                 input_sink,
+                None,
                 input_state,
                 width,
                 height,

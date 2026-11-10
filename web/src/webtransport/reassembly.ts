@@ -108,6 +108,9 @@ export class FrameAssembler {
 
   constructor(private readonly now: () => number = () => performance.now()) {}
 
+  /** Fragments found missing so far, each counted once at its first NACK: the loss telemetry reads. */
+  lost = 0;
+
   /** The round trip loss recovery waits on, in ms. */
   get rttMs(): number {
     return this.srtt ?? INITIAL_RTT_MS;
@@ -323,6 +326,7 @@ export class FrameAssembler {
           // Re-inserted, so the map stays in time order for the prune above.
           this.asked.delete(seq * 65_536 + i);
           this.asked.set(seq * 65_536 + i, at);
+          if (p.asks[i] === 0) this.lost += 1;
           p.asks[i] += 1;
           p.askedAt[i] = at;
         }

@@ -1,6 +1,6 @@
 // MediaTransport over WebTransport: protocol/transport-webtransport.md, wt_proto 1,
-// video, input, ping/pong, NACK, audio and the microphone, with PyroWave (codec-pyrowave.md) for a
-// client that offers it. Feedback is a later ticket (#1040).
+// video, input, ping/pong, NACK, receiver feedback, audio and the microphone, with PyroWave
+// (codec-pyrowave.md) for a client that offers it.
 
 import {
   base64Bytes,
@@ -19,6 +19,7 @@ import {
 import { blockLayout } from "../pyrowave/bitstream";
 import { PyroWaveReceiver } from "../pyrowave/receiver";
 import type { WebTransportCoords } from "../api/types";
+import { FEEDBACK_MS, FeedbackRecorder } from "./feedback";
 import type { InputWire } from "./inputSender";
 import { workerTicker, type Ticker } from "./pingTicker";
 import { FrameAssembler, type Reassembled } from "./reassembly";
@@ -46,6 +47,10 @@ export const HANDSHAKE_DEADLINE_MS = 10_000;
 const ANSWER_TIMEOUT_MS = 10_000;
 /** How long a connection that failed without an answer gets to report its close code. */
 const CLOSE_CODE_WAIT_MS = 1_000;
+/** How long close() lets the `bye` leave before it closes the session regardless. */
+export const BYE_FLUSH_MS = 100;
+/** PWV1's 14-bit size fields: no PyroWave picture is larger on a side. */
+const MAX_PYROWAVE_SIDE = 16_384;
 /** The agent forces at most one IDR per 150 ms (quasar-protocol#29, item 8); asking faster is noise. */
 export const KEYFRAME_SPACING_MS = 150;
 /** How often loss-recovery deadlines are checked when no datagram arrives. */
@@ -108,6 +113,11 @@ export function videoConfigFrom(ack: Record<string, unknown>): VideoConfig {
   ) {
     throw new TransportError("internal", "hello_ack without a usable video configuration");
   }
+  // The PyroWave receiver and decoder size their arrays from these.
+  const side = (n: number) => Number.isInteger(n) && n >= 1 && n <= MAX_PYROWAVE_SIDE;
+  if (v.codec === "pyrowave" && !(side(v.width) && side(v.height))) {
+    throw new TransportError("internal", "hello_ack with a PyroWave picture size out of range");
+  }
   const cs = v.color_space as Record<string, unknown> | undefined;
   return {
     configId,
@@ -161,11 +171,16 @@ export class WebTransportMedia implements MediaTransport {
   private wt: WebTransport | null = null;
   private writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
   private datagramWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
-  private stopTicker: (() => void) | null = null;
+  private stopTickers: (() => void)[] = [];
   private pingId = 0;
+  /** The sink of the current connect, for what is reported outside a read loop. */
+  private sink: MediaSink | null = null;
+  private lostSoFar: () => number = () => 0;
   private closed = false;
   /** Closes the attempt in flight; null once one has connected or ended. */
   private abortAttempt: (() => void) | null = null;
+  /** The connected attempt's guard: off, its loops reach the sink no more. */
+  private live: { on: boolean } | null = null;
   private connected = false;
   private coords: WebTransportCoords;
   /** When the current token arrived, on the monotonic clock. */
@@ -199,6 +214,7 @@ export class WebTransportMedia implements MediaTransport {
   }
 
   async connect(sink: MediaSink): Promise<void> {
+    this.sink = sink;
     const deadline = this.now() + CONNECT_DEADLINE_MS;
     let reminted = false;
     for (;;) {
@@ -227,6 +243,7 @@ export class WebTransportMedia implements MediaTransport {
     if (wait <= 0) {
       this.lastKeyAt = this.now();
       this.send({ type: "keyframe_request", reason });
+      this.sink?.keyframeRequested?.(reason);
       return;
     }
     this.pendingKey = reason;
@@ -247,13 +264,16 @@ export class WebTransportMedia implements MediaTransport {
     this.send({ type: "codec_fallback", reason });
   }
 
+  /** Settles when `close()` has closed the session. */
+  private closing: Promise<void> = Promise.resolve();
+
   private stopRecovery(): void {
     if (this.recoveryTimer !== null) clearInterval(this.recoveryTimer);
     this.recoveryTimer = null;
   }
 
-  close(): void {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closed) return this.closing;
     this.closed = true;
     if (this.keyTimer !== null) clearTimeout(this.keyTimer);
     // Not left to `wt.closed`, which a connection that never finishes closing does not resolve.
@@ -262,10 +282,13 @@ export class WebTransportMedia implements MediaTransport {
     this.stopPings();
     // An attempt still connecting is closed here; it sees `closed` at its next await.
     this.abortAttempt?.();
+    if (this.live) this.live.on = false;
     if (this.connected) this.send({ type: "bye", reason: "client_closed" });
-    // The bye is queued on the stream ahead of the close.
-    void this.writer?.ready.then(() => this.wt?.close({ closeCode: 0, reason: "" }), () => {});
-    if (!this.writer) this.wt?.close();
+    // The bye is queued on the stream ahead of the close. A control stream that was reset, or one
+    // that stays blocked, must not keep the session open (control-api.md §Transport fallback).
+    const flushed = this.writer?.ready.catch(() => {});
+    this.closing = Promise.race([flushed, after(BYE_FLUSH_MS, undefined)]).then(() => this.wt?.close({ closeCode: 0, reason: "" }));
+    return this.closing;
   }
 
   /** A fresh token, at most once per {@link REMINT_MIN_INTERVAL_MS}; false when it is too soon. */
@@ -282,9 +305,9 @@ export class WebTransportMedia implements MediaTransport {
     return true;
   }
 
+  /** Stops the ping and feedback tickers. */
   private stopPings(): void {
-    this.stopTicker?.();
-    this.stopTicker = null;
+    for (const stop of this.stopTickers.splice(0)) stop();
   }
 
   private send(message: object): void {
@@ -382,7 +405,11 @@ export class WebTransportMedia implements MediaTransport {
     // Datagrams can overtake the hello_ack; the decode stage holds units by config_id, the
     // router PyroWave fragments.
     const router = this.makeRouter(sink, live);
-    void this.readDatagrams(wt, sink, router, live).catch(() => {});
+    const feedback = new FeedbackRecorder(this.now());
+    void this.readDatagrams(wt, sink, router, live, feedback).catch((err: unknown) => {
+      // No more video would arrive on this connection: end it, as a malformed control stream does.
+      if (live.on) wt.close({ closeCode: 4400, reason: err instanceof Error ? err.message.slice(0, 100) : "" });
+    });
     let first: Record<string, unknown> | null;
     try {
       first = await Promise.race([next(), after(ANSWER_TIMEOUT_MS, null)]);
@@ -413,13 +440,21 @@ export class WebTransportMedia implements MediaTransport {
     this.wt = wt;
     this.writer = writer;
     this.connected = true;
+    this.live = live;
     this.router = router;
     this.datagramWriter = wt.datagrams.writable.getWriter();
     sink.streams?.(audioStreamsFrom(first));
     router.config(config);
     const ping = () => this.send({ type: "ping", id: ++this.pingId, tc: this.now() });
     ping();
-    this.stopTicker = (this.opts.ticker ?? workerTicker)(PING_MS, ping);
+    const ticker = this.opts.ticker ?? workerTicker;
+    // On the Worker clock too: the agent reads feedback that stops while it sends media as
+    // congestion, so a hidden tab must keep reporting.
+    const report = () => {
+      const message = live.on ? feedback.take(this.now()) : null;
+      if (message) this.send(message);
+    };
+    this.stopTickers.push(ticker(PING_MS, ping), ticker(FEEDBACK_MS, report));
     void (async () => {
       try {
         for (let m = await next(); m && live.on; m = await next()) {
@@ -427,7 +462,7 @@ export class WebTransportMedia implements MediaTransport {
           if (m.type === "hello_ack") router.config(videoConfigFrom(m));
           else if (m.type === "nack_miss" && typeof m.frame_seq === "number" && Array.isArray(m.frags)) {
             router.miss(m.frame_seq, m.frags as [number, number][]);
-          } else if (m.type === "pong" && typeof m.tc === "number") sink.rtt?.(Math.max(0, this.now() - m.tc));
+          } else if (m.type === "pong" && typeof m.tc === "number") sink.rtt?.(Math.max(0, this.now() - m.tc), typeof m.tw === "number" ? m.tw : undefined);
           else if (m.type === "ping") {
             this.send({ type: "pong", id: m.id, ts: m.ts, tw: m.tw, tc: this.now() });
           }
@@ -456,7 +491,13 @@ export class WebTransportMedia implements MediaTransport {
     return { kind: "ack" };
   }
 
-  private async readDatagrams(wt: WebTransport, sink: MediaSink, router: Router, live: { on: boolean }): Promise<void> {
+  private async readDatagrams(
+    wt: WebTransport,
+    sink: MediaSink,
+    router: Router,
+    live: { on: boolean },
+    feedback: FeedbackRecorder,
+  ): Promise<void> {
     const reader = wt.datagrams.readable.getReader();
     for (;;) {
       const { value, done } = await reader.read();
@@ -464,6 +505,7 @@ export class WebTransportMedia implements MediaTransport {
         router.stop();
         return;
       }
+      feedback.record(value as Uint8Array, this.now());
       if ((value as Uint8Array)[0] === CHANNEL_AUDIO) {
         const packet = parseAudioDatagram(value as Uint8Array);
         if (packet) sink.audio?.(packet);
@@ -550,12 +592,14 @@ export class WebTransportMedia implements MediaTransport {
     const tick = () => this.recovered(assembler.tick(), sink);
     // PyroWave frames never reach the assembler, so a repair for one finds no frame and is dropped.
     const repair = (r: FecRepair) => this.recovered(assembler.repair(r), sink);
+    this.lostSoFar = () => assembler.lost;
     return { datagram, repair, config, miss, tick, stop };
   }
 
   /** §Loss recovery: NACKs out, a keyframe asked for a late frame, whole units to the sink. */
   private recovered({ units, nacks, needKeyframe }: Reassembled, sink: MediaSink): void {
     for (const n of nacks) this.send({ type: "nack", frame_seq: n.frameSeq, frags: n.frags });
+    if (nacks.length) sink.lost?.(this.lostSoFar());
     if (needKeyframe) this.requestKeyframe("late");
     for (const u of units) sink.unit(u);
   }

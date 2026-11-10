@@ -58,7 +58,13 @@ fn ready_media() -> Arc<Media> {
 fn ready_media_with(input: Input) -> Arc<Media> {
     gst::init().unwrap();
     let encoder = gst::ElementFactory::make("identity").build().unwrap();
-    let media = Media::new(&encoder, input, Audio::new(audio::Plan::default()), None);
+    let media = Media::new(
+        &encoder,
+        input,
+        Audio::new(audio::Plan::default()),
+        None,
+        None,
+    );
     let caps = gst::Caps::builder("video/x-h264")
         .field("stream-format", "avc")
         .field("width", 64)
@@ -80,33 +86,45 @@ fn a_token_is_single_use_lives_its_expiry_plus_15_s_and_never_crosses() {
     registry.assign(SESSION, &token_hash(TOKEN), now);
 
     assert_eq!(
-        registry.redeem(&hello_for("other", TOKEN, 1), now).err(),
+        registry
+            .redeem(&hello_for("other", TOKEN, 1), now, Duration::ZERO)
+            .err(),
         Some(Refusal::NotReady),
         "a session this agent does not hold yet"
     );
     assert_eq!(
-        registry.redeem(&hello_for(SESSION, TOKEN, 1), now).err(),
+        registry
+            .redeem(&hello_for(SESSION, TOKEN, 1), now, Duration::ZERO)
+            .err(),
         Some(Refusal::NotReady),
         "no encode chain yet"
     );
     assert_eq!(
-        registry.redeem(&hello_for(SESSION, TOKEN, 0), now).err(),
+        registry
+            .redeem(&hello_for(SESSION, TOKEN, 0), now, Duration::ZERO)
+            .err(),
         Some(Refusal::UnsupportedVersion)
     );
     assert!(registry.set_media(SESSION, ready_media()));
     // Kind separation: a signaling token's hash never reaches the agent.
     assert_eq!(
         registry
-            .redeem(&hello_for(SESSION, "a-signaling-token", 1), now)
+            .redeem(
+                &hello_for(SESSION, "a-signaling-token", 1),
+                now,
+                Duration::ZERO
+            )
             .err(),
         Some(Refusal::AuthFailed)
     );
     // The token refused as not ready was kept, and is good until expiry + 15 s.
     assert!(registry
-        .redeem(&hello_for(SESSION, TOKEN, 2), at(15))
+        .redeem(&hello_for(SESSION, TOKEN, 2), at(15), Duration::ZERO)
         .is_ok());
     assert_eq!(
-        registry.redeem(&hello_for(SESSION, TOKEN, 1), at(15)).err(),
+        registry
+            .redeem(&hello_for(SESSION, TOKEN, 1), at(15), Duration::ZERO)
+            .err(),
         Some(Refusal::AuthFailed),
         "consumed"
     );
@@ -114,7 +132,7 @@ fn a_token_is_single_use_lives_its_expiry_plus_15_s_and_never_crosses() {
     assert!(registry.add_token(SESSION, &token_hash("second"), now));
     assert_eq!(
         registry
-            .redeem(&hello_for(SESSION, "second", 1), at(16))
+            .redeem(&hello_for(SESSION, "second", 1), at(16), Duration::ZERO)
             .err(),
         Some(Refusal::AuthFailed),
         "expired past the skew"
@@ -125,7 +143,7 @@ fn a_token_is_single_use_lives_its_expiry_plus_15_s_and_never_crosses() {
     assert!(registry.set_media("b", ready_media()));
     assert_eq!(
         registry
-            .redeem(&hello_for(SESSION, "token-of-b", 1), now)
+            .redeem(&hello_for(SESSION, "token-of-b", 1), now, Duration::ZERO)
             .err(),
         Some(Refusal::AuthFailed),
         "another session's token"
@@ -133,7 +151,9 @@ fn a_token_is_single_use_lives_its_expiry_plus_15_s_and_never_crosses() {
 
     registry.end("b");
     assert_eq!(
-        registry.redeem(&hello_for("b", "token-of-b", 1), now).err(),
+        registry
+            .redeem(&hello_for("b", "token-of-b", 1), now, Duration::ZERO)
+            .err(),
         Some(Refusal::SessionEnded)
     );
     assert!(!registry.add_token("b", &token_hash("late"), at(60)));
@@ -494,7 +514,7 @@ async fn agent_with(limits: Limits) -> Agent {
 }
 
 async fn agent_with_plan(limits: Limits, plan: audio::Plan) -> Agent {
-    agent_built(Stream::H264, limits, plan).await
+    agent_built(Stream::H264, limits, plan, "ball", |_| None).await
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -560,10 +580,17 @@ fn synthetic(stream: Stream) -> gst::Pipeline {
 }
 
 async fn agent_for(stream: Stream, limits: Limits) -> Agent {
-    agent_built(stream, limits, audio::Plan::default()).await
+    agent_built(stream, limits, audio::Plan::default(), "ball", |_| None).await
 }
 
-async fn agent_built(stream: Stream, limits: Limits, plan: audio::Plan) -> Agent {
+/// `pattern` is the H.264 test picture's; `rate` arms the session's ABR on its encoder.
+async fn agent_built(
+    stream: Stream,
+    limits: Limits,
+    plan: audio::Plan,
+    pattern: &str,
+    rate: impl FnOnce(&gst::Element) -> Option<Rate>,
+) -> Agent {
     gst::init().unwrap();
     let registry = Arc::new(Registry::default());
     registry.assign(SESSION, &token_hash(TOKEN), SystemTime::now() + TOKEN_TTL);
@@ -572,12 +599,13 @@ async fn agent_built(stream: Stream, limits: Limits, plan: audio::Plan) -> Agent
             gst::ElementFactory::find("openh264enc").is_some(),
             "the conformance test needs openh264enc (gstreamer1.0-plugins-bad)"
         );
-        gst::parse::launch(
-            "videotestsrc is-live=true pattern=ball ! video/x-raw,width=640,height=360,framerate=30/1 \
+        gst::parse::launch(&format!(
+            "videotestsrc is-live=true pattern={pattern} \
+             ! video/x-raw,width=640,height=360,framerate=30/1 \
              ! openh264enc name=enc gop-size=1000 bitrate=4000000 \
              ! video/x-h264,profile=constrained-baseline ! h264parse name=parse \
              ! rtph264pay config-interval=-1 pt=96 ! fakesink sync=false",
-        )
+        ))
         .unwrap()
         .downcast::<gst::Pipeline>()
         .unwrap()
@@ -596,6 +624,7 @@ async fn agent_built(stream: Stream, limits: Limits, plan: audio::Plan) -> Agent
         input,
         plan,
         None,
+        rate(&encoder),
     );
     assert!(tap.is_some(), "an assigned session takes the tap");
     pipeline.set_state(gst::State::Playing).unwrap();
@@ -684,18 +713,6 @@ impl Agent {
         write_message(&mut send, &hello).await.unwrap();
         let reply = read_message(&mut recv).await.unwrap();
         (session, send, recv, reply)
-    }
-}
-
-thread_local! {
-    /// Run once by `Media::detach` between clearing the client and taking the input lock.
-    static DETACH_GAP: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
-}
-
-/// `Media::detach`'s seam: the moment a test can attach a successor into the gap.
-pub(super) fn detach_gap() {
-    if let Some(run) = DETACH_GAP.with(|g| g.borrow_mut().take()) {
-        run();
     }
 }
 
@@ -1176,6 +1193,354 @@ async fn nack_and_late(stream: Stream) {
     );
 }
 
+/// The receiving side of a `tc tbf` shape, simulated: each datagram is timed through a
+/// `cap_kbps` bottleneck with a drop-tail queue, and reported with the contract's
+/// `feedback` (§Feedback) as a browser client would.
+struct Bottleneck {
+    start: std::time::Instant,
+    cap_kbps: f64,
+    queue_bytes: f64,
+    /// When the bottleneck is next free, seconds after `start`.
+    free_at: f64,
+    /// (`pkt_seq`, arrival in seconds, or `None` dropped), not reported yet.
+    pending: Vec<(u32, Option<f64>)>,
+    next: Option<u32>,
+    seq: u64,
+}
+
+impl Bottleneck {
+    fn new(cap_kbps: f64) -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            cap_kbps,
+            queue_bytes: 64.0 * 1024.0,
+            free_at: 0.0,
+            pending: Vec::new(),
+            next: None,
+            seq: 0,
+        }
+    }
+
+    fn now(&self) -> f64 {
+        self.start.elapsed().as_secs_f64()
+    }
+
+    fn receive(&mut self, d: &[u8]) {
+        let seq = u32::from_le_bytes(d[1..5].try_into().unwrap());
+        let next = *self.next.get_or_insert(seq);
+        // Missing from loopback: dropped before the bottleneck.
+        for gap in 0..seq.wrapping_sub(next).min(8192) {
+            self.pending.push((next.wrapping_add(gap), None));
+        }
+        self.next = Some(seq.wrapping_add(1));
+        let (now, service) = (self.now(), d.len() as f64 * 8.0 / (self.cap_kbps * 1000.0));
+        let backlog = (self.free_at - now).max(0.0) / service * d.len() as f64;
+        let arrival = (backlog + d.len() as f64 <= self.queue_bytes).then(|| {
+            self.free_at = self.free_at.max(now) + service;
+            self.free_at
+        });
+        self.pending.push((seq, arrival));
+    }
+
+    /// The `feedback` for everything up to the last datagram arrived by now.
+    fn feedback(&mut self) -> Option<Value> {
+        let now = self.now();
+        let last = self
+            .pending
+            .iter()
+            .take(8192)
+            .rposition(|&(_, a)| a.is_some_and(|a| a <= now))?;
+        let batch: Vec<_> = self.pending.drain(..=last).collect();
+        let first_pkt_seq = batch[0].0;
+        let ref_s = batch
+            .iter()
+            .filter_map(|&(_, a)| a)
+            .fold(f64::MAX, f64::min);
+        let mut bytes = Vec::new();
+        let mut lost = 0;
+        for &(_, a) in &batch {
+            let unit = match a {
+                Some(a) if a <= now => (((a - ref_s) * 20_000.0) as u64).min(0xFFFE) as u16,
+                _ => {
+                    lost += 1;
+                    0xFFFF
+                }
+            };
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        self.seq += 1;
+        Some(json!({
+            "type": "feedback", "seq": self.seq,
+            "first_pkt_seq": first_pkt_seq, "count": batch.len(),
+            "ref_us": (ref_s * 1e6) as u64,
+            "arrivals_b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+            "recv_kbps": 0, "lost": lost, "interval_ms": 50,
+        }))
+    }
+}
+
+/// #1040: receiver feedback from a rate-capped client drives the session's real ABR
+/// (governor, classifier, smooth mode) until the encoder sends below the cap. Below it
+/// within 10 s needs the #68 emergency drop: smooth's capped steps (−12.5 % per 7 s
+/// dwell) take over 30 s.
+#[tokio::test]
+async fn a_rate_capped_client_steps_the_encoder_below_the_cap() {
+    const CAP_KBPS: f64 = 1500.0;
+    let metrics = Arc::new(crate::session::metrics::SessionMetrics::new("smooth", 30));
+    let (trace_tx, _trace_rx) = tokio::sync::mpsc::channel(256);
+    let trace_tx =
+        crate::session::runner::DiagnosticEventTx::new(trace_tx, Arc::default(), Arc::default());
+    let cfg = {
+        let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
+        settings.encoder = crate::session::EncoderChoice::Openh264;
+        settings.abr_mode = crate::session::AbrMode::Smooth;
+        let stream = crate::session::StreamParams {
+            width: 640,
+            height: 360,
+            fps: 30,
+            bitrate_kbps: 4000,
+            h264_profile: "constrained-baseline".to_string(),
+            codec: crate::session::Codec::H264,
+            abr_floor_kbps: 0,
+            mic: false,
+        };
+        crate::session::SessionConfig::for_assignment_with(&settings, stream, None)
+    };
+    let abr_metrics = metrics.clone();
+    // Snow does not compress: the encoder really sends its setpoint, over the cap.
+    let agent = agent_built(
+        Stream::H264,
+        Limits::default(),
+        audio::Plan::default(),
+        "snow",
+        move |encoder| {
+            crate::session::pipeline::feedback_abr(
+                encoder,
+                &cfg,
+                abr_metrics,
+                trace_tx,
+                SESSION.to_string(),
+                None,
+            )
+        },
+    )
+    .await;
+    let encoder = agent.pipeline.by_name("enc").unwrap();
+    // What the session's encoder probes feed: the classifier's "sending at the cap".
+    let sent = metrics.clone();
+    encoder
+        .static_pad("src")
+        .unwrap()
+        .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(b) = info.buffer() {
+                sent.record_encode_out(std::time::Instant::now(), b.size() as u64);
+            }
+            gst::PadProbeReturn::Ok
+        });
+    let (session, mut send, _recv, _) = agent.hello(TOKEN).await;
+
+    let mut path = Bottleneck::new(CAP_KBPS);
+    let mut report = tokio::time::interval(Duration::from_millis(50));
+    let mut drain = tokio::time::interval(Duration::from_secs(1));
+    let mut congested = false;
+    let deadline = tokio::time::sleep(Duration::from_secs(10));
+    tokio::pin!(deadline);
+    let kbps = loop {
+        tokio::select! {
+            d = session.read_datagram() => path.receive(&d.unwrap()),
+            _ = report.tick() => {
+                if let Some(fb) = path.feedback() {
+                    write_message(&mut send, &fb).await.unwrap();
+                }
+            }
+            _ = drain.tick() => {
+                // The runner's heartbeat drains a window every ~5 s; faster here.
+                let window = metrics.drain_window(std::time::Instant::now());
+                congested |= window.adaptation_state == "network_congested";
+                let kbps = encoder.property::<u32>("bitrate") / 1000;
+                if (kbps as f64) < CAP_KBPS {
+                    break kbps;
+                }
+            }
+            () = &mut deadline => panic!(
+                "the encoder still at {} kbps after 10 s behind a {CAP_KBPS} kbps cap",
+                encoder.property::<u32>("bitrate") / 1000
+            ),
+        }
+    };
+    assert!(congested, "the drop came through the congestion classifier");
+    assert!(kbps >= 500, "never below the ABR floor ({kbps} kbps)");
+}
+
+/// §Feedback: while PyroWave is active its own rate controller stands in for the ABR, so a
+/// PyroWave client's feedback feeds no estimate; after its fallback to H.264 it does.
+#[tokio::test]
+async fn feedback_while_pyrowave_is_active_feeds_no_estimate() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let fed = Arc::new(AtomicUsize::new(0));
+    let count = fed.clone();
+    let agent = agent_built(
+        Stream::H264,
+        Limits::default(),
+        audio::Plan::default(),
+        "ball",
+        move |_| {
+            Some(Rate {
+                ceiling_kbps: 4000.0,
+                start: Box::new(|| {}),
+                observe: Box::new(move |_| {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }),
+            })
+        },
+    )
+    .await;
+    let media = agent.listener.registry().lock()[SESSION]
+        .media
+        .clone()
+        .unwrap();
+    media.grant_pyrowave(
+        PyroWaveGrant {
+            wanted: true,
+            target_kbps: 200_000,
+            floor_kbps: 100_000,
+            max_rtt_ms: 1_000,
+        },
+        (320, 192, 60),
+        true,
+    );
+    let raw = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../testdata/pyrowave/detail_320x192_xhi.pwv1"
+    ))
+    .unwrap();
+    let session = agent.connect().await;
+    let (mut send, mut recv) = session.open_bi().await.unwrap();
+    let hello = json!({"type": "hello", "wt_proto": 1, "token": TOKEN, "session_id": SESSION,
+                       "client": "browser", "pyrowave": true});
+    write_message(&mut send, &hello).await.unwrap();
+    assert_eq!(
+        read_message(&mut recv).await.unwrap()["video"]["codec"],
+        "pyrowave"
+    );
+
+    // A path with room: every datagram is reported as arrived, as a browser would.
+    let mut path = Bottleneck::new(1e6);
+    media.on_pyrowave_frame(&gst::Buffer::from_slice(raw[28..].to_vec()));
+    path.receive(&session.read_datagram().await.unwrap());
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let feedback = path.feedback().expect("a datagram to report");
+    write_message(&mut send, &feedback).await.unwrap();
+    // The fallback's hello_ack comes after the agent read that feedback: the control
+    // stream is in order.
+    let fallback = json!({"type": "codec_fallback", "reason": "decode_error"});
+    write_message(&mut send, &fallback).await.unwrap();
+    assert_eq!(
+        read_message(&mut recv).await.unwrap()["video"]["codec"],
+        "h264"
+    );
+    assert_eq!(
+        fed.load(Ordering::SeqCst),
+        0,
+        "a PyroWave client's feedback fed the ABR"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fed.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "H.264 feedback never fed the ABR"
+        );
+        if let Ok(d) =
+            tokio::time::timeout(Duration::from_millis(50), session.read_datagram()).await
+        {
+            path.receive(&d.unwrap());
+        }
+        if let Some(feedback) = path.feedback() {
+            write_message(&mut send, &feedback).await.unwrap();
+        }
+    }
+}
+
+/// #1040: the estimate is the video ABR's, and on WebRTC audio is a peer connection GCC
+/// never sees. A still screen with music: only audio flows, and feedback that reports it
+/// arriving later and later, as behind a queue, moves no estimate.
+#[tokio::test]
+async fn audio_alone_never_moves_the_video_estimate() {
+    let fed = Arc::new(Mutex::new(Vec::new()));
+    let seen = fed.clone();
+    let plan = audio::Plan {
+        audio: true,
+        mic: false,
+        pulse_server: None,
+        jitter_ms: 40,
+    };
+    let mut agent = agent_built(Stream::H264, Limits::default(), plan, "ball", move |_| {
+        Some(Rate {
+            ceiling_kbps: 4000.0,
+            start: Box::new(|| {}),
+            observe: Box::new(move |kbps| seen.lock().unwrap().push(kbps)),
+        })
+    })
+    .await;
+    tap_session_audio(&mut agent);
+    let (session, mut send, _recv, _) = agent.hello(TOKEN).await;
+    // Video reached the client, then the screen goes still.
+    while session.read_datagram().await.unwrap()[0] != 0x01 {}
+    agent.pipeline.set_state(gst::State::Paused).unwrap();
+
+    let mut path = Bottleneck::new(1e6);
+    let (mut audio, mut late) = (0, 0.0);
+    let until = Instant::now() + Duration::from_secs(2);
+    while let Ok(d) = tokio::time::timeout_at(until, session.read_datagram()).await {
+        let d = d.unwrap();
+        // Each audio datagram waits 10 ms longer than the one before it.
+        if d[0] == 0x02 {
+            audio += 1;
+            late += 0.010;
+        }
+        let pkt_seq = u32::from_le_bytes(d[1..5].try_into().unwrap());
+        path.pending.push((pkt_seq, Some(path.now() + late)));
+        if let Some(feedback) = path.feedback() {
+            write_message(&mut send, &feedback).await.unwrap();
+        }
+    }
+    assert!(audio >= 100, "10 ms audio for 2 s: {audio} datagrams");
+    let fed = fed.lock().unwrap();
+    assert!(!fed.is_empty(), "the feedback was read");
+    assert!(
+        fed.iter().all(|&kbps| kbps == 4000.0),
+        "audio alone moved the video estimate: {fed:?}"
+    );
+}
+
+/// A client displaced, or told the session ended, neither starts nor feeds the ABR: the
+/// encoder is its successor's, and a start after the session ended would register hooks
+/// that keep the encoder alive.
+#[test]
+fn a_client_that_is_gone_neither_starts_nor_feeds_the_abr() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (started, fed) = (calls.clone(), calls.clone());
+    let rate = Rate {
+        ceiling_kbps: 4000.0,
+        start: Box::new(move || {
+            started.fetch_add(1, SeqCst);
+        }),
+        observe: Box::new(move |_| {
+            fed.fetch_add(1, SeqCst);
+        }),
+    };
+    let gone = Arc::new(OnceLock::new());
+    let mut control = Control::new(&rate, gone.clone());
+    control.feed(3000.0);
+    assert_eq!(calls.load(SeqCst), 2, "a live client starts and feeds");
+    gone.set(Gone::TakenOver).unwrap();
+    control.feed(3000.0);
+    Control::new(&rate, gone).feed(3000.0);
+    assert_eq!(calls.load(SeqCst), 2);
+}
+
 #[tokio::test]
 async fn a_client_flooding_nacks_gets_only_its_budget_answered() {
     let agent = agent().await;
@@ -1490,42 +1855,6 @@ fn only_the_attached_clients_input_reaches_the_devices() {
 }
 
 #[test]
-fn a_client_attaching_while_its_predecessor_is_still_leaving_starts_from_clean_devices() {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-    use std::sync::atomic::Ordering::SeqCst;
-    let (input, events, released) = recorded();
-    let media = ready_media_with(input);
-    let key =
-        |code: u32, pressed: bool| json!({"t": "k", "code": code, "pressed": pressed}).to_string();
-
-    let a = media.attach(false, Duration::ZERO).unwrap();
-    media.input_event(a.id, &key(30, true), false);
-
-    // B attaches after A's detach cleared the client and before it took the input lock.
-    let b: Rc<RefCell<Option<media::Attached>>> = Rc::default();
-    let (m, slot) = (media.clone(), b.clone());
-    DETACH_GAP.with(|g| {
-        *g.borrow_mut() = Some(Box::new(move || {
-            *slot.borrow_mut() = m.attach(false, Duration::ZERO)
-        }))
-    });
-    media.detach(a.id);
-    let b = b.borrow_mut().take().expect("B attached in the gap");
-    assert_eq!(
-        released.load(SeqCst),
-        1,
-        "A's held key was lifted when B attached"
-    );
-
-    // A's late detach step lifts nothing of B's.
-    media.input_event(b.id, &key(32, true), false);
-    assert_eq!(events.lock().unwrap().len(), 2);
-    media.detach(b.id);
-    assert_eq!(released.load(SeqCst), 2);
-}
-
-#[test]
 fn a_gamepad_slot_beyond_the_api_limit_is_dropped() {
     let (input, events, _) = recorded();
     let media = ready_media_with(input);
@@ -1661,6 +1990,52 @@ async fn the_newest_client_takes_over_and_an_ended_session_says_so() {
     assert_eq!(close_code(&late).await, Some(CLOSE_ENDED));
 }
 
+/// The agent's half of the WebTransport → WebRTC fallback (control-api.md §Transport fallback,
+/// "Close first"): the client that falls back says `bye` while it holds a key. The agent closes
+/// normally, lifts what it held, counts no client, and the session is still there for the
+/// WebRTC peer that follows (and for a later WebTransport client with a fresh token).
+#[tokio::test]
+async fn a_client_that_falls_back_leaves_no_client_no_held_key_and_a_live_session() {
+    let agent = agent().await;
+    let tap = agent.tap.as_ref().unwrap();
+    let (session, mut send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+    frames(&session, 1, true).await;
+    session
+        .send_datagram(Bytes::from_static(
+            b"\x03{\"t\":\"k\",\"code\":17,\"pressed\":true}",
+        ))
+        .unwrap();
+    assert_eq!(input_events(&agent, 1).await.len(), 1, "the key is held");
+    assert_eq!(agent.released.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    write_message(
+        &mut send,
+        &json!({"type": "bye", "reason": "client_closed"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(close_code(&session).await, Some(CLOSE_NORMAL));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while tap.attached() || agent.released.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the client that fell back still counts, or its key is still held"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Not ended: a fresh token for the same session still gets a `hello_ack` and frames.
+    assert!(agent.listener.registry().add_token(
+        SESSION,
+        &token_hash("after-fallback"),
+        SystemTime::now() + TOKEN_TTL
+    ));
+    let (again, _send, _recv, ack) = agent.hello("after-fallback").await;
+    assert_eq!(ack["type"], "hello_ack");
+    assert!(frames(&again, 1, true).await[0].keyframe);
+}
+
 /// What the session's idle reap reads (#1179): a client counts from its `hello_ack` while it
 /// streams, across a takeover, and stops counting once it leaves.
 #[tokio::test]
@@ -1694,6 +2069,353 @@ async fn the_tap_counts_a_streaming_client_until_it_leaves() {
     while tap.attached() {
         assert!(Instant::now() < deadline, "a client that left still counts");
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn key_input(code: u32) -> Value {
+    json!({"type": "input", "event": {"t": "k", "code": code, "pressed": true}})
+}
+
+/// The video transport ids these tests give the WebRTC side.
+const T1: u64 = 101;
+const T2: u64 = 102;
+
+fn webrtc(agent: &Agent, transport: u64) -> WebRtcSide {
+    WebRtcSide {
+        media: agent.tap.as_ref().unwrap().media().clone(),
+        transport: Some(transport),
+    }
+}
+
+/// What `transport`'s data channel hands the devices, through the session's media client.
+fn webrtc_key(agent: &Agent, transport: u64, code: u32) {
+    let input = agent.input.clone();
+    webrtc(agent, transport).input(move || {
+        input
+            .lock()
+            .unwrap()
+            .push(json!({"t": "k", "code": code, "pressed": true}).to_string())
+    });
+}
+
+fn codes_seen(agent: &Agent) -> Vec<u64> {
+    agent
+        .input
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            serde_json::from_str::<Value>(e).unwrap()["code"]
+                .as_u64()
+                .unwrap()
+        })
+        .collect()
+}
+
+/// A WebTransport client takes the session by `token`, which is added first.
+async fn take_over(agent: &Agent, token: &str) -> (Session, SendStream, RecvStream, Value) {
+    let expires = SystemTime::now() + TOKEN_TTL;
+    assert!(agent
+        .listener
+        .registry()
+        .add_token(SESSION, &token_hash(token), expires));
+    agent.hello(token).await
+}
+
+/// §Takeover, WebRTC takes over WebTransport: the client gets `bye taken_over` and `4410` at
+/// once, what it held is lifted then, once, and nothing it sends after reaches the devices.
+#[tokio::test]
+async fn a_webrtc_peer_takes_over_the_webtransport_client() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let agent = agent().await;
+    let tap = agent.tap.as_ref().unwrap();
+    let (session, mut send, mut recv, _) = agent.hello(TOKEN).await;
+    write_message(&mut send, &key_input(30)).await.unwrap();
+    assert_eq!(input_events(&agent, 1).await.len(), 1);
+
+    assert!(tap.media().webrtc_attached(T1), "a client was attached");
+    assert_eq!(agent.released.load(SeqCst), 1, "lifted at the takeover");
+    assert!(!tap.attached(), "the idle reap no longer counts it");
+    let _ = write_message(&mut send, &key_input(31)).await;
+    webrtc_key(&agent, T2, 33);
+    webrtc_key(&agent, T1, 32);
+    assert_eq!(
+        read_message(&mut recv).await.unwrap(),
+        json!({"type": "bye", "reason": "taken_over"})
+    );
+    assert_eq!(close_code(&session).await, Some(CLOSE_TAKEN_OVER));
+    assert_eq!(
+        codes_seen(&agent),
+        [30, 32],
+        "the old client's late key and another transport's are dropped"
+    );
+    assert_eq!(
+        agent.released.load(SeqCst),
+        1,
+        "its own close lifted nothing of the WebRTC peer's"
+    );
+    assert_eq!(tap.media().take_to_mute(), None, "nothing to stop");
+}
+
+/// §Takeover, WebTransport takes over WebRTC: the peer's key is lifted before the client's
+/// `hello_ack`, the runner is told once which transport to stop, and that peer's late input
+/// and its disconnect reach nothing of the client's.
+#[tokio::test]
+async fn a_webtransport_client_takes_over_the_webrtc_peer() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let agent = agent().await;
+    let media = agent.tap.as_ref().unwrap().media().clone();
+    webrtc_key(&agent, T1, 1);
+    assert!(
+        agent.input.lock().unwrap().is_empty(),
+        "no WebRTC peer accepted yet"
+    );
+    assert!(!media.webrtc_attached(T1), "no client to displace");
+    webrtc_key(&agent, T1, 30);
+    assert_eq!(media.take_to_mute(), None);
+
+    let (session, mut send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+    assert_eq!(agent.released.load(SeqCst), 1, "lifted before the ack");
+    assert_eq!(
+        media.take_to_mute(),
+        Some(T1),
+        "the runner stops that transport"
+    );
+    assert_eq!(media.take_to_mute(), None, "once");
+
+    webrtc_key(&agent, T1, 31);
+    webrtc(&agent, T1).disconnected(true);
+    write_message(&mut send, &key_input(32)).await.unwrap();
+    assert_eq!(input_events(&agent, 2).await.len(), 2);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(codes_seen(&agent), [30, 32]);
+    assert_eq!(
+        agent.released.load(SeqCst),
+        1,
+        "the peer's disconnect lifted the client's key"
+    );
+    assert!(frames(&session, 1, true).await[0].keyframe);
+}
+
+/// #1193: the host missed the WebTransport close on a fallback. The WebRTC attach displaces the
+/// client then, so its control-stream silence 10 s later lifts nothing the WebRTC peer holds.
+#[tokio::test]
+async fn a_key_held_over_webrtc_after_a_fallback_without_a_webtransport_close_stays_held() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let agent = agent().await;
+    let media = agent.tap.as_ref().unwrap().media().clone();
+    // Never closed by the client, and silent from here on.
+    let (session, mut send, _recv, _) = agent.hello(TOKEN).await;
+    write_message(&mut send, &key_input(30)).await.unwrap();
+    assert_eq!(input_events(&agent, 1).await.len(), 1);
+
+    media.webrtc_attached(T1);
+    webrtc_key(&agent, T1, 30);
+    assert_eq!(codes_seen(&agent), [30, 30], "held again over WebRTC");
+    let released = agent.released.load(SeqCst);
+    tokio::time::sleep(CONTROL_IDLE + Duration::from_secs(1)).await;
+    assert_eq!(
+        agent.released.load(SeqCst),
+        released,
+        "a release after the WebRTC press lifted the key the WebRTC peer holds"
+    );
+    assert_eq!(
+        released, 1,
+        "the client's key was lifted once, at the attach"
+    );
+    assert_eq!(close_code(&session).await, Some(CLOSE_TAKEN_OVER));
+}
+
+/// §Authentication and tokens, "Reconnect": a reload's fresh token resumes the same session
+/// with nothing restarted (the same decoder configuration, frame numbers carrying on), from a
+/// keyframe.
+#[tokio::test]
+async fn a_reload_reconnects_with_a_fresh_token_and_resumes_from_a_keyframe() {
+    let agent = agent().await;
+    let tap = agent.tap.as_ref().unwrap();
+    let (first, mut send, _recv, ack) = agent.hello(TOKEN).await;
+    let last = frames(&first, 5, true).await.last().unwrap().frame_seq;
+    write_message(
+        &mut send,
+        &json!({"type": "bye", "reason": "client_closed"}),
+    )
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while tap.attached() {
+        assert!(Instant::now() < deadline, "the reloaded page never left");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let (second, _send, _recv, again) = take_over(&agent, "reload").await;
+    assert_eq!(again, ack, "the same session's configuration");
+    let next = &frames(&second, 1, true).await[0];
+    assert!(next.keyframe, "the reconnected client starts at a keyframe");
+    assert!(
+        next.frame_seq > last,
+        "frame numbers carry on: {} after {last}",
+        next.frame_seq
+    );
+}
+
+/// §Takeover's bound (erratum 28): 6 takeovers of a session in any 60 s, counted across both
+/// transports. A 7th WebTransport `hello` is refused, keeping its token, and the connected
+/// client streams on. A WebRTC answer while a WebTransport client holds is counted and never
+/// refused; a new WebRTC peer displacing the WebRTC holder is refused, on both PCs.
+#[tokio::test]
+async fn a_seventh_takeover_inside_60_s_is_refused_on_either_transport() {
+    let agent = agent().await;
+    let registry = agent.listener.registry();
+    let tap = agent.tap.as_ref().unwrap();
+    let media = tap.media();
+    // Nobody to displace: no takeover.
+    let mut clients = vec![agent.hello(TOKEN).await];
+    for n in 0..6u64 {
+        if n % 2 == 0 {
+            assert!(media.webrtc_attached(T1 + n), "takeover {n} is WebRTC's");
+            continue;
+        }
+        let client = take_over(&agent, &format!("takeover-{n}")).await;
+        assert_eq!(
+            client.3["type"], "hello_ack",
+            "takeover {n} is WebTransport's"
+        );
+        clients.push(client);
+    }
+
+    let (refused, _send, _recv, reply) = take_over(&agent, "seventh").await;
+    assert_eq!(reply["code"], "takeover_rate_limited", "{reply}");
+    assert_eq!(close_code(&refused).await, Some(CLOSE_NORMAL));
+    assert!(
+        registry.lock()[SESSION]
+            .tokens
+            .iter()
+            .any(|t| t.hash == token_hash("seventh")),
+        "a refused hello keeps its token"
+    );
+    let streaming = &clients.last().unwrap().0;
+    frames(streaming, 1, false).await;
+    assert!(tap.attached(), "the connected client keeps streaming");
+
+    assert!(media.webrtc_attached(T2 + 10), "over the bound, and let in");
+    let mut asked = false;
+    assert!(
+        !media.webrtc_replace(T2 + 10, || {
+            asked = true;
+            true
+        }),
+        "a new peer displacing the WebRTC holder is refused"
+    );
+    assert!(!asked, "the PC's own budget was not spent");
+    assert!(media.webrtc_refuses(T2 + 10), "and on its audio PC");
+}
+
+/// Seat B F1: a page that streamed over WebRTC, then over WebTransport through six reloads
+/// that each displaced the last tab, falls back to WebRTC. Its answer on the old transport is a
+/// new peer's, and it displaces a WebTransport client, not the WebRTC holder: let in, given a
+/// transport of its own, and counted.
+#[tokio::test]
+async fn a_fallback_after_six_reloads_is_not_refused() {
+    let agent = agent().await;
+    let media = agent.tap.as_ref().unwrap().media().clone();
+    assert!(
+        !media.webrtc_attached(T1),
+        "the page first streams over WebRTC"
+    );
+    let mut clients = Vec::new();
+    for n in 0..6 {
+        let client = take_over(&agent, &format!("reload-{n}")).await;
+        assert_eq!(client.3["type"], "hello_ack");
+        clients.push(client);
+    }
+    let mut asked = false;
+    assert!(
+        media.webrtc_replace(T1, || {
+            asked = true;
+            true
+        }),
+        "the falling-back page gets a transport"
+    );
+    assert!(asked, "only the PC's own budget decides");
+    assert!(
+        media.webrtc_attached(T2),
+        "its answer displaces the WebTransport client"
+    );
+    webrtc_key(&agent, T2, 30);
+    assert_eq!(
+        codes_seen(&agent),
+        [30],
+        "the falling-back page holds the session"
+    );
+}
+
+/// Seat B F3: a WebRTC peer whose PC failed or closed holds nothing. A WebTransport client
+/// after it displaces nobody: it is not counted, so not refused, and no transport is stopped.
+#[tokio::test]
+async fn a_webtransport_hello_after_the_webrtc_tab_closed_is_not_counted() {
+    let agent = agent().await;
+    let media = agent.tap.as_ref().unwrap().media().clone();
+    let mut clients = vec![agent.hello(TOKEN).await];
+    for n in 0..5 {
+        clients.push(take_over(&agent, &format!("reload-{n}")).await);
+    }
+    assert!(media.webrtc_attached(T1), "the 6th takeover");
+    webrtc(&agent, T1).disconnected(false);
+    assert_eq!(
+        media.holder(),
+        media::Holder::WebRtc(T1),
+        "a transient disconnect keeps it"
+    );
+    webrtc(&agent, T1).disconnected(true);
+
+    let (_session, _send, _recv, reply) = take_over(&agent, "after-the-tab").await;
+    assert_eq!(reply["type"], "hello_ack", "{reply}");
+    assert_eq!(media.take_to_mute(), None, "nobody to stop or tell");
+}
+
+/// Two takeovers at once, a WebTransport `hello` and a WebRTC first answer, end with one
+/// holder, and exactly one client is displaced: the one that lost.
+#[test]
+fn a_hello_racing_a_webrtc_first_answer_leaves_one_holder_and_one_displaced() {
+    for _ in 0..500 {
+        let media = ready_media();
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let wt = {
+            let (media, start) = (media.clone(), start.clone());
+            std::thread::spawn(move || {
+                start.wait();
+                media.attach(false, Duration::ZERO).unwrap()
+            })
+        };
+        let rtc = {
+            let (media, start) = (media.clone(), start.clone());
+            std::thread::spawn(move || {
+                start.wait();
+                media.webrtc_attached(T1)
+            })
+        };
+        let wt = wt.join().unwrap();
+        let displaced_wt = rtc.join().unwrap();
+        let displaced_rtc = media.take_to_mute() == Some(T1);
+        assert_eq!(
+            displaced_wt,
+            wt.gone.get().is_some(),
+            "what the WebRTC attach reports is what happened to the client"
+        );
+        assert!(
+            displaced_wt ^ displaced_rtc,
+            "exactly one is displaced: client {displaced_wt}, peer {displaced_rtc}"
+        );
+        let holder = media.holder();
+        assert_eq!(
+            holder,
+            if displaced_wt {
+                media::Holder::WebRtc(T1)
+            } else {
+                media::Holder::Wt(wt.id)
+            }
+        );
     }
 }
 
@@ -1991,7 +2713,11 @@ fn two_hellos_racing_one_token_redeem_it_once() {
                 std::thread::spawn(move || {
                     start.wait();
                     registry
-                        .redeem(&hello_for(SESSION, TOKEN, 1), SystemTime::now())
+                        .redeem(
+                            &hello_for(SESSION, TOKEN, 1),
+                            SystemTime::now(),
+                            Duration::ZERO,
+                        )
                         .is_ok()
                 })
             })
@@ -2875,6 +3601,40 @@ async fn a_pyrowave_client_gets_frames_that_rejoin_byte_for_byte_and_can_fall_ba
     assert_eq!(nal_types(&first.data).last(), Some(&5));
 }
 
+/// A session id assigned again while its tap runs gets a fresh registry entry, which no longer
+/// names that tap's media: the tap still ends its own when it drops, so the client on it is
+/// told the session ended.
+#[test]
+fn a_tap_dropped_after_its_session_was_assigned_again_ends_its_own_media() {
+    gst::init().unwrap();
+    let registry = Arc::new(Registry::default());
+    let assign = || registry.assign(SESSION, &token_hash(TOKEN), SystemTime::now() + TOKEN_TTL);
+    assign();
+    let pipeline = synthetic(Stream::Av1);
+    let tap = Tap::attach(
+        &registry,
+        &pipeline
+            .by_name("parse")
+            .unwrap()
+            .static_pad("src")
+            .unwrap(),
+        &pipeline.by_name("enc").unwrap(),
+        SESSION,
+        None,
+        no_input(),
+        audio::Plan::default(),
+        None,
+        None,
+    )
+    .unwrap();
+    tap.media().on_caps(&streams::av1_caps(640), SESSION);
+    let client = tap.media().attach(false, Duration::ZERO).unwrap();
+
+    assign();
+    drop(tap);
+    assert_eq!(client.gone.get(), Some(&Gone::SessionEnded));
+}
+
 /// #1228: a session stop releases the tap's PyroWave encoder before the source goes (it shares
 /// the GPU queue and a compositor ring frame), while the tap itself lives on until the
 /// transports drop. A second release, and one with no encoder, are no-ops.
@@ -2897,6 +3657,7 @@ fn releasing_the_tap_stops_its_pyrowave_encoder_and_keeps_the_tap() {
         None,
         no_input(),
         audio::Plan::default(),
+        None,
         None,
     )
     .unwrap();

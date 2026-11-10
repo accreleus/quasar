@@ -91,7 +91,7 @@ func (h *Handler) handleSetDefault(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "tool_id must be a lowercase uuid or null")
 		return
 	}
-	prev, err := h.store.SetDefault(r.Context(), toolID)
+	prev, tool, prevTool, err := h.store.SetDefault(r.Context(), toolID)
 	switch {
 	case errors.Is(err, ErrNotFound):
 		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "no such compatibility tool")
@@ -103,8 +103,12 @@ func (h *Handler) handleSetDefault(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not set the default compatibility tool")
 		return
 	}
-	audit.TryRecord(r.Context(), h.auditor, user.ID, "compat_tool.default.set", "instance", "",
-		map[string]any{"tool_id": toolID, "previous_tool_id": prev})
+	details := map[string]any{"tool_id": toolID, "previous_tool_id": prev}
+	addGE(details, "", tool)
+	if prev != nil {
+		addGE(details, "previous_", prevTool)
+	}
+	audit.TryRecord(r.Context(), h.auditor, user.ID, "compat_tool.default.set", "instance", "", details)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"default_tool_id": toolID})
 }
 
@@ -244,6 +248,10 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 			action = "compat_tool.enable"
 		}
 		details := map[string]any{"tag": res.Tag, "sha512": res.SHA512, "host_count": len(res.HostIDs)}
+		if res.Tag == nil {
+			// A Valve build has no tag or SHA-512: its row carries the name hosts know it by.
+			details["steam_name"] = res.SteamName
+		}
 		audit.CapIDs(details, "host_ids", res.HostIDs)
 		audit.TryRecord(r.Context(), h.auditor, user.ID, action, "compat_tool", id, details)
 		if h.conv != nil {

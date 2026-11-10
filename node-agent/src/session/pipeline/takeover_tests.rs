@@ -931,6 +931,277 @@ fn a_takeover_mid_stream_moves_the_stream_to_the_new_peer() {
     );
 }
 
+/// Forgets the test's WebTransport registry.
+struct WtRegistry;
+
+impl Drop for WtRegistry {
+    fn drop(&mut self) {
+        *crate::webtransport::TEST_REGISTRY.lock().unwrap() = None;
+    }
+}
+
+/// A host whose session was assigned WebTransport (amendment 54), and its media client,
+/// ready for a WebTransport `hello`.
+fn start_webtransport(tag: &str) -> (Host, Arc<crate::webtransport::Media>, WtRegistry) {
+    start_webtransport_cfg(tag, host_cfg(false))
+}
+
+fn start_webtransport_cfg(
+    tag: &str,
+    mut cfg: SessionConfig,
+) -> (Host, Arc<crate::webtransport::Media>, WtRegistry) {
+    let registry = Arc::new(crate::webtransport::Registry::default());
+    registry.assign(
+        &format!("takeover-{tag}"),
+        "00",
+        std::time::SystemTime::now() + Duration::from_secs(60),
+    );
+    *crate::webtransport::TEST_REGISTRY.lock().unwrap() = Some(registry);
+    let guard = WtRegistry;
+    cfg.webtransport = true;
+    let host = Host::start_cfg(tag, cfg);
+    let media = host
+        .transports
+        .webtransport_media()
+        .expect("the session took a WebTransport tap");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !media.ready() {
+        assert!(Instant::now() < deadline, "no caps reached the tap");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (host, media, guard)
+}
+
+/// Media keeps flowing to `peer`, video and audio.
+fn receives_media(host: &mut Host, peer: &mut Peer) -> bool {
+    let (video, audio) = (rtp(&peer.video), rtp(&peer.audio));
+    pump(host, peer, Duration::from_secs(2), |_, p| {
+        rtp(&p.video) > video + 20 && rtp(&p.audio) > audio + 10
+    })
+}
+
+/// `transport-webtransport.md` §Takeover across transports, through the runner's own calls: a
+/// WebTransport client takes the session from a streaming WebRTC peer (its media stops and
+/// the client holding signaling is told `taken_over`), and a new WebRTC peer takes it back
+/// (the WebTransport client is displaced when that peer's answer applies, and the peer gets
+/// video and audio).
+#[test]
+fn takeover_crosses_between_webrtc_and_webtransport() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (mut host, media, _wt) = start_webtransport("cross");
+    let mut a = first_attach(&mut host);
+
+    let wt = media
+        .attach(false, Duration::ZERO)
+        .expect("the WebTransport hello is accepted");
+    assert!(
+        host.transports.take_from_webrtc(&host.sig_tx),
+        "the runner's tick sees the takeover"
+    );
+    assert!(!host.transports.take_from_webrtc(&host.sig_tx), "once");
+    pump(&mut host, &mut a, Duration::from_millis(300), |_, _| false);
+    let (video, audio) = (rtp(&a.video), rtp(&a.audio));
+    pump(&mut host, &mut a, Duration::from_secs(1), |_, _| false);
+    assert_eq!(
+        (rtp(&a.video), rtp(&a.audio)),
+        (video, audio),
+        "the displaced WebRTC peer still receives media"
+    );
+    assert!(
+        matches!(
+            host.errors.as_slice(),
+            [SignalMsg::Error { code: Some(code), pc: None, .. }] if code == "taken_over"
+        ),
+        "{:?}",
+        host.errors
+    );
+    assert!(media.attached(), "the WebTransport client streams");
+
+    let mut b = attach_as(&mut host, Peer::another_browser());
+    assert!(
+        wt.gone.get().is_some(),
+        "the WebTransport client was displaced"
+    );
+    assert!(!media.attached());
+    assert!(receives_media(&mut host, &mut b), "{}", describe(&b));
+    assert_eq!(host.errors.len(), 1, "the new peer was told nothing");
+    a.stop();
+    assert_eq!(host.bus_errors, Vec::<String>::new());
+}
+
+/// Seat A A1: a WebTransport client displaces the WebRTC holder while a new WebRTC peer's
+/// replacement transport is still unanswered. The runner's tick stops only the transport whose
+/// peer was displaced, which is retired already, so the new peer's answer makes it the holder
+/// with video and audio, and nobody is told `taken_over`.
+#[test]
+fn a_new_peer_answering_after_a_webtransport_takeover_gets_media() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (mut host, media, _wt) = start_webtransport("pingpong");
+    let _a = first_attach(&mut host);
+    let wt = media
+        .attach(false, Duration::ZERO)
+        .expect("the WebTransport hello is accepted");
+
+    let mut b = Peer::another_browser();
+    request_offers(&mut host);
+    let replaced = pump(&mut host, &mut b, Duration::from_secs(10), |h, _| {
+        h.replaced.contains(&PcId::Video)
+    });
+    assert!(replaced, "the new peer got no transport: {:?}", host.errors);
+    // The runner's tick lands before the new peer's answer.
+    let stopped = host.transports.take_from_webrtc(&host.sig_tx);
+    let up = pump(&mut host, &mut b, Duration::from_secs(20), |_, p| {
+        streaming(p)
+    });
+    assert!(up, "the new peer got no media: {}", describe(&b));
+    assert!(receives_media(&mut host, &mut b));
+    assert!(
+        wt.gone.get().is_some(),
+        "the WebTransport client was displaced"
+    );
+    assert!(!stopped, "nothing current was stopped");
+    assert!(host.errors.is_empty(), "{:?}", host.errors);
+}
+
+/// #1040: a new WebRTC peer's answer replaces the video transport under a streaming
+/// WebTransport client, which puts the encoder back at launch with no ABR owner, and that
+/// peer never connects. The client still holds the session: its next estimates drive the
+/// encoder again.
+#[test]
+fn a_webtransport_client_keeps_its_abr_through_an_abandoned_webrtc_takeover() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut cfg = host_cfg(false);
+    cfg.abr_governor.min_interval_ms = 1;
+    let (mut host, media, _wt) = start_webtransport_cfg("orphan", cfg);
+    let _a = first_attach(&mut host);
+    let wt = media
+        .attach(false, Duration::ZERO)
+        .expect("the WebTransport hello is accepted");
+    host.transports.take_from_webrtc(&host.sig_tx);
+    let launch = host.cfg.stream.bitrate_kbps;
+    let bitrate = |host: &Host| host.encoder.property::<u32>("bitrate") / 1000;
+    // As `webtransport::Control` feeds it: one start per client, then its estimates.
+    let rate = media.rate().expect("the session's ABR is armed");
+    let congested = || {
+        (rate.observe)(f64::from(launch) / 4.0);
+        std::thread::sleep(Duration::from_millis(5));
+        (rate.observe)(f64::from(launch) / 4.0);
+    };
+    (rate.start)();
+    congested();
+    assert!(
+        bitrate(&host) < launch,
+        "the client's estimate never moved the encoder"
+    );
+
+    abandon_a_takeover(&mut host);
+    assert!(
+        wt.gone.get().is_none() && media.attached(),
+        "the client still holds the session"
+    );
+    assert_eq!(bitrate(&host), launch, "the replacement starts at launch");
+
+    congested();
+    assert!(
+        bitrate(&host) < launch,
+        "the abandoned takeover left the client with no ABR"
+    );
+    assert_eq!(host.bus_errors, Vec::<String>::new());
+}
+
+/// #1193 through the runner's dispatch: the page fell back to WebRTC while the host still held
+/// its WebTransport client. The launch transport's first answer displaces that client at once,
+/// so its control-stream silence later releases nothing, and the page is told nothing.
+#[test]
+fn a_fallback_answer_displaces_the_webtransport_client_at_once() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (mut host, media, _wt) = start_webtransport("fallback");
+    let wt = media
+        .attach(false, Duration::ZERO)
+        .expect("the WebTransport hello is accepted");
+    assert!(
+        !host.transports.take_from_webrtc(&host.sig_tx),
+        "no WebRTC peer held the session"
+    );
+
+    let _a = first_attach(&mut host);
+    assert!(
+        wt.gone.get().is_some(),
+        "the WebTransport client was displaced"
+    );
+    assert!(!media.attached());
+    assert!(host.errors.is_empty(), "{:?}", host.errors);
+}
+
+/// §Takeover's bound through the runner's dispatch (erratum 28). After 6 takeovers in 60 s a
+/// WebRTC peer answering while a WebTransport client holds is still let in (seat B F1), and
+/// counted; a further peer displacing that WebRTC holder is refused `takeover_rate_limited` on
+/// each PC and gets no transport, and the holder keeps the stream.
+#[test]
+fn a_seventh_takeover_by_a_webrtc_peer_is_refused() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (mut host, media, _wt) = start_webtransport("bound");
+    let _a = first_attach(&mut host);
+    let mut clients = Vec::new();
+    for n in 0..6 {
+        clients.push(
+            media
+                .attach(false, Duration::ZERO)
+                .unwrap_or_else(|e| panic!("takeover {n}: {e:?}")),
+        );
+    }
+    assert!(host.transports.take_from_webrtc(&host.sig_tx));
+    assert!(
+        media.attach(false, Duration::ZERO).is_err(),
+        "a 7th WebTransport hello is refused"
+    );
+
+    let mut b = attach_as(&mut host, Peer::another_browser());
+    assert!(
+        clients.last().unwrap().gone.get().is_some(),
+        "the peer displaced the WebTransport client"
+    );
+    let replaced = host.replaced.len();
+
+    let mut c = Peer::another_browser();
+    request_offers(&mut host);
+    let rate_limited = |h: &Host| {
+        codes(&h.errors)
+            .into_iter()
+            .filter(|(code, _)| code == TAKEOVER_RATE_LIMITED)
+            .map(|(_, pc)| pc as usize)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let refused = pump(&mut host, &mut c, Duration::from_secs(10), |h, _| {
+        rate_limited(h).len() == 2
+    });
+    assert!(refused, "errors: {:?}", host.errors);
+    assert_eq!(
+        host.replaced.len(),
+        replaced,
+        "no transport for the refused peer"
+    );
+    assert!(
+        receives_media(&mut host, &mut b),
+        "the holder keeps the stream"
+    );
+}
+
 /// The first page answered but its transport never connected (its loader is still up),
 /// and a second page attaches.
 fn takeover_while_connecting(tag: &str, another_browser: bool) -> (Host, Peer) {
@@ -2876,6 +3147,79 @@ fn a_session_nobody_answered_stops() {
     assert!(
         matches!(ended, Some(SessionEvent::Stopped { .. })),
         "the session did not stop: {ended:?}"
+    );
+}
+
+/// Keeps every swap waiting for its replacement, as a held game does.
+struct SwapHold;
+
+impl SwapHold {
+    fn on() -> SwapHold {
+        crate::session::runner::SWAP_HOLD.store(true, Ordering::Relaxed);
+        SwapHold
+    }
+}
+
+impl Drop for SwapHold {
+    fn drop(&mut self) {
+        crate::session::runner::SWAP_HOLD.store(false, Ordering::Relaxed);
+    }
+}
+
+/// #1249: a stop sent while a swap waits for its replacement ends the session then, not at
+/// the swap's 45 s budget, and the stopped session reports neither a swap nor a rollback.
+#[test]
+fn a_stop_during_a_held_swap_ends_the_session_without_swap_done() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let _hold = SwapHold::on();
+    let mut session = Session::start("swap-stop", Duration::from_secs(600));
+    session.mute = true;
+    let mut nobody = Peer::new();
+    let offered = session.pump(&mut nobody, Duration::from_secs(20), |s, _| {
+        s.offers == [1, 1]
+    });
+    assert!(offered, "offers per PC: {:?}", session.offers);
+
+    session
+        .swap
+        .send(crate::session::runner::SwapRequest {
+            container: None,
+            in_place: false,
+        })
+        .expect("swap lane");
+    // `Swapping` goes out on the runner's thread right before the swap: from here its next
+    // look at the stop flag is the swap's own.
+    let swapping = session.pump(&mut nobody, Duration::from_secs(10), |s, _| {
+        s.log.iter().any(|e| matches!(e, SessionEvent::Swapping))
+    });
+    assert!(swapping, "the swap never started");
+
+    session.stop.store(true, Ordering::SeqCst);
+
+    let ended = session.ends_within(Duration::from_secs(15));
+    assert!(
+        matches!(ended, Some(SessionEvent::Stopped { .. })),
+        "the session did not stop inside the held swap: {ended:?}"
+    );
+    let swap_reports: Vec<_> = session
+        .log
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                SessionEvent::SwapDone
+                    | SessionEvent::SwapRolledBack(_)
+                    | SessionEvent::AppPresented
+                    | SessionEvent::Failed(_)
+            )
+        })
+        .collect();
+    assert!(
+        swap_reports.is_empty(),
+        "a stopped session reported {swap_reports:?}"
     );
 }
 

@@ -120,6 +120,15 @@ it out; admins see it.
 _Avoid_: "warm session", "idle session", "pre-launch" (not a session the user
 started).
 
+**Adoption** — a Steam launch taking over the parked session's running runtime
+instead of starting a container of its own. The control plane checks the claim in
+the launch's scheduling transaction, the agent adopts at `session_start`, the play
+session records `adopt_session_id` and the parked row goes `stopped` with
+`state_detail = "claimed"`. An agent that no longer holds that runtime builds the
+session fresh, so an adoption never fails because the park was lost. _Avoid_:
+"resume" (the adopting session is new: it takes the runtime and the parked home's
+hold, never the parked session's stream).
+
 **Missing** — the state of a library observation (one game a scan saw installed
 for one user on one host) that the last complete scan of that home did not
 list. A missing game still counts as installed: its tile, entitlement and any
@@ -158,6 +167,14 @@ that exact identity. _Avoid_: "retry count" (a rolled-back swap relaunches the
 previous app under the previous generation's name; the counter is a name, not
 a tally of what is running), and the unrelated policy epoch in `source_policy`.
 
+**Quick switch** — swapping the app a running session is running, from its Switch
+game rail (`POST /v1/sessions/{id}/swap`), without ending the session or its
+stream. Two tiles of one Steam parent switch inside the running Steam when the
+agent can (`in_place: true`); anything else replaces the container with a new
+generation, and the switch screen stays up until the new app is on screen — its
+window for a game, its first frame otherwise. _Avoid_: "Hot Loading" (that is
+parked Steam, a session with no viewer), "restart" (the session keeps running).
+
 **Intentional stop** — the agent's own teardown of a generation (a swap's step
 2, a session stop, a drop). The marker is set on the container handle BEFORE
 the engine sees the stop, so an exit the observer sees afterwards is discarded
@@ -184,7 +201,8 @@ name that merely contains the prefix, an API-owned application, an audio sidecar
 prove is left to the next boot rather than retried immediately. Removal is
 boot-only, behind the persistent owner lease. _Avoid_: "orphan" (the old CLI
 sweep's word; it suggested anything unclaimed was ours to delete), and "adoption"
-— nothing here resumes or observes a prior session.
+for a leftover container — *adoption* is a Steam launch taking a parked session's
+runtime, and nothing in this sweep resumes or observes a prior session.
 
 ## Transports
 
@@ -364,6 +382,34 @@ no numbering and no stability guarantee to any client — it is for humans and
 agents reading logs, never for a wire contract), "log tag" (that reads like the
 tracing `target`, which is the module path and a different axis).
 
+## The end-to-end test suite
+
+**Scenario** — one scripted exercise of a stream with its own pass rule, run with no
+model in the loop: a stream hold, a transport fallback, an input pass. It takes
+parameters (transport, codec, profile). Also the name quasar-bench files its run under.
+
+**Plan** — an ordered list of scenarios with their parameters, run as one command.
+Not the *stream plan* (a session's post-placement decision).
+
+**Criterion** — one named, checkable part of a scenario's pass rule, recorded with the
+observed and the expected value; `pass` is true, false, or null when it could not be
+judged. Not a *verdict* (the stream-health judgement) and not a *readiness check*.
+
+**Suite run** — one execution of a plan against one stack from one test client.
+
+**Run bundle** — the self-describing directory a suite run leaves: what was run, on
+which builds, from which client, and everything recorded, in a versioned format
+(`docs/testing-e2e-suite.md`). It has a client half and a host half, joined by session
+id. Not the *diagnostic bundle*, which is one session's trace and which it contains.
+_Avoid_: bare "bundle".
+
+**Test client** — the machine and client software (a browser now, the native client
+later) that receives the stream in a suite run. Distinct from the host that sends it.
+
+**Reference app** — the app a scenario streams when the picture must be attributable
+and repeatable: it stamps a machine-readable marker into every frame (today the bench
+app described in `docs/testing-bench-mode.md`).
+
 ## Images
 
 **Platform image** — a container image that runs Quasar itself, or builds it:
@@ -478,12 +524,14 @@ home can be initialized. Existing user homes are preserved. _Avoid_: "backup".
 
 ## Ultra-low latency (PyroWave)
 
-**Ultra-low latency (PyroWave)** — the user-facing name of the PyroWave stream: a codec choice
-(an entry in the Launch options Codec list) plus a profile setting an admin makes (Off / Allow /
-Prefer when possible), not a switch. It applies at launch, in a browser with WebGPU and on a
+**Ultra-low latency (PyroWave)** — the user-facing name of the PyroWave stream: the launch asks
+for it with `?codec=pyrowave` on the library URL (in 0.6 the only way in; the Launch options Codec
+entry that sends the same `pyrowave: true` arrives with #1060), and a profile setting an admin makes
+(Off / Allow / Prefer when possible, through the admin launch-profile API for now) decides whether it
+may run. It applies at launch, in a browser with WebGPU and on a
 WebTransport session whose QUIC round trip the agent measures as local; on a `prefer` profile an
 Auto launch may get it by the Auto rule. Otherwise the session streams its standard codec and says
-why. _Avoid_: "PyroWave mode" in the UI, "LAN mode", "Ultra-low latency (LAN)", "switch".
+why. _Avoid_: "PyroWave mode" in the UI, "LAN mode", "Ultra-low latency (LAN)".
 
 **PyroWave** — the intra-only wavelet codec behind Ultra-low latency (PyroWave): encoded on the
 host GPU in Vulkan compute, decoded in the browser in WebGPU, carried only on WebTransport.

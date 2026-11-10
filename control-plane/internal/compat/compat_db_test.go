@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -247,7 +248,20 @@ func TestAdminRoutesAreAdminOnly(t *testing.T) {
 
 func TestSetDefaultAuditsAndClears(t *testing.T) {
 	h := newHarness(t)
+	ctx := context.Background()
 	ten := h.id["proton_10"]
+	ge, geSHA, _ := h.ge()
+	// A second enabled GE tool, so a set can name a GE tool on both sides of its row.
+	prevTag, prevSHA, prevName := "GE-Proton11-11", strings.Repeat("ab", 64), "GE-Proton11-11-x86_64"
+	var prevGE string
+	if err := h.pool.QueryRow(ctx, `INSERT INTO compat_tools (family, source, tag, steam_name, display_name, enabled,
+		asset_name, asset_size_bytes, asset_sha512)
+		VALUES ('ge', 'tag', $1, $2, $1, true, $1 || '-x86_64.tar.gz', 1, $3) RETURNING id::text`,
+		prevTag, prevName, prevSHA).Scan(&prevGE); err != nil {
+		t.Fatal(err)
+	}
+	// Enabled straight in SQL: an enable writes its own audit row, and this test counts them.
+	h.exec(`UPDATE compat_tools SET enabled = true WHERE id = $1::uuid`, ge)
 
 	code, body := h.do("PUT", "/v1/admin/compat-tools/default", h.admin, `{"tool_id":"`+ten+`"}`)
 	if code != http.StatusOK || body["default_tool_id"] != ten {
@@ -265,28 +279,54 @@ func TestSetDefaultAuditsAndClears(t *testing.T) {
 	}
 
 	// Setting the same value again is audited too: every accepted write is.
-	h.do("PUT", "/v1/admin/compat-tools/default", h.admin, `{"tool_id":"`+ten+`"}`)
+	for _, set := range []string{ge, prevGE, prevGE} {
+		if code, body := h.do("PUT", "/v1/admin/compat-tools/default", h.admin, `{"tool_id":"`+set+`"}`); code != http.StatusOK ||
+			body["default_tool_id"] != set {
+			t.Fatalf("set default %s: %d %v", set, code, body)
+		}
+	}
 	code, _ = h.do("PUT", "/v1/admin/compat-tools/default", h.admin, `{"tool_id":null}`)
 	if code != http.StatusOK {
 		t.Fatalf("clear: %d", code)
 	}
-	rows, err := h.pool.Query(context.Background(), `SELECT action, target_type, details FROM admin_activity ORDER BY id`)
+	rows, err := h.pool.Query(ctx, `SELECT action, target_type, details FROM admin_activity ORDER BY id`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rows.Close()
-	var got []string
+	var got []map[string]any
 	for rows.Next() {
 		var action, target string
 		var raw []byte
 		if err := rows.Scan(&action, &target, &raw); err != nil {
 			t.Fatal(err)
 		}
-		got = append(got, action+"/"+target+" "+string(raw))
+		var d map[string]any
+		if err := json.Unmarshal(raw, &d); err != nil {
+			t.Fatal(err)
+		}
+		d["action"], d["target_type"] = action, target
+		got = append(got, d)
 	}
-	if len(got) != 3 || !strings.HasPrefix(got[0], "compat_tool.default.set/instance") ||
-		!strings.Contains(got[0], ten) || !strings.Contains(got[1], ten) || !strings.Contains(got[2], `"tool_id": null`) || !strings.Contains(got[2], ten) {
-		t.Errorf("audit rows = %q, want a set, the same set again and a clear, each naming the tool", got)
+	bothGE := map[string]any{"action": "compat_tool.default.set", "target_type": "instance", "tool_id": prevGE,
+		"previous_tool_id": ge, "tag": prevTag, "sha512": prevSHA,
+		"previous_tag": recommended[0].Tag, "previous_sha512": geSHA}
+	want := []map[string]any{
+		// A Valve tool set over nothing has no tag or SHA-512 to name.
+		{"action": "compat_tool.default.set", "target_type": "instance", "tool_id": ten, "previous_tool_id": nil},
+		// A GE tool names its own tag and SHA-512; the previous tool was Valve, so it names none.
+		{"action": "compat_tool.default.set", "target_type": "instance", "tool_id": ge, "previous_tool_id": ten,
+			"tag": recommended[0].Tag, "sha512": geSHA},
+		bothGE,
+		// The same value again is audited too, and names the tool it replaced (itself).
+		{"action": "compat_tool.default.set", "target_type": "instance", "tool_id": prevGE, "previous_tool_id": prevGE,
+			"tag": prevTag, "sha512": prevSHA, "previous_tag": prevTag, "previous_sha512": prevSHA},
+		// A clear names the tool it took the default from.
+		{"action": "compat_tool.default.set", "target_type": "instance", "tool_id": nil, "previous_tool_id": prevGE,
+			"previous_tag": prevTag, "previous_sha512": prevSHA},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("audit rows = %v, want %v", got, want)
 	}
 }
 
@@ -551,5 +591,24 @@ func TestEnableOnManyHostsStillWritesItsAuditRow(t *testing.T) {
 		AND jsonb_array_length(details->'host_ids') = 40 AND details->>'host_ids_truncated' = 'true'
 		AND (details->>'host_count')::int = (SELECT count(*) FROM hosts)`, id); n != 1 {
 		t.Errorf("%d enable audit rows, want 1 (40 ids, truncated, host_count = every host)", n)
+	}
+}
+
+// A Valve build has no tag or SHA-512: its enable and disable rows carry the Steam name instead.
+func TestAValveToolEnableDisableRowCarriesItsSteamName(t *testing.T) {
+	h := newHarness(t)
+	id := h.id["proton_9"]
+	if code, body := h.enable(id, false); code != http.StatusOK || body["enabled"] != false {
+		t.Fatalf("disable: %d %v", code, body)
+	}
+	if code, body := h.enable(id, true); code != http.StatusOK || body["enabled"] != true {
+		t.Fatalf("enable: %d %v", code, body)
+	}
+	for _, action := range []string{"compat_tool.disable", "compat_tool.enable"} {
+		if n := h.count(`SELECT count(*) FROM admin_activity WHERE action = $1 AND target_id = $2
+			AND details->>'steam_name' = 'proton_9' AND details->'tag' = 'null'::jsonb
+			AND details->'sha512' = 'null'::jsonb`, action, id); n != 1 {
+			t.Errorf("%s rows carrying the Steam name = %d, want 1", action, n)
+		}
 	}
 }

@@ -1026,6 +1026,32 @@ else
   fail "verify:cargo-target-per-instance" "docker-compose.devtools.yml no longer keys CARGO_TARGET_DIR off \$QUASAR_INSTANCE"
 fi
 
+# ── #1266: a stage that needs no Postgres runs on `devtools-solo`, which is on
+# Docker's own bridge and so creates no compose network. On the networked
+# `devtools` service every worktree that ran one gate left two networks behind,
+# until the daemon's address pools were full and no network could be created.
+VERIFY_NET_BAD=""
+for stage in quick web control agent engine-suite-build versions; do
+  VERIFY_LOG_S="$WORK/verify-docker-args-$stage.log"
+  : > "$VERIFY_LOG_S"
+  env PATH="$VERIFY_STUB:$PATH" VERIFY_DOCKER_LOG="$VERIFY_LOG_S" \
+    QUASAR_DX_ROOT=/fake/worktree-alpha \
+    bash "$ROOT/scripts/verify.sh" "$stage" >/dev/null 2>&1 || true
+  grep -E '^compose .* run ' "$VERIFY_LOG_S" | grep -q ' devtools-solo bash ' || VERIFY_NET_BAD="$VERIFY_NET_BAD $stage"
+done
+if [ -z "$VERIFY_NET_BAD" ]; then
+  pass "verify:no-postgres-stages-make-no-network" "quick, web, control, agent, engine-suite-build and versions run on devtools-solo"
+else
+  fail "verify:no-postgres-stages-make-no-network" "not run on devtools-solo:$VERIFY_NET_BAD"
+fi
+
+if awk '/^  devtools-solo:/{f=1;next} f&&/^  [^ ]/{f=0} f' "$ROOT/scripts/verify/docker-compose.devtools.yml" \
+    | grep -qE '^    network_mode: bridge$'; then
+  pass "verify:solo-on-the-bridge" "devtools-solo has network_mode: bridge"
+else
+  fail "verify:solo-on-the-bridge" "devtools-solo in docker-compose.devtools.yml is not on network_mode: bridge"
+fi
+
 printf '\n== degraded reporting ==\n'
 
 # ── doctor with an unreachable gpu-test role → degraded, rc 0 ────────────────
@@ -3685,6 +3711,13 @@ if [ $? -eq 0 ]; then
   pass "manifest:bench-keys-not-drifted" "$BENCH_KEYS_OUT"
 else
   fail "manifest:bench-keys-not-drifted" "$BENCH_KEYS_OUT"
+fi
+
+# The end-to-end suite's run bundle (#1272): the fixture is valid, each rule has a bundle that breaks it.
+if command -v node >/dev/null 2>&1; then
+  rc_of 0 "e2e:bundle-format" -- node --test "$ROOT/scripts/validate/stream/bundle.test.mjs"
+else
+  warn "e2e:bundle-format" "node not installed — SKIPPED"
 fi
 
 # Release publication must wait for every image its manifest names.

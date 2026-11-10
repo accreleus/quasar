@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  BYE_FLUSH_MS,
   CONNECT_DEADLINE_MS,
   HANDSHAKE_DEADLINE_MS,
   KEYFRAME_SPACING_MS,
@@ -9,8 +10,9 @@ import {
 } from "./webTransportMedia";
 import type { InputMsg } from "../input/inputSender";
 import type { Presenter } from "./presenter";
-import { TransportError, type MediaSink, type MediaTransport } from "./transport";
-import { createWebTransportRuntime } from "../pages/app/webTransportRuntime";
+import { TransportError, type MediaSink, type MediaTransport, type TransportEnd } from "./transport";
+import { createWebTransportRuntime, type WebTransportRuntimeDeps } from "../pages/app/webTransportRuntime";
+import type { BenchDeps } from "../bench/benchController";
 import { mintTransportToken } from "../api/library";
 import {
   avcC,
@@ -153,6 +155,14 @@ describe("WebTransportMedia connect", () => {
     expect(agent.last.closes[0]).toMatchObject({ closeCode: 4400 });
   });
 
+  it("refuses a PyroWave hello_ack whose picture size no PWV1 header can state", async () => {
+    const agent = new FakeAgent();
+    const ack = helloAck(0, avcC(), 1_000_000, 1_000_000);
+    agent.replies = [[{ ...ack, video: { ...ack.video, codec: "pyrowave" } }]];
+    await expect(transport(agent, { pyrowave: true, ticker: () => () => {} }).connect(NO_SINK)).rejects.toMatchObject({ code: "internal" });
+    expect(agent.last.closes[0]).toMatchObject({ closeCode: 4400 });
+  });
+
   it("re-mints an old token after a failed attempt, by its own clock, and never twice within 10 s", async () => {
     const agent = new FakeAgent();
     const notReady = [{ type: "error", code: "session_not_ready" }];
@@ -221,7 +231,8 @@ describe("WebTransportMedia keyframe requests", () => {
     agent.replies = [[helloAck(0, avcC())]];
     let now = 1_000;
     const t = transport(agent, { now: () => now });
-    await t.connect(NO_SINK);
+    const counted: string[] = [];
+    await t.connect({ ...NO_SINK, keyframeRequested: (r) => void counted.push(r) });
     vi.useFakeTimers();
     t.requestKeyframe("loss");
     t.requestKeyframe("late");
@@ -231,6 +242,8 @@ describe("WebTransportMedia keyframe requests", () => {
     now += KEYFRAME_SPACING_MS;
     await vi.advanceTimersByTimeAsync(KEYFRAME_SPACING_MS);
     expect(agent.sent("keyframe_request").map((k) => k.reason)).toEqual(["loss", "decode_error"]);
+    // Telemetry counts what went on the wire, not what was asked.
+    expect(counted).toEqual(["loss", "decode_error"]);
   });
 });
 
@@ -251,10 +264,41 @@ describe("WebTransportMedia loss recovery", () => {
   });
 });
 
+describe("WebTransportMedia receiver feedback", () => {
+  it("reports the datagrams that arrived on the control stream, in the contract's shape", async () => {
+    const agent = new FakeAgent();
+    agent.replies = [[helloAck(0, avcC())]];
+    const t = transport(agent);
+    await t.connect(NO_SINK);
+    const pkt = { n: 7 };
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(3000, 0) }, pkt));
+    await vi.waitFor(() => expect(agent.sent("feedback")).toHaveLength(1));
+    const [fb] = agent.sent("feedback");
+    expect(fb).toMatchObject({ seq: 1, first_pkt_seq: 7, count: pkt.n - 7, lost: 0 });
+    expect(typeof fb.arrivals_b64).toBe("string");
+    t.close();
+  });
+
+  it("reports on the transport's ticker, the Worker clock a hidden tab keeps running", async () => {
+    const periods: number[] = [];
+    const agent = new FakeAgent();
+    agent.replies = [[helloAck(0, avcC())]];
+    const t = transport(agent, {
+      ticker: (ms) => {
+        periods.push(ms);
+        return () => {};
+      },
+    });
+    await t.connect(NO_SINK);
+    expect(periods).toEqual([1000, 50]);
+    t.close();
+  });
+});
+
 // ── The runtime, end to end against the fake agent ─────────────────────────
 
 describe("createWebTransportRuntime", () => {
-  function setup(opts: { draws?: boolean; noWebGpu?: boolean } = {}) {
+  function setup(opts: { draws?: boolean; noWebGpu?: boolean; deps?: Partial<WebTransportRuntimeDeps> } = {}) {
     const agent = new FakeAgent();
     agent.replies = [[helloAck(0, avcC())]];
     const decoders: FakeDecoder[] = [];
@@ -289,10 +333,119 @@ describe("createWebTransportRuntime", () => {
           },
           isConfigSupported: async (c) => ({ supported: true, config: c }),
         },
+        // No network from a unit test: the trace and the stats posts go nowhere.
+        createTracer: () => ({ start() {}, stop() {}, emitBenchWindow() {} }),
+        telemetry: { fetch: async () => new Response("{}") },
+        ...opts.deps,
       },
     });
     return { agent, decoders, presented, presenter, callbacks, rt, presenterFatal: () => presenterFatal! };
   }
+
+  it("in bench mode gives the marker reader each decoded frame before the presenter takes it, and posts its windows through the trace (#1035)", async () => {
+    const read: { width: number; closed: boolean }[] = [];
+    const windows: unknown[] = [];
+    const tracer = { start: vi.fn(), stop: vi.fn(), emitBenchWindow: (p: unknown) => void windows.push(p) };
+    class FakeBench {
+      constructor(private readonly deps: BenchDeps) {}
+      start() {}
+      // The real one flushes its last window on stop.
+      stop() {
+        this.deps.emitWindow({ n: read.length } as never);
+      }
+      handle() {
+        return { enabled: true };
+      }
+      onFrame() {
+        const src = this.deps.source!()!;
+        read.push({ width: src.width, closed: (src.image as unknown as FakeFrame).closed });
+      }
+    }
+    const { agent, presented, rt } = setup({
+      deps: {
+        isBenchModeEnabled: () => true,
+        loadBench: async () => ({ BenchController: FakeBench as never }),
+        createTracer: () => tracer,
+      },
+    });
+    rt.start();
+    await vi.waitFor(() => expect((window as unknown as Record<string, unknown>).__qBench).toEqual({ enabled: true }));
+    const pkt = { n: 0 };
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(900, 0) }, pkt));
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 1, keyframe: false, data: bytes(900, 1) }, pkt));
+    await vi.waitFor(() => expect(presented).toHaveLength(2));
+    // Read at the frame's own size while it was still open; the presenter closed it afterwards.
+    expect(read).toEqual([{ width: 1920, closed: false }, { width: 1920, closed: false }]);
+    expect(tracer.start).toHaveBeenCalledTimes(1);
+    rt.destroy();
+    expect(windows).toEqual([{ n: 2 }]);
+    expect(tracer.stop).toHaveBeenCalledTimes(1);
+    delete (window as unknown as Record<string, unknown>).__qBench;
+  });
+
+  it("keeps presenting when the bench instrument throws", async () => {
+    class BrokenBench {
+      start() {}
+      stop() {}
+      handle() {
+        return { enabled: true };
+      }
+      onFrame() {
+        throw new Error("marker decode failed");
+      }
+    }
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { agent, presented, rt } = setup({
+      deps: { isBenchModeEnabled: () => true, loadBench: async () => ({ BenchController: BrokenBench as never }) },
+    });
+    rt.start();
+    await vi.waitFor(() => expect((window as unknown as Record<string, unknown>).__qBench).toEqual({ enabled: true }));
+    const pkt = { n: 0 };
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(900, 0) }, pkt));
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 1, keyframe: false, data: bytes(900, 1) }, pkt));
+    await vi.waitFor(() => expect(presented).toHaveLength(2));
+    expect(presented.every((f) => f.closed)).toBe(true);
+    // Said once, not per frame.
+    expect(warn.mock.calls.filter((c) => c[0] === "bench:")).toHaveLength(1);
+    rt.destroy();
+    delete (window as unknown as Record<string, unknown>).__qBench;
+  });
+
+  it("opens the first telemetry window at connect, and reports a fragment it had to NACK as lost (#1035)", async () => {
+    // The telemetry's clock, so the windows are exact whatever the real timer does.
+    let now = 0;
+    const snaps: { fps: number; packetsLost: number }[] = [];
+    const { agent, presented, rt } = setup({ deps: { telemetry: { nowMs: () => now, fetch: async () => new Response("{}") } } });
+    now = 5_000; // made, then five seconds getting a presenter, a token and a connection
+    rt.registerTelemetry((s) => snaps.push(s));
+    rt.start();
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    const pkt = { n: 0 };
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(10, 0) }, pkt));
+    const one = packetize({ configId: 0, frameSeq: 1, keyframe: false, data: bytes(3000, 1) }, pkt);
+    agent.last.datagrams(one.slice(1)); // its first fragment is lost
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 2, keyframe: false, data: bytes(10, 2) }, pkt));
+    await vi.waitFor(() => expect(agent.sent("nack")).toHaveLength(1));
+    const resent = one[0].slice();
+    resent[5] |= 4;
+    agent.last.datagrams([resent]);
+    await vi.waitFor(() => expect(presented).toHaveLength(3));
+    now = 6_000;
+    await vi.waitFor(() => expect(snaps.length).toBeGreaterThan(0), { timeout: 3_000 });
+    // Three frames in the one second since the ticks started: not three over six.
+    expect(snaps[0].fps).toBeCloseTo(3, 6);
+    expect(snaps[0].packetsLost).toBe(1);
+    rt.destroy();
+  });
+
+  it("starts no bench instrument for an ordinary session", async () => {
+    const loadBench = vi.fn();
+    const { rt } = setup({ deps: { loadBench } });
+    rt.start();
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    expect(loadBench).not.toHaveBeenCalled();
+    rt.destroy();
+  });
 
   it("connects with the contract's hello, decodes reassembled frames and presents each one", async () => {
     const { agent, decoders, presented, rt } = setup();
@@ -402,7 +555,8 @@ describe("createWebTransportRuntime", () => {
     expect(rt.getSnapshot().firstFrame).toBe(false);
     vi.spyOn(console, "warn").mockImplementation(() => {});
     presenterFatal()("the GPU device was lost");
-    expect(callbacks.onFallback).toHaveBeenCalledWith("internal");
+    // The fallback follows the close (control-api.md §Transport fallback, "Close first").
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("internal"));
   });
 
   it("reports a presenter that cannot be made, and builds no transport", async () => {
@@ -525,6 +679,55 @@ describe("createWebTransportRuntime", () => {
     document.dispatchEvent(new Event("visibilitychange"));
     await vi.waitFor(() => expect(agent.sent("keyframe_request")).toEqual([{ type: "keyframe_request", reason: "loss" }]));
     rt.destroy();
+  });
+});
+
+describe("WebTransportMedia close once connected", () => {
+  async function connected(agent: FakeAgent, sink: Partial<MediaSink> = {}) {
+    agent.replies = [[helloAck(0, avcC())]];
+    const t = transport(agent, { ticker: () => () => {} });
+    await t.connect({ ...NO_SINK, ...sink });
+    return t;
+  }
+  const keyframe = (frameSeq: number) => packetize({ configId: 0, frameSeq, keyframe: true, data: bytes(10, frameSeq) });
+
+  it.each([
+    ["reset", (a: FakeAgent) => void (a.controlReset = true)],
+    ["blocked", (a: FakeAgent) => void (a.hold = "write")],
+  ])("closes the session though its control stream is %s and the bye cannot leave", async (_, breakControl) => {
+    vi.useFakeTimers();
+    const agent = new FakeAgent();
+    const t = await connected(agent);
+    breakControl(agent);
+    t.close();
+    await vi.advanceTimersByTimeAsync(BYE_FLUSH_MS);
+    expect(agent.last.closes).toEqual([{ closeCode: 0, reason: "" }]);
+  });
+
+  it("feeds the sink nothing after close(), from datagrams already in flight", async () => {
+    const agent = new FakeAgent();
+    agent.closeEndsDatagrams = false;
+    const units: number[] = [];
+    const t = await connected(agent, { unit: (u) => units.push(u.frameSeq) });
+    agent.last.datagrams(keyframe(1));
+    await vi.waitFor(() => expect(units).toEqual([1]));
+    t.close();
+    agent.last.datagrams(keyframe(2));
+    await flush();
+    expect(units).toEqual([1]);
+  });
+
+  it("ends the connection when the datagram path throws, not left up with no video", async () => {
+    const agent = new FakeAgent();
+    const ends: TransportEnd[] = [];
+    await connected(agent, {
+      unit: () => {
+        throw new Error("boom");
+      },
+      end: (e) => ends.push(e),
+    });
+    agent.last.datagrams(keyframe(1));
+    await vi.waitFor(() => expect(ends).toEqual([{ code: 4400, reason: "boom" }]));
   });
 });
 
@@ -747,11 +950,43 @@ describe("createWebTransportRuntime fallback", () => {
     agent.last.closeWith(4400);
     await vi.waitFor(() => expect(release).toBeDefined());
     fatal("the GPU device was lost");
-    expect(callbacks.onFallback).toHaveBeenCalledWith("internal");
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("internal"));
     release();
     await flush();
     expect(agent.conns).toHaveLength(1);
     expect(callbacks.onFallback).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not ask the page to fall back until the WebTransport session has been told to close (#1250)", async () => {
+    let sink!: MediaSink;
+    let closed!: () => void;
+    const onFallback = vi.fn();
+    const fake: MediaTransport = {
+      connect: async (s) => void (sink = s),
+      requestKeyframe: () => {},
+      sendMic: () => false,
+      codecFallback: () => {},
+      input: { reliable: () => {}, datagram: () => false },
+      // A close that is still flushing its bye, or waiting out its bound.
+      close: () => new Promise<void>((r) => (closed = r)),
+    };
+    const rt = createWebTransportRuntime({
+      sessionId: "s1",
+      authToken: "auth",
+      coords: COORDS,
+      canvas: document.createElement("canvas"),
+      callbacks: { onDisconnectSuspected: () => {}, onSessionTakenOver: () => {}, onTransportFailed: () => {}, onFallback },
+      deps: { createTransport: () => fake, createPresenter: async () => ({ present: () => true, destroy: () => {} }) },
+    });
+    rt.start();
+    await vi.waitFor(() => expect(sink).toBeDefined());
+    vi.mocked(mintTransportToken).mockRejectedValue(new Error("409"));
+    sink.end({ code: null, reason: "" });
+    await vi.waitFor(() => expect(closed).toBeDefined());
+    await flush();
+    expect(onFallback).not.toHaveBeenCalled();
+    closed();
+    await vi.waitFor(() => expect(onFallback).toHaveBeenCalledTimes(1));
   });
 
   it("closes WebTransport before it asks the page to fall back", async () => {
