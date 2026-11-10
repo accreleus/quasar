@@ -95,6 +95,7 @@ const RULES = [
   ["a pass status where every criterion was not judged", (d) => edit(d, `${SC}/scenario.json`, (s) => ({ ...s, criteria: [{ id: "a", pass: null, observed: null, expected: "1" }] })), /a pass status with no criterion that passed/],
   ["a criterion id used twice", (d) => edit(d, `${SC}/scenario.json`, (s) => ({ ...s, criteria: [...s.criteria, { id: "first_frame_s", pass: true, observed: 1, expected: "<= 20" }] })), /criterion id first_frame_s is not unique/],
   ["a criterion id that is a number", (d) => edit(d, `${SC}/scenario.json`, (s) => ({ ...s, criteria: [{ id: 7, pass: true, observed: 1, expected: "1" }] })), /criterion id 7 must be a non-empty string/],
+  ["a criterion id that is empty", (d) => edit(d, `${SC}/scenario.json`, (s) => ({ ...s, criteria: [{ id: "", pass: true, observed: 1, expected: "1" }] })), /criterion id "" must be a non-empty string/],
   ["a criterion id that is an object", (d) => edit(d, `${SC}/scenario.json`, (s) => ({ ...s, criteria: [{ id: { n: 7 }, pass: true, observed: 1, expected: "1" }] })), /must be a non-empty string/],
   ["a scenario listed twice", (d) => edit(d, "manifest.json", (m) => ({ ...m, scenarios: [SC, SC] })), /scenario 01-stream-hold is listed twice/],
   ["scenarios that is not a list", (d) => edit(d, "manifest.json", (m) => ({ ...m, scenarios: SC })), /scenarios must be a list of directory names/],

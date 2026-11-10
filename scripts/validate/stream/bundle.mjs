@@ -167,12 +167,13 @@ function check(dir, errors, { keys = manifestKeys() } = {}) {
     // string one that print the same would otherwise be two rows nobody can tell apart.
     const ids = new Set();
     for (const c of Array.isArray(sc.criteria) ? sc.criteria : []) {
-      if (c?.id === undefined) continue;
-      if (typeof c.id !== "string") err(at, `criterion id ${JSON.stringify(c.id)} must be a non-empty string`);
-      else if (c.id !== "") {
-        if (ids.has(c.id)) err(at, `criterion id ${c.id} is not unique`);
-        ids.add(c.id);
+      if (c?.id === undefined) continue; // reported below as a criterion with no id
+      if (typeof c.id !== "string" || c.id === "") {
+        err(at, `criterion id ${JSON.stringify(c.id)} must be a non-empty string`);
+        continue;
       }
+      if (ids.has(c.id)) err(at, `criterion id ${c.id} is not unique`);
+      ids.add(c.id);
     }
     // The review derives a scenario's verdict from its status and its criteria; a pass
     // with a failed criterion is the two disagreeing, so it is not a bundle.
@@ -185,7 +186,7 @@ function check(dir, errors, { keys = manifestKeys() } = {}) {
       err(at, "a pass status with no criterion that passed");
     }
     for (const c of Array.isArray(sc.criteria) ? sc.criteria : []) {
-      if (!c?.id || !("observed" in c) || !("expected" in c) || ![true, false, null].includes(c.pass)) {
+      if (c?.id === undefined || !("observed" in c) || !("expected" in c) || ![true, false, null].includes(c.pass)) {
         err(at, `criterion ${c?.id ?? "?"} needs id, pass (true, false or null), observed and expected`);
       } else if (c.pass === null && c.observed !== null) {
         err(at, `criterion ${c.id} was not judged, so observed must be null`);
