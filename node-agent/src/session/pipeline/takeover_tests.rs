@@ -3095,6 +3095,79 @@ fn a_session_nobody_answered_stops() {
     );
 }
 
+/// Keeps every swap waiting for its replacement, as a held game does.
+struct SwapHold;
+
+impl SwapHold {
+    fn on() -> SwapHold {
+        crate::session::runner::SWAP_HOLD.store(true, Ordering::Relaxed);
+        SwapHold
+    }
+}
+
+impl Drop for SwapHold {
+    fn drop(&mut self) {
+        crate::session::runner::SWAP_HOLD.store(false, Ordering::Relaxed);
+    }
+}
+
+/// #1249: a stop sent while a swap waits for its replacement ends the session then, not at
+/// the swap's 45 s budget, and the stopped session reports neither a swap nor a rollback.
+#[test]
+fn a_stop_during_a_held_swap_ends_the_session_without_swap_done() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let _hold = SwapHold::on();
+    let mut session = Session::start("swap-stop", Duration::from_secs(600));
+    session.mute = true;
+    let mut nobody = Peer::new();
+    let offered = session.pump(&mut nobody, Duration::from_secs(20), |s, _| {
+        s.offers == [1, 1]
+    });
+    assert!(offered, "offers per PC: {:?}", session.offers);
+
+    session
+        .swap
+        .send(crate::session::runner::SwapRequest {
+            container: None,
+            in_place: false,
+        })
+        .expect("swap lane");
+    // `Swapping` goes out on the runner's thread right before the swap: from here its next
+    // look at the stop flag is the swap's own.
+    let swapping = session.pump(&mut nobody, Duration::from_secs(10), |s, _| {
+        s.log.iter().any(|e| matches!(e, SessionEvent::Swapping))
+    });
+    assert!(swapping, "the swap never started");
+
+    session.stop.store(true, Ordering::SeqCst);
+
+    let ended = session.ends_within(Duration::from_secs(15));
+    assert!(
+        matches!(ended, Some(SessionEvent::Stopped { .. })),
+        "the session did not stop inside the held swap: {ended:?}"
+    );
+    let swap_reports: Vec<_> = session
+        .log
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                SessionEvent::SwapDone
+                    | SessionEvent::SwapRolledBack(_)
+                    | SessionEvent::AppPresented
+                    | SessionEvent::Failed(_)
+            )
+        })
+        .collect();
+    assert!(
+        swap_reports.is_empty(),
+        "a stopped session reported {swap_reports:?}"
+    );
+}
+
 impl Session {
     /// A size step, then an app swap, then a stop, with whatever the transports are
     /// waiting for still outstanding. The size step makes the source renegotiate; the

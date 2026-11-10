@@ -25,9 +25,10 @@ const IPV4 = /(?<![\d.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?!\d|\.\d)/g;
 const DOC_NETS = ["192.0.2.", "198.51.100.", "203.0.113."]; // RFC 5737
 const SECRETS = [
   [/\beyJ[\w-]{10,}\.[\w-]{10,}\./, "a JWT"],
-  // A token has a digit or punctuation in it; "Bearer authentication" in prose has neither.
-  [/\bBearer\s+(?=[\w.~+/-]*[\d.~+/-])[\w.~+/-]{8,}/i, "a bearer token"],
-  [/\b(password|passwd|secret|access_token|refresh_token|sig_token|api[_-]?key)["']?\s*[=:]\s*["']?(?!null|true|false)[^\s"',}]{4,}/i, "a credential"],
+  // A token has a digit in it; "Bearer authentication." in prose has none.
+  [/\bBearer\s+(?=[\w.~+/-]*\d)[\w.~+/-]{8,}/i, "a bearer token"],
+  // A value that says there is none ("password": null, secret: none, token=[REDACTED]) is not one.
+  [/\b(password|passwd|secret|access_token|refresh_token|sig_token|api[_-]?key)["']?\s*[=:]\s*["']?(?!\[?(?:null|none|n\/?a|redacted|omitted|unknown|true|false)\]?(?=[\s"',}]|$))[^\s"',}]{4,}/im, "a credential"],
 ];
 
 function leaks(text) {
@@ -120,6 +121,20 @@ function check(dir, errors, { keys = manifestKeys() } = {}) {
     return rows;
   };
 
+  // First, what is in the directory: nothing is opened until every entry is known to be a
+  // regular file (opening a named pipe would wait for ever).
+  const files = [];
+  const walk = (rel) => {
+    for (const e of fs.readdirSync(path.join(dir, rel), { withFileTypes: true })) {
+      const p = path.join(rel, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.isFile()) files.push(p);
+      else err(p, "is not a regular file (a bundle holds no links)");
+    }
+  };
+  walk("");
+  if (errors.length) return;
+
   const manifest = readJson("manifest.json");
   const client = readJson("client.json");
   const builds = readJson("builds.json");
@@ -131,15 +146,15 @@ function check(dir, errors, { keys = manifestKeys() } = {}) {
       if (manifest[k] === undefined) err("manifest.json", `no ${k}`);
     }
     // A name is one directory inside the bundle, never a path out of it.
-    if (!Array.isArray(manifest.scenarios) || manifest.scenarios.some((n) => typeof n !== "string" || !/^\w[\w.-]*$/.test(n))) {
+    if (manifest.scenarios !== undefined && (!Array.isArray(manifest.scenarios) || manifest.scenarios.some((n) => typeof n !== "string" || !/^\w[\w.-]*$/.test(n)))) {
       err("manifest.json", "scenarios must be a list of directory names");
       manifest.scenarios = [];
     }
-    if (!Array.isArray(manifest.not_recorded)) {
+    if (manifest.not_recorded !== undefined && !Array.isArray(manifest.not_recorded)) {
       err("manifest.json", "not_recorded must be a list");
       manifest.not_recorded = [];
     }
-    for (const n of manifest.not_recorded) {
+    for (const n of manifest.not_recorded ?? []) {
       if (!n?.fact || !n?.why) err("manifest.json", "a not_recorded entry needs fact and why");
     }
   }
@@ -192,20 +207,22 @@ function check(dir, errors, { keys = manifestKeys() } = {}) {
   }
 
   // Every text file, whatever its name: a log or a captured console can carry a token too.
-  // shortcut: each file is read whole; cap or stream it when a bundle carries GB-size logs.
-  const walk = (rel) => {
-    for (const e of fs.readdirSync(path.join(dir, rel), { withFileTypes: true })) {
-      const p = path.join(rel, e.name);
-      if (e.isDirectory()) walk(p);
-      else if (!e.isFile()) err(p, "is not a regular file (a bundle holds no links)");
-      else {
-        const buf = fs.readFileSync(path.join(dir, p));
-        if (buf.subarray(0, 4096).includes(0)) continue; // a picture, a video, an archive
-        for (const what of leaks(buf.toString("utf8"))) err(p, `holds ${what}`);
-      }
+  // The check never guesses an encoding. A bundle's text is UTF-8: a file that declares
+  // UTF-16 or UTF-32 with a byte-order mark is refused, not decoded, and any other file
+  // with a NUL byte in its first 4 KB is a picture, a video or an archive and is not read.
+  // shortcut: a text file is read whole; stream it when a bundle carries GB-size logs.
+  const head = Buffer.alloc(4096);
+  for (const p of files) {
+    const fd = fs.openSync(path.join(dir, p), "r");
+    const n = fs.readSync(fd, head, 0, head.length, 0);
+    fs.closeSync(fd);
+    const mark = head.readUInt16BE(0);
+    if (n >= 2 && (mark === 0xfffe || mark === 0xfeff || (n >= 4 && head.readUInt32BE(0) === 0x0000feff))) {
+      err(p, "is UTF-16 or UTF-32 (a bundle's text is UTF-8)");
+    } else if (!head.subarray(0, n).includes(0)) {
+      for (const what of leaks(fs.readFileSync(path.join(dir, p), "utf8"))) err(p, `holds ${what}`);
     }
-  };
-  walk("");
+  }
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

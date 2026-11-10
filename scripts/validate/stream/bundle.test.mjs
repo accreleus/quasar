@@ -72,8 +72,23 @@ const RULES = [
   ["a timeline row with no event", (d) => append(d, `${SC}/timeline.jsonl`, { ts_unix_ms: 1, clock: "client" }), /needs ts_unix_ms, clock \(client or host\) and ev/],
   ["a sample row that is not an object", (d) => fs.appendFileSync(path.join(d, SC, "metrics.jsonl"), "null\n"), /metrics.jsonl:\d+: not an object/],
   ["a link", (d) => fs.symlinkSync("/nonexistent/x.json", path.join(d, SC, "x.json")), /x.json: is not a regular file/],
+  // Opening a named pipe waits for ever: it must be refused before anything is read.
+  ["a named pipe where a file is read", (d) => { fs.rmSync(path.join(d, SC, "metrics.jsonl")); execFileSync("mkfifo", [path.join(d, SC, "metrics.jsonl")]); }, /metrics.jsonl: is not a regular file/],
+  // One case per byte-order mark: the file is refused, whatever it holds.
+  ...[["UTF-16LE", [0xff, 0xfe], "utf16le"], ["UTF-16BE", [0xfe, 0xff], "utf16le"], ["UTF-32LE", [0xff, 0xfe, 0, 0], "utf16le"], ["UTF-32BE", [0, 0, 0xfe, 0xff], "utf16le"]].map(([name, bom, enc]) => [
+    `a ${name} log`, (d) => fs.writeFileSync(path.join(d, SC, "agent.log"), Buffer.concat([Buffer.from(bom), Buffer.from("Authorization: Bearer abcdefgh12345678\n", enc)])), /agent.log: is UTF-16 or UTF-32/,
+  ]),
   ["a token in a file with no extension", (d) => fs.writeFileSync(path.join(d, SC, "agent-stdout"), "Authorization: Bearer abcdefgh12345678\n"), /agent-stdout: holds a bearer token/],
+  ["a password that only starts like 'none'", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "password: none-of-your-business1\n"), /x.log: holds a credential/],
+  ["a password that only starts like 'null'", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "password: nullify\n"), /x.log: holds a credential/],
   ["a password in a log", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "login password=hunter2\n"), /x.log: holds a credential/],
+  ["no timeline for a scenario that ran", (d) => fs.rmSync(path.join(d, SC, "timeline.jsonl")), /timeline.jsonl: missing/],
+  ["a client of no known kind", (d) => edit(d, "client.json", (c) => ({ ...c, kind: "tv" })), /kind must be web or native/],
+  ["no word on shaping", (d) => edit(d, "network.json", ({ shaping, ...n }) => n), /network.json: no shaping/],
+  ["a not_recorded entry with no reason", (d) => edit(d, "manifest.json", (m) => ({ ...m, not_recorded: [{ fact: "x" }] })), /needs fact and why/],
+  ["builds with no components", (d) => edit(d, "builds.json", () => ({ unknown: {} })), /builds.json: no components/],
+  ["a scenario with no sessions", (d) => edit(d, `${SC}/scenario.json`, ({ sessions, ...s }) => s), /scenario.json: no sessions/],
+  ["a sample row with no metrics", (d) => append(d, `${SC}/metrics.jsonl`, { kind: "metric", source: "agent", ts_unix_ms: 1 }), /needs ts_unix_ms and metrics/],
   ["a status outside the four", (d) => edit(d, `${SC}/scenario.json`, (s) => ({ ...s, status: "ok" })), /status must be one of/],
   ["scenarios that is not a list", (d) => edit(d, "manifest.json", (m) => ({ ...m, scenarios: SC })), /scenarios must be a list of directory names/],
   ["a scenario name that is a path", (d) => edit(d, "manifest.json", (m) => ({ ...m, scenarios: ["../x"] })), /scenarios must be a list of directory names/],
@@ -107,8 +122,9 @@ for (const [name, breakIt, expected] of RULES) {
 test("a browser version, a documentation address and a container's home are not leaks", () => {
   const dir = bundle();
   edit(dir, "network.json", (n) => ({ ...n, note: "Chrome/157.0.7339.81 via 192.0.2.5, logs in /home/quasar/.local/share/Steam", sig_token: null }));
-  fs.writeFileSync(path.join(dir, "README.md"), "The Bearer authentication header is required.\n");
-  fs.writeFileSync(path.join(dir, SC, "shot.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0, 0, 0]));
+  fs.writeFileSync(path.join(dir, "README.md"), "Use Bearer authentication. Secret: none of the builds recorded it. password=[REDACTED]\n");
+  // A picture is not read for text, whatever bytes it holds after its header.
+  fs.writeFileSync(path.join(dir, SC, "shot.png"), Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0, 0, 0]), Buffer.from("Bearer abcdefgh12345678")]));
   assert.deepEqual(validateBundle(dir), []);
 });
 
