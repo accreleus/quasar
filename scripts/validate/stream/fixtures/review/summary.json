@@ -1,0 +1,150 @@
+{
+  "format": 1,
+  "suite_run_id": "fixture-0001",
+  "plan": "smoke",
+  "client": {
+    "label": "mac-test-client",
+    "kind": "web"
+  },
+  "builds": [
+    {
+      "component": "control_plane",
+      "build": "0.6.0-dev (9e3c207f)"
+    },
+    {
+      "component": "gpu_driver",
+      "build": null,
+      "why": "no API reports the driver version"
+    },
+    {
+      "component": "node_agent",
+      "build": "0.6.0-dev (9e3c207f)"
+    },
+    {
+      "component": "reference_app",
+      "build": "767e2ad"
+    },
+    {
+      "component": "web",
+      "build": null,
+      "why": "the web client has no build id"
+    }
+  ],
+  "counts": {
+    "pass": 1,
+    "fail": 0,
+    "error": 0,
+    "skipped": 0
+  },
+  "thresholds": {
+    "version": "2026-08-23.4"
+  },
+  "not_recorded": [
+    {
+      "fact": "audio_latency_ms",
+      "why": "nothing measures audio latency yet"
+    }
+  ],
+  "scenarios": [
+    {
+      "dir": "01-stream-hold",
+      "id": "01-stream-hold",
+      "scenario": "stream-hold",
+      "status": "pass",
+      "reason": null,
+      "params": {
+        "transport": "webrtc",
+        "codec": "h264",
+        "profile": "1080p60",
+        "hold_s": 240
+      },
+      "criteria": [
+        {
+          "id": "audio_latency_ms",
+          "pass": null,
+          "observed": null,
+          "expected": "<= 80"
+        },
+        {
+          "id": "first_frame_s",
+          "pass": true,
+          "observed": 4.2,
+          "expected": "<= 20"
+        },
+        {
+          "id": "freeze_count",
+          "pass": true,
+          "observed": 0,
+          "expected": "0"
+        }
+      ],
+      "windows": {
+        "keys": [
+          "fps"
+        ],
+        "absent": [
+          "present_interval_max_ms",
+          "g2g_p95_ms",
+          "missing_indices"
+        ],
+        "rows": [
+          {
+            "ts_unix_ms": 1786940060000,
+            "worst_for": "fps",
+            "value": 4
+          },
+          {
+            "ts_unix_ms": 1786940061000,
+            "worst_for": "fps",
+            "value": 4
+          },
+          {
+            "ts_unix_ms": 1786940062000,
+            "worst_for": "fps",
+            "value": 4
+          },
+          {
+            "ts_unix_ms": 1786940063000,
+            "worst_for": "fps",
+            "value": 4
+          },
+          {
+            "ts_unix_ms": 1786940064000,
+            "worst_for": "fps",
+            "value": 4
+          }
+        ]
+      },
+      "anomalies": [
+        {
+          "threshold": "classifier.hitch_sd_ms",
+          "sample_key": "present_interval_sd_ms",
+          "limit": 18,
+          "unit": "ms",
+          "windows_over": 90,
+          "worst": 22,
+          "first_ts_unix_ms": 1786940030000
+        },
+        {
+          "threshold": "web.signal.packets_lost_fair",
+          "sample_key": "packets_lost",
+          "limit": 3,
+          "unit": "count",
+          "windows_over": 178,
+          "worst": 358,
+          "first_ts_unix_ms": 1786940002000
+        },
+        {
+          "threshold": "web.signal.packets_lost_poor",
+          "sample_key": "packets_lost",
+          "limit": 15,
+          "unit": "count",
+          "windows_over": 172,
+          "worst": 358,
+          "first_ts_unix_ms": 1786940008000
+        }
+      ],
+      "files": []
+    }
+  ]
+}

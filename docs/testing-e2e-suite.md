@@ -3,12 +3,13 @@
 A fixed list of scenarios run against a Quasar stack from a test client, with no model in the
 loop, leaving one **run bundle** that an agent or a person reviews afterwards. Spec: #1271.
 
-> **Status.** The bundle format and its validator exist (#1272). The runner and the
-> `make e2e-*` verbs are the spec's later tickets; this page grows with them.
+> **Status.** The bundle format and its validator exist (#1272), and so does the review
+> that summarises a bundle (#1275). The runner and the posting verb are the spec's later
+> tickets; this page grows with them.
 
 ## What you need
 
-- Node 22. The validator has no dependencies.
+- Node 22. The validator and the review have no dependencies.
 
 ## What to do
 
@@ -21,6 +22,19 @@ node scripts/validate/stream/bundle.mjs <bundle-dir>
 Exit 0 valid, 1 not valid (each problem on its own line, as `<file>: <what>`), 2 usage. It never
 stops on a stack trace: a bundle it could not read to the end is not valid, and says so.
 The last line is `RESULT status=ok|failed target=e2e-bundle errors=N`.
+
+Summarise it:
+
+```
+make e2e-review BUNDLE=<bundle-dir>
+```
+
+It writes `review/summary.json` and `review/REVIEW.md` inside the bundle — which leaves the
+bundle valid — and ends with
+`RESULT status=ok|failed target=e2e-review scenarios=N pass=N fail=N error=N skipped=N`.
+Exit 0 when every scenario's status is `pass` (a skipped scenario is listed and does not fail
+the run), 1 when one is `fail` or `error`, 2 when the bundle is not valid: then it prints the
+validator's problems and writes nothing.
 
 ## The run bundle, format 1
 
@@ -50,3 +64,30 @@ A directory, zipped when it is handed between machines.
 
 The test (`node --test scripts/validate/stream/bundle.test.mjs`, part of `make verify`) breaks the
 fixture once per rule above.
+
+## Reading REVIEW.md
+
+`REVIEW.md` is the deterministic summary: the same bundle in gives the same bytes out, so two
+reviews of one bundle can be diffed. It is not a verdict — each scenario's status is what the
+run recorded.
+
+- **The top** is the suite run id, the plan, the test client (label and kind), the builds line
+  (`unknown (why)` for a part that could not say), the counts, the thresholds version, and
+  every `not_recorded` fact with its reason.
+- **Criteria** are listed failed first (`fail`, then `not judged`, then `pass`), each with its
+  observed and expected value. `null` stays `null`: a fact that was not measured is never `0`.
+- **The five worst one-second windows** are ranked from the `browser` samples by
+  `present_interval_max_ms`, `g2g_p95_ms` and `missing_indices` (highest) and `fps` (lowest).
+  Each row names the key that put it there, and the line above the table names the keys the
+  bundle does not carry: an absent key is skipped, never scored as `0`.
+- **Anomalies** are rule-based: one row per threshold in `docs/session-trace/thresholds.json`
+  that is a limit on one sample key, with how many windows crossed it and the worst value. A
+  threshold phrased as a p10 or a delta over a window — rather than a value a single sample
+  carries — maps onto no one key, so it is not used.
+- **Files worth opening** appears for a scenario with a failed criterion or a `fail`/`error`
+  status: its directory, its `timeline.jsonl` and any pictures in it, by path relative to the
+  bundle.
+
+The test (`node --test scripts/validate/stream/review.test.mjs`, part of `make verify`) pins the
+fixture's two files as golden, runs it twice for the same bytes, and checks the 150-line budget
+of a four-scenario review.
