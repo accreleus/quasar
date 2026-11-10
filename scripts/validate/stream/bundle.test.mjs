@@ -110,6 +110,10 @@ const RULES = [
   ["a cookie under a JSON key", (d) => edit(d, "client.json", (c) => ({ ...c, "Set-Cookie": "sid=abc12345" })), /client.json: holds a credential/],
   ["a camelCase token under a JSON key", (d) => edit(d, "client.json", (c) => ({ ...c, nested: { sigToken: "abcdefgh" } })), /client.json: holds a credential/],
   ["an authorization header under a JSON key", (d) => edit(d, "network.json", (n) => ({ ...n, headers: [{ Authorization: "opaque-value" }] })), /network.json: holds a credential/],
+  ["a credential-named key holding an object", (d) => edit(d, "client.json", (c) => ({ ...c, authorization: { value: "credential-in-object" } })), /client.json: holds a credential/],
+  ["a credential-named key holding an array", (d) => edit(d, "client.json", (c) => ({ ...c, nested: [{ accessToken: ["credential-in-array"] }] })), /client.json: holds a credential/],
+  ["a credential-named key holding a number", (d) => edit(d, "client.json", (c) => ({ ...c, accessToken: 12345678 })), /client.json: holds a credential/],
+  ["a credential-named key holding true", (d) => edit(d, "client.json", (c) => ({ ...c, secret: true })), /client.json: holds a credential/],
   ["sessions that is an object", (d) => edit(d, `${SC}/scenario.json`, (s) => ({ ...s, sessions: { zero: "x" } })), /scenario.json: sessions must be a list of strings/],
   ["sessions that is a string", (d) => edit(d, `${SC}/scenario.json`, (s) => ({ ...s, sessions: "abc" })), /scenario.json: sessions must be a list of strings/],
   ["sessions that is null", (d) => edit(d, `${SC}/scenario.json`, (s) => ({ ...s, sessions: null })), /scenario.json: sessions must be a list of strings/],
@@ -134,7 +138,7 @@ test("an empty sessions list is valid: nothing to collect for the scenario", () 
 
 test("a browser version, a documentation address and a container's home are not leaks", () => {
   const dir = bundle();
-  edit(dir, "network.json", (n) => ({ ...n, note: "Chrome/157.0.7339.81 via 192.0.2.5, logs in /home/quasar/.local/share/Steam", sig_token: null, authorization: "none", Cookie: "[redacted]" }));
+  edit(dir, "network.json", (n) => ({ ...n, note: "Chrome/157.0.7339.81 via 192.0.2.5, logs in /home/quasar/.local/share/Steam", sig_token: null, authorization: "none", Cookie: "[redacted]", password: false, secret: "", api_key: {}, access_token: [] }));
   fs.writeFileSync(path.join(dir, "README.md"), "Use Bearer authentication. Secret: none of the builds recorded it. password=[REDACTED]\nThe password: none. The token: n/a; fine.\n");
   // A picture is not read for text, whatever bytes it holds after its header.
   fs.writeFileSync(path.join(dir, SC, "shot.png"), Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0, 0, 0]), Buffer.from("Bearer abcdefgh12345678")]));

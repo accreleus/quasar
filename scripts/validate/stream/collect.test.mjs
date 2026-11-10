@@ -77,7 +77,9 @@ function world(over = {}) {
     now: T_END + 3_600_000, // collected an hour after the session ended
     start: T_START,
     end: T_END,
-    pruned: false, // telemetry deleted 24 h after the end (telemetry/policy.go DefaultPostMortem)
+    pruned: false, // telemetry deleted after the retention period (telemetry/policy.go DefaultPostMortem)
+    captures: [], // diag.* events: kept by retention (policy.go rule 3), so they outlive `pruned`
+    hitches: [], // from_ms of the hitch windows the classifier would find
     clockOffsetMs: 2,
     // telemetry store rows, as Recent returns them (newest first once sorted)
     samples: [
@@ -96,6 +98,8 @@ function world(over = {}) {
     identity: { version: "0.6.1-dev", source_commit: "f00dfeed", built_at: "2026-11-10T08:00:00Z", schema_version: 123 },
     // hostcfg/store.go GetEffective: map[string]string — values are strings, never booleans
     effective: { abr_mode: "smooth", abr_ladder_resolution: "true", abr_ladder: "TRUE", abr_ladder_fps: "False", abr_floor_kbps: "4000" },
+    rowExtra: {}, // more fields on the session row (failure_code, error_message, app_log_tail ...)
+    clock: null, // replaces the diagnostic bundle's clock
     redirect: () => false,
     tweak: () => undefined, // (pathname, body) => [status, body] to replace an answer
     onRequest: () => {},
@@ -119,9 +123,10 @@ function sessionRow(w, id) {
     negotiated_codec: "h264",
     transport: "webtransport",
     pyrowave: { allowed: true, reason: null, wanted: false, choice: null, auto_reason: null, active: false, used: false, target_kbps: null, switch_reason: null },
-    created_at: iso(w.start),
-    started_at: iso(w.start),
+    created_at: iso(w.start ?? w.end),
+    started_at: w.start == null ? null : iso(w.start),
     ended_at: w.end == null ? null : iso(w.end),
+    ...w.rowExtra,
   };
 }
 
@@ -139,7 +144,7 @@ function resolveWindow(q, now) {
   return [from, to];
 }
 
-const TAXONOMY = { fps: "encoder.fps", encode_ms: "encoder.encode_ms" };
+const TAXONOMY = { agent: { fps: "encoder.fps", encode_ms: "encoder.encode_ms" }, browser: { fps: "client.fps", decode_ms: "client.decode_ms" } };
 
 function fake(w = world()) {
   const fn = async (url, init) => {
@@ -172,20 +177,23 @@ function fake(w = world()) {
     if (m && (m[2] === "diagnostic-bundle" || m[2] === "trace/events")) {
       const [from, to] = resolveWindow(q, w.now);
       const inWin = (ts) => ts >= from && ts <= to;
-      const events = live(w.events).filter((e) => inWin(e.ts_unix_ms)).slice(-SAMPLE_CAP);
+      const events = [...live(w.events), ...w.captures].filter((e) => inWin(e.ts_unix_ms)).sort((a, b) => a.ts_unix_ms - b.ts_unix_ms).slice(-SAMPLE_CAP);
       if (m[2] === "trace/events") return [200, { window: { from_ms: from, to_ms: to }, events }]; // projectionEvents: raw
-      // handleDiagnosticBundle: series keyed by taxonomy name, browser points shifted onto the
-      // host clock (telemetry/align.go), events aligned the same way, newest 1000 per series
+      // handleDiagnosticBundle: Window() reads the newest 1000 raw samples of the window across ALL
+      // sources (samplesInWindow), then assess() turns them into series keyed by taxonomy name, with
+      // browser points shifted onto the host clock (telemetry/align.go), events aligned the same way
+      const taken = live(w.samples).filter((x) => inWin(x.ts_unix_ms)).sort((a, b) => b.ts_unix_ms - a.ts_unix_ms).slice(0, SAMPLE_CAP);
       const series = {};
-      for (const s of live(w.samples).filter((x) => x.source === "agent" && inWin(x.ts_unix_ms))) {
-        for (const [k, name] of Object.entries(TAXONOMY)) {
-          if (typeof s.metrics[k] === "number") (series[name] ??= []).push({ ts_unix_ms: s.ts_unix_ms, v: s.metrics[k] });
+      for (const smp of taken) {
+        for (const [k, name] of Object.entries(TAXONOMY[smp.source] ?? {})) {
+          const shift = smp.source === "browser" ? w.clockOffsetMs : 0;
+          if (typeof smp.metrics[k] === "number") (series[name] ??= []).push({ ts_unix_ms: smp.ts_unix_ms + shift, v: smp.metrics[k] });
         }
       }
-      for (const name of Object.keys(series)) series[name] = series[name].sort((a, b) => a.ts_unix_ms - b.ts_unix_ms).slice(-SAMPLE_CAP);
-      const clock = w.pruned
+      for (const name of Object.keys(series)) series[name].sort((a, b) => a.ts_unix_ms - b.ts_unix_ms);
+      const clock = w.clock ?? (w.pruned
         ? { unmeasured: true }
-        : { client_offset_ms: w.clockOffsetMs, uncertainty_ms: 1, measured_at: iso(w.start + 10_000) };
+        : { client_offset_ms: w.clockOffsetMs, uncertainty_ms: 1, measured_at: iso(w.start + 10_000) });
       return [
         200,
         {
@@ -195,8 +203,15 @@ function fake(w = world()) {
           abr_mode: "smooth",
           series,
           events: events.map((e) => (e.source === "browser" ? { ...e, ts_unix_ms: e.ts_unix_ms + w.clockOffsetMs } : e)),
-          agent_adaptation: [],
-          classifier: { clock: { age_ms: w.now - (w.start + 10_000) } }, // verdict.go: moves with the real clock
+          // derived windows, the adaptation labels and the classifier are all computed over THIS read's window
+          derived_windows: {
+            hitches: w.hitches.filter(inWin).map((f) => ({ from_ms: f, to_ms: f + 100, present_interval_sd_ms: 5 })),
+            abr_downshifts: [],
+            encoder_saturation: [],
+            likely_network_congestion: [],
+          },
+          agent_adaptation: taken.filter((x) => x.source === "agent" && x.metrics.adaptation_state).map((x) => ({ ts_unix_ms: x.ts_unix_ms, state: x.metrics.adaptation_state })).sort((a, b) => a.ts_unix_ms - b.ts_unix_ms),
+          classifier: { verdict: "healthy", window: { from_ms: from, to_ms: to }, clock: { age_ms: w.now - (w.start + 10_000) } }, // verdict.go: moves with the real clock
           captures: [],
         },
       ];
@@ -230,6 +245,13 @@ async function cli(argv, fetchFn, env = { QUASAR_ADMIN_TOKEN: TOKEN }) {
   }
 }
 
+const clientBundle2 = () => {
+  const dir = clientBundle();
+  fs.cpSync(path.join(dir, SC), path.join(dir, "02-second"), { recursive: true });
+  edit(dir, "02-second/scenario.json", (s) => ({ ...s, id: "02-second", sessions: [SID2] }));
+  edit(dir, "manifest.json", (m) => ({ ...m, scenarios: [SC, "02-second"] }));
+  return dir;
+};
 const run = (dir, w = world(), extra = {}) => {
   const f = fake(w);
   return collect(dir, { baseUrl: BASE, token: TOKEN, fetch: f, now: () => w.now, ...extra }).then((r) => Object.assign(r, { f }));
@@ -394,7 +416,7 @@ test("M1 a read the server fills is split, not trusted", async () => {
 });
 
 // ── idempotence: a collected scenario is never fetched again ────────────────
-test("I2 a collected scenario is not fetched again, and a second run with other answers changes no byte of it", async () => {
+test("I2 under --resume a collected scenario is not fetched again, and a second run with other answers changes no byte of it", async () => {
   const dir = clientBundle();
   await run(dir);
   const first = treeHash(dir);
@@ -405,13 +427,13 @@ test("I2 a collected scenario is not fetched again, and a second run with other 
     events: [],
     pruned: true,
   });
-  const r = await run(dir, other);
+  const r = await run(dir, other, { resume: true });
   assert.equal(r.f.calls.length, 0, "not one request is made");
   assert.equal(r.complete, true);
   assert.equal(treeHash(dir), first, "not one byte of the bundle changed");
 });
 
-test("I2 a first-run failure is retried, and the scenario that was collected is left alone", async () => {
+test("I2 under --resume a first-run failure is retried, and the scenario that was collected is left alone", async () => {
   const dir = clientBundle();
   // a second scenario with its own session
   fs.cpSync(path.join(dir, SC), path.join(dir, "02-second"), { recursive: true });
@@ -427,7 +449,7 @@ test("I2 a first-run failure is retried, and the scenario that was collected is 
   assert.equal(readJson(dir, "manifest.json").halves.host, false);
   const kept = treeHash(path.join(dir, SC));
 
-  const r2 = await run(dir, world({ ids: [SID, SID2], effective: { abr_mode: "protective" } }));
+  const r2 = await run(dir, world({ ids: [SID, SID2], effective: { abr_mode: "protective" } }), { resume: true });
   assert.equal(r2.complete, true);
   assert.ok(r2.f.calls.every((u) => !u.includes(SID + "/") && !u.endsWith(SID)), "the collected session is not asked for");
   assert.ok(r2.f.calls.some((u) => u.includes(SID2)), "the failed one is retried");
@@ -492,13 +514,13 @@ test("prototype pollution: a __proto__ key in an answer reaches no prototype and
   assert.deepEqual(Object.keys(out).sort(), ["__proto__", "a", "constructor"]);
 });
 
-test("A3 a hard link already at a target is replaced, not written through", async () => {
+test("A3 a hard link already at a target is replaced, not written through (--resume: a diagnostic-bundle.json is otherwise a D1 claim)", async () => {
   const dir = clientBundle();
   const outside = path.join(TMP, `outside-${crypto.randomUUID()}.txt`);
   fs.writeFileSync(outside, "an outside file\n");
   fs.linkSync(outside, path.join(dir, SC, "diagnostic-bundle.json"));
   assert.deepEqual(validateBundle(dir), [], "a hard link is a regular file to the validator");
-  await run(dir);
+  await run(dir, world(), { resume: true });
   assert.equal(fs.readFileSync(outside, "utf8"), "an outside file\n", "the outside inode is unchanged");
   assert.ok(readJson(dir, `${SC}/diagnostic-bundle.json`).series);
 });
@@ -713,4 +735,385 @@ test("the command: 0 collected, 1 invalid bundle, 2 usage", async () => {
   const broken = clientBundle();
   edit(broken, "manifest.json", (m) => ({ ...m, format: 2 }));
   assert.equal((await cli([broken, "--base-url", BASE], fake())).code, EXIT.invalid);
+});
+
+// ── D1: a bundle that already claims a host half is not collected by default ─
+test("D1 a second default run is the refusal: exit 2, no request, no write; --resume finishes", async () => {
+  const dir = clientBundle();
+  await run(dir);
+  const done = treeHash(dir);
+  const api = fake();
+  const r = await cli([dir, "--base-url", BASE], api);
+  assert.equal(r.code, EXIT.error);
+  assert.equal(api.calls.length, 0);
+  assert.equal(treeHash(dir), done);
+  assert.match(r.errs.join("\n"), /already has a host half.*--resume/);
+  assert.match(r.out.at(-1), /^RESULT status=error target=e2e-collect reason=host-half-present$/);
+  const again = await cli([dir, "--base-url", BASE, "--resume"], api);
+  assert.equal(again.code, EXIT.ok);
+  assert.equal(api.calls.length, 0, "a collected scenario is not fetched again");
+});
+
+test("D1 a bundle's own claim is never believed by default: a forged marker, a stray file, halves.host", async () => {
+  const claims = {
+    "a forged host-half.json": (d) => fs.writeFileSync(path.join(d, SC, "host-half.json"), JSON.stringify({ collected: true, node_agent: { version: "forged" } })),
+    "a diagnostic-bundle.json": (d) => fs.writeFileSync(path.join(d, SC, "diagnostic-bundle.json"), "{}"),
+    "a conditions.json under sessions/": (d) => {
+      fs.mkdirSync(path.join(d, SC, "sessions", SID2), { recursive: true });
+      fs.writeFileSync(path.join(d, SC, "sessions", SID2, "conditions.json"), "{}");
+    },
+    "halves.host true": (d) => edit(d, "manifest.json", (m) => ({ ...m, halves: { client: true, host: true } })),
+  };
+  for (const [what, plant] of Object.entries(claims)) {
+    const dir = clientBundle();
+    plant(dir);
+    const before = treeHash(dir);
+    const api = fake();
+    const r = await cli([dir, "--base-url", BASE], api);
+    assert.equal(r.code, EXIT.error, what);
+    assert.equal(api.calls.length, 0, `${what}: no request`);
+    assert.equal(treeHash(dir), before, `${what}: no write`);
+  }
+});
+
+test("D1 --resume counts a marked scenario collected only if its files are all there; a forged marker is collected for real", async () => {
+  const dir = clientBundle();
+  fs.writeFileSync(path.join(dir, SC, "host-half.json"), JSON.stringify({ collected: true, node_agent: { version: "forged" } }));
+  const r = await run(dir, world(), { resume: true });
+  assert.ok(r.f.calls.some((u) => u.includes(SID)), "the forged marker did not stop the fetch");
+  assert.equal(readJson(dir, "builds.json").components.node_agent.version, "0.6.1-dev", "the forged agent was not promoted");
+  assert.ok(readJson(dir, `${SC}/diagnostic-bundle.json`).series);
+
+  // a real collection with one file removed afterwards is collected again, not trusted
+  for (const gone of ["conditions.json", "diagnostic-bundle.json", "session.json", "trace.json"]) {
+    const d = clientBundle();
+    await run(d);
+    fs.rmSync(path.join(d, SC, gone));
+    const again = await run(d, world(), { resume: true });
+    assert.ok(again.f.calls.length > 0, `${gone} missing: fetched again`);
+    assert.ok(fs.existsSync(path.join(d, SC, gone)), `${gone} was rewritten`);
+  }
+  // ... and so is one whose file is the wrong shape
+  const wrong = clientBundle();
+  await run(wrong);
+  fs.writeFileSync(path.join(wrong, SC, "diagnostic-bundle.json"), "[]");
+  assert.ok((await run(wrong, world(), { resume: true })).f.calls.length > 0);
+});
+
+test("A9 a top-level write that failed after the scenario was committed is repaired by --resume, without fetching the session again", async () => {
+  if (process.getuid?.() === 0) return; // a read-only directory does not stop root
+  const dir = clientBundle();
+  fs.chmodSync(dir, 0o555);
+  try {
+    await assert.rejects(run(dir));
+  } finally {
+    fs.chmodSync(dir, 0o755);
+  }
+  assert.equal(readJson(dir, `${SC}/host-half.json`).collected, true);
+  assert.equal(readJson(dir, "manifest.json").halves.host, false, "the interrupted manifest still says no host half");
+  const r = await run(dir, world(), { resume: true });
+  assert.ok(!r.f.paths().some((p) => p.startsWith("/v1/sessions/") || p.includes("/v1/admin/sessions/")), "the session is not fetched again");
+  assert.equal(r.complete, true);
+  assert.equal(readJson(dir, "manifest.json").halves.host, true);
+  assert.equal(readJson(dir, "builds.json").components.control_plane.version, "0.6.1-dev");
+  assert.deepEqual(validateBundle(dir), []);
+});
+
+// ── D2: a scenario's outputs are committed together, from the client's rows only ─
+test("A14 a write that fails mid-scenario leaves it untouched, and a retry with another answer is consistent", async () => {
+  if (process.getuid?.() === 0) return;
+  const dir = clientBundle();
+  edit(dir, `${SC}/scenario.json`, (s) => ({ ...s, sessions: [SID, SID2] }));
+  const locked = path.join(dir, SC, "sessions", SID2);
+  fs.mkdirSync(locked, { recursive: true });
+  fs.chmodSync(locked, 0o555);
+  const before = treeHash(dir);
+  const sample = (fps) => [{ source: "agent", ts_unix_ms: T_START + 77_500, metrics: { fps } }];
+  try {
+    await assert.rejects(run(dir, world({ ids: [SID, SID2], samples: sample(60) })), /EACCES/);
+  } finally {
+    fs.chmodSync(locked, 0o755);
+  }
+  assert.equal(treeHash(dir), before, "not one byte, file or temporary file was left");
+  assert.ok(!fs.existsSync(path.join(dir, SC, "host-half.json")));
+
+  const r = await run(dir, world({ ids: [SID, SID2], samples: sample(61) }));
+  assert.equal(r.complete, true);
+  const row = rows(dir, `${SC}/metrics.jsonl`).find((x) => x.source === "agent" && x.ts_unix_ms === T_START + 77_500);
+  assert.equal(row.metrics.fps, 61, "no host row of the failed run was merged as a client row");
+  assert.equal(readJson(dir, `${SC}/diagnostic-bundle.json`).series["encoder.fps"].find((p) => p.ts_unix_ms === T_START + 77_500).v, 61);
+  assert.ok(fs.existsSync(path.join(dir, SC, "sessions", SID2, "metrics.jsonl")));
+});
+
+test("D2 the renames come after every temporary file exists, and the marker is the last scenario file", async () => {
+  const dir = clientBundle();
+  const log = [];
+  const [rename, write] = [fs.renameSync, fs.writeFileSync];
+  fs.renameSync = (a, b) => (log.push(`rename ${path.basename(b)}`), rename(a, b));
+  fs.writeFileSync = (f, ...rest) => (log.push(`write ${path.basename(String(f)).replace(/^\.(.*)\.[0-9a-f]{12}\.tmp$/, "$1")}`), write(f, ...rest));
+  try {
+    await run(dir);
+  } finally {
+    [fs.renameSync, fs.writeFileSync] = [rename, write];
+  }
+  const scenario = log.slice(0, log.indexOf("rename host-half.json") + 1);
+  const firstRename = scenario.findIndex((l) => l.startsWith("rename"));
+  assert.ok(scenario.slice(0, firstRename).every((l) => l.startsWith("write")), "every temporary file is written before the first rename");
+  assert.equal(scenario.slice(firstRename).at(-1), "rename host-half.json");
+  assert.deepEqual(scenario.slice(firstRename).slice(-2), ["rename metrics.jsonl", "rename host-half.json"]);
+});
+
+// ── D3: nothing from an answer reaches a file unless it is a value of a checked shape ─
+test("A10 a name from an answer is listed only if it is a plain identifier; the rest is counted", async () => {
+  const dir = clientBundle();
+  const evil = "authorization=secret-value-1234";
+  const samples = [
+    { source: "agent", ts_unix_ms: T_START + 1000, metrics: { fps: 60, [evil]: 1, not_a_manifest_key: 1, "x y": 1, accessToken: 1 } },
+    { source: evil, ts_unix_ms: T_START + 2000, metrics: { fps: 1 } },
+    { source: "app", ts_unix_ms: T_START + 3000, metrics: { [evil]: 1, frames: 3 } },
+  ];
+  const r = await run(dir, world({ samples }));
+  assert.equal(r.complete, true);
+  for (const rel of walk(dir)) assert.doesNotMatch(read(dir, rel), /secret-value-1234/, rel);
+  const half = readJson(dir, `${SC}/host-half.json`);
+  assert.deepEqual(half.metric_keys_not_in_manifest, ["agent.not_a_manifest_key"]);
+  assert.equal(half.sources_not_in_bundle, undefined);
+  assert.deepEqual(half.other_dropped, { metric_keys: 4, sources: 1 });
+  assert.deepEqual(rows(dir, `${SC}/metrics.jsonl`).find((x) => x.source === "app").metrics, { frames: 3 });
+  assert.deepEqual(r.problems, []);
+});
+
+test("A10 a reason names the route path only: a metrics cursor is never in a file", async () => {
+  const dir = clientBundle();
+  const w = world({
+    tweak: (route, body) => {
+      if (!route.endsWith("/metrics")) return undefined;
+      return w.pages++ === 0 ? [200, { items: [body[1].items[0]], next_cursor: "authorization=secret-value-1234" }] : [500, {}];
+    },
+  });
+  w.pages = 0;
+  const r = await run(dir, w);
+  assert.equal(r.complete, false);
+  assert.match(r.incomplete[0].reason, /HTTP 500/);
+  assert.doesNotMatch(read(dir, `${SC}/host-half.json`), /secret-value|cursor|\?/);
+});
+
+test("A11 a window that is empty or inverted is that scenario's reason, never a TypeError", async () => {
+  const sample = [{ source: "agent", ts_unix_ms: T_START, metrics: { fps: 60 } }];
+  const cases = {
+    "a live session that starts after now": world({ start: T_END + 7_200_000, end: null, samples: sample }),
+    "an end before the start": world({ start: T_END, end: T_START - 60_000, samples: sample }),
+  };
+  for (const [what, w] of Object.entries(cases)) {
+    const dir = clientBundle();
+    const r = await run(dir, w);
+    assert.equal(r.complete, false, what);
+    assert.match(r.incomplete[0].reason, /window is empty/, what);
+    assert.equal(readJson(dir, `${SC}/host-half.json`).collected, false);
+    assert.ok(!r.f.paths().some((p) => p.includes("diagnostic-bundle")), `${what}: no read was made`);
+  }
+});
+
+test("A13 a wrong-typed field nested in an answer is that scenario's reason, and nothing of it is written", async () => {
+  const row = (patch) => (route, body) => (route === `/v1/sessions/${SID}` ? [200, { session: { ...body[1].session, ...patch(body[1].session) } }] : undefined);
+  const diag = (patch) => (route, body) => (route.endsWith("/diagnostic-bundle") ? [200, { ...body[1], ...patch(body[1]) }] : undefined);
+  const shapes = {
+    "a numeric setting": [{ effective: { abr_mode: 7 } }, null],
+    "a boolean setting": [{ effective: { abr_mode: true } }, null],
+    "a null setting": [{ effective: { abr_mode: null } }, null],
+    "pyrowave a string": [{}, row(() => ({ pyrowave: "not-an-object" }))],
+    "transport a number": [{}, row(() => ({ transport: 7 }))],
+    "stream width a string": [{}, row((s) => ({ stream: { ...s.stream, width: "1920" } }))],
+    "failure_code an object": [{}, row(() => ({ failure_code: { a: 1 } }))],
+    "trace a string": [{}, diag(() => ({ trace: "not-an-object" }))],
+    "an event with no type": [{}, diag((b) => ({ events: [{ ts_unix_ms: 1786940102000, source: "agent" }, ...b.events] }))],
+    "an event with no source": [{}, diag(() => ({ events: [{ ts_unix_ms: 1786940102000, type: "x" }] }))],
+    "derived windows not lists": [{}, diag(() => ({ derived_windows: { hitches: "x" } }))],
+    "agent adaptation an object": [{}, diag(() => ({ agent_adaptation: {} }))],
+    "no classifier": [{}, diag(() => ({ classifier: null }))],
+  };
+  for (const [what, [over, tweak]] of Object.entries(shapes)) {
+    const dir = clientBundle();
+    const files = new Set(walk(dir));
+    const r = await run(dir, world({ ...over, ...(tweak ? { tweak } : {}) }));
+    assert.equal(r.complete, false, what);
+    assert.deepEqual(walk(dir).filter((f) => !files.has(f)), [path.join(SC, "host-half.json")], what);
+  }
+});
+
+test("A15 a trace window longer than the budget is not collected, and costs few requests", async () => {
+  const year = 365 * 24 * 3_600_000;
+  const dir = clientBundle();
+  const r = await run(dir, world({ start: T_START, end: null, now: T_START + year }));
+  assert.equal(r.complete, false);
+  assert.match(r.incomplete[0].reason, /longer than one collection reads/);
+  assert.ok(r.f.calls.length < 10, `${r.f.calls.length} requests`);
+
+  // 250 windows of 10 minutes, each read full and split in two: 750 reads, over the budget
+  const hours = 41;
+  const full = world({
+    start: T_START,
+    end: T_START + hours * 3_600_000,
+    now: T_START + hours * 3_600_000 + 1000,
+    tweak: (route, body) => {
+      if (!route.endsWith("/diagnostic-bundle")) return undefined;
+      const span = body[1].window.to_ms - body[1].window.from_ms;
+      return span < 9 * 60_000 ? undefined : [200, { ...body[1], events: Array.from({ length: 1000 }, (_, i) => ({ ts_unix_ms: body[1].window.from_ms + i, source: "agent", type: "x", payload: {} })) }];
+    },
+  });
+  const dir2 = clientBundle();
+  const t = await run(dir2, full);
+  assert.equal(t.complete, false);
+  assert.match(t.incomplete[0].reason, /longer than one collection reads/);
+  assert.ok(t.f.calls.filter((u) => u.includes("/diagnostic-bundle")).length <= 600, "no more than 600 window reads");
+});
+
+test("A16 --base-url is http(s)://host[:port] only; a bad one is exit 2 before any request", async () => {
+  for (const bad of ["https://stack.invalid/prefix", "https://stack.invalid?x=1", "https://stack.invalid?", "https://stack.invalid#f", "https://user:pw@stack.invalid", "ftp://stack.invalid", "not a url", "https://stack.invalid//"]) {
+    const dir = clientBundle();
+    const api = fake();
+    const r = await cli([dir, "--base-url", bad], api);
+    assert.equal(r.code, EXIT.error, bad);
+    assert.equal(api.calls.length, 0, bad);
+  }
+  const dir = clientBundle();
+  const api = fake();
+  assert.equal((await cli([dir, "--base-url", `${BASE}:8443/`], api)).code, EXIT.ok);
+  assert.ok(api.calls.every((u) => u.startsWith(`${BASE}:8443/v1/`)));
+});
+
+test("N6 a session id is compared case-insensitively and requested in lower case", async () => {
+  const lower = "abcdef12-2222-3333-4444-5555555555ab";
+  const dir = clientBundle();
+  edit(dir, `${SC}/scenario.json`, (s) => ({ ...s, sessions: [lower.toUpperCase()] }));
+  const r = await run(dir, world({ ids: [lower] }));
+  assert.equal(r.complete, true);
+  assert.ok(r.f.paths().includes(`/v1/sessions/${lower}`));
+  assert.equal(readJson(dir, `${SC}/session.json`).id, lower);
+});
+
+// ── D4 ──────────────────────────────────────────────────────────────────────
+test("D4 a credential held in an object under a credential-named key is refused before any request", async () => {
+  const dir = clientBundle();
+  edit(dir, "client.json", (c) => ({ ...c, authorization: { value: "credential-in-object" }, nested: [{ accessToken: ["credential-in-array"] }] }));
+  const before = treeHash(dir);
+  const api = fake();
+  const r = await cli([dir, "--base-url", BASE], api);
+  assert.equal(r.code, EXIT.invalid);
+  assert.equal(api.calls.length, 0);
+  assert.equal(treeHash(dir), before);
+  assert.ok(r.errs.some((m) => /client.json: holds a credential/.test(m)));
+});
+
+// ── truth from the control plane's code ─────────────────────────────────────
+test("B1 a capture outlives retention, and a session with only a capture is not collected", async () => {
+  const dir = clientBundle();
+  const capture = { source: "agent", ts_unix_ms: T_START + 5000, type: "diag.encoder_props", payload: {} };
+  const r = await run(dir, world({ pruned: true, captures: [capture] }));
+  assert.equal(r.complete, false);
+  assert.match(r.incomplete[0].reason, /the trace is no longer kept/);
+  assert.equal(readJson(dir, `${SC}/host-half.json`).collected, false);
+  assert.ok(!fs.existsSync(path.join(dir, SC, "diagnostic-bundle.json")));
+
+  // a capture is still kept in the artifact when there is other data
+  const kept = clientBundle();
+  await run(kept, world({ captures: [capture] }));
+  assert.ok(readJson(kept, `${SC}/trace.json`).events.some((e) => e.type === "diag.encoder_props"));
+});
+
+test("B2 a session read in several windows keeps its whole analysis; a single read is the API's answer", async () => {
+  const end = T_START + 25 * 60_000;
+  const samples = Array.from({ length: 150 }, (_, i) => ({ source: "agent", ts_unix_ms: T_START + 1000 + i * 10_000, metrics: { fps: 60, adaptation_state: i % 2 ? "healthy" : "degraded" } }));
+  const hitches = [T_START + 120_000, T_START + 1_400_000];
+  const dir = clientBundle();
+  const r = await run(dir, world({ end, now: end + 3_600_000, samples, hitches }));
+  assert.equal(r.complete, true);
+  assert.equal(r.f.calls.filter((u) => u.includes("/diagnostic-bundle")).length, 3);
+  const d = readJson(dir, `${SC}/diagnostic-bundle.json`);
+  assert.deepEqual(d.derived_windows.hitches.map((h) => h.from_ms), hitches, "a hitch after the first read is kept");
+  assert.deepEqual(d.window, { from_ms: T_START - 5000, to_ms: end + 5000 });
+  assert.equal(d.classifier_reads.length, 3);
+  assert.equal(d.classifier.window.from_ms, T_START - 5000, "classifier is the first read's");
+  assert.deepEqual(d.classifier_reads[0], d.classifier);
+  assert.ok(d.classifier_reads.every((c, i, a) => i === 0 || c.window.from_ms === a[i - 1].window.to_ms), "each classifier names its own window");
+  assert.equal(d.agent_adaptation.length, 150, "agent adaptation concatenated, de-duplicated by time");
+  assert.equal(d.series["encoder.fps"].length, 150);
+
+  const one = clientBundle();
+  const w = world({ hitches: [T_START + 100_000] });
+  await run(one, w);
+  const single = readJson(one, `${SC}/diagnostic-bundle.json`);
+  assert.equal(single.classifier_reads, undefined);
+  assert.deepEqual(single.window, { from_ms: T_START - 5000, to_ms: T_END + 5000 });
+  assert.equal(single.derived_windows.hitches.length, 1);
+});
+
+test("S5 a read is full when its series hold 1000 distinct instants: the store caps samples per read across sources", async () => {
+  const agent = Array.from({ length: 600 }, (_, i) => ({ source: "agent", ts_unix_ms: T_START + 1000 + i * 400, metrics: { fps: 60 } }));
+  const browser = Array.from({ length: 600 }, (_, i) => ({ source: "browser", ts_unix_ms: T_START + 1200 + i * 400, metrics: { fps: 120 } }));
+  const dir = clientBundle();
+  const r = await run(dir, world({ samples: [...agent, ...browser] }));
+  assert.equal(r.complete, true);
+  assert.ok(r.f.calls.filter((u) => u.includes("/diagnostic-bundle")).length > 1, "the read the cap truncated was split");
+  const d = readJson(dir, `${SC}/diagnostic-bundle.json`);
+  assert.equal(d.series["encoder.fps"].length, 600);
+  assert.equal(d.series["client.fps"].length, 600, "no point was lost to the cap");
+});
+
+test("S6 a session that never started is collected: its row, its conditions and the agent identity, no trace", async () => {
+  const dir = clientBundle();
+  const traceBefore = read(dir, `${SC}/trace.json`);
+  const metricsBefore = read(dir, `${SC}/metrics.jsonl`);
+  const w = world({ start: null, rowExtra: { state: "failed", failure_code: "launch_failed", error_message: "prepare session resources: mounts", app_log_tail: "peer 10.20.30.40 token=abc123456" } });
+  const r = await run(dir, w);
+  assert.equal(r.complete, true);
+  assert.ok(!r.f.paths().some((p) => p.includes("/diagnostic-bundle") || p.includes("/trace/") || p.endsWith("/metrics")), "no trace was asked for");
+  const session = readJson(dir, `${SC}/session.json`);
+  assert.equal(session.failure_code, "launch_failed");
+  assert.match(session.error_message, /mounts/);
+  assert.equal(session.started_at_ms, undefined);
+  assert.doesNotMatch(read(dir, `${SC}/session.json`), /app_log_tail|abc123456/);
+  assert.ok(readJson(dir, `${SC}/conditions.json`).effective);
+  const half = readJson(dir, `${SC}/host-half.json`);
+  assert.equal(half.collected, true);
+  assert.equal(half.trace, "the session never started");
+  assert.equal(half.node_agent.version, "0.6.1-dev");
+  assert.equal(read(dir, `${SC}/trace.json`), traceBefore);
+  assert.equal(read(dir, `${SC}/metrics.jsonl`), metricsBefore);
+  assert.ok(!fs.existsSync(path.join(dir, SC, "diagnostic-bundle.json")));
+  assert.equal(readJson(dir, "manifest.json").halves.host, true);
+  assert.deepEqual(r.problems, []);
+  // --resume knows it is whole
+  assert.equal((await run(dir, world({ start: null }), { resume: true })).f.calls.length, 0);
+
+  // a session still launching (no start, no end) is not collected
+  const live = clientBundle();
+  const l = await run(live, world({ start: null, end: null }));
+  assert.equal(l.complete, false);
+  assert.match(l.incomplete[0].reason, /not started or ended/);
+});
+
+test("N4 the clock the client half measured is kept when the server's is unmeasured", async () => {
+  const dir = clientBundle();
+  const mine = { client_offset_ms: 7, uncertainty_ms: 2 };
+  edit(dir, `${SC}/trace.json`, (t) => ({ ...t, clock: mine }));
+  await run(dir, world({ clock: { unmeasured: true } }));
+  assert.deepEqual(readJson(dir, `${SC}/trace.json`).clock, mine);
+  const both = clientBundle();
+  edit(both, `${SC}/trace.json`, (t) => ({ ...t, clock: mine }));
+  await run(both);
+  assert.equal(readJson(both, `${SC}/trace.json`).clock.client_offset_ms, 2, "a measured server clock wins");
+});
+
+test("N5 every session's raw events are kept, each in its own session directory; the scenario's trace is the first session's", async () => {
+  const dir = clientBundle();
+  edit(dir, `${SC}/scenario.json`, (s) => ({ ...s, sessions: [SID, SID2] }));
+  const r = await run(dir, world({ ids: [SID, SID2] }));
+  assert.equal(r.complete, true);
+  assert.equal(readJson(dir, `${SC}/trace.json`).session_id, SID);
+  const second = readJson(dir, `${SC}/sessions/${SID2}/trace.json`);
+  assert.equal(second.session_id, SID2);
+  assert.ok(second.events.some((e) => e.type === "abr.ladder.step"));
+  assert.ok(!second.events.some((e) => e.type === "client.freeze_detected"), "the client half's events belong to the first session");
+  assert.deepEqual(validateBundle(dir), []);
 });

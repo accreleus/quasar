@@ -311,7 +311,7 @@ nightly-budget-status: ## Tail today's nightly-budget log + LAST_REGRESSION if a
 validate: ## End-to-end validation report — LEVEL=ui|api|session|all TARGET=local|<url> KEEP=1 ARGS='--reuse-web'
 	@bash $(DX)/validate.sh
 
-e2e-collect: ## The host half of a run bundle, by session id — BUNDLE=<dir> [HOST=<role|name>]
+e2e-collect: ## The host half of a run bundle, by session id — BUNDLE=<dir> [HOST=<role|name>] [RESUME=1: finish a collection this machine started]
 	@bash $(DX)/e2e_collect.sh
 
 ## ── Image QA ────────────────────────────────────────────────────────────────

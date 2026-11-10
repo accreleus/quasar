@@ -43,7 +43,7 @@ export function isCredentialName(key) {
 
 const NONE = /^\[?(null|none|n\/?a|redacted|omitted|unknown|true|false)\]?[.;!?,]?$/i;
 
-// A JSON file (or JSONL) whose key names a credential and whose value is a real string.
+// A JSON file (or JSONL) whose key names a credential and whose value is anything but "there is none".
 function jsonCredential(text) {
   const docs = [];
   try {
@@ -55,11 +55,14 @@ function jsonCredential(text) {
       } catch {}
     }
   }
+  // A credential-named key must hold nothing: null, false, "", a none-word, or an empty container.
+  const none = (x) =>
+    x === null || x === false || x === "" || (typeof x === "string" && (!x.trim() || NONE.test(x.trim()))) ||
+    (x !== null && typeof x === "object" && Object.keys(x).length === 0);
   const bad = (v) =>
     Array.isArray(v)
       ? v.some(bad)
-      : v !== null && typeof v === "object" &&
-        Object.entries(v).some(([k, x]) => (isCredentialName(k) && typeof x === "string" && x.trim() && !NONE.test(x.trim())) || bad(x));
+      : v !== null && typeof v === "object" && Object.entries(v).some(([k, x]) => (isCredentialName(k) && !none(x)) || bad(x));
   return docs.some(bad);
 }
 

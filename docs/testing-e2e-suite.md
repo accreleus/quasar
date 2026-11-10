@@ -36,15 +36,28 @@ comes from `scripts/dx/admin_token.sh` (which may mint and cache one); it travel
 in `QUASAR_ADMIN_TOKEN`, never on argv, and is **never written into the bundle**: it is replaced
 wherever an answer echoes it. It can run days after the client half, on another machine. A
 **directory** only: unzip a bundle first. The bundle is validated before the collector makes
-any authenticated request, and a bundle that is not valid is not collected.
+any authenticated request, and a bundle that is not valid is not collected. `HOST`'s stack is
+`http(s)://host[:port]` only: no credentials, path, query or fragment.
+
+**A bundle that already has a host half is not collected.** Everything in a bundle is untrusted,
+including its own `host-half.json`, so "already collected" is not believed from the bundle
+alone. If any scenario holds a `host-half.json`, `diagnostic-bundle.json` or `conditions.json`
+(at the top or under `sessions/`), or the manifest says `halves.host: true`, the run stops
+before any request with exit 2 (`reason=host-half-present`). Collect a fresh copy of the client
+bundle, or add `RESUME=1` to finish a collection **this machine started** (a scenario that failed,
+or a run that was cut short).
 
 The collector reads the control plane's own answers, in the control plane's own shapes: the
 session row first, then the trace for the window the session ran in (`started_at - 5 s` to
 `ended_at + 5 s`, or now), in reads the server allows (10 minutes at most; a read that comes
-back full is split), then the raw samples, the host's settings and both builds. **Telemetry is
-deleted a day after a session ends** (the row stays), so a session collected later than that has
-no trace: it is not an error and not an empty half, it is `collected: false` with the reason
-"the trace is no longer kept".
+back full is split), then the raw samples, the host's settings and both builds. **The stack
+deletes telemetry after its retention period** (a day by default; the row stays), so a session
+collected later than that has no trace: it is not an error and not an empty half, it is
+`collected: false` with the reason "the trace is no longer kept". Debug captures (`diag.*`
+events) outlive the sweep and do not count as a trace. A live session over an hour has already
+lost its oldest telemetry. A session that **never started** (a launch failure: no `started_at`)
+is collected: its row (with `failure_code` and `error_message`), its conditions and the agent
+identity, no trace; `host-half.json` says `"trace": "the session never started"`.
 
 Exit codes, as they are:
 
@@ -52,28 +65,33 @@ Exit codes, as they are:
 |---|---|---|
 | 0 | every session collected, the bundle valid | `RESULT status=ok target=e2e-collect scenarios=N sessions=N collected=N` |
 | 1 | the bundle is not valid, before or after collecting | `RESULT status=failed target=e2e-collect errors=N` (plus ` reason=invalid-before-collect` when it was refused before any request) |
-| 2 | usage, no bearer, a rejected bearer (names `scripts/dx/admin_token.sh`), a session id that is not a UUID | `RESULT status=error target=e2e-collect reason=<usage\|no-token\|unauthorized\|...>` |
+| 2 | usage, a bad `--base-url`, no bearer, a rejected bearer (names `scripts/dx/admin_token.sh`), a session id that is not a UUID, a bundle that already has a host half | `RESULT status=error target=e2e-collect reason=<usage\|no-token\|unauthorized\|host-half-present\|...>` |
 | 3 | incomplete: some scenario could not be collected | `RESULT status=failed target=e2e-collect scenarios=N sessions=N collected=N` |
 
 Usage is exit 2 here, as in `e2e-bundle`; the `session-*` verbs use 3.
 
-**A collected scenario is never fetched again.** `<scenario>/host-half.json` with
-`collected: true` means skip: a second run makes no request for it and changes no byte of it,
-whatever the stack now answers. Only scenarios that are not collected are retried, so a
-collection that failed or was cut short is finished by running the verb again. The settings
-and builds are **as read at collection**, not as they were when the session ran (a host can be
-changed between): `host-half.json` records `read_at_ms`.
+**`RESUME=1` never fetches a collected scenario again.** `<scenario>/host-half.json` with
+`collected: true` counts only if every file the collector writes for that scenario is present and
+well shaped; otherwise the scenario is collected again. A counted scenario is skipped: no request,
+not a byte of it changed, whatever the stack now answers. `manifest.json` and `builds.json` are
+reconciled from the scenarios' states at the end of every run, so an interrupted run is repaired by
+running again. A scenario's files are committed together: all are written to temporary names
+first and renamed into place together, `host-half.json` last, so a failed write leaves the
+scenario as it was and a retry merges with the client's rows only. The settings are **as read
+at collection**, not as they were when the session ran (a host can be changed between):
+`host-half.json` records `read_at_ms`. The builds are read when a scenario is collected; a failed
+build read is not retried by `RESUME=1`, only by collecting a fresh copy.
 
 ### What the host half adds
 
 | file | holds |
 |---|---|
-| `<scenario>/diagnostic-bundle.json` | the session's diagnostic bundle, as `GET /v1/admin/sessions/{id}/diagnostic-bundle` returned it for the session's window (reads of a long session folded together; addresses and credentials redacted) |
+| `<scenario>/diagnostic-bundle.json` | the session's diagnostic bundle, as `GET /v1/admin/sessions/{id}/diagnostic-bundle` returned it for the session's window (addresses and credentials redacted). A session over one read (about 10 minutes) is folded: series and events together, `derived_windows` and `agent_adaptation` concatenated, `classifier` the first read's and `classifier_reads` every read's with its own window |
 | `<scenario>/session.json` | the session row, in the run-directory shape `bench_submit.py` reads (`launch`, `fps`, `bitrate_kbps`, `codec`, `rungs`, `host_id`, timestamps), plus `transport`, `negotiated_codec` and `pyrowave` as the row names them |
 | `<scenario>/conditions.json` | `effective`: the host's effective settings as read at collection, projected as `bench_run.sh`'s `flag()` does (a value that reads `true` or `false` in any case becomes `on`/`off`; the ladder aliases are added) |
 | `<scenario>/metrics.jsonl` | the session's raw samples (every key, string-valued ones too, at their own timestamps) **merged** with the client half's own rows: same source and `ts_unix_ms` is the same row, joined key by key, the client half's value winning a key both have; sorted by ts then source. A key the metric manifest lacks, or a source the format lacks, is dropped and listed in `host-half.json` |
-| `<scenario>/trace.json` | the session's stored trace events (as stored, not clock-aligned), merged with the client half's |
-| `<scenario>/host-half.json` | `{ "collected": true, "read_at_ms": ..., "node_agent": ... }` (plus `metric_keys_not_in_manifest` and `sources_not_in_bundle` when something was dropped), or `collected: false` with the `reason` |
+| `<scenario>/trace.json` | the session's stored trace events (as stored, not clock-aligned), merged with the client half's; a clock the client measured is kept when the server's is unmeasured. A second session's own events are in its `sessions/<id>/trace.json` |
+| `<scenario>/host-half.json` | `{ "collected": true, "read_at_ms": ..., "node_agent": ... }` (plus `metric_keys_not_in_manifest` and `sources_not_in_bundle` when something was dropped: a name is listed only if it is a plain identifier, any other is counted in `other_dropped`; `"trace": "the session never started"` for a launch failure), or `collected: false` with the `reason` |
 | `builds.json` | `components.control_plane` from `GET /v1/admin/platform/identity`, `components.node_agent` from the host row's `agent_version`/`source_commit`/`built_at` (`GET /v1/hosts/{id}`, which answers `{"host": ...}`); a build that cannot be read is `null` with its reason in `unknown`, replacing whatever the client half held; every other component is left as the client half wrote it |
 | `manifest.json` | `halves.host: true`, only when every scenario is collected |
 
@@ -81,7 +99,7 @@ Every file the collector writes goes through one function: credential-named fiel
 (`authorization`, `cookie`, any `*token`, `password`, `secret`, `api key`, `private key`, in any
 case or spelling) are dropped, IPv4 addresses become `[address]`, and the exact bearer is
 replaced in every value. The file is written beside its target and renamed over it, so a link
-already there is replaced, not followed. A value from an answer is never echoed into a `reason`.
+already there is replaced, not followed. A value from an answer is never echoed into a `reason` (a reason names the route path, never its query). Every field the collector uses is shape-checked before anything is written: a wrong type makes that scenario `collected: false`.
 Limits: a bearer an answer encodes (base64, URL-encoded, split) is not recognised, and a local
 user racing the filesystem during the run is out of scope.
 
@@ -117,5 +135,6 @@ A directory, zipped when it is handed between machines.
 The test (`node --test scripts/validate/stream/bundle.test.mjs`, part of `make verify`) breaks the
 fixture once per rule above. The collector's test drives it against a fake API as an in-process
 `fetch` — no sockets, no stack — and checks a client-only bundle comes out complete and valid,
-that a second collection changes no byte, and that a 404, an address and the bearer are each
-handled as described above.
+that a second collection (`RESUME=1`) changes no byte and a default one is refused, that a failed
+write leaves the scenario as it was, and that a 404, an address and the bearer are each handled as
+described above.

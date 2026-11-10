@@ -3,15 +3,17 @@
 #
 # scripts/dx/e2e_collect.sh — the host half of a run bundle (make e2e-collect).
 #
-#   make e2e-collect BUNDLE=<dir> [HOST=<role|name>]
+#   make e2e-collect BUNDLE=<dir> [HOST=<role|name>] [RESUME=1]
 #
 # Resolves the stack exactly as the session-* verbs do (HOST -> api_external in
 # .claude/skills/_shared/hosts.json), takes the admin bearer from the one ladder
 # (scripts/dx/admin_token.sh) and hands it to scripts/validate/stream/collect.mjs
 # through the ENVIRONMENT, never on argv. Read-only: nothing on the host changes.
+# A bundle that already has a host half is refused (exit 2) unless RESUME=1, which finishes a
+# collection this machine started.
 #
 # Exit: 0 every session collected, 1 the bundle is not valid, 2 usage / no bearer /
-# wrong host, 3 incomplete (a session the stack no longer holds; the reason is in
+# wrong host / a bundle that already has a host half, 3 incomplete (a session the stack no longer holds; the reason is in
 # that scenario's host-half.json).
 set -euo pipefail
 # shellcheck source=scripts/dx/common.sh
@@ -55,4 +57,6 @@ TOKEN="$(QUASAR_ADMIN_TOKEN="${QUASAR_ADMIN_TOKEN:-${QSES_ADMIN_TOKEN:-}}" \
 [ -n "$TOKEN" ] || die no-token \
   "no admin bearer for host=$DX_HOST (the ladder printed every tier it tried above). Next: scripts/dx/admin_token.sh --host $DX_HOST --fresh"
 
-QUASAR_ADMIN_TOKEN="$TOKEN" exec node "$COLLECT" "$BUNDLE" --base-url "$API_BASE"
+ARGS=()
+[ "${RESUME:-}" = 1 ] && ARGS+=(--resume)
+QUASAR_ADMIN_TOKEN="$TOKEN" exec node "$COLLECT" "$BUNDLE" --base-url "$API_BASE" "${ARGS[@]}"
