@@ -72,6 +72,11 @@ impl AbrLoop {
             .is_some_and(|m| m.abr_owner() == self.id)
     }
 
+    /// No loop owns the session's encoder.
+    fn orphaned(&self) -> bool {
+        self.metrics.upgrade().is_some_and(|m| m.abr_owner() == 0)
+    }
+
     fn fps(&self) -> u32 {
         self.fps.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -830,11 +835,18 @@ fn arm(
 /// `estimate()`, and in Smooth mode the adaptation hint and the ladder; and make this loop
 /// the encoder's one writer. Hooks and owner are both single on `SessionMetrics`, so the
 /// transport that starts last drives the encoder.
+///
+/// Its governor must match the encoder when it starts. It does not after another loop
+/// owned the encoder, or when this loop drove it and then lost it to nobody (a transport
+/// replacement put the encoder back at launch): both start from the launch point.
 fn start(abr_loop: &Arc<AbrLoop>, plan: &Plan, estimate: Box<dyn Fn() -> f64 + Send + Sync>) {
     if let Some(m) = abr_loop.metrics.upgrade() {
         let previous = m.abr_owner();
         m.claim_abr(abr_loop.id);
-        if previous != 0 && previous != abr_loop.id {
+        let drove = abr_loop
+            .first_estimate
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if previous != abr_loop.id && (previous != 0 || drove) {
             take_over(abr_loop, plan, &m);
         }
     }
@@ -1145,27 +1157,36 @@ pub(crate) fn feedback_abr(
     let mode = cfg.abr_mode;
     let observe_loop = abr_loop.clone();
     let observed = latest.clone();
+    let begin: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let latest = latest.clone();
+        start(
+            &abr_loop,
+            &plan,
+            Box::new(move || f64::from_bits(latest.load(std::sync::atomic::Ordering::Relaxed))),
+        );
+        tracing::info!(
+            "AS-03 ABR armed (mode={}): WebTransport receiver feedback → encoder, \
+             bounds [{}, {}] kbps",
+            mode.as_str(),
+            plan.launch_floor_kbps,
+            plan.ceiling_kbps
+        );
+    });
+    let retake = begin.clone();
     Some(crate::webtransport::Rate {
         ceiling_kbps,
         // Each client starts afresh: it takes the encoder over (a WebRTC peer that started
         // since owns it until then) and registers new hooks.
-        start: Box::new(move || {
-            let latest = latest.clone();
-            start(
-                &abr_loop,
-                &plan,
-                Box::new(move || f64::from_bits(latest.load(std::sync::atomic::Ordering::Relaxed))),
-            );
-            tracing::info!(
-                "AS-03 ABR armed (mode={}): WebTransport receiver feedback → encoder, \
-                 bounds [{}, {}] kbps",
-                mode.as_str(),
-                plan.launch_floor_kbps,
-                plan.ceiling_kbps
-            );
-        }),
+        start: Box::new(move || begin()),
         observe: Box::new(move |kbps| {
             observed.store(kbps.to_bits(), std::sync::atomic::Ordering::Relaxed);
+            // One ABR owner per encoder; an owner that lost the encoder re-takes it from
+            // the launch point on its next estimate. Lost to nobody, that is: a WebRTC
+            // answer replaced the video transport (`reset_to_launch`) and that peer never
+            // connected. A live owner is never taken from here, only by a client's `start`.
+            if observe_loop.orphaned() {
+                retake();
+            }
             observe_loop.observe(kbps, true);
         }),
     })
@@ -1701,6 +1722,47 @@ mod tests {
         assert_eq!(bitrate(), 11_500, "back at launch under its new owner");
         (b.observe)(11_500.0);
         assert_eq!(bitrate(), 11_500);
+    }
+
+    /// #1040: a WebRTC answer replaced the video transport under a streaming WebTransport
+    /// client (`WebRtcSlot::replace_video`), and that peer never connected. The client's
+    /// loop lost the encoder to nobody: its next estimate takes it back, from launch, with
+    /// no second `start` (`webtransport::Control` starts once per client).
+    #[test]
+    fn a_loop_that_lost_the_encoder_to_nobody_drives_it_again_from_launch() {
+        init();
+        let metrics = Arc::new(SessionMetrics::new("smooth", 60));
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let trace =
+            crate::session::runner::DiagnosticEventTx::new(tx, Arc::default(), Arc::default());
+        let mut cfg = cfg_with_floors(0, Some(500));
+        cfg.abr_governor.min_interval_ms = 1;
+        let encoder = gst::ElementFactory::make("openh264enc").build().unwrap();
+        let lever = software_lever((cfg.stream.width, cfg.stream.height));
+        let client =
+            feedback_abr(&encoder, &cfg, metrics.clone(), trace, "s".into(), None).unwrap();
+        let bitrate = || encoder.property::<u32>("bitrate") / 1000;
+        let pause = || std::thread::sleep(std::time::Duration::from_millis(5));
+        (client.start)();
+        pause();
+        (client.observe)(2000.0);
+        assert!(
+            bitrate() < 11_500,
+            "the client's loop drove the encoder down"
+        );
+
+        reset_to_launch(&encoder, &cfg, &lever, &metrics);
+        assert_eq!(bitrate(), 11_500, "the replacement put it back at launch");
+
+        // Its governor starts again too: the old one would sit out its down dwell here.
+        (client.observe)(2000.0);
+        pause();
+        (client.observe)(2000.0);
+        let driven = bitrate();
+        assert!(
+            driven < 11_500,
+            "the abandoned takeover left the client with no ABR ({driven} kbit/s)"
+        );
     }
 
     // ---- ResolutionLever ----

@@ -111,25 +111,32 @@ pub(crate) struct Rate {
 }
 
 /// One client's congestion control: its feedback and the agent's silence clock into an
-/// estimate, and the estimate into the session's ABR.
+/// estimate, and the estimate into the session's ABR. Built only for a session whose ABR
+/// is armed, so one without it keeps no send log.
 struct Control<'a> {
     rate: &'a Rate,
     estimator: congestion::Estimator,
+    log: congestion::SendLog,
     started: bool,
     refused: u64,
+    /// Set once the client is displaced or the session ended.
+    gone: Arc<OnceLock<Gone>>,
 }
 
 impl<'a> Control<'a> {
-    fn new(rate: &'a Rate) -> Self {
+    fn new(rate: &'a Rate, gone: Arc<OnceLock<Gone>>) -> Self {
+        let now = std::time::Instant::now();
         Self {
             rate,
-            estimator: congestion::Estimator::new(rate.ceiling_kbps, std::time::Instant::now()),
+            estimator: congestion::Estimator::new(rate.ceiling_kbps, now),
+            log: congestion::SendLog::new(now),
             started: false,
             refused: 0,
+            gone,
         }
     }
 
-    fn feedback(&mut self, message: &Value, log: &mut congestion::SendLog, session: &Session) {
+    fn feedback(&mut self, message: &Value, session: &Session) {
         let fb = match congestion::feedback_of(message) {
             Ok(fb) => fb,
             Err(field) => {
@@ -152,19 +159,26 @@ impl<'a> Control<'a> {
             congestion_events: path.congestion_events,
         };
         let now = std::time::Instant::now();
-        if let Some(kbps) = self.estimator.on_feedback(&fb, log, now, path) {
+        if let Some(kbps) = self.estimator.on_feedback(&fb, &mut self.log, now, path) {
             self.feed(kbps);
         }
     }
 
-    fn tick(&mut self, log: &congestion::SendLog, session: &Session) {
+    fn tick(&mut self, session: &Session) {
         let rtt = quinn::Connection::rtt(session);
-        if let Some(kbps) = self.estimator.on_tick(std::time::Instant::now(), log, rtt) {
+        let now = std::time::Instant::now();
+        if let Some(kbps) = self.estimator.on_tick(now, &self.log, rtt) {
             self.feed(kbps);
         }
     }
 
     fn feed(&mut self, kbps: f64) {
+        // A client that no longer has the session must never start or re-take the ABR: the
+        // encoder is its successor's, and after the session ended the hooks a start
+        // registers would leak the encoder (`SessionMetrics::clear_hooks`).
+        if self.gone.get().is_some() {
+            return;
+        }
         if !std::mem::replace(&mut self.started, true) {
             (self.rate.start)();
         }
@@ -1026,11 +1040,13 @@ fn retransmit_window(session: &Session) -> Duration {
 fn resend(
     session: &Session,
     datagrams: Vec<bytes::Bytes>,
-    log: &mut congestion::SendLog,
+    mut log: Option<&mut congestion::SendLog>,
     too_large: &mut u64,
 ) -> bool {
     for d in datagrams {
-        log.record(&d, std::time::Instant::now(), true);
+        if let Some(log) = log.as_deref_mut() {
+            log.record(&d, std::time::Instant::now(), true);
+        }
         match session.send_datagram(d) {
             Ok(()) => {}
             Err(web_transport_quinn::SessionError::SendDatagramError(
@@ -1268,8 +1284,9 @@ async fn stream(
     let mut nack_budget = retransmit::NackBudget::new(std::time::Instant::now());
     let (mut nacks_capped, mut resends_too_large) = (0u64, 0u64);
     let mut warned_oversized = false;
-    let mut log = congestion::SendLog::new(std::time::Instant::now());
-    let mut control = media.rate().map(Control::new);
+    let mut control = media
+        .rate()
+        .map(|rate| Control::new(rate, client.gone.clone()));
     let mut control_tick = tokio::time::interval(congestion::REPORT_EVERY);
     control_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Nothing is sent before `hello_ack`: what queued up behind it is stale.
@@ -1286,18 +1303,17 @@ async fn stream(
             // ABR (B09, #1058), so nothing sent then is logged, and no estimate is fed.
             _ = control_tick.tick(), if control.is_some() && current.codec != "pyrowave" => {
                 if let Some(control) = control.as_mut() {
-                    control.tick(&log, session);
+                    control.tick(session);
                 }
             }
             packet = client.audio.recv(), if audio_open => match packet {
                 Some(packet) => {
                     let seq = pkt_seq;
                     pkt_seq = pkt_seq.wrapping_add(1);
-                    let datagram = audio::datagram(&packet, seq);
-                    if current.codec != "pyrowave" {
-                        log.record(&datagram, std::time::Instant::now(), false);
-                    }
-                    if session.send_datagram(datagram).is_err() {
+                    // Not in the send log: the estimate is the video ABR's, and on WebRTC
+                    // audio is a peer connection GCC never sees. Feedback naming an audio
+                    // `pkt_seq` finds no record and counts for nothing.
+                    if session.send_datagram(audio::datagram(&packet, seq)).is_err() {
                         break QUIET;
                     }
                 }
@@ -1342,8 +1358,9 @@ async fn stream(
                     }
                     // shortcut: a PyroWave frame (~380 datagrams at 1080p/200) goes as one burst;
                     // §Rate's SHOULD pace over half a frame interval is B09 (#1058).
+                    let mut log = control.as_mut().filter(|_| !unit.pyrowave).map(|c| &mut c.log);
                     let sent = datagrams.into_iter().try_for_each(|d| {
-                        if !unit.pyrowave {
+                        if let Some(log) = log.as_deref_mut() {
                             log.record(&d, now, false);
                         }
                         session.send_datagram(d)
@@ -1391,7 +1408,8 @@ async fn stream(
                                 (frame_seq, sent.answer(frame_seq, &ranges, &mut pkt_seq, now, window))
                             });
                             if let Some((frame_seq, answer)) = answer {
-                                if !resend(session, answer.resend, &mut log, &mut resends_too_large) {
+                                let log = control.as_mut().map(|c| &mut c.log);
+                                if !resend(session, answer.resend, log, &mut resends_too_large) {
                                     break QUIET;
                                 }
                                 if !answer.missed.is_empty() {
@@ -1405,7 +1423,7 @@ async fn stream(
                         }
                         Some("feedback") if current.codec != "pyrowave" => {
                             if let Some(control) = control.as_mut() {
-                                control.feedback(&message, &mut log, session);
+                                control.feedback(&message, session);
                             }
                         }
                         Some("input") => {

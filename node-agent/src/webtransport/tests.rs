@@ -1462,6 +1462,85 @@ async fn feedback_while_pyrowave_is_active_feeds_no_estimate() {
     }
 }
 
+/// #1040: the estimate is the video ABR's, and on WebRTC audio is a peer connection GCC
+/// never sees. A still screen with music: only audio flows, and feedback that reports it
+/// arriving later and later, as behind a queue, moves no estimate.
+#[tokio::test]
+async fn audio_alone_never_moves_the_video_estimate() {
+    let fed = Arc::new(Mutex::new(Vec::new()));
+    let seen = fed.clone();
+    let plan = audio::Plan {
+        audio: true,
+        mic: false,
+        pulse_server: None,
+        jitter_ms: 40,
+    };
+    let mut agent = agent_built(Stream::H264, Limits::default(), plan, "ball", move |_| {
+        Some(Rate {
+            ceiling_kbps: 4000.0,
+            start: Box::new(|| {}),
+            observe: Box::new(move |kbps| seen.lock().unwrap().push(kbps)),
+        })
+    })
+    .await;
+    tap_session_audio(&mut agent);
+    let (session, mut send, _recv, _) = agent.hello(TOKEN).await;
+    // Video reached the client, then the screen goes still.
+    while session.read_datagram().await.unwrap()[0] != 0x01 {}
+    agent.pipeline.set_state(gst::State::Paused).unwrap();
+
+    let mut path = Bottleneck::new(1e6);
+    let (mut audio, mut late) = (0, 0.0);
+    let until = Instant::now() + Duration::from_secs(2);
+    while let Ok(d) = tokio::time::timeout_at(until, session.read_datagram()).await {
+        let d = d.unwrap();
+        // Each audio datagram waits 10 ms longer than the one before it.
+        if d[0] == 0x02 {
+            audio += 1;
+            late += 0.010;
+        }
+        let pkt_seq = u32::from_le_bytes(d[1..5].try_into().unwrap());
+        path.pending.push((pkt_seq, Some(path.now() + late)));
+        if let Some(feedback) = path.feedback() {
+            write_message(&mut send, &feedback).await.unwrap();
+        }
+    }
+    assert!(audio >= 100, "10 ms audio for 2 s: {audio} datagrams");
+    let fed = fed.lock().unwrap();
+    assert!(!fed.is_empty(), "the feedback was read");
+    assert!(
+        fed.iter().all(|&kbps| kbps == 4000.0),
+        "audio alone moved the video estimate: {fed:?}"
+    );
+}
+
+/// A client displaced, or told the session ended, neither starts nor feeds the ABR: the
+/// encoder is its successor's, and a start after the session ended would register hooks
+/// that keep the encoder alive.
+#[test]
+fn a_client_that_is_gone_neither_starts_nor_feeds_the_abr() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (started, fed) = (calls.clone(), calls.clone());
+    let rate = Rate {
+        ceiling_kbps: 4000.0,
+        start: Box::new(move || {
+            started.fetch_add(1, SeqCst);
+        }),
+        observe: Box::new(move |_| {
+            fed.fetch_add(1, SeqCst);
+        }),
+    };
+    let gone = Arc::new(OnceLock::new());
+    let mut control = Control::new(&rate, gone.clone());
+    control.feed(3000.0);
+    assert_eq!(calls.load(SeqCst), 2, "a live client starts and feeds");
+    gone.set(Gone::TakenOver).unwrap();
+    control.feed(3000.0);
+    Control::new(&rate, gone).feed(3000.0);
+    assert_eq!(calls.load(SeqCst), 2);
+}
+
 #[tokio::test]
 async fn a_client_flooding_nacks_gets_only_its_budget_answered() {
     let agent = agent().await;

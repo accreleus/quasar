@@ -832,7 +832,8 @@ impl SessionMetrics {
         let had_drain = self.on_drain.lock().unwrap().take().is_some();
         let had_window = self.on_window.lock().unwrap().take().is_some();
         // No owner either: a replacement transport already put the encoder back at launch
-        // (`abr_glue::reset_to_launch`), so its loop's start is no takeover to repeat.
+        // (`abr_glue::reset_to_launch`), so its loop's start is no takeover to repeat. A
+        // WebTransport client still streaming takes it back (`abr_glue::feedback_abr`).
         self.abr_owner.store(0, Ordering::Relaxed);
         tracing::debug!(had_drain, had_window, "session metrics ABR hooks cleared");
     }

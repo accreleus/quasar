@@ -151,8 +151,9 @@ struct Slot {
     status: Status,
 }
 
-/// When, and how big, each recent agent → client datagram was sent, by its `pkt_seq`, and
-/// what feedback has said of it: each is counted once, whatever is reported again.
+/// When, and how big, each recent agent → client video datagram was sent, by its `pkt_seq`,
+/// and what feedback has said of it: each is counted once, whatever is reported again. A
+/// `pkt_seq` never recorded (audio shares the counter) is skipped when feedback names it.
 pub(crate) struct SendLog {
     start: Instant,
     slots: Vec<Slot>,
@@ -170,8 +171,8 @@ impl SendLog {
         }
     }
 
-    /// Any channel's datagram: `pkt_seq` is bytes 1..5 of every one (§Channels). A
-    /// `resend` (a NACK answer) counts toward loss, not toward the receive rate.
+    /// `pkt_seq` is bytes 1..5 of every datagram (§Channels). A `resend` (a NACK answer)
+    /// counts toward loss, not toward the receive rate.
     pub(crate) fn record(&mut self, datagram: &[u8], at: Instant, resend: bool) {
         let Some(seq) = datagram.get(1..5) else {
             return;
