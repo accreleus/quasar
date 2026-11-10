@@ -34,7 +34,8 @@ make e2e-collect BUNDLE=<bundle-dir> HOST=<role>
 `HOST` resolves the stack the way the `session-*` verbs do (`local` when unset), and the
 bearer comes from `scripts/dx/admin_token.sh`; it travels to the collector in
 `QUASAR_ADMIN_TOKEN` and is written nowhere. It can run days after the client half, on another
-machine. A **directory** only: unzip a bundle first.
+machine. A **directory** only: unzip a bundle first. The bundle is validated before the admin
+bearer is used, and a bundle that is not valid is not collected.
 
 Exit 0 every session collected, 1 the bundle is not valid after collection, 2 usage or the
 bearer was rejected, 3 incomplete. The last line is

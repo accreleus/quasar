@@ -2,6 +2,7 @@
 //
 // A fake API as an in-process `fetch` — no sockets, no stack, no lab host.
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -49,6 +50,15 @@ const walk = (dir, rel = "") =>
     const p = path.join(rel, e.name);
     return e.isDirectory() ? walk(dir, p) : [p];
   });
+
+// One hash over every path and byte in a tree: "the collector wrote nothing" as a value.
+function treeHash(dir) {
+  const h = crypto.createHash("sha256");
+  for (const rel of walk(dir).sort()) {
+    h.update(rel).update("\0").update(fs.readFileSync(path.join(dir, rel)));
+  }
+  return h.digest("hex");
+}
 
 // ── the canned answers ──────────────────────────────────────────────────────
 function diagnostic() {
@@ -110,7 +120,7 @@ const IDENTITY = {
   identity: { version: "0.6.1-dev", source_commit: "f00dfeed", built_at: "2026-11-10T08:00:00Z", schema_version: 123 },
 };
 
-/** `answers` overrides individual routes with `[status, body]`. */
+/** `answers` overrides individual routes with `[status, body]`. `fn.calls` is every URL asked for. */
 function fake(answers = {}) {
   const routes = {
     [`/v1/admin/sessions/${SID}/diagnostic-bundle`]: [200, diagnostic()],
@@ -120,12 +130,30 @@ function fake(answers = {}) {
     "/v1/admin/platform/identity": [200, IDENTITY],
     ...answers,
   };
-  return async (url, init) => {
+  const fn = async (url, init) => {
+    fn.calls.push(url);
     assert.equal(init.headers.Authorization, `Bearer ${TOKEN}`, "every request carries the bearer");
     const route = new URL(url).pathname;
     const [status, body] = routes[route] ?? [404, { error: "not_found" }];
     return { status, json: async () => body };
   };
+  fn.calls = [];
+  return fn;
+}
+
+/** Run the CLI with `console` captured; returns its exit code and lines. */
+async function cli(argv, fetchFn, env = { QUASAR_ADMIN_TOKEN: TOKEN }) {
+  const out = [];
+  const errs = [];
+  const [log, error] = [console.log, console.error];
+  console.log = (m) => out.push(String(m));
+  console.error = (m) => errs.push(String(m));
+  try {
+    return { code: await main(argv, { fetch: fetchFn, env }), out, errs };
+  } finally {
+    console.log = log;
+    console.error = error;
+  }
 }
 
 test("a client-only bundle comes out complete and valid", async () => {
@@ -291,4 +319,87 @@ test("the command: 0 collected, 1 invalid bundle, 2 usage", async () => {
   } finally {
     console.log = quiet;
   }
+});
+
+// ── a bundle is untrusted input ─────────────────────────────────────────────
+test("a session id that is not a UUID is refused before any request", async () => {
+  const dir = clientBundle();
+  edit(dir, `${SC}/scenario.json`, (s) => ({ ...s, sessions: ["../../admin/users"] }));
+  const before = treeHash(dir);
+  const api = fake();
+
+  const r = await cli([dir, "--base-url", BASE], api);
+  assert.equal(r.code, EXIT.error, "a usage-class failure is exit 2");
+  assert.equal(api.calls.length, 0, "no admin-authenticated request is made at all");
+  assert.equal(treeHash(dir), before, "the bundle is untouched");
+  assert.ok(r.errs.some((m) => m.includes(SC) && /is not a session id/.test(m)), "the message names the scenario");
+  assert.ok(r.errs.every((m) => m.length < 200), "and stays short");
+
+  // A long value is clipped rather than echoed whole.
+  const long = "../../" + "x".repeat(200);
+  edit(dir, `${SC}/scenario.json`, (s) => ({ ...s, sessions: [long] }));
+  const again = await cli([dir, "--base-url", BASE], fake());
+  assert.equal(again.code, EXIT.error);
+  assert.ok(again.errs.every((m) => !m.includes(long)), "a 200-character id is not echoed whole");
+});
+
+test("a manifest scenario name that leaves the bundle is refused before any request or write", async () => {
+  const dir = clientBundle();
+  const outside = path.join(path.dirname(dir), `outside-${path.basename(dir)}`);
+  fs.mkdirSync(outside, { recursive: true });
+  // It even looks like a scenario directory: only the format check refuses the name.
+  fs.writeFileSync(path.join(outside, "scenario.json"), read(dir, `${SC}/scenario.json`));
+  fs.writeFileSync(path.join(outside, "keep.txt"), "not a bundle\n");
+  const name = `../${path.basename(outside)}`;
+  edit(dir, "manifest.json", (m) => ({ ...m, scenarios: [name] }));
+  const before = treeHash(dir);
+  const outsideBefore = treeHash(outside);
+  const api = fake();
+
+  const r = await cli([dir, "--base-url", BASE], api);
+  assert.equal(r.code, EXIT.invalid, "an invalid bundle is exit 1");
+  assert.equal(api.calls.length, 0, "no admin-authenticated request is made at all");
+  assert.match(r.out.join("\n"), /reason=invalid-before-collect/);
+  assert.equal(treeHash(dir), before, "nothing inside the bundle was written");
+  assert.equal(treeHash(outside), outsideBefore, "nothing outside it was written either");
+  assert.deepEqual(fs.readdirSync(outside).sort(), ["keep.txt", "scenario.json"]);
+});
+
+test("a scenario directory that is a symlink out of the bundle is refused before any request", async () => {
+  const dir = clientBundle();
+  const target = path.join(path.dirname(dir), `linked-${path.basename(dir)}`);
+  fs.mkdirSync(target, { recursive: true });
+  fs.writeFileSync(path.join(target, "scenario.json"), read(dir, `${SC}/scenario.json`));
+  fs.rmSync(path.join(dir, SC), { recursive: true });
+  fs.symlinkSync(target, path.join(dir, SC), "dir");
+  const outsideBefore = treeHash(target);
+  const api = fake();
+
+  const r = await cli([dir, "--base-url", BASE], api);
+  assert.equal(r.code, EXIT.invalid, "an invalid bundle is exit 1");
+  assert.equal(api.calls.length, 0, "no admin-authenticated request is made at all");
+  assert.match(r.out.join("\n"), /reason=invalid-before-collect/);
+  assert.equal(treeHash(target), outsideBefore, "the linked directory is untouched");
+  assert.deepEqual(fs.readdirSync(target), ["scenario.json"]);
+});
+
+test("a host id from the API that is not a UUID is recorded as not collected, never requested", async () => {
+  const dir = clientBundle();
+  const api = fake({
+    [`/v1/sessions/${SID}`]: [200, { session: { ...sessionDoc().session, host_id: "../../admin/users" } }],
+  });
+
+  const r = await cli([dir, "--base-url", BASE], api);
+  assert.equal(r.code, EXIT.incomplete, "one session not collected is exit 3");
+  assert.deepEqual(
+    api.calls.map((u) => new URL(u).pathname),
+    [`/v1/admin/sessions/${SID}/diagnostic-bundle`, `/v1/sessions/${SID}`, "/v1/admin/platform/identity"],
+    "the answer steered no request: nothing under /v1/admin/hosts/ was asked for",
+  );
+  assert.ok(api.calls.every((u) => !u.includes("..")), "no request path was steered by the answer");
+
+  const half = JSON.parse(read(dir, `${SC}/host-half.json`));
+  assert.equal(half.collected, false);
+  assert.match(half.reason, /is not a host id/);
+  assert.equal(JSON.parse(read(dir, "manifest.json")).halves.host, false);
 });

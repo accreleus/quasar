@@ -29,6 +29,13 @@ export const EXIT = { ok: 0, invalid: 1, error: 2, incomplete: 3 };
 // the route called it (token, sig_token, access_token, password, ...).
 const CREDENTIAL = /(^|_)(token|password|passwd|secret|api_?key)$/i;
 
+// A session or host id is a UUID, and nothing else. A bundle may come from another
+// machine: a value from it goes into an admin-authenticated request path and into a
+// write path, so anything that is not this shape is refused before it is used.
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const isId = (v) => typeof v === "string" && UUID.test(v);
+const clip = (v) => (typeof v === "string" ? v.slice(0, 80) : String(v).slice(0, 80));
+
 // The same rule bundle.mjs applies when it reads a bundle back: an address is four
 // in-range octets, except loopback, a documentation network and x.0.0.0 (which is
 // how a browser's version reads).
@@ -250,14 +257,41 @@ function getJson(baseUrl, token, fetchFn, route) {
 export async function collect(dir, { baseUrl, token, fetch: fetchFn = globalThis.fetch } = {}) {
   if (!token) throw new Error("no admin bearer: QUASAR_ADMIN_TOKEN is empty");
   if (!baseUrl) throw new Error("no --base-url");
+
+  // The bundle is untrusted input and may come from another machine. Its format is
+  // checked FIRST — before a scenario name becomes a write path and before a session
+  // id becomes an admin request — so nothing it holds can steer this process until
+  // that has passed. A client-only bundle is a valid bundle, so this costs nothing.
+  const problems = validateBundle(dir);
+  if (problems.length) {
+    return { complete: false, refusedBefore: true, problems, incomplete: [], scenarios: 0, sessions: 0, collected: 0 };
+  }
+
   const manifest = readJson(path.join(dir, "manifest.json"));
-  if (!isObj(manifest)) throw new Error("manifest.json: not an object");
-  const scenarios = Array.isArray(manifest.scenarios) ? manifest.scenarios.filter((n) => typeof n === "string") : [];
+  const scenarios = manifest.scenarios;
   if (!scenarios.length) throw new Error("manifest.json: no scenario directories to collect");
   const builds = readJson(path.join(dir, "builds.json"));
-  if (!isObj(builds)) throw new Error("builds.json: not an object");
-  builds.components = isObj(builds.components) ? builds.components : {};
   builds.unknown = isObj(builds.unknown) ? builds.unknown : {};
+
+  // Every session id is checked before the first request, not at the point of use: a
+  // bad id in the last scenario must not leave the first one's requests already sent.
+  const plan = [];
+  for (const name of scenarios) {
+    const scDir = path.join(dir, name);
+    const scenario = readJson(path.join(scDir, "scenario.json"));
+    const ids = Array.isArray(scenario?.sessions) ? scenario.sessions : [];
+    for (const id of ids) {
+      if (!isId(id)) {
+        const e = new Error(
+          `${name}/scenario.json: '${clip(id)}' is not a session id (a session id is a UUID); nothing was requested`,
+        );
+        e.code = "usage";
+        throw e;
+      }
+    }
+    plan.push({ name, scDir, ids });
+  }
+
   const manifestKeys = seriesKeys();
   const get = (route) => getJson(baseUrl, token, fetchFn, route);
 
@@ -266,10 +300,7 @@ export async function collect(dir, { baseUrl, token, fetch: fetchFn = globalThis
   const hosts = new Map();
   const incomplete = [];
 
-  for (const name of scenarios) {
-    const scDir = path.join(dir, name);
-    const scenario = readJson(path.join(scDir, "scenario.json"));
-    const ids = Array.isArray(scenario?.sessions) ? scenario.sessions.filter((s) => typeof s === "string") : [];
+  for (const { name, scDir, ids } of plan) {
     if (!ids.length) {
       writeJson(path.join(scDir, "host-half.json"), { collected: true });
       continue;
@@ -280,7 +311,8 @@ export async function collect(dir, { baseUrl, token, fetch: fetchFn = globalThis
     let reason = null;
     sessions += ids.length;
     for (const id of ids) {
-      const traceRoute = `/v1/admin/sessions/${id}/diagnostic-bundle`;
+      const sid = encodeURIComponent(id);
+      const traceRoute = `/v1/admin/sessions/${sid}/diagnostic-bundle`;
       const diag = await get(traceRoute);
       if (diag.status === 404) {
         reason = `session ${id}: the stack no longer holds it or its trace (HTTP 404 on GET ${traceRoute})`;
@@ -290,9 +322,9 @@ export async function collect(dir, { baseUrl, token, fetch: fetchFn = globalThis
         reason = `session ${id}: GET ${traceRoute} answered HTTP ${diag.status}`;
         break;
       }
-      const row = await get(`/v1/sessions/${id}`);
+      const row = await get(`/v1/sessions/${sid}`);
       if (row.status !== 200 || !isObj(row.body?.session)) {
-        reason = `session ${id}: GET /v1/sessions/${id} answered HTTP ${row.status}`;
+        reason = `session ${id}: GET /v1/sessions/${sid} answered HTTP ${row.status}`;
         break;
       }
       const hostId = row.body.session.host_id;
@@ -300,14 +332,20 @@ export async function collect(dir, { baseUrl, token, fetch: fetchFn = globalThis
         reason = `session ${id}: its row names no host, so there are no settings or agent identity to read`;
         break;
       }
-      const settings = await get(`/v1/admin/hosts/${hostId}/settings`);
-      if (settings.status !== 200 || !isObj(settings.body)) {
-        reason = `session ${id}: GET /v1/admin/hosts/${hostId}/settings answered HTTP ${settings.status}`;
+      // The API's own answer steers a path too, so it gets the same check.
+      if (!isId(hostId)) {
+        reason = `session ${id}: its row's host id '${clip(hostId)}' is not a host id (a host id is a UUID); no settings were requested`;
         break;
       }
-      const host = await get(`/v1/hosts/${hostId}`);
+      const hid = encodeURIComponent(hostId);
+      const settings = await get(`/v1/admin/hosts/${hid}/settings`);
+      if (settings.status !== 200 || !isObj(settings.body)) {
+        reason = `session ${id}: GET /v1/admin/hosts/${hid}/settings answered HTTP ${settings.status}`;
+        break;
+      }
+      const host = await get(`/v1/hosts/${hid}`);
       if (host.status !== 200 || !isObj(host.body)) {
-        reason = `session ${id}: GET /v1/hosts/${hostId} answered HTTP ${host.status}`;
+        reason = `session ${id}: GET /v1/hosts/${hid} answered HTTP ${host.status}`;
         break;
       }
       docs.push({ id, diag: diag.body, session: row.body.session, settings: settings.body, host: host.body });
@@ -445,14 +483,15 @@ export async function main(argv, { fetch: fetchFn = globalThis.fetch, env = proc
     result = await collect(args.dir, { baseUrl: args.baseUrl, token, fetch: fetchFn });
   } catch (e) {
     console.error(e.message);
-    const reason = e.code === "unauthorized" ? "unauthorized" : "collect-failed";
+    const reason = e.code === "unauthorized" ? "unauthorized" : e.code === "usage" ? "usage" : "collect-failed";
     console.log(`RESULT status=error target=e2e-collect reason=${reason}`);
     return EXIT.error;
   }
 
   if (result.problems.length) {
     for (const p of result.problems) console.error(p);
-    console.log(`RESULT status=failed target=e2e-collect errors=${result.problems.length}`);
+    const why = result.refusedBefore ? " reason=invalid-before-collect" : "";
+    console.log(`RESULT status=failed target=e2e-collect errors=${result.problems.length}${why}`);
     return EXIT.invalid;
   }
   if (!result.complete) {
