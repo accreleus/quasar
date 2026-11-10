@@ -85,6 +85,23 @@ describe("PyroWaveReceiver", () => {
     expect(r.nextDeadline()).toBeNull();
   });
 
+  it("counts the datagrams missing from frames closed or dropped incomplete, and none of a whole frame (#1298)", () => {
+    const r = new PyroWaveReceiver(3, N, FRAME_MS);
+    feed(r, fragments(1));
+    expect(r.lost).toBe(0);
+    // Closed at its deadline, two short.
+    feed(r, fragments(2).slice(2), 0);
+    r.due(FRAME_MS);
+    expect(r.lost).toBe(2);
+    // Frame 3 is one short and still pending when frame 4 completes: dropped, its one counted.
+    feed(r, fragments(3).slice(1), FRAME_MS);
+    feed(r, fragments(4), FRAME_MS);
+    expect(r.lost).toBe(3);
+    // Pushed out by a fifth pending frame, three short.
+    for (const seq of [5, 6, 7, 8, 9]) feed(r, fragments(seq).slice(3), FRAME_MS);
+    expect(r.lost).toBe(6);
+  });
+
   it("the fixture's real oversized blocks rejoin, and a lost part loses only its block", () => {
     const frags = fragments(1);
     const parts = frags.filter((f) => f.payload[0] === 1);

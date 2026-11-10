@@ -739,7 +739,7 @@
       "n_key": null,
       "deprecated_for": null,
       "since": "P1",
-      "why": "CUMULATIVE receiver packet loss, posted raw. Every rule that uses it takes a delta across the window (falsifier estimator 'delta'); a single sample cannot produce one and reports 'no samples' rather than 0. On a WebTransport session there is no RTP receiver to ask: the value is the video fragments the client found missing, each counted once when it is first NACKed, whether or not the resend then arrived. With FEC on, a fragment a repair datagram rebuilds before its NACK is never counted, so the value is the loss FEC did not heal, not the path's loss."
+      "why": "CUMULATIVE receiver packet loss, posted raw. Every rule that uses it takes a delta across the window (falsifier estimator 'delta'); a single sample cannot produce one and reports 'no samples' rather than 0. On a WebTransport session there is no RTP receiver to ask: the value is the video fragments the client found missing, each counted once when it is first NACKed, whether or not the resend then arrived. With FEC on, a fragment a repair datagram rebuilds before its NACK is never counted, so the value is the loss FEC did not heal, not the path's loss. On a PyroWave session nothing is NACKed: the value is the datagrams missing from each frame the client closed at its deadline or dropped incomplete. A frame none of whose datagrams arrived is not seen and not counted, and a datagram that arrives after its frame closed stays counted."
     },
     {
       "key": "frames_dropped",

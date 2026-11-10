@@ -59,6 +59,9 @@ interface Pending {
 export class PyroWaveReceiver {
   private pending = new Map<number, Pending>();
   private lastDone: number | null = null;
+  /** Datagrams missing from every frame closed or dropped incomplete, cumulative. A frame none
+   *  of whose datagrams arrived is not seen, so not counted. */
+  lost = 0;
 
   constructor(
     readonly configId: number,
@@ -115,7 +118,11 @@ export class PyroWaveReceiver {
   }
 
   private finish(seq: number, p: Pending, complete: boolean): PyroWaveFrame {
-    for (const k of [...this.pending.keys()]) if (k === seq || serialAfter(seq, k, 16)) this.pending.delete(k);
+    for (const [k, q] of [...this.pending]) {
+      if (k !== seq && !serialAfter(seq, k, 16)) continue;
+      this.lost += q.fragCount - q.have;
+      this.pending.delete(k);
+    }
     this.lastDone = seq;
     const { configId, ts90k, captureUs, packets, covered } = p;
     return { configId, frameSeq: seq, ts90k, captureUs, packets, covered, complete };
@@ -124,7 +131,10 @@ export class PyroWaveReceiver {
   private dropOldest(): void {
     let oldest: number | null = null;
     for (const k of this.pending.keys()) if (oldest === null || serialAfter(oldest, k, 16)) oldest = k;
-    if (oldest !== null) this.pending.delete(oldest);
+    if (oldest === null) return;
+    const p = this.pending.get(oldest) as Pending;
+    this.lost += p.fragCount - p.have;
+    this.pending.delete(oldest);
   }
 
   /** Validates one datagram and records what it carries; an invalid one adds nothing. */
