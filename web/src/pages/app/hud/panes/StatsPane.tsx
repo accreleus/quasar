@@ -370,7 +370,7 @@ export function StatsPane(props: StatsPaneProps) {
                 {props.transportFallbackReason && (
                   <tr>
                     <td>fell back</td>
-                    <td>{props.transportFallbackReason}</td>
+                    <td>{props.transportFallbackReason.replaceAll("_", " ")}</td>
                   </tr>
                 )}
                 {codecs.resolved && (

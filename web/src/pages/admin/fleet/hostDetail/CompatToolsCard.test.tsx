@@ -69,7 +69,7 @@ describe("CompatToolsCard", () => {
     show([entry({ state: "failed", bytes: null, reason: "checksum_mismatch", run_id: "r1" })]);
     expect(await screen.findByText("Failed")).toBeTruthy();
     expect(screen.getByText(/did not match its checksum/)).toBeTruthy();
-    expect(screen.getByRole("link", { name: "See the Compatibility tools job for GE-Proton10-4" }).getAttribute("href")).toBe("/admin/fleet/jobs");
+    expect(screen.getByRole("link", { name: "See the job for GE-Proton10-4" }).getAttribute("href")).toBe("/admin/fleet/jobs");
   });
 
   it("reads an install deferred for disk as not started, with the free space", async () => {
@@ -104,8 +104,8 @@ describe("CompatToolsCard", () => {
       entry({ state: "failed", bytes: null, reason: "io_error", run_id: "r1" }),
       entry({ tool_id: "t2", tag: "GE-Proton9-27", steam_name: "GE-Proton9-27", state: "failed", bytes: null, reason: "io_error", run_id: "r2" }),
     ]);
-    expect(await screen.findByRole("link", { name: "See the Compatibility tools job for GE-Proton10-4" })).toBeTruthy();
-    expect(screen.getByRole("link", { name: "See the Compatibility tools job for GE-Proton9-27" })).toBeTruthy();
+    expect(await screen.findByRole("link", { name: "See the job for GE-Proton10-4" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "See the job for GE-Proton9-27" })).toBeTruthy();
   });
 
   it("shows a state it does not know as its own word instead of crashing the page", async () => {
