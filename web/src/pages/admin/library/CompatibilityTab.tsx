@@ -12,6 +12,7 @@ import { useAuth } from "../../../auth/context";
 import { Button } from "../../../components/Button";
 import { Chip } from "../../../components/Chip";
 import { IconPlus } from "../../../components/icons";
+import { Modal } from "../../../components/Modal";
 import { ResourceStates } from "../../../components/ResourceStates";
 import { useSectionHead } from "../../../components/shell/sectionHead";
 import { SelectField } from "../../../components/TextField";
@@ -39,6 +40,7 @@ export function CompatibilityTab() {
   const { token } = useAuth();
   const { addToast } = useToast();
   const [adding, setAdding] = useState(false);
+  const [removeTarget, setRemoveTarget] = useState<CompatTool | null>(null);
   const [removing, setRemoving] = useState<ReadonlySet<string>>(new Set());
   const [refused, setRefused] = useState<Record<string, string>>({});
 
@@ -61,7 +63,7 @@ export function CompatibilityTab() {
   });
 
   const setDefault = useAdminAction(
-    (toolId: string | null) => adminApi.setCompatToolDefault(token!, toolId),
+    (toolId: string | null) => res.mutate((ctx) => adminApi.setCompatToolDefault(ctx.token, toolId)),
     {
       success: "Default tool saved",
       failure: "Could not save the default tool",
@@ -188,7 +190,7 @@ export function CompatibilityTab() {
                               aria-label={`Remove ${t.display_name}`}
                               aria-describedby={state === "installing" ? `compat-state-${t.id}` : undefined}
                               disabled={state === "installing" || removing.has(t.id)}
-                              onClick={() => void remove(t)}
+                              onClick={() => setRemoveTarget(t)}
                             >
                               Remove
                             </Button>
@@ -209,6 +211,33 @@ export function CompatibilityTab() {
             </div>
           </div>
         </>
+      )}
+      {removeTarget && (
+        <Modal
+          open
+          onClose={() => setRemoveTarget(null)}
+          title="Remove compatibility tool"
+          footer={
+            <>
+              <Button variant="ghost" onClick={() => setRemoveTarget(null)}>Cancel</Button>
+              <Button
+                variant="danger"
+                onClick={() => {
+                  setRemoveTarget(null);
+                  void remove(removeTarget);
+                }}
+              >
+                Remove tool
+              </Button>
+            </>
+          }
+        >
+          <p className="sec">
+            This removes <strong>{removeTarget.display_name}</strong> from every host. Any game
+            still set to it, or the default tool setting, must be changed first. The server
+            refuses the removal while either still uses it.
+          </p>
+        </Modal>
       )}
       {adding && (
         <AddToolModal

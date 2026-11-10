@@ -69,8 +69,14 @@ export interface MediaSink {
   pyrowave(frame: PyroWaveFrame): void;
   /** Called once, after connect resolved, when the transport is gone. */
   end(end: TransportEnd): void;
-  /** A ping's round trip in ms, once a second while connected (§Ping and pong). */
-  rtt?(ms: number): void;
+  /** A pong, once a second while connected (§Ping and pong): the round trip in ms, and the
+   *  agent's wall clock (`tw`, Unix ms) when it answered. */
+  rtt?(ms: number, agentWallMs?: number): void;
+  /** A `keyframe_request` went on the wire (requests inside the spacing window are merged). */
+  keyframeRequested?(reason: KeyframeReason): void;
+  /** Video fragments the client has found missing since connect, cumulative: each counted once,
+   *  when it is first NACKed, whether or not the resend then arrives. */
+  lost?(fragments: number): void;
 }
 
 export interface MediaTransport {
@@ -83,8 +89,9 @@ export interface MediaTransport {
   codecFallback(reason: string): void;
   /** Where client input goes once connected (§Input). */
   readonly input: InputWire;
-  /** Says `bye` when connected; idempotent. */
-  close(): void;
+  /** Says `bye` when connected; idempotent. Settles once the session has been told to close
+   *  (after the bye is flushed, or a short bound when it cannot be): a fallback waits for it. */
+  close(): Promise<void> | void;
 }
 
 /** A refused or failed connect. `code` is the agent's `error.code`
