@@ -253,8 +253,9 @@ export function HostDetail() {
     !conflict &&
     services != null &&
     (services.report === "reported" || services.report === "offline");
-  // Not left open for a later poll to show: the offer it confirmed is gone.
-  if (removeOpen && !canRemove) setRemoveOpen(false);
+  // Not left open for a later poll to show: the offer it confirmed is gone. Only on a definite
+  // answer: a poll whose release read failed (no `machine`) must not close a dialog mid-confirm.
+  if (removeOpen && machine != null && !canRemove) setRemoveOpen(false);
   const servicesFoot =
     inFlight?.phase === "waiting" ? (
       <>

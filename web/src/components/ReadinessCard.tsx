@@ -172,7 +172,8 @@ export function ReadinessCard({
       <div key={c.id} className={rowClass} data-testid={`readiness-check-${c.id}`}>
         <div className="host-setting-copy">
           <div className="row gap2">
-            <ReadinessGlyph status={c.status} />
+            {/* An advisory check that failed is a warning everywhere else (Fleet alerts, the chip above). */}
+            <ReadinessGlyph status={c.status === "fail" && isAdvisoryCheck(c.id) ? "warn" : c.status} />
             <h3 className="rdy-title">{c.id === "nvidia_vulkan_av1_compatibility" ? "Vulkan AV1 compatibility" : c.id.replaceAll("_", " ")}</h3>
             {blocksLabel && (
               <span data-testid={`readiness-blocks-${c.id}`} title={blocksLabel}>

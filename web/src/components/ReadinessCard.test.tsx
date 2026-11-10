@@ -61,7 +61,8 @@ describe("ReadinessCard", () => {
 
   it("does not show Needs attention when the only failure is an advisory PyroWave probe", () => {
     render(<ReadinessCard checks={[check({ id: "media_probe_gpu0_pyrowave", status: "fail", summary: "GPU 0 cannot encode pyrowave" })]} />);
-    expect(within(screen.getByTestId("readiness-check-media_probe_gpu0_pyrowave")).getByRole("img", { name: "Fail" })).toBeInTheDocument();
+    // The row reads as a warning too, as Fleet alerts do: not a red Fail under a card with no chip.
+    expect(within(screen.getByTestId("readiness-check-media_probe_gpu0_pyrowave")).getByRole("img", { name: "Warning" })).toBeInTheDocument();
     expect(screen.queryByText("Needs attention")).not.toBeInTheDocument();
   });
 

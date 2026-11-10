@@ -180,4 +180,16 @@ describe("AuthProvider device probe at sign-in", () => {
     fireEvent.click(screen.getByRole("button", { name: "go" }));
     await waitFor(() => expect(markDeviceProbePosted).toHaveBeenCalledWith("u1", true, false, expect.any(Number), 300_000));
   });
+
+  // A revoked device signs in to a fresh device row with no capabilities (control-api.md
+  // §DELETE /v1/me/devices/{id}); this browser's stamp still says its last post is current.
+  it.each(["login", "claim"] as const)("%s: posts even when the local stamp is fresh", async (how) => {
+    vi.mocked(authApi.login).mockResolvedValue(signedIn as never);
+    vi.mocked(claimSetup).mockResolvedValue(signedIn as never);
+    vi.mocked(deviceProbeIsFresh).mockReturnValue(true);
+    render(<AuthProvider><SignIn how={how} /></AuthProvider>);
+    fireEvent.click(screen.getByRole("button", { name: "go" }));
+    await waitFor(() => expect(authApi.postDevice).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(authApi.postDevice).mock.calls[0][0]).toBe("tok-2");
+  });
 });

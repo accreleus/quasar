@@ -108,7 +108,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // The device capability probe, after the state flip so the redirect to /app is never
     // blocked; best-effort (P4-08). Through ensureDeviceProbe, as on rehydrate: a probe with
     // a timed-out step must be asked again soon, not read as fresh for a day (WebRTC meanwhile).
-    void ensureDeviceProbe(res.access_token, res.user.id).catch((err) =>
+    // Forced: a sign-in always posts, since the server may have dropped this browser's record.
+    void ensureDeviceProbe(res.access_token, res.user.id, { force: true }).catch((err) =>
       reportBestEffortFailure("silent-debug", "auth: device capability post", err),
     );
   }, []);
@@ -130,7 +131,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // Same best-effort capability probe as login(), fired AFTER the state
       // flip so the wizard's next step is never blocked on it. Failures are
       // silent (P4-08 posture).
-      void ensureDeviceProbe(res.access_token, res.user.id).catch((err) =>
+      void ensureDeviceProbe(res.access_token, res.user.id, { force: true }).catch((err) =>
         reportBestEffortFailure("silent-debug", "auth: claim device capability post", err),
       );
     },
