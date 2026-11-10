@@ -136,6 +136,8 @@ let lastOnChannel: ((ch: { readyState: string; onclose: (() => void) | null }) =
 /** The runtime's recovery sink, same capture: a test plays the transport's
  *  verdict (e.g. the 4404 close) without a WebSocket. */
 let lastOnRecovery: ((state: Record<string, unknown>) => void) | null = null;
+/** The last WebRTC transport, for the audio track a test hands its runtime. */
+let lastTransport: { onAudioTrack: unknown } | null = null;
 vi.mock("../../webrtc/session", () => ({
   QuasarSession: class {
     videoReceiver = null;
@@ -152,6 +154,7 @@ vi.mock("../../webrtc/session", () => ({
     ) {
       lastOnChannel = onChannel;
       lastOnRecovery = onRecoveryState ?? null;
+      lastTransport = this;
     }
     close() {}
     // As QuasarSession does: abandoning the reconnect terminalises recovery.
@@ -268,6 +271,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   lastOnChannel = null;
   lastOnRecovery = null;
+  lastTransport = null;
   lastDrawerProps = null;
   wt.set = null;
   wt.callbacks = null;
@@ -645,19 +649,19 @@ describe("SessionPage — capture after a WebTransport reconnect or fallback", (
     expect(playLayer()).toBeNull();
   });
 
-  it("shows Click to play again after a reconnect outside full screen", async () => {
+  it("asks for capture, with no Click to play, after a reconnect outside full screen (#1300)", async () => {
     await revealOverWebTransport();
     await act(async () => {
       fireEvent.click(screen.getByText("Click to play"));
     });
-    expect(playLayer()).toBeNull();
+    expect(engageSpy).toHaveBeenCalledTimes(1);
 
     await act(async () => wt.set!({ channelOpen: false, inputCaptured: false, pointerLocked: false }));
     await advance(100);
-    expect(playLayer()).toBeNull(); // not before the new connection is up
     await act(async () => wt.set!({ channelOpen: true }));
     await advance(100);
-    expect(playLayer()).not.toBeNull();
+    expect(engageSpy).toHaveBeenCalledTimes(2);
+    expect(playLayer()).toBeNull();
   });
 
   it("re-engages in full screen once WebRTC's channel opens after a fallback", async () => {
@@ -676,20 +680,51 @@ describe("SessionPage — capture after a WebTransport reconnect or fallback", (
     expect(playLayer()).toBeNull();
   });
 
-  it("shows Click to play once WebRTC's channel opens after a fallback outside full screen", async () => {
+  /** The audio element WebRTC's runtime makes for the session's sound. */
+  const webRtcAudio = () => {
+    act(() => (lastTransport!.onAudioTrack as (s: unknown) => void)(null));
+    return document.body.querySelector("audio") as HTMLAudioElement;
+  };
+
+  it("a fallback outside full screen stays revealed and audible, with no Click to play, and a refused capture raises none (#1300)", async () => {
     await revealOverWebTransport();
     await act(async () => {
       fireEvent.click(screen.getByText("Click to play"));
     });
-    expect(playLayer()).toBeNull();
+    expect(engageSpy).toHaveBeenCalledTimes(1);
 
+    // Outside full screen the browser may refuse a lock with no click.
+    engageSpy.mockImplementation(() => Promise.resolve({ mode: "failed" }));
     await act(async () => wt.callbacks!.onFallback("stream_lost"));
     await advance(100);
-    expect(playLayer()).toBeNull(); // the picture is not back yet
     await act(async () => {
       openChannel();
     });
     await advance(100);
+    expect(engageSpy).toHaveBeenCalledTimes(2);
+    expect(playLayer()).toBeNull();
+    expect(webRtcAudio().muted).toBe(false);
+    await advance(5_000);
+    expect(engageSpy).toHaveBeenCalledTimes(2);
+    expect(playLayer()).toBeNull();
+  });
+
+  it("a reload after a fallback is a first load: WebRTC from the start, behind Click to play", async () => {
+    sessionStorage.setItem("quasar.wt-fallback.s1", "stream_lost");
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    renderPage({ webtransport });
+    await advance(1_000);
+    expect(wt.set, "no WebTransport runtime").toBeNull();
+    await act(async () => {
+      openChannel();
+    });
+    await advance(1_500);
+    expect(engageSpy).not.toHaveBeenCalled();
     expect(playLayer()).not.toBeNull();
+    await act(async () => {
+      fireEvent.click(screen.getByText("Click to play"));
+    });
+    expect(engageSpy).toHaveBeenCalledTimes(1);
+    expect(playLayer()).toBeNull();
   });
 });

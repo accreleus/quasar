@@ -454,7 +454,7 @@ function SessionPageBody() {
   const fallBackToWebRtc = async (reason: string) => {
     setSwitching(true);
     // Capture went with the WebTransport connection: ask for it again once WebRTC is up.
-    autoArmedRef.current = true;
+    autoArmedRef.current = "resume";
     rememberFallback(sessionId ?? "", reason);
     new TraceEventEmitter(sessionId ?? "", authToken ?? "").emitTransportFallback(reason);
     try {
@@ -981,12 +981,14 @@ function SessionPageBody() {
   // never went full screen) gets one "Click to play" layer, never a retry loop.
   // Armed again by a quick switch, which spends its own click the same way.
   const [immersive] = useState(launchImmersive);
-  const autoArmedRef = useRef(immersive);
+  // `resume`: armed mid-session by a transport that changed under a picture already showing.
+  // It takes capture back when the browser allows it with no click, and never raises the layer.
+  const autoArmedRef = useRef<false | "reveal" | "resume">(immersive ? "reveal" : false);
   const [clickToPlay, setClickToPlay] = useState(false);
   // A WebTransport connection lost and rebuilt takes capture with it: arm again for the new one.
   const wasOpenRef = useRef(false);
   useEffect(() => {
-    if (webtransport && wasOpenRef.current && !channelOpen) autoArmedRef.current = true;
+    if (webtransport && wasOpenRef.current && !channelOpen) autoArmedRef.current = "resume";
     wasOpenRef.current = channelOpen;
   }, [channelOpen, webtransport]);
   useEffect(() => {
@@ -994,10 +996,11 @@ function SessionPageBody() {
     if (!autoArmedRef.current || !loaderInert || !channelOpen || swapScreenUp || sessionOver) return;
     const rt = runtimeRef.current;
     if (!rt || !videoRef.current) return; // stays armed for the runtime to arrive
+    const offerClick = autoArmedRef.current === "reveal";
     autoArmedRef.current = false;
     if (rt.isCaptured()) return;
     // No Pointer Lock (touch, gesture mode): engaging needs no gesture at all.
-    if (pointerLockSupported() && !document.fullscreenElement) {
+    if (offerClick && pointerLockSupported() && !document.fullscreenElement) {
       setClickToPlay(true);
       return;
     }
@@ -1006,12 +1009,12 @@ function SessionPageBody() {
     if (ua?.hasBeenActive) unmute();
     const engaging = rt.engage();
     if (!engaging) {
-      setClickToPlay(true);
+      if (offerClick) setClickToPlay(true);
       return;
     }
     void engaging.then((result) => {
       noteRawUnavailable(result);
-      if (result.mode === "failed") setClickToPlay(true);
+      if (result.mode === "failed" && offerClick) setClickToPlay(true);
     });
   }, [loaderInert, channelOpen, swapScreenUp, sessionOver, runtimeSnap, unmute, noteRawUnavailable]);
   useEffect(() => {
@@ -1308,7 +1311,7 @@ function SessionPageBody() {
         onSwapStart={() => {
           hudRef.current?.close();
           // #647: the tile click is a gesture; spend it like Play does.
-          if (immersive && enterLaunchFullscreen()) autoArmedRef.current = true;
+          if (immersive && enterLaunchFullscreen()) autoArmedRef.current = "reveal";
         }}
         onScreenChange={setSwapScreenUp}
       >
