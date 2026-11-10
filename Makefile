@@ -103,6 +103,7 @@ export VERSION DRY_RUN
 	test test-go test-rust test-uinput test-web test-webgpu test-engines test-engines-build \
         test-db preflight release up down restart rebuild redeploy-cp status health logs logs-follow \
         dev-web dev-cp diagnose diagnose-bundle clean reset agent-creds validate \
+        e2e-collect \
         ui-audit ui-audit-routes ui-audit-ab session-display session-soak abr-ladder \
         bench-submit bench-retro bench-run bench-suite bench-budget bench-baseline \
         homes-gc \
@@ -309,6 +310,9 @@ nightly-budget-status: ## Tail today's nightly-budget log + LAST_REGRESSION if a
 
 validate: ## End-to-end validation report — LEVEL=ui|api|session|all TARGET=local|<url> KEEP=1 ARGS='--reuse-web'
 	@bash $(DX)/validate.sh
+
+e2e-collect: ## The host half of a run bundle, by session id — BUNDLE=<dir> [HOST=<role|name>]
+	@bash $(DX)/e2e_collect.sh
 
 ## ── Image QA ────────────────────────────────────────────────────────────────
 
