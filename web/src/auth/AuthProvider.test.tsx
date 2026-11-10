@@ -8,7 +8,7 @@
  */
 
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { AuthProvider } from "./AuthProvider";
 import { useAuth } from "./context";
 import { saveSession, type PersistedSession } from "./storage";
@@ -29,7 +29,10 @@ vi.mock("../webrtc/capability", () => ({
   markDeviceProbePosted: vi.fn(),
 }));
 
+vi.mock("../api/setup", () => ({ claimSetup: vi.fn() }));
+
 import * as authApi from "../api/auth";
+import { claimSetup } from "../api/setup";
 import { deviceProbeIsFresh, markDeviceProbePosted, probeCapabilities, probeH264Decodable } from "../webrtc/capability";
 
 const TOKEN_KEY = "quasar.auth.token";
@@ -151,5 +154,30 @@ describe("AuthProvider device capability re-post", () => {
       await waitFor(() => expect(authApi.postDevice).toHaveBeenCalledTimes(1));
       await waitFor(() => expect(actual.deviceProbeIsFresh("u1", false, false)).toBe(true));
     });
+  });
+});
+
+/** Sign-in and the setup claim stamp the probe as rehydration does (deviceProbe.ts). */
+describe("AuthProvider device probe at sign-in", () => {
+  const signedIn = { access_token: "tok-2", expires_at: stored.expiresAt, user: stored.user };
+
+  function SignIn({ how }: { how: "login" | "claim" }) {
+    const { login, claim } = useAuth();
+    return (
+      <button onClick={() => void (how === "login" ? login("a@b.co", "pw") : claim("setup-token", "a@b.co", "ab", "pw"))}>
+        go
+      </button>
+    );
+  }
+
+  it.each(["login", "claim"] as const)("%s: a probe with a timed-out step is stamped to be asked again soon", async (how) => {
+    vi.mocked(authApi.login).mockResolvedValue(signedIn as never);
+    vi.mocked(claimSetup).mockResolvedValue(signedIn as never);
+    vi.mocked(markDeviceProbePosted).mockClear();
+    // The WebCodecs step timed out: its key is absent.
+    vi.mocked(probeCapabilities).mockResolvedValueOnce({ codecs: { h264: true }, webgpu: {} } as never);
+    render(<AuthProvider><SignIn how={how} /></AuthProvider>);
+    fireEvent.click(screen.getByRole("button", { name: "go" }));
+    await waitFor(() => expect(markDeviceProbePosted).toHaveBeenCalledWith("u1", true, false, expect.any(Number), 300_000));
   });
 });

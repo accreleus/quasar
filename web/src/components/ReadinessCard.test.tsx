@@ -59,6 +59,12 @@ describe("ReadinessCard", () => {
     expect(screen.getByText("Needs attention")).toBeInTheDocument();
   });
 
+  it("does not show Needs attention when the only failure is an advisory PyroWave probe", () => {
+    render(<ReadinessCard checks={[check({ id: "media_probe_gpu0_pyrowave", status: "fail", summary: "GPU 0 cannot encode pyrowave" })]} />);
+    expect(within(screen.getByTestId("readiness-check-media_probe_gpu0_pyrowave")).getByRole("img", { name: "Fail" })).toBeInTheDocument();
+    expect(screen.queryByText("Needs attention")).not.toBeInTheDocument();
+  });
+
   it("renders a skip check neutrally and does not count it as a failure", () => {
     render(<ReadinessCard checks={[check({ id: "amd_only_check", status: "skip", summary: "Not applicable on this host." })]} />);
     expect(screen.getByRole("img", { name: "Skipped" })).toBeInTheDocument();

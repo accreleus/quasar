@@ -253,6 +253,8 @@ export function HostDetail() {
     !conflict &&
     services != null &&
     (services.report === "reported" || services.report === "offline");
+  // Not left open for a later poll to show: the offer it confirmed is gone.
+  if (removeOpen && !canRemove) setRemoveOpen(false);
   const servicesFoot =
     inFlight?.phase === "waiting" ? (
       <>

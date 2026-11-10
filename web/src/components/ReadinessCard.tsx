@@ -4,7 +4,7 @@
 // a full-width grid). Host settings deliberately does not repeat it.
 
 import type { ReadinessCheck, ReadinessGate, ReadinessOverride } from "../api/types";
-import { groupChecks } from "../lib/readiness/groups";
+import { groupChecks, isAdvisoryCheck } from "../lib/readiness/groups";
 import { Button } from "./Button";
 import { Chip } from "./Chip";
 import { CopyableCommand } from "./CopyableCommand";
@@ -147,7 +147,8 @@ export function ReadinessCard({
   // field entirely (undefined) rather than sending null, and both mean the
   // same thing here — nothing to render yet.
   const hasChecks = checks != null && checks.length > 0;
-  const anyFail = hasChecks && checks.some((c) => c.status === "fail");
+  // An advisory check's fail is a warning, as Fleet alerts read it (lib/fleet/deriveAlerts.ts).
+  const anyFail = hasChecks && checks.some((c) => c.status === "fail" && !isAdvisoryCheck(c.id));
   // #102: grouped by the area an operator would fix; `skip` (not applicable
   // to this host, per the contract) leaves the first screen for a disclosure.
   const { groups, notApplicable } = groupChecks(checks ?? []);
