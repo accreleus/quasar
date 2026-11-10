@@ -411,7 +411,8 @@ describe("createWebTransportRuntime", () => {
     expect(rt.getSnapshot().firstFrame).toBe(false);
     vi.spyOn(console, "warn").mockImplementation(() => {});
     presenterFatal()("the GPU device was lost");
-    expect(callbacks.onFallback).toHaveBeenCalledWith("internal");
+    // The fallback follows the close (control-api.md §Transport fallback, "Close first").
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("internal"));
   });
 
   it("reports a presenter that cannot be made, and builds no transport", async () => {
@@ -805,11 +806,43 @@ describe("createWebTransportRuntime fallback", () => {
     agent.last.closeWith(4400);
     await vi.waitFor(() => expect(release).toBeDefined());
     fatal("the GPU device was lost");
-    expect(callbacks.onFallback).toHaveBeenCalledWith("internal");
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("internal"));
     release();
     await flush();
     expect(agent.conns).toHaveLength(1);
     expect(callbacks.onFallback).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not ask the page to fall back until the WebTransport session has been told to close (#1250)", async () => {
+    let sink!: MediaSink;
+    let closed!: () => void;
+    const onFallback = vi.fn();
+    const fake: MediaTransport = {
+      connect: async (s) => void (sink = s),
+      requestKeyframe: () => {},
+      sendMic: () => false,
+      codecFallback: () => {},
+      input: { reliable: () => {}, datagram: () => false },
+      // A close that is still flushing its bye, or waiting out its bound.
+      close: () => new Promise<void>((r) => (closed = r)),
+    };
+    const rt = createWebTransportRuntime({
+      sessionId: "s1",
+      authToken: "auth",
+      coords: COORDS,
+      canvas: document.createElement("canvas"),
+      callbacks: { onDisconnectSuspected: () => {}, onSessionTakenOver: () => {}, onTransportFailed: () => {}, onFallback },
+      deps: { createTransport: () => fake, createPresenter: async () => ({ present: () => true, destroy: () => {} }) },
+    });
+    rt.start();
+    await vi.waitFor(() => expect(sink).toBeDefined());
+    vi.mocked(mintTransportToken).mockRejectedValue(new Error("409"));
+    sink.end({ code: null, reason: "" });
+    await vi.waitFor(() => expect(closed).toBeDefined());
+    await flush();
+    expect(onFallback).not.toHaveBeenCalled();
+    closed();
+    await vi.waitFor(() => expect(onFallback).toHaveBeenCalledTimes(1));
   });
 
   it("closes WebTransport before it asks the page to fall back", async () => {

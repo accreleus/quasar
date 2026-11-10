@@ -253,13 +253,16 @@ export class WebTransportMedia implements MediaTransport {
     this.send({ type: "codec_fallback", reason });
   }
 
+  /** Settles when `close()` has closed the session. */
+  private closing: Promise<void> = Promise.resolve();
+
   private stopRecovery(): void {
     if (this.recoveryTimer !== null) clearInterval(this.recoveryTimer);
     this.recoveryTimer = null;
   }
 
-  close(): void {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closed) return this.closing;
     this.closed = true;
     if (this.keyTimer !== null) clearTimeout(this.keyTimer);
     // Not left to `wt.closed`, which a connection that never finishes closing does not resolve.
@@ -273,7 +276,8 @@ export class WebTransportMedia implements MediaTransport {
     // The bye is queued on the stream ahead of the close. A control stream that was reset, or one
     // that stays blocked, must not keep the session open (control-api.md §Transport fallback).
     const flushed = this.writer?.ready.catch(() => {});
-    void Promise.race([flushed, after(BYE_FLUSH_MS, undefined)]).then(() => this.wt?.close({ closeCode: 0, reason: "" }));
+    this.closing = Promise.race([flushed, after(BYE_FLUSH_MS, undefined)]).then(() => this.wt?.close({ closeCode: 0, reason: "" }));
+    return this.closing;
   }
 
   /** A fresh token, at most once per {@link REMINT_MIN_INTERVAL_MS}; false when it is too soon. */
