@@ -848,6 +848,11 @@ pub(crate) static REBUILD_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 pub(crate) static RESTREAM_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
 
+/// Test hook: a swap's replacement is never taken as shown, as a held game's is not, so a
+/// test can stop the session while the swap waits.
+#[cfg(test)]
+pub(crate) static SWAP_HOLD: AtomicBool = AtomicBool::new(false);
+
 /// A `session_assign` that adopts this runner's runtime (amendment 39, `adopt_session_id`).
 /// The agent has already checked that it may, and re-labels the runtime's reports.
 #[derive(Debug, Clone)]
@@ -2265,6 +2270,15 @@ fn swap_reveal(
         _ if drawn && past_deadline => Some("swap budget reached"),
         _ => None,
     }
+}
+
+/// How a swap that did not fail ended.
+enum SwapOutcome {
+    /// The encoder is on the replacement.
+    Done,
+    /// The session was stopped while the replacement was awaited (#1249): the replacement is
+    /// gone, nothing was rolled back, and the caller's stop path tears the rest down.
+    Stopped,
 }
 
 /// Why a swap did not complete, and whether the session survived it.
@@ -3873,9 +3887,12 @@ pub fn run_blocking(
                 vulkan_contexts.as_ref(),
                 session_metrics.clone(),
                 (current_render, current_ui_scale),
+                &stop,
                 &emit,
             ) {
-                Ok(()) => {
+                // No `SwapDone`, no rollback: the stop path at the top of the tick ends it.
+                Ok(SwapOutcome::Stopped) => continue 'tick,
+                Ok(SwapOutcome::Done) => {
                     emit(SessionEvent::SwapDone);
                     current_app = next_app;
                     let ts = std::time::SystemTime::now()
@@ -4551,8 +4568,9 @@ fn perform_swap(
     // The live render size (`None` is the pinned encode size) and UI scale, pushed onto
     // the new compositor BEFORE it boots; see the apply site below.
     display: (Option<(i32, i32)>, f64),
+    stop: &AtomicBool,
     emit: &dyn Fn(SessionEvent),
-) -> Result<(), SwapFailure> {
+) -> Result<SwapOutcome, SwapFailure> {
     let sink = ipsink_name(session_id, gen);
     let cname = app_container_name(session_id, gen);
     let mut new_source = AppSource::new(cfg, session_id, &sink, &cname, res, req.container)
@@ -4664,6 +4682,18 @@ fn perform_swap(
         );
     }
 
+    // A stop that landed during the two waits above: do not start the replacement (a Steam
+    // container on the managed home) only to kill it a moment later. Nothing of it runs yet
+    // and the helper is already muted, so there is nothing to roll back.
+    if stop.load(Ordering::Relaxed) {
+        tracing::info!(
+            token = "swap-stopped",
+            "swap: the session was stopped before the replacement was launched; not launching it"
+        );
+        drop(new_source);
+        return Ok(SwapOutcome::Stopped);
+    }
+
     // ── Step 3: launch the replacement app ───────────────────────────────────
     new_source.launch_deferred_app();
 
@@ -4701,6 +4731,20 @@ fn perform_swap(
         None,
     );
     let ready = loop {
+        // Before the reveal below: a stopped session gets no `AppPresented`.
+        if stop.load(Ordering::Relaxed) {
+            tracing::info!(
+                token = "swap-stopped",
+                "swap: the session was stopped while the replacement was awaited; dropping it"
+            );
+            // The replacement's helper dies with its container: without this the session
+            // end's quit would wait `END_QUIT_BOUND` on a game it reported running.
+            if let Some(launch) = res.launch() {
+                launch.mount().mute();
+            }
+            drop(new_source);
+            return Ok(SwapOutcome::Stopped);
+        }
         if let Err(e) = pump_new_source_bus(&new_bus, &mut new_source) {
             break Err(e);
         }
@@ -4737,6 +4781,8 @@ fn perform_swap(
             swap_source_ready(false, commits, frames, &mut frames_at_first_commit)
                 .then_some("first frame")
         };
+        #[cfg(test)]
+        let shown = shown.filter(|_| !SWAP_HOLD.load(Ordering::Relaxed));
         if let Some(reveal) = shown {
             tracing::info!(
                 app_surface_commits = commits.unwrap_or(0),
@@ -4842,7 +4888,7 @@ fn perform_swap(
     // ever sees the new generation. The old app container is already gone (step 2), so
     // this drop only NULLs its compositor; application cleanup remains an owned durable API obligation.
     *current_source = new_source;
-    Ok(())
+    Ok(SwapOutcome::Done)
 }
 
 /// Drain the new generation's bus into its [`AppSource`], turning a pipeline
