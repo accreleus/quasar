@@ -118,6 +118,8 @@ struct State {
     pyro: Option<Pyro>,
     /// `codec.switched` payloads the runner has yet to report.
     switches: Vec<serde_json::Value>,
+    /// The last switch reported was on to PyroWave.
+    on_pyrowave: bool,
     client: Option<Client>,
     next_client: u64,
     /// Skip delta units until a keyframe: a client joined, its queue overflowed, or the
@@ -404,7 +406,9 @@ impl Media {
             "codec {} -> {to} (reason {reason}, config {config_id:?})",
             from.unwrap_or("none")
         );
-        self.lock().switches.push(serde_json::json!({
+        let mut st = self.lock();
+        st.on_pyrowave = to == "pyrowave";
+        st.switches.push(serde_json::json!({
             "from": from, "to": to, "reason": reason,
             "config_id": config_id, "target_kbps": kbps,
         }));
@@ -559,9 +563,21 @@ impl Media {
     /// True when a WebTransport client was displaced.
     pub(crate) fn webrtc_attached(&self, transport: u64) -> bool {
         let mut hold = self.hold();
-        let displaced = self.lock().client.take();
+        let (displaced, standard) = {
+            let mut st = self.lock();
+            // Whether or not its WebTransport client is still attached (a fallback's has left).
+            let standard = st
+                .config
+                .as_ref()
+                .filter(|_| st.on_pyrowave)
+                .map(|c| c.codec);
+            (st.client.take(), standard)
+        };
         if let Some(old) = &displaced {
             let _ = old.gone.set(Gone::TakenOver);
+        }
+        if let Some(standard) = standard {
+            self.switched(Some("pyrowave"), standard, "webrtc", None, None);
         }
         hold.count();
         if hold.holder != Holder::None {
@@ -1913,6 +1929,32 @@ mod tests {
             })]
         );
         assert!(media.take_switched(true).is_empty(), "reported once");
+    }
+
+    /// #1215: a takeover displaces the PyroWave client; a fallback's client has already left.
+    #[test]
+    fn a_webrtc_peer_taking_a_pyrowave_session_is_a_switch_off_that_keeps_it_wanting() {
+        for fallback in [false, true] {
+            let (media, _encoder, _) = granted();
+            let client = media.attach(true, LAN).unwrap();
+            if fallback {
+                media.detach(client.id);
+            }
+            media.take_switched(true);
+            media.webrtc_attached(7);
+            assert_eq!(
+                media.take_switched(true),
+                [serde_json::json!({
+                    "from": "pyrowave", "to": "h264", "reason": "webrtc",
+                    "config_id": null, "target_kbps": null,
+                })],
+                "fallback: {fallback}"
+            );
+            media.webrtc_attached(8);
+            assert!(media.take_switched(true).is_empty(), "said once");
+            let back = media.attach(true, LAN).unwrap();
+            assert_eq!(back.reason, Some("reconnect"), "fallback: {fallback}");
+        }
     }
 
     #[test]
