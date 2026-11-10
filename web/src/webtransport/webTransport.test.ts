@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  BYE_FLUSH_MS,
   CONNECT_DEADLINE_MS,
   HANDSHAKE_DEADLINE_MS,
   KEYFRAME_SPACING_MS,
@@ -9,7 +10,7 @@ import {
 } from "./webTransportMedia";
 import type { InputMsg } from "../input/inputSender";
 import type { Presenter } from "./presenter";
-import { TransportError, type MediaSink, type MediaTransport } from "./transport";
+import { TransportError, type MediaSink, type MediaTransport, type TransportEnd } from "./transport";
 import { createWebTransportRuntime } from "../pages/app/webTransportRuntime";
 import { mintTransportToken } from "../api/library";
 import {
@@ -150,6 +151,14 @@ describe("WebTransportMedia connect", () => {
     const agent = new FakeAgent();
     agent.replies = [[{ type: "hello_ack", wt_proto: 1, config_id: 0, video: null }]];
     await expect(transport(agent).connect(NO_SINK)).rejects.toMatchObject({ code: "internal" });
+    expect(agent.last.closes[0]).toMatchObject({ closeCode: 4400 });
+  });
+
+  it("refuses a PyroWave hello_ack whose picture size no PWV1 header can state", async () => {
+    const agent = new FakeAgent();
+    const ack = helloAck(0, avcC(), 1_000_000, 1_000_000);
+    agent.replies = [[{ ...ack, video: { ...ack.video, codec: "pyrowave" } }]];
+    await expect(transport(agent, { pyrowave: true, ticker: () => () => {} }).connect(NO_SINK)).rejects.toMatchObject({ code: "internal" });
     expect(agent.last.closes[0]).toMatchObject({ closeCode: 4400 });
   });
 
@@ -525,6 +534,55 @@ describe("createWebTransportRuntime", () => {
     document.dispatchEvent(new Event("visibilitychange"));
     await vi.waitFor(() => expect(agent.sent("keyframe_request")).toEqual([{ type: "keyframe_request", reason: "loss" }]));
     rt.destroy();
+  });
+});
+
+describe("WebTransportMedia close once connected", () => {
+  async function connected(agent: FakeAgent, sink: Partial<MediaSink> = {}) {
+    agent.replies = [[helloAck(0, avcC())]];
+    const t = transport(agent, { ticker: () => () => {} });
+    await t.connect({ ...NO_SINK, ...sink });
+    return t;
+  }
+  const keyframe = (frameSeq: number) => packetize({ configId: 0, frameSeq, keyframe: true, data: bytes(10, frameSeq) });
+
+  it.each([
+    ["reset", (a: FakeAgent) => void (a.controlReset = true)],
+    ["blocked", (a: FakeAgent) => void (a.hold = "write")],
+  ])("closes the session though its control stream is %s and the bye cannot leave", async (_, breakControl) => {
+    vi.useFakeTimers();
+    const agent = new FakeAgent();
+    const t = await connected(agent);
+    breakControl(agent);
+    t.close();
+    await vi.advanceTimersByTimeAsync(BYE_FLUSH_MS);
+    expect(agent.last.closes).toEqual([{ closeCode: 0, reason: "" }]);
+  });
+
+  it("feeds the sink nothing after close(), from datagrams already in flight", async () => {
+    const agent = new FakeAgent();
+    agent.closeEndsDatagrams = false;
+    const units: number[] = [];
+    const t = await connected(agent, { unit: (u) => units.push(u.frameSeq) });
+    agent.last.datagrams(keyframe(1));
+    await vi.waitFor(() => expect(units).toEqual([1]));
+    t.close();
+    agent.last.datagrams(keyframe(2));
+    await flush();
+    expect(units).toEqual([1]);
+  });
+
+  it("ends the connection when the datagram path throws, not left up with no video", async () => {
+    const agent = new FakeAgent();
+    const ends: TransportEnd[] = [];
+    await connected(agent, {
+      unit: () => {
+        throw new Error("boom");
+      },
+      end: (e) => ends.push(e),
+    });
+    agent.last.datagrams(keyframe(1));
+    await vi.waitFor(() => expect(ends).toEqual([{ code: 4400, reason: "boom" }]));
   });
 });
 

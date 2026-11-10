@@ -465,6 +465,13 @@ describe("DecodeStage", () => {
     expect(keyframes).toEqual([]);
   });
 
+  it("reports a configuration whose description cannot be read as unsupported", async () => {
+    const { s, fatal } = stage();
+    s.config({ ...config(0, new Uint8Array(3)), codec: "h265" });
+    await flush();
+    expect(fatal).toEqual(["decoder_unsupported"]);
+  });
+
   it("does not skip after a short burst of decoder backlog", async () => {
     let t = 0;
     const { s, decoders, keyframes } = stage({ now: () => t });
