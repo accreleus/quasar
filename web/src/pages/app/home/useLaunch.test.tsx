@@ -431,6 +431,63 @@ describe("useLaunch full screen on Play (#647)", () => {
     expect(document.documentElement.requestFullscreen).not.toHaveBeenCalled();
     expect(order).toEqual([]);
   });
+
+  /** A launch that lands: the response the page navigates with. */
+  const landed = {
+    session: { id: "new-1", stream: { width: 1920, height: 1080, fps: 60, codec: "h264" } },
+    signaling: { url: "ws://x", token: "t" },
+  } as never;
+
+  /** The click's own grant, not a pre-set flag: the browser sets fullscreenElement
+   *  when the request settles. */
+  function grantAtTheClick() {
+    document.documentElement.requestFullscreen = vi.fn(() => {
+      fsEl = document.documentElement;
+      return Promise.resolve();
+    });
+  }
+
+  it("a launch that lands hands the full screen to the session page", async () => {
+    // The route change unmounts the home page. What Play spent belongs to the session
+    // page from then on, so the unmount must leave it: leaving it here takes the
+    // player out of full screen the moment the picture arrives, and the reveal then
+    // offers "Click to play" instead of capturing (#647).
+    grantAtTheClick();
+    vi.mocked(libraryApi.launchSession).mockResolvedValue(landed);
+    const { result, unmount } = renderLaunch();
+    await act(async () => {
+      await result.current.launchApp(app, "1080p60");
+    });
+    expect(navigate).toHaveBeenCalledWith("/app/session/new-1", expect.anything());
+
+    unmount();
+    await act(async () => {});
+    expect(document.exitFullscreen).not.toHaveBeenCalled();
+  });
+
+  it("a launch that lands after a capacity retry hands it over the same way", async () => {
+    // The retry wait's own timer (#494) must be clear before the route change too: the
+    // unmount treats a live one as an abandoned launch and leaves the full screen.
+    grantAtTheClick();
+    vi.useFakeTimers();
+    vi.mocked(libraryApi.launchSession)
+      .mockRejectedValueOnce(new ApiError(503, "capacity_exhausted", "full right now", undefined, undefined, 1))
+      .mockResolvedValueOnce(landed);
+    const { result, unmount } = renderLaunch();
+    await act(async () => {
+      void result.current.launchApp(app, "1080p60");
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(libraryApi.launchSession).toHaveBeenCalledTimes(2);
+    expect(navigate).toHaveBeenCalledWith("/app/session/new-1", expect.anything());
+
+    unmount();
+    await act(async () => {});
+    expect(document.exitFullscreen).not.toHaveBeenCalled();
+  });
 });
 
 describe("useLaunch carries the URL switches from the library to a game page (#1216)", () => {
