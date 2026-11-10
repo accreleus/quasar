@@ -25,8 +25,11 @@ import {
   flush,
   helloAck,
   packetize,
+  repairOf,
   type FakeFrame,
 } from "./testSupport";
+import { parseVideoDatagram } from "./framing";
+import { FEC_HOLD_MS } from "./reassembly";
 
 beforeEach(() => {
   vi.stubGlobal("EncodedVideoChunk", FakeChunk);
@@ -67,7 +70,7 @@ describe("WebTransportMedia connect", () => {
       [1, 2, 3, 4],
       [9, 9],
     ]);
-    expect(agent.sent("hello")[0]).toEqual({ type: "hello", wt_proto: 1, token: "tok-1", session_id: "s1", client: "browser" });
+    expect(agent.sent("hello")[0]).toEqual({ type: "hello", wt_proto: 1, token: "tok-1", session_id: "s1", client: "browser", fec: ["xor"] });
   });
 
   it("sends no certificate hashes for an edge URL", async () => {
@@ -260,6 +263,27 @@ describe("WebTransportMedia loss recovery", () => {
     // Nothing more arrives: a still picture. The repeat and the lateness come off the timer.
     await vi.waitFor(() => expect(agent.sent("nack")).toHaveLength(2));
     await vi.waitFor(() => expect(agent.sent("keyframe_request")).toEqual([{ type: "keyframe_request", reason: "late" }]));
+    t.close();
+  });
+
+  it(`sends a NACK held for FEC ${FEC_HOLD_MS} ms after the gap showed, with no datagram to carry it`, async () => {
+    const agent = new FakeAgent();
+    agent.replies = [[helloAck(0, avcC())]];
+    let now = 1_000;
+    const t = transport(agent, { now: () => now });
+    await t.connect(NO_SINK);
+    vi.useFakeTimers();
+    const pkt = { n: 0 };
+    const key = packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(3000, 0) }, pkt);
+    // A whole frame and its repair (the agent is sending FEC), then a frame with a gap.
+    agent.last.datagrams([...key, repairOf(key.map((d) => parseVideoDatagram(d)!), 0, 3)]);
+    const gapped = packetize({ configId: 0, frameSeq: 1, keyframe: false, data: bytes(3000, 1) }, pkt);
+    agent.last.datagrams([gapped[0], gapped[2]]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(agent.sent("nack")).toEqual([]);
+    now += FEC_HOLD_MS;
+    await vi.advanceTimersByTimeAsync(FEC_HOLD_MS);
+    expect(agent.sent("nack")).toEqual([{ type: "nack", frame_seq: 1, frags: [[1, 1]] }]);
     t.close();
   });
 });
