@@ -112,10 +112,10 @@ func TestClearingAMappingSupersedesButClearingNothingDoesNot(t *testing.T) {
 func TestADefaultChangeSupersedesButTheSameDefaultDoesNot(t *testing.T) {
 	f := newSupersedeFixture(t)
 	ctx := context.Background()
-	_, err := f.cs.SetDefault(ctx, &f.p10) // the fixture's default
+	_, _, _, err := f.cs.SetDefault(ctx, &f.p10) // the fixture's default
 	must(t, err)
 	f.assertUntouched(t, "same default")
-	_, err = f.cs.SetDefault(ctx, &f.hotfix)
+	_, _, _, err = f.cs.SetDefault(ctx, &f.hotfix)
 	must(t, err)
 	f.assertSuperseded(t, "new default")
 }
@@ -196,7 +196,7 @@ func TestAFailingSupersederRollsBackTheWrite(t *testing.T) {
 	if _, _, err := cs.ClearMapping(ctx, "1145360"); !errors.Is(err, boom) {
 		t.Errorf("ClearMapping = %v, want the superseder's error", err)
 	}
-	if _, err := cs.SetDefault(ctx, &hotfix); !errors.Is(err, boom) {
+	if _, _, _, err := cs.SetDefault(ctx, &hotfix); !errors.Is(err, boom) {
 		t.Errorf("SetDefault = %v, want the superseder's error", err)
 	}
 	var n int
@@ -238,9 +238,9 @@ func TestConcurrentMappingWritersDoNotDeadlock(t *testing.T) {
 				case 1:
 					_, _, err = cs.ClearMapping(ctx, fmt.Sprint(500+w))
 				default:
-					_, err = cs.SetDefault(ctx, nil)
+					_, _, _, err = cs.SetDefault(ctx, nil)
 					if err == nil {
-						_, err = cs.SetDefault(ctx, &hotfix)
+						_, _, _, err = cs.SetDefault(ctx, &hotfix)
 					}
 				}
 				if err != nil {
