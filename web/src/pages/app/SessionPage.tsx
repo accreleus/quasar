@@ -520,6 +520,7 @@ function SessionPageBody() {
           coords: webtransport,
           canvas: canvasRef.current,
           pyrowave: state?.pyrowave === true,
+          tierFps: state?.tier ? parseInt(state.tier.split("@")[1] ?? "", 10) || undefined : undefined,
           callbacks: {
             ...inputCallbacks,
             onDisconnectSuspected: () => void pollEndReason(),

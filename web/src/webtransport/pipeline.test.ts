@@ -96,10 +96,12 @@ describe("FrameAssembler", () => {
     const two = unitOf(2, false, 3000); // three fragments; the middle one is lost
     a.push(two[0]);
     expect(a.push(two[2])).toEqual({ ...NONE, nacks: [{ frameSeq: 2, frags: [[1, 1]] }] });
+    expect(a.lost).toBe(1);
     expect(a.push(unitOf(3, false)[0])).toEqual(NONE); // whole, but after the hole; asked once already
     t = 20;
     expect(seqs(a.push({ ...two[1], retransmit: true }))).toEqual([2, 3]);
     expect(a.rttMs).toBe(20);
+    expect(a.lost).toBe(1); // counted once, when first found missing
   });
 
   it("NACKs fragment 0 of a frame lost whole, then the rest once its count is known", () => {

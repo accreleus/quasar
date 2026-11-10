@@ -235,7 +235,8 @@ describe("WebTransportMedia input and ping", () => {
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     let clock = 1000;
     const rtts: number[] = [];
-    const { agent, t, up } = connected({ ...NO_SINK, rtt: (ms) => rtts.push(ms) }, () => clock);
+    const walls: (number | undefined)[] = [];
+    const { agent, t, up } = connected({ ...NO_SINK, rtt: (ms, tw) => (walls.push(tw), rtts.push(ms)) }, () => clock);
     await up;
     await flush();
     expect(agent.sent("ping")).toEqual([{ type: "ping", id: 1, tc: 1000 }]);
@@ -244,6 +245,8 @@ describe("WebTransportMedia input and ping", () => {
     agent.last.control({ type: "pong", id: 1, tc: 1000, ts: 5, tw: 1762400000000 });
     await flush();
     expect(rtts).toEqual([42]);
+    // The agent's wall clock rides along: it is what maps capture_us to this machine's clock (#1035).
+    expect(walls).toEqual([1762400000000]);
 
     clock = 2000;
     vi.advanceTimersByTime(1000);

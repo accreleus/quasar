@@ -7,13 +7,16 @@ import { mintTransportToken } from "../../api/library";
 import type { WebTransportCoords } from "../../api/types";
 import { setupCapture } from "../../input/capture";
 import { NEUTRAL_MOUSE, type MouseSettings } from "../../input/mouseScale";
-import { median, percentile } from "../../lib/stats";
-import { EMPTY_SNAPSHOT, type TelemetrySnapshot } from "../../webrtc/telemetry";
+import type { BenchController } from "../../bench/benchController";
+import { isBenchModeEnabled } from "../../bench/benchFlag";
+import type { TelemetrySnapshot } from "../../webrtc/telemetry";
+import { TraceEventEmitter } from "../../webrtc/traceEvents";
 import { AudioOut, type AudioOutDeps } from "../../webtransport/audioOut";
 import { MicOut, type MicOutDeps } from "../../webtransport/micOut";
 import { DecodeStage, type DecodeFailure, type DecodeStageOptions } from "../../webtransport/decodeStage";
 import { fallbackReason } from "../../webtransport/fallback";
 import { createWebGpuPresenter, type Presenter } from "../../webtransport/presenter";
+import { WtTelemetry, type WtTelemetryOptions } from "../../webtransport/telemetry";
 import { PyroWaveStage, warmPyroWave, type PyroWaveStageOptions } from "../../pyrowave/stage";
 import { TransportError, type MediaTransport, type TransportEnd } from "../../webtransport/transport";
 import { webTransportInputSender } from "../../webtransport/inputSender";
@@ -29,8 +32,8 @@ import type { SessionSummaryAccumulator } from "./telemetrySink";
 const CLOSE_ENDED = 4404;
 const CLOSE_TAKEN_OVER = 4410;
 const TELEMETRY_MS = 1_000;
-/** capture→present samples kept for the median and p95. */
-const G2G_WINDOW = 600;
+/** Stats samples and the clock row are posted on WebRTC's cadence. */
+const POST_MS = 5_000;
 /** The mime form telemetry's negotiatedCodec uses, from the hello_ack's wire codec. */
 const CODEC_MIME: Record<string, string> = { h264: "video/H264", h265: "video/H265", av1: "video/AV1", pyrowave: "video/pyrowave" };
 /** The failure card's sentence for a failure that stops the view. Every other failure falls back
@@ -54,6 +57,11 @@ export interface WebTransportRuntimeDeps {
   warmPyroWave(device: GPUDevice): Promise<boolean>;
   loadPyroWave?: PyroWaveStageOptions["load"];
   setupCapture: typeof setupCapture;
+  /** Test seams of the telemetry (its fetch and clocks). */
+  telemetry?: Partial<WtTelemetryOptions>;
+  createTracer(sessionId: string, authToken: string): Pick<TraceEventEmitter, "start" | "stop" | "emitBenchWindow">;
+  loadBench(): Promise<{ BenchController: typeof BenchController }>;
+  isBenchModeEnabled(): boolean;
 }
 
 export interface WebTransportRuntimeConfig {
@@ -61,6 +69,8 @@ export interface WebTransportRuntimeConfig {
   authToken: string;
   coords: WebTransportCoords;
   canvas: HTMLCanvasElement;
+  /** The launched tier's fps, for client health's per-frame budget; absent: unknown. */
+  tierFps?: number;
   /** The session wants PyroWave (`session.pyrowave.wanted`): offer it in `hello` if this browser can decode it. */
   pyrowave?: boolean;
   callbacks: Pick<SessionRuntimeCallbacks, "onDisconnectSuspected" | "onSessionTakenOver"> &
@@ -78,6 +88,9 @@ export interface WebTransportRuntimeConfig {
 const productionDeps: WebTransportRuntimeDeps = {
   createTransport: (o) => new WebTransportMedia(o),
   createPresenter: createWebGpuPresenter,
+  createTracer: (sessionId, authToken) => new TraceEventEmitter(sessionId, authToken),
+  loadBench: () => import("../../bench/benchController"),
+  isBenchModeEnabled,
   warmPyroWave: (device) => warmPyroWave(device),
   setupCapture,
 };
@@ -107,8 +120,14 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   let inputSender: ReturnType<typeof webTransportInputSender> | null = null;
   let captured = false;
   let mouse: MouseSettings = NEUTRAL_MOUSE;
-  let rttMs: number | null = null;
-  let negotiatedCodec: string | null = null;
+  const telemetry = new WtTelemetry({ sessionId: cfg.sessionId, authToken: cfg.authToken, profileFps: cfg.tierFps, ...deps.telemetry });
+  let postTimer: ReturnType<typeof setInterval> | null = null;
+  // The trace is HTTP, not the transport's: bench windows are posted through it as on WebRTC.
+  const tracer = deps.createTracer(cfg.sessionId, cfg.authToken);
+  let bench: BenchController | null = null;
+  /** The decoded frame the bench marker reader reads, for the length of one `onFrame`. */
+  let benchFrame: VideoFrame | null = null;
+  let benchFaulted = false;
   let audioOut: AudioOut | null = null;
   /** The sound starts muted (webrtc/sessionRuntime holdAudio): nothing the app plays before the reveal is heard. */
   let audioHeld = true;
@@ -116,10 +135,6 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   let mic: MicOut | null = null;
   const startedAt = performance.now();
 
-  let framesTotal = 0;
-  let bytesTotal = 0;
-  let framesInWindow = 0;
-  const g2g: number[] = [];
   const fpsSeries: number[] = [];
   const latencySeries: number[] = [];
 
@@ -135,6 +150,14 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   const stop = () => {
     if (timer !== null) clearInterval(timer);
     timer = null;
+    if (postTimer !== null) clearInterval(postTimer);
+    postTimer = null;
+    // Bench stops first: its last window reads the clock offset and goes out through the tracer.
+    bench?.stop();
+    bench = null;
+    tracer.stop();
+    // The last windows, and the clock row a short session has not posted yet.
+    void telemetry.flush();
     document.removeEventListener("visibilitychange", onVisible);
     teardownInput();
     mic?.stop();
@@ -171,23 +194,13 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
 
   // A hidden tab's decoder falls behind; one keyframe when it shows again resyncs it.
   function onVisible(): void {
-    if (document.visibilityState === "visible") transport?.requestKeyframe("loss");
+    if (document.visibilityState !== "visible") return;
+    telemetry.breakCadence();
+    transport?.requestKeyframe("loss");
   }
 
   const tick = () => {
-    const g2gMs = median(g2g);
-    const snap: TelemetrySnapshot = {
-      ...EMPTY_SNAPSHOT,
-      fps: framesInWindow * (1000 / TELEMETRY_MS),
-      rttMs,
-      // Frames are presented as they decode: there is no playout buffer on this path yet.
-      playoutTargetMs: 0,
-      g2gMs,
-      g2g95Ms: percentile(g2g, 95),
-      negotiatedCodec,
-      framesDecodedTotal: framesTotal,
-      bytesReceivedTotal: bytesTotal,
-    };
+    const snap = telemetry.tick();
     const audio = audioOut?.stats();
     if (audio?.avOffsetMs != null) {
       // Read by the bench and the hardware pass: how much later than its video the sound is heard.
@@ -195,8 +208,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       cfg.canvas.dataset.audioUnderrunMs = audio.underrunMs.toFixed(0);
     }
     fpsSeries.push(snap.fps);
-    if (g2gMs != null) latencySeries.push(g2gMs);
-    framesInWindow = 0;
+    if (snap.g2gMs != null) latencySeries.push(snap.g2gMs);
     for (const fn of telemetrySubs) fn(snap);
   };
 
@@ -240,16 +252,9 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     pyroOffer =
       cfg.pyrowave === true && device !== undefined && p.presentTexture !== undefined && (await deps.warmPyroWave(device));
     if (destroyed || failed) return;
-    // shortcut: assumes the agent's and this machine's clocks agree (true with the
-    // browser on the host); the pong's clock offset is #1035.
-    const presented = (captureUs: number, sample = Date.now() - captureUs / 1000) => {
+    const presented = (captureUs: number) => {
       audioOut?.noteVideo(captureUs);
-      framesTotal += 1;
-      framesInWindow += 1;
-      if (sample >= 0 && sample < 5000) {
-        g2g.push(sample);
-        if (g2g.length > G2G_WINDOW) g2g.shift();
-      }
+      telemetry.presented(captureUs);
       if (!snapshot.firstFrame) set({ firstFrame: true, status: "streaming over WebTransport" });
     };
     if (pyroOffer && device) {
@@ -264,8 +269,25 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     const s = new DecodeStage({
       ...deps.decoder,
       onFrame: (frame) => {
-        const sample = Date.now() - frame.timestamp / 1000;
-        if (p.present(frame)) presented(frame.timestamp, sample);
+        const captureUs = frame.timestamp;
+        telemetry.decodeOut(captureUs);
+        if (bench) {
+          // ?bench=1 only: the marker is read off the decoded frame, at its own size, before
+          // the presenter takes (and closes) it. A fault in the instrument must not cost the frame.
+          // The window's present_ms is therefore decoder output, where a WebRTC session's is
+          // RVFC's expectedDisplayTime: an A/B between the two must say so (#1035).
+          benchFrame = frame;
+          try {
+            bench.onFrame();
+          } catch (err) {
+            // Once: a persistent fault would otherwise log every frame.
+            if (!benchFaulted) console.warn("bench:", err);
+            benchFaulted = true;
+          } finally {
+            benchFrame = null;
+          }
+        }
+        if (p.present(frame)) presented(captureUs);
       },
       requestKeyframe: (reason) => transport?.requestKeyframe(reason),
       onFatal: (reason: DecodeFailure) => fail(reason),
@@ -281,6 +303,8 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     if (destroyed || failed) return;
     const t = deps.createTransport({ sessionId: cfg.sessionId, coords, mintToken: mintCoords, pyrowave: pyroOffer });
     transport = t;
+    if (reconnecting) telemetry.breakCadence();
+    let lostOnThisConnection = 0;
     try {
       await t.connect({
         streams: (streams) => {
@@ -297,7 +321,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
         audio: (packet) => audioOut?.packet(packet),
         config: (c) => {
           if (destroyed || failed || t !== transport) return;
-          negotiatedCodec = CODEC_MIME[c.codec] ?? c.codec;
+          telemetry.setCodec(CODEC_MIME[c.codec] ?? c.codec);
           if (c.switchReason) console.info(`WebTransport codec ${c.codec}: ${c.switchReason}`);
           // capture.ts scales the mouse by the stream size, which a canvas does not know.
           cfg.canvas.dataset.streamW = String(c.width);
@@ -314,16 +338,23 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
         },
         unit: (u) => {
           if (destroyed || failed || t !== transport) return;
-          bytesTotal += u.data.length;
+          telemetry.bytes(u.data.length);
+          telemetry.decodeIn(u.captureUs);
           stage?.unit(u);
         },
         pyrowave: (f) => {
           if (destroyed || failed || t !== transport) return;
-          for (const b of f.packets) bytesTotal += b.byteLength;
+          for (const b of f.packets) telemetry.bytes(b.byteLength);
           pyroStage?.frame(f);
         },
-        rtt: (ms) => {
-          if (t === transport) rttMs = ms;
+        keyframeRequested: () => telemetry.keyframeRequested(),
+        lost: (fragments) => {
+          // The count is this connection's own, from 0: a reconnect's must add, not replace.
+          if (t === transport) telemetry.addLost(fragments - lostOnThisConnection);
+          lostOnThisConnection = fragments;
+        },
+        rtt: (ms, agentWallMs) => {
+          if (t === transport) telemetry.pong(ms, agentWallMs);
         },
         end: (e) => onEnd(t, e),
       });
@@ -343,9 +374,33 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     set({ wsOpen: true, pcConnected: true, channelOpen: true, iceState: "connected" });
     startInput(t);
     if (timer === null) {
+      telemetry.startWindow();
       timer = setInterval(tick, TELEMETRY_MS);
+      postTimer = setInterval(() => void telemetry.flush(), POST_MS);
+      tracer.start();
+      startBench();
       document.addEventListener("visibilitychange", onVisible);
     }
+  }
+
+  /** `?bench=1` only: it reads pixels back every frame, so an ordinary session never loads it. */
+  function startBench(): void {
+    if (!deps.isBenchModeEnabled() || bench !== null) return;
+    void deps
+      .loadBench()
+      .then(({ BenchController: Ctor }) => {
+        if (destroyed || failed || bench !== null) return;
+        const b = new Ctor({
+          source: () => (benchFrame ? { image: benchFrame, width: benchFrame.displayWidth, height: benchFrame.displayHeight } : null),
+          sendInput: (msg) => inputSender?.send(msg),
+          emitWindow: (payload) => tracer.emitBenchWindow(payload as unknown as Record<string, unknown>),
+          getClockOffsetMs: () => telemetry.clockOffsetMs(),
+        });
+        b.start();
+        bench = b;
+        (window as unknown as Record<string, unknown>)["__qBench"] = b.handle();
+      })
+      .catch((err: unknown) => console.warn("bench: load instrument", err));
   }
 
   /** Input capture belongs to one connection: built from its input paths, torn down with it. */
