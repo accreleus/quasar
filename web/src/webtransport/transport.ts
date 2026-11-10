@@ -83,8 +83,9 @@ export interface MediaTransport {
   codecFallback(reason: string): void;
   /** Where client input goes once connected (§Input). */
   readonly input: InputWire;
-  /** Says `bye` when connected; idempotent. */
-  close(): void;
+  /** Says `bye` when connected; idempotent. Settles once the session has been told to close
+   *  (after the bye is flushed, or a short bound when it cannot be): a fallback waits for it. */
+  close(): Promise<void> | void;
 }
 
 /** A refused or failed connect. `code` is the agent's `error.code`
