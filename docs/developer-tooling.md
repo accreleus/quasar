@@ -90,6 +90,7 @@ ephemeral test database) so parallel checkouts and agents never collide.
 | `scripts/release/new-release-signing-key.sh` · `sign-platform-release-manifest.sh` · `verify-platform-release-manifest.sh` | The optional detached release signature ([schema](../scripts/release/platform-release-signature.md), #120). Keygen refuses to write inside the repo; the signer takes its key from `$QUASAR_RELEASE_SIGNING_KEY` and verifies its own output before exiting 0. The normative verifier is the updater's Go one — this trio is the producer and the by-hand check |
 | `scripts/release/release-cut.sh` (`make release VERSION=x.y.z`) | Cuts a release in one command (#109): moves `## Unreleased` into a dated section, commits + tags `vX.Y.Z` on `main`, pushes both — the push is what fires the tag-push lane above. `--dry-run` previews; `--transform` is the pure changelog rewrite (fixture-testable, no git) |
 | `scripts/harness/lib/harness.sh` (+ `harness-selftest.sh`) | PASS/FAIL/SKIP/report core every `run-*.sh` harness builds on |
+| `scripts/validate/stream/bundle.mjs` | Says whether a directory is a valid run bundle of the end-to-end streaming test suite ([guide](testing-e2e-suite.md)) |
 
 ### Where things live
 
