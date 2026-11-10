@@ -3,14 +3,55 @@
 A fixed list of scenarios run against a Quasar stack from a test client, with no model in the
 loop, leaving one **run bundle** that an agent or a person reviews afterwards. Spec: #1271.
 
-> **Status.** The bundle format and its validator exist (#1272). The runner and the
-> `make e2e-*` verbs are the spec's later tickets; this page grows with them.
+> **Status.** The bundle format and its validator (#1272) and the runner (#1273, `make e2e-run`)
+> exist. `e2e-collect`, `e2e-review`, `e2e-post`, `e2e-compare` and `e2e-pack` are the spec's later
+> tickets; this page grows with them.
 
 ## What you need
 
 - Node 22. The validator has no dependencies.
+- To run a plan (`e2e-run`): Chrome or Chromium, `npm ci` in `scripts/validate` (the verb does it on first use), and the stack's URL.
+- A test user: an ordinary user's sign-in in `QUASAR_E2E_EMAIL` and `QUASAR_E2E_PASSWORD`, or in a file of `KEY=value` lines named by `QUASAR_E2E_CRED_FILE`. No admin token is needed or used.
+- The reference app in that user's library (`QUASAR_E2E_APP` names it, default `Quasar Benchapp`).
 
 ## What to do
+
+Run a plan from the machine you are testing from:
+
+```
+make e2e-run TARGET=<stack url> PLAN=smoke [CDP=<DevTools http endpoint>] [OUT=<dir>]
+```
+
+`PLAN` is a name under `scripts/validate/stream/plans/` or a path to a plan file. With `CDP=` the
+runner attaches to a browser that is already running (the Mac test client), uses its default
+context and a real window, and closes only the pages it opened. Without it, it launches `CHROME=`
+(or Playwright's Chromium). Each `stream-hold` signs in through the login form, launches the
+reference app from the library with the product's `?transport=` and `?codec=` switches and bench
+mode on, holds, and stops the session; the session is stopped on every exit path, `Ctrl-C`
+included. The run ends with one line:
+
+```
+RESULT status=ok|failed|error target=e2e-run bundle=<dir> pass=N fail=N error=N skipped=N
+```
+
+Exit 0 when no scenario failed or errored (skipped ones are counted, never hidden), 1 when one did,
+2 for a usage error or a bundle that does not pass the check below. Start reading at
+`<bundle>/<NN>-stream-hold/scenario.json`: its `criteria` each say `pass`, `observed` and `expected`;
+`pass: null` means it could not be judged here (and `observed` is `null`).
+
+`stream-hold` criteria: `first_frame_s` within 30; `marker_decoded`; `transport_as_asked`,
+`codec_as_asked` and `profile_as_asked` against the session row; `freeze_count` 0, `missing_indices_rate`
+at most 1 % and `present_cadence` (fewer than `classifier.hitch_min_samples` seconds whose
+present-interval sd reaches `classifier.hitch_sd_ms`) over the stream after its first 10 s. The
+profile is not a control the user has (the Launch options pick a codec, frame rate and resolution),
+so `profile_as_asked` compares the asked profile with the stream the session got. A scenario the
+client cannot run (no WebTransport, a codec it cannot decode, the app not in the catalog) is
+`skipped` with the reason.
+
+The runner reads only what the product exposes (`window.__qBench`, the page, the API) and wraps no
+browser API. What it cannot see is in `manifest.json` `not_recorded`, each with a reason. Every file
+is scrubbed when written: addresses, tokens and the test user's sign-in become markers, the
+stack's host name becomes `<stack>`, and the manifest counts what was replaced.
 
 Check a bundle:
 

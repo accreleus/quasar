@@ -3716,6 +3716,7 @@ fi
 # The end-to-end suite's run bundle (#1272): the fixture is valid, each rule has a bundle that breaks it.
 if command -v node >/dev/null 2>&1; then
   rc_of 0 "e2e:bundle-format" -- node --test "$ROOT/scripts/validate/stream/bundle.test.mjs"
+  rc_of 0 "e2e:runner" -- node --test "$ROOT/scripts/validate/stream/run.test.mjs"
 else
   warn "e2e:bundle-format" "node not installed — SKIPPED"
 fi

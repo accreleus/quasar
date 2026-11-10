@@ -43,6 +43,27 @@ function leaks(text) {
   return found;
 }
 
+/** `text` with every address, token and credential the check above would refuse replaced by a
+ *  marker. `counts` (optional) is bumped per kind. IPv6 is replaced here though not checked. */
+export function scrub(text, counts = {}) {
+  const hit = (k) => (counts[k] = (counts[k] ?? 0) + 1);
+  let out = text.replace(IPV4, (ip, ...o) => {
+    if (o.slice(0, 4).some((x) => +x > 255) || ip.endsWith(".0.0.0") || ip === "127.0.0.1" || DOC_NETS.some((n) => ip.startsWith(n))) return ip;
+    hit("addresses");
+    return "<address>";
+  });
+  for (const v6 of [/(?<![\w:])(?:[0-9a-f]{1,4}:){3,7}[0-9a-f]{0,4}(?![\w:])/gi, /(?<![\w:])(?:[0-9a-f]{1,4}:){1,7}:(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){0,6})?(?![\w:])/gi]) {
+    out = out.replace(v6, () => (hit("addresses"), "<address>"));
+  }
+  for (const [re, what] of SECRETS) {
+    out = out.replace(new RegExp(re.source, re.flags.includes("g") ? re.flags : `${re.flags}g`), (m) => {
+      hit(what === "a credential" ? "credentials" : "tokens");
+      return /^bearer/i.test(m) ? "Bearer <token>" : what === "a JWT" ? "<token>" : "<credential>";
+    });
+  }
+  return out;
+}
+
 // What scripts/dx/bench_app_samples.py writes into a browser sample beside the manifest's
 // bench keys: two renames, the input-to-photon roll-up and its own flag.
 const FOLD_KEYS = ["bench_n", "bench_decoded", "i2p_p50_ms", "i2p_max_ms", "i2p_n", "ts_nudged"];

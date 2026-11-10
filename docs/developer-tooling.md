@@ -91,6 +91,7 @@ ephemeral test database) so parallel checkouts and agents never collide.
 | `scripts/release/release-cut.sh` (`make release VERSION=x.y.z`) | Cuts a release in one command (#109): moves `## Unreleased` into a dated section, commits + tags `vX.Y.Z` on `main`, pushes both — the push is what fires the tag-push lane above. `--dry-run` previews; `--transform` is the pure changelog rewrite (fixture-testable, no git) |
 | `scripts/harness/lib/harness.sh` (+ `harness-selftest.sh`) | PASS/FAIL/SKIP/report core every `run-*.sh` harness builds on |
 | `scripts/validate/stream/bundle.mjs` | Says whether a directory is a valid run bundle of the end-to-end streaming test suite ([guide](testing-e2e-suite.md)) |
+| `scripts/validate/stream/run.mjs` (`make e2e-run`) | Runs a plan of scenarios from a test client (launched or attached over CDP) with an ordinary user's sign-in, and writes a run bundle ([guide](testing-e2e-suite.md)) |
 
 ### Where things live
 
