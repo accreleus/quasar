@@ -109,7 +109,10 @@ export function bundleText(value) {
     .replace(/\u2029/g, "\\u2029")
     .replace(/`/g, "'")
     .replace(/\|/g, "\\|");
-  return s.length > MAX_TEXT ? `${s.slice(0, MAX_TEXT)}…` : s;
+  if (s.length <= MAX_TEXT) return s;
+  // Never cut a surrogate pair in half: the page must stay valid UTF-8.
+  const cut = /[\uD800-\uDBFF]$/.test(s.slice(0, MAX_TEXT)) ? s.slice(0, MAX_TEXT - 1) : s.slice(0, MAX_TEXT);
+  return `${cut}…`;
 }
 
 /** Bundle text as an inline code span: the only shape it may take on the page. */
