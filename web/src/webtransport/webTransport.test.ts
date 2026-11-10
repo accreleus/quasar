@@ -343,6 +343,61 @@ describe("createWebTransportRuntime", () => {
     delete (window as unknown as Record<string, unknown>).__qBench;
   });
 
+  it("keeps presenting when the bench instrument throws", async () => {
+    class BrokenBench {
+      start() {}
+      stop() {}
+      handle() {
+        return { enabled: true };
+      }
+      onFrame() {
+        throw new Error("marker decode failed");
+      }
+    }
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { agent, presented, rt } = setup({
+      deps: { isBenchModeEnabled: () => true, loadBench: async () => ({ BenchController: BrokenBench as never }) },
+    });
+    rt.start();
+    await vi.waitFor(() => expect((window as unknown as Record<string, unknown>).__qBench).toEqual({ enabled: true }));
+    const pkt = { n: 0 };
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(900, 0) }, pkt));
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 1, keyframe: false, data: bytes(900, 1) }, pkt));
+    await vi.waitFor(() => expect(presented).toHaveLength(2));
+    expect(presented.every((f) => f.closed)).toBe(true);
+    // Said once, not per frame.
+    expect(warn.mock.calls.filter((c) => c[0] === "bench:")).toHaveLength(1);
+    rt.destroy();
+    delete (window as unknown as Record<string, unknown>).__qBench;
+  });
+
+  it("opens the first telemetry window at connect, and reports a fragment it had to NACK as lost (#1035)", async () => {
+    // The telemetry's clock, so the windows are exact whatever the real timer does.
+    let now = 0;
+    const snaps: { fps: number; packetsLost: number }[] = [];
+    const { agent, presented, rt } = setup({ deps: { telemetry: { nowMs: () => now, fetch: async () => new Response("{}") } } });
+    now = 5_000; // made, then five seconds getting a presenter, a token and a connection
+    rt.registerTelemetry((s) => snaps.push(s));
+    rt.start();
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    const pkt = { n: 0 };
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(10, 0) }, pkt));
+    const one = packetize({ configId: 0, frameSeq: 1, keyframe: false, data: bytes(3000, 1) }, pkt);
+    agent.last.datagrams(one.slice(1)); // its first fragment is lost
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 2, keyframe: false, data: bytes(10, 2) }, pkt));
+    await vi.waitFor(() => expect(agent.sent("nack")).toHaveLength(1));
+    const resent = one[0].slice();
+    resent[5] |= 4;
+    agent.last.datagrams([resent]);
+    await vi.waitFor(() => expect(presented).toHaveLength(3));
+    now = 6_000;
+    await vi.waitFor(() => expect(snaps.length).toBeGreaterThan(0), { timeout: 3_000 });
+    // Three frames in the one second since the ticks started: not three over six.
+    expect(snaps[0].fps).toBeCloseTo(3, 6);
+    expect(snaps[0].packetsLost).toBe(1);
+    rt.destroy();
+  });
+
   it("starts no bench instrument for an ordinary session", async () => {
     const loadBench = vi.fn();
     const { rt } = setup({ deps: { loadBench } });

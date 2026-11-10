@@ -59,8 +59,6 @@ export class WtTelemetry {
   private keyframeRequests = 0;
   private lostTotal = 0;
   private lostAtTick = 0;
-  private lostSeen = 0;
-  private lostBase = 0;
   /** The last window's median interval: what a thin window's freezes are judged against. */
   private typicalMs: number | null = null;
   private decodeMsInWindow: number[] = [];
@@ -108,18 +106,23 @@ export class WtTelemetry {
     this.keyframeRequests += 1;
   }
 
-  /** Video fragments found missing since connect (cumulative, as `packets_lost` is on WebRTC). */
-  lost(total: number): void {
-    // A reconnect starts a new count at 0: the session's total carries on.
-    if (total < this.lostSeen) this.lostBase += this.lostSeen;
-    this.lostSeen = total;
-    this.lostTotal = this.lostBase + total;
+  /** More video fragments found missing. The session's total is posted cumulative, as the
+   *  contract and the classifier read `packets_lost` (the WebRTC client posts a per-window
+   *  delta instead: #1270). The caller turns each connection's own count into additions. */
+  addLost(fragments: number): void {
+    if (fragments > 0) this.lostTotal += fragments;
   }
 
   /** A unit handed to the decoder, keyed by its capture time (the frame's timestamp). */
   decodeIn(captureUs: number): void {
     if (this.inDecode.size >= MAX_IN_DECODE) this.inDecode.delete(this.inDecode.keys().next().value as number);
     this.inDecode.set(captureUs, this.nowMs());
+  }
+
+  /** Presenting stopped for a reason that is not a freeze (the tab was hidden, the transport
+   *  was replaced): the next frame starts a new run of intervals. */
+  breakCadence(): void {
+    this.lastPresentMs = null;
   }
 
   /** That unit's frame came out of the decoder. */
@@ -218,7 +221,7 @@ export class WtTelemetry {
       fps: snap.fps,
       bitrate_kbps: Math.round(snap.bitrateKbps ?? 0),
       freeze_count: freezeCount,
-      // Cumulative, as on WebRTC: the classifier takes its delta across a window.
+      // Cumulative, as the contract says: the classifier takes its delta across a window (#1270).
       packets_lost: this.lostTotal,
       playout_target_ms: 0,
       present_n: cadence.n,

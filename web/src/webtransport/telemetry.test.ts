@@ -162,17 +162,29 @@ describe("WtTelemetry", () => {
     expect(h.t.tick().freezeCount).toBe(1);
   });
 
-  it("reports fragments found missing as cumulative packet loss, across a reconnect", async () => {
+  it("reports fragments found missing as cumulative packet loss", async () => {
     const h = harness();
-    h.t.lost(3);
+    h.t.addLost(3);
     expect(h.t.tick().packetsLost).toBe(3);
-    h.t.lost(5);
+    h.t.addLost(2);
     expect(h.t.tick().packetsLost).toBe(2);
-    h.t.lost(1); // a new connection counts from 0 again
+    h.t.addLost(1); // a new connection's first loss
+    h.t.addLost(0);
     expect(h.t.tick().packetsLost).toBe(1);
     await h.t.flush();
     const samples = h.posts[0].body.samples as { metrics: Record<string, number> }[];
     expect(samples.map((s) => s.metrics.packets_lost)).toEqual([3, 5, 6]);
+  });
+
+  it("does not count the gap across a hidden tab or a reconnect as a freeze", () => {
+    const h = harness();
+    h.frames(30, 16);
+    h.advance(4000); // hidden, or reconnecting
+    h.t.breakCadence();
+    h.frames(30, 16);
+    const snap = h.t.tick();
+    expect(snap.freezeCount).toBe(0);
+    expect(snap.presentCadence.n).toBe(58);
   });
 
   it("does not call a window with too few frames smooth", async () => {

@@ -127,6 +127,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   let bench: BenchController | null = null;
   /** The decoded frame the bench marker reader reads, for the length of one `onFrame`. */
   let benchFrame: VideoFrame | null = null;
+  let benchFaulted = false;
   let audioOut: AudioOut | null = null;
   /** The sound starts muted (webrtc/sessionRuntime holdAudio): nothing the app plays before the reveal is heard. */
   let audioHeld = true;
@@ -185,7 +186,9 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
 
   // A hidden tab's decoder falls behind; one keyframe when it shows again resyncs it.
   function onVisible(): void {
-    if (document.visibilityState === "visible") transport?.requestKeyframe("loss");
+    if (document.visibilityState !== "visible") return;
+    telemetry.breakCadence();
+    transport?.requestKeyframe("loss");
   }
 
   const tick = () => {
@@ -269,7 +272,9 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
           try {
             bench.onFrame();
           } catch (err) {
-            console.warn("bench:", err);
+            // Once: a persistent fault would otherwise log every frame.
+            if (!benchFaulted) console.warn("bench:", err);
+            benchFaulted = true;
           } finally {
             benchFrame = null;
           }
@@ -290,6 +295,8 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     if (destroyed || failed) return;
     const t = deps.createTransport({ sessionId: cfg.sessionId, coords, mintToken: mintCoords, pyrowave: pyroOffer });
     transport = t;
+    if (reconnecting) telemetry.breakCadence();
+    let lostOnThisConnection = 0;
     try {
       await t.connect({
         streams: (streams) => {
@@ -334,7 +341,9 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
         },
         keyframeRequested: () => telemetry.keyframeRequested(),
         lost: (fragments) => {
-          if (t === transport) telemetry.lost(fragments);
+          // The count is this connection's own, from 0: a reconnect's must add, not replace.
+          if (t === transport) telemetry.addLost(fragments - lostOnThisConnection);
+          lostOnThisConnection = fragments;
         },
         rtt: (ms, agentWallMs) => {
           if (t === transport) telemetry.pong(ms, agentWallMs);
