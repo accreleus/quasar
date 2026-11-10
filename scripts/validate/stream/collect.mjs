@@ -11,23 +11,18 @@
 //
 // No dependencies, and it never launches anything: the client half may have run on
 // another machine days earlier. A session the API no longer holds (404, or a trace
-// that has been pruned) is recorded as not collected, never as empty.
+// that retention has deleted) is recorded as not collected, never as empty.
 //
 // Exit: 0 every session collected and the bundle valid, 1 the bundle is not valid,
 //       2 usage or the bearer was rejected, 3 incomplete (some session could not be
 //       collected — the reason is in that scenario's host-half.json).
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { validateBundle } from "./bundle.mjs";
-
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+import { SOURCES, isCredentialName, manifestKeys, validateBundle } from "./bundle.mjs";
 
 export const EXIT = { ok: 0, invalid: 1, error: 2, incomplete: 3 };
-
-// A field whose name says it holds a credential never reaches a bundle, whatever
-// the route called it (token, sig_token, access_token, password, ...).
-const CREDENTIAL = /(^|_)(token|password|passwd|secret|api_?key)$/i;
 
 // A session or host id is a UUID, and nothing else. A bundle may come from another
 // machine: a value from it goes into an admin-authenticated request path and into a
@@ -43,6 +38,7 @@ const IPV4 = /(?<![\d.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?!\d|\.\d)/g;
 const DOC_NETS = ["192.0.2.", "198.51.100.", "203.0.113."]; // RFC 5737
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+const num = (v) => typeof v === "number" && Number.isFinite(v);
 
 function isAddress(ip) {
   const o = ip.split(".").map(Number);
@@ -56,149 +52,156 @@ function redactText(text, token) {
   return out;
 }
 
-/** A deep copy of `value` with credentials dropped, addresses replaced and keys sorted. */
+/**
+ * A deep copy of `value` with credential-named fields dropped, addresses replaced, the exact
+ * bearer replaced everywhere and keys sorted. Objects are built with no prototype, so a
+ * `__proto__` key from an answer is an ordinary key and cannot reach Object.prototype.
+ * Limit (declined): a bearer base64-, URL-encoded or split inside an answer is not recognised.
+ */
 export function redact(value, token) {
   if (typeof value === "string") return redactText(value, token);
   if (Array.isArray(value)) return value.map((v) => redact(v, token));
   if (isObj(value)) {
-    const out = {};
+    const out = Object.create(null);
     for (const k of Object.keys(value).sort()) {
-      if (CREDENTIAL.test(k)) continue;
-      out[k] = redact(value[k], token);
+      if (!isCredentialName(k)) out[redactText(k, token)] = redact(value[k], token);
     }
     return out;
   }
   return value;
 }
 
+/** A problem with what an answer or a file held, never with the bearer: that scenario is not collected. */
+class Unreadable extends Error {}
+const need = (cond, what) => {
+  if (!cond) throw new Unreadable(what);
+};
+
+/**
+ * The ONE place the collector writes a file (JSON, or JSONL when the name ends in .jsonl and
+ * the value is a list of rows). The value is redacted and serialised with sorted keys, written
+ * to a temporary file beside the target and renamed over it, so a hard link or symlink already
+ * at the target is replaced, never written through. The target must resolve inside the bundle.
+ */
+function writer(dir, token) {
+  const lexical = path.resolve(dir);
+  const root = fs.realpathSync(dir);
+  return (file, value) => {
+    const target = path.resolve(file);
+    need(target.startsWith(lexical + path.sep), "a write left the bundle");
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    const parent = fs.realpathSync(path.dirname(target));
+    need(parent === root || parent.startsWith(root + path.sep), "a write left the bundle");
+    const text = file.endsWith(".jsonl")
+      ? value.map((r) => JSON.stringify(redact(r, token)) + "\n").join("")
+      : JSON.stringify(redact(value, token), null, 2) + "\n";
+    const tmp = path.join(parent, `.${path.basename(target)}.${crypto.randomBytes(6).toString("hex")}.tmp`);
+    try {
+      fs.writeFileSync(tmp, text, { flag: "wx" });
+      fs.renameSync(tmp, path.join(parent, path.basename(target)));
+    } catch (e) {
+      fs.rmSync(tmp, { force: true });
+      throw e;
+    }
+  };
+}
+
 function readJson(file) {
   try {
     return JSON.parse(fs.readFileSync(file, "utf8"));
   } catch (e) {
-    throw new Error(`${file}: ${e.code === "ENOENT" ? "missing" : `not JSON (${e.message})`}`);
+    throw new Unreadable(`${file}: ${e.code === "ENOENT" ? "missing" : "not JSON"}`);
   }
 }
 
-function readJsonl(file) {
+/** The rows of a JSONL file the collector will merge with; [] when there is none. */
+function readRows(file) {
   if (!fs.existsSync(file)) return [];
   return fs
     .readFileSync(file, "utf8")
     .split("\n")
     .filter((l) => l.trim())
     .map((l, i) => {
+      let row;
       try {
-        return JSON.parse(l);
+        row = JSON.parse(l);
       } catch {
-        throw new Error(`${file}:${i + 1}: not JSON`);
+        throw new Unreadable(`${file}:${i + 1}: not JSON`);
       }
+      need(isObj(row) && num(row.ts_unix_ms) && isObj(row.metrics), `${file}:${i + 1}: needs ts_unix_ms and metrics`);
+      return row;
     });
 }
 
-// Write only when the bytes would change: a second collection against the same
-// answers then touches nothing at all.
-function writeIfChanged(file, text) {
-  if (fs.existsSync(file) && fs.readFileSync(file, "utf8") === text) return;
-  fs.writeFileSync(file, text);
-}
-
-const writeJson = (file, value) => writeIfChanged(file, JSON.stringify(value, null, 2) + "\n");
-const writeJsonl = (file, rows) =>
-  writeIfChanged(file, rows.length ? rows.map((r) => JSON.stringify(r)).join("\n") + "\n" : "");
-
-// The metric manifest's series names (its `taxonomy`, e.g. `encoder.fps`) and the
-// stored sample key and source each one becomes in a scenario directory. Bench-mode
-// keys ride in a browser sample, as everywhere else.
-function seriesKeys(file = path.join(ROOT, "docs/session-trace/metrics.json")) {
-  const map = new Map();
-  for (const m of JSON.parse(fs.readFileSync(file, "utf8")).metrics) {
-    if (!m.taxonomy) continue;
-    map.set(m.taxonomy, { key: m.key, source: m.source === "bench" ? "browser" : m.source });
-  }
-  return map;
-}
-
-function metricRows(bundle, keys) {
-  const rows = new Map();
-  const unknown = [];
-  for (const [name, points] of Object.entries(bundle?.series ?? {})) {
-    const m = keys.get(name);
-    if (!m) {
-      unknown.push(name);
-      continue;
-    }
-    for (const p of Array.isArray(points) ? points : []) {
-      if (typeof p?.ts_unix_ms !== "number" || typeof p.v !== "number" || !Number.isFinite(p.v)) continue;
-      const id = `${m.source}|${p.ts_unix_ms}`;
-      if (!rows.has(id)) rows.set(id, { kind: "metric", source: m.source, ts_unix_ms: p.ts_unix_ms, metrics: {} });
-      rows.get(id).metrics[m.key] = p.v;
-    }
-  }
-  return { rows: [...rows.values()], unknown };
-}
-
-// Same source + ts is the same row, so the client half's own sample wins and the
-// host's is not appended twice. Sorted by ts then source, as the format asks.
+// The row's identity is its source and ts. A host sample joins the client's row for the same
+// moment key by key: the client's value wins for a key both have, the host's other keys are
+// added. Sorted by ts then source, as the format asks.
 function mergeMetrics(existing, added) {
-  const seen = new Set(existing.map((r) => `${r?.source}|${r?.ts_unix_ms}`));
-  const out = existing.slice();
-  for (const r of added) {
+  const byId = new Map();
+  const out = [];
+  for (const r of [...existing, ...added]) {
     const id = `${r.source}|${r.ts_unix_ms}`;
-    if (!seen.has(id)) out.push(r);
+    let row = byId.get(id);
+    if (!row) {
+      row = { ...r, metrics: Object.create(null) };
+      byId.set(id, row);
+      out.push(row);
+    }
+    for (const [k, v] of Object.entries(r.metrics)) if (!Object.hasOwn(row.metrics, k)) row.metrics[k] = v;
   }
   const cmp = (a, b) => (a.source < b.source ? -1 : a.source > b.source ? 1 : 0);
-  return out.sort((a, b) => (a?.ts_unix_ms ?? 0) - (b?.ts_unix_ms ?? 0) || cmp(a, b));
+  return out.sort((a, b) => a.ts_unix_ms - b.ts_unix_ms || cmp(a, b));
 }
 
-function mergeEvents(existing, added) {
-  const id = (e) => `${e?.ts_unix_ms}|${e?.type}|${e?.source}`;
-  const seen = new Set(existing.map(id));
-  const out = existing.slice();
-  for (const e of added) if (!seen.has(id(e))) out.push(e);
+const eventId = (e) => `${e.ts_unix_ms}|${e.type}|${e.source}`;
+function mergeEvents(...lists) {
+  const seen = new Set();
+  const out = [];
+  for (const e of lists.flat()) {
+    if (!seen.has(eventId(e))) {
+      seen.add(eventId(e));
+      out.push(e);
+    }
+  }
   const byText = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
-  return out.sort(
-    (a, b) =>
-      (a?.ts_unix_ms ?? 0) - (b?.ts_unix_ms ?? 0) ||
-      byText(String(a?.type), String(b?.type)) ||
-      byText(String(a?.source), String(b?.source)),
-  );
+  return out.sort((a, b) => a.ts_unix_ms - b.ts_unix_ms || byText(a.type, b.type) || byText(a.source, b.source));
 }
 
-// `bench_run.sh` writes the SAME read into conditions.json: booleans as on/off,
-// everything else stringified, with the ladder aliases quasar-bench compares by
-// name. `effective` is null until an amendment-aware agent has reported, and an
-// absent key is "not measured", never {}.
+// bench_run.sh writes the SAME read into conditions.json: its flag() — a value that reads
+// "true" or "false" in any case becomes on/off, anything else stays as it is — with the
+// ladder aliases quasar-bench compares by name. `effective` is a map of strings, or null
+// until an amendment-aware agent has reported; an absent key is "not measured", never {}.
 const CONDITION_ALIAS = {
   abr_ladder_resolution: "ladder_resolution",
   abr_ladder_fps: "ladder_fps",
   abr_ladder_floor_follows_rung: "floor_follows_rung",
 };
+const flag = (v) => (String(v).toLowerCase() === "true" ? "on" : String(v).toLowerCase() === "false" ? "off" : String(v));
 
-function conditions(settings) {
-  const eff = settings?.effective;
-  if (!isObj(eff)) {
-    return { unknown: { effective: "the host has not reported its effective settings" } };
-  }
-  const projected = {};
-  for (const k of Object.keys(eff).sort()) {
-    const v = eff[k];
-    const flag = typeof v === "boolean" ? (v ? "on" : "off") : String(v);
-    projected[k] = flag;
-    if (CONDITION_ALIAS[k]) projected[CONDITION_ALIAS[k]] = flag;
+function conditions(effective) {
+  if (effective === null) return { unknown: { effective: "the host has not reported its effective settings" } };
+  const projected = Object.create(null);
+  for (const k of Object.keys(effective).sort()) {
+    projected[k] = flag(effective[k]);
+    if (CONDITION_ALIAS[k]) projected[CONDITION_ALIAS[k]] = flag(effective[k]);
   }
   return { effective: projected };
 }
 
-// The `session.json` shape scripts/dx/bench_submit.py reads (session_soak_driver.py
-// builds the same record from GET /v1/sessions/{id}).
-function sessionRow(sess) {
-  const st = sess?.stream ?? {};
-  const row = { kind: "session", id: sess?.id };
-  for (const k of ["state", "app_id", "host_id", "profile_id"]) if (sess?.[k] != null) row[k] = sess[k];
-  if (typeof st.width === "number" && typeof st.height === "number") row.launch = [st.width, st.height];
+// The `session.json` shape scripts/dx/bench_submit.py reads (session_soak_driver.py builds the
+// same record from GET /v1/sessions/{id}), plus the fields the 0.6 parity gate compares,
+// named as the session row names them.
+function sessionRow(s) {
+  const st = s.stream;
+  const row = { kind: "session", id: s.id };
+  for (const k of ["state", "app_id", "host_id", "profile_id", "transport", "negotiated_codec", "pyrowave"]) {
+    if (s[k] !== undefined) row[k] = s[k];
+  }
+  if (num(st.width) && num(st.height)) row.launch = [st.width, st.height];
   for (const k of ["fps", "bitrate_kbps", "codec", "external_resize_supported"]) if (st[k] != null) row[k] = st[k];
-  if (Array.isArray(st.rungs)) row.rungs = st.rungs.map((r) => [Number(r[0]), Number(r[1])]);
-  const start = Date.parse(sess?.started_at ?? "");
-  const end = Date.parse(sess?.ended_at ?? "");
+  row.rungs = st.rungs.map(([w, h]) => [w, h]);
+  const start = Date.parse(s.started_at ?? "");
+  const end = Date.parse(s.ended_at ?? "");
   if (!Number.isNaN(start)) row.started_at_ms = start;
   if (!Number.isNaN(end)) {
     row.ended_at_ms = end;
@@ -207,229 +210,381 @@ function sessionRow(sess) {
   return row;
 }
 
-function identity(version, commit, builtAt) {
+/** built_at/commit/version as the answer holds them (in key order, so two reads compare as text); null when it holds none ("not read"). */
+function identity(o, versionKey) {
   const out = {};
-  if (version != null) out.version = version;
-  if (commit != null) out.commit = commit;
-  if (builtAt != null) out.built_at = builtAt;
-  return out;
+  for (const [to, from] of [["built_at", "built_at"], ["commit", "source_commit"], ["version", versionKey]]) {
+    if (typeof o[from] === "string" && o[from]) out[to] = o[from];
+  }
+  return Object.keys(out).length ? out : null;
 }
 
 const trimBase = (baseUrl) => String(baseUrl).replace(/\/+$/, "");
 
-function getJson(baseUrl, token, fetchFn, route) {
-  return (async () => {
-    let res;
+// Every request: no redirect is followed (a 3xx is not an answer), and the bearer goes only
+// to the base URL the operator gave.
+async function getJson(baseUrl, token, fetchFn, route) {
+  let res;
+  try {
+    res = await fetchFn(`${trimBase(baseUrl)}${route}`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+      redirect: "error",
+    });
+  } catch (e) {
+    if (/redirect/i.test(`${e.message} ${e.cause?.message}`)) throw new Unreadable(`GET ${route} answered a redirect, which is never followed`);
+    throw new Error(`GET ${route} could not be made (${e.message}) — is ${trimBase(baseUrl)} reachable?`);
+  }
+  if (res.status === 401 || res.status === 403) {
+    const e = new Error(
+      `the admin bearer was rejected (HTTP ${res.status} on GET ${route}). Next: scripts/dx/admin_token.sh --fresh`,
+    );
+    e.code = "unauthorized";
+    throw e;
+  }
+  let body = null;
+  if (res.status === 200) {
     try {
-      res = await fetchFn(`${trimBase(baseUrl)}${route}`, {
-        headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
-      });
-    } catch (e) {
-      throw new Error(`GET ${route} could not be made (${e.message}) — is ${trimBase(baseUrl)} reachable?`);
+      body = await res.json();
+    } catch {
+      body = null;
     }
-    if (res.status === 401 || res.status === 403) {
-      const e = new Error(
-        `the admin bearer was rejected (HTTP ${res.status} on GET ${route}). ` +
-          `Next: scripts/dx/admin_token.sh --fresh`,
-      );
-      e.code = "unauthorized";
-      throw e;
+  }
+  return { status: res.status, body };
+}
+
+const MIN = 60_000;
+const PAD = 5_000; // the window around a session, as session_soak_driver.py and bench_run.sh read it
+const PAGE = 1000; // the server's sample cap per read (telemetry.clampLimit; traceReadLimit)
+const MAX_PAGES = 200;
+
+// What one session's answers hold, all read and shape-checked before anything is written.
+// Every route and shape here is the handler's: diagnostic_handler.go (resolveWindow,
+// handleDiagnosticBundle, handleAdminTelemetryRead), metrics_handler.go (handleAdminMetrics),
+// handler.go (handleGet, sessionResp), crud/handler.go (handleGetHost), hostcfg/handler.go
+// (handleGet) and platform/handler.go (handleIdentity).
+async function fetchSession(get, id, now) {
+  const sid = encodeURIComponent(id);
+  const ok = async (route) => {
+    const r = await get(route);
+    need(r.status !== 404, `GET ${route} answered HTTP 404: the stack no longer holds it`);
+    need(r.status === 200, `GET ${route} answered HTTP ${r.status}`);
+    need(isObj(r.body), `GET ${route} answered a body that is not a JSON object`);
+    return r.body;
+  };
+
+  // handler.go handleGet: { "session": sessionResp }
+  const s = (await ok(`/v1/sessions/${sid}`)).session;
+  need(isObj(s) && s.id === id, "its row is not the session that was asked for");
+  need(isObj(s.stream), "its row has no stream object");
+  need(
+    Array.isArray(s.stream.rungs) && s.stream.rungs.every((r) => Array.isArray(r) && r.length === 2 && r.every(num)),
+    "its row's rungs are not [width, height] pairs",
+  );
+  for (const k of ["started_at", "ended_at"]) {
+    need(s[k] == null || (typeof s[k] === "string" && !Number.isNaN(Date.parse(s[k]))), `its row's ${k} is not a time`);
+  }
+  need(s.host_id != null, "its row names no host, so there are no settings or agent identity to read");
+  need(isId(s.host_id), "its row's host id is not a UUID");
+  need(s.started_at != null, "it never started, so there is no trace window to ask for");
+
+  // The window the server's resolveWindow is given explicitly (its default is the 5 minutes
+  // ending NOW, which is empty days later), in reads of at most 10 minutes; a read that comes
+  // back full (the server caps a series at 1000 points) is split, never trusted.
+  const from = Date.parse(s.started_at) - PAD;
+  const to = (s.ended_at != null ? Date.parse(s.ended_at) : now()) + PAD;
+  const reads = [];
+  const span = async (a, b) => {
+    const q = `?from=${a}&to=${b}`;
+    // diagnostic_handler.go handleDiagnosticBundle: trace, window, clock, series{name:[{ts_unix_ms,v}]}, events
+    const diag = await ok(`/v1/admin/sessions/${sid}/diagnostic-bundle${q}`);
+    need(isObj(diag.series), "the diagnostic bundle has no series object");
+    for (const pts of Object.values(diag.series)) {
+      need(Array.isArray(pts) && pts.every((p) => isObj(p) && num(p.ts_unix_ms) && num(p.v)), "the diagnostic bundle's series are not points");
     }
-    let body = null;
-    if (res.status === 200) {
-      try {
-        body = await res.json();
-      } catch {
-        body = null;
-      }
+    need(Array.isArray(diag.events) && diag.events.every((e) => isObj(e) && num(e.ts_unix_ms)), "the diagnostic bundle's events are not events");
+    need(diag.trace?.session_id === undefined || diag.trace.session_id === id, "the diagnostic bundle is another session's");
+    // handleAdminTelemetryRead projectionEvents: { window, events } — the RAW events, not clock-aligned
+    const ev = await ok(`/v1/admin/sessions/${sid}/trace/events${q}`);
+    need(
+      Array.isArray(ev.events) && ev.events.every((e) => isObj(e) && num(e.ts_unix_ms) && typeof e.type === "string" && typeof e.source === "string"),
+      "the trace events are not events",
+    );
+    const full = ev.events.length >= PAGE || Object.values(diag.series).some((p) => p.length >= PAGE);
+    if (!full) return reads.push({ diag, events: ev.events });
+    need(b - a >= 4 * MIN, "its trace is denser than one read holds, even in the smallest window");
+    const mid = Math.floor((a + b) / 2);
+    await span(a, mid);
+    await span(mid, b);
+  };
+  for (let a = from; a < to; a += 10 * MIN) await span(a, Math.min(a + 10 * MIN, to));
+
+  // handleAdminMetrics: { items: [{source, ts_unix_ms, metrics}], next_cursor }, newest first.
+  // The RAW samples, every key and the original timestamps; paged until the cursor ends.
+  const samples = [];
+  let cursor = "";
+  for (let page = 0; ; page += 1) {
+    need(page < MAX_PAGES, "it has more samples than one collection reads");
+    const m = await ok(`/v1/admin/sessions/${sid}/metrics?limit=${PAGE}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
+    need(
+      Array.isArray(m.items) && m.items.every((i) => isObj(i) && typeof i.source === "string" && num(i.ts_unix_ms) && isObj(i.metrics)),
+      "the metrics are not samples",
+    );
+    samples.push(...m.items);
+    cursor = m.next_cursor;
+    if (cursor == null) break;
+    need(typeof cursor === "string" && cursor !== "", "the metrics cursor is not a cursor");
+  }
+
+  const hasData =
+    samples.length > 0 ||
+    reads.some((r) => r.events.length > 0 || r.diag.events.length > 0 || Object.values(r.diag.series).some((p) => p.length > 0));
+  need(hasData, "the trace is no longer kept (telemetry is deleted a day after a session ends)");
+
+  const hid = encodeURIComponent(s.host_id);
+  // hostcfg handleGet: { resolved, overrides, effective: map[string]string | null, codecs, pending_restart }
+  const settings = await ok(`/v1/admin/hosts/${hid}/settings`);
+  need(
+    settings.effective === null || (isObj(settings.effective) && Object.values(settings.effective).every((v) => v === null || typeof v !== "object")),
+    "the host settings' effective map is not a map of values",
+  );
+  // crud handleGetHost: { "host": hostResp }
+  const host = (await ok(`/v1/hosts/${hid}`)).host;
+  need(isObj(host), "the host row is not an object");
+
+  return { id, row: s, from, to, reads, samples, effective: settings.effective, agent: identity(host, "agent_version") };
+}
+
+// The metric keys and sources the format admits. Anything else the API sent is dropped and
+// listed in host-half.json, never written.
+function hostRows(samples, keys, dropped) {
+  const rows = new Map();
+  for (const smp of samples) {
+    if (!SOURCES.includes(smp.source)) {
+      dropped.sources.add(clip(smp.source));
+      continue;
     }
-    return { status: res.status, body };
-  })();
+    const id = `${smp.source}|${smp.ts_unix_ms}`;
+    if (!rows.has(id)) rows.set(id, { kind: "metric", source: smp.source, ts_unix_ms: smp.ts_unix_ms, metrics: Object.create(null) });
+    const row = rows.get(id);
+    for (const [k, v] of Object.entries(smp.metrics)) {
+      if (keys[smp.source] && !keys[smp.source].has(k)) dropped.keys.add(`${smp.source}.${clip(k)}`);
+      else if (!Object.hasOwn(row.metrics, k)) row.metrics[k] = v;
+    }
+  }
+  return [...rows.values()];
+}
+
+// The diagnostic bundle as the artifact: the reads' series and events folded together (a
+// session longer than one read), everything else as the first read returned it.
+function foldDiagnostic(reads, from, to) {
+  const series = new Map();
+  const events = [];
+  for (const { diag } of reads) {
+    for (const [name, pts] of Object.entries(diag.series)) {
+      if (!series.has(name)) series.set(name, new Map());
+      for (const p of pts) series.get(name).set(p.ts_unix_ms, p);
+    }
+    events.push(diag.events);
+  }
+  return {
+    ...reads[0].diag,
+    window: { from_ms: from, to_ms: to },
+    series: Object.fromEntries([...series].map(([n, m]) => [n, [...m.values()].sort((a, b) => a.ts_unix_ms - b.ts_unix_ms)])),
+    events: mergeEvents(...events),
+  };
 }
 
 /**
- * Fetch the host half of `dir` and write it in. `fetch` defaults to Node's own; a
- * test passes a canned in-process one.
+ * Fetch the host half of `dir` and write it in. `fetch` defaults to Node's own; a test passes
+ * a canned in-process one, and `now` for the clock.
  *
- * Returns `{ complete, problems, scenarios, sessions, collected }`, with
- * `refusedBefore: true` when the bundle's format was refused before any request or
- * write. Throws on a rejected bearer (`code: "unauthorized"`) and on a value from the
- * bundle that is not a UUID (`code: "usage"`).
+ * A scenario whose host-half.json says `collected: true` is never fetched again; only the others
+ * are retried. Everything for a scenario is fetched and shape-checked, then every output is
+ * computed, and only then written.
+ *
+ * Returns `{ complete, problems, incomplete, scenarios, sessions, collected }`, with
+ * `refusedBefore: true` when the bundle was refused before any request or write. Throws on a
+ * rejected bearer (`code: "unauthorized"`) and on a value from the bundle that is not a UUID
+ * (`code: "usage"`).
  */
-export async function collect(dir, { baseUrl, token, fetch: fetchFn = globalThis.fetch } = {}) {
+export async function collect(dir, { baseUrl, token, fetch: fetchFn = globalThis.fetch, now = Date.now } = {}) {
   if (!token) throw new Error("no admin bearer: QUASAR_ADMIN_TOKEN is empty");
   if (!baseUrl) throw new Error("no --base-url");
+  const refuse = (problems) => ({ complete: false, refusedBefore: true, problems, incomplete: [], scenarios: 0, sessions: 0, collected: 0 });
 
-  // The bundle is untrusted input and may come from another machine. Its format is
-  // checked FIRST — before a scenario name becomes a write path and before a session
-  // id becomes an admin request — so nothing it holds can steer this process until
-  // that has passed. A client-only bundle is a valid bundle, so this costs nothing.
-  const problems = validateBundle(dir);
-  if (problems.length) {
-    return { complete: false, refusedBefore: true, problems, incomplete: [], scenarios: 0, sessions: 0, collected: 0 };
-  }
+  // The bundle is untrusted input and may come from another machine. Its format is checked
+  // FIRST — before a scenario name becomes a write path and before a session id becomes an
+  // admin request. A client-only bundle is a valid bundle, so this costs nothing.
+  const bad = validateBundle(dir);
+  if (bad.length) return refuse(bad);
 
   const manifest = readJson(path.join(dir, "manifest.json"));
-  const scenarios = manifest.scenarios;
-  if (!scenarios.length) throw new Error("manifest.json: no scenario directories to collect");
   const builds = readJson(path.join(dir, "builds.json"));
   builds.unknown = isObj(builds.unknown) ? builds.unknown : {};
+  need(manifest.scenarios.length > 0, "manifest.json: no scenario directories to collect");
 
-  // Every session id is checked before the first request, not at the point of use: a
-  // bad id in the last scenario must not leave the first one's requests already sent.
+  // The whole plan, before the first request: what each scenario names, what is already
+  // collected, and every existing file the collector will merge with or replace.
   const plan = [];
-  for (const name of scenarios) {
+  const problems = [];
+  const keys = manifestKeys();
+  for (const name of manifest.scenarios) {
     const scDir = path.join(dir, name);
-    const scenario = readJson(path.join(scDir, "scenario.json"));
-    const ids = Array.isArray(scenario?.sessions) ? scenario.sessions : [];
+    const ids = readJson(path.join(scDir, "scenario.json")).sessions;
     for (const id of ids) {
       if (!isId(id)) {
-        const e = new Error(
-          `${name}/scenario.json: '${clip(id)}' is not a session id (a session id is a UUID); nothing was requested`,
-        );
+        const e = new Error(`${name}/scenario.json: '${clip(id)}' is not a session id (a session id is a UUID); nothing was requested`);
         e.code = "usage";
         throw e;
       }
     }
-    plan.push({ name, scDir, ids });
+    const halfFile = path.join(scDir, "host-half.json");
+    let prior = null;
+    try {
+      if (fs.existsSync(halfFile)) {
+        prior = readJson(halfFile);
+        need(isObj(prior), "not an object");
+      }
+    } catch (e) {
+      problems.push(`${name}/host-half.json: ${e.message.replace(/^.*: /, "")}`);
+    }
+    const item = { name, scDir, ids, prior, outs: [] };
+    if (prior?.collected !== true && ids.length) {
+      try {
+        ids.forEach((id, i) => {
+          const out = i === 0 ? scDir : path.join(scDir, "sessions", id);
+          for (const p of [path.join(scDir, "sessions"), out]) need(!fs.existsSync(p) || fs.statSync(p).isDirectory(), `${path.relative(dir, p)} is not a directory`);
+          for (const f of ["diagnostic-bundle.json", "session.json", "conditions.json", "metrics.jsonl", ...(i === 0 ? ["trace.json", "host-half.json"] : [])]) {
+            const p = path.join(out, f);
+            need(!fs.existsSync(p) || fs.lstatSync(p).isFile(), `${path.relative(dir, p)} is not a file`);
+          }
+          item.outs.push({ id, out, metrics: readRows(path.join(out, "metrics.jsonl")) });
+        });
+        const traceFile = path.join(scDir, "trace.json");
+        item.trace = fs.existsSync(traceFile) ? readJson(traceFile) : {};
+        need(isObj(item.trace) && (item.trace.events === undefined || (Array.isArray(item.trace.events) && item.trace.events.every((e) => isObj(e) && num(e.ts_unix_ms)))), `${name}/trace.json is not a trace`);
+        need(item.trace.series === undefined || isObj(item.trace.series), `${name}/trace.json is not a trace`);
+      } catch (e) {
+        problems.push(e.message.startsWith(dir) ? e.message.slice(dir.length + 1) : e.message);
+      }
+    }
+    plan.push(item);
   }
+  if (problems.length) return refuse(problems);
 
-  const manifestKeys = seriesKeys();
+  const write = writer(dir, token);
   const get = (route) => getJson(baseUrl, token, fetchFn, route);
-
-  let sessions = 0;
-  let collected = 0;
-  const hosts = new Map();
+  const todo = plan.filter((p) => p.prior?.collected !== true && p.ids.length);
+  const state = new Map(); // scenario -> { collected, agent } once this run is done
+  for (const p of plan) state.set(p.name, p.prior?.collected === true ? { collected: true, agent: p.prior.node_agent } : { collected: !p.ids.length, agent: undefined });
   const incomplete = [];
 
-  for (const { name, scDir, ids } of plan) {
-    if (!ids.length) {
-      writeJson(path.join(scDir, "host-half.json"), { collected: true });
-      continue;
+  // A scenario that names no session has nothing to collect, and says so.
+  const empty = plan.filter((p) => !p.ids.length && p.prior?.collected !== true);
+  if (todo.length || empty.length) {
+    for (const p of empty) write(path.join(p.scDir, "host-half.json"), { collected: true });
+
+    // platform/handler.go handleIdentity: { "identity": {...} }; read once, before any scenario is written
+    let controlPlane = null;
+    let cpReason = null;
+    if (todo.length) {
+      try {
+        const r = await get("/v1/admin/platform/identity");
+        need(r.status === 200 && isObj(r.body?.identity), `GET /v1/admin/platform/identity answered HTTP ${r.status}`);
+        controlPlane = identity(r.body.identity, "version");
+        need(controlPlane, "GET /v1/admin/platform/identity held no version, commit or build time");
+      } catch (e) {
+        if (!(e instanceof Unreadable)) throw e;
+        cpReason = e.message;
+      }
     }
 
-    // Fetch everything first: a scenario is written whole or not at all.
-    const docs = [];
-    let reason = null;
-    sessions += ids.length;
-    for (const id of ids) {
-      const sid = encodeURIComponent(id);
-      const traceRoute = `/v1/admin/sessions/${sid}/diagnostic-bundle`;
-      const diag = await get(traceRoute);
-      if (diag.status === 404) {
-        reason = `session ${id}: the stack no longer holds it or its trace (HTTP 404 on GET ${traceRoute})`;
-        break;
+    for (const p of todo) {
+      const docs = [];
+      let reason = null;
+      try {
+        for (const id of p.ids) docs.push(await fetchSession(get, id, now));
+      } catch (e) {
+        if (!(e instanceof Unreadable)) throw e;
+        reason = `session ${p.ids[docs.length]}: ${e.message}`;
       }
-      if (diag.status !== 200 || !isObj(diag.body)) {
-        reason = `session ${id}: GET ${traceRoute} answered HTTP ${diag.status}`;
-        break;
+      if (reason) {
+        incomplete.push({ scenario: p.name, reason });
+        write(path.join(p.scDir, "host-half.json"), { collected: false, reason });
+        continue;
       }
-      const row = await get(`/v1/sessions/${sid}`);
-      if (row.status !== 200 || !isObj(row.body?.session)) {
-        reason = `session ${id}: GET /v1/sessions/${sid} answered HTTP ${row.status}`;
-        break;
-      }
-      const hostId = row.body.session.host_id;
-      if (!hostId) {
-        reason = `session ${id}: its row names no host, so there are no settings or agent identity to read`;
-        break;
-      }
-      // The API's own answer steers a path too, so it gets the same check.
-      if (!isId(hostId)) {
-        reason = `session ${id}: its row's host id '${clip(hostId)}' is not a host id (a host id is a UUID); no settings were requested`;
-        break;
-      }
-      const hid = encodeURIComponent(hostId);
-      const settings = await get(`/v1/admin/hosts/${hid}/settings`);
-      if (settings.status !== 200 || !isObj(settings.body)) {
-        reason = `session ${id}: GET /v1/admin/hosts/${hid}/settings answered HTTP ${settings.status}`;
-        break;
-      }
-      const host = await get(`/v1/hosts/${hid}`);
-      if (host.status !== 200 || !isObj(host.body)) {
-        reason = `session ${id}: GET /v1/hosts/${hid} answered HTTP ${host.status}`;
-        break;
-      }
-      docs.push({ id, diag: diag.body, session: row.body.session, settings: settings.body, host: host.body });
-    }
 
-    if (reason) {
-      incomplete.push({ scenario: name, reason });
-      writeJson(path.join(scDir, "host-half.json"), { collected: false, reason: redact(reason, token) });
-      continue;
-    }
-
-    const { rows, unknown } = metricRows(docs[0].diag, manifestKeys);
-    docs.forEach((doc, i) => {
-      // The first session is the scenario's own (session.json and friends sit at the
-      // scenario level, as bench_submit.py expects); any further one keeps its own.
-      const out = i === 0 ? scDir : path.join(scDir, "sessions", doc.id);
-      fs.mkdirSync(out, { recursive: true });
-      writeJson(path.join(out, "diagnostic-bundle.json"), redact(doc.diag, token));
-      writeJson(path.join(out, "session.json"), redact(sessionRow(doc.session), token));
-      writeJson(path.join(out, "conditions.json"), redact(conditions(doc.settings), token));
-      const hostRows = i === 0 ? rows : metricRows(doc.diag, manifestKeys).rows;
-      const metrics = mergeMetrics(readJsonl(path.join(out, "metrics.jsonl")), hostRows);
-      writeJsonl(path.join(out, "metrics.jsonl"), metrics);
-    });
-
-    const traceFile = path.join(scDir, "trace.json");
-    const prev = fs.existsSync(traceFile) ? readJson(traceFile) : {};
-    writeJson(
-      traceFile,
-      redact(
+      // Decide every output, then write them all.
+      const readAt = now();
+      const dropped = { sources: new Set(), keys: new Set() };
+      const writes = [];
+      docs.forEach((d, i) => {
+        const { out, metrics } = p.outs[i];
+        writes.push(
+          [path.join(out, "diagnostic-bundle.json"), foldDiagnostic(d.reads, d.from, d.to)],
+          [path.join(out, "session.json"), sessionRow(d.row)],
+          [path.join(out, "conditions.json"), conditions(d.effective)],
+          [path.join(out, "metrics.jsonl"), mergeMetrics(metrics, hostRows(d.samples, keys, dropped))],
+        );
+      });
+      const first = docs[0];
+      writes.push([
+        path.join(p.scDir, "trace.json"),
         {
-          session_id: docs[0].id,
-          window: docs[0].diag.window ?? prev.window ?? null,
-          clock: docs[0].diag.clock ?? prev.clock ?? null,
-          events: mergeEvents(Array.isArray(prev.events) ? prev.events : [], docs[0].diag.events ?? []),
-          series: prev.series ?? {},
+          session_id: first.id,
+          window: { from_ms: first.from, to_ms: first.to },
+          clock: first.reads[0].diag.clock ?? p.trace.clock ?? null,
+          events: mergeEvents(p.trace.events ?? [], ...first.reads.map((r) => r.events)),
+          series: p.trace.series ?? {},
         },
-        token,
-      ),
-    );
-    writeJson(
-      path.join(scDir, "host-half.json"),
-      redact({ collected: true, ...(unknown.length ? { series_not_in_manifest: unknown.sort() } : {}) }, token),
-    );
-    collected += ids.length;
-    for (const doc of docs) {
-      const h = doc.host;
-      hosts.set(doc.session.host_id, identity(h.agent_version, h.source_commit, h.built_at));
+      ]);
+      const agents = new Set(docs.map((d) => JSON.stringify(d.agent)));
+      const agent = agents.size === 1 ? JSON.parse([...agents][0]) : null;
+      writes.push([
+        path.join(p.scDir, "host-half.json"),
+        {
+          collected: true,
+          read_at_ms: readAt,
+          node_agent: agent,
+          ...(dropped.sources.size ? { sources_not_in_bundle: [...dropped.sources].sort() } : {}),
+          ...(dropped.keys.size ? { metric_keys_not_in_manifest: [...dropped.keys].sort() } : {}),
+        },
+      ]);
+      for (const [file, value] of writes) write(file, value);
+      state.set(p.name, { collected: true, agent });
     }
+
+    // The two builds a host half can name; everything else stays as the client half wrote it.
+    // A component that cannot be read is null with its reason, replacing whatever the client
+    // half held.
+    const setBuild = (name, value, why) => {
+      builds.components[name] = value;
+      if (value) delete builds.unknown[name];
+      else builds.unknown[name] = why;
+    };
+    if (todo.length) setBuild("control_plane", controlPlane, cpReason);
+    const agents = [...state.values()].filter((s) => s.collected && s.agent !== undefined);
+    const distinct = new Set(agents.map((s) => JSON.stringify(s.agent)));
+    setBuild(
+      "node_agent",
+      distinct.size === 1 && !distinct.has("null") ? JSON.parse([...distinct][0]) : null,
+      agents.length ? "the collected sessions did not share one readable host agent build" : "no session was collected, so no host agent identity was read",
+    );
+    manifest.halves = isObj(manifest.halves) ? manifest.halves : {};
+    manifest.halves.host = [...state.values()].every((s) => s.collected);
+    write(path.join(dir, "manifest.json"), manifest);
+    write(path.join(dir, "builds.json"), builds);
   }
 
-  // The two builds a host half can name. Everything else stays as the client half
-  // wrote it; a component that cannot be read stays null with its reason.
-  const id = await get("/v1/admin/platform/identity");
-  if (id.status === 200 && isObj(id.body?.identity)) {
-    const i = id.body.identity;
-    builds.components.control_plane = identity(i.version, i.source_commit, i.built_at);
-    delete builds.unknown.control_plane;
-  } else if (!builds.components.control_plane) {
-    builds.components.control_plane = null;
-    builds.unknown.control_plane = `GET /v1/admin/platform/identity answered HTTP ${id.status}`;
-  }
-
-  const distinct = [...hosts.values()].map((v) => JSON.stringify(v));
-  if (distinct.length === 1) {
-    builds.components.node_agent = JSON.parse(distinct[0]);
-    delete builds.unknown.node_agent;
-  } else if (!builds.components.node_agent) {
-    builds.components.node_agent = null;
-    builds.unknown.node_agent =
-      distinct.length === 0
-        ? "no session was collected, so no host agent identity was read"
-        : "the sessions ran on hosts with different agent builds";
-  }
-
-  const complete = incomplete.length === 0;
-  manifest.halves = isObj(manifest.halves) ? manifest.halves : {};
-  manifest.halves.host = complete;
-  writeJson(path.join(dir, "manifest.json"), manifest);
-  writeJson(path.join(dir, "builds.json"), builds);
-
-  return { complete, incomplete, problems: validateBundle(dir), scenarios: scenarios.length, sessions, collected };
+  const total = plan.reduce((n, p) => n + p.ids.length, 0);
+  return {
+    complete: [...state.values()].every((s) => s.collected),
+    incomplete,
+    problems: validateBundle(dir),
+    scenarios: plan.length,
+    sessions: total,
+    collected: plan.filter((p) => state.get(p.name).collected).reduce((n, p) => n + p.ids.length, 0),
+  };
 }
 
 function parseArgs(argv) {

@@ -107,6 +107,13 @@ const RULES = [
   ["an address", (d) => edit(d, "network.json", (n) => ({ ...n, host: "10.20.30.40" })), /network.json: holds an address/],
   ["a JWT", (d) => fs.writeFileSync(path.join(d, "note.txt"), "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc"), /note.txt: holds a JWT/],
   ["a credential", (d) => edit(d, "client.json", (c) => ({ ...c, password: "hunter2" })), /client.json: holds a credential/],
+  ["a cookie under a JSON key", (d) => edit(d, "client.json", (c) => ({ ...c, "Set-Cookie": "sid=abc12345" })), /client.json: holds a credential/],
+  ["a camelCase token under a JSON key", (d) => edit(d, "client.json", (c) => ({ ...c, nested: { sigToken: "abcdefgh" } })), /client.json: holds a credential/],
+  ["an authorization header under a JSON key", (d) => edit(d, "network.json", (n) => ({ ...n, headers: [{ Authorization: "opaque-value" }] })), /network.json: holds a credential/],
+  ["sessions that is an object", (d) => edit(d, `${SC}/scenario.json`, (s) => ({ ...s, sessions: { zero: "x" } })), /scenario.json: sessions must be a list of strings/],
+  ["sessions that is a string", (d) => edit(d, `${SC}/scenario.json`, (s) => ({ ...s, sessions: "abc" })), /scenario.json: sessions must be a list of strings/],
+  ["sessions that is null", (d) => edit(d, `${SC}/scenario.json`, (s) => ({ ...s, sessions: null })), /scenario.json: sessions must be a list of strings/],
+  ["sessions that holds a number", (d) => edit(d, `${SC}/scenario.json`, (s) => ({ ...s, sessions: ["abc", 7] })), /scenario.json: sessions must be a list of strings/],
   ["a token", (d) => fs.writeFileSync(path.join(d, SC, "console.log"), "Authorization: Bearer abcdefgh12345678\n"), /console.log: holds a bearer token/],
 ];
 for (const [name, breakIt, expected] of RULES) {
@@ -119,10 +126,16 @@ for (const [name, breakIt, expected] of RULES) {
   });
 }
 
+test("an empty sessions list is valid: nothing to collect for the scenario", () => {
+  const dir = bundle();
+  edit(dir, `${SC}/scenario.json`, (s) => ({ ...s, sessions: [] }));
+  assert.deepEqual(validateBundle(dir), []);
+});
+
 test("a browser version, a documentation address and a container's home are not leaks", () => {
   const dir = bundle();
-  edit(dir, "network.json", (n) => ({ ...n, note: "Chrome/157.0.7339.81 via 192.0.2.5, logs in /home/quasar/.local/share/Steam", sig_token: null }));
-  fs.writeFileSync(path.join(dir, "README.md"), "Use Bearer authentication. Secret: none of the builds recorded it. password=[REDACTED]\n");
+  edit(dir, "network.json", (n) => ({ ...n, note: "Chrome/157.0.7339.81 via 192.0.2.5, logs in /home/quasar/.local/share/Steam", sig_token: null, authorization: "none", Cookie: "[redacted]" }));
+  fs.writeFileSync(path.join(dir, "README.md"), "Use Bearer authentication. Secret: none of the builds recorded it. password=[REDACTED]\nThe password: none. The token: n/a; fine.\n");
   // A picture is not read for text, whatever bytes it holds after its header.
   fs.writeFileSync(path.join(dir, SC, "shot.png"), Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0, 0, 0]), Buffer.from("Bearer abcdefgh12345678")]));
   assert.deepEqual(validateBundle(dir), []);
