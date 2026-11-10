@@ -265,56 +265,69 @@ func (s *Store) List(ctx context.Context) ([]Tool, *string, error) {
 	return out, def, rows.Err()
 }
 
-// SetDefault sets or clears the fleet default and returns the previous one. It locks
-// instance_settings, then the tool row FOR SHARE (control-api.md §Usable, "Lock order").
-func (s *Store) SetDefault(ctx context.Context, toolID *string) (prev *string, err error) {
+// SetDefault sets or clears the fleet default and returns the previous one, with the tag and
+// SHA-512 of the tool named and of the previous one for the audit row. It locks instance_settings,
+// then the tool row FOR SHARE (control-api.md §Usable, "Lock order").
+func (s *Store) SetDefault(ctx context.Context, toolID *string) (prev *string, tool, prevTool ToolRef, err error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return nil, err
+		return nil, ToolRef{}, ToolRef{}, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	if _, err := tx.Exec(ctx, `INSERT INTO instance_settings (id) VALUES (true) ON CONFLICT DO NOTHING`); err != nil {
-		return nil, fmt.Errorf("ensure instance settings: %w", err)
+		return nil, ToolRef{}, ToolRef{}, fmt.Errorf("ensure instance settings: %w", err)
 	}
 	if err := tx.QueryRow(ctx,
 		`SELECT compat_tool_default_id::text FROM instance_settings WHERE id = true FOR UPDATE`).Scan(&prev); err != nil {
-		return nil, fmt.Errorf("lock instance settings: %w", err)
+		return nil, ToolRef{}, ToolRef{}, fmt.Errorf("lock instance settings: %w", err)
 	}
 	if toolID != nil {
 		var usable bool
-		err := tx.QueryRow(ctx, `SELECT enabled AND NOT name_conflict AND NOT pin_conflict
-			FROM compat_tools WHERE id = $1::uuid FOR SHARE`, *toolID).Scan(&usable)
+		var tag, sha *string
+		err := tx.QueryRow(ctx, `SELECT enabled AND NOT name_conflict AND NOT pin_conflict, tag, asset_sha512
+			FROM compat_tools WHERE id = $1::uuid FOR SHARE`, *toolID).Scan(&usable, &tag, &sha)
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrNotFound
+			return nil, ToolRef{}, ToolRef{}, ErrNotFound
 		}
 		if err != nil {
-			return nil, err
+			return nil, ToolRef{}, ToolRef{}, err
 		}
 		if !usable {
-			return nil, ErrNotUsable
+			return nil, ToolRef{}, ToolRef{}, ErrNotUsable
 		}
+		tool = refOf(*toolID, tag, sha)
+	}
+	if prev != nil {
+		// The default's row cannot be gone: the column REFERENCES compat_tools ON DELETE RESTRICT.
+		var tag, sha *string
+		if err := tx.QueryRow(ctx, `SELECT tag, asset_sha512 FROM compat_tools WHERE id = $1::uuid`,
+			*prev).Scan(&tag, &sha); err != nil {
+			return nil, ToolRef{}, ToolRef{}, fmt.Errorf("read the previous default: %w", err)
+		}
+		prevTool = refOf(*prev, tag, sha)
 	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE instance_settings SET compat_tool_default_id = $1::uuid WHERE id = true`, toolID); err != nil {
-		return nil, err
+		return nil, ToolRef{}, ToolRef{}, err
 	}
 	after := func() {}
 	if (prev == nil) != (toolID == nil) || (prev != nil && *prev != *toolID) {
 		if after, err = s.supersede(ctx, tx); err != nil {
-			return nil, err
+			return nil, ToolRef{}, ToolRef{}, err
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, err
+		return nil, ToolRef{}, ToolRef{}, err
 	}
 	after()
-	return prev, nil
+	return prev, tool, prevTool, nil
 }
 
 // Toggled is what an accepted enable or disable changed, for its audit row.
 type Toggled struct {
 	Changed     bool
 	Tag, SHA512 *string
+	SteamName   *string
 	HostIDs     []string
 }
 
@@ -339,8 +352,8 @@ func (s *Store) SetEnabled(ctx context.Context, id string, enabled bool) (Toggle
 	}
 	var family string
 	var cur, pin bool
-	err = tx.QueryRow(ctx, `SELECT family, enabled, pin_conflict, tag, asset_sha512 FROM compat_tools
-		WHERE id = $1::uuid FOR UPDATE`, id).Scan(&family, &cur, &pin, &out.Tag, &out.SHA512)
+	err = tx.QueryRow(ctx, `SELECT family, enabled, pin_conflict, tag, asset_sha512, steam_name FROM compat_tools
+		WHERE id = $1::uuid FOR UPDATE`, id).Scan(&family, &cur, &pin, &out.Tag, &out.SHA512, &out.SteamName)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return out, ErrNotFound
 	}
