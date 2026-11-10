@@ -1419,6 +1419,7 @@ mod tests {
             typing: Mutex::default(),
             encoder: glib::WeakRef::new(),
             trace: None,
+            rate: None,
         });
         media.on_caps(&streams::hevc_caps(640), "s");
         let mut client = media.attach(false, Duration::ZERO).unwrap();
@@ -1456,6 +1457,7 @@ mod tests {
             &parse,
             crate::webtransport::tests::no_input(),
             Audio::new(audio::Plan::default()),
+            None,
             None,
         );
         tap(&parse.static_pad("src").unwrap(), &media, "s");
@@ -1578,6 +1580,7 @@ mod tests {
             typing: Mutex::default(),
             encoder: glib::WeakRef::new(),
             trace: None,
+            rate: None,
         })
     }
 
