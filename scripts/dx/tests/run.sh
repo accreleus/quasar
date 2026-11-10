@@ -510,7 +510,7 @@ MK_BAD_TIGHT='--app=x;touch$IFS/tmp/PAYLOAD-MARKER'
 # fix, so this looks for the interpolation itself, quoted or not.
 # MAKEFILE_LIST belongs on this list: make maintains it, but a command-line
 # assignment still beats make's own, so it was settable exactly like a knob.
-MK_KNOBS='ARGS|SID|DIR|RUN|NAME|URL|ROUTES|KEY|BEFORE|AFTER|OUT|HOST|S|N|LEVEL|TARGET|KEEP|GREP|REF|IMAGE|PROFILE|CONFIRM|WINDOW|SINCE|JSON|KIND|MAKEFILE_LIST'
+MK_KNOBS='ARGS|SID|DIR|BUNDLE|RUN|NAME|URL|ROUTES|KEY|BEFORE|AFTER|OUT|HOST|S|N|LEVEL|TARGET|KEEP|GREP|REF|IMAGE|PROFILE|CONFIRM|WINDOW|SINCE|JSON|KIND|MAKEFILE_LIST'
 if grep -nE "^	.*\\\$\\(($MK_KNOBS)[,)]" "$ROOT/Makefile" > "$WORK/mk-interp.txt" 2>/dev/null; then
   fail "knob:no-interpolation" "a caller-settable variable is spliced into a recipe line: $(tr '\n' '|' < "$WORK/mk-interp.txt")"
 else
@@ -552,6 +552,7 @@ mk_dry_clean sid-session-soak  session-soak     SID="$MK_BAD_QUOTE"
 mk_dry_clean sid-display       session-display  SID="$MK_BAD_BACKTICK"
 mk_dry_clean sid-abr-ladder    abr-ladder       SID="$MK_BAD_CMDSUB"
 mk_dry_clean dir-bench-submit  bench-submit     DIR="$MK_BAD_QUOTE"
+mk_dry_clean bundle-e2e-review e2e-review       BUNDLE="$MK_BAD_QUOTE"
 mk_dry_clean run-bench-budget  bench-budget     RUN="$MK_BAD_BACKTICK"
 mk_dry_clean name-bench-base   bench-baseline   NAME="$MK_BAD_QUOTE" RUN=r1
 mk_dry_clean url-ui-audit      ui-audit         URL="$MK_BAD_QUOTE"
@@ -3057,7 +3058,7 @@ if command -v make >/dev/null 2>&1; then
   mk_missing=""
   for t in help init doctor config-check verify test test-go test-rust test-uinput test-web test-webgpu \
            test-db preflight up down restart rebuild redeploy-cp status health logs \
-           logs-follow dev-web dev-cp diagnose diagnose-bundle clean reset; do
+           logs-follow dev-web dev-cp diagnose diagnose-bundle clean reset e2e-review; do
     if ! make -C "$ROOT" -n "$t" >/dev/null 2>&1; then
       mk_missing="$mk_missing $t"
     fi
@@ -3719,6 +3720,14 @@ if command -v node >/dev/null 2>&1; then
   rc_of 0 "e2e:runner" -- node --test "$ROOT/scripts/validate/stream/run.test.mjs"
 else
   warn "e2e:bundle-format" "node not installed — SKIPPED"
+fi
+
+# The review an agent reads first (#1275): golden bytes, the same bytes twice, a
+# failing scenario, an invalid bundle, and the 150-line budget.
+if command -v node >/dev/null 2>&1; then
+  rc_of 0 "e2e:review" -- node --test "$ROOT/scripts/validate/stream/review.test.mjs"
+else
+  warn "e2e:review" "node not installed — SKIPPED"
 fi
 
 # Release publication must wait for every image its manifest names.

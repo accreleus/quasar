@@ -92,6 +92,7 @@ ephemeral test database) so parallel checkouts and agents never collide.
 | `scripts/harness/lib/harness.sh` (+ `harness-selftest.sh`) | PASS/FAIL/SKIP/report core every `run-*.sh` harness builds on |
 | `scripts/validate/stream/bundle.mjs` | Says whether a directory is a valid run bundle of the end-to-end streaming test suite ([guide](testing-e2e-suite.md)) |
 | `scripts/validate/stream/run.mjs` (`make e2e-run`) | Runs a plan of scenarios from a test client (launched or attached over CDP) with an ordinary user's sign-in, and writes a run bundle ([guide](testing-e2e-suite.md)) |
+| `scripts/validate/stream/review.mjs` (`make e2e-review BUNDLE=<dir>`) | Writes `review/summary.json` and `review/REVIEW.md` inside a run bundle: the derived result and counts, each scenario's failed and not-judged criteria as rows (passed ones on one line), the five worst one-second windows, the anomalies each rule can honestly report from `docs/session-trace/thresholds.json`, what was not recorded and why, and the evidence files for a scenario that did not pass ([guide](testing-e2e-suite.md)) |
 
 ### Where things live
 
