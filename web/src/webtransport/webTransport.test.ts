@@ -11,7 +11,8 @@ import {
 import type { InputMsg } from "../input/inputSender";
 import type { Presenter } from "./presenter";
 import { TransportError, type MediaSink, type MediaTransport, type TransportEnd } from "./transport";
-import { createWebTransportRuntime } from "../pages/app/webTransportRuntime";
+import { createWebTransportRuntime, type WebTransportRuntimeDeps } from "../pages/app/webTransportRuntime";
+import type { BenchDeps } from "../bench/benchController";
 import { mintTransportToken } from "../api/library";
 import {
   avcC,
@@ -230,7 +231,8 @@ describe("WebTransportMedia keyframe requests", () => {
     agent.replies = [[helloAck(0, avcC())]];
     let now = 1_000;
     const t = transport(agent, { now: () => now });
-    await t.connect(NO_SINK);
+    const counted: string[] = [];
+    await t.connect({ ...NO_SINK, keyframeRequested: (r) => void counted.push(r) });
     vi.useFakeTimers();
     t.requestKeyframe("loss");
     t.requestKeyframe("late");
@@ -240,6 +242,8 @@ describe("WebTransportMedia keyframe requests", () => {
     now += KEYFRAME_SPACING_MS;
     await vi.advanceTimersByTimeAsync(KEYFRAME_SPACING_MS);
     expect(agent.sent("keyframe_request").map((k) => k.reason)).toEqual(["loss", "decode_error"]);
+    // Telemetry counts what went on the wire, not what was asked.
+    expect(counted).toEqual(["loss", "decode_error"]);
   });
 });
 
@@ -294,7 +298,7 @@ describe("WebTransportMedia receiver feedback", () => {
 // ── The runtime, end to end against the fake agent ─────────────────────────
 
 describe("createWebTransportRuntime", () => {
-  function setup(opts: { draws?: boolean; noWebGpu?: boolean } = {}) {
+  function setup(opts: { draws?: boolean; noWebGpu?: boolean; deps?: Partial<WebTransportRuntimeDeps> } = {}) {
     const agent = new FakeAgent();
     agent.replies = [[helloAck(0, avcC())]];
     const decoders: FakeDecoder[] = [];
@@ -329,10 +333,119 @@ describe("createWebTransportRuntime", () => {
           },
           isConfigSupported: async (c) => ({ supported: true, config: c }),
         },
+        // No network from a unit test: the trace and the stats posts go nowhere.
+        createTracer: () => ({ start() {}, stop() {}, emitBenchWindow() {} }),
+        telemetry: { fetch: async () => new Response("{}") },
+        ...opts.deps,
       },
     });
     return { agent, decoders, presented, presenter, callbacks, rt, presenterFatal: () => presenterFatal! };
   }
+
+  it("in bench mode gives the marker reader each decoded frame before the presenter takes it, and posts its windows through the trace (#1035)", async () => {
+    const read: { width: number; closed: boolean }[] = [];
+    const windows: unknown[] = [];
+    const tracer = { start: vi.fn(), stop: vi.fn(), emitBenchWindow: (p: unknown) => void windows.push(p) };
+    class FakeBench {
+      constructor(private readonly deps: BenchDeps) {}
+      start() {}
+      // The real one flushes its last window on stop.
+      stop() {
+        this.deps.emitWindow({ n: read.length } as never);
+      }
+      handle() {
+        return { enabled: true };
+      }
+      onFrame() {
+        const src = this.deps.source!()!;
+        read.push({ width: src.width, closed: (src.image as unknown as FakeFrame).closed });
+      }
+    }
+    const { agent, presented, rt } = setup({
+      deps: {
+        isBenchModeEnabled: () => true,
+        loadBench: async () => ({ BenchController: FakeBench as never }),
+        createTracer: () => tracer,
+      },
+    });
+    rt.start();
+    await vi.waitFor(() => expect((window as unknown as Record<string, unknown>).__qBench).toEqual({ enabled: true }));
+    const pkt = { n: 0 };
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(900, 0) }, pkt));
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 1, keyframe: false, data: bytes(900, 1) }, pkt));
+    await vi.waitFor(() => expect(presented).toHaveLength(2));
+    // Read at the frame's own size while it was still open; the presenter closed it afterwards.
+    expect(read).toEqual([{ width: 1920, closed: false }, { width: 1920, closed: false }]);
+    expect(tracer.start).toHaveBeenCalledTimes(1);
+    rt.destroy();
+    expect(windows).toEqual([{ n: 2 }]);
+    expect(tracer.stop).toHaveBeenCalledTimes(1);
+    delete (window as unknown as Record<string, unknown>).__qBench;
+  });
+
+  it("keeps presenting when the bench instrument throws", async () => {
+    class BrokenBench {
+      start() {}
+      stop() {}
+      handle() {
+        return { enabled: true };
+      }
+      onFrame() {
+        throw new Error("marker decode failed");
+      }
+    }
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { agent, presented, rt } = setup({
+      deps: { isBenchModeEnabled: () => true, loadBench: async () => ({ BenchController: BrokenBench as never }) },
+    });
+    rt.start();
+    await vi.waitFor(() => expect((window as unknown as Record<string, unknown>).__qBench).toEqual({ enabled: true }));
+    const pkt = { n: 0 };
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(900, 0) }, pkt));
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 1, keyframe: false, data: bytes(900, 1) }, pkt));
+    await vi.waitFor(() => expect(presented).toHaveLength(2));
+    expect(presented.every((f) => f.closed)).toBe(true);
+    // Said once, not per frame.
+    expect(warn.mock.calls.filter((c) => c[0] === "bench:")).toHaveLength(1);
+    rt.destroy();
+    delete (window as unknown as Record<string, unknown>).__qBench;
+  });
+
+  it("opens the first telemetry window at connect, and reports a fragment it had to NACK as lost (#1035)", async () => {
+    // The telemetry's clock, so the windows are exact whatever the real timer does.
+    let now = 0;
+    const snaps: { fps: number; packetsLost: number }[] = [];
+    const { agent, presented, rt } = setup({ deps: { telemetry: { nowMs: () => now, fetch: async () => new Response("{}") } } });
+    now = 5_000; // made, then five seconds getting a presenter, a token and a connection
+    rt.registerTelemetry((s) => snaps.push(s));
+    rt.start();
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    const pkt = { n: 0 };
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(10, 0) }, pkt));
+    const one = packetize({ configId: 0, frameSeq: 1, keyframe: false, data: bytes(3000, 1) }, pkt);
+    agent.last.datagrams(one.slice(1)); // its first fragment is lost
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 2, keyframe: false, data: bytes(10, 2) }, pkt));
+    await vi.waitFor(() => expect(agent.sent("nack")).toHaveLength(1));
+    const resent = one[0].slice();
+    resent[5] |= 4;
+    agent.last.datagrams([resent]);
+    await vi.waitFor(() => expect(presented).toHaveLength(3));
+    now = 6_000;
+    await vi.waitFor(() => expect(snaps.length).toBeGreaterThan(0), { timeout: 3_000 });
+    // Three frames in the one second since the ticks started: not three over six.
+    expect(snaps[0].fps).toBeCloseTo(3, 6);
+    expect(snaps[0].packetsLost).toBe(1);
+    rt.destroy();
+  });
+
+  it("starts no bench instrument for an ordinary session", async () => {
+    const loadBench = vi.fn();
+    const { rt } = setup({ deps: { loadBench } });
+    rt.start();
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    expect(loadBench).not.toHaveBeenCalled();
+    rt.destroy();
+  });
 
   it("connects with the contract's hello, decodes reassembled frames and presents each one", async () => {
     const { agent, decoders, presented, rt } = setup();
