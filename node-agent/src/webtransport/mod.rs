@@ -301,7 +301,8 @@ pub(crate) struct Tap {
     registry: Arc<Registry>,
     session_id: String,
     /// The PyroWave encoder of a granted session; dropped after the session is ended here.
-    pyrowave: Option<crate::session::pipeline::pyrowave_branch::Encoder>,
+    /// Behind a lock so `release` can stop it through `&self`, ahead of the source teardown.
+    pyrowave: Mutex<Option<crate::session::pipeline::pyrowave_branch::Encoder>>,
     media: Arc<Media>,
 }
 
@@ -338,7 +339,7 @@ impl Tap {
         Some(Self {
             registry: registry.clone(),
             session_id: session_id.to_string(),
-            pyrowave,
+            pyrowave: Mutex::new(pyrowave),
             media,
         })
     }
@@ -413,10 +414,24 @@ fn pyrowave_branch(
     }
 }
 
+impl Tap {
+    /// Stops the PyroWave encoder now (idempotent; a no-op without one). It shares the GPU
+    /// queue and a compositor ring frame with the source, so a session stop calls this before
+    /// the source teardown (`Transport::release`, #535, #1228).
+    pub(crate) fn release(&self) {
+        let encoder = self
+            .pyrowave
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        drop(encoder);
+    }
+}
+
 impl Drop for Tap {
     fn drop(&mut self) {
         self.registry.end(&self.session_id);
-        self.pyrowave.take();
+        self.release();
     }
 }
 

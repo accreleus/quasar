@@ -1581,6 +1581,9 @@ impl pipeline::Transport for SessionTransports {
 
     fn release(&self) {
         self.video.release();
+        if let Some(tap) = &self.webtransport {
+            tap.release();
+        }
         if let Some(audio) = &self.audio_webrtc {
             let _ = audio.set_state(gst::State::Null);
         }

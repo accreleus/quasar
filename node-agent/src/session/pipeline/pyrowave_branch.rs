@@ -328,7 +328,7 @@ fn pipeline_of(pad: &gst::Pad) -> Option<gst::Element> {
     Some(element)
 }
 
-fn start_with(
+pub(crate) fn start_with(
     feed: Feed,
     download: Option<gst::Element>,
     enc: &gst::Element,

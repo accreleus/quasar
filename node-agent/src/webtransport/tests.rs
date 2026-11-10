@@ -2874,3 +2874,83 @@ async fn a_pyrowave_client_gets_frames_that_rejoin_byte_for_byte_and_can_fall_ba
     );
     assert_eq!(nal_types(&first.data).last(), Some(&5));
 }
+
+/// #1228: a session stop releases the tap's PyroWave encoder before the source goes (it shares
+/// the GPU queue and a compositor ring frame), while the tap itself lives on until the
+/// transports drop. A second release, and one with no encoder, are no-ops.
+#[test]
+fn releasing_the_tap_stops_its_pyrowave_encoder_and_keeps_the_tap() {
+    use crate::session::pipeline::pyrowave_branch::{feed_at, start_with};
+    gst::init().unwrap();
+    let registry = Arc::new(Registry::default());
+    registry.assign(SESSION, &token_hash(TOKEN), SystemTime::now() + TOKEN_TTL);
+    let pipeline = synthetic(Stream::Av1);
+    let tap = Tap::attach(
+        &registry,
+        &pipeline
+            .by_name("parse")
+            .unwrap()
+            .static_pad("src")
+            .unwrap(),
+        &pipeline.by_name("enc").unwrap(),
+        SESSION,
+        None,
+        no_input(),
+        audio::Plan::default(),
+        None,
+    )
+    .unwrap();
+    tap.release(); // no encoder yet: nothing to do
+
+    // A live encode pipeline for the PyroWave feed, as the runner's has.
+    let raw = gst::Caps::builder("video/x-raw")
+        .field("format", "NV12")
+        .field("width", 64)
+        .field("height", 48)
+        .field("framerate", gst::Fraction::new(60, 1))
+        .build();
+    let main = gst::parse::launch(
+        "videotestsrc is-live=true name=src ! capsfilter name=caps ! queue name=q ! fakesink sync=false",
+    )
+    .unwrap()
+    .downcast::<gst::Pipeline>()
+    .unwrap();
+    main.by_name("caps").unwrap().set_property("caps", &raw);
+    let feed = feed_at(main.by_name("q").unwrap().static_pad("src").unwrap(), &raw).unwrap();
+    let encoder = start_with(
+        feed,
+        None,
+        &gst::ElementFactory::make("identity").build().unwrap(),
+        || true,
+        |_| {},
+        |_| {},
+    )
+    .unwrap();
+    let side = encoder.pipeline.clone();
+    *tap.pyrowave.lock().unwrap() = Some(encoder);
+    main.set_state(gst::State::Playing).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while side.current_state() != gst::State::Playing {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the PyroWave pipeline never started"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    tap.release();
+    assert_eq!(
+        side.current_state(),
+        gst::State::Null,
+        "the encoder was stopped"
+    );
+    assert!(tap.pyrowave.lock().unwrap().is_none(), "and dropped");
+    assert!(
+        registry.lock().contains_key(SESSION),
+        "the tap itself is still alive"
+    );
+    tap.release();
+
+    let _ = main.set_state(gst::State::Null);
+    let _ = pipeline.set_state(gst::State::Null);
+}
