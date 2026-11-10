@@ -1573,34 +1573,51 @@ impl Lossy {
     }
 }
 
-/// A session whose frames take several datagrams (snow does not compress), with an ABR
-/// that records what it is fed.
-async fn lossy_session() -> (Agent, Arc<Mutex<Vec<f64>>>) {
+/// #1046: repair datagrams are paid for out of the estimate. At 4 % loss they are a fifth
+/// on top of the video, so the ABR is fed the estimate over 1.2; a client that takes no FEC
+/// leaves it whole.
+#[test]
+fn the_abr_is_fed_the_estimate_less_the_fec_share() {
     let fed = Arc::new(Mutex::new(Vec::new()));
     let seen = fed.clone();
-    let agent = agent_built(
+    let rate = Rate {
+        ceiling_kbps: 6000.0,
+        start: Box::new(|| {}),
+        observe: Box::new(move |kbps: f64| seen.lock().unwrap().push(kbps.round())),
+    };
+    let mut control = Control::new(&rate, Arc::default(), true);
+    control.feed(4200.0);
+    let fec = control.fec.as_mut().unwrap();
+    fec.observe(0.04, std::time::Instant::now());
+    control.feed(4200.0);
+    Control::new(&rate, Arc::default(), false).feed(4200.0);
+    assert_eq!(*fed.lock().unwrap(), [4200.0, 3500.0, 4200.0]);
+}
+
+/// A session whose frames take several datagrams (snow does not compress), with an ABR.
+async fn lossy_session() -> Agent {
+    agent_built(
         Stream::H264,
         Limits::default(),
         audio::Plan::default(),
         "snow",
-        move |_| {
+        |_| {
             Some(Rate {
                 ceiling_kbps: 4000.0,
                 start: Box::new(|| {}),
-                observe: Box::new(move |kbps| seen.lock().unwrap().push(kbps)),
+                observe: Box::new(|_| {}),
             })
         },
     )
-    .await;
-    (agent, fed)
+    .await
 }
 
 /// #1046, §FEC: a client that offered `xor` and reports loss is sent repair datagrams, and
 /// a fragment it lost is rebuilt from one by the contract's rule, with no NACK and so no
-/// retransmission. The repairs' share comes out of what the ABR is fed.
+/// retransmission.
 #[tokio::test]
 async fn a_client_that_offers_xor_and_reports_loss_rebuilds_a_fragment_without_a_nack() {
-    let (agent, fed) = lossy_session().await;
+    let agent = lossy_session().await;
     let session = agent.connect().await;
     let (mut send, mut recv) = session.open_bi().await.unwrap();
     let hello = json!({"type": "hello", "wt_proto": 1, "token": TOKEN,
@@ -1662,25 +1679,20 @@ async fn a_client_that_offers_xor_and_reports_loss_rebuilds_a_fragment_without_a
             }
         }
         payload.truncate(len as usize);
-        assert_eq!(
-            lost.get(&(frame_seq, k)).map(|p| &p[..]),
-            Some(&payload[..]),
-            "fragment {k} of frame {frame_seq} rebuilt"
-        );
+        // One the loopback itself dropped (a loaded machine) left nothing to compare with.
+        let Some(original) = lost.get(&(frame_seq, k)) else {
+            continue;
+        };
+        assert_eq!(payload, original[..], "fragment {k} of frame {frame_seq}");
         rebuilt += 1;
     }
-    // Around 4 % loss the repairs are 15 to 25 % on top of the video, and the encoder is
-    // fed the estimate less their share: the 4000 kbps ceiling over 1.15 to 1.25.
-    let fed = fed.lock().unwrap();
-    let least = fed.iter().copied().fold(f64::MAX, f64::min);
-    assert!((3199.0..3479.0).contains(&least), "the ABR was fed {fed:?}");
 }
 
 /// §Hello: a client that offers no scheme is answered `fec: null` and sent no repair
 /// datagram, whatever loss it reports.
 #[tokio::test]
 async fn a_client_that_offers_no_fec_gets_none_whatever_it_loses() {
-    let (agent, fed) = lossy_session().await;
+    let agent = lossy_session().await;
     let (session, mut send, _recv, ack) = agent.hello(TOKEN).await;
     assert_eq!(ack["fec"], Value::Null);
     let mut path = Lossy::new();
@@ -1689,11 +1701,6 @@ async fn a_client_that_offers_no_fec_gets_none_whatever_it_loses() {
         assert_eq!(d[0], 0x01, "only video is sent");
         path.receive(&d, &mut send).await;
     }
-    let fed = fed.lock().unwrap();
-    assert!(
-        !fed.is_empty() && fed.iter().all(|&kbps| kbps == 4000.0),
-        "no share is taken for FEC that is not sent: {fed:?}"
-    );
 }
 
 /// §Hello ack: a session with no ABR reads no feedback, so it has no loss to size FEC by

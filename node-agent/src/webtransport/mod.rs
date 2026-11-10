@@ -1387,6 +1387,9 @@ async fn stream(
                         sent.keep(unit.frame_seq, &datagrams, now, retransmit_window(session));
                         // A PyroWave frame gets none: no loss is measured while it is active
                         // (§Feedback), so there is nothing to size its repairs by.
+                        // shortcut: repairs follow the whole frame, so past 48 fragments they can
+                        // arrive after the client's NACK hold; send them per block if keyframe
+                        // loss shows in the bench.
                         if let Some(fec) = control.as_mut().and_then(|c| c.fec.as_mut()) {
                             let repairs = fec.protect(&datagrams, &mut pkt_seq);
                             datagrams.extend(repairs);
