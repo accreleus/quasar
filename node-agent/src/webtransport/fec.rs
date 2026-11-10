@@ -129,13 +129,19 @@ impl Policy {
     }
 
     /// The repair datagrams for one frame's video datagrams (in `frag_index` order),
-    /// numbered from `*pkt_seq`: sent after them, never retransmitted.
-    pub(crate) fn protect(&mut self, fragments: &[Bytes], pkt_seq: &mut u32) -> Vec<Bytes> {
+    /// numbered from `*pkt_seq`: sent after them, never retransmitted. `overhead` is what
+    /// the caller charged the ABR, which is under [`Self::overhead`] near the ABR's floor.
+    pub(crate) fn protect(
+        &mut self,
+        fragments: &[Bytes],
+        overhead: f64,
+        pkt_seq: &mut u32,
+    ) -> Vec<Bytes> {
         let lens: Vec<usize> = fragments
             .iter()
             .map(|d| d.len().saturating_sub(VIDEO_HEADER))
             .collect();
-        layout(&lens, self.overhead(), &mut self.carry)
+        layout(&lens, overhead, &mut self.carry)
             .into_iter()
             .map(|group| {
                 let d = repair(group, fragments, *pkt_seq);
@@ -209,7 +215,7 @@ mod tests {
                         ..Policy::default()
                     };
                     let mut pkt_seq = 900;
-                    let repairs = policy.protect(&fragments, &mut pkt_seq);
+                    let repairs = policy.protect(&fragments, policy.overhead(), &mut pkt_seq);
                     assert_eq!(pkt_seq, 900 + repairs.len() as u32, "one pkt_seq each");
                     let mut covered = vec![0; n];
                     for (i, r) in repairs.iter().enumerate() {
@@ -279,7 +285,7 @@ mod tests {
             {
                 let fragments = frame(i as u16, n, 1123, 200);
                 video += fragments.iter().map(Bytes::len).sum::<usize>();
-                let repairs = policy.protect(&fragments, &mut pkt_seq);
+                let repairs = policy.protect(&fragments, policy.overhead(), &mut pkt_seq);
                 assert!(n > 1 || repairs.is_empty(), "one fragment has no group");
                 fec += repairs.iter().map(Bytes::len).sum::<usize>();
             }
@@ -291,7 +297,9 @@ mod tests {
             );
         }
         let mut off = Policy::default();
-        assert!(off.protect(&frame(0, 40, 1123, 200), &mut 0).is_empty());
+        assert!(off
+            .protect(&frame(0, 40, 1123, 200), 0.0, &mut 0)
+            .is_empty());
     }
 
     #[test]

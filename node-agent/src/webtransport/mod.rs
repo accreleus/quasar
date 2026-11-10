@@ -104,6 +104,11 @@ impl Input {
 pub(crate) struct Rate {
     /// The estimate never goes above this: the ABR's ceiling.
     pub(crate) ceiling_kbps: f64,
+    /// The floor the ABR's setpoint is clamped to now; it moves with the ladder's rung.
+    pub(crate) floor_kbps: Box<dyn Fn() -> f64 + Send + Sync>,
+    /// False with the ABR off: the estimate is tracked and never written to the encoder,
+    /// so nothing would pay for FEC.
+    pub(crate) retargets: bool,
     /// A client's first estimate: its loop takes the encoder over (one writer per encoder).
     pub(crate) start: Box<dyn Fn() + Send + Sync>,
     pub(crate) observe: Box<dyn Fn(f64) + Send + Sync>,
@@ -122,6 +127,8 @@ struct Control<'a> {
     gone: Arc<OnceLock<Gone>>,
     /// §FEC: `Some` when `hello_ack.fec` named `xor`.
     fec: Option<fec::Policy>,
+    /// The FEC overhead the ABR was last charged for, which is all the repairs may spend.
+    charged: f64,
 }
 
 impl<'a> Control<'a> {
@@ -135,6 +142,7 @@ impl<'a> Control<'a> {
             refused: 0,
             gone,
             fec: fec.then(fec::Policy::default),
+            charged: 0.0,
         }
     }
 
@@ -199,9 +207,27 @@ impl<'a> Control<'a> {
             (self.rate.start)();
         }
         // The estimate is for everything sent: repair datagrams take their share of it
-        // here, so video plus FEC stays inside it.
-        let overhead = self.fec.as_ref().map_or(0.0, fec::Policy::overhead);
-        (self.rate.observe)(kbps / (1.0 + overhead));
+        // here, so video plus FEC stays inside it. The ABR never goes under its floor, so
+        // the share is at most what the estimate leaves above that.
+        self.charged = self.fec.as_ref().map_or(0.0, |fec| {
+            let room = (kbps / (self.rate.floor_kbps)() - 1.0).max(0.0);
+            fec.overhead().min(room)
+        });
+        (self.rate.observe)(kbps / (1.0 + self.charged));
+    }
+
+    /// The repair datagrams that follow one frame's video datagrams. A PyroWave frame gets
+    /// none: no loss is measured while it is active (§Feedback), so nothing sizes them.
+    fn protect(
+        &mut self,
+        pyrowave: bool,
+        fragments: &[bytes::Bytes],
+        pkt_seq: &mut u32,
+    ) -> Vec<bytes::Bytes> {
+        match self.fec.as_mut().filter(|_| !pyrowave) {
+            Some(fec) => fec.protect(fragments, self.charged, pkt_seq),
+            None => Vec::new(),
+        }
     }
 }
 
@@ -275,9 +301,18 @@ struct Hello {
     /// Amendment 55: this connection can decode PyroWave.
     #[serde(default)]
     pyrowave: bool,
-    /// The FEC schemes the client decodes (§Hello).
+    /// The FEC schemes the client decodes (§Hello). Anything but a list names none: FEC is
+    /// optional, so a malformed offer costs the client its repairs, not its session.
     #[serde(default)]
-    fec: Vec<String>,
+    fec: Value,
+}
+
+impl Hello {
+    fn decodes(&self, scheme: &str) -> bool {
+        self.fec
+            .as_array()
+            .is_some_and(|schemes| schemes.iter().any(|s| s == scheme))
+    }
 }
 
 fn token_hash(token: &str) -> String {
@@ -1261,8 +1296,9 @@ async fn authenticate(
             return;
         }
     };
-    // §FEC: the amount follows the loss in feedback, which only a session with an ABR reads.
-    let fec = media.rate().is_some() && hello.fec.iter().any(|scheme| scheme == "xor");
+    // §FEC: repairs are paid for by lowering the encoder's rate, so only an ABR that
+    // writes it sends them.
+    let fec = media.rate().is_some_and(|rate| rate.retargets) && hello.decodes("xor");
     tracing::info!(
         token = "webtransport-client-connected",
         session_id = %hello.session_id,
@@ -1385,15 +1421,13 @@ async fn stream(
                         pyrowave_frames.remember(unit.frame_seq);
                     } else {
                         sent.keep(unit.frame_seq, &datagrams, now, retransmit_window(session));
-                        // A PyroWave frame gets none: no loss is measured while it is active
-                        // (§Feedback), so there is nothing to size its repairs by.
-                        // shortcut: repairs follow the whole frame, so past 48 fragments they can
-                        // arrive after the client's NACK hold; send them per block if keyframe
-                        // loss shows in the bench.
-                        if let Some(fec) = control.as_mut().and_then(|c| c.fec.as_mut()) {
-                            let repairs = fec.protect(&datagrams, &mut pkt_seq);
-                            datagrams.extend(repairs);
-                        }
+                    }
+                    // shortcut: repairs follow the whole frame, so past 48 fragments they can
+                    // arrive after the client's NACK hold; send them per block if keyframe
+                    // loss shows in the bench.
+                    if let Some(control) = control.as_mut() {
+                        let repairs = control.protect(unit.pyrowave, &datagrams, &mut pkt_seq);
+                        datagrams.extend(repairs);
                     }
                     // shortcut: a PyroWave frame (~380 datagrams at 1080p/200) goes as one burst;
                     // §Rate's SHOULD pace over half a frame interval is B09 (#1058).

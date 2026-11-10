@@ -26,7 +26,7 @@ fn hello_for(session_id: &str, token: &str, wt_proto: u32) -> Hello {
         token: token.into(),
         session_id: session_id.into(),
         pyrowave: false,
-        fec: Vec::new(),
+        fec: Value::Null,
     }
 }
 
@@ -707,10 +707,21 @@ impl Agent {
 
     /// Connect, open the control stream and send `hello`; the first reply.
     async fn hello(&self, token: &str) -> (Session, SendStream, RecvStream, Value) {
+        self.hello_with(token, json!({"fec": []})).await
+    }
+
+    /// A `hello` with `extra`'s fields beside the required ones.
+    async fn hello_with(
+        &self,
+        token: &str,
+        extra: Value,
+    ) -> (Session, SendStream, RecvStream, Value) {
         let session = self.connect().await;
         let (mut send, mut recv) = session.open_bi().await.unwrap();
-        let hello = json!({"type": "hello", "wt_proto": 1, "token": token,
-                           "session_id": SESSION, "client": "browser", "fec": []});
+        let mut hello = json!({"type": "hello", "wt_proto": 1, "token": token,
+                               "session_id": SESSION, "client": "browser"});
+        let extra = extra.as_object().unwrap().clone();
+        hello.as_object_mut().unwrap().extend(extra);
         write_message(&mut send, &hello).await.unwrap();
         let reply = read_message(&mut recv).await.unwrap();
         (session, send, recv, reply)
@@ -1388,6 +1399,8 @@ async fn feedback_while_pyrowave_is_active_feeds_no_estimate() {
         move |_| {
             Some(Rate {
                 ceiling_kbps: 4000.0,
+                floor_kbps: Box::new(|| 500.0),
+                retargets: true,
                 start: Box::new(|| {}),
                 observe: Box::new(move |_| {
                     count.fetch_add(1, Ordering::SeqCst);
@@ -1479,6 +1492,8 @@ async fn audio_alone_never_moves_the_video_estimate() {
     let mut agent = agent_built(Stream::H264, Limits::default(), plan, "ball", move |_| {
         Some(Rate {
             ceiling_kbps: 4000.0,
+            floor_kbps: Box::new(|| 500.0),
+            retargets: true,
             start: Box::new(|| {}),
             observe: Box::new(move |kbps| seen.lock().unwrap().push(kbps)),
         })
@@ -1525,6 +1540,8 @@ fn a_client_that_is_gone_neither_starts_nor_feeds_the_abr() {
     let (started, fed) = (calls.clone(), calls.clone());
     let rate = Rate {
         ceiling_kbps: 4000.0,
+        floor_kbps: Box::new(|| 500.0),
+        retargets: true,
         start: Box::new(move || {
             started.fetch_add(1, SeqCst);
         }),
@@ -1582,6 +1599,8 @@ fn the_abr_is_fed_the_estimate_less_the_fec_share() {
     let seen = fed.clone();
     let rate = Rate {
         ceiling_kbps: 6000.0,
+        floor_kbps: Box::new(|| 500.0),
+        retargets: true,
         start: Box::new(|| {}),
         observe: Box::new(move |kbps: f64| seen.lock().unwrap().push(kbps.round())),
     };
@@ -1594,16 +1613,19 @@ fn the_abr_is_fed_the_estimate_less_the_fec_share() {
     assert_eq!(*fed.lock().unwrap(), [4200.0, 3500.0, 4200.0]);
 }
 
-/// A session whose frames take several datagrams (snow does not compress), with an ABR.
-async fn lossy_session() -> Agent {
+/// A session whose frames take several datagrams (snow does not compress), with an ABR
+/// that writes the encoder (`retargets`) or only tracks the estimate.
+async fn lossy_session(retargets: bool) -> Agent {
     agent_built(
         Stream::H264,
         Limits::default(),
         audio::Plan::default(),
         "snow",
-        |_| {
+        move |_| {
             Some(Rate {
                 ceiling_kbps: 4000.0,
+                floor_kbps: Box::new(|| 500.0),
+                retargets,
                 start: Box::new(|| {}),
                 observe: Box::new(|_| {}),
             })
@@ -1617,7 +1639,7 @@ async fn lossy_session() -> Agent {
 /// retransmission.
 #[tokio::test]
 async fn a_client_that_offers_xor_and_reports_loss_rebuilds_a_fragment_without_a_nack() {
-    let agent = lossy_session().await;
+    let agent = lossy_session(true).await;
     let session = agent.connect().await;
     let (mut send, mut recv) = session.open_bi().await.unwrap();
     let hello = json!({"type": "hello", "wt_proto": 1, "token": TOKEN,
@@ -1692,7 +1714,7 @@ async fn a_client_that_offers_xor_and_reports_loss_rebuilds_a_fragment_without_a
 /// datagram, whatever loss it reports.
 #[tokio::test]
 async fn a_client_that_offers_no_fec_gets_none_whatever_it_loses() {
-    let agent = lossy_session().await;
+    let agent = lossy_session(true).await;
     let (session, mut send, _recv, ack) = agent.hello(TOKEN).await;
     assert_eq!(ack["fec"], Value::Null);
     let mut path = Lossy::new();
@@ -1714,6 +1736,140 @@ async fn a_session_without_an_abr_names_no_fec_scheme() {
                        "session_id": SESSION, "client": "browser", "fec": ["xor"]});
     write_message(&mut send, &hello).await.unwrap();
     assert_eq!(read_message(&mut recv).await.unwrap()["fec"], Value::Null);
+}
+
+/// `QUASAR_ABR_MODE=off` still tracks the estimate and never writes it to the encoder, so
+/// nothing would pay for repairs: such a session names no scheme and sends none.
+#[tokio::test]
+async fn a_session_whose_abr_does_not_retarget_gets_no_fec_whatever_it_loses() {
+    let agent = lossy_session(false).await;
+    let (session, mut send, _recv, ack) = agent.hello_with(TOKEN, json!({"fec": ["xor"]})).await;
+    assert_eq!(ack["fec"], Value::Null);
+    let mut path = Lossy::new();
+    for _ in 0..800 {
+        let d = datagram(&session).await.3;
+        assert_eq!(d[0], 0x01, "only video is sent");
+        path.receive(&d, &mut send).await;
+    }
+}
+
+/// §Hello: `fec` is a list. No list, an empty one or one of schemes this agent does not
+/// know is a client that takes no FEC, never a refused hello.
+#[tokio::test]
+async fn a_hello_that_names_no_known_fec_scheme_is_served_without_fec() {
+    for offer in [
+        json!({}),
+        json!({ "fec": null }),
+        json!({"fec": []}),
+        json!({"fec": ["fec2"]}),
+        json!({"fec": "xor"}),
+    ] {
+        let agent = lossy_session(true).await;
+        let (session, _send, _recv, ack) = agent.hello_with(TOKEN, offer.clone()).await;
+        assert_eq!(ack["type"], "hello_ack", "{offer}");
+        assert_eq!(ack["fec"], Value::Null, "{offer}");
+        assert_eq!(datagram(&session).await.3[0], 0x01, "{offer}: video flows");
+    }
+}
+
+/// 40 full video datagrams: 25 % of them pays for ten repairs, 4 % for one.
+fn forty_fragments() -> Vec<Bytes> {
+    vec![Bytes::from(vec![1; media::MAX_DATAGRAM]); 40]
+}
+
+/// #1046: the ABR's setpoint never goes under its floor, so repairs may spend only what the
+/// estimate leaves above it; under that, video alone already fills the path.
+#[test]
+fn repairs_spend_only_what_the_estimate_leaves_above_the_abr_floor() {
+    let fed = Arc::new(Mutex::new(Vec::new()));
+    let seen = fed.clone();
+    let rate = Rate {
+        ceiling_kbps: 6000.0,
+        floor_kbps: Box::new(|| 2500.0),
+        retargets: true,
+        start: Box::new(|| {}),
+        observe: Box::new(move |kbps: f64| seen.lock().unwrap().push(kbps.round())),
+    };
+    let mut control = Control::new(&rate, Arc::default(), true);
+    let fec = control.fec.as_mut().unwrap();
+    fec.observe(0.05, std::time::Instant::now());
+    assert_eq!(fec.overhead(), 0.25);
+    let frame = forty_fragments();
+    let mut repairs = |estimate_kbps| {
+        control.feed(estimate_kbps);
+        control.protect(false, &frame, &mut 0).len()
+    };
+    assert_eq!(repairs(2000.0), 0, "under the floor");
+    assert_eq!(repairs(2500.0), 0, "at the floor");
+    assert_eq!(repairs(2600.0), 1, "4 % above the floor");
+    assert_eq!(repairs(5000.0), 10, "room for all 25 %");
+    assert_eq!(*fed.lock().unwrap(), [2000.0, 2500.0, 2500.0, 4000.0]);
+}
+
+/// A PyroWave frame gets no repair even at a level an earlier loss left.
+#[test]
+fn a_pyrowave_frame_gets_no_repair_at_any_overhead() {
+    let rate = Rate {
+        ceiling_kbps: 6000.0,
+        floor_kbps: Box::new(|| 500.0),
+        retargets: true,
+        start: Box::new(|| {}),
+        observe: Box::new(|_| {}),
+    };
+    let mut control = Control::new(&rate, Arc::default(), true);
+    let fec = control.fec.as_mut().unwrap();
+    fec.observe(0.05, std::time::Instant::now());
+    control.feed(6000.0);
+    let frame = forty_fragments();
+    assert_eq!(control.protect(false, &frame, &mut 0).len(), 10);
+    assert!(control.protect(true, &frame, &mut 0).is_empty());
+}
+
+/// codec-pyrowave.md §Loss, §Feedback: a client that offered `xor` and is sent PyroWave
+/// frames gets no repair datagram, whatever loss it reports. `hello_ack.fec` still names
+/// the scheme: the connection may fall back to the standard codec.
+#[tokio::test]
+async fn a_pyrowave_client_that_offers_xor_is_sent_no_repair_whatever_it_loses() {
+    let agent = lossy_session(true).await;
+    let media = agent.listener.registry().lock()[SESSION]
+        .media
+        .clone()
+        .unwrap();
+    media.grant_pyrowave(
+        PyroWaveGrant {
+            wanted: true,
+            target_kbps: 200_000,
+            floor_kbps: 100_000,
+            max_rtt_ms: 1_000,
+        },
+        (320, 192, 60),
+        true,
+    );
+    let raw = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../testdata/pyrowave/detail_320x192_xhi.pwv1"
+    ))
+    .unwrap();
+    let offer = json!({"pyrowave": true, "fec": ["xor"]});
+    let (session, mut send, _recv, ack) = agent.hello_with(TOKEN, offer).await;
+    assert_eq!(ack["video"]["codec"], "pyrowave");
+    assert_eq!(ack["fec"], "xor");
+
+    // A second of frames: twice the window the estimator measures loss over.
+    let mut path = Lossy::new();
+    let mut video = 0;
+    for _ in 0..60 {
+        media.on_pyrowave_frame(&gst::Buffer::from_slice(raw[28..].to_vec()));
+        while let Ok(d) =
+            tokio::time::timeout(Duration::from_millis(16), session.read_datagram()).await
+        {
+            let d = d.unwrap();
+            assert_eq!(d[0], 0x01, "only video is sent");
+            video += 1;
+            path.receive(&d, &mut send).await;
+        }
+    }
+    assert!(video > 1000, "the frames arrived ({video} datagrams)");
 }
 
 #[tokio::test]
