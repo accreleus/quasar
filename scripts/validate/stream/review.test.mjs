@@ -7,7 +7,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { validateBundle } from "./bundle.mjs";
-import { review } from "./review.mjs";
+import { review, renderReview } from "./review.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "../../..");
@@ -320,6 +320,17 @@ test("an anomaly fires at its limit, over distinct timestamps, after warm-up", (
   // Under the limit by a decimal: nothing crosses it.
   metrics(dir, [browser(21000, { present_interval_sd_ms: 17.9 }), browser(22000, { present_interval_sd_ms: 17.9 })]);
   assert.equal(review(dir, { thresholdsFile: thresholds }).scenarios[0].anomalies.rows.length, 0);
+
+  // Nothing was checked is not "no threshold crossed".
+  metrics(dir, []);
+  const unchecked = review(dir, { thresholdsFile: thresholds });
+  assert.equal(unchecked.scenarios[0].anomalies.state, "unchecked");
+  assert.match(renderReview(unchecked), /^Not checked: the bundle records no browser samples\.$/m);
+  assert.doesNotMatch(renderReview(unchecked), /No threshold crossed/);
+  assert.match(
+    renderReview(review(dir, { thresholdsFile: path.join(TMP, "missing.json") })),
+    /^Not checked: no thresholds file was read\.$/m,
+  );
 });
 
 test("samples no human could judge are not ranked, and the two files agree", () => {
