@@ -162,19 +162,20 @@ function check(dir, errors, { keys = manifestKeys() } = {}) {
     if (["skipped", "error"].includes(sc.status) && !sc.reason) err(at, `status ${sc.status} needs a reason`);
     if (!("clock_offset_ms" in sc)) err(at, "no clock_offset_ms (null when the offset was not measured)");
     if (!Array.isArray(sc.criteria)) err(at, "no criteria");
-    // Criterion ids name the rows of the review's table: a repeat makes two rows one fact,
-    // so an id is a non-empty string and uniqueness is by that string. A numeric id and a
-    // string one that print the same would otherwise be two rows nobody can tell apart.
+    // Criterion ids name the rows of the review's table: two ids a reader cannot tell
+    // apart make two rows one fact. So an id is an identifier, not text: ASCII letters,
+    // digits, "_", "." and "-", which leaves nothing that prints like something else
+    // (a number beside its string, a composed letter beside a decomposed one, a
+    // character that does not print at all).
     const ids = new Set();
     for (const c of Array.isArray(sc.criteria) ? sc.criteria : []) {
       if (c?.id === undefined) continue; // reported below as a criterion with no id
-      if (typeof c.id !== "string" || c.id === "") {
-        err(at, `criterion id ${JSON.stringify(c.id)} must be a non-empty string`);
+      if (typeof c.id !== "string" || !/^[A-Za-z0-9_.-]{1,64}$/.test(c.id)) {
+        err(at, `criterion id ${JSON.stringify(c.id).slice(0, 80)} must be an identifier (letters, digits, _ . -, at most 64)`);
         continue;
       }
-      const key = c.id.normalize("NFC"); // "é" composed and decomposed print the same
-      if (ids.has(key)) err(at, `criterion id ${c.id} is not unique`);
-      ids.add(key);
+      if (ids.has(c.id)) err(at, `criterion id ${c.id} is not unique`);
+      ids.add(c.id);
     }
     // The review derives a scenario's verdict from its status and its criteria; a pass
     // with a failed criterion is the two disagreeing, so it is not a bundle.

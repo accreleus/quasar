@@ -191,7 +191,6 @@ test("bundle text cannot add a line to the page", () => {
     ["a scenario name", (d, v) => scenario(d, (s) => ({ ...s, scenario: v }))],
     ["a scenario id", (d, v) => scenario(d, ({ scenario, ...s }) => ({ ...s, id: v }))],
     ["a scenario reason", (d, v) => scenario(d, (s) => ({ ...s, status: "fail", reason: v }))],
-    ["a criterion id", (d, v) => scenario(d, (s) => ({ ...s, criteria: [{ id: v, pass: true, observed: 1, expected: "1" }] }))],
     ["an observed value", (d, v) => scenario(d, (s) => ({ ...s, criteria: [{ id: "c", pass: true, observed: v, expected: "1" }] }))],
     ["an expected value", (d, v) => scenario(d, (s) => ({ ...s, criteria: [{ id: "c", pass: true, observed: 1, expected: v }] }))],
     ["a param key", (d, v) => scenario(d, (s) => ({ ...s, params: { ...s.params, [v]: "x" } }))],
@@ -212,6 +211,16 @@ test("bundle text cannot add a line to the page", () => {
       structure(read(harmless, "REVIEW.md")),
       `${label} added structure to the page`,
     );
+  }
+  // A criterion id is an identifier, so the same text there is not a bundle either; nor is
+  // an id that only LOOKS like another (a character that does not print).
+  for (const id of [PAYLOAD, "a\u200db"]) {
+    const forgedId = bundle();
+    scenario(forgedId, (s) => ({ ...s, status: "fail", reason: "x", criteria: [{ id, pass: false, observed: 0, expected: "1" }, { id: "ab", pass: true, observed: 1, expected: "1" }] }));
+    const refused = run(forgedId);
+    assert.equal(refused.status, 2);
+    assert.match(refused.stderr, /criterion id .* must be an identifier/);
+    assert.equal(fs.existsSync(path.join(forgedId, "review", "REVIEW.md")), false);
   }
   // The same text in a scenario *directory* name is not a bundle at all.
   const dir = bundle();
