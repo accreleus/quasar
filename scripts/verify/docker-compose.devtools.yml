@@ -1,7 +1,8 @@
 name: quasar-devtools
 
-services:
-  devtools:
+# What a devtools container is, whichever network it runs on.
+x-services:
+  devtools: &devtools
     build:
       context: ../..
       dockerfile: scripts/verify/Dockerfile.devtools
@@ -48,6 +49,11 @@ services:
       - quasar-cargo-target:/cache/cargo-target
       - quasar-npm-cache:/cache/npm
       - quasar-web-node-modules:/workspace/web/node_modules
+
+services:
+  # With Postgres beside it: `verify.sh db` and `full`.
+  devtools:
+    <<: *devtools
     depends_on:
       postgres:
         condition: service_healthy
@@ -55,6 +61,15 @@ services:
     networks:
       - default
       - test
+
+  # Every stage that needs no Postgres (`make test-go`, `test-rust`, `test-web`, ...), on
+  # Docker's own bridge so it creates no network. `compose run --rm` removes the container
+  # but never the project's networks, and the project is per worktree: on `devtools`
+  # each worktree that ran one gate left two networks behind, until the daemon's address
+  # pools were full (about 15 worktrees) and no network could be created at all (#1266).
+  devtools-solo:
+    <<: *devtools
+    network_mode: bridge
 
   postgres:
     image: postgres:16.4-alpine
