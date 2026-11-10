@@ -642,10 +642,10 @@ test("the evidence list reads timeline, then text, then pictures, and is not fil
     reason: "no frame",
     criteria: [...s.criteria, { id: "x", pass: false, observed: 0, expected: 1 }],
   }));
-  // A hold long enough for 18 shots, all created before any log — and with names whose
+  // A hold long enough for 20 shots, all created before any log — and with names whose
   // code-unit order is the reverse of a locale's ("Z" sorts after "z" only by locale).
   fs.mkdirSync(path.join(dir, SC, "shots"));
-  for (let i = 0; i < 18; i += 1) fs.writeFileSync(path.join(dir, SC, "shots", `t${i}s.png`), "");
+  for (let i = 0; i < 20; i += 1) fs.writeFileSync(path.join(dir, SC, "shots", `t${i}s.png`), "");
   fs.writeFileSync(path.join(dir, SC, "z.log"), "");
   fs.writeFileSync(path.join(dir, SC, "Z.log"), "");
   fs.writeFileSync(path.join(dir, SC, "console.log"), "");
@@ -671,7 +671,7 @@ test("the evidence list reads timeline, then text, then pictures, and is not fil
     ],
     "timeline first, then text by code unit, then pictures by code unit",
   );
-  assert.match(files, /\(\+12 more\)$/);
+  assert.match(files, /\(\+14 more\)$/);
 });
 
 test("200 000 sample rows are reviewed without spreading an array into Math.min or Math.max", () => {
