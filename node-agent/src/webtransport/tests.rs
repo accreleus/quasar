@@ -1661,8 +1661,6 @@ async fn the_newest_client_takes_over_and_an_ended_session_says_so() {
     assert_eq!(close_code(&late).await, Some(CLOSE_ENDED));
 }
 
-/// What the session's idle reap reads (#1179): a client counts from its `hello_ack` while it
-/// streams, across a takeover, and stops counting once it leaves.
 /// The agent's half of the WebTransport → WebRTC fallback (control-api.md §Transport fallback,
 /// "Close first"): the client that falls back says `bye` while it holds a key. The agent closes
 /// normally, lifts what it held, counts no client, and the session is still there for the
@@ -1709,6 +1707,8 @@ async fn a_client_that_falls_back_leaves_no_client_no_held_key_and_a_live_sessio
     assert!(frames(&again, 1, true).await[0].keyframe);
 }
 
+/// What the session's idle reap reads (#1179): a client counts from its `hello_ack` while it
+/// streams, across a takeover, and stops counting once it leaves.
 #[tokio::test]
 async fn the_tap_counts_a_streaming_client_until_it_leaves() {
     let agent = agent().await;

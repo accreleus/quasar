@@ -222,6 +222,6 @@ jobs:
           for t in a_session_runs_from_hello_through_decodable_frames_to_a_clean_close \
                    input_arrives_by_datagram_and_control_stream_only_after_hello_ack \
                    a_client_that_falls_back_leaves_no_client_no_held_key_and_a_live_session; do
-            grep -q "$t ... ok" "$RUNNER_TEMP/wt.log"
+            grep -qF "::$t ... ok" "$RUNNER_TEMP/wt.log" || { echo "missing or failed: $t"; exit 1; }
           done
-          [ "$(grep -c '^test webtransport::.* ok$' "$RUNNER_TEMP/wt.log")" -ge 10 ]
+          [ "$(grep -c '^test webtransport::.* ok$' "$RUNNER_TEMP/wt.log")" -ge 80 ]
