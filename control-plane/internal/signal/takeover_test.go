@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -234,7 +235,13 @@ func TestAgentTakenOverErrorClosesWith4410(t *testing.T) {
 	}
 	readBrowserFrame(t, conn)
 
-	taken := `{"type":"error","code":"taken_over","message":"taken over by a webtransport client"}`
+	// The frame the node agent sends, pinned on its side by
+	// signaling::tests::taken_over_is_the_frame_the_control_plane_is_tested_with.
+	raw, err := os.ReadFile("../../../testdata/signaling/taken_over.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	taken := strings.TrimSpace(string(raw))
 	if err := relay.Deliver(sess.ID, []byte(taken)); err != nil {
 		t.Fatal(err)
 	}
