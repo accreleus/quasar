@@ -17,7 +17,8 @@ const G2G_WINDOW = 600;
 const CLOCK_WINDOW = 40;
 /** Frames whose decode has not come back yet; a decoder that drops some must not grow this. */
 const MAX_IN_DECODE = 64;
-/** Samples held while a post fails, and the most one post carries (control-api stats). */
+/** Samples queued between posts, and the most one post carries (control-api stats). A batch
+ *  whose post fails is dropped, as on WebRTC: telemetry never retries at the session's cost. */
 const MAX_PENDING = 60;
 const MAX_BATCH = 64;
 
@@ -56,6 +57,12 @@ export class WtTelemetry {
   private bytesTotal = 0;
   private lastTickMs: number;
   private keyframeRequests = 0;
+  private lostTotal = 0;
+  private lostAtTick = 0;
+  private lostSeen = 0;
+  private lostBase = 0;
+  /** The last window's median interval: what a thin window's freezes are judged against. */
+  private typicalMs: number | null = null;
   private decodeMsInWindow: number[] = [];
   private readonly inDecode = new Map<number, number>();
   private readonly g2g: number[] = [];
@@ -77,6 +84,11 @@ export class WtTelemetry {
     this.lastTickMs = this.nowMs();
   }
 
+  /** The first window opens here, when the ticks start: connecting is not part of it. */
+  startWindow(): void {
+    this.lastTickMs = this.nowMs();
+  }
+
   setCodec(mime: string | null): void {
     this.codec = mime;
   }
@@ -91,8 +103,17 @@ export class WtTelemetry {
     this.bytesTotal += n;
   }
 
+  /** A `keyframe_request` went on the wire, whoever asked: the decoder, a late frame, a tab shown again. */
   keyframeRequested(): void {
     this.keyframeRequests += 1;
+  }
+
+  /** Video fragments found missing since connect (cumulative, as `packets_lost` is on WebRTC). */
+  lost(total: number): void {
+    // A reconnect starts a new count at 0: the session's total carries on.
+    if (total < this.lostSeen) this.lostBase += this.lostSeen;
+    this.lostSeen = total;
+    this.lostTotal = this.lostBase + total;
   }
 
   /** A unit handed to the decoder, keyed by its capture time (the frame's timestamp). */
@@ -151,7 +172,10 @@ export class WtTelemetry {
     const dtSec = Math.max(0.001, (now - this.lastTickMs) / 1000);
     this.lastTickMs = now;
     const cadence = summarizePresentWindow(this.intervals, null, this.opts.profileFps || null);
-    const typical = cadence.medianMs;
+    // A window too thin for a median (the stream just came back from a stall) is judged against
+    // the last one, or the profile's frame time: the stall itself must not go uncounted.
+    this.typicalMs = cadence.medianMs ?? this.typicalMs;
+    const typical = this.typicalMs ?? (this.opts.profileFps ? 1000 / this.opts.profileFps : null);
     const freezeCount = typical === null ? 0 : this.intervals.filter((iv) => isFreeze(iv, typical)).length;
     const decodeMs = this.decodeMsInWindow.length ? this.decodeMsInWindow.reduce((a, b) => a + b, 0) / this.decodeMsInWindow.length : null;
     const hidden = this.isHidden();
@@ -171,6 +195,7 @@ export class WtTelemetry {
       bitrateKbps: (this.bytesInWindow * 8) / 1000 / dtSec,
       rttMs: this.rttMs,
       decodeMs,
+      packetsLost: this.lostTotal - this.lostAtTick,
       freezeCount,
       presentFps: cadence.fpsFromMean,
       presentSdMs: cadence.sdMs,
@@ -193,6 +218,8 @@ export class WtTelemetry {
       fps: snap.fps,
       bitrate_kbps: Math.round(snap.bitrateKbps ?? 0),
       freeze_count: freezeCount,
+      // Cumulative, as on WebRTC: the classifier takes its delta across a window.
+      packets_lost: this.lostTotal,
       playout_target_ms: 0,
       present_n: cadence.n,
       wt_keyframe_requests: this.keyframeRequests,
@@ -228,6 +255,7 @@ export class WtTelemetry {
     this.framesInWindow = 0;
     this.bytesInWindow = 0;
     this.keyframeRequests = 0;
+    this.lostAtTick = this.lostTotal;
     return snap;
   }
 

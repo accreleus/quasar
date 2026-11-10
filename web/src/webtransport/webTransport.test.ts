@@ -222,7 +222,8 @@ describe("WebTransportMedia keyframe requests", () => {
     agent.replies = [[helloAck(0, avcC())]];
     let now = 1_000;
     const t = transport(agent, { now: () => now });
-    await t.connect(NO_SINK);
+    const counted: string[] = [];
+    await t.connect({ ...NO_SINK, keyframeRequested: (r) => void counted.push(r) });
     vi.useFakeTimers();
     t.requestKeyframe("loss");
     t.requestKeyframe("late");
@@ -232,6 +233,8 @@ describe("WebTransportMedia keyframe requests", () => {
     now += KEYFRAME_SPACING_MS;
     await vi.advanceTimersByTimeAsync(KEYFRAME_SPACING_MS);
     expect(agent.sent("keyframe_request").map((k) => k.reason)).toEqual(["loss", "decode_error"]);
+    // Telemetry counts what went on the wire, not what was asked.
+    expect(counted).toEqual(["loss", "decode_error"]);
   });
 });
 

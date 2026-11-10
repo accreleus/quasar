@@ -158,6 +158,9 @@ export class WebTransportMedia implements MediaTransport {
   private datagramWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
   private stopTicker: (() => void) | null = null;
   private pingId = 0;
+  /** The sink of the current connect, for what is reported outside a read loop. */
+  private sink: MediaSink | null = null;
+  private lostSoFar: () => number = () => 0;
   private closed = false;
   /** Closes the attempt in flight; null once one has connected or ended. */
   private abortAttempt: (() => void) | null = null;
@@ -194,6 +197,7 @@ export class WebTransportMedia implements MediaTransport {
   }
 
   async connect(sink: MediaSink): Promise<void> {
+    this.sink = sink;
     const deadline = this.now() + CONNECT_DEADLINE_MS;
     let reminted = false;
     for (;;) {
@@ -222,6 +226,7 @@ export class WebTransportMedia implements MediaTransport {
     if (wait <= 0) {
       this.lastKeyAt = this.now();
       this.send({ type: "keyframe_request", reason });
+      this.sink?.keyframeRequested?.(reason);
       return;
     }
     this.pendingKey = reason;
@@ -536,12 +541,14 @@ export class WebTransportMedia implements MediaTransport {
     };
     const miss = (frameSeq: number, frags: [number, number][]) => this.recovered(assembler.miss(frameSeq, frags), sink);
     const tick = () => this.recovered(assembler.tick(), sink);
+    this.lostSoFar = () => assembler.lost;
     return { datagram, config, miss, tick, stop };
   }
 
   /** §Loss recovery: NACKs out, a keyframe asked for a late frame, whole units to the sink. */
   private recovered({ units, nacks, needKeyframe }: Reassembled, sink: MediaSink): void {
     for (const n of nacks) this.send({ type: "nack", frame_seq: n.frameSeq, frags: n.frags });
+    if (nacks.length) sink.lost?.(this.lostSoFar());
     if (needKeyframe) this.requestKeyframe("late");
     for (const u of units) sink.unit(u);
   }

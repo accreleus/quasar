@@ -118,7 +118,7 @@ describe("WtTelemetry", () => {
     const [first, second] = stats.body.samples as { metrics: Record<string, number>; client_health?: string; codec_mime_type: string; device_key: string }[];
     expect(Object.keys(first.metrics).sort()).toEqual(
       [
-        "bitrate_kbps", "fps", "freeze_count", "is_hidden", "playout_target_ms", "present_beat_fraction", "present_fps",
+        "bitrate_kbps", "fps", "freeze_count", "is_hidden", "packets_lost", "playout_target_ms", "present_beat_fraction", "present_fps",
         "present_fps_median", "present_interval_max_ms", "present_interval_median_ms", "present_interval_p95_ms",
         "present_interval_sd_ms", "present_long_frames", "present_n", "rtt_ms", "wt_capture_to_present_ms", "wt_keyframe_requests",
       ].sort(),
@@ -131,6 +131,48 @@ describe("WtTelemetry", () => {
     // Posted once: a second flush has nothing to send.
     await h.t.flush();
     expect(h.posts.filter((p) => p.url.endsWith("/stats"))).toHaveLength(1);
+  });
+
+  it("opens its first window when the ticks start, not when it was made", () => {
+    const h = harness();
+    h.advance(5000); // the presenter, the token and the connect
+    h.t.startWindow();
+    h.frames(60, 1000 / 60);
+    h.t.bytes(125_000);
+    const snap = h.t.tick();
+    expect(snap.fps).toBeCloseTo(60, 0);
+    expect(snap.bitrateKbps).toBeCloseTo(1000, -1);
+  });
+
+  it("counts the stall of a window too thin for a median, against the last window's cadence", () => {
+    const h = harness();
+    h.frames(60, 1000 / 60);
+    expect(h.t.tick().freezeCount).toBe(0);
+    h.frames(1, 2900); // a 2.9 s stall, then two frames before the tick
+    h.frames(2, 16);
+    const snap = h.t.tick();
+    expect(snap.presentCadence.n).toBe(3);
+    expect(snap.freezeCount).toBe(1);
+  });
+
+  it("judges a first thin window against the profile's frame time", () => {
+    const h = harness(60);
+    h.frames(1, 16);
+    h.frames(1, 1500);
+    expect(h.t.tick().freezeCount).toBe(1);
+  });
+
+  it("reports fragments found missing as cumulative packet loss, across a reconnect", async () => {
+    const h = harness();
+    h.t.lost(3);
+    expect(h.t.tick().packetsLost).toBe(3);
+    h.t.lost(5);
+    expect(h.t.tick().packetsLost).toBe(2);
+    h.t.lost(1); // a new connection counts from 0 again
+    expect(h.t.tick().packetsLost).toBe(1);
+    await h.t.flush();
+    const samples = h.posts[0].body.samples as { metrics: Record<string, number> }[];
+    expect(samples.map((s) => s.metrics.packets_lost)).toEqual([3, 5, 6]);
   });
 
   it("does not call a window with too few frames smooth", async () => {

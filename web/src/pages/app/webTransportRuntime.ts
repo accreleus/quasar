@@ -262,17 +262,21 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
         telemetry.decodeOut(captureUs);
         if (bench) {
           // ?bench=1 only: the marker is read off the decoded frame, at its own size, before
-          // the presenter takes (and closes) it.
+          // the presenter takes (and closes) it. A fault in the instrument must not cost the frame.
+          // The window's present_ms is therefore decoder output, where a WebRTC session's is
+          // RVFC's expectedDisplayTime: an A/B between the two must say so (#1035).
           benchFrame = frame;
-          bench.onFrame();
-          benchFrame = null;
+          try {
+            bench.onFrame();
+          } catch (err) {
+            console.warn("bench:", err);
+          } finally {
+            benchFrame = null;
+          }
         }
         if (p.present(frame)) presented(captureUs);
       },
-      requestKeyframe: (reason) => {
-        telemetry.keyframeRequested();
-        transport?.requestKeyframe(reason);
-      },
+      requestKeyframe: (reason) => transport?.requestKeyframe(reason),
       onFatal: (reason: DecodeFailure) => fail(reason),
     });
     stage = s;
@@ -328,6 +332,10 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
           for (const b of f.packets) telemetry.bytes(b.byteLength);
           pyroStage?.frame(f);
         },
+        keyframeRequested: () => telemetry.keyframeRequested(),
+        lost: (fragments) => {
+          if (t === transport) telemetry.lost(fragments);
+        },
         rtt: (ms, agentWallMs) => {
           if (t === transport) telemetry.pong(ms, agentWallMs);
         },
@@ -349,6 +357,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     set({ wsOpen: true, pcConnected: true, channelOpen: true, iceState: "connected" });
     startInput(t);
     if (timer === null) {
+      telemetry.startWindow();
       timer = setInterval(tick, TELEMETRY_MS);
       postTimer = setInterval(() => void telemetry.flush(), POST_MS);
       tracer.start();
