@@ -28,7 +28,7 @@ const SECRETS = [
   // A token has a digit in it; "Bearer authentication." in prose has none.
   [/\bBearer\s+(?=[\w.~+/-]*\d)[\w.~+/-]{8,}/i, "a bearer token"],
   // A value that says there is none ("password": null, secret: none, token=[REDACTED]) is not one.
-  [/\b(password|passwd|secret|access_token|refresh_token|sig_token|api[_-]?key)["']?\s*[=:]\s*["']?(?!\[?(?:null|none|n\/?a|redacted|omitted|unknown|true|false)\b)[^\s"',}]{4,}/i, "a credential"],
+  [/\b(password|passwd|secret|access_token|refresh_token|sig_token|api[_-]?key)["']?\s*[=:]\s*["']?(?!\[?(?:null|none|n\/?a|redacted|omitted|unknown|true|false)\]?(?=[\s"',}]|$))[^\s"',}]{4,}/im, "a credential"],
 ];
 
 function leaks(text) {
@@ -186,18 +186,21 @@ function check(dir, errors, { keys = manifestKeys() } = {}) {
   }
 
   // Every text file, whatever its name: a log or a captured console can carry a token too.
-  // A file with a NUL byte in its first 4 KB is a picture, a video or an archive and is not
-  // read further; UTF-16 with a byte-order mark is text.
+  // The check never guesses an encoding. A bundle's text is UTF-8: a file that declares
+  // UTF-16 or UTF-32 with a byte-order mark is refused, not decoded, and any other file
+  // with a NUL byte in its first 4 KB is a picture, a video or an archive and is not read.
   // shortcut: a text file is read whole; stream it when a bundle carries GB-size logs.
   const head = Buffer.alloc(4096);
   for (const p of files) {
     const fd = fs.openSync(path.join(dir, p), "r");
     const n = fs.readSync(fd, head, 0, head.length, 0);
     fs.closeSync(fd);
-    const utf16 = n >= 2 && head[0] === 0xff && head[1] === 0xfe;
-    if (!utf16 && head.subarray(0, n).includes(0)) continue;
-    const text = fs.readFileSync(path.join(dir, p)).toString(utf16 ? "utf16le" : "utf8");
-    for (const what of leaks(text)) err(p, `holds ${what}`);
+    const mark = head.readUInt16BE(0);
+    if (n >= 2 && (mark === 0xfffe || mark === 0xfeff || (n >= 4 && head.readUInt32BE(0) === 0x0000feff))) {
+      err(p, "is UTF-16 or UTF-32 (a bundle's text is UTF-8)");
+    } else if (!head.subarray(0, n).includes(0)) {
+      for (const what of leaks(fs.readFileSync(path.join(dir, p), "utf8"))) err(p, `holds ${what}`);
+    }
   }
 }
 
