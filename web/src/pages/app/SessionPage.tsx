@@ -1136,6 +1136,7 @@ function SessionPageBody() {
           <canvas
             ref={canvasRef}
             className="session-video"
+            data-scaling-mode={scalingMode}
             data-compositor-w={compositorSize?.w}
             data-compositor-h={compositorSize?.h}
           />
