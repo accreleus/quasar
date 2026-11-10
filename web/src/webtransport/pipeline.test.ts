@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ControlDecoder, ControlProtocolError, encodeControl, parseFecDatagram, parseVideoDatagram, serialAfter, type VideoFragment } from "./framing";
-import { FrameAssembler, INITIAL_RTT_MS, KEY_REASK_MS, MAX_PENDING, MAX_PENDING_AGE_MS, RTT_SLACK_MS } from "./reassembly";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { ControlDecoder, ControlProtocolError, encodeControl, parseFecDatagram, parseVideoDatagram, serialAfter } from "./framing";
+import { FEC_ACTIVE_MS, FEC_HOLD_MS, FrameAssembler, INITIAL_RTT_MS, KEY_REASK_MS, MAX_PENDING, MAX_PENDING_AGE_MS, RTT_SLACK_MS } from "./reassembly";
 import {
   BACKLOG_MS,
   DecodeStage,
@@ -14,7 +16,7 @@ import {
   hevcCodecString,
 } from "./decodeStage";
 import { containRect, createWebGpuPresenter, presentGeometry } from "./presenter";
-import { avcC, bytes, FakeChunk, FakeDecoder, fakeFrame, flush, packetize, type FakeFrame, type UnitSpec } from "./testSupport";
+import { avcC, bytes, FakeChunk, FakeDecoder, fakeFrame, flush, packetize, repairOf, type FakeFrame, type UnitSpec } from "./testSupport";
 
 beforeEach(() => {
   vi.stubGlobal("EncodedVideoChunk", FakeChunk);
@@ -84,27 +86,6 @@ describe("FrameAssembler", () => {
   });
 
   describe("FEC, scheme xor (#1046)", () => {
-    /** The repair datagram an agent sends for fragments `first + i * stride` of `f`. */
-    const repairOf = (f: VideoFragment[], first: number, count: number, stride = 1) => {
-      const group = Array.from({ length: count }, (_, i) => f[first + i * stride].payload);
-      const payload = new Uint8Array(Math.max(...group.map((g) => g.length)));
-      let lengthXor = 0;
-      for (const g of group) {
-        lengthXor ^= g.length;
-        g.forEach((b, i) => (payload[i] ^= b));
-      }
-      const d = new Uint8Array(14 + payload.length);
-      const v = new DataView(d.buffer);
-      d[0] = 0x04;
-      d[5] = 1;
-      v.setUint16(6, f[0].frameSeq, true);
-      v.setUint16(8, first, true);
-      d[10] = count;
-      d[11] = stride;
-      v.setUint16(12, lengthXor, true);
-      d.set(payload, 14);
-      return d;
-    };
     // Five fragments; the last is shorter than the rest.
     const data = bytes(5000, 7);
     const five = () => frags({ configId: 0, frameSeq: 4, keyframe: true, data });
@@ -188,6 +169,95 @@ describe("FrameAssembler", () => {
       expect(with_(11, 0)).toBeNull(); // stride 0
       expect(parseFecDatagram(good.subarray(0, 14))).toBeNull(); // no payload
       expect(with_(0, 0x01)).toBeNull(); // not the FEC channel
+    });
+
+    it("rebuilds any one fragment from the agent's own repair datagrams (testdata/webtransport/fec-xor.json)", () => {
+      const hex = (s: string) => Uint8Array.from(s.match(/../g)!, (b) => parseInt(b, 16));
+      const vectors = JSON.parse(readFileSync(resolve(__dirname, "../../../testdata/webtransport/fec-xor.json"), "utf8")) as {
+        fragments: string[];
+        cases: { repairs: string[] }[];
+      };
+      const f = vectors.fragments.map((d) => parseVideoDatagram(hex(d))!);
+      const unit = f.flatMap((x) => Array.from(x.payload)).join();
+      const groups: number[] = [];
+      for (const c of vectors.cases) {
+        for (const d of c.repairs) {
+          const r = parseFecDatagram(hex(d))!;
+          groups.push(r.count);
+          for (let k = r.firstFrag; k < r.firstFrag + r.count * r.stride; k += r.stride) {
+            const a = new FrameAssembler(() => 0);
+            f.forEach((x, i) => i !== k && a.push(x));
+            expect(a.repair(r).units.map((u) => Array.from(u.data).join())).toEqual([unit]);
+          }
+        }
+      }
+      // One group over the frame, then two and three interleaved: each case covers all seven.
+      expect(groups).toEqual([7, 4, 3, 3, 2, 2]);
+    });
+
+    describe("while the agent sends FEC, a gap's first NACK waits for the frame's repairs", () => {
+      /** An assembler that has just had a whole frame and its repair: the agent is sending FEC. */
+      const sending = (clock: { t: number }) => {
+        const a = new FrameAssembler(() => clock.t);
+        const k = frags({ configId: 0, frameSeq: 3, keyframe: true, data: bytes(3000, 1) });
+        for (const x of k) a.push(x);
+        a.repair(parseFecDatagram(repairOf(k, 0, 3))!);
+        return a;
+      };
+
+      it("sends no NACK for a fragment the repair rebuilds, and does not count it lost", () => {
+        const clock = { t: 0 };
+        const a = sending(clock);
+        const f = five();
+        clock.t = 1;
+        a.push(f[0]);
+        a.push(f[1]);
+        expect(a.push(f[3])).toMatchObject({ nacks: [], wakeMs: FEC_HOLD_MS });
+        clock.t = 2;
+        expect(a.push(f[4]).nacks).toEqual([]);
+        clock.t = 3;
+        const r = a.repair(parseFecDatagram(repairOf(f, 0, 5))!);
+        expect(r.nacks).toEqual([]);
+        expect(whole(r)).toBe(true);
+        expect([a.lost, a.repaired]).toEqual([0, 1]);
+      });
+
+      it(`NACKs a loss the repair cannot cover ${FEC_HOLD_MS} ms after the gap showed, not later`, () => {
+        const clock = { t: 0 };
+        const a = sending(clock);
+        const f = five();
+        clock.t = 1;
+        a.push(f[0]);
+        expect(a.push(f[3]).nacks).toEqual([]); // 1 and 2 are missing
+        a.push(f[4]);
+        clock.t = 2;
+        expect(a.repair(parseFecDatagram(repairOf(f, 0, 5))!).nacks).toEqual([]); // two of its group: no rebuild
+        clock.t = 1 + FEC_HOLD_MS - 0.5;
+        expect(a.tick()).toMatchObject({ nacks: [], wakeMs: 0.5 });
+        clock.t = 1 + FEC_HOLD_MS;
+        expect(a.tick().nacks).toEqual([{ frameSeq: 4, frags: [[1, 2]] }]);
+        expect(a.lost).toBe(2);
+      });
+
+      it("NACKs at once when a later frame shows the repairs are not coming", () => {
+        const clock = { t: 0 };
+        const a = sending(clock);
+        const f = five();
+        clock.t = 1;
+        a.push(f[0]);
+        expect(a.push(f[2]).nacks).toEqual([]);
+        const next = frags({ configId: 0, frameSeq: 5, keyframe: false, data: bytes(10, 9) });
+        expect(a.push(next[0]).nacks).toEqual([{ frameSeq: 4, frags: [[1, 1], [3, 4]] }]);
+      });
+
+      it("does not wait once no repair has arrived for a second", () => {
+        const clock = { t: 0 };
+        const a = sending(clock);
+        const f = five();
+        clock.t = FEC_ACTIVE_MS + 1;
+        a.push(f[0]);
+        expect(a.push(f[2]).nacks).toEqual([{ frameSeq: 4, frags: [[1, 1]] }]);
+      });
     });
   });
 

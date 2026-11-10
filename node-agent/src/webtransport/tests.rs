@@ -26,6 +26,7 @@ fn hello_for(session_id: &str, token: &str, wt_proto: u32) -> Hello {
         token: token.into(),
         session_id: session_id.into(),
         pyrowave: false,
+        fec: Vec::new(),
     }
 }
 
@@ -1532,13 +1533,180 @@ fn a_client_that_is_gone_neither_starts_nor_feeds_the_abr() {
         }),
     };
     let gone = Arc::new(OnceLock::new());
-    let mut control = Control::new(&rate, gone.clone());
+    let mut control = Control::new(&rate, gone.clone(), false);
     control.feed(3000.0);
     assert_eq!(calls.load(SeqCst), 2, "a live client starts and feeds");
     gone.set(Gone::TakenOver).unwrap();
     control.feed(3000.0);
-    Control::new(&rate, gone).feed(3000.0);
+    Control::new(&rate, gone, false).feed(3000.0);
     assert_eq!(calls.load(SeqCst), 2);
+}
+
+/// A path with room that loses every 25th datagram (4 %), as the client's feedback
+/// reports it (§Feedback). True when `d` is one it lost.
+struct Lossy {
+    path: Bottleneck,
+    reported: Instant,
+}
+
+impl Lossy {
+    fn new() -> Self {
+        Self {
+            path: Bottleneck::new(1e6),
+            reported: Instant::now(),
+        }
+    }
+
+    async fn receive(&mut self, d: &[u8], send: &mut SendStream) -> bool {
+        let lost = u32::from_le_bytes(d[1..5].try_into().unwrap()) % 25 == 24;
+        if !lost {
+            // The gap a lost one leaves is what `Bottleneck` reports as not received.
+            self.path.receive(d);
+        }
+        if self.reported.elapsed() >= Duration::from_millis(50) {
+            self.reported = Instant::now();
+            if let Some(feedback) = self.path.feedback() {
+                write_message(send, &feedback).await.unwrap();
+            }
+        }
+        lost
+    }
+}
+
+/// A session whose frames take several datagrams (snow does not compress), with an ABR
+/// that records what it is fed.
+async fn lossy_session() -> (Agent, Arc<Mutex<Vec<f64>>>) {
+    let fed = Arc::new(Mutex::new(Vec::new()));
+    let seen = fed.clone();
+    let agent = agent_built(
+        Stream::H264,
+        Limits::default(),
+        audio::Plan::default(),
+        "snow",
+        move |_| {
+            Some(Rate {
+                ceiling_kbps: 4000.0,
+                start: Box::new(|| {}),
+                observe: Box::new(move |kbps| seen.lock().unwrap().push(kbps)),
+            })
+        },
+    )
+    .await;
+    (agent, fed)
+}
+
+/// #1046, §FEC: a client that offered `xor` and reports loss is sent repair datagrams, and
+/// a fragment it lost is rebuilt from one by the contract's rule, with no NACK and so no
+/// retransmission. The repairs' share comes out of what the ABR is fed.
+#[tokio::test]
+async fn a_client_that_offers_xor_and_reports_loss_rebuilds_a_fragment_without_a_nack() {
+    let (agent, fed) = lossy_session().await;
+    let session = agent.connect().await;
+    let (mut send, mut recv) = session.open_bi().await.unwrap();
+    let hello = json!({"type": "hello", "wt_proto": 1, "token": TOKEN,
+                       "session_id": SESSION, "client": "browser", "fec": ["xor"]});
+    write_message(&mut send, &hello).await.unwrap();
+    assert_eq!(read_message(&mut recv).await.unwrap()["fec"], "xor");
+
+    let mut path = Lossy::new();
+    let mut frames: HashMap<u16, BTreeMap<u16, Bytes>> = HashMap::new();
+    let mut lost: HashMap<(u16, u16), Bytes> = HashMap::new();
+    let (mut repairs, mut rebuilt) = (0, 0);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while rebuilt < 3 {
+        let d = tokio::time::timeout_at(deadline, session.read_datagram())
+            .await
+            .unwrap_or_else(|_| panic!("{repairs} repairs and {rebuilt} rebuilt in 20 s"))
+            .unwrap();
+        let dropped = path.receive(&d, &mut send).await;
+        let at = |i: usize| u16::from_le_bytes([d[i], d[i + 1]]);
+        if d[0] == 0x01 {
+            assert_eq!(d[5] & 4, 0, "no NACK was sent, so nothing is resent");
+            if dropped {
+                lost.insert((at(7), at(9)), d.slice(media::HEADER..));
+            } else {
+                frames
+                    .entry(at(7))
+                    .or_default()
+                    .insert(at(9), d.slice(media::HEADER..));
+            }
+            continue;
+        }
+        assert_eq!(d[0], 0x04, "video and FEC only");
+        repairs += 1;
+        if dropped {
+            continue;
+        }
+        assert!(d.len() <= media::MAX_DATAGRAM);
+        assert_eq!(d[5], 0x01, "scheme xor");
+        let (frame_seq, first, count, stride) = (at(6), at(8), d[10] as u16, d[11] as u16);
+        assert!((2..=48).contains(&count) && stride >= 1);
+        // §FEC: the one missing fragment is the repair payload XOR every other protected
+        // payload, truncated to `length_xor` XOR every other protected length.
+        let Some(have) = frames.get(&frame_seq) else {
+            continue;
+        };
+        let group: Vec<u16> = (0..count).map(|i| first + i * stride).collect();
+        let missing: Vec<u16> = group
+            .iter()
+            .copied()
+            .filter(|i| !have.contains_key(i))
+            .collect();
+        let [k] = missing[..] else { continue };
+        let mut payload = d[14..].to_vec();
+        let mut len = at(12);
+        for other in group.iter().filter(|&&i| i != k).map(|i| &have[i]) {
+            len ^= other.len() as u16;
+            for (out, byte) in payload.iter_mut().zip(other.iter()) {
+                *out ^= byte;
+            }
+        }
+        payload.truncate(len as usize);
+        assert_eq!(
+            lost.get(&(frame_seq, k)).map(|p| &p[..]),
+            Some(&payload[..]),
+            "fragment {k} of frame {frame_seq} rebuilt"
+        );
+        rebuilt += 1;
+    }
+    // Around 4 % loss the repairs are 15 to 25 % on top of the video, and the encoder is
+    // fed the estimate less their share: the 4000 kbps ceiling over 1.15 to 1.25.
+    let fed = fed.lock().unwrap();
+    let least = fed.iter().copied().fold(f64::MAX, f64::min);
+    assert!((3199.0..3479.0).contains(&least), "the ABR was fed {fed:?}");
+}
+
+/// §Hello: a client that offers no scheme is answered `fec: null` and sent no repair
+/// datagram, whatever loss it reports.
+#[tokio::test]
+async fn a_client_that_offers_no_fec_gets_none_whatever_it_loses() {
+    let (agent, fed) = lossy_session().await;
+    let (session, mut send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["fec"], Value::Null);
+    let mut path = Lossy::new();
+    for _ in 0..800 {
+        let d = datagram(&session).await.3;
+        assert_eq!(d[0], 0x01, "only video is sent");
+        path.receive(&d, &mut send).await;
+    }
+    let fed = fed.lock().unwrap();
+    assert!(
+        !fed.is_empty() && fed.iter().all(|&kbps| kbps == 4000.0),
+        "no share is taken for FEC that is not sent: {fed:?}"
+    );
+}
+
+/// §Hello ack: a session with no ABR reads no feedback, so it has no loss to size FEC by
+/// and names no scheme.
+#[tokio::test]
+async fn a_session_without_an_abr_names_no_fec_scheme() {
+    let agent = agent().await;
+    let session = agent.connect().await;
+    let (mut send, mut recv) = session.open_bi().await.unwrap();
+    let hello = json!({"type": "hello", "wt_proto": 1, "token": TOKEN,
+                       "session_id": SESSION, "client": "browser", "fec": ["xor"]});
+    write_message(&mut send, &hello).await.unwrap();
+    assert_eq!(read_message(&mut recv).await.unwrap()["fec"], Value::Null);
 }
 
 #[tokio::test]

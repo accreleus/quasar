@@ -190,6 +190,8 @@ export class WebTransportMedia implements MediaTransport {
   private keyTimer: ReturnType<typeof setTimeout> | null = null;
   /** §Loss recovery's tick: releases and late frames wait for no datagram. */
   private recoveryTimer: ReturnType<typeof setInterval> | null = null;
+  /** Fires when a NACK held for FEC falls due with no datagram to carry it. */
+  private holdTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingKey: KeyframeReason | null = null;
   private router: Router | null = null;
   private readonly sleep: (ms: number) => Promise<void>;
@@ -270,6 +272,8 @@ export class WebTransportMedia implements MediaTransport {
   private stopRecovery(): void {
     if (this.recoveryTimer !== null) clearInterval(this.recoveryTimer);
     this.recoveryTimer = null;
+    if (this.holdTimer !== null) clearTimeout(this.holdTimer);
+    this.holdTimer = null;
   }
 
   close(): Promise<void> {
@@ -597,7 +601,13 @@ export class WebTransportMedia implements MediaTransport {
   }
 
   /** §Loss recovery: NACKs out, a keyframe asked for a late frame, whole units to the sink. */
-  private recovered({ units, nacks, needKeyframe }: Reassembled, sink: MediaSink): void {
+  private recovered({ units, nacks, needKeyframe, wakeMs }: Reassembled, sink: MediaSink): void {
+    if (wakeMs !== undefined && this.holdTimer === null) {
+      this.holdTimer = setTimeout(() => {
+        this.holdTimer = null;
+        if (this.live?.on && !this.closed) this.router?.tick();
+      }, wakeMs);
+    }
     for (const n of nacks) this.send({ type: "nack", frame_seq: n.frameSeq, frags: n.frags });
     if (nacks.length) sink.lost?.(this.lostSoFar());
     if (needKeyframe) this.requestKeyframe("late");

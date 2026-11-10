@@ -27,6 +27,11 @@ const ASK_MEMORY_MS = 2_000;
 const MAX_ASKS_REMEMBERED = 4_096;
 /** §NACK: at most 32 ranges per message. */
 const MAX_NACK_RANGES = 32;
+/** FEC first (§Loss recovery 4): how long a gap's first NACK waits for the frame's repair
+ *  datagrams, which the agent sends after its fragments. Half a 60 fps frame interval. */
+export const FEC_HOLD_MS = 8;
+/** The agent is sending FEC when a repair datagram arrived within this long. */
+export const FEC_ACTIVE_MS = 1_000;
 
 interface Pending {
   /** Null for a frame known only from the gap it left: nothing of it has arrived. */
@@ -44,6 +49,8 @@ interface Pending {
   late: boolean;
   /** Repair datagrams held for this frame (§FEC), until each has rebuilt its fragment or cannot. */
   repairs?: FecRepair[];
+  /** When each gap whose first NACK is held for FEC was first seen; sparse. */
+  heldAt?: number[];
 }
 
 /** Repair datagrams held per frame: more than a frame of the largest size could use. */
@@ -61,6 +68,8 @@ export interface Reassembled {
   nacks: Nack[];
   /** A frame later ones reference is late: ask for a keyframe. */
   needKeyframe: boolean;
+  /** A NACK held for FEC falls due in this many ms: call {@link FrameAssembler.tick} then. */
+  wakeMs?: number;
 }
 
 const gap = (at: number): Pending => ({
@@ -79,7 +88,10 @@ const gap = (at: number): Pending => ({
 /**
  * Video fragments back into access units, released in `frame_seq` order, with the client
  * half of §Loss recovery. A missing fragment is NACKed as soon as a later fragment shows it
- * missing, and once more after one round trip. A frame is late when a `nack_miss` names one
+ * missing, and once more after one round trip. While the agent is sending FEC, that first
+ * NACK waits up to {@link FEC_HOLD_MS} for the frame's repairs, or until a later frame shows
+ * they are not coming; a fragment rebuilt meanwhile is never NACKed.
+ * A frame is late when a `nack_miss` names one
  * of its missing fragments, its repeat NACK goes unanswered for another round trip, or no
  * fragment of it arrives for {@link MAX_PENDING_AGE_MS}. A late frame is dropped; if it was
  * not `discardable`, every frame is dropped until the next keyframe, and one is asked for.
@@ -105,6 +117,10 @@ export class FrameAssembler {
   private srtt: number | null = null;
   /** Latest NACK time per `frameSeq * 65536 + fragIndex`, in time order. */
   private asked = new Map<number, number>();
+  /** When the last repair datagram arrived. */
+  private repairAt: number | null = null;
+  /** Set by {@link recover}: when the earliest held NACK falls due. */
+  private wakeAt: number | null = null;
 
   constructor(private readonly now: () => number = () => performance.now()) {}
 
@@ -210,6 +226,7 @@ export class FrameAssembler {
   repair(r: FecRepair): Reassembled {
     const at = this.now();
     this.expire(at);
+    this.repairAt = at;
     const p = this.pending.get(r.frameSeq);
     if (p && !p.late && (p.repairs?.length ?? 0) < MAX_REPAIRS_PER_FRAME) {
       (p.repairs ??= []).push(r);
@@ -288,7 +305,17 @@ export class FrameAssembler {
       this.keyAskedAt = at;
     }
     this.needKey = false;
-    return { units, nacks, needKeyframe };
+    return this.wakeAt === null ? { units, nacks, needKeyframe } : { units, nacks, needKeyframe, wakeMs: this.wakeAt - at };
+  }
+
+  /** Is fragment `i`'s first NACK still waiting for the frame's repairs? Not once a later
+   *  frame has shown: the agent sent this frame's repairs before it. */
+  private held(p: Pending, i: number, at: number, later: boolean): boolean {
+    if (later || this.repairAt === null || at - this.repairAt > FEC_ACTIVE_MS) return false;
+    const due = ((p.heldAt ??= [])[i] ??= at) + FEC_HOLD_MS;
+    if (at >= due) return false;
+    this.wakeAt = Math.min(this.wakeAt ?? due, due);
+    return true;
   }
 
   /** A retransmission's round trip, from the latest NACK for it. After a repeat, a resend
@@ -311,6 +338,7 @@ export class FrameAssembler {
       this.asked.delete(k);
     }
     const nacks: Nack[] = [];
+    this.wakeAt = null;
     for (const [seq, p] of this.pending) {
       // Waiting for a keyframe, a delta is dropped whatever happens to it.
       if (p.late || (this.waitingForKey && p.first && !p.first.keyframe)) continue;
@@ -319,7 +347,7 @@ export class FrameAssembler {
       const frags: [number, number][] = [];
       for (let i = p.contiguous; i < known && !p.late; i++) {
         if (p.parts[i]) continue;
-        const due = p.asks[i] === 0 || at - p.askedAt[i] >= wait;
+        const due = p.asks[i] === 0 ? !this.held(p, i, at, later) : at - p.askedAt[i] >= wait;
         if (!due) continue;
         if (p.asks[i] >= 2) p.late = true;
         else if (addRange(frags, i)) {
