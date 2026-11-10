@@ -1908,11 +1908,7 @@ impl SessionTransports {
                 |_, _| gst::PadProbeReturn::Drop,
             );
         }
-        let _ = out_tx.send(SignalMsg::Error {
-            message: "the session was taken over by another client".to_string(),
-            code: Some(signaling::TAKEN_OVER.to_string()),
-            pc: None,
-        });
+        let _ = out_tx.send(SignalMsg::taken_over());
         tracing::info!(
             token = "webtransport-took-over-webrtc",
             "a WebTransport client took the session from its WebRTC peer: that peer's media \

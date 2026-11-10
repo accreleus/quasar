@@ -117,6 +117,16 @@ impl SignalMsg {
         }
     }
 
+    /// The `error` that tells the client holding signaling a WebTransport client took the
+    /// session; the control plane relays it and closes that socket `4410`.
+    pub fn taken_over() -> Self {
+        SignalMsg::Error {
+            message: "the session was taken over by another client".to_string(),
+            code: Some(TAKEN_OVER.to_string()),
+            pc: None,
+        }
+    }
+
     /// Serialize to a compact JSON string for one WebSocket text frame.
     pub fn to_json(&self) -> serde_json::Result<String> {
         serde_json::to_string(self)
@@ -131,6 +141,21 @@ impl SignalMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The frame the control plane's relay closes `4410` on: its test
+    /// (`signal.TestAgentTakenOverErrorClosesWith4410`) is fed this same file.
+    #[test]
+    fn taken_over_is_the_frame_the_control_plane_is_tested_with() {
+        let fixture = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/signaling/taken_over.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            SignalMsg::taken_over().to_json().unwrap(),
+            fixture.trim_end()
+        );
+    }
 
     #[test]
     fn offer_roundtrips_to_protocol_shape() {

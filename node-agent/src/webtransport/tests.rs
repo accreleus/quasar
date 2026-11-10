@@ -3192,6 +3192,39 @@ async fn a_pyrowave_client_gets_frames_that_rejoin_byte_for_byte_and_can_fall_ba
     assert_eq!(nal_types(&first.data).last(), Some(&5));
 }
 
+/// A session id assigned again while its tap runs gets a fresh registry entry, which no longer
+/// names that tap's media: the tap still ends its own when it drops, so the client on it is
+/// told the session ended.
+#[test]
+fn a_tap_dropped_after_its_session_was_assigned_again_ends_its_own_media() {
+    gst::init().unwrap();
+    let registry = Arc::new(Registry::default());
+    let assign = || registry.assign(SESSION, &token_hash(TOKEN), SystemTime::now() + TOKEN_TTL);
+    assign();
+    let pipeline = synthetic(Stream::Av1);
+    let tap = Tap::attach(
+        &registry,
+        &pipeline
+            .by_name("parse")
+            .unwrap()
+            .static_pad("src")
+            .unwrap(),
+        &pipeline.by_name("enc").unwrap(),
+        SESSION,
+        None,
+        no_input(),
+        audio::Plan::default(),
+        None,
+    )
+    .unwrap();
+    tap.media().on_caps(&streams::av1_caps(640), SESSION);
+    let client = tap.media().attach(false, Duration::ZERO).unwrap();
+
+    assign();
+    drop(tap);
+    assert_eq!(client.gone.get(), Some(&Gone::SessionEnded));
+}
+
 /// #1228: a session stop releases the tap's PyroWave encoder before the source goes (it shares
 /// the GPU queue and a compositor ring frame), while the tap itself lives on until the
 /// transports drop. A second release, and one with no encoder, are no-ops.

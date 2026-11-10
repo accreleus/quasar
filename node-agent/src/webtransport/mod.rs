@@ -466,6 +466,8 @@ impl Tap {
 impl Drop for Tap {
     fn drop(&mut self) {
         self.registry.end(&self.session_id);
+        // Its own media too: an id assigned again got a fresh entry that no longer names it.
+        self.media.end();
         self.release();
     }
 }
