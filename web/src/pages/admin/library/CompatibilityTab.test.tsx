@@ -251,11 +251,29 @@ describe("CompatibilityTab default tool", () => {
 });
 
 describe("CompatibilityTab Remove", () => {
-  it("disables the tool on every host", async () => {
-    vi.mocked(adminApi.setCompatToolEnabled).mockResolvedValue({ ...DONE, enabled: false });
+  /** The row's Remove, then the confirmation's own button. */
+  async function confirmRemove(name: string) {
+    fireEvent.click(await screen.findByRole("button", { name: `Remove ${name}` }));
+    fireEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Remove tool" }));
+  }
+
+  it("asks first: nothing is removed until the confirmation, and Cancel removes nothing", async () => {
     renderTab();
     fireEvent.click(await screen.findByRole("button", { name: "Remove GE-Proton9-20" }));
+    const dialog = within(await screen.findByRole("dialog"));
+    expect(dialog.getByText("GE-Proton9-20")).toBeTruthy();
+    expect(adminApi.setCompatToolEnabled).not.toHaveBeenCalled();
+    fireEvent.click(dialog.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(adminApi.setCompatToolEnabled).not.toHaveBeenCalled();
+  });
+
+  it("disables the tool on every host once confirmed", async () => {
+    vi.mocked(adminApi.setCompatToolEnabled).mockResolvedValue({ ...DONE, enabled: false });
+    renderTab();
+    await confirmRemove("GE-Proton9-20");
     await waitFor(() => expect(adminApi.setCompatToolEnabled).toHaveBeenCalledWith("test-token", "t-920", false));
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   // The real shape from the control plane: counts in the message, not game names.
@@ -266,7 +284,7 @@ describe("CompatibilityTab Remove", () => {
     vi.mocked(adminApi.setCompatToolEnabled).mockRejectedValue(inUse());
     renderTab();
     const row = (await screen.findByText("GE-Proton10-4", { selector: ".primary" })).closest("tr")!;
-    fireEvent.click(within(row).getByRole("button", { name: "Remove GE-Proton10-4" }));
+    await confirmRemove("GE-Proton10-4");
     const err = await screen.findByText("Not removed: 6 games use this tool. Change their tool first.");
     expect(err.className).toContain("form-error");
     expect(err.closest("tr")?.className).toBe("exp-row");
@@ -282,7 +300,7 @@ describe("CompatibilityTab Remove", () => {
     list.mockResolvedValue(catalogue([...VALVE, { ...IN_USE, ...over }], over.is_default ? "t-104" : null));
     vi.mocked(adminApi.setCompatToolEnabled).mockRejectedValue(inUse());
     renderTab();
-    fireEvent.click(await screen.findByRole("button", { name: "Remove GE-Proton10-4" }));
+    await confirmRemove("GE-Proton10-4");
     expect(await screen.findByText(text)).toBeTruthy();
   });
 });
