@@ -1461,3 +1461,75 @@ fn a_log_tail_over_one_mib_is_read_over_two_passes() {
         vec![Report::LaunchState(LaunchState::GameRunning)]
     );
 }
+
+#[test]
+fn a_sign_in_that_finished_clears_even_when_the_window_list_cannot_be_read() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    rig.windows.set_fail(true);
+    rig.watcher.poll();
+
+    rig.login_state("WaitingForCredentials");
+    assert_eq!(
+        rig.watcher.poll(),
+        vec![Report::SteamNeedsUser(NeedsUser::SignIn)]
+    );
+    assert_eq!(rig.watcher.needs_now(), Some(NeedsUser::SignIn));
+    rig.login_state("LoggedIn");
+    rig.watcher.poll();
+    assert_eq!(rig.watcher.needs_now(), None, "the log says it is over");
+}
+
+#[test]
+fn a_window_need_stands_through_a_pass_that_could_not_read_the_windows() {
+    let mut rig = Rig::new();
+    write_proc(&rig.proc_root, 100, STEAM);
+    rig.windows.set(vec![WindowInfo {
+        steam_game: Some(769),
+        wm_class: "steamwebhelper".into(),
+        title: "Steam Guard - Computer Authorization Required".into(),
+    }]);
+    rig.watcher.poll();
+    assert_eq!(rig.watcher.needs_now(), Some(NeedsUser::SteamGuard));
+    rig.windows.set_fail(true);
+    rig.watcher.poll();
+    assert_eq!(rig.watcher.needs_now(), Some(NeedsUser::SteamGuard));
+}
+
+#[test]
+fn a_refusal_that_logs_progress_then_failure_is_not_a_launch_taken() {
+    let mut rig = Rig::new();
+    rig.watcher.poll();
+    assert!(!rig.watcher.launch_taken());
+    let action = |id: u32, text: &str| {
+        format!("GameAction [AppID {APPID}, ActionID {id}] : LaunchApp {text}")
+    };
+    rig.append_log(&action(1, "changed task to RequestingLicense with \"\""));
+    rig.watcher.poll();
+    assert!(rig.watcher.launch_taken(), "progress is the launch taken");
+    // The failure arrives in a later pass, its two lines in two more.
+    rig.append_log(&action(1, "failed with AppError_5 with \"\""));
+    rig.watcher.poll();
+    assert!(!rig.watcher.launch_taken(), "a failure of that action wins");
+    rig.append_log(&action(1, "changed task to Failed with \"\""));
+    rig.watcher.poll();
+    assert!(
+        !rig.watcher.launch_taken(),
+        "its Failed task is not progress"
+    );
+    // A later action that moves is a launch taken again.
+    rig.append_log(&action(2, "changed task to CreatingProcess with \"\""));
+    rig.watcher.poll();
+    assert!(rig.watcher.launch_taken());
+}
+
+#[test]
+fn a_failed_line_without_progress_before_it_changes_nothing() {
+    let mut rig = Rig::new();
+    rig.watcher.poll();
+    rig.append_log(&format!(
+        "GameAction [AppID {APPID}, ActionID 3] : LaunchApp changed task to Failed with \"\""
+    ));
+    rig.watcher.poll();
+    assert!(!rig.watcher.launch_taken());
+}

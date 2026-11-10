@@ -146,6 +146,15 @@ pub struct Watcher {
     windows_read: bool,
     /// The last window list read, for the helper's pin.
     last_windows: Vec<WindowInfo>,
+    /// The target's latest `LaunchApp` action in Steam's log, by ActionID, and whether it
+    /// failed (#1159). Progress on an action means Steam took the launch up; a failure of that
+    /// same action wins over its earlier progress, and a later action's progress counts anew.
+    action: Option<(u32, bool)>,
+    /// The last window-derived need, kept across a pass whose window list could not be read.
+    window_need: Option<NeedsUser>,
+    /// Another game's reaper was seen, or Steam logged a launch of another app: the user is
+    /// doing something else (#1159). Latched.
+    elsewhere: bool,
 }
 
 impl Watcher {
@@ -179,7 +188,33 @@ impl Watcher {
             focused: None,
             windows_read: false,
             last_windows: Vec::new(),
+            action: None,
+            window_need: None,
+            elsewhere: false,
         }
+    }
+
+    /// Where the target is now, as last reported.
+    pub fn launch_state(&self) -> LaunchState {
+        self.state
+    }
+
+    /// Steam's log has shown a `LaunchApp` making progress for the target (a task change, a
+    /// wait for the user, or the answer to one) and has not since failed that action: a launch
+    /// it ignored (mid sign-in) leaves no such line, so a caller may send it again only while
+    /// this is false.
+    pub fn launch_taken(&self) -> bool {
+        matches!(self.action, Some((_, false)))
+    }
+
+    /// Why Steam needs the user right now, if it does; it clears when the need does.
+    pub fn needs_now(&self) -> Option<NeedsUser> {
+        self.active_needs
+    }
+
+    /// Another game ran, or Steam launched another app, since this watcher began.
+    pub fn elsewhere(&self) -> bool {
+        self.elsewhere
     }
 
     /// The appid this watcher follows.
@@ -221,6 +256,7 @@ impl Watcher {
         if scan.reaper_alive {
             self.running_via_reaper = true;
         }
+        self.elsewhere |= scan.other_reaper;
         self.read_console_log(now);
         self.read_login_state();
 
@@ -254,23 +290,23 @@ impl Watcher {
         match mapped {
             Ok(windows) => {
                 // The higher-ranked of the window and log reasons wins.
-                let desired = [
-                    classify_windows(&windows, self.cfg.appid),
-                    self.held_log_needs(now),
-                ]
-                .into_iter()
-                .flatten()
-                .min_by_key(|reason| needs_rank(*reason));
+                self.window_need = classify_windows(&windows, self.cfg.appid);
+                let desired = [self.window_need, self.held_log_needs(now)]
+                    .into_iter()
+                    .flatten()
+                    .min_by_key(|reason| needs_rank(*reason));
                 self.update_needs(desired, &mut reports);
                 self.last_windows = windows;
             }
             Err(_) => {
-                // The mapped list is skipped for this pass: no window-derived
-                // reason changes, but a log-derived wait-for-user can still
-                // be reported.
-                if let Some(reason) = self.held_log_needs(now) {
-                    self.update_needs(Some(reason), &mut reports);
-                }
+                // The mapped list is skipped for this pass: the window-derived reason
+                // stands as it was, but the log-derived one is read afresh, so a sign-in
+                // that finished clears even when the windows cannot be read.
+                let desired = [self.window_need, self.held_log_needs(now)]
+                    .into_iter()
+                    .flatten()
+                    .min_by_key(|reason| needs_rank(*reason));
+                self.update_needs(desired, &mut reports);
             }
         }
 
@@ -448,8 +484,29 @@ impl Watcher {
                 self.interstitial_since = None;
             }
         } else if line.contains("GameAction") {
+            // A refusal logs progress, then `failed with AppError_n` and `changed task to
+            // Failed` for the same ActionID (#1159): the failure is the terminal word.
+            let failed = line.contains("LaunchApp failed with")
+                || line.contains("LaunchApp changed task to Failed");
+            let progress = !failed
+                && (line.contains("LaunchApp changed task to")
+                    || line.contains("LaunchApp waiting for user response to")
+                    || line.contains("LaunchApp continues with user response"));
             if extract_appid(line) != Some(self.cfg.appid) {
+                self.elsewhere |= progress && line.contains("LaunchApp");
                 return;
+            }
+            if let Some(id) = extract_action_id(line) {
+                match self.action {
+                    Some((current, _)) if current == id => {
+                        if failed {
+                            self.action = Some((id, true));
+                        }
+                    }
+                    // A later action: its progress is a new launch taken up.
+                    _ if progress => self.action = Some((id, false)),
+                    _ => {}
+                }
             }
             if let Some(task_at) = line.find("LaunchApp waiting for user response to") {
                 // The one log line that means Steam is actually stopped for
@@ -658,6 +715,12 @@ impl LogTail {
     }
 }
 
+fn extract_action_id(line: &str) -> Option<u32> {
+    let rest = line.get(line.find("ActionID ")? + "ActionID ".len()..)?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
 fn extract_appid(line: &str) -> Option<u32> {
     let at = line.find("AppID")? + "AppID".len();
     let rest = line.get(at..)?;
@@ -674,6 +737,8 @@ fn extract_appid(line: &str) -> Option<u32> {
 struct ProcScan {
     readable: bool,
     reaper_alive: bool,
+    /// A game's reaper for some other app is alive.
+    other_reaper: bool,
     steam_client: bool,
 }
 
@@ -681,6 +746,7 @@ fn scan_proc(proc_root: &std::path::Path, appid: u32) -> ProcScan {
     let unreadable = ProcScan {
         readable: false,
         reaper_alive: false,
+        other_reaper: false,
         steam_client: false,
     };
     let Ok(entries) = std::fs::read_dir(proc_root) else {
@@ -692,6 +758,7 @@ fn scan_proc(proc_root: &std::path::Path, appid: u32) -> ProcScan {
     let mut scan = ProcScan {
         readable: true,
         reaper_alive: false,
+        other_reaper: false,
         steam_client: false,
     };
     for entry in entries {
@@ -714,8 +781,10 @@ fn scan_proc(proc_root: &std::path::Path, appid: u32) -> ProcScan {
             .map(|part| String::from_utf8_lossy(part).into_owned())
             .filter(|arg| !arg.is_empty())
             .collect();
-        if is_reaper_for(&args, appid) {
-            scan.reaper_alive = true;
+        match reaper_appid(&args) {
+            Some(found) if found == appid => scan.reaper_alive = true,
+            Some(_) => scan.other_reaper = true,
+            None => {}
         }
         if args
             .first()
@@ -746,6 +815,11 @@ fn read_cmdline(path: &std::path::Path) -> Result<Option<Vec<u8>>, ()> {
 }
 
 fn is_reaper_for(args: &[String], appid: u32) -> bool {
+    reaper_appid(args) == Some(appid)
+}
+
+/// The app a game's reaper runs, when `args` are one.
+fn reaper_appid(args: &[String]) -> Option<u32> {
     // An Install=1 reaper runs an install script (Proton's
     // iscriptevaluator.exe) before the game; it is not the game, and its
     // exit must never read as the game's.
@@ -754,12 +828,15 @@ fn is_reaper_for(args: &[String], appid: u32) -> bool {
             .iter()
             .any(|arg| basename(arg).to_lowercase() == "iscriptevaluator.exe")
     {
-        return false;
+        return None;
     }
-    let appid_arg = format!("AppId={appid}");
-    args.iter().any(|arg| basename(arg) == "reaper")
-        && args.iter().any(|arg| arg == "SteamLaunch")
-        && args.iter().any(|arg| arg == &appid_arg)
+    if !args.iter().any(|arg| basename(arg) == "reaper")
+        || !args.iter().any(|arg| arg == "SteamLaunch")
+    {
+        return None;
+    }
+    args.iter()
+        .find_map(|arg| arg.strip_prefix("AppId=")?.parse().ok())
 }
 
 fn basename(arg: &str) -> &str {
@@ -976,6 +1053,13 @@ impl CloudSync {
 pub fn game_running(proc_root: &Path, appid: u32) -> Option<bool> {
     let scan = scan_proc(proc_root, appid);
     scan.readable.then_some(scan.reaper_alive)
+}
+
+/// Whether a Steam client process runs under `proc_root`; `None` when `/proc` could not be
+/// read in full, which never counts as gone.
+pub fn steam_client_running(proc_root: &Path) -> Option<bool> {
+    let scan = scan_proc(proc_root, 0);
+    scan.readable.then_some(scan.steam_client)
 }
 
 /// The pids of `appid`'s launch reaper and every process under it, at most 4096. Parents

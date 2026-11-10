@@ -143,6 +143,12 @@ pub enum AgentMsg {
         /// the in-place swap.
         #[serde(skip_serializing_if = "Option::is_none")]
         parked_sessions_v1: Option<bool>,
+        /// Amendment 59: an adoption moves the runtime to the new stream.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        adopt_restream_v1: Option<bool>,
+        /// Amendment 56: the agent applies `session_assign.compat_tools`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        compat_tools_v1: Option<bool>,
     },
     ConfigPolicyState {
         attempt_id: String,
@@ -218,6 +224,10 @@ pub enum AgentMsg {
         /// Amendment 54: `transports` and `webtransport`, replaced wholesale on every report.
         #[serde(flatten)]
         transports: crate::webtransport::Transports,
+        /// Amendment 56: the tools in the install record and the free space; only when
+        /// `compat_tools_v1` was advertised.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        compat_tools: Option<Box<serde_json::Value>>,
     },
     Heartbeat {
         running_sessions: Vec<String>,
@@ -1134,6 +1144,13 @@ pub enum ControlMsg {
         wt_token_hash: Option<String>,
         #[serde(default)]
         wt_token_expires_at: Option<String>,
+        /// Amendment 56: the compatibility-tool mapping of a Steam-family session. Sent only to
+        /// an agent that advertised `compat_tools_v1`.
+        #[serde(default)]
+        compat_tools: Option<serde_json::Value>,
+        /// Amendment 55: the grant to send this session's WebTransport client PyroWave.
+        #[serde(default)]
+        pyrowave: Option<crate::webtransport::PyroWaveGrant>,
     },
     /// Amendment 54: a further transport token for a WebTransport session.
     SessionTransportToken {
@@ -1647,6 +1664,39 @@ mod tests {
     }
 
     #[test]
+    fn session_assign_carries_the_pyrowave_grant_when_present() {
+        let mut msg = serde_json::json!({
+            "type": "session_assign", "id": "c1", "session_id": "s1",
+            "stream": {"width": 1920, "height": 1080, "fps": 60,
+                "bitrate_kbps": 15000, "h264_profile": "constrained-baseline"}
+        });
+        let parsed: ControlMsg = serde_json::from_value(msg.clone()).unwrap();
+        assert!(matches!(
+            parsed,
+            ControlMsg::SessionAssign { pyrowave: None, .. }
+        ));
+        msg["pyrowave"] = serde_json::json!(
+            {"wanted": true, "target_kbps": 200000, "floor_kbps": 100000, "max_rtt_ms": 5}
+        );
+        let ControlMsg::SessionAssign {
+            pyrowave: Some(grant),
+            ..
+        } = serde_json::from_value(msg).unwrap()
+        else {
+            panic!("the grant parses");
+        };
+        assert_eq!(
+            grant,
+            crate::webtransport::PyroWaveGrant {
+                wanted: true,
+                target_kbps: 200_000,
+                floor_kbps: 100_000,
+                max_rtt_ms: 5
+            }
+        );
+    }
+
+    #[test]
     fn storage_volume_serde_roundtrip() {
         let v = StorageVolume {
             label: "agent-data".to_string(),
@@ -1662,6 +1712,7 @@ mod tests {
     #[test]
     fn capacity_json_omits_absent_additive_fields() {
         let msg = AgentMsg::Capacity {
+            compat_tools: None,
             transports: crate::webtransport::capacity(),
             deployment_settings: None,
             config_policy_accepted_groups: None,
@@ -1714,6 +1765,7 @@ mod tests {
     #[test]
     fn capacity_json_includes_present_additive_fields() {
         let msg = AgentMsg::Capacity {
+            compat_tools: None,
             transports: crate::webtransport::capacity(),
             deployment_settings: None,
             config_policy_accepted_groups: None,
@@ -2130,6 +2182,8 @@ mod tests {
             config_policy_groups: None,
             terminal_home_cleanup_v1: None,
             parked_sessions_v1: None,
+            adopt_restream_v1: None,
+            compat_tools_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Enrollment {
@@ -2165,6 +2219,8 @@ mod tests {
             config_policy_groups: None,
             terminal_home_cleanup_v1: None,
             parked_sessions_v1: None,
+            adopt_restream_v1: None,
+            compat_tools_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Reconnect {
@@ -2207,6 +2263,8 @@ mod tests {
             config_policy_groups: None,
             terminal_home_cleanup_v1: None,
             parked_sessions_v1: None,
+            adopt_restream_v1: None,
+            compat_tools_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Reconnect {
@@ -2246,6 +2304,8 @@ mod tests {
             config_policy_groups: None,
             terminal_home_cleanup_v1: None,
             parked_sessions_v1: None,
+            adopt_restream_v1: None,
+            compat_tools_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Reconnect {
@@ -2613,6 +2673,36 @@ mod tests {
         assert!(!obj.contains_key("audio_sinks"));
         assert_eq!(json["connectors"], serde_json::json!(["DP-4"]));
         assert_eq!(json["input_devices"][0]["path"], "/dev/input/event4");
+    }
+
+    /// Amendment 56: `compat_tools` as the control plane marshals it (`agentws.CompatToolsSpec`)
+    /// parses, and an assign without it reads as none.
+    #[test]
+    fn compat_tools_parse_from_the_control_planes_bytes() {
+        let assign = |extra: &str| {
+            let raw = format!(
+                r#"{{"type":"session_assign","id":"c1","session_id":"p1","gpu_index":0,"app":{{}},
+                "stream":{{"width":1920,"height":1080,"fps":60,"bitrate_kbps":15000,"h264_profile":"constrained-baseline"}}{extra}}}"#
+            );
+            match serde_json::from_str(&raw).unwrap() {
+                ControlMsg::SessionAssign { compat_tools, .. } => compat_tools,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(assign(""), None);
+        let tools = crate::compat_tools::parse(
+            &assign(
+                r#","compat_tools":{"mount":[],"entries":[{"appid":"0","name":"proton_10","forced":false},{"appid":"1145360","name":"proton_hotfix","forced":true}]}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(tools.mount.is_empty());
+        assert_eq!(tools.entries.len(), 2);
+        assert!(tools.entries[1].forced);
+        // A value of the wrong shape drops only itself: the assign still parses.
+        assert!(assign(r#","compat_tools":{"forced":"yes"}"#).is_some());
+        assert!(assign(r#","compat_tools":"x""#).is_some());
     }
 
     /// Amendment 39: `kind`, `adopt_session_id`, `in_place` and the new stop reasons parse;

@@ -65,6 +65,7 @@ export type RegistrationMode = Schemas["RegistrationMode"];
  *  because the enum lives in frozen `protocol/openapi.yaml` — as does its stale doc. */
 export type StorageProvider = Schemas["StorageProvider"];
 
+export type DefaultTransport = NonNullable<InstanceSettings["default_transport"]>;
 /** `library/ImagesTab.tsx` defaults it to `"notify"` when absent, matching the column's
  *  `DEFAULT 'notify'` (migration 0054); optional for pre-P3 servers. */
 export type ImageUpdatePolicy = NonNullable<InstanceSettings["image_update_policy"]>;
@@ -252,6 +253,9 @@ export type LaunchProfile = Schemas["LaunchProfile"];
 /** `rungs` order IS preference; the server assigns `position`. Must contain at
  *  least one h264 rung (400 otherwise); h264 not last is a warning only. */
 export type LaunchProfileWrite = Schemas["LaunchProfileWrite"];
+export type LaunchProfileTransport = Schemas["LaunchProfileTransport"];
+export type HostWebTransport = Schemas["HostWebTransport"];
+export type HostWebTransportWrite = Schemas["HostWebTransportWrite"];
 
 export type AdminLaunchProfilesResponse = Schemas["AdminLaunchProfilesResponse"];
 
@@ -302,6 +306,9 @@ export type RungRejection = Schemas["RungRejection"];
 export type ICEServer = Schemas["ICEServer"];
 
 export type SignalingCoords = Schemas["SignalingCoords"];
+
+/** `transport_options.webtransport` (amendment 54). */
+export type WebTransportCoords = Schemas["WebTransportCoords"];
 
 export type LaunchResponse = Omit<Schemas["LaunchResponse"], "session"> & {
   session: Session;
@@ -478,6 +485,13 @@ export type RuntimePreset = Schemas["RuntimePreset"];
 export type RuntimePresetEnvelope = Schemas["RuntimePresetEnvelope"];
 
 export type RuntimePresetsResponse = Schemas["RuntimePresetsResponse"];
+
+// ── Compatibility tools (amendment 56) ────────────────────────────────────────
+export type CompatTool = Schemas["CompatTool"];
+export type CompatToolList = Schemas["CompatToolList"];
+export type CompatToolMapping = Schemas["CompatToolMapping"];
+export type HostCompatTools = Schemas["HostCompatTools"];
+export type CompatToolMappingWrite = Schemas["CompatToolMappingWrite"];
 
 /** Only `name` is required; an absent field takes the server default on create
  *  and is unchanged on patch. Never send a zero-value to mean "unset". */

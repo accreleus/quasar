@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"github.com/accreleus/quasar/control-plane/internal/outbound"
 )
 
 // Fetcher retrieves the raw manifest bytes for a given catalog ref
@@ -103,9 +105,9 @@ func (f *HTTPFetcher) ManifestURL(ref string) string {
 // URL at a given ref. Never fails a launch: Store.Sync treats any error as
 // "serve the cached catalog, report sync_error", never a 5xx.
 type HTTPFetcher struct {
-	Client *http.Client // defaults to a client with DefaultFetchTimeout if nil
-	Repo   string       // "owner/name"; defaults to DefaultManifestRepo, overridable via QUASAR_IMAGE_CATALOG_REPO
-	Path   string       // manifest path within the repo; defaults to DefaultManifestPath, overridable via QUASAR_IMAGE_CATALOG_PATH
+	Client outbound.Doer // defaults to the shared outbound client for catalogHost if nil
+	Repo   string        // "owner/name"; defaults to DefaultManifestRepo, overridable via QUASAR_IMAGE_CATALOG_REPO
+	Path   string        // manifest path within the repo; defaults to DefaultManifestPath, overridable via QUASAR_IMAGE_CATALOG_PATH
 }
 
 // NewHTTPFetcher builds the production fetcher against
@@ -123,12 +125,26 @@ func NewHTTPFetcher() *HTTPFetcher {
 	if path == "" {
 		path = DefaultManifestPath
 	}
-	return &HTTPFetcher{
-		Client: &http.Client{Timeout: DefaultFetchTimeout},
-		Repo:   repo,
-		Path:   path,
-	}
+	return &HTTPFetcher{Client: newCatalogClient(), Repo: repo, Path: path}
 }
+
+// catalogHost is the only host the manifest is read from; the repo and path
+// knobs change what is read, never where.
+const catalogHost = "raw.githubusercontent.com"
+
+func newCatalogClient() outbound.Doer {
+	c, err := outbound.New(outbound.Config{
+		AllowHosts:   outbound.ParseHostList("", catalogHost),
+		Timeout:      DefaultFetchTimeout,
+		MaxBodyBytes: maxManifestBytes,
+	})
+	if err != nil { // ParseHostList never returns an empty set
+		panic(fmt.Sprintf("images: build catalog outbound client: %v", err))
+	}
+	return c
+}
+
+const maxManifestBytes = 8 << 20
 
 // Fetch retrieves the manifest at ref (a branch, tag, or commit SHA) via
 // raw.githubusercontent.com. The context bounds the request in addition to
@@ -139,7 +155,7 @@ func (f *HTTPFetcher) Fetch(ctx context.Context, ref string) ([]byte, error) {
 	}
 	client := f.Client
 	if client == nil {
-		client = &http.Client{Timeout: DefaultFetchTimeout}
+		client = newCatalogClient()
 	}
 	repo := f.Repo
 	if repo == "" {
@@ -155,7 +171,8 @@ func (f *HTTPFetcher) Fetch(ctx context.Context, ref string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("build manifest fetch request for %s: %w", url, err)
 	}
-	resp, err := client.Do(req)
+	// A renamed repo answers with one same-host redirect; nothing else is followed.
+	resp, err := outbound.GetOneRedirect(client, req, outbound.ParseHostList("", catalogHost), nil)
 	if err != nil {
 		return nil, fmt.Errorf("fetch manifest %s: %w", url, err)
 	}
@@ -169,7 +186,7 @@ func (f *HTTPFetcher) Fetch(ctx context.Context, ref string) ([]byte, error) {
 				"instance_settings.image_catalog_ref)",
 			url, resp.StatusCode, ref, repo, path)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20)) // bounded: a misconfigured ref must not stream unbounded
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxManifestBytes)) // bounded: a misconfigured ref must not stream unbounded
 	if err != nil {
 		return nil, fmt.Errorf("read manifest body from %s: %w", url, err)
 	}

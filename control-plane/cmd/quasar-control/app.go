@@ -17,6 +17,7 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/audit"
 	"github.com/accreleus/quasar/control-plane/internal/auth"
 	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
+	"github.com/accreleus/quasar/control-plane/internal/compat"
 	"github.com/accreleus/quasar/control-plane/internal/config"
 	"github.com/accreleus/quasar/control-plane/internal/console"
 	"github.com/accreleus/quasar/control-plane/internal/crud"
@@ -82,6 +83,7 @@ type Services struct {
 	cfgHandler      *hostcfg.Handler
 	settingsHandler *settings.Handler
 	invitesHandler  *invites.Handler
+	compatHandler   *compat.Handler
 	enrollHandler   *hostenroll.Handler
 	consoleHandler  *console.Handler
 	platformHandler *platform.Handler
@@ -652,6 +654,26 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	settingsHandler := settings.NewHandler(settingsStore, auditStore)
 	settingsHandler.OnAllowedOriginsChanged = originResolver.Invalidate
 	invitesHandler := invites.NewHandler(invites.NewStore(pool), cfg.PublicBaseURL, auditStore)
+	compatStore := compat.NewStore(pool)
+	compatStore.Auditor = auditStore
+	compatStore.Superseder = coordinator.SupersedeParked
+	compatStore.Stopper = coordinator.StopByAdmin
+	go compatStore.RunStopLoop(janitorCtx, time.Minute)
+	compatCtx, compatCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := compatStore.Reconcile(compatCtx); err != nil {
+		log.Error("compat tools: reconciling the catalogue failed", "err", err)
+	}
+	compatCancel()
+	// The compat_tools.converge job (amendment 56): desired state is every enabled GE tool on every
+	// compat_tools_v1 host; runs are filled with the host's first difference when it claims one.
+	compatConv := compat.NewConverger(pool, jobStore, auditStore, log)
+	compatConv.Supported = agentRegistry.SupportsCompatTools
+	compatGitHub, err := compat.NewGitHub(log)
+	if err != nil {
+		janitorStop()
+		return nil, fmt.Errorf("compat tools github client: %w", err)
+	}
+	compatHandler := compat.NewHandler(compatStore, auditStore, compatConv, compatGitHub)
 	enrollHandler := hostenroll.NewHandler(hostenroll.NewStore(pool), auditStore)
 	consoleHandler := console.NewHandler(consoleStore, agentRegistry, auditStore)
 	auditHandler := audit.NewHandler(auditStore)
@@ -859,6 +881,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	preparationStore := preparation.New(pool)
 	agentHandler.SetPreparation(preparationStore)
 	agentHandler.OnPreparationReport = imagesEnsurer.ReconcilePreparation
+	agentHandler.OnCompatTools = func(ctx context.Context, hostID string) { compatConv.Host(ctx, hostID, false) }
 	agentHandler.SetImageEvents(imagesEnsurer)
 	agentHandler.SetImageCleanupEvents(imagesCleanup)
 
@@ -997,6 +1020,17 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 				imagesEnsurer.ReconcilePreparation(run.HostID)
 			}
 		},
+	})
+	jobRegistry.MustRegister(jobs.Definition{
+		ID:          compat.JobID,
+		Name:        "Compatibility tools",
+		Description: "Installs every enabled GE-Proton release on each host and removes the others, one action per run, under the trust rules (control-api.md §Compatibility tools). Disabling this job stops installs and removals and changes nothing on disk.",
+		Plane:       jobs.PlaneAgent,
+		Scope:       jobs.ScopeHost,
+		Managed:     true,
+		Default:     jobs.Schedule{Kind: jobs.KindEvent},
+		FillParams:  compatConv.Params,
+		OnTerminal:  compatConv.Closed,
 	})
 	jobRegistry.MustRegister(jobs.Definition{
 		ID:          homeGCJobID,
@@ -1300,6 +1334,11 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		refreshPreflight()
 		rep, err := releaseDetector.Detect(ctx)
 		if err != nil {
+			// A failed pass notifies nobody and starts nothing (#1003). A build it
+			// did record (the branch half needs no listing) is stored, and it waits
+			// for the next pass that SUCCEEDS for both. That is deliberate: the
+			// listing is what says which release is newest, so a partial view must
+			// never drive a notification or an unattended apply.
 			return jobs.Outcome{}, err
 		}
 		summary := rep.Summary()
@@ -1362,6 +1401,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		return nil, fmt.Errorf("jobs registry sync: %w", syncErr)
 	}
 	jobsDispatcher = jobs.New(jobStore, jobRegistry, jobsCfg, log)
+	compatConv.Disp = jobsDispatcher
 	jobsDispatcher.Start(janitorCtx)
 	// The #488 warm-up's event trigger: the one place the control plane learns an
 	// image reached `ready`. Wired after the dispatcher exists; until then, and when
@@ -1390,6 +1430,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		cfgHandler:       cfgHandler,
 		settingsHandler:  settingsHandler,
 		invitesHandler:   invitesHandler,
+		compatHandler:    compatHandler,
 		enrollHandler:    enrollHandler,
 		consoleHandler:   consoleHandler,
 		platformHandler:  platformHandler,
@@ -1438,6 +1479,7 @@ func (s *Services) RegisterRoutes(mux httpx.Router) {
 	}
 	s.settingsHandler.Register(mux, admin)
 	s.invitesHandler.Register(mux, admin)
+	s.compatHandler.Register(mux, admin)
 	s.enrollHandler.Register(mux, admin)
 	s.consoleHandler.Register(mux, admin)
 	s.platformHandler.Register(mux, admin)

@@ -25,13 +25,40 @@ fn hello_for(session_id: &str, token: &str, wt_proto: u32) -> Hello {
         wt_proto,
         token: token.into(),
         session_id: session_id.into(),
+        pyrowave: false,
     }
 }
 
+/// An input seam that records what reaches it.
+fn recorded() -> (
+    Input,
+    Arc<Mutex<Vec<String>>>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let released = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (seen, lifted) = (events.clone(), released.clone());
+    let input = Input {
+        event: Arc::new(move |json| seen.lock().unwrap().push(json.to_string())),
+        release_all: Arc::new(move || {
+            lifted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }),
+    };
+    (input, events, released)
+}
+
+pub(super) fn no_input() -> Input {
+    recorded().0
+}
+
 fn ready_media() -> Arc<Media> {
+    ready_media_with(no_input())
+}
+
+fn ready_media_with(input: Input) -> Arc<Media> {
     gst::init().unwrap();
     let encoder = gst::ElementFactory::make("identity").build().unwrap();
-    let media = Media::new(&encoder);
+    let media = Media::new(&encoder, input, Audio::new(audio::Plan::default()), None);
     let caps = gst::Caps::builder("video/x-h264")
         .field("stream-format", "avc")
         .field("width", 64)
@@ -112,6 +139,326 @@ fn a_token_is_single_use_lives_its_expiry_plus_15_s_and_never_crosses() {
     assert!(!registry.add_token("b", &token_hash("late"), at(60)));
 }
 
+/// Hand-made access units for the codecs the image has no encoder for. The tap and the
+/// framing read NAL and OBU headers only, never slice data.
+pub(super) mod streams {
+    use super::*;
+
+    pub(in crate::webtransport) fn hevc_caps(width: i32) -> gst::Caps {
+        // hvcC: profile 1 (Main), compat 0x60000000, level 93, 4-byte NAL lengths.
+        let mut hvcc = vec![0u8; 23];
+        hvcc[..2].copy_from_slice(&[1, 0x01]);
+        hvcc[2..6].copy_from_slice(&0x6000_0000u32.to_be_bytes());
+        hvcc[12] = 93;
+        hvcc[21] = 0x03;
+        gst::Caps::builder("video/x-h265")
+            .field("stream-format", "hvc1")
+            .field("alignment", "au")
+            .field("width", width)
+            .field("height", 360)
+            .field("framerate", gst::Fraction::new(30, 1))
+            .field("codec_data", gst::Buffer::from_slice(hvcc))
+            .build()
+    }
+
+    pub(in crate::webtransport) fn av1_caps(width: i32) -> gst::Caps {
+        gst::Caps::builder("video/x-av1")
+            .field("parsed", true)
+            .field("stream-format", "obu-stream")
+            .field("alignment", "tu")
+            .field("width", width)
+            .field("height", 360)
+            .field("framerate", gst::Fraction::new(30, 1))
+            .field(
+                "codec_data",
+                gst::Buffer::from_slice(vec![0x81, 0x08, 0x0c, 0]),
+            )
+            .build()
+    }
+
+    fn length_prefixed(nals: &[(u8, usize)]) -> Vec<u8> {
+        let mut au = Vec::new();
+        for &(header, len) in nals {
+            au.extend_from_slice(&(len as u32 + 2).to_be_bytes());
+            au.extend_from_slice(&[header << 1, 1]);
+            au.extend(std::iter::repeat_n(0x55, len));
+        }
+        au
+    }
+
+    /// An H.265 access unit: with `irap`, VPS, SPS, PPS and an IRAP slice of that NAL type
+    /// (19 IDR_W_RADL, 21 CRA), otherwise a TRAIL_R slice.
+    pub(in crate::webtransport) fn hevc_au(irap: Option<u8>, body: usize) -> Vec<u8> {
+        match irap {
+            Some(t) => length_prefixed(&[(32, 10), (33, 20), (34, 5), (t, body)]),
+            None => length_prefixed(&[(1, body)]),
+        }
+    }
+
+    fn obu(kind: u8, len: usize) -> Vec<u8> {
+        let mut o = vec![kind << 3 | 0x02];
+        let mut n = len;
+        loop {
+            let byte = (n & 0x7f) as u8;
+            n >>= 7;
+            o.push(if n > 0 { byte | 0x80 } else { byte });
+            if n == 0 {
+                break;
+            }
+        }
+        o.extend(std::iter::repeat_n(0x55, len));
+        o
+    }
+
+    /// An AV1 temporal unit as `av1parse` hands it on: temporal delimiter first, a sequence
+    /// header when `sequence_header`, then one frame OBU.
+    pub(in crate::webtransport) fn av1_tu(sequence_header: bool, body: usize) -> Vec<u8> {
+        let mut tu = obu(2, 0);
+        if sequence_header {
+            tu.extend(obu(1, 10));
+        }
+        tu.extend(obu(6, body));
+        tu
+    }
+
+    /// MSB-first bit writer with Exp-Golomb, for parameter sets a real parser accepts.
+    #[derive(Default)]
+    struct Bits {
+        bytes: Vec<u8>,
+        used: u8,
+    }
+
+    impl Bits {
+        fn u(&mut self, bits: u32, value: u64) -> &mut Self {
+            for i in (0..bits).rev() {
+                if self.used == 0 {
+                    self.bytes.push(0);
+                }
+                let last = self.bytes.len() - 1;
+                self.bytes[last] |= (((value >> i) & 1) as u8) << (7 - self.used);
+                self.used = (self.used + 1) % 8;
+            }
+            self
+        }
+
+        fn ue(&mut self, value: u64) -> &mut Self {
+            let v = value + 1;
+            let len = 64 - v.leading_zeros();
+            self.u(len - 1, 0).u(len, v)
+        }
+
+        fn se(&mut self, value: i64) -> &mut Self {
+            self.ue(if value > 0 {
+                value as u64 * 2 - 1
+            } else {
+                value.unsigned_abs() * 2
+            })
+        }
+
+        /// rbsp_trailing_bits, then emulation prevention, behind the 2-byte NAL header.
+        fn nal(&mut self, kind: u8) -> Vec<u8> {
+            self.u(1, 1);
+            while self.used != 0 {
+                self.u(1, 0);
+            }
+            let mut nal = vec![kind << 1, 1];
+            let mut zeros = 0;
+            for &b in &self.bytes {
+                if zeros >= 2 && b <= 3 {
+                    nal.push(3);
+                    zeros = 0;
+                }
+                zeros = if b == 0 { zeros + 1 } else { 0 };
+                nal.push(b);
+            }
+            nal
+        }
+    }
+
+    fn profile_tier_level(b: &mut Bits) {
+        // Main, compat bit 1 and 2, progressive, frame-only, level 93 (3.1).
+        b.u(2, 0)
+            .u(1, 0)
+            .u(5, 1)
+            .u(32, 0x6000_0000)
+            .u(1, 1)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 1);
+        b.u(32, 0).u(12, 0).u(8, 93);
+    }
+
+    /// An H.265 Annex-B access unit a real `h265parse` accepts: 64x64 Main, VPS, SPS, PPS, then
+    /// (`irap`) an IDR_W_RADL slice or a TRAIL_R slice with POC `poc`. The slice data is junk.
+    pub(in crate::webtransport) fn hevc_byte_stream(irap: bool, poc: u8) -> Vec<u8> {
+        let mut vps = Bits::default();
+        vps.u(4, 0)
+            .u(1, 1)
+            .u(1, 1)
+            .u(6, 0)
+            .u(3, 0)
+            .u(1, 1)
+            .u(16, 0xffff);
+        profile_tier_level(&mut vps);
+        vps.u(1, 1).ue(0).ue(0).ue(0).u(6, 0).ue(0).u(1, 0).u(1, 0);
+        let mut sps = Bits::default();
+        sps.u(4, 0).u(3, 0).u(1, 1);
+        profile_tier_level(&mut sps);
+        sps.ue(0).ue(1).ue(64).ue(64).u(1, 0).ue(0).ue(0).ue(4);
+        sps.u(1, 1).ue(0).ue(0).ue(0);
+        sps.ue(0).ue(3).ue(0).ue(3).ue(0).ue(0);
+        sps.u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .ue(0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0);
+        let mut pps = Bits::default();
+        pps.ue(0)
+            .ue(0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(3, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .ue(0)
+            .ue(0)
+            .se(0);
+        pps.u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .se(0)
+            .se(0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0);
+        pps.u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .u(1, 0)
+            .ue(0)
+            .u(1, 0)
+            .u(1, 0);
+        let mut slice = Bits::default();
+        slice.u(1, 1);
+        if irap {
+            slice.u(1, 0);
+        }
+        slice.ue(0).ue(if irap { 2 } else { 1 });
+        if !irap {
+            // POC lsb, an explicit short-term set of one picture back, then P-slice fields.
+            slice
+                .u(8, poc as u64)
+                .u(1, 0)
+                .ue(1)
+                .ue(0)
+                .ue(0)
+                .u(1, 1)
+                .u(1, 0)
+                .ue(0);
+        }
+        slice.se(0);
+        let mut au = Vec::new();
+        let nals: Vec<Vec<u8>> = if irap {
+            vec![vps.nal(32), sps.nal(33), pps.nal(34), slice.nal(19)]
+        } else {
+            vec![slice.nal(1)]
+        };
+        for (i, mut nal) in nals.into_iter().enumerate() {
+            if i + 1 == if irap { 4 } else { 1 } {
+                nal.extend(std::iter::repeat_n(0x55, 40));
+            }
+            au.extend_from_slice(&[0, 0, 0, 1]);
+            au.extend(nal);
+        }
+        au
+    }
+
+    /// An AV1 temporal unit a real `av1parse` accepts: a 64x64 still-picture (reduced header)
+    /// sequence header, then one lossless key frame OBU whose tile data is junk.
+    pub(in crate::webtransport) fn av1_key_tu() -> Vec<u8> {
+        let mut seq = Bits::default();
+        seq.u(3, 0)
+            .u(1, 1)
+            .u(1, 1)
+            .u(5, 8)
+            .u(4, 7)
+            .u(4, 7)
+            .u(8, 63)
+            .u(8, 63);
+        seq.u(1, 0).u(1, 0).u(1, 0); // 128x128 superblocks, filter intra, intra edge
+        seq.u(1, 0).u(1, 0).u(1, 0); // superres, cdef, restoration
+        seq.u(1, 0).u(1, 0).u(1, 0).u(1, 0).u(2, 0).u(1, 0); // color config
+        seq.u(1, 0); // film grain params
+        seq.u(1, 1);
+        while seq.used != 0 {
+            seq.u(1, 0);
+        }
+        let mut frame = Bits::default();
+        frame.u(1, 0).u(1, 0).u(1, 0).u(1, 1); // cdf update, screen content, render size, uniform tiles
+        frame.u(8, 0).u(3, 0).u(1, 0).u(1, 0).u(1, 0); // base_q_idx 0, delta q, qmatrix, segmentation, tx set
+        let mut obu_frame = frame.bytes.clone();
+        obu_frame.extend(std::iter::repeat_n(0x55, 40));
+        let mut tu = obu(2, 0);
+        tu.extend(wrap(1, &seq.bytes));
+        tu.extend(wrap(6, &obu_frame));
+        tu
+    }
+
+    fn wrap(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let mut o = obu(kind, 0);
+        o.pop();
+        o.push(payload.len() as u8);
+        o.extend_from_slice(payload);
+        o
+    }
+
+    /// The OBU types of a temporal unit, panicking on one without a size field.
+    pub(in crate::webtransport) fn obu_types(tu: &[u8]) -> Vec<u8> {
+        let mut types = Vec::new();
+        let mut at = 0;
+        while at < tu.len() {
+            let h = tu[at];
+            assert!(h & 0x02 != 0, "an OBU without a size field");
+            types.push(h >> 3 & 0x0f);
+            let (mut size, mut shift) = (0usize, 0);
+            at += 1;
+            loop {
+                let b = tu[at];
+                at += 1;
+                size |= usize::from(b & 0x7f) << shift;
+                shift += 7;
+                if b & 0x80 == 0 {
+                    break;
+                }
+            }
+            at += size;
+        }
+        assert_eq!(at, tu.len(), "an OBU past the end");
+        types
+    }
+
+    /// The NAL types of a length-prefixed H.265 access unit.
+    pub(in crate::webtransport) fn hevc_types(au: &[u8]) -> Vec<u8> {
+        let mut types = Vec::new();
+        let mut rest = au;
+        while !rest.is_empty() {
+            let len = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;
+            assert!(len > 0 && 4 + len <= rest.len(), "bad NAL length {len}");
+            types.push(rest[4] >> 1 & 0x3f);
+            rest = &rest[4 + len..];
+        }
+        types
+    }
+}
+
 /// An agent with one WebTransport session, encoding a live test picture through the
 /// same parser → payloader boundary the WebRTC transport builds.
 struct Agent {
@@ -120,12 +467,21 @@ struct Agent {
     hash: Vec<u8>,
     pipeline: gst::Pipeline,
     tap: Option<Tap>,
+    /// The session's audio pipeline, when the test gave it one.
+    audio_pipeline: Option<gst::Pipeline>,
+    /// Every input event the agent's devices were given, as JSON text.
+    input: Arc<Mutex<Vec<String>>>,
+    /// How many times a departing client's inputs were lifted.
+    released: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Drop for Agent {
     fn drop(&mut self) {
         self.tap.take();
         let _ = self.pipeline.set_state(gst::State::Null);
+        if let Some(audio) = &self.audio_pipeline {
+            let _ = audio.set_state(gst::State::Null);
+        }
     }
 }
 
@@ -134,29 +490,112 @@ async fn agent() -> Agent {
 }
 
 async fn agent_with(limits: Limits) -> Agent {
-    gst::init().unwrap();
-    assert!(
-        gst::ElementFactory::find("openh264enc").is_some(),
-        "the conformance test needs openh264enc (gstreamer1.0-plugins-bad)"
-    );
-    let registry = Arc::new(Registry::default());
-    registry.assign(SESSION, &token_hash(TOKEN), SystemTime::now() + TOKEN_TTL);
+    agent_for(Stream::H264, limits).await
+}
+
+async fn agent_with_plan(limits: Limits, plan: audio::Plan) -> Agent {
+    agent_built(Stream::H264, limits, plan).await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Stream {
+    H264,
+    H265,
+    Av1,
+    /// An AV1 encoder whose keyframes carry no sequence header.
+    Av1NoSequenceHeader,
+}
+
+/// A stand-in for an encoder and parser the image does not have: one unit every 33 ms,
+/// a keyframe first and on each force-key-unit request, as the parser's src pad would
+/// hand them on (`DELTA_UNIT` on every other).
+fn synthetic(stream: Stream) -> gst::Pipeline {
     let pipeline = gst::parse::launch(
-        "videotestsrc is-live=true pattern=ball ! video/x-raw,width=640,height=360,framerate=30/1 \
-         ! openh264enc name=enc gop-size=1000 bitrate=4000000 \
-         ! video/x-h264,profile=constrained-baseline ! h264parse name=parse \
-         ! rtph264pay config-interval=-1 pt=96 ! fakesink sync=false",
+        "appsrc name=src is-live=true format=time do-timestamp=true \
+         ! identity name=enc ! identity name=parse ! fakesink sync=false",
     )
     .unwrap()
     .downcast::<gst::Pipeline>()
     .unwrap();
+    let src = pipeline
+        .by_name("src")
+        .unwrap()
+        .downcast::<gstreamer_app::AppSrc>()
+        .unwrap();
+    src.set_caps(Some(&match stream {
+        Stream::H265 => streams::hevc_caps(640),
+        _ => streams::av1_caps(640),
+    }));
+    let forced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = forced.clone();
+    src.static_pad("src")
+        .unwrap()
+        .add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_, _| {
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            gst::PadProbeReturn::Ok
+        });
+    std::thread::spawn(move || {
+        for n in 0u64.. {
+            let key = n == 0 || forced.swap(false, std::sync::atomic::Ordering::SeqCst);
+            let body = if key { 3000 } else { 400 };
+            let data = match stream {
+                Stream::H265 => streams::hevc_au(key.then_some(if n == 0 { 19 } else { 21 }), body),
+                Stream::Av1NoSequenceHeader => streams::av1_tu(false, body),
+                _ => streams::av1_tu(key, body),
+            };
+            let mut buffer = gst::Buffer::from_slice(data);
+            if !key {
+                buffer
+                    .get_mut()
+                    .unwrap()
+                    .set_flags(gst::BufferFlags::DELTA_UNIT);
+            }
+            if src.push_buffer(buffer).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(33));
+        }
+    });
+    pipeline
+}
+
+async fn agent_for(stream: Stream, limits: Limits) -> Agent {
+    agent_built(stream, limits, audio::Plan::default()).await
+}
+
+async fn agent_built(stream: Stream, limits: Limits, plan: audio::Plan) -> Agent {
+    gst::init().unwrap();
+    let registry = Arc::new(Registry::default());
+    registry.assign(SESSION, &token_hash(TOKEN), SystemTime::now() + TOKEN_TTL);
+    let pipeline = if stream == Stream::H264 {
+        assert!(
+            gst::ElementFactory::find("openh264enc").is_some(),
+            "the conformance test needs openh264enc (gstreamer1.0-plugins-bad)"
+        );
+        gst::parse::launch(
+            "videotestsrc is-live=true pattern=ball ! video/x-raw,width=640,height=360,framerate=30/1 \
+             ! openh264enc name=enc gop-size=1000 bitrate=4000000 \
+             ! video/x-h264,profile=constrained-baseline ! h264parse name=parse \
+             ! rtph264pay config-interval=-1 pt=96 ! fakesink sync=false",
+        )
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap()
+    } else {
+        synthetic(stream)
+    };
     let parse = pipeline.by_name("parse").unwrap();
     let encoder = pipeline.by_name("enc").unwrap();
+    let (input, events, released) = recorded();
     let tap = Tap::attach(
         &registry,
         &parse.static_pad("src").unwrap(),
         &encoder,
         SESSION,
+        None,
+        input,
+        plan,
+        None,
     );
     assert!(tap.is_some(), "an assigned session takes the tap");
     pipeline.set_state(gst::State::Playing).unwrap();
@@ -185,7 +624,45 @@ async fn agent_with(limits: Limits) -> Agent {
         hash,
         pipeline,
         tap,
+        audio_pipeline: None,
+        input: events,
+        released,
     }
+}
+
+/// An audio pipeline made the way the session's is (`add_opus_encode`, on silence), tapped
+/// at its Opus encoder for the agent's one session.
+fn tap_session_audio(agent: &mut Agent) {
+    use crate::session::settings::RuntimeSettings;
+    use crate::session::StreamParams;
+    let stream = StreamParams {
+        width: 640,
+        height: 360,
+        fps: 30,
+        bitrate_kbps: 4000,
+        h264_profile: "constrained-baseline".to_string(),
+        codec: crate::session::Codec::H264,
+        abr_floor_kbps: 0,
+        mic: true,
+    };
+    let mut cfg = crate::session::SessionConfig::for_assignment_with(
+        &RuntimeSettings::baseline_with(&|_| None),
+        stream,
+        None,
+    );
+    cfg.use_test_audio = true;
+    let pipeline = gst::Pipeline::new();
+    let (_, opus) = crate::session::pipeline::audio_branch::add_opus_encode(&pipeline, &cfg)
+        .expect("the session's Opus encode builds");
+    let sink = gst::ElementFactory::make("fakesink")
+        .property("sync", false)
+        .build()
+        .unwrap();
+    pipeline.add(&sink).unwrap();
+    opus.link(&sink).unwrap();
+    agent.tap.as_ref().unwrap().audio().tap(&opus);
+    pipeline.set_state(gst::State::Playing).unwrap();
+    agent.audio_pipeline = Some(pipeline);
 }
 
 impl Agent {
@@ -207,6 +684,18 @@ impl Agent {
         write_message(&mut send, &hello).await.unwrap();
         let reply = read_message(&mut recv).await.unwrap();
         (session, send, recv, reply)
+    }
+}
+
+thread_local! {
+    /// Run once by `Media::detach` between clearing the client and taking the input lock.
+    static DETACH_GAP: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+
+/// `Media::detach`'s seam: the moment a test can attach a successor into the gap.
+pub(super) fn detach_gap() {
+    if let Some(run) = DETACH_GAP.with(|g| g.borrow_mut().take()) {
+        run();
     }
 }
 
@@ -242,7 +731,11 @@ pub(super) async fn hold_close() -> CloseDone {
 
 /// The close code the browser's `WebTransport.closed` would resolve with.
 async fn close_code(session: &Session) -> Option<u32> {
-    match tokio::time::timeout(Duration::from_secs(10), session.closed()).await {
+    close_code_within(session, Duration::from_secs(10)).await
+}
+
+async fn close_code_within(session: &Session, within: Duration) -> Option<u32> {
+    match tokio::time::timeout(within, session.closed()).await {
         Ok(SessionError::WebTransportError(WebTransportError::Closed(code, _))) => Some(code),
         other => panic!("not a WebTransport close: {other:?}"),
     }
@@ -394,6 +887,370 @@ async fn a_browser_like_client_gets_h264_access_units_after_its_token() {
     assert_eq!(close_code(&reused).await, Some(CLOSE_AUTH));
 }
 
+/// An audio datagram as a client parses it (§Audio).
+#[derive(Debug)]
+struct AudioPacket {
+    pkt_seq: u32,
+    packet_seq: u16,
+    ts_48khz: u32,
+    capture_us: u64,
+    opus: Vec<u8>,
+}
+
+/// Every datagram from `session` for `span`, in arrival order: audio parsed, and the video
+/// ones counted. Asserts that one `pkt_seq` counts both channels without a gap.
+async fn audio_for(session: &Session, span: Duration) -> (Vec<AudioPacket>, usize) {
+    let (mut audio, mut video) = (Vec::new(), 0);
+    let mut last: Option<u32> = None;
+    let until = Instant::now() + span;
+    while let Ok(Ok(d)) = tokio::time::timeout_at(until, session.read_datagram()).await {
+        assert!(
+            d.len() <= media::MAX_DATAGRAM,
+            "a {} byte datagram",
+            d.len()
+        );
+        let pkt_seq = u32::from_le_bytes(d[1..5].try_into().unwrap());
+        if let Some(last) = last {
+            assert_eq!(
+                pkt_seq,
+                last.wrapping_add(1),
+                "one pkt_seq for video and audio"
+            );
+        }
+        last = Some(pkt_seq);
+        match d[0] {
+            0x01 => video += 1,
+            0x02 => audio.push(AudioPacket {
+                pkt_seq,
+                packet_seq: u16::from_le_bytes([d[5], d[6]]),
+                ts_48khz: u32::from_le_bytes(d[7..11].try_into().unwrap()),
+                capture_us: u64::from_le_bytes(d[11..19].try_into().unwrap()),
+                opus: d[audio::AUDIO_HEADER..].to_vec(),
+            }),
+            other => panic!("channel {other:#x} is not sent to a client"),
+        }
+    }
+    (audio, video)
+}
+
+#[tokio::test]
+async fn a_session_with_audio_and_a_microphone_sends_opus_and_takes_the_microphone() {
+    let plan = audio::Plan {
+        audio: true,
+        mic: true,
+        pulse_server: None,
+        jitter_ms: 40,
+    };
+    let mut agent = agent_with_plan(Limits::default(), plan).await;
+    tap_session_audio(&mut agent);
+    let (session, mut send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(
+        ack["audio"],
+        json!({"codec": "opus", "channels": 2, "sample_rate": 48000, "ptime_ms": 10})
+    );
+    assert_eq!(
+        ack["mic"],
+        json!({"codec": "opus", "channels": 1, "sample_rate": 48000, "ptime_ms": 10})
+    );
+
+    let started = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64;
+    let (got, video) = audio_for(&session, Duration::from_millis(1500)).await;
+    assert!(video > 10, "video still flows beside audio ({video})");
+    assert!(got.len() >= 80, "10 ms packets over 1.5 s: {}", got.len());
+    for pair in got.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        assert_eq!(
+            b.packet_seq,
+            a.packet_seq.wrapping_add(1),
+            "none lost on a clean path"
+        );
+        assert_eq!(b.ts_48khz.wrapping_sub(a.ts_48khz), 480, "10 ms at 48 kHz");
+        assert!(b.pkt_seq != a.pkt_seq);
+        assert!(b.capture_us > a.capture_us, "capture time rises");
+    }
+    // Packets leave the encoder in bursts; capture time follows the audio's own clock.
+    for pair in got.windows(2) {
+        let step = pair[1].capture_us - pair[0].capture_us;
+        assert!(
+            step.abs_diff(10_000) < 3_000,
+            "capture time steps by 10 ms, not by arrival: {step} µs"
+        );
+    }
+    for p in &got {
+        assert!(
+            p.capture_us.abs_diff(started) < 10_000_000,
+            "capture_us is wall-clock µs"
+        );
+        // TOC byte: CELT-only, fullband, one 10 ms frame (RFC 6716 §3.1): low-delay, 10 ms.
+        assert_eq!(p.opus[0] >> 3, 30, "the session's low-delay 10 ms Opus");
+    }
+
+    // The microphone: real 10 ms Opus packets in §Microphone framing reach the sink decoded.
+    let packets = audio::test_opus_packets(30);
+    let audio_hub = agent.tap.as_ref().unwrap().audio();
+    for (i, opus) in packets.iter().enumerate() {
+        let mut d = vec![0x05];
+        d.extend_from_slice(&(i as u16).to_le_bytes());
+        d.extend_from_slice(&(i as u32 * 480).to_le_bytes());
+        d.extend_from_slice(opus);
+        session.send_datagram(Bytes::from(d)).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while audio_hub.mic_delivered() < 20 {
+        assert!(
+            Instant::now() < deadline,
+            "{} decoded microphone buffers reached the sink",
+            audio_hub.mic_delivered()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    write_message(
+        &mut send,
+        &json!({"type": "bye", "reason": "client_closed"}),
+    )
+    .await
+    .unwrap();
+}
+
+/// What a codec's access unit must contain for the keyframe flag to be true.
+fn carries_random_access(stream: Stream, data: &[u8]) -> bool {
+    match stream {
+        Stream::H264 => nal_types(data).contains(&5),
+        Stream::H265 => streams::hevc_types(data)
+            .iter()
+            .any(|t| (16..=23).contains(t)),
+        Stream::Av1 | Stream::Av1NoSequenceHeader => streams::obu_types(data).contains(&1),
+    }
+}
+
+async fn codec_session(stream: Stream, codec: &str) {
+    let agent = agent_for(stream, Limits::default()).await;
+    let (session, mut send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+    assert_eq!(ack["video"]["codec"], codec);
+    let description = base64::engine::general_purpose::STANDARD
+        .decode(ack["video"]["description_b64"].as_str().unwrap())
+        .unwrap();
+    match stream {
+        Stream::H265 => assert_eq!(
+            (description[1], description[12], description[21] & 3),
+            (1, 93, 3),
+            "hvcC: Main, level 93, 4-byte NAL lengths"
+        ),
+        _ => assert_eq!(description[0], 0x81, "av1C"),
+    }
+
+    let got = frames(&session, 40, true).await;
+    assert!(got[0].keyframe, "the client starts at a keyframe");
+    assert!(got[0].data.len() > 2 * 1123, "a keyframe spans fragments");
+    for f in &got {
+        assert_eq!(
+            f.keyframe,
+            carries_random_access(stream, &f.data),
+            "the keyframe flag matches the bitstream"
+        );
+        if stream == Stream::Av1 {
+            assert!(
+                !streams::obu_types(&f.data).contains(&2),
+                "no temporal delimiter"
+            );
+        }
+    }
+
+    write_message(
+        &mut send,
+        &json!({"type": "keyframe_request", "reason": "startup"}),
+    )
+    .await
+    .unwrap();
+    let after = frames(&session, 20, false).await;
+    assert!(
+        after.iter().any(|f| f.keyframe),
+        "a keyframe follows the request"
+    );
+}
+
+#[tokio::test]
+async fn an_h265_session_sends_length_prefixed_access_units_with_irap_keyframes() {
+    codec_session(Stream::H265, "h265").await;
+}
+
+#[tokio::test]
+async fn an_av1_session_sends_obu_temporal_units_without_delimiters_and_sequence_header_keyframes()
+{
+    codec_session(Stream::Av1, "av1").await;
+}
+
+#[tokio::test]
+async fn an_encoder_with_no_usable_keyframe_ends_the_session_with_an_internal_error() {
+    let agent = agent_for(Stream::Av1NoSequenceHeader, Limits::default()).await;
+    let (session, _send, mut recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+    let error = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let message = read_message(&mut recv).await.unwrap();
+            if message["type"] == "error" {
+                break message;
+            }
+        }
+    })
+    .await
+    .expect("no error: the agent kept forcing keyframes for good");
+    assert_eq!(error["code"], "internal", "the client falls back to WebRTC");
+    assert_eq!(close_code(&session).await, Some(CLOSE_NORMAL));
+}
+
+/// The next video datagram, as (frame_seq, frag_index, frag_count, datagram).
+async fn datagram(session: &Session) -> (u16, u16, u16, Bytes) {
+    let d = tokio::time::timeout(Duration::from_secs(10), session.read_datagram())
+        .await
+        .expect("video stalled")
+        .unwrap();
+    let at = |i: usize| u16::from_le_bytes([d[i], d[i + 1]]);
+    (at(7), at(9), at(11), d)
+}
+
+#[tokio::test]
+async fn a_nacked_fragment_is_resent_one_past_the_window_is_a_miss_and_late_gets_a_keyframe() {
+    nack_and_late(Stream::H264).await;
+}
+
+#[tokio::test]
+async fn nack_and_late_keyframe_recovery_work_for_h265() {
+    nack_and_late(Stream::H265).await;
+}
+
+#[tokio::test]
+async fn nack_and_late_keyframe_recovery_work_for_av1() {
+    nack_and_late(Stream::Av1).await;
+}
+
+async fn nack_and_late(stream: Stream) {
+    let agent = agent_for(stream, Limits::default()).await;
+    let (session, mut send, mut recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["retransmit_window_ms"], 250);
+
+    let (frame_seq, _, _, original) = datagram(&session).await;
+    let index = u16::from_le_bytes([original[9], original[10]]);
+    let nack = json!({"type": "nack", "frame_seq": frame_seq, "frags": [[index, index]]});
+    write_message(&mut send, &nack).await.unwrap();
+    let mut resent = None;
+    for _ in 0..1000 {
+        let (_, _, _, d) = datagram(&session).await;
+        if d[5] & 4 != 0 {
+            resent = Some(d);
+            break;
+        }
+    }
+    let resent = resent.expect("no retransmission within 1000 datagrams");
+    assert_eq!(resent[6..], original[6..], "same header and payload");
+    assert_eq!(resent[5], original[5] | 4, "flags plus retransmit");
+    let seq = |d: &Bytes| u32::from_le_bytes(d[1..5].try_into().unwrap());
+    let ahead = seq(&resent).wrapping_sub(seq(&original));
+    assert!(ahead > 0 && ahead < 1 << 31, "a new pkt_seq");
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    write_message(&mut send, &nack).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), read_message(&mut recv))
+            .await
+            .expect("no nack_miss")
+            .unwrap(),
+        json!({"type": "nack_miss", "frame_seq": frame_seq, "frags": [[index, index]]}),
+        "past the 250 ms window the agent no longer holds it"
+    );
+
+    write_message(
+        &mut send,
+        &json!({"type": "keyframe_request", "reason": "late"}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        frames(&session, 15, false).await.iter().any(|f| f.keyframe),
+        "a late frame's keyframe request is answered"
+    );
+}
+
+#[tokio::test]
+async fn a_client_flooding_nacks_gets_only_its_budget_answered() {
+    let agent = agent().await;
+    let (_session, mut send, mut recv, _) = agent.hello(TOKEN).await;
+    // A frame the agent never held: every answered nack is one nack_miss.
+    let nack = json!({"type": "nack", "frame_seq": 40_000, "frags": [[0, 0]]});
+    const SENT: usize = 1000;
+    let started = std::time::Instant::now();
+    let write = async {
+        for _ in 0..SENT {
+            write_message(&mut send, &nack).await.unwrap();
+        }
+    };
+    let read = async {
+        let mut misses = 0;
+        while let Ok(Ok(m)) =
+            tokio::time::timeout(Duration::from_millis(500), read_message(&mut recv)).await
+        {
+            misses += usize::from(m["type"] == "nack_miss");
+        }
+        misses
+    };
+    let ((), misses) = tokio::join!(write, read);
+    // 100 at once, then 500 a second while the flood lasted.
+    let budget = 100 + (started.elapsed().as_secs_f64() * 500.0).ceil() as usize;
+    assert!(misses >= 100, "the burst is answered ({misses})");
+    assert!(
+        misses <= budget.min(SENT - 1),
+        "{misses} answered of {SENT}, budget {budget}"
+    );
+}
+
+/// The job `agent-live.yml` runs under `webtransport::`: one session from hello to a clean
+/// close, asserting outcomes only (what a browser would see), not the listener's internals.
+#[tokio::test]
+async fn a_session_runs_from_hello_through_decodable_frames_to_a_clean_close() {
+    let agent = agent().await;
+    let (session, mut send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+
+    let got = frames(&session, 60, false).await;
+    assert!(got[0].keyframe, "the client starts at a keyframe");
+    for f in &got {
+        let types = nal_types(&f.data);
+        assert_eq!(
+            f.keyframe,
+            types.contains(&5),
+            "keyframe flag matches the bitstream"
+        );
+    }
+
+    write_message(
+        &mut send,
+        &json!({"type": "bye", "reason": "client_closed"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(close_code(&session).await, Some(CLOSE_NORMAL));
+}
+
+#[tokio::test]
+async fn a_session_without_audio_or_a_microphone_says_so_and_ignores_both() {
+    let agent = agent().await;
+    let (session, _send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(
+        (ack["audio"].clone(), ack["mic"].clone()),
+        (Value::Null, Value::Null)
+    );
+    session
+        .send_datagram(Bytes::from_static(&[0x05, 0, 0, 0, 0, 0, 0, 1, 2, 3]))
+        .unwrap();
+    // Video alone, so the one-channel `frames` check holds.
+    assert_eq!(frames(&session, 5, true).await.len(), 5);
+}
+
 #[tokio::test]
 async fn before_hello_the_agent_reads_one_stream_and_waits_five_seconds() {
     let agent = agent().await;
@@ -443,6 +1300,338 @@ async fn before_hello_the_agent_reads_one_stream_and_waits_five_seconds() {
     assert!(opened.elapsed() >= Duration::from_millis(4900));
 }
 
+/// Waits for the agent's devices to have been given `n` events.
+async fn input_events(agent: &Agent, n: usize) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let seen = agent.input.lock().unwrap().clone();
+        if seen.len() >= n || Instant::now() > deadline {
+            return seen;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn input_arrives_by_datagram_and_control_stream_only_after_hello_ack() {
+    let agent = agent().await;
+    let session = agent.connect().await;
+    // Before `hello_ack` every datagram is dropped.
+    session
+        .send_datagram(Bytes::from_static(
+            b"\x03{\"t\":\"k\",\"code\":1,\"pressed\":true}",
+        ))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (mut send, mut recv) = session.open_bi().await.unwrap();
+    let hello = json!({"type": "hello", "wt_proto": 1, "token": TOKEN,
+                       "session_id": SESSION, "client": "browser", "fec": []});
+    write_message(&mut send, &hello).await.unwrap();
+    assert_eq!(read_message(&mut recv).await.unwrap()["type"], "hello_ack");
+
+    // The input.md JSON arrives byte for byte, from a datagram and from the control stream.
+    let motion = r#"{"t":"mm","dx":4,"dy":-2,"seq":17,"tc":123456.7}"#;
+    session
+        .send_datagram(Bytes::from([&[0x03u8][..], motion.as_bytes()].concat()))
+        .unwrap();
+    // Another channel's id, and one nobody knows, are dropped.
+    session
+        .send_datagram(Bytes::from_static(
+            b"\x01{\"t\":\"k\",\"code\":2,\"pressed\":true}",
+        ))
+        .unwrap();
+    session
+        .send_datagram(Bytes::from_static(
+            b"\x7f{\"t\":\"k\",\"code\":3,\"pressed\":true}",
+        ))
+        .unwrap();
+    let key = json!({"t": "k", "code": 30, "pressed": false});
+    write_message(&mut send, &json!({"type": "input", "event": key}))
+        .await
+        .unwrap();
+    let seen = input_events(&agent, 2).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let seen_all = agent.input.lock().unwrap().clone();
+    assert_eq!(seen_all.len(), 2, "only the two events: {seen_all:?}");
+    assert!(seen.contains(&motion.to_string()), "{seen:?}");
+    assert!(
+        seen_all
+            .iter()
+            .any(|e| serde_json::from_str::<Value>(e).unwrap() == key),
+        "{seen_all:?}"
+    );
+
+    // Ping is answered at once with the ping's fields and the agent's clocks.
+    let wall = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+        * 1000.0;
+    write_message(
+        &mut send,
+        &json!({"type": "ping", "id": 17, "tc": 123456.7}),
+    )
+    .await
+    .unwrap();
+    let pong = read_message(&mut recv).await.unwrap();
+    assert_eq!(
+        (&pong["type"], &pong["id"], &pong["tc"]),
+        (&json!("pong"), &json!(17), &json!(123456.7))
+    );
+    assert!(pong["ts"].as_f64().unwrap() >= 0.0);
+    assert!(
+        (pong["tw"].as_f64().unwrap() - wall).abs() < 5_000.0,
+        "tw is Unix ms: {pong}"
+    );
+
+    // A departing client's held inputs are lifted.
+    assert_eq!(agent.released.load(std::sync::atomic::Ordering::SeqCst), 0);
+    write_message(
+        &mut send,
+        &json!({"type": "bye", "reason": "client_closed"}),
+    )
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while agent.released.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "release_all never ran");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_datagram_gamepad_state_moves_axes_and_never_changes_buttons() {
+    let agent = agent().await;
+    let (session, mut send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+    let gp = |i: u32, buttons: [u8; 2], axes: [f64; 2]| json!({"t": "gp", "i": i, "buttons": buttons, "axes": axes});
+    let datagram =
+        |event: &Value| Bytes::from([&[CHANNEL_INPUT][..], event.to_string().as_bytes()].concat());
+
+    // A reliable press, then a stale datagram from before it: old buttons, new stick.
+    write_message(
+        &mut send,
+        &json!({"type": "input", "event": gp(0, [1, 0], [0.0, 0.0])}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(input_events(&agent, 1).await.len(), 1);
+    session
+        .send_datagram(datagram(&gp(0, [0, 0], [0.5, -0.5])))
+        .unwrap();
+    // A pad no reliable state has established yet has no buttons to keep: dropped.
+    session
+        .send_datagram(datagram(&gp(1, [1, 1], [0.9, 0.9])))
+        .unwrap();
+    assert_eq!(input_events(&agent, 2).await.len(), 2);
+    // The release is a reliable event and does change them.
+    write_message(
+        &mut send,
+        &json!({"type": "input", "event": gp(0, [0, 0], [0.5, -0.5])}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(input_events(&agent, 3).await.len(), 3);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let seen: Vec<Value> = agent
+        .input
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| serde_json::from_str(e).unwrap())
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            gp(0, [1, 0], [0.0, 0.0]),
+            gp(0, [1, 0], [0.5, -0.5]),
+            gp(0, [0, 0], [0.5, -0.5])
+        ],
+        "the stale datagram moved the stick and left the button held"
+    );
+}
+
+#[test]
+fn only_the_attached_clients_input_reaches_the_devices() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (input, events, released) = recorded();
+    let media = ready_media_with(input);
+    let key =
+        |code: u32, pressed: bool| json!({"t": "k", "code": code, "pressed": pressed}).to_string();
+    let neutral = json!({"t": "gp", "i": 0, "buttons": [0, 0], "axes": [0.0, 0.0]}).to_string();
+
+    let old = media.attach(false, Duration::ZERO).unwrap();
+    media.input_event(old.id, &key(30, true), false);
+    assert_eq!(events.lock().unwrap().len(), 1);
+
+    // A takeover lifts what the old client held as the new one attaches, before it can send.
+    let new = media.attach(false, Duration::ZERO).unwrap();
+    assert_eq!(released.load(SeqCst), 1);
+    // The old tab's late input, its neutral pad state included, reaches nothing.
+    media.input_event(old.id, &neutral, true);
+    media.input_event(old.id, &key(31, true), false);
+    let delivered = events.lock().unwrap().clone();
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    media.input_event(new.id, &key(32, true), false);
+    assert_eq!(events.lock().unwrap().len(), 2);
+
+    // The old client's cleanup does not lift the new client's key.
+    media.detach(old.id);
+    assert_eq!(released.load(SeqCst), 1);
+    media.input_event(new.id, &key(32, false), false);
+    assert_eq!(events.lock().unwrap().len(), 3);
+
+    // The attached client leaving does, and nothing it sends after that is taken.
+    media.detach(new.id);
+    assert_eq!(released.load(SeqCst), 2);
+    media.input_event(new.id, &key(33, true), false);
+    assert_eq!(events.lock().unwrap().len(), 3);
+}
+
+#[test]
+fn a_client_attaching_while_its_predecessor_is_still_leaving_starts_from_clean_devices() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::atomic::Ordering::SeqCst;
+    let (input, events, released) = recorded();
+    let media = ready_media_with(input);
+    let key =
+        |code: u32, pressed: bool| json!({"t": "k", "code": code, "pressed": pressed}).to_string();
+
+    let a = media.attach(false, Duration::ZERO).unwrap();
+    media.input_event(a.id, &key(30, true), false);
+
+    // B attaches after A's detach cleared the client and before it took the input lock.
+    let b: Rc<RefCell<Option<media::Attached>>> = Rc::default();
+    let (m, slot) = (media.clone(), b.clone());
+    DETACH_GAP.with(|g| {
+        *g.borrow_mut() = Some(Box::new(move || {
+            *slot.borrow_mut() = m.attach(false, Duration::ZERO)
+        }))
+    });
+    media.detach(a.id);
+    let b = b.borrow_mut().take().expect("B attached in the gap");
+    assert_eq!(
+        released.load(SeqCst),
+        1,
+        "A's held key was lifted when B attached"
+    );
+
+    // A's late detach step lifts nothing of B's.
+    media.input_event(b.id, &key(32, true), false);
+    assert_eq!(events.lock().unwrap().len(), 2);
+    media.detach(b.id);
+    assert_eq!(released.load(SeqCst), 2);
+}
+
+#[test]
+fn a_gamepad_slot_beyond_the_api_limit_is_dropped() {
+    let (input, events, _) = recorded();
+    let media = ready_media_with(input);
+    let id = media.attach(false, Duration::ZERO).unwrap().id;
+    let gp = |i: u32| json!({"t": "gp", "i": i, "buttons": [0], "axes": [0.0]}).to_string();
+    for i in [4, 1000, u32::MAX] {
+        media.input_event(id, &gp(i), false);
+        media.input_event(id, &gp(i), true);
+    }
+    assert!(events.lock().unwrap().is_empty());
+    media.input_event(id, &gp(3), false);
+    assert_eq!(events.lock().unwrap().len(), 1);
+    assert_eq!(media.remembered_pads(), 1, "one pad remembered");
+}
+
+#[tokio::test]
+async fn a_takeover_lifts_the_old_clients_keys_once_and_keeps_the_new_clients() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let agent = agent().await;
+    let registry = agent.listener.registry();
+    let key =
+        |code: u32| json!({"type": "input", "event": {"t": "k", "code": code, "pressed": true}});
+
+    let (first, mut first_send, _first_recv, _) = agent.hello(TOKEN).await;
+    write_message(&mut first_send, &key(30)).await.unwrap();
+    assert_eq!(input_events(&agent, 1).await.len(), 1);
+
+    assert!(registry.add_token(
+        SESSION,
+        &token_hash("reconnect"),
+        SystemTime::now() + TOKEN_TTL
+    ));
+    let (_second, mut second_send, _second_recv, ack) = agent.hello("reconnect").await;
+    assert_eq!(ack["type"], "hello_ack");
+    assert_eq!(
+        agent.released.load(SeqCst),
+        1,
+        "lifted before the new client's ack"
+    );
+
+    // The old tab, still connected for a moment, sends more; the new client presses a key.
+    let late = Bytes::from_static(b"\x03{\"t\":\"k\",\"code\":31,\"pressed\":true}");
+    let _ = first.send_datagram(late);
+    let _ = write_message(&mut first_send, &key(31)).await;
+    write_message(&mut second_send, &key(32)).await.unwrap();
+    assert_eq!(input_events(&agent, 2).await.len(), 2);
+    assert_eq!(close_code(&first).await, Some(CLOSE_TAKEN_OVER));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let seen: Vec<Value> = agent
+        .input
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| serde_json::from_str(e).unwrap())
+        .collect();
+    assert_eq!(
+        seen.iter()
+            .map(|e| e["code"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [30, 32],
+        "{seen:?}"
+    );
+    assert_eq!(
+        agent.released.load(SeqCst),
+        1,
+        "the old client's cleanup left the new client's key alone"
+    );
+
+    write_message(
+        &mut second_send,
+        &json!({"type": "bye", "reason": "client_closed"}),
+    )
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while agent.released.load(SeqCst) < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the new client's keys were never lifted"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_client_silent_on_the_control_stream_for_10_s_is_gone_and_its_inputs_lifted() {
+    let agent = agent().await;
+    let (session, _send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+    let tap = agent.tap.as_ref().unwrap();
+    assert!(tap.attached());
+    let silent = Instant::now();
+    close_code_within(&session, Duration::from_secs(14)).await;
+    assert!(
+        silent.elapsed() >= Duration::from_millis(9_900),
+        "{:?}",
+        silent.elapsed()
+    );
+    assert_eq!(agent.released.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // The idle reap reads the same client field this close clears (#1179).
+    assert!(
+        !tap.attached(),
+        "a client closed for silence no longer counts"
+    );
+}
+
 #[tokio::test]
 async fn the_newest_client_takes_over_and_an_ended_session_says_so() {
     let agent = agent().await;
@@ -470,6 +1659,42 @@ async fn the_newest_client_takes_over_and_an_ended_session_says_so() {
     let (late, _send, _recv, reply) = agent.hello("too-late").await;
     assert_eq!(reply["code"], "session_ended");
     assert_eq!(close_code(&late).await, Some(CLOSE_ENDED));
+}
+
+/// What the session's idle reap reads (#1179): a client counts from its `hello_ack` while it
+/// streams, across a takeover, and stops counting once it leaves.
+#[tokio::test]
+async fn the_tap_counts_a_streaming_client_until_it_leaves() {
+    let agent = agent().await;
+    let tap = agent.tap.as_ref().unwrap();
+    assert!(!tap.attached(), "no client has said hello");
+
+    let (first, _send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+    frames(&first, 1, true).await;
+    assert!(tap.attached());
+
+    let expires = SystemTime::now() + TOKEN_TTL;
+    assert!(agent
+        .listener
+        .registry()
+        .add_token(SESSION, &token_hash("reconnect"), expires));
+    let (second, mut send, _recv2, _) = agent.hello("reconnect").await;
+    assert_eq!(close_code(&first).await, Some(CLOSE_TAKEN_OVER));
+    frames(&second, 1, true).await;
+    assert!(tap.attached(), "the client that took over counts");
+
+    write_message(
+        &mut send,
+        &json!({"type": "bye", "reason": "client_closed"}),
+    )
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while tap.attached() {
+        assert!(Instant::now() < deadline, "a client that left still counts");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]
@@ -1503,4 +2728,229 @@ async fn a_stalled_control_stream_is_closed_without_stopping_chromes_h3_streams(
         "{closed:?}"
     );
     chrome.assert_h3_streams_untouched(false).await;
+}
+
+/// The PyroWave datagrams of `n` frames, each frame rejoined from its datagrams' packets
+/// (every part of an oversized block in order) after checking the header and coverage rules
+/// of codec-pyrowave.md §Video datagrams. Fails on any non-PyroWave datagram.
+async fn pyrowave_frames(
+    session: &Session,
+    n: usize,
+    config_id: u8,
+    blocks: u32,
+) -> Vec<(u16, Vec<u8>)> {
+    let mut parts: HashMap<u16, BTreeMap<u16, Bytes>> = HashMap::new();
+    let mut done = Vec::new();
+    while done.len() < n {
+        let d = tokio::time::timeout(Duration::from_secs(10), session.read_datagram())
+            .await
+            .expect("video stalled")
+            .unwrap();
+        assert!(d.len() <= media::MAX_DATAGRAM);
+        assert_eq!(
+            (d[0], d[5], d[6]),
+            (0x01, 3, config_id),
+            "a PyroWave datagram: keyframe + discardable"
+        );
+        let frame_seq = u16::from_le_bytes([d[7], d[8]]);
+        let count = u16::from_le_bytes([d[11], d[12]]);
+        let frags = parts.entry(frame_seq).or_default();
+        frags.insert(u16::from_le_bytes([d[9], d[10]]), d.slice(media::HEADER..));
+        if frags.len() < count as usize {
+            continue;
+        }
+        let mut frame = Vec::new();
+        let mut next = 0u32;
+        for p in parts.remove(&frame_seq).unwrap().into_values() {
+            let le = |at: usize| u32::from_le_bytes(p[at..at + 4].try_into().unwrap());
+            let (first, end) = (le(4), le(8));
+            match p[0] {
+                0 => {
+                    assert_eq!(first, next, "ranges are contiguous");
+                    next = end;
+                }
+                1 if p[1] == 0 => {
+                    assert_eq!(first, next);
+                    next = end;
+                }
+                1 => assert_eq!(end, next, "a later part repeats its block's range"),
+                kind => panic!("kind {kind}"),
+            }
+            frame.extend_from_slice(&p[pyrowave::HEADER..]);
+        }
+        assert_eq!(next, blocks, "the ranges partition [0, N)");
+        done.push((frame_seq, frame));
+    }
+    done
+}
+
+#[tokio::test]
+async fn a_pyrowave_client_gets_frames_that_rejoin_byte_for_byte_and_can_fall_back() {
+    let agent = agent().await;
+    let media = agent.listener.registry().lock()[SESSION]
+        .media
+        .clone()
+        .unwrap();
+    media.grant_pyrowave(
+        PyroWaveGrant {
+            wanted: true,
+            target_kbps: 200_000,
+            floor_kbps: 100_000,
+            // The 5 ms gate is `media`'s unit tests'; a loaded test host's loopback can exceed it.
+            max_rtt_ms: 1_000,
+        },
+        (320, 192, 60),
+        true,
+    );
+    let raw = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../testdata/pyrowave/detail_320x192_xhi.pwv1"
+    ))
+    .unwrap();
+    let golden = &raw[28..];
+
+    let session = agent.connect().await;
+    let (mut send, mut recv) = session.open_bi().await.unwrap();
+    let hello = json!({"type": "hello", "wt_proto": 1, "token": TOKEN, "session_id": SESSION,
+                       "client": "browser", "pyrowave": true});
+    write_message(&mut send, &hello).await.unwrap();
+    let ack = read_message(&mut recv).await.unwrap();
+    assert_eq!(ack["type"], "hello_ack");
+    assert_eq!(ack["video"]["codec"], "pyrowave");
+    assert_eq!(ack["codec_switch_reason"], "launch");
+    assert_eq!(
+        ack["video"]["color_space"],
+        json!({"primaries": "bt709", "transfer": "bt709", "matrix": "bt709", "full_range": false})
+    );
+    let description = base64::engine::general_purpose::STANDARD
+        .decode(ack["video"]["description_b64"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(description, raw[..24], "the fixture's own PWV1Header");
+    let config_id = ack["config_id"].as_u64().unwrap() as u8;
+
+    // The stand-in encoder's H.264 keeps flowing; none of it reaches this client.
+    for _ in 0..3 {
+        media.on_pyrowave_frame(&gst::Buffer::from_slice(golden.to_vec()));
+    }
+    let got = pyrowave_frames(&session, 3, config_id, pyrowave::block_count(320, 192)).await;
+    assert!(
+        got.iter().all(|(_, f)| f == golden),
+        "packed and rejoined, byte for byte"
+    );
+
+    // codec-pyrowave.md §Loss: a NACK naming a PyroWave frame is ignored. Nothing was kept for
+    // retransmission, so nothing is resent, and no nack_miss comes (the next control message
+    // below is the fallback's hello_ack).
+    write_message(
+        &mut send,
+        &json!({"type": "nack", "frame_seq": got[0].0, "frags": [[0, 0]]}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), session.read_datagram())
+            .await
+            .is_err(),
+        "a PyroWave frame was retransmitted"
+    );
+
+    write_message(
+        &mut send,
+        &json!({"type": "codec_fallback", "reason": "decode_error"}),
+    )
+    .await
+    .unwrap();
+    let back = read_message(&mut recv).await.unwrap();
+    assert_eq!(back["type"], "hello_ack");
+    assert_eq!(back["video"]["codec"], "h264");
+    assert_eq!(back["codec_switch_reason"], "client_decode_error");
+    let h264 = back["config_id"].as_u64().unwrap() as u8;
+    assert_eq!(h264, config_id.wrapping_add(1));
+    let first = frames(&session, 1, false).await.remove(0);
+    assert_eq!(
+        (first.config_id, first.keyframe),
+        (h264, true),
+        "a keyframe first"
+    );
+    assert_eq!(nal_types(&first.data).last(), Some(&5));
+}
+
+/// #1228: a session stop releases the tap's PyroWave encoder before the source goes (it shares
+/// the GPU queue and a compositor ring frame), while the tap itself lives on until the
+/// transports drop. A second release, and one with no encoder, are no-ops.
+#[test]
+fn releasing_the_tap_stops_its_pyrowave_encoder_and_keeps_the_tap() {
+    use crate::session::pipeline::pyrowave_branch::{feed_at, start_with};
+    gst::init().unwrap();
+    let registry = Arc::new(Registry::default());
+    registry.assign(SESSION, &token_hash(TOKEN), SystemTime::now() + TOKEN_TTL);
+    let pipeline = synthetic(Stream::Av1);
+    let tap = Tap::attach(
+        &registry,
+        &pipeline
+            .by_name("parse")
+            .unwrap()
+            .static_pad("src")
+            .unwrap(),
+        &pipeline.by_name("enc").unwrap(),
+        SESSION,
+        None,
+        no_input(),
+        audio::Plan::default(),
+        None,
+    )
+    .unwrap();
+    tap.release(); // no encoder yet: nothing to do
+
+    // A live encode pipeline for the PyroWave feed, as the runner's has.
+    let raw = gst::Caps::builder("video/x-raw")
+        .field("format", "NV12")
+        .field("width", 64)
+        .field("height", 48)
+        .field("framerate", gst::Fraction::new(60, 1))
+        .build();
+    let main = gst::parse::launch(
+        "videotestsrc is-live=true name=src ! capsfilter name=caps ! queue name=q ! fakesink sync=false",
+    )
+    .unwrap()
+    .downcast::<gst::Pipeline>()
+    .unwrap();
+    main.by_name("caps").unwrap().set_property("caps", &raw);
+    let feed = feed_at(main.by_name("q").unwrap().static_pad("src").unwrap(), &raw).unwrap();
+    let encoder = start_with(
+        feed,
+        None,
+        &gst::ElementFactory::make("identity").build().unwrap(),
+        || true,
+        |_| {},
+        |_| {},
+    )
+    .unwrap();
+    let side = encoder.pipeline.clone();
+    *tap.pyrowave.lock().unwrap() = Some(encoder);
+    main.set_state(gst::State::Playing).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while side.current_state() != gst::State::Playing {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the PyroWave pipeline never started"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    tap.release();
+    assert_eq!(
+        side.current_state(),
+        gst::State::Null,
+        "the encoder was stopped"
+    );
+    assert!(tap.pyrowave.lock().unwrap().is_none(), "and dropped");
+    assert!(
+        registry.lock().contains_key(SESSION),
+        "the tap itself is still alive"
+    );
+    tap.release();
+
+    let _ = main.set_state(gst::State::Null);
+    let _ = pipeline.set_state(gst::State::Null);
 }

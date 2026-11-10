@@ -458,6 +458,7 @@ async fn run_agent() {
     memstat::log_startup();
     label_runtime_dir();
     quasar_node_agent::session::launch_helper::install();
+    quasar_node_agent::compat_tools::init();
 
     agent::run(cfg).await;
 }
@@ -706,7 +707,7 @@ fn run_input_probe() {
     }
 }
 
-/// `quasar-node-agent media-probe [--gpu N] [--codec h264|h265|av1] [--size WxH@FPS]
+/// `quasar-node-agent media-probe [--gpu N] [--codec h264|h265|av1|pyrowave] [--size WxH@FPS]
 /// [--frames N] [--budget-secs N]`. The GPU binding and encoder selection arrive as env
 /// from the parent (`host_probe::media`). One result line, preceded by a remediation line
 /// on a pixel mismatch; exit 0 pass, 1 fail, 2 usage, 3 indeterminate, 4 unsupported (a

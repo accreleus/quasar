@@ -26,6 +26,8 @@ type RegisterMsg struct {
 	SourcePolicyVersions  map[string]int  `json:"source_policy_versions,omitempty"`
 	TerminalHomeCleanupV1 bool            `json:"terminal_home_cleanup_v1,omitempty"`
 	ParkedSessionsV1      bool            `json:"parked_sessions_v1,omitempty"`
+	AdoptRestreamV1       bool            `json:"adopt_restream_v1,omitempty"` // amendment 59
+	CompatToolsV1         bool            `json:"compat_tools_v1,omitempty"`
 	ConfigPolicyVersions  map[string]int  `json:"config_policy_versions,omitempty"`
 	ConfigPolicyGroups    []string        `json:"config_policy_groups"`
 	Type                  string          `json:"type"`
@@ -191,6 +193,9 @@ type CapacityMsg struct {
 	// (see webTransportReport).
 	Transports   []string        `json:"transports"`
 	WebTransport json.RawMessage `json:"webtransport"`
+	// CompatTools (amendment 56): the tools in the agent's install record and its free space,
+	// kept if absent. Read only from a connection that advertised compat_tools_v1.
+	CompatTools json.RawMessage `json:"compat_tools"`
 }
 
 // ReadinessCheck is a validation view of one readiness check, never the storage

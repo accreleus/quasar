@@ -83,6 +83,7 @@
           "/usr/local/bin/quasar-launch-helper",
           "/etc/ld.so.conf.d/gst-vulkan.conf",
           "/opt/gst/lib64/libpyrowave-shared.so.1",
+          "/opt/gst/lib64/gstreamer-1.0/libgstpyrowave.so",
           "/opt/gst/include/pyrowave/pyrowave.h",
           "/opt/gst/lib64/pkgconfig/pyrowave-shared.pc",
           "/opt/gst/share/licenses/pyrowave/LICENSE",
@@ -147,8 +148,10 @@
           "pulsesrc", "pulsesink",
           "rtph264pay", "rtpopuspay",
           "rtpopusdepay", "opusdec",
-          "coloreffects"
+          "coloreffects",
+          "pyrowaveenc"
         ],
+        "_pyrowaveenc_note": "#1056: the PyroWave encoder, built from node-agent/crates/gst-pyrowave into /opt/gst/lib64/gstreamer-1.0. It registers with no GPU and no library (it dlopens libpyrowave-shared at READY->PAUSED), so it belongs in this device-free list; whether a GPU can encode PyroWave is the agent's PyroWave codec probe.",
         "_required_notes": "Device-free elements only -- everything here must register with no GPU attached. rtpgccbwe comes from gst-plugins-rs and is the element most often lost to a wrong 0.13/0.14/0.15 pin. interpipesrc/sink come from the gow gst-interpipe fork. The webrtc transport chain (rtpbin/nicesrc/dtlssrtpenc/sctpenc/rtprtxsend/rtpulpfecenc) is asserted because the published games-on-whales gst-wayland-display images build with -Dauto_features=disabled and lack all of it -- that is why they cannot be used as a base here. coloreffects is gst-plugins-bad's, asserted for #97 (the 'Colour Ripple' bench app's gst-launch pipeline fails with 'no element \"coloreffects\"' otherwise) -- not used by node-agent Rust.",
         "_audio_note": "pulsesrc/audioconvert/audioresample/opusenc feed the streamed audio PeerConnection from the session's audio sidecar (the `pipewire` packages above, speaking the PulseAudio protocol); when quasar-nv shipped without its daemon on 2026-07-26, every session went silent. rtpopusdepay/opusdec are the microphone RECEIVE path (mic_branch.rs) -- client mic -> pulsesink device=quasar_mic in the sidecar. alsasink and kmssink are no longer required: they served the agent-drawn console (its local audio and its AMD display path), retired with it in #461 -- a console desktop now drives the display and plays its own audio from its own container (ADR 0009). A retired component, not a relaxed assertion.",
         "required_with_gpu": ["vulkanh264enc", "vulkanscale"],
@@ -172,6 +175,7 @@
           "test -f /opt/gst/lib64/libpyrowave-shared.so.1 && ! ldd /opt/gst/lib64/libpyrowave-shared.so.1 | grep -q 'not found'": "#1052: every library libpyrowave-shared needs resolves in this image (it links libstdc++ and libgcc_s dynamically and loads the Vulkan loader itself at run time).",
           "grep -aq pyrowave_get_api_version /opt/gst/lib64/libpyrowave-shared.so.1": "#1052: the library exports the C API (a symbol, because the image has no nm), so an empty or wrong-target build cannot pass on the file's presence alone.",
           "grep -q '^Name: pyrowave-shared' /opt/gst/lib64/pkgconfig/pyrowave-shared.pc": "#1052: the pkg-config entry names the library the way the pyrowaveenc build will ask for it.",
+          "[ \"$(readlink -f /usr/lib64/libvulkan.so.1)\" = /usr/lib64/libvulkan.so.1.4.345 ]": "#1104 review, #267: the process loads the pinned Vulkan-Loader (deploy/pins.env VULKAN_LOADER_REF), not Fedora 43's 1.4.341, whose device-proc lookups walk the instance list unlocked and crash beside another thread's instance creation. A pin bump moves this file name with it.",
           "env -i /usr/local/bin/quasar-launch-helper": "#731: the helper starts, and with no -applaunch appid it exits 0, as it must for every app that is not a derived Steam tile."
         }
       },

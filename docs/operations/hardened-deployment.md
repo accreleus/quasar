@@ -80,3 +80,9 @@ curl --fail --cacert "$QUASAR_TLS_DIR/fullchain.pem" "https://$QUASAR_PUBLIC_HOS
 
 Confirm `Strict-Transport-Security`, `Content-Security-Policy`, and `X-Frame-Options` headers, then
 launch a session from the HTTPS origin and confirm its signaling URL upgrades over WSS.
+
+The Content-Security-Policy's `connect-src` allows `'self'`, `ws:`, `wss:` and `https:`. A
+WebTransport session connects to the agent's own `https:` origin (its listener, or the host's public
+URL), which can change after the page loads, and signaling can use the proxy's public origin rather
+than the page's. A reverse proxy that sets its own CSP must allow the same, or WebTransport sessions
+fail to connect (#1147).

@@ -51,6 +51,9 @@ type CreateParams struct {
 	NoHomeSettleWait bool
 	TokenHash        string
 	TokenExpires     time.Time
+	// PyroWaveCandidate: the launch may want PyroWave, so the INSERT takes one of the GPU's
+	// PyroWave slots when one is free (control-api.md §The PyroWave ceiling).
+	PyroWaveCandidate bool
 	// The EFFECTIVE runtime app's opt-in to persistent home storage (P5-02); true
 	// makes scheduleAttempt enforce the P5-04 single-writer guard. Must come from
 	// LaunchApp.ManagedHome, never apps.managed_home: a tile's own column is false
@@ -89,6 +92,9 @@ type CreateParams struct {
 	// in the candidate query only: never a filter, never in the re-check, the
 	// totals probe or a diagnostic. Empty renders nothing.
 	CodecPreference []string
+	// CompatGameID is the Steam appid of the game this launch names ("" for none). A per-game GE
+	// compat-tool mapping on it restricts placement to hosts where the tool is usable.
+	CompatGameID string
 	// Kind is KindParked for a warm Steam (amendment 39); "" is a play.
 	Kind string
 	// claim adopts the caller's parked session (control-api.md §Warm Steam,
@@ -97,12 +103,15 @@ type CreateParams struct {
 	claim *parkedClaim
 }
 
-// parkedClaim names the parked session a launch tries to adopt. hostParks is
-// the in-memory parked_sessions_v1 answer for its host, read before the
-// transaction.
+// parkedClaim names the parked session a launch tries to adopt. hostParks and
+// restream are the in-memory parked_sessions_v1 and adopt_restream_v1 answers
+// for its host, read before the transaction.
 type parkedClaim struct {
 	id        string
 	hostParks bool
+	restream  bool
+	// transport is what the launch's stream plan chose on the parked GPU.
+	transport string
 }
 
 // sameHolder is the session whose home hold a launch may pass: the parked
@@ -389,7 +398,9 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	}
 	var claimed *claimedParked
 	if p.claim != nil {
-		if claimed, err = claimParked(ctx, tx, p); err != nil {
+		if claimed, err = claimParked(ctx, tx, p); errors.Is(err, errClaimLost) {
+			return Session{}, false, claimLostAnswer(ctx, tx, p)
+		} else if err != nil {
 			return Session{}, false, err
 		}
 		// The adopted runtime is already on that GPU, so its memory is not new.
@@ -440,7 +451,7 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	err = tx.QueryRow(ctx, candidateSQL, candidateArgs...).Scan(&gpuID, &hostID, &gpuIndex)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if claimed != nil {
-			return Session{}, false, &ParkedClaimRefusedError{HolderID: p.claim.id} // check 5
+			return Session{}, false, &ParkedClaimRefusedError{HolderID: p.claim.id, Cause: causeNoRoom} // check 5
 		}
 		return Session{}, false, classifyReject(ctx, tx, cand)
 	}
@@ -530,7 +541,8 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		    device_id,
 		    assigned_at,
 		    kind, parked_until,
-		    shared_home_app_id
+		    shared_home_app_id,
+		    pyrowave_slot
 		) VALUES (
 		    $1, $2, $3, $4, 'assigned',
 		    $5, $6, $7, $8, $9,
@@ -544,7 +556,13 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		    now(),
 		    COALESCE(NULLIF($18, ''), 'play'),
 		    CASE WHEN $18 = 'parked' THEN now() + make_interval(mins => $19::int) END,
-		    NULLIF($20, '')::uuid
+		    NULLIF($20, '')::uuid,
+		    -- Counted under the GPU row lock the recheck took: two launches cannot both
+		    -- take the last slot.
+		    $21::bool AND $4::uuid IS NOT NULL AND (
+		        SELECT count(*) FROM sessions x
+		        WHERE x.gpu_id = $4::uuid AND x.pyrowave_slot AND x.state IN `+activeStatesSQL+`
+		    ) < COALESCE((SELECT pyrowave_max_per_gpu FROM instance_settings WHERE id = true), 1)
 		)
 		RETURNING `+sessionCols,
 		p.UserID, p.AppID, hostID, gpuID,
@@ -558,6 +576,7 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		deviceID,
 		p.Kind, parkedMinutes,
 		p.SharedHomeAppID,
+		p.PyroWaveCandidate,
 	))
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.ConstraintName == "sessions_one_parked_per_user" {
@@ -587,6 +606,9 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 
 	sess.GPUIndex = &gpuIndex
 	sess.notice = sharedNotice
+	if claimed != nil {
+		sess.restream = claimed.restream
+	}
 	return sess, false, nil
 }
 
@@ -651,6 +673,9 @@ func classifyRejectPlain(ctx context.Context, tx pgx.Tx, cand candidacy) error {
 	}
 	if !totalsFit {
 		rej := noHostRejection(ctx, tx, cand.p.AppImage)
+		if compatRej := compatToolRejection(ctx, tx, cand, rej); compatRej != nil {
+			return compatRej
+		}
 		if cand.p.homePinned {
 			// Only a host that is gone or offline: a draining one is connected and
 			// comes back by itself, so it keeps the generic text.
@@ -718,6 +743,46 @@ func (e *NoHostRejection) Error() string {
 }
 
 func (e *NoHostRejection) Unwrap() error { return e.err }
+
+// CompatToolRejection marks a no_host_available refusal whose sole cause is the launched game's
+// per-game GE tool: no online host can run it yet. Tool is the tag; Usable is false when the tool
+// is disabled or marked, so no host will ever have it. It names no host.
+type CompatToolRejection struct {
+	err    error
+	Tool   string
+	Usable bool
+}
+
+func (e *CompatToolRejection) Error() string {
+	return fmt.Sprintf("%v (compat tool %s, usable=%t)", e.err, e.Tool, e.Usable)
+}
+
+func (e *CompatToolRejection) Unwrap() error { return e.err }
+
+// compatToolRejection returns the compat_tool_missing refusal when the compat gate is the only
+// reason the totals probe failed (the same probe without it fits), nil otherwise, and nil on a query
+// failure so the generic refusal stands.
+func compatToolRejection(ctx context.Context, tx pgx.Tx, cand candidacy, rej error) error {
+	if cand.p.CompatGameID == "" {
+		return nil
+	}
+	gameID := cand.p.CompatGameID
+	cand.p.CompatGameID = ""
+	sql, args := cand.totalsQuery()
+	var fits bool
+	if tx.QueryRow(ctx, sql, args...).Scan(&fits) != nil || !fits {
+		return nil
+	}
+	r := &CompatToolRejection{err: rej}
+	if tx.QueryRow(ctx, `
+		SELECT t.tag, t.enabled AND NOT t.name_conflict AND NOT t.pin_conflict
+		FROM compat_tool_mappings m JOIN compat_tools t ON t.id = m.tool_id
+		WHERE m.provider = 'steam' AND m.external_id = $1 AND t.family = 'ge'`,
+		gameID).Scan(&r.Tool, &r.Usable) != nil {
+		return nil
+	}
+	return r
+}
 
 // HomeHostOfflineRejection marks a no_host_available refusal whose cause is that
 // the user's managed home is claimed by a host that is offline or gone (a host that

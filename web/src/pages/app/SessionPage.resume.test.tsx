@@ -31,6 +31,7 @@ const mintSignalingToken = vi.fn();
 const updateSessionDisplay = vi.fn();
 vi.mock("../../api/library", () => ({
   getSession: (...a: unknown[]) => getSession(...a),
+  listApps: () => Promise.resolve({ items: [] }),
   stopSession: (...a: unknown[]) => stopSession(...a),
   mintSignalingToken: (...a: unknown[]) => mintSignalingToken(...a),
   updateSessionDisplay: (...a: unknown[]) => updateSessionDisplay(...a),

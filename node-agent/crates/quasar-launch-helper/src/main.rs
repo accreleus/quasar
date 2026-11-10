@@ -21,8 +21,9 @@ use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use quasar_launch_watch::{
-    appid_from_flags, parse_command, CloudEnd, CloudSync, Command, LaunchState, NeedsUser, Quit,
-    QuitAction, Report, WatchConfig, Watcher, WindowInfo, Windows, STEAM_CLIENT_APPID,
+    appid_from_flags, parse_command, steam_client_running, CloudEnd, CloudSync, Command,
+    LaunchState, NeedsUser, Quit, QuitAction, Report, WatchConfig, Watcher, WindowInfo, Windows,
+    STEAM_CLIENT_APPID,
 };
 use x11rb::connection::Connection;
 use x11rb::cookie::Cookie;
@@ -53,6 +54,13 @@ const MAX_WINDOWS: usize = 256;
 /// Longest property read, in 32-bit units.
 const MAX_PROPERTY: u32 = 256;
 const STEAM: &str = "/usr/bin/steam";
+/// A Steam still signing in accepts `-applaunch` and drops it (#1159), so a launch it has shown
+/// no sign of taking is sent again this often, for this long. 120 s is past the 90 s reveal cap.
+const RELAUNCH_EVERY: Duration = Duration::from_secs(5);
+const RELAUNCH_FOR: Duration = Duration::from_secs(120);
+/// The retry waits out a need for the user (a sign-in), which does not count against
+/// [`RELAUNCH_FOR`], but never beyond this after the launch.
+const RELAUNCH_MAX: Duration = Duration::from_secs(600);
 /// X keysym `Return`.
 const XK_RETURN: u32 = 0xff0d;
 
@@ -119,6 +127,12 @@ struct Helper {
     /// The controller notice: pinned to Steam's window, then answered, at most once a launch.
     notice: Notice,
     quit: Option<Quit>,
+    /// A `launch` Steam has not yet been seen to take up; sent again until it is.
+    relaunch: Option<Relaunch>,
+    /// A `launch` waiting for the entrypoint's own `steam -silent` to start: one that ran
+    /// `steam -applaunch` before a client exists would start a second Steam, and the Steam
+    /// image starts its client only after this helper's `ready`.
+    pending: Option<u32>,
     /// The watched game's cloud log, read from when the watch began, and whether this watch has
     /// reported the game's exit. Only a quit after that exit waits on it for the exit sync (#810).
     exit_sync: Option<(u32, CloudSync)>,
@@ -127,6 +141,23 @@ struct Helper {
     screen: Box<dyn Screen>,
     /// `steam` from `PATH`; a test points it at a stand-in.
     steam: PathBuf,
+    /// A test waits for the stand-in to finish, so what it writes lands before `run_steam` returns.
+    #[cfg(test)]
+    wait_for_steam: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Relaunch {
+    appid: u32,
+    next: Instant,
+    /// The end of the retry window; it moves out while Steam needs the user.
+    until: Instant,
+    /// The hard end, however long Steam needed the user.
+    last: Instant,
+    /// The previous step, to count how long Steam needed the user.
+    stepped: Instant,
+    /// Steam had taken the launch up at the previous step; a failure of it re-arms the retry.
+    taken: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +186,8 @@ impl Helper {
             needs_user: false,
             notice: Notice::Waiting,
             quit: None,
+            relaunch: None,
+            pending: None,
             exit_sync: None,
             game_exited: false,
             children: Vec::new(),
@@ -166,6 +199,8 @@ impl Helper {
                 "steam"
             }
             .into(),
+            #[cfg(test)]
+            wait_for_steam: false,
         }
     }
 
@@ -173,7 +208,7 @@ impl Helper {
         self.watch_with(appid, launched, Box::<X11Windows>::default());
     }
 
-    fn watch_with(&mut self, appid: u32, launched: bool, windows: Box<dyn Windows + Send>) {
+    fn new_watcher(&self, appid: u32, windows: Box<dyn Windows + Send>) -> Watcher {
         let mut watcher = Watcher::new(
             WatchConfig {
                 proc_root: self.proc_root.clone(),
@@ -185,6 +220,15 @@ impl Helper {
         if self.dismiss {
             watcher.answer_notice();
         }
+        watcher
+    }
+
+    fn watch_with(&mut self, appid: u32, launched: bool, windows: Box<dyn Windows + Send>) {
+        let watcher = self.new_watcher(appid, windows);
+        self.arm(watcher, appid, launched);
+    }
+
+    fn arm(&mut self, watcher: Watcher, appid: u32, launched: bool) {
         self.watcher = Some(watcher);
         self.exit_sync = Some((appid, CloudSync::new(&self.log_dir, appid)));
         self.game_exited = false;
@@ -196,13 +240,18 @@ impl Helper {
     fn command(&mut self, command: Command, agent: &mut Agent) {
         match command {
             Command::Launch(appid) => {
-                let ok = self.run_steam(&["-applaunch", &appid.to_string()]);
-                if ok {
-                    eprintln!("quasar-launch-helper: launched Steam app {appid}");
-                    agent.forget_game();
-                    self.watch(appid, true);
+                // A launch that does not run leaves no retry of an earlier target behind,
+                // and no earlier held launch either.
+                self.relaunch = None;
+                self.pending = None;
+                if !self.steam_running() {
+                    eprintln!(
+                        "quasar-launch-helper: no Steam client yet; app {appid} waits for it"
+                    );
+                    self.pending = Some(appid);
+                    return;
                 }
-                agent.done(Done::Launch { appid, ok });
+                self.launch(appid, agent);
             }
             Command::BigPicture => {
                 let ok = self.run_steam(&["steam://open/bigpicture"]);
@@ -221,6 +270,9 @@ impl Helper {
                     );
                     return;
                 }
+                self.relaunch = None;
+                // A held launch of the game being quit must never run after it (#1243).
+                self.pending = None;
                 match self.screen.close(appid) {
                     Ok(sent) => eprintln!(
                         "quasar-launch-helper: asked {sent} window(s) of Steam app {appid} to close"
@@ -245,6 +297,38 @@ impl Helper {
         }
     }
 
+    /// Whether a Steam client process exists yet. An unreadable `/proc` never holds a
+    /// launch back: the helper runs inside the container's own pid namespace, where it is
+    /// always there.
+    fn steam_running(&self) -> bool {
+        steam_client_running(&self.proc_root) != Some(false)
+    }
+
+    /// Run the target game through the client that is already up.
+    fn launch(&mut self, appid: u32, agent: &mut Agent) {
+        // The watcher's baseline in Steam's logs is taken before Steam can write
+        // anything for this launch, or the first thing it logs would be skipped.
+        let mut watcher = self.new_watcher(appid, Box::<X11Windows>::default());
+        let now = Instant::now();
+        let baseline = watcher.poll_at(now);
+        let ok = self.run_steam(&["-applaunch", &appid.to_string()]);
+        if ok {
+            eprintln!("quasar-launch-helper: launched Steam app {appid}");
+            agent.forget_game();
+            self.arm(watcher, appid, true);
+            self.forward(baseline, agent);
+            self.relaunch = Some(Relaunch {
+                appid,
+                next: now + RELAUNCH_EVERY,
+                until: now + RELAUNCH_FOR,
+                last: now + RELAUNCH_MAX,
+                stepped: now,
+                taken: false,
+            });
+        }
+        agent.done(Done::Launch { appid, ok });
+    }
+
     /// `steam` with fixed argv, as this user, detached from our stdio.
     fn run_steam(&mut self, args: &[&str]) -> bool {
         self.children
@@ -261,6 +345,14 @@ impl Helper {
             .spawn()
         {
             Ok(child) => {
+                #[cfg(test)]
+                let child = {
+                    let mut child = child;
+                    if self.wait_for_steam {
+                        let _ = child.wait();
+                    }
+                    child
+                };
                 self.children.push(child);
                 true
             }
@@ -274,10 +366,70 @@ impl Helper {
     fn pass(&mut self, now: Instant, agent: &mut Agent) {
         self.children
             .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+        if let Some(appid) = self.pending {
+            if self.steam_running() {
+                self.pending = None;
+                self.launch(appid, agent);
+            }
+        }
         self.poll_watcher(now, agent);
+        self.step_relaunch(now);
         self.answer_notice(now);
         self.pin();
         self.step_quit(now, agent);
+    }
+
+    /// Send the armed `launch` again while Steam shows no sign of having taken it. The helper
+    /// relaunches only on positive evidence the launch was not taken, and never against what
+    /// the user is doing now: not once the game runs or exited, another game or launch showed
+    /// up, a quit runs, the target changed, or the window is over. While Steam's log shows the
+    /// launch moving it holds; if Steam then logs that action as failed, the retry goes on.
+    /// While Steam needs the user (a sign-in) it waits, and that time is not counted, up to
+    /// [`RELAUNCH_MAX`] in all.
+    fn step_relaunch(&mut self, now: Instant) {
+        let Some(mut relaunch) = self.relaunch else {
+            return;
+        };
+        let Some(watcher) = self.watcher.as_ref() else {
+            self.relaunch = None;
+            return;
+        };
+        let live = watcher.appid() == relaunch.appid
+            && !watcher.elsewhere()
+            && matches!(
+                watcher.launch_state(),
+                LaunchState::Starting | LaunchState::ClientOnly
+            );
+        let paused = watcher.needs_now().is_some();
+        let taken = watcher.launch_taken();
+        // Progress on the launch stops the retry for as long as it stands; Steam then failing
+        // that action starts a fresh window, inside the same hard end.
+        if relaunch.taken && !taken {
+            relaunch.until = now + RELAUNCH_FOR;
+            relaunch.next = now + RELAUNCH_EVERY;
+        }
+        relaunch.taken = taken;
+        if paused {
+            relaunch.until += now.saturating_duration_since(relaunch.stepped);
+        }
+        relaunch.stepped = now;
+        // The soft window ends the sending, not the watch: while the launch is taken the retry
+        // stays armed until the hard end, so a failure Steam logs later still gets it sent again.
+        let over = now >= relaunch.last || (!taken && now >= relaunch.until);
+        if !live || self.quit.is_some() || over {
+            self.relaunch = None;
+            return;
+        }
+        if !paused && !taken && now >= relaunch.next {
+            relaunch.next = now + RELAUNCH_EVERY;
+            if self.run_steam(&["-applaunch", &relaunch.appid.to_string()]) {
+                eprintln!(
+                    "quasar-launch-helper: Steam has not taken up app {}; launched it again",
+                    relaunch.appid
+                );
+            }
+        }
+        self.relaunch = Some(relaunch);
     }
 
     /// Poll the watcher and forward its reports, noting the ones the helper acts on.
@@ -285,7 +437,13 @@ impl Helper {
         let Some(watcher) = &mut self.watcher else {
             return;
         };
-        for report in watcher.poll_at(now) {
+        let reports = watcher.poll_at(now);
+        self.forward(reports, agent);
+    }
+
+    /// Send the watcher's reports on, noting the ones the helper acts on.
+    fn forward(&mut self, reports: Vec<Report>, agent: &mut Agent) {
+        for report in reports {
             if matches!(report, Report::SteamNeedsUser(_)) {
                 self.needs_user = true;
             }
@@ -1353,8 +1511,10 @@ mod tests {
         std::fs::write(
             &steam,
             format!(
-                "#!/bin/sh\nprintf '%s|' \"$@\" >> '{}'\n",
-                dir.join("argv.txt").display()
+                "#!/bin/sh\nprintf '%s|' \"$@\" >> '{0}'\n[ -f '{1}' ] && cat '{1}' >> '{2}'\nexit 0\n",
+                dir.join("argv.txt").display(),
+                dir.join("steam_says.txt").display(),
+                dir.join("logs/console_log.txt").display()
             ),
         )
         .unwrap();
@@ -1387,6 +1547,376 @@ mod tests {
             agent.latest[COMMAND_DONE].as_deref(),
             Some("{\"type\":\"command_done\",\"v\":1,\"command\":\"launch\",\"appid\":1145360,\"ok\":true}\n")
         );
+    }
+
+    /// A Steam client process, as the helper's `/proc` scan reads it: the entrypoint's own
+    /// `steam -silent`.
+    fn steam_client(proc: &std::path::Path) {
+        let pid = proc.join("7");
+        std::fs::create_dir_all(&pid).unwrap();
+        std::fs::write(pid.join("cmdline"), b"/usr/bin/steam\0-silent\0").unwrap();
+        std::fs::write(pid.join("stat"), "7 (steam) S 1 7 7 0 -1").unwrap();
+    }
+
+    /// #1243: the Steam image starts its client only after this helper printed `ready`, so
+    /// a `launch` queued before that waits for a Steam process instead of starting a second
+    /// Steam. `ready` itself is never held back by the wait.
+    #[test]
+    fn a_launch_waits_for_a_steam_client_before_running_steam() {
+        let _scripts = scripts();
+        let dir = tempfile::tempdir().unwrap();
+        let proc = dir.path().join("proc");
+        std::fs::create_dir_all(&proc).unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let mut helper = Helper::new(proc.clone(), dir.path().join("logs"), false);
+        helper.steam = fake_steam(dir.path());
+        helper.wait_for_steam = true;
+        let mut agent = Agent::new(dir.path().join("none.sock"));
+        let t = Instant::now();
+        helper.command(Command::Launch(1145360), &mut agent);
+        helper.pass(t, &mut agent);
+        assert!(
+            !dir.path().join("argv.txt").exists(),
+            "no steam before a client runs"
+        );
+        assert!(
+            agent.latest[COMMAND_DONE].is_none(),
+            "and the launch is not answered yet"
+        );
+        // A newer launch replaces the held one: only the latest game ever runs.
+        helper.command(Command::Launch(620), &mut agent);
+        steam_client(&proc);
+        helper.pass(t + PASS, &mut agent);
+        assert_eq!(argv(dir.path()), "-applaunch|620|");
+        assert!(agent.latest[COMMAND_DONE]
+            .as_deref()
+            .unwrap()
+            .contains("\"ok\":true"));
+    }
+
+    /// A helper whose `launch 1145360` has been sent to the stand-in `steam`, and its clock.
+    fn launched(dir: &std::path::Path) -> (Helper, Agent, Instant) {
+        let mut helper = Helper::new(dir.join("proc"), dir.join("logs"), false);
+        helper.steam = fake_steam(dir);
+        helper.wait_for_steam = true;
+        let mut agent = Agent::new(dir.join("none.sock"));
+        helper.command(Command::Launch(1145360), &mut agent);
+        (helper, agent, Instant::now())
+    }
+
+    /// Wait for the stand-in `steam` to have run `n` times, then for any extra run to show.
+    fn runs(dir: &std::path::Path, n: usize) -> usize {
+        let count = || {
+            std::fs::read_to_string(dir.join("argv.txt"))
+                .map_or(0, |t| t.matches("-applaunch").count())
+        };
+        for _ in 0..200 {
+            if count() >= n {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(150));
+        count()
+    }
+
+    fn log_raw(dir: &std::path::Path, text: &str) {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("logs/console_log.txt"))
+            .unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+    }
+
+    fn log_line(dir: &std::path::Path, line: &str) {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("logs/console_log.txt"))
+            .unwrap();
+        writeln!(file, "{line}").unwrap();
+    }
+
+    #[test]
+    fn a_launch_steam_ignored_is_sent_again_until_it_takes() {
+        let _scripts = scripts();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let (mut helper, mut agent, t0) = launched(dir.path());
+        assert_eq!(runs(dir.path(), 1), 1);
+        helper.pass(t0 + Duration::from_secs(1), &mut agent);
+        assert_eq!(runs(dir.path(), 1), 1, "not before the interval");
+        helper.pass(t0 + Duration::from_secs(6), &mut agent);
+        assert_eq!(runs(dir.path(), 2), 2, "Steam signing in dropped the first");
+        helper.pass(t0 + Duration::from_secs(8), &mut agent);
+        helper.pass(t0 + Duration::from_secs(12), &mut agent);
+        assert_eq!(runs(dir.path(), 3), 3);
+        // Steam takes the launch up: it logs an action for the game.
+        log_line(
+            dir.path(),
+            "GameAction [AppID 1145360, ActionID 1] : LaunchApp changed task to CreatingProcess",
+        );
+        helper.pass(t0 + Duration::from_secs(13), &mut agent);
+        helper.pass(t0 + Duration::from_secs(30), &mut agent);
+        assert_eq!(
+            runs(dir.path(), 4),
+            3,
+            "a launch Steam took is not sent again while it stands"
+        );
+    }
+
+    const PROGRESS: &str =
+        "GameAction [AppID 1145360, ActionID 1] : LaunchApp changed task to CreatingProcess";
+
+    #[test]
+    fn a_launch_is_not_sent_again_once_it_is_no_longer_the_users_to_repeat() {
+        let _scripts = scripts();
+        let dir = tempfile::tempdir().unwrap();
+        let after = Duration::from_secs(6);
+        type Stop<'a> = Box<dyn Fn(&mut Helper, &mut Agent) + 'a>;
+        let stops: [(&str, Stop); 6] = [
+            (
+                "the game runs",
+                Box::new(|_, _| log_line(dir.path(), "Game process added : AppID 1145360 \"x\"")),
+            ),
+            (
+                "a quit runs",
+                Box::new(|h, a| h.command(Command::Quit(1145360), a)),
+            ),
+            (
+                "the window is over",
+                Box::new(|h, _| h.relaunch.as_mut().unwrap().until = Instant::now()),
+            ),
+            (
+                "another game runs",
+                Box::new(|_, _| {
+                    let proc = dir.path().join("proc/42");
+                    std::fs::create_dir_all(&proc).unwrap();
+                    std::fs::write(
+                        proc.join("cmdline"),
+                        b"/steam/reaper\0SteamLaunch\0AppId=620\0--\0game\0",
+                    )
+                    .unwrap();
+                }),
+            ),
+            (
+                "Steam launches another app",
+                Box::new(|_, _| {
+                    log_line(
+                        dir.path(),
+                        "GameAction [AppID 620, ActionID 1] : LaunchApp changed task to CreatingProcess",
+                    )
+                }),
+            ),
+            (
+                "another launch cannot run",
+                Box::new(|h, a| {
+                    h.steam = dir.path().join("missing");
+                    h.command(Command::Launch(620), a);
+                }),
+            ),
+        ];
+        for (why, stop) in stops {
+            let _ = std::fs::remove_dir_all(dir.path().join("proc"));
+            let _ = std::fs::remove_file(dir.path().join("argv.txt"));
+            let _ = std::fs::remove_file(dir.path().join("logs/console_log.txt"));
+            std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+            std::fs::write(dir.path().join("logs/console_log.txt"), "old\n").unwrap();
+            let (mut helper, mut agent, t0) = launched(dir.path());
+            assert_eq!(runs(dir.path(), 1), 1);
+            stop(&mut helper, &mut agent);
+            helper.pass(t0 + after, &mut agent);
+            helper.pass(t0 + after * 2, &mut agent);
+            assert_eq!(runs(dir.path(), 2), 1, "no second launch once {why}");
+        }
+    }
+
+    #[test]
+    fn a_launch_that_cannot_run_clears_the_retry_of_the_one_before() {
+        let _scripts = scripts();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut helper, mut agent, _) = launched(dir.path());
+        assert!(helper.relaunch.is_some());
+        helper.steam = dir.path().join("missing");
+        helper.command(Command::Launch(620), &mut agent);
+        assert!(helper.relaunch.is_none());
+    }
+
+    #[test]
+    fn what_steam_logs_right_after_the_launch_counts_as_the_launch_taken() {
+        let _scripts = scripts();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        std::fs::write(
+            dir.path().join("logs/console_log.txt"),
+            "an earlier session\n",
+        )
+        .unwrap();
+        // The stand-in `steam` logs the progress as part of the launch itself, before the
+        // helper's next step: only a baseline taken before the spawn sees it.
+        std::fs::write(dir.path().join("steam_says.txt"), format!("{PROGRESS}\n")).unwrap();
+        let (mut helper, mut agent, t0) = launched(dir.path());
+        helper.pass(t0, &mut agent);
+        helper.pass(t0 + Duration::from_secs(6), &mut agent);
+        helper.pass(t0 + Duration::from_secs(12), &mut agent);
+        assert_eq!(runs(dir.path(), 2), 1, "no retry of a launch Steam took");
+    }
+
+    #[test]
+    fn a_refusal_that_logs_progress_then_failure_gets_the_launch_sent_again() {
+        let _scripts = scripts();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let (mut helper, mut agent, t0) = launched(dir.path());
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let action = |id: u32, text: &str| {
+            format!("GameAction [AppID 1145360, ActionID {id}] : LaunchApp {text}\n")
+        };
+        log_raw(
+            dir.path(),
+            &action(1, "changed task to RequestingLicense with \"\""),
+        );
+        helper.pass(at(1), &mut agent);
+        helper.pass(at(8), &mut agent);
+        assert_eq!(runs(dir.path(), 2), 1, "while it moves, it holds");
+        // The failure, its first half in one poll and the rest in the next.
+        let failed = action(1, "failed with AppError_5 with \"\"");
+        let (head, tail) = failed.split_at(40);
+        log_raw(dir.path(), head);
+        helper.pass(at(9), &mut agent);
+        assert_eq!(runs(dir.path(), 2), 1, "half a line says nothing");
+        log_raw(dir.path(), tail);
+        helper.pass(at(10), &mut agent);
+        helper.pass(at(16), &mut agent);
+        assert_eq!(runs(dir.path(), 2), 2, "a failed action is sent again");
+        log_raw(dir.path(), &action(1, "changed task to Failed with \"\""));
+        helper.pass(at(17), &mut agent);
+        // The next action moves: held again.
+        log_raw(
+            dir.path(),
+            &action(2, "changed task to CreatingProcess with \"\""),
+        );
+        helper.pass(at(18), &mut agent);
+        helper.pass(at(40), &mut agent);
+        assert_eq!(runs(dir.path(), 3), 2);
+    }
+
+    #[test]
+    fn a_failure_after_progress_does_not_reset_the_hard_end() {
+        let _scripts = scripts();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let (mut helper, mut agent, t0) = launched(dir.path());
+        let at = |secs| t0 + Duration::from_secs(secs);
+        log_raw(
+            dir.path(),
+            "GameAction [AppID 1145360, ActionID 1] : LaunchApp changed task to RequestingLicense with \"\"\n",
+        );
+        helper.pass(at(1), &mut agent);
+        // The production loop keeps polling past the first soft window while the launch stands.
+        helper.pass(at(121), &mut agent);
+        helper.pass(at(300), &mut agent);
+        log_raw(
+            dir.path(),
+            "GameAction [AppID 1145360, ActionID 1] : LaunchApp failed with AppError_5 with \"\"\n",
+        );
+        helper.pass(at(590), &mut agent);
+        helper.pass(at(596), &mut agent);
+        assert_eq!(runs(dir.path(), 2), 2, "a late failure is still retried");
+        helper.pass(at(RELAUNCH_MAX.as_secs() + 1), &mut agent);
+        assert!(helper.relaunch.is_none());
+    }
+
+    struct Unreadable;
+
+    impl Windows for Unreadable {
+        fn mapped(&mut self) -> std::io::Result<Vec<WindowInfo>> {
+            Err(std::io::Error::other("no window list"))
+        }
+        fn focused_app(&mut self) -> std::io::Result<Option<u32>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn a_finished_sign_in_resumes_the_retry_even_when_the_windows_cannot_be_read() {
+        let _scripts = scripts();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let (mut helper, mut agent, t0) = launched(dir.path());
+        let mut watcher = helper.new_watcher(1145360, Box::new(Unreadable));
+        watcher.poll_at(t0);
+        helper.watcher = Some(watcher);
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let login =
+            |text: &str| std::fs::write(dir.path().join("logs/steamui_login.txt"), text).unwrap();
+        login("SetLoginState: WaitingForCredentials\n");
+        helper.pass(at(6), &mut agent);
+        helper.pass(at(60), &mut agent);
+        assert_eq!(runs(dir.path(), 2), 1, "paused at the sign-in");
+        login("SetLoginState: WaitingForCredentials\nSetLoginState: LoggedIn\n");
+        helper.pass(at(65), &mut agent);
+        assert_eq!(runs(dir.path(), 2), 2, "signed in: sent again");
+    }
+
+    #[test]
+    fn a_line_that_is_not_progress_does_not_count_as_the_launch_taken() {
+        let _scripts = scripts();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let (mut helper, mut agent, t0) = launched(dir.path());
+        log_line(
+            dir.path(),
+            "GameAction [AppID 1145360, ActionID 1] : LaunchApp failed with \"x\"",
+        );
+        helper.pass(t0 + Duration::from_secs(6), &mut agent);
+        assert_eq!(runs(dir.path(), 2), 2);
+    }
+
+    #[test]
+    fn the_retry_waits_while_steam_needs_a_sign_in_and_resumes_when_it_is_done() {
+        let _scripts = scripts();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let (mut helper, mut agent, t0) = launched(dir.path());
+        assert_eq!(runs(dir.path(), 1), 1);
+        // X is absent here, and an unreadable window list never clears a need: use a list.
+        let mut watcher = helper.new_watcher(1145360, Box::new(Fake(vec![])));
+        watcher.poll_at(t0);
+        helper.watcher = Some(watcher);
+        let at = |secs| t0 + Duration::from_secs(secs);
+        std::fs::write(
+            dir.path().join("logs/steamui_login.txt"),
+            "SetLoginState: WaitingForCredentials\n",
+        )
+        .unwrap();
+        helper.pass(at(6), &mut agent);
+        helper.pass(at(200), &mut agent);
+        assert_eq!(runs(dir.path(), 2), 1, "nothing is sent at a sign-in");
+        assert!(helper.relaunch.is_some(), "and the retry is kept");
+        std::fs::write(
+            dir.path().join("logs/steamui_login.txt"),
+            "SetLoginState: WaitingForCredentials\nSetLoginState: LoggedIn\n",
+        )
+        .unwrap();
+        helper.pass(at(205), &mut agent);
+        assert_eq!(
+            runs(dir.path(), 2),
+            2,
+            "signed in: the launch is sent again"
+        );
+        // A sign-in that never ends does not hold the retry past its hard end.
+        std::fs::write(
+            dir.path().join("logs/steamui_login.txt"),
+            "SetLoginState: WaitingForCredentials\nSetLoginState: LoggedIn\nSetLoginState: WaitingForCredentials\n",
+        )
+        .unwrap();
+        helper.pass(at(210), &mut agent);
+        helper.pass(at(RELAUNCH_MAX.as_secs() + 1), &mut agent);
+        assert!(helper.relaunch.is_none());
     }
 
     #[test]

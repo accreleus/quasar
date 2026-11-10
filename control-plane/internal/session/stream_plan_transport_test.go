@@ -45,6 +45,8 @@ func TestPlanStreamTransport(t *testing.T) {
 	noH264.WebCodecs["h264"] = false
 	noWT := wtProbe()
 	noWT.WebTransport = false
+	// A record posted before the WebCodecs keys existed: it proves WebTransport and nothing else.
+	beforeWebCodecs := &DeviceProbe{WebTransport: true}
 
 	tests := []struct {
 		name       string
@@ -67,6 +69,7 @@ func TestPlanStreamTransport(t *testing.T) {
 		{"wanted but the device lacks webtransport", wtInputs("webtransport", "", true, noWT), "webrtc", "device_no_webtransport"},
 		{"wanted but the device cannot decode the codec", wtInputs("webtransport", "", true, noH264), "webrtc", "device_no_webcodecs"},
 		{"wanted but the device cannot decode opus", wtInputs("webtransport", "", true, noOpus), "webrtc", "device_no_webcodecs"},
+		{"wanted but the probe predates the webcodecs keys", wtInputs("webtransport", "", true, beforeWebCodecs), "webrtc", "device_no_webcodecs"},
 		{"endpoint is checked before the device", wtInputs("webtransport", "", false, noWT), "webrtc", "host_no_endpoint"},
 		{"a refused request on a webrtc profile reports the profile, not the host", wtInputs("webrtc", "webtransport", false, nil), "webrtc", "profile_disallows"},
 	}
@@ -87,30 +90,113 @@ func TestPlanStreamTransport(t *testing.T) {
 	}
 }
 
-// The probe is checked for the session's codec, in the catalog spelling (hevc, not h265).
-func TestPlanStreamTransportChecksTheSessionsCodec(t *testing.T) {
-	in := wtInputs("webtransport", "", true, wtProbe())
-	in.Chain.Rungs = []profile.Profile{rung("hevc", profile.CodecHEVC, 1920, 1080, 60, 8000), in.Chain.Rungs[0]}
-	in.Probe.HEVC = true
+// A "default" profile reaches the plan already resolved (resolveLaunchProfile): Transport is the
+// instance setting and TransportInherited says so. The setting behaves exactly as the profile
+// value of the same name, and the only difference is the reason a request for WebTransport is
+// refused (amendment 61).
+func TestPlanStreamTransportInheritedDefault(t *testing.T) {
+	for _, tc := range []struct {
+		setting, requested string
+		want, wantReason   string
+	}{
+		{"webrtc", "", "webrtc", ""},
+		{"webrtc", "webrtc", "webrtc", ""},
+		{"webrtc", "webtransport", "webrtc", "instance_default_disallows"},
+		{"webtransport", "", "webtransport", ""},
+		{"webtransport", "webrtc", "webrtc", ""},
+		{"webtransport", "webtransport", "webtransport", ""},
+	} {
+		t.Run(tc.setting+"/"+tc.requested, func(t *testing.T) {
+			in := wtInputs(tc.setting, tc.requested, true, wtProbe())
+			in.Chain.TransportInherited = true
+			plan, err := planStream(in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if plan.Update.Transport != tc.want || plan.Update.TransportReason != tc.wantReason {
+				t.Errorf("transport = %q (reason %q), want %q (reason %q)",
+					plan.Update.Transport, plan.Update.TransportReason, tc.want, tc.wantReason)
+			}
+		})
+	}
+	// An explicit webrtc profile keeps its own reason.
+	in := wtInputs("webrtc", "webtransport", true, wtProbe())
+	if plan, _ := planStream(in); plan.Update.TransportReason != "profile_disallows" {
+		t.Errorf("explicit webrtc reason = %q", plan.Update.TransportReason)
+	}
+}
 
+// WebTransport carries h264, hevc and av1 (A18, #1043): the resolved codec no longer sends a
+// session to WebRTC, and the device's own WebCodecs probe for that codec decides instead. The
+// transport check never changes the codec. codec_unsupported_on_transport stays for a codec
+// outside webTransportCodecs.
+func TestPlanStreamTransportCarriesH264HevcAndAV1(t *testing.T) {
+	tests := []struct {
+		name       string
+		codec      profile.Codec
+		wantCodec  string
+		endpoint   bool
+		probe      func() *DeviceProbe
+		want       string
+		wantReason string
+	}{
+		{"h264", profile.CodecH264, "h264", true, wtProbe, "webtransport", ""},
+		{"hevc", profile.CodecHEVC, "h265", true, wtProbe, "webtransport", ""},
+		{"av1", profile.CodecAV1, "av1", true, wtProbe, "webtransport", ""},
+		{"hevc the device cannot decode stays on webrtc", profile.CodecHEVC, "h265", true, func() *DeviceProbe {
+			p := wtProbe()
+			p.WebCodecs["hevc"] = false
+			return p
+		}, "webrtc", "device_no_webcodecs"},
+		{"av1 the device cannot decode stays on webrtc", profile.CodecAV1, "av1", true, func() *DeviceProbe {
+			p := wtProbe()
+			p.WebCodecs["av1"] = false
+			return p
+		}, "webrtc", "device_no_webcodecs"},
+		{"hevc without an endpoint reports the endpoint", profile.CodecHEVC, "h265", false, wtProbe, "webrtc", "host_no_endpoint"},
+		{"av1 on a device without webtransport reports the device", profile.CodecAV1, "av1", true, func() *DeviceProbe {
+			p := wtProbe()
+			p.WebTransport = false
+			return p
+		}, "webrtc", "device_no_webtransport"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			in := wtInputs("webtransport", "", tc.endpoint, tc.probe())
+			in.Chain.Rungs = []profile.Profile{rung("r", tc.codec, 1920, 1080, 60, 8000)}
+			in.Probe.HEVC, in.Probe.AV1 = true, true
+			plan, err := planStream(in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if plan.Update.Codec != tc.wantCodec {
+				t.Fatalf("codec = %s, want %s: the transport check must never change the codec", plan.Update.Codec, tc.wantCodec)
+			}
+			if plan.Update.Transport != tc.want || plan.Update.TransportReason != tc.wantReason {
+				t.Errorf("transport = %q (%q), want %q (%q)", plan.Update.Transport, plan.Update.TransportReason, tc.want, tc.wantReason)
+			}
+			if (plan.Endpoint != nil) != (tc.want == "webtransport") {
+				t.Errorf("endpoint = %+v for transport %q", plan.Endpoint, plan.Update.Transport)
+			}
+		})
+	}
+}
+
+// A codec the transport does not carry keeps its reason; the map is the only place that says which.
+func TestPlanStreamTransportKeepsTheReasonForAnUncarriedCodec(t *testing.T) {
+	saved := webTransportCodecs[profile.CodecAV1]
+	webTransportCodecs[profile.CodecAV1] = false
+	defer func() { webTransportCodecs[profile.CodecAV1] = saved }()
+	in := wtInputs("webtransport", "", true, wtProbe())
+	in.Chain.Rungs = []profile.Profile{rung("r", profile.CodecAV1, 1920, 1080, 60, 8000)}
+	in.Probe.HEVC, in.Probe.AV1 = true, true
 	plan, err := planStream(in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.Update.Codec != "h265" || plan.Update.Transport != "webtransport" {
-		t.Fatalf("codec/transport = %s/%s, want h265/webtransport", plan.Update.Codec, plan.Update.Transport)
-	}
-
-	in.Probe.WebCodecs["hevc"] = false
-	plan, err = planStream(in)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if plan.Update.Codec != "h265" {
-		t.Fatalf("codec = %s: the transport check must never change the codec", plan.Update.Codec)
-	}
-	if plan.Update.Transport != "webrtc" || plan.Update.TransportReason != "device_no_webcodecs" {
-		t.Errorf("transport = %q (%q), want webrtc (device_no_webcodecs)", plan.Update.Transport, plan.Update.TransportReason)
+	if plan.Update.Transport != "webrtc" || plan.Update.TransportReason != "codec_unsupported_on_transport" || plan.Update.Codec != "av1" {
+		t.Errorf("got %q (%q) codec %s, want webrtc / codec_unsupported_on_transport / av1",
+			plan.Update.Transport, plan.Update.TransportReason, plan.Update.Codec)
 	}
 }
 

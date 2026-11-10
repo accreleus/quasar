@@ -311,6 +311,9 @@ fn assert_vulkan_encoder_device(
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     Starting,
+    /// Amendment 59: an adoption's restream finished (how long it took), or failed at a
+    /// step. For the agent only; nothing goes out for it.
+    Restreamed(Result<Duration, RestreamFailure>),
     HomeSeed(super::home::HomeSeedOutcome),
     /// Fine-grained launch progress while the top-level state remains starting.
     Progress(&'static str),
@@ -798,6 +801,53 @@ pub struct SwapRequest {
     pub in_place: bool,
 }
 
+/// Why an adoption's restream failed (amendment 59): the logged step and why, and whether
+/// it is the hardware's own answer (an element, caps or encoder refusal), which the agent
+/// remembers for the connection epoch. A start failure, a lost device or a load-dependent
+/// step never is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestreamFailure {
+    pub step: &'static str,
+    pub why: String,
+    pub deterministic: bool,
+}
+
+impl RestreamFailure {
+    pub(crate) fn new(step: &'static str, why: impl Into<String>) -> Self {
+        Self {
+            step,
+            why: why.into(),
+            deterministic: false,
+        }
+    }
+
+    fn hardware(step: &'static str, why: impl Into<String>) -> Self {
+        Self {
+            deterministic: true,
+            ..Self::new(step, why)
+        }
+    }
+}
+
+/// How long a rebuilt encoder has to put out its first buffer; the agent's deadline
+/// (agent.rs `ADOPT_RESTREAM_DEADLINE`) usually stops it sooner.
+const REBUILD_OUTPUT_WAIT: Duration = Duration::from_secs(5);
+
+/// Test hook: a rebuild's new encoder is given caps nothing can meet, as a caps
+/// negotiation failure would.
+#[cfg(test)]
+pub(crate) static REBUILD_BREAK_CAPS: AtomicBool = AtomicBool::new(false);
+
+/// Test hook: how long a rebuild stands still with the old encoder gone and the new one
+/// not built, so a test can land the agent's deadline there.
+#[cfg(test)]
+pub(crate) static REBUILD_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Test hook: how long a restream stands still before it starts, so a test can stop the
+/// session while one is in flight.
+#[cfg(test)]
+pub(crate) static RESTREAM_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
+
 /// A `session_assign` that adopts this runner's runtime (amendment 39, `adopt_session_id`).
 /// The agent has already checked that it may, and re-labels the runtime's reports.
 #[derive(Debug, Clone)]
@@ -810,6 +860,11 @@ pub struct AdoptRequest {
     pub container: Option<super::container::ContainerSpec>,
     pub idle_timeout: Duration,
     pub app_boot_timeout: Option<Duration>,
+    /// Amendment 59: the adopting session's stream, when its codec, H.264 profile, bitrate
+    /// or fps differs (its size moves by the display update that follows the adoption). The runner moves the
+    /// runtime to it and answers [`SessionEvent::Restreamed`] before anything else of the
+    /// adoption; the agent re-labels only on `Ok`.
+    pub restream: Option<super::StreamParams>,
 }
 
 /// `to` runs in `from`'s container with only `STEAM_STARTUP_FLAGS` changed (amendment 39).
@@ -825,6 +880,14 @@ fn same_container_but_flags(
         spec
     };
     strip(from) == strip(to)
+}
+
+/// `session_swap_app` carries no compatibility tools, so the swap target gets the session's
+/// (`compat_tools::carry`) before anything compares or launches it.
+fn inherit_session_tools(current: Option<&super::container::ContainerSpec>, req: &mut SwapRequest) {
+    if let (Some(current), Some(next)) = (current, req.container.as_mut()) {
+        crate::compat_tools::carry(current, next);
+    }
 }
 
 /// The games an in-place swap moves between, `(A, B)`, or `None` for today's container
@@ -1476,32 +1539,51 @@ pub(crate) struct SessionTransports {
     negotiation: [Negotiation; 2],
     budget: [ReplacementBudget; 2],
     /// The session's WebTransport client, beside its WebRTC fallback (amendment 54).
-    _webtransport: Option<crate::webtransport::Tap>,
+    webtransport: Option<crate::webtransport::Tap>,
 }
 
 impl pipeline::Transport for SessionTransports {
-    fn attach(session: pipeline::EncodedSession) -> anyhow::Result<Self> {
+    fn attach(mut session: pipeline::EncodedSession) -> anyhow::Result<Self> {
         let webtransport = crate::webtransport::listener()
             .filter(|_| session.cfg.webtransport)
             .and_then(|l| {
+                let feed = session.pyrowave_feed.take();
                 crate::webtransport::Tap::attach(
                     l.registry(),
                     &session.video,
                     &session.encoder,
                     &session.session_id,
+                    Some(session.trace_tx.clone()),
+                    crate::webtransport::Input::devices(
+                        session.devices.clone(),
+                        session.input_state.clone(),
+                        session.cfg.stream.width,
+                        session.cfg.stream.height,
+                    ),
+                    crate::webtransport::Tap::plan(&session.cfg),
+                    session
+                        .cfg
+                        .pyrowave
+                        .map(|grant| (&session.cfg, grant, feed)),
                 )
             });
         let slot = pipeline::WebRtcSlot::new(session)?;
+        if let Some(tap) = &webtransport {
+            slot.tap_audio_for_stream(tap.audio());
+        }
         // Audio first: `attach_video` takes the encode pipeline to READY.
         let (audio_webrtc, audio_pipeline) = slot.build_audio()?;
         let video = slot.attach_video(false, None)?;
         let mut transports = Self::new(slot, video, audio_webrtc, audio_pipeline);
-        transports._webtransport = webtransport;
+        transports.webtransport = webtransport;
         Ok(transports)
     }
 
     fn release(&self) {
         self.video.release();
+        if let Some(tap) = &self.webtransport {
+            tap.release();
+        }
         if let Some(audio) = &self.audio_webrtc {
             let _ = audio.set_state(gst::State::Null);
         }
@@ -1528,7 +1610,7 @@ impl SessionTransports {
                 ReplacementBudget::new(MAX_REPLACEMENTS_PER_WINDOW),
                 ReplacementBudget::new(MAX_REPLACEMENTS_PER_WINDOW),
             ],
-            _webtransport: None,
+            webtransport: None,
         }
     }
 
@@ -1557,6 +1639,56 @@ impl SessionTransports {
     /// replaces that PC's transport instead, and the new transport offers: `Ok(Some(pc))`.
     /// `Err` only when the video transport could not be replaced, which leaves the
     /// session nothing to stream on.
+    /// Amendment 59: make `to` the launch point of the live video transport, without
+    /// replacing it (a rebuild's transports are new already).
+    pub(crate) fn move_launch_point(
+        &self,
+        to: &super::StreamParams,
+    ) -> Result<(), (&'static str, anyhow::Error)> {
+        self.slot.move_launch_point(to)
+    }
+
+    /// A rebuild's new transports take over the old ones' displaced peers, replacement
+    /// budget and negotiation: a late answer or ICE from the old viewer is then stale,
+    /// never applied to the new `webrtcbin`.
+    pub(crate) fn inherit(&mut self, old: &mut SessionTransports) {
+        for i in [PcId::Video as usize, PcId::Audio as usize] {
+            if let Some(gone) = old.negotiation[i].replaced() {
+                old.displaced[i].push(gone);
+            }
+            let displaced = &mut old.displaced[i];
+            while displaced.len() > DISPLACED_REMEMBERED {
+                displaced.remove(0);
+            }
+            self.displaced[i] = std::mem::take(displaced);
+            self.budget[i] = std::mem::replace(
+                &mut old.budget[i],
+                ReplacementBudget::new(MAX_REPLACEMENTS_PER_WINDOW),
+            );
+        }
+        self.unanswered = [true, self.audio_webrtc.is_some()];
+    }
+
+    /// Amendment 59 (a)–(b) on an adopted runtime: the video PC gets a new transport
+    /// starting from `to`, recorded as a replacement so a late answer from the old viewer
+    /// is told apart. On `Err`, the step that failed.
+    pub(crate) fn restream(
+        &mut self,
+        to: &super::StreamParams,
+    ) -> Result<(), (&'static str, anyhow::Error)> {
+        let i = PcId::Video as usize;
+        if let Some(gone) = self.negotiation[i].replaced() {
+            let displaced = &mut self.displaced[i];
+            displaced.push(gone);
+            if displaced.len() > DISPLACED_REMEMBERED {
+                displaced.remove(0);
+            }
+        }
+        self.slot.restream(&mut self.video, to)?;
+        self.unanswered[i] = true;
+        Ok(())
+    }
+
     pub(crate) fn inbound(
         &mut self,
         mut msg: SignalMsg,
@@ -1850,12 +1982,29 @@ fn idle_reap_reason(
         if booting {
             return None;
         }
-        return (running_for >= window).then_some("idle: WebRTC transport never established");
+        return (running_for >= window).then_some("idle: transport never established");
     }
     match unhealthy_for {
-        Some(d) if d >= window => Some("idle: WebRTC transport lost"),
+        Some(d) if d >= window => Some("idle: transport lost"),
         _ => None,
     }
+}
+
+/// The session's media client this tick, for the idle reap: `Some(true)` connected,
+/// `Some(false)` gone, `None` still connecting. A WebTransport client counts while it is
+/// attached; it is detached once its connection closes or goes silent
+/// (`transport-webtransport.md` §Bye and error). A session that streamed only on
+/// WebTransport never had a WebRTC peer, so its ICE stays `New` after that client leaves.
+fn client_link(
+    ice: gstreamer_webrtc::WebRTCICEConnectionState,
+    wt_attached: bool,
+    ever_connected: bool,
+) -> Option<bool> {
+    use gstreamer_webrtc::WebRTCICEConnectionState as S;
+    if wt_attached || ice_is_connected(ice) {
+        return Some(true);
+    }
+    (ice_is_dead(ice) || (ever_connected && ice == S::New)).then_some(false)
 }
 
 /// Was `msg` posted by an element that is still in `pipeline`?
@@ -2021,6 +2170,23 @@ impl AppBootGate {
     }
 }
 
+/// A container swap's ready wait, one tick after its `AppBootGate` (#1234): why to show the
+/// replacement now, or `None` to keep holding. A held app that exits is shown so the normal
+/// exit policy takes it; the swap's budget ends any other hold. Pure.
+fn swap_reveal(
+    step: AppBootStep,
+    drawn: bool,
+    exited: bool,
+    past_deadline: bool,
+) -> Option<&'static str> {
+    match step {
+        AppBootStep::Present(reveal) => Some(reveal),
+        _ if drawn && exited => Some("app exited while held"),
+        _ if drawn && past_deadline => Some("swap budget reached"),
+        _ => None,
+    }
+}
+
 /// Why a swap did not complete, and whether the session survived it.
 ///
 /// `fatal = false` is the ordinary rollback: the previous app runs again and the session
@@ -2163,6 +2329,346 @@ fn start_first_source<F: Fn(SessionEvent)>(
         None
     };
     Some((source, vulkan_contexts))
+}
+
+/// Clock, GPU contexts, then READY (with the Vulkan device check) and PLAYING for an encode
+/// pipeline: the session's first, or an adoption's rebuild (amendment 59). On `Err`, the
+/// reason, already logged; the caller tears down.
+fn start_encode_pipeline(
+    pipe: &gst::Pipeline,
+    cfg: &SessionConfig,
+    shared_clock: &gst::Clock,
+    shared_base: gst::ClockTime,
+    vulkan_contexts: Option<&VulkanContextBridge>,
+    cuda_ctx: Option<&gst::Context>,
+    va_ctx: Option<&gst::Context>,
+) -> Result<(), String> {
+    // Same clock + base as the source pipeline(s) so interpipesrc's pass-through PTS land
+    // in this pipeline's running-time (#68).
+    pipe.set_start_time(None::<gst::ClockTime>);
+    pipe.use_clock(Some(shared_clock));
+    pipe.set_base_time(shared_base);
+    // The VulkanImage crosses an interpipe boundary between two GstPipelines: install the
+    // producer-owned contexts explicitly before READY rather than relying on the timing of
+    // interpipe's forwarded context query, then verify what the encoder resolved.
+    let expected_vulkan_device =
+        vulkan_contexts.map(|contexts| install_vulkan_context_bridge(contexts, pipe));
+    // Inject the SAME shared CUDA context before PLAYING so cudaconvert + the NVENC encoder
+    // adopt it rather than making a new one, keeping the interpipe's CUDAMemory surfaces
+    // valid. set_context at READY is in time: elements bind it at READY->PAUSED.
+    if let Some(ctx) = cuda_ctx {
+        pipe.set_context(ctx);
+    }
+    // Same for the shared VA display, so the encoder reuses the compositor's NV12 surfaces
+    // instead of importing.
+    if let Some(ctx) = va_ctx {
+        pipe.set_context(ctx);
+        // set_context lands too late for device-pinned vapostproc/vah264enc: they bind a
+        // display on NULL->READY before the stored context is read ("Can't replace VA
+        // display while operating"). A sync handler answers their NEED_CONTEXT in time.
+        super::va_share::install_need_context_handler(pipe, ctx);
+    }
+    if let Some(expected) = expected_vulkan_device {
+        // A pre-session device-open/verify failure carrying a device-lost signature means
+        // the fresh Vulkan device is unusable before any session owns it: a GPU-global
+        // `device_open_failed`, which the agent escalates to a drain+restart. A plain
+        // build error stays per-session; `build_failure_reason` picks.
+        stage("encode-ready");
+        if let Err(e) = pipe.set_state(gst::State::Ready) {
+            let reason = vulkan_fault::build_failure_reason(
+                "encode set READY for Vulkan device verification",
+                &e.to_string(),
+            );
+            tracing::error!(
+                token = "runner-vulkan-ready-failed",
+                reason = %reason,
+                "encode pipeline READY transition (Vulkan device verification) failed"
+            );
+            return Err(reason);
+        }
+        if let Err(e) = assert_vulkan_encoder_device(pipe, expected) {
+            let reason = vulkan_fault::build_failure_reason(
+                "verify Vulkan context identity",
+                &format!("{e:#}"),
+            );
+            tracing::error!(
+                token = "runner-vulkan-identity-failed",
+                reason = %reason,
+                "verify Vulkan context identity failed"
+            );
+            return Err(reason);
+        }
+    }
+    stage("encode-play");
+    if let Err(e) = pipe.set_state(gst::State::Playing) {
+        tracing::error!(
+            token = "runner-encode-playing-failed",
+            error = %e,
+            "encode pipeline PLAYING transition failed"
+        );
+        return Err(format!("encode set PLAYING: {e}"));
+    }
+    // VK-05: the encode pipeline just reached PLAYING — rearm vulkanh264enc's
+    // rate-control/bitrate now (gst 1.28.4 drops a pre-PLAYING rate-control set,
+    // silently falling back to CQP; see pipeline::rearm_vulkan_rc).
+    if pipeline::vulkan_image_transport(cfg) {
+        if let Some(enc) = pipe.by_name(pipeline::VULKAN_ENCODER_NAME) {
+            pipeline::rearm_vulkan_rc(&enc, cfg.stream.bitrate_kbps);
+        } else {
+            tracing::warn!(
+                token = "vulkan-encoder-rearm-not-found",
+                "VK-05: could not find the Vulkan encoder ({}) in the encode pipeline to \
+                 rearm rate-control post-PLAYING — encoder may be stuck at CQP",
+                pipeline::VULKAN_ENCODER_NAME
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The rebuilt encoder's config: `to`'s codec, profile and bitrate, at the packet size the
+/// old payloader was shrunk to (#1134), which `cfg` does not record.
+fn rebuild_config(
+    cfg: &SessionConfig,
+    to: &super::StreamParams,
+    old_pipe: &gst::Pipeline,
+) -> SessionConfig {
+    let mut next = cfg.clone();
+    next.stream.codec = to.codec;
+    next.stream.h264_profile = to.h264_profile.clone();
+    next.stream.bitrate_kbps = to.bitrate_kbps;
+    next.encoder = cfg.configured_encoder;
+    if let Some(shrunk) = old_pipe
+        .by_name(pipeline::VIDEO_PAYLOADER_NAME)
+        .and_then(|pay| pipeline::rtp_mtu_of(&pay))
+    {
+        next.rtp_mtu = next.rtp_mtu.min(shrunk);
+    }
+    next
+}
+
+/// The rebuilds amendment 59 (c) refuses before anything is touched.
+fn rebuild_refused(
+    current: super::EncoderChoice,
+    next: super::EncoderChoice,
+    webtransport_tap: bool,
+) -> Option<(&'static str, String)> {
+    // What the compositor emits is fixed by the encoder family it was built for.
+    if next != current {
+        return Some((
+            "encoder_family",
+            format!("{current:?} would encode on {next:?}"),
+        ));
+    }
+    // A tap's end clears the session's WebTransport tokens for good (`Registry::end`), so a
+    // rebuild would leave that client nothing to reconnect with. Parked runtimes never have
+    // one (always `webrtc`).
+    webtransport_tap.then(|| {
+        (
+            "transport",
+            "a WebTransport session's encoder is not rebuilt warm".to_string(),
+        )
+    })
+}
+
+/// Amendment 59 (c): the encode pipeline rebuilt for `to`'s codec or H.264 profile on a
+/// warm runtime. The source (compositor, app container, Steam) is not touched: the new
+/// pipeline listens to the same interpipe sink, at the size and fps it was built with
+/// (`cfg`, which the runner keeps at them); fps then moves by the lever and size by the
+/// display update. The old encoder is at NULL, its transports released first, before the
+/// new one is built. `Ok` only once the new encoder has put out a buffer. On `Err`
+/// (`encoder_family`, `transport` and `nvenc_drain` touch nothing) the caller takes the
+/// failure branch.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_encode(
+    cfg: &SessionConfig,
+    to: &super::StreamParams,
+    old_pipe: &gst::Pipeline,
+    old_transports: &SessionTransports,
+    sink: &str,
+    defer: bool,
+    stop: &AtomicBool,
+    sig_tx: pipeline::OutTx,
+    res: &SessionResources,
+    metrics: &Arc<SessionMetrics>,
+    contexts: (
+        Option<&VulkanContextBridge>,
+        Option<&gst::Context>,
+        Option<&gst::Context>,
+    ),
+    diagnostic_tx: &DiagnosticEventTx,
+    session_id: &str,
+    clock: (&gst::Clock, gst::ClockTime),
+) -> Result<
+    (
+        SessionConfig,
+        pipeline::EncodePipeline<SessionTransports>,
+        gst::Bus,
+    ),
+    RestreamFailure,
+> {
+    let (vulkan_contexts, cuda_ctx, va_ctx) = contexts;
+    let mut next = rebuild_config(cfg, to, old_pipe);
+    let resolved = pipeline::resolve_effective_encoder(&mut next)
+        .map_err(|e| RestreamFailure::hardware("encoder", format!("{e:#}")))?;
+    if let Some((step, why)) = rebuild_refused(
+        cfg.encoder,
+        next.encoder,
+        old_transports.webtransport.is_some(),
+    ) {
+        return Err(RestreamFailure::new(step, why));
+    }
+    let drain = || RestreamFailure::new("nvenc_drain", "another encoder is live on this host");
+    if super::nvenc_defer::others_encoding(defer) {
+        return Err(drain());
+    }
+    pipeline::Transport::release(old_transports);
+    if !super::nvenc_defer::destroy_if_alone(old_pipe, defer) {
+        return Err(drain());
+    }
+    old_transports.audio_pipeline.finish();
+    // The old ABR loop's hooks hold the old encoder.
+    metrics.clear_hooks();
+    #[cfg(test)]
+    std::thread::sleep(Duration::from_millis(
+        REBUILD_PAUSE_MS.load(Ordering::Relaxed),
+    ));
+    if stop.load(Ordering::Relaxed) {
+        return Err(RestreamFailure::new(
+            "deadline",
+            "stopped before the new encoder was built",
+        ));
+    }
+    pipeline::preload_encoder_plugins(&[&resolved.factory]);
+    let built = pipeline::build_encode_pipeline::<SessionTransports>(
+        &next,
+        sig_tx,
+        res.devices.clone(),
+        res.input_state.clone(),
+        sink,
+        metrics.clone(),
+        va_ctx,
+        diagnostic_tx.clone(),
+        session_id.to_string(),
+        &resolved.factory,
+    )
+    .map_err(|e| RestreamFailure::hardware("encoder", format!("{e:#}")))?;
+    // Every way out after this tears the new pipeline down as the old one went.
+    let discard = |failure: RestreamFailure| {
+        pipeline::Transport::release(&built.transport);
+        built.transport.audio_pipeline.finish();
+        if !super::nvenc_defer::destroy_if_alone(&built.pipeline, defer) {
+            // Beside another live encoder: parked, so two slots are held until the drain.
+            super::nvenc_defer::finish_encode(&built.pipeline, defer);
+        }
+        Err(failure)
+    };
+    let encoder = built
+        .pipeline
+        .by_name(pipeline::VIDEO_ENCODER_NAME)
+        .or_else(|| built.pipeline.by_name(pipeline::VULKAN_ENCODER_NAME));
+    let Some(encoder) = encoder else {
+        return discard(RestreamFailure::hardware(
+            "encoder",
+            "no encoder in the new pipeline",
+        ));
+    };
+    #[cfg(test)]
+    if REBUILD_BREAK_CAPS.load(Ordering::Relaxed) {
+        if let Some(filter) = encoder
+            .static_pad("src")
+            .and_then(|p| p.peer())
+            .and_then(|p| p.parent_element())
+        {
+            filter.set_property("caps", gst::Caps::builder("video/x-nothing").build());
+        }
+    }
+    let Some(bus) = built.pipeline.bus() else {
+        return discard(RestreamFailure::new(
+            "encoder",
+            "the new encode pipeline has no bus",
+        ));
+    };
+    let output = Arc::new(AtomicBool::new(false));
+    if let Some(pad) = encoder.static_pad("src") {
+        let seen = output.clone();
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            seen.store(true, Ordering::Relaxed);
+            gst::PadProbeReturn::Remove
+        });
+    }
+    // A start failure (PLAYING refused, a lost device) is not the hardware's answer to
+    // this codec, and its `build_failure_reason` text is kept for the fresh build's log.
+    if let Err(why) = start_encode_pipeline(
+        &built.pipeline,
+        &next,
+        clock.0,
+        clock.1,
+        vulkan_contexts,
+        cuda_ctx,
+        va_ctx,
+    ) {
+        return discard(RestreamFailure::new("encoder", why));
+    }
+    if let Err(failure) = first_output(&output, &bus, stop, REBUILD_OUTPUT_WAIT) {
+        return discard(failure);
+    }
+    if let Err((step, e)) = built.transport.move_launch_point(to) {
+        return discard(RestreamFailure::new(step, format!("{e:#}")));
+    }
+    built.transport.audio_pipeline.play();
+    metrics.set_external_resize_supported(built.resolution_lever.stage().supported);
+    Ok((next, built, bus))
+}
+
+/// Whether a rebuilt encoder's bus error is the hardware's answer to this codec, which the
+/// agent remembers (amendment 59). Only a caps refusal, a format the encoder will not take
+/// or a missing element; out of memory, a session limit, a source or interpipe error and a
+/// lost device are load or state, never remembered. A streaming task stopped with
+/// `not-negotiated` is not remembered either: Vulkan encoders return that flow when their
+/// per-frame output buffer cannot be allocated in device memory, which is load.
+fn rebuild_error_is_deterministic(error: &gst::glib::Error, debug: &str) -> bool {
+    if vulkan_fault::is_device_lost(&format!("{error} {debug}")) {
+        return false;
+    }
+    error.matches(gst::CoreError::Negotiation)
+        || error.matches(gst::StreamError::Format)
+        || error.matches(gst::CoreError::MissingPlugin)
+}
+
+/// Wait for a new encoder's first buffer (live sources reach PLAYING before any caps).
+/// A bus error first is the encoder's own failure (`encoder`; deterministic unless the
+/// device was lost); a stop or `wait` passing is `deadline`.
+fn first_output(
+    output: &AtomicBool,
+    bus: &gst::Bus,
+    stop: &AtomicBool,
+    wait: Duration,
+) -> Result<(), RestreamFailure> {
+    let until = Instant::now() + wait;
+    while !output.load(Ordering::Relaxed) {
+        if let Some(msg) = bus.timed_pop_filtered(
+            gst::ClockTime::from_mseconds(10),
+            &[gst::MessageType::Error],
+        ) {
+            if let gst::MessageView::Error(err) = msg.view() {
+                let debug = err.debug().map(|d| d.to_string()).unwrap_or_default();
+                let why = format!("{} ({debug})", err.error());
+                return Err(if rebuild_error_is_deterministic(&err.error(), &debug) {
+                    RestreamFailure::hardware("encoder", why)
+                } else {
+                    RestreamFailure::new("encoder", why)
+                });
+            }
+        }
+        if stop.load(Ordering::Relaxed) || Instant::now() >= until {
+            return Err(RestreamFailure::new(
+                "deadline",
+                "the new encoder put out nothing in time",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// One line per step of a launch, so the last one before a crash says how far the runner
@@ -2443,10 +2949,10 @@ pub fn run_blocking(
         }
     };
     let pipeline::EncodePipeline {
-        pipeline: encode_pipe,
+        pipeline: mut encode_pipe,
         transport,
-        interpipesrc,
-        resolution_lever,
+        mut interpipesrc,
+        mut resolution_lever,
     } = built;
     // The scale stage and the IDR that must follow a change are paired inside the lever.
     // Publish the capability BEFORE the first window can drain, so
@@ -2470,77 +2976,16 @@ pub fn run_blocking(
     // Bound after the lease so it drops first: on every return below, the audio pipeline
     // goes to NULL (#408) before the lease drains parked NVENC pipelines (#489).
     let mut transports = transport;
-    // Same clock + base as the source pipeline(s) so interpipesrc's pass-through PTS land
-    // in this pipeline's running-time (#68).
-    encode_pipe.set_start_time(None::<gst::ClockTime>);
-    encode_pipe.use_clock(Some(&shared_clock));
-    encode_pipe.set_base_time(shared_base);
-    // The VulkanImage crosses an interpipe boundary between two GstPipelines: install the
-    // producer-owned contexts explicitly before READY rather than relying on the timing of
-    // interpipe's forwarded context query, then verify what the encoder resolved.
-    let expected_vulkan_device = vulkan_contexts
-        .as_ref()
-        .map(|contexts| install_vulkan_context_bridge(contexts, &encode_pipe));
-    // Inject the SAME shared CUDA context before PLAYING so cudaconvert + the NVENC encoder
-    // adopt it rather than making a new one, keeping the interpipe's CUDAMemory surfaces
-    // valid. set_context at READY is in time: elements bind it at READY->PAUSED.
-    if let Some(ctx) = cuda_ctx.as_ref() {
-        encode_pipe.set_context(ctx);
-    }
-    // Same for the shared VA display, so the encoder reuses the compositor's NV12 surfaces
-    // instead of importing.
-    if let Some(ctx) = va_ctx.as_ref() {
-        encode_pipe.set_context(ctx);
-        // set_context lands too late for device-pinned vapostproc/vah264enc: they bind a
-        // display on NULL->READY before the stored context is read ("Can't replace VA
-        // display while operating"). A sync handler answers their NEED_CONTEXT in time.
-        super::va_share::install_need_context_handler(&encode_pipe, ctx);
-    }
-    if let Some(expected) = expected_vulkan_device {
-        // A pre-session device-open/verify failure carrying a device-lost signature means
-        // the fresh Vulkan device is unusable before any session owns it: a GPU-global
-        // `device_open_failed`, which the agent escalates to a drain+restart. A plain
-        // build error stays per-session; `build_failure_reason` picks.
-        stage("encode-ready");
-        if let Err(e) = encode_pipe.set_state(gst::State::Ready) {
-            let reason = vulkan_fault::build_failure_reason(
-                "encode set READY for Vulkan device verification",
-                &e.to_string(),
-            );
-            tracing::error!(
-                token = "runner-vulkan-ready-failed",
-                reason = %reason,
-                "encode pipeline READY transition (Vulkan device verification) failed"
-            );
-            emit(SessionEvent::Failed(reason));
-            stop_source(&mut current_source, &transports, res.launch());
-            super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-            return;
-        }
-        if let Err(e) = assert_vulkan_encoder_device(&encode_pipe, expected) {
-            let reason = vulkan_fault::build_failure_reason(
-                "verify Vulkan context identity",
-                &format!("{e:#}"),
-            );
-            tracing::error!(
-                token = "runner-vulkan-identity-failed",
-                reason = %reason,
-                "verify Vulkan context identity failed"
-            );
-            emit(SessionEvent::Failed(reason));
-            stop_source(&mut current_source, &transports, res.launch());
-            super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-            return;
-        }
-    }
-    stage("encode-play");
-    if let Err(e) = encode_pipe.set_state(gst::State::Playing) {
-        tracing::error!(
-            token = "runner-encode-playing-failed",
-            error = %e,
-            "encode pipeline PLAYING transition failed"
-        );
-        emit(SessionEvent::Failed(format!("encode set PLAYING: {e}")));
+    if let Err(reason) = start_encode_pipeline(
+        &encode_pipe,
+        &cfg,
+        &shared_clock,
+        shared_base,
+        vulkan_contexts.as_ref(),
+        cuda_ctx.as_ref(),
+        va_ctx.as_ref(),
+    ) {
+        emit(SessionEvent::Failed(reason));
         stop_source(&mut current_source, &transports, res.launch());
         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
         return;
@@ -2548,25 +2993,10 @@ pub fn run_blocking(
     emit(SessionEvent::Progress(
         "media pipeline ready; negotiating transport",
     ));
-    // VK-05: the encode pipeline just reached PLAYING — rearm vulkanh264enc's
-    // rate-control/bitrate now (gst 1.28.4 drops a pre-PLAYING rate-control set,
-    // silently falling back to CQP; see pipeline::rearm_vulkan_rc).
-    if pipeline::vulkan_image_transport(&cfg) {
-        if let Some(enc) = encode_pipe.by_name(pipeline::VULKAN_ENCODER_NAME) {
-            pipeline::rearm_vulkan_rc(&enc, cfg.stream.bitrate_kbps);
-        } else {
-            tracing::warn!(
-                token = "vulkan-encoder-rearm-not-found",
-                "VK-05: could not find the Vulkan encoder ({}) in the encode pipeline to \
-                 rearm rate-control post-PLAYING — encoder may be stuck at CQP",
-                pipeline::VULKAN_ENCODER_NAME
-            );
-        }
-    }
     // Teardown is the idempotent `audio_pipeline.finish()`, the one mechanism no exit
     // path can skip.
     transports.audio_pipeline.play();
-    let Some(encode_bus) = encode_pipe.bus() else {
+    let Some(mut encode_bus) = encode_pipe.bus() else {
         tracing::error!(
             token = "runner-encode-bus-missing",
             "encode pipeline has no bus"
@@ -2581,10 +3011,10 @@ pub fn run_blocking(
     let mut running = false;
     let mut effective_media_sent = false;
     // On-demand observation, idle until a `session_capture` lands. The encoder handle is
-    // resolved once: the encode pipeline is never structurally touched after build (the
-    // no-renegotiation constraint), so it stays valid for the session.
+    // resolved here and again after an adoption's encoder rebuild (amendment 59), the one
+    // time the encode pipeline is replaced.
     let mut capture = Capture::new();
-    let capture_encoder = encode_pipe
+    let mut capture_encoder = encode_pipe
         .by_name(pipeline::VIDEO_ENCODER_NAME)
         .or_else(|| encode_pipe.by_name(pipeline::VULKAN_ENCODER_NAME));
     let mut running_since: Option<Instant> = None;
@@ -2606,7 +3036,8 @@ pub fn run_blocking(
     let mut app_boot_budget = cfg.app_boot_timeout;
     let mut app_boot_started_at: Option<Instant> = None;
     let mut app_presented_at: Option<Instant> = None;
-    let cap_for = |budget: Option<Duration>| {
+    // Takes `res` rather than capturing it: a swap may give the session its launch helper.
+    let cap_for = |res: &SessionResources, budget: Option<Duration>| {
         res.launch().map(|_| {
             super::launch_helper::reveal_cap(
                 std::env::var("QUASAR_STEAM_REVEAL_CAP_SECS").ok(),
@@ -2614,7 +3045,7 @@ pub fn run_blocking(
             )
         })
     };
-    let mut reveal_cap = cap_for(app_boot_budget);
+    let mut reveal_cap = cap_for(&res, app_boot_budget);
     let mut app_boot = AppBootGate::new(reveal_cap, app_boot_budget);
     // Amendment 39 (#759): what this runtime is now and what it is doing.
     let mut kind = cfg.kind;
@@ -2651,7 +3082,7 @@ pub fn run_blocking(
     // an ICE restart without keeping the SDP itself around.
     let mut last_ice_ufrag: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    loop {
+    'tick: loop {
         if stop.load(Ordering::Relaxed) {
             emit(SessionEvent::Stopping);
             stop_source(&mut current_source, &transports, res.launch());
@@ -2704,6 +3135,93 @@ pub fn run_blocking(
         }
 
         while let Ok(req) = adopt_rx.try_recv() {
+            let restreamed = req.restream.is_some();
+            let rebuilt = req.restream.as_ref().is_some_and(|to| {
+                to.codec != cfg.stream.codec || to.h264_profile != cfg.stream.h264_profile
+            });
+            if let Some(to) = &req.restream {
+                let began = Instant::now();
+                #[cfg(test)]
+                {
+                    let pause = RESTREAM_PAUSE_MS.load(Ordering::Relaxed);
+                    std::thread::sleep(Duration::from_millis(pause));
+                }
+                let moved = if rebuilt {
+                    let sink = interpipesrc.property::<String>("listen-to");
+                    rebuild_encode(
+                        &cfg,
+                        to,
+                        &encode_pipe,
+                        &transports,
+                        &sink,
+                        defer_encode_teardown,
+                        &stop,
+                        sig_tx.clone(),
+                        &res,
+                        &session_metrics,
+                        (vulkan_contexts.as_ref(), cuda_ctx.as_ref(), va_ctx.as_ref()),
+                        &diagnostic_tx,
+                        &session_id,
+                        (&shared_clock, shared_base),
+                    )
+                    .map(|(next, built, bus)| {
+                        cfg = next;
+                        encode_pipe = built.pipeline;
+                        let mut fresh = built.transport;
+                        fresh.inherit(&mut transports);
+                        transports = fresh;
+                        interpipesrc = built.interpipesrc;
+                        resolution_lever = built.resolution_lever;
+                        encode_bus = bus;
+                        capture_encoder = encode_pipe
+                            .by_name(pipeline::VIDEO_ENCODER_NAME)
+                            .or_else(|| encode_pipe.by_name(pipeline::VULKAN_ENCODER_NAME));
+                    })
+                } else {
+                    transports
+                        .restream(to)
+                        .map_err(|(step, e)| RestreamFailure::new(step, format!("{e:#}")))
+                };
+                match moved {
+                    Ok(()) => {
+                        // Size and fps stay as built: a swap builds its compositor, and
+                        // the interpipe caps, from them. The lever and the display update
+                        // move what is encoded.
+                        cfg.stream.bitrate_kbps = to.bitrate_kbps;
+                        cfg.stream.codec = to.codec;
+                        cfg.stream.h264_profile = to.h264_profile.clone();
+                        let elapsed = began.elapsed();
+                        tracing::info!(
+                            token = "runtime-adopt-restreamed",
+                            elapsed_ms = elapsed.as_millis() as u64,
+                            rebuild = rebuilt,
+                            "adopted runtime moved to {:?} {}x{}@{} at {} kbit/s",
+                            to.codec,
+                            to.width,
+                            to.height,
+                            to.fps,
+                            to.bitrate_kbps
+                        );
+                        emit(SessionEvent::Restreamed(Ok(elapsed)));
+                        // A new video transport: the old viewer's is gone, and this one's
+                        // peer leaving is the session's peer leaving.
+                        stale_transport = false;
+                        // The agent gave up meanwhile (its deadline): no game is launched
+                        // into a home that is being torn down.
+                        if stop.load(Ordering::Relaxed) {
+                            continue 'tick;
+                        }
+                    }
+                    Err(failure) => {
+                        emit(SessionEvent::Restreamed(Err(failure)));
+                        // Torn down as a declined runtime: the stop path's terminal report
+                        // goes out under the adopted id (the agent has not re-labelled).
+                        // Nothing else of this tick runs against the released pipeline.
+                        stop.store(true, Ordering::Relaxed);
+                        continue 'tick;
+                    }
+                }
+            }
             let now = Instant::now();
             held_since = None;
             if in_place.take().is_some() {
@@ -2716,7 +3234,7 @@ pub fn run_blocking(
             cfg.idle_timeout = req.idle_timeout;
             cfg.app_boot_timeout = req.app_boot_timeout;
             app_boot_budget = req.app_boot_timeout;
-            reveal_cap = cap_for(app_boot_budget);
+            reveal_cap = cap_for(&res, app_boot_budget);
             current_app = req.container;
             follow_app(&mut current_source, &res, current_app.as_ref());
             tracing::info!(
@@ -2781,6 +3299,11 @@ pub fn run_blocking(
             // negotiated with the ended session's viewer is replaced on the answer (#535).
             for pc in [PcId::Video, PcId::Audio] {
                 if pc == PcId::Audio && transports.audio_webrtc.is_none() {
+                    continue;
+                }
+                // A restream's new video transport, and a rebuild's new transports, offer
+                // on their own.
+                if restreamed && (pc == PcId::Video || rebuilt) {
                     continue;
                 }
                 let restart = SignalMsg::RestartIce { pc: Some(pc) };
@@ -3166,7 +3689,7 @@ pub fn run_blocking(
         // untouched on the old compositor until the single `listen-to` switch, so they are
         // never starved and never renegotiate. `SwapDone` is not emitted until the new app
         // is on screen (`perform_swap`), which is the client's reveal signal.
-        while let Ok(req) = swap_rx.try_recv() {
+        while let Ok(mut req) = swap_rx.try_recv() {
             // The session has ended; the control plane's unresolved-swap limit answers it.
             if held_since.is_some() {
                 tracing::info!(
@@ -3182,6 +3705,7 @@ pub fn run_blocking(
                 );
                 continue;
             }
+            inherit_session_tools(current_app.as_ref(), &mut req);
             let reports = res
                 .launch()
                 .map(super::launch_helper::LaunchSocket::reports);
@@ -3213,6 +3737,27 @@ pub fn run_blocking(
                     "in-place swap not possible (no connected launch helper, or the apps \
                      differ beyond STEAM_STARTUP_FLAGS); swapping the container"
                 );
+            }
+            // The helper is opened only for a session that starts on a Steam game. One that
+            // started on another app (a desktop) gets it for the first Steam game it swaps
+            // to, so that game's start-up is held like a launch's (#1241) and later
+            // game-to-game swaps can go in place.
+            if res.launch().is_none()
+                && req
+                    .container
+                    .as_ref()
+                    .and_then(|c| super::launch_helper::appid_from_env(&c.env))
+                    .is_some()
+            {
+                res.set_launch(super::launch_helper::LaunchSocket::open(
+                    &cfg.runtime_dir,
+                    &session_id,
+                    req.container.as_ref().map(|c| &c.env),
+                    false,
+                    session_metrics.clone(),
+                    diagnostic_tx.clone(),
+                ));
+                reveal_cap = cap_for(&res, app_boot_budget);
             }
             let next_app = req.container.clone();
             gen += 1;
@@ -3348,7 +3893,7 @@ pub fn run_blocking(
             }
         }
 
-        // Idle reap: watch the live transport on the encode webrtcbin. A parked or held
+        // Idle reap: watch the media client on either transport. A parked or held
         // runtime has no viewer to wait for.
         let watched = held_since.is_none() && kind != Some(SessionKind::Parked);
         if let Some(since) = running_since.filter(|_| watched) {
@@ -3356,14 +3901,20 @@ pub fn run_blocking(
                 .video
                 .webrtc
                 .property::<gstreamer_webrtc::WebRTCICEConnectionState>("ice-connection-state");
-            if ice_is_connected(ice) {
-                ever_connected = true;
-                streamed = true;
-                unhealthy_since = None;
-            } else if ice_is_dead(ice) {
-                unhealthy_since.get_or_insert_with(Instant::now);
-            } else {
-                unhealthy_since = None;
+            let wt_attached = transports
+                .webtransport
+                .as_ref()
+                .is_some_and(|tap| tap.attached());
+            match client_link(ice, wt_attached, ever_connected) {
+                Some(true) => {
+                    ever_connected = true;
+                    streamed = true;
+                    unhealthy_since = None;
+                }
+                Some(false) => {
+                    unhealthy_since.get_or_insert_with(Instant::now);
+                }
+                None => unhealthy_since = None,
             }
             let reap_window = cfg.idle_timeout;
             // #484: charge the never-connected window from the app-presented instant, not
@@ -3827,7 +4378,7 @@ pub const REASON_APP_EXITED_EARLY: &str = "app_exited_early";
 /// #484 reason code: the app container is alive but never presented a frame within
 /// `QUASAR_APP_BOOT_TIMEOUT_SECS`. Same `AppFailed` shape as
 /// [`REASON_APP_EXITED_EARLY`]; this case used to surface as a mute
-/// `idle: WebRTC transport never established` reap.
+/// `idle: transport never established` reap.
 pub const REASON_APP_NEVER_PRESENTED: &str = "app_never_presented";
 
 /// The terminal event for a `fail`-policy app-container exit.
@@ -4047,8 +4598,22 @@ fn perform_swap(
         emit(SessionEvent::AppBooting);
     }
     let budget = swap_app_ready_timeout();
-    let deadline = Instant::now() + budget;
+    let started = Instant::now();
+    let deadline = started + budget;
     let mut frames_at_first_commit: Option<u64> = None;
+    // A Steam game the helper follows is held like a launch (#727): a new container's first
+    // draw is Steam starting, so the switch screen stays up until the game is on screen.
+    // This budget, not the reveal cap (90 s by default), is what ends a long hold. Any other
+    // app, or no helper, is shown on its first draw.
+    let mut gate = AppBootGate::new(
+        res.launch().map(|_| {
+            super::launch_helper::reveal_cap(
+                std::env::var("QUASAR_STEAM_REVEAL_CAP_SECS").ok(),
+                cfg.app_boot_timeout,
+            )
+        }),
+        None,
+    );
     let ready = loop {
         if let Err(e) = pump_new_source_bus(&new_bus, &mut new_source) {
             break Err(e);
@@ -4061,10 +4626,36 @@ fn perform_swap(
         // Order matters: commits first, then frames — see `swap_source_ready`.
         let commits = new_source.app_surface_commits();
         let frames = new_source.sink_frames();
-        if swap_source_ready(expects_app, commits, frames, &mut frames_at_first_commit) {
+        let shown = if expects_app {
+            let reports = res
+                .launch()
+                .map(super::launch_helper::LaunchSocket::reports)
+                .unwrap_or_default();
+            let step = gate.tick(Instant::now(), started, commits, frames, reports);
+            if step == AppBootStep::Held {
+                tracing::info!(
+                    session_id = %session_id,
+                    "swap: first frame after {} ms; holding the switch for the game (up to {}s)",
+                    started.elapsed().as_millis(),
+                    budget.as_secs()
+                );
+            }
+            let drawn = gate.drawn_at.is_some();
+            swap_reveal(
+                step,
+                drawn,
+                drawn && new_source.container_exited(),
+                Instant::now() >= deadline,
+            )
+        } else {
+            swap_source_ready(false, commits, frames, &mut frames_at_first_commit)
+                .then_some("first frame")
+        };
+        if let Some(reveal) = shown {
             tracing::info!(
                 app_surface_commits = commits.unwrap_or(0),
                 sink_frames = frames,
+                reveal,
                 "swap: replacement app has presented its first frame"
             );
             if expects_app {
@@ -4074,9 +4665,12 @@ fn perform_swap(
         }
         // A replacement that exits before it ever presents: its own generation's observer
         // reports the exit with its final lines, so the swap fails NOW with the real cause
-        // rather than sitting out the budget and reporting "no frame". Checked AFTER the
-        // readiness gate so an app that presented and then exited is adopted and handled
-        // by the normal exit policy, never rolled back as "never presented".
+        // rather than sitting out the budget and reporting "no frame". Not once it has drawn
+        // (a held game): `swap_reveal` adopts that one, and the normal exit policy takes it.
+        if gate.drawn_at.is_some() {
+            std::thread::sleep(SWAP_POLL);
+            continue;
+        }
         if let Some(status) = new_source.take_container_exit() {
             let tail = new_source.app_log_tail();
             tracing::warn!(
@@ -4091,6 +4685,22 @@ fn perform_swap(
             ));
         }
         if Instant::now() >= deadline {
+            // A parked Steam draws nothing until its game does (#1243). One whose helper has
+            // launched the game (it reports a launch state) and whose container still runs is
+            // switched to at the budget (an update, a slow sign-in), not rolled back. A Steam
+            // that never came up still rolls back.
+            let launched = res.launch().is_some_and(|l| {
+                let r = l.reports();
+                r.helper_connected && r.launch_state.is_some()
+            });
+            if expects_app && launched && !new_source.container_exited() {
+                tracing::info!(
+                    session_id = %session_id,
+                    "swap: Steam is still starting at the {budget:?} budget; switching to it"
+                );
+                emit(SessionEvent::AppPresented);
+                break Ok(());
+            }
             break Err(format!(
                 "replacement app produced no frame within {budget:?} \
                  (app_surface_commits={commits:?})"
@@ -4217,19 +4827,158 @@ fn roll_back_stopped_app(
 #[cfg(test)]
 mod tests {
     use super::{
-        app_exit_event, audio_path_label, context_object_identity, effective_encoder_device_path,
-        fold_display_update, idle_reap_reason, is_sctp_association_error, mic_state_label,
-        running_report, stop_requested_for_transport_error, swap_source_ready,
+        app_exit_event, audio_path_label, client_link, context_object_identity,
+        effective_encoder_device_path, fold_display_update, idle_reap_reason,
+        is_sctp_association_error, mic_state_label, running_report,
+        stop_requested_for_transport_error, swap_reveal, swap_source_ready,
         validate_display_update, AppBootGate, AppBootStep, AppExitStatus, AudioPipelineGuard,
         DiagnosticEventTx, DisplayUpdateRequest, Negotiation, SessionEvent, TraceEvent,
         VulkanContextBridge, REASON_APP_EXITED_EARLY, VULKAN_DEVICE_CONTEXT,
     };
     use super::{
-        in_place_plan, InPlaceAction, InPlaceStep, ProgressThrottle, SwapRequest,
-        IN_PLACE_LAUNCH_BOUND, IN_PLACE_QUIT_BOUND,
+        in_place_plan, inherit_session_tools, InPlaceAction, InPlaceStep, ProgressThrottle,
+        SwapRequest, IN_PLACE_LAUNCH_BOUND, IN_PLACE_QUIT_BOUND,
     };
     use gstreamer::prelude::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Amendment 59: only a caps refusal, a refused format or a missing element is
+    // remembered; load, state and a lost device never are.
+    #[test]
+    fn a_rebuild_error_is_deterministic_only_for_caps_format_or_a_missing_element() {
+        gstreamer::init().unwrap();
+        let e =
+            |err: gst::glib::Error, debug: &str| super::rebuild_error_is_deterministic(&err, debug);
+        let stream = |c: gst::StreamError| gst::glib::Error::new(c, "x");
+        let resource = |c: gst::ResourceError| gst::glib::Error::new(c, "x");
+        for (name, got, want) in [
+            (
+                "not negotiated",
+                e(gst::glib::Error::new(gst::CoreError::Negotiation, "x"), ""),
+                true,
+            ),
+            (
+                "format refused",
+                e(
+                    stream(gst::StreamError::Format),
+                    "Video profile format not supported",
+                ),
+                true,
+            ),
+            (
+                "missing element",
+                e(
+                    gst::glib::Error::new(gst::CoreError::MissingPlugin, "x"),
+                    "",
+                ),
+                true,
+            ),
+            (
+                // Also what a Vulkan encoder's failed device-memory allocation looks like.
+                "not-negotiated flow via the source task",
+                e(
+                    stream(gst::StreamError::Failed),
+                    "streaming stopped, reason not-negotiated (-4)",
+                ),
+                false,
+            ),
+            (
+                "interpipe or source error",
+                e(
+                    stream(gst::StreamError::Failed),
+                    "streaming stopped, reason error (-5)",
+                ),
+                false,
+            ),
+            (
+                "out of memory",
+                e(
+                    resource(gst::ResourceError::NoSpaceLeft),
+                    "NV_ENC_ERR_OUT_OF_MEMORY",
+                ),
+                false,
+            ),
+            (
+                "session limit",
+                e(
+                    resource(gst::ResourceError::Busy),
+                    "NV_ENC_ERR_OUT_OF_MEMORY: OpenEncodeSessionEx",
+                ),
+                false,
+            ),
+            (
+                "encoder start failure",
+                e(gst::glib::Error::new(gst::LibraryError::Init, "x"), ""),
+                false,
+            ),
+            (
+                "device lost",
+                e(
+                    gst::glib::Error::new(gst::CoreError::Negotiation, "x"),
+                    "VK_ERROR_DEVICE_LOST",
+                ),
+                false,
+            ),
+        ] {
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
+    // #1134: a packet size the old payloader was shrunk to survives a codec rebuild.
+    #[test]
+    fn a_rebuild_keeps_the_packet_size_the_old_payloader_was_shrunk_to() {
+        gst::init().unwrap();
+        let settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
+        let stream = crate::session::StreamParams {
+            width: 1280,
+            height: 720,
+            fps: 60,
+            bitrate_kbps: 8000,
+            h264_profile: "constrained-baseline".into(),
+            codec: crate::session::Codec::H264,
+            abr_floor_kbps: 0,
+            mic: false,
+        };
+        let mut cfg = crate::session::SessionConfig::for_assignment_with(&settings, stream, None);
+        cfg.rtp_mtu = 1200;
+        let to = crate::session::StreamParams {
+            codec: crate::session::Codec::H265,
+            h264_profile: "main".into(),
+            ..cfg.stream.clone()
+        };
+        let old = gst::Pipeline::new();
+        assert_eq!(
+            super::rebuild_config(&cfg, &to, &old).rtp_mtu,
+            1200,
+            "no payloader: the configured size"
+        );
+        let pay = gst::ElementFactory::make("rtph264pay")
+            .name(pipeline::VIDEO_PAYLOADER_NAME)
+            .build()
+            .unwrap();
+        old.add(&pay).unwrap();
+        // Shrunk twice, 1200 to 1000, as the old transport's watcher would have.
+        let overhead = pipeline::rtp_mtu_of(&pay).unwrap() - pay.property::<u32>("mtu");
+        pay.set_property("mtu", 1000 - overhead);
+        let next = super::rebuild_config(&cfg, &to, &old);
+        assert_eq!(next.rtp_mtu, 1000);
+        assert_eq!(next.stream.codec, crate::session::Codec::H265);
+    }
+
+    // Amendment 59 (c): what a rebuild refuses before it touches the old encoder.
+    #[test]
+    fn a_rebuild_refuses_another_encoder_family_and_a_webtransport_tap() {
+        use crate::session::EncoderChoice::{Nvenc, Vulkan};
+        assert_eq!(super::rebuild_refused(Vulkan, Vulkan, false), None);
+        assert_eq!(
+            super::rebuild_refused(Vulkan, Nvenc, false).map(|r| r.0),
+            Some("encoder_family")
+        );
+        assert_eq!(
+            super::rebuild_refused(Vulkan, Vulkan, true).map(|r| r.0),
+            Some("transport")
+        );
+    }
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -5168,9 +5917,89 @@ mod tests {
         );
     }
 
+    // ── #1179 the client on either transport ───────────────────────────────────
+    use gstreamer_webrtc::WebRTCICEConnectionState as Ice;
+
+    /// The runner's idle-reap bookkeeping over 1 s ticks of (ICE state, WebTransport client
+    /// attached): the second it reaps at, if any.
+    fn reaped_at(ticks: impl IntoIterator<Item = (Ice, bool)>) -> Option<u64> {
+        let (mut ever_connected, mut lost_since) = (false, None::<u64>);
+        for (t, (ice, wt_attached)) in (0u64..).zip(ticks) {
+            match client_link(ice, wt_attached, ever_connected) {
+                Some(true) => {
+                    ever_connected = true;
+                    lost_since = None;
+                }
+                Some(false) => {
+                    lost_since.get_or_insert(t);
+                }
+                None => lost_since = None,
+            }
+            let unhealthy_for = lost_since.map(|s| Duration::from_secs(t - s));
+            let running_for = Duration::from_secs(t);
+            if idle_reap_reason(WINDOW, running_for, ever_connected, unhealthy_for, false).is_some()
+            {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    fn secs(n: u64, tick: (Ice, bool)) -> impl Iterator<Item = (Ice, bool)> {
+        std::iter::repeat_n(tick, n as usize)
+    }
+
+    #[test]
+    fn a_streaming_webtransport_session_is_never_reaped() {
+        // Its WebRTC fallback is never answered, so ICE stays `New` for the whole session.
+        let ticks = secs(5, (Ice::New, false)).chain(secs(600, (Ice::New, true)));
+        assert_eq!(reaped_at(ticks), None);
+    }
+
+    #[test]
+    fn a_webtransport_client_that_never_attaches_is_reaped_after_the_window() {
+        assert_eq!(reaped_at(secs(600, (Ice::New, false))), Some(120));
+    }
+
+    #[test]
+    fn a_webtransport_client_that_leaves_is_reaped_a_window_later() {
+        let ticks = secs(300, (Ice::New, true)).chain(secs(600, (Ice::New, false)));
+        assert_eq!(reaped_at(ticks), Some(300 + 120));
+    }
+
+    #[test]
+    fn a_webtransport_reconnect_inside_the_window_keeps_the_session() {
+        let ticks = secs(300, (Ice::New, true))
+            .chain(secs(100, (Ice::New, false)))
+            .chain(secs(600, (Ice::New, true)));
+        assert_eq!(reaped_at(ticks), None);
+    }
+
+    #[test]
+    fn a_webtransport_client_that_falls_back_to_webrtc_keeps_the_session() {
+        let ticks = secs(300, (Ice::New, true))
+            .chain(secs(10, (Ice::New, false)))
+            .chain(secs(5, (Ice::Checking, false)))
+            .chain(secs(600, (Ice::Connected, false)));
+        assert_eq!(reaped_at(ticks), None);
+    }
+
+    #[test]
+    fn webrtc_links_read_as_before() {
+        assert_eq!(client_link(Ice::Connected, false, false), Some(true));
+        assert_eq!(client_link(Ice::Completed, false, true), Some(true));
+        assert_eq!(client_link(Ice::Disconnected, false, true), Some(false));
+        assert_eq!(client_link(Ice::Failed, false, false), Some(false));
+        assert_eq!(client_link(Ice::New, false, false), None);
+        // An ICE restart after a connection gets a fresh clock, as it always did.
+        assert_eq!(client_link(Ice::Checking, false, true), None);
+        // A WebTransport client attached is connected whatever ICE says.
+        assert_eq!(client_link(Ice::Failed, true, true), Some(true));
+    }
+
     // ── #484 app-boot visibility ──────────────────────────────────────────────
     // A cold app boot is 30–50 s, and charging it against the never-connected idle budget
-    // killed real sessions at 120 s with `idle: WebRTC transport never established`.
+    // killed real sessions at 120 s with `idle: transport never established`.
 
     #[test]
     fn booting_defers_the_never_connected_reap_at_every_age() {
@@ -5189,6 +6018,31 @@ mod tests {
         assert!(
             idle_reap_reason(WINDOW, Duration::from_secs(9999), true, Some(WINDOW), true).is_some()
         );
+    }
+
+    #[test]
+    fn swap_reveal_holds_a_drawn_game_until_shown_exited_or_out_of_budget() {
+        use AppBootStep::*;
+        // The gate's own answer wins.
+        assert_eq!(
+            swap_reveal(Present("first frame"), true, false, false),
+            Some("first frame")
+        );
+        // Held, nothing else: keep the switch screen up.
+        assert_eq!(swap_reveal(Held, true, false, false), None);
+        assert_eq!(swap_reveal(Wait, true, false, false), None);
+        // A held app that died is shown at once, so the exit policy takes it (#1234 review).
+        assert_eq!(
+            swap_reveal(Wait, true, true, false),
+            Some("app exited while held")
+        );
+        // The swap budget ends a hold, even on the tick the draw is first held.
+        assert_eq!(
+            swap_reveal(Held, true, false, true),
+            Some("swap budget reached")
+        );
+        // Nothing drawn: no hold to end, the caller's exit and deadline checks decide.
+        assert_eq!(swap_reveal(Wait, false, true, true), None);
     }
 
     /// Ticks for an app that commits its first surface at `t` and has a frame after it at
@@ -5380,6 +6234,37 @@ mod tests {
             mounts: vec!["/homes/u1:/home/quasar".into()],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_swap_target_gets_the_sessions_compat_tools_and_stays_in_place() {
+        use crate::compat_tools::{ENV_ENTRIES, ENV_TOOLS_PATH};
+        use crate::session::launch_helper::LaunchReports;
+        let connected = Some(LaunchReports {
+            helper_connected: true,
+            ..Default::default()
+        });
+        // As `session_assign` leaves the running game: the tools env and the mounted tool.
+        let mut running = steam_app("-silent -applaunch 620");
+        running.env.insert(ENV_ENTRIES.into(), "0=proton_10".into());
+        running
+            .env
+            .insert(ENV_TOOLS_PATH.into(), "/quasar/compat".into());
+        running.compat_tools = vec!["GE-Proton11-12-x86_64".into()];
+        // As `session_swap_app` hands the target over: no compat tools at all.
+        let mut req = SwapRequest {
+            container: Some(steam_app("-silent -applaunch 730")),
+            in_place: true,
+        };
+        assert_eq!(in_place_plan(Some(&running), &req, connected), None);
+        inherit_session_tools(Some(&running), &mut req);
+        assert_eq!(
+            in_place_plan(Some(&running), &req, connected),
+            Some((620, 730))
+        );
+        let next = req.container.unwrap();
+        assert_eq!(next.env[ENV_ENTRIES], "0=proton_10");
+        assert_eq!(next.compat_tools, running.compat_tools);
     }
 
     #[test]

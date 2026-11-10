@@ -32,6 +32,8 @@ pub const DEFAULT_BUDGET_SECS: u64 = 15;
 /// it needs fewer frames than the H.264 media probe.
 pub const CODEC_PROBE_FRAMES: u64 = 10;
 pub const CODEC_PROBE_BUDGET_SECS: u64 = 10;
+/// The PyroWave codec probe's `--codec`: a wire codec, never a session one.
+pub const PYROWAVE: &str = "pyrowave";
 
 /// What the child was asked to prove. Every field arrives on argv; the binding and
 /// encoder selection arrive as env (see `host_probe::media`).
@@ -62,11 +64,11 @@ impl Default for MediaProbeRequest {
 }
 
 impl MediaProbeRequest {
-    /// The codec probe for `codec` on `gpu` (CONTEXT.md "Codec probe").
-    pub fn codec_probe(gpu: i32, codec: Codec) -> Self {
+    /// The codec probe for wire codec `codec` on `gpu` (GLOSSARY.md "Codec probe").
+    pub fn codec_probe(gpu: i32, codec: &str) -> Self {
         MediaProbeRequest {
             gpu,
-            codec: codec.as_str().into(),
+            codec: codec.into(),
             frames: CODEC_PROBE_FRAMES,
             budget: Duration::from_secs(CODEC_PROBE_BUDGET_SECS),
             ..MediaProbeRequest::default()
@@ -537,6 +539,9 @@ fn verdict(wanted: u64, seen: &Observed) -> ProbeVerdict {
 /// Run the probe. Initialises GStreamer exactly as a session does — `GST_REGISTRY` for
 /// the VA path included — or the probe answers a different question than the host faces.
 pub fn run(request: &MediaProbeRequest) -> ProbeVerdict {
+    if request.codec == PYROWAVE {
+        return super::probe_pyrowave::run(request);
+    }
     let codec = match Codec::parse(&request.codec) {
         Ok(c) => c,
         Err(e) => return ProbeVerdict::Usage(format!("{e:#}")),
@@ -1493,7 +1498,7 @@ mod tests {
 
     #[test]
     fn a_codec_probe_request_asks_for_ten_frames_within_ten_seconds() {
-        let r = MediaProbeRequest::codec_probe(1, Codec::Av1);
+        let r = MediaProbeRequest::codec_probe(1, Codec::Av1.as_str());
         assert_eq!((r.gpu, r.codec.as_str(), r.frames), (1, "av1", 10));
         assert_eq!(r.budget, Duration::from_secs(10));
         assert_eq!((r.width, r.height, r.fps), (1280, 720, 60));

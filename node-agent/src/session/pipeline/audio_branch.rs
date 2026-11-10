@@ -11,6 +11,9 @@ use gstreamer::prelude::*;
 use crate::session::audio::QUASAR_MONITOR_SOURCE_NAME;
 use crate::session::SessionConfig;
 
+/// The Opus encoder's element name: a transport taps its src pad, the encoded-frame boundary.
+pub(crate) const OPUS_ENC_NAME: &str = "quasar-opus-enc";
+
 /// Add + link the WebRTC audio chain into `pipeline` (the Opus encode, then RTP), returning
 /// its tail (the send queue) for linking into webrtcbin. Shared by the single and split
 /// pipelines, so the audio path is identical in both.
@@ -24,6 +27,7 @@ pub(super) fn add_audio_chain(
         .property("pt", 111_u32)
         .build()
         .context("rtpopuspay not found")?;
+    super::codec_chain::set_rtp_mtu(&rtp_opus_pay, cfg.rtp_mtu);
     let audio_rtp_caps = gst::Caps::builder("application/x-rtp")
         .field("media", "audio")
         .field("encoding-name", "OPUS")
@@ -64,7 +68,7 @@ pub(super) fn add_audio_chain(
 /// Add + link the session's audio capture and Opus encode into `pipeline`: the audio half
 /// of the encoded-frame boundary, for any transport. Returns the capture source and the
 /// `opusenc`, whose src pad gives one 10 ms Opus packet per buffer (`opus/48000/2`).
-pub(super) fn add_opus_encode(
+pub(crate) fn add_opus_encode(
     pipeline: &gst::Pipeline,
     cfg: &SessionConfig,
 ) -> Result<(gst::Element, gst::Element)> {
@@ -124,6 +128,7 @@ pub(super) fn add_opus_encode(
     // keeps the bitrate envelope flat for the congestion controller. Enum-typed properties
     // MUST use `property_from_str` (.claude/rules/gstreamer-gotchas.md).
     let opus_enc = gst::ElementFactory::make("opusenc")
+        .name(OPUS_ENC_NAME)
         .property_from_str("frame-size", "10")
         .property_from_str("audio-type", "restricted-lowdelay")
         .property_from_str("bitrate-type", "cbr")
@@ -178,6 +183,25 @@ mod tests {
         let mut cfg = SessionConfig::for_assignment_with(&settings, stream, None);
         cfg.use_test_audio = true;
         cfg
+    }
+
+    #[test]
+    fn the_opus_payloader_gets_the_rtp_mtu_budget() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let mut cfg = test_audio_cfg();
+        cfg.rtp_mtu = 1000;
+        add_audio_chain(&pipeline, &cfg, "test").expect("audio chain builds");
+        let pay = pipeline
+            .iterate_elements()
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|e| e.factory().is_some_and(|f| f.name() == "rtpopuspay"))
+            .expect("rtpopuspay in the chain");
+        assert_eq!(
+            pay.property::<u32>("mtu"),
+            super::super::codec_chain::payloader_mtu(1000)
+        );
     }
 
     #[test]

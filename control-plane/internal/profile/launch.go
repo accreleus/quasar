@@ -28,9 +28,17 @@ type LaunchProfile struct {
 	Description string
 	Visibility  Visibility
 	SortOrder   int32
-	// Transport is webrtc | webtransport_opt_in | webtransport; empty reads as webrtc.
-	// semantics: control-api.md §The launch profile's transport
-	Transport string
+	// Transport is default | webrtc | webtransport_opt_in | webtransport; empty reads as webrtc.
+	// A launch resolves default to the instance setting (resolveLaunchProfile), so past that
+	// point it is the EFFECTIVE transport and TransportInherited says it came from the setting.
+	// semantics: control-api.md §The launch profile's transport, §The instance default
+	Transport          string
+	TransportInherited bool
+	// PyroWaveMode is off | allow | prefer; empty reads as off. PyroWaveKbps is the maximum
+	// PyroWave bitrate, nil for no cap below 1 000 000.
+	// semantics: control-api.md §Ultra-low latency (PyroWave)
+	PyroWaveMode string
+	PyroWaveKbps *int32
 	// Rungs are the stream profiles this launch profile walks, best first.
 	Rungs []Profile
 }

@@ -15,6 +15,7 @@ const mintSignalingToken = vi.fn();
 const updateSessionDisplay = vi.fn();
 vi.mock("../../api/library", () => ({
   getSession: (...a: unknown[]) => getSession(...a),
+  listApps: () => Promise.resolve({ items: [] }),
   stopSession: (...a: unknown[]) => stopSession(...a),
   mintSignalingToken: (...a: unknown[]) => mintSignalingToken(...a),
   updateSessionDisplay: (...a: unknown[]) => updateSessionDisplay(...a),
@@ -85,8 +86,48 @@ vi.mock("../../webrtc/traceEvents", () => ({
     emitPlayoutChanged() {}
     emitWebRtcStateChanged() {}
     emitFreezeDetected() {}
+    emitTransportFallback() {}
   },
 }));
+
+/** The WebTransport runtime double: a test plays its snapshot and its fallback by hand. */
+const wt = vi.hoisted(() => ({
+  set: null as null | ((patch: Record<string, unknown>) => void),
+  callbacks: null as null | { onFallback(reason: string): void },
+}));
+vi.mock("./webTransportRuntime", async () => {
+  const { IDLE_SNAPSHOT } = await import("./sessionRuntime");
+  return {
+    createWebTransportRuntime: (cfg: { callbacks: { onFallback(reason: string): void } }) => {
+      let snap = { ...IDLE_SNAPSHOT };
+      const listeners = new Set<() => void>();
+      wt.callbacks = cfg.callbacks;
+      wt.set = (patch) => {
+        snap = { ...snap, ...patch };
+        listeners.forEach((l) => l());
+      };
+      return {
+        getSnapshot: () => snap,
+        subscribe: (fn: () => void) => (listeners.add(fn), () => listeners.delete(fn)),
+        start() {},
+        destroy() {},
+        engage: () => engageSpy(),
+        release() {},
+        syncKeyboardLock() {},
+        setMouse() {},
+        isCaptured: () => false,
+        cancelRecovery() {},
+        hasMicSlot: () => false,
+        attachMicTrack: () => Promise.resolve(),
+        detachMicTrack: () => Promise.resolve(),
+        registerTelemetry: () => () => {},
+        summary: () => ({ elapsedMs: 0, fps: [], latency: [] }),
+        releaseAudio() {},
+        holdAudio() {},
+      };
+    },
+  };
+});
 
 /** Captured from the last QuasarSession constructor call so tests can flip
  *  channelOpen by hand — exactly the ondatachannel/onopen path SessionPage
@@ -189,7 +230,7 @@ function SummaryProbe() {
   return <pre data-testid="summary">{JSON.stringify(state?.sessionSummary ?? null)}</pre>;
 }
 
-function renderPage() {
+function renderPage(extra: Record<string, unknown> = {}) {
   return render(
     <MemoryRouter
       initialEntries={[
@@ -201,6 +242,7 @@ function renderPage() {
             appName: "Portal 2",
             appId: "a1",
             tier: "1920×1080@60",
+            ...extra,
           },
         },
       ]}
@@ -227,6 +269,8 @@ beforeEach(() => {
   lastOnChannel = null;
   lastOnRecovery = null;
   lastDrawerProps = null;
+  wt.set = null;
+  wt.callbacks = null;
   updateSessionDisplay.mockResolvedValue({ session: makeSession({ state: "running" }) });
   getSession.mockImplementation(async () => ({ session: currentSession }));
   stopSession.mockResolvedValue(undefined);
@@ -566,5 +610,86 @@ describe("SessionPage — Match cursor compositor size (#898)", () => {
     cleanup();
     await reveal();
     expect(lastDrawerProps?.uiScale).toBe(1);
+  });
+});
+
+// Capture goes with a WebTransport connection: a reconnect or a fallback must ask for it again,
+// or the player has a picture, no input and no hint why.
+describe("SessionPage — capture after a WebTransport reconnect or fallback", () => {
+  const webtransport = { url: "https://agent/wt", token: "w", expires_at: "2026-11-06T12:01:00Z", cert_hashes: [] };
+  // An earlier test's implementation survives clearAllMocks; here a click must not enter full screen.
+  beforeEach(() => requestFullscreen.mockImplementation(() => Promise.resolve()));
+
+  /** The WebTransport page up and revealed: channel open, app presented, lock animation done. */
+  async function revealOverWebTransport() {
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    renderPage({ webtransport });
+    await advance(1_000);
+    await act(async () => {
+      wt.set!({ channelOpen: true, wsOpen: true, pcConnected: true, firstFrame: true });
+    });
+    await advance(1_500);
+  }
+
+  it("re-engages without a click in full screen after a reconnect", async () => {
+    fsEl = document.documentElement;
+    await revealOverWebTransport();
+    expect(engageSpy).toHaveBeenCalledTimes(1);
+
+    await act(async () => wt.set!({ channelOpen: false, inputCaptured: false, pointerLocked: false }));
+    await advance(100);
+    expect(engageSpy).toHaveBeenCalledTimes(1); // nothing to capture for until the channel is back
+    await act(async () => wt.set!({ channelOpen: true }));
+    await advance(100);
+    expect(engageSpy).toHaveBeenCalledTimes(2);
+    expect(playLayer()).toBeNull();
+  });
+
+  it("shows Click to play again after a reconnect outside full screen", async () => {
+    await revealOverWebTransport();
+    await act(async () => {
+      fireEvent.click(screen.getByText("Click to play"));
+    });
+    expect(playLayer()).toBeNull();
+
+    await act(async () => wt.set!({ channelOpen: false, inputCaptured: false, pointerLocked: false }));
+    await advance(100);
+    expect(playLayer()).toBeNull(); // not before the new connection is up
+    await act(async () => wt.set!({ channelOpen: true }));
+    await advance(100);
+    expect(playLayer()).not.toBeNull();
+  });
+
+  it("re-engages in full screen once WebRTC's channel opens after a fallback", async () => {
+    fsEl = document.documentElement;
+    await revealOverWebTransport();
+    expect(engageSpy).toHaveBeenCalledTimes(1);
+
+    await act(async () => wt.callbacks!.onFallback("connect_timeout"));
+    await advance(100);
+    expect(engageSpy).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      openChannel();
+    });
+    await advance(100);
+    expect(engageSpy).toHaveBeenCalledTimes(2);
+    expect(playLayer()).toBeNull();
+  });
+
+  it("shows Click to play once WebRTC's channel opens after a fallback outside full screen", async () => {
+    await revealOverWebTransport();
+    await act(async () => {
+      fireEvent.click(screen.getByText("Click to play"));
+    });
+    expect(playLayer()).toBeNull();
+
+    await act(async () => wt.callbacks!.onFallback("stream_lost"));
+    await advance(100);
+    expect(playLayer()).toBeNull(); // the picture is not back yet
+    await act(async () => {
+      openChannel();
+    });
+    await advance(100);
+    expect(playLayer()).not.toBeNull();
   });
 });

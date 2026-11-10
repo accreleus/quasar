@@ -598,6 +598,33 @@ pub fn template_root_beside(home_root: &str) -> String {
     }
 }
 
+/// The agent's compatibility-tools root beside the template root, as Compose defaults it:
+/// `/var/lib/quasar/templates` → `/var/lib/quasar/compat-tools`.
+pub fn compat_tools_root_beside(template_root: &str) -> String {
+    match std::path::Path::new(template_root).parent() {
+        Some(parent) if parent != std::path::Path::new("") => {
+            parent.join("compat-tools").to_string_lossy().into_owned()
+        }
+        _ => "/var/lib/quasar/compat-tools".into(),
+    }
+}
+
+/// Revision 5 (#1071): the agent-owned compatibility-tools root, bound at the same path so a
+/// session's read-only bind of one tool names the host directory (agent-api.md §register).
+fn compat_tools_root(spec: &mut ContainerSpec, inputs: &Inputs) -> Result<(), RenderError> {
+    let root = compat_tools_root_beside(&inputs.template_root);
+    safe_host_path("the compatibility-tools root", &root)?;
+    if std::path::Path::new(&root).starts_with(&inputs.home_root) {
+        return Err(RenderError::Invalid(
+            "the compatibility-tools root beside the template root is under the home root".into(),
+        ));
+    }
+    spec.env
+        .insert("QUASAR_COMPAT_TOOLS_ROOT".into(), root.clone());
+    spec.binds.push(bind(&root, &root, false));
+    Ok(())
+}
+
 /// For a machine with no home root (a control-only machine), and for machine state
 /// written before the template root was recorded.
 pub fn default_template_root() -> String {
@@ -693,7 +720,8 @@ impl Book {
             // Revision 3 (RH-07 #402): least privilege in every engine mode.
             // Revision 4 (#461): console mode no longer grants the agent the sound device
             // or `SYS_ADMIN`; the console session's container holds them.
-            Role::NodeAgent => Some(1..=4),
+            // Revision 5 (#1071): the compatibility-tools root, bound at the same path.
+            Role::NodeAgent => Some(1..=5),
             Role::RecoveryActor => Some(1..=revision::RECIPE_REVISION),
             // Revision 2: Add host's images arrive as operator overrides plus install-time
             // fallbacks, so the installed release's images can come between (#365).
@@ -761,6 +789,9 @@ pub fn render(
                     console_access(&mut spec, inputs, revision);
                 }
                 console_vt(&mut spec, inputs);
+                if revision >= 5 {
+                    compat_tools_root(&mut spec, inputs)?;
+                }
             } else if inputs.console {
                 // Fail closed: an older revision would render without the console additions
                 // and a console request would settle `applied` with no console access.
@@ -1048,6 +1079,7 @@ pub const AGENT_VARIABLES: &[&str] = &[
     "QUASAR_HOMES_GC_DRY_RUN",
     "QUASAR_HOMES_GC_RETENTION_HOURS",
     "QUASAR_HOME_TEMPLATES",
+    "QUASAR_ICE_INTERFACES",
     "QUASAR_IDLE_TIMEOUT_SECS",
     "QUASAR_IMAGE_SOURCE_HOSTS",
     "QUASAR_INPUT_BATCH_MS",
@@ -1069,8 +1101,11 @@ pub const AGENT_VARIABLES: &[&str] = &[
     "QUASAR_NVIDIA_DRIVER_RUN",
     "QUASAR_NVIDIA_DRIVER_TRUST_ON_FIRST_USE",
     "QUASAR_NV_LIB32_PATH",
+    "QUASAR_PYROWAVE_CPU_INPUT",
     "QUASAR_QUEUE_BUFFERS",
     "QUASAR_REQUIRE_HW_RENDER",
+    "QUASAR_RTP_MTU",
+    "QUASAR_RTP_MTU_SHRINK",
     "QUASAR_SLICES",
     "QUASAR_STEAM_REVEAL_CAP_SECS",
     "QUASAR_SWAP_APP_READY_TIMEOUT_MS",

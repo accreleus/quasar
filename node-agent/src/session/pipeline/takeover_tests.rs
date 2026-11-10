@@ -3241,3 +3241,7 @@ mod warm_steam;
 
 /// The transport seam (#1028) with a transport that is not WebRTC.
 mod fake_transport;
+/// #1134: packets shrink live on a path that drops the full-size ones.
+mod mtu_shrink;
+/// #1131: every RTP packet fits `QUASAR_RTP_MTU`.
+mod rtp_mtu;

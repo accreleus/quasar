@@ -11,16 +11,17 @@
 //! and the same DTLS association. A new peer therefore gets a new `webrtcbin`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 
-use super::abr_glue::{self, EncodeResolutionLever};
+use super::abr_glue::{self, EncodeResolutionLever, ResolutionLever};
 use super::audio_branch::add_audio_chain;
 use super::codec_chain::build_video_payloader;
+use super::ice_interfaces::restrict_ice_gathering;
 use super::mic_branch::add_mic_branch;
 use super::probes::{attach_rtp_marker_trace, attach_rtp_out_probe, attach_rtp_ts_trace};
 use super::rtp_ext::{
@@ -60,10 +61,15 @@ pub struct VideoTransport {
 /// What it takes to put a transport on the RTP tail, kept for the session so it can be
 /// done again.
 pub struct WebRtcSlot {
-    cfg: SessionConfig,
+    /// Its stream is the launch point a new transport's ABR starts from; an adoption moves
+    /// it (amendment 59, [`Self::restream`]).
+    cfg: Mutex<SessionConfig>,
     pipeline: gst::Pipeline,
     /// The RTP capsfilter's src pad, where each `webrtcbin` transport is linked.
     tail: gst::Pad,
+    /// Outlives every transport, so a size [`super::mtu_shrink`] stepped down to does too: a
+    /// viewer reconnecting over the same path would black out again at the configured size.
+    payloader: gst::Element,
     encoder: gst::Element,
     out_tx: OutTx,
     devices: Option<Arc<VirtualDevices>>,
@@ -75,6 +81,9 @@ pub struct WebRtcSlot {
     lever: Arc<EncodeResolutionLever>,
     /// `QUASAR_DIAG_NO_OBS` unset.
     observe: bool,
+    /// The session's WebTransport audio: every audio pipeline this slot builds is tapped
+    /// at its Opus encoder (`build_audio`), the first and each replacement.
+    stream_audio: OnceLock<Arc<crate::webtransport::Audio>>,
 }
 
 /// Give a `webrtcbin` sink pad the MediaStream id this PC always uses. Left unset,
@@ -233,9 +242,10 @@ impl WebRtcSlot {
             trace_tx,
             session_id,
             observe,
+            pyrowave_feed: _,
         } = session;
         let codec = cfg.stream.codec;
-        let pay = build_video_payloader(codec)?;
+        let pay = build_video_payloader(codec, cfg.rtp_mtu)?;
         // TWCC must be declared HERE, in the capsfilter, never via `add-extension` on the
         // payloader. webrtcbin builds its offer from these caps, the payloader's
         // auto-header-extension instantiates the matching `rtphdrexttwcc` writer from the
@@ -302,11 +312,12 @@ impl WebRtcSlot {
             attach_rtp_ts_trace(&pay);
         }
         Ok(Self {
-            cfg,
+            cfg: Mutex::new(cfg),
             pipeline,
             tail: rtp_capsfilter
                 .static_pad("src")
                 .context("rtp capsfilter has no src pad")?,
+            payloader: pay,
             encoder,
             out_tx,
             devices,
@@ -317,7 +328,13 @@ impl WebRtcSlot {
             capture_times,
             lever,
             observe,
+            stream_audio: OnceLock::new(),
         })
+    }
+
+    /// Tap the session's audio for its WebTransport client; before the first `build_audio`.
+    pub(crate) fn tap_audio_for_stream(&self, audio: Arc<crate::webtransport::Audio>) {
+        let _ = self.stream_audio.set(audio);
     }
 
     /// Build a video transport on the tail. `replacement` is false for the session's
@@ -330,10 +347,19 @@ impl WebRtcSlot {
         replacement: bool,
         gate: Option<gst::PadProbeId>,
     ) -> Result<VideoTransport> {
-        let cfg = &self.cfg;
+        let cfg = &self.cfg.lock().unwrap().clone();
         let gate = Arc::new(Mutex::new(gate.or_else(|| self.hold_rtp())));
         let webrtc = make_webrtcbin(cfg.stun.as_deref())?;
+        restrict_ice_gathering(&webrtc, PcId::Video);
         // Signals webrtcbin emits while it builds its send session: connect them first.
+        if cfg.rtp_mtu_shrink {
+            super::mtu_shrink::attach(
+                &webrtc,
+                &self.payloader,
+                &self.encoder,
+                self.session_id.clone(),
+            );
+        }
         if self.observe {
             attach_abs_capture_time_egress_probe(
                 &webrtc,
@@ -526,11 +552,51 @@ impl WebRtcSlot {
                 ),
             }
         }
-        abr_glue::reset_to_launch(&self.encoder, &self.cfg, &self.lever, &self.metrics);
+        let cfg = self.cfg.lock().unwrap().clone();
+        abr_glue::reset_to_launch(&self.encoder, &cfg, &self.lever, &self.metrics);
         *video = self.attach_video(true, gate)?;
         // The pipeline handed its latency to the first transport on the way to PLAYING;
         // one added later has to be told.
         let _ = self.pipeline.recalculate_latency();
+        Ok(())
+    }
+
+    /// Amendment 59 (a)–(b): make `to`'s bitrate, fps and size the launch point, then give
+    /// the video PC a new transport, whose ABR starts from there and which offers at once.
+    /// On `Err`, the step that failed (`fps`, `bitrate` or `transport`).
+    pub fn restream(
+        &self,
+        video: &mut VideoTransport,
+        to: &crate::session::StreamParams,
+    ) -> std::result::Result<(), (&'static str, anyhow::Error)> {
+        self.move_launch_point(to)?;
+        self.replace_video(video).map_err(|e| ("transport", e))
+    }
+
+    /// [`Self::restream`] without the new transport: `to`'s bitrate and fps written live,
+    /// and its bitrate, fps and size the launch point a later transport starts from.
+    pub fn move_launch_point(
+        &self,
+        to: &crate::session::StreamParams,
+    ) -> std::result::Result<(), (&'static str, anyhow::Error)> {
+        let mut cfg = self.cfg.lock().unwrap().clone();
+        if to.fps != cfg.stream.fps {
+            self.lever.set_fps(to.fps).map_err(|e| ("fps", e))?;
+        }
+        // The CPB is sized kbps / fps, so a new fps rewrites it too.
+        let rate_moves = to.bitrate_kbps != cfg.stream.bitrate_kbps || to.fps != cfg.stream.fps;
+        if rate_moves && !abr_glue::write_bitrate_live(&self.encoder, &cfg, to.bitrate_kbps, to.fps)
+        {
+            return Err((
+                "bitrate",
+                anyhow::anyhow!("the encoder's bitrate is not writable live"),
+            ));
+        }
+        cfg.stream.bitrate_kbps = to.bitrate_kbps;
+        cfg.stream.fps = to.fps;
+        cfg.stream.width = to.width;
+        cfg.stream.height = to.height;
+        *self.cfg.lock().unwrap() = cfg;
         Ok(())
     }
 
@@ -543,7 +609,7 @@ impl WebRtcSlot {
     pub fn build_audio(&self) -> Result<(Option<gst::Element>, Option<gst::Pipeline>)> {
         #[cfg(test)]
         AUDIO_BUILDS.lock().unwrap().push(self.session_id.clone());
-        let cfg = &self.cfg;
+        let cfg = &self.cfg.lock().unwrap().clone();
         if audio_disabled() {
             tracing::info!(
                 "stream audio disabled by runtime or session topology — video-only offer"
@@ -565,8 +631,14 @@ impl WebRtcSlot {
         let audio_pipe = gst::Pipeline::new();
         audio_health::watch_bus(&audio_pipe, &self.session_id);
         let audio_tail = add_audio_chain(&audio_pipe, cfg, &self.session_id)?;
+        if let Some(audio) = self.stream_audio.get() {
+            if let Some(opus) = audio_pipe.by_name(super::audio_branch::OPUS_ENC_NAME) {
+                audio.tap(&opus);
+            }
+        }
         let audio_webrtc = make_webrtcbin(cfg.stun.as_deref())
             .context("failed to create audio webrtcbin (encode pipeline)")?;
+        restrict_ice_gathering(&audio_webrtc, PcId::Audio);
         // #425: tune the mic receive-leg jitter buffer on the AUDIO PC only; the video
         // webrtcbin is never touched here.
         set_audio_receive_latency(&audio_webrtc, cfg.mic_jitter_ms);

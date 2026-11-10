@@ -7,7 +7,7 @@
 
 import { useState } from "react";
 import * as adminApi from "../../../api/admin";
-import type { LaunchProfile, ProfilePolicyResponse, StreamProfile } from "../../../api/types";
+import type { DefaultTransport, LaunchProfile, LaunchProfileTransport, ProfilePolicyResponse, StreamProfile } from "../../../api/types";
 import { ApiError } from "../../../api/client";
 import { useAuth } from "../../../auth/context";
 import { ActionsMenu, type ActionsMenuItem, type ActionsMenuSeparator } from "../../../components/ActionsMenu";
@@ -24,10 +24,15 @@ import { isLaunchProfileInUse } from "./launchProfileHelpers";
 import { LaunchProfileDrawer } from "./LaunchProfileDrawer";
 import { moveRung, RungEditor } from "./RungEditor";
 import { useSectionHead } from "../../../components/shell/sectionHead";
+import { SettingRow } from "../settings/SettingRow";
+import { useSettings } from "../settings/useSettings";
+
+const KNOWN_TRANSPORTS: string[] = ["default", "webrtc", "webtransport", "webtransport_opt_in"];
 
 const DEFAULT_POLICY: ProfilePolicyResponse = { global_default_profile_id: null, user_overrides_allowed: true };
 
-// ── Defaults card (mock's "Default profile" + "Let users choose a profile") ─
+// ── Defaults card (mock's "Default profile" + "Let users choose a profile",
+// plus the instance's default transport, amendment 61) ─
 
 function DefaultsCard({
   launchProfiles,
@@ -35,12 +40,22 @@ function DefaultsCard({
   busy,
   onChangeDefault,
   onChangeOverridesAllowed,
+  transport,
+  transportError,
+  transportBusy,
+  onChangeTransport,
 }: {
   launchProfiles: LaunchProfile[];
   policy: ProfilePolicyResponse;
   busy: boolean;
   onChangeDefault: (id: string) => void;
   onChangeOverridesAllowed: (checked: boolean) => void;
+  /** The instance default transport; null until the settings load. */
+  transport: DefaultTransport | null;
+  /** Why the settings did not load, when they did not. */
+  transportError: string | null;
+  transportBusy: boolean;
+  onChangeTransport: (t: DefaultTransport) => void;
 }) {
   // The global default is a user-facing setting (control-api.md: the field a
   // session with no preference falls back to), so the candidates are the same
@@ -64,6 +79,26 @@ function DefaultsCard({
           ))}
         </select>
       </div>
+      {(transport || transportError) && (
+        <div>
+          <div className="eyebrow">Default transport</div>
+          {/* This is the only place to set it, so a failed load says so instead of hiding it. */}
+          <ResourceStates loading={false} error={transport ? null : transportError} />
+          {transport && (
+            <select
+              className="select mt2"
+              value={transport}
+              disabled={transportBusy}
+              aria-label="Default transport"
+              onChange={(e) => onChangeTransport(e.target.value as DefaultTransport)}
+            >
+              <option value="webrtc">WebRTC</option>
+              <option value="webtransport">WebTransport (experimental)</option>
+            </select>
+          )}
+          <div className="hint mt2">For profiles set to Use instance default, from the next launch</div>
+        </div>
+      )}
       <div style={{ maxWidth: 420 }}>
         <div className="row between gap5">
           <div>
@@ -178,6 +213,7 @@ function LaunchProfileCard({
   const { addToast } = useToast();
   const [busy, setBusy] = useState(false);
 
+  const transport: string = profile.transport ?? "webrtc";
   const rungs = profile.rungs.map((r) => r.stream_profile);
   const availableToAdd = streamProfiles.filter((sp) => !rungs.some((r) => r.id === sp.id));
   const appCount = profile.used_by?.apps.length ?? 0;
@@ -199,13 +235,15 @@ function LaunchProfileCard({
     },
   ];
 
-  const persist = async (nextRungIds: string[]) => {
+  const persist = async (nextRungIds: string[], transport?: LaunchProfileTransport) => {
     setBusy(true);
     try {
+      // `transport` absent = unchanged (control-api.md), so a rung edit never touches it.
       const saved = await adminApi.updateLaunchProfile(token, profile.id, {
         display_name: profile.display_name,
         description: profile.description,
         rungs: nextRungIds,
+        ...(transport && { transport }),
       });
       onChanged(saved);
       for (const w of saved.warnings ?? []) {
@@ -249,6 +287,29 @@ function LaunchProfileCard({
             void persist([...rungs.map((r) => r.id), profileId]);
           }}
         />
+        <div className="eyebrow lp-group">Delivery</div>
+        <SettingRow
+          label="Transport"
+          hint="Use instance default follows the Default transport above, from the next launch. WebRTC is the fallback. WebTransport is experimental: if it can’t connect, the session starts on WebRTC."
+        >
+          <select
+            className="select"
+            aria-label={`Transport for ${profile.display_name}`}
+            value={transport}
+            // A value this UI does not know (a newer server) is shown as itself and left alone.
+            disabled={busy || !KNOWN_TRANSPORTS.includes(transport)}
+            onChange={(e) => void persist(rungs.map((r) => r.id), e.target.value as LaunchProfileTransport)}
+          >
+            <option value="default">Use instance default</option>
+            <option value="webrtc">WebRTC</option>
+            <option value="webtransport">WebTransport (experimental)</option>
+            {/* Set through the API for the developer URL switch; kept visible so it is never silently overwritten. */}
+            {transport === "webtransport_opt_in" && (
+              <option value="webtransport_opt_in">WebTransport on request (developer)</option>
+            )}
+            {!KNOWN_TRANSPORTS.includes(transport) && <option value={transport}>{transport}</option>}
+          </select>
+        </SettingRow>
       </div>
     </div>
   );
@@ -287,6 +348,7 @@ export function LaunchTab() {
   const launchProfiles = resource.data?.launchProfiles ?? [];
   const streamProfiles = resource.data?.streamProfiles ?? [];
   const policy = resource.data?.policy ?? DEFAULT_POLICY;
+  const settings = useSettings();
 
   const [creating, setCreating] = useState(false);
   const [renameTarget, setRenameTarget] = useState<LaunchProfile | null>(null);
@@ -338,6 +400,11 @@ export function LaunchTab() {
           busy={savePolicy.pending != null || resource.loading}
           onChangeDefault={(id) => void savePolicy.run({ global_default_profile_id: id || null })}
           onChangeOverridesAllowed={(checked) => void savePolicy.run({ user_overrides_allowed: checked })}
+          // A pre-amendment-61 server sends none: it streams WebRTC.
+          transport={settings.settings ? (settings.settings.default_transport ?? "webrtc") : null}
+          transportError={settings.error}
+          transportBusy={settings.pending === "default_transport"}
+          onChangeTransport={(t) => void settings.patch("default_transport", t)}
         />
       )}
 

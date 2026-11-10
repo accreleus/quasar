@@ -73,6 +73,8 @@ pub enum JobOutcome {
     Deferred(String),
     /// The run broke. The string is the error.
     Failed(String),
+    /// The run broke, with a summary (`reason` and its facts) beside the error text.
+    FailedWith(Value, String),
 }
 
 impl JobOutcome {
@@ -82,7 +84,7 @@ impl JobOutcome {
             JobOutcome::Succeeded(_) => "succeeded",
             JobOutcome::Skipped(_) => "skipped",
             JobOutcome::Deferred(_) => "deferred",
-            JobOutcome::Failed(_) => "failed",
+            JobOutcome::Failed(_) | JobOutcome::FailedWith(..) => "failed",
         }
     }
 
@@ -98,13 +100,14 @@ impl JobOutcome {
             JobOutcome::Succeeded(v) => json!({ "result": v }),
             JobOutcome::Skipped(r) | JobOutcome::Deferred(r) => json!({ "reason": r }),
             JobOutcome::Failed(_) => json!({}),
+            JobOutcome::FailedWith(v, _) => v.clone(),
         }
     }
 
     /// The wire `error`, set only for a failure.
     fn error(&self) -> Option<String> {
         match self {
-            JobOutcome::Failed(e) => Some(e.clone()),
+            JobOutcome::Failed(e) | JobOutcome::FailedWith(_, e) => Some(e.clone()),
             _ => None,
         }
     }
@@ -436,7 +439,7 @@ impl JobPoller {
                 "job: run deferred job_id={} run_id={} dur_ms={dur_ms} reason={reason:?}",
                 run.job_id, run.run_id
             ),
-            JobOutcome::Failed(err) => tracing::error!(
+            JobOutcome::Failed(err) | JobOutcome::FailedWith(_, err) => tracing::error!(
                 token = "job-run-failed",
                 "job: run failed job_id={} run_id={} dur_ms={dur_ms} err={err:?}",
                 run.job_id, run.run_id

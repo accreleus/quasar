@@ -31,9 +31,11 @@ import { elapsedWords, relativeTime } from "../../lib/format/relativeTime";
 import { useAdminAction } from "../../lib/resource/action";
 import { useResource } from "../../lib/resource/react";
 import { ImageCleanupModal } from "./library/ImageCleanupModal";
+import { CompatToolsCard } from "./fleet/hostDetail/CompatToolsCard";
 import { CapacityCard } from "./fleet/hostDetail/CapacityCard";
 import { FloorNote } from "./fleet/hostDetail/FloorNote";
 import { ServicesCard } from "./fleet/hostDetail/ServicesCard";
+import { WebTransportCard } from "./fleet/hostDetail/WebTransportCard";
 import { ApplyConfirmModal } from "./fleet/ApplyControls";
 import { hostFloorState } from "./fleet/hostFloor";
 import { SessionsCard } from "./fleet/hostDetail/SessionsCard";
@@ -244,7 +246,9 @@ export function HostDetail() {
     floor,
   });
   const inFlight = removal.removal;
+  // An unknown control-plane identity (the release read failed) could be this very machine.
   const canRemove =
+    machine != null &&
     removable(host, machine) &&
     !conflict &&
     services != null &&
@@ -397,7 +401,9 @@ export function HostDetail() {
         />
       )}
 
-      {removeOpen && (
+      {/* `?remove=1` opens it too: never for a host this page would not offer removal of
+          (the control plane's own machine), whose Forget would drop its own row. */}
+      {removeOpen && canRemove && (
         <RemoveHostModal
           host={host}
           liveSessions={sessions.length}
@@ -408,8 +414,16 @@ export function HostDetail() {
             setRemoveOpen(false);
             removal.start(host, sessions.length);
           }}
+          onForget={() => {
+            setRemoveOpen(false);
+            void forget.run(host);
+          }}
         />
       )}
+
+      <CompatToolsCard hostId={host.id} />
+
+      <WebTransportCard hostId={host.id} now={now} />
 
       <CapacityCard host={host} gpus={gpus} now={now} />
 

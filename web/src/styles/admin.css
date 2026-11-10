@@ -536,6 +536,10 @@
   padding: var(--s3) var(--card-pad) var(--card-pad);
 }
 
+.lp-group {
+  margin-top: var(--s4);
+}
+
 .lp-desc {
   margin-top: calc(var(--s1) * -1);
   margin-bottom: var(--s3);

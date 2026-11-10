@@ -117,6 +117,8 @@ beforeEach(() => {
   mocked.getHostGPUs.mockResolvedValue({ items: [] } as never);
   mocked.getPlatformReleases.mockResolvedValue(view());
   mocked.listPlatformAttempts.mockResolvedValue({ attempts: [] } as never);
+  mocked.getHostCompatTools.mockResolvedValue({ supported: true, free_bytes: null, reported_at: null, tools: [] });
+  mocked.getHostWebTransport.mockResolvedValue({ reported: null, override: null, endpoint: null, usable: false, reason: "not_reported" });
 });
 
 describe("HostDetail below the floor", () => {

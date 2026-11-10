@@ -139,6 +139,8 @@ beforeEach(() => {
   mocked.getHostGPUs.mockResolvedValue({ items: [gpu()] } as never);
   mocked.getPlatformReleases.mockResolvedValue({ faults: [] } as never);
   mocked.listPlatformAttempts.mockResolvedValue({ attempts: [] } as never);
+  mocked.getHostCompatTools.mockResolvedValue({ supported: true, free_bytes: null, reported_at: null, tools: [] });
+  mocked.getHostWebTransport.mockResolvedValue({ reported: null, override: null, endpoint: null, usable: false, reason: "not_reported" });
   mocked.drainHost.mockResolvedValue({} as never);
   mocked.uncordonHost.mockResolvedValue({} as never);
   mocked.setReadinessOverride.mockResolvedValue({} as never);

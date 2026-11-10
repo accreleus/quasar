@@ -38,6 +38,9 @@ export interface StatsPaneProps {
   tier?: string;
   /** Server-resolved codec (wire id), for the multi-codec mismatch check. */
   resolvedCodec?: string;
+  /** The session's transport: webrtc | webtransport. */
+  transport?: string;
+  transportFallbackReason?: string | null;
   /** Without it the pane shows only client-side numbers (no server verdict). */
   sessionId?: string;
   /** ISO `session.started_at`. The v1 drawer header carried this timer and the
@@ -356,6 +359,18 @@ export function StatsPane(props: StatsPaneProps) {
                   <tr>
                     <td>tier</td>
                     <td>{props.tier}</td>
+                  </tr>
+                )}
+                {props.transport && (
+                  <tr>
+                    <td>transport</td>
+                    <td>{props.transport === "webtransport" ? "WebTransport" : "WebRTC"}</td>
+                  </tr>
+                )}
+                {props.transportFallbackReason && (
+                  <tr>
+                    <td>fell back</td>
+                    <td>{props.transportFallbackReason}</td>
                   </tr>
                 )}
                 {codecs.resolved && (

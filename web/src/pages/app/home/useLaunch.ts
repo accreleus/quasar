@@ -4,13 +4,16 @@
 // Lifted out of AppHomeNext.tsx verbatim when the v3 home split the page into
 // components — the page composes, this owns the launch.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 import * as libraryApi from "../../../api/library";
 import { ApiError } from "../../../api/client";
 import type { App, ProfilesResponse, Session } from "../../../api/types";
+import { AuthContext } from "../../../auth/context";
+import { ensureDeviceProbeForLaunch } from "../../../auth/deviceProbe";
 import { useToast } from "../../../components/Toast";
 import { playoutOverride } from "../../../webrtc/playoutOverride";
+import { pyrowavePreference, rememberUrlSwitches, transportPreference } from "../../../webtransport/transportSwitch";
 import {
   CLOSING_RETRY_DELAY_MS,
   MAX_CLOSING_RETRY_WAIT_MS,
@@ -20,6 +23,7 @@ import {
   closingToastCopy,
   decideCapacityRetry,
   isCapacityRetryable,
+  STEAM_RESTARTING,
   waitingToastCopy,
 } from "../capacityRetry";
 import { isRecommendationEligible } from "../launchOptions";
@@ -106,7 +110,10 @@ export function useLaunch({
   revealDetail,
 }: UseLaunchOptions): UseLaunch {
   const navigate = useNavigate();
+  const { search } = useLocation();
   const { addToast, removeToast } = useToast();
+  const userId = useContext(AuthContext)?.user?.id;
+  useEffect(() => rememberUrlSwitches(search), [search]);
   const [launching, setLaunching] = useState(false);
   const [waitingForSlot, setWaitingForSlot] = useState(false);
   const [waitingReason, setWaitingReason] = useState<WaitingReason | null>(null);
@@ -155,6 +162,9 @@ export function useLaunch({
       const req: libraryApi.LaunchRequest = { app_id: app.id, mic: true };
       if (profileId) req.profile_id = profileId;
       if (streamCodec) req.stream = { codec: streamCodec };
+      const transport = transportPreference();
+      if (transport) req.transport = transport;
+      if (pyrowavePreference()) req.pyrowave = true;
 
       // #494: abort an in-flight POST /v1/sessions (or a pending retry wait) if
       // the page navigates away mid-launch. One controller per launchApp call;
@@ -181,9 +191,11 @@ export function useLaunch({
           waitingToastReason = null;
         }
       };
+      // The plan reads the stored probe; a stale one must not downgrade a capable browser.
+      if (token && userId) await ensureDeviceProbeForLaunch(token, userId);
       for (;;) {
         try {
-          const { session, signaling, notice } = await libraryApi.launchSession(
+          const { session, signaling, notice, transport_options } = await libraryApi.launchSession(
             token,
             req,
             controller.signal,
@@ -206,6 +218,9 @@ export function useLaunch({
               resolvedCodec: session.stream.codec,
               micGranted: session.stream.mic === true,
               playoutOverride: playoutOverride(),
+              // Present only when the stream plan chose WebTransport.
+              webtransport: transport_options?.webtransport,
+              pyrowave: session.pyrowave?.wanted === true,
             },
           });
           return;
@@ -266,23 +281,31 @@ export function useLaunch({
             }
             if (decision.kind === "retry") {
               if (!mountedRef.current) return;
-              setWaitingForSlot(true);
-              setWaitingReason(reason);
-              // Replace a showing toast if the reason changed since it was
-              // raised — otherwise a no_host_available→capacity_exhausted (or
-              // reverse) flip leaves stale copy up for the rest of the wait.
-              if (waitingToastId !== null && waitingToastReason !== reason) {
-                removeToast(waitingToastId);
-                waitingToastId = null;
-              }
-              if (waitingToastId === null) {
-                waitingToastId = addToast({
-                  variant: "info",
-                  ...(closingName !== null
-                    ? closingToastCopy(closingName, app.name)
-                    : waitingToastCopy(reason as "slot" | "host", app.name, streamCodec)),
-                });
-                waitingToastReason = reason;
+              if (err instanceof ApiError && err.reason === STEAM_RESTARTING) {
+                // Not a wait for capacity: the parked Steam is restarting, so the launch just
+                // takes a few seconds longer. Stay in the ordinary "Launching…" state (#1163).
+                dismissWaitingToast();
+                setWaitingForSlot(false);
+                setWaitingReason(null);
+              } else {
+                setWaitingForSlot(true);
+                setWaitingReason(reason);
+                // Replace a showing toast if the reason changed since it was
+                // raised — otherwise a no_host_available→capacity_exhausted (or
+                // reverse) flip leaves stale copy up for the rest of the wait.
+                if (waitingToastId !== null && waitingToastReason !== reason) {
+                  removeToast(waitingToastId);
+                  waitingToastId = null;
+                }
+                if (waitingToastId === null) {
+                  waitingToastId = addToast({
+                    variant: "info",
+                    ...(closingName !== null
+                      ? closingToastCopy(closingName, app.name)
+                      : waitingToastCopy(reason as "slot" | "host", app.name, streamCodec)),
+                  });
+                  waitingToastReason = reason;
+                }
               }
               try {
                 await abortableSleep(decision.delayMs, controller.signal, retryTimeoutRef);
@@ -338,7 +361,7 @@ export function useLaunch({
         }
       }
     },
-    [token, launching, navigate, addToast, removeToast, apps],
+    [token, userId, launching, navigate, addToast, removeToast, apps],
   );
 
   // ── One-click launch, gated on the eligibility warning (#385 item 2) ──────

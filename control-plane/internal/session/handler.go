@@ -262,12 +262,14 @@ type sessionResp struct {
 	// serialized. semantics: control-api.md §Storage
 	SharedHomeAppID *string `json:"shared_home_app_id"`
 	// Always serialized. semantics: control-api.md §Transport — WebRTC and WebTransport
-	Transport               string     `json:"transport"`
-	TransportReason         *string    `json:"transport_reason"`
-	TransportFallbackReason *string    `json:"transport_fallback_reason"`
-	CreatedAt               time.Time  `json:"created_at"`
-	StartedAt               *time.Time `json:"started_at"`
-	EndedAt                 *time.Time `json:"ended_at"`
+	Transport               string  `json:"transport"`
+	TransportReason         *string `json:"transport_reason"`
+	TransportFallbackReason *string `json:"transport_fallback_reason"`
+	// Always serialized, null before the stream plan wrote one. semantics: control-api.md §The session's pyrowave
+	PyroWave  *PyroWaveRecord `json:"pyrowave"`
+	CreatedAt time.Time       `json:"created_at"`
+	StartedAt *time.Time      `json:"started_at"`
+	EndedAt   *time.Time      `json:"ended_at"`
 }
 
 type signalingResp struct {
@@ -375,6 +377,7 @@ func sessionRespWithStream(s Session, stream streamResp) sessionResp {
 		TransportReason: s.TransportReason,
 
 		TransportFallbackReason: s.TransportFallbackReason,
+		PyroWave:                s.PyroWave,
 		Stream:                  stream,
 		CreatedAt:               s.CreatedAt,
 		StartedAt:               s.StartedAt,
@@ -414,7 +417,9 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		Mic bool `json:"mic"`
 		// "webrtc" | "webtransport"; absent ⇒ the profile decides.
 		Transport *string `json:"transport"`
-		Stream    *struct {
+		// Amendment 58: Ultra-low latency (PyroWave) picked; a wrong type is a 400 here.
+		PyroWave bool `json:"pyrowave"`
+		Stream   *struct {
 			Width       *int32  `json:"width"`
 			Height      *int32  `json:"height"`
 			FPS         *int32  `json:"fps"`
@@ -481,6 +486,7 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	if req.Transport != nil {
 		lp.Transport = *req.Transport
 	}
+	lp.PyroWave = req.PyroWave
 
 	res, err := h.coord.LaunchByProfile(r.Context(), user.ID, lp)
 	switch {
@@ -567,13 +573,16 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		// prevention; never shorten it to make this header smaller), so a relaunch
 		// right after a peer's DELETE bounces here for the ~15 s that teardown
 		// takes. Retry-After lets a polling client wait rather than error (#494).
-		retryAfter := capacityExhaustedRetryAfterSeconds
+		retryAfter, reason := capacityExhaustedRetryAfterSeconds, ""
 		var claim *ParkedClaimRefusedError
 		if errors.As(err, &claim) {
 			retryAfter = parkedClaimRetryAfterSeconds
+			if !claim.Warming {
+				reason = httpx.ReasonSteamRestarting
+			}
 		}
 		w.Header().Set("Retry-After", retryAfter)
-		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeCapacityExhausted,
+		httpx.WriteErrorReason(w, http.StatusServiceUnavailable, httpx.CodeCapacityExhausted, reason,
 			refusalMessage(err, "all capacity is in use; try again shortly",
 				"no free GPU can encode %s; try again shortly"))
 		return
@@ -800,7 +809,7 @@ func (h *Handler) handleStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if user.Role == auth.RoleAdmin {
-		h.recordActivity(r.Context(), user.ID, "session.stop", "session", id, map[string]any{"already_terminal": wasTerminal})
+		h.recordActivity(r.Context(), user.ID, "session.stop", "session", sess.ID, map[string]any{"already_terminal": wasTerminal})
 	}
 
 	// 202 Accepted while teardown proceeds; 200 if it was already terminal
@@ -994,6 +1003,15 @@ func writeHomeInUse(w http.ResponseWriter, err error, message string) {
 // clears it. Every other refusal omits the reason.
 // semantics: control-api.md §Admission control (amendment 40)
 func writeNoHostAvailable(w http.ResponseWriter, err error) {
+	var ct *CompatToolRejection
+	if errors.As(err, &ct) {
+		msg := fmt.Sprintf("no host can run the compatibility tool %s this game needs yet; hosts install it in the background, so try again shortly, and if it persists ask your administrator to check Library > Compatibility", ct.Tool)
+		if !ct.Usable {
+			msg = fmt.Sprintf("the compatibility tool %s this game needs is disabled or marked unusable; ask your administrator", ct.Tool)
+		}
+		httpx.WriteErrorReason(w, http.StatusServiceUnavailable, httpx.CodeNoHostAvailable, httpx.ReasonCompatToolMissing, msg)
+		return
+	}
 	var off *HomeHostOfflineRejection
 	if errors.As(err, &off) {
 		httpx.WriteErrorReason(w, http.StatusServiceUnavailable, httpx.CodeNoHostAvailable,

@@ -299,9 +299,15 @@ type Session struct {
 	Transport               string
 	TransportReason         *string
 	TransportFallbackReason *string
+	// PyroWave is sessions.pyrowave (migration 0115), nil before the stream plan wrote it;
+	// PyroWaveSlot is sessions.pyrowave_slot, the scheduler's reservation.
+	PyroWave     *PyroWaveRecord
+	PyroWaveSlot bool
 	// wt is the first transport token, for the assign dispatch and the 201. Not persisted:
 	// only its hash is, in session_tokens.
 	wt *transportGrant
+	// restream: what a claim's play stream changes on the adopted runtime.
+	restream []string
 	// notice is the launch's steam_library_not_shared message, "" for none.
 	// Not persisted.
 	notice string
@@ -862,17 +868,53 @@ func (s *Store) SetStateDetail(ctx context.Context, id, detail string) error {
 	return nil
 }
 
-// CommitSwappedApp sets app_id and state_detail in one statement, leaving the
-// state `running` and the reservation unchanged. Applies only while `running`.
-func (s *Store) CommitSwappedApp(ctx context.Context, id, newAppID, detail string) error {
+// CommitSwappedApp commits the target an agent proved it swapped to: the row's
+// app_id, the Steam home the target mounts as its shared one (newSharedAppID,
+// "" for none), and the release of the hold on a shared Steam home the swap
+// away from. `swap complete` is reported only after the agent stopped the
+// outgoing container and the new app presented, so the Steam data dir the old
+// container mounted is unmounted by then: holding it until the session ends
+// would lock the user out of their library for a desktop they already left
+// (control-api.md §Storage, "A shared Steam library"). The state stays
+// `running` and the reservation is unchanged; it applies only while `running`.
+func (s *Store) CommitSwappedApp(ctx context.Context, id, newAppID, newSharedAppID, detail string) error {
 	if !isValidUUID(id) {
 		return nil // no such row to update; mirrors the 0-rows-affected no-op below
 	}
-	_, err := s.pool.Exec(ctx, `
-		UPDATE sessions SET app_id = $2::uuid, state_detail = $3, launch_progress = NULL
-		WHERE id = $1::uuid AND state = 'running'
-	`, id, newAppID, detail)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
+		return fmt.Errorf("begin swapped app commit: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var userID string
+	var oldShared *string
+	err = tx.QueryRow(ctx, `SELECT user_id::text,shared_home_app_id::text FROM sessions
+		WHERE id=$1::uuid AND state = 'running' FOR UPDATE`, id).Scan(&userID, &oldShared)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("lock swapped app: %w", err)
+	}
+	if oldShared != nil && (newSharedAppID == "" || *oldShared != newSharedAppID) {
+		// Only this session's hold, and only on a Steam home the target does not
+		// mount as its own (amendment 62): the CAS cannot release anyone else's.
+		if _, err := tx.Exec(ctx, `UPDATE managed_home_claims SET pending_home_session_id=NULL,
+			pending_home_token=NULL,pending_home_started_at=NULL
+			WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid AND pending_home_session_id=$3::uuid
+			  AND NOT EXISTS (SELECT 1 FROM apps WHERE id=$4::uuid AND COALESCE(parent_app_id,id)=$2::uuid)`,
+			userID, *oldShared, id, newAppID); err != nil {
+			return fmt.Errorf("release swapped-out shared home hold: %w", err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE sessions SET app_id = $2::uuid, shared_home_app_id = NULLIF($3, '')::uuid,
+			state_detail = $4, launch_progress = NULL
+		WHERE id = $1::uuid AND state = 'running'
+	`, id, newAppID, newSharedAppID, detail); err != nil {
+		return fmt.Errorf("commit swapped app: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit swapped app: %w", err)
 	}
 	return nil
@@ -1170,9 +1212,9 @@ func (s *Store) NonTerminalSessionIDsOnHost(ctx context.Context, hostID string) 
 //
 //  3. A session also holds the home it mounts as a shared home
 //     (sessions.shared_home_app_id): no two sessions ever mount one Steam data
-//     dir at once, whichever of them owns it. The swap exclusion never covers
-//     that hold: a sharing session swapping into the Steam family is refused,
-//     since nothing proves its old container has let go of the mount.
+//     dir at once, whichever of them owns it. The swapping session ($3) never
+//     counts, through either home: the agent proves the outgoing container's
+//     exit before the target starts (control-api.md §Storage, amendment 62).
 //
 // It returns the conflicting SESSION ID, not a count (§2.1's 409 body carries
 // it), with its kind and whether it is stopping (homeInUse). $3 (excludeID) is
@@ -1185,7 +1227,7 @@ const liveHomeSessionSQL = `
 	JOIN apps a ON a.id = s.app_id
 	WHERE s.user_id = $1::uuid
 	  AND (COALESCE(a.parent_app_id, a.id) = $2::uuid OR s.shared_home_app_id = $2::uuid)
-	  AND ($3 = '' OR s.id != $3::uuid OR s.shared_home_app_id = $2::uuid)
+	  AND ($3 = '' OR s.id != $3::uuid)
 	  AND s.state IN ('pending','assigned','starting','running','stopping')
 	LIMIT 1`
 
@@ -1324,6 +1366,12 @@ type DeviceProbe struct {
 	// WebCodecs is capabilities.webcodecs: catalog codec spelling (h264|hevc|av1) plus
 	// opus_decode, true only where the client proved isConfigSupported.
 	WebCodecs map[string]bool
+	// WebGPU is capabilities.webgpu.available (amendment 55).
+	WebGPU bool
+	// MeasuredAt is the server-stamped measured_at; RTTMsExact is rtt_ms unrounded, 0 when
+	// absent. The PyroWave Auto rule reads both (a LAN rtt_ms under 1 rounds to 0).
+	MeasuredAt time.Time
+	RTTMsExact float64
 }
 
 // parseDeviceProbe projects user_devices.capabilities onto DeviceProbe. Missing,
@@ -1359,6 +1407,7 @@ func parseDeviceProbe(rawCaps []byte) *DeviceProbe {
 		// any, so a wrong shape loses only this key, not the whole probe.
 		WebTransport any `json:"webtransport"`
 		WebCodecs    any `json:"webcodecs"`
+		WebGPU       any `json:"webgpu"`
 	}
 	if err := json.Unmarshal(rawCaps, &caps); err != nil {
 		// Malformed JSON: an absent probe, not an error worth propagating.
@@ -1377,7 +1426,7 @@ func parseDeviceProbe(rawCaps []byte) *DeviceProbe {
 		return nil // stale probe → no-op → default tier
 	}
 
-	p := &DeviceProbe{}
+	p := &DeviceProbe{MeasuredAt: measuredAt}
 	if caps.Display.RefreshHz != nil && *caps.Display.RefreshHz > 0 && *caps.Display.RefreshHz <= 1000 {
 		p.DisplayRefreshHz = *caps.Display.RefreshHz
 	}
@@ -1392,6 +1441,7 @@ func parseDeviceProbe(rawCaps []byte) *DeviceProbe {
 	}
 	if caps.RTTMs != nil {
 		p.RTTMs = int32(*caps.RTTMs)
+		p.RTTMsExact = *caps.RTTMs
 	}
 	if caps.MaxDecodeHeight != nil {
 		p.MaxDecodeHeight = int32(*caps.MaxDecodeHeight)
@@ -1414,6 +1464,9 @@ func parseDeviceProbe(rawCaps []byte) *DeviceProbe {
 		for k, v := range wc {
 			p.WebCodecs[k] = v == true
 		}
+	}
+	if g, ok := caps.WebGPU.(map[string]any); ok {
+		p.WebGPU = g["available"] == true
 	}
 	return p
 }
@@ -1569,6 +1622,32 @@ func (s *Store) UpdateSessionCodec(ctx context.Context, id, codec string) error 
 	return nil
 }
 
+// ApplyPyroWaveSwitch records an agent codec.switched on the session's PyroWave record:
+// active, used, switch_reason, and wanted cleared by a step-down. A step-down also gives back
+// the session's PyroWave slot: it never switches on again, so the GPU's slot would sit idle.
+// semantics: control-api.md §The session's pyrowave, §The PyroWave ceiling
+func (s *Store) ApplyPyroWaveSwitch(ctx context.Context, id string, active bool, reason string) error {
+	if !isValidUUID(id) {
+		return nil
+	}
+	_, err := s.pool.Exec(ctx, `
+		UPDATE sessions
+		SET pyrowave = pyrowave || jsonb_build_object(
+		        'active', $2::bool,
+		        'used', COALESCE((pyrowave->>'used')::bool, false) OR $2::bool,
+		        'switch_reason', $3::text,
+		        'wanted', COALESCE((pyrowave->>'wanted')::bool, false)
+		                  AND $3::text NOT IN ('rtt_too_high', 'congestion', 'client_decode_error', 'encoder_error')),
+		    pyrowave_slot = pyrowave_slot
+		                  AND $3::text NOT IN ('rtt_too_high', 'congestion', 'client_decode_error', 'encoder_error')
+		WHERE id = $1::uuid AND pyrowave IS NOT NULL AND state NOT IN ('stopped', 'failed')
+	`, id, active, reason)
+	if err != nil {
+		return fmt.Errorf("apply pyrowave switch: %w", err)
+	}
+	return nil
+}
+
 // UpdateSessionNegotiatedCodec records the codec the BROWSER reports decoding
 // (migration 0038). Untrusted telemetry input: the value must already have
 // passed normaliseNegotiatedCodec. Guarded on a NON-TERMINAL session, as
@@ -1607,7 +1686,8 @@ const sessionCols = `id::text, user_id::text, app_id::text, host_id::text, gpu_i
 	health_state, health_state_reason, health_state_changed_at,
 	created_at, assigned_at, started_at, ended_at,
 	shared_home_app_id::text,
-	transport, transport_reason, transport_fallback_reason`
+	transport, transport_reason, transport_fallback_reason,
+	pyrowave, pyrowave_slot`
 
 // selectSessionSQL is the column list + FROM shared by all session reads.
 const selectSessionSQL = `SELECT ` + sessionCols + ` FROM sessions`
@@ -1650,6 +1730,7 @@ func scanSessionRow(r row, extra ...any) (Session, error) {
 	var s Session
 	var st string
 	var hs string
+	var pyrowave []byte
 	dest := []any{
 		&s.ID, &s.UserID, &s.AppID, &s.HostID, &s.GPUID,
 		&st, &s.StateDetail, &s.ErrorMessage,
@@ -1668,9 +1749,17 @@ func scanSessionRow(r row, extra ...any) (Session, error) {
 		&s.CreatedAt, &s.AssignedAt, &s.StartedAt, &s.EndedAt,
 		&s.SharedHomeAppID,
 		&s.Transport, &s.TransportReason, &s.TransportFallbackReason,
+		&pyrowave, &s.PyroWaveSlot,
 	}
 	if err := r.Scan(append(dest, extra...)...); err != nil {
 		return Session{}, err
+	}
+	if pyrowave != nil {
+		// Written only by this server's plan and trace ingestion; an unreadable one reads as none.
+		var rec PyroWaveRecord
+		if json.Unmarshal(pyrowave, &rec) == nil {
+			s.PyroWave = &rec
+		}
 	}
 	s.State = State(st)
 	s.HealthState = HealthState(hs)
