@@ -43,6 +43,10 @@ export const HANDSHAKE_DEADLINE_MS = 10_000;
 const ANSWER_TIMEOUT_MS = 10_000;
 /** How long a connection that failed without an answer gets to report its close code. */
 const CLOSE_CODE_WAIT_MS = 1_000;
+/** How long close() lets the `bye` leave before it closes the session regardless. */
+export const BYE_FLUSH_MS = 100;
+/** PWV1's 14-bit size fields: no PyroWave picture is larger on a side. */
+const MAX_PYROWAVE_SIDE = 16_384;
 /** The agent forces at most one IDR per 150 ms (quasar-protocol#29, item 8); asking faster is noise. */
 export const KEYFRAME_SPACING_MS = 150;
 /** How often loss-recovery deadlines are checked when no datagram arrives. */
@@ -105,6 +109,11 @@ export function videoConfigFrom(ack: Record<string, unknown>): VideoConfig {
   ) {
     throw new TransportError("internal", "hello_ack without a usable video configuration");
   }
+  // The PyroWave receiver and decoder size their arrays from these.
+  const side = (n: number) => Number.isInteger(n) && n >= 1 && n <= MAX_PYROWAVE_SIDE;
+  if (v.codec === "pyrowave" && !(side(v.width) && side(v.height))) {
+    throw new TransportError("internal", "hello_ack with a PyroWave picture size out of range");
+  }
   const cs = v.color_space as Record<string, unknown> | undefined;
   return {
     configId,
@@ -164,6 +173,8 @@ export class WebTransportMedia implements MediaTransport {
   private closed = false;
   /** Closes the attempt in flight; null once one has connected or ended. */
   private abortAttempt: (() => void) | null = null;
+  /** The connected attempt's guard: off, its loops reach the sink no more. */
+  private live: { on: boolean } | null = null;
   private connected = false;
   private coords: WebTransportCoords;
   /** When the current token arrived, on the monotonic clock. */
@@ -247,13 +258,16 @@ export class WebTransportMedia implements MediaTransport {
     this.send({ type: "codec_fallback", reason });
   }
 
+  /** Settles when `close()` has closed the session. */
+  private closing: Promise<void> = Promise.resolve();
+
   private stopRecovery(): void {
     if (this.recoveryTimer !== null) clearInterval(this.recoveryTimer);
     this.recoveryTimer = null;
   }
 
-  close(): void {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closed) return this.closing;
     this.closed = true;
     if (this.keyTimer !== null) clearTimeout(this.keyTimer);
     // Not left to `wt.closed`, which a connection that never finishes closing does not resolve.
@@ -262,10 +276,13 @@ export class WebTransportMedia implements MediaTransport {
     this.stopPings();
     // An attempt still connecting is closed here; it sees `closed` at its next await.
     this.abortAttempt?.();
+    if (this.live) this.live.on = false;
     if (this.connected) this.send({ type: "bye", reason: "client_closed" });
-    // The bye is queued on the stream ahead of the close.
-    void this.writer?.ready.then(() => this.wt?.close({ closeCode: 0, reason: "" }), () => {});
-    if (!this.writer) this.wt?.close();
+    // The bye is queued on the stream ahead of the close. A control stream that was reset, or one
+    // that stays blocked, must not keep the session open (control-api.md §Transport fallback).
+    const flushed = this.writer?.ready.catch(() => {});
+    this.closing = Promise.race([flushed, after(BYE_FLUSH_MS, undefined)]).then(() => this.wt?.close({ closeCode: 0, reason: "" }));
+    return this.closing;
   }
 
   /** A fresh token, at most once per {@link REMINT_MIN_INTERVAL_MS}; false when it is too soon. */
@@ -380,7 +397,10 @@ export class WebTransportMedia implements MediaTransport {
     // Datagrams can overtake the hello_ack; the decode stage holds units by config_id, the
     // router PyroWave fragments.
     const router = this.makeRouter(sink, live);
-    void this.readDatagrams(wt, sink, router, live).catch(() => {});
+    void this.readDatagrams(wt, sink, router, live).catch((err: unknown) => {
+      // No more video would arrive on this connection: end it, as a malformed control stream does.
+      if (live.on) wt.close({ closeCode: 4400, reason: err instanceof Error ? err.message.slice(0, 100) : "" });
+    });
     let first: Record<string, unknown> | null;
     try {
       first = await Promise.race([next(), after(ANSWER_TIMEOUT_MS, null)]);
@@ -411,6 +431,7 @@ export class WebTransportMedia implements MediaTransport {
     this.wt = wt;
     this.writer = writer;
     this.connected = true;
+    this.live = live;
     this.router = router;
     this.datagramWriter = wt.datagrams.writable.getWriter();
     sink.streams?.(audioStreamsFrom(first));

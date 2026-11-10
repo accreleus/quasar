@@ -171,6 +171,8 @@ export class FakeAgent {
   refuseHandshake = false;
   /** `close()` does not settle `closed`, as a connection that never finishes closing. */
   closeNeverSettles = false;
+  /** Control-stream writes fail from here on, as on a stream the agent reset. */
+  controlReset = false;
   /** Park the client at one await of its connect until `release()`; `answer` means no reply. */
   hold: "ready" | "stream" | "write" | "answer" | null = null;
   /** Off: datagrams already in flight still arrive after close(), the case a stale attempt must ignore. */
@@ -262,6 +264,7 @@ export class FakeAgent {
           writable: new WritableStream<Uint8Array>({
             async write(chunk) {
               await agent.parked("write");
+              if (agent.controlReset) throw new Error("stream reset");
               for (const m of decoder.push(chunk)) {
                 agent.received.push(m);
                 if (m.type === "hello") onHello();

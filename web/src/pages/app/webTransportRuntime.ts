@@ -144,6 +144,9 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     for (const fn of listeners) fn();
   };
 
+  /** The last transport's close: a fallback waits for it, also when a reconnect closed it. */
+  let closing: Promise<void> | void = undefined;
+
   const stop = () => {
     if (timer !== null) clearInterval(timer);
     timer = null;
@@ -159,22 +162,27 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     teardownInput();
     mic?.stop();
     audioOut?.close();
-    transport?.close();
+    closing = transport?.close() ?? closing;
     stage?.close();
     pyroStage?.close();
     presenter?.destroy();
+    return closing;
   };
 
   // A failure the contract falls back on hands the session to WebRTC; the rest end this view.
   const fail = (code: string) => {
     if (failed || destroyed) return;
     failed = true;
-    stop();
+    const closed = stop();
     const reason = fallbackReason(code);
     if (reason) {
       // WebRTC's own input path takes over; nothing is left capturing for this connection.
       set({ status: "falling back to WebRTC…", channelOpen: false, inputCaptured: false, pointerLocked: false });
-      cfg.callbacks.onFallback(reason);
+      // Close first (control-api.md §Transport fallback): the page opens WebRTC only once the
+      // WebTransport session has been told to close, which close() bounds to a short wait.
+      void Promise.resolve(closed).then(() => {
+        if (!destroyed) cfg.callbacks.onFallback(reason);
+      });
       return;
     }
     const detail = transportFailureDetail(code);
@@ -447,7 +455,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     reconnected = true;
     transport = null; // the closed one's own `end` is then not this view's
     teardownInput(); // the new connection builds its own
-    t.close();
+    closing = t.close();
     set({ status: "reconnecting over WebTransport…", channelOpen: false, inputCaptured: false, pointerLocked: false });
     mintCoords().then((c) => connectTransport(c, true), () => fail("stream_lost"));
   }
