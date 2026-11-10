@@ -38,7 +38,7 @@ import { MicCapture, MicCaptureError, withUntrustedCertContext } from "../../web
 import { probeCertificateTrust, type CertTrust } from "../../lib/certTrust";
 import { useToast } from "../../components/Toast";
 import { playoutOverride } from "../../webrtc/playout";
-import type { TelemetrySnapshot } from "../../webrtc/telemetry";
+import { newPostedCounters, type TelemetrySnapshot } from "../../webrtc/telemetry";
 import { Button } from "../../components/Button";
 import { Hud, type HudHandle } from "./hud/Hud";
 import {
@@ -171,6 +171,8 @@ function SessionPageBody() {
   // handler here. SessionPage never holds the per-tick snapshot itself, keeping
   // the video/input subtree off the 1 Hz telemetry path (#139).
   const telemetrySubsRef = useRef<Set<(snap: TelemetrySnapshot) => void>>(new Set());
+  // One for the page view: every runtime built here (re-seat, fallback) continues it.
+  const postedCountersRef = useRef(newPostedCounters());
 
   const [signalCoords, setSignalCoords] = useState(() => ({
     // Empty after a remembered fallback: the launch token was meant for WebTransport's fallback
@@ -521,6 +523,7 @@ function SessionPageBody() {
           canvas: canvasRef.current,
           pyrowave: state?.pyrowave === true,
           tierFps: state?.tier ? parseInt(state.tier.split("@")[1] ?? "", 10) || undefined : undefined,
+          counters: postedCountersRef.current,
           callbacks: {
             ...inputCallbacks,
             onDisconnectSuspected: () => void pollEndReason(),
@@ -540,6 +543,7 @@ function SessionPageBody() {
       playoutOverrideMs: state?.playoutOverride ?? playoutOverride(),
       // Parsed from tier "W×H@fps"; undefined falls back to an absolute decode ceiling.
       tierFps: state?.tier ? parseInt(state.tier.split("@")[1] ?? "", 10) || undefined : undefined,
+      counters: postedCountersRef.current,
       callbacks: {
         ...inputCallbacks,
         onDisconnectSuspected: () => void pollEndReason(),

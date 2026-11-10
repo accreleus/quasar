@@ -148,6 +148,19 @@ const EMPTY_SNAPSHOT: TelemetrySnapshot = {
 };
 
 /**
+ * What a stats sample posts for `packets_lost`, `frames_dropped` and `freeze_count`: cumulative
+ * (protocol/openapi.yaml BrowserMetrics). One object per page view of a session, shared by the
+ * transports it goes through, so the posted series never falls when a peer connection or the
+ * transport is replaced and its own counters start again at 0.
+ */
+export interface PostedCounters {
+  packetsLost: number;
+  framesDropped: number;
+  freezeCount: number;
+}
+export const newPostedCounters = (): PostedCounters => ({ packetsLost: 0, framesDropped: 0, freezeCount: 0 });
+
+/**
  * Wires up the three measurement loops for a live session. Create, call start()
  * when the video track arrives and the channel is open, register `onUpdate` for
  * the diagnostic panel, call stop() on cleanup.
@@ -282,6 +295,7 @@ export class SessionTelemetry {
     getCaptureMetrics?: () => CaptureMetrics,
     profileFps?: number,
     getAbsCaptureTimeNegotiated?: () => boolean,
+    private readonly posted: PostedCounters = newPostedCounters(),
   ) {
     this.video = video;
     this.getStatsFn = getStatsFn;
@@ -537,6 +551,10 @@ export class SessionTelemetry {
     this.prevPacketsLost = totalLost;
     this.prevFramesDropped = totalDropped;
     this.prevFreezeCount = totalFreezes;
+    // Sums of the clamped deltas, not the raw counters: those can dip or start again.
+    this.posted.packetsLost += this.packetsLost;
+    this.posted.framesDropped += this.framesDropped;
+    this.posted.freezeCount += this.freezeCount;
 
     // A current RTP stream is not proof RVFC continues to present frames.
     this.expireStaleRvfcCaptureTime();
@@ -605,9 +623,9 @@ export class SessionTelemetry {
     if (this.rttMs != null) m["rtt_ms"] = this.rttMs;
     if (this.jbMs != null) m["jitter_buffer_ms"] = this.jbMs;
     if (this.decodeMs != null) m["decode_ms"] = this.decodeMs;
-    m["packets_lost"] = this.packetsLost;
-    m["frames_dropped"] = this.framesDropped;
-    m["freeze_count"] = this.freezeCount;
+    m["packets_lost"] = this.posted.packetsLost;
+    m["frames_dropped"] = this.posted.framesDropped;
+    m["freeze_count"] = this.posted.freezeCount;
     if (this.displayRefreshHz != null) m["display_refresh_hz"] = this.displayRefreshHz;
 
     // playout_target_ms records the buffer this window was measured under so a

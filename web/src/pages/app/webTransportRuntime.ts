@@ -9,7 +9,7 @@ import { setupCapture } from "../../input/capture";
 import { NEUTRAL_MOUSE, type MouseSettings } from "../../input/mouseScale";
 import type { BenchController } from "../../bench/benchController";
 import { isBenchModeEnabled } from "../../bench/benchFlag";
-import type { TelemetrySnapshot } from "../../webrtc/telemetry";
+import type { PostedCounters, TelemetrySnapshot } from "../../webrtc/telemetry";
 import { TraceEventEmitter } from "../../webrtc/traceEvents";
 import { AudioOut, type AudioOutDeps } from "../../webtransport/audioOut";
 import { MicOut, type MicOutDeps } from "../../webtransport/micOut";
@@ -74,6 +74,8 @@ export interface WebTransportRuntimeConfig {
   canvas: HTMLCanvasElement;
   /** The launched tier's fps, for client health's per-frame budget; absent: unknown. */
   tierFps?: number;
+  /** The page view's posted cumulative counters; a WebRTC fallback continues them. */
+  counters?: PostedCounters;
   /** The session wants PyroWave (`session.pyrowave.wanted`): offer it in `hello` if this browser can decode it. */
   pyrowave?: boolean;
   callbacks: Pick<SessionRuntimeCallbacks, "onDisconnectSuspected" | "onSessionTakenOver"> &
@@ -123,7 +125,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   let inputSender: ReturnType<typeof webTransportInputSender> | null = null;
   let captured = false;
   let mouse: MouseSettings = NEUTRAL_MOUSE;
-  const telemetry = new WtTelemetry({ sessionId: cfg.sessionId, authToken: cfg.authToken, profileFps: cfg.tierFps, ...deps.telemetry });
+  const telemetry = new WtTelemetry({ sessionId: cfg.sessionId, authToken: cfg.authToken, profileFps: cfg.tierFps, counters: cfg.counters, ...deps.telemetry });
   let postTimer: ReturnType<typeof setInterval> | null = null;
   // The trace is HTTP, not the transport's: bench windows are posted through it as on WebRTC.
   const tracer = deps.createTracer(cfg.sessionId, cfg.authToken);
