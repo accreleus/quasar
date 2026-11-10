@@ -21,12 +21,13 @@ export const CLOCKS = ["client", "host"];
 // shortcut: IPv4 only; IPv6, bare host names and home paths (a session container's own
 // home is a real path in app logs) are left to scripts/dev/leak-scan.sh with the
 // operator's patterns, which runs before a bundle is posted anywhere public.
-const IPV4 = /(?<![\d.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?![\d.])/g;
+const IPV4 = /(?<![\d.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?!\d|\.\d)/g;
 const DOC_NETS = ["192.0.2.", "198.51.100.", "203.0.113."]; // RFC 5737
 const SECRETS = [
   [/\beyJ[\w-]{10,}\.[\w-]{10,}\./, "a JWT"],
-  [/\bBearer\s+[\w.~+/-]{8,}/i, "a bearer token"],
-  [/"(password|access_token|refresh_token|sig_token)"\s*:\s*"[^"]+"/i, "a credential"],
+  // A token has a digit or punctuation in it; "Bearer authentication" in prose has neither.
+  [/\bBearer\s+(?=[\w.~+/-]*[\d.~+/-])[\w.~+/-]{8,}/i, "a bearer token"],
+  [/\b(password|passwd|secret|access_token|refresh_token|sig_token|api[_-]?key)["']?\s*[=:]\s*["']?(?!null|true|false)[^\s"',}]{4,}/i, "a credential"],
 ];
 
 function leaks(text) {
@@ -58,9 +59,18 @@ export function manifestKeys(file = path.join(ROOT, "docs/session-trace/metrics.
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 
-/** Every way `dir` is not a valid bundle. An empty list means valid. */
-export function validateBundle(dir, { keys = manifestKeys() } = {}) {
+/** Every way `dir` is not a valid bundle. An empty list means valid. It never throws. */
+export function validateBundle(dir, opts) {
   const errors = [];
+  try {
+    check(dir, errors, opts);
+  } catch (e) {
+    errors.push(`the validator could not finish: ${e.message}`);
+  }
+  return errors;
+}
+
+function check(dir, errors, { keys = manifestKeys() } = {}) {
   const err = (where, what) => errors.push(`${where}: ${what}`);
   const readJson = (rel) => {
     try {
@@ -144,8 +154,8 @@ export function validateBundle(dir, { keys = manifestKeys() } = {}) {
     const timeline = readJsonl(`${name}/timeline.jsonl`);
     if (timeline === null && sc.status !== "skipped") err(`${name}/timeline.jsonl`, "missing");
     (timeline ?? []).forEach((row, i) => {
-      if (typeof row.ts_unix_ms !== "number" || !CLOCKS.includes(row.clock)) {
-        err(`${name}/timeline.jsonl:${i + 1}`, `needs ts_unix_ms and clock (${CLOCKS.join(" or ")})`);
+      if (typeof row.ts_unix_ms !== "number" || !CLOCKS.includes(row.clock) || typeof row.ev !== "string") {
+        err(`${name}/timeline.jsonl:${i + 1}`, `needs ts_unix_ms, clock (${CLOCKS.join(" or ")}) and ev`);
       }
     });
 
@@ -161,22 +171,25 @@ export function validateBundle(dir, { keys = manifestKeys() } = {}) {
   }
 
   // Every text file, whatever its name: a log or a captured console can carry a token too.
+  // shortcut: each file is read whole; cap or stream it when a bundle carries GB-size logs.
   const walk = (rel) => {
     for (const e of fs.readdirSync(path.join(dir, rel), { withFileTypes: true })) {
       const p = path.join(rel, e.name);
       if (e.isDirectory()) walk(p);
-      else if (/\.(json|jsonl|md|txt|log|html)$/.test(e.name)) {
-        for (const what of leaks(fs.readFileSync(path.join(dir, p), "utf8"))) err(p, `holds ${what}`);
+      else if (!e.isFile()) err(p, "is not a regular file (a bundle holds no links)");
+      else {
+        const buf = fs.readFileSync(path.join(dir, p));
+        if (buf.subarray(0, 4096).includes(0)) continue; // a picture, a video, an archive
+        for (const what of leaks(buf.toString("utf8"))) err(p, `holds ${what}`);
       }
     }
   };
-  if (fs.existsSync(dir)) walk("");
-  return errors;
+  walk("");
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const dir = process.argv[2];
-  if (!dir || !fs.existsSync(dir)) {
+  if (!dir || !fs.statSync(dir, { throwIfNoEntry: false })?.isDirectory()) {
     console.error("usage: bundle.mjs <bundle-dir>");
     process.exit(2);
   }

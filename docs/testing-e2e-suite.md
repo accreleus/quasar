@@ -18,7 +18,8 @@ Check a bundle:
 node scripts/validate/stream/bundle.mjs <bundle-dir>
 ```
 
-Exit 0 valid, 1 not valid (each problem on its own line, as `<file>: <what>`), 2 usage.
+Exit 0 valid, 1 not valid (each problem on its own line, as `<file>: <what>`), 2 usage. It never
+stops on a stack trace: a bundle it could not read to the end is not valid, and says so.
 The last line is `RESULT status=ok|failed target=e2e-bundle errors=N`.
 
 ## The run bundle, format 1
@@ -38,14 +39,14 @@ A directory, zipped when it is handed between machines.
 
 ### Rules the validator enforces
 
-- **Shape.** The four top-level files and every `scenario.json` are JSON objects with the fields in the table; `scenarios` lists directory names (no path); a scenario that was not skipped has a `timeline.jsonl`; every line of a `.jsonl` file is an object.
+- **Shape.** The four top-level files and every `scenario.json` are JSON objects with the fields in the table; `scenarios` lists directory names (no path); a scenario that was not skipped has a `timeline.jsonl`; every line of a `.jsonl` file is an object; a bundle holds regular files only, no links.
 - **Status** is `pass`, `fail`, `error` or `skipped`. `skipped` and `error` carry a `reason`.
 - **A criterion** has `id`, `pass` (`true`, `false`, or `null` for "not judged"), `observed` and `expected`.
 - **Not measured is `null`, never `0`.** A criterion that was not judged has `observed: null`. A fact listed in `not_recorded` has no value as a criterion or as a sample.
 - **Keys are the metric manifest's.** An `agent` or `browser` sample key must be in `docs/session-trace/metrics.json` (bench-mode keys ride in `browser` samples, with the six keys `scripts/dx/bench_app_samples.py` derives: `bench_n`, `bench_decoded`, `i2p_p50_ms`, `i2p_max_ms`, `i2p_n`, `ts_nudged`). Sample sources are the five quasar-bench accepts: `agent`, `browser`, `app`, `netem`, `harness`.
 - **Every timestamp names its clock.** A timeline row says `client` or `host`; a sample's clock is its key's clock in the metric manifest. `clock_offset_ms` is the measured client-to-host offset, or `null`.
 - **A missing build has a reason.**
-- **No address, token or password** in any `.json`, `.jsonl`, `.md`, `.txt`, `.log` or `.html` file. Documentation addresses (RFC 5737) pass. The check knows IPv4 only, and does not look for host names or home paths (a session container's own home is a real path in app logs): `scripts/dev/leak-scan.sh` with the operator's patterns still runs before a bundle goes anywhere public.
+- **No address, token or password** in any file that is not binary, whatever its name. Documentation addresses (RFC 5737) pass. Known limits: the address check knows IPv4 only, reads a four-part version such as `1.2.3.4` as an address, and lets `x.0.0.0` through (a browser's version looks like that); host names and home paths are not looked for (a session container's own home is a real path in app logs). `scripts/dev/leak-scan.sh` with the operator's patterns still runs before a bundle goes anywhere public.
 
 The test (`node --test scripts/validate/stream/bundle.test.mjs`, part of `make verify`) breaks the
 fixture once per rule above.
