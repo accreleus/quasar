@@ -62,9 +62,10 @@ A directory, zipped when it is handed between machines.
 
 - **Shape.** The four top-level files and every `scenario.json` are JSON objects. Required: in the manifest `format`, `suite_run_id`, `plan`, `started_at_ms`, `ended_at_ms`, `runner`, `halves`, `scenarios` (directory names, no path) and `not_recorded` (each entry a `fact` and a `why`); `client.kind`; `builds.components`; `network.shaping`; in a scenario `id`, `params`, `sessions`, `status`, `clock_offset_ms` and `criteria`. A scenario that was not skipped has a `timeline.jsonl`. Every line of `timeline.jsonl` and `metrics.jsonl` is an object; a sample has `ts_unix_ms` and `metrics`. A bundle holds regular files only, no links. The other fields in the table are not checked yet.
 - **Status** is `pass`, `fail`, `error` or `skipped`. `skipped` and `error` carry a `reason`.
-- **A criterion** has `id`, `pass` (`true`, `false`, or `null` for "not judged"), `observed` and `expected`.
+- **A criterion** has `id`, `pass` (`true`, `false`, or `null` for "not judged"), `observed` and `expected`. An `id` is a non-empty **string** and is unique by that string: it is the page's row and the run's count, so a number and the string that prints the same are refused rather than rendered as two rows nobody can tell apart.
 - **The status and the criteria agree.** A scenario whose status is `pass` has no criterion with `pass: false`: the review derives the run's verdict from both, so the two may not disagree.
-- **One name, one run.** `manifest.scenarios` holds each directory name once, and a scenario's criterion `id`s are unique — they are the page's rows and the run's counts.
+- **A pass rests on something.** A scenario whose status is `pass` has at least one criterion with `pass: true`. A pass with zero criteria, or with every criterion `null`, is refused: a short bundle is not a success (spec #1271, story 3).
+- **One name, one run.** `manifest.scenarios` holds each directory name once.
 - **Not measured is `null`, never `0`.** A criterion that was not judged has `observed: null`. A fact listed in `not_recorded` has no value as a criterion or as a sample.
 - **Keys are the metric manifest's.** An `agent` or `browser` sample key must be in `docs/session-trace/metrics.json` (bench-mode keys ride in `browser` samples, with the six keys `scripts/dx/bench_app_samples.py` derives: `bench_n`, `bench_decoded`, `i2p_p50_ms`, `i2p_max_ms`, `i2p_n`, `ts_nudged`). Sample sources are the five quasar-bench accepts: `agent`, `browser`, `app`, `netem`, `harness`.
 - **Every timestamp names its clock.** A timeline row says `client` or `host`; a sample's clock is its key's clock in the metric manifest. `clock_offset_ms` is the measured client-to-host offset, or `null`.
@@ -103,24 +104,47 @@ recorded — but the run's result is derived from it, not copied.
   worst value) and the five with the lowest rank are shown, ties going to the earlier key and
   then the earlier timestamp; when a tie is cut, the last row shown at that value says
   `(+N more at this value)`. The line above the table names the keys the bundle does not carry
-  (an absent key is skipped, never scored `0`). The line below names the clocks: `g2g_p95_ms`
-  and `missing_indices` are on the host clock, the other keys on the client's, offset by the
-  scenario's `clock_offset_ms`.
+  (an absent key is skipped, never scored `0`). When — and only when — a ranked key comes from a
+  bench-mode row, a line below names the ranked keys that are on the host clock (`g2g_p95_ms`,
+  `missing_indices`), says the other keys are on the client's clock, and gives the scenario's
+  `clock_offset_ms`.
 - **Anomalies** use a rule only where the comparison is the one the product makes.
-  `classifier.hitch_sd_ms` excludes the first `classifier.warmup_exclude_s` seconds and needs at
-  least `classifier.hitch_min_samples` samples over it, as the control plane does; the two
-  `web.client_health.present_*` limits are per sample, as the client applies them, and skip a
-  hidden tab. One row per rule that fired, with the seconds over, the worst value and the first
-  one. A threshold phrased as a p10 or a delta over a window maps onto no one sample, and a rule
-  on a cumulative counter is not a per-window comparison: `packets_lost` and `freeze_count` are
-  cumulative in the contract (issue #1270) and are not used. With no browser samples or no
-  threshold file the section says `Not checked: <why>`, never `No threshold crossed`.
-- **Files worth opening** appears for a scenario that did not pass: every picture at any depth
-  (the runner writes `shots/*.png`), every `*.log`, `diagnostic-bundle.json` and
-  `timeline.jsonl`, by relative path and sorted, at most 12 with `+N more`.
+  `classifier.hitch_sd_ms` skips the first `classifier.warmup_exclude_s` seconds after the
+  scenario's first browser sample (the control plane anchors on the session's running time, so
+  the review can miss a hitch the control plane counts; it never adds one) and needs at least
+  `classifier.hitch_min_samples` samples over it; the two `web.client_health.present_*` limits
+  are per sample, as the client applies them, and skip a hidden tab (`is_hidden` is `1` or
+  `true`, as the contract posts it). One row per rule that fired, with the seconds over, the
+  worst value and the first one.
+  A rule is **checked** only when the thresholds file states every key it needs — its limit and
+  its helpers (`classifier.warmup_exclude_s`, `classifier.hitch_min_samples`), each a finite
+  number — and at least one sample carries its sample key. Nothing is defaulted: no value is
+  invented for a key the file does not state. The section prints a table row for a rule that
+  crossed, nothing for a rule that was checked and did not, and one folded line,
+  `Not checked: <rule> (<why>), ...`, for the rules that could not be checked.
+  `No threshold crossed.` appears only when at least one rule was really checked and none
+  crossed; with no browser samples or no threshold file the section says
+  `Not checked: <why>` for the whole section. A bundle whose samples are bench-mode rows only
+  therefore never implies that the stream was clean.
+  A threshold phrased as a p10 or a delta over a window maps onto no one sample, and a rule on a
+  cumulative counter is not a per-window comparison: `packets_lost` and `freeze_count` are
+  cumulative in the contract (issue #1270) and are not used. The families the page does not use
+  at all (`health.*`, `client_health.*`, `web.present_cadence.*`, `web.playout.*`,
+  `web.signal.*`, `web.clock.*` and the classifier values that are a p10 or a p95) are listed
+  with a reason in `scripts/validate/stream/review.mjs`.
+- **Files worth opening** appears for a scenario that did not pass, in reading order: the
+  `timeline.jsonl` first, then the other text evidence sorted by relative path (`*.log`,
+  `diagnostic-bundle.json`, `host-half.json`, `failed-requests.json`, `session.json`,
+  `bench-windows.json`), then every picture at any depth (the runner writes `shots/*.png`)
+  sorted by path — at most 12 with `+N more`, so a long hold's shots never push the files that
+  explain the failure out of the list.
 
 The test (`node --test scripts/validate/stream/review.test.mjs`, part of `make verify`) pins the
 fixture's two files as golden, runs it twice for the same bytes, and checks the properties the
-page promises: a bundle value cannot add a line, member order changes no byte, a window is one
-sample row, the anomaly rules fire at their limits, a write that cannot happen is one line, and
-the worst realistic four-scenario bundle fits in 150 lines.
+page promises: a bundle value cannot add a line, member order changes no byte (including a
+build component that says neither version nor commit, and a param named `__proto__`), a window
+is one sample row (identical rows included), the anomaly rules fire at their limits and are
+named as not checked when the thresholds file cannot state them, a hidden tab is not judged, a
+write that cannot happen is one line and leaves no earlier review behind, the evidence list
+reads timeline then text then pictures, and the worst realistic four-scenario bundle fits in
+150 lines.

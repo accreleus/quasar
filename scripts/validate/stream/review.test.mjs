@@ -7,7 +7,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { validateBundle } from "./bundle.mjs";
-import { review, renderReview } from "./review.mjs";
+import { ANOMALY_RULES, review, renderReview } from "./review.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "../../..");
@@ -107,10 +107,12 @@ test("a failed scenario exits 1, is named first, and its evidence is listed in p
   const md = read(dir, "REVIEW.md");
   const rows = md.split("\n").filter((l) => l.startsWith("| `"));
   assert.match(rows[0], /^\| `input_pass` \| `fail` \| `false` \| `true` \|$/, "the failed criterion comes first");
-  assert.match(
-    md,
-    /Files worth opening: `01-stream-hold\/console\.log`, `01-stream-hold\/diagnostic-bundle\.json`, `01-stream-hold\/shots\/end\.png`, `01-stream-hold\/shots\/first-frame\.png`, `01-stream-hold\/timeline\.jsonl`\n/,
-    "sorted by relative path, at any depth",
+  // Reading order: the timeline first, then the text evidence, then the pictures — each
+  // group by relative path at any depth.
+  const files = md.split("\n").find((l) => l.startsWith("Files worth opening: "));
+  assert.equal(
+    files,
+    "Files worth opening: `01-stream-hold/timeline.jsonl`, `01-stream-hold/console.log`, `01-stream-hold/diagnostic-bundle.json`, `01-stream-hold/session.json`, `01-stream-hold/shots/end.png`, `01-stream-hold/shots/first-frame.png`",
   );
 });
 
@@ -271,6 +273,30 @@ test("a window is one sample row: dense ranks, no fold, and a plateau says how m
   assert.equal(read(b, "REVIEW.md"), first.md);
   assert.equal(read(b, "summary.json"), first.json);
   assert.match(first.md, /^\| `1000` \| `present_interval_max_ms` \| `900` \|$/m, "the 900 ms stall survives");
+
+  // Identical rows are identical windows: six of them are six candidates, and the tie is
+  // counted, not folded away. Reversing their order changes no byte either.
+  const identical = [
+    ...Array.from({ length: 6 }, () => browser(1000, { fps: 1 })),
+    ...Array.from({ length: 7 }, (_, i) => browser(100000 + i * 1000, { fps: 60 })),
+  ];
+  const c = bundle();
+  metrics(c, identical);
+  assert.equal(run(c).status, 0);
+  const same = { md: read(c, "REVIEW.md"), json: read(c, "summary.json") };
+  const rowsFor = (md) => md.split("\n").filter((l) => /^\| `\d+` \| `fps` \|/.test(l));
+  assert.deepEqual(rowsFor(same.md), [
+    "| `1000` | `fps` | `1` |",
+    "| `1000` | `fps` | `1` |",
+    "| `1000` | `fps` | `1` |",
+    "| `1000` | `fps` | `1` |",
+    "| `1000` | `fps` | `1` (+1 more at this value) |",
+  ]);
+  const d = bundle();
+  metrics(d, [...identical].reverse());
+  assert.equal(run(d).status, 0);
+  assert.equal(read(d, "REVIEW.md"), same.md, "reversed identical rows are the same page");
+  assert.equal(read(d, "summary.json"), same.json);
 });
 
 test("the plateau's cut rows are counted on the last row shown", () => {
@@ -313,9 +339,25 @@ test("an anomaly fires at its limit, over distinct timestamps, after warm-up", (
     ["classifier.hitch_sd_ms", "present_interval_sd_ms", 2, 19, 21000],
   );
 
-  // One sample short of the minimum: the control plane would not call it a window.
-  metrics(dir, [browser(21000, { present_interval_sd_ms: 30 })]);
+  // Exactly one sample over, after the warm-up, and the minimum is two: the control plane
+  // would not call it a window. (The sample at 1000 is inside the warm-up; the one at
+  // 21000 is the first second the control plane's window covers.)
+  metrics(dir, [browser(1000, { present_interval_sd_ms: 40 }), browser(21000, { present_interval_sd_ms: 30 })]);
   assert.equal(review(dir, { thresholdsFile: thresholds }).scenarios[0].anomalies.rows.length, 0);
+  // The same samples with the minimum lowered to one: one sample is enough.
+  const one = path.join(TMP, "thresholds-min-1.json");
+  fs.writeFileSync(
+    one,
+    JSON.stringify({
+      version: "test",
+      thresholds: {
+        "classifier.hitch_sd_ms": { value: 18, unit: "ms" },
+        "classifier.warmup_exclude_s": { value: 20, unit: "s" },
+        "classifier.hitch_min_samples": { value: 1, unit: "count" },
+      },
+    }),
+  );
+  assert.equal(review(dir, { thresholdsFile: one }).scenarios[0].anomalies.rows.length, 1);
 
   // Under the limit by a decimal: nothing crosses it.
   metrics(dir, [browser(21000, { present_interval_sd_ms: 17.9 }), browser(22000, { present_interval_sd_ms: 17.9 })]);
@@ -331,6 +373,144 @@ test("an anomaly fires at its limit, over distinct timestamps, after warm-up", (
     renderReview(review(dir, { thresholdsFile: path.join(TMP, "missing.json") })),
     /^Not checked: no thresholds file was read\.$/m,
   );
+});
+
+test("a hidden tab is not a sample the client judges, whether the flag is 1 or true", () => {
+  // The contract posts `is_hidden` as 0 or 1 (`docs/session-trace/metrics.json`, and both
+  // web clients); an older fixture wrote a boolean. Only those two true shapes are hidden.
+  const thresholds = path.join(TMP, "thresholds-present.json");
+  fs.writeFileSync(
+    thresholds,
+    JSON.stringify({
+      version: "test",
+      thresholds: {
+        "web.client_health.present_sd_degraded_ms": { value: 28, unit: "ms" },
+        "web.client_health.present_p95_degraded_ms": { value: 45, unit: "ms" },
+      },
+    }),
+  );
+  const dir = bundle();
+  const bad = (ts, hidden) => browser(1000 + ts, { is_hidden: hidden, present_interval_sd_ms: 40, present_interval_p95_ms: 60 });
+  // Fifteen bad samples the client classed `backgrounded_or_hidden`: no rule fires.
+  metrics(dir, Array.from({ length: 15 }, (_, i) => bad(i * 1000, 1)));
+  const hiddenNumber = review(dir, { thresholdsFile: thresholds }).scenarios[0].anomalies;
+  assert.deepEqual(hiddenNumber.rows, [], "is_hidden: 1 is a hidden sample");
+  // The fixture shape (a boolean) is hidden too.
+  metrics(dir, Array.from({ length: 15 }, (_, i) => bad(i * 1000, true)));
+  assert.deepEqual(review(dir, { thresholdsFile: thresholds }).scenarios[0].anomalies.rows, []);
+  // 0, false and an absent flag are judged, so both rules fire on all fifteen.
+  for (const hidden of [0, false, undefined]) {
+    metrics(dir, Array.from({ length: 15 }, (_, i) => bad(i * 1000, hidden)));
+    const rows = review(dir, { thresholdsFile: thresholds }).scenarios[0].anomalies.rows;
+    assert.deepEqual(
+      rows.map((r) => [r.threshold, r.samples_over]),
+      [
+        ["web.client_health.present_sd_degraded_ms", 15],
+        ["web.client_health.present_p95_degraded_ms", 15],
+      ],
+      `is_hidden: ${hidden} is a sample the client judged`,
+    );
+  }
+});
+
+test("a rule the thresholds file cannot state is not checked, and no value is guessed for it", () => {
+  const dir = bundle();
+  // Two clean samples that carry every key the rules read: a stream that crossed nothing.
+  metrics(dir, [
+    browser(1000, { present_interval_sd_ms: 5, present_interval_p95_ms: 5 }),
+    browser(2000, { present_interval_sd_ms: 5, present_interval_p95_ms: 5 }),
+  ]);
+  const write = (name, thresholds) => {
+    const file = path.join(TMP, name);
+    fs.writeFileSync(file, JSON.stringify({ version: "test", thresholds }));
+    return file;
+  };
+  const full = {
+    "classifier.hitch_sd_ms": { value: 18, unit: "ms" },
+    "classifier.warmup_exclude_s": { value: 20, unit: "s" },
+    "classifier.hitch_min_samples": { value: 2, unit: "count" },
+    "web.client_health.present_sd_degraded_ms": { value: 28, unit: "ms" },
+    "web.client_health.present_p95_degraded_ms": { value: 45, unit: "ms" },
+  };
+  const without = (key) => Object.fromEntries(Object.entries(full).filter(([k]) => k !== key));
+
+  // Every rule is stated and every sample carries its key: all three really are checked,
+  // so this is the one shape that may say the stream crossed no threshold.
+  const stated = review(dir, { thresholdsFile: write("th-all.json", full) }).scenarios[0].anomalies;
+  assert.deepEqual(stated.rows, []);
+  assert.deepEqual(stated.not_checked, []);
+  assert.match(renderReview(review(dir, { thresholdsFile: path.join(TMP, "th-all.json") })), /^No threshold crossed\.$/m);
+
+  // Each key the hitch rule needs: absent, or not a finite number, means the rule is not
+  // checked and no default warm-up or minimum stands in for it.
+  for (const key of ["classifier.hitch_sd_ms", "classifier.warmup_exclude_s", "classifier.hitch_min_samples"]) {
+    for (const value of [undefined, "many", null]) {
+      const thresholds = { ...without(key) };
+      if (value !== undefined) thresholds[key] = { value, unit: "count" };
+      const file = write(`th-${key.replace(/\./g, "-")}-${String(value)}.json`, thresholds);
+      const state = review(dir, { thresholdsFile: file }).scenarios[0].anomalies;
+      assert.deepEqual(state.rows, [], `${key}=${value} must not fire a rule`);
+      assert.deepEqual(
+        state.not_checked.map((n) => [n.rule, n.why]),
+        [["classifier.hitch_sd_ms", `the thresholds file has no ${key}`]],
+        `${key}=${value}`,
+      );
+      const md = renderReview(review(dir, { thresholdsFile: file }));
+      assert.doesNotMatch(md, /No threshold crossed/, `${key}=${value} still claimed every rule was checked`);
+      assert.match(md, /^Not checked: `classifier\.hitch_sd_ms` \(the thresholds file has no [\w.]+\)\.$/m);
+    }
+  }
+
+  // No rule stated at all: every rule is named as not checked, on one line, and the page
+  // never claims the stream crossed no threshold.
+  const none = write("th-empty.json", {});
+  const empty = review(dir, { thresholdsFile: none }).scenarios[0].anomalies;
+  assert.equal(empty.state, "checked");
+  assert.deepEqual(empty.rows, []);
+  const md = renderReview(review(dir, { thresholdsFile: none }));
+  assert.doesNotMatch(md, /No threshold crossed/);
+  const lines = md.split("\n").filter((l) => l.startsWith("Not checked: "));
+  assert.equal(lines.length, 1, "the not-checked rules are folded onto one line");
+  for (const rule of ANOMALY_RULES) assert.match(lines[0], new RegExp(`\`${rule.threshold.replace(/\./g, "\\.")}\``));
+
+  // A rule whose sample key no sample carries compared nothing.
+  metrics(dir, [browser(1000, { fps: 60 }), browser(2000, { fps: 60 })]);
+  const noKey = review(dir, { thresholdsFile: path.join(TMP, "th-all.json") }).scenarios[0].anomalies;
+  assert.deepEqual(noKey.rows, []);
+  assert.deepEqual(
+    noKey.not_checked.map((n) => n.why),
+    [
+      "no sample carries present_interval_sd_ms",
+      "no sample carries present_interval_sd_ms",
+      "no sample carries present_interval_p95_ms",
+    ],
+  );
+  assert.doesNotMatch(renderReview(review(dir, { thresholdsFile: path.join(TMP, "th-all.json") })), /No threshold crossed/);
+});
+
+test("a bundle of bench-mode rows only says what was not checked, and never 'no threshold crossed'", () => {
+  // The runner on #1292 writes metrics.jsonl from bench windows alone: those rows carry
+  // `bench_n`, `g2g_*`, `missing_indices` and friends, and never a present interval.
+  const dir = bundle();
+  fs.cpSync(path.join(DX, "tests/fixtures/appfold"), path.join(dir, SC), { recursive: true });
+  const fold = spawnSync(
+    "python3",
+    [path.join(DX, "bench_app_samples.py"), "--dir", path.join(dir, SC), "--t0-ms", "1800000000000"],
+    { encoding: "utf8" },
+  );
+  assert.equal(fold.status, 0, fold.stderr);
+  assert.match(fs.readFileSync(path.join(dir, SC, "metrics.jsonl"), "utf8"), /bench_n/);
+  assert.deepEqual(validateBundle(dir), []);
+
+  const out = run(dir);
+  assert.equal(out.status, 0, out.stderr);
+  const md = read(dir, "REVIEW.md");
+  assert.doesNotMatch(md, /No threshold crossed/);
+  const lines = md.split("\n").filter((l) => l.startsWith("Not checked: "));
+  assert.equal(lines.length, 1, "the not-checked rules are folded onto one line");
+  assert.match(lines[0], /`classifier\.hitch_sd_ms` \(no sample carries present_interval_sd_ms\)/);
+  assert.match(lines[0], /`web\.client_health\.present_sd_degraded_ms` \(no sample carries present_interval_sd_ms\)/);
+  assert.match(lines[0], /`web\.client_health\.present_p95_degraded_ms` \(no sample carries present_interval_p95_ms\)/);
 });
 
 test("samples no human could judge are not ranked, and the two files agree", () => {
@@ -379,6 +559,145 @@ test("a write that cannot happen is one line and no half a review", () => {
       fs.chmodSync(ro, 0o755);
     }
   }
+});
+
+test("a build component that says neither version nor commit prints from its sorted form", () => {
+  // A13: the fallback used to stringify the file's member order, so the same build
+  // recorded as {"z":1,"a":2} and {"a":2,"z":1} gave two different pages.
+  const order = (components) => {
+    const dir = bundle();
+    edit(dir, "builds.json", (b) => ({ ...b, components }));
+    assert.equal(run(dir).status, 0);
+    return { md: read(dir, "REVIEW.md"), json: read(dir, "summary.json") };
+  };
+  const base = JSON.parse(fs.readFileSync(path.join(HERE, "fixtures/bundle/builds.json"), "utf8")).components;
+  const forward = order({ ...base, other: { z: 1, a: 2, nested: { y: 1, b: 2 } } });
+  const reverse = order({ ...base, other: { nested: { b: 2, y: 1 }, a: 2, z: 1 } });
+  const build = JSON.parse(forward.json).builds.find((b) => b.component === "other").build;
+  assert.equal(build, '{"a":2,"nested":{"b":2,"y":1},"z":1}');
+  assert.equal(reverse.md, forward.md, "member order changed the page");
+  assert.equal(reverse.json, forward.json, "member order changed the summary");
+  assert.match(forward.md, /`other` `\{\\"a\\":2,\\"nested\\":\{\\"b\\":2,\\"y\\":1\},\\"z\\":1\}`/);
+});
+
+test("a param named __proto__ reaches both files", () => {
+  // A19: a plain `{}` accumulator loses the member. The bundle may carry the key.
+  const dir = bundle();
+  const file = path.join(dir, SC, "scenario.json");
+  const scenario = fs.readFileSync(file, "utf8");
+  assert.match(scenario, /"params":\s*\{/, "the fixture's params are not empty");
+  fs.writeFileSync(file, scenario.replace(/"params":\s*\{/, '"params": {"__proto__":"x",'));
+  const params = JSON.parse(fs.readFileSync(file, "utf8")).params;
+  assert.equal(params["__proto__"], "x", "the fixture really holds __proto__");
+  assert.equal(Object.keys(params).length, 5);
+  assert.equal(run(dir).status, 0);
+  const md = read(dir, "REVIEW.md");
+  assert.match(md, /`__proto__=x`/, "the param appears on the page");
+  assert.equal(JSON.parse(read(dir, "summary.json")).scenarios[0].params["__proto__"], "x");
+  assert.equal({}.polluted, undefined, "nothing was polluted");
+});
+
+test("a stale review is gone before the next one is rendered", () => {
+  // A18: a failed run must not leave the previous run's page at the canonical path.
+  const dir = bundle();
+  const ok = run(dir);
+  assert.equal(ok.status, 0, ok.stderr);
+  const stale = read(dir, "REVIEW.md");
+  assert.match(stale, /^- Result: ok$/m);
+  // Now the bundle says the scenario failed, and the write cannot happen: a directory at
+  // summary.json. REVIEW.md is removed first, so no page survives at all.
+  edit(dir, `${SC}/scenario.json`, (s) => ({ ...s, status: "fail", reason: "it broke", criteria: [...s.criteria, { id: "x", pass: false, observed: 0, expected: 1 }] }));
+  fs.rmSync(path.join(dir, "review", "summary.json"));
+  fs.mkdirSync(path.join(dir, "review", "summary.json"));
+  const blocked = run(dir);
+  assert.equal(blocked.status, 2);
+  assert.match(blocked.stdout, /^review\/summary\.json may be stale and could not be removed$/m);
+  assert.match(blocked.stdout, /RESULT status=error target=e2e-review reason=cannot-write\n$/);
+  assert.equal(fs.existsSync(path.join(dir, "review", "REVIEW.md")), false, "no page survives a run that failed to write");
+
+  // And when the old page cannot be removed, the run names the file it may be reading.
+  if (process.getuid?.() !== 0) {
+    const ro = bundle();
+    assert.equal(run(ro).status, 0);
+    assert.equal(fs.existsSync(path.join(ro, "review", "REVIEW.md")), true);
+    edit(ro, `${SC}/scenario.json`, (s) => ({ ...s, status: "fail", reason: "it broke", criteria: [...s.criteria, { id: "x", pass: false, observed: 0, expected: 1 }] }));
+    fs.chmodSync(path.join(ro, "review"), 0o555);
+    try {
+      const denied = run(ro);
+      assert.equal(denied.status, 2);
+      assert.match(denied.stdout, /^review\/REVIEW\.md may be stale and could not be removed$/m);
+      assert.match(denied.stdout, /RESULT status=error target=e2e-review reason=cannot-write\n$/);
+      assert.equal(denied.stderr, "");
+    } finally {
+      fs.chmodSync(path.join(ro, "review"), 0o755);
+    }
+  }
+});
+
+test("the evidence list reads timeline, then text, then pictures, and is not filled by shots", () => {
+  const dir = bundle();
+  edit(dir, `${SC}/scenario.json`, (s) => ({
+    ...s,
+    status: "fail",
+    reason: "no frame",
+    criteria: [...s.criteria, { id: "x", pass: false, observed: 0, expected: 1 }],
+  }));
+  // A hold long enough for 18 shots, all created before any log — and with names whose
+  // code-unit order is the reverse of a locale's ("Z" sorts after "z" only by locale).
+  fs.mkdirSync(path.join(dir, SC, "shots"));
+  for (let i = 0; i < 18; i += 1) fs.writeFileSync(path.join(dir, SC, "shots", `t${i}s.png`), "");
+  fs.writeFileSync(path.join(dir, SC, "z.log"), "");
+  fs.writeFileSync(path.join(dir, SC, "Z.log"), "");
+  fs.writeFileSync(path.join(dir, SC, "console.log"), "");
+  fs.writeFileSync(path.join(dir, SC, "bench-windows.json"), "{}");
+  assert.equal(run(dir).status, 1);
+  const files = read(dir, "REVIEW.md").split("\n").find((l) => l.startsWith("Files worth opening: "));
+  const listed = [...files.matchAll(/`([^`]+)`/g)].map((m) => m[1]);
+  assert.deepEqual(
+    listed,
+    [
+      `${SC}/timeline.jsonl`,
+      `${SC}/Z.log`,
+      `${SC}/bench-windows.json`,
+      `${SC}/console.log`,
+      `${SC}/session.json`,
+      `${SC}/z.log`,
+      `${SC}/shots/t0s.png`,
+      `${SC}/shots/t10s.png`,
+      `${SC}/shots/t11s.png`,
+      `${SC}/shots/t12s.png`,
+      `${SC}/shots/t13s.png`,
+      `${SC}/shots/t14s.png`,
+    ],
+    "timeline first, then text by code unit, then pictures by code unit",
+  );
+  assert.match(files, /\(\+12 more\)$/);
+});
+
+test("200 000 sample rows are reviewed without spreading an array into Math.min or Math.max", () => {
+  // N10: `Math.min(...rows)` throws RangeError long before this size.
+  const thresholds = path.join(TMP, "thresholds-200k.json");
+  fs.writeFileSync(
+    thresholds,
+    JSON.stringify({
+      version: "test",
+      thresholds: { "web.client_health.present_sd_degraded_ms": { value: 28, unit: "ms" } },
+    }),
+  );
+  const dir = bundle();
+  const lines = [];
+  for (let i = 0; i < 200000; i += 1) {
+    const value = i % 100 === 0 ? 30 : 5;
+    lines.push(JSON.stringify({ kind: "metric", source: "browser", ts_unix_ms: 1000 + i, metrics: { present_interval_sd_ms: value } }));
+  }
+  fs.writeFileSync(path.join(dir, SC, "metrics.jsonl"), `${lines.join("\n")}\n`);
+  const summary = review(dir, { thresholdsFile: thresholds }); // throws before the fix
+  assert.deepEqual(
+    summary.scenarios[0].anomalies.rows.map((r) => [r.threshold, r.samples_over, r.worst]),
+    [["web.client_health.present_sd_degraded_ms", 2000, 30]],
+  );
+  const out = run(dir);
+  assert.equal(out.status, 0, out.stderr);
 });
 
 // The windows table's rows, for the tests that only care about it.

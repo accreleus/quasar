@@ -162,10 +162,14 @@ function check(dir, errors, { keys = manifestKeys() } = {}) {
     if (["skipped", "error"].includes(sc.status) && !sc.reason) err(at, `status ${sc.status} needs a reason`);
     if (!("clock_offset_ms" in sc)) err(at, "no clock_offset_ms (null when the offset was not measured)");
     if (!Array.isArray(sc.criteria)) err(at, "no criteria");
-    // Criterion ids name the rows of the review's table: a repeat makes two rows one fact.
+    // Criterion ids name the rows of the review's table: a repeat makes two rows one fact,
+    // so an id is a non-empty string and uniqueness is by that string. A numeric id and a
+    // string one that print the same would otherwise be two rows nobody can tell apart.
     const ids = new Set();
     for (const c of Array.isArray(sc.criteria) ? sc.criteria : []) {
-      if (c?.id !== undefined) {
+      if (c?.id === undefined) continue;
+      if (typeof c.id !== "string") err(at, `criterion id ${JSON.stringify(c.id)} must be a non-empty string`);
+      else if (c.id !== "") {
         if (ids.has(c.id)) err(at, `criterion id ${c.id} is not unique`);
         ids.add(c.id);
       }
@@ -174,6 +178,11 @@ function check(dir, errors, { keys = manifestKeys() } = {}) {
     // with a failed criterion is the two disagreeing, so it is not a bundle.
     if (sc.status === "pass" && (Array.isArray(sc.criteria) ? sc.criteria : []).some((c) => c?.pass === false)) {
       err(at, "a pass status with a criterion that failed");
+    }
+    // A pass rests on something: a scenario that passed judged at least one criterion, and
+    // judged it a pass. A short bundle is never a success (spec #1271, story 3).
+    if (sc.status === "pass" && Array.isArray(sc.criteria) && !sc.criteria.some((c) => c?.pass === true)) {
+      err(at, "a pass status with no criterion that passed");
     }
     for (const c of Array.isArray(sc.criteria) ? sc.criteria : []) {
       if (!c?.id || !("observed" in c) || !("expected" in c) || ![true, false, null].includes(c.pass)) {

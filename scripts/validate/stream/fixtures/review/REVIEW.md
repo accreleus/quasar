@@ -29,8 +29,8 @@ Ranked on `fps` (lowest); absent: `present_interval_max_ms`, `g2g_p95_ms`, `miss
 | `1786940062000` | `fps` | `4` |
 | `1786940063000` | `fps` | `4` |
 | `1786940064000` | `fps` | `4` (+55 more at this value) |
-Clocks: `g2g_p95_ms` and `missing_indices` are on the host clock; the other keys are on the client's, offset by `3` ms.
 ### Anomalies
 | threshold | sample key | limit | samples over | worst | first ts_unix_ms |
 | --- | --- | --- | --- | --- | --- |
 | `classifier.hitch_sd_ms` | `present_interval_sd_ms` | `>= 18 ms` | `90` | `22` | `1786940030000` |
+Not checked: `web.client_health.present_p95_degraded_ms` (no sample carries present_interval_p95_ms).

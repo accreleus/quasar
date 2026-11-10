@@ -13,10 +13,13 @@
 // (`code` below), headings and counts are literals and derived numbers, and the verdict
 // is derived here from the statuses and criteria rather than copied from the run's word.
 //
-// The bundle is validated first. An invalid one is printed as its problem lines and
-// nothing is written. Exit 0 only when at least one scenario passed and none failed or
-// errored; 1 when one did, and also when nothing passed (no scenario, or every one
-// skipped); 2 when the bundle is not valid or the review cannot be written.
+// A review a previous run left at the canonical path is removed before anything else, so
+// a run that fails leaves no page rather than the last run's verdict. The bundle is then
+// validated; an invalid one is printed as its problem lines and nothing is written.
+// Exit 0 only when at least one scenario passed and none failed or errored; 1
+// when one did, and also when nothing passed (no scenario, or every one skipped); 2 when
+// the bundle is not valid, a stale review cannot be removed, or the review cannot be
+// written.
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -46,11 +49,28 @@ export const WINDOW_KEYS = [
 // a finite number, and only where the comparison is the same one the product makes on
 // the same numbers.
 //
-// Deliberately absent, and why: `min_host_fps` is a p10 over a window,
-// `congestion_loss_delta` and `congestion_rtt_p95_ms` are a delta and a p95 over one,
-// `encoder_ceiling_ms` is a p95 of encode_ms, `encoder_stall_ms` is a silence over time;
-// the `playout.*` values are controller steps, `signal.sd_*` and the `decode_*` limits
-// are glyph bands and fractions, none of them a pass rule on one sample.
+// Deliberately absent, by family, and why — each is a judgement over time, a controller
+// input or a band, not a limit on one sample:
+//
+// - `classifier.min_host_fps` is a p10 of host encoder fps over a window;
+//   `classifier.encoder_ceiling_ms` is a p95 of encode_ms, and
+//   `classifier.congestion_loss_delta` / `classifier.congestion_rtt_p95_ms` are a delta
+//   and a p95 across one.
+// - `agent.encoder_stall_ms` is a silence measured over time, not a sample value.
+// - `health.*` (`network_degrading_after_s`, `abr_at_floor_after_s`,
+//   `unsustainable_after_s`) and `client_health.*` (`degrade_sustain_s`,
+//   `smooth_sustain_s`) are dwell times: how long a state must persist before it counts.
+// - `web.client_health.*` other than the two present limits below:
+//   `freeze_degraded_count` is the cumulative counter discussed next, and
+//   `decode_budget_fraction` / `decode_abs_ceiling_ms` are a fraction and its fallback
+//   ceiling, not a pass rule on one sample.
+// - `web.present_cadence.*` describes how a cadence window is recognised (a minimum
+//   sample count, bands and factors), not a value to cross.
+// - `web.playout.*` values are controller steps and their knees: an input to the
+//   controller, not a verdict on a sample.
+// - `web.signal.*` are connection-glyph bands (and the two cumulative counters below).
+// - `web.clock.*` are the client's re-post cadence for its clock offset, not stream
+//   health.
 //
 // The three counter rules are absent for a contract reason. `packets_lost` and
 // `freeze_count` are CUMULATIVE in `docs/session-trace/metrics.json` (`window:
@@ -61,8 +81,11 @@ export const WINDOW_KEYS = [
 // `web.client_health.freeze_degraded_count` therefore map onto no comparable sample and
 // are not used. What is used:
 //
-// - `classifier.hitch_sd_ms`, only as the control plane applies it: warm-up samples are
-//   excluded and a window needs at least `classifier.hitch_min_samples` samples over it.
+// - `classifier.hitch_sd_ms`, as far as one sample per second can stand for it: it skips
+//   the first `classifier.warmup_exclude_s` seconds after the scenario's first browser
+//   sample (the control plane anchors on the session's running time, so the review can
+//   miss a hitch the control plane counts; it never adds one), and a hitch needs at
+//   least `classifier.hitch_min_samples` samples over it.
 // - the two `web.client_health.present_*` limits, per sample, exactly as the client
 //   classifies a sample, except that a hidden tab is not a sample the client judges.
 export const ANOMALY_RULES = [
@@ -77,9 +100,26 @@ export const ANOMALY_RULES = [
 ];
 
 const PICTURES = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif"]);
+// The two ranked keys that come from a bench-mode row, which is stamped on the host clock.
+const HOST_CLOCK_KEYS = ["g2g_p95_ms", "missing_indices"];
+// Text evidence, by file name: what a runner or the harness wrote beside the pictures.
+// `timeline.jsonl` is listed first because it is the run's order of events.
+const TIMELINE = "timeline.jsonl";
+const TEXT_EVIDENCE = new Set([
+  "diagnostic-bundle.json",
+  "host-half.json",
+  "failed-requests.json",
+  "session.json",
+  "bench-windows.json",
+]);
 const WORST_SHOWN = 5;
 const FILES_SHOWN = 12;
 const MAX_TEXT = 200;
+
+// A sample is hidden when `is_hidden` is 1 or true: the contract says 0 or 1
+// (`docs/session-trace/metrics.json`) and both web clients post the number, while an
+// older fixture wrote a boolean. Nothing else is hidden.
+const sampleHidden = (metrics) => metrics.is_hidden === 1 || metrics.is_hidden === true;
 
 const readJson = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
 const readJsonl = (file) =>
@@ -118,11 +158,15 @@ export function bundleText(value) {
 /** Bundle text as an inline code span: the only shape it may take on the page. */
 const code = (value) => `\`${bundleText(value)}\``;
 
-/** Every object key sorted at every depth, so neither file depends on member order. */
+/**
+ * Every object key sorted at every depth, so neither file depends on member order. The
+ * accumulator has no prototype: assigning a key named `__proto__` to a plain object would
+ * set its prototype and lose the member, and a bundle may carry that key.
+ */
 function sortDeep(value) {
   if (Array.isArray(value)) return value.map(sortDeep);
   if (value === null || typeof value !== "object") return value;
-  const out = {};
+  const out = Object.create(null);
   for (const key of Object.keys(value).sort()) out[key] = sortDeep(value[key]);
   return out;
 }
@@ -139,7 +183,11 @@ function loadThresholds(file) {
 }
 
 const thresholdValue = (thresholds, key) => {
-  const value = Number(thresholds?.thresholds?.[key]?.value);
+  // Absent, null (JSON has no NaN) and anything that is not a finite number is a key the
+  // file does not state; a rule that needs it is not checked, never given a default.
+  const raw = thresholds?.thresholds?.[key]?.value;
+  if (raw === null || raw === undefined) return null;
+  const value = Number(raw);
   return Number.isFinite(value) ? value : null;
 };
 
@@ -175,7 +223,6 @@ function worstWindows(rows) {
   const ranked = WINDOW_KEYS.filter(({ key }) => windows.some((w) => Number.isFinite(w.metrics[key])));
 
   const candidates = [];
-  const seen = new Set();
   ranked.forEach(({ key, worst }, keyIndex) => {
     const values = windows.map((w) => w.metrics[key]).filter(Number.isFinite);
     const middle = median(values);
@@ -186,9 +233,8 @@ function worstWindows(rows) {
     const byBadness = [...new Set(worse.map((w) => w.metrics[key]))].sort((a, b) => (worst === "lowest" ? a - b : b - a));
     for (const w of worse) {
       const value = w.metrics[key];
-      const seenKey = `${key}\u0000${value}\u0000${w.ts_unix_ms}`;
-      if (seen.has(seenKey)) continue; // two identical rows are one row on the page
-      seen.add(seenKey);
+      // Every sample row is a window, so two rows with the same timestamp, key and value
+      // are two windows: they are two candidates, and the tie count says so.
       candidates.push({ ts_unix_ms: w.ts_unix_ms, worst_for: key, value, rank: byBadness.indexOf(value), keyIndex });
     }
   });
@@ -221,25 +267,48 @@ function worstWindows(rows) {
 
 /**
  * Each rule that fires, once, over distinct timestamps: two samples stamped with the
- * same second are one window, not two. `state` says whether the rules could be applied
- * at all, so "no threshold crossed" never stands in for "nothing was checked".
+ * same second are one window, not two.
+ *
+ * A rule that cannot be reproduced from the thresholds file is not checked, and no value
+ * is guessed in its place: the limit, the warm-up and the minimum sample count must all
+ * be finite numbers in that file. A rule over a key no sample carries compared nothing,
+ * so it is not checked either. `not_checked` names each rule and why, so "no threshold
+ * crossed" never stands in for "nothing was checked".
  */
 function anomalies(rows, thresholds) {
   const samples = rows.filter(
     (row) => row.source === "browser" && row.metrics && typeof row.ts_unix_ms === "number",
   );
-  if (!thresholds) return { state: "unchecked", why: "no thresholds file was read" };
-  if (!samples.length) return { state: "unchecked", why: "the bundle records no browser samples" };
+  if (!thresholds) return { state: "unchecked", why: "no thresholds file was read", rows: [], not_checked: [] };
+  if (!samples.length) return { state: "unchecked", why: "the bundle records no browser samples", rows: [], not_checked: [] };
 
   const out = [];
+  const notChecked = [];
   for (const rule of ANOMALY_RULES) {
+    // Every key the rule needs, not only its limit.
+    const missing = [rule.threshold, rule.warmup, rule.minSamples].filter(
+      (key) => key && thresholdValue(thresholds, key) === null,
+    );
+    if (missing.length) {
+      notChecked.push({ rule: rule.threshold, why: `the thresholds file has no ${missing[0]}` });
+      continue;
+    }
+    if (!samples.some((s) => Number.isFinite(s.metrics[rule.key]))) {
+      notChecked.push({ rule: rule.threshold, why: `no sample carries ${rule.key}` });
+      continue;
+    }
     const limit = thresholdValue(thresholds, rule.threshold);
-    if (limit === null) continue; // a threshold that moved is not invented here
     let pool = samples;
-    if (rule.skipHidden) pool = pool.filter((s) => s.metrics.is_hidden !== true);
+    // The client judges no sample from a hidden tab: it classifies it
+    // `backgrounded_or_hidden` before any present_* comparison.
+    if (rule.skipHidden) pool = pool.filter((s) => !sampleHidden(s.metrics));
     if (rule.warmup) {
-      const warmup = thresholdValue(thresholds, rule.warmup) ?? 0;
-      const first = Math.min(...samples.map((s) => s.ts_unix_ms));
+      // The anchor is the scenario's first browser sample, on the client's clock. The
+      // control plane anchors on the session's running time, so the review can miss a
+      // hitch the control plane counts; it never adds one.
+      const warmup = thresholdValue(thresholds, rule.warmup);
+      let first = Infinity;
+      for (const s of samples) if (s.ts_unix_ms < first) first = s.ts_unix_ms;
       pool = pool.filter((s) => s.ts_unix_ms >= first + warmup * 1000);
     }
     const byTs = new Map();
@@ -250,19 +319,22 @@ function anomalies(rows, thresholds) {
       if (previous === undefined || value > previous) byTs.set(s.ts_unix_ms, value);
     }
     const over = [...byTs.entries()].sort((a, b) => a[0] - b[0]);
-    const min = rule.minSamples ? Math.max(1, thresholdValue(thresholds, rule.minSamples) ?? 1) : 1;
+    const min = rule.minSamples ? Math.max(1, thresholdValue(thresholds, rule.minSamples)) : 1;
     if (over.length < min) continue; // the control plane would not call this a window
+    // A loop, not Math.max(...values): a bundle may hold hundreds of thousands of rows.
+    let worst = -Infinity;
+    for (const [, value] of over) if (value > worst) worst = value;
     out.push({
       threshold: rule.threshold,
       sample_key: rule.key,
       limit,
       unit: typeof thresholds.thresholds[rule.threshold].unit === "string" ? thresholds.thresholds[rule.threshold].unit : null,
       samples_over: over.length,
-      worst: Math.max(...over.map(([, value]) => value)),
+      worst,
       first_ts_unix_ms: over[0][0],
     });
   }
-  return { state: "checked", rows: out };
+  return { state: "checked", rows: out, not_checked: notChecked };
 }
 
 /** What builds.json could say, and what it says it could not. Sorted, not file order. */
@@ -275,19 +347,23 @@ function buildsSummary(builds) {
       const parts = [];
       if (value.version !== undefined) parts.push(String(value.version));
       if (value.commit !== undefined) parts.push(`(${value.commit})`);
-      if (!parts.length) parts.push(JSON.stringify(value));
+      // Sorted before it is stringified: a part that says neither must not print its
+      // members in the order the file happened to hold them.
+      if (!parts.length) parts.push(JSON.stringify(sortDeep(value)));
       return { component, build: parts.join(" ") };
     });
 }
 
-// The evidence a person opens for a scenario that did not pass. Every picture at any
-// depth (the runner writes `<scenario>/shots/*.png`), every log, the diagnostic bundle
-// and the timeline; relative paths, sorted, because directory listing order is not.
+// The evidence a person opens for a scenario that did not pass, in reading order: the
+// timeline first, then the other text evidence (logs, and the JSON a runner or the
+// harness wrote), then the pictures. Each group is sorted by relative path because
+// directory listing order is not; pictures come last so a long hold's shots cannot fill
+// the list before the files that explain what happened.
 const wanted = (name) =>
   PICTURES.has(path.extname(name).toLowerCase()) ||
   name.endsWith(".log") ||
-  name === "diagnostic-bundle.json" ||
-  name === "timeline.jsonl";
+  name === TIMELINE ||
+  TEXT_EVIDENCE.has(name);
 
 function filesToOpen(dir, name, passed) {
   if (passed) return { list: [], more: 0 };
@@ -301,8 +377,14 @@ function filesToOpen(dir, name, passed) {
     }
   };
   walk("");
-  found.sort();
-  return { list: found.slice(0, FILES_SHOWN), more: Math.max(0, found.length - FILES_SHOWN) };
+  const isPicture = (p) => PICTURES.has(path.extname(p).toLowerCase());
+  const isTimeline = (p) => path.basename(p) === TIMELINE;
+  const ordered = [
+    ...found.filter(isTimeline).sort(),
+    ...found.filter((p) => !isTimeline(p) && !isPicture(p)).sort(),
+    ...found.filter(isPicture).sort(),
+  ];
+  return { list: ordered.slice(0, FILES_SHOWN), more: Math.max(0, ordered.length - FILES_SHOWN) };
 }
 
 function scenarioReview(dir, name, thresholds) {
@@ -385,14 +467,17 @@ function buildText(build) {
     : `${code(build.component)} ${code(build.build)}`;
 }
 
-// One fixed sentence, and the scenario's own offset in a code span: the two clocks are
-// not comparable without it.
+// The clocks line exists to explain a ranked key that is on the host clock, so it is
+// printed only when one of those keys is ranked, and it names only those keys: the rest
+// come from telemetry rows on the client's clock.
 function clockLine(scenario) {
+  const host = scenario.windows.keys.filter((key) => HOST_CLOCK_KEYS.includes(key));
+  if (!host.length) return null;
   const offset =
     scenario.clock_offset_ms === null
       ? "an unmeasured amount"
       : `${code(scenario.clock_offset_ms)} ms`;
-  return `Clocks: ${code("g2g_p95_ms")} and ${code("missing_indices")} are on the host clock; the other keys are on the client's, offset by ${offset}.`;
+  return `Clocks: ${host.map(code).join(" and ")} ${host.length === 1 ? "is" : "are"} on the host clock; the other keys are on the client's, offset by ${offset}.`;
 }
 
 /** REVIEW.md, rendered from the summary alone, so both files describe the same run. */
@@ -458,20 +543,27 @@ export function renderReview(summary) {
         }
       }
     }
-    L.push(clockLine(s));
+    const clocks = clockLine(s);
+    if (clocks !== null) L.push(clocks);
 
     L.push("### Anomalies");
     if (s.anomalies.state !== "checked") L.push(`Not checked: ${s.anomalies.why}.`);
-    else if (!s.anomalies.rows.length) L.push("No threshold crossed.");
     else {
-      L.push(
-        "| threshold | sample key | limit | samples over | worst | first ts_unix_ms |",
-        "| --- | --- | --- | --- | --- | --- |",
-      );
-      for (const a of s.anomalies.rows) {
-        const limit = `>= ${a.limit}${a.unit ? ` ${a.unit}` : ""}`;
-        L.push(cellRow([a.threshold, a.sample_key, limit, a.samples_over, a.worst, a.first_ts_unix_ms]));
+      if (s.anomalies.rows.length) {
+        L.push(
+          "| threshold | sample key | limit | samples over | worst | first ts_unix_ms |",
+          "| --- | --- | --- | --- | --- | --- |",
+        );
+        for (const a of s.anomalies.rows) {
+          const limit = `>= ${a.limit}${a.unit ? ` ${a.unit}` : ""}`;
+          L.push(cellRow([a.threshold, a.sample_key, limit, a.samples_over, a.worst, a.first_ts_unix_ms]));
+        }
       }
+      // The rules that were not checked, folded onto one line to keep the page short.
+      // Each `why` is a fixed sentence of this file's own, never bundle text.
+      if (s.anomalies.not_checked.length) {
+        L.push(`Not checked: ${s.anomalies.not_checked.map((n) => `${code(n.rule)} (${n.why})`).join(", ")}.`);
+      } else if (!s.anomalies.rows.length) L.push("No threshold crossed.");
     }
 
     if (!s.passed) {
@@ -485,21 +577,54 @@ export function renderReview(summary) {
   return L.join("\n") + "\n";
 }
 
-class CannotWrite extends Error {}
+class CannotWrite extends Error {
+  constructor(message, stale = null) {
+    super(message);
+    this.stale = stale;
+  }
+}
+
+// A previous review must not outlive the run that replaced it. The canonical files are
+// removed before the new ones are rendered, so a run that then fails to write leaves no
+// page at all rather than the last run's verdict. Our own temporaries from a run that was
+// killed are cleared too.
+const TEMPORARY = /^\.(?:REVIEW\.md|summary\.json)\.tmp-\d+-\d+$/;
+
+function clearReview(dir) {
+  const out = path.join(dir, REVIEW_DIR);
+  const stat = fs.lstatSync(out, { throwIfNoEntry: false });
+  if (!stat || !stat.isDirectory()) return; // nothing can be stale in there
+  let entries;
+  try {
+    entries = fs.readdirSync(out);
+  } catch (e) {
+    throw new CannotWrite(e.message, path.join(REVIEW_DIR, MARKDOWN_FILE));
+  }
+  for (const file of [MARKDOWN_FILE, SUMMARY_FILE, ...entries.filter((e) => TEMPORARY.test(e))]) {
+    try {
+      fs.rmSync(path.join(out, file), { recursive: false, force: true });
+    } catch {
+      throw new CannotWrite(`cannot remove ${file}`, path.join(REVIEW_DIR, file));
+    }
+  }
+}
 
 /**
  * Write review/summary.json and review/REVIEW.md inside the bundle. Both are rendered
  * in memory and written to temporary names in `review/`, then renamed into place, so a
- * failure leaves no half a review. Anything unexpected at the target (a directory, a
- * link, a read-only parent) is CannotWrite, and the caller prints one line.
+ * failure leaves no half a review — and the previous review is removed first, so it
+ * cannot be read as this run's either. Anything unexpected at the target (a directory, a
+ * link, a read-only parent) is CannotWrite, which names the file that may be stale when
+ * there is one, and the caller prints one line.
  */
 export function writeReview(dir, summary) {
   const out = path.join(dir, REVIEW_DIR);
-  const bodies = [
-    [SUMMARY_FILE, JSON.stringify(sortDeep(summary), null, 2) + "\n"],
-    [MARKDOWN_FILE, renderReview(summary)],
-  ];
   try {
+    clearReview(dir);
+    const bodies = [
+      [SUMMARY_FILE, JSON.stringify(sortDeep(summary), null, 2) + "\n"],
+      [MARKDOWN_FILE, renderReview(summary)],
+    ];
     fs.mkdirSync(out, { recursive: true });
     if (!fs.lstatSync(out).isDirectory()) throw new CannotWrite();
     for (const [file] of bodies) {
@@ -526,6 +651,16 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     console.log("RESULT status=error target=e2e-review usage=1");
     process.exit(2);
   }
+  // Before anything is rendered or validated: a review at the canonical path that this
+  // run does not replace would be read as this run's verdict. If it cannot be removed,
+  // say which file may be stale and stop.
+  try {
+    clearReview(dir);
+  } catch (e) {
+    if (e?.stale) console.log(`${e.stale} may be stale and could not be removed`);
+    console.log("RESULT status=error target=e2e-review reason=cannot-write");
+    process.exit(2);
+  }
   let summary;
   try {
     summary = review(dir);
@@ -537,9 +672,11 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   }
   try {
     writeReview(dir, summary);
-  } catch {
+  } catch (e) {
     // One line, no stack, and no half a review: both files were rendered before either
-    // was renamed into place.
+    // was renamed into place. When the previous review could not be removed, say which
+    // file a reader may still find, because that page is not this run's.
+    if (e?.stale) console.log(`${e.stale} may be stale and could not be removed`);
     console.log("RESULT status=error target=e2e-review reason=cannot-write");
     process.exit(2);
   }

@@ -48,6 +48,12 @@
   "scenarios": [
     {
       "anomalies": {
+        "not_checked": [
+          {
+            "rule": "web.client_health.present_p95_degraded_ms",
+            "why": "no sample carries present_interval_p95_ms"
+          }
+        ],
         "rows": [
           {
             "first_ts_unix_ms": 1786940030000,
