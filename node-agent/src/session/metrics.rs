@@ -336,6 +336,9 @@ pub struct SessionMetrics {
     /// window's label. Registered only in `Smooth` mode; dies with this struct.
     #[allow(clippy::type_complexity)]
     on_window: Mutex<Option<Box<dyn Fn(AdaptationState, Option<f64>) + Send + Sync>>>,
+    /// The ABR loop that writes this session's encoder (`abr_glue::AbrLoop::id`), 0 for
+    /// none: one writer per encoder, the transport that started last.
+    abr_owner: AtomicU64,
     /// Drain bookkeeping: the counter snapshot + instant of the last drain.
     last: Mutex<DrainSnapshot>,
 }
@@ -458,6 +461,7 @@ impl SessionMetrics {
             stage: Mutex::new(StagePending::default()),
             on_drain: Mutex::new(None),
             on_window: Mutex::new(None),
+            abr_owner: AtomicU64::new(0),
             last: Mutex::new(DrainSnapshot {
                 at: now,
                 frames_out: 0,
@@ -795,6 +799,15 @@ impl SessionMetrics {
             .store(kbps.to_bits(), Ordering::Relaxed);
     }
 
+    /// Make ABR loop `id` the one writer of this session's encoder.
+    pub fn claim_abr(&self, id: u64) {
+        self.abr_owner.store(id, Ordering::Relaxed);
+    }
+
+    pub fn abr_owner(&self) -> u64 {
+        self.abr_owner.load(Ordering::Relaxed)
+    }
+
     /// AS-03: register the per-drain hook (see the `on_drain` field doc). Last
     /// registration wins; dropped with the session's `SessionMetrics`.
     pub fn set_on_drain(&self, hook: Box<dyn Fn() + Send + Sync>) {
@@ -818,6 +831,10 @@ impl SessionMetrics {
     pub fn clear_hooks(&self) {
         let had_drain = self.on_drain.lock().unwrap().take().is_some();
         let had_window = self.on_window.lock().unwrap().take().is_some();
+        // No owner either: a replacement transport already put the encoder back at launch
+        // (`abr_glue::reset_to_launch`), so its loop's start is no takeover to repeat. A
+        // WebTransport client still streaming takes it back (`abr_glue::feedback_abr`).
+        self.abr_owner.store(0, Ordering::Relaxed);
         tracing::debug!(had_drain, had_window, "session metrics ABR hooks cleared");
     }
 

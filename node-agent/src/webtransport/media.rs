@@ -233,6 +233,7 @@ pub(crate) struct Media {
     encoder: glib::WeakRef<gst::Element>,
     /// Where `codec.switched` goes, and the session it names.
     trace: Option<(crate::session::pipeline::TraceTx, String)>,
+    rate: Option<super::Rate>,
 }
 
 /// The client half `Media::attach` hands back.
@@ -301,6 +302,7 @@ impl Media {
         input: super::Input,
         audio: Arc<Audio>,
         trace: Option<(crate::session::pipeline::TraceTx, String)>,
+        rate: Option<super::Rate>,
     ) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::default(),
@@ -309,7 +311,13 @@ impl Media {
             hold: Mutex::default(),
             encoder: encoder.downgrade(),
             trace,
+            rate,
         })
+    }
+
+    /// Where this session's clients' rate estimates go; `None` when its ABR is not armed.
+    pub(crate) fn rate(&self) -> Option<&super::Rate> {
+        self.rate.as_ref()
     }
 
     fn hold(&self) -> std::sync::MutexGuard<'_, Hold> {
@@ -1208,6 +1216,7 @@ mod tests {
             hold: Mutex::default(),
             encoder: glib::WeakRef::new(),
             trace: None,
+            rate: None,
         });
         media.on_caps(&caps(1280, &avcc), "s");
         let mut client = media
@@ -1279,6 +1288,7 @@ mod tests {
                 &encoder,
                 crate::webtransport::tests::no_input(),
                 Audio::new(audio::Plan::default()),
+                None,
                 None,
             ),
             encoder,
@@ -1599,6 +1609,7 @@ mod tests {
             hold: Mutex::default(),
             encoder: glib::WeakRef::new(),
             trace: None,
+            rate: None,
         });
         media.on_caps(&streams::hevc_caps(640), "s");
         let mut client = media.attach(false, Duration::ZERO).unwrap();
@@ -1636,6 +1647,7 @@ mod tests {
             &parse,
             crate::webtransport::tests::no_input(),
             Audio::new(audio::Plan::default()),
+            None,
             None,
         );
         tap(&parse.static_pad("src").unwrap(), &media, "s");
@@ -1758,6 +1770,7 @@ mod tests {
             hold: Mutex::default(),
             encoder: glib::WeakRef::new(),
             trace: None,
+            rate: None,
         })
     }
 
