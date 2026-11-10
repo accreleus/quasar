@@ -206,9 +206,11 @@ impl<'a> Control<'a> {
         if !std::mem::replace(&mut self.started, true) {
             (self.rate.start)();
         }
-        // The estimate is for everything sent: repair datagrams take their share of it
-        // here, so video plus FEC stays inside it. The ABR never goes under its floor, so
-        // the share is at most what the estimate leaves above that.
+        // Fed estimate / (1 + share). The governor holds while that is at least (1 − deadband)
+        // × its setpoint, so a share inside the deadband moves nothing and video plus FEC is
+        // at most estimate / (1 − deadband), the bound video alone has (tests: `governed`).
+        // The ABR never goes under its floor: the share is at most what the estimate leaves
+        // above that.
         self.charged = self.fec.as_ref().map_or(0.0, |fec| {
             let room = (kbps / (self.rate.floor_kbps)() - 1.0).max(0.0);
             fec.overhead().min(room)

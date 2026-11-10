@@ -1806,6 +1806,111 @@ fn repairs_spend_only_what_the_estimate_leaves_above_the_abr_floor() {
     assert_eq!(*fed.lock().unwrap(), [2000.0, 2500.0, 2500.0, 4000.0]);
 }
 
+/// What a session on a real smooth governor (2500 to 8000 kbit/s) sends in each of `seconds`
+/// at `estimate_kbps` and FEC `level`: the setpoint, and that plus the repairs
+/// `Control::protect` makes for a second of 60 fps video at it, in kbit/s. The clock is the
+/// test's, one estimate a second.
+fn governed(level: u8, estimate_kbps: f64, seconds: u64) -> Vec<(u32, f64)> {
+    use crate::session::abr::{AbrConfig, Governor};
+    let base = std::time::Instant::now();
+    let governor = Arc::new(Mutex::new((
+        Governor::new(AbrConfig::new_smooth(2500, 8000, 60), base),
+        base,
+    )));
+    let (floor, observed) = (governor.clone(), governor.clone());
+    let rate = Rate {
+        ceiling_kbps: 8000.0,
+        floor_kbps: Box::new(move || f64::from(floor.lock().unwrap().0.floor_kbps())),
+        retargets: true,
+        start: Box::new(|| {}),
+        observe: Box::new(move |kbps| {
+            let mut governor = observed.lock().unwrap();
+            let now = governor.1;
+            governor.0.observe(kbps, now);
+        }),
+    };
+    let mut control = Control::new(&rate, Arc::default(), true);
+    let fec = control.fec.as_mut().unwrap();
+    fec.observe(f64::from(level) / 100.0, base);
+    assert_eq!(fec.overhead(), f64::from(level) * 0.05);
+    (1..=seconds)
+        .map(|second| {
+            governor.lock().unwrap().1 = base + Duration::from_secs(second);
+            control.feed(estimate_kbps);
+            let setpoint = governor.lock().unwrap().0.setpoint_kbps();
+            let fragments = (setpoint as usize * 125 / 60).div_ceil(media::MAX_DATAGRAM);
+            let frame = vec![Bytes::from(vec![1; media::MAX_DATAGRAM]); fragments];
+            let repairs: usize = (0..60)
+                .flat_map(|_| control.protect(false, &frame, &mut 0))
+                .map(|repair| repair.len())
+                .sum();
+            let video = 60 * fragments * media::MAX_DATAGRAM;
+            let sent = f64::from(setpoint) * (1.0 + repairs as f64 / video as f64);
+            (setpoint, sent)
+        })
+        .collect()
+}
+
+/// What the governor lets video alone reach before it steps down: the estimate over
+/// 1 − its deadband. Video plus FEC is held to the same.
+fn governor_bound(estimate_kbps: f64) -> f64 {
+    estimate_kbps / (1.0 - crate::session::abr::AbrConfig::DEFAULT_DEADBAND)
+}
+
+/// #1046: a FEC share inside the governor's deadband (levels 1 to 3, up to 15 %) does not
+/// move the encoder. At the ceiling the repairs go on top of it, so the session sends more
+/// than its ceiling, and no more than the governor's own bound.
+#[test]
+fn a_fec_share_inside_the_deadband_rides_on_top_of_the_ceiling() {
+    for level in 1..=3 {
+        for (setpoint, sent) in governed(level, 8000.0, 30) {
+            assert_eq!(setpoint, 8000, "level {level}");
+            assert!(
+                sent > 8000.0 && sent <= governor_bound(8000.0),
+                "level {level}: {sent:.0} kbit/s"
+            );
+        }
+    }
+}
+
+/// Levels 4 and 5 are outside the deadband: from the ceiling a smooth governor takes its
+/// one 12.5 % step and holds there, the total back inside the bound.
+#[test]
+fn a_fec_share_outside_the_deadband_steps_the_setpoint_down() {
+    for level in 4..=5 {
+        for (setpoint, sent) in governed(level, 8000.0, 30) {
+            assert_eq!(setpoint, 7000, "level {level}");
+            assert!(
+                sent > 8000.0 && sent <= governor_bound(8000.0),
+                "level {level}: {sent:.0} kbit/s"
+            );
+        }
+    }
+}
+
+/// On a link that carries less than the ceiling the governor settles (12.5 % per 7 s) where
+/// video plus FEC is inside the bound video alone has (level 0), at every level.
+#[test]
+fn on_a_constrained_link_video_plus_fec_settles_inside_the_governors_bound() {
+    for estimate_kbps in [3000.0, 5000.0, 6500.0] {
+        for level in 0..=5 {
+            let sent = governed(level, estimate_kbps, 90);
+            let settled = &sent[80..];
+            let (setpoint, _) = settled[0];
+            for &(at, sent) in settled {
+                assert_eq!(
+                    at, setpoint,
+                    "{estimate_kbps} kbit/s, level {level}: settled"
+                );
+                assert!(
+                    sent <= governor_bound(estimate_kbps) && (level == 0 || sent > f64::from(at)),
+                    "{estimate_kbps} kbit/s, level {level}: {at} + FEC = {sent:.0}"
+                );
+            }
+        }
+    }
+}
+
 /// A PyroWave frame gets no repair even at a level an earlier loss left.
 #[test]
 fn a_pyrowave_frame_gets_no_repair_at_any_overhead() {
