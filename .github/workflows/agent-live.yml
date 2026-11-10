@@ -177,7 +177,10 @@ jobs:
 
   # A real WebTransport session against the agent's listener and the production parser
   # boundary: hello and hello_ack, video datagrams that reassemble into well-formed H.264
-  # access units, and a clean close (#1044). The client is the Rust WebTransport client the
+  # access units, a clean close, input reaching the devices by datagram and by the control
+  # stream, and the agent's half of the fallback to WebRTC (#1044). The browser's half of the
+  # fallback is the web job's (web/src/webtransport/fallback.test.ts and the runtime's fallback
+  # tests). The client is the Rust WebTransport client the
   # conformance suite uses: Playwright's Chromium has no H.264 decoder, and a browser that
   # does needs a Chrome the lab runs (scripts/harness/run-takeover-peers.sh). Outcomes only,
   # so other WebTransport work landing beside it does not move this job.
@@ -215,6 +218,10 @@ jobs:
             -v "$RUNNER_TEMP/cargo-registry":/opt/cargo/registry \
             -e CARGO_INCREMENTAL=0 -e CARGO_PROFILE_DEV_DEBUG=line-tables-only \
             "$IMAGE" cargo test --lib webtransport:: -- --test-threads=4 2>&1 | tee "$RUNNER_TEMP/wt.log"
-          # A filter that matches nothing passes: insist the session test itself ran.
-          grep -q 'a_session_runs_from_hello_through_decodable_frames_to_a_clean_close ... ok' "$RUNNER_TEMP/wt.log"
+          # A filter that matches nothing passes: insist the session, input and fallback tests ran.
+          for t in a_session_runs_from_hello_through_decodable_frames_to_a_clean_close \
+                   input_arrives_by_datagram_and_control_stream_only_after_hello_ack \
+                   a_client_that_falls_back_leaves_no_client_no_held_key_and_a_live_session; do
+            grep -q "$t ... ok" "$RUNNER_TEMP/wt.log"
+          done
           [ "$(grep -c '^test webtransport::.* ok$' "$RUNNER_TEMP/wt.log")" -ge 10 ]
