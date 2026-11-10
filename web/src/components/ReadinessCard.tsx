@@ -4,7 +4,7 @@
 // a full-width grid). Host settings deliberately does not repeat it.
 
 import type { ReadinessCheck, ReadinessGate, ReadinessOverride } from "../api/types";
-import { groupChecks } from "../lib/readiness/groups";
+import { groupChecks, isAdvisoryCheck } from "../lib/readiness/groups";
 import { Button } from "./Button";
 import { Chip } from "./Chip";
 import { CopyableCommand } from "./CopyableCommand";
@@ -147,7 +147,8 @@ export function ReadinessCard({
   // field entirely (undefined) rather than sending null, and both mean the
   // same thing here — nothing to render yet.
   const hasChecks = checks != null && checks.length > 0;
-  const anyFail = hasChecks && checks.some((c) => c.status === "fail");
+  // An advisory check's fail is a warning, as Fleet alerts read it (lib/fleet/deriveAlerts.ts).
+  const anyFail = hasChecks && checks.some((c) => c.status === "fail" && !isAdvisoryCheck(c.id));
   // #102: grouped by the area an operator would fix; `skip` (not applicable
   // to this host, per the contract) leaves the first screen for a disclosure.
   const { groups, notApplicable } = groupChecks(checks ?? []);
@@ -171,7 +172,8 @@ export function ReadinessCard({
       <div key={c.id} className={rowClass} data-testid={`readiness-check-${c.id}`}>
         <div className="host-setting-copy">
           <div className="row gap2">
-            <ReadinessGlyph status={c.status} />
+            {/* An advisory check that failed is a warning everywhere else (Fleet alerts, the chip above). */}
+            <ReadinessGlyph status={c.status === "fail" && isAdvisoryCheck(c.id) ? "warn" : c.status} />
             <h3 className="rdy-title">{c.id === "nvidia_vulkan_av1_compatibility" ? "Vulkan AV1 compatibility" : c.id.replaceAll("_", " ")}</h3>
             {blocksLabel && (
               <span data-testid={`readiness-blocks-${c.id}`} title={blocksLabel}>

@@ -389,6 +389,18 @@ describe("HostDetail — remove host (#366)", () => {
     expect(await screen.findByText("Remove gpu-host-4?")).toBeTruthy();
   });
 
+  it("keeps an open confirmation through a poll whose release read failed", async () => {
+    renderDetail(`/admin/fleet/hosts/${ID}?remove=1`);
+    expect(await screen.findByText("Remove gpu-host-4?")).toBeTruthy();
+    // The next polls cannot say whose machine the control plane runs on.
+    mocked.getPlatformReleases.mockRejectedValue(new Error("502"));
+    await act(async () => {
+      vi.advanceTimersByTime(70_000);
+    });
+    expect(mocked.getPlatformReleases.mock.calls.length).toBeGreaterThan(1);
+    expect(screen.getByText("Remove gpu-host-4?")).toBeTruthy();
+  });
+
   it("never offers removal of the control plane's own machine", async () => {
     mocked.getPlatformReleases.mockResolvedValue({
       faults: [],
