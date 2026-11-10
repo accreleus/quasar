@@ -7,6 +7,11 @@ export const CHANNEL_VIDEO = 0x01;
 export const CHANNEL_INPUT = 0x03;
 export const CHANNEL_AUDIO = 0x02;
 export const CHANNEL_MIC = 0x05;
+export const CHANNEL_FEC = 0x04;
+const FEC_HEADER = 14;
+const FEC_SCHEME_XOR = 1;
+/** §FEC: one repair datagram protects 2 to 48 fragments. */
+const FEC_MAX_COUNT = 48;
 const VIDEO_HEADER = 25;
 const AUDIO_HEADER = 19;
 const FLAG_KEYFRAME = 1;
@@ -94,6 +99,36 @@ export function parseVideoDatagram(d: Uint8Array): VideoFragment | null {
     // Unix µs sits near 2^51, inside a double's exact range.
     captureUs: Number(v.getBigUint64(17, true)),
     payload: d.subarray(VIDEO_HEADER),
+  };
+}
+
+/** A `0x04` repair datagram of scheme `xor` (§FEC): it rebuilds any one of its fragments. */
+export interface FecRepair {
+  frameSeq: number;
+  /** The fragments it protects: `firstFrag + i * stride` for `i` in `0 … count − 1`. */
+  firstFrag: number;
+  count: number;
+  stride: number;
+  /** XOR of the protected payloads' lengths. */
+  lengthXor: number;
+  /** XOR of the protected payloads, each zero-padded to the longest. A view, not a copy. */
+  payload: Uint8Array;
+}
+
+/** A `0x04` datagram of a scheme this client decodes; null for anything else or a malformed one. */
+export function parseFecDatagram(d: Uint8Array): FecRepair | null {
+  if (d.length <= FEC_HEADER || d[0] !== CHANNEL_FEC || d[5] !== FEC_SCHEME_XOR) return null;
+  const v = new DataView(d.buffer, d.byteOffset, d.byteLength);
+  const count = d[10];
+  const stride = d[11];
+  if (count < 2 || count > FEC_MAX_COUNT || stride < 1) return null;
+  return {
+    frameSeq: v.getUint16(6, true),
+    firstFrag: v.getUint16(8, true),
+    count,
+    stride,
+    lengthXor: v.getUint16(12, true),
+    payload: d.subarray(FEC_HEADER),
   };
 }
 

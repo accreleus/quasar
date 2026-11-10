@@ -5,12 +5,15 @@
 import {
   base64Bytes,
   CHANNEL_AUDIO,
+  CHANNEL_FEC,
   ControlDecoder,
   ControlProtocolError,
   encodeControl,
   parseAudioDatagram,
+  parseFecDatagram,
   parseVideoDatagram,
   serialAfter,
+  type FecRepair,
   type VideoFragment,
 } from "./framing";
 import { blockLayout } from "../pyrowave/bitstream";
@@ -141,6 +144,8 @@ export const audioStreamsFrom = (ack: Record<string, unknown>): AudioStreams => 
  *  access-unit assembler. Also the order of configurations for both. */
 interface Router {
   datagram(f: VideoFragment): void;
+  /** A repair datagram (§FEC), for the frame it protects. */
+  repair(r: FecRepair): void;
   config(c: VideoConfig): void;
   /** `nack_miss`: the agent no longer holds those fragments. */
   miss(frameSeq: number, frags: [number, number][]): void;
@@ -353,6 +358,8 @@ export class WebTransportMedia implements MediaTransport {
           token: this.coords.token,
           session_id: this.opts.sessionId,
           client: "browser",
+          // The schemes this client decodes (§FEC); the agent names one in hello_ack, or null.
+          fec: ["xor"],
           ...(this.opts.pyrowave ? { pyrowave: true } : {}),
         }),
       );
@@ -462,6 +469,11 @@ export class WebTransportMedia implements MediaTransport {
         if (packet) sink.audio?.(packet);
         continue;
       }
+      if ((value as Uint8Array)[0] === CHANNEL_FEC) {
+        const repair = parseFecDatagram(value as Uint8Array);
+        if (repair) router.repair(repair);
+        continue;
+      }
       const frag = parseVideoDatagram(value as Uint8Array);
       if (!frag) continue; // another channel, or malformed: dropped (§Channels)
       router.datagram(frag);
@@ -536,7 +548,9 @@ export class WebTransportMedia implements MediaTransport {
     };
     const miss = (frameSeq: number, frags: [number, number][]) => this.recovered(assembler.miss(frameSeq, frags), sink);
     const tick = () => this.recovered(assembler.tick(), sink);
-    return { datagram, config, miss, tick, stop };
+    // PyroWave frames never reach the assembler, so a repair for one finds no frame and is dropped.
+    const repair = (r: FecRepair) => this.recovered(assembler.repair(r), sink);
+    return { datagram, repair, config, miss, tick, stop };
   }
 
   /** §Loss recovery: NACKs out, a keyframe asked for a late frame, whole units to the sink. */

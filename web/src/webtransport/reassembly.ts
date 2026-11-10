@@ -1,4 +1,4 @@
-import { serialAfter, type VideoFragment } from "./framing";
+import { serialAfter, type FecRepair, type VideoFragment } from "./framing";
 import type { AccessUnit } from "./transport";
 
 /** Frames held at once, incomplete or waiting for an earlier one; past it the oldest counts as lost. */
@@ -42,7 +42,12 @@ interface Pending {
   askedAt: number[];
   at: number;
   late: boolean;
+  /** Repair datagrams held for this frame (§FEC), until each has rebuilt its fragment or cannot. */
+  repairs?: FecRepair[];
 }
+
+/** Repair datagrams held per frame: more than a frame of the largest size could use. */
+const MAX_REPAIRS_PER_FRAME = 64;
 
 /** A `nack` to send (§NACK): inclusive `frag_index` ranges of one frame. */
 export interface Nack {
@@ -160,23 +165,94 @@ export class FrameAssembler {
       return this.step(at);
     }
     if (p.parts[f.fragIndex]) return this.step(at);
-    p.parts[f.fragIndex] = f.payload;
-    p.at = at;
-    p.have += 1;
-    p.bytes += f.payload.length;
-    p.top = Math.max(p.top, f.fragIndex);
-    while (p.parts[p.contiguous]) p.contiguous += 1;
-    this.bytes += f.payload.length;
-    if (p.bytes > MAX_UNIT_BYTES) {
-      this.lose(f.frameSeq, p.first.discardable);
-      return this.step(at);
-    }
-
-    if (p.have === p.first.fragCount) this.complete(f.frameSeq, p);
+    // FEC first (§Loss recovery 4): a fragment the frame's repairs can now rebuild is rebuilt
+    // here, before recover() would NACK it.
+    if (this.store(f.frameSeq, p, f.fragIndex, f.payload, at)) this.rebuild(f.frameSeq, p, at);
     while (this.pending.size + this.ready.size > MAX_PENDING || this.bytes > MAX_PENDING_BYTES) {
       if (!this.dropOldest()) break;
     }
     return this.step(at);
+  }
+
+  /**
+   * One fragment's payload into its frame. False when the frame is gone afterwards: whole and
+   * moved to `ready`, or lost for being over the byte budget.
+   */
+  private store(seq: number, p: Pending, index: number, payload: Uint8Array, at: number): boolean {
+    const first = p.first as VideoFragment;
+    p.parts[index] = payload;
+    p.at = at;
+    p.have += 1;
+    p.bytes += payload.length;
+    p.top = Math.max(p.top, index);
+    while (p.parts[p.contiguous]) p.contiguous += 1;
+    this.bytes += payload.length;
+    if (p.bytes > MAX_UNIT_BYTES) {
+      this.lose(seq, first.discardable);
+      return false;
+    }
+    if (p.have === first.fragCount) {
+      this.complete(seq, p);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * A repair datagram (§FEC). It is used at once when its group lacks exactly one fragment,
+   * and held otherwise: a later fragment may leave one missing. One for a frame that is not
+   * pending (whole, lost, or not seen yet) is dropped; the agent sends repairs after the
+   * fragments they protect.
+   */
+  repair(r: FecRepair): Reassembled {
+    const at = this.now();
+    this.expire(at);
+    const p = this.pending.get(r.frameSeq);
+    if (p && !p.late && (p.repairs?.length ?? 0) < MAX_REPAIRS_PER_FRAME) {
+      (p.repairs ??= []).push(r);
+      this.rebuild(r.frameSeq, p, at);
+    }
+    return this.step(at);
+  }
+
+  /** Fragments rebuilt from repair datagrams, for telemetry. */
+  repaired = 0;
+
+  /** Rebuilds every fragment the frame's repairs can, until none makes progress. */
+  private rebuild(seq: number, p: Pending, at: number): void {
+    const first = p.first;
+    // A rebuilt fragment takes a sibling's header (§FEC): nothing to do before one has arrived.
+    if (!first || !p.repairs) return;
+    for (let progress = true; progress; ) {
+      progress = false;
+      for (const r of [...p.repairs]) {
+        const missing: number[] = [];
+        let lengthXor = r.lengthXor;
+        const last = r.firstFrag + (r.count - 1) * r.stride;
+        for (let i = r.firstFrag; i <= last && last < first.fragCount; i += r.stride) {
+          const part = p.parts[i];
+          if (part) lengthXor ^= part.length;
+          else missing.push(i);
+        }
+        // Past the frame, nothing left to rebuild, or a length its own payload cannot hold: no use.
+        if (last >= first.fragCount || missing.length === 0 || (missing.length === 1 && lengthXor > r.payload.length)) {
+          p.repairs.splice(p.repairs.indexOf(r), 1);
+          continue;
+        }
+        if (missing.length > 1) continue; // two or more missing is NACK's (§FEC)
+        const out = r.payload.slice(0, lengthXor);
+        for (let i = r.firstFrag; i <= last; i += r.stride) {
+          const part = p.parts[i];
+          if (!part) continue;
+          const n = Math.min(part.length, out.length);
+          for (let b = 0; b < n; b++) out[b] ^= part[b];
+        }
+        p.repairs.splice(p.repairs.indexOf(r), 1);
+        this.repaired += 1;
+        if (!this.store(seq, p, missing[0], out, at)) return;
+        progress = true;
+      }
+    }
   }
 
   /** `nack_miss`: the agent no longer holds these fragments, so a frame missing one is late. */
