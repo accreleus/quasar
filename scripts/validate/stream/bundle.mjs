@@ -23,12 +23,13 @@ export const CLOCKS = ["client", "host"];
 // operator's patterns, which runs before a bundle is posted anywhere public.
 const IPV4 = /(?<![\d.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?!\d|\.\d)/g;
 const DOC_NETS = ["192.0.2.", "198.51.100.", "203.0.113."]; // RFC 5737
-const SECRETS = [
+// Shared with the collector, which replaces what these match before it writes.
+export const SECRETS = [
   [/\beyJ[\w-]{10,}\.[\w-]{10,}\./, "a JWT"],
   // A token has a digit in it; "Bearer authentication." in prose has none.
   [/\bBearer\s+(?=[\w.~+/-]*\d)[\w.~+/-]{8,}/i, "a bearer token"],
   // A value that says there is none ("password": null, secret: none, token=[REDACTED], password: none.) is not one.
-  [/\b(password|passwd|secret|access_token|refresh_token|sig_token|api[_-]?key)["']?\s*[=:]\s*["']?(?!\[?(?:null|none|n\/?a|redacted|omitted|unknown|true|false)\]?(?=[\s"',}.;!?]|$))[^\s"',}]{4,}/i, "a credential"],
+  [/\b(authorization|cookie|password|passwd|secret|access_token|refresh_token|sig_token|api[_-]?key)["']?\s*[=:]\s*["']?(?!\[?(?:null|none|n\/?a|redacted|omitted|unknown|true|false|bearer)\]?(?=[\s"',}.;!?]|$))[^\s"',}]{4,}/i, "a credential"],
 ];
 
 /**

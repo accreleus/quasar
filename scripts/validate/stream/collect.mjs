@@ -24,7 +24,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { SOURCES, isCredentialName, manifestKeys, validateBundle } from "./bundle.mjs";
+import { SECRETS, SOURCES, isCredentialName, manifestKeys, validateBundle } from "./bundle.mjs";
 
 export const EXIT = { ok: 0, invalid: 1, error: 2, incomplete: 3 };
 
@@ -50,9 +50,14 @@ function isAddress(ip) {
   return !(ip.endsWith(".0.0.0") || ip === "127.0.0.1" || DOC_NETS.some((n) => ip.startsWith(n)));
 }
 
+// Free text from an answer (an error message, a log line) can spell a credential out
+// ("authorization=...", "Bearer ..."): whatever the validator would call a secret is replaced.
+const SECRET_TEXT = SECRETS.map(([re]) => new RegExp(re.source, `${re.flags}g`));
+
 function redactText(text, token) {
   let out = text.replace(IPV4, (m) => (isAddress(m) ? "[address]" : m));
   if (token) out = out.split(token).join("[redacted]");
+  for (const re of SECRET_TEXT) out = out.replace(re, "[redacted]");
   return out;
 }
 
@@ -106,7 +111,7 @@ function writer(dir, token) {
     try {
       fs.writeFileSync(tmp, text, { flag: "wx" });
     } catch (e) {
-      fs.rmSync(tmp, { force: true });
+      if (e.code !== "EEXIST") fs.rmSync(tmp, { force: true }); // EEXIST: the entry is not ours to remove
       throw e;
     }
     staged.push([tmp, path.join(parent, path.basename(target))]);
@@ -375,7 +380,7 @@ async function fetchSession(get, id, now) {
       );
       need(Array.isArray(diag.agent_adaptation) && diag.agent_adaptation.every(point), "the diagnostic bundle's agent adaptation is not a list of points");
       need(isObj(diag.classifier), "the diagnostic bundle has no classifier");
-      need(diag.trace.session_id === undefined || String(diag.trace.session_id).toLowerCase() === id, "the diagnostic bundle is another session's");
+      need(diag.trace.session_id === undefined || (typeof diag.trace.session_id === "string" && diag.trace.session_id.toLowerCase() === id), "the diagnostic bundle is another session's");
       // handleAdminTelemetryRead projectionEvents: { window, events }, the RAW events, not clock-aligned
       const ev = await ok(`/v1/admin/sessions/${sid}/trace/events${q}`);
       need(Array.isArray(ev.events) && ev.events.every(traceEvent), "the trace events are not events");
@@ -474,7 +479,7 @@ function foldDiagnostic(reads) {
   if (reads.length === 1) return reads[0].diag;
   const series = new Map();
   const events = [];
-  const derived = {};
+  const derived = Object.create(null);
   const adaptation = [];
   for (const { diag } of reads) {
     for (const [name, pts] of Object.entries(diag.series)) {

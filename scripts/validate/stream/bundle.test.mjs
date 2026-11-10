@@ -81,6 +81,7 @@ const RULES = [
   ["a token in a file with no extension", (d) => fs.writeFileSync(path.join(d, SC, "agent-stdout"), "Authorization: Bearer abcdefgh12345678\n"), /agent-stdout: holds a bearer token/],
   ["a password that only starts like 'none'", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "password: none-of-your-business1\n"), /x.log: holds a credential/],
   ["a password that only starts like 'null'", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "password: nullify\n"), /x.log: holds a credential/],
+  ["an authorization header in a log", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "request failed, authorization=credential-value-1234\n"), /x.log: holds a credential/],
   ["a password in a log", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "login password=hunter2\n"), /x.log: holds a credential/],
   ["no timeline for a scenario that ran", (d) => fs.rmSync(path.join(d, SC, "timeline.jsonl")), /timeline.jsonl: missing/],
   ["a client of no known kind", (d) => edit(d, "client.json", (c) => ({ ...c, kind: "tv" })), /kind must be web or native/],

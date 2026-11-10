@@ -1117,3 +1117,47 @@ test("N5 every session's raw events are kept, each in its own session directory;
   assert.ok(!second.events.some((e) => e.type === "client.freeze_detected"), "the client half's events belong to the first session");
   assert.deepEqual(validateBundle(dir), []);
 });
+
+// ── round 3, seat A ─────────────────────────────────────────────────────────
+test("A17 a derived-window kind named like an object member folds like any other", async () => {
+  const end = T_START + 11 * 60_000; // two reads
+  for (const kind of ["__proto__", "constructor"]) {
+    const dir = clientBundle();
+    const tweak = (route, body) =>
+      route.endsWith("/diagnostic-bundle") ? [200, { ...body[1], derived_windows: JSON.parse(`{"${kind}":[{"from_ms":${T_START + 1000},"to_ms":${T_START + 2000}}]}`) }] : undefined;
+    const r = await run(dir, world({ end, now: end + 3_600_000, tweak }));
+    assert.equal(r.complete, true, kind);
+    assert.match(read(dir, `${SC}/diagnostic-bundle.json`), new RegExp(`"${kind}": \\[`), `${kind} is kept as a kind`);
+  }
+});
+
+test("A18 a credential spelled out in a failure message never reaches session.json", async () => {
+  for (const field of ["failure_code", "error_message"]) {
+    const dir = clientBundle();
+    const r = await run(dir, world({ start: null, rowExtra: { state: "failed", failure_code: "launch_failed", error_message: "pull failed", [field]: "pull failed: authorization=credential-value-1234 Bearer abc123def456" } }));
+    assert.equal(r.complete, true);
+    const text = read(dir, `${SC}/session.json`);
+    assert.doesNotMatch(text, /credential-value-1234|abc123def456/, field);
+    assert.match(text, /pull failed: \[redacted\]/, "the words around it are kept");
+  }
+});
+
+test("A19 a trace whose session id only prints like the id is another session's", async () => {
+  const dir = clientBundle();
+  const tweak = (route, body) => (route.endsWith("/diagnostic-bundle") ? [200, { ...body[1], trace: { ...body[1].trace, session_id: [SID] } }] : undefined);
+  const r = await run(dir, world({ tweak }));
+  assert.equal(r.complete, false);
+  assert.match(readJson(dir, `${SC}/host-half.json`).reason, /another session's/);
+  assert.ok(!fs.existsSync(path.join(dir, SC, "diagnostic-bundle.json")));
+});
+
+test("A20 a file already at a temporary's name is left alone when the write fails on it", async (t) => {
+  const dir = clientBundle();
+  t.mock.method(crypto, "randomBytes", () => Buffer.from("0123456789ab", "hex"));
+  const planted = path.join(dir, SC, ".metrics.jsonl.0123456789ab.tmp");
+  fs.writeFileSync(planted, "pre-planted sentinel");
+  const before = treeHash(dir);
+  await assert.rejects(run(dir), /EEXIST/);
+  assert.equal(fs.readFileSync(planted, "utf8"), "pre-planted sentinel");
+  assert.equal(treeHash(dir), before, "not one byte changed");
+});
