@@ -251,8 +251,10 @@ function getJson(baseUrl, token, fetchFn, route) {
  * Fetch the host half of `dir` and write it in. `fetch` defaults to Node's own; a
  * test passes a canned in-process one.
  *
- * Returns `{ complete, problems, scenarios, sessions, collected }`. Throws on a
- * rejected bearer (`code: "unauthorized"`) and on a directory that is not a bundle.
+ * Returns `{ complete, problems, scenarios, sessions, collected }`, with
+ * `refusedBefore: true` when the bundle's format was refused before any request or
+ * write. Throws on a rejected bearer (`code: "unauthorized"`) and on a value from the
+ * bundle that is not a UUID (`code: "usage"`).
  */
 export async function collect(dir, { baseUrl, token, fetch: fetchFn = globalThis.fetch } = {}) {
   if (!token) throw new Error("no admin bearer: QUASAR_ADMIN_TOKEN is empty");
