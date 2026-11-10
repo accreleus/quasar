@@ -72,6 +72,7 @@
     {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "GST_WAYLAND_DISPLAY_REF", "value": "05bc3c99c3e0f54ebebc021bd4ccc2c0a23418ea"},
     {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "PYROWAVE_REF", "value": "7fe0e2667cd3076b8b2bf04bcb80bc8d691b800b"},
     {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "GRANITE_REF", "value": "53090429539bf3404250d18fe58db971f0907c04"},
+    {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "VULKAN_LOADER_REF", "value": "363f465abadab0a8dcfc5c85d2c691e9b0b788d6"},
     {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "CARGO_C_VERSION", "value": "0.10.23"},
     {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "RUST_VERSION", "value": "1.94.0"},
     {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "DOCKER_VERSION", "value": "27.5.1"}
