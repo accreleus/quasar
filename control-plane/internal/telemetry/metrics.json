@@ -739,7 +739,7 @@
       "n_key": null,
       "deprecated_for": null,
       "since": "P1",
-      "why": "CUMULATIVE receiver packet loss, posted raw. Every rule that uses it takes a delta across the window (falsifier estimator 'delta'); a single sample cannot produce one and reports 'no samples' rather than 0."
+      "why": "CUMULATIVE receiver packet loss, posted raw. Every rule that uses it takes a delta across the window (falsifier estimator 'delta'); a single sample cannot produce one and reports 'no samples' rather than 0. On a WebTransport session there is no RTP receiver to ask: the value is the video fragments the client found missing, each counted once when it is first NACKed, whether or not the resend then arrived."
     },
     {
       "key": "frames_dropped",
@@ -976,6 +976,32 @@
       "since": "metric-manifest 2026-08-23",
       "why": "The same number as glass_to_glass_ms under a name that does not overclaim: RTP capture-time to browser present, median over a rolling ring of up to 600 RVFC samples. Posted alongside the old key this release so no stored series breaks.",
       "rvfc_qualified": true
+    },
+    {
+      "key": "wt_capture_to_present_ms",
+      "source": "browser",
+      "taxonomy": "client.wt_capture_to_present_ms",
+      "unit": "ms",
+      "clock": "host_wall",
+      "window": "rolling_600",
+      "estimator": "median",
+      "n_key": null,
+      "deprecated_for": null,
+      "since": "0.6 (#1035)",
+      "why": "A WebTransport session's counterpart of rvfc_capture_to_display_ms: the agent's capture_us to the moment the frame is handed to the WebGPU presenter, median over a rolling ring of up to 600 frames. capture_us is stamped at ENCODER OUTPUT (quasar-protocol#29 item 13), as abs-capture-time is on WebRTC, so capture and encode are not in it; the bench marker is the number that includes them. Compared on the agent's clock through the control-stream ping/pong offset, so it is absent until that offset is stable. It ends at present submission, not at display scan-out, and is not RVFC-qualified: do not read it against the RVFC key as if the two ended at the same instant."
+    },
+    {
+      "key": "wt_keyframe_requests",
+      "source": "browser",
+      "taxonomy": "transport.wt_keyframe_requests",
+      "unit": "count",
+      "clock": "none",
+      "window": "1s",
+      "estimator": "sum",
+      "n_key": null,
+      "deprecated_for": null,
+      "since": "0.6 (#1035)",
+      "why": "keyframe_request messages the WebTransport client put on the wire in the window, whoever asked: the decoder (start-up, a restart, a backlog skip), loss recovery giving a frame up as late, or a tab shown again. Requests inside the client's spacing window are merged into one, so this counts sends, not asks. Each is a recovery the NACK path did not cover; a steady non-zero rate on a clean link means loss recovery or the decoder is struggling."
     },
     {
       "key": "network_pacing_ms",
@@ -1736,7 +1762,7 @@
         "target_kbps"
       ],
       "clock": "host_wall",
-      "why": "The codec sent to the session's media client changed between PyroWave and the standard codec (amendment 55), or a wanted PyroWave was not started at a hello. NOT IMPLEMENTED YET: the contract is pinned (codec-pyrowave.md) and nothing emits this."
+      "why": "The codec sent to the session's media client changed between PyroWave and the standard codec (amendment 55), or a wanted PyroWave was not started at a hello. The control plane records it on the session's `pyrowave` (`active`, `used`, `switch_reason`), and a step-down reason (`rtt_too_high`, `congestion`, `client_decode_error`, `encoder_error`) gives the GPU's PyroWave slot back."
     },
     {
       "type": "sdp.answer_applied",

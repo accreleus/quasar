@@ -157,7 +157,7 @@ pub(crate) fn build_answerer_pipeline(out_tx: OutTx) -> Result<(gst::Pipeline, g
 
     connect_ice_candidate(&webrtc, out_tx, PcId::Video);
     // A loopback test peer: no virtual input devices, no control-plane WS.
-    connect_state_logging(&webrtc, None, None, String::new());
+    connect_state_logging(&webrtc, None, None, None, String::new());
 
     // Consume incoming media so the transport negotiates and the pipeline doesn't stall on
     // an unlinked pad.
@@ -634,11 +634,14 @@ fn record_media_evidence(
 /// `devices` is `None` on the test-src pipeline and the answerer. When present,
 /// `Failed`/`Closed`/`Disconnected` triggers `release_all()` so a key held at disconnect
 /// does not stay stuck in the compositor and game; releasing on a transient `Disconnected`
-/// is intentional, since a stuck key is worse than a dropped hold. `trace_tx` /
-/// `session_id` are empty on the demo path (no control-plane WS).
+/// is intentional, since a stuck key is worse than a dropped hold. With `webtransport` the
+/// release goes through the session's media client: it lifts nothing unless this transport's
+/// peer holds the session, and `Failed`/`Closed` end that hold.
+/// `trace_tx` / `session_id` are empty on the demo path (no control-plane WS).
 pub(super) fn connect_state_logging(
     webrtc: &gst::Element,
     devices: Option<Arc<VirtualDevices>>,
+    webtransport: Option<crate::webtransport::WebRtcSide>,
     trace_tx: Option<TraceTx>,
     session_id: String,
 ) {
@@ -695,7 +698,11 @@ pub(super) fn connect_state_logging(
                 | gstreamer_webrtc::WebRTCPeerConnectionState::Closed
                 | gstreamer_webrtc::WebRTCPeerConnectionState::Disconnected
         ) {
-            if let Some(ref d) = devices {
+            if let Some(ref side) = webtransport {
+                side.disconnected(
+                    state != gstreamer_webrtc::WebRTCPeerConnectionState::Disconnected,
+                );
+            } else if let Some(ref d) = devices {
                 if let Err(e) = d.release_all() {
                     tracing::warn!(
                         token = "disconnect-release-all-failed",
@@ -726,10 +733,12 @@ pub(super) fn connect_state_logging(
 }
 
 /// Wire the "input" DataChannel: log open, and translate each inbound message into device
-/// input via `sink` (`None` under `use_test_src`).
+/// input via `sink` (`None` under `use_test_src`). With `webtransport`, only while this
+/// transport's peer holds the session.
 pub(super) fn connect_data_channel_open(
     data_channel: &glib::Object,
     sink: InputSink,
+    webtransport: Option<crate::webtransport::WebRtcSide>,
     input_state: std::sync::Arc<crate::session::input::InputState>,
     width: i32,
     height: i32,
@@ -775,7 +784,11 @@ pub(super) fn connect_data_channel_open(
             }
         }
 
-        crate::session::input::handle(&msg, &sink, &input_state, width, height);
+        let inject = || crate::session::input::handle(&msg, &sink, &input_state, width, height);
+        match &webtransport {
+            Some(side) => side.input(inject),
+            None => inject(),
+        }
         None
     });
 }

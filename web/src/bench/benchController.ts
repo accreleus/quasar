@@ -61,7 +61,13 @@ const MAX_WINDOWS = 3600;
 
 /** Everything the controller needs from the session, injected for testability. */
 export interface BenchDeps {
-  video: HTMLVideoElement;
+  /** The <video> of a WebRTC session: its RVFC drives the frame loop and its pixels are read. */
+  video?: HTMLVideoElement;
+  /**
+   * The frame to read when there is no <video> (a WebTransport session's decoded frame, read
+   * before the presenter takes it). The session then calls `onFrame()` itself, once per frame.
+   */
+  source?: () => { image: CanvasImageSource; width: number; height: number } | null;
   /** Sends one input message over the session's input DataChannel. */
   sendInput: (msg: Record<string, unknown>) => void;
   /** Posts one completed window as a `bench.window` trace event. */
@@ -308,7 +314,7 @@ export class BenchController {
   private schedule(): void {
     if (!this.running) return;
     const video = this.deps.video;
-    if (typeof video.requestVideoFrameCallback !== "function") return;
+    if (typeof video?.requestVideoFrameCallback !== "function") return;
     video.requestVideoFrameCallback((_now, metadata) => {
       this.onFrame(metadata);
       this.schedule();
@@ -480,8 +486,9 @@ export class BenchController {
   private grab(): MarkerImageData | null {
     if (this.deps.grabFrame) return this.deps.grabFrame();
     const video = this.deps.video;
-    const vw = video.videoWidth;
-    const vh = video.videoHeight;
+    const src = this.deps.source ? this.deps.source() : video ? { image: video, width: video.videoWidth, height: video.videoHeight } : null;
+    if (!src) return null;
+    const { width: vw, height: vh } = src;
     if (!vw || !vh) return null;
 
     // ANY change in the received size invalidates the cached cell geometry —
@@ -508,7 +515,7 @@ export class BenchController {
       if (!this.ctx) return null;
     }
     try {
-      this.ctx.drawImage(video, 0, 0, this.cropW, this.cropH, 0, 0, this.cropW, this.cropH);
+      this.ctx.drawImage(src.image, 0, 0, this.cropW, this.cropH, 0, 0, this.cropW, this.cropH);
       return this.ctx.getImageData(0, 0, this.cropW, this.cropH);
     } catch {
       return null; // tainted canvas / not enough data yet
@@ -519,8 +526,9 @@ export class BenchController {
   private tightenCrop(x: number, y: number, cell: number): void {
     const wanted = Math.ceil(x + 30 * cell + cell);
     const wantedH = Math.ceil(y + 19 * cell + cell);
-    const vw = this.deps.video.videoWidth;
-    const vh = this.deps.video.videoHeight;
+    // The size grab() last read, whichever source it came from.
+    const vw = this.geomW;
+    const vh = this.geomH;
     const w = Math.min(vw || wanted, wanted);
     const h = Math.min(vh || wantedH, wantedH);
     if (w > 0 && h > 0 && (w < this.cropW || h < this.cropH)) {
