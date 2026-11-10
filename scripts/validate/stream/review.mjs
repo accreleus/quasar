@@ -422,7 +422,7 @@ export function renderReview(summary) {
     L.push(`${code(s.dir)} — ${statusWord(s.status)}${s.passed ? "" : s.status === "pass" ? " (a criterion failed)" : ""}`);
     const params = Object.keys(s.params)
       .sort()
-      .map((key) => code(`${key}=${s.params[key]}`));
+      .map((key) => `\`${bundleText(key)}=${bundleText(s.params[key])}\``);
     L.push(`${code(s.scenario ?? s.id)}${params.length ? ` · ${params.join(", ")}` : ""}`);
     if (s.reason !== null) L.push(`Reason: ${code(s.reason)}`);
 
