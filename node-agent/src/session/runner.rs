@@ -3221,6 +3221,8 @@ pub fn run_blocking(
             );
             // No `stopping` first: the control plane parks only a session still `running` when
             // the held report arrives (agent-api.md §session_state `runtime_held`).
+            // Before `Held`: the agent drops this session's trace events after it.
+            report_switches(&transports, running, &emit);
             emit(SessionEvent::Signaling(SignalMsg::Bye));
             emit(SessionEvent::Held);
             held_since = Some(Instant::now());
