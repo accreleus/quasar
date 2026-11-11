@@ -37,7 +37,7 @@ export function check(p) {
   if (stray.length) return `params has a key stream-hold does not define: ${stray.map((k) => JSON.stringify(k.slice(0, 40))).join(", ")} (it defines ${PARAM_KEYS.join(", ")})`;
   if (!["webrtc", "webtransport"].includes(p.transport)) return `transport must be webrtc or webtransport, got ${shown(p.transport)}`;
   if (!Object.hasOwn(CODEC_LABEL, p.codec)) return `codec must be one of ${Object.keys(CODEC_LABEL).join(", ")}, got ${shown(p.codec)}`;
-  if (typeof p.profile !== "string" || !/^\d+p\d+$/.test(p.profile)) return `profile must look like 1080p60, got ${shown(p.profile)}`;
+  if (typeof p.profile !== "string" || !/^\d{1,5}p\d{1,3}$/.test(p.profile)) return `profile must look like 1080p60, got ${shown(p.profile)}`;
   if (!finite(p.hold_s) || p.hold_s <= 0) return `hold_s must be a positive number of seconds, got ${shown(p.hold_s)}`;
   if (typeof p.app !== "string" || !p.app) return `app must be a catalog name, got ${shown(p.app)}`;
   // WebTransport draws on a canvas: only the bench ring counts its frames, and the page's loader is not a frame.
@@ -87,13 +87,15 @@ export function hitchCount(frames, fromMs, toMs, hidden, t) {
   return { judged: sds.length, hitches: sds.filter((s) => s >= t.hitch_sd_ms).length };
 }
 
-/** The frames the bench callback saw (`seen`) of the frames the video element decoded (`decoded`) over [a, b]; null when there is no video to compare with. */
+/** The frames the bench callback saw (`seen`) of the frames the video element decoded (`decoded`) over [a, b]; null when there is no video to compare with, `{ malformed: true }` when a time or a count is not a number. */
 export function instrumentShare(frames, videoSamples, a, b) {
-  const v = videoSamples.filter((s) => finite(s.videoFrames) && s.t >= a && s.t <= b);
+  // Malformed evidence is never counted and never dropped to improve the share: the cadence is then not judged.
+  if (!videoSamples.every((s) => finite(s?.t) && finite(s.videoFrames) && s.videoFrames >= 0) || !frames.every((f) => finite(f?.present_ms))) return { malformed: true };
+  const v = videoSamples.filter((s) => s.t >= a && s.t <= b);
   if (v.length < 2) return null;
   const decoded = v.at(-1).videoFrames - v[0].videoFrames;
   if (!(decoded > 0)) return null;
-  return { seen: frames.filter((f) => f?.present_ms >= v[0].t && f.present_ms <= v.at(-1).t).length, decoded };
+  return { seen: frames.filter((f) => f.present_ms >= v[0].t && f.present_ms <= v.at(-1).t).length, decoded };
 }
 
 function transportObserved(s) {
@@ -115,9 +117,11 @@ export function judge({ params, session, windows, frames, firstFrameS, stats, hi
   const spanTo = obs.at(-1)?.t_end_ms;
   const cad = obs.length ? hitchCount(frames, spanFrom, spanTo, hidden, T) : null;
   const inst = obs.length ? instrumentShare(frames, videoSamples, spanFrom, spanTo) : null;
-  const saw = inst ? `${inst.seen} of ${inst.decoded} frames` : null;
+  const saw = inst?.decoded ? `${inst.seen} of ${inst.decoded} frames` : null;
   let cadence = crit("present_cadence", null, null, `no ${warm} window had ${T.present_min_samples} present intervals`);
-  if (cad?.judged && inst && inst.seen / inst.decoded < INSTRUMENT_MIN_SHARE) {
+  if (inst?.malformed) {
+    cadence = crit("present_cadence", null, null, "not judged: a frame time or a video frame count in the evidence is not a number");
+  } else if (cad?.judged && inst && inst.seen / inst.decoded < INSTRUMENT_MIN_SHARE) {
     cadence = crit("present_cadence", null, null, `not judged: the bench callback saw ${saw} the video decoded (${Math.round((inst.seen / inst.decoded) * 100)}%), so the instrument set the cadence (issue #1304)`);
   } else if (cad?.judged) {
     cadence = crit("present_cadence", cad.hitches < T.hitch_min_samples, cad.hitches, `< ${T.hitch_min_samples} one-second windows with present-interval sd >= ${T.hitch_sd_ms} ms, after the ${warm}${saw ? `; the bench callback saw ${saw} the video decoded` : ""}`);
@@ -129,7 +133,7 @@ export function judge({ params, session, windows, frames, firstFrameS, stats, hi
     crit("marker_decoded", stats && finite(stats.decoded) && stats.decoded >= 0 ? stats.decoded > 0 : null, stats?.decoded ?? null, "> 0 marker frames decoded"),
     crit("transport_as_asked", s ? s.transport === params.transport && !s.transport_fallback_reason : null, s ? transportObserved(s) : null, params.transport),
     crit("codec_as_asked", codec ? codec[0] === params.codec : null, codec ? `${codec[0]} (${codec[1]})` : null, params.codec),
-    crit("profile_as_asked", stream && h ? stream.height === +h && stream.fps === +fps : null, stream ? `${stream.height}p${stream.fps}` : null, `${params.profile} (the launch size, not external_*)`),
+    crit("profile_as_asked", stream && h && [stream.height, stream.fps].every((x) => finite(x) && x >= 0) ? stream.height === +h && stream.fps === +fps : null, stream ? `${stream.height}p${stream.fps}` : null, `${params.profile} (the launch size, not external_*)`),
     crit("frameless_seconds", obs.length && countsKnown(obs) ? frameless === 0 : null, frameless, `0 one-second bench windows without a frame, after the ${warm}`),
     {
       id: "missing_indices_rate",
@@ -252,7 +256,7 @@ export default {
       const deadline = tClick + (FIRST_FRAME_LIMIT_S + 90) * 1000; // cold hosts launch slowly; the criterion still judges the limit
       while (now() < deadline && firstFrameAt === null) {
         const p = await look();
-        if (p.frames > 0 || p.videoFrames > 0) firstFrameAt = now();
+        if ([p.frames, p.videoFrames].some((n) => finite(n) && n > 0)) firstFrameAt = now(); // a count, or it is not a frame
         else await sleep(250);
       }
       const firstFrameS = firstFrameAt === null ? null : (firstFrameAt - tClick) / 1000;

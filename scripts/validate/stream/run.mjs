@@ -128,10 +128,15 @@ export function trackLaunches(page, baseUrl, onOwned = () => {}) {
         if (typeof id === "string" && UUID.test(id) && !t.owned.has(id)) { t.owned.add(id); onOwned(id); }
         else t.unread += 1;
       })());
-    } else if (isUnexpectedWrite(method, u.pathname)) {
-      const w = `${method.slice(0, 16)} ${u.pathname.slice(0, 80)}`;
-      if (!t.writes.includes(w)) t.writes.push(w);
     }
+  });
+  // A write is seen when the page sends it: one whose answer never arrives may still have been applied.
+  page.on("request", (q) => {
+    let u;
+    try { u = new URL(q.url()); } catch { return; }
+    if (u.origin !== origin || !isUnexpectedWrite(q.method(), u.pathname)) return;
+    const w = `${q.method().slice(0, 16)} ${u.pathname.slice(0, 80)}`;
+    if (!t.writes.includes(w)) t.writes.push(w);
   });
   return t;
 }
@@ -174,7 +179,8 @@ export async function stopOwned(api, launches, rec) {
     }
   }
   if (launches.unread) cleanup.push(`${launches.unread} session launch(es) were accepted but the id could not be read, so they could not be stopped`);
-  for (const w of launches.writes) cleanup.push(`the page changed something on the stack (${w}) that this run cannot put back`);
+  // The route is the page's own text: while its bearer is unknown it cannot be redacted, so it is not written.
+  for (const w of launches.writes) cleanup.push(`the page changed something on the stack (${rec.holding ? "route withheld: the page's sign-in was never known" : w}) that this run cannot put back`);
   return { sessions: [...launches.owned].filter((id) => !unconfirmed.has(id)), cleanup };
 }
 

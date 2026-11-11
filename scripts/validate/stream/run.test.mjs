@@ -31,6 +31,7 @@ function windows(n, frozen = []) {
   return Array.from({ length: n }, (_, i) => ({ ...(frozen.includes(i) ? FROZEN : HEALTHY), t_start_ms: T0 + i * 1000, t_end_ms: T0 + (i + 1) * 1000, t_end_host_ms: T0 + (i + 1) * 1000 + 3, last_host_time_ms: frozen.includes(i) ? null : T0 + i * 1000 + 950 }));
 }
 const frames = (n) => Array.from({ length: n * 60 }, (_, i) => ({ present_ms: T0 + Math.round(i * (1000 / 60)), decoded: true }));
+const request = (method, p, base = BASE) => ({ url: () => `${base}${p}`, method: () => method });
 const response = (status, p, body, method = "POST", base = BASE) => ({ status: () => status, url: () => `${base}${p}`, request: () => ({ method: () => method }), json: async () => body, text: async () => JSON.stringify(body) });
 
 /** Does a loader with these classes match `sel` (a comma list of .class and :not(.class) compounds, the only forms the probe uses)? */
@@ -812,19 +813,19 @@ const onPage = (w, fn) => { const orig = w.host.newPage; w.host.newPage = async 
 
 test("A15: a page that changes something on the stack the run cannot put back makes the scenario an error naming it", async () => {
   // The game page's per-game settings calls are stubs today (gameData.ts, issue #720); this is what a real PUT would look like.
-  const w = world({ onPlay: (x) => x.emit("response", response(200, `/v1/apps/app-1/settings`, {}, "PUT")) });
+  const w = world({ onPlay: (x) => x.emit("request", request("PUT", `/v1/apps/app-1/settings`)) });
   const { scenario } = await run(w);
   assert.equal(scenario().status, "error");
   assert.match(scenario().reason, /left behind: the page changed something on the stack \(PUT \/v1\/apps\/app-1\/settings\) that this run cannot put back/);
   assert.deepEqual(w.stopped, [SID]);
   // The library's keep-alive heartbeat is not a preference (the real page sends it, once a minute).
-  const hb = await run(world({ onPlay: (x) => { for (let i = 0; i < 3; i += 1) x.emit("response", response(204, "/v1/me/steam-warm", {}, "PUT")); } }));
+  const hb = await run(world({ onPlay: (x) => { for (let i = 0; i < 3; i += 1) x.emit("request", request("PUT", "/v1/me/steam-warm")); } }));
   assert.equal(hb.scenario().status, "pass");
   // The same write twice is named once.
-  const twice = await run(world({ onPlay: (x) => { for (let i = 0; i < 2; i += 1) x.emit("response", response(200, "/v1/apps/app-1/settings", {}, "PUT")); } }));
+  const twice = await run(world({ onPlay: (x) => { for (let i = 0; i < 2; i += 1) x.emit("request", request("PUT", "/v1/apps/app-1/settings")); } }));
   assert.equal([...twice.scenario().reason.matchAll(/PUT \/v1\/apps\/app-1\/settings/g)].length, 1);
   // The sessions endpoint's own writes (the page stopping its session) and reads are not changes of a preference.
-  const ok = await run(world({ onPlay: (x) => x.emit("response", response(200, `/v1/sessions/${SID}`, {}, "DELETE")) }));
+  const ok = await run(world({ onPlay: (x) => x.emit("request", request("DELETE", `/v1/sessions/${SID}`)) }));
   assert.equal(ok.scenario().status, "pass");
 });
 
@@ -978,7 +979,8 @@ const uuid = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
 const noBearerLogin = (w) => onPage(w, (p) => { p.click = async () => {}; return p; }); // the page signs in without ever storing a bearer
 
 test("A26: every write the page sends is refused by default; the launch, the sign-in calls and exactly two named writes are not", async () => {
-  const wrote = (method, p, status = 200) => run(world({ onPlay: (x) => x.emit("response", response(status, p, {}, method)) }));
+  // A33: the write is seen when the page sends it. With no status here the answer never arrives; the write is refused all the same.
+  const wrote = (method, p, status) => run(world({ onPlay: (x) => { x.emit("request", request(method, p)); if (status) x.emit("response", response(status, p, {}, method)); } }));
   // The two exceptions, by exact method and path (the real sign-in posts the device record; the library keeps warm Steam alive).
   for (const [m, p] of [["POST", "/v1/me/devices"], ["PUT", "/v1/me/steam-warm"], ["POST", "/v1/auth/login"], ["POST", "/v1/auth/refresh"], ["POST", `/v1/sessions/${SID}/stats`], ["DELETE", `/v1/sessions/${SID}`], ["GET", "/v1/me/anything"], ["OPTIONS", "/v1/me/x"]]) {
     assert.equal((await wrote(m, p)).scenario().status, "pass", `${m} ${p}`);
@@ -1024,6 +1026,12 @@ test("A28: while the page's bearer is unknown no page-derived error text is writ
   const r = await run(c);
   assert.match(r.scenario().reason, /left behind: a page it opened would not close(;|$)/);
   for (const f of everyFile(r.dir).filter((x) => !x.endsWith(".png"))) assert.ok(!fs.readFileSync(f, "utf8").includes(PAGE_BEARER), path.relative(r.dir, f));
+  // A34: the same for the route of a write the page sent: it is the page's text, so only the fact is written.
+  const wr = world();
+  onPage(wr, (p) => { p.click = async () => { wr.emit("request", request("PUT", `/v1/me/x/${PAGE_BEARER}`)); }; return p; });
+  const rw = await run(wr);
+  assert.match(rw.scenario().reason, /the page changed something on the stack \(route withheld: the page's sign-in was never known\)/);
+  for (const f of everyFile(rw.dir).filter((x) => !x.endsWith(".png"))) assert.ok(!fs.readFileSync(f, "utf8").includes(PAGE_BEARER), path.relative(rw.dir, f));
   // Once the bearer is known the words are written in full (and redacted): the close error is as before.
   const known = await run(world({ closeFails: true }));
   assert.match(known.scenario().reason, /would not close \(close failed\)/);
@@ -1044,6 +1052,35 @@ test("A29: a count a criterion reads must be a finite, non-negative number", () 
   for (const decoded of [Infinity, -1, NaN, "5"]) assert.equal(J({ stats: { decoded } }).marker_decoded.pass, null, String(decoded));
   assert.equal(J({ stats: { decoded: 0 } }).marker_decoded.pass, false);
   assert.equal(J({ stats: { decoded: 3 } }).marker_decoded.pass, true);
+});
+
+test("A35: a frame time or a video frame count that is not a number leaves present_cadence unjudged", () => {
+  const video = (rate, from = 0) => Array.from({ length: 50 }, (_, i) => ({ t: T0 + i * 1000, videoFrames: from + i * rate }));
+  // The seat's inputs: string timestamps that a comparison would coerce into the share, and a counter that starts below zero.
+  const strings = Array.from({ length: 2500 }, (_, i) => ({ present_ms: String(T0 + 20_000 + (i % 1700)) }));
+  for (const [name, o] of [["string present_ms", { frames: [...frames(50), ...strings], videoSamples: video(150) }], ["negative counter", { videoSamples: video(60, -10_000) }], ["string sample time", { videoSamples: video(60).map((v) => ({ ...v, t: String(v.t) })) }], ["non-finite counter", { videoSamples: video(60).map((v, i) => (i === 30 ? { ...v, videoFrames: Infinity } : v)) }], ["a frame with no time", { frames: [...frames(50), {}], videoSamples: video(60) }]]) {
+    const c = J(o).present_cadence;
+    assert.equal(c.pass, null, name);
+    assert.match(c.expected, /not a number/, name);
+  }
+  assert.deepEqual(instrumentShare(frames(50), video(60, -1), T0 + 20_000, T0 + 49_000), { malformed: true });
+  assert.equal(J({ videoSamples: video(60) }).present_cadence.pass, true);
+});
+
+test("A36: a frame counter and a profile number must be finite numbers", async () => {
+  // A non-number from stats() is not a first frame (no video frame either).
+  for (const n of [Infinity, NaN, "5", -1]) {
+    const r = await run(world({ stats: { frames: n, decoded: 0 }, videoRate: 0 }));
+    assert.equal(r.by().first_frame_s.pass, false, String(n));
+    assert.notEqual(r.scenario().status, "pass", String(n));
+  }
+  // The seat's input: a profile of 400 digits is Infinity as a number, and would equal a non-finite height.
+  const huge = `${"9".repeat(400)}p60`;
+  assert.match(check({ transport: "webrtc", codec: "h264", profile: huge, hold_s: 90, app: "x" }), /profile must look like 1080p60/);
+  for (const stream of [{ height: Infinity, fps: 60 }, { height: "1080", fps: 60 }, { height: 1080, fps: NaN }, { height: -1080, fps: 60 }]) {
+    for (const profile of [huge, "1080p60"]) assert.equal(J({ params: { ...PARAMS, profile }, session: { ...ROW, stream } }).profile_as_asked.pass, null, JSON.stringify(stream));
+  }
+  assert.equal(J().profile_as_asked.pass, true);
 });
 
 test("A31: the drain-and-stop loop runs at most 10 rounds; what is left is named and the bundle is still written", async () => {
