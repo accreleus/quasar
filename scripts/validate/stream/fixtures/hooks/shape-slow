@@ -1,0 +1,4 @@
+#!/bin/sh
+# A harmless test hook: it changes nothing and only says what it was asked. Real hooks live outside the repository.
+echo "$QUASAR_E2E_PHASE: scenario=$QUASAR_E2E_SCENARIO session=${QUASAR_E2E_SESSION:-none} transport=$QUASAR_E2E_TRANSPORT"
+exit 0

@@ -9,7 +9,8 @@
 //   env: QUASAR_E2E_EMAIL / QUASAR_E2E_PASSWORD (or QUASAR_E2E_CRED_FILE=<KEY=value lines>),
 //        QUASAR_E2E_APP (reference app name), CHROME (browser to launch when --cdp is absent),
 //        CLIENT (a label for this test client, a role, never a host name),
-//        INSECURE_TLS=1 (a stack with a self-signed certificate: turns certificate checks off)
+//        INSECURE_TLS=1 (a stack with a self-signed certificate: turns certificate checks off),
+//        HOOKS / QUASAR_E2E_HOOKS (--hooks: the caller's directory of hook scripts, see hooks.mjs)
 //
 // Exit 0 at least one scenario passed and none failed or errored, 1 otherwise, 2 usage, a bundle that
 // fails validateBundle (it is deleted, never left), or a browser that could not be left clean.
@@ -21,6 +22,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "../lib/args.mjs";
 import { attachEvidenceListeners } from "../lib/listeners.mjs";
 import { FORMAT, validateBundle } from "./bundle.mjs";
+import { declaredHooks, Hooks } from "./hooks.mjs";
 import { Recorder, ScenarioRecorder } from "./record.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -288,7 +290,7 @@ async function loadScenario(name) {
  * probeClient(page), browserNow(page), close(), and (optionally) `info` for builds.json. Never throws for a
  * scenario's failure; returns the counts.
  */
-export async function runSuite({ plan, dir, baseUrl, creds, host, api, thresholds, label = null, insecureTls = false, secrets = new Set(), app = DEFAULT_APP, commit = "unknown", dirty = false, abort = new Promise(() => {}), now = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
+export async function runSuite({ plan, dir, baseUrl, creds, host, api, thresholds, label = null, insecureTls = false, secrets = new Set(), app = DEFAULT_APP, commit = "unknown", dirty = false, abort = new Promise(() => {}), now = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), hooksDir = null, hookTimeoutMs, onNote = (line) => console.error(line), load = loadScenario }) {
   if (fs.existsSync(dir)) throw new Error(`${dir} already exists: a bundle is never written over another`);
   const suiteRunId = `e2e-${new Date(now()).toISOString().replace(/[-:]|\.\d+/g, "")}-${crypto.randomBytes(2).toString("hex")}`;
   const staging = path.join(path.dirname(path.resolve(dir)), `.${path.basename(dir)}.staging-${crypto.randomBytes(4).toString("hex")}`);
@@ -296,6 +298,10 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
   try {
     const url = new URL(baseUrl);
     const bundle = new Recorder(staging, { now, secrets, literals: [[url.host, "<stack>"], [url.hostname, "<stack>"], [creds.email, "<user>"], [String(creds.email).split("@")[0], "<user>"], [creds.password, "<credential>"]] });
+    // Hooks: a runner that died between apply and clear left a ledger beside the bundle; it is cleared before anything else, or the run does not start.
+    const hooks = hooksDir ? new Hooks({ dir: hooksDir, ledgerDir: path.dirname(path.resolve(dir)), timeoutMs: hookTimeoutMs }) : null;
+    const recovered = hooks ? await hooks.recover((ev, d) => onNote(bundle.text(`${ev} ${JSON.stringify(d)}`))) : [];
+    if (recovered.length) onNote(`cleared hook(s) a runner that died had left applied: ${recovered.join(", ")}`);
     const startedAt = now();
     const racedSleep = (ms) => Promise.race([sleep(ms), abort.then(() => { throw new Error("interrupted"); })]);
     const clock = { offset: null }; // the browser's clock minus the runner's, measured once around a round trip
@@ -340,25 +346,41 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
         let left = null;
         let launches = null;
         let owned = { sessions: [], cleanup: [] };
+        let hookLeft = [];
+        let stuck = [];
         try {
           if (e.problem) throw new Error(`the plan cannot be run: ${e.problem}`);
-          const scenario = await loadScenario(e.scenario);
+          const scenario = await load(e.scenario);
           const bad = scenario.check?.(e.params);
           if (bad) throw new Error(`the plan cannot be run: ${bad}`);
-          page = await host.newPage();
-          rec.put("console.log", "");
-          launches = trackLaunches(page, baseUrl, (id) => rec.step("session-started", { session: id }));
-          attachEvidenceListeners(page, baseUrl, sink);
-          // Nothing the page says is written until its bearer is known (rec.release, after sign-in): see ScenarioRecorder.
-          page.on("console", (m) => rec.fromPage("console.log", `${stamp()} [${m.type()}] ${m.text()}\n`));
-          page.on("pageerror", (err) => rec.fromPage("console.log", `${stamp()} [pageerror] ${err.message}\n`));
-          // The page signs in on its own; its bearer is a secret of this run, whatever the page does with it afterwards.
-          page.on("response", (r) => {
-            if (r.request().method() === "POST" && new URL(r.url()).pathname === "/v1/auth/login" && r.status() === 200) {
-              r.json().then((b) => { if (typeof b?.access_token === "string") secrets.add(b.access_token); }).catch(() => {});
-            }
-          });
-          out = await scenario.run(page, { baseUrl, params: e.params, rec, api, creds, client, thresholds, secrets, launches, now, sleep: racedSleep, clockOffset: () => clock.offset });
+          const names = declaredHooks(scenario);
+          const missing = names.filter((n) => !hooks?.has(n));
+          // A hook an earlier scenario could not clear is tried again; while it stays applied nothing runs on its faulted path.
+          stuck = hooks ? await hooks.clearAll((ev, d) => rec.step(ev, d)) : [];
+          if (stuck.length) {
+            out = { status: "skipped", reason: `not run: a hook an earlier scenario left applied would not clear (${stuck.join("; ")})`, criteria: [], sessions: [], clock_offset_ms: null };
+          } else if (missing.length) {
+            out = { status: "skipped", reason: `needs hook ${missing.join(", ")}, ${hooks ? "which the hooks directory has no executable script for" : "and no hooks directory (HOOKS=) was given"}`, criteria: [], sessions: [], clock_offset_ms: null };
+          } else {
+            page = await host.newPage();
+            rec.put("console.log", "");
+            launches = trackLaunches(page, baseUrl, (id) => rec.step("session-started", { session: id }));
+            attachEvidenceListeners(page, baseUrl, sink);
+            // Nothing the page says is written until its bearer is known (rec.release, after sign-in): see ScenarioRecorder.
+            page.on("console", (m) => rec.fromPage("console.log", `${stamp()} [${m.type()}] ${m.text()}\n`));
+            page.on("pageerror", (err) => rec.fromPage("console.log", `${stamp()} [pageerror] ${err.message}\n`));
+            // The page signs in on its own; its bearer is a secret of this run, whatever the page does with it afterwards.
+            page.on("response", (r) => {
+              if (r.request().method() === "POST" && new URL(r.url()).pathname === "/v1/auth/login" && r.status() === 200) {
+                r.json().then((b) => { if (typeof b?.access_token === "string") secrets.add(b.access_token); }).catch(() => {});
+              }
+            });
+            const hook = async (name, phase) => {
+              if (!names.includes(name)) throw new Error(`the scenario did not declare hook ${JSON.stringify(String(name)).slice(0, 50)}`);
+              await hooks.call(name, phase, { scenario: e.id, transport: e.params.transport, session: [...launches.owned].at(-1) }, (ev, d) => rec.step(ev, d));
+            };
+            out = await scenario.run(page, { baseUrl, params: e.params, rec, api, creds, client, thresholds, secrets, launches, now, sleep: racedSleep, clockOffset: () => clock.offset, hook });
+          }
         } catch (err) {
           // A page-derived message is not written while the page's bearer is unknown (the scenario catches its own errors; this is what escapes it).
           out = { status: "error", reason: page && rec.holding ? "the scenario did not complete (the page's own words are not written before its sign-in is read)" : String(err?.message ?? err), criteria: [], sessions: [], clock_offset_ms: null };
@@ -366,13 +388,15 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
           // Order matters: close the page, wait for every response it was still delivering, then stop what the run owns.
           // The close error's words are the browser's about a page: held back like the page's own until its bearer is known.
           if (page) await host.closePage(page).catch((err) => { left = `a page it opened would not close${rec.holding ? "" : ` (${err?.message ?? err})`}`; });
+          // Every applied hook is cleared on every exit path, before the sessions are stopped so that the stop is not made over the fault.
+          if (hooks && !stuck.length) hookLeft = await hooks.clearAll((ev, d) => rec.step(ev, d));
           if (launches) owned = await stopOwned(api, launches, rec);
           const dropped = rec.dropHeld() + (rec.holding ? sink.consoleErrors.length + sink.networkFailures.length : 0);
           if (dropped) rec.step("pre-auth-evidence-dropped", { lines: dropped, why: "the page's bearer was never known, so nothing it said could be written safely" });
           rec.json("failed-requests.json", rec.holding ? { console_errors: [], network_failures: [] } : { console_errors: sink.consoleErrors, network_failures: sink.networkFailures });
         }
         out = { ...out, sessions: owned.sessions };
-        const cleanup = [...(out.cleanup ?? []), ...owned.cleanup, ...(left ? [left] : [])];
+        const cleanup = [...(out.cleanup ?? []), ...owned.cleanup, ...(left ? [left] : []), ...hookLeft];
         if (cleanup.length) {
           rec.step("cleanup-failed", { left_behind: cleanup });
           out = { ...out, status: "error", reason: `${out.reason ? `${out.reason}; ` : ""}left behind: ${cleanup.join("; ")}` };
@@ -405,7 +429,7 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
     });
     const errors = [...bundle.problems, ...validateBundle(staging)];
     if (!errors.length) { fs.renameSync(staging, dir); committed = true; }
-    return { counts, suiteRunId, errors, bundle: committed ? dir : null };
+    return { counts, suiteRunId, errors, bundle: committed ? dir : null, recovered };
   } finally {
     if (!committed) fs.rmSync(staging, { recursive: true, force: true });
   }
@@ -446,7 +470,7 @@ export function summarise({ counts: { pass, fail, error }, errors, closeFailed =
 }
 
 function usage(msg) {
-  console.error(`${msg}\nusage: e2e-run TARGET=<stack url> PLAN=<plan> [CDP=<endpoint>] [OUT=<dir>] [CLIENT=<label>] [INSECURE_TLS=1]; sign-in from QUASAR_E2E_EMAIL and QUASAR_E2E_PASSWORD (or QUASAR_E2E_CRED_FILE)`);
+  console.error(`${msg}\nusage: e2e-run TARGET=<stack url> PLAN=<plan> [CDP=<endpoint>] [OUT=<dir>] [CLIENT=<label>] [HOOKS=<dir>] [INSECURE_TLS=1]; sign-in from QUASAR_E2E_EMAIL and QUASAR_E2E_PASSWORD (or QUASAR_E2E_CRED_FILE)`);
   console.log("RESULT status=error target=e2e-run bundle= pass=0 fail=0 error=0 skipped=0");
   process.exit(2);
 }
@@ -472,6 +496,8 @@ async function main() {
     return usage(e.message);
   }
 
+  const hooksDir = args.hooks || process.env.QUASAR_E2E_HOOKS || null;
+  if (hooksDir !== null && !(typeof hooksDir === "string" && fs.existsSync(hooksDir) && fs.statSync(hooksDir).isDirectory())) return usage("HOOKS must be a directory of hook scripts");
   const insecureTls = configureTls(process.env.INSECURE_TLS === "1");
   const { chromium } = await import("playwright").catch(() => import("playwright-core"));
   const browser = args.cdp
@@ -491,7 +517,7 @@ async function main() {
   let opened = null;
   try {
     opened = await openHost(browser, { attached: !!args.cdp, insecureTls });
-    result = await runSuite({ plan, dir: out, baseUrl, creds, host: opened.host, api, thresholds, label, insecureTls, secrets, app: process.env.QUASAR_E2E_APP || DEFAULT_APP, commit, dirty, abort });
+    result = await runSuite({ plan, dir: out, baseUrl, creds, host: opened.host, api, thresholds, label, insecureTls, secrets, app: process.env.QUASAR_E2E_APP || DEFAULT_APP, commit, dirty, abort, hooksDir });
   } finally {
     // Attached, only this run's own context is closed; the person's browser keeps running as it was.
     try { await (opened ? opened.close() : args.cdp ? null : browser.close()); } catch (e) { closeFailed = e; }

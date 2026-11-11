@@ -112,6 +112,40 @@ refused: 409 ...`), and on the Mac test client one bench-armed 60 s hold at 1080
 hold with `bench: false` was not). A scenario the client cannot run (no WebTransport, a codec it
 cannot decode, the app not in the catalog) is `skipped` with the reason.
 
+### Hooks
+
+A scenario that needs a step it cannot do itself, such as cutting the WebTransport path or shaping the
+network, names it as a hook (`fault:webtransport-block`, `shape:<level>`: lower-case word, a colon, then
+letters, digits and dashes). You supply the scripts; the repository ships none, because a real one knows a
+lab address (`scripts/validate/stream/fixtures/hooks/` has two that only print what they were asked).
+
+```
+make e2e-run TARGET=... PLAN=... HOOKS=<dir>        # or QUASAR_E2E_HOOKS=<dir>
+```
+
+- **Script.** `<dir>/<name with ':' as '-'>` (`fault:webtransport-block` is `<dir>/fault-webtransport-block`),
+  an executable file inside `<dir>`. It is run with one argument, `apply` or `clear`, no shell, 30 s to
+  finish (then it and its children are killed). Exit 0 is success; anything else, or the timeout, is a
+  failure. Its environment is yours plus `QUASAR_E2E_SCENARIO` (the scenario directory name),
+  `QUASAR_E2E_SESSION` (only once a session was launched), `QUASAR_E2E_TRANSPORT` and `QUASAR_E2E_PHASE`.
+  `clear` must be safe to run when `apply` did nothing or only half of it.
+- **Timeline.** Each run is a `hook` row: hook, phase, exit code, `timed_out`, milliseconds, and the first
+  2000 characters of its output, redacted like everything the bundle holds.
+- **Cleared on every exit path.** The scenario asks for `apply` when it needs the fault, so it can be
+  applied mid-stream. Whatever a scenario does not clear itself, the runner clears when the scenario ends,
+  however it ended (a throw, Ctrl-C, SIGTERM). A clear that fails makes the scenario `error`, names the
+  hook under "left behind", and the following scenarios are `skipped` until it clears.
+- **A runner killed between apply and clear** (`kill -9`) cannot clear. Before each apply it writes
+  `.e2e-hooks-applied.json` in the directory that holds `OUT`; the next run with the same `HOOKS=` runs `clear`
+  for every entry first and says so on stderr. If one will not clear, or the process that wrote it is
+  still running, the run does not start. A damaged ledger also stops it: remove the file once the hooks are
+  known to be clear.
+- **No script.** A scenario whose hook has no executable script (or no `HOOKS=`) is `skipped`; the reason
+  names the hook. Nothing is launched.
+
+The hooks directory is yours and trusted. The plan is not: it can only choose a scenario and its params,
+never a script.
+
 `client.json` carries the label, the browser, OS and CPU (from client hints; `user_agent` is Chrome's
 reduced string), the GPU (the unmasked WebGL renderer where the browser offers it), decode support per
 codec (`supported`, `power_efficient`, and WebCodecs), `power` (`null` when the Battery API only reports

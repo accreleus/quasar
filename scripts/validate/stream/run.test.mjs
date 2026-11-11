@@ -2,7 +2,7 @@
 // and a fake API. No browser, no network. The page's own evaluate() callbacks really run, against
 // a stand-in window, so the in-page code is exercised too.
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -1142,4 +1142,223 @@ test("B8: builds.json says which builds e2e-collect fills and which it does not 
   const u = JSON.parse(read(dir, "builds.json")).unknown;
   for (const k of ["control_plane", "node_agent"]) assert.match(u[k], /e2e-collect\) fills this/);
   for (const k of ["web", "gpu_driver", "reference_app"]) assert.equal(u[k], "the client cannot see it, and e2e-collect does not read it yet");
+});
+
+// ── hooks (hooks.mjs): apply and clear around a scenario ────────────────────
+
+import { declaredHooks, Hooks, hookScript, LEDGER } from "./hooks.mjs";
+import { pathToFileURL } from "node:url";
+
+const BLOCK = "fault:webtransport-block";
+const tmp = (p = "e2e-hooks-") => fs.mkdtempSync(path.join(os.tmpdir(), p));
+/** A hooks directory: each script logs "<phase> <scenario> <session> <transport>" to `log` beside it, then runs `extra` (a phase-aware snippet). */
+function mkHooks(extra = "", names = ["fault-webtransport-block"]) {
+  const dir = tmp();
+  for (const n of names) {
+    fs.writeFileSync(path.join(dir, n), `#!/bin/sh\necho "$1 $QUASAR_E2E_SCENARIO $QUASAR_E2E_SESSION $QUASAR_E2E_TRANSPORT" >> "$(dirname "$0")/log"\n${extra}\nexit 0\n`, { mode: 0o755 });
+  }
+  return dir;
+}
+const logOf = (dir) => (fs.existsSync(path.join(dir, "log")) ? fs.readFileSync(path.join(dir, "log"), "utf8").trim().split("\n") : []);
+const PASS = [{ id: "x", pass: true, observed: 1, expected: "1" }];
+
+/** A scenario module that launches (so a session id is known), applies the hook, then does `during(ctx, w)`. */
+const fake = (w, during = async () => {}, hooks = [BLOCK]) => ({
+  hooks,
+  async run(page, ctx) {
+    ctx.rec.release(); // as a real scenario does once signed in: before that the runner withholds the page's words
+    w.emit("response", response(201, "/v1/sessions", { session: { id: SID } }));
+    await ctx.launches.settle();
+    await ctx.hook(BLOCK, "apply");
+    await during(ctx, w);
+    return { status: "pass", criteria: PASS, sessions: [], clock_offset_ms: null };
+  },
+});
+
+async function runHooks(w, scenario, { hooksDir, parent = tmp("e2e-parent-"), ...extra } = {}) {
+  const dir = path.join(parent, "bundle");
+  const result = await runSuite({ plan: { name: "t", scenarios: [{ scenario: "fake" }] }, dir, baseUrl: BASE, creds: CREDS, host: w.host, api: w.api, thresholds: T, secrets: w.secrets, now: w.now, sleep: w.sleep, hooksDir, load: async () => scenario, onNote: (l) => notes.push(l), ...extra });
+  const sc = () => JSON.parse(fs.readFileSync(path.join(dir, "01-fake/scenario.json"), "utf8"));
+  const timeline = () => fs.readFileSync(path.join(dir, "01-fake/timeline.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  return { dir, parent, result, sc, timeline };
+}
+let notes = [];
+
+test("hooks: a hook asked for mid-scenario is applied with the scenario's facts and cleared at the end", async () => {
+  notes = [];
+  const w = world();
+  const hooksDir = mkHooks();
+  const r = await runHooks(w, fake(w, async (ctx) => ctx.hook(BLOCK, "clear")), { hooksDir });
+  assert.deepEqual(r.result.errors, []);
+  assert.equal(r.sc().status, "pass");
+  assert.deepEqual(logOf(hooksDir), [`apply 01-fake ${SID} webrtc`, `clear 01-fake ${SID} webrtc`]);
+  assert.deepEqual(r.timeline().filter((s) => s.ev === "hook").map((s) => [s.phase, s.exit_code]), [["apply", 0], ["clear", 0]]);
+  assert.equal(fs.existsSync(path.join(r.parent, LEDGER)), false, "the ledger is removed once nothing is applied");
+});
+
+test("hooks: a scenario that never clears has its hook cleared by the runner; one that throws as well", async () => {
+  for (const during of [async () => {}, async () => { throw new Error("the scenario broke"); }]) {
+    notes = [];
+    const w = world();
+    const hooksDir = mkHooks();
+    const r = await runHooks(w, fake(w, during), { hooksDir });
+    assert.deepEqual(logOf(hooksDir).map((l) => l.split(" ")[0]), ["apply", "clear"]);
+    assert.equal(fs.existsSync(path.join(r.parent, LEDGER)), false);
+    assert.equal(r.sc().status, during.toString().includes("broke") ? "error" : "pass");
+  }
+});
+
+test("hooks: an interrupt (SIGINT/SIGTERM resolve `abort`) while a hook is applied still clears it", async () => {
+  notes = [];
+  const w = world();
+  const hooksDir = mkHooks();
+  let stop;
+  const abort = new Promise((r) => { stop = r; });
+  const r = await runHooks(w, fake(w, async (ctx) => { stop(); await ctx.sleep(1000); }), { hooksDir, abort, sleep: () => new Promise(() => {}) });
+  assert.deepEqual(logOf(hooksDir).map((l) => l.split(" ")[0]), ["apply", "clear"]);
+  assert.equal(r.sc().status, "error");
+  assert.match(r.sc().reason, /interrupted/);
+});
+
+test("hooks: a clear that fails makes the scenario error, names the hook, and stays in the ledger", async () => {
+  notes = [];
+  const w = world();
+  const hooksDir = mkHooks('[ "$1" = clear ] && exit 3');
+  const r = await runHooks(w, fake(w), { hooksDir });
+  assert.equal(r.sc().status, "error");
+  assert.match(r.sc().reason, /left behind: .*hook fault:webtransport-block clear failed \(exit 3\)/);
+  const ledger = JSON.parse(fs.readFileSync(path.join(r.parent, LEDGER), "utf8"));
+  assert.deepEqual(ledger.entries.map((e) => e.name), [BLOCK]);
+});
+
+test("hooks: after a failed clear the next scenario is skipped, not judged on a faulted path", async () => {
+  const w = world();
+  const hooksDir = mkHooks('[ "$1" = clear ] && exit 3');
+  const dir = path.join(tmp("e2e-parent-"), "bundle");
+  const result = await runSuite({ plan: { name: "t", scenarios: [{ scenario: "fake" }, { scenario: "fake" }] }, dir, baseUrl: BASE, creds: CREDS, host: w.host, api: w.api, thresholds: T, secrets: w.secrets, now: w.now, sleep: w.sleep, hooksDir, load: async () => fake(w), onNote: () => {} });
+  assert.deepEqual(result.counts, { pass: 0, fail: 0, error: 1, skipped: 1 });
+  assert.match(JSON.parse(fs.readFileSync(path.join(dir, "02-fake/scenario.json"), "utf8")).reason, /would not clear/);
+});
+
+test("hooks: a hook with no script, a non-executable one or no HOOKS= at all skips the scenario naming it, and launches nothing", async () => {
+  const empty = tmp();
+  const plain = mkHooks();
+  fs.chmodSync(path.join(plain, "fault-webtransport-block"), 0o644);
+  for (const [hooksDir, wording] of [[empty, /needs hook fault:webtransport-block, which the hooks directory has no executable script for/], [plain, /needs hook fault:webtransport-block/], [null, /no hooks directory \(HOOKS=\) was given/]]) {
+    const w = world();
+    const r = await runHooks(w, fake(w), { hooksDir });
+    assert.equal(r.sc().status, "skipped");
+    assert.match(r.sc().reason, wording);
+    assert.equal(w.opened.length, 1, "only the probe page was opened");
+    assert.equal(w.calls.length, 0, "the API was not touched");
+    assert.deepEqual(r.result.errors, []);
+  }
+});
+
+test("hooks: a name of the wrong shape, or a script that links out of the directory, is never run", async () => {
+  for (const bad of ["../etc:x", "Fault:x", "fault:", "fault:a b", "fault", "fault:x/y"]) assert.equal(hookScript(mkHooks(), bad), null, bad);
+  assert.throws(() => declaredHooks({ hooks: ["fault:x", "fault:x"] }), /distinct names/);
+  assert.throws(() => declaredHooks({ hooks: "fault:x" }), /distinct names/);
+  assert.deepEqual(declaredHooks({}), []);
+  const outside = mkHooks();
+  const dir = tmp();
+  fs.symlinkSync(path.join(outside, "fault-webtransport-block"), path.join(dir, "fault-webtransport-block"));
+  assert.equal(hookScript(dir, BLOCK), null);
+  assert.equal(hookScript(outside, BLOCK), fs.realpathSync(path.join(outside, "fault-webtransport-block")));
+});
+
+test("hooks: a scenario cannot ask for a hook it did not declare, or an unknown phase", async () => {
+  const w = world();
+  const hooksDir = mkHooks("", ["fault-webtransport-block", "shape-slow"]);
+  const r = await runHooks(w, { hooks: [], async run(page, ctx) { ctx.rec.release(); await ctx.hook("shape:slow", "apply"); return { status: "pass", criteria: PASS }; } }, { hooksDir });
+  assert.equal(r.sc().status, "error");
+  assert.match(r.sc().reason, /did not declare hook/);
+  assert.deepEqual(logOf(hooksDir), []);
+  const h = new Hooks({ dir: hooksDir, ledgerDir: tmp() });
+  await assert.rejects(h.call(BLOCK, "toggle", {}, () => {}), /apply or clear/);
+  await assert.rejects(h.call(BLOCK, "clear", {}, () => {}), /not applied/);
+});
+
+test("hooks: a hook that hangs is killed at the timeout, which fails the apply; the clear still runs", async () => {
+  notes = [];
+  const w = world();
+  const hooksDir = mkHooks('[ "$1" = apply ] && sleep 30');
+  const t0 = Date.now();
+  const r = await runHooks(w, fake(w), { hooksDir, hookTimeoutMs: 300 });
+  assert.ok(Date.now() - t0 < 10_000, "did not wait for the sleep");
+  assert.equal(r.sc().status, "error");
+  assert.match(r.sc().reason, /hook fault:webtransport-block apply failed \(timed out\)/);
+  assert.deepEqual(logOf(hooksDir).map((l) => l.split(" ")[0]), ["apply", "clear"]);
+  assert.equal(fs.existsSync(path.join(r.parent, LEDGER)), false);
+  assert.equal(r.timeline().find((s) => s.ev === "hook").timed_out, true);
+});
+
+test("hooks: output is redacted and capped before it reaches the timeline, and a hook gets no shell", async () => {
+  const w = world();
+  const hooksDir = mkHooks(`echo "token ${CREDS.password} 10.20.30.40"; i=0; while [ $i -lt 400 ]; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; i=$((i+1)); done`);
+  const r = await runHooks(w, fake(w), { hooksDir });
+  const text = fs.readFileSync(path.join(r.dir, "01-fake/timeline.jsonl"), "utf8");
+  assert.ok(!text.includes(CREDS.password));
+  assert.ok(!text.includes("10.20.30.40"));
+  assert.match(text, /<credential>/);
+  assert.ok(r.timeline().find((s) => s.ev === "hook").stdout.length <= 2000);
+  // Arguments are one array entry each: the phase is never parsed by a shell.
+  assert.deepEqual(r.result.errors, []);
+});
+
+test("hooks: a runner killed between apply and clear leaves a ledger; the next run clears it first and says so", async () => {
+  notes = [];
+  const w = world();
+  const hooksDir = mkHooks();
+  const parent = tmp("e2e-parent-");
+  const hooksUrl = pathToFileURL(path.join(HERE, "hooks.mjs")).href;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", `import { Hooks } from ${JSON.stringify(hooksUrl)};
+    const h = new Hooks({ dir: ${JSON.stringify(hooksDir)}, ledgerDir: ${JSON.stringify(parent)} });
+    await h.call(${JSON.stringify(BLOCK)}, "apply", { scenario: "01-fake", transport: "webtransport", session: ${JSON.stringify(SID)} }, () => {});
+    console.log("applied"); setInterval(() => {}, 1000);`], { stdio: ["ignore", "pipe", "inherit"] });
+  await new Promise((resolve, reject) => { child.stdout.on("data", (b) => /applied/.test(String(b)) && resolve()); child.on("exit", () => reject(new Error("the child ended early"))); });
+  const gone = new Promise((r) => child.on("exit", r));
+  child.kill("SIGKILL");
+  await gone;
+  assert.deepEqual(logOf(hooksDir).map((l) => l.split(" ")[0]), ["apply"]);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(parent, LEDGER), "utf8")).entries.length, 1);
+
+  const r = await runHooks(w, { hooks: [], async run() { return { status: "pass", criteria: PASS }; } }, { hooksDir, parent });
+  assert.deepEqual(r.result.recovered, [BLOCK]);
+  assert.deepEqual(logOf(hooksDir), [`apply 01-fake ${SID} webtransport`, `clear 01-fake ${SID} webtransport`], "cleared with the facts it was applied with");
+  assert.ok(notes.some((l) => /cleared hook\(s\) a runner that died had left applied: fault:webtransport-block/.test(l)), notes.join("\n"));
+  assert.equal(fs.existsSync(path.join(parent, LEDGER)), false);
+  assert.equal(r.sc().status, "pass");
+});
+
+test("hooks: a stale hook that will not clear stops the run before anything starts; a live holder or a damaged ledger does too", async () => {
+  const noop = { hooks: [], async run() { return { status: "pass", criteria: PASS }; } };
+  const ledger = (parent, hooksDir, pid) => fs.writeFileSync(path.join(parent, LEDGER), JSON.stringify({ format: 1, entries: [{ id: "abc", pid, hooks_dir: fs.realpathSync(hooksDir), name: BLOCK, facts: { scenario: "01-fake", transport: "webrtc" } }] }));
+  const dead = 2 ** 22 + 12345; // beyond pid_max
+  // clear fails
+  let w = world();
+  let hooksDir = mkHooks('[ "$1" = clear ] && exit 1');
+  let parent = tmp("e2e-parent-");
+  ledger(parent, hooksDir, dead);
+  await assert.rejects(runHooks(w, noop, { hooksDir, parent }), /refusing to start: .*fault:webtransport-block \(exit 1\)/);
+  assert.equal(w.opened.length, 0, "no browser page was opened");
+  assert.ok(fs.existsSync(path.join(parent, LEDGER)), "the entry stays for the next try");
+  assert.deepEqual(fs.readdirSync(parent).filter((n) => n.includes("staging")), [], "no staging directory is left");
+  // a live holder
+  w = world();
+  hooksDir = mkHooks();
+  parent = tmp("e2e-parent-");
+  ledger(parent, hooksDir, process.pid);
+  await assert.rejects(runHooks(w, noop, { hooksDir, parent }), /still holds hook fault:webtransport-block/);
+  assert.deepEqual(logOf(hooksDir), []);
+  // not a ledger
+  parent = tmp("e2e-parent-");
+  fs.writeFileSync(path.join(parent, LEDGER), "{not json");
+  await assert.rejects(runHooks(world(), noop, { hooksDir, parent }), /is not a ledger this runner wrote/);
+  // another hooks directory's entries are left alone
+  parent = tmp("e2e-parent-");
+  ledger(parent, mkHooks(), dead);
+  const r = await runHooks(world(), noop, { hooksDir, parent });
+  assert.deepEqual(r.result.recovered, []);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(parent, LEDGER), "utf8")).entries.length, 1);
 });

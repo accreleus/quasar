@@ -315,7 +315,7 @@ nightly-budget-status: ## Tail today's nightly-budget log + LAST_REGRESSION if a
 validate: ## End-to-end validation report — LEVEL=ui|api|session|all TARGET=local|<url> KEEP=1 ARGS='--reuse-web'
 	@bash $(DX)/validate.sh
 
-e2e-run: ## Run a plan of the end-to-end streaming suite from this client — TARGET=<stack url> PLAN=<plan> [CDP=<DevTools endpoint> OUT=<dir> CLIENT=<label> INSECURE_TLS=1]
+e2e-run: ## Run a plan of the end-to-end streaming suite from this client — TARGET=<stack url> PLAN=<plan> [CDP=<DevTools endpoint> OUT=<dir> CLIENT=<label> HOOKS=<hook dir> INSECURE_TLS=1]
 	@bash $(DX)/e2e_run.sh
 
 e2e-collect: ## The host half of a run bundle, by session id — BUNDLE=<dir> [HOST=<role|name>] [RESUME=1: finish a collection this machine started]
