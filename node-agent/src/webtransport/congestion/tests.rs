@@ -23,9 +23,13 @@ struct Sim {
     t: u64,
     seq: u32,
     free_at: u64,
+    last_arrival: u64,
     cap_kbps: f64,
     queue_bytes: f64,
     send_kbps: Option<f64>,
+    /// The most the content gives the encoder at a send time, kbit/s: a still screen sends
+    /// little whatever the estimate.
+    content_kbps: Box<dyn Fn(u64) -> f64>,
     /// Extra one-way delay at a send time, µs.
     extra_us: Box<dyn Fn(u64) -> u64>,
     offset_us: u64,
@@ -52,9 +56,11 @@ impl Sim {
             t: 0,
             seq,
             free_at: 0,
+            last_arrival: 0,
             cap_kbps,
             queue_bytes: 256.0 * 1024.0,
             send_kbps: None,
+            content_kbps: Box::new(|_| f64::MAX),
             extra_us: Box::new(|_| 0),
             offset_us: 0,
             drift: 0.0,
@@ -82,7 +88,10 @@ impl Sim {
     }
 
     fn frame(&mut self) {
-        let kbps = self.send_kbps.unwrap_or(self.est.estimate_kbps());
+        let kbps = self
+            .send_kbps
+            .unwrap_or(self.est.estimate_kbps())
+            .min((self.content_kbps)(self.t));
         let bytes = kbps * 1000.0 / 8.0 / 60.0;
         let n = (bytes / SIZE as f64).ceil().max(1.0) as u32;
         let service = (SIZE as f64 * 8.0 * 1000.0 / self.cap_kbps) as u64;
@@ -95,7 +104,11 @@ impl Sim {
             let dropped = self.drop_every > 0 && self.seq.is_multiple_of(self.drop_every);
             let arrival = (!dropped && backlog + SIZE as f64 <= self.queue_bytes).then(|| {
                 self.free_at = self.free_at.max(self.t) + service;
-                self.free_at + 10_000 + (self.extra_us)(self.t)
+                // One path, first in first out: a delay spike holds back what follows it.
+                self.last_arrival = self
+                    .last_arrival
+                    .max(self.free_at + 10_000 + (self.extra_us)(self.t));
+                self.last_arrival
             });
             self.pending.push_back((self.seq, arrival));
             self.seq = self.seq.wrapping_add(1);
@@ -293,7 +306,7 @@ fn overuse_with_sparse_arrivals_still_cuts() {
     assert_eq!(
         est.estimate_kbps(),
         BETA * CEILING,
-        "no rate: the estimate is the base"
+        "no throughput yet: the ceiling is the base"
     );
 }
 
@@ -521,4 +534,93 @@ fn a_message_out_of_contract_is_refused_naming_the_field() {
         bad[field] = value.clone();
         assert_eq!(feedback_of(&bad), Err(named), "{field} = {value}");
     }
+}
+
+/// The weak link of #1316: 0–20 ms of jitter per frame, and every 7 s a delay spike of
+/// `spike_ms` that builds over 200 ms and drains over 300 ms. First in, first out.
+fn jitter(spike_ms: u64) -> Box<dyn Fn(u64) -> u64> {
+    Box::new(move |t| {
+        let jitter = (t / 16_667).wrapping_mul(2_654_435_761) % 20_000;
+        let phase = t % 7_000_000;
+        let spike = match phase {
+            _ if t < 3_000_000 => 0,
+            0..200_000 => phase * spike_ms / 200,
+            200_000..500_000 => (500_000 - phase) * spike_ms / 300,
+            _ => 0,
+        };
+        jitter + spike
+    })
+}
+
+/// A second of a quiet scene (1500 kbit/s) every 10 s from 5 s on.
+fn quiet_seconds(t: u64) -> f64 {
+    if t > 5_000_000 && (t / 1_000_000) % 10 == 5 {
+        1500.0
+    } else {
+        f64::MAX
+    }
+}
+
+#[test]
+fn a_jittery_near_lossless_link_with_quiet_scenes_keeps_the_estimate_up() {
+    // The link carries more than the ceiling; one datagram in 20 000 is lost.
+    let mut s = Sim::new(15_000.0);
+    s.extra_us = jitter(110);
+    s.content_kbps = Box::new(quiet_seconds);
+    s.drop_every = 20_000;
+    s.run(60.0);
+    // A spike costs one cut, on the most the link delivered in the last busy second.
+    let low = s.min_after(3.0);
+    assert!(low > 0.85 * CEILING, "lowest {low:.0}");
+}
+
+#[test]
+fn a_still_screen_then_a_busy_one_does_not_collapse_the_estimate() {
+    let mut s = Sim::new(15_000.0);
+    s.extra_us = jitter(110);
+    // One datagram a frame for 10 s, then whatever the estimate allows.
+    s.content_kbps = Box::new(|t| if t < 10_000_000 { 1.0 } else { f64::MAX });
+    s.run(30.0);
+    let low = s.min_after(0.0);
+    assert!(low > 0.8 * CEILING, "lowest {low:.0}");
+    assert!(
+        s.mean_after(20.0) > 0.85 * CEILING,
+        "busy at {:.0}",
+        s.mean_after(20.0)
+    );
+}
+
+#[test]
+fn a_long_delay_spike_costs_one_cut_not_one_per_rtt() {
+    let mut s = Sim::new(15_000.0);
+    s.extra_us = jitter(400);
+    s.run(60.0);
+    let low = s.min_after(3.0);
+    assert!(low > 0.85 * CEILING, "lowest {low:.0}");
+}
+
+#[test]
+fn a_capped_link_with_quiet_scenes_still_holds_the_estimate_at_the_cap() {
+    let mut s = Sim::new(6000.0);
+    s.content_kbps = Box::new(quiet_seconds);
+    s.run(40.0);
+    let mean = s.mean_after(10.0);
+    assert!(
+        (4500.0..6300.0).contains(&mean),
+        "the sender follows the estimate around a 6000 kbps cap, mean {mean:.0}"
+    );
+}
+
+#[test]
+fn a_link_that_drops_to_a_third_drives_the_estimate_down() {
+    let mut s = Sim::new(15_000.0);
+    s.run(10.0);
+    assert_eq!(s.est.estimate_kbps(), CEILING);
+    s.cap_kbps = 3000.0;
+    s.run(3.0);
+    let e = s.est.estimate_kbps();
+    assert!(e < 3000.0, "3 s after the drop: {e:.0}");
+    s.run(10.0);
+    let mean = s.mean_after(16.0);
+    assert!((2000.0..3300.0).contains(&mean), "mean {mean:.0}");
 }

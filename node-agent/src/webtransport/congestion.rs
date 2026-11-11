@@ -8,8 +8,11 @@
 //!   groups) compared with an adaptive threshold. Only differences on one clock are used,
 //!   so a clock offset cancels and drift is a slope far under the threshold; a route step
 //!   or a standing queue is a level, not a slope.
-//! - **AIMD** on that signal: overuse cuts to 0.85 × the receive rate; normal grows 8 % a
-//!   second, never past 1.5 × the receive rate.
+//! - **AIMD** on that signal: overuse cuts to 0.85 × the link's throughput; normal grows
+//!   8 % a second, never past 1.5 × the receive rate. The throughput is the highest receive
+//!   rate of the last second of feedback in which the sender was not application-limited
+//!   (BBR's delivery-rate filter, libwebrtc's ALR): a quiet scene, or the gap a delay spike
+//!   leaves in the arrivals, measures the content or the stall, not the link (#1316).
 //! - **Loss.** Over 10 % scales by (1 − loss/2); under 2 % lets it grow.
 //! - The estimate is the least of the two, of 1.5 × QUIC's own cwnd/RTT once QUIC has
 //!   seen congestion, and of the ceiling.
@@ -73,6 +76,12 @@ const MAX_LOSS_ENTRIES: usize = 64;
 const RATE_WINDOW_US: u64 = 500_000;
 /// A rate measured over less than this is noise; the last good one stands in.
 const MIN_RATE_SPAN_US: u64 = 100_000;
+/// The overuse cut's base is the highest of this many throughput samples: a second of
+/// busy feedback (§Feedback's 50 ms), so a quiet stretch ages none of them.
+const THROUGHPUT_SAMPLES: usize = 20;
+/// A window whose datagrams were sent under this share of the estimate is
+/// application-limited, and is no throughput sample.
+const APP_LIMITED: f64 = 0.8;
 const MAX_ARRIVALS: usize = 1 << 14;
 
 /// QUIC's own estimate bounds ours with this headroom. An exact cap would deadlock: once
@@ -199,6 +208,15 @@ pub(crate) struct QuicPath {
     pub(crate) rtt: Duration,
     pub(crate) cwnd_bytes: u64,
     pub(crate) congestion_events: u64,
+}
+
+/// Which bound the estimate sits at; silence decays the delay and loss bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Bound {
+    Ceiling,
+    Delay,
+    Loss,
+    Quic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -393,10 +411,11 @@ pub(crate) struct Estimator {
     estimate_kbps: f64,
     inter_arrival: InterArrival,
     trendline: Trendline,
-    /// Received datagrams that are not resends: (client arrival µs, bytes).
-    arrivals: VecDeque<(u64, u32)>,
+    /// Received datagrams that are not resends: (client arrival µs, bytes, agent send µs).
+    arrivals: VecDeque<(u64, u32, u64)>,
     newest_arrival: u64,
-    last_rate_kbps: Option<f64>,
+    /// Receive rates of the last windows that were not application-limited.
+    throughput: VecDeque<f64>,
     /// Per message: (agent instant, received, lost); a late arrival after a loss is a
     /// correction (+1, −1).
     losses: VecDeque<(Instant, i64, i64)>,
@@ -408,6 +427,7 @@ pub(crate) struct Estimator {
     last_decay: Option<Instant>,
     quic_cap_kbps: Option<f64>,
     loss: Option<f64>,
+    bound: Bound,
 }
 
 /// What one message measured, for the tests.
@@ -415,6 +435,8 @@ pub(crate) struct Estimator {
 pub(crate) struct Measured {
     pub(crate) usage: Usage,
     pub(crate) rate_kbps: Option<f64>,
+    /// The rate the same datagrams were sent at, on the agent's clock.
+    pub(crate) sent_kbps: Option<f64>,
     pub(crate) loss: Option<f64>,
 }
 
@@ -430,7 +452,7 @@ impl Estimator {
             trendline: Trendline::default(),
             arrivals: VecDeque::new(),
             newest_arrival: 0,
-            last_rate_kbps: None,
+            throughput: VecDeque::new(),
             losses: VecDeque::new(),
             last_update: now,
             last_decrease: None,
@@ -440,6 +462,7 @@ impl Estimator {
             last_decay: None,
             quic_cap_kbps: None,
             loss: None,
+            bound: Bound::Ceiling,
         }
     }
 
@@ -472,9 +495,23 @@ impl Estimator {
             .as_secs_f64()
             .min(1.0);
         self.last_update = now;
-        if let Some(r) = m.rate_kbps {
-            self.last_rate_kbps = Some(r);
+        let app_limited = m
+            .sent_kbps
+            .is_some_and(|s| s < APP_LIMITED * self.estimate_kbps);
+        if let Some(r) = m.rate_kbps.filter(|_| !app_limited) {
+            self.throughput.push_back(r);
+            if self.throughput.len() > THROUGHPUT_SAMPLES {
+                self.throughput.pop_front();
+            }
         }
+        // Nothing measured while busy: one cut from the ceiling, never compounding.
+        let base = self
+            .throughput
+            .iter()
+            .copied()
+            .reduce(f64::max)
+            .unwrap_or(self.ceiling_kbps);
+        let mut cut_by = None;
 
         match m.usage {
             Usage::Overusing => {
@@ -483,16 +520,10 @@ impl Estimator {
                     .last_decrease
                     .is_none_or(|at| now.saturating_duration_since(at) >= reduce_every)
                 {
-                    // Sparse arrivals give no rate: the last one, else the estimate, still cuts.
-                    let base = m.rate_kbps.or(self.last_rate_kbps);
-                    let cut = BETA * base.unwrap_or(self.estimate_kbps);
+                    let cut = BETA * base;
                     if cut < self.delay_kbps {
-                        tracing::debug!(
-                            token = "webtransport-cc-overuse",
-                            "WebTransport path overused: delay estimate {:.0} → {cut:.0} kbps",
-                            self.delay_kbps
-                        );
                         self.delay_kbps = cut;
+                        cut_by = Some("delay");
                     }
                     self.last_decrease = Some(now);
                 }
@@ -518,6 +549,7 @@ impl Estimator {
                 {
                     self.loss_kbps = self.estimate_kbps * (1.0 - 0.5 * loss);
                     self.last_loss_decrease = Some(now);
+                    cut_by = Some("loss");
                     // These losses are spent; the next decision reads new ones.
                     self.losses.clear();
                 }
@@ -530,7 +562,30 @@ impl Estimator {
             let rtt_ms = path.rtt.as_secs_f64().max(0.001) * 1000.0;
             QUIC_CAP * path.cwnd_bytes as f64 * 8.0 / rtt_ms
         });
+        let was = (self.bound, self.estimate_kbps);
         self.settle();
+        if cut_by.is_some() || self.bound != was.0 {
+            tracing::info!(
+                token = "webtransport-cc-bound",
+                bound = ?self.bound,
+                cut = cut_by.unwrap_or("none"),
+                usage = ?m.usage,
+                recv_kbps = m.rate_kbps.unwrap_or(0.0) as u64,
+                sent_kbps = m.sent_kbps.unwrap_or(0.0) as u64,
+                app_limited,
+                base_kbps = base as u64,
+                loss_pct = m.loss.unwrap_or(0.0) * 100.0,
+                delay_kbps = self.delay_kbps as u64,
+                loss_kbps = self.loss_kbps as u64,
+                quic_kbps = self.quic_cap_kbps.unwrap_or(0.0) as u64,
+                rtt_ms = path.rtt.as_millis() as u64,
+                cwnd_bytes = path.cwnd_bytes,
+                quic_congestion_events = path.congestion_events,
+                "WebTransport estimate {:.0} → {:.0} kbps",
+                was.1,
+                self.estimate_kbps
+            );
+        }
         self.due(now)
     }
 
@@ -550,8 +605,19 @@ impl Estimator {
         let factor = SILENCE_DECAY.powf(steps);
         self.delay_kbps *= factor;
         self.loss_kbps *= factor;
-        self.last_decay = Some(now);
+        let was = self.estimate_kbps;
         self.settle();
+        if self.last_decay.replace(now).is_none() {
+            tracing::info!(
+                token = "webtransport-cc-bound",
+                bound = ?self.bound,
+                cut = "silence",
+                silent_ms = now.saturating_duration_since(sent).as_millis() as u64,
+                rtt_ms = rtt.as_millis() as u64,
+                "WebTransport estimate {was:.0} → {:.0} kbps: no feedback for media sent",
+                self.estimate_kbps
+            );
+        }
         self.due(now)
     }
 
@@ -560,7 +626,21 @@ impl Estimator {
         self.delay_kbps = clamp(self.delay_kbps);
         self.loss_kbps = clamp(self.loss_kbps);
         let quic = self.quic_cap_kbps.unwrap_or(f64::MAX);
-        self.estimate_kbps = clamp(self.delay_kbps.min(self.loss_kbps).min(quic));
+        let (kbps, bound) = [
+            (self.delay_kbps, Bound::Delay),
+            (self.loss_kbps, Bound::Loss),
+            (quic, Bound::Quic),
+        ]
+        .into_iter()
+        .fold((self.ceiling_kbps, Bound::Ceiling), |a, b| {
+            if b.0 < a.0 {
+                b
+            } else {
+                a
+            }
+        });
+        self.estimate_kbps = clamp(kbps);
+        self.bound = bound;
     }
 
     fn due(&mut self, now: Instant) -> Option<f64> {
@@ -609,7 +689,8 @@ impl Estimator {
                 }
             }
             if let (false, Some(at)) = (slot.resend, at_us) {
-                self.arrivals.push_back((at, u32::from(slot.bytes)));
+                self.arrivals
+                    .push_back((at, u32::from(slot.bytes), slot.sent_us));
                 self.newest_arrival = self.newest_arrival.max(at);
                 if self.arrivals.len() > MAX_ARRIVALS {
                     self.arrivals.pop_front();
@@ -619,19 +700,19 @@ impl Estimator {
 
         let newest = self.newest_arrival;
         self.arrivals
-            .retain(|&(t, _)| t.saturating_add(RATE_WINDOW_US) >= newest);
-        // N datagrams span N − 1 gaps: the oldest one's bytes arrived before the span began.
-        let (oldest, first_bytes) = self
-            .arrivals
-            .iter()
-            .min_by_key(|&&(t, _)| t)
-            .copied()
-            .unwrap_or((newest, 0));
-        let span = newest - oldest;
-        let rate_kbps = (span >= MIN_RATE_SPAN_US).then(|| {
-            let bytes: u64 = self.arrivals.iter().map(|&(_, b)| u64::from(b)).sum();
-            (bytes - u64::from(first_bytes)) as f64 * 8.0 * 1000.0 / span as f64
-        });
+            .retain(|&(t, _, _)| t.saturating_add(RATE_WINDOW_US) >= newest);
+        let bytes: u64 = self.arrivals.iter().map(|&(_, b, _)| u64::from(b)).sum();
+        // N datagrams span N − 1 gaps: the first one's bytes came before the span began.
+        let rate = |key: fn(&(u64, u32, u64)) -> u64, min_span: u64| {
+            let first = self.arrivals.iter().min_by_key(|a| key(a))?;
+            let last = self.arrivals.iter().map(key).max()?;
+            let span = last - key(first);
+            (span >= min_span)
+                .then(|| (bytes - u64::from(first.1)) as f64 * 8.0 * 1000.0 / span as f64)
+        };
+        let rate_kbps = rate(|a| a.0, MIN_RATE_SPAN_US);
+        // Datagrams all sent in one instant give no send rate: no application-limited window.
+        let sent_kbps = rate_kbps.and(rate(|a| a.2, 1));
 
         if received != 0 || lost != 0 {
             self.losses.push_back((now, received, lost));
@@ -656,6 +737,7 @@ impl Estimator {
         Measured {
             usage: self.trendline.usage,
             rate_kbps,
+            sent_kbps,
             loss,
         }
     }
