@@ -93,17 +93,24 @@ type diagnosticBundleResp struct {
 // --- helpers -----------------------------------------------------------------
 
 // resolveWindow computes [fromMs, toMs]. Explicit from/to are honored and clamped
-// to the 10-min max; otherwise a default 5-min window ending now. An inverted pair
-// or a sub-2-min span is widened to the floor; over 10 min is trimmed to the cap,
+// to the 10-min max; otherwise a default 5-min window ending now, or — for a
+// session that has already ended — ending at that session's own end (#1319: a
+// default measured back from now finds nothing at all once the session is older
+// than it, even though its samples are still retained). An inverted pair or a
+// sub-2-min span is widened to the floor; over 10 min is trimmed to the cap,
 // anchored on `to`.
-func resolveWindow(r *http.Request) (fromMs, toMs int64) {
+func resolveWindow(r *http.Request, sess Session) (fromMs, toMs int64) {
 	q := r.URL.Query()
 	fromStr := q.Get("from")
 	toStr := q.Get("to")
 
 	nowMs := time.Now().UnixMilli()
 	if fromStr == "" && toStr == "" {
-		return nowMs - defaultTraceWindow.Milliseconds(), nowMs
+		to := nowMs
+		if sess.EndedAt != nil && !sess.EndedAt.IsZero() {
+			to = sess.EndedAt.UnixMilli()
+		}
+		return to - defaultTraceWindow.Milliseconds(), to
 	}
 
 	from, ferr := strconv.ParseInt(fromStr, 10, 64)
@@ -242,7 +249,7 @@ func (h *Handler) handleDiagnosticBundle(w http.ResponseWriter, r *http.Request)
 	}
 	id = sess.ID // canonical spelling: the ingest counters are keyed on it (#1100)
 
-	fromMs, toMs := resolveWindow(r)
+	fromMs, toMs := resolveWindow(r, sess)
 	raw, err := h.store.Telemetry().Window(r.Context(), id,
 		telemetry.Range{FromMs: fromMs, ToMs: toMs}, telemetry.Filter{Limit: traceReadLimit})
 	if err != nil {
@@ -327,10 +334,11 @@ const (
 func (h *Handler) handleAdminTelemetryRead(p traceProjection) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
-		if _, ok := h.adminSessionOr404(w, r, id); !ok {
+		sess, ok := h.adminSessionOr404(w, r, id)
+		if !ok {
 			return
 		}
-		fromMs, toMs := resolveWindow(r)
+		fromMs, toMs := resolveWindow(r, sess)
 		window := traceWindowResp{FromMs: fromMs, ToMs: toMs}
 
 		if p == projectionEvents {
