@@ -14,15 +14,19 @@
 //!   (BBR's delivery-rate filter, libwebrtc's ALR): a quiet scene, or the gap a delay spike
 //!   leaves in the arrivals, measures the content or the stall, not the link (#1316).
 //! - **Loss.** Over 10 % scales by (1 − loss/2); under 2 % lets it grow.
-//! - The estimate is the least of the two, of 1.5 × QUIC's own cwnd/RTT once QUIC has
-//!   seen congestion, and of the ceiling.
+//! - The estimate is the least of the two and of the ceiling. QUIC's own window follows it
+//!   (`Window`), so it is no bound here.
 //! - Feedback that stops while media is being sent decays it.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
+use quinn_proto::RttEstimator;
 use serde_json::Value;
+use web_transport_quinn::quinn::congestion::{Controller, ControllerFactory, CubicConfig};
 
 /// §Feedback: `count` is at most 8192; arrivals are in 50 µs units, `0xFFFF` not received.
 const MAX_COUNT: usize = 8192;
@@ -83,10 +87,6 @@ const THROUGHPUT_SAMPLES: usize = 20;
 /// application-limited, and is no throughput sample.
 const APP_LIMITED: f64 = 0.8;
 const MAX_ARRIVALS: usize = 1 << 14;
-
-/// QUIC's own estimate bounds ours with this headroom. An exact cap would deadlock: once
-/// the ABR sends under cwnd/RTT, QUIC is application-limited and its window stops growing.
-const QUIC_CAP: f64 = 1.5;
 
 /// Feedback silence while media is sent: past max(this, 2 intervals + RTT), the estimate
 /// decays by `SILENCE_DECAY` every `SILENCE_STEP`.
@@ -216,7 +216,6 @@ pub(crate) enum Bound {
     Ceiling,
     Delay,
     Loss,
-    Quic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -425,7 +424,6 @@ pub(crate) struct Estimator {
     last_report: Option<Instant>,
     last_feedback: Option<Instant>,
     last_decay: Option<Instant>,
-    quic_cap_kbps: Option<f64>,
     loss: Option<f64>,
     bound: Bound,
 }
@@ -460,7 +458,6 @@ impl Estimator {
             last_report: None,
             last_feedback: None,
             last_decay: None,
-            quic_cap_kbps: None,
             loss: None,
             bound: Bound::Ceiling,
         }
@@ -558,10 +555,6 @@ impl Estimator {
             _ => self.loss_kbps *= GROWTH_PER_S.powf(dt),
         }
 
-        self.quic_cap_kbps = (path.congestion_events > 0).then(|| {
-            let rtt_ms = path.rtt.as_secs_f64().max(0.001) * 1000.0;
-            QUIC_CAP * path.cwnd_bytes as f64 * 8.0 / rtt_ms
-        });
         let was = (self.bound, self.estimate_kbps);
         self.settle();
         if cut_by.is_some() || self.bound != was.0 {
@@ -577,7 +570,6 @@ impl Estimator {
                 loss_pct = m.loss.unwrap_or(0.0) * 100.0,
                 delay_kbps = self.delay_kbps as u64,
                 loss_kbps = self.loss_kbps as u64,
-                quic_kbps = self.quic_cap_kbps.unwrap_or(0.0) as u64,
                 rtt_ms = path.rtt.as_millis() as u64,
                 cwnd_bytes = path.cwnd_bytes,
                 quic_congestion_events = path.congestion_events,
@@ -625,11 +617,9 @@ impl Estimator {
         let clamp = |k: f64| k.clamp(MIN_KBPS, self.ceiling_kbps);
         self.delay_kbps = clamp(self.delay_kbps);
         self.loss_kbps = clamp(self.loss_kbps);
-        let quic = self.quic_cap_kbps.unwrap_or(f64::MAX);
         let (kbps, bound) = [
             (self.delay_kbps, Bound::Delay),
             (self.loss_kbps, Bound::Loss),
-            (quic, Bound::Quic),
         ]
         .into_iter()
         .fold((self.ceiling_kbps, Bound::Ceiling), |a, b| {
@@ -739,6 +729,199 @@ impl Estimator {
             rate_kbps,
             sent_kbps,
             loss,
+        }
+    }
+}
+
+/// QUIC's window over the estimate's rate × RTT: a keyframe burst and RTT jitter fit under
+/// it, and quinn paces at 1.25 × window / RTT, 2.5 × the rate.
+const WINDOW_GAIN: f64 = 2.0;
+/// A LAN's RTT would make the window a few datagrams, and a keyframe wait behind them.
+const WINDOW_RTT_MIN: Duration = Duration::from_millis(100);
+
+/// One connection's QUIC congestion window. Until the estimate reaches the ABR, and while
+/// PyroWave is active, it is quinn's Cubic: a client that sends no feedback follows QUIC
+/// congestion control alone (§Feedback). Once the estimate governs the encoder, the window
+/// follows it and no loss shrinks it: Cubic read packets reordered or late from jitter, and
+/// 0.1 % random loss, as congestion, and held video to a few Mbit/s while the datagrams over
+/// its window waited or were dropped in the send queue (#1330). The estimate is then the
+/// only controller, as `rtpgccbwe` is on WebRTC.
+pub(crate) struct Window {
+    cubic: Box<dyn Controller>,
+    /// The rate the encoder is held to, bit/s; 0 while the estimate does not govern it.
+    governed: Arc<AtomicU64>,
+    srtt: Duration,
+}
+
+/// Builds a connection's [`Window`]; its handle is the connection's [`Governor`].
+pub(crate) struct WindowFactory(pub(crate) Governor);
+
+/// What sets a connection's window: the estimate, once it governs the encoder.
+#[derive(Clone, Default)]
+pub(crate) struct Governor(Arc<AtomicU64>);
+
+impl Governor {
+    pub(crate) fn govern(&self, kbps: f64) {
+        self.0.store((kbps * 1000.0) as u64, Ordering::Relaxed);
+    }
+
+    /// Back to Cubic.
+    pub(crate) fn release(&self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
+}
+
+impl ControllerFactory for WindowFactory {
+    fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+        Box::new(Window {
+            cubic: Arc::new(CubicConfig::default()).build(now, current_mtu),
+            governed: self.0 .0.clone(),
+            srtt: Duration::ZERO,
+        })
+    }
+}
+
+impl Controller for Window {
+    fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
+        self.cubic.on_sent(now, bytes, last_packet_number);
+    }
+
+    fn on_ack(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        bytes: u64,
+        app_limited: bool,
+        rtt: &RttEstimator,
+    ) {
+        self.srtt = rtt.get();
+        self.cubic.on_ack(now, sent, bytes, app_limited, rtt);
+    }
+
+    fn on_end_acks(
+        &mut self,
+        now: Instant,
+        in_flight: u64,
+        app_limited: bool,
+        largest_packet_num_acked: Option<u64>,
+    ) {
+        self.cubic
+            .on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
+    }
+
+    fn on_congestion_event(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        is_persistent_congestion: bool,
+        lost_bytes: u64,
+    ) {
+        self.cubic
+            .on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
+    }
+
+    fn on_mtu_update(&mut self, new_mtu: u16) {
+        self.cubic.on_mtu_update(new_mtu);
+    }
+
+    fn window(&self) -> u64 {
+        match self.governed.load(Ordering::Relaxed) {
+            0 => self.cubic.window(),
+            bps => {
+                let rtt = self.srtt.max(WINDOW_RTT_MIN).as_secs_f64();
+                ((WINDOW_GAIN * bps as f64 / 8.0 * rtt) as u64).max(self.cubic.initial_window())
+            }
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn Controller> {
+        Box::new(Window {
+            cubic: self.cubic.clone_box(),
+            governed: self.governed.clone(),
+            srtt: self.srtt,
+        })
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.cubic.initial_window()
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
+
+/// What to do with the next video unit while QUIC's datagram queue is backed up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Admit {
+    Send,
+    Skip,
+    /// Skip, and ask the encoder for a keyframe to resume on.
+    SkipForKeyframe,
+}
+
+/// Bytes in QUIC's datagram queue under one fragment: nothing is waiting.
+const BACKLOG_EMPTY: usize = super::media::MAX_DATAGRAM;
+
+/// Video behind a closed window (a stalled path) is worthless once it is older than the
+/// client's NACK hold, and quinn's queue holds a MiB of it, dropping only the oldest
+/// datagram when full. A queue that has not shrunk for that long is stalled: units are
+/// skipped until it empties and a keyframe comes, so it never holds more than the hold's
+/// worth. A keyframe being paced out shrinks it, so it is never mistaken for a stall.
+#[derive(Default)]
+pub(crate) struct Backlog {
+    last: usize,
+    growing_since: Option<Instant>,
+    skipping: bool,
+    asked: bool,
+    pub(crate) skipped: u64,
+}
+
+impl Backlog {
+    /// `queued`: bytes in QUIC's datagram queue now; `keyframe`: the unit can be decoded
+    /// alone; `hold`: how long video stays worth sending.
+    pub(crate) fn admit(
+        &mut self,
+        queued: usize,
+        keyframe: bool,
+        now: Instant,
+        hold: Duration,
+    ) -> Admit {
+        let empty = queued < BACKLOG_EMPTY;
+        if empty || queued < self.last {
+            self.growing_since = None;
+        } else {
+            self.growing_since.get_or_insert(now);
+        }
+        self.last = queued;
+        if !self.skipping {
+            let since = match self.growing_since {
+                Some(at) if now.saturating_duration_since(at) > hold => at,
+                _ => return Admit::Send,
+            };
+            tracing::info!(
+                token = "webtransport-video-stalled",
+                queued,
+                stalled_ms = now.saturating_duration_since(since).as_millis() as u64,
+                "WebTransport datagram queue has not drained; video skipped until it does"
+            );
+            self.skipping = true;
+            self.asked = false;
+        }
+        if empty && keyframe {
+            tracing::info!(
+                token = "webtransport-video-resumed",
+                skipped = self.skipped,
+                "WebTransport datagram queue drained; video resumes at a keyframe"
+            );
+            self.skipping = false;
+            return Admit::Send;
+        }
+        self.skipped += 1;
+        if empty && !std::mem::replace(&mut self.asked, true) {
+            Admit::SkipForKeyframe
+        } else {
+            Admit::Skip
         }
     }
 }

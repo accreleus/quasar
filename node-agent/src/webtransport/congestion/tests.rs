@@ -311,36 +311,6 @@ fn overuse_with_sparse_arrivals_still_cuts() {
 }
 
 #[test]
-fn quic_bounds_the_estimate_only_once_it_has_seen_congestion() {
-    let start = Instant::now();
-    let mut log = SendLog::new(start);
-    let mut est = Estimator::new(CEILING, start);
-    let fb = Feedback {
-        first_pkt_seq: 0,
-        ref_us: 0,
-        arrivals: vec![],
-    };
-    let slow_start = QuicPath {
-        rtt: RTT,
-        cwnd_bytes: 5000,
-        congestion_events: 0,
-    };
-    est.on_feedback(&fb, &mut log, start, slow_start);
-    assert_eq!(
-        est.estimate_kbps(),
-        CEILING,
-        "a window still in slow start is no evidence"
-    );
-    let congested = QuicPath {
-        congestion_events: 1,
-        ..slow_start
-    };
-    est.on_feedback(&fb, &mut log, start, congested);
-    // 1.5 × 5000 B × 8 / 20 ms.
-    assert_eq!(est.estimate_kbps(), 3000.0);
-}
-
-#[test]
 fn feedback_silence_while_media_is_sent_decays_the_estimate() {
     let mut s = Sim::new(50_000.0);
     s.send_kbps = Some(6000.0);
@@ -623,4 +593,87 @@ fn a_link_that_drops_to_a_third_drives_the_estimate_down() {
     s.run(10.0);
     let mean = s.mean_after(16.0);
     assert!((2000.0..3300.0).contains(&mean), "mean {mean:.0}");
+}
+
+#[test]
+fn a_governed_window_follows_the_estimate_and_no_loss_shrinks_it() {
+    let start = Instant::now();
+    let governor = Governor::default();
+    let mut w = Arc::new(WindowFactory(governor.clone())).build(start, 1200);
+    let cubic = w.window();
+    w.on_congestion_event(start, start, true, 1200);
+    let collapsed = w.window();
+    assert!(
+        collapsed < cubic,
+        "ungoverned, it is Cubic: loss shrinks it"
+    );
+    // 2 × 8 Mbit/s × the 100 ms RTT floor.
+    governor.govern(8000.0);
+    assert_eq!(w.window(), 200_000);
+    w.on_congestion_event(start, start + Duration::from_secs(1), true, 1200);
+    assert_eq!(w.window(), 200_000, "a governed window ignores loss");
+    governor.govern(100.0);
+    assert_eq!(
+        w.window(),
+        w.initial_window(),
+        "never under Cubic's first window"
+    );
+    governor.release();
+    assert!(w.window() <= collapsed, "released, it is Cubic again");
+}
+
+const HOLD: Duration = Duration::from_millis(250);
+const FRAME: Duration = Duration::from_millis(33);
+
+#[test]
+fn a_keyframe_being_paced_out_is_never_read_as_a_stall() {
+    let start = Instant::now();
+    let mut b = Backlog::default();
+    // A 300 KB keyframe drained at 20 KB a frame interval, 10 KB frames behind it.
+    let mut queued = 0usize;
+    for n in 0..60u32 {
+        let at = start + FRAME * n;
+        assert_eq!(b.admit(queued, n == 0, at, HOLD), Admit::Send, "unit {n}");
+        queued += if n == 0 { 300_000 } else { 10_000 };
+        queued = queued.saturating_sub(20_000);
+    }
+    assert_eq!(b.skipped, 0);
+}
+
+#[test]
+fn a_queue_that_stops_draining_skips_video_until_it_drains_and_a_keyframe_comes() {
+    let start = Instant::now();
+    let mut b = Backlog::default();
+    let mut queued = 0usize;
+    let mut n = 0u32;
+    let mut admit = |b: &mut Backlog, queued: usize, key: bool| {
+        n += 1;
+        b.admit(queued, key, start + FRAME * n, HOLD)
+    };
+    // The window closes: every frame stays in the queue.
+    let mut sent = 0;
+    while admit(&mut b, queued, false) == Admit::Send {
+        queued += 10_000;
+        sent += 1;
+    }
+    // Growing since the second frame; skipping starts once that is longer than the hold.
+    assert_eq!(sent, 9, "the queue holds the hold's worth, not a MiB");
+    assert_eq!(
+        admit(&mut b, queued, true),
+        Admit::Skip,
+        "not while it is backed up"
+    );
+    assert_eq!(
+        admit(&mut b, 0, false),
+        Admit::SkipForKeyframe,
+        "drained: ask once"
+    );
+    assert_eq!(admit(&mut b, 0, false), Admit::Skip);
+    assert_eq!(
+        admit(&mut b, 0, true),
+        Admit::Send,
+        "resumes at the keyframe"
+    );
+    assert_eq!(admit(&mut b, 10_000, false), Admit::Send);
+    assert_eq!(b.skipped, 4);
 }

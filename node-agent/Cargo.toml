@@ -117,6 +117,9 @@ time = { version = "0.3", features = ["parsing", "formatting"] }
 # ring backend, like rustls above, so no aws-lc-rs build. rcgen makes its short-lived
 # self-signed certificate (ring backend, no default features).
 web-transport-quinn = { version = "0.13", default-features = false, features = ["ring"] }
+# The crate under quinn, for `RttEstimator`, which a custom congestion controller takes and
+# quinn does not re-export (#1330).
+quinn-proto = { version = "0.11", default-features = false }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 bytes = "1"
 

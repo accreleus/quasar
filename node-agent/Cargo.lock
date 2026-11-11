@@ -1926,6 +1926,7 @@ dependencies = [
  "pkg-config",
  "quasar-recovery",
  "quasar-runtime",
+ "quinn-proto",
  "rcgen",
  "regex",
  "rustls",
