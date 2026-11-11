@@ -155,7 +155,7 @@ impl<'a> Control<'a> {
         }
     }
 
-    fn feedback(&mut self, message: &Value, session: &Session) {
+    fn feedback(&mut self, message: &Value, path: congestion::QuicPath, now: std::time::Instant) {
         let fb = match congestion::feedback_of(message) {
             Ok(fb) => fb,
             Err(field) => {
@@ -171,13 +171,6 @@ impl<'a> Control<'a> {
                 return;
             }
         };
-        let path = quinn::Connection::stats(session).path;
-        let path = congestion::QuicPath {
-            rtt: path.rtt,
-            cwnd_bytes: path.cwnd,
-            congestion_events: path.congestion_events,
-        };
-        let now = std::time::Instant::now();
         let estimate = self.estimator.on_feedback(&fb, &mut self.log, now, path);
         // Before the estimate is fed: the encoder's share follows the level this loss sets.
         if let (Some(fec), Some(loss)) = (self.fec.as_mut(), self.estimator.loss()) {
@@ -194,13 +187,20 @@ impl<'a> Control<'a> {
         }
         if let Some(kbps) = estimate {
             self.feed(kbps);
+            // QUIC's loss response is given up only while the estimate drives the encoder
+            // from live feedback; the encoder never goes under the ABR's floor, so neither
+            // does the window.
+            if self.rate.retargets && self.gone.get().is_none() {
+                self.governor.govern(kbps.max((self.rate.floor_kbps)()));
+            }
         }
     }
 
-    fn tick(&mut self, session: &Session) {
-        let rtt = quinn::Connection::rtt(session);
-        let now = std::time::Instant::now();
+    fn tick(&mut self, rtt: Duration, now: std::time::Instant) {
         if let Some(kbps) = self.estimator.on_tick(now, &self.log, rtt) {
+            // Feedback has gone silent: the decay holds the encoder at the floor at best, and
+            // that may still overrun the path, so Cubic takes it back until feedback returns.
+            self.governor.release();
             self.feed(kbps);
         }
     }
@@ -215,8 +215,6 @@ impl<'a> Control<'a> {
         if !std::mem::replace(&mut self.started, true) {
             (self.rate.start)();
         }
-        // The encoder never goes under the ABR's floor, so neither does QUIC's window.
-        self.governor.govern(kbps.max((self.rate.floor_kbps)()));
         // Fed estimate / (1 + share). The governor holds while that is at least (1 − deadband)
         // × its setpoint, so a share inside the deadband moves nothing and video plus FEC is
         // at most estimate / (1 − deadband), the bound video alone has (tests: `governed`).
@@ -838,6 +836,8 @@ fn server_config(served: Arc<Served>) -> Result<quinn::ServerConfig> {
     let tls = tls_config(served)?;
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    // A placeholder: a transport's congestion factory, and so its `Governor`, would be shared
+    // by every connection, so `serve` accepts each with its own (`accept_with`).
     config
         .transport_config(Arc::new(transport(congestion::Governor::default())))
         .max_incoming(4 * MAX_UNAUTHENTICATED);
@@ -1121,6 +1121,34 @@ fn nack_of(message: &Value) -> Option<(u16, Vec<[u16; 2]>)> {
 /// smoothed RTT when that is longer (§Loss recovery).
 fn retransmit_window(session: &Session) -> Duration {
     retransmit::WINDOW.max(quinn::Connection::rtt(session) * 2)
+}
+
+/// The backlog guard's verdict on the next video unit or `nack` answer; a skip that wants a
+/// keyframe has asked for it.
+fn admit(
+    backlog: &mut congestion::Backlog,
+    session: &Session,
+    media: &Media,
+    keyframe: bool,
+) -> congestion::Admit {
+    let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
+    let hold = retransmit_window(session);
+    let admit = backlog.admit(queued, keyframe, std::time::Instant::now(), hold);
+    if admit == congestion::Admit::SkipForKeyframe {
+        media.keyframe();
+    }
+    admit
+}
+
+/// How a stream ends when no keyframe gets through its datagram queue: as an unusable
+/// encoder ends it, so the client falls back to WebRTC.
+fn stalled() -> (Option<Value>, u32, &'static str) {
+    let message = "no keyframe got through the datagram queue";
+    (
+        Some(json!({"type": "error", "code": "internal", "message": message})),
+        CLOSE_NORMAL,
+        "",
+    )
 }
 
 /// Send `nack` answers; false when the connection is gone. A resend the path's maximum
@@ -1409,7 +1437,7 @@ async fn stream(
             // ABR (B09, #1058), so nothing sent then is logged, and no estimate is fed.
             _ = control_tick.tick(), if control.is_some() && current.codec != "pyrowave" => {
                 if let Some(control) = control.as_mut() {
-                    control.tick(session);
+                    control.tick(quinn::Connection::rtt(session), std::time::Instant::now());
                 }
             }
             packet = client.audio.recv(), if audio_open => match packet {
@@ -1437,16 +1465,12 @@ async fn stream(
             out = client.rx.recv() => match out {
                 Some(Out::Unit(unit)) if unit.config_id != current.config_id => {}
                 Some(Out::Unit(unit)) => {
-                    let now = std::time::Instant::now();
-                    let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
-                    match backlog.admit(queued, unit.keyframe || unit.pyrowave, now, retransmit_window(session)) {
+                    match admit(&mut backlog, session, media, unit.keyframe || unit.pyrowave) {
                         congestion::Admit::Send => {}
-                        congestion::Admit::Skip => continue,
-                        congestion::Admit::SkipForKeyframe => {
-                            media.keyframe();
-                            continue;
-                        }
+                        congestion::Admit::GiveUp => break stalled(),
+                        _ => continue,
                     }
+                    let now = std::time::Instant::now();
                     let max = session.max_datagram_size().min(media::MAX_DATAGRAM);
                     let Some(mut datagrams) = media::packetize(&unit, &current, max, &mut pkt_seq) else {
                         if !warned_oversized {
@@ -1528,30 +1552,41 @@ async fn stream(
                         // retransmission and no nack_miss.
                         Some("nack") if nack_of(&message).is_some_and(|(seq, _)| pyrowave_frames.ignores(seq)) => {}
                         Some("nack") if !nack_budget.take(std::time::Instant::now()) => nacks_capped += 1,
-                        Some("nack") => {
-                            let answer = nack_of(&message).map(|(frame_seq, ranges)| {
-                                let window = retransmit_window(session);
-                                let now = std::time::Instant::now();
-                                (frame_seq, sent.answer(frame_seq, &ranges, &mut pkt_seq, now, window))
-                            });
-                            if let Some((frame_seq, answer)) = answer {
-                                let log = control.as_mut().map(|c| &mut c.log);
-                                handed += answer.resend.len() as u64;
-                                if !resend(session, answer.resend, log, &mut resends_too_large) {
-                                    break QUIET;
-                                }
-                                if !answer.missed.is_empty() {
-                                    let miss = json!({"type": "nack_miss", "frame_seq": frame_seq, "frags": answer.missed});
-                                    let write = write_message(&mut send, &miss);
-                                    if !matches!(tokio::time::timeout(CONTROL_WRITE, write).await, Ok(Ok(()))) {
+                        Some("nack") => match admit(&mut backlog, session, media, false) {
+                            congestion::Admit::GiveUp => break stalled(),
+                            // Behind a stalled queue a resend is as stale as new video.
+                            congestion::Admit::Skip | congestion::Admit::SkipForKeyframe => {}
+                            congestion::Admit::Send => {
+                                let answer = nack_of(&message).map(|(frame_seq, ranges)| {
+                                    let window = retransmit_window(session);
+                                    let now = std::time::Instant::now();
+                                    (frame_seq, sent.answer(frame_seq, &ranges, &mut pkt_seq, now, window))
+                                });
+                                if let Some((frame_seq, answer)) = answer {
+                                    let log = control.as_mut().map(|c| &mut c.log);
+                                    handed += answer.resend.len() as u64;
+                                    if !resend(session, answer.resend, log, &mut resends_too_large) {
                                         break QUIET;
+                                    }
+                                    if !answer.missed.is_empty() {
+                                        let miss = json!({"type": "nack_miss", "frame_seq": frame_seq, "frags": answer.missed});
+                                        let write = write_message(&mut send, &miss);
+                                        if !matches!(tokio::time::timeout(CONTROL_WRITE, write).await, Ok(Ok(()))) {
+                                            break QUIET;
+                                        }
                                     }
                                 }
                             }
-                        }
+                        },
                         Some("feedback") if current.codec != "pyrowave" => {
                             if let Some(control) = control.as_mut() {
-                                control.feedback(&message, session);
+                                let path = quinn::Connection::stats(session).path;
+                                let path = congestion::QuicPath {
+                                    rtt: path.rtt,
+                                    cwnd_bytes: path.cwnd,
+                                    congestion_events: path.congestion_events,
+                                };
+                                control.feedback(&message, path, std::time::Instant::now());
                             }
                         }
                         Some("input") => {
@@ -1580,9 +1615,10 @@ async fn stream(
     let quic = quinn::Connection::stats(session);
     tracing::info!(
         token = "webtransport-client-quic-stats",
-        datagrams_handed = handed,
+        datagrams_handed_incl_audio_and_resends = handed,
         datagrams_sent = quic.frame_tx.datagram,
-        video_skipped = backlog.skipped,
+        units_and_nack_answers_skipped_total = backlog.skipped,
+        governed_kbps = governor.kbps(),
         lost_packets = quic.path.lost_packets,
         congestion_events = quic.path.congestion_events,
         cwnd_bytes = quic.path.cwnd,

@@ -609,11 +609,25 @@ fn a_link_that_drops_to_a_third_drives_the_estimate_down() {
     assert!((2000.0..3300.0).contains(&mean), "mean {mean:.0}");
 }
 
+fn window(governor: &Governor, now: Instant) -> Box<Window> {
+    Arc::new(WindowFactory(governor.clone()))
+        .build(now, 1200)
+        .into_any()
+        .downcast()
+        .unwrap()
+}
+
+/// What `on_ack` takes from quinn's `RttEstimator`, which a test cannot make.
+fn acked(w: &mut Window, srtt: Duration, min_rtt: Duration) {
+    w.srtt = srtt;
+    w.min_rtt = min_rtt;
+}
+
 #[test]
 fn a_governed_window_follows_the_estimate_and_no_loss_shrinks_it() {
     let start = Instant::now();
     let governor = Governor::default();
-    let mut w = Arc::new(WindowFactory(governor.clone())).build(start, 1200);
+    let mut w = window(&governor, start);
     let cubic = w.window();
     w.on_congestion_event(start, start, true, 1200);
     let collapsed = w.window();
@@ -621,8 +635,10 @@ fn a_governed_window_follows_the_estimate_and_no_loss_shrinks_it() {
         collapsed < cubic,
         "ungoverned, it is Cubic: loss shrinks it"
     );
-    // 2 × 8 Mbit/s × the 100 ms RTT floor.
     governor.govern(8000.0);
+    assert_eq!(w.window(), collapsed, "no RTT yet: Cubic until an ack");
+    acked(&mut w, Duration::from_millis(5), Duration::from_millis(5));
+    // 2 × 8 Mbit/s × the 100 ms RTT floor.
     assert_eq!(w.window(), 200_000);
     w.on_congestion_event(start, start + Duration::from_secs(1), true, 1200);
     assert_eq!(w.window(), 200_000, "a governed window ignores loss");
@@ -632,8 +648,38 @@ fn a_governed_window_follows_the_estimate_and_no_loss_shrinks_it() {
         w.initial_window(),
         "never under Cubic's first window"
     );
+}
+
+#[test]
+fn a_release_starts_cubic_afresh_from_the_paths_bdp() {
+    let start = Instant::now();
+    let governor = Governor::default();
+    let mut w = window(&governor, start);
+    // Queueing put the smoothed RTT at 2 s; the path's own is 20 ms.
+    acked(&mut w, Duration::from_secs(2), Duration::from_millis(20));
+    governor.govern(8000.0);
+    w.on_sent(start, 1200, 1);
+    // Losses while governed collapse the Cubic underneath to its minimum.
+    for n in 1..5 {
+        let at = start + Duration::from_secs(n);
+        w.on_congestion_event(at, at, true, 1200);
+    }
+    assert_eq!(w.cubic.window(), 2400);
     governor.release();
-    assert!(w.window() <= collapsed, "released, it is Cubic again");
+    // 8 Mbit/s × 20 ms: neither 2 × MTU nor the governed 2 × rate × 2 s.
+    assert_eq!(w.window(), 20_000, "before quinn calls in again");
+    let later = start + Duration::from_secs(10);
+    w.on_sent(later, 1200, 2);
+    assert_eq!(w.window(), 20_000);
+    assert_eq!(w.initial_window(), 12_000, "quinn's first window is kept");
+    // A real Cubic: the next loss takes it to 0.7 ×.
+    w.on_congestion_event(later, later, false, 1200);
+    assert_eq!(w.window(), 14_000);
+    // A slow path's BDP is under Cubic's first window: that is the floor.
+    governor.govern(1000.0);
+    w.on_sent(later, 1200, 3);
+    governor.release();
+    assert_eq!(w.window(), 12_000);
 }
 
 const HOLD: Duration = Duration::from_millis(250);
@@ -690,6 +736,65 @@ fn a_queue_that_stops_draining_skips_video_until_it_drains_and_a_keyframe_comes(
     );
     assert_eq!(admit(&mut b, 10_000, false), Admit::Send);
     assert_eq!(b.skipped, 4);
+}
+
+/// Backed up for more than the hold: skipping from `start + 9 frames`.
+fn stalled(b: &mut Backlog, start: Instant) -> Instant {
+    let mut queued = 0;
+    for n in 0..20u32 {
+        let at = start + FRAME * n;
+        if b.admit(queued, false, at, HOLD) != Admit::Send {
+            return at;
+        }
+        queued += 10_000;
+    }
+    panic!("never stalled");
+}
+
+#[test]
+fn a_keyframe_skipped_behind_a_datagram_is_asked_for_again_every_hold() {
+    let start = Instant::now();
+    let mut b = Backlog::default();
+    let at = stalled(&mut b, start);
+    assert_eq!(b.admit(0, false, at + FRAME, HOLD), Admit::SkipForKeyframe);
+    // The keyframe comes while an audio datagram and a resend still wait.
+    assert_eq!(b.admit(2400, true, at + FRAME * 2, HOLD), Admit::Skip);
+    assert_eq!(b.admit(0, false, at + FRAME * 3, HOLD), Admit::Skip);
+    assert_eq!(
+        b.admit(0, false, at + FRAME + HOLD, HOLD),
+        Admit::SkipForKeyframe,
+        "asked again a hold later"
+    );
+    assert_eq!(b.admit(0, true, at + FRAME * 2 + HOLD, HOLD), Admit::Send);
+}
+
+#[test]
+fn a_queue_no_keyframe_gets_through_ends_the_media() {
+    let start = Instant::now();
+    let mut b = Backlog::default();
+    let at = stalled(&mut b, start);
+    let give_up = HOLD * GIVE_UP_HOLDS;
+    // Keyframes keep coming, but the queue never empties.
+    let mut t = at;
+    while t <= at + give_up {
+        assert_ne!(
+            b.admit(400_000, true, t, HOLD),
+            Admit::GiveUp,
+            "{:?}",
+            t - at
+        );
+        t += FRAME;
+    }
+    assert_eq!(b.admit(400_000, true, t, HOLD), Admit::GiveUp);
+    // A keyframe admitted before then ends the episode, and the next one starts afresh.
+    let mut b = Backlog::default();
+    let at = stalled(&mut b, start);
+    assert_eq!(b.admit(0, true, at + give_up / 2, HOLD), Admit::Send);
+    let again = stalled(&mut b, at + give_up);
+    assert_eq!(
+        b.admit(400_000, false, again + give_up - FRAME, HOLD),
+        Admit::Skip
+    );
 }
 
 /// A known limit, not a guarantee: inside the 500 ms hold a quiet sender cannot be told

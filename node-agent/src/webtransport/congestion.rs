@@ -832,50 +832,100 @@ const WINDOW_GAIN: f64 = 2.0;
 /// A LAN's RTT would make the window a few datagrams, and a keyframe wait behind them.
 const WINDOW_RTT_MIN: Duration = Duration::from_millis(100);
 
-/// One connection's QUIC congestion window. Until the estimate reaches the ABR, and while
-/// PyroWave is active, it is quinn's Cubic: a client that sends no feedback follows QUIC
-/// congestion control alone (§Feedback). Once the estimate governs the encoder, the window
-/// follows it and no loss shrinks it: Cubic read packets reordered or late from jitter, and
+/// One connection's QUIC congestion window. It is quinn's Cubic unless the estimate is
+/// governing the encoder from live feedback (`Governor`): a client that sends no feedback,
+/// one whose feedback stopped, a session with the ABR off and a PyroWave session all follow
+/// QUIC congestion control alone (§Feedback). While governed the window follows the
+/// estimate and no loss shrinks it: Cubic read packets reordered or late from jitter, and
 /// 0.1 % random loss, as congestion, and held video to a few Mbit/s while the datagrams over
 /// its window waited or were dropped in the send queue (#1330). The estimate is then the
 /// only controller, as `rtpgccbwe` is on WebRTC.
 pub(crate) struct Window {
     cubic: Box<dyn Controller>,
-    /// The rate the encoder is held to, bit/s; 0 while the estimate does not govern it.
     governed: Arc<AtomicU64>,
+    /// The rate it was last governed at, bit/s; 0 while Cubic has it.
+    held: u64,
     srtt: Duration,
+    min_rtt: Duration,
+    mtu: u16,
+    /// Cubic's first window, which quinn also reads at a path change.
+    first: u64,
 }
 
 /// Builds a connection's [`Window`]; its handle is the connection's [`Governor`].
 pub(crate) struct WindowFactory(pub(crate) Governor);
 
-/// What sets a connection's window: the estimate, once it governs the encoder.
+/// What sets a connection's window: the estimate, while it governs the encoder.
 #[derive(Clone, Default)]
 pub(crate) struct Governor(Arc<AtomicU64>);
 
 impl Governor {
     pub(crate) fn govern(&self, kbps: f64) {
-        self.0.store((kbps * 1000.0) as u64, Ordering::Relaxed);
+        self.0
+            .store((kbps * 1000.0).max(1.0) as u64, Ordering::Relaxed);
     }
 
     /// Back to Cubic.
     pub(crate) fn release(&self) {
         self.0.store(0, Ordering::Relaxed);
     }
+
+    /// The rate the window is held to, kbit/s; 0 on Cubic.
+    pub(crate) fn kbps(&self) -> u64 {
+        self.0.load(Ordering::Relaxed) / 1000
+    }
+}
+
+fn cubic(window: u64, now: Instant, mtu: u16) -> Box<dyn Controller> {
+    let mut config = CubicConfig::default();
+    config.initial_window(window);
+    Arc::new(config).build(now, mtu)
 }
 
 impl ControllerFactory for WindowFactory {
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+        let cubic = Arc::new(CubicConfig::default()).build(now, current_mtu);
         Box::new(Window {
-            cubic: Arc::new(CubicConfig::default()).build(now, current_mtu),
+            first: cubic.initial_window(),
+            cubic,
             governed: self.0 .0.clone(),
+            held: 0,
             srtt: Duration::ZERO,
+            min_rtt: Duration::ZERO,
+            mtu: current_mtu,
         })
+    }
+}
+
+impl Window {
+    /// The governed rate, once an ack has given the window an RTT to size it by.
+    fn governing(&self) -> Option<u64> {
+        Some(self.governed.load(Ordering::Relaxed)).filter(|&bps| bps > 0 && !self.srtt.is_zero())
+    }
+
+    /// Cubic's window on release: the path's delay-free BDP at the rate it last carried, so
+    /// it neither starts collapsed (Cubic took every loss while governed) nor keeps the
+    /// governed window's headroom. In slow start, as a new connection is.
+    fn seed(&self) -> u64 {
+        ((self.held as f64 / 8.0 * self.min_rtt.as_secs_f64()) as u64).max(self.first)
+    }
+
+    /// Follows the governor: a release starts a new Cubic from `seed`.
+    fn sync(&mut self, now: Instant) {
+        match self.governing() {
+            Some(bps) => self.held = bps,
+            None if self.held != 0 => {
+                self.cubic = cubic(self.seed(), now, self.mtu);
+                self.held = 0;
+            }
+            None => {}
+        }
     }
 }
 
 impl Controller for Window {
     fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
+        self.sync(now);
         self.cubic.on_sent(now, bytes, last_packet_number);
     }
 
@@ -887,7 +937,10 @@ impl Controller for Window {
         app_limited: bool,
         rtt: &RttEstimator,
     ) {
+        // Before quinn's first sample this is its initial RTT; by `hello` the handshake gave one.
         self.srtt = rtt.get();
+        self.min_rtt = rtt.min();
+        self.sync(now);
         self.cubic.on_ack(now, sent, bytes, app_limited, rtt);
     }
 
@@ -898,6 +951,7 @@ impl Controller for Window {
         app_limited: bool,
         largest_packet_num_acked: Option<u64>,
     ) {
+        self.sync(now);
         self.cubic
             .on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
     }
@@ -909,21 +963,25 @@ impl Controller for Window {
         is_persistent_congestion: bool,
         lost_bytes: u64,
     ) {
+        self.sync(now);
         self.cubic
             .on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
     }
 
     fn on_mtu_update(&mut self, new_mtu: u16) {
+        self.mtu = new_mtu;
         self.cubic.on_mtu_update(new_mtu);
     }
 
     fn window(&self) -> u64 {
-        match self.governed.load(Ordering::Relaxed) {
-            0 => self.cubic.window(),
-            bps => {
+        match self.governing() {
+            Some(bps) => {
                 let rtt = self.srtt.max(WINDOW_RTT_MIN).as_secs_f64();
-                ((WINDOW_GAIN * bps as f64 / 8.0 * rtt) as u64).max(self.cubic.initial_window())
+                ((WINDOW_GAIN * bps as f64 / 8.0 * rtt) as u64).max(self.first)
             }
+            // Released since the last call that could rebuild Cubic.
+            None if self.held != 0 => self.seed(),
+            None => self.cubic.window(),
         }
     }
 
@@ -931,12 +989,16 @@ impl Controller for Window {
         Box::new(Window {
             cubic: self.cubic.clone_box(),
             governed: self.governed.clone(),
+            held: self.held,
             srtt: self.srtt,
+            min_rtt: self.min_rtt,
+            mtu: self.mtu,
+            first: self.first,
         })
     }
 
     fn initial_window(&self) -> u64 {
-        self.cubic.initial_window()
+        self.first
     }
 
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
@@ -944,29 +1006,40 @@ impl Controller for Window {
     }
 }
 
-/// What to do with the next video unit while QUIC's datagram queue is backed up.
+/// What to do with the next video unit or `nack` answer while QUIC's datagram queue is
+/// backed up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Admit {
     Send,
     Skip,
     /// Skip, and ask the encoder for a keyframe to resume on.
     SkipForKeyframe,
+    /// No keyframe got through for `GIVE_UP_HOLDS` holds: end the WebTransport media so the
+    /// client falls back to WebRTC.
+    GiveUp,
 }
 
 /// Bytes in QUIC's datagram queue under one fragment: nothing is waiting.
 const BACKLOG_EMPTY: usize = super::media::MAX_DATAGRAM;
+/// Holds of skipping with no keyframe admitted before the media is given up: 6 s at the
+/// 250 ms hold, past a 2 s outage and quinn's probe backoff after it (about 2 s), and under
+/// the 10 s idle timeout that ends a dead path.
+const GIVE_UP_HOLDS: u32 = 24;
 
 /// Video behind a closed window (a stalled path) is worthless once it is older than the
 /// client's NACK hold, and quinn's queue holds a MiB of it, dropping only the oldest
-/// datagram when full. A queue that has not shrunk for that long is stalled: units are
-/// skipped until it empties and a keyframe comes, so it never holds more than the hold's
-/// worth. A keyframe being paced out shrinks it, so it is never mistaken for a stall.
+/// datagram when full. A queue that has not shrunk for that long is stalled: video and NACK
+/// answers are skipped until it empties and a keyframe comes, so it never holds more than
+/// the hold's worth. A keyframe being paced out shrinks it, so it is never mistaken for a
+/// stall.
 #[derive(Default)]
 pub(crate) struct Backlog {
     last: usize,
     growing_since: Option<Instant>,
-    skipping: bool,
-    asked: bool,
+    /// When skipping began.
+    skipping: Option<Instant>,
+    asked: Option<Instant>,
+    /// Video units and `nack` answers skipped over the connection.
     pub(crate) skipped: u64,
 }
 
@@ -987,31 +1060,50 @@ impl Backlog {
             self.growing_since.get_or_insert(now);
         }
         self.last = queued;
-        if !self.skipping {
-            let since = match self.growing_since {
-                Some(at) if now.saturating_duration_since(at) > hold => at,
-                _ => return Admit::Send,
-            };
-            tracing::info!(
-                token = "webtransport-video-stalled",
-                queued,
-                stalled_ms = now.saturating_duration_since(since).as_millis() as u64,
-                "WebTransport datagram queue has not drained; video skipped until it does"
-            );
-            self.skipping = true;
-            self.asked = false;
-        }
+        let since = match self.skipping {
+            Some(since) => since,
+            None => {
+                let since = match self.growing_since {
+                    Some(at) if now.saturating_duration_since(at) > hold => at,
+                    _ => return Admit::Send,
+                };
+                tracing::info!(
+                    token = "webtransport-video-stalled",
+                    queued,
+                    stalled_ms = now.saturating_duration_since(since).as_millis() as u64,
+                    "WebTransport datagram queue has not drained; video skipped until it does"
+                );
+                self.asked = None;
+                *self.skipping.insert(now)
+            }
+        };
         if empty && keyframe {
             tracing::info!(
                 token = "webtransport-video-resumed",
                 skipped = self.skipped,
                 "WebTransport datagram queue drained; video resumes at a keyframe"
             );
-            self.skipping = false;
+            self.skipping = None;
             return Admit::Send;
         }
+        if now.saturating_duration_since(since) > hold * GIVE_UP_HOLDS {
+            tracing::warn!(
+                token = "webtransport-video-unrecoverable",
+                queued,
+                "no keyframe got through the WebTransport datagram queue; ending the \
+                 WebTransport media so the client falls back"
+            );
+            return Admit::GiveUp;
+        }
         self.skipped += 1;
-        if empty && !std::mem::replace(&mut self.asked, true) {
+        // Again every hold: a keyframe that came while the queue still held a datagram was
+        // skipped like the rest.
+        if empty
+            && self
+                .asked
+                .is_none_or(|at| now.saturating_duration_since(at) >= hold)
+        {
+            self.asked = Some(now);
             Admit::SkipForKeyframe
         } else {
             Admit::Skip
