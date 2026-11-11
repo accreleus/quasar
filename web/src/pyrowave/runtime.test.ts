@@ -98,6 +98,39 @@ function setup(opts: { offer?: boolean; warm?: boolean } = {}) {
 
 const datagrams = (configId: number, frameSeq: number) => pyroWaveDatagrams({ configId, frameSeq }, packPyroWave(frames[0], N));
 
+describe("PyroWave loss over the transport (#1298)", () => {
+  it("reports the datagrams missing from incomplete frames as lost, cumulative across configurations", async () => {
+    const agent = new FakeAgent();
+    agent.replies = [[pyroAck(0)]];
+    const clock = { now: 1_000 };
+    const lost = vi.fn();
+    const t = new WebTransportMedia({
+      sessionId: "s1",
+      coords: COORDS,
+      mintToken: async () => COORDS,
+      pyrowave: true,
+      createWebTransport: agent.create,
+      sleep: async () => {},
+      now: () => clock.now,
+      ticker: () => () => {},
+    });
+    await t.connect({ config: () => {}, unit: () => {}, pyrowave: () => {}, end: () => {}, lost });
+    agent.last.datagrams(datagrams(0, 1));
+    agent.last.datagrams(datagrams(0, 2).slice(2));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(lost, "a whole frame, and one still inside its deadline").not.toHaveBeenCalled();
+    clock.now += 17;
+    await vi.waitFor(() => expect(lost).toHaveBeenLastCalledWith(2));
+    agent.last.control(pyroAck(1, "reconnect"));
+    agent.last.datagrams(datagrams(1, 3).slice(1));
+    await new Promise((r) => setTimeout(r, 20));
+    clock.now += 17;
+    await vi.waitFor(() => expect(lost).toHaveBeenLastCalledWith(3));
+    expect(agent.sent("nack")).toEqual([]);
+    await t.close();
+  });
+});
+
 describe("a PyroWave session in the WebTransport runtime", () => {
   it("offers PyroWave, decodes each frame with its coverage and draws it; a lost datagram is concealed, not NACKed", async () => {
     const { agent, rt, decodes, textures, clock } = setup();
