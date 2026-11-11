@@ -360,6 +360,49 @@ scenario: it posts nothing (with a bench server configured the script still asks
 version) and prints each run's plan, tags and external id — the way to see
 what a bundle would post.
 
+### The fallback and keyboard-and-mouse scenarios
+
+```
+make e2e-run TARGET=... PLAN=fallback HOOKS=<dir>     # needs the hook fault:webtransport-block
+make e2e-run TARGET=... PLAN=input
+```
+
+Neither is in `smoke`. Both launch the way `stream-hold` does and take its `transport`, `codec`, `profile`, `app`,
+`bench` and `cover_qr`; `first_frame_s` is judged first and a scenario is never `pass` without it. A criterion
+with no evidence source today is `pass: null` and its `expected` says what is missing: nothing is invented and
+no telemetry key, trace event or stats field is added for it.
+
+`transport-fallback` takes `transport: webtransport` and `when`: `mid` (default; the pointer lock is taken and a
+key held, then the hook is applied while streaming) or `connect` (applied before the launch). `hold_s` is how
+long it waits for the fallback and a frame: counted from the fault in `mid`, from the first frame in `connect`
+(the fault was already on). A `mid` run whose session had already fallen back before the fault (the session row
+has a reason, the page already posted the event, or the `<video>` is already decoding) is an `error` that says so
+and the hook is not applied; only evidence from after the fault counts. With no first frame the fault is never
+applied (`mid`) or nothing is watched after it (`connect`), so the criteria after the fault are `pass: null`.
+
+| criterion | judged as |
+|---|---|
+| `webtransport_closed_first` | `pass: null`. The page does not expose when its WebTransport session closed, the trace has no event for it, and the agent logs nothing of its own for a lost WebTransport client. Needs a client trace event or bench field for the close time, or an agent log line, in the host half |
+| `continues_on_webrtc` | after the fallback the session is not `stopped`/`failed`, and the `<video>` (the WebRTC path; WebTransport draws on a canvas) decodes frames across a 5 s tail |
+| `fallback_event` | the session row's `transport_fallback_reason` (the control plane writes it from the `transport.fallback` event), or that event as the page itself posts it to the stack, has a reason matching `^[a-z0-9_]{1,64}$`; `observed` says which source |
+| `frame_after_fallback` | the `<video>` decoded a frame after the fault went on (it had none before it); `observed` is the seconds from the fault |
+| `held_key_released` | `pass: null`. A key held across the fallback (`key-held`, then `key-released` by the runner at the end) is the test; the client cannot see the host's key state. Needs the host half (an agent input log) or the reference app logging individual keys. In `connect` nothing is held: no input is captured before the first picture |
+
+`input-kbm` sends one fixed sequence (`SEQUENCE` in the scenario file: six keys, the three mouse buttons, wheel up
+and down, relative motion) as trusted events through the DevTools protocol (`Input.dispatchKeyEvent`,
+`Input.dispatchMouseEvent`). The pointer lock first: the product takes it from its "Click to play" layer (a click on
+the stage only opens the HUD shelf), so the scenario waits for that layer and clicks it with a trusted click, up to
+three times. A key or button held when the run is cut is released on the way out; a release that fails is named
+in "left behind". `hold_s` is the pause after the sequence. `input-sent.json` holds what was sent (in order) and what the page
+received, for the host half to compare.
+
+| criterion | judged as |
+|---|---|
+| `pointer_lock_taken` | `document.pointerLockElement` is the stream surface after the click on the "Click to play" layer; `pass: null` when no first frame was seen (the sequence was not sent) |
+| `keys_match`, `buttons_match`, `motion_sum_matches` | `pass: null`. The reference app does not log individual keys, buttons or motion (its echo is one bit) and the runner cannot see the page's input channel. Needs the app's own input log on the host |
+| `nothing_held_at_end` | every key and button the page was sent down was also sent up, as the page received them. The product's own held-key set is not exposed, so a key the page failed to release on the host is not seen here |
+| `input_to_photon_ms` | `pass: null` (no limit is calibrated); `expected` carries the count, median and max of the samples from eight `__qBench.pressKey` rounds. A sample that is not a finite number is not counted; none at all says the marker echoed no key |
+
 ## The run bundle, format 1
 
 A directory, zipped when it is handed between machines.
