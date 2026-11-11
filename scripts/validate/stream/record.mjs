@@ -22,6 +22,7 @@ export class Recorder {
     this.literals = literals.filter(([t]) => t);
     this.secrets = secrets;
     this.known = -1;
+    this.problems = []; // anything that makes the bundle unsafe to keep: the runner treats it as a failed validation
     fs.mkdirSync(dir, { recursive: true });
   }
 
@@ -42,6 +43,11 @@ export class Recorder {
     return scrub(out, this.redacted);
   }
 
+  isSecret(t) {
+    this.text(""); // brings the spellings up to date
+    return this.pairs.some(([lit]) => lit === t);
+  }
+
   /** A copy of `v` with every string cleaned and every credential-named member dropped. */
   value(v) {
     if (typeof v === "string") return this.text(v);
@@ -49,8 +55,13 @@ export class Recorder {
     if (v === null || typeof v !== "object") return v;
     const out = {};
     for (const [k, x] of Object.entries(v)) {
-      if (CREDENTIAL_KEY.test(k)) this.redacted.credential_keys = (this.redacted.credential_keys ?? 0) + 1;
-      else out[this.text(k)] = this.value(x);
+      // A key is an identity: never rewritten by literal replacement. One that names a credential, or is a secret itself, is dropped.
+      if (CREDENTIAL_KEY.test(k) || this.isSecret(k)) this.redacted.credential_keys = (this.redacted.credential_keys ?? 0) + 1;
+      else {
+        const key = scrub(k, this.redacted);
+        if (Object.hasOwn(out, key)) this.problems.push(`redaction would make two members of one object the same key ${JSON.stringify(key.slice(0, 40))}`);
+        out[key] = this.value(x);
+      }
     }
     return out;
   }
@@ -81,12 +92,42 @@ export class ScenarioRecorder {
     this.dirName = dirName;
     this.clockOffset = clockOffset;
     bundle.put(`${dirName}/timeline.jsonl`, "");
+    // What the page says (console lines, errors, API bodies) can carry its bearer, which the runner learns only after sign-in:
+    // it is held in memory until release() and written then, through the redactor. dropHeld() discards it if the bearer never became known.
+    this.holding = true;
+    this.held = [];
+  }
+
+  fromPage(rel, text) {
+    if (this.holding) this.held.push(() => this.bundle.append(`${this.dirName}/${rel}`, text));
+    else this.bundle.append(`${this.dirName}/${rel}`, text);
+  }
+
+  /** A timeline row about what the page did (an API answer's body), held like fromPage. */
+  pageStep(ev, data = {}) {
+    const row = this.row(ev, data);
+    if (this.holding) this.held.push(() => this.bundle.row(`${this.dirName}/timeline.jsonl`, row));
+    else this.bundle.row(`${this.dirName}/timeline.jsonl`, row);
+  }
+
+  release() {
+    this.holding = false;
+    for (const write of this.held.splice(0)) write();
+  }
+
+  /** The number of held lines discarded; holding stays on, so nothing later is written either. */
+  dropHeld() {
+    return this.held.splice(0).length;
   }
 
   /** The timeline's clock is the browser's when the offset is known, else the runner's (named in `clock_source`). */
-  step(ev, data = {}) {
+  row(ev, data) {
     const off = this.clockOffset();
-    this.bundle.row(`${this.dirName}/timeline.jsonl`, { ts_unix_ms: this.bundle.now() + (off ?? 0), clock: "client", clock_source: off === null ? "runner" : "browser", ev, ...data });
+    return { ts_unix_ms: this.bundle.now() + (off ?? 0), clock: "client", clock_source: off === null ? "runner" : "browser", ev, ...data };
+  }
+
+  step(ev, data = {}) {
+    this.bundle.row(`${this.dirName}/timeline.jsonl`, this.row(ev, data));
   }
 
   json(rel, v) { this.bundle.json(`${this.dirName}/${rel}`, v); }

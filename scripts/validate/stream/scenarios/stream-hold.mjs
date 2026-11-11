@@ -4,15 +4,15 @@
 //
 // ctx (the runner builds it; the tests pass a fake): { baseUrl, params, rec, api, creds, client,
 // thresholds, secrets, now(), clockOffset(), sleep(ms) }.
-// Returns { status, reason?, criteria, sessions, clock_offset_ms, cleanup? }; `cleanup` lists what
-// the scenario could not put back, and the runner turns any entry into an `error`.
+// Returns { status, reason?, criteria, clock_offset_ms }; the runner owns the sessions (ctx.launches) and their cleanup.
 import { benchRows } from "../benchfold.mjs";
+
+const TERMINAL = ["stopped", "failed"];
 
 export const name = "stream-hold";
 // The budget asked of a launched stream. The product publishes none; spec #1271 chose 30 s.
 export const FIRST_FRAME_LIMIT_S = 30;
 const SHOT_EVERY_S = 10;
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SESSION_URL = /\/app\/session\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[/?#]|$)/i;
 const CODEC_LABEL = { h264: "H.264", h265: "HEVC", av1: "AV1", pyrowave: "Auto" };
 // The bench callback seeing fewer frames than the video decoded means the instrument, not the stream, set the cadence (#1304).
@@ -28,8 +28,13 @@ const shown = (v) => JSON.stringify(v)?.slice(0, 40);
 // A criterion that was not judged has no observed value (the validator's rule).
 const crit = (id, pass, observed, expected) => ({ id, pass, observed: pass === null ? null : observed, expected });
 
+/** What a plan entry's params may hold; all but `app` and `bench`/`cover_qr` have a default (docs/testing-e2e-suite.md lists them). */
+export const PARAM_KEYS = ["transport", "codec", "profile", "hold_s", "app", "bench", "cover_qr"];
+
 /** Why `p` cannot be run, or null. The runner asks before it opens a page. */
 export function check(p) {
+  const stray = Object.keys(p).filter((k) => !PARAM_KEYS.includes(k));
+  if (stray.length) return `params has a key stream-hold does not define: ${stray.map((k) => JSON.stringify(k.slice(0, 40))).join(", ")} (it defines ${PARAM_KEYS.join(", ")})`;
   if (!["webrtc", "webtransport"].includes(p.transport)) return `transport must be webrtc or webtransport, got ${shown(p.transport)}`;
   if (!Object.hasOwn(CODEC_LABEL, p.codec)) return `codec must be one of ${Object.keys(CODEC_LABEL).join(", ")}, got ${shown(p.codec)}`;
   if (typeof p.profile !== "string" || !/^\d+p\d+$/.test(p.profile)) return `profile must look like 1080p60, got ${shown(p.profile)}`;
@@ -51,6 +56,9 @@ export function observeWindows(windows, warmupS, hidden = []) {
 export function framelessSeconds(obs) {
   return obs.filter((w) => w.n === 0 && !(w.no_image > 0)).length;
 }
+
+/** Every judged window states how many frames it saw; one that does not makes the count unknown, not zero. */
+const countsKnown = (obs) => obs.every((w) => finite(w.n) && w.n >= 0);
 
 /** missing / (decoded + missing) over the windows: the indices that were due. Any absent, negative or non-finite count makes it null. */
 export function missingRate(obs) {
@@ -114,12 +122,12 @@ export function judge({ params, session, windows, frames, firstFrameS, stats, hi
   const frameless = framelessSeconds(obs);
 
   return [
-    crit("first_frame_s", firstFrameS !== null && firstFrameS <= FIRST_FRAME_LIMIT_S, firstFrameS, `<= ${FIRST_FRAME_LIMIT_S}`),
+    crit("first_frame_s", finite(firstFrameS) && firstFrameS >= 0 ? firstFrameS <= FIRST_FRAME_LIMIT_S : firstFrameS === null ? false : null, finite(firstFrameS) && firstFrameS >= 0 ? firstFrameS : null, `<= ${FIRST_FRAME_LIMIT_S}`),
     crit("marker_decoded", stats ? stats.decoded > 0 : null, stats?.decoded ?? null, "> 0 marker frames decoded"),
     crit("transport_as_asked", s ? s.transport === params.transport && !s.transport_fallback_reason : null, s ? transportObserved(s) : null, params.transport),
     crit("codec_as_asked", codec ? codec[0] === params.codec : null, codec ? `${codec[0]} (${codec[1]})` : null, params.codec),
     crit("profile_as_asked", stream && h ? stream.height === +h && stream.fps === +fps : null, stream ? `${stream.height}p${stream.fps}` : null, `${params.profile} (the launch size, not external_*)`),
-    crit("frameless_seconds", obs.length ? frameless === 0 : null, frameless, `0 one-second bench windows without a frame, after the ${warm}`),
+    crit("frameless_seconds", obs.length && countsKnown(obs) ? frameless === 0 : null, frameless, `0 one-second bench windows without a frame, after the ${warm}`),
     {
       id: "missing_indices_rate",
       pass: null,
@@ -180,26 +188,17 @@ export default {
     const tb = () => now() + (ctx.clockOffset?.() ?? 0); // the browser's clock, which the bench windows are stamped on
     ctx.refused = null;
 
-    // The sessions this run owns: the ids in the 201s of its own POST /v1/sessions, plus the id of its own
-    // page's URL once the API confirms it. The listener reads; it wraps nothing.
-    const owned = new Set();
-    const cleanup = [];
+    // The sessions this run owns are the runner's to track and stop (ctx.launches): a page address never adds one.
+    const origin = new URL(ctx.baseUrl).origin;
     const pending = [];
     page.on("response", (r) => {
-      const { pathname } = new URL(r.url());
+      const u = new URL(r.url());
+      if (u.origin !== origin || r.status() < 400 || !u.pathname.startsWith("/v1/")) return;
       const method = r.request().method();
-      if (r.status() === 201 && method === "POST" && pathname === "/v1/sessions") {
-        pending.push((async () => {
-          const id = (await r.json().catch(() => null))?.session?.id;
-          if (typeof id === "string" && UUID.test(id)) { owned.add(id); rec.step("session-started", { session: id }); }
-          else cleanup.push("a session launch was accepted but its id could not be read, so it could not be stopped");
-        })());
-      }
-      if (r.status() < 400 || !pathname.startsWith("/v1/")) return;
       pending.push((async () => {
         const body = (await r.text().catch(() => "")).slice(0, 300);
-        rec.step("api-error", { method, path: pathname, status: r.status(), body });
-        if (method === "POST" && pathname === "/v1/sessions") ctx.refused = `the launch was refused: ${r.status()} ${body.trim()}`;
+        rec.pageStep("api-error", { method, path: u.pathname, status: r.status(), body });
+        if (method === "POST" && u.pathname === "/v1/sessions") ctx.refused = `the launch was refused: ${r.status()} ${body.trim()}`;
       })());
     });
 
@@ -216,11 +215,7 @@ export default {
       rec.step("play-clicked", { app: params.app });
       const sid = await waitForSession(page, ctx);
       const row0 = await api.session(sid);
-      if (!row0 || row0.id !== sid) {
-        rec.step("session-unattributed", { session: sid, why: "the API has no such session for this user" });
-        throw new Error("the page's session id is not a session of this user, so it was left alone");
-      }
-      owned.add(sid);
+      if (!row0 || row0.id !== sid) throw new Error("the API no longer returns the session this run launched");
       rec.step("session-route", { session: sid });
 
       const frames = [];
@@ -284,24 +279,16 @@ export default {
         criteria: judge({ params, session: row, windows, frames, firstFrameS, stats, hidden, videoSamples, thresholds: ctx.thresholds }),
         clock_offset_ms: known ? known.offset_ms : null,
       };
+      // A session that is already over before this run's own stop was not held: whatever the criteria say.
+      if (TERMINAL.includes(row.state)) result = { ...result, status: "error", reason: `the session ended during the hold (it was ${row.state} before this run stopped it)` };
       rec.step("hold-done");
     } catch (err) {
       rec.step("error", { message: String(err?.message ?? err) });
       result = { status: "error", reason: String(err?.message ?? err), criteria: [], clock_offset_ms: null };
     } finally {
-      // Every exit path: the sessions this run started are stopped, and a stop is "stopped" only once the API says so.
       await Promise.allSettled(pending);
-      for (const id of owned) {
-        try {
-          await api.stop(id);
-          rec.step("stopped", { session: id });
-        } catch (e) {
-          rec.step("stop-failed", { session: id, message: String(e?.message ?? e) });
-          cleanup.push(`session ${id} is not confirmed stopped (${String(e?.message ?? e)})`);
-        }
-      }
     }
-    return { sessions: [...owned], ...result, ...verdict(result), ...(cleanup.length ? { cleanup } : {}) };
+    return { ...result, ...verdict(result) };
   },
 };
 
@@ -318,7 +305,10 @@ async function signIn(page, ctx) {
   await page.waitForURL((u) => !new URL(u).pathname.startsWith("/login"), { timeout: 20000 });
   // The page's own bearer is a secret of this run too: removed from everything written, as a value.
   const bearer = await page.evaluate(() => localStorage.getItem("quasar.auth.token") ?? sessionStorage.getItem("quasar.auth.token"));
-  if (typeof bearer === "string" && bearer) ctx.secrets?.add(bearer);
+  if (typeof bearer === "string" && bearer) {
+    ctx.secrets?.add(bearer);
+    ctx.rec.release(); // only now can what the page said be written through the redactor
+  }
 }
 
 /** Waits for the control to be enabled, then clicks it as a script, not as a pointer (an untrusted click cannot start full screen or take the pointer lock). Returns the time of the click. */
@@ -354,23 +344,31 @@ async function pickAndPlay(page, ctx) {
   return press(sheet.getByRole("button", { name: /^Play now/ }), ctx, "Play now");
 }
 
+/** The session id in the page's address, but only one this run launched (a 201 of its own page); any other is an error and is left alone. */
 async function waitForSession(page, ctx) {
   const stop = ctx.now() + 90000;
   while (ctx.now() < stop) {
     const m = SESSION_URL.exec(new URL(page.url(), ctx.baseUrl).pathname);
-    if (m) return m[1];
+    if (m) {
+      await ctx.launches.settle();
+      if (ctx.launches.owned.has(m[1])) return m[1];
+      throw new Error("the page went to a session this run did not launch, so it was left alone");
+    }
     if (ctx.refused) throw new Error(ctx.refused);
     await ctx.sleep(300);
   }
   throw new Error("the Play click never reached a session page");
 }
 
+// The loader keeps is-locking / is-streaming on a failed or ended session (SessionLoader.tsx adds is-failed and is-over beside it), so those are not a frame.
+export const REVEALED = ".sl-root.is-locking:not(.is-failed):not(.is-over), .sl-root.is-streaming:not(.is-failed):not(.is-over)";
+
 /** What the page shows right now: bench frames, the playing <video> (WebRTC), the page's own reveal of the stream (either transport), and whether it is visible. */
 const probe = (page) =>
-  page.evaluate(() => ({
+  page.evaluate((sel) => ({
     frames: window.__qBench?.stats().frames ?? 0,
     videoFrames: document.querySelector("video.session-video:not([hidden])")?.getVideoPlaybackQuality?.().totalVideoFrames ?? 0,
-    revealed: !!document.querySelector(".sl-root.is-locking, .sl-root.is-streaming"),
+    revealed: !!document.querySelector(sel),
     visible: document.visibilityState,
     focused: document.hasFocus?.(),
-  }));
+  }), REVEALED);

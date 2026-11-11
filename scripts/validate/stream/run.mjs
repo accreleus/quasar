@@ -26,8 +26,13 @@ import { Recorder, ScenarioRecorder } from "./record.mjs";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "../../..");
 const TERMINAL = ["stopped", "failed"];
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export const DEFAULT_APP = "Quasar Benchapp";
 const LABEL = /^[A-Za-z0-9_.-]{1,64}$/;
+const PLAN_KEYS = ["name", "scenarios"];
+const ENTRY_KEYS = ["scenario", "params"];
+// A secret this short cannot be taken out of unrelated values (a UUID, a key) without damaging them.
+export const MIN_SECRET = 8;
 
 const NOT_RECORDED = [
   { fact: "audio_latency_ms", why: "nothing in the product or the page measures audio latency yet" },
@@ -39,6 +44,9 @@ const NOT_RECORDED = [
 export function loadPlan(arg) {
   const file = /[/\\]|\.json$/.test(arg) ? arg : path.join(HERE, "plans", `${arg}.json`);
   const plan = JSON.parse(fs.readFileSync(file, "utf8"));
+  if (!plan || typeof plan !== "object" || Array.isArray(plan)) throw new Error(`plan ${arg} is not an object`);
+  const unknown = Object.keys(plan).filter((k) => !PLAN_KEYS.includes(k));
+  if (unknown.length) throw new Error(`plan ${arg} has a key this runner does not define: ${unknown.map((k) => JSON.stringify(k.slice(0, 40))).join(", ")} (it defines ${PLAN_KEYS.join(", ")})`);
   if (!Array.isArray(plan.scenarios) || plan.scenarios.length === 0) throw new Error(`plan ${arg} lists no scenarios`);
   return plan;
 }
@@ -71,6 +79,69 @@ export function readCreds(env) {
     email: env.QUASAR_E2E_EMAIL ?? file.QUASAR_E2E_EMAIL ?? file.EMAIL,
     password: env.QUASAR_E2E_PASSWORD ?? file.QUASAR_E2E_PASSWORD ?? file.PASSWORD,
   };
+}
+
+/** Why the sign-in cannot be removed safely from what the run writes, or null. */
+export function secretTooShort(creds) {
+  const local = String(creds.email).split("@")[0];
+  if (String(creds.password).length < MIN_SECRET || local.length < MIN_SECRET) {
+    return `the test user's password and e-mail local part must each be at least ${MIN_SECRET} characters: a shorter secret cannot be removed from the bundle without damaging unrelated values. Use a test user with a longer password`;
+  }
+  return null;
+}
+
+/**
+ * The sessions this run owns: the ids in the 201s of its page's own POST /v1/sessions to the stack's own
+ * origin, and nothing else. A page address, a list or a baseline never adds one. `writes` records anything
+ * else the page changed on the stack (a PUT, PATCH or DELETE outside /v1/sessions/): the runner does not know
+ * how to put it back, so the scenario reports it as left behind.
+ */
+export function trackLaunches(page, baseUrl, onOwned = () => {}) {
+  const origin = new URL(baseUrl).origin;
+  const t = { owned: new Set(), unread: 0, writes: [], pending: new Set() };
+  const track = (p) => { t.pending.add(p); p.finally(() => t.pending.delete(p)); };
+  /** Waits for every response handler started so far, and those they start. */
+  t.settle = async () => { while (t.pending.size) await Promise.allSettled([...t.pending]); };
+  page.on("response", (r) => {
+    let u;
+    try { u = new URL(r.url()); } catch { return; }
+    if (u.origin !== origin) return;
+    const method = r.request().method();
+    if (r.status() === 201 && method === "POST" && u.pathname === "/v1/sessions") {
+      track((async () => {
+        const id = (await r.json().catch(() => null))?.session?.id;
+        if (typeof id === "string" && UUID.test(id) && !t.owned.has(id)) { t.owned.add(id); onOwned(id); }
+        else t.unread += 1;
+      })());
+    } else if (["PUT", "PATCH", "DELETE"].includes(method) && r.status() < 400 && u.pathname.startsWith("/v1/") && !u.pathname.startsWith("/v1/sessions/")) {
+      t.writes.push(`${method} ${u.pathname.slice(0, 80)}`);
+    }
+  });
+  return t;
+}
+
+/** Stops every owned session, again for any that arrive while stopping, until the set is stable. A stop counts only once the API confirms it. */
+export async function stopOwned(api, launches, rec) {
+  const cleanup = [];
+  const done = new Set();
+  for (;;) {
+    await launches.settle();
+    const todo = [...launches.owned].filter((id) => !done.has(id));
+    if (!todo.length) break;
+    for (const id of todo) {
+      done.add(id);
+      try {
+        await api.stop(id);
+        rec.step("stopped", { session: id });
+      } catch (e) {
+        rec.step("stop-failed", { session: id, message: String(e?.message ?? e) });
+        cleanup.push(`session ${id} is not confirmed stopped (${String(e?.message ?? e)})`);
+      }
+    }
+  }
+  if (launches.unread) cleanup.push(`${launches.unread} session launch(es) were accepted but the id could not be read, so they could not be stopped`);
+  for (const w of launches.writes) cleanup.push(`the page changed something on the stack (${w}) that this run cannot put back`);
+  return { sessions: [...launches.owned], cleanup };
 }
 
 /** The API as the signed-in user: their own bearer, never an admin token. The bearer goes into `secrets` the moment it is known. */
@@ -184,15 +255,18 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
   let committed = false;
   try {
     const url = new URL(baseUrl);
-    const bundle = new Recorder(staging, { now, secrets, literals: [[url.host, "<stack>"], [url.hostname, "<stack>"], [creds.email, "<user>"], [creds.password, "<credential>"]] });
+    const bundle = new Recorder(staging, { now, secrets, literals: [[url.host, "<stack>"], [url.hostname, "<stack>"], [creds.email, "<user>"], [String(creds.email).split("@")[0], "<user>"], [creds.password, "<credential>"]] });
     const startedAt = now();
     const racedSleep = (ms) => Promise.race([sleep(ms), abort.then(() => { throw new Error("interrupted"); })]);
     const clock = { offset: null }; // the browser's clock minus the runner's, measured once around a round trip
 
     const entries = plan.scenarios.map((raw, i) => {
-      const s = raw && typeof raw === "object" ? raw : {};
-      const params = { transport: "webrtc", codec: "h264", profile: "1080p60", hold_s: 90, app, ...(s.params && typeof s.params === "object" ? s.params : {}) };
-      return { id: `${nn(i)}-${String(s.scenario).replace(/[^\w.-]/g, "_").slice(0, 40)}`, scenario: s.scenario, params };
+      const s = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+      const own = s.params === undefined ? {} : s.params;
+      const bad = !(own && typeof own === "object" && !Array.isArray(own)) ? "params must be an object" : null;
+      const stray = Object.keys(s).filter((k) => !ENTRY_KEYS.includes(k));
+      const params = { transport: "webrtc", codec: "h264", profile: "1080p60", hold_s: 90, app, ...(bad ? {} : own) };
+      return { id: `${nn(i)}-${String(s.scenario).replace(/[^\w.-]/g, "_").slice(0, 40)}`, scenario: s.scenario, params, problem: bad ?? (stray.length ? `the plan entry has a key this runner does not define: ${stray.map((k) => JSON.stringify(k.slice(0, 40))).join(", ")} (it defines ${ENTRY_KEYS.join(", ")})` : null) };
     });
 
     const probePage = await host.newPage();
@@ -224,29 +298,39 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
         const sink = { consoleErrors: [], networkFailures: [] };
         let page = null;
         let left = null;
+        let launches = null;
+        let owned = { sessions: [], cleanup: [] };
         try {
+          if (e.problem) throw new Error(`the plan cannot be run: ${e.problem}`);
           const scenario = await loadScenario(e.scenario);
           const bad = scenario.check?.(e.params);
           if (bad) throw new Error(`the plan cannot be run: ${bad}`);
           page = await host.newPage();
           rec.put("console.log", "");
+          launches = trackLaunches(page, baseUrl, (id) => rec.step("session-started", { session: id }));
           attachEvidenceListeners(page, baseUrl, sink);
-          page.on("console", (m) => bundle.append(`${e.id}/console.log`, `${stamp()} [${m.type()}] ${m.text()}\n`));
-          page.on("pageerror", (err) => bundle.append(`${e.id}/console.log`, `${stamp()} [pageerror] ${err.message}\n`));
+          // Nothing the page says is written until its bearer is known (rec.release, after sign-in): see ScenarioRecorder.
+          page.on("console", (m) => rec.fromPage("console.log", `${stamp()} [${m.type()}] ${m.text()}\n`));
+          page.on("pageerror", (err) => rec.fromPage("console.log", `${stamp()} [pageerror] ${err.message}\n`));
           // The page signs in on its own; its bearer is a secret of this run, whatever the page does with it afterwards.
           page.on("response", (r) => {
             if (r.request().method() === "POST" && new URL(r.url()).pathname === "/v1/auth/login" && r.status() === 200) {
               r.json().then((b) => { if (typeof b?.access_token === "string") secrets.add(b.access_token); }).catch(() => {});
             }
           });
-          out = await scenario.run(page, { baseUrl, params: e.params, rec, api, creds, client, thresholds, secrets, now, sleep: racedSleep, clockOffset: () => clock.offset });
+          out = await scenario.run(page, { baseUrl, params: e.params, rec, api, creds, client, thresholds, secrets, launches, now, sleep: racedSleep, clockOffset: () => clock.offset });
         } catch (err) {
           out = { status: "error", reason: String(err?.message ?? err), criteria: [], sessions: [], clock_offset_ms: null };
         } finally {
-          rec.json("failed-requests.json", { console_errors: sink.consoleErrors, network_failures: sink.networkFailures });
+          // Order matters: close the page, wait for every response it was still delivering, then stop what the run owns.
           if (page) await host.closePage(page).catch((err) => { left = `a page it opened would not close (${err?.message ?? err})`; });
+          if (launches) owned = await stopOwned(api, launches, rec);
+          const dropped = rec.dropHeld() + (rec.holding ? sink.consoleErrors.length + sink.networkFailures.length : 0);
+          if (dropped) rec.step("pre-auth-evidence-dropped", { lines: dropped, why: "the page's bearer was never known, so nothing it said could be written safely" });
+          rec.json("failed-requests.json", rec.holding ? { console_errors: [], network_failures: [] } : { console_errors: sink.consoleErrors, network_failures: sink.networkFailures });
         }
-        const cleanup = [...(out.cleanup ?? []), ...(left ? [left] : [])];
+        out = { ...out, sessions: owned.sessions };
+        const cleanup = [...(out.cleanup ?? []), ...owned.cleanup, ...(left ? [left] : [])];
         if (cleanup.length) {
           rec.step("cleanup-failed", { left_behind: cleanup });
           out = { ...out, status: "error", reason: `${out.reason ? `${out.reason}; ` : ""}left behind: ${cleanup.join("; ")}` };
@@ -276,7 +360,7 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
       redacted: Object.keys(bundle.redacted),
       target: "stack",
     });
-    const errors = validateBundle(staging);
+    const errors = [...bundle.problems, ...validateBundle(staging)];
     if (!errors.length) { fs.renameSync(staging, dir); committed = true; }
     return { counts, suiteRunId, errors, bundle: committed ? dir : null };
   } finally {
@@ -286,7 +370,10 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
 
 /** Certificate checks stay on unless the caller asks (INSECURE_TLS=1, for a stack with a self-signed certificate): the process-wide switch Node's fetch has. */
 export function configureTls(insecure, env = process.env) {
+  // Whatever the environment says, checks are on unless the caller asked: an inherited "0" is removed. Returns what is in force.
   if (insecure) env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+  else delete env.NODE_TLS_REJECT_UNAUTHORIZED;
+  return env.NODE_TLS_REJECT_UNAUTHORIZED === "0";
 }
 
 /**
@@ -323,6 +410,8 @@ async function main() {
   if (label !== null && !LABEL.test(label)) return usage("CLIENT must be a plain identifier (letters, digits, _ . -), a role such as mac-test-client, never a host name");
   const creds = readCreds(process.env);
   if (!creds.email || !creds.password) return usage("no sign-in: set QUASAR_E2E_EMAIL and QUASAR_E2E_PASSWORD");
+  const short = secretTooShort(creds);
+  if (short) return usage(short);
   // The sign-in lives in this process only: no browser or other child inherits it.
   for (const k of ["QUASAR_E2E_EMAIL", "QUASAR_E2E_PASSWORD", "QUASAR_E2E_CRED_FILE"]) delete process.env[k];
   let plan;
@@ -334,8 +423,7 @@ async function main() {
     return usage(e.message);
   }
 
-  const insecureTls = process.env.INSECURE_TLS === "1";
-  configureTls(insecureTls);
+  const insecureTls = configureTls(process.env.INSECURE_TLS === "1");
   const { chromium } = await import("playwright").catch(() => import("playwright-core"));
   const browser = args.cdp
     ? await chromium.connectOverCDP(args.cdp)

@@ -24,10 +24,11 @@ command -v node >/dev/null 2>&1 || usage "node is not installed"
 if [ ! -d "$VALIDATE/node_modules" ]; then
   echo "installing scripts/validate node deps (npm ci, first run)" >&2
   # The sign-in is for the runner alone: npm and its install scripts do not get it.
-  (cd "$VALIDATE" && env -u QUASAR_E2E_EMAIL -u QUASAR_E2E_PASSWORD -u QUASAR_E2E_CRED_FILE npm ci >&2)
+  (cd "$VALIDATE" && env -u QUASAR_E2E_EMAIL -u QUASAR_E2E_PASSWORD -u QUASAR_E2E_CRED_FILE -u NODE_TLS_REJECT_UNAUTHORIZED npm ci >&2)
 fi
 
 args=(--target "$TARGET" --plan "$PLAN")
 [ -z "${CDP:-}" ] || args+=(--cdp "$CDP")
 [ -z "${OUT:-}" ] || args+=(--out "$OUT")
+# Certificate checks are on unless INSECURE_TLS=1, whatever NODE_TLS_REJECT_UNAUTHORIZED says here: the runner removes it itself.
 exec node "$VALIDATE/stream/run.mjs" "${args[@]}"

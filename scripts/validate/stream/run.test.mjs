@@ -10,7 +10,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { benchRows } from "./benchfold.mjs";
 import { Recorder } from "./record.mjs";
-import { configureTls, makeApi, openHost, probeClient, readThresholds, runSuite, summarise } from "./run.mjs";
+import { configureTls, loadPlan, makeApi, openHost, probeClient, readThresholds, runSuite, secretTooShort, summarise } from "./run.mjs";
 import { check, framelessSeconds, hitchCount, instrumentShare, judge, missingRate, observeWindows, shotCovered, verdict } from "./scenarios/stream-hold.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -31,10 +31,17 @@ function windows(n, frozen = []) {
   return Array.from({ length: n }, (_, i) => ({ ...(frozen.includes(i) ? FROZEN : HEALTHY), t_start_ms: T0 + i * 1000, t_end_ms: T0 + (i + 1) * 1000, t_end_host_ms: T0 + (i + 1) * 1000 + 3, last_host_time_ms: frozen.includes(i) ? null : T0 + i * 1000 + 950 }));
 }
 const frames = (n) => Array.from({ length: n * 60 }, (_, i) => ({ present_ms: T0 + Math.round(i * (1000 / 60)), decoded: true }));
-const response = (status, p, body, method = "POST") => ({ status: () => status, url: () => `${BASE}${p}`, request: () => ({ method: () => method }), json: async () => body, text: async () => JSON.stringify(body) });
+const response = (status, p, body, method = "POST", base = BASE) => ({ status: () => status, url: () => `${base}${p}`, request: () => ({ method: () => method }), json: async () => body, text: async () => JSON.stringify(body) });
+
+/** Does a loader with these classes match `sel` (a comma list of .class and :not(.class) compounds, the only forms the probe uses)? */
+const matches = (sel, classes) => {
+  const have = classes.split(" ");
+  const ok = sel.split(",").some((part) => [...part.matchAll(/(:not\()?\.([\w-]+)\)?/g)].every(([, not, c]) => (not ? !have.includes(c) : have.includes(c) || c === "sl-root")));
+  return ok ? {} : null;
+};
 
 /** A world holding the fake clock, the fake page's state and the fake API's record. */
-function world({ wins = windows(50), session = {}, failScreenshotAt = null, webtransport = true, noBench = false, refuse = false, noFrame = false, revealed = false, stopFails = false, closeFails = false, noUrl = false, url = null, stats = { frames: 100, decoded: 100 }, videoRate = 60, hiddenBetween = null, skew = 0, extraFrames = null } = {}) {
+function world({ wins = windows(50), session = {}, failScreenshotAt = null, webtransport = true, noBench = false, refuse = false, noFrame = false, revealed = false, stopFails = false, closeFails = false, noUrl = false, url = null, stats = { frames: 100, decoded: 100 }, videoRate = 60, hiddenBetween = null, skew = 0, extraFrames = null, loader = null, onPlay = null, bare = false } = {}) {
   const w = { t: T0, stopped: [], live: [], url: "about:blank", ls: new Map(), shots: 0, failScreenshotAt, calls: [], secrets: new Set(), handlers: {}, opened: [], closed: [], clicks: [], gotos: [] };
   w.now = () => w.t;
   w.sleep = async (ms) => { w.t += ms; };
@@ -58,6 +65,8 @@ function world({ wins = windows(50), session = {}, failScreenshotAt = null, webt
     evaluate: async (fn) => fn({ disabled: false, getAttribute: () => null, click: () => {
       w.clicks.push(desc);
       if (!/Play now/.test(desc)) return;
+      if (onPlay) onPlay(w);
+      if (bare) return;
       if (refuse) return w.emit("response", response(409, "/v1/sessions", { error: { code: "profile_ineligible" } }));
       w.live.push(SID);
       w.emit("response", response(201, "/v1/sessions", { session: { id: SID }, signaling: { token: "single-use" } }));
@@ -84,7 +93,7 @@ function world({ wins = windows(50), session = {}, failScreenshotAt = null, webt
       const saved = Object.fromEntries(["window", "localStorage", "sessionStorage", "document"].map((k) => [k, globalThis[k]]));
       const hidden = hiddenBetween && w.t >= hiddenBetween[0] && w.t < hiddenBetween[1];
       const video = { getVideoPlaybackQuality: () => ({ totalVideoFrames: Math.round(((w.t - T0) / 1000) * videoRate) }) };
-      const doc = { visibilityState: hidden ? "hidden" : "visible", hasFocus: () => true, querySelector: (sel) => (/sl-root/.test(sel) ? (revealed ? {} : null) : /video/.test(sel) && !noBench && !revealed && !noFrame ? video : null) };
+      const doc = { visibilityState: hidden ? "hidden" : "visible", hasFocus: () => true, querySelector: (sel) => (/sl-root/.test(sel) ? (loader ? matches(sel, loader) : revealed ? {} : null) : /video/.test(sel) && !noBench && !revealed && !noFrame ? video : null) };
       Object.assign(globalThis, { window: noBench ? {} : { __qBench: qbench }, localStorage: store, sessionStorage: { getItem: () => null }, document: doc });
       try { return await fn(arg); } finally { w.ls = new Map(Object.entries(store)); Object.assign(globalThis, saved); }
     },
@@ -300,17 +309,23 @@ test("a launch the page made but never navigated to is stopped by the id in its 
   assert.ok(timeline().some((r) => r.ev === "session-started" && r.session === SID));
 });
 
-test("an id in the page URL that the API does not know is left alone and named", async () => {
+test("an id in the page URL that this run did not launch is an error, and that session is left alone (A17)", async () => {
   const hyphens = "-".repeat(36);
-  for (const [url, why] of [[`${BASE}/app/session/${hyphens}`, /never reached a session page/], [`${BASE}/app/session/${OTHER}`, /not a session of this user/]]) {
+  for (const [url, why] of [[`${BASE}/app/session/${hyphens}`, /never reached a session page/], [`${BASE}/app/session/${OTHER}`, /did not launch/]]) {
     const w = world({ url });
-    const { result, scenario, timeline } = await run(w);
+    const { result, scenario } = await run(w);
     assert.deepEqual(result.errors, []);
     assert.equal(scenario().status, "error", url);
     assert.match(scenario().reason, why);
-    assert.equal(timeline().some((r) => r.ev === "session-unattributed"), why.source.includes("not a session"));
     assert.ok(!w.stopped.includes(OTHER) && !w.calls.includes(`stop ${hyphens}`));
   }
+  // The seat's input: no launch 201 at all, the page just goes to a session the API shows as the user's own and running.
+  const w = world({ bare: true, onPlay: (x) => { x.url = `${BASE}/app/session/${OTHER}`; } });
+  w.api.session = async (id) => ({ id, app_id: "app-1", state: "running", transport: "webrtc", negotiated_codec: "h264", stream: { height: 1080, fps: 60 } });
+  const { scenario } = await run(w);
+  assert.equal(scenario().status, "error");
+  assert.match(scenario().reason, /did not launch/);
+  assert.deepEqual(w.stopped, [], "a session the run has no launch 201 for is never stopped");
 });
 
 test("a session row that is not the session asked for is an error, not a pass", async () => {
@@ -409,14 +424,11 @@ test("a body that echoes the sign-in leaves JSON that parses: redaction never ed
     };
     return p;
   };
-  const { dir, result, scenario } = await run(w, PLAN({ password: "abcdef1234", token: API_BEARER, note: "kept" }));
+  const { dir, result, scenario } = await run(w, PLAN({}));
   assert.deepEqual(result.errors, []);
   for (const f of everyFile(dir).filter((x) => /\.jsonl?$/.test(x))) {
     for (const line of f.endsWith(".jsonl") ? read(f, "").split("\n").filter(Boolean) : [read(f, "")]) assert.doesNotThrow(() => JSON.parse(line), path.relative(dir, f));
   }
-  const manifest = JSON.parse(read(dir, "manifest.json"));
-  assert.equal(manifest.plan.scenarios[0].params.note, "kept");
-  assert.ok(!("password" in manifest.plan.scenarios[0].params) && !("token" in manifest.plan.scenarios[0].params), "a credential-named key is dropped");
   assert.equal(scenario().status, "error");
   assert.ok(!read(dir, "01-stream-hold/timeline.jsonl").includes("abcdef1234"));
   for (const secret of [API_BEARER, CREDS.password, "x1y2z3w4"]) for (const f of everyFile(dir).filter((x) => !x.endsWith(".png"))) assert.ok(!fs.readFileSync(f, "utf8").includes(secret), `${secret} in ${path.relative(dir, f)}`);
@@ -454,9 +466,9 @@ test("a bundle is never written over another", async () => {
 
 test("certificate checks are on unless INSECURE_TLS asks, and the bundle says which", async () => {
   const env = {};
-  configureTls(false, env);
+  assert.equal(configureTls(false, env), false);
   assert.deepEqual(env, {});
-  configureTls(true, env);
+  assert.equal(configureTls(true, env), true);
   assert.equal(env.NODE_TLS_REJECT_UNAUTHORIZED, "0");
   for (const insecureTls of [false, true]) {
     const { dir } = await run(world(), PLAN({}), { insecureTls });
@@ -763,4 +775,171 @@ test("a shot of an app that shows a sign-in QR has the cover on it, and is not t
   assert.deepEqual(steps, ["shot-skipped"]);
   await shotCovered(page(null), rec, "c", false);
   assert.deepEqual(taken.at(-1), ["c", 0]);
+});
+
+// ── round 3: the second review's list (A15..A25) ────────────────────────────
+
+const LATE = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+const onPage = (w, fn) => { const orig = w.host.newPage; w.host.newPage = async () => fn(await orig()); };
+
+test("A15: a page that changes something on the stack the run cannot put back makes the scenario an error naming it", async () => {
+  // The game page's per-game settings calls are stubs today (gameData.ts, issue #720); this is what a real PUT would look like.
+  const w = world({ onPlay: (x) => x.emit("response", response(200, `/v1/apps/app-1/settings`, {}, "PUT")) });
+  const { scenario } = await run(w);
+  assert.equal(scenario().status, "error");
+  assert.match(scenario().reason, /left behind: the page changed something on the stack \(PUT \/v1\/apps\/app-1\/settings\) that this run cannot put back/);
+  assert.deepEqual(w.stopped, [SID]);
+  // The sessions endpoint's own writes (the page stopping its session) and reads are not changes of a preference.
+  const ok = await run(world({ onPlay: (x) => x.emit("response", response(200, `/v1/sessions/${SID}`, {}, "DELETE")) }));
+  assert.equal(ok.scenario().status, "pass");
+});
+
+test("A16: a 201 from another origin is not this run's session and is never stopped", async () => {
+  const w = world({ bare: true, onPlay: (x) => x.emit("response", response(201, "/v1/sessions", { session: { id: OTHER } }, "POST", "https://other.example.test")) });
+  const { scenario } = await run(w);
+  assert.equal(scenario().status, "error");
+  assert.deepEqual(scenario().sessions, []);
+  assert.deepEqual(w.stopped, []);
+});
+
+test("A18: a launch 201 delivered while the page is closing is still stopped and listed", async () => {
+  const w = world({ refuse: true });
+  const close = w.host.closePage;
+  w.host.closePage = async (p) => {
+    await close(p);
+    if (w.opened.indexOf(p) > 0) { await Promise.resolve(); w.emit("response", response(201, "/v1/sessions", { session: { id: LATE } })); }
+  };
+  const { scenario, timeline } = await run(w);
+  assert.equal(scenario().status, "error"); // the refusal
+  assert.deepEqual(w.stopped, [LATE]);
+  assert.deepEqual(scenario().sessions, [LATE]);
+  assert.ok(timeline().some((r) => r.ev === "stopped" && r.session === LATE));
+});
+
+test("A19: what the page says before its bearer is known is held, then written without it", async () => {
+  const w = world();
+  onPage(w, (p) => {
+    const click = p.click;
+    p.click = async (...a) => { await click(...a); w.emit("console", { type: () => "log", text: () => `quasar.auth.token=${PAGE_BEARER}` }); w.emit("pageerror", { message: `boom ${PAGE_BEARER}` }); };
+    return p;
+  });
+  const { dir, scenario, result } = await run(w);
+  assert.deepEqual(result.errors, []);
+  assert.equal(scenario().status, "pass");
+  const log = read(dir, "01-stream-hold/console.log");
+  assert.match(log, /quasar\.auth\.token=<credential>/);
+  assert.match(log, /\[pageerror\] boom <credential>/);
+  for (const f of everyFile(dir).filter((x) => !x.endsWith(".png"))) assert.ok(!fs.readFileSync(f, "utf8").includes(PAGE_BEARER), path.relative(dir, f));
+});
+
+test("A19: when the page's bearer never becomes known what was held is dropped, and the timeline says how many lines", async () => {
+  const w = world();
+  onPage(w, (p) => {
+    p.click = async () => { w.emit("console", { type: () => "log", text: () => "line one" }); w.emit("console", { type: () => "log", text: () => "line two" }); };
+    return p;
+  });
+  const { dir, scenario, timeline, result } = await run(w);
+  assert.deepEqual(result.errors, []);
+  assert.ok(!read(dir, "01-stream-hold/console.log").includes("line"), "nothing the page said was written");
+  const drop = timeline().find((r) => r.ev === "pre-auth-evidence-dropped");
+  assert.ok(drop && drop.lines >= 2, JSON.stringify(drop));
+  assert.ok(["pass", "error", "fail"].includes(scenario().status));
+});
+
+test("A21: a failed or ended loader is not a first frame, whatever else it carries", async () => {
+  for (const loader of ["sl-root is-locking is-failed is-over", "sl-root is-streaming is-failed is-over", "sl-root is-streaming is-failed"]) {
+    const w = world({ noBench: true, loader });
+    const { scenario, by } = await run(w, PLAN({ bench: false }));
+    assert.equal(by().first_frame_s.pass, false, loader);
+    assert.equal(scenario().status, "fail", loader);
+  }
+  // The seat's probe: bench off, no video frames, a stopped session behind the failed loader.
+  const stopped = await run(world({ noBench: true, loader: "sl-root is-streaming is-failed is-over", session: { state: "stopped" } }), PLAN({ bench: false }));
+  assert.notEqual(stopped.scenario().status, "pass");
+  const live = world({ noBench: true, loader: "sl-root is-streaming" });
+  assert.equal((await run(live, PLAN({ bench: false }))).by().first_frame_s.pass, true);
+});
+
+test("A21: a session that is already stopped or failed when the hold ends is an error, whatever the criteria say", async () => {
+  for (const state of ["stopped", "failed"]) {
+    const { scenario, by } = await run(world({ session: { state } }));
+    assert.equal(by().first_frame_s.pass, true, "the criteria themselves look fine");
+    assert.equal(scenario().status, "error");
+    assert.match(scenario().reason, /the session ended during the hold/);
+  }
+});
+
+test("A22: a key is never rewritten by a secret; a key that is one is dropped; two keys redaction makes equal invalidate the bundle", async () => {
+  const dir = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "rec-")), "b");
+  const rec = new Recorder(dir, { literals: [["hunter222", "<credential>"]] });
+  rec.json("a.json", { "hunter222": 1, "hunter222-note": 2, id: "11111111-2222" });
+  assert.deepEqual(JSON.parse(read(dir, "a.json")), { "hunter222-note": 2, id: "11111111-2222" });
+  assert.deepEqual(rec.problems, []);
+  rec.json("b.json", { "Bearer abc12345678901": 1, "Bearer zzz98765432109": 2 });
+  assert.match(rec.problems[0], /two members of one object the same key/);
+});
+
+test("A22: a password or e-mail local part under 8 characters is refused before anything starts", () => {
+  assert.equal(secretTooShort({ email: "tester-account@example.test", password: "correct-horse-battery" }), null);
+  for (const creds of [{ email: "tester-account@example.test", password: "111111" }, { email: "t@example.test", password: "correct-horse-battery" }, { email: "abcdefg@example.test", password: "correct-horse-battery" }]) assert.match(secretTooShort(creds), /at least 8 characters.*longer password/, JSON.stringify(creds));
+  const r = spawnSync(process.execPath, [path.join(HERE, "run.mjs"), "--target", "https://x.example.test", "--plan", "smoke"], { env: { PATH: process.env.PATH, QUASAR_E2E_EMAIL: "tester-account@example.test", QUASAR_E2E_PASSWORD: "111111" }, encoding: "utf8" });
+  assert.equal(r.status, 2);
+  assert.match(r.stdout, /RESULT status=error target=e2e-run/);
+  assert.match(r.stderr, /Use a test user with a longer password/);
+  assert.ok(!r.stdout.includes("111111") && !r.stderr.includes("111111"));
+});
+
+test("A23: a negative or non-finite first-frame time is not a pass, and windows with no valid frame count do not make a clean zero", async () => {
+  for (const firstFrameS of [-1, NaN, Infinity]) {
+    const c = J({ firstFrameS }).first_frame_s;
+    assert.equal(c.pass, null, String(firstFrameS));
+    assert.equal(c.observed, null);
+    assert.equal(verdict({ criteria: Object.values(J({ firstFrameS })) }).status, "error");
+  }
+  assert.equal(J({ firstFrameS: 0 }).first_frame_s.pass, true);
+  const unknown = windows(50).map(({ n, ...w }) => w);
+  const c = J({ windows: unknown }).frameless_seconds;
+  assert.equal(c.pass, null);
+  assert.equal(c.observed, null);
+  const bad = windows(50).map((w, i) => (i === 40 ? { ...w, n: -3 } : w));
+  assert.equal(J({ windows: bad }).frameless_seconds.pass, null);
+  assert.equal(J({ windows: windows(50) }).frameless_seconds.pass, true);
+});
+
+test("A24: an unknown key in a plan entry, its params or the plan itself is refused; omitted params take the documented defaults", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "plan-"));
+  const write = (o) => { const f = path.join(dir, "p.json"); fs.writeFileSync(f, JSON.stringify(o)); return f; };
+  assert.throws(() => loadPlan(write({ name: "x", hold_s: 0, scenarios: [{ scenario: "stream-hold" }] })), /key this runner does not define: "hold_s"/);
+  assert.equal(loadPlan(write({ name: "x", scenarios: [{ scenario: "stream-hold" }] })).scenarios.length, 1);
+  assert.throws(() => loadPlan(write([])), /not an object/);
+  for (const [entry, why] of [[{ scenario: "stream-hold", hold_s: 30 }, /plan entry has a key this runner does not define: "hold_s"/], [{ scenario: "stream-hold", params: { hold_s: 30, codc: "av1" } }, /params has a key stream-hold does not define: "codc"/], [{ scenario: "stream-hold", params: [] }, /params must be an object/], [{ scenario: "stream-hold", params: "x" }, /params must be an object/]]) {
+    const w = world();
+    const { scenario, result } = await run(w, { name: "t", scenarios: [entry] });
+    assert.deepEqual(result.errors, []);
+    assert.equal(scenario().status, "error");
+    assert.match(scenario().reason, why);
+    assert.deepEqual(w.clicks, [], "nothing was launched");
+  }
+  const { scenario, dir: out } = await run(world(), { name: "t", scenarios: [{ scenario: "stream-hold" }] });
+  assert.equal(scenario().status, "pass");
+  assert.equal(JSON.parse(read(out, "manifest.json")).plan.scenarios[0].params.hold_s, 90);
+});
+
+test("A25: an inherited NODE_TLS_REJECT_UNAUTHORIZED=0 is removed unless the caller asked, and npm ci does not get it", () => {
+  const env = { NODE_TLS_REJECT_UNAUTHORIZED: "0", OTHER: "kept" };
+  assert.equal(configureTls(false, env), false);
+  assert.deepEqual(env, { OTHER: "kept" });
+  assert.equal(configureTls(true, env), true);
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-tls-"));
+  fs.mkdirSync(path.join(root, "scripts/dx"), { recursive: true });
+  fs.mkdirSync(path.join(root, "scripts/validate/stream"), { recursive: true });
+  fs.copyFileSync(path.join(HERE, "../../dx/e2e_run.sh"), path.join(root, "scripts/dx/e2e_run.sh"));
+  fs.writeFileSync(path.join(root, "scripts/validate/stream/run.mjs"), "console.log('ran');\n");
+  const bin = path.join(root, "bin");
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, "npm"), `#!/bin/sh\nenv > "${root}/npm.env"\n`, { mode: 0o755 });
+  const r = spawnSync("bash", [path.join(root, "scripts/dx/e2e_run.sh")], { env: { PATH: `${bin}:${process.env.PATH}`, TARGET: "https://x.example.test", PLAN: "smoke", NODE_TLS_REJECT_UNAUTHORIZED: "0" }, encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!/NODE_TLS_REJECT_UNAUTHORIZED/.test(fs.readFileSync(path.join(root, "npm.env"), "utf8")), "npm ci got the switch");
+  fs.rmSync(root, { recursive: true });
 });
