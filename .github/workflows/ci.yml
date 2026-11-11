@@ -401,7 +401,10 @@ jobs:
           key: apt-debs-node-agent-${{ steps.image.outputs.id }}-${{ hashFiles('.github/ci-apt/node-agent.txt', 'scripts/verify/ci-apt-install.sh') }}
           # A package-list or script edit still restores this job's last set for the image: the install script
           # only downloads what is missing, and can install the set offline when no mirror answers.
-          restore-keys: apt-debs-node-agent-${{ steps.image.outputs.id }}-
+          # The last key is the name both jobs shared before they had their own.
+          restore-keys: |
+            apt-debs-node-agent-${{ steps.image.outputs.id }}-
+            apt-debs-${{ steps.image.outputs.id }}-
       # The gstreamer-rs sys crates need the GStreamer dev headers; ubuntu-26.04 ships
       # gst 1.28.2. webrtc/sdp live in -bad.
       - name: Install GStreamer dev packages
@@ -472,7 +475,10 @@ jobs:
           key: apt-debs-engines-${{ steps.image.outputs.id }}-${{ hashFiles('.github/ci-apt/engines.txt', 'scripts/verify/ci-apt-install.sh') }}
           # A package-list or script edit still restores this job's last set for the image: the install script
           # only downloads what is missing, and can install the set offline when no mirror answers.
-          restore-keys: apt-debs-engines-${{ steps.image.outputs.id }}-
+          # The last key is the name both jobs shared before they had their own.
+          restore-keys: |
+            apt-debs-engines-${{ steps.image.outputs.id }}-
+            apt-debs-${{ steps.image.outputs.id }}-
       - name: Install GStreamer dev packages
         run: bash scripts/verify/ci-apt-install.sh .github/ci-apt/engines.txt "$RUNNER_TEMP/apt-debs"
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

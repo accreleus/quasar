@@ -34,12 +34,13 @@ offline_install() {
   local n
   n=$(find "$debs" -maxdepth 1 -name '*.deb' | wc -l)
   [ "$n" -gt 0 ] || return 1
-  echo "ci-apt-install: no mirror answered; installing the $n cached .debs offline"
+  echo "ci-apt-install: apt-get update did not finish; installing the $n cached .debs offline"
   (cd "$debs" && sudo timeout 300 apt-get install -y --no-install-recommends --no-download ./*.deb) || return 1
   # The restored set may be another job's or an older list's: every package asked for must be in.
   local p
   for p in "${packages[@]}"; do
-    dpkg -s "${p%%=*}" >/dev/null 2>&1 || { echo "ci-apt-install: the cached set lacks $p" >&2; return 1; }
+    dpkg-query -W -f='${Status}' "${p%%=*}" 2>/dev/null | grep -qx 'install ok installed' ||
+      { echo "ci-apt-install: the cached set lacks $p" >&2; return 1; }
   done
 }
 if ! sudo timeout 120 apt-get update; then
