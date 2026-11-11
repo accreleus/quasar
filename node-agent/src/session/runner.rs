@@ -2023,6 +2023,24 @@ pub(crate) fn stop_source(
     source.teardown();
 }
 
+/// The `codec.switched` events the WebTransport tap queued, onto the reliable lane (#1299).
+/// Run before every terminal event too: the control plane drops a trace event for a session
+/// that has stopped, and a switch queued since the tick's drain would otherwise be lost.
+pub(crate) fn report_switches(
+    transports: &SessionTransports,
+    running: bool,
+    emit: &dyn Fn(SessionEvent),
+) {
+    if let Some(tap) = &transports.webtransport {
+        for payload in tap.media().take_switched(running) {
+            emit(SessionEvent::Trace {
+                event: "codec.switched",
+                payload,
+            });
+        }
+    }
+}
+
 /// [`stop_source`] for a game the player quit (#726). The source stop can take seconds, so the
 /// browser is told first (#753). `launch` is the game's helper: the exit cloud sync is waited
 /// for before the container goes (#810); `None` where the game's sync was already waited for.
@@ -3177,6 +3195,7 @@ pub fn run_blocking(
         std::collections::HashMap::new();
     'tick: loop {
         if stop.load(Ordering::Relaxed) {
+            report_switches(&transports, running, &emit);
             emit(SessionEvent::Stopping);
             stop_source(&mut current_source, &transports, res.launch());
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
@@ -3217,6 +3236,7 @@ pub fn run_blocking(
                 session_id = %session_id,
                 "the Steam game exited; ending the session"
             );
+            report_switches(&transports, running, &emit);
             stop_for_game_exit(&emit, &mut current_source, &transports, res.launch());
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             transports.audio_pipeline.finish();
@@ -3365,6 +3385,7 @@ pub fn run_blocking(
             let Some(mount) = mount else {
                 let reason = "the adopted runtime has no launch helper to start the game";
                 tracing::error!(token = "runtime-adopted-without-helper", "{reason}");
+                report_switches(&transports, running, &emit);
                 emit(SessionEvent::Failed(reason.to_string()));
                 stop_source(&mut current_source, &transports, res.launch());
                 super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
@@ -3472,14 +3493,7 @@ pub fn run_blocking(
         }
 
         // After the offer above, so a `hello` that beat it is reported behind `running`.
-        if let Some(tap) = &transports.webtransport {
-            for payload in tap.media().take_switched(running) {
-                emit(SessionEvent::Trace {
-                    event: "codec.switched",
-                    payload,
-                });
-            }
-        }
+        report_switches(&transports, running, &emit);
 
         // Apply-only: the agent loop already validated the numbers. See
         // `apply_display_update`.
@@ -3649,6 +3663,7 @@ pub fn run_blocking(
                         reason = %reason,
                         "video transport replacement failed"
                     );
+                    report_switches(&transports, running, &emit);
                     emit(SessionEvent::Failed(reason));
                     stop_source(&mut current_source, &transports, res.launch());
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
@@ -3785,6 +3800,7 @@ pub fn run_blocking(
                 pc = %failure.pc,
                 "webrtc: set-remote-description failed — failing session: {reason}"
             );
+            report_switches(&transports, running, &emit);
             emit(SessionEvent::Failed(reason));
             stop_source(&mut current_source, &transports, res.launch());
             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
@@ -3944,6 +3960,7 @@ pub fn run_blocking(
                         reason = %failure.reason,
                         "swap failed fatally; ending session"
                     );
+                    report_switches(&transports, running, &emit);
                     emit(SessionEvent::Failed(failure.reason));
                     stop_source(&mut current_source, &transports, res.launch());
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
@@ -3993,6 +4010,7 @@ pub fn run_blocking(
                         reason,
                         "in-place swap failed: {reason}; the session ends"
                     );
+                    report_switches(&transports, running, &emit);
                     stop_for_game_exit(&emit, &mut current_source, &transports, None);
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                     transports.audio_pipeline.finish();
@@ -4053,6 +4071,7 @@ pub fn run_blocking(
                     running_for.as_secs(),
                     app_presented_at.is_some()
                 );
+                report_switches(&transports, running, &emit);
                 emit(SessionEvent::Stopping);
                 stop_source(&mut current_source, &transports, res.launch());
                 super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
@@ -4072,6 +4091,7 @@ pub fn run_blocking(
                         "session ended via idle reap (it never streamed)"
                     );
                 }
+                report_switches(&transports, running, &emit);
                 emit(SessionEvent::Failed(reason.to_string()));
                 return;
             }
@@ -4102,6 +4122,7 @@ pub fn run_blocking(
                             reason = %reason,
                             "source pipeline bus error"
                         );
+                        report_switches(&transports, running, &emit);
                         emit(SessionEvent::Failed(reason));
                         stop_source(&mut current_source, &transports, res.launch());
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
@@ -4117,6 +4138,7 @@ pub fn run_blocking(
                                 reason = %reason,
                                 "renderer degraded; failing session"
                             );
+                            report_switches(&transports, running, &emit);
                             emit(SessionEvent::Failed(reason));
                             stop_source(&mut current_source, &transports, res.launch());
                             super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
@@ -4137,6 +4159,7 @@ pub fn run_blocking(
                 error = %err,
                 "container launch failed"
             );
+            report_switches(&transports, running, &emit);
             emit(SessionEvent::Failed(format!(
                 "container launch failed: {err}"
             )));
@@ -4202,6 +4225,7 @@ pub fn run_blocking(
                             "app boot: FAILED — no frame within {budget_secs}s; \
                              failing session as {REASON_APP_NEVER_PRESENTED}"
                         );
+                        report_switches(&transports, running, &emit);
                         emit(SessionEvent::AppFailed {
                             reason: format!(
                                 "app produced no frame within {budget_secs}s of container start"
@@ -4281,6 +4305,7 @@ pub fn run_blocking(
                             presented,
                             "app container exited; unrecognized disposition treated as fail"
                         );
+                        report_switches(&transports, running, &emit);
                         emit(app_exit_event(status, presented, app_log_tail));
                         stop_source(&mut current_source, &transports, res.launch());
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
@@ -4294,6 +4319,7 @@ pub fn run_blocking(
                             presented,
                             "app container exited; on_app_exit=fail"
                         );
+                        report_switches(&transports, running, &emit);
                         emit(app_exit_event(status, presented, app_log_tail));
                         stop_source(&mut current_source, &transports, res.launch());
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
@@ -4348,6 +4374,7 @@ pub fn run_blocking(
                             err.error(),
                             err.debug()
                         );
+                        report_switches(&transports, running, &emit);
                         emit(SessionEvent::Stopping);
                         stop_source(&mut current_source, &transports, res.launch());
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
@@ -4388,6 +4415,7 @@ pub fn run_blocking(
                                 }),
                             },
                         );
+                        report_switches(&transports, running, &emit);
                         emit(SessionEvent::Stopping);
                         stop_source(&mut current_source, &transports, res.launch());
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
@@ -4413,6 +4441,7 @@ pub fn run_blocking(
                         reason = %reason,
                         "encode pipeline bus error"
                     );
+                    report_switches(&transports, running, &emit);
                     emit(SessionEvent::Failed(reason));
                     stop_source(&mut current_source, &transports, res.launch());
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
@@ -4432,6 +4461,7 @@ pub fn run_blocking(
                     stop_source(&mut current_source, &transports, res.launch());
                     super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                     transports.audio_pipeline.finish();
+                    report_switches(&transports, running, &emit);
                     emit(SessionEvent::Stopped {
                         bytes_used: compute_bytes_used(&cfg),
                         detail: None,
