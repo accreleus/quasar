@@ -34,7 +34,8 @@ pub(crate) use audio::Audio;
 pub use cert::CertReport;
 use cert::{Cert, CertSet};
 pub use media::PyroWaveGrant;
-use media::{Attached, Gone, Out, Refused};
+use media::Refused;
+pub(crate) use media::{Attached, Gone, Out};
 pub(crate) use media::{Media, WebRtcSide};
 
 const WT_PROTO: u32 = 1;
@@ -317,7 +318,7 @@ impl Hello {
     }
 }
 
-fn token_hash(token: &str) -> String {
+pub(crate) fn token_hash(token: &str) -> String {
     Sha256::digest(token.as_bytes())
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -404,11 +405,20 @@ impl Registry {
 
     /// The session is stopping: its tokens go, and its client gets `bye session_ended`.
     pub fn end(&self, session_id: &str) {
-        let media = self.lock().get_mut(session_id).and_then(|entry| {
-            entry.tokens.clear();
-            entry.ended_at.get_or_insert_with(SystemTime::now);
-            entry.media.take()
-        });
+        self.end_if(session_id, |_| true);
+    }
+
+    /// `end`, only when `names` holds for the entry's media, checked under the same lock.
+    fn end_if(&self, session_id: &str, names: impl FnOnce(Option<&Arc<Media>>) -> bool) {
+        let media = self
+            .lock()
+            .get_mut(session_id)
+            .filter(|entry| names(entry.media.as_ref()))
+            .and_then(|entry| {
+                entry.tokens.clear();
+                entry.ended_at.get_or_insert_with(SystemTime::now);
+                entry.media.take()
+            });
         if let Some(media) = media {
             media.end();
         }
@@ -458,6 +468,24 @@ impl Registry {
     }
 }
 
+#[cfg(test)]
+impl Registry {
+    /// A `hello` with `token`, redeemed as the listener redeems one; `Err` is its `error.code`.
+    pub(crate) fn hello(&self, session_id: &str, token: &str) -> Result<Attached, &'static str> {
+        let hello = Hello {
+            kind: "hello".into(),
+            wt_proto: WT_PROTO,
+            token: token.into(),
+            session_id: session_id.into(),
+            pyrowave: false,
+            fec: Value::Null,
+        };
+        self.redeem(&hello, SystemTime::now(), Duration::ZERO)
+            .map(|(_, attached)| attached)
+            .map_err(|refusal| refusal.code().0)
+    }
+}
+
 /// The registry a session's transports use when no listener runs: a test's own.
 #[cfg(test)]
 pub(crate) static TEST_REGISTRY: Mutex<Option<Arc<Registry>>> = Mutex::new(None);
@@ -472,6 +500,11 @@ pub(crate) fn registry() -> Option<Arc<Registry>> {
 
 /// Takes the session's video off the encoded-frame boundary for its WebTransport
 /// client, and forgets the session when dropped with the transport.
+///
+/// One live tap per session id (#1197): `attach` registers its media over any earlier tap's
+/// (`set_media`, under the registry lock), and a drop ends the entry only while it still names
+/// that tap's media. A rebuild's old tap is dropped after its successor attached, so it never
+/// ends the successor's entry; nor does a tap whose id was assigned again.
 pub(crate) struct Tap {
     registry: Arc<Registry>,
     session_id: String,
@@ -606,8 +639,10 @@ impl Tap {
 
 impl Drop for Tap {
     fn drop(&mut self) {
-        self.registry.end(&self.session_id);
-        // Its own media too: an id assigned again got a fresh entry that no longer names it.
+        let own = &self.media;
+        self.registry
+            .end_if(&self.session_id, |m| m.is_some_and(|m| Arc::ptr_eq(m, own)));
+        // Its own media too, which the entry may no longer name.
         self.media.end();
         self.release();
     }
@@ -1449,6 +1484,7 @@ async fn stream(
                     }
                 }
                 None => break match client.gone.get() {
+                    Some(Gone::Rebuilt) => QUIET,
                     Some(Gone::TakenOver) => (Some(json!({"type": "bye", "reason": "taken_over"})), CLOSE_TAKEN_OVER, ""),
                     Some(Gone::Unusable) => (
                         Some(json!({"type": "error", "code": "internal", "message": "the encoder sent no usable keyframe"})),

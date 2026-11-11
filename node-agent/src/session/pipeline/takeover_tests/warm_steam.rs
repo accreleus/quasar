@@ -1384,3 +1384,73 @@ fn the_old_viewers_late_answer_after_a_rebuild_is_stale() {
     );
     end(session, &mut b);
 }
+
+// #1197: an adopted runtime with a WebTransport tap, rebuilt for another profile. The session
+// id stays registered throughout; the client attached before the rebuild is closed for a
+// reconnect (never `session_ended`), and its reconnect attaches to the new encoder.
+#[test]
+fn a_rebuild_keeps_the_webtransport_registration_and_its_client_reconnects() {
+    use crate::webtransport::{token_hash, Gone, Registry};
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let registry = Arc::new(Registry::default());
+    let expires = std::time::SystemTime::now() + Duration::from_secs(60);
+    let id = "takeover-rebuild-wt";
+    registry.assign(id, &token_hash("first"), expires);
+    *crate::webtransport::TEST_REGISTRY.lock().unwrap() = Some(registry.clone());
+    let _wt = super::WtRegistry;
+    let runtime = tempfile::tempdir().unwrap();
+    std::fs::write(runtime.path().join("quasar-launch-helper"), b"").unwrap();
+    let dir = runtime.path().to_str().unwrap().to_string();
+    let mut session = Session::start_with("rebuild-wt", Duration::from_secs(60), move |cfg| {
+        cfg.runtime_dir = dir;
+        cfg.kind = Some(SessionKind::Parked);
+        cfg.container = Some(app("-silent"));
+        cfg.webtransport = true;
+    });
+    // No WebRTC peer ever answers: one that connected would take the session over (§Takeover).
+    session.mute = true;
+    let mut nobody = Peer::new();
+    let mut hello = |session: &mut Session, token: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match registry.hello(id, token) {
+                Ok(attached) => return attached,
+                Err("session_not_ready") if Instant::now() < deadline => {
+                    session.pump(&mut nobody, Duration::from_millis(50), |_, _| false);
+                }
+                Err(code) => panic!("hello refused: {code}"),
+            }
+        }
+    };
+    let before = hello(&mut session, "first");
+    let _helper = FakeHelper::connect(runtime.path(), &session.id);
+    let at = adopt_restreamed(&mut session, other_profile(0));
+    let mut b = Peer::new();
+    await_restreamed(&mut session, &mut b, at);
+    assert!(
+        restreamed_ok(&session.log, at).is_some(),
+        "{:?}",
+        &session.log[at..]
+    );
+    assert_eq!(before.gone.get(), Some(&Gone::Rebuilt));
+    assert!(
+        registry.add_token(id, &token_hash("second"), expires),
+        "the rebuild ended the session's WebTransport registration"
+    );
+    let mut after = hello(&mut session, "second");
+    let mut received = 0;
+    assert!(
+        session.pump(&mut b, Duration::from_secs(10), |_, _| {
+            while after.rx.try_recv().is_ok() {
+                received += 1;
+            }
+            received > 10
+        }),
+        "the reconnected client got no media from the rebuilt encoder ({received} messages)"
+    );
+    assert_eq!(after.gone.get(), None);
+    end(session, &mut b);
+}
