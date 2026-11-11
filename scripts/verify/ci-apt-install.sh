@@ -30,6 +30,9 @@ mapfile -t packages < <(grep -v -e '^#' -e '^$' "$list")
 # the archive did not resolve, on every run). With the .deb set restored from the cache nothing
 # needs them: install the cached files as they are. apt takes the named files as its
 # candidates and resolves their dependencies among them and what is installed.
+# shortcut: this installs every cached .deb, a superset of the list, so a package the list no
+# longer names (or never did) still installs here and only shows on the next online run;
+# install from a local flat repository of the cache if that ever hides a real omission.
 offline_install() {
   local n
   n=$(find "$debs" -maxdepth 1 -name '*.deb' | wc -l)
