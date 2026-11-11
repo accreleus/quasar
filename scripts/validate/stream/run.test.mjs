@@ -42,8 +42,8 @@ const matches = (sel, classes) => {
 };
 
 /** A world holding the fake clock, the fake page's state and the fake API's record. */
-function world({ wins = windows(50), session = {}, failScreenshotAt = null, webtransport = true, noBench = false, refuse = false, noFrame = false, revealed = false, stopFails = false, closeFails = false, noUrl = false, url = null, stats = { frames: 100, decoded: 100 }, videoRate = 60, hiddenBetween = null, skew = 0, extraFrames = null, loader = null, onPlay = null, bare = false } = {}) {
-  const w = { t: T0, stopped: [], live: [], url: "about:blank", ls: new Map(), shots: 0, failScreenshotAt, calls: [], gone: new Set(), secrets: new Set(), handlers: {}, opened: [], closed: [], clicks: [], gotos: [] };
+function world({ wins = windows(50), session = {}, failScreenshotAt = null, webtransport = true, noBench = false, refuse = false, noFrame = false, revealed = false, stopFails = false, closeFails = false, noUrl = false, url = null, stats = { frames: 100, decoded: 100 }, videoRate = 60, hiddenBetween = null, skew = 0, extraFrames = null, loader = null, onPlay = null, bare = false, hooksDir = null, lockOnClick = true, swallowKeyUp = null, fallbackDelayMs = 3000, fallbackReason = "stream_lost", noFallback = false } = {}) {
+  const w = { cdp: [], listeners: {}, locked: false, lastX: null, videoStart: T0, hooksDir, faultSeenAt: null, t: T0, stopped: [], live: [], url: "about:blank", ls: new Map(), shots: 0, failScreenshotAt, calls: [], gone: new Set(), secrets: new Set(), handlers: {}, opened: [], closed: [], clicks: [], gotos: [] };
   w.now = () => w.t;
   w.sleep = async (ms) => { w.t += ms; };
   w.emit = (e, m) => (w.handlers[e] ?? []).forEach((fn) => fn(m));
@@ -51,7 +51,18 @@ function world({ wins = windows(50), session = {}, failScreenshotAt = null, webt
   w.api = {
     apps: async () => { w.calls.push("apps"); w.secrets.add(API_BEARER); return [{ id: "app-1", name: "Quasar Benchapp" }]; },
     // The API returns a row for any id this run was told about, except those a test lists in w.gone (its 404: unknown, or not this user's).
-    session: async (id) => { w.calls.push(`session ${id}`); return rows[id] ?? (w.gone.has(id) ? undefined : { id, app_id: "app-1", state: "running" }); },
+    session: async (id) => {
+      w.calls.push(`session ${id}`);
+      // A scenario's fault takes effect when its hook has run (the hook scripts log "apply" in their directory): the stack then reports a fallback and the <video> starts.
+      if (w.hooksDir && fs.existsSync(path.join(w.hooksDir, "log")) && fs.readFileSync(path.join(w.hooksDir, "log"), "utf8").includes("apply")) {
+        w.faultSeenAt ??= w.t;
+        if (!noFallback && w.t >= w.faultSeenAt + fallbackDelayMs && rows[SID] && !rows[SID].transport_fallback_reason) {
+          rows[SID].transport_fallback_reason = fallbackReason;
+          w.videoStart = w.t;
+        }
+      }
+      return rows[id] ?? (w.gone.has(id) ? undefined : { id, app_id: "app-1", state: "running" });
+    },
     stop: async (id) => {
       w.calls.push(`stop ${id}`);
       if (stopFails) throw new Error("the session did not reach a terminal state in 30 s");
@@ -59,7 +70,8 @@ function world({ wins = windows(50), session = {}, failScreenshotAt = null, webt
       w.live = w.live.filter((s) => s !== id);
     },
   };
-  const qbench = { dump: () => ({ frames: noFrame ? [] : extraFrames ?? frames(wins.length), windows: noFrame ? [] : wins }), stats: () => (noFrame ? { frames: 0, decoded: 0 } : stats) };
+  w.rows = rows;
+  const qbench = { pressKey: () => true, dump: () => ({ frames: noFrame ? [] : extraFrames ?? frames(wins.length), windows: noFrame ? [] : wins }), stats: () => (noFrame ? { frames: 0, decoded: 0 } : stats) };
   // A chainable fake locator: its element is enabled, and clicking "Play now" starts the session.
   const loc = (desc) => ({
     first: () => loc(desc),
@@ -75,6 +87,29 @@ function world({ wins = windows(50), session = {}, failScreenshotAt = null, webt
       if (!noUrl) w.url = url ?? `${BASE}/app/session/${SID}`;
     } }),
   });
+  // The DevTools session: an event is delivered to the page's listeners as a trusted one, as the browser would.
+  const deliver = (type, e) => (w.listeners[type] ?? []).forEach((fn) => fn({ isTrusted: true, ...e }));
+  const cdp = {
+    send: async (method, p) => {
+      w.cdp.push([method, p]);
+      if (method === "Input.dispatchKeyEvent") {
+        if (p.type === "keyDown") deliver("keydown", { code: p.code });
+        else if (p.type === "keyUp" && p.code !== swallowKeyUp) deliver("keyup", { code: p.code });
+      } else if (method === "Input.dispatchMouseEvent") {
+        const idx = { left: 0, middle: 1, right: 2 }[p.button];
+        if (p.type === "mousePressed") {
+          if (idx === 0 && lockOnClick && !w.locked) w.locked = true;
+          deliver("mousedown", { button: idx });
+        } else if (p.type === "mouseReleased") deliver("mouseup", { button: idx });
+        else if (p.type === "mouseWheel") deliver("wheel", { deltaX: p.deltaX, deltaY: p.deltaY });
+        else if (p.type === "mouseMoved") {
+          deliver("mousemove", { movementX: w.lastX === null ? 0 : p.x - w.lastX, movementY: w.lastY === null ? 0 : p.y - w.lastY });
+          w.lastX = p.x;
+          w.lastY = p.y;
+        }
+      }
+    },
+  };
   const page = () => ({
     on: (ev, fn) => { (w.handlers[ev] ??= []).push(fn); },
     goto: async (u) => { w.gotos.push(u); w.url = u; },
@@ -83,6 +118,7 @@ function world({ wins = windows(50), session = {}, failScreenshotAt = null, webt
     waitForURL: async () => {},
     url: () => w.url,
     close: async () => {},
+    context: () => ({ newCDPSession: async () => cdp }),
     screenshot: async ({ path: p }) => {
       if (w.failScreenshotAt !== null && ++w.shots > w.failScreenshotAt) throw new Error("the page crashed");
       fs.writeFileSync(p, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0]));
@@ -94,9 +130,11 @@ function world({ wins = windows(50), session = {}, failScreenshotAt = null, webt
       for (const [k, v] of w.ls) store[k] = v;
       const saved = Object.fromEntries(["window", "localStorage", "sessionStorage", "document"].map((k) => [k, globalThis[k]]));
       const hidden = hiddenBetween && w.t >= hiddenBetween[0] && w.t < hiddenBetween[1];
-      const video = { getVideoPlaybackQuality: () => ({ totalVideoFrames: Math.round(((w.t - T0) / 1000) * videoRate) }) };
-      const doc = { visibilityState: hidden ? "hidden" : "visible", hasFocus: () => true, querySelector: (sel) => (/sl-root/.test(sel) ? (loader ? matches(sel, loader) : revealed ? {} : null) : /video/.test(sel) && !noBench && !revealed && !noFrame ? video : null) };
-      Object.assign(globalThis, { window: noBench ? {} : { __qBench: qbench }, localStorage: store, sessionStorage: { getItem: () => null }, document: doc });
+      const video = { getVideoPlaybackQuality: () => ({ totalVideoFrames: w.t < w.videoStart ? 0 : Math.round(((w.t - w.videoStart) / 1000) * videoRate) }), getBoundingClientRect: () => ({ left: 100, top: 50, width: 800, height: 600 }) };
+      const doc = { pointerLockElement: w.locked ? { classList: { contains: (c) => c === "session-video" } } : null, visibilityState: hidden ? "hidden" : "visible", hasFocus: () => true, querySelector: (sel) => (/sl-root/.test(sel) ? (loader ? matches(sel, loader) : revealed ? {} : null) : /video/.test(sel) && !noBench && !revealed && !noFrame ? video : null) };
+      w.win ??= { addEventListener: (type, fn) => { (w.listeners[type] ??= []).push(fn); } };
+      w.win.__qBench = noBench ? undefined : qbench;
+      Object.assign(globalThis, { window: w.win, localStorage: store, sessionStorage: { getItem: () => null }, document: doc });
       try { return await fn(arg); } finally { w.ls = new Map(Object.entries(store)); Object.assign(globalThis, saved); }
     },
   });
@@ -1449,4 +1487,189 @@ test("hooks: a stale hook that will not clear stops the run before anything star
   const r = await runHooks(world(), noop, { hooksDir, parent });
   assert.deepEqual(r.result.recovered, []);
   assert.equal(JSON.parse(fs.readFileSync(path.join(parent, LEDGER), "utf8")).entries.length, 1);
+});
+
+// ── transport-fallback and input-kbm (the real scenario modules, against the same fake page) ─────────────────
+
+import { fallbackEvents, judge as judgeFallback, check as checkFallback } from "./scenarios/transport-fallback.mjs";
+import { judge as judgeInput, SEQUENCE, check as checkInput } from "./scenarios/input-kbm.mjs";
+
+/** Runs one real scenario from the plan; the bundle is checked by runSuite itself (result.errors). */
+async function runReal(w, entry, { hooksDir = null, parent = tmp("e2e-parent-"), plan } = {}) {
+  const dir = path.join(parent, "bundle");
+  const result = await runSuite({ plan: plan ?? { name: "t", scenarios: [entry] }, dir, baseUrl: BASE, creds: CREDS, host: w.host, api: w.api, thresholds: T, secrets: w.secrets, now: w.now, sleep: w.sleep, hooksDir, onNote: () => {} });
+  const id = (i = 1) => `0${i}-${plan ? plan.scenarios[i - 1].scenario : entry.scenario}`;
+  const sc = (i = 1) => JSON.parse(fs.readFileSync(path.join(dir, id(i), "scenario.json"), "utf8"));
+  const by = (i = 1) => Object.fromEntries(sc(i).criteria.map((c) => [c.id, c]));
+  const timeline = (i = 1) => fs.readFileSync(path.join(dir, id(i), "timeline.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  return { dir, result, sc, by, timeline, id };
+}
+const FALLBACK = (when, extra = {}) => ({ scenario: "transport-fallback", params: { transport: "webtransport", hold_s: 30, when, ...extra } });
+const fallbackWorld = (opts = {}) => {
+  const hooksDir = mkHooks();
+  const w = world({ hooksDir, ...opts });
+  w.videoStart = Infinity; // no <video> frame until the fallback: WebTransport draws on a canvas
+  return { w, hooksDir };
+};
+
+test("transport-fallback mid: key held, fault applied, fallback seen, a video frame, the key released at the end", async () => {
+  const { w, hooksDir } = fallbackWorld();
+  const r = await runReal(w, FALLBACK("mid"), { hooksDir });
+  assert.deepEqual(r.result.errors, []);
+  const c = r.by();
+  assert.equal(r.sc().status, "pass", JSON.stringify(r.sc().criteria));
+  assert.deepEqual(r.sc().criteria.map((x) => x.id), ["first_frame_s", "webtransport_closed_first", "continues_on_webrtc", "fallback_event", "frame_after_fallback", "held_key_released"]);
+  assert.equal(c.fallback_event.pass, true);
+  assert.match(c.fallback_event.observed, /^stream_lost \(the session row\)$/);
+  assert.equal(c.frame_after_fallback.pass, true);
+  assert.equal(c.continues_on_webrtc.pass, true);
+  assert.equal(c.webtransport_closed_first.pass, null);
+  assert.match(c.webtransport_closed_first.expected, /no source today/);
+  assert.equal(c.held_key_released.pass, null);
+  assert.match(c.held_key_released.expected, /host half/);
+  for (const k of ["webtransport_closed_first", "held_key_released"]) assert.equal(c[k].observed, null);
+  // Order: the key goes down before the fault, comes up after it; the hook is applied once and cleared by the runner.
+  const ev = r.timeline().map((s) => s.ev);
+  assert.ok(ev.indexOf("key-held") < ev.indexOf("fault-applied") && ev.indexOf("fault-applied") < ev.indexOf("fallback-seen") && ev.indexOf("fallback-seen") < ev.indexOf("key-released"), ev.join(" "));
+  const keys = w.cdp.filter(([m, p]) => m === "Input.dispatchKeyEvent").map(([, p]) => `${p.type}:${p.code}`);
+  assert.deepEqual(keys, ["keyDown:KeyW", "keyUp:KeyW"]);
+  assert.deepEqual(logOf(hooksDir).map((l) => l.split(" ")[0]), ["apply", "clear"]);
+  assert.ok(logOf(hooksDir)[0].endsWith("webtransport"), "the hook was told the transport");
+});
+
+test("transport-fallback connect: the fault is on before the launch, no key is held, and it says why", async () => {
+  const { w, hooksDir } = fallbackWorld({ fallbackReason: "connect_failed" });
+  const r = await runReal(w, FALLBACK("connect"), { hooksDir });
+  assert.equal(r.sc().status, "pass", JSON.stringify(r.sc().criteria));
+  assert.equal(r.by().fallback_event.observed.split(" ")[0], "connect_failed");
+  assert.match(r.by().held_key_released.expected, /before the first picture/);
+  assert.deepEqual(w.cdp.filter(([m]) => m === "Input.dispatchKeyEvent"), []);
+  const ev = r.timeline().map((s) => s.ev);
+  assert.ok(ev.indexOf("fault-applied") < ev.indexOf("play-clicked"), "applied before the launch");
+  // No session id is known to the hook before the launch.
+  assert.match(logOf(hooksDir)[0], /^apply 01-transport-fallback  webtransport$/);
+});
+
+test("transport-fallback: a fault that changes nothing fails fallback_event, frame_after_fallback and continues_on_webrtc", async () => {
+  const { w, hooksDir } = fallbackWorld({ noFallback: true });
+  const r = await runReal(w, FALLBACK("mid", { hold_s: 10 }), { hooksDir });
+  assert.equal(r.sc().status, "fail");
+  for (const k of ["fallback_event", "frame_after_fallback", "continues_on_webrtc"]) assert.equal(r.by()[k].pass, false, k);
+  assert.equal(r.by().first_frame_s.pass, true);
+});
+
+test("transport-fallback: the event the page posts counts, and only a well-formed one", async () => {
+  const body = (events) => JSON.stringify({ client: "browser", events });
+  assert.deepEqual(fallbackEvents(body([{ ts_unix_ms: 5, type: "transport.fallback", payload: { from: "webtransport", to: "webrtc", reason: "stream_lost" } }])), [{ ts_unix_ms: 5, reason: "stream_lost" }]);
+  assert.deepEqual(fallbackEvents(body([{ type: "transport.fallback", payload: { reason: "Bad Reason!" } }, { type: "playout.changed", payload: { reason: "x" } }, null, { type: "transport.fallback", payload: {} }])), []);
+  assert.deepEqual(fallbackEvents("{not json"), []);
+  assert.deepEqual(fallbackEvents(body([{ ts_unix_ms: "soon", type: "transport.fallback", payload: { reason: "internal" } }])), [{ ts_unix_ms: null, reason: "internal" }]);
+  // Through the page: a POST to the session's trace endpoint is read; the same body to another path is not.
+  for (const [path_, seen] of [[`/v1/sessions/${SID}/trace/events`, true], ["/v1/other", false]]) {
+    const { w, hooksDir } = fallbackWorld({ noFallback: true });
+    w.afterLogin = () => w.emit("request", { url: () => `${BASE}${path_}`, method: () => "POST", postData: () => body([{ ts_unix_ms: 5, type: "transport.fallback", payload: { reason: "stream_lost" } }]) });
+    const r = await runReal(w, FALLBACK("mid", { hold_s: 10 }), { hooksDir });
+    assert.equal(r.by().fallback_event.pass, seen);
+    if (seen) assert.match(r.by().fallback_event.observed, /^stream_lost \(the page's own post only/);
+  }
+});
+
+test("transport-fallback: judge reads the tail, a session that ended and an unreadable row", () => {
+  const base = { params: { hold_s: 30 }, firstFrameS: 1 };
+  const good = { row: { state: "running" }, fallbackReason: "stream_lost", posted: [], videoAfterS: 4, tail: { before: 10, after: 70 }, keyHeld: true };
+  const get = (seen) => Object.fromEntries(judgeFallback({ ...base, seen: { ...good, ...seen } }).map((c) => [c.id, c]));
+  assert.equal(get({}).continues_on_webrtc.pass, true);
+  assert.equal(get({ tail: { before: 70, after: 70 } }).continues_on_webrtc.pass, false, "frames stopped");
+  assert.equal(get({ tail: { before: 10, after: NaN } }).continues_on_webrtc.pass, false, "a count that is not a number is never an advance");
+  assert.equal(get({ row: { state: "stopped" } }).continues_on_webrtc.pass, false);
+  assert.equal(get({ row: undefined }).continues_on_webrtc.pass, null);
+  assert.equal(get({ fallbackReason: null, posted: [{ reason: "internal" }] }).fallback_event.pass, true, "the posted event is enough");
+  assert.equal(get({ fallbackReason: null }).fallback_event.pass, false);
+  assert.equal(get({ videoAfterS: NaN }).frame_after_fallback.pass, false);
+  assert.equal(get({ keyHeld: false }).held_key_released.pass, null);
+});
+
+test("transport-fallback: a plan that cannot run is refused before a page opens; no hook script skips it", async () => {
+  assert.match(checkFallback({ transport: "webrtc", codec: "h264", profile: "1080p60", hold_s: 30, app: "x" }), /needs transport webtransport/);
+  assert.match(checkFallback({ transport: "webtransport", codec: "h264", profile: "1080p60", hold_s: 30, app: "x", when: "late" }), /when must be mid or connect/);
+  assert.match(checkFallback({ transport: "webtransport", codec: "h264", profile: "1080p60", hold_s: 30, app: "x", when: "mid", extra: 1 }), /does not define/);
+  assert.equal(checkFallback({ transport: "webtransport", codec: "h264", profile: "1080p60", hold_s: 30, app: "x" }), null);
+  const w = world();
+  const r = await runReal(w, FALLBACK("mid"), { hooksDir: null });
+  assert.equal(r.sc().status, "skipped");
+  assert.match(r.sc().reason, /needs hook fault:webtransport-block/);
+  assert.equal(w.opened.length, 1);
+  const w2 = world({ webtransport: false });
+  const r2 = await runReal(w2, FALLBACK("mid"), { hooksDir: mkHooks() });
+  assert.equal(r2.sc().reason, "this browser has no WebTransport");
+});
+
+// input-kbm
+
+const INPUT = (extra = {}) => ({ scenario: "input-kbm", params: { hold_s: 5, ...extra } });
+const echoWindows = (i2p) => windows(10).map((x, i) => ({ ...x, i2p_ms: i === 5 ? i2p : [], i2p_missed: 0 }));
+
+test("input-kbm: the fixed sequence goes out as trusted events in order, and the judgeable criteria pass", async () => {
+  const w = world({ wins: echoWindows([40, 50, 60]) });
+  const r = await runReal(w, INPUT());
+  assert.deepEqual(r.result.errors, []);
+  assert.equal(r.sc().status, "pass", JSON.stringify(r.sc().criteria));
+  const c = r.by();
+  assert.deepEqual(r.sc().criteria.map((x) => x.id), ["first_frame_s", "pointer_lock_taken", "keys_match", "buttons_match", "motion_sum_matches", "nothing_held_at_end", "input_to_photon_ms"]);
+  assert.equal(c.pointer_lock_taken.pass, true);
+  assert.equal(c.nothing_held_at_end.pass, true);
+  for (const k of ["keys_match", "buttons_match", "motion_sum_matches"]) {
+    assert.equal(c[k].pass, null);
+    assert.match(c[k].expected, /does not log individual keys/);
+  }
+  assert.equal(c.input_to_photon_ms.pass, null);
+  assert.match(c.input_to_photon_ms.expected, /Measured 3 samples, median 50 ms, max 60 ms/);
+  // What went out through the DevTools protocol, in order (the click that takes the lock comes first).
+  const sent = w.cdp.map(([m, p]) => `${m.replace("Input.dispatch", "")}:${p.type}${p.code ? `:${p.code}` : ""}${p.button ? `:${p.button}` : ""}`);
+  const expected = SEQUENCE.flatMap((s) => (s.kind === "key" ? [`KeyEvent:keyDown:${s.code}`, `KeyEvent:keyUp:${s.code}`] : s.kind === "button" ? [`MouseEvent:mousePressed:${s.button}`, `MouseEvent:mouseReleased:${s.button}`] : s.kind === "wheel" ? ["MouseEvent:mouseWheel"] : ["MouseEvent:mouseMoved"]));
+  assert.deepEqual(sent.slice(-expected.length), expected);
+  assert.deepEqual(sent.slice(0, 3), ["MouseEvent:mouseMoved", "MouseEvent:mousePressed:left", "MouseEvent:mouseReleased:left"]);
+  const rec = JSON.parse(read(r.dir, `${r.id()}/input-sent.json`));
+  assert.equal(rec.sequence.length, SEQUENCE.length);
+  assert.deepEqual(rec.sequence.map((s) => s.seq), SEQUENCE.map((_, i) => i));
+  assert.equal(rec.received_by_page.untrusted, 0);
+  assert.deepEqual(rec.received_by_page.motion_sum, { x: 40 + 0 - 40, y: 0 + 30 - 30 });
+  assert.deepEqual(rec.received_by_page.wheel_sum, { x: 0, y: 0 });
+  assert.deepEqual(rec.held_at_end, { keys: [], buttons: [] });
+});
+
+test("input-kbm: a key the page is left holding makes nothing_held_at_end false, and the scenario fails (stuck-key reversion proof)", async () => {
+  const w = world({ wins: echoWindows([40]), swallowKeyUp: "ShiftLeft" });
+  const r = await runReal(w, INPUT());
+  assert.equal(r.by().nothing_held_at_end.pass, false);
+  assert.match(r.by().nothing_held_at_end.observed, /still down: keys \["ShiftLeft"\]/);
+  assert.equal(r.sc().status, "fail");
+  assert.deepEqual(JSON.parse(read(r.dir, `${r.id()}/input-sent.json`)).held_at_end, { keys: ["ShiftLeft"], buttons: [] });
+});
+
+test("input-kbm: no pointer lock fails pointer_lock_taken; an unreadable record and an absent echo are not judged", async () => {
+  const w = world({ wins: echoWindows([]), lockOnClick: false });
+  const r = await runReal(w, INPUT());
+  assert.equal(r.by().pointer_lock_taken.pass, false);
+  assert.equal(r.sc().status, "fail");
+  assert.match(r.by().input_to_photon_ms.expected, /marker echoed no key/);
+  const get = (seen) => Object.fromEntries(judgeInput({ firstFrameS: 1, seen: { locked: true, held: { keys: [], buttons: [] }, i2p: [], i2pMissed: 0, ...seen } }).map((c) => [c.id, c]));
+  assert.equal(get({ held: null }).nothing_held_at_end.pass, null);
+  assert.equal(get({ held: { keys: [], buttons: [0] } }).nothing_held_at_end.pass, false);
+  assert.equal(checkInput({ transport: "webrtc", codec: "h264", profile: "1080p60", hold_s: 5, app: "x" }), null);
+});
+
+test("input-kbm: a sample that is not a number is not counted", async () => {
+  const w = world({ wins: echoWindows([40, "55", null, Infinity]) });
+  const r = await runReal(w, INPUT());
+  assert.match(r.by().input_to_photon_ms.expected, /Measured 1 samples, median 40 ms/);
+});
+
+test("input and fallback plans load and name only scenarios that exist", () => {
+  for (const [name, scenarios] of [["input", ["input-kbm"]], ["fallback", ["transport-fallback", "transport-fallback"]]]) {
+    const plan = loadPlan(name);
+    assert.deepEqual(plan.scenarios.map((s) => s.scenario), scenarios);
+    for (const s of plan.scenarios) assert.equal((s.scenario === "input-kbm" ? checkInput : checkFallback)({ transport: "webrtc", codec: "h264", profile: "1080p60", hold_s: 90, app: "x", ...s.params }), null);
+  }
+  assert.ok(!loadPlan("smoke").scenarios.some((s) => ["input-kbm", "transport-fallback"].includes(s.scenario)));
 });

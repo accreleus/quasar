@@ -6,27 +6,19 @@
 // thresholds, secrets, now(), clockOffset(), sleep(ms) }.
 // Returns { status, reason?, criteria, clock_offset_ms }; the runner owns the sessions (ctx.launches) and their cleanup.
 import { benchRows } from "../benchfold.mjs";
+import { cannotRun, CODEC_LABEL, crit, FIRST_FRAME_LIMIT_S, finite, firstFrameCriterion, play, probe, REVEALED, shotCovered, shown, signIn, skipped, verdict, watchApiErrors } from "./stream-common.mjs";
+
+export { FIRST_FRAME_LIMIT_S, REVEALED, shotCovered, verdict };
 
 const TERMINAL = ["stopped", "failed"];
 
 export const name = "stream-hold";
-// The budget asked of a launched stream. The product publishes none: this is the runner's own number, not a product limit.
-export const FIRST_FRAME_LIMIT_S = 30;
 const SHOT_EVERY_S = 10;
-const SESSION_URL = /\/app\/session\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[/?#]|$)/i;
-const CODEC_LABEL = { h264: "H.264", h265: "HEVC", av1: "AV1", pyrowave: "Auto" };
 // The bench callback seeing fewer frames than the video decoded means the instrument, not the stream, set the cadence (#1304).
 const INSTRUMENT_MIN_SHARE = 0.9;
 
-// Steam's sign-in QR, as fractions of the picture (measured on the lab; the same box the lab proofs cover).
-const QR = { x: 0.14, y: 0.185, w: 0.22, h: 0.545 };
-
-const finite = (x) => typeof x === "number" && Number.isFinite(x);
 const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
 const sd = (xs) => Math.sqrt(mean(xs.map((x) => (x - mean(xs)) ** 2)));
-const shown = (v) => JSON.stringify(v)?.slice(0, 40);
-// A criterion that was not judged has no observed value (the validator's rule).
-const crit = (id, pass, observed, expected) => ({ id, pass, observed: pass === null ? null : observed, expected });
 
 /** What a plan entry's params may hold; all but `app` and `bench`/`cover_qr` have a default (docs/testing-e2e-suite.md lists them). */
 export const PARAM_KEYS = ["transport", "codec", "profile", "hold_s", "app", "bench", "cover_qr"];
@@ -129,7 +121,7 @@ export function judge({ params, session, windows, frames, firstFrameS, stats, hi
   const frameless = framelessSeconds(obs);
 
   return [
-    crit("first_frame_s", finite(firstFrameS) && firstFrameS >= 0 ? firstFrameS <= FIRST_FRAME_LIMIT_S : firstFrameS === null ? false : null, finite(firstFrameS) && firstFrameS >= 0 ? firstFrameS : null, `<= ${FIRST_FRAME_LIMIT_S} s: the first frame the client decoded (it can still be under the loader)`),
+    firstFrameCriterion(firstFrameS),
     crit("marker_decoded", stats && finite(stats.decoded) && stats.decoded >= 0 ? stats.decoded > 0 : null, stats?.decoded ?? null, "> 0 marker frames decoded"),
     crit("transport_as_asked", s ? s.transport === params.transport && !s.transport_fallback_reason : null, s ? transportObserved(s) : null, params.transport),
     crit("codec_as_asked", codec ? codec[0] === params.codec : null, codec ? `${codec[0]} (${codec[1]})` : null, params.codec),
@@ -145,69 +137,20 @@ export function judge({ params, session, windows, frames, firstFrameS, stats, hi
   ];
 }
 
-/** pass needs the first frame and no failed criterion; a first frame that could not be judged is an error with its reason. */
-export function verdict({ status, reason, criteria = [] }) {
-  if (status) return { status, ...(reason ? { reason } : {}) };
-  if (criteria.some((c) => c.pass === false)) return { status: "fail" };
-  if (criteria.find((c) => c.id === "first_frame_s")?.pass === true) return { status: "pass" };
-  return { status: "error", reason: "no first frame could be judged" };
-}
-
-/** A screenshot with a black box over the QR a launcher shows; no stream surface to place it on means no shot at all. */
-export async function shotCovered(page, rec, label, cover) {
-  if (!cover) return rec.shot(page, label);
-  const placed = await page.evaluate((q) => {
-    const el = [...document.querySelectorAll(".session-video")].find((e) => e.videoWidth || e.tagName === "CANVAS");
-    if (!el) return false;
-    const r = el.getBoundingClientRect();
-    const ar = +el.dataset.compositorW / +el.dataset.compositorH || 16 / 9;
-    const mode = el.dataset.scalingMode || "contain";
-    const k = mode === "stretch" ? null : mode === "cover" ? Math.max(r.width / ar, r.height) : Math.min(r.width / ar, r.height);
-    const pw = k ? k * ar : r.width;
-    const ph = k ?? r.height;
-    const d = document.createElement("div");
-    d.id = "__qrcover";
-    d.style.cssText = `position:fixed;z-index:2147483647;pointer-events:none;background:#000;left:${Math.floor(r.left + (r.width - pw) / 2 + pw * q.x)}px;top:${Math.floor(r.top + (r.height - ph) / 2 + ph * q.y)}px;width:${Math.ceil(pw * q.w)}px;height:${Math.ceil(ph * q.h)}px`;
-    document.documentElement.appendChild(d);
-    return true;
-  }, QR);
-  try {
-    if (placed) await rec.shot(page, label);
-    else rec.step("shot-skipped", { label, why: "no stream surface to place the QR cover on" });
-  } finally {
-    await page.evaluate(() => document.getElementById("__qrcover")?.remove()).catch(() => {});
-  }
-}
-
 export default {
   name,
   check,
   async run(page, ctx) {
     const { params, rec, api, client, now, sleep } = ctx;
-    const skipped = (reason) => ({ status: "skipped", reason, criteria: [], sessions: [], clock_offset_ms: null });
-    if (params.transport === "webtransport" && !client.webtransport) return skipped("this browser has no WebTransport");
-    if (params.codec === "pyrowave" ? !client.webgpu : client.decode?.[params.codec]?.supported === false) {
-      return skipped(`this client cannot decode ${params.codec}`);
-    }
+    const why = cannotRun(params, client);
+    if (why) return skipped(why);
 
     const cover = params.cover_qr ?? params.app === "Steam";
     const shot = (label) => shotCovered(page, rec, label, cover);
     const tb = () => now() + (ctx.clockOffset?.() ?? 0); // the browser's clock, which the bench windows are stamped on
-    ctx.refused = null;
 
     // The sessions this run owns are the runner's to track and stop (ctx.launches): a page address never adds one.
-    const origin = new URL(ctx.baseUrl).origin;
-    const pending = [];
-    page.on("response", (r) => {
-      const u = new URL(r.url());
-      if (u.origin !== origin || r.status() < 400 || !u.pathname.startsWith("/v1/")) return;
-      const method = r.request().method();
-      pending.push((async () => {
-        const body = (await r.text().catch(() => "")).slice(0, 300);
-        rec.pageStep("api-error", { method, path: u.pathname, status: r.status(), body });
-        if (method === "POST" && u.pathname === "/v1/sessions") ctx.refused = `the launch was refused: ${r.status()} ${body.trim()}`;
-      })());
-    });
+    const pending = watchApiErrors(page, ctx);
 
     let result;
     // What step the run is in, for the one reason that may be written before the page's bearer is known (see the catch).
@@ -219,14 +162,7 @@ export default {
       const app = (await api.apps()).find((a) => a.name === params.app);
       if (!app) return skipped(`app "${params.app}" is not in this user's catalog`);
 
-      const switches = [params.transport === "webtransport" && "transport=webtransport", params.codec === "pyrowave" && "codec=pyrowave"].filter(Boolean);
-      await page.goto(`${ctx.baseUrl}/app/game/${encodeURIComponent(app.id)}${switches.length ? `?${switches.join("&")}` : ""}`, { waitUntil: "domcontentloaded" });
-      const tClick = await pickAndPlay(page, ctx);
-      rec.step("play-clicked", { app: params.app });
-      const sid = await waitForSession(page, ctx);
-      const row0 = await api.session(sid);
-      if (!row0 || row0.id !== sid) throw new Error("the API no longer returns the session this run launched");
-      rec.step("session-route", { session: sid });
+      const { sid, tClick } = await play(page, ctx, app);
       stage = "the hold";
 
       const frames = [];
@@ -310,83 +246,3 @@ export default {
   },
 };
 
-async function signIn(page, ctx) {
-  await page.goto(ctx.baseUrl, { waitUntil: "domcontentloaded" });
-  await page.evaluate((bench) => {
-    for (const k of Object.keys(localStorage)) if (k.startsWith("quasar.auth.")) localStorage.removeItem(k);
-    if (bench) localStorage.setItem("quasar.bench", "1");
-  }, ctx.params.bench !== false);
-  await page.goto(`${ctx.baseUrl}/login`, { waitUntil: "domcontentloaded" });
-  await page.fill("#login-email", ctx.creds.email);
-  await page.fill("#login-password", ctx.creds.password);
-  await page.click('button[type="submit"]');
-  await page.waitForURL((u) => !new URL(u).pathname.startsWith("/login"), { timeout: 20000 });
-  // The page's own bearer is a secret of this run too: removed from everything written, as a value.
-  const bearer = await page.evaluate(() => localStorage.getItem("quasar.auth.token") ?? sessionStorage.getItem("quasar.auth.token"));
-  if (typeof bearer === "string" && bearer) {
-    ctx.secrets?.add(bearer);
-    ctx.rec.release(); // only now can what the page said be written through the redactor
-  }
-}
-
-/** Waits for the control to be enabled, then clicks it as a script, not as a pointer (an untrusted click cannot start full screen or take the pointer lock). Returns the time of the click. */
-async function press(locator, ctx, what) {
-  const stop = ctx.now() + 30000;
-  for (;;) {
-    const ready = await locator.first().evaluate((el) => !el.disabled && el.getAttribute("aria-disabled") !== "true").catch(() => false);
-    if (ready) {
-      const t = ctx.now();
-      await locator.first().evaluate((el) => el.click());
-      return t;
-    }
-    if (ctx.now() > stop) throw new Error(`${what} never became available on the page`);
-    await ctx.sleep(300);
-  }
-}
-
-/**
- * Asks for the codec, frame rate and resolution through the game page's own Launch options ("Change"
- * opens the sheet), then Play now. No preference of the user is touched. Returns the time of the Play click.
- */
-async function pickAndPlay(page, ctx) {
-  const { params } = ctx;
-  const [, height, fps] = /^(\d+)p(\d+)$/.exec(params.profile);
-  if (!new URL(page.url(), ctx.baseUrl).pathname.startsWith("/app/game/")) {
-    throw new Error(`the page did not open the game page for ${params.app} (it is at ${new URL(page.url(), ctx.baseUrl).pathname}; an account with the Classic layout on is sent to the library instead)`);
-  }
-  await press(page.getByRole("button", { name: "Change", exact: true }), ctx, "Change (Launch options)");
-  const sheet = page.getByRole("dialog", { name: /^Launch options/ });
-  for (const [group, label] of [["Codec", CODEC_LABEL[params.codec]], ["Frame rate", `${fps} fps`], ["Resolution", `${height}p`]]) {
-    await press(sheet.getByRole("radiogroup", { name: group }).getByRole("radio", { name: new RegExp(`^${label.replace(/\./g, "\\.")}`) }), ctx, `${group} "${label}"`);
-  }
-  return press(sheet.getByRole("button", { name: /^Play now/ }), ctx, "Play now");
-}
-
-/** The session id in the page's address, but only one this run launched (a 201 of its own page); any other is an error and is left alone. */
-async function waitForSession(page, ctx) {
-  const stop = ctx.now() + 90000;
-  while (ctx.now() < stop) {
-    const m = SESSION_URL.exec(new URL(page.url(), ctx.baseUrl).pathname);
-    if (m) {
-      await ctx.launches.settle();
-      if (ctx.launches.owned.has(m[1])) return m[1];
-      throw new Error("the page went to a session this run did not launch, so it was left alone");
-    }
-    if (ctx.refused) throw new Error(ctx.refused);
-    await ctx.sleep(300);
-  }
-  throw new Error("the Play click never reached a session page");
-}
-
-// The loader keeps is-locking / is-streaming on a failed or ended session (SessionLoader.tsx adds is-failed and is-over beside it), so those are not a frame.
-export const REVEALED = ".sl-root.is-locking:not(.is-failed):not(.is-over), .sl-root.is-streaming:not(.is-failed):not(.is-over)";
-
-/** What the page shows right now: bench frames, the playing <video> (WebRTC), whether the loader has revealed the stream (noted, never a frame), and whether it is visible. */
-const probe = (page) =>
-  page.evaluate((sel) => ({
-    frames: window.__qBench?.stats().frames ?? 0,
-    videoFrames: document.querySelector("video.session-video:not([hidden])")?.getVideoPlaybackQuality?.().totalVideoFrames ?? 0,
-    revealed: !!document.querySelector(sel),
-    visible: document.visibilityState,
-    focused: document.hasFocus?.(),
-  }), REVEALED);
