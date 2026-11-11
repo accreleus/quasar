@@ -107,7 +107,7 @@ export VERSION DRY_RUN
 	test test-go test-rust test-uinput test-web test-webgpu test-engines test-engines-build \
         test-db preflight release up down restart rebuild redeploy-cp status health logs logs-follow \
         dev-web dev-cp diagnose diagnose-bundle clean reset agent-creds validate \
-        e2e-run e2e-collect e2e-review \
+        e2e-run e2e-collect e2e-review e2e-post \
         ui-audit ui-audit-routes ui-audit-ab session-display session-soak abr-ladder \
         bench-submit bench-retro bench-run bench-suite bench-budget bench-baseline \
         homes-gc \
@@ -323,6 +323,9 @@ e2e-collect: ## The host half of a run bundle, by session id — BUNDLE=<dir> [H
 
 e2e-review: ## The deterministic summary an agent reads first — BUNDLE=<bundle-dir>
 	@node scripts/validate/stream/review.mjs "$$BUNDLE"
+
+e2e-post: ## Put a suite run on quasar-bench: one run per scenario — BUNDLE=<dir> HOST=<role> [DRY_RUN=1]
+	@bash $(DX)/e2e_post.sh
 
 ## ── Image QA ────────────────────────────────────────────────────────────────
 

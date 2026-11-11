@@ -4,9 +4,9 @@ A fixed list of scenarios run against a Quasar stack from a test client, with no
 loop, leaving one **run bundle** that an agent or a person reviews afterwards. Spec: #1271.
 
 > **Status.** The bundle format and its validator (#1272), the runner (#1273, `make e2e-run`), the
-> host half of a bundle (#1274, `make e2e-collect`) and the review that summarises a bundle (#1275,
-> `make e2e-review`) exist. `e2e-post`, `e2e-compare` and `e2e-pack` are the spec's later tickets;
-> this page grows with them.
+> host half of a bundle (#1274, `make e2e-collect`), the review that summarises a bundle (#1275,
+> `make e2e-review`) and posting a run to quasar-bench (#1276, `make e2e-post`) exist. `e2e-compare`
+> and `e2e-pack` are the spec's later tickets; this page grows with them.
 
 ## What you need
 
@@ -260,6 +260,55 @@ A scenario passed when its status is `pass` and none of its criteria has `pass: 
 page's verdict is derived from the two, never copied from the run's own word, and nothing
 short of a pass is a success. Both files are rendered in memory and renamed into place, so a
 failed write leaves no half a review.
+
+Post it on quasar-bench:
+
+```
+make e2e-post BUNDLE=<bundle-dir> HOST=<role> [DRY_RUN=1]
+```
+
+**What you need.** A collected bundle — its `builds.json` must name the node agent's commit, so
+run `e2e-collect` first if it does not — the role name of the host it ran on (`HOST`; the bundle
+holds no host name, so the role is the caller's word), and the bench server and key `bench-submit`
+uses (`BENCH_URL` / `BENCH_KEY`, else qbench's own config). `scripts/dx/bench_submit.py` reads
+those; this verb never sees them.
+
+**What it does.** One quasar-bench run per scenario whose status is not `skipped`, through
+`scripts/dx/bench_submit.py`, so the server and the API are the ones that script already posts to.
+Each run is created with `repo=accreleus/quasar` and `commit` the node agent's commit from
+`builds.json` — never this checkout's HEAD, which is why a bundle without one is refused rather
+than posted under the wrong build. The tags are `suite_run` (the suite run id), `client` (the label
+from `client.json`), `transport`, `codec` and `profile` (the scenario's params), and `clock=raw`:
+the collected `trace.json` keeps client-clock browser events, so these runs are not comparable with
+host-aligned ones event for event. The run's notes carry the criteria, one line each,
+`<id> pass|fail|not-judged <observed>`; `expected`, a scenario's `reason` and any other free text
+are not copied. Artifacts are `review/summary.json`, the scenario's `scenario.json` and
+`timeline.jsonl`, its `shots/*.png`, and on the first run only a `tar.gz` of the whole bundle. The
+verdict is PASS for a `pass` and FAIL for a `fail` or an `error`; an error also carries the tag
+`status=error`. A failed scenario is posted, never withheld, and is not marked invalid. A skipped
+scenario posts nothing.
+
+**The host pairs the runs.** A run's host is `<HOST>@<client label>`: the server pairs runs by
+suite, scenario and host and takes the host string as a whole, so two test clients on one host
+never compare with each other. **Posting twice updates the same runs** — `bench_submit.py` upserts
+on an external id built from the scenario's session id and the suite run id, so a re-post converges
+instead of forking a second run.
+
+**A value taken from the bundle is used only in the shape its field has** (an identifier, a UUID, a
+commit); one that does not match is left out and counted in `left_out=N`, so a tag is never free
+text. The bundle is validated before anything is posted, and every value reaches
+`bench_submit.py` as its own argument, never through a shell.
+
+The run ends with:
+
+```
+RESULT status=ok|failed|error target=e2e-post posted=N skipped=N [failed=N] [left_out=N] [dry_run=1] [reason=...]
+```
+
+Exit 0 every scenario posted (or planned, with `DRY_RUN=1`), 1 the bundle is not valid, the build
+has no commit, or a post failed, 2 usage. `DRY_RUN=1` runs `bench_submit.py --dry-run` for each
+scenario: it contacts no service and prints each run's plan, tags and external id — the way to see
+what a bundle would post.
 
 ## The run bundle, format 1
 
