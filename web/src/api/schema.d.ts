@@ -12008,7 +12008,7 @@ export interface components {
             wt_arrival_jitter_ms?: number;
             /** @description Amendment 66 (accreleus/quasar#1318), additive. CUMULATIVE for the page view: audio sample frames played that the stream did not supply (48000 is one second). WebRTC: the browser's inbound-rtp concealedSamples. WebTransport: silence played for want of audio plus the fade that replaces a lost packet. Absent until the transport has measured audio. */
             audio_concealed_samples?: number;
-            /** @description Amendment 66 (accreleus/quasar#1318), additive. CUMULATIVE for the page view: separate audible dropouts. WebRTC: the browser's inbound-rtp concealmentEvents. WebTransport: runs of silence from an empty audio queue (one per run) plus lost packets concealed. Absent until the transport has measured audio. */
+            /** @description Amendment 66 (accreleus/quasar#1318), additive. CUMULATIVE for the page view: separate audible dropouts. WebRTC: the browser's inbound-rtp concealmentEvents. WebTransport: runs of silence from an empty audio queue (one per run) plus lost packets concealed (a gap of several lost packets, with the silence after its fade, counts once). Absent until the transport has measured audio. */
             audio_concealment_events?: number;
             /** @description Accepted by the browser ingest allow-list and declared here, but no client has ever posted it — the browser cannot observe host encode time. Kept declared so the ingest contract does not change. */
             encode_ms?: number;

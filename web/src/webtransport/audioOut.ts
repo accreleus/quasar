@@ -24,7 +24,7 @@ export interface AudioOutStats {
   /** Audio is heard this much after its video (negative: before). */
   avOffsetMs: number | null;
   underrunMs: number;
-  /** The context is running, so the counts below are measured; false: do not post them. */
+  /** The context has run with the worklet, so the counts below are measured; false: do not post them. */
   measured: boolean;
   /** Frames of audio that were not the stream's: silence for want of data, or a concealment fade that played. Cumulative. */
   concealedSamples: number;
@@ -113,6 +113,8 @@ export class AudioOut {
   private decoded = 0;
   private stale = 0;
   private concealed = 0;
+  /** Latched: a player that ran and was then suspended still owes the dropouts it counted. */
+  private hasMeasured = false;
   private late = 0;
   /** The last packet taken, by `packet_seq`; null before the first and after a pause. */
   private lastSeq: number | null = null;
@@ -155,6 +157,7 @@ export class AudioOut {
     this.ctx = ctx;
     this.out = out;
     out.port.onmessage = (e: MessageEvent<{ underrunFrames: number; concealedFrames: number; underrunEvents: number; dropped: number }>) => {
+      this.hasMeasured = true; // the worklet reports only while the context runs
       this.worklet = e.data;
     };
     out.setGain(this.held ? 0 : 1);
@@ -240,13 +243,14 @@ export class AudioOut {
   }
 
   stats(): AudioOutStats {
+    this.hasMeasured ||= this.out !== null && this.ctx?.state === "running";
     const rate = this.ctx?.sampleRate ?? 48_000;
     return {
       targetDelayMs: this.sync.targetDelayMs(this.minDelayMs()),
       videoLatencyMs: this.sync.videoLatencyMs(),
       avOffsetMs: this.sync.avOffsetMs(this.minDelayMs()),
       underrunMs: (this.worklet.underrunFrames / rate) * 1000,
-      measured: this.out !== null && this.ctx?.state === "running",
+      measured: this.hasMeasured,
       concealedSamples: this.worklet.underrunFrames + this.worklet.concealedFrames,
       concealmentEvents: this.worklet.underrunEvents,
       dropped: this.worklet.dropped,

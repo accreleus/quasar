@@ -470,6 +470,10 @@ describe("AudioOut", () => {
     expect(suspended.out.stats().measured).toBe(false);
     suspended.ctx.state = "running";
     expect(suspended.out.stats().measured).toBe(true);
+    // Latched: suspended again before a reconnect or a stop, what it counted is still harvested.
+    suspended.port.onmessage?.({ data: { underrunFrames: 960, concealedFrames: 480, underrunEvents: 3, dropped: 0 } });
+    suspended.ctx.state = "suspended";
+    expect(suspended.out.stats()).toMatchObject({ measured: true, concealedSamples: 1_440, concealmentEvents: 3 });
   });
 
   it("plays one concealed 10 ms chunk for a lost packet: the last chunk fading to silence, then a fade in", async () => {
