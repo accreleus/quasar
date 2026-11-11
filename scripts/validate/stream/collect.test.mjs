@@ -1070,7 +1070,9 @@ test("S6 a session that never started is collected: its row, its conditions and 
   assert.equal(r.complete, true);
   assert.ok(!r.f.paths().some((p) => p.includes("/diagnostic-bundle") || p.includes("/trace/") || p.endsWith("/metrics")), "no trace was asked for");
   const session = readJson(dir, `${SC}/session.json`);
-  assert.equal(session.failure_code, "launch_failed");
+  assert.equal(session.failure_code, undefined, "the code is never copied");
+  assert.equal(session.has_failure_code, true);
+  assert.doesNotMatch(read(dir, `${SC}/session.json`), /launch_failed/);
   assert.equal(session.error_message, undefined, "the free-text message is never copied");
   assert.equal(session.has_error_message, true);
   assert.doesNotMatch(read(dir, `${SC}/session.json`), /mounts/);
@@ -1148,7 +1150,8 @@ test("A18 a failure's free text is never copied: no credential shape in it can r
       assert.doesNotMatch(file, /credential-value-1234|dXNlcjpwYXNz|a=b|abc123def456|hunter2|pull failed/, `${field}: ${text}`);
       const session = JSON.parse(file);
       assert.equal(session.has_error_message, true);
-      assert.equal(session.failure_code, field === "failure_code" ? undefined : "launch_failed");
+      assert.equal(session.failure_code, undefined);
+      assert.equal(session.has_failure_code, true);
     }
   }
 });
@@ -1318,27 +1321,23 @@ test("A22 a normal answer leaves nothing out: PyroWaveRecord member for member, 
   assert.equal(readJson(dir, "builds.json").components.node_agent.version, "0.6.1-dev");
 });
 
-test("A23 a failure code is written in a code's shape, and a credential's hex token is no code", async () => {
-  const token = "0123456789abcdef0123456789abcdef01234567";
-  for (const [code, kept] of [
-    [token, false],
-    ["launch_failed", true],
-    ["app_exited_early", true],
-  ]) {
+test("A23 a failure code is never copied, whatever it looks like: the row says only that one exists", async () => {
+  // A hex token, a token shaped like a snake_case code, and two real codes: none is in the bundle.
+  for (const code of ["0123456789abcdef0123456789abcdef01234567", `ghp_${"a1".repeat(18)}`, "launch_failed", "app_exited_early"]) {
     const dir = clientBundle();
     const r = await run(dir, world({ start: null, rowExtra: { state: "failed", failure_code: code, error_message: `pull failed: ${MARKER}` } }));
     assert.equal(r.complete, true, code);
     assert.deepEqual(r.problems, [], code);
     const session = readJson(dir, `${SC}/session.json`);
-    assert.equal(session.failure_code, kept ? code : undefined, code);
+    assert.equal(session.failure_code, undefined, code);
+    assert.equal(session.has_failure_code, true, code);
     assert.equal(session.has_error_message, true, code);
     assert.equal(session.error_message, undefined, "the message is never copied");
     assertMarkerNowhere(dir);
-    if (!kept) assert.ok(!read(dir, `${SC}/host-half.json`).includes(token), "not even counted as text");
-    assert.deepEqual(
-      readJson(dir, `${SC}/host-half.json`).not_projected,
-      kept ? undefined : { session: 1, conditions: 0, identity: 0 },
-      code,
-    );
+    for (const f of walk(dir)) assert.ok(!fs.readFileSync(path.join(dir, f), "utf8").includes(code), `${code} in ${f}`);
+    assert.equal(readJson(dir, `${SC}/host-half.json`).not_projected, undefined, "an existing code is not a rejected value");
   }
+  const none = clientBundle();
+  await run(none, world({ start: null, rowExtra: { state: "failed" } }));
+  assert.equal(readJson(none, `${SC}/session.json`).has_failure_code, false);
 });

@@ -34,9 +34,6 @@ export const EXIT = { ok: 0, invalid: 1, error: 2, incomplete: 3 };
 // counted in host-half.json's not_projected: the collector never copies free text. These are
 // field shapes, not patterns that hunt for a credential.
 const IDENT = /^[A-Za-z0-9_.-]{1,64}$/; // a name: a state, a transport, a codec, a settings key
-// A failure code the agent chose: snake_case, its first word letters only, at most 64 characters
-// (a credential's hex token matches neither part).
-const CODE = /^(?=.{1,64}$)[a-z]+(_[a-z0-9]+){0,7}$/;
 const VERSION = /^[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}$/; // a build's version
 const COMMIT = /^[0-9a-f]{7,40}$/i; // a build's commit
 // A host setting's value. A path holds a "/" and free text a space: neither matches, and neither
@@ -276,7 +273,7 @@ function pyrowave(o, note) {
     else if (type === "string" ? fits(IDENT, v) : type === "number" ? num(v) : typeof v === "boolean") out[k] = v;
     else note("session");
   }
-  for (const k of Object.keys(o)) if (!(k in PYROWAVE) && o[k] != null) note("session");
+  for (const k of Object.keys(o)) if (!Object.hasOwn(PYROWAVE, k) && o[k] != null) note("session");
   return out;
 }
 
@@ -299,16 +296,12 @@ function sessionRow(s, never, note) {
   row.host_id = s.host_id; // a UUID: fetchSession refused anything else before this
   const pw = pyrowave(s.pyrowave, note);
   if (pw !== undefined) row.pyrowave = pw;
-  // Why it never started, as far as a file may say it: the failure CODE when it has a code's shape
-  // (snake_case, letters first, so a credential's hex token is no code), and only the fact that a
-  // message exists. The message is free text the agent wrote (a pull error can spell out a
-  // registry credential), and no pattern finds every credential in free text, so it is not
-  // copied: read it from the stack.
+  // Why it never started is on the stack, not in a file. Both the failure code and the message
+  // are text the agent chose (the control plane stores the code as sent, and a pull error can
+  // spell out a registry credential), and no shape or pattern tells every credential from a
+  // code. So neither is copied: the row says only that each exists.
   if (never) {
-    if (s.failure_code != null) {
-      if (fits(CODE, s.failure_code)) row.failure_code = s.failure_code;
-      else note("session");
-    }
+    row.has_failure_code = typeof s.failure_code === "string" && s.failure_code !== "";
     row.has_error_message = typeof s.error_message === "string" && s.error_message !== "";
   }
   if (num(st.width) && num(st.height)) row.launch = [st.width, st.height];

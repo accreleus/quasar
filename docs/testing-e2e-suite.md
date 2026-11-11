@@ -56,9 +56,9 @@ collected later than that has no trace: it is not an error and not an empty half
 `collected: false` with the reason "the trace is no longer kept". Debug captures (`diag.*`
 events) outlive the sweep and do not count as a trace. A live session over an hour has already
 lost its oldest telemetry. A session that **never started** (a launch failure: no `started_at`)
-is collected: its row (with `failure_code` when the answer holds a snake_case code such as
-`app_exited_early`, and `has_error_message`; the message itself is free text and is not copied,
-read it on the stack), its conditions and the agent identity, no trace; `host-half.json` says
+is collected: its row (with `has_failure_code` and `has_error_message`; the code and the message
+are text the agent chose and are not copied, read them on the stack), its conditions and the
+agent identity, no trace; `host-half.json` says
 `"trace": "the session never started"`.
 
 **What is and is not stripped.** Credential-named fields are dropped, the admin bearer and
@@ -68,7 +68,7 @@ pattern finds every credential in free text. So every string the collector proje
 `session.json`, `conditions.json`, `host-half.json` and `builds.json` passes a shape check for
 its own field or is left out, and the count of what was left out is written in that scenario's
 `host-half.json` `not_projected` (`{"session": 2, "conditions": 1, "identity": 0}`, absent when
-nothing was); a failed session's message is never copied; a host path setting is written as
+nothing was); a failed session's code and message are never copied; a host path setting is written as
 `[omitted]`. `scripts/dev/leak-scan.sh` with the operator's patterns still runs before a bundle
 goes anywhere public.
 
