@@ -146,6 +146,13 @@ describe("Launch options: Ultra-low latency (PyroWave)", () => {
     expect(props.onConfirmProfile).toHaveBeenCalledWith("p-1440", undefined, false);
   });
 
+  it("disabled with its own line for a reason the client does not know", () => {
+    renderOpen(block({ available: false, reason: "something_new" }));
+    expect(entry()).toBeDisabled();
+    expect(entry().querySelector(".qr-sub")?.textContent).toBe("Ultra-low latency isn't available here");
+    expect(entry().querySelector(".qr-sub")?.textContent).not.toMatch(/host flagged/);
+  });
+
   it("5. disabled when the profile does not allow it, with the reason", () => {
     renderOpen(block({ mode: "off", available: false, reason: "profile_disallows" }));
     expect(entry()).toBeDisabled();

@@ -5,7 +5,7 @@
 // no Save button; Rename is an identity-only modal; only "New launch profile"
 // opens a drawer). Authorization is server-enforced; UX only (invariant #6).
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import * as adminApi from "../../../api/admin";
 import type {
   DefaultTransport,
@@ -252,24 +252,36 @@ function LaunchProfileCard({
   const pyrowaveMode: LaunchProfilePyroWaveMode = profile.pyrowave_mode ?? "off";
   const [kbpsText, setKbpsText] = useState(mbpsText(profile.pyrowave_kbps));
   const [kbpsError, setKbpsError] = useState<string | null>(null);
+  const kbpsErrorId = `kbps-error-${profile.id}`;
   useEffect(() => setKbpsText(mbpsText(profile.pyrowave_kbps)), [profile.pyrowave_kbps]);
 
   // Maximum bitrate: blank is automatic (null); saved on blur or Enter, never per keystroke.
-  const commitKbps = () => {
+  // A number input reports unparseable text ("200 Mb/s") as "" with badInput, which is not "automatic".
+  // The ref, not `busy`: Enter then blur run in one render, before `busy` shows.
+  const savingKbps = useRef(false);
+  const commitKbps = (input: HTMLInputElement) => {
+    if (savingKbps.current) return;
     const text = kbpsText.trim();
     const current = profile.pyrowave_kbps ?? null;
     const mbps = text === "" ? null : Number(text);
-    if (mbps !== null && !(mbps >= MIN_PYROWAVE_MBPS && mbps <= MAX_PYROWAVE_MBPS)) {
+    if (input.validity.badInput || (mbps !== null && !(mbps >= MIN_PYROWAVE_MBPS && mbps <= MAX_PYROWAVE_MBPS))) {
       setKbpsError(`Enter ${MIN_PYROWAVE_MBPS} to ${MAX_PYROWAVE_MBPS} Mb/s, or leave it blank for automatic.`);
       return;
     }
     setKbpsError(null);
     const kbps = mbps === null ? null : Math.round(mbps * 1000);
-    if (kbps !== current) void persist(rungs.map((r) => r.id), { pyrowave_kbps: kbps });
+    setKbpsText(mbpsText(kbps));
+    if (kbps !== current) {
+      savingKbps.current = true;
+      void persist(rungs.map((r) => r.id), { pyrowave_kbps: kbps }).then((ok) => {
+        savingKbps.current = false;
+        if (!ok) setKbpsText(mbpsText(current));
+      });
+    }
   };
 
   // Absent fields are unchanged (control-api.md), so a rung edit never touches transport or PyroWave.
-  const persist = async (nextRungIds: string[], extra: Partial<LaunchProfileWrite> = {}) => {
+  const persist = async (nextRungIds: string[], extra: Partial<LaunchProfileWrite> = {}): Promise<boolean> => {
     setBusy(true);
     try {
       const saved = await adminApi.updateLaunchProfile(token, profile.id, {
@@ -282,11 +294,13 @@ function LaunchProfileCard({
       for (const w of saved.warnings ?? []) {
         addToast({ variant: "info", title: w.message });
       }
+      return true;
     } catch (e: unknown) {
       addToast({
         variant: "danger",
         title: e instanceof ApiError ? e.message : "Could not save launch profile.",
       });
+      return false;
     } finally {
       setBusy(false);
     }
@@ -370,6 +384,7 @@ function LaunchProfileCard({
                 inputMode="decimal"
                 aria-label={`Maximum bitrate for ${profile.display_name}`}
                 aria-invalid={kbpsError ? true : undefined}
+                aria-describedby={kbpsError ? kbpsErrorId : undefined}
                 placeholder="Auto"
                 min={MIN_PYROWAVE_MBPS}
                 max={MAX_PYROWAVE_MBPS}
@@ -379,13 +394,13 @@ function LaunchProfileCard({
                   setKbpsText(e.target.value);
                   setKbpsError(null);
                 }}
-                onBlur={commitKbps}
-                onKeyDown={(e) => e.key === "Enter" && commitKbps()}
+                onBlur={(e) => commitKbps(e.currentTarget)}
+                onKeyDown={(e) => e.key === "Enter" && commitKbps(e.currentTarget)}
               />
               <span className="sec">Mb/s</span>
             </div>
             {kbpsError && (
-              <p className="form-error" role="alert">
+              <p id={kbpsErrorId} className="form-error" role="alert">
                 {kbpsError}
               </p>
             )}

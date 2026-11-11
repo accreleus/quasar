@@ -14,7 +14,7 @@
 //      forced app — stays live.
 
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { AppHomeNext } from "../AppHomeNext";
 import { AuthContext, type AuthContextValue } from "../../../auth/context";
@@ -83,6 +83,7 @@ const launchProfile = (id: string, r: ReturnType<typeof rung>) => ({
   nominal: { width: r.width, height: r.height, fps: r.fps, bitrate_kbps: r.nominal_bitrate_kbps },
   eligibility: "eligible",
   reasons: [],
+  pyrowave: { mode: "allow", available: true, reason: null, auto: false, auto_reason: null },
   rungs: [r],
 });
 
@@ -219,11 +220,8 @@ describe("a policy-pinned app does not offer overrides it will be refused for", 
     await openOptions();
 
     const panel = document.querySelector(".lo.show") as HTMLElement;
-    // PyroWave is the one entry this fixture's profile does not offer (no pyrowave block).
-    const codecButtons = [...panel.querySelectorAll<HTMLButtonElement>('[aria-label="Codec"] .qp-row')].filter(
-      (b) => !b.textContent?.startsWith("Ultra-low latency"),
-    );
-    expect(codecButtons.length).toBeGreaterThan(0);
+    const codecButtons = [...panel.querySelectorAll<HTMLButtonElement>('[aria-label="Codec"] .qp-row')];
+    expect(codecButtons.some((b) => b.textContent?.startsWith("Ultra-low latency"))).toBe(true);
     for (const btn of codecButtons) expect(btn.disabled).toBe(false);
   });
 
@@ -245,6 +243,25 @@ describe("a policy-pinned app does not offer overrides it will be refused for", 
     await waitFor(() => expect(mocked.launchSession).toHaveBeenCalled());
     const req = mocked.launchSession.mock.calls[0][1];
     expect(req.profile_id).toBe("1080p60");
+  });
+
+  it("sends a PyroWave pick on to POST /v1/sessions: pyrowave true, no codec", async () => {
+    mocked.listApps.mockResolvedValue({ items: [app({ profile_policy: "inherit" })] } as never);
+    mocked.launchSession.mockResolvedValue({
+      session: { id: "s1", stream: { width: 2560, height: 1440, fps: 120, codec: "h264", playout0_ms: 50, mic: true } },
+      signaling: { url: "ws://x", token: "t" },
+    } as never);
+
+    await openBand();
+    await openOptions();
+    const panel = document.querySelector(".lo.show") as HTMLElement;
+    fireEvent.click(within(panel).getByRole("radio", { name: /^Ultra-low latency/ }));
+    fireEvent.click(within(panel).getByRole("button", { name: /Play now/ }));
+
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalled(), { timeout: 8000 });
+    const req = mocked.launchSession.mock.calls[0][1];
+    expect(req.pyrowave).toBe(true);
+    expect(req).not.toHaveProperty("stream");
   });
 
   it("leaves an UNPINNED app's rows selectable", async () => {

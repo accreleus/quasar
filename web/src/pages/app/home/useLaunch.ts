@@ -166,7 +166,8 @@ export function useLaunch({
       if (streamCodec) req.stream = { codec: streamCodec };
       const transport = transportPreference();
       if (transport) req.transport = transport;
-      if (pyrowave || pyrowavePreference()) req.pyrowave = true;
+      // An explicit standard-codec pick beats the remembered `?codec=pyrowave` dev switch.
+      if (pyrowave || (!streamCodec && pyrowavePreference())) req.pyrowave = true;
 
       // #494: abort an in-flight POST /v1/sessions (or a pending retry wait) if
       // the page navigates away mid-launch. One controller per launchApp call;

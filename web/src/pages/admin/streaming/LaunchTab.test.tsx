@@ -583,6 +583,70 @@ describe("LaunchTab", () => {
       expect(mocked.updateLaunchProfile).not.toHaveBeenCalled();
     });
 
+    describe("Maximum bitrate edge cases", () => {
+      const saved = (kbps: number | null) => launchProfile({ pyrowave_mode: "prefer", pyrowave_kbps: kbps });
+      const open = async (kbps: number | null = 200000) => {
+        mocked.listLaunchProfiles.mockResolvedValue({ items: [saved(kbps)] });
+        renderPage();
+        await act(async () => {});
+      };
+
+      it("puts the stored value back, and keeps the error toast, when the save fails", async () => {
+        mocked.updateLaunchProfile.mockRejectedValue(new ApiError(500, "internal", "disk full"));
+        await open();
+        fireEvent.change(bitrate()!, { target: { value: "150" } });
+        await act(async () => {
+          fireEvent.blur(bitrate()!);
+        });
+        expect(await screen.findByText("disk full")).toBeInTheDocument();
+        expect(bitrate()).toHaveValue(200);
+      });
+
+      it("treats text the number input cannot parse as an error, never as automatic", async () => {
+        await open();
+        const input = bitrate()!;
+        Object.defineProperty(input, "validity", { value: { badInput: true }, configurable: true });
+        fireEvent.change(input, { target: { value: "200 Mb/s" } }); // a number input reads this as ""
+        await act(async () => {
+          fireEvent.blur(input);
+        });
+        expect(screen.getByRole("alert")).toHaveTextContent("Enter 50 to 1000 Mb/s");
+        expect(mocked.updateLaunchProfile).not.toHaveBeenCalled();
+      });
+
+      it("shows what it committed: 0300 reads 300", async () => {
+        await open(300000);
+        fireEvent.change(bitrate()!, { target: { value: "0300" } });
+        await act(async () => {
+          fireEvent.blur(bitrate()!);
+        });
+        expect((bitrate() as HTMLInputElement).value).toBe("300");
+        expect(mocked.updateLaunchProfile).not.toHaveBeenCalled();
+      });
+
+      it("sends one PATCH for Enter followed by blur while the save is in flight", async () => {
+        let finish!: (p: LaunchProfile) => void;
+        mocked.updateLaunchProfile.mockReturnValue(new Promise<LaunchProfile>((r) => (finish = r)));
+        await open();
+        fireEvent.change(bitrate()!, { target: { value: "150" } });
+        await act(async () => {
+          fireEvent.keyDown(bitrate()!, { key: "Enter" });
+          fireEvent.blur(bitrate()!);
+        });
+        expect(mocked.updateLaunchProfile).toHaveBeenCalledTimes(1);
+        await act(async () => finish(saved(150000)));
+      });
+
+      it("ties the error to the field", async () => {
+        await open();
+        fireEvent.change(bitrate()!, { target: { value: "10" } });
+        await act(async () => {
+          fireEvent.blur(bitrate()!);
+        });
+        expect(bitrate()).toHaveAccessibleDescription("Enter 50 to 1000 Mb/s, or leave it blank for automatic.");
+      });
+    });
+
     it("puts the mode back and toasts when the save fails", async () => {
       mocked.updateLaunchProfile.mockRejectedValue(new ApiError(500, "internal", "disk full"));
       renderPage();

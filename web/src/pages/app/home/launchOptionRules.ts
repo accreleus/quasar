@@ -4,12 +4,14 @@
 
 import type { AppDisplayStream } from "../../../api/types";
 import {
+  AUTO_NOT_PYROWAVE,
   autoPyroWaveNote,
   availableFps,
   availableResolutions,
   codecBasis,
   codecLabel,
   fpsUniverse,
+  PYROWAVE_UNAVAILABLE,
   reasonSentences,
   resolveSelection,
   type DraftCodec,
@@ -132,8 +134,10 @@ function pyrowaveRow(space: OptionSpace): Pick<OptionRow<DraftCodec>, "label" | 
   if (entries.some((e) => e.eligibility !== "ineligible")) {
     return { label, sub: "Local network only", enabled: true };
   }
-  const first = entries.find((e) => e.recommended) ?? entries[0];
-  const why = reasonSentences(first?.reasons ?? [{ code: "profile_disallows", message: "" }])[0] ?? UNEXPLAINED;
+  // A blocked entry's only reason is its PyroWave block's; another entry's reasons are bandwidth ones.
+  const blocked = entries.filter((e) => !e.pyrowave?.available);
+  const first = blocked.find((e) => e.recommended) ?? blocked[0];
+  const why = (first && reasonSentences(first.reasons)[0]) || PYROWAVE_UNAVAILABLE;
   return { label, sub: why.replace(/\.$/, ""), enabled: false, title: why };
 }
 
@@ -284,6 +288,15 @@ export function verdict(
   }
   if (row.eligibility === "risky") {
     return { tone: "risky", text: reasonSentences(row.reasons, "risky")[0] ?? UNEXPLAINED };
+  }
+
+  if (draft.codec === "pyrowave") {
+    // The row's eligibility is the standard codec's; the PyroWave block speaks for PyroWave.
+    const slow = row.pyrowave?.auto_reason;
+    const cost = price(row.bitrateKbps ?? 0, true);
+    return slow === "link_too_slow" || slow === "rtt_too_high"
+      ? { tone: "risky", text: `Ultra-low latency may not hold up: ${AUTO_NOT_PYROWAVE[slow]}. It needs ${cost} on your local network.` }
+      : { tone: "ok", text: `Needs ${cost} on your local network.` };
   }
 
   const measured = confidence === "high";

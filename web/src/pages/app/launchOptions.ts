@@ -60,6 +60,12 @@ interface OptionEntry {
   viaPyroWave: boolean;
 }
 
+/** A missing block reads as a profile that does not allow it; an unknown reason as unavailable. */
+function pyrowaveReasonCode(block: LaunchProfilePyroWave | undefined): string {
+  if (!block) return "profile_disallows";
+  return block.reason && PYROWAVE_REASONS.has(block.reason) ? block.reason : "pyrowave_unavailable";
+}
+
 /** The full derived option space for one `ProfilesResponse`. Opaque —
  * consumed only via the accessor functions below. */
 export interface OptionSpace {
@@ -223,7 +229,7 @@ export function buildOptionSpace(
         ...e,
         bitrateKbps: pyrowaveTargetKbps(e.height, e.fps),
         eligibility: blocked ? "ineligible" : e.eligibility,
-        reasons: blocked ? [{ code: block?.reason ?? "profile_disallows", message: "" }] : e.reasons,
+        reasons: blocked ? [{ code: pyrowaveReasonCode(block), message: "" }] : e.reasons,
         viaPyroWave: true,
       };
     }),
@@ -387,6 +393,12 @@ interface ReasonCopy {
   soft?: string;
 }
 
+/** Availability reasons control-api.md §Launch options defines for the PyroWave block (an
+ *  open string): any other code is shown as `pyrowave_unavailable`. */
+const PYROWAVE_REASONS = new Set(["profile_disallows", "host_no_pyrowave", "device_no_webgpu", "device_no_webtransport"]);
+
+export const PYROWAVE_UNAVAILABLE = "Ultra-low latency isn't available here.";
+
 const REASON_COPY: Record<string, ReasonCopy> = {
   bandwidth_too_low: {
     hard: "Your connection is slower than this quality needs. Pick a lower resolution or frame rate.",
@@ -422,7 +434,7 @@ const REASON_COPY: Record<string, ReasonCopy> = {
   host_no_pyrowave: { hard: "No host here can stream PyroWave right now." },
   device_no_webgpu: { hard: "Your browser can't decode PyroWave." },
   device_no_webtransport: { hard: "Your browser can't use WebTransport, which PyroWave needs." },
-  gpu_pyrowave_busy: { hard: "The host's graphics card is already streaming PyroWave." },
+  pyrowave_unavailable: { hard: PYROWAVE_UNAVAILABLE },
   probe_missing: {
     hard: "Quasar hasn't measured your network yet, so these are conservative estimates rather than a measurement.",
   },
@@ -467,7 +479,7 @@ export function reasonSentences(
   return out;
 }
 
-const AUTO_NOT_PYROWAVE: Record<string, string> = {
+export const AUTO_NOT_PYROWAVE: Record<string, string> = {
   no_measurement: "your network hasn't been measured recently",
   rtt_too_high: "the connection takes too long to reach the host",
   link_too_slow: "the link is too slow",
