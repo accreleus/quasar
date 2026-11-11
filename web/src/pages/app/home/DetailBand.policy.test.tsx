@@ -219,7 +219,10 @@ describe("a policy-pinned app does not offer overrides it will be refused for", 
     await openOptions();
 
     const panel = document.querySelector(".lo.show") as HTMLElement;
-    const codecButtons = panel.querySelectorAll<HTMLButtonElement>('[aria-label="Codec"] .qp-row');
+    // PyroWave is the one entry this fixture's profile does not offer (no pyrowave block).
+    const codecButtons = [...panel.querySelectorAll<HTMLButtonElement>('[aria-label="Codec"] .qp-row')].filter(
+      (b) => !b.textContent?.startsWith("Ultra-low latency"),
+    );
     expect(codecButtons.length).toBeGreaterThan(0);
     for (const btn of codecButtons) expect(btn.disabled).toBe(false);
   });

@@ -17,14 +17,18 @@ import type {
   App,
   CatalogCodec,
   LaunchProfileEvaluation,
+  LaunchProfilePyroWave,
   ProfileEvaluation,
   ProfileReason,
   ProfilesResponse,
 } from "../../api/types";
 import type { CodecCapabilities } from "../../webrtc/capability";
 
-/** The codec segment's selection space: "auto" plus the catalog vocabulary. */
-export type DraftCodec = "auto" | CatalogCodec;
+/** The codec segment's selection space: "auto", the catalog vocabulary and
+ * Ultra-low latency (PyroWave), which is no catalog codec: the rung walk still
+ * picks the standard codec and PyroWave rides on that session (control-api.md
+ * §Ultra-low latency (PyroWave)). */
+export type DraftCodec = "auto" | CatalogCodec | "pyrowave";
 
 /** One cascade selection — codec, then fps, then resolution (by height, the
  * same bucket key `fmtResolution` groups on in libraryDetail.tsx). */
@@ -49,6 +53,11 @@ interface OptionEntry {
   reasons: ProfileReason[];
   /** "auto" rows only — true when this is `recommended_id`. */
   recommended: boolean;
+  /** The profile's PyroWave block; set on "auto" and "pyrowave" rows. */
+  pyrowave?: LaunchProfilePyroWave;
+  /** The session would stream PyroWave at this row: the PyroWave codec, or an
+   * Auto row the profile's Auto rule gives it to. */
+  viaPyroWave: boolean;
 }
 
 /** The full derived option space for one `ProfilesResponse`. Opaque —
@@ -80,6 +89,8 @@ export interface ResolutionRow {
    * differ per row — a 4K row may resolve through an av1 top rung while a
    * 720p row is h264-only). */
   entryCodec?: CatalogCodec;
+  pyrowave?: LaunchProfilePyroWave;
+  viaPyroWave?: boolean;
 }
 
 /** What committing a draft resolves to — echoed on the launch card and sent
@@ -95,12 +106,23 @@ export interface ResolvedSelection {
   eligibility: "eligible" | "risky" | "ineligible";
   reasons: ProfileReason[];
   recommended: boolean;
+  /** The user picked Ultra-low latency: Play sends `pyrowave: true`, no codec. */
+  wantsPyroWave: boolean;
+  viaPyroWave: boolean;
 }
 
 const CODEC_ORDER: readonly CatalogCodec[] = ["h264", "hevc", "av1"];
 
 // Copy comes from the code (reasonSentence); the message is never shown.
 const NOT_DECODABLE: ProfileReason = { code: "codec_not_supported", message: "" };
+
+/** The most PyroWave uses at a stream height and frame rate: the formula of
+ * record in codec-pyrowave.md §Rate, before the profile's Maximum bitrate cap
+ * (which the profiles response does not carry), so an upper bound. */
+export function pyrowaveTargetKbps(height: number, fps: number): number {
+  const atSixty = height <= 1080 ? 200_000 : height <= 1440 ? 300_000 : 400_000;
+  return Math.min(Math.floor((atSixty * fps) / 60), 1_000_000);
+}
 
 function decodable(codec: CatalogCodec, caps: CodecCapabilities): boolean {
   if (codec === "h264") return caps.h264;
@@ -131,16 +153,19 @@ export function buildOptionSpace(
     // resolution), so without H.264 here Auto lands on the first allowed rung.
     const allowed = rungs.find((r) => r.eligibility !== "ineligible");
     const undecodable = !codecCaps.h264 && allowed !== undefined && !decodable(allowed.codec, codecCaps);
+    const viaPyroWave = p.pyrowave?.auto === true;
     return {
       codec: (undecodable ? allowed : topRung)?.codec ?? "h264",
       width: p.nominal.width,
       height: p.nominal.height,
       fps: p.nominal.fps,
-      bitrateKbps: p.nominal.bitrate_kbps,
+      bitrateKbps: viaPyroWave ? pyrowaveTargetKbps(p.nominal.height, p.nominal.fps) : p.nominal.bitrate_kbps,
       profileId: p.id,
       eligibility: undecodable ? "ineligible" : p.eligibility,
       reasons: undecodable ? [NOT_DECODABLE, ...p.reasons] : p.reasons,
       recommended: p.id === recommendedId && !undecodable,
+      pyrowave: p.pyrowave,
+      viaPyroWave,
     };
   });
 
@@ -176,6 +201,7 @@ export function buildOptionSpace(
           eligibility: rung.eligibility,
           reasons: rung.reasons,
           recommended: false,
+          viaPyroWave: false,
         },
       });
     }
@@ -184,6 +210,25 @@ export function buildOptionSpace(
     entriesByCodec.set(codec, entries);
     codecs.push(codec);
   }
+
+  // Always listed, so a profile or device that rules it out says why instead of
+  // the entry vanishing. A row is a profile's Auto row, priced as PyroWave and
+  // ineligible with the block's reason when that profile cannot offer it.
+  entriesByCodec.set(
+    "pyrowave",
+    autoEntries.map((e) => {
+      const block = e.pyrowave;
+      const blocked = !block?.available;
+      return {
+        ...e,
+        bitrateKbps: pyrowaveTargetKbps(e.height, e.fps),
+        eligibility: blocked ? "ineligible" : e.eligibility,
+        reasons: blocked ? [{ code: block?.reason ?? "profile_disallows", message: "" }] : e.reasons,
+        viaPyroWave: true,
+      };
+    }),
+  );
+  codecs.push("pyrowave");
 
   return { codecs, entriesByCodec };
 }
@@ -240,6 +285,8 @@ export function availableResolutions(space: OptionSpace, codec: DraftCodec, fps:
       bitrateKbps: match.bitrateKbps,
       profileId: match.profileId,
       entryCodec: match.codec,
+      pyrowave: match.pyrowave,
+      viaPyroWave: match.viaPyroWave,
     };
   });
 }
@@ -274,7 +321,7 @@ export function resolveSelection(space: OptionSpace, draft: LaunchDraft): Resolv
   if (!match) return null;
   return {
     profileId: match.profileId,
-    codec: draft.codec === "auto" ? null : match.codec,
+    codec: draft.codec === "auto" || draft.codec === "pyrowave" ? null : match.codec,
     entryCodec: match.codec,
     width: match.width,
     height: match.height,
@@ -283,6 +330,8 @@ export function resolveSelection(space: OptionSpace, draft: LaunchDraft): Resolv
     eligibility: match.eligibility,
     reasons: match.reasons,
     recommended: match.recommended,
+    wantsPyroWave: draft.codec === "pyrowave",
+    viaPyroWave: match.viaPyroWave,
   };
 }
 
@@ -304,6 +353,7 @@ export function codecLabel(codec: DraftCodec): string {
   if (codec === "auto") return "Auto";
   if (codec === "h264") return "H.264";
   if (codec === "hevc") return "HEVC";
+  if (codec === "pyrowave") return "PyroWave";
   return "AV1";
 }
 
@@ -314,6 +364,7 @@ export function codecBasis(codec: DraftCodec): string {
   if (codec === "auto") return "Your host picks the codec, best first, and falls back to one this device can decode.";
   if (codec === "h264") return "H.264 plays on every device and needs the most bandwidth of the three.";
   if (codec === "hevc") return "HEVC gives you the same picture as H.264 for noticeably less bandwidth.";
+  if (codec === "pyrowave") return "Ultra-low latency has the lowest delay of any codec, and needs a fast local network.";
   return "AV1 is the most efficient of the three, and the newest — decoding it can work this device harder.";
 }
 
@@ -367,6 +418,11 @@ const REASON_COPY: Record<string, ReasonCopy> = {
   historical_client_performance_failed: {
     hard: "This device couldn't keep up with this option last time it ran. Pick a lower quality.",
   },
+  profile_disallows: { hard: "This profile doesn't allow PyroWave." },
+  host_no_pyrowave: { hard: "No host here can stream PyroWave right now." },
+  device_no_webgpu: { hard: "Your browser can't decode PyroWave." },
+  device_no_webtransport: { hard: "Your browser can't use WebTransport, which PyroWave needs." },
+  gpu_pyrowave_busy: { hard: "The host's graphics card is already streaming PyroWave." },
   probe_missing: {
     hard: "Quasar hasn't measured your network yet, so these are conservative estimates rather than a measurement.",
   },
@@ -409,6 +465,20 @@ export function reasonSentences(
     out.push(reasonSentence(r, severity));
   }
   return out;
+}
+
+const AUTO_NOT_PYROWAVE: Record<string, string> = {
+  no_measurement: "your network hasn't been measured recently",
+  rtt_too_high: "the connection takes too long to reach the host",
+  link_too_slow: "the link is too slow",
+};
+
+/** Under Codec: why Auto did or did not pick PyroWave. Only a profile that
+ * prefers it, on a device that can offer it, has anything to say. */
+export function autoPyroWaveNote(block: LaunchProfilePyroWave | undefined): string | null {
+  if (block?.mode !== "prefer" || !block.available) return null;
+  if (block.auto) return "Auto chose PyroWave: you're on the local network.";
+  return `Not PyroWave: ${AUTO_NOT_PYROWAVE[block.auto_reason ?? ""] ?? "this connection doesn't qualify"}.`;
 }
 
 /** Why nothing in this response is launchable: reasons across every profile
@@ -506,6 +576,13 @@ export function optionsFor(input: {
       (e) => e.profileId === wanted && e.eligibility !== "ineligible",
     );
   const pinnedProfileId = resolves ? wanted : null;
+  // A pinned app launches its own profile only, so only that profile can offer PyroWave.
+  if (pinnedProfileId) {
+    space.entriesByCodec.set(
+      "pyrowave",
+      (space.entriesByCodec.get("pyrowave") ?? []).filter((e) => e.profileId === pinnedProfileId),
+    );
+  }
 
   // A pinned app seeds from its own profile, not the per-device
   // recommendation: seeding the recommendation would default to a selection

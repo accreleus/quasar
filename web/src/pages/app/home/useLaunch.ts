@@ -97,6 +97,8 @@ export interface UseLaunch {
     app: App,
     profileId?: string,
     streamCodec?: "h264" | "h265" | "av1",
+    /** The user picked Ultra-low latency (PyroWave). */
+    pyrowave?: boolean,
   ) => Promise<void>;
   quickLaunch: (app: App) => Promise<void>;
 }
@@ -151,7 +153,7 @@ export function useLaunch({
   }, []);
 
   const launchApp = useCallback(
-    async (app: App, profileId?: string, streamCodec?: "h264" | "h265" | "av1") => {
+    async (app: App, profileId?: string, streamCodec?: "h264" | "h265" | "av1", pyrowave?: boolean) => {
       if (!token || launching || inFlightRef.current) return;
       // #647: before the first await, while the click still counts.
       enterLaunchFullscreen();
@@ -164,7 +166,7 @@ export function useLaunch({
       if (streamCodec) req.stream = { codec: streamCodec };
       const transport = transportPreference();
       if (transport) req.transport = transport;
-      if (pyrowavePreference()) req.pyrowave = true;
+      if (pyrowave || pyrowavePreference()) req.pyrowave = true;
 
       // #494: abort an in-flight POST /v1/sessions (or a pending retry wait) if
       // the page navigates away mid-launch. One controller per launchApp call;

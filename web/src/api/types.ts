@@ -264,6 +264,8 @@ export type AdminLaunchProfilesResponse = Schemas["AdminLaunchProfilesResponse"]
 export type ProfileNominal = Schemas["ProfileNominal"];
 
 export type LaunchProfileEvaluation = Schemas["LaunchProfileEvaluation"];
+export type LaunchProfilePyroWave = Schemas["LaunchProfilePyroWave"];
+export type LaunchProfilePyroWaveMode = Schemas["LaunchProfilePyroWaveMode"];
 
 export type ProfilesResponse = Schemas["ProfilesResponse"];
 

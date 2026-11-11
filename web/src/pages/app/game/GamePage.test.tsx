@@ -575,7 +575,7 @@ describe("game page", () => {
     );
     await act(async () => {});
     fireEvent.click(screen.getByRole("button", { name: "Play" }));
-    expect(confirm).toHaveBeenCalledWith("p-1440", undefined);
+    expect(confirm).toHaveBeenCalledWith("p-1440", undefined, false);
   });
 
   it("a forced app launches on its pin: no profile by default or from an unchanged Change, the pin with a codec", async () => {
