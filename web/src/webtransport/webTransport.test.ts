@@ -11,7 +11,7 @@ import {
 import type { InputMsg } from "../input/inputSender";
 import type { Presenter } from "./presenter";
 import { TransportError, type MediaSink, type MediaTransport, type TransportEnd } from "./transport";
-import { createWebTransportRuntime, MEDIA_SILENCE_MS, type WebTransportRuntimeDeps } from "../pages/app/webTransportRuntime";
+import { createWebTransportRuntime as createRuntime, MEDIA_SILENCE_MS, type WebTransportRuntimeDeps } from "../pages/app/webTransportRuntime";
 import type { BenchDeps } from "../bench/benchController";
 import { mintTransportToken } from "../api/library";
 import {
@@ -31,10 +31,19 @@ import {
 import { parseVideoDatagram } from "./framing";
 import { FEC_HOLD_MS } from "./reassembly";
 
+/** Every runtime a test builds: one left running ticks after the test's `document` is gone. */
+const live: ReturnType<typeof createRuntime>[] = [];
+const createWebTransportRuntime: typeof createRuntime = (cfg) => {
+  const rt = createRuntime(cfg);
+  live.push(rt);
+  return rt;
+};
+
 beforeEach(() => {
   vi.stubGlobal("EncodedVideoChunk", FakeChunk);
 });
 afterEach(() => {
+  for (const rt of live.splice(0)) rt.destroy();
   vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -431,6 +440,54 @@ describe("createWebTransportRuntime", () => {
     expect(presented.every((f) => f.closed)).toBe(true);
     // Said once, not per frame.
     expect(warn.mock.calls.filter((c) => c[0] === "bench:")).toHaveLength(1);
+    rt.destroy();
+    delete (window as unknown as Record<string, unknown>).__qBench;
+  });
+
+  it("in bench mode reads a held frame when it is shown, and never one that was given up unshown", async () => {
+    vi.useFakeTimers();
+    const read: number[] = [];
+    class FakeBench {
+      start() {}
+      stop() {}
+      handle() {
+        return { enabled: true };
+      }
+      onFrame() {
+        read.push(performance.now());
+      }
+    }
+    const { agent, presented, rt } = setup({
+      deps: { isBenchModeEnabled: () => true, loadBench: async () => ({ BenchController: FakeBench as never }) },
+    });
+    rt.start();
+    await vi.advanceTimersByTimeAsync(10);
+    const pkt = { n: 0 };
+    let seq = 0;
+    const arrivals: number[] = [];
+    const send = () => {
+      arrivals.push(performance.now());
+      agent.last.datagrams(packetize({ configId: 0, frameSeq: seq, keyframe: seq++ === 0, data: bytes(10, seq) }, pkt));
+    };
+    // A link whose frames arrive 5 and 28 ms after one another: the playout holds frames for a cushion.
+    for (let i = 0; i < 80; i++) {
+      send();
+      await vi.advanceTimersByTimeAsync(i % 2 ? 5 : 28);
+      expect(read).toHaveLength(presented.length);
+    }
+    await vi.advanceTimersByTimeAsync(100);
+    expect(read).toHaveLength(presented.length);
+    // Each was read when it was shown, which for a held frame is after it arrived.
+    const heldBy = presented.map((f, k) => read[k] - arrivals[Math.round((f.timestamp - 1_762_400_000_000_000) / 16_667)]);
+    expect(heldBy.every((ms) => ms >= 0)).toBe(true);
+    expect(heldBy.filter((ms) => ms > 1).length).toBeGreaterThan(20);
+    // Ten frames at one instant: the oldest overflow the hold and are closed, the rest are released at
+    // their capture cadence. What was never shown was never read.
+    const shown0 = presented.length;
+    for (let i = 0; i < 10; i++) send();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(read).toHaveLength(presented.length);
+    expect(presented.length - shown0).toBeLessThan(10);
     rt.destroy();
     delete (window as unknown as Record<string, unknown>).__qBench;
   });
@@ -962,6 +1019,47 @@ describe("createWebTransportRuntime fallback", () => {
       expect(agent.sent("hello")).toHaveLength(2);
       stall.mockRestore();
       rt.destroy();
+    });
+
+    it("fires on a page whose ticks always run late: only each stall is excused", async () => {
+      const { agent, rt } = await streaming();
+      const real = performance.now.bind(performance);
+      const t0 = real();
+      // Every 1 s tick reads as 3 s apart.
+      const slow = vi.spyOn(performance, "now").mockImplementation(() => t0 + (real() - t0) * 3);
+      await vi.advanceTimersByTimeAsync(8_000);
+      expect(agent.sent("hello")).toHaveLength(2);
+      slow.mockRestore();
+      rt.destroy();
+    });
+
+    it("excuses no more than the time since the last frame: a frame just before a late tick, then silence, still fires", async () => {
+      const { agent, rt } = await streaming();
+      const real = performance.now.bind(performance);
+      let skew = 0;
+      vi.spyOn(performance, "now").mockImplementation(() => real() + skew);
+      await vi.advanceTimersByTimeAsync(1_900);
+      skew = 4_000; // the page stalls for 4 s and a frame is the first thing it handles
+      frame(agent, 1);
+      await vi.advanceTimersByTimeAsync(110); // the next tick, 5 s after the last one
+      expect(agent.sent("hello")).toHaveLength(1);
+      // Silent from there on: a whole bound later it is a lost stream. Excusing the 4 s again past
+      // the frame's own time would put that off by 4 s.
+      await vi.advanceTimersByTimeAsync(SILENT);
+      expect(agent.sent("hello")).toHaveLength(2);
+      rt.destroy();
+    });
+
+    it("counts the bound from when ticking starts, not from when the runtime was made", async () => {
+      vi.useFakeTimers();
+      const s = setup();
+      await vi.advanceTimersByTimeAsync(10_000); // a slow page before the stream is started
+      s.rt.start();
+      await vi.advanceTimersByTimeAsync(10);
+      frame(s.agent, 0);
+      await vi.advanceTimersByTimeAsync(SILENT);
+      expect(s.agent.sent("hello")).toHaveLength(2);
+      s.rt.destroy();
     });
 
     it("does not fire in a hidden tab, and gives a tab that shows again the whole bound", async () => {

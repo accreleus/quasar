@@ -106,6 +106,10 @@ export interface TelemetrySnapshot {
    * "none this window" without re-deriving getStats parsing. */
   framesDecodedTotal: number;
   bytesReceivedTotal: number;
+  /** Audio the stream did not supply (concealed or silent frames), cumulative for the page view; null until audio is measured. */
+  audioConcealedSamples: number | null;
+  /** Separate runs of that, cumulative for the page view; null until audio is measured. */
+  audioConcealmentEvents: number | null;
 }
 
 /**
@@ -145,6 +149,8 @@ const EMPTY_SNAPSHOT: TelemetrySnapshot = {
   negotiatedCodec: null,
   framesDecodedTotal: 0,
   bytesReceivedTotal: 0,
+  audioConcealedSamples: null,
+  audioConcealmentEvents: null,
 };
 
 /**
@@ -157,8 +163,23 @@ export interface PostedCounters {
   packetsLost: number;
   framesDropped: number;
   freezeCount: number;
+  /** Audio dropouts (audio_concealed_samples, audio_concealment_events); null until a transport measures audio. */
+  audioConcealedSamples: number | null;
+  audioConcealmentEvents: number | null;
 }
-export const newPostedCounters = (): PostedCounters => ({ packetsLost: 0, framesDropped: 0, freezeCount: 0 });
+export const newPostedCounters = (): PostedCounters => ({
+  packetsLost: 0,
+  framesDropped: 0,
+  freezeCount: 0,
+  audioConcealedSamples: null,
+  audioConcealmentEvents: null,
+});
+
+/** Adds one transport's audio dropout increments to the page view's totals; the first call starts them at 0. */
+export function addAudioDropouts(c: PostedCounters, samples: number, events: number): void {
+  c.audioConcealedSamples = (c.audioConcealedSamples ?? 0) + Math.max(0, samples);
+  c.audioConcealmentEvents = (c.audioConcealmentEvents ?? 0) + Math.max(0, events);
+}
 
 /**
  * Wires up the three measurement loops for a live session. Create, call start()
@@ -225,6 +246,8 @@ export class SessionTelemetry {
   private lostBase = 0;
   private prevFramesDropped = 0;
   private prevFreezeCount = 0;
+  private prevConcealedSamples = 0;
+  private prevConcealmentEvents = 0;
 
   // Clock sync (ping/pong over the input DataChannel)
   private pingSeq = 0;
@@ -453,6 +476,8 @@ export class SessionTelemetry {
       negotiatedCodec: this.negotiatedCodec,
       framesDecodedTotal: this.framesDecodedTotal,
       bytesReceivedTotal: this.bytesReceivedTotal,
+      audioConcealedSamples: this.posted.audioConcealedSamples,
+      audioConcealmentEvents: this.posted.audioConcealmentEvents,
     };
   }
 
@@ -476,11 +501,13 @@ export class SessionTelemetry {
     // through unknown rather than assume an unsafe index signature.
     type StatMap = Record<string, unknown>;
     let rtp: StatMap | null = null;
+    let audioRtp: StatMap | null = null;
     let cp: StatMap | null = null;
     const codecStats = new Map<string, StatMap>();
     for (const s of report.values()) {
       const stat = s as unknown as StatMap;
       if (stat["type"] === "inbound-rtp" && stat["kind"] === "video") rtp = stat;
+      else if (stat["type"] === "inbound-rtp" && stat["kind"] === "audio") audioRtp = stat;
       else if (stat["type"] === "candidate-pair") {
         if ((stat["nominated"] as boolean | undefined) || (stat["state"] as string | undefined) === "succeeded") {
           if (!cp || (stat["nominated"] as boolean | undefined)) cp = stat;
@@ -559,6 +586,15 @@ export class SessionTelemetry {
     this.posted.framesDropped += this.framesDropped;
     this.posted.freezeCount += this.freezeCount;
 
+    // The browser's own concealment of lost or late audio, as increments of its cumulative counters.
+    if (audioRtp && typeof audioRtp["concealedSamples"] === "number") {
+      const samples = audioRtp["concealedSamples"] as number;
+      const events = (audioRtp["concealmentEvents"] as number | undefined) ?? 0;
+      addAudioDropouts(this.posted, samples - this.prevConcealedSamples, events - this.prevConcealmentEvents);
+      this.prevConcealedSamples = samples;
+      this.prevConcealmentEvents = events;
+    }
+
     // A current RTP stream is not proof RVFC continues to present frames.
     this.expireStaleRvfcCaptureTime();
 
@@ -629,6 +665,8 @@ export class SessionTelemetry {
     m["packets_lost"] = this.posted.packetsLost;
     m["frames_dropped"] = this.posted.framesDropped;
     m["freeze_count"] = this.posted.freezeCount;
+    if (this.posted.audioConcealedSamples !== null) m["audio_concealed_samples"] = this.posted.audioConcealedSamples;
+    if (this.posted.audioConcealmentEvents !== null) m["audio_concealment_events"] = this.posted.audioConcealmentEvents;
     if (this.displayRefreshHz != null) m["display_refresh_hz"] = this.displayRefreshHz;
 
     // playout_target_ms records the buffer this window was measured under so a

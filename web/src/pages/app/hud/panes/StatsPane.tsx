@@ -458,6 +458,14 @@ export function StatsPane(props: StatsPaneProps) {
                   </td>
                 </tr>
                 <tr>
+                  <MetricLabel text="audio dropouts" metric="audio_concealment_events" />
+                  <td className={telemetry.audioConcealmentEvents ? "diag-warn" : undefined}>
+                    {telemetry.audioConcealmentEvents == null
+                      ? "–"
+                      : `${telemetry.audioConcealmentEvents} · ${Math.round((telemetry.audioConcealedSamples ?? 0) / 48)} ms`}
+                  </td>
+                </tr>
+                <tr>
                   {/* Not this-second: g2g is a median over up to 600 RVFC samples. */}
                   <MetricLabel text="capture→display" metric="rvfc_capture_to_display_ms" />
                   <td>{fmt(telemetry.g2gMs)}</td>
