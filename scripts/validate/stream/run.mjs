@@ -22,7 +22,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "../lib/args.mjs";
 import { attachEvidenceListeners } from "../lib/listeners.mjs";
 import { FORMAT, validateBundle } from "./bundle.mjs";
-import { declaredHooks, Hooks } from "./hooks.mjs";
+import { declaredHooks, Hooks, LEDGER } from "./hooks.mjs";
 import { Recorder, ScenarioRecorder } from "./record.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -299,7 +299,9 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
     const url = new URL(baseUrl);
     const bundle = new Recorder(staging, { now, secrets, literals: [[url.host, "<stack>"], [url.hostname, "<stack>"], [creds.email, "<user>"], [String(creds.email).split("@")[0], "<user>"], [creds.password, "<credential>"]] });
     // Hooks: a runner that died between apply and clear left a ledger beside the bundle; it is cleared before anything else, or the run does not start.
-    const hooks = hooksDir ? new Hooks({ dir: hooksDir, ledgerDir: path.dirname(path.resolve(dir)), timeoutMs: hookTimeoutMs }) : null;
+    const hooks = hooksDir ? new Hooks({ dir: hooksDir, ledgerDir: path.dirname(path.resolve(dir)), timeoutMs: hookTimeoutMs, redact: (s) => bundle.text(s) }) : null;
+    // Without HOOKS= nothing here can clear a hook; a ledger beside the bundle says a run left one applied.
+    if (!hooks && fs.existsSync(path.join(path.dirname(path.resolve(dir)), LEDGER))) onNote(`warning: ${LEDGER} beside the bundle says an earlier run left a hook applied; this run has no HOOKS= and cannot clear it`);
     const recovered = hooks ? await hooks.recover((ev, d) => onNote(bundle.text(`${ev} ${JSON.stringify(d)}`))) : [];
     if (recovered.length) onNote(`cleared hook(s) a runner that died had left applied: ${recovered.join(", ")}`);
     const startedAt = now();

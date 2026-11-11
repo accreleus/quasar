@@ -42,8 +42,8 @@ export function hookScript(dir, name) {
   }
 }
 
-/** Runs `file phase` with `env`; resolves (never rejects) with the exit, the capped output and whether the timeout killed it. */
-export function runHook(file, phase, env, timeoutMs) {
+/** Runs `file phase` with `env`; resolves (never rejects) with the exit, the output as read (the caller redacts, then caps it) and whether the timeout killed it. */
+export function runHook(file, phase, env, timeoutMs, onSpawn = () => {}) {
   return new Promise((resolve) => {
     const t0 = Date.now();
     const out = { stdout: "", stderr: "" };
@@ -54,7 +54,7 @@ export function runHook(file, phase, env, timeoutMs) {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      resolve({ ...out, stdout: out.stdout.slice(0, OUTPUT_MAX), stderr: out.stderr.slice(0, OUTPUT_MAX), ms: Date.now() - t0, code: null, signal: null, timedOut: false, ...r });
+      resolve({ ...out, ms: Date.now() - t0, code: null, signal: null, timedOut: false, ...r });
     };
     // detached: the whole process group is killed at the timeout, so a hook's own children cannot outlive it.
     const timer = setTimeout(() => { try { process.kill(-child.pid, "SIGKILL"); } catch { /* already gone */ } end({ timedOut: true }); }, timeoutMs);
@@ -63,6 +63,7 @@ export function runHook(file, phase, env, timeoutMs) {
     } catch (e) {
       return end({ stderr: String(e?.message ?? e) });
     }
+    onSpawn(child.pid); // detached: the pid is the hook's process group
     child.stdout.on("data", take("stdout"));
     child.stderr.on("data", take("stderr"));
     child.on("error", (e) => end({ stderr: String(e?.message ?? e) }));
@@ -76,10 +77,13 @@ const why = (r) => (r.timedOut ? "timed out" : r.signal ? `killed by ${r.signal}
 function isAlive(pid) {
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; }
 }
+const STATES = ["applying", "applied", "clearing"];
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export class Hooks {
   /** @param ledgerDir where the ledger of applied hooks lives: the bundle's parent (the staging directory is beside the bundle). */
-  constructor({ dir, ledgerDir, env = process.env, timeoutMs = DEFAULT_TIMEOUT_MS }) {
+  constructor({ dir, ledgerDir, env = process.env, timeoutMs = DEFAULT_TIMEOUT_MS, redact = (s) => s }) {
+    this.redact = redact; // the recorder's: output is redacted whole and only then cut, so no secret is cut in half
     this.root = fs.realpathSync(dir);
     this.ledger = path.join(ledgerDir, LEDGER);
     this.env = env;
@@ -95,6 +99,7 @@ export class Hooks {
     let entries;
     try { entries = JSON.parse(text).entries; } catch { entries = null; }
     const valid = (e) => e && typeof e.id === "string" && Number.isInteger(e.pid) && typeof e.hooks_dir === "string" && HOOK_NAME.test(e.name)
+      && STATES.includes(e.state) && (e.hook_pid === undefined || (Number.isInteger(e.hook_pid) && e.hook_pid > 1))
       && e.facts && typeof e.facts === "object" && Object.values(e.facts).every((v) => FACT.test(v));
     if (!Array.isArray(entries) || !entries.every(valid)) throw new Error(`${this.ledger} is not a ledger this runner wrote; it cannot say what is still applied, so it is not guessed (remove it once the hooks are known to be clear)`);
     return entries;
@@ -110,8 +115,10 @@ export class Hooks {
 
   /** The environment a hook sees: the caller's own, plus the scenario's facts (the session only when it is known). */
   hookEnv(phase, f) {
+    // A hook shapes a link or blocks a transport: it has no use for the test user's sign-in.
+    const { QUASAR_E2E_EMAIL: _e, QUASAR_E2E_PASSWORD: _p, QUASAR_E2E_CRED_FILE: _f, ...env } = this.env;
     return {
-      ...this.env,
+      ...env,
       QUASAR_E2E_SCENARIO: f.scenario,
       ...(f.session ? { QUASAR_E2E_SESSION: f.session } : {}),
       QUASAR_E2E_TRANSPORT: f.transport,
@@ -119,10 +126,24 @@ export class Hooks {
     };
   }
 
-  async run(name, phase, facts, note) {
+  /** One entry's state in the ledger; `hook_pid` is there only while that hook process may be running. */
+  mark(id, state, hookPid) {
+    this.writeLedger(this.readLedger().map((e) => {
+      if (e.id !== id) return e;
+      const { hook_pid: _was, ...rest } = e;
+      return { ...rest, state, ...(hookPid ? { hook_pid: hookPid } : {}) };
+    }));
+  }
+
+  /** Runs the script for ledger entry `id`. While it runs the ledger holds its process group, so a later runner never clears over a hook that is still going. */
+  async run(name, phase, facts, note, id) {
     const file = hookScript(this.root, name);
-    const r = file ? await runHook(file, phase, this.hookEnv(phase, facts), this.timeoutMs) : { code: null, signal: null, timedOut: false, ms: 0, stdout: "", stderr: "the script is gone or not executable" };
-    note("hook", { hook: name, phase, exit_code: r.code, ...(r.signal ? { signal: r.signal } : {}), timed_out: r.timedOut, ms: r.ms, stdout: r.stdout, stderr: r.stderr });
+    const going = phase === "apply" ? "applying" : "clearing";
+    if (file) this.mark(id, going);
+    const r = file ? await runHook(file, phase, this.hookEnv(phase, facts), this.timeoutMs, (pid) => this.mark(id, going, pid)) : { code: null, signal: null, timedOut: false, ms: 0, stdout: "", stderr: "the script is gone or not executable" };
+    note("hook", { hook: name, phase, exit_code: r.code, ...(r.signal ? { signal: r.signal } : {}), timed_out: r.timedOut, ms: r.ms, stdout: this.redact(r.stdout).slice(0, OUTPUT_MAX), stderr: this.redact(r.stderr).slice(0, OUTPUT_MAX) });
+    // The hook process is gone (runHook waited for it, or killed its group): only now is the entry plain `applied` again.
+    if (file) this.mark(id, "applied");
     return r;
   }
 
@@ -130,19 +151,21 @@ export class Hooks {
   async call(name, phase, facts, note) {
     if (!PHASES.includes(phase)) throw new Error(`a hook phase is apply or clear, not ${JSON.stringify(String(phase)).slice(0, 20)}`);
     const mine = { scenario: String(facts.scenario), transport: String(facts.transport), ...(facts.session ? { session: String(facts.session) } : {}) };
+    // The same shape the ledger is read with: a fact that would not read back is refused before anything is applied.
+    if (!Object.values(mine).every((v) => FACT.test(v))) throw new Error(`hook ${name}: the scenario's facts (its id, transport and session) must be plain names`);
     if (phase === "apply") {
       if (this.applied.has(name)) throw new Error(`hook ${name} is already applied`);
       const id = crypto.randomBytes(6).toString("hex");
       // The ledger first: a runner killed during the apply must still be known to have started it.
-      this.writeLedger([...this.readLedger(), { id, pid: process.pid, hooks_dir: this.root, name, facts: mine }]);
+      this.writeLedger([...this.readLedger(), { id, pid: process.pid, hooks_dir: this.root, name, state: "applying", facts: mine }]);
       this.applied.set(name, { id, facts: mine });
-      const r = await this.run(name, "apply", mine, note);
+      const r = await this.run(name, "apply", mine, note, id);
       if (!ok(r)) throw new Error(`hook ${name} apply failed (${why(r)})`);
       return;
     }
     const a = this.applied.get(name);
     if (!a) throw new Error(`hook ${name} is not applied`);
-    const r = await this.run(name, "clear", a.facts, note);
+    const r = await this.run(name, "clear", a.facts, note, a.id);
     if (!ok(r)) throw new Error(`hook ${name} clear failed (${why(r)})`);
     this.applied.delete(name);
     this.writeLedger(this.readLedger().filter((e) => e.id !== a.id));
@@ -162,10 +185,18 @@ export class Hooks {
     const mine = this.readLedger().filter((e) => e.hooks_dir === this.root);
     const live = mine.filter((e) => isAlive(e.pid));
     if (live.length) throw new Error(`refusing to start: process ${live[0].pid} still holds hook ${live[0].name}; it is another e2e-run using these hooks`);
+    // A runner killed while a hook ran left that hook running (it is its own process group). Clearing over it
+    // would let the old apply land after the clear, so it is waited for; one that does not end stops the run.
+    for (const e of mine.filter((x) => x.state !== "applied")) {
+      if (!e.hook_pid) throw new Error(`refusing to start: hook ${e.name} was ${e.state} when its runner died and its process is not known; remove ${this.ledger} once the hook is known to be clear`);
+      const until = Date.now() + this.timeoutMs;
+      while (isAlive(-e.hook_pid) && Date.now() < until) await sleep(100);
+      if (isAlive(-e.hook_pid)) throw new Error(`refusing to start: hook ${e.name} from a runner that died is still running (process group ${e.hook_pid}); end it, then run again`);
+    }
     const cleared = [];
     const failed = [];
     for (const e of mine.reverse()) {
-      const r = await this.run(e.name, "clear", e.facts, note);
+      const r = await this.run(e.name, "clear", e.facts, note, e.id);
       if (ok(r)) {
         this.writeLedger(this.readLedger().filter((x) => x.id !== e.id));
         cleared.push(e.name);

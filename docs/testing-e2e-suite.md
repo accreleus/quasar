@@ -126,7 +126,8 @@ make e2e-run TARGET=... PLAN=... HOOKS=<dir>        # or QUASAR_E2E_HOOKS=<dir>
 - **Script.** `<dir>/<name with ':' as '-'>` (`fault:webtransport-block` is `<dir>/fault-webtransport-block`),
   an executable file inside `<dir>`. It is run with one argument, `apply` or `clear`, no shell, 30 s to
   finish (then it and its children are killed). Exit 0 is success; anything else, or the timeout, is a
-  failure. Its environment is yours plus `QUASAR_E2E_SCENARIO` (the scenario directory name),
+  failure. Its environment is yours, without the test user's sign-in (`QUASAR_E2E_EMAIL`,
+  `QUASAR_E2E_PASSWORD`, `QUASAR_E2E_CRED_FILE`), plus `QUASAR_E2E_SCENARIO` (the scenario directory name),
   `QUASAR_E2E_SESSION` (only once a session was launched), `QUASAR_E2E_TRANSPORT` and `QUASAR_E2E_PHASE`.
   `clear` must be safe to run when `apply` did nothing or only half of it.
 - **Timeline.** Each run is a `hook` row: hook, phase, exit code, `timed_out`, milliseconds, and the first
@@ -136,8 +137,11 @@ make e2e-run TARGET=... PLAN=... HOOKS=<dir>        # or QUASAR_E2E_HOOKS=<dir>
   however it ended (a throw, Ctrl-C, SIGTERM). A clear that fails makes the scenario `error`, names the
   hook under "left behind", and the following scenarios are `skipped` until it clears.
 - **A runner killed between apply and clear** (`kill -9`) cannot clear. Before each apply it writes
-  `.e2e-hooks-applied.json` in the directory that holds `OUT`; the next run with the same `HOOKS=` runs `clear`
-  for every entry first and says so on stderr. If one will not clear, or the process that wrote it is
+  `.e2e-hooks-applied.json` in the directory that holds `OUT`; the next run with the same `HOOKS=` and
+  an `OUT` in the same directory runs `clear` for every entry first and says so on stderr. A run with
+  no `HOOKS=` that finds the file only warns: it cannot clear anything. A hook that was still running
+  when its runner died keeps running; the next run waits for it to end (up to the hook's 30 s) before
+  it clears, and does not start if it does not end. If one will not clear, or the process that wrote it is
   still running, the run does not start. A damaged ledger also stops it: remove the file once the hooks are
   known to be clear.
 - **No script.** A scenario whose hook has no executable script (or no `HOOKS=`) is `skipped`; the reason

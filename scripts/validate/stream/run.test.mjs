@@ -1146,7 +1146,7 @@ test("B8: builds.json says which builds e2e-collect fills and which it does not 
 
 // ── hooks (hooks.mjs): apply and clear around a scenario ────────────────────
 
-import { declaredHooks, Hooks, hookScript, LEDGER } from "./hooks.mjs";
+import { declaredHooks, Hooks, hookScript, LEDGER, runHook } from "./hooks.mjs";
 import { pathToFileURL } from "node:url";
 
 const BLOCK = "fault:webtransport-block";
@@ -1306,6 +1306,54 @@ test("hooks: output is redacted and capped before it reaches the timeline, and a
   assert.deepEqual(r.result.errors, []);
 });
 
+test("hooks: output is redacted whole and only then cut, so a secret across the cut is not written in part", async () => {
+  const w = world();
+  const hooksDir = mkHooks(`printf '%1990s' | tr ' ' x; echo " 10.20.30.40 more"; { printf '%1993s' | tr ' ' y; echo " ${CREDS.password} end"; } >&2`);
+  const r = await runHooks(w, fake(w), { hooksDir });
+  const text = fs.readFileSync(path.join(r.dir, "01-fake/timeline.jsonl"), "utf8");
+  assert.ok(!text.includes("10.20."), "no part of the address");
+  assert.ok(!text.includes(CREDS.password.slice(0, 4)), "no part of the password");
+});
+
+test("hooks: a hook does not get the test user's sign-in, and facts that are not plain names are refused before the ledger", async () => {
+  const dir = mkHooks();
+  const parent = tmp("e2e-parent-");
+  const h = new Hooks({ dir, ledgerDir: parent, env: { PATH: process.env.PATH, QUASAR_E2E_EMAIL: "a", QUASAR_E2E_PASSWORD: "b", QUASAR_E2E_CRED_FILE: "c", KEEP: "1" } });
+  const env = h.hookEnv("apply", { scenario: "s", transport: "webrtc" });
+  assert.deepEqual(Object.keys(env).filter((k) => /EMAIL|PASSWORD|CRED/.test(k)), []);
+  assert.equal(env.KEEP, "1");
+  await assert.rejects(h.call(BLOCK, "apply", { scenario: "s", transport: "web rtc" }, () => {}), /must be plain names/);
+  assert.equal(fs.existsSync(path.join(parent, LEDGER)), false);
+  assert.deepEqual(logOf(dir), [], "nothing was applied");
+});
+
+test("hooks: the ledger is on disk while the apply is still running", async () => {
+  const parent = tmp("e2e-parent-");
+  const dir = mkHooks('[ "$1" = apply ] && { [ -f "$LEDGER_FILE" ] || exit 7; }');
+  const h = new Hooks({ dir, ledgerDir: parent, env: { PATH: process.env.PATH, LEDGER_FILE: path.join(parent, LEDGER) } });
+  await h.call(BLOCK, "apply", { scenario: "s", transport: "webrtc" }, () => {});
+  await h.call(BLOCK, "clear", {}, () => {});
+  assert.equal(fs.existsSync(path.join(parent, LEDGER)), false);
+});
+
+test("hooks: the timeout kills the hook's own children too", async () => {
+  const dir = mkHooks('sleep 30 & echo $! > "$(dirname "$0")/child"; sleep 30');
+  const r = await runHook(path.join(dir, "fault-webtransport-block"), "apply", { PATH: process.env.PATH }, 400);
+  assert.equal(r.timedOut, true);
+  const pid = Number(fs.readFileSync(path.join(dir, "child"), "utf8"));
+  await new Promise((res) => setTimeout(res, 200));
+  assert.throws(() => process.kill(pid, 0), "the grandchild is gone");
+});
+
+test("hooks: a run with no HOOKS= says so when a ledger beside the bundle shows a hook left applied", async () => {
+  notes = [];
+  const w = world();
+  const parent = tmp("e2e-parent-");
+  fs.writeFileSync(path.join(parent, LEDGER), "{}");
+  await runHooks(w, fake(w, async () => {}, []), { parent, hooksDir: null }).catch(() => {});
+  assert.ok(notes.some((n) => /earlier run left a hook applied/.test(n)), notes.join("|"));
+});
+
 test("hooks: a runner killed between apply and clear leaves a ledger; the next run clears it first and says so", async () => {
   notes = [];
   const w = world();
@@ -1331,9 +1379,49 @@ test("hooks: a runner killed between apply and clear leaves a ledger; the next r
   assert.equal(r.sc().status, "pass");
 });
 
+test("hooks: a runner killed while its apply is still running: the next run waits for that hook to end before it clears, or does not start", async () => {
+  const kill9DuringApply = async (sleepS) => {
+    const hooksDir = mkHooks(`[ "$1" = apply ] && { echo began >> "$(dirname "$0")/log"; sleep ${sleepS}; echo finished >> "$(dirname "$0")/log"; }`);
+    const parent = tmp("e2e-parent-");
+    const hooksUrl = pathToFileURL(path.join(HERE, "hooks.mjs")).href;
+    const child = spawn(process.execPath, ["--input-type=module", "-e", `import { Hooks } from ${JSON.stringify(hooksUrl)};
+      const h = new Hooks({ dir: ${JSON.stringify(hooksDir)}, ledgerDir: ${JSON.stringify(parent)} });
+      await h.call(${JSON.stringify(BLOCK)}, "apply", { scenario: "01-fake", transport: "webtransport" }, () => {});`], { stdio: "ignore" });
+    while (!logOf(hooksDir).includes("began")) await new Promise((r) => setTimeout(r, 20));
+    const gone = new Promise((r) => child.on("exit", r));
+    child.kill("SIGKILL");
+    await gone;
+    return { hooksDir, parent };
+  };
+  // The orphaned apply ends by itself: recovery waits for it, and only then clears.
+  const a = await kill9DuringApply(1);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(a.parent, LEDGER), "utf8")).entries[0].state, "applying");
+  assert.deepEqual(await new Hooks({ dir: a.hooksDir, ledgerDir: a.parent }).recover(() => {}), [BLOCK]);
+  assert.deepEqual(logOf(a.hooksDir).map((l) => l.split(" ")[0]), ["apply", "began", "finished", "clear"], "the clear is the last thing that happened");
+  assert.equal(fs.existsSync(path.join(a.parent, LEDGER)), false);
+  // One that does not end in time: the run does not start, nothing is cleared over it, the ledger stays.
+  const b = await kill9DuringApply(30);
+  await assert.rejects(new Hooks({ dir: b.hooksDir, ledgerDir: b.parent, timeoutMs: 300 }).recover(() => {}), /still running \(process group \d+\)/);
+  const [entry] = JSON.parse(fs.readFileSync(path.join(b.parent, LEDGER), "utf8")).entries;
+  assert.deepEqual(logOf(b.hooksDir).map((l) => l.split(" ")[0]), ["apply", "began"]);
+  process.kill(-entry.hook_pid, "SIGKILL"); // the test's own orphan
+  // An entry that says a hook was running but not which process: not guessed.
+  fs.writeFileSync(path.join(b.parent, LEDGER), JSON.stringify({ format: 1, entries: [{ ...entry, hook_pid: undefined }] }));
+  await assert.rejects(new Hooks({ dir: b.hooksDir, ledgerDir: b.parent }).recover(() => {}), /its process is not known/);
+});
+
+test("hooks: a credential only the hook knows (token=, MY_TOKEN=) does not reach the timeline", async () => {
+  const w = world();
+  const hooksDir = mkHooks("echo token=hook-only-secret-123; echo MY_TOKEN=abcdef123456 >&2");
+  const r = await runHooks(w, fake(w), { hooksDir });
+  const text = fs.readFileSync(path.join(r.dir, "01-fake/timeline.jsonl"), "utf8");
+  assert.ok(!text.includes("hook-only-secret-123") && !text.includes("abcdef123456"), text.slice(0, 400));
+  assert.deepEqual(r.result.errors, []);
+});
+
 test("hooks: a stale hook that will not clear stops the run before anything starts; a live holder or a damaged ledger does too", async () => {
   const noop = { hooks: [], async run() { return { status: "pass", criteria: PASS }; } };
-  const ledger = (parent, hooksDir, pid) => fs.writeFileSync(path.join(parent, LEDGER), JSON.stringify({ format: 1, entries: [{ id: "abc", pid, hooks_dir: fs.realpathSync(hooksDir), name: BLOCK, facts: { scenario: "01-fake", transport: "webrtc" } }] }));
+  const ledger = (parent, hooksDir, pid) => fs.writeFileSync(path.join(parent, LEDGER), JSON.stringify({ format: 1, entries: [{ id: "abc", pid, hooks_dir: fs.realpathSync(hooksDir), name: BLOCK, state: "applied", facts: { scenario: "01-fake", transport: "webrtc" } }] }));
   const dead = 2 ** 22 + 12345; // beyond pid_max
   // clear fails
   let w = world();
