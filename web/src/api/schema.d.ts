@@ -11986,6 +11986,7 @@ export interface components {
             present_long_frames?: number;
             /** @description Intervals the window actually contained. Below 5 every other present_* key is omitted rather than computed from a fragment. */
             present_n?: number;
+            /** @description The display buffer this sample was measured under, ms. WebRTC: the jitter-buffer target. WebTransport *(amendment 66)*: the display cushion in force, 0 on a clean link, at most three frame intervals and 50 ms. */
             playout_target_ms?: number;
             /** @description RVFC captureTime has a current validated sample (0/1); stale/missing/invalid captureTime resets it. Not proof of abs-capture-time RTP negotiation. */
             rvfc_capture_time_available?: number;
@@ -12003,6 +12004,12 @@ export interface components {
             wt_capture_to_present_ms?: number;
             /** @description Amendment 63 (accreleus/quasar#1035), additive. keyframe_request messages a WebTransport client put on the wire in the sample's window (transport-webtransport.md Loss recovery), whoever asked: the decoder, a frame given up as late, a tab shown again. Requests merged by the client's spacing window count once. A WebRTC session never posts it. */
             wt_keyframe_requests?: number;
+            /** @description Amendment 66 (accreleus/quasar#1317), additive. A WebTransport session's smoothed video frame arrival jitter in ms (the change in transit time between consecutive decoded frames, averaged over about 16 frames): the input to the client's display cushion, whose size is playout_target_ms. Absent on a PyroWave session and on WebRTC. */
+            wt_arrival_jitter_ms?: number;
+            /** @description Amendment 66 (accreleus/quasar#1318), additive. CUMULATIVE for the page view: audio sample frames played that the stream did not supply (48000 is one second). WebRTC: the browser's inbound-rtp concealedSamples. WebTransport: silence played for want of audio plus the fade that replaces a lost packet. Absent until the transport has measured audio. */
+            audio_concealed_samples?: number;
+            /** @description Amendment 66 (accreleus/quasar#1318), additive. CUMULATIVE for the page view: separate audible dropouts. WebRTC: the browser's inbound-rtp concealmentEvents. WebTransport: runs of silence from an empty audio queue (one per run) plus lost packets concealed (a gap of several lost packets, with the silence after its fade, counts once). Absent until the transport has measured audio. */
+            audio_concealment_events?: number;
             /** @description Accepted by the browser ingest allow-list and declared here, but no client has ever posted it — the browser cannot observe host encode time. Kept declared so the ingest contract does not change. */
             encode_ms?: number;
             network_pacing_ms?: number;

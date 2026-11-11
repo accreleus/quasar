@@ -23,15 +23,51 @@ export const CLOCKS = ["client", "host"];
 // operator's patterns, which runs before a bundle is posted anywhere public.
 const IPV4 = /(?<![\d.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?!\d|\.\d)/g;
 const DOC_NETS = ["192.0.2.", "198.51.100.", "203.0.113."]; // RFC 5737
-const SECRETS = [
+// Shared with the collector, which replaces what these match before it writes.
+export const SECRETS = [
   [/\beyJ[\w-]{10,}\.[\w-]{10,}\./, "a JWT"],
   // A token has a digit in it; "Bearer authentication." in prose has none.
   [/\bBearer\s+(?=[\w.~+/-]*\d)[\w.~+/-]{8,}/i, "a bearer token"],
-  // A value that says there is none ("password": null, secret: none, token=[REDACTED]) is not one.
-  [/\b(password|passwd|secret|access_token|refresh_token|sig_token|api[_-]?key)["']?\s*[=:]\s*["']?(?!\[?(?:null|none|n\/?a|redacted|omitted|unknown|true|false)\]?(?=[\s"',}]|$))[^\s"',}]{4,}/im, "a credential"],
+  // A value that says there is none ("password": null, secret: none, token=[REDACTED], password: none.) is not one.
+  [/\b(authorization|cookie|password|passwd|secret|access_token|refresh_token|sig_token|api[_-]?key)["']?\s*[=:]\s*["']?(?!\[?(?:null|none|n\/?a|redacted|omitted|unknown|true|false|bearer)\]?(?=[\s"',}.;!?]|$))[^\s"',}]{4,}/i, "a credential"],
 ];
 
-function leaks(text) {
+/**
+ * Does a JSON key name a credential? One rule, shared with the collector's redaction:
+ * case, hyphens, spaces, underscores and camelCase are normalised away first, so
+ * `Authorization`, `x-api-key`, `accessToken`, `Set-Cookie` and `private key` all match.
+ */
+export function isCredentialName(key) {
+  const k = String(key).replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase().replace(/[\s-]+/g, "_");
+  return /(^|_)(authorization|cookies?|set_cookie|passwords?|passwd|secret|(api|private|secret|access|signing)_?key)$|token$/.test(k);
+}
+
+const NONE = /^\[?(null|none|n\/?a|redacted|omitted|unknown|true|false)\]?[.;!?,]?$/i;
+
+// A JSON file (or JSONL) whose key names a credential and whose value is anything but "there is none".
+function jsonCredential(text) {
+  const docs = [];
+  try {
+    docs.push(JSON.parse(text));
+  } catch {
+    for (const line of text.split("\n")) {
+      try {
+        docs.push(JSON.parse(line));
+      } catch {}
+    }
+  }
+  // A credential-named key must hold nothing: null, false, "", a none-word, or an empty container.
+  const none = (x) =>
+    x === null || x === false || x === "" || (typeof x === "string" && (!x.trim() || NONE.test(x.trim()))) ||
+    (x !== null && typeof x === "object" && Object.keys(x).length === 0);
+  const bad = (v) =>
+    Array.isArray(v)
+      ? v.some(bad)
+      : v !== null && typeof v === "object" && Object.entries(v).some(([k, x]) => (isCredentialName(k) && !none(x)) || bad(x));
+  return docs.some(bad);
+}
+
+function leaks(text, file) {
   const found = [];
   for (const m of text.matchAll(IPV4)) {
     const ip = m[0];
@@ -41,6 +77,7 @@ function leaks(text) {
     break;
   }
   for (const [re, what] of SECRETS) if (re.test(text)) found.push(what);
+  if (/\.jsonl?$/.test(file) && jsonCredential(text) && !found.includes("a credential")) found.push("a credential");
   return found;
 }
 
@@ -179,6 +216,10 @@ function check(dir, errors, { keys = manifestKeys() } = {}) {
     if (!sc) continue;
     const at = `${name}/scenario.json`;
     for (const k of ["id", "params", "sessions"]) if (sc[k] === undefined) err(at, `no ${k}`);
+    // An empty list is valid: nothing to collect for this scenario.
+    if (sc.sessions !== undefined && (!Array.isArray(sc.sessions) || sc.sessions.some((id) => typeof id !== "string"))) {
+      err(at, "sessions must be a list of strings");
+    }
     if (!STATUSES.includes(sc.status)) err(at, `status must be one of ${STATUSES.join(", ")}`);
     if (["skipped", "error"].includes(sc.status) && !sc.reason) err(at, `status ${sc.status} needs a reason`);
     if (!("clock_offset_ms" in sc)) err(at, "no clock_offset_ms (null when the offset was not measured)");
@@ -251,7 +292,7 @@ function check(dir, errors, { keys = manifestKeys() } = {}) {
     if (n >= 2 && (mark === 0xfffe || mark === 0xfeff || (n >= 4 && head.readUInt32BE(0) === 0x0000feff))) {
       err(p, "is UTF-16 or UTF-32 (a bundle's text is UTF-8)");
     } else if (!head.subarray(0, n).includes(0)) {
-      for (const what of leaks(fs.readFileSync(path.join(dir, p), "utf8"))) err(p, `holds ${what}`);
+      for (const what of leaks(fs.readFileSync(path.join(dir, p), "utf8"), p)) err(p, `holds ${what}`);
     }
   }
 }

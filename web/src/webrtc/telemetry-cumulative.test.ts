@@ -6,11 +6,14 @@ import { newPostedCounters, SessionTelemetry, type PostedCounters, type Telemetr
 type Totals = { packetsLost: number; framesDropped: number; freezeCount: number };
 
 /** A telemetry whose getStats answers with `totals.now`, as one peer connection's receiver does. */
-function telemetry(totals: { now: Totals }, counters?: PostedCounters) {
+function telemetry(totals: { now: Totals; audio?: { concealedSamples: number; concealmentEvents: number } }, counters?: PostedCounters) {
   const video = { videoWidth: 0, videoHeight: 0, requestVideoFrameCallback: () => 1 } as unknown as HTMLVideoElement;
   const channel = { readyState: "open", bufferedAmount: 0, onmessage: null, send: () => {} } as unknown as RTCDataChannel;
   const stats = async () =>
-    new Map([["rtp", { type: "inbound-rtp", kind: "video", ...totals.now }]]) as unknown as RTCStatsReport;
+    new Map<string, unknown>([
+      ["rtp", { type: "inbound-rtp", kind: "video", ...totals.now }],
+      ...(totals.audio ? [["audio", { type: "inbound-rtp", kind: "audio", ...totals.audio }] as [string, unknown]] : []),
+    ]) as unknown as RTCStatsReport;
   const t = new SessionTelemetry(video, stats, channel, "s1", "token", undefined, undefined, undefined, undefined, counters);
   const windows: Pick<TelemetrySnapshot, "packetsLost" | "framesDropped" | "freezeCount">[] = [];
   t.onUpdate(({ packetsLost, framesDropped, freezeCount }) => windows.push({ packetsLost, framesDropped, freezeCount }));
@@ -82,5 +85,33 @@ describe("SessionTelemetry cumulative counters", () => {
     expect(posted("packets_lost")[0]).toBe(12);
     expect(posted("frames_dropped")[0]).toBe(7);
     expect(posted("freeze_count")[0]).toBe(4);
+  });
+
+  it("posts the browser's audio concealment cumulative across a replaced peer connection, and nothing for a session without audio", async () => {
+    const counters = newPostedCounters();
+    const quiet = { now: { packetsLost: 0, framesDropped: 0, freezeCount: 0 } };
+    const none = telemetry(quiet, counters);
+    await vi.advanceTimersByTimeAsync(5_000);
+    none.t.stop();
+    expect(posts[0]).not.toHaveProperty("audio_concealed_samples");
+
+    posts = [];
+    const totals = { now: quiet.now, audio: { concealedSamples: 480, concealmentEvents: 1 } };
+    const first = telemetry(totals, counters);
+    await vi.advanceTimersByTimeAsync(1_000);
+    totals.audio = { concealedSamples: 1_920, concealmentEvents: 3 };
+    await vi.advanceTimersByTimeAsync(4_000);
+    first.t.stop();
+    expect(posted("audio_concealed_samples").slice(0, 2)).toEqual([480, 1_920]);
+    expect(posted("audio_concealment_events").slice(0, 2)).toEqual([1, 3]);
+
+    // The replacement peer connection's counters start again at 0; the page view's totals go on.
+    posts = [];
+    const next = { now: quiet.now, audio: { concealedSamples: 96, concealmentEvents: 1 } };
+    const replacement = telemetry(next, counters);
+    await vi.advanceTimersByTimeAsync(5_000);
+    replacement.t.stop();
+    expect(posted("audio_concealed_samples")[0]).toBe(2_016);
+    expect(posted("audio_concealment_events")[0]).toBe(4);
   });
 });

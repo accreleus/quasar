@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MIN_CLOCK_SAMPLES } from "../webrtc/clockOffset";
+import { summarizePresentWindow } from "../webrtc/presentCadence";
 import { isFreeze, WtTelemetry } from "./telemetry";
 
 /** A telemetry on fake clocks: `mono` is performance.now(), `epoch` is Date.now(). */
@@ -131,6 +132,49 @@ describe("WtTelemetry", () => {
     // Posted once: a second flush has nothing to send.
     await h.t.flush();
     expect(h.posts.filter((p) => p.url.endsWith("/stats"))).toHaveLength(1);
+  });
+
+  it("posts the display cushion as playout_target_ms and the arrival jitter behind it", async () => {
+    const h = harness();
+    h.frames(10, 8);
+    h.t.tick();
+    h.t.setPlayout(12.5, 3.25);
+    h.frames(10, 8);
+    expect(h.t.tick().playoutTargetMs).toBe(12.5);
+    await h.t.flush();
+    const [first, second] = (h.posts[0].body.samples as { metrics: Record<string, number> }[]).map((s) => s.metrics);
+    expect(first).toMatchObject({ playout_target_ms: 0 });
+    expect(first).not.toHaveProperty("wt_arrival_jitter_ms");
+    expect(second).toMatchObject({ playout_target_ms: 12.5, wt_arrival_jitter_ms: 3.25 });
+  });
+
+  it("posts audio dropouts cumulative once audio has been measured, and none before", async () => {
+    const h = harness();
+    h.frames(10, 16);
+    h.t.tick();
+    h.t.addAudioDropouts(0, 0); // audio is up and has dropped nothing
+    h.t.tick();
+    h.t.addAudioDropouts(960, 2);
+    h.t.tick();
+    h.t.addAudioDropouts(480, 1); // a reconnect's new player adds, it does not replace
+    expect(h.t.tick()).toMatchObject({ audioConcealedSamples: 1_440, audioConcealmentEvents: 3 });
+    await h.t.flush();
+    const metrics = (h.posts[0].body.samples as { metrics: Record<string, number> }[]).map((s) => s.metrics);
+    expect(metrics[0]).not.toHaveProperty("audio_concealed_samples");
+    expect(metrics.map((m) => m.audio_concealed_samples)).toEqual([undefined, 0, 960, 1_440]);
+    expect(metrics.map((m) => m.audio_concealment_events)).toEqual([undefined, 0, 2, 3]);
+  });
+
+  it("counts long frames and present rate by the one definition WebRTC uses", () => {
+    // Bursty submit times, as a decoder gives after a late frame: two quick frames and a gap.
+    const h = harness();
+    h.t.presented(0);
+    const gaps = [8, 8, 8, 8, 2, 2, 8, 8, 30, 8, 8, 8, 2, 2, 8, 30, 8, 8, 8, 8];
+    for (const g of gaps) h.frames(1, g);
+    const snap = h.t.tick();
+    const reference = summarizePresentWindow(gaps, null, 60);
+    expect(snap.presentCadence).toEqual(reference);
+    expect(reference.longFrames).toBe(2);
   });
 
   it("opens its first window when the ticks start, not when it was made", () => {
