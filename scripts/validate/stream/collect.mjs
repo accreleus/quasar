@@ -227,7 +227,14 @@ function sessionRow(s, never) {
   for (const k of ["state", "app_id", "host_id", "profile_id", "transport", "negotiated_codec", "pyrowave"]) {
     if (s[k] !== undefined) row[k] = s[k];
   }
-  if (never) for (const k of ["failure_code", "error_message"]) if (s[k] != null) row[k] = s[k];
+  // Why it never started, as far as a file may say it: the failure CODE when it is one (an
+  // identifier), and only the fact that a message exists. The message is free text the agent
+  // wrote (a pull error can spell out a registry credential), and no pattern finds every
+  // credential in free text, so it is not copied: read it from the stack.
+  if (never) {
+    if (typeof s.failure_code === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(s.failure_code)) row.failure_code = s.failure_code;
+    row.has_error_message = typeof s.error_message === "string" && s.error_message !== "";
+  }
   if (num(st.width) && num(st.height)) row.launch = [st.width, st.height];
   for (const k of ["fps", "bitrate_kbps", "codec", "external_resize_supported"]) if (st[k] != null) row[k] = st[k];
   row.rungs = st.rungs.map(([w, h]) => [w, h]);

@@ -1070,7 +1070,9 @@ test("S6 a session that never started is collected: its row, its conditions and 
   assert.ok(!r.f.paths().some((p) => p.includes("/diagnostic-bundle") || p.includes("/trace/") || p.endsWith("/metrics")), "no trace was asked for");
   const session = readJson(dir, `${SC}/session.json`);
   assert.equal(session.failure_code, "launch_failed");
-  assert.match(session.error_message, /mounts/);
+  assert.equal(session.error_message, undefined, "the free-text message is never copied");
+  assert.equal(session.has_error_message, true);
+  assert.doesNotMatch(read(dir, `${SC}/session.json`), /mounts/);
   assert.equal(session.started_at_ms, undefined);
   assert.doesNotMatch(read(dir, `${SC}/session.json`), /app_log_tail|abc123456/);
   assert.ok(readJson(dir, `${SC}/conditions.json`).effective);
@@ -1131,14 +1133,22 @@ test("A17 a derived-window kind named like an object member folds like any other
   }
 });
 
-test("A18 a credential spelled out in a failure message never reaches session.json", async () => {
-  for (const field of ["failure_code", "error_message"]) {
-    const dir = clientBundle();
-    const r = await run(dir, world({ start: null, rowExtra: { state: "failed", failure_code: "launch_failed", error_message: "pull failed", [field]: "pull failed: authorization=credential-value-1234 Bearer abc123def456" } }));
-    assert.equal(r.complete, true);
-    const text = read(dir, `${SC}/session.json`);
-    assert.doesNotMatch(text, /credential-value-1234|abc123def456/, field);
-    assert.match(text, /pull failed: \[redacted\]/, "the words around it are kept");
+test("A18 a failure's free text is never copied: no credential shape in it can reach session.json", async () => {
+  // Every shape the reviews found, and one no pattern would find: none is in the file,
+  // because the message is not copied and a failure code that is not a code is not either.
+  const shapes = ["authorization=credential-value-1234", "Authorization: Basic dXNlcjpwYXNz", "Set-Cookie: a=b", "Bearer abc123def456", "hunter2 is the registry password"];
+  for (const text of shapes) {
+    for (const field of ["failure_code", "error_message"]) {
+      const dir = clientBundle();
+      const r = await run(dir, world({ start: null, rowExtra: { state: "failed", failure_code: "launch_failed", error_message: "pull failed", [field]: `pull failed: ${text}` } }));
+      assert.equal(r.complete, true);
+      assert.deepEqual(r.problems, []);
+      const file = read(dir, `${SC}/session.json`);
+      assert.doesNotMatch(file, /credential-value-1234|dXNlcjpwYXNz|a=b|abc123def456|hunter2|pull failed/, `${field}: ${text}`);
+      const session = JSON.parse(file);
+      assert.equal(session.has_error_message, true);
+      assert.equal(session.failure_code, field === "failure_code" ? undefined : "launch_failed");
+    }
   }
 });
 
