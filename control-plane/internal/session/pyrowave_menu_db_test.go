@@ -5,6 +5,7 @@ package session
 // The DB cases need Postgres (make test-db).
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -63,7 +64,10 @@ func pyrowaveMenu(t *testing.T, c pwMenuCase) map[string]any {
 	if c.instanceDefault != "" {
 		must(t, exec(t, pool, `INSERT INTO instance_settings (id, default_transport) VALUES (true, $1)
 			ON CONFLICT (id) DO UPDATE SET default_transport = EXCLUDED.default_transport`, c.instanceDefault))
-		t.Cleanup(func() { _, _ = pool.Exec(t.Context(), `UPDATE instance_settings SET default_transport = 'webrtc'`) })
+		// Not t.Context(): it is cancelled before cleanups run, and the setting would leak into the next test.
+		t.Cleanup(func() {
+			_, _ = pool.Exec(context.Background(), `UPDATE instance_settings SET default_transport = 'webrtc'`)
+		})
 	}
 	setGPUCodecsRaw(t, pool, s.hostID, 0, c.gpuCodecs)
 	if !c.noProbe {
