@@ -91,6 +91,7 @@ ephemeral test database) so parallel checkouts and agents never collide.
 | `scripts/release/release-cut.sh` (`make release VERSION=x.y.z`) | Cuts a release in one command (#109): moves `## Unreleased` into a dated section, commits + tags `vX.Y.Z` on `main`, pushes both — the push is what fires the tag-push lane above. `--dry-run` previews; `--transform` is the pure changelog rewrite (fixture-testable, no git) |
 | `scripts/harness/lib/harness.sh` (+ `harness-selftest.sh`) | PASS/FAIL/SKIP/report core every `run-*.sh` harness builds on |
 | `scripts/validate/stream/bundle.mjs` | Says whether a directory is a valid run bundle of the end-to-end streaming test suite ([guide](testing-e2e-suite.md)) |
+| `scripts/validate/stream/collect.mjs` (`make e2e-collect`) | Completes a run bundle with its host half, by session id, through the admin API — the diagnostic bundle, the session row, the host's effective settings and both builds ([guide](testing-e2e-suite.md)) |
 | `scripts/validate/stream/review.mjs` (`make e2e-review BUNDLE=<dir>`) | Writes `review/summary.json` and `review/REVIEW.md` inside a run bundle: the derived result and counts, each scenario's failed and not-judged criteria as rows (passed ones on one line), the five worst one-second windows, the anomalies each rule can honestly report from `docs/session-trace/thresholds.json`, what was not recorded and why, and the evidence files for a scenario that did not pass ([guide](testing-e2e-suite.md)) |
 
 ### Where things live

@@ -3717,8 +3717,11 @@ fi
 # The end-to-end suite's run bundle (#1272): the fixture is valid, each rule has a bundle that breaks it.
 if command -v node >/dev/null 2>&1; then
   rc_of 0 "e2e:bundle-format" -- node --test "$ROOT/scripts/validate/stream/bundle.test.mjs"
+  # Its host half (#1274), driven against a fake API as an in-process fetch — no stack, no sockets.
+  rc_of 0 "e2e:collect" -- node --test "$ROOT/scripts/validate/stream/collect.test.mjs"
 else
   warn "e2e:bundle-format" "node not installed — SKIPPED"
+  warn "e2e:collect" "node not installed — SKIPPED"
 fi
 
 # The review an agent reads first (#1275): golden bytes, the same bytes twice, a

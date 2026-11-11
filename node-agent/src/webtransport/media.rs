@@ -116,6 +116,10 @@ struct State {
     /// client never sees two configurations under one `config_id` across a codec switch.
     next_id: u8,
     pyro: Option<Pyro>,
+    /// `codec.switched` payloads the runner has yet to report.
+    switches: Vec<serde_json::Value>,
+    /// The last switch reported was on to PyroWave.
+    on_pyrowave: bool,
     client: Option<Client>,
     next_client: u64,
     /// Skip delta units until a keyframe: a client joined, its queue overflowed, or the
@@ -231,8 +235,6 @@ pub(crate) struct Media {
     /// being the holder cannot slip an event in behind the release that ended it.
     hold: Mutex<Hold>,
     encoder: glib::WeakRef<gst::Element>,
-    /// Where `codec.switched` goes, and the session it names.
-    trace: Option<(crate::session::pipeline::TraceTx, String)>,
     rate: Option<super::Rate>,
 }
 
@@ -301,7 +303,6 @@ impl Media {
         encoder: &gst::Element,
         input: super::Input,
         audio: Arc<Audio>,
-        trace: Option<(crate::session::pipeline::TraceTx, String)>,
         rate: Option<super::Rate>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -310,7 +311,6 @@ impl Media {
             input,
             hold: Mutex::default(),
             encoder: encoder.downgrade(),
-            trace,
             rate,
         })
     }
@@ -392,35 +392,38 @@ impl Media {
         });
     }
 
-    /// `codec.switched` (agent-api.md, amendment 55).
+    /// `codec.switched` (agent-api.md, amendment 55), queued for [`Self::take_switched`].
+    /// Takes the held guard: a switch is queued under the same lock as the state change it
+    /// reports, so two paths cannot report their switches in the opposite order to the
+    /// changes they made.
     fn switched(
-        &self,
+        st: &mut State,
         from: Option<&str>,
         to: &str,
         reason: &str,
-        config_id: u8,
+        config_id: Option<u8>,
         kbps: Option<u32>,
     ) {
         tracing::info!(
             token = "webtransport-codec-switched",
-            "WebTransport codec {} -> {to} (reason {reason}, config {config_id})",
+            "codec {} -> {to} (reason {reason}, config {config_id:?})",
             from.unwrap_or("none")
         );
-        if let Some((tx, session_id)) = &self.trace {
-            tx.try_emit(
-                session_id.clone(),
-                crate::session::runner::TraceEvent {
-                    ts_unix_ms: SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_millis() as i64),
-                    event: "codec.switched",
-                    payload: serde_json::json!({
-                        "from": from, "to": to, "reason": reason,
-                        "config_id": config_id, "target_kbps": kbps,
-                    }),
-                },
-            );
+        st.on_pyrowave = to == "pyrowave";
+        st.switches.push(serde_json::json!({
+            "from": from, "to": to, "reason": reason,
+            "config_id": config_id, "target_kbps": kbps,
+        }));
+    }
+
+    /// The switches since the last call, for the runner's reliable lane, in order. None
+    /// before the session reported `running`: the control plane drops a trace event for a
+    /// session that is not (agent-api.md §session_trace_event), and a `hello` can come first.
+    pub(crate) fn take_switched(&self, running: bool) -> Vec<serde_json::Value> {
+        if !running {
+            return Vec::new();
         }
+        std::mem::take(&mut self.lock().switches)
     }
 
     /// A PyroWave client is attached: the encode branch has work.
@@ -522,12 +525,19 @@ impl Media {
         st.want_key = true;
         st.refused_keyframes = 0;
         let kbps = st.pyro.as_ref().map(|p| p.grant.target_kbps);
-        drop(st);
-        let audio = self.audio.attach(id);
         if let Some(reason) = reason {
             let kbps = (config.codec == "pyrowave").then_some(kbps).flatten();
-            self.switched(None, config.codec, reason, config.config_id, kbps);
+            Self::switched(
+                &mut st,
+                None,
+                config.codec,
+                reason,
+                Some(config.config_id),
+                kbps,
+            );
         }
+        drop(st);
+        let audio = self.audio.attach(id);
         match hold.holder {
             Holder::None => {}
             Holder::Wt(_) => self.release(&mut hold),
@@ -562,7 +572,20 @@ impl Media {
     /// True when a WebTransport client was displaced.
     pub(crate) fn webrtc_attached(&self, transport: u64) -> bool {
         let mut hold = self.hold();
-        let displaced = self.lock().client.take();
+        let displaced = {
+            let mut st = self.lock();
+            // Whether or not its WebTransport client is still attached (a fallback's has left).
+            let standard = st
+                .config
+                .as_ref()
+                .filter(|_| st.on_pyrowave)
+                .map(|c| c.codec);
+            let displaced = st.client.take();
+            if let Some(standard) = standard {
+                Self::switched(&mut st, Some("pyrowave"), standard, "webrtc", None, None);
+            }
+            displaced
+        };
         if let Some(old) = &displaced {
             let _ = old.gone.set(Gone::TakenOver);
         }
@@ -658,14 +681,15 @@ impl Media {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => st.client = None,
         }
-        drop(st);
-        self.switched(
+        Self::switched(
+            &mut st,
             Some("pyrowave"),
             config.codec,
             reason,
-            config.config_id,
+            Some(config.config_id),
             None,
         );
+        drop(st);
         self.keyframe();
     }
 
@@ -1215,7 +1239,6 @@ mod tests {
             input: crate::webtransport::tests::no_input(),
             hold: Mutex::default(),
             encoder: glib::WeakRef::new(),
-            trace: None,
             rate: None,
         });
         media.on_caps(&caps(1280, &avcc), "s");
@@ -1288,7 +1311,6 @@ mod tests {
                 &encoder,
                 crate::webtransport::tests::no_input(),
                 Audio::new(audio::Plan::default()),
-                None,
                 None,
             ),
             encoder,
@@ -1608,7 +1630,6 @@ mod tests {
             input: crate::webtransport::tests::no_input(),
             hold: Mutex::default(),
             encoder: glib::WeakRef::new(),
-            trace: None,
             rate: None,
         });
         media.on_caps(&streams::hevc_caps(640), "s");
@@ -1647,7 +1668,6 @@ mod tests {
             &parse,
             crate::webtransport::tests::no_input(),
             Audio::new(audio::Plan::default()),
-            None,
             None,
         );
         tap(&parse.static_pad("src").unwrap(), &media, "s");
@@ -1769,7 +1789,6 @@ mod tests {
             input: crate::webtransport::tests::no_input(),
             hold: Mutex::default(),
             encoder: glib::WeakRef::new(),
-            trace: None,
             rate: None,
         })
     }
@@ -1903,6 +1922,92 @@ mod tests {
             ["unit 1 pyrowave key"],
             "no standard unit or configuration reaches a PyroWave client"
         );
+    }
+
+    /// #1299: the client's `hello` comes while the session is `starting` (it retries from
+    /// the launch on), ahead of the runner's `running` report.
+    #[test]
+    fn a_switch_at_a_hello_before_running_is_reported_once_the_session_runs() {
+        let (media, _encoder, _) = granted();
+        let _client = media.attach(true, LAN).unwrap();
+        assert!(media.take_switched(false).is_empty(), "not before running");
+        let switched = media.take_switched(true);
+        assert_eq!(
+            switched,
+            [serde_json::json!({
+                "from": null, "to": "pyrowave", "reason": "launch",
+                "config_id": 1, "target_kbps": GRANT.target_kbps,
+            })]
+        );
+        assert!(media.take_switched(true).is_empty(), "reported once");
+    }
+
+    /// #1299: a switch is queued, and `on_pyrowave` set, under the guard of the change it
+    /// reports. `attach` (a hello) and `switch_off` (a fallback or an encoder error) race on
+    /// different threads; a switch queued after the guard was released could report the
+    /// opposite order to the changes. An observer takes the guard between the two and sees a
+    /// PyroWave client that `on_pyrowave` denies.
+    #[test]
+    fn a_pyrowave_client_is_never_visible_before_its_switch_is_recorded() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (media, _encoder, _) = granted();
+        let done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for _ in 0..20_000 {
+                    media.grant_pyrowave(GRANT, (320, 192, 60), true);
+                    if let Ok(a) = media.attach(true, LAN) {
+                        media.detach(a.id);
+                    }
+                }
+                done.store(true, Ordering::SeqCst);
+            });
+            s.spawn(|| {
+                while !done.load(Ordering::SeqCst) {
+                    media.switch_off(None, "client_decode_error");
+                }
+            });
+            s.spawn(|| {
+                while !done.load(Ordering::SeqCst) {
+                    let st = media.lock();
+                    assert!(
+                        st.client.as_ref().is_none_or(|c| c.pyrowave.is_none()) || st.on_pyrowave,
+                        "a PyroWave client is attached and no switch on to PyroWave is recorded"
+                    );
+                }
+            });
+        });
+        // Whichever way the race went, what was queued ends where the session ended.
+        let switches = media.take_switched(true);
+        let st = media.lock();
+        let last_on = switches.last().is_some_and(|v| v["to"] == "pyrowave");
+        assert_eq!(last_on, st.on_pyrowave);
+    }
+
+    /// #1215: a takeover displaces the PyroWave client; a fallback's client has already left.
+    #[test]
+    fn a_webrtc_peer_taking_a_pyrowave_session_is_a_switch_off_that_keeps_it_wanting() {
+        for fallback in [false, true] {
+            let (media, _encoder, _) = granted();
+            let client = media.attach(true, LAN).unwrap();
+            if fallback {
+                media.detach(client.id);
+            }
+            media.take_switched(true);
+            media.webrtc_attached(7);
+            assert_eq!(
+                media.take_switched(true),
+                [serde_json::json!({
+                    "from": "pyrowave", "to": "h264", "reason": "webrtc",
+                    "config_id": null, "target_kbps": null,
+                })],
+                "fallback: {fallback}"
+            );
+            media.webrtc_attached(8);
+            assert!(media.take_switched(true).is_empty(), "said once");
+            let back = media.attach(true, LAN).unwrap();
+            assert_eq!(back.reason, Some("reconnect"), "fallback: {fallback}");
+        }
     }
 
     #[test]

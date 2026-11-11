@@ -1214,8 +1214,10 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			// effective_media and diag.* persist synchronously: queue saturation
 			// must not erase the admin's only record of what ran, and a diag.*
 			// result is being polled on right now — a coalescing-queue drop
-			// would turn that poll into a timeout.
-			if m.Event == "session.effective_media" || strings.HasPrefix(m.Event, diagEventPrefix) {
+			// would turn that poll into a timeout. codec.switched is state, not
+			// telemetry (it moves Session.pyrowave): the queue keeps only the newest
+			// per session, so an "off" would erase the "on" that set `used`.
+			if m.Event == "session.effective_media" || m.Event == "codec.switched" || strings.HasPrefix(m.Event, diagEventPrefix) {
 				h.events.AgentTraceEvent(bg, hostID, m)
 			} else {
 				h.diagnostics.enqueue(diagnosticEvent{hostID: hostID, trace: &m})
