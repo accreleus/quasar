@@ -26,7 +26,18 @@ echo "debs restored from cache: $(find "$debs" -maxdepth 1 -name '*.deb' | wc -l
 [ -s "$list" ] || { echo "ci-apt-install: missing or empty package list: $list" >&2; exit 2; }
 mapfile -t packages < <(grep -v -e '^#' -e '^$' "$list")
 [ "${#packages[@]}" -gt 0 ] || { echo "ci-apt-install: $list names no packages" >&2; exit 2; }
-sudo timeout 120 apt-get update
+# The runner's first mirror can stop answering altogether (2026-11-11: every index timed out,
+# so the 120 s bound ended the step before apt reached the list's next mirror). Drop it and
+# let the next one serve; with none left, use the archive itself.
+if ! sudo timeout 120 apt-get update; then
+  echo "ci-apt-install: apt-get update did not finish; retrying without the runner's first mirror"
+  mirrors=/etc/apt/apt-mirrors.txt
+  if [ -f "$mirrors" ]; then
+    sudo sed -i '/azure\.archive\.ubuntu\.com/d' "$mirrors"
+    grep -q '[^[:space:]]' "$mirrors" || echo 'http://archive.ubuntu.com/ubuntu/' | sudo tee "$mirrors" >/dev/null
+  fi
+  sudo timeout 180 apt-get update
+fi
 for attempt in 1 2 3; do
   sudo timeout 180 apt-get install -y --no-install-recommends --download-only "${packages[@]}" && break
   [ "$attempt" -lt 3 ] || { echo "ci-apt-install: download still stalled after $attempt attempts" >&2; exit 1; }
