@@ -28,11 +28,31 @@ import { SECRETS, SOURCES, isCredentialName, manifestKeys, validateBundle } from
 
 export const EXIT = { ok: 0, invalid: 1, error: 2, incomplete: 3 };
 
+// ── the shapes a projected value may have ───────────────────────────────────
+// Every string the collector itself takes from an answer into session.json, conditions.json,
+// host-half.json or builds.json passes the shape for its own field, or it is not written and is
+// counted in host-half.json's not_projected: the collector never copies free text. These are
+// field shapes, not patterns that hunt for a credential.
+const IDENT = /^[A-Za-z0-9_.-]{1,64}$/; // a name: a state, a transport, a codec, a settings key
+// A failure code the agent chose: snake_case, its first word letters only, at most 64 characters
+// (a credential's hex token matches neither part).
+const CODE = /^(?=.{1,64}$)[a-z]+(_[a-z0-9]+){0,7}$/;
+const VERSION = /^[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}$/; // a build's version
+const COMMIT = /^[0-9a-f]{7,40}$/i; // a build's commit
+// A host setting's value. A path holds a "/" and free text a space: neither matches, and neither
+// belongs in a bundle.
+const SETTING = /^[A-Za-z0-9_.:+-]{1,64}$/;
 // A session or host id is a UUID, and nothing else. A bundle may come from another
 // machine: a value from it goes into an admin-authenticated request path and into a
 // write path, so anything that is not this shape is refused before it is used.
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isId = (v) => typeof v === "string" && UUID.test(v);
+const fits = (re, v) => typeof v === "string" && re.test(v);
+/** A time as ISO, or null when the text is not one: what is written back is never the answer's own text. */
+const isoTime = (v) => {
+  const ms = typeof v === "string" ? Date.parse(v) : NaN;
+  return Number.isNaN(ms) ? null : new Date(ms).toISOString();
+};
 const clip = (v) => (typeof v === "string" ? v.slice(0, 80) : String(v).slice(0, 80));
 
 // The same rule bundle.mjs applies when it reads a bundle back: an address is four
@@ -208,35 +228,95 @@ const CONDITION_ALIAS = {
 };
 const flag = (v) => (String(v).toLowerCase() === "true" ? "on" : String(v).toLowerCase() === "false" ? "off" : String(v));
 
-function conditions(effective) {
+// A key that is not a name is not written; a value is written only in a setting value's shape, so
+// a host path or free text becomes "[omitted]". Both are counted once per answer value left out
+// (an alias repeats the same value and is not a second one).
+function conditions(effective, note) {
   if (effective === null) return { unknown: { effective: "the host has not reported its effective settings" } };
   const projected = Object.create(null);
   for (const k of Object.keys(effective).sort()) {
-    projected[k] = flag(effective[k]);
-    if (CONDITION_ALIAS[k]) projected[CONDITION_ALIAS[k]] = flag(effective[k]);
+    if (!fits(IDENT, k)) {
+      note("conditions");
+      continue;
+    }
+    const value = flag(effective[k]);
+    const shown = fits(SETTING, value) ? value : "[omitted]";
+    if (shown === "[omitted]") note("conditions");
+    projected[k] = shown;
+    if (CONDITION_ALIAS[k]) projected[CONDITION_ALIAS[k]] = shown;
   }
   return { effective: projected };
+}
+
+// The members of sessionResp's pyrowave (session.PyroWaveRecord,
+// control-plane/internal/session/pyrowave_plan.go:47-57) and the type each is written as. Nothing
+// else from the answer is projected: a member not named here, and a nested object or array, is
+// left out and counted. A string member is written only in a name's shape.
+const PYROWAVE = {
+  allowed: "boolean",
+  wanted: "boolean",
+  active: "boolean",
+  used: "boolean",
+  target_kbps: "number",
+  reason: "string",
+  choice: "string",
+  auto_reason: "string",
+  switch_reason: "string",
+};
+
+/** The answer's pyrowave record, member by member in its own type; undefined when it holds none. */
+function pyrowave(o, note) {
+  if (o == null) return undefined;
+  const out = {};
+  for (const [k, type] of Object.entries(PYROWAVE)) {
+    const v = o[k];
+    if (v === undefined) continue;
+    // The Go field is a pointer: null is "the answer held none", and no text at all.
+    if (v === null) out[k] = null;
+    else if (type === "string" ? fits(IDENT, v) : type === "number" ? num(v) : typeof v === "boolean") out[k] = v;
+    else note("session");
+  }
+  for (const k of Object.keys(o)) if (!(k in PYROWAVE) && o[k] != null) note("session");
+  return out;
 }
 
 // The `session.json` shape scripts/dx/bench_submit.py reads (session_soak_driver.py builds the
 // same record from GET /v1/sessions/{id}), plus the fields the 0.6 parity gate compares,
 // named as the session row names them. A session that never started keeps its failure.
-function sessionRow(s, never) {
+// Each field from the answer is written only in its own shape; the rest is left out and counted.
+function sessionRow(s, never, note) {
   const st = s.stream;
   const row = { kind: "session", id: s.id };
-  for (const k of ["state", "app_id", "host_id", "profile_id", "transport", "negotiated_codec", "pyrowave"]) {
-    if (s[k] !== undefined) row[k] = s[k];
+  for (const k of ["state", "profile_id", "transport", "negotiated_codec"]) {
+    if (s[k] === undefined) continue;
+    if (s[k] === null || fits(IDENT, s[k])) row[k] = s[k];
+    else note("session");
   }
-  // Why it never started, as far as a file may say it: the failure CODE when it is one (an
-  // identifier), and only the fact that a message exists. The message is free text the agent
-  // wrote (a pull error can spell out a registry credential), and no pattern finds every
-  // credential in free text, so it is not copied: read it from the stack.
+  if (s.app_id !== undefined) {
+    if (s.app_id === null || isId(s.app_id)) row.app_id = s.app_id;
+    else note("session");
+  }
+  row.host_id = s.host_id; // a UUID: fetchSession refused anything else before this
+  const pw = pyrowave(s.pyrowave, note);
+  if (pw !== undefined) row.pyrowave = pw;
+  // Why it never started, as far as a file may say it: the failure CODE when it has a code's shape
+  // (snake_case, letters first, so a credential's hex token is no code), and only the fact that a
+  // message exists. The message is free text the agent wrote (a pull error can spell out a
+  // registry credential), and no pattern finds every credential in free text, so it is not
+  // copied: read it from the stack.
   if (never) {
-    if (typeof s.failure_code === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(s.failure_code)) row.failure_code = s.failure_code;
+    if (s.failure_code != null) {
+      if (fits(CODE, s.failure_code)) row.failure_code = s.failure_code;
+      else note("session");
+    }
     row.has_error_message = typeof s.error_message === "string" && s.error_message !== "";
   }
   if (num(st.width) && num(st.height)) row.launch = [st.width, st.height];
-  for (const k of ["fps", "bitrate_kbps", "codec", "external_resize_supported"]) if (st[k] != null) row[k] = st[k];
+  for (const k of ["fps", "bitrate_kbps", "external_resize_supported"]) if (st[k] != null) row[k] = st[k];
+  if (st.codec != null) {
+    if (fits(IDENT, st.codec)) row.codec = st.codec;
+    else note("session");
+  }
   row.rungs = st.rungs.map(([w, h]) => [w, h]);
   const start = Date.parse(s.started_at ?? "");
   const end = Date.parse(s.ended_at ?? "");
@@ -248,11 +328,19 @@ function sessionRow(s, never) {
   return row;
 }
 
-/** built_at/commit/version as the answer holds them (in key order, so two reads compare as text); null when it holds none ("not read"). */
-function identity(o, versionKey) {
+/**
+ * A build identity as the answer holds it (in key order, so two reads compare as text); null when
+ * it holds no field ("not read"). A field is written only in its own shape, a build time only as
+ * ISO, and anything else is left out and counted.
+ */
+function identity(o, versionKey, note) {
   const out = {};
   for (const [to, from] of [["built_at", "built_at"], ["commit", "source_commit"], ["version", versionKey]]) {
-    if (typeof o[from] === "string" && o[from]) out[to] = o[from];
+    const v = o[from];
+    if (v == null) continue; // null is the answer holding none, which is "not read", not a rejection
+    const ok = to === "built_at" ? isoTime(v) : fits(to === "commit" ? COMMIT : VERSION, v) ? v : null;
+    if (ok) out[to] = ok;
+    else note("identity");
   }
   return Object.keys(out).length ? out : null;
 }
@@ -321,8 +409,9 @@ const isData = (e) => !e.type.startsWith("diag.");
 // Routes and shapes are the handlers': diagnostic_handler.go (resolveWindow,
 // handleDiagnosticBundle, handleAdminTelemetryRead), metrics_handler.go (handleAdminMetrics),
 // handler.go (handleGet, sessionResp), crud/handler.go (handleGetHost), hostcfg/handler.go
-// (handleGet) and platform/handler.go (handleIdentity).
-async function fetchSession(get, id, now) {
+// (handleGet) and platform/handler.go (handleIdentity). `note` counts what the projection into a
+// file had to leave out.
+async function fetchSession(get, id, now, note) {
   const sid = encodeURIComponent(id);
   const ok = async (route) => {
     const where = route.split("?")[0];
@@ -438,7 +527,7 @@ async function fetchSession(get, id, now) {
   const host = (await ok(`/v1/hosts/${hid}`)).host;
   need(isObj(host), "the host row is not an object");
 
-  return { id, row: s, never, from, to, reads, samples, effective: settings.effective, agent: identity(host, "agent_version") };
+  return { id, row: s, never, from, to, reads, samples, effective: settings.effective, agent: identity(host, "agent_version", note) };
 }
 
 // A name from an answer goes into a file only if it is a plain identifier and not a credential's
@@ -651,12 +740,19 @@ export async function collect(dir, { baseUrl, token, fetch: fetchFn = globalThis
   // platform/handler.go handleIdentity: { "identity": {...} }; read once, before any scenario is written
   let controlPlane = null;
   let cpReason = null;
+  // What the projection left out, counted per file and never echoed (neither the value nor its
+  // length). The platform identity is one read for the whole run, so its count rides in the first
+  // scenario this run collects; each scenario counts its own.
+  const cpLeftOut = { identity: 0 };
+  let cpCounted = false;
   const readCp = withSessions && (todo.length > 0 || (finishedBefore && manifest.halves?.host !== true));
   if (readCp) {
     try {
       const r = await get("/v1/admin/platform/identity");
       need(r.status === 200 && isObj(r.body?.identity), `GET /v1/admin/platform/identity answered HTTP ${r.status}`);
-      controlPlane = identity(r.body.identity, "version");
+      controlPlane = identity(r.body.identity, "version", () => {
+        cpLeftOut.identity += 1;
+      });
       need(controlPlane, "GET /v1/admin/platform/identity held no version, commit or build time");
     } catch (e) {
       if (!(e instanceof Unreadable)) throw e;
@@ -666,9 +762,13 @@ export async function collect(dir, { baseUrl, token, fetch: fetchFn = globalThis
 
   for (const p of todo) {
     const docs = [];
+    const leftOut = { session: 0, conditions: 0, identity: 0 };
+    const note = (file) => {
+      leftOut[file] += 1;
+    };
     let reason = null;
     try {
-      for (const id of p.ids) docs.push(await fetchSession(get, id, now));
+      for (const id of p.ids) docs.push(await fetchSession(get, id, now, note));
     } catch (e) {
       if (!(e instanceof Unreadable)) throw e;
       reason = `session ${p.ids[docs.length]}: ${e.message}`;
@@ -686,8 +786,8 @@ export async function collect(dir, { baseUrl, token, fetch: fetchFn = globalThis
     try {
       docs.forEach((d, i) => {
         const { out, metrics } = p.outs[i];
-        write(path.join(out, "session.json"), sessionRow(d.row, d.never));
-        write(path.join(out, "conditions.json"), conditions(d.effective));
+        write(path.join(out, "session.json"), sessionRow(d.row, d.never, note));
+        write(path.join(out, "conditions.json"), conditions(d.effective, note));
         if (d.never) return;
         write(path.join(out, "diagnostic-bundle.json"), foldDiagnostic(d.reads));
         const measured = d.reads.map((r) => r.diag.clock).find((c) => c.unmeasured !== true);
@@ -703,11 +803,16 @@ export async function collect(dir, { baseUrl, token, fetch: fetchFn = globalThis
       for (const [file, rows] of metricFiles) write(file, rows);
       const agents = new Set(docs.map((d) => JSON.stringify(d.agent)));
       const agent = agents.size === 1 ? JSON.parse([...agents][0]) : null;
+      if (!cpCounted) {
+        leftOut.identity += cpLeftOut.identity;
+        cpCounted = true;
+      }
       write(path.join(p.scDir, "host-half.json"), {
         collected: true,
         read_at_ms: readAt,
         node_agent: agent,
         ...(docs.every((d) => d.never) ? { trace: "the session never started" } : {}),
+        ...(leftOut.session || leftOut.conditions || leftOut.identity ? { not_projected: { ...leftOut } } : {}),
         ...dropped.fields(),
       });
       commit();

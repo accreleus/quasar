@@ -56,16 +56,21 @@ collected later than that has no trace: it is not an error and not an empty half
 `collected: false` with the reason "the trace is no longer kept". Debug captures (`diag.*`
 events) outlive the sweep and do not count as a trace. A live session over an hour has already
 lost its oldest telemetry. A session that **never started** (a launch failure: no `started_at`)
-is collected: its row (with `failure_code` when it is a code, and `has_error_message`; the message itself is free text and is not copied, read it on the stack), its conditions and the agent
-identity, no trace; `host-half.json` says `"trace": "the session never started"`.
+is collected: its row (with `failure_code` when the answer holds a snake_case code such as
+`app_exited_early`, and `has_error_message`; the message itself is free text and is not copied,
+read it on the stack), its conditions and the agent identity, no trace; `host-half.json` says
+`"trace": "the session never started"`.
 
 **What is and is not stripped.** Credential-named fields are dropped, the admin bearer and
 addresses are replaced wherever they appear, and free text an answer carries (an event's
 message) is passed through the validator's secret patterns. That last step is best effort: no
-pattern finds every credential in free text. So the one free-text field the collector would
-project itself, a failed session's error message, is not copied at all, and
-`scripts/dev/leak-scan.sh` with the operator's patterns still runs before a bundle goes anywhere
-public.
+pattern finds every credential in free text. So every string the collector projects itself into
+`session.json`, `conditions.json`, `host-half.json` and `builds.json` passes a shape check for
+its own field or is left out, and the count of what was left out is written in that scenario's
+`host-half.json` `not_projected` (`{"session": 2, "conditions": 1, "identity": 0}`, absent when
+nothing was); a failed session's message is never copied; a host path setting is written as
+`[omitted]`. `scripts/dev/leak-scan.sh` with the operator's patterns still runs before a bundle
+goes anywhere public.
 
 Exit codes, as they are:
 
@@ -99,7 +104,7 @@ build read is not retried by `RESUME=1`, only by collecting a fresh copy.
 | `<scenario>/conditions.json` | `effective`: the host's effective settings as read at collection, projected as `bench_run.sh`'s `flag()` does (a value that reads `true` or `false` in any case becomes `on`/`off`; the ladder aliases are added) |
 | `<scenario>/metrics.jsonl` | the session's raw samples (every key, string-valued ones too, at their own timestamps) **merged** with the client half's own rows: same source and `ts_unix_ms` is the same row, joined key by key, the client half's value winning a key both have; sorted by ts then source. A key the metric manifest lacks, or a source the format lacks, is dropped and listed in `host-half.json` |
 | `<scenario>/trace.json` | the session's stored trace events (as stored, not clock-aligned), merged with the client half's; a clock the client measured is kept when the server's is unmeasured. A second session's own events are in its `sessions/<id>/trace.json` |
-| `<scenario>/host-half.json` | `{ "collected": true, "read_at_ms": ..., "node_agent": ... }` (plus `metric_keys_not_in_manifest` and `sources_not_in_bundle` when something was dropped: a name is listed only if it is a plain identifier, any other is counted in `other_dropped`; `"trace": "the session never started"` for a launch failure), or `collected: false` with the `reason` |
+| `<scenario>/host-half.json` | `{ "collected": true, "read_at_ms": ..., "node_agent": ... }` (plus `metric_keys_not_in_manifest` and `sources_not_in_bundle` when something was dropped: a name is listed only if it is a plain identifier, any other is counted in `other_dropped`; `"trace": "the session never started"` for a launch failure; `not_projected` when a projected value had the wrong shape and was left out), or `collected: false` with the `reason` |
 | `builds.json` | `components.control_plane` from `GET /v1/admin/platform/identity`, `components.node_agent` from the host row's `agent_version`/`source_commit`/`built_at` (`GET /v1/hosts/{id}`, which answers `{"host": ...}`); a build that cannot be read is `null` with its reason in `unknown`, replacing whatever the client half held; every other component is left as the client half wrote it |
 | `manifest.json` | `halves.host: true`, only when every scenario is collected |
 

@@ -290,10 +290,11 @@ test("a client-only bundle comes out complete and valid", async () => {
   assert.ok(readJson(dir, `${SC}/diagnostic-bundle.json`).series["encoder.fps"], "the diagnostic bundle is kept as the artifact");
 
   const builds = readJson(dir, "builds.json");
-  assert.deepEqual(builds.components.control_plane, { version: "0.6.1-dev", commit: "f00dfeed", built_at: "2026-11-10T08:00:00Z" });
-  assert.deepEqual(builds.components.node_agent, { version: "0.6.1-dev", commit: "abc1234", built_at: "2026-11-10T09:00:00Z" });
+  assert.deepEqual(builds.components.control_plane, { version: "0.6.1-dev", commit: "f00dfeed", built_at: "2026-11-10T08:00:00.000Z" });
+  assert.deepEqual(builds.components.node_agent, { version: "0.6.1-dev", commit: "abc1234", built_at: "2026-11-10T09:00:00.000Z" });
   assert.equal(builds.components.reference_app.version, "767e2ad", "the client half's builds are untouched");
   assert.ok(builds.unknown.web, "their unknown reasons are untouched");
+  assert.equal(readJson(dir, `${SC}/host-half.json`).not_projected, undefined, "a normal answer leaves nothing out");
 });
 
 test("S1 metrics.jsonl is built from the raw samples: every key, strings too, original timestamps", async () => {
@@ -1170,4 +1171,174 @@ test("A20 a file already at a temporary's name is left alone when the write fail
   await assert.rejects(run(dir), /EEXIST/);
   assert.equal(fs.readFileSync(planted, "utf8"), "pre-planted sentinel");
   assert.equal(treeHash(dir), before, "not one byte changed");
+});
+
+// ── round 5, seat A: the projection invariant ───────────────────────────────
+// Every string the collector itself projects into session.json, conditions.json, host-half.json or
+// builds.json passes the shape for its own field, or it is not written and is counted in
+// host-half.json's not_projected. Answers stored whole (diagnostic-bundle.json, the raw events in
+// trace.json) are the documented best-effort limit and are not this test's subject.
+const MARKER = "hunter2 is the registry password";
+
+// The marker (and the word a pattern would hunt for) is in no file of the bundle: the value is
+// left out, never echoed, and neither is its length.
+function assertMarkerNowhere(dir) {
+  for (const rel of walk(dir)) {
+    assert.ok(!read(dir, rel).includes(MARKER), `${rel} holds the marker`);
+    assert.ok(!read(dir, rel).includes("hunter2"), `${rel} holds the marker's word`);
+  }
+}
+
+test("A22 session.json: every projected string passes its own field's shape; the rest is counted", async () => {
+  const dir = clientBundle();
+  const w = world({
+    tweak: (route, body) =>
+      route === `/v1/sessions/${SID}`
+        ? [
+            200,
+            {
+              session: {
+                ...body[1].session,
+                state: MARKER,
+                app_id: MARKER,
+                profile_id: MARKER,
+                transport: MARKER,
+                negotiated_codec: MARKER,
+                stream: { ...body[1].session.stream, codec: MARKER },
+                pyrowave: {
+                  allowed: true,
+                  reason: MARKER,
+                  wanted: false,
+                  choice: MARKER,
+                  auto_reason: MARKER,
+                  active: false,
+                  used: false,
+                  target_kbps: 900,
+                  switch_reason: MARKER,
+                  extra_member: MARKER, // a member PyroWaveRecord does not have
+                  nested: { reason: MARKER }, // an object, never a member
+                },
+              },
+            },
+          ]
+        : undefined,
+  });
+  const r = await run(dir, w);
+  assert.equal(r.complete, true);
+  assert.deepEqual(r.problems, []);
+  assert.deepEqual(r.incomplete, []);
+
+  const session = readJson(dir, `${SC}/session.json`);
+  for (const k of ["state", "app_id", "profile_id", "transport", "negotiated_codec", "codec"]) {
+    assert.equal(session[k], undefined, `${k} is not written`);
+  }
+  assert.deepEqual(
+    session.pyrowave,
+    { allowed: true, wanted: false, active: false, used: false, target_kbps: 900 },
+    "only PyroWaveRecord's own members, each in its own type",
+  );
+  // The well-shaped fields of the same answer are still written.
+  assert.equal(session.host_id, HOST_ID);
+  assert.deepEqual(session.launch, [1920, 1080]);
+  assert.equal(session.fps, 60);
+  assert.deepEqual(session.rungs, [[1920, 1080], [1280, 720]]);
+  assert.equal(session.started_at_ms, T_START);
+  assertMarkerNowhere(dir);
+  assert.deepEqual(readJson(dir, `${SC}/host-half.json`).not_projected, { session: 12, conditions: 0, identity: 0 });
+});
+
+test("A22 conditions.json: a host path and free text are [omitted]; a key that is not a name is left out", async () => {
+  const dir = clientBundle();
+  const w = world({
+    effective: {
+      abr_mode: "smooth",
+      abr_ladder_resolution: "true",
+      abr_floor_kbps: "4000",
+      home_root: "/srv/quasar-home", // a host path: a "/" is no setting value's shape
+      note: MARKER, // free text: a space is not either
+      "a key": "1", // not a name, so not a key
+    },
+  });
+  const r = await run(dir, w);
+  assert.equal(r.complete, true);
+  assert.deepEqual(r.problems, []);
+
+  const { effective } = readJson(dir, `${SC}/conditions.json`);
+  assert.equal(effective.home_root, "[omitted]", "a host path is not copied");
+  assert.equal(effective.note, "[omitted]");
+  assert.ok(!("a key" in effective));
+  // The well-shaped settings of the same answer are still written, alias included.
+  assert.equal(effective.abr_mode, "smooth");
+  assert.equal(effective.abr_floor_kbps, "4000");
+  assert.equal(effective.abr_ladder_resolution, "on");
+  assert.equal(effective.ladder_resolution, "on", "the alias carries the same value, and is not a second omission");
+  assertMarkerNowhere(dir);
+  assert.deepEqual(readJson(dir, `${SC}/host-half.json`).not_projected, { session: 0, conditions: 3, identity: 0 });
+});
+
+test("A22 host-half.json and builds.json: a build's version, commit and time are written only in their own shapes", async () => {
+  const dir = clientBundle();
+  const w = world({
+    host: { id: HOST_ID, node_name: "lab-gpu-host", agent_version: MARKER, source_commit: MARKER, built_at: MARKER },
+    identity: { version: MARKER, source_commit: MARKER, built_at: MARKER },
+  });
+  const r = await run(dir, w);
+  assert.equal(r.complete, true);
+  assert.deepEqual(r.problems, []);
+
+  const half = readJson(dir, `${SC}/host-half.json`);
+  assert.equal(half.collected, true);
+  assert.equal(half.node_agent, null, "an identity left with no field is not read");
+  const builds = readJson(dir, "builds.json");
+  assert.equal(builds.components.node_agent, null);
+  assert.equal(builds.components.control_plane, null);
+  assert.ok(builds.unknown.node_agent);
+  assert.ok(builds.unknown.control_plane);
+  assertMarkerNowhere(dir);
+  // Three fields on the host row and three on the platform identity: one count per value.
+  assert.deepEqual(half.not_projected, { session: 0, conditions: 0, identity: 6 });
+});
+
+test("A22 a normal answer leaves nothing out: PyroWaveRecord member for member, and no not_projected", async () => {
+  const dir = clientBundle();
+  const r = await run(dir);
+  assert.equal(r.complete, true);
+  const session = readJson(dir, `${SC}/session.json`);
+  assert.deepEqual(
+    session.pyrowave,
+    { allowed: true, reason: null, wanted: false, choice: null, auto_reason: null, active: false, used: false, target_kbps: null, switch_reason: null },
+    "a null member is the answer holding none, and is written as null, not counted",
+  );
+  assert.equal(session.state, "stopped");
+  assert.equal(session.app_id, "99999999-8888-7777-6666-555555555555");
+  assert.equal(session.profile_id, "1080p60-h264");
+  const { effective } = readJson(dir, `${SC}/conditions.json`);
+  assert.equal(Object.values(effective).filter((v) => v === "[omitted]").length, 0);
+  assert.equal(readJson(dir, `${SC}/host-half.json`).not_projected, undefined);
+  assert.equal(readJson(dir, "builds.json").components.node_agent.version, "0.6.1-dev");
+});
+
+test("A23 a failure code is written in a code's shape, and a credential's hex token is no code", async () => {
+  const token = "0123456789abcdef0123456789abcdef01234567";
+  for (const [code, kept] of [
+    [token, false],
+    ["launch_failed", true],
+    ["app_exited_early", true],
+  ]) {
+    const dir = clientBundle();
+    const r = await run(dir, world({ start: null, rowExtra: { state: "failed", failure_code: code, error_message: `pull failed: ${MARKER}` } }));
+    assert.equal(r.complete, true, code);
+    assert.deepEqual(r.problems, [], code);
+    const session = readJson(dir, `${SC}/session.json`);
+    assert.equal(session.failure_code, kept ? code : undefined, code);
+    assert.equal(session.has_error_message, true, code);
+    assert.equal(session.error_message, undefined, "the message is never copied");
+    assertMarkerNowhere(dir);
+    if (!kept) assert.ok(!read(dir, `${SC}/host-half.json`).includes(token), "not even counted as text");
+    assert.deepEqual(
+      readJson(dir, `${SC}/host-half.json`).not_projected,
+      kept ? undefined : { session: 1, conditions: 0, identity: 0 },
+      code,
+    );
+  }
 });
