@@ -11,7 +11,7 @@ import {
 import type { InputMsg } from "../input/inputSender";
 import type { Presenter } from "./presenter";
 import { TransportError, type MediaSink, type MediaTransport, type TransportEnd } from "./transport";
-import { createWebTransportRuntime, MEDIA_SILENCE_MS, type WebTransportRuntimeDeps } from "../pages/app/webTransportRuntime";
+import { createWebTransportRuntime as createRuntime, MEDIA_SILENCE_MS, type WebTransportRuntimeDeps } from "../pages/app/webTransportRuntime";
 import type { BenchDeps } from "../bench/benchController";
 import { mintTransportToken } from "../api/library";
 import {
@@ -31,10 +31,19 @@ import {
 import { parseVideoDatagram } from "./framing";
 import { FEC_HOLD_MS } from "./reassembly";
 
+/** Every runtime a test builds: one left running ticks after the test's `document` is gone. */
+const live: ReturnType<typeof createRuntime>[] = [];
+const createWebTransportRuntime: typeof createRuntime = (cfg) => {
+  const rt = createRuntime(cfg);
+  live.push(rt);
+  return rt;
+};
+
 beforeEach(() => {
   vi.stubGlobal("EncodedVideoChunk", FakeChunk);
 });
 afterEach(() => {
+  for (const rt of live.splice(0)) rt.destroy();
   vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -961,6 +970,18 @@ describe("createWebTransportRuntime fallback", () => {
       await vi.advanceTimersByTimeAsync(SILENT);
       expect(agent.sent("hello")).toHaveLength(2);
       stall.mockRestore();
+      rt.destroy();
+    });
+
+    it("fires on a page whose ticks always run late: only each stall is excused", async () => {
+      const { agent, rt } = await streaming();
+      const real = performance.now.bind(performance);
+      const t0 = real();
+      // Every 1 s tick reads as 3 s apart.
+      const slow = vi.spyOn(performance, "now").mockImplementation(() => t0 + (real() - t0) * 3);
+      await vi.advanceTimersByTimeAsync(8_000);
+      expect(agent.sent("hello")).toHaveLength(2);
+      slow.mockRestore();
       rt.destroy();
     });
 

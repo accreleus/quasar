@@ -88,6 +88,22 @@ describe("Playout", () => {
     expect(shown).toEqual(a.map(([at]) => at));
   });
 
+  it("uses no timer on a clean link with ordinary sub-millisecond noise", () => {
+    let clock = 0;
+    let timers = 0;
+    let shown = 0;
+    const p = new Playout({ show: () => shown++, now: () => clock, setTimer: () => ++timers, clearTimer: () => {} });
+    p.setFps(120);
+    for (let i = 0; i < 600; i++) {
+      // The fastest frame first, so every later one is a little after its due time's base.
+      clock = 20 + i * FRAME_MS + (i === 0 ? 0 : 0.2 + 0.3 * Math.sin(i));
+      p.push(fakeFrame(), i * FRAME_MS * 1000);
+    }
+    expect(shown).toBe(600);
+    expect(timers).toBe(0);
+    expect(p.cushion()).toBe(0);
+  });
+
   it("gives a bumpy link fewer long frames than showing frames as they arrive, within a bound", () => {
     const a = stream(600, bumpy);
     const asArrived = a.map(([at]) => at);

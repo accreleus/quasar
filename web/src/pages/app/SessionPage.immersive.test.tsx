@@ -723,6 +723,18 @@ describe("SessionPage — capture after a WebTransport reconnect or fallback", (
     expect(playLayer()).not.toBeNull();
   });
 
+  it("a reconnect before the first reveal still owes Click to play outside full screen", async () => {
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    renderPage({ webtransport });
+    await advance(1_000);
+    await act(async () => wt.set!({ channelOpen: true }));
+    await act(async () => wt.set!({ channelOpen: false }));
+    await act(async () => wt.set!({ channelOpen: true, wsOpen: true, pcConnected: true, firstFrame: true }));
+    await advance(1_500);
+    expect(engageSpy).not.toHaveBeenCalled();
+    expect(playLayer()).not.toBeNull();
+  });
+
   it("a reload after a fallback is a first load: WebRTC from the start, behind Click to play", async () => {
     sessionStorage.setItem("quasar.wt-fallback.s1", "stream_lost");
     currentSession = makeSession({ state: "running", state_detail: "app presented" });

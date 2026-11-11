@@ -19,6 +19,8 @@ const MAX_QUEUED = 6;
 /** The fastest-path delay creeps up this much per frame, so clock drift cannot pin it low
  *  (shortcut: a permanent step up in path delay is followed only at this rate). */
 const BASE_CREEP_MS = 0.002;
+/** A frame due within this is shown now: a timer cannot land closer, and would only add its own jitter. */
+const TIMER_SLACK_MS = 1;
 /** RFC 3550 jitter smoothing. */
 const JITTER_SMOOTHING = 16;
 
@@ -71,6 +73,8 @@ export class Playout {
     const arrival = this.now();
     const captureMs = captureUs / 1000;
     this.update(arrival, captureMs);
+    // No cushion, nothing waiting: shown on arrival, with no timer in the path (a clean link).
+    if (this.cushionMs === 0 && this.queue.length === 0) return this.opts.show(frame, captureUs);
     this.queue.push({ frame, captureUs, dueMs: captureMs + (this.baseMs ?? 0) + this.cushionMs });
     while (this.queue.length > MAX_QUEUED) this.queue.shift()?.frame.close();
     this.pump();
@@ -112,7 +116,7 @@ export class Playout {
   private pump(): void {
     if (this.timer !== null) (this.opts.clearTimer ?? clearTimeout)(this.timer as never);
     this.timer = null;
-    const now = this.now();
+    const now = this.now() + TIMER_SLACK_MS;
     let newest = -1;
     for (let i = 0; i < this.queue.length; i++) if (this.queue[i].dueMs <= now) newest = i;
     if (newest >= 0) {

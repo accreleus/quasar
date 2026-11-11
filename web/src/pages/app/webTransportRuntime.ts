@@ -217,8 +217,9 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
 
   const tick = () => {
     // A late tick is a stalled page, not a silent connection: its datagrams are still queued.
+    // Only the stall itself is excused, or a page whose ticks always run late would never fire.
     const now = performance.now();
-    if (lastVideoAt !== null && now - lastTickAt > 2 * TELEMETRY_MS) lastVideoAt = now;
+    if (lastVideoAt !== null && now - lastTickAt > 2 * TELEMETRY_MS) lastVideoAt += now - lastTickAt - TELEMETRY_MS;
     lastTickAt = now;
     // A connection that is up and carries no media never ends by itself.
     if (
