@@ -1,7 +1,7 @@
 // Telemetry for a WebTransport session (#1035): the same stats series, clock row and
 // TelemetrySnapshot a WebRTC session produces (webrtc/telemetry.ts), measured where this
-// transport has the facts: the presenter's own present times, the bytes and frames the
-// runtime handles, and the control stream's ping/pong. There is no RTCPeerConnection to ask.
+// transport has the facts: the display frames the presenter's pictures land in, the bytes and
+// frames the runtime handles, and the control stream's ping/pong. There is no RTCPeerConnection to ask.
 
 import { median, percentile } from "../lib/stats";
 import { getOrCreateDeviceKey } from "../webrtc/capability";
@@ -31,6 +31,9 @@ export interface WtTelemetryOptions {
   nowEpochMs?: () => number;
   nowMs?: () => number;
   isHidden?: () => boolean;
+  /** Calls back once with the start time (ms, `performance.now()` timeline) of the next display
+   *  frame: `requestAnimationFrame`. A hidden tab never calls back. */
+  requestFrame?: (cb: (displayMs: number) => void) => void;
   deviceKey?: string;
   /** The page view's posted totals, carried into a WebRTC fallback. */
   counters?: PostedCounters;
@@ -49,8 +52,15 @@ export class WtTelemetry {
   private readonly nowEpochMs: () => number;
   private readonly nowMs: () => number;
   private readonly isHidden: () => boolean;
+  private readonly requestFrame: (cb: (displayMs: number) => void) => void;
   private readonly deviceKey: string;
 
+  /** A picture was submitted and the display frame it lands in has not started: one flag, so a
+   *  hidden tab (no frames) holds nothing and several submits in a frame are one displayed frame. */
+  private awaitingDisplay = false;
+  /** The cadence run: a display callback asked for before a break must not start the next run. */
+  private run = 0;
+  /** Start of the display frame the last picture landed in. */
   private lastPresentMs: number | null = null;
   private intervals: number[] = [];
   private framesInWindow = 0;
@@ -82,6 +92,7 @@ export class WtTelemetry {
     this.nowEpochMs = opts.nowEpochMs ?? (() => Date.now());
     this.nowMs = opts.nowMs ?? (() => performance.now());
     this.isHidden = opts.isHidden ?? (() => typeof document !== "undefined" && document.visibilityState === "hidden");
+    this.requestFrame = opts.requestFrame ?? ((cb) => (typeof requestAnimationFrame === "function" ? void requestAnimationFrame(cb) : cb(this.nowMs())));
     this.deviceKey = opts.deviceKey ?? getOrCreateDeviceKey();
     this.lastTickMs = this.nowMs();
     this.counters = opts.counters ?? newPostedCounters();
@@ -137,9 +148,10 @@ export class WtTelemetry {
   }
 
   /** Presenting stopped for a reason that is not a freeze (the tab was hidden, the transport
-   *  was replaced): the next frame starts a new run of intervals. */
+   *  was replaced): the next displayed frame starts a new run of intervals. */
   breakCadence(): void {
     this.lastPresentMs = null;
+    this.run += 1;
   }
 
   /** That unit's frame came out of the decoder. */
@@ -168,15 +180,19 @@ export class WtTelemetry {
   }
 
   /**
-   * A frame reached the presenter. `captureUs` is the agent's wall clock at encoder output; it is compared on
-   * the agent's clock, so a sample exists only once the offset is known.
+   * A frame was submitted to the presenter. `captureUs` is the agent's wall clock at encoder output; it is
+   * compared on the agent's clock, so a sample exists only once the offset is known. The frame and
+   * capture-to-present are counted at submission (the contract's meaning); the cadence is stamped at
+   * the display frame the picture lands in (`displayed`), as WebRTC's RVFC intervals are.
    */
   presented(captureUs: number): void {
-    const now = this.nowMs();
-    if (this.lastPresentMs !== null) this.intervals.push(now - this.lastPresentMs);
-    this.lastPresentMs = now;
     this.framesInWindow += 1;
     this.framesTotal += 1;
+    if (!this.awaitingDisplay) {
+      this.awaitingDisplay = true;
+      const run = this.run;
+      this.requestFrame((displayMs) => this.displayed(displayMs, run));
+    }
     const offset = this.clockOffsetMs();
     if (offset === null) return;
     const sample = this.nowEpochMs() + offset - captureUs / 1000;
@@ -184,6 +200,19 @@ export class WtTelemetry {
       this.g2g.push(sample);
       if (this.g2g.length > G2G_WINDOW) this.g2g.shift();
     }
+  }
+
+  /** A display frame started with a picture submitted before it: the pictures submitted since the
+   *  last display frame are one displayed frame (the later ones cover the earlier). */
+  private displayed(displayMs: number, run: number): void {
+    this.awaitingDisplay = false;
+    // Asked for before a break (a hidden tab runs no callback until it is shown; a reconnect): the
+    // wait for the first new picture is not an interval.
+    if (run !== this.run) return;
+    // A throttled background tab can still run a callback: its seconds-long gaps are not stalls.
+    if (this.isHidden()) return this.breakCadence();
+    if (this.lastPresentMs !== null) this.intervals.push(displayMs - this.lastPresentMs);
+    this.lastPresentMs = displayMs;
   }
 
   /** Closes one window (call once a second): the snapshot for the HUD, and one stats sample queued. */
