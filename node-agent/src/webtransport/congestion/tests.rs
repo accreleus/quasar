@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 use super::*;
+use crate::webtransport::tests::Captured;
 
 const SIZE: usize = 1148;
 const CEILING: f64 = 8000.0;
@@ -36,6 +37,8 @@ struct Sim {
     drift: f64,
     /// Every `n`th datagram is dropped on the way (0: none).
     drop_every: u32,
+    /// Datagrams the full bottleneck queue dropped.
+    queue_drops: u32,
     /// (`pkt_seq`, arrival on the agent's clock, or dropped), in send order.
     pending: VecDeque<(u32, Option<u64>)>,
     /// (seconds, estimate) after each message.
@@ -65,6 +68,7 @@ impl Sim {
             offset_us: 0,
             drift: 0.0,
             drop_every: 0,
+            queue_drops: 0,
             pending: VecDeque::new(),
             trace: Vec::new(),
         }
@@ -102,7 +106,9 @@ impl Sim {
                 .record(&d, self.start + Duration::from_micros(self.t), false);
             let backlog = self.free_at.saturating_sub(self.t) as f64 / service as f64 * SIZE as f64;
             let dropped = self.drop_every > 0 && self.seq.is_multiple_of(self.drop_every);
-            let arrival = (!dropped && backlog + SIZE as f64 <= self.queue_bytes).then(|| {
+            let full = backlog + SIZE as f64 > self.queue_bytes;
+            self.queue_drops += u32::from(full);
+            let arrival = (!dropped && !full).then(|| {
                 self.free_at = self.free_at.max(self.t) + service;
                 // One path, first in first out: a delay spike holds back what follows it.
                 self.last_arrival = self
@@ -349,19 +355,26 @@ fn feedback_silence_while_media_is_sent_decays_the_estimate() {
     let sent_until = s.t;
     // The agent keeps sending; nothing comes back.
     let mut fed_abr = Vec::new();
-    for step in 1..=30u64 {
-        s.t = sent_until + step * 100_000;
-        s.frame();
-        let at = s.start + Duration::from_micros(s.t);
-        if let Some(k) = s.est.on_tick(at, &s.log, RTT) {
-            fed_abr.push((step, k));
+    let lines = logged(|| {
+        for step in 1..=30u64 {
+            s.t = sent_until + step * 100_000;
+            s.frame();
+            let at = s.start + Duration::from_micros(s.t);
+            if let Some(k) = s.est.on_tick(at, &s.log, RTT) {
+                fed_abr.push((step, k));
+            }
         }
-    }
+    });
     assert_eq!(
         fed_abr.first().map(|&(step, _)| step),
         Some(7),
         "500 ms past the first unanswered send (step 1): {fed_abr:?}"
     );
+    let decays = lines
+        .iter()
+        .filter(|l| l.contains("cut=\"silence\""))
+        .count();
+    assert_eq!(decays, fed_abr.len(), "every decay is logged: {lines:?}");
     let e = s.est.estimate_kbps();
     // Step 30 is 2.4 s past that timeout: 0.8 every 500 ms.
     let decayed = fed * 0.8f64.powf(4.8);
@@ -623,4 +636,160 @@ fn a_link_that_drops_to_a_third_drives_the_estimate_down() {
     s.run(10.0);
     let mean = s.mean_after(16.0);
     assert!((2000.0..3300.0).contains(&mean), "mean {mean:.0}");
+}
+
+#[test]
+fn a_quiet_sender_follows_a_link_that_drops_below_its_content() {
+    // Content at 0.55 × the ceiling: under 80 % of the estimate, so no window is a
+    // throughput sample.
+    let mut s = Sim::new(15_000.0);
+    s.content_kbps = Box::new(|_| 0.55 * CEILING);
+    s.run(10.0);
+    assert_eq!(s.est.estimate_kbps(), CEILING);
+    s.cap_kbps = 3000.0;
+    s.run(1.0);
+    let e = s.est.estimate_kbps();
+    assert!(e <= 3000.0, "1 s after the drop: {e:.0}");
+    s.run(5.0);
+    assert_eq!(s.queue_drops, 0, "the bottleneck queue never filled");
+    let mean = s.mean_after(12.0);
+    assert!((2000.0..3300.0).contains(&mean), "mean {mean:.0}");
+}
+
+/// `n` video datagrams sent `gap_us` apart, and feedback that names them all as received
+/// a millisecond apart, except those `lost` says.
+fn busy_window(log: &mut SendLog, start: Instant, gap_us: u64, lost: fn(u16) -> bool) -> Feedback {
+    for seq in 0..200u32 {
+        let mut d = vec![0u8; SIZE];
+        d[1..5].copy_from_slice(&seq.to_le_bytes());
+        log.record(
+            &d,
+            start + Duration::from_micros(u64::from(seq) * gap_us),
+            false,
+        );
+    }
+    Feedback {
+        first_pkt_seq: 0,
+        ref_us: 0,
+        arrivals: (0..200u16)
+            .map(|i| if lost(i) { NOT_RECEIVED } else { i * 20 })
+            .collect(),
+    }
+}
+
+#[test]
+fn feedback_with_no_fresh_video_arrival_adds_no_throughput_sample() {
+    let start = Instant::now();
+    let mut log = SendLog::new(start);
+    let mut est = Estimator::new(CEILING, start);
+    // 9.2 Mbit/s sent: busy.
+    let fb = busy_window(&mut log, start, 1000, |_| false);
+    let at = start + Duration::from_millis(250);
+    est.on_feedback(&fb, &mut log, at, NO_QUIC);
+    assert_eq!(est.throughput.len(), 1);
+    // The range reported again, and a message naming only audio (never in the send log).
+    let audio = Feedback {
+        first_pkt_seq: 5000,
+        ref_us: 0,
+        arrivals: vec![0; 10],
+    };
+    for i in 1..=10 {
+        let at = at + Duration::from_millis(50 * i);
+        est.on_feedback(&fb, &mut log, at, NO_QUIC);
+        est.on_feedback(&audio, &mut log, at, NO_QUIC);
+    }
+    assert_eq!(est.throughput.len(), 1, "no fresh arrival, no sample");
+}
+
+#[test]
+fn datagrams_sent_in_one_instant_are_no_throughput_sample() {
+    let start = Instant::now();
+    let mut log = SendLog::new(start);
+    let mut est = Estimator::new(CEILING, start);
+    let fb = busy_window(&mut log, start, 0, |_| false);
+    est.on_feedback(&fb, &mut log, start + Duration::from_millis(250), NO_QUIC);
+    assert!(est.throughput.is_empty(), "no send rate, no sample");
+}
+
+#[test]
+fn a_busy_sender_under_heavy_loss_is_still_a_throughput_sample() {
+    let start = Instant::now();
+    let mut log = SendLog::new(start);
+    let mut est = Estimator::new(CEILING, start);
+    // 9.2 Mbit/s sent, 40 % lost: what arrived was sent at 5.5.
+    let fb = busy_window(&mut log, start, 1000, |i| i % 5 < 2);
+    est.on_feedback(&fb, &mut log, start + Duration::from_millis(250), NO_QUIC);
+    assert_eq!(est.throughput.len(), 1, "the lost datagrams were sent too");
+}
+
+/// The lines `run` logs at INFO and above, on this thread.
+fn logged(run: impl FnOnce()) -> Vec<String> {
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(captured.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        run();
+    });
+    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    logs.lines().map(String::from).collect()
+}
+
+#[test]
+fn a_bound_flipping_at_the_feedback_rate_is_logged_at_most_once_a_second() {
+    let start = Instant::now();
+    let mut log = SendLog::new(start);
+    let mut est = Estimator::new(CEILING, start);
+    est.delay_kbps = 3000.0;
+    est.settle();
+    let empty = Feedback {
+        first_pkt_seq: 0,
+        ref_us: 0,
+        arrivals: vec![],
+    };
+    // QUIC's cap alternates between 2880 and 3600 kbps around the delay bound, for 2 s.
+    let lines = logged(|| {
+        for i in 0..40u32 {
+            let path = QuicPath {
+                rtt: RTT,
+                cwnd_bytes: if i % 2 == 0 { 4800 } else { 6000 },
+                congestion_events: 1,
+            };
+            est.on_feedback(
+                &empty,
+                &mut log,
+                start + 50 * Duration::from_millis(i.into()),
+                path,
+            );
+        }
+    });
+    assert!((1..=3).contains(&lines.len()), "{} lines", lines.len());
+}
+
+#[test]
+fn each_quic_congestion_event_that_lowers_the_estimate_is_logged() {
+    let start = Instant::now();
+    let mut log = SendLog::new(start);
+    let mut est = Estimator::new(CEILING, start);
+    let empty = Feedback {
+        first_pkt_seq: 0,
+        ref_us: 0,
+        arrivals: vec![],
+    };
+    let lines = logged(|| {
+        for (events, cwnd) in [(1, 5000), (2, 4000), (3, 3000)] {
+            let path = QuicPath {
+                rtt: RTT,
+                cwnd_bytes: cwnd,
+                congestion_events: events,
+            };
+            let at = start + Duration::from_millis(50 * events);
+            est.on_feedback(&empty, &mut log, at, path);
+        }
+    });
+    let cuts = lines.iter().filter(|l| l.contains("cut=\"quic\"")).count();
+    assert_eq!(cuts, 3, "{lines:?}");
+    assert_eq!(est.estimate_kbps(), 1800.0);
 }
