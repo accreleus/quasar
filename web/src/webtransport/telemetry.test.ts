@@ -8,6 +8,9 @@ function harness(profileFps = 60) {
   const clock = { mono: 0, epoch: 1_000_000 };
   const posts: { url: string; body: Record<string, unknown> }[] = [];
   let hidden = false;
+  /** Callbacks waiting for the next display frame (requestAnimationFrame's queue). */
+  const rafQueue: ((displayMs: number) => void)[] = [];
+  let rafCalls = 0;
   const t = new WtTelemetry({
     sessionId: "s1",
     authToken: "tok",
@@ -16,6 +19,10 @@ function harness(profileFps = 60) {
     nowMs: () => clock.mono,
     nowEpochMs: () => clock.epoch,
     isHidden: () => hidden,
+    requestFrame: (cb) => {
+      rafCalls++;
+      rafQueue.push(cb);
+    },
     fetch: (async (url: string, init: RequestInit) => {
       posts.push({ url, body: JSON.parse(init.body as string) });
       return new Response("{}");
@@ -25,24 +32,28 @@ function harness(profileFps = 60) {
     clock.mono += ms;
     clock.epoch += ms;
   };
-  /** Presents `n` frames `gapMs` apart, each captured `ageMs` earlier on the AGENT's clock. */
+  /** A display frame starts at `displayMs`: what a browser does for requestAnimationFrame callbacks. */
+  const vsync = (displayMs: number) => rafQueue.splice(0).forEach((cb) => cb(displayMs));
+  /** Presents `n` frames `gapMs` apart, each captured `ageMs` earlier on the AGENT's clock, each in a display frame of its own. */
   const frames = (n: number, gapMs: number, ageMs = 0, agentAheadMs = 0) => {
     for (let i = 0; i < n; i++) {
       advance(gapMs);
       t.presented((clock.epoch + agentAheadMs - ageMs) * 1000);
+      vsync(clock.mono);
     }
   };
   /** Enough pongs for a stable estimate, from an agent whose clock is `aheadMs` ahead. */
   const sync = (aheadMs: number, rttMs = 4) => {
     for (let i = 0; i < MIN_CLOCK_SAMPLES; i++) t.pong(rttMs, clock.epoch + aheadMs - rttMs / 2);
   };
-  return { t, clock, posts, advance, frames, sync, hide: () => (hidden = true) };
+  return { t, clock, posts, advance, frames, vsync, sync, rafCalls: () => rafCalls, hide: () => (hidden = true), show: () => (hidden = false) };
 }
 
 describe("WtTelemetry", () => {
   it("reports fps, bitrate and the present cadence of one window", () => {
     const h = harness();
     h.t.presented(0);
+    h.vsync(h.clock.mono);
     h.frames(60, 1000 / 60);
     h.t.bytes(125_000);
     const snap = h.t.tick();
@@ -166,15 +177,94 @@ describe("WtTelemetry", () => {
   });
 
   it("counts long frames and present rate by the one definition WebRTC uses", () => {
-    // Bursty submit times, as a decoder gives after a late frame: two quick frames and a gap.
     const h = harness();
     h.t.presented(0);
+    h.vsync(h.clock.mono);
     const gaps = [8, 8, 8, 8, 2, 2, 8, 8, 30, 8, 8, 8, 2, 2, 8, 30, 8, 8, 8, 8];
     for (const g of gaps) h.frames(1, g);
     const snap = h.t.tick();
     const reference = summarizePresentWindow(gaps, null, 60);
     expect(snap.presentCadence).toEqual(reference);
     expect(reference.longFrames).toBe(2);
+  });
+
+  describe("present cadence is stamped at the display frame (#1328)", () => {
+    const VSYNC = 1000 / 120;
+    /** `vsyncs` display frames at 120 Hz, each with `perFrame` pictures submitted inside it (a decoder burst). */
+    const stream = (h: ReturnType<typeof harness>, vsyncs: number, perFrame: number, from = 0) => {
+      for (let i = 0; i < vsyncs; i++) {
+        const at = (from + i) * VSYNC;
+        for (let k = 0; k < perFrame; k++) {
+          h.clock.mono = at - VSYNC + 1 + k;
+          h.t.presented(0);
+        }
+        h.vsync(at);
+      }
+    };
+
+    it("counts several frames submitted inside one display frame as one displayed frame, with no interval under a display frame", () => {
+      const h = harness(120);
+      stream(h, 120, 3);
+      const snap = h.t.tick();
+      expect(snap.presentCadence.n).toBe(119);
+      expect(snap.presentCadence.medianMs).toBeCloseTo(VSYNC, 6);
+      expect(snap.presentCadence.fpsFromMedian).toBeCloseTo(120, 6);
+      expect(snap.presentCadence.longFrames).toBe(0);
+      expect(snap.freezeCount).toBe(0);
+      // Every submitted picture is still a frame for the fps and the decoded total.
+      expect(snap.framesDecodedTotal).toBe(360);
+    });
+
+    it("reads the display rate and no long frames for a steady 120 fps stream on a 120 Hz display, however the submits fall in the frame", () => {
+      const h = harness(120);
+      for (let i = 0; i < 240; i++) {
+        h.clock.mono = i * VSYNC - VSYNC + (i % 2 ? 7.5 : 0.5); // late, then early, in each display frame
+        h.t.presented(0);
+        h.vsync(i * VSYNC);
+      }
+      const c = h.t.tick().presentCadence;
+      expect(c.fpsFromMedian).toBeCloseTo(120, 6);
+      expect(c.sdMs).toBeCloseTo(0, 6);
+      expect(c.p95Ms).toBeCloseTo(VSYNC, 6);
+      expect(c.longFrames).toBe(0);
+    });
+
+    it("still reads a real gap as one long frame", () => {
+      const h = harness(120);
+      stream(h, 60, 3);
+      stream(h, 60, 3, 60 + 5); // five display frames with no picture
+      const c = h.t.tick().presentCadence;
+      expect(c.longFrames).toBe(1);
+      expect(c.maxMs).toBeCloseTo(6 * VSYNC, 6);
+    });
+
+    it("reports no cadence for a hidden tab and does not grow a queue", () => {
+      const h = harness(120);
+      stream(h, 30, 1);
+      h.t.tick();
+      h.hide(); // no display frames: the callbacks never run
+      h.clock.mono = 5000;
+      for (let i = 0; i < 500; i++) h.t.presented(0);
+      expect(h.rafCalls()).toBe(31); // 30 for the stream, one waiting for the hidden tab
+      const snap = h.t.tick();
+      expect(snap.presentCadence.n).toBe(0);
+      expect(snap.freezeCount).toBe(0);
+    });
+
+    it("does not report a hidden interval as a long frame when a throttled callback runs, or when the tab is shown again", () => {
+      const h = harness(120);
+      stream(h, 30, 1);
+      h.hide();
+      h.t.presented(0);
+      h.vsync(10_000); // a background tab's one-a-second callback
+      h.show();
+      h.t.breakCadence(); // the runtime does this when the tab is visible again
+      stream(h, 30, 1, 10_000 / VSYNC);
+      const snap = h.t.tick();
+      expect(snap.presentCadence.n).toBe(58);
+      expect(snap.presentCadence.longFrames).toBe(0);
+      expect(snap.freezeCount).toBe(0);
+    });
   });
 
   it("opens its first window when the ticks start, not when it was made", () => {
