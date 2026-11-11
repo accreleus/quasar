@@ -61,14 +61,14 @@ test("a pass scenario is one run with the bundle's build, tags and artifacts", (
   assert.equal(call.cmd, "python3");
   assert.equal(a[0], path.join(DX, "bench_submit.py"));
   assert.equal(after(a, "--suite"), "e2e");
-  assert.equal(after(a, "--scenario"), "stream-hold");
+  assert.equal(after(a, "--scenario"), "stream-hold.webrtc.h264.1080p60");
   assert.equal(after(a, "--host"), "gpu-test@mac-test-client");
   assert.equal(after(a, "--repo"), "accreleus/quasar");
   assert.equal(after(a, "--commit"), "9e3c207f");
   assert.equal(after(a, "--verdict"), "PASS");
   assert.equal(after(a, "--ext-id-salt"), "fixture-0001");
   const tags = valuesOf(a, "--tag");
-  for (const t of ["clock=raw", "transport=webrtc", "codec=h264", "profile=1080p60", "suite_run=fixture-0001", "client=mac-test-client", "git_quasar=9e3c207f"]) {
+  for (const t of ["clock=raw", "git_protocol=unknown", "transport=webrtc", "codec=h264", "profile=1080p60", "suite_run=fixture-0001", "client=mac-test-client", "git_quasar=9e3c207f"]) {
     assert.ok(tags.includes(t), `${t} is missing from ${tags.join(" ")}`);
   }
   const artifacts = valuesOf(a, "--artifact");
@@ -94,6 +94,76 @@ test("the shots and the bundle archive ride on the first run only", () => {
   assert.equal(archives[0].length, 1);
   assert.equal(archives[1].length, 0);
   assert.ok(valuesOf(calls[0].args, "--artifact").some((p) => p.endsWith("shots/first-frame.png")));
+});
+
+test("the same scenario with other params is another bench scenario (the server pairs by suite, scenario and host)", () => {
+  const dir = bundle();
+  const SC2 = "02-stream-hold";
+  fs.cpSync(path.join(dir, SC), path.join(dir, SC2), { recursive: true });
+  edit(dir, `${SC2}/scenario.json`, (s) => ({ ...s, id: SC2, params: { ...s.params, transport: "webtransport", codec: "pyrowave" } }));
+  edit(dir, "manifest.json", (m) => ({ ...m, scenarios: [SC, SC2] }));
+  const rec = recorder();
+  assert.equal(postBundle(dir, { host: HOST, spawn: rec.spawn }).posted, 2);
+  assert.deepEqual(rec.submitted().map((c) => after(c.args, "--scenario")), ["stream-hold.webrtc.h264.1080p60", "stream-hold.webtransport.pyrowave.1080p60"]);
+});
+
+test("A1: a scenario whose name is not a name posts nothing; the directory name is never a stand-in", () => {
+  for (const scenario of ["stream hold", undefined, 7]) {
+    const dir = bundle();
+    edit(dir, `${SC}/scenario.json`, (s) => ({ ...s, scenario }));
+    const rec = recorder();
+    const out = postBundle(dir, { host: HOST, spawn: rec.spawn });
+    assert.deepEqual([out.status, out.posted, out.failed], ["failed", 0, 1], String(scenario));
+    assert.equal(rec.submitted().length, 0);
+  }
+});
+
+test("A2: session.json's id must be one of the scenario's sessions, and its tag fields plain names", () => {
+  const cases = [
+    (s) => ({ ...s, id: "not-a-uuid\nFORGED" }),
+    (s) => ({ ...s, id: "99999999-2222-3333-4444-555555555555" }),
+    (s) => ({ session: s }),
+    (s) => ({ ...s, codec: "h264 x" }),
+    (s) => ({ ...s, profile: "a;b" }),
+    (s) => ({ ...s, host_id: "x".repeat(300) }),
+  ];
+  for (const [i, fn] of cases.entries()) {
+    const dir = bundle();
+    edit(dir, `${SC}/session.json`, fn);
+    const rec = recorder();
+    const out = postBundle(dir, { host: HOST, spawn: rec.spawn });
+    assert.deepEqual([out.status, out.posted, out.failed], ["failed", 0, 1], `case ${i}`);
+    assert.equal(rec.submitted().length, 0, `case ${i}`);
+  }
+  // The id is compared without case, as the collector does.
+  const dir = bundle();
+  edit(dir, `${SC}/session.json`, (s) => ({ ...s, id: s.id.toUpperCase() }));
+  assert.equal(postBundle(dir, { host: HOST, spawn: recorder().spawn }).posted, 1);
+});
+
+test("A3: the archive holds the bundle's files, also through a link and an option-like name; without it nothing is posted", (t) => {
+  if (spawnSync("tar", ["--version"]).status !== 0) return t.skip("no tar on PATH");
+  const real = bundle();
+  const odd = path.join(path.dirname(real), "--exclude=*");
+  fs.renameSync(real, odd);
+  const link = `${real}-link`;
+  fs.symlinkSync(odd, link);
+  for (const dir of [odd, link]) {
+    const listed = [];
+    const spawn = (cmd, args, o) => {
+      if (cmd !== "tar") return { status: 0, stdout: "", stderr: "" };
+      const r = spawnSync(cmd, args, o);
+      listed.push(spawnSync("tar", ["-tzf", args[1]], { encoding: "utf8" }).stdout);
+      return r;
+    };
+    assert.equal(postBundle(dir, { host: HOST, spawn }).posted, 1, dir);
+    assert.match(listed[0], /manifest\.json/, dir);
+  }
+  // tar fails: the first run is not posted without its archive.
+  const rec = recorder();
+  const out = postBundle(odd, { host: HOST, spawn: (cmd, args) => (cmd === "tar" ? { status: 2, stdout: "", stderr: "" } : rec.spawn(cmd, args)) });
+  assert.deepEqual([out.status, out.reason, out.posted], ["failed", "no-archive", 0]);
+  assert.equal(rec.submitted().length, 0);
 });
 
 test("a skipped scenario posts nothing and is counted", () => {
@@ -200,7 +270,7 @@ test("a missing client label leaves the host as the role and is counted", () => 
 
 test("a post that fails is counted and the verb exits 1", () => {
   const rec = recorder(1);
-  const out = postBundle(bundle(), { host: HOST, spawn: rec.spawn });
+  const out = postBundle(bundle(), { host: HOST, spawn: (cmd, args) => (cmd === "tar" ? { status: 0 } : rec.spawn(cmd, args)) });
   assert.equal(out.exit, 1);
   assert.equal(out.status, "failed");
   assert.deepEqual([out.posted, out.failed], [0, 1]);

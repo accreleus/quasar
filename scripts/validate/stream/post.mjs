@@ -65,6 +65,23 @@ function paramsTags(sc) {
   return { tags, leftOut };
 }
 
+/**
+ * bench_submit.py builds the run's identity and several tags from session.json (`ext_id`,
+ * `derive_tags`): the id must be one of the scenario's own sessions, and every field that becomes a
+ * tag as text must be a plain name. Null when the file may be posted (or is absent).
+ */
+function sessionProblem(file, sc) {
+  if (!fs.existsSync(file)) return null;
+  const s = readJson(file);
+  if (!isObj(s)) return "session.json is not an object";
+  const mine = (Array.isArray(sc.sessions) ? sc.sessions : []).map((id) => String(id).toLowerCase());
+  if (!fits(SHAPES.uuid, s.id) || !mine.includes(s.id.toLowerCase())) return "session.json's id is not one of the scenario's sessions (run e2e-collect first)";
+  for (const k of ["codec", "profile", "host_id"]) {
+    if (s[k] !== undefined && s[k] !== null && !fits(SHAPES.identifier, s[k])) return `session.json's ${k} is not a plain name`;
+  }
+  return null;
+}
+
 /** The scenario's own files as artifacts: the pictures, and the two files the run directory lacks. */
 function scenarioArtifacts(dir, name) {
   const out = [];
@@ -85,13 +102,13 @@ function scenarioArtifacts(dir, name) {
 
 /** The whole bundle as one tar.gz in a private temporary directory (removed by the caller). */
 function archive(dir, spawn, tar) {
-  const src = path.resolve(dir);
+  const src = dir; // already the real path: a link given as BUNDLE would archive as a link and nothing else
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-post-"));
   const dest = path.join(tmp, `${path.basename(src)}.tar.gz`);
-  const r = spawn(tar, ["-czf", dest, "-C", path.dirname(src), path.basename(src)], { encoding: "utf8" });
+  const r = spawn(tar, ["-czf", dest, "-C", path.dirname(src), "--", path.basename(src)], { encoding: "utf8" });
   if (r?.error || r?.status !== 0) {
     fs.rmSync(tmp, { recursive: true, force: true });
-    console.error(`the bundle could not be archived (${tar} -czf): ${r?.error?.message ?? `exit ${r?.status}`}; it is not attached`);
+    console.error(`the bundle could not be archived (${tar} -czf): ${r?.error?.message ?? `exit ${r?.status}`}); nothing is posted`);
     return null;
   }
   return { dest, tmp };
@@ -102,10 +119,11 @@ function archive(dir, spawn, tar) {
  * the argv without running anything; the defaults are the real bench_submit.py and tar.
  */
 export function postBundle(
-  dir,
+  given,
   { host, dryRun = false, spawn = spawnSync, python = "python3", submit = SUBMIT, tar = "tar", env = process.env } = {},
 ) {
   const out = { status: "ok", exit: EXIT.ok, posted: 0, skipped: 0, failed: 0, leftOut: 0, dryRun, reason: null, problems: [] };
+  const dir = fs.realpathSync(given);
   const problems = validateBundle(dir);
   if (problems.length) return { ...out, status: "failed", exit: EXIT.failed, reason: "invalid-bundle", problems };
 
@@ -139,16 +157,23 @@ export function postBundle(
         out.skipped += 1;
         continue;
       }
-      const scenario = fits(SHAPES.identifier, sc.scenario) ? sc.scenario : fits(SHAPES.identifier, name) ? name : null;
-      if (!scenario) {
-        console.error(`${name}: the scenario is not a name (letters, digits, _ . -, at most 64); nothing posted for it`);
+      // The run's name and identity are the bundle's own words or nothing: no stand-in is posted.
+      const problem = fits(SHAPES.identifier, sc.scenario) ? sessionProblem(path.join(dir, name, "session.json"), sc) : "its scenario is not a name (letters, digits, _ . -, at most 64)";
+      if (problem) {
+        console.error(`${name}: ${problem}; nothing posted for it`);
         out.failed += 1;
         continue;
       }
-      if (!bundleArchive) bundleArchive = archive(dir, spawn, tar);
+      const scenario = sc.scenario;
+      // The archive is part of the post: without it nothing is posted, the first run included.
+      bundleArchive ??= archive(dir, spawn, tar);
+      if (!bundleArchive) return { ...out, status: "failed", exit: EXIT.failed, reason: "no-archive" };
 
       const { tags, leftOut } = paramsTags(sc);
       out.leftOut += leftOut.length;
+      // The server pairs runs by suite, scenario and host, newest per commit: the same scenario
+      // with other params is another bench scenario, or webrtc would be compared with webtransport.
+      const benchScenario = [scenario, ...tags.map(([, v]) => v)].join(".");
       // `clock=raw`: the bundle's trace.json keeps client-clock browser events, so these runs
       // are not comparable with host-aligned ones event for event (issue #1276).
       const all = [["clock", "raw"], ...tags];
@@ -165,7 +190,7 @@ export function postBundle(
         submit,
         "--dir", path.join(dir, name),
         "--suite", SUITE,
-        "--scenario", scenario,
+        "--scenario", benchScenario,
         "--host", benchHost,
         "--repo", REPO,
         "--commit", commit,
@@ -173,13 +198,15 @@ export function postBundle(
         "--notes", criteriaNotes(sc.criteria),
         // bench_submit.py derives this from THIS checkout; the run is of the bundle's build.
         "--tag", `git_quasar=${commit}`,
+        // The same for the protocol pin, which the bundle does not hold.
+        "--tag", "git_protocol=unknown",
       ];
       for (const [k, v] of all) argv.push("--tag", `${k}=${v}`);
       if (suiteRun) argv.push("--ext-id-salt", suiteRun);
       for (const a of artifacts) argv.push("--artifact", a);
       if (dryRun) argv.push("--dry-run");
 
-      console.log(`${dryRun ? "plan" : "post"} ${name} as ${SUITE}/${scenario} verdict=${verdict} host=${benchHost}`);
+      console.log(`${dryRun ? "plan" : "post"} ${name} as ${SUITE}/${benchScenario} verdict=${verdict} host=${benchHost}`);
       const r = spawn(python, argv, { encoding: "utf8", env });
       if (r?.stdout) process.stdout.write(r.stdout);
       if (r?.stderr) process.stderr.write(r.stderr);
