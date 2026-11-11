@@ -29,6 +29,8 @@ const TERMINAL = ["stopped", "failed"];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export const DEFAULT_APP = "Quasar Benchapp";
 const LABEL = /^[A-Za-z0-9_.-]{1,64}$/;
+// Writes the page makes on its own that change no preference: the library's keep-alive (control-api.md §Warm Steam, no body, no setting).
+const KEEP_ALIVES = ["PUT /v1/me/steam-warm"];
 const PLAN_KEYS = ["name", "scenarios"];
 const ENTRY_KEYS = ["scenario", "params"];
 // A secret this short cannot be taken out of unrelated values (a UUID, a key) without damaging them.
@@ -113,8 +115,9 @@ export function trackLaunches(page, baseUrl, onOwned = () => {}) {
         if (typeof id === "string" && UUID.test(id) && !t.owned.has(id)) { t.owned.add(id); onOwned(id); }
         else t.unread += 1;
       })());
-    } else if (["PUT", "PATCH", "DELETE"].includes(method) && r.status() < 400 && u.pathname.startsWith("/v1/") && !u.pathname.startsWith("/v1/sessions/")) {
-      t.writes.push(`${method} ${u.pathname.slice(0, 80)}`);
+    } else if (["PUT", "PATCH", "DELETE"].includes(method) && r.status() < 400 && u.pathname.startsWith("/v1/") && !u.pathname.startsWith("/v1/sessions/") && !KEEP_ALIVES.includes(`${method} ${u.pathname}`)) {
+      const w = `${method} ${u.pathname.slice(0, 80)}`;
+      if (!t.writes.includes(w)) t.writes.push(w);
     }
   });
   return t;

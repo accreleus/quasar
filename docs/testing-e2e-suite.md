@@ -45,7 +45,7 @@ every answer it was still delivering, stop the owned set, and again for any that
 until the set is stable. A session is `stopped` in the timeline only after the API says it is over, and
 every owned id is in `scenario.sessions`. Anything that could not be put back (a stop not confirmed, a
 page that would not close, a `PUT`, `PATCH` or `DELETE` the page made on the stack outside
-`/v1/sessions/`) makes the scenario `error` with a reason that names exactly what was left behind.
+`/v1/sessions/`, except the library's keep-alive `PUT /v1/me/steam-warm`, which the real page sends and which sets no preference) makes the scenario `error` with a reason that names exactly what was left behind.
 **Known gap:** the game page's Play remembers a non-default choice as that game's own settings; today
 that call is a stub (`web/src/pages/app/game/gameData.ts`, no control-api route), so nothing is
 written. The day it is real the runner will see the write, report the scenario `error`, and cannot

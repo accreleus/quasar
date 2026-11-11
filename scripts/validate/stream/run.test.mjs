@@ -789,6 +789,12 @@ test("A15: a page that changes something on the stack the run cannot put back ma
   assert.equal(scenario().status, "error");
   assert.match(scenario().reason, /left behind: the page changed something on the stack \(PUT \/v1\/apps\/app-1\/settings\) that this run cannot put back/);
   assert.deepEqual(w.stopped, [SID]);
+  // The library's keep-alive heartbeat is not a preference (the real page sends it, once a minute).
+  const hb = await run(world({ onPlay: (x) => { for (let i = 0; i < 3; i += 1) x.emit("response", response(204, "/v1/me/steam-warm", {}, "PUT")); } }));
+  assert.equal(hb.scenario().status, "pass");
+  // The same write twice is named once.
+  const twice = await run(world({ onPlay: (x) => { for (let i = 0; i < 2; i += 1) x.emit("response", response(200, "/v1/apps/app-1/settings", {}, "PUT")); } }));
+  assert.equal([...twice.scenario().reason.matchAll(/PUT \/v1\/apps\/app-1\/settings/g)].length, 1);
   // The sessions endpoint's own writes (the page stopping its session) and reads are not changes of a preference.
   const ok = await run(world({ onPlay: (x) => x.emit("response", response(200, `/v1/sessions/${SID}`, {}, "DELETE")) }));
   assert.equal(ok.scenario().status, "pass");
