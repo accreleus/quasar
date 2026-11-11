@@ -79,6 +79,9 @@ const RULES = [
     `a ${name} log`, (d) => fs.writeFileSync(path.join(d, SC, "agent.log"), Buffer.concat([Buffer.from(bom), Buffer.from("Authorization: Bearer abcdefgh12345678\n", enc)])), /agent.log: is UTF-16 or UTF-32/,
   ]),
   ["a token in a file with no extension", (d) => fs.writeFileSync(path.join(d, SC, "agent-stdout"), "Authorization: Bearer abcdefgh12345678\n"), /agent-stdout: holds a bearer token/],
+  ["a credential in angle brackets", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "password=<hunterzzz>\n"), /x.log: holds a credential/],
+  ["a credential that starts like a marker", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "password=<credential>hunter2secret\n"), /x.log: holds a credential/],
+  ["a token= in free text", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "MY_TOKEN=abcdef123456\n"), /x.log: holds a credential/],
   ["a password that only starts like 'none'", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "password: none-of-your-business1\n"), /x.log: holds a credential/],
   ["a password that only starts like 'null'", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "password: nullify\n"), /x.log: holds a credential/],
   ["an authorization header in a log", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "request failed, authorization=credential-value-1234\n"), /x.log: holds a credential/],
@@ -151,7 +154,7 @@ test("an empty sessions list is valid: nothing to collect for the scenario", () 
 test("a browser version, a documentation address and a container's home are not leaks", () => {
   const dir = bundle();
   edit(dir, "network.json", (n) => ({ ...n, note: "Chrome/157.0.7339.81 via 192.0.2.5, logs in /home/quasar/.local/share/Steam", sig_token: null, authorization: "none", Cookie: "[redacted]", password: false, secret: "", api_key: {}, access_token: [] }));
-  fs.writeFileSync(path.join(dir, "README.md"), "Use Bearer authentication. Secret: none of the builds recorded it. password=[REDACTED]\nThe password: none. The token: n/a; fine.\n");
+  fs.writeFileSync(path.join(dir, "README.md"), "Use Bearer authentication. Secret: none of the builds recorded it. password=[REDACTED]\nThe password: none. The token: n/a; fine. token=<credential> and password: <credential>.\n");
   // A picture is not read for text, whatever bytes it holds after its header.
   fs.writeFileSync(path.join(dir, SC, "shot.png"), Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0, 0, 0]), Buffer.from("Bearer abcdefgh12345678")]));
   assert.deepEqual(validateBundle(dir), []);
