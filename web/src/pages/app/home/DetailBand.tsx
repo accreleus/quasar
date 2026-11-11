@@ -55,7 +55,7 @@ export interface DetailBandProps {
   onRetryProfiles: () => void;
   onClose: () => void;
   /** `streamCodec` (wire vocabulary) is omitted for an Auto commit. */
-  onConfirmProfile: (profileId: string, streamCodec?: "h264" | "h265" | "av1") => void;
+  onConfirmProfile: (profileId: string, streamCodec?: "h264" | "h265" | "av1", pyrowave?: boolean) => void;
   onToggleFavourite: () => void;
   /** spec §2.2: a live session on this app's home is running. Presentation
    *  only — the server's 409 is the gate. */
@@ -128,7 +128,7 @@ export const DetailBand = forwardRef<HTMLDivElement, DetailBandProps>(function D
       // #525: on a pinned app send the pin itself. {codec, fps, height} is
       // lossy — two profiles sharing height+fps are indistinguishable, and
       // `resolveSelection` picks whichever came first, risking a 409.
-      onConfirmProfile(model.pinnedProfileId ?? resolved.profileId, wireCodec);
+      onConfirmProfile(model.pinnedProfileId ?? resolved.profileId, wireCodec, resolved.wantsPyroWave);
     },
     [model, selection, onConfirmProfile],
   );

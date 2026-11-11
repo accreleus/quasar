@@ -89,7 +89,23 @@ func (s *Store) profileHostCaps(ctx context.Context, userID, appID string) (prof
 	if err := rows.Err(); err != nil {
 		return profile.HostCaps{}, err
 	}
-	return profile.HostCaps{Codecs: profileCodecUnion(reports)}, nil
+	return profile.HostCaps{Codecs: profileCodecUnion(reports), NoPyroWave: profileNoPyroWave(reports)}, nil
+}
+
+// profileNoPyroWave: the union is measured and no candidate GPU lists pyrowave. An unreported
+// or malformed union is unknown, as for the codecs.
+func profileNoPyroWave(reports [][]byte) bool {
+	if profileCodecUnion(reports) == nil {
+		return false
+	}
+	for _, raw := range reports {
+		var codecs []string
+		_ = json.Unmarshal(raw, &codecs)
+		if codecSet(codecs)[wireCodecPyroWave] {
+			return false
+		}
+	}
+	return true
 }
 
 // previewHomeOwner is homeClaimOwner in a read-only transaction: the host a

@@ -101,6 +101,10 @@ deploy/.build-report.json
 
 # Local diagnostic bundles (make diagnose-bundle) — redacted but still local-only
 .diagnostics/
+# make e2e-run with no OUT= writes its bundle here, and a killed run leaves its hook ledger (it holds a local path)
+e2e-bundle-*/
+.e2e-bundle-*.staging-*/
+.e2e-hooks-applied.json*
 
 # scripts/dx/uiaudit.sh evidence dirs (screenshots + metrics + reports) —
 # local-only, never committed (reports are shared by attaching the generated

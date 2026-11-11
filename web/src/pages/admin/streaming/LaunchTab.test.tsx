@@ -475,4 +475,202 @@ describe("LaunchTab", () => {
     expect(screen.getByRole("combobox", { name: "Transport for Balanced" })).toHaveValue("webrtc");
     expect(await screen.findByText("disk full")).toBeInTheDocument();
   });
+
+  describe("Ultra-low latency (PyroWave)", () => {
+    const modeSelect = () => screen.getByRole("combobox", { name: "Ultra-low latency (PyroWave) for Balanced" });
+    const bitrate = () => screen.queryByRole("spinbutton", { name: "Maximum bitrate for Balanced" });
+    const patched = () => mocked.updateLaunchProfile.mock.calls[0][2];
+
+    it("reads Off when the server sent no mode, and shows no Maximum bitrate row", async () => {
+      renderPage();
+      await act(async () => {});
+      expect(modeSelect()).toHaveValue("off");
+      expect(within(modeSelect()).getAllByRole("option").map((o) => o.textContent)).toEqual([
+        "Off",
+        "Allow",
+        "Prefer when possible",
+      ]);
+      expect(bitrate()).toBeNull();
+    });
+
+    it("saves the mode alone as soon as it changes, then shows the bitrate row", async () => {
+      mocked.updateLaunchProfile.mockResolvedValue(launchProfile({ pyrowave_mode: "allow", pyrowave_kbps: null }));
+      renderPage();
+      await act(async () => {});
+      await act(async () => {
+        fireEvent.change(modeSelect(), { target: { value: "allow" } });
+      });
+
+      expect(patched()).toEqual({ display_name: "Balanced", description: "", rungs: ["sp1"], pyrowave_mode: "allow" });
+      expect(modeSelect()).toHaveValue("allow");
+      expect(bitrate()).toHaveValue(null); // blank is automatic
+      expect(bitrate()).toHaveAttribute("placeholder", "Auto");
+    });
+
+    it("shows Prefer with its bitrate in Mb/s, and Off hides the row again", async () => {
+      mocked.listLaunchProfiles.mockResolvedValue({
+        items: [launchProfile({ pyrowave_mode: "prefer", pyrowave_kbps: 200000 })],
+      });
+      mocked.updateLaunchProfile.mockResolvedValue(launchProfile({ pyrowave_mode: "off", pyrowave_kbps: 200000 }));
+      renderPage();
+      await act(async () => {});
+      expect(modeSelect()).toHaveValue("prefer");
+      expect(bitrate()).toHaveValue(200);
+
+      await act(async () => {
+        fireEvent.change(modeSelect(), { target: { value: "off" } });
+      });
+      expect(patched()).toMatchObject({ pyrowave_mode: "off" });
+      expect(patched()).not.toHaveProperty("pyrowave_kbps");
+      expect(bitrate()).toBeNull();
+    });
+
+    it("saves a number as kbit/s on blur", async () => {
+      mocked.listLaunchProfiles.mockResolvedValue({ items: [launchProfile({ pyrowave_mode: "allow" })] });
+      mocked.updateLaunchProfile.mockResolvedValue(launchProfile({ pyrowave_mode: "allow", pyrowave_kbps: 150500 }));
+      renderPage();
+      await act(async () => {});
+      fireEvent.change(bitrate()!, { target: { value: "150.5" } });
+      expect(mocked.updateLaunchProfile).not.toHaveBeenCalled(); // not per keystroke
+      await act(async () => {
+        fireEvent.blur(bitrate()!);
+      });
+
+      expect(patched()).toMatchObject({ pyrowave_kbps: 150500 });
+      expect(patched()).not.toHaveProperty("pyrowave_mode");
+      expect(bitrate()).toHaveValue(150.5);
+    });
+
+    it("saves a cleared field as null (automatic) on Enter", async () => {
+      mocked.listLaunchProfiles.mockResolvedValue({
+        items: [launchProfile({ pyrowave_mode: "prefer", pyrowave_kbps: 200000 })],
+      });
+      mocked.updateLaunchProfile.mockResolvedValue(launchProfile({ pyrowave_mode: "prefer", pyrowave_kbps: null }));
+      renderPage();
+      await act(async () => {});
+      fireEvent.change(bitrate()!, { target: { value: "" } });
+      await act(async () => {
+        fireEvent.keyDown(bitrate()!, { key: "Enter" });
+      });
+
+      expect(patched()).toMatchObject({ pyrowave_kbps: null });
+      expect(bitrate()).toHaveValue(null);
+    });
+
+    it("saves nothing when the bitrate did not change", async () => {
+      mocked.listLaunchProfiles.mockResolvedValue({
+        items: [launchProfile({ pyrowave_mode: "prefer", pyrowave_kbps: 200000 })],
+      });
+      renderPage();
+      await act(async () => {});
+      await act(async () => {
+        fireEvent.blur(bitrate()!);
+      });
+      expect(mocked.updateLaunchProfile).not.toHaveBeenCalled();
+    });
+
+    it.each(["10", "1001", "0"])("refuses %s Mb/s with a message and saves nothing", async (value) => {
+      mocked.listLaunchProfiles.mockResolvedValue({ items: [launchProfile({ pyrowave_mode: "allow" })] });
+      renderPage();
+      await act(async () => {});
+      fireEvent.change(bitrate()!, { target: { value } });
+      await act(async () => {
+        fireEvent.blur(bitrate()!);
+      });
+
+      expect(screen.getByRole("alert")).toHaveTextContent("Enter 50 to 1000 Mb/s, or leave it blank for automatic.");
+      expect(bitrate()).toHaveAttribute("aria-invalid", "true");
+      expect(mocked.updateLaunchProfile).not.toHaveBeenCalled();
+    });
+
+    describe("Maximum bitrate edge cases", () => {
+      const saved = (kbps: number | null) => launchProfile({ pyrowave_mode: "prefer", pyrowave_kbps: kbps });
+      const open = async (kbps: number | null = 200000) => {
+        mocked.listLaunchProfiles.mockResolvedValue({ items: [saved(kbps)] });
+        renderPage();
+        await act(async () => {});
+      };
+
+      it("puts the stored value back, and keeps the error toast, when the save fails", async () => {
+        mocked.updateLaunchProfile.mockRejectedValue(new ApiError(500, "internal", "disk full"));
+        await open();
+        fireEvent.change(bitrate()!, { target: { value: "150" } });
+        await act(async () => {
+          fireEvent.blur(bitrate()!);
+        });
+        expect(await screen.findByText("disk full")).toBeInTheDocument();
+        expect(bitrate()).toHaveValue(200);
+      });
+
+      it("treats text the number input cannot parse as an error, never as automatic", async () => {
+        await open();
+        const input = bitrate()!;
+        Object.defineProperty(input, "validity", { value: { badInput: true }, configurable: true });
+        fireEvent.change(input, { target: { value: "200 Mb/s" } }); // a number input reads this as ""
+        await act(async () => {
+          fireEvent.blur(input);
+        });
+        expect(screen.getByRole("alert")).toHaveTextContent("Enter 50 to 1000 Mb/s");
+        expect(mocked.updateLaunchProfile).not.toHaveBeenCalled();
+      });
+
+      it("shows what it committed: 0300 reads 300", async () => {
+        await open(300000);
+        fireEvent.change(bitrate()!, { target: { value: "0300" } });
+        await act(async () => {
+          fireEvent.blur(bitrate()!);
+        });
+        expect((bitrate() as HTMLInputElement).value).toBe("300");
+        expect(mocked.updateLaunchProfile).not.toHaveBeenCalled();
+      });
+
+      it("sends one PATCH for Enter followed by blur while the save is in flight", async () => {
+        let finish!: (p: LaunchProfile) => void;
+        mocked.updateLaunchProfile.mockReturnValue(new Promise<LaunchProfile>((r) => (finish = r)));
+        await open();
+        fireEvent.change(bitrate()!, { target: { value: "150" } });
+        await act(async () => {
+          fireEvent.keyDown(bitrate()!, { key: "Enter" });
+          fireEvent.blur(bitrate()!);
+        });
+        expect(mocked.updateLaunchProfile).toHaveBeenCalledTimes(1);
+        await act(async () => finish(saved(150000)));
+      });
+
+      it("ties the error to the field", async () => {
+        await open();
+        fireEvent.change(bitrate()!, { target: { value: "10" } });
+        await act(async () => {
+          fireEvent.blur(bitrate()!);
+        });
+        expect(bitrate()).toHaveAccessibleDescription("Enter 50 to 1000 Mb/s, or leave it blank for automatic.");
+      });
+    });
+
+    it("puts the mode back and toasts when the save fails", async () => {
+      mocked.updateLaunchProfile.mockRejectedValue(new ApiError(500, "internal", "disk full"));
+      renderPage();
+      await act(async () => {});
+      await act(async () => {
+        fireEvent.change(modeSelect(), { target: { value: "prefer" } });
+      });
+      expect(modeSelect()).toHaveValue("off");
+      expect(await screen.findByText("disk full")).toBeInTheDocument();
+    });
+
+    it("toasts the server's warning that PyroWave needs WebTransport", async () => {
+      mocked.updateLaunchProfile.mockResolvedValue(
+        launchProfile({
+          pyrowave_mode: "allow",
+          warnings: [{ code: "pyrowave_needs_webtransport", message: "PyroWave needs WebTransport." }],
+        }),
+      );
+      renderPage();
+      await act(async () => {});
+      await act(async () => {
+        fireEvent.change(modeSelect(), { target: { value: "allow" } });
+      });
+      expect(await screen.findByText("PyroWave needs WebTransport.")).toBeInTheDocument();
+    });
+  });
 });

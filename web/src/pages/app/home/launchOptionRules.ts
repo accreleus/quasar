@@ -4,11 +4,14 @@
 
 import type { AppDisplayStream } from "../../../api/types";
 import {
+  AUTO_NOT_PYROWAVE,
+  autoPyroWaveNote,
   availableFps,
   availableResolutions,
   codecBasis,
   codecLabel,
   fpsUniverse,
+  PYROWAVE_UNAVAILABLE,
   reasonSentences,
   resolveSelection,
   type DraftCodec,
@@ -96,6 +99,11 @@ export function formatBitrate(kbps: number): string {
   return `${kbps} Kbps`;
 }
 
+/** PyroWave's figure is a ceiling: the profile's Maximum bitrate can lower it. */
+function price(kbps: number, viaPyroWave?: boolean): string {
+  return `${viaPyroWave ? "up to " : ""}${formatBitrate(kbps)}`;
+}
+
 /** `.qp-tag`s for a row, in the mock's order. */
 function tagsFor(row: ResolutionRow): { tags?: Array<"recommended" | "risky"> } {
   const tags: Array<"recommended" | "risky"> = [];
@@ -116,6 +124,21 @@ function recommendedHeight(space: OptionSpace, draft: LaunchDraft): number | nul
     (r) => r.recommended && r.selectable,
   );
   return rec?.height ?? null;
+}
+
+/** The fifth Codec entry. It is on while some profile can offer it; otherwise
+ *  it says why, from the recommended profile first (what a launch would use). */
+function pyrowaveRow(space: OptionSpace): Pick<OptionRow<DraftCodec>, "label" | "sub" | "enabled" | "title"> {
+  const entries = space.entriesByCodec.get("pyrowave") ?? [];
+  const label = "Ultra-low latency (PyroWave)";
+  if (entries.some((e) => e.eligibility !== "ineligible")) {
+    return { label, sub: "Local network only", enabled: true };
+  }
+  // A blocked entry's only reason is its PyroWave block's; another entry's reasons are bandwidth ones.
+  const blocked = entries.filter((e) => !e.pyrowave?.available);
+  const first = blocked.find((e) => e.recommended) ?? blocked[0];
+  const why = (first && reasonSentences(first.reasons)[0]) || PYROWAVE_UNAVAILABLE;
+  return { label, sub: why.replace(/\.$/, ""), enabled: false, title: why };
 }
 
 /**
@@ -140,14 +163,17 @@ export function optionColumns(
   const rows = availableResolutions(space, draft.codec, draft.fps);
   const fpsAvailable = new Set(availableFps(space, draft.codec));
 
-  const codec: OptionRow<DraftCodec>[] = space.codecs.map((c) => ({
-    value: c,
-    label: codecLabel(c),
-    // The codec column stays live even on a pinned app: a `stream.codec`-only
-    // override is accepted on a forced profile (control-plane launcher.go).
-    enabled: true,
-    selected: draft.codec === c,
-  }));
+  const codec: OptionRow<DraftCodec>[] = space.codecs.map((c) => {
+    const row = {
+      value: c,
+      label: codecLabel(c),
+      // The codec column stays live even on a pinned app: a `stream.codec`-only
+      // override is accepted on a forced profile (control-plane launcher.go).
+      enabled: true,
+      selected: draft.codec === c,
+    };
+    return c === "pyrowave" ? { ...row, ...pyrowaveRow(space) } : row;
+  });
 
   const fps: OptionRow<number>[] = fpsUniverse(space).map((value) => {
     const has = fpsAvailable.has(value);
@@ -161,7 +187,7 @@ export function optionColumns(
       label: `${value} fps`,
       sub: has
         ? at?.bitrateKbps !== undefined
-          ? `${formatBitrate(at.bitrateKbps)} at ${resolutionLabel(draft.height)}`
+          ? `${price(at.bitrateKbps, at.viaPyroWave)} at ${resolutionLabel(draft.height)}`
           : undefined
         : auto
           ? "Not available on this device"
@@ -188,7 +214,7 @@ export function optionColumns(
       ? missing
       : row.eligibility === "ineligible"
         ? why ?? missing
-        : `${pixels} · ${formatBitrate(row.bitrateKbps ?? 0)} at ${draft.fps} fps`;
+        : `${pixels} · ${price(row.bitrateKbps ?? 0, row.viaPyroWave)} at ${draft.fps} fps`;
     return {
       value: row.height,
       label,
@@ -203,9 +229,11 @@ export function optionColumns(
 
   // Auto also says what it lands on for the drafted row: "the host picks" is
   // only half an answer when the row in front of you has already resolved.
-  const landsOn = rowFor(space, draft)?.entryCodec;
+  const landed = rowFor(space, draft);
+  const landsOn = landed?.viaPyroWave ? "PyroWave" : landed?.entryCodec && codecLabel(landed.entryCodec);
+  const autoNote = autoPyroWaveNote(landed?.pyrowave);
   const codecHint = auto
-    ? `${codecBasis("auto")}${landsOn ? ` Here it lands on ${codecLabel(landsOn)}.` : ""}`
+    ? `${codecBasis("auto")}${landsOn ? ` Here it lands on ${landsOn}.` : ""}${autoNote ? ` ${autoNote}` : ""}`
     : codecBasis(draft.codec);
 
   if (pinned) {
@@ -262,6 +290,15 @@ export function verdict(
     return { tone: "risky", text: reasonSentences(row.reasons, "risky")[0] ?? UNEXPLAINED };
   }
 
+  if (draft.codec === "pyrowave") {
+    // The row's eligibility is the standard codec's; the PyroWave block speaks for PyroWave.
+    const slow = row.pyrowave?.auto_reason;
+    const cost = price(row.bitrateKbps ?? 0, true);
+    return slow === "link_too_slow" || slow === "rtt_too_high"
+      ? { tone: "risky", text: `Ultra-low latency may not hold up: ${AUTO_NOT_PYROWAVE[slow]}. It needs ${cost} on your local network.` }
+      : { tone: "ok", text: `Needs ${cost} on your local network.` };
+  }
+
   const measured = confidence === "high";
   if (row.recommended) {
     return {
@@ -271,7 +308,7 @@ export function verdict(
         : `Recommended for this device. Your network has not been measured yet, so that is a conservative estimate.`,
     };
   }
-  const cost = formatBitrate(row.bitrateKbps ?? 0);
+  const cost = price(row.bitrateKbps ?? 0, row.viaPyroWave);
   return {
     tone: "ok",
     text: measured
@@ -385,13 +422,13 @@ export function launchSpec(
   const codec =
     draft.codec === "auto"
       ? resolved
-        ? `Auto · ${codecLabel(resolved.entryCodec)}`
+        ? `Auto · ${resolved.viaPyroWave ? "PyroWave" : codecLabel(resolved.entryCodec)}`
         : "Auto"
       : codecLabel(draft.codec);
   return {
     resolution: `${width}×${height}`,
     fps: `${fps} fps`,
-    bitrate: formatBitrate(kbps),
+    bitrate: price(kbps, resolved?.viaPyroWave),
     codec,
   };
 }

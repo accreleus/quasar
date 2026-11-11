@@ -138,21 +138,61 @@ type pyrowaveIntent struct {
 	target     int32
 }
 
+// pyrowaveEligibility is step 1, shared by the launch and the Launch options preview: "" when
+// eligible, else the first failed check. hostLists: the GPU (launch) or some candidate GPU
+// (preview) lists pyrowave.
+func pyrowaveEligibility(lp profile.LaunchProfile, hostLists bool, probe *DeviceProbe) string {
+	switch {
+	case !pyrowaveProfileAllows(lp):
+		return reasonProfileDisallows
+	case !hostLists:
+		return reasonHostNoPyroWave
+	case probe == nil || !probe.WebGPU:
+		return reasonDeviceNoWebGPU
+	}
+	return ""
+}
+
+// PyroWaveOffer is a launch profile's pyrowave block on GET /v1/me/profiles.
+// semantics: control-api.md §Ultra-low latency (PyroWave) ▸ Launch options
+type PyroWaveOffer struct {
+	Mode       string  `json:"mode"`
+	Available  bool    `json:"available"`
+	Reason     *string `json:"reason"`
+	Auto       bool    `json:"auto"`
+	AutoReason *string `json:"auto_reason"`
+}
+
+// pyrowaveOffer is the preview of an Auto launch: the same steps as pyrowaveIntent, from what is
+// known before placement. height and fps are the top rung's; it never reads the per-GPU ceiling.
+func pyrowaveOffer(lp profile.LaunchProfile, hostLists bool, probe *DeviceProbe, height, fps int32, now time.Time) PyroWaveOffer {
+	offer := PyroWaveOffer{Mode: pyrowaveMode(lp)}
+	reason := pyrowaveEligibility(lp, hostLists, probe)
+	if reason == "" && !probe.WebTransport {
+		reason = reasonDeviceNoWebTransport
+	}
+	if reason != "" {
+		offer.Reason = &reason
+		return offer
+	}
+	offer.Available = true
+	if offer.Mode == pyrowavePrefer {
+		if ar := pyrowaveAutoReason(probe, pyrowaveTargetKbps(height, fps, lp.PyroWaveKbps), now); ar != "" {
+			offer.AutoReason = &ar
+		} else {
+			offer.Auto = true
+		}
+	}
+	return offer
+}
+
 func (in StreamInputs) pyrowaveIntent(height, fps int32) pyrowaveIntent {
 	it := pyrowaveIntent{target: pyrowaveTargetKbps(height, fps, in.Chain.PyroWaveKbps)}
-	switch {
-	case !pyrowaveProfileAllows(in.Chain):
-		it.reason = reasonProfileDisallows
-	case !codecSet(in.GPUCodecs)[wireCodecPyroWave]:
-		it.reason = reasonHostNoPyroWave
-	case in.Probe == nil || !in.Probe.WebGPU:
-		it.reason = reasonDeviceNoWebGPU
-	default:
-		it.eligible = true
-	}
-	if !it.eligible {
+	it.reason = pyrowaveEligibility(in.Chain, codecSet(in.GPUCodecs)[wireCodecPyroWave], in.Probe)
+	if it.reason != "" {
 		return it
 	}
+	it.eligible = true
 	switch {
 	case in.Params.PyroWave:
 		it.wanted, it.choice = true, choiceExplicit

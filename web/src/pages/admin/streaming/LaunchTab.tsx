@@ -5,9 +5,17 @@
 // no Save button; Rename is an identity-only modal; only "New launch profile"
 // opens a drawer). Authorization is server-enforced; UX only (invariant #6).
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import * as adminApi from "../../../api/admin";
-import type { DefaultTransport, LaunchProfile, LaunchProfileTransport, ProfilePolicyResponse, StreamProfile } from "../../../api/types";
+import type {
+  DefaultTransport,
+  LaunchProfile,
+  LaunchProfilePyroWaveMode,
+  LaunchProfileTransport,
+  LaunchProfileWrite,
+  ProfilePolicyResponse,
+  StreamProfile,
+} from "../../../api/types";
 import { ApiError } from "../../../api/client";
 import { useAuth } from "../../../auth/context";
 import { ActionsMenu, type ActionsMenuItem, type ActionsMenuSeparator } from "../../../components/ActionsMenu";
@@ -28,6 +36,12 @@ import { SettingRow } from "../settings/SettingRow";
 import { useSettings } from "../settings/useSettings";
 
 const KNOWN_TRANSPORTS: string[] = ["default", "webrtc", "webtransport", "webtransport_opt_in"];
+
+// pyrowave_kbps range, control-api.md §The launch profile's pyrowave_mode and pyrowave_kbps.
+const MIN_PYROWAVE_MBPS = 50;
+const MAX_PYROWAVE_MBPS = 1000;
+
+const mbpsText = (kbps: number | null | undefined) => (kbps == null ? "" : String(kbps / 1000));
 
 const DEFAULT_POLICY: ProfilePolicyResponse = { global_default_profile_id: null, user_overrides_allowed: true };
 
@@ -235,25 +249,58 @@ function LaunchProfileCard({
     },
   ];
 
-  const persist = async (nextRungIds: string[], transport?: LaunchProfileTransport) => {
+  const pyrowaveMode: LaunchProfilePyroWaveMode = profile.pyrowave_mode ?? "off";
+  const [kbpsText, setKbpsText] = useState(mbpsText(profile.pyrowave_kbps));
+  const [kbpsError, setKbpsError] = useState<string | null>(null);
+  const kbpsErrorId = `kbps-error-${profile.id}`;
+  useEffect(() => setKbpsText(mbpsText(profile.pyrowave_kbps)), [profile.pyrowave_kbps]);
+
+  // Maximum bitrate: blank is automatic (null); saved on blur or Enter, never per keystroke.
+  // A number input reports unparseable text ("200 Mb/s") as "" with badInput, which is not "automatic".
+  // The ref, not `busy`: Enter then blur run in one render, before `busy` shows.
+  const savingKbps = useRef(false);
+  const commitKbps = (input: HTMLInputElement) => {
+    if (savingKbps.current) return;
+    const text = kbpsText.trim();
+    const current = profile.pyrowave_kbps ?? null;
+    const mbps = text === "" ? null : Number(text);
+    if (input.validity.badInput || (mbps !== null && !(mbps >= MIN_PYROWAVE_MBPS && mbps <= MAX_PYROWAVE_MBPS))) {
+      setKbpsError(`Enter ${MIN_PYROWAVE_MBPS} to ${MAX_PYROWAVE_MBPS} Mb/s, or leave it blank for automatic.`);
+      return;
+    }
+    setKbpsError(null);
+    const kbps = mbps === null ? null : Math.round(mbps * 1000);
+    setKbpsText(mbpsText(kbps));
+    if (kbps !== current) {
+      savingKbps.current = true;
+      void persist(rungs.map((r) => r.id), { pyrowave_kbps: kbps }).then((ok) => {
+        savingKbps.current = false;
+        if (!ok) setKbpsText(mbpsText(current));
+      });
+    }
+  };
+
+  // Absent fields are unchanged (control-api.md), so a rung edit never touches transport or PyroWave.
+  const persist = async (nextRungIds: string[], extra: Partial<LaunchProfileWrite> = {}): Promise<boolean> => {
     setBusy(true);
     try {
-      // `transport` absent = unchanged (control-api.md), so a rung edit never touches it.
       const saved = await adminApi.updateLaunchProfile(token, profile.id, {
         display_name: profile.display_name,
         description: profile.description,
         rungs: nextRungIds,
-        ...(transport && { transport }),
+        ...extra,
       });
       onChanged(saved);
       for (const w of saved.warnings ?? []) {
         addToast({ variant: "info", title: w.message });
       }
+      return true;
     } catch (e: unknown) {
       addToast({
         variant: "danger",
         title: e instanceof ApiError ? e.message : "Could not save launch profile.",
       });
+      return false;
     } finally {
       setBusy(false);
     }
@@ -298,7 +345,7 @@ function LaunchProfileCard({
             value={transport}
             // A value this UI does not know (a newer server) is shown as itself and left alone.
             disabled={busy || !KNOWN_TRANSPORTS.includes(transport)}
-            onChange={(e) => void persist(rungs.map((r) => r.id), e.target.value as LaunchProfileTransport)}
+            onChange={(e) => void persist(rungs.map((r) => r.id), { transport: e.target.value as LaunchProfileTransport })}
           >
             <option value="default">Use instance default</option>
             <option value="webrtc">WebRTC</option>
@@ -310,6 +357,55 @@ function LaunchProfileCard({
             {!KNOWN_TRANSPORTS.includes(transport) && <option value={transport}>{transport}</option>}
           </select>
         </SettingRow>
+        <SettingRow
+          label="Ultra-low latency (PyroWave)"
+          hint="Off: never offered. Allow: users can pick it in Launch options. Prefer when possible: Auto picks it at launch when the device and network allow. It always runs over WebTransport."
+        >
+          <select
+            className="select"
+            aria-label={`Ultra-low latency (PyroWave) for ${profile.display_name}`}
+            value={pyrowaveMode}
+            disabled={busy}
+            onChange={(e) =>
+              void persist(rungs.map((r) => r.id), { pyrowave_mode: e.target.value as LaunchProfilePyroWaveMode })
+            }
+          >
+            <option value="off">Off</option>
+            <option value="allow">Allow</option>
+            <option value="prefer">Prefer when possible</option>
+          </select>
+        </SettingRow>
+        {pyrowaveMode !== "off" && (
+          <SettingRow label="Maximum bitrate" hint="The most the stream will use. Leave it blank to size it by resolution.">
+            <div className="row gap2">
+              <input
+                className="input mono lp-kbps"
+                type="number"
+                inputMode="decimal"
+                aria-label={`Maximum bitrate for ${profile.display_name}`}
+                aria-invalid={kbpsError ? true : undefined}
+                aria-describedby={kbpsError ? kbpsErrorId : undefined}
+                placeholder="Auto"
+                min={MIN_PYROWAVE_MBPS}
+                max={MAX_PYROWAVE_MBPS}
+                value={kbpsText}
+                disabled={busy}
+                onChange={(e) => {
+                  setKbpsText(e.target.value);
+                  setKbpsError(null);
+                }}
+                onBlur={(e) => commitKbps(e.currentTarget)}
+                onKeyDown={(e) => e.key === "Enter" && commitKbps(e.currentTarget)}
+              />
+              <span className="sec">Mb/s</span>
+            </div>
+            {kbpsError && (
+              <p id={kbpsErrorId} className="form-error" role="alert">
+                {kbpsError}
+              </p>
+            )}
+          </SettingRow>
+        )}
       </div>
     </div>
   );

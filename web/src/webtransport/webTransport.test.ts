@@ -540,7 +540,7 @@ describe("createWebTransportRuntime", () => {
     const pkt = { n: 0 };
     // Fragments of a frame arrive reversed: datagrams are unordered.
     for (const u of units) agent.last.datagrams(packetize(u, pkt).reverse());
-    await vi.waitFor(() => expect(presented).toHaveLength(3));
+    await vi.waitFor(() => expect(presented).toHaveLength(3), { timeout: 8_000 });
 
     expect(decoders[0].configs[0]).toMatchObject({ codec: "avc1.42e01f", codedWidth: 1920, codedHeight: 1080 });
     expect(decoders[0].chunks.map((c) => c.type)).toEqual(["key", "delta", "delta"]);

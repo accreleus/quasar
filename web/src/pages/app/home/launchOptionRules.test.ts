@@ -10,8 +10,8 @@
 // says so.
 
 import { describe, expect, it } from "vitest";
-import type { ProfilesResponse } from "../../../api/types";
-import { buildOptionSpace, type LaunchDraft, type OptionSpace } from "../launchOptions";
+import type { LaunchProfilePyroWave, ProfilesResponse } from "../../../api/types";
+import { buildOptionSpace, optionsFor, resolveSelection, type LaunchDraft, type OptionSpace } from "../launchOptions";
 import { heal, launchSpec, optionColumns, recommendation, verdict } from "./launchOptionRules";
 
 const CAPS = { h264: true, hevc: true, av1: true, vp9: false } as const;
@@ -105,15 +105,15 @@ describe("optionColumns", () => {
 
   it("offers Auto plus every codec the catalogue has and the device can decode", () => {
     const cols = optionColumns(space, draft());
-    expect(cols.codec.map((r) => r.label)).toEqual(["Auto", "H.264", "HEVC", "AV1"]);
-    expect(cols.codec.every((r) => r.enabled)).toBe(true);
+    expect(cols.codec.map((r) => r.label)).toEqual(["Auto", "H.264", "HEVC", "AV1", "Ultra-low latency (PyroWave)"]);
+    expect(cols.codec.filter((r) => r.value !== "pyrowave").every((r) => r.enabled)).toBe(true);
     expect(cols.codec.find((r) => r.selected)?.value).toBe("auto");
   });
 
   it("drops a codec this device cannot decode — it is never a row to explain", () => {
     const noAv1 = buildOptionSpace(RESPONSE.profiles, { h264: true, hevc: true, av1: false, vp9: false }, "p-av1");
     const cols = optionColumns(noAv1, draft({ codec: "h264", height: 1080 }));
-    expect(cols.codec.map((r) => r.label)).toEqual(["Auto", "H.264", "HEVC"]);
+    expect(cols.codec.map((r) => r.label)).toEqual(["Auto", "H.264", "HEVC", "Ultra-low latency (PyroWave)"]);
   });
 
   it("explains the disabled frame rates once, under their column", () => {
@@ -255,7 +255,7 @@ describe("optionColumns", () => {
     const cols = optionColumns(space, draft(), { pinned: true });
     expect(cols.fps.every((r) => !r.enabled)).toBe(true);
     expect(cols.resolution.every((r) => !r.enabled)).toBe(true);
-    expect(cols.codec.every((r) => r.enabled)).toBe(true);
+    expect(cols.codec.filter((r) => r.value !== "pyrowave").every((r) => r.enabled)).toBe(true);
     expect(cols.pinnedNote).toBe("Fixed by this app, it always launches at its own setting.");
     expect(cols.resolution[0].title).toBe(cols.pinnedNote);
     // A frozen column says why in its own hint, not only in a tooltip.
@@ -482,5 +482,225 @@ describe("recommendation", () => {
         recommended: { height: 1440, fps: 60 },
       }),
     ).toEqual({ tone: "ok", text: "Custom setting. The recommendation is 1440p at 60 fps." });
+  });
+});
+
+// ── Ultra-low latency (PyroWave): the fifth Codec entry (amendment 58) ──────
+
+const block = (over: Partial<LaunchProfilePyroWave> = {}): LaunchProfilePyroWave => ({
+  mode: "prefer",
+  available: true,
+  reason: null,
+  auto: false,
+  auto_reason: null,
+  ...over,
+});
+
+/** RESPONSE with the same PyroWave block on every profile. */
+const withBlock = (b: LaunchProfilePyroWave | undefined): ProfilesResponse =>
+  ({
+    ...RESPONSE,
+    profiles: RESPONSE.profiles.map((p) => ({ ...p, pyrowave: b })),
+  }) as ProfilesResponse;
+
+const pyrowaveRow = (res: ProfilesResponse, d: LaunchDraft = draft()) =>
+  optionColumns(spaceOf(res), d).codec.find((r) => r.value === "pyrowave")!;
+
+describe("Ultra-low latency (PyroWave) in the Codec column", () => {
+  it("state 1: Auto picked it, so the head and the note say so and the rate is PyroWave's", () => {
+    const res = withBlock(block({ auto: true }));
+    const space = spaceOf(res);
+    const d = draft();
+    expect(launchSpec(space, d).codec).toBe("Auto · PyroWave");
+    // The 1440p row's own figure: 300 Mb/s at 60 fps under 1440, as a ceiling.
+    expect(launchSpec(space, d).bitrate).toBe("up to 300 Mbps");
+    expect(optionColumns(space, d).codecHint).toBe(
+      "Your host picks the codec, best first, and falls back to one this device can decode. " +
+        "Here it lands on PyroWave. Auto chose PyroWave: you're on the local network.",
+    );
+    expect(optionColumns(space, d).resolution.find((r) => r.value === 1440)?.sub).toBe(
+      "2560×1440 · up to 300 Mbps at 60 fps",
+    );
+  });
+
+  it("state 2: Auto did not pick it, the entry stays enabled, and the note says why", () => {
+    const res = withBlock(block({ auto: false, auto_reason: "link_too_slow" }));
+    const cols = optionColumns(spaceOf(res), draft());
+    expect(cols.codecHint).toBe(
+      "Your host picks the codec, best first, and falls back to one this device can decode. " +
+        "Here it lands on AV1. Not PyroWave: the link is too slow.",
+    );
+    expect(launchSpec(spaceOf(res), draft()).codec).toBe("Auto · AV1");
+    expect(cols.codec.find((r) => r.value === "pyrowave")).toMatchObject({
+      enabled: true,
+      sub: "Local network only",
+    });
+  });
+
+  it.each([
+    ["no_measurement", "Not PyroWave: your network hasn't been measured recently."],
+    ["rtt_too_high", "Not PyroWave: the connection takes too long to reach the host."],
+    ["link_too_slow", "Not PyroWave: the link is too slow."],
+    ["something_new", "Not PyroWave: this connection doesn't qualify."],
+  ])("explains auto_reason %s in the user's words", (auto_reason, note) => {
+    const hint = optionColumns(spaceOf(withBlock(block({ auto_reason }))), draft()).codecHint;
+    expect(hint.endsWith(` ${note}`)).toBe(true);
+  });
+
+  it("adds no note on an allow profile, whose Auto never picks it, or on one that is not available", () => {
+    const base = "Your host picks the codec, best first, and falls back to one this device can decode. Here it lands on AV1.";
+    expect(optionColumns(spaceOf(withBlock(block({ mode: "allow" }))), draft()).codecHint).toBe(base);
+    expect(
+      optionColumns(spaceOf(withBlock(block({ available: false, reason: "device_no_webgpu" }))), draft()).codecHint,
+    ).toBe(base);
+  });
+
+  it("state 3: picked, the head reads PyroWave, the note is its own, and the launch asks for it with no codec", () => {
+    const space = spaceOf(withBlock(block({ mode: "allow" })));
+    const d = draft({ codec: "pyrowave" });
+    const cols = optionColumns(space, d);
+    expect(cols.codec.find((r) => r.selected)?.value).toBe("pyrowave");
+    expect(cols.codecHint).toBe("Ultra-low latency has the lowest delay of any codec, and needs a fast local network.");
+    expect(launchSpec(space, d)).toMatchObject({ codec: "PyroWave", bitrate: "up to 300 Mbps" });
+    expect(resolveSelection(space, d)).toMatchObject({ codec: null, wantsPyroWave: true, profileId: "p-av1" });
+    // Auto and an explicit codec do not ask for it.
+    expect(resolveSelection(space, draft())?.wantsPyroWave).toBe(false);
+    expect(resolveSelection(space, draft({ codec: "h264", height: 1080 }))?.wantsPyroWave).toBe(false);
+  });
+
+  it("states 4 and 5: disabled, never hidden, with the reason in the sub-line and the tooltip", () => {
+    expect(pyrowaveRow(withBlock(block({ available: false, reason: "device_no_webgpu" })))).toMatchObject({
+      label: "Ultra-low latency (PyroWave)",
+      enabled: false,
+      sub: "Your browser can't decode PyroWave",
+      title: "Your browser can't decode PyroWave.",
+    });
+    expect(pyrowaveRow(withBlock(block({ mode: "off", available: false, reason: "profile_disallows" })))).toMatchObject({
+      enabled: false,
+      sub: "This profile doesn't allow PyroWave",
+    });
+  });
+
+  it.each([
+    ["host_no_pyrowave", "No host here can stream PyroWave right now"],
+    ["device_no_webtransport", "Your browser can't use WebTransport, which PyroWave needs"],
+  ])("gives %s its own reason", (reason, sub) => {
+    expect(pyrowaveRow(withBlock(block({ available: false, reason }))).sub).toBe(sub);
+  });
+
+  it("says its own fallback for a reason it does not know, not the generic one", () => {
+    expect(pyrowaveRow(withBlock(block({ available: false, reason: "something_new" })))).toMatchObject({
+      enabled: false,
+      sub: "Ultra-low latency isn't available here",
+      title: "Ultra-low latency isn't available here.",
+    });
+    expect(pyrowaveRow(withBlock(block({ available: false, reason: null })))).toMatchObject({
+      sub: "Ultra-low latency isn't available here",
+    });
+  });
+
+  describe("when no profile can stream the device, the disabled entry still gives a PyroWave reason", () => {
+    const noneSelectable = (blocks: Record<string, LaunchProfilePyroWave>): ProfilesResponse =>
+      ({
+        ...RESPONSE,
+        profiles: RESPONSE.profiles.map((p) => ({
+          ...p,
+          eligibility: "ineligible",
+          reasons: BANDWIDTH,
+          rungs: p.rungs.map((r) => ({ ...r, eligibility: "ineligible", reasons: BANDWIDTH })),
+          pyrowave: blocks[p.id],
+        })),
+      }) as unknown as ProfilesResponse;
+
+    it("takes the reason from a blocked profile, never a row's bandwidth sentence", () => {
+      const gone = block({ available: false, reason: "device_no_webgpu" });
+      const row = pyrowaveRow(noneSelectable({ "p-av1": block({ mode: "allow" }), "p-h264": gone, "p-hevc": gone }));
+      expect(row).toMatchObject({ enabled: false, sub: "Your browser can't decode PyroWave" });
+      expect(row.title).not.toMatch(/connection|slower/);
+    });
+
+    it("falls back to its own line when no block is the cause", () => {
+      const ok = block({ mode: "allow" });
+      const row = pyrowaveRow(noneSelectable({ "p-av1": ok, "p-h264": ok, "p-hevc": ok }));
+      expect(row).toMatchObject({ enabled: false, sub: "Ultra-low latency isn't available here" });
+    });
+  });
+
+  it("reads a server that sends no pyrowave block as a profile that does not allow it", () => {
+    expect(pyrowaveRow(withBlock(undefined))).toMatchObject({
+      enabled: false,
+      sub: "This profile doesn't allow PyroWave",
+    });
+  });
+
+  it("is enabled when any profile offers it, and the rows of the others are disabled with their reason", () => {
+    const res = {
+      ...RESPONSE,
+      profiles: RESPONSE.profiles.map((p) => ({
+        ...p,
+        pyrowave: p.id === "p-av1" ? block({ mode: "allow" }) : block({ mode: "off", available: false, reason: "profile_disallows" }),
+      })),
+    } as ProfilesResponse;
+    const cols = optionColumns(spaceOf(res), draft({ codec: "pyrowave" }));
+    expect(cols.codec.find((r) => r.value === "pyrowave")?.enabled).toBe(true);
+    const hevc = cols.resolution.find((r) => r.value === 2160)!;
+    expect(hevc).toMatchObject({ enabled: false, sub: "This profile doesn't allow PyroWave." });
+    expect(cols.resolution.find((r) => r.value === 1440)?.enabled).toBe(true);
+  });
+
+  it("answers a pinned app from the pinned profile alone", () => {
+    const res = {
+      ...RESPONSE,
+      profiles: RESPONSE.profiles.map((p) => ({
+        ...p,
+        pyrowave: p.id === "p-av1" ? block({ mode: "off", available: false, reason: "profile_disallows" }) : block({ mode: "allow" }),
+      })),
+    } as ProfilesResponse;
+    const app = { profile_policy: "force", default_profile_id: "p-av1" } as never;
+    const pinned = optionsFor({ app, data: res, caps: CAPS, isAdmin: false });
+    expect(pinned.pinnedProfileId).toBe("p-av1");
+    expect(optionColumns(pinned.space, pinned.seed, { pinned: true }).codec.find((r) => r.value === "pyrowave")).toMatchObject({
+      enabled: false,
+      sub: "This profile doesn't allow PyroWave",
+    });
+    const free = optionsFor({ app: { profile_policy: "allow" } as never, data: res, caps: CAPS, isAdmin: false });
+    expect(optionColumns(free.space, free.seed).codec.find((r) => r.value === "pyrowave")?.enabled).toBe(true);
+  });
+
+  it("heals to a row PyroWave can run when it is picked", () => {
+    const res = {
+      ...RESPONSE,
+      profiles: RESPONSE.profiles.map((p) => ({
+        ...p,
+        pyrowave: p.id === "p-h264" ? block({ mode: "allow" }) : block({ mode: "off", available: false, reason: "profile_disallows" }),
+      })),
+    } as ProfilesResponse;
+    expect(heal(spaceOf(res), draft({ codec: "pyrowave" }), "codec")).toEqual({ codec: "pyrowave", fps: 60, height: 1080 });
+  });
+});
+
+describe("the footer line for a PyroWave pick", () => {
+  // The 1440p row is the recommended, eligible one: the standard codecs' sentence would claim
+  // "Your measured network carries 1440p ... with room to spare" for PyroWave too.
+  const line = (b: LaunchProfilePyroWave) => verdict(spaceOf(withBlock(b)), draft({ codec: "pyrowave" }));
+
+  it.each([
+    ["link_too_slow", "the link is too slow"],
+    ["rtt_too_high", "the connection takes too long to reach the host"],
+  ])("says what the server said when auto_reason is %s", (auto_reason, why) => {
+    expect(line(block({ auto_reason }))).toEqual({
+      tone: "risky",
+      text: `Ultra-low latency may not hold up: ${why}. It needs up to 300 Mbps on your local network.`,
+    });
+  });
+
+  it.each([null, "no_measurement", "something_new"])("is neutral otherwise (auto_reason %s)", (auto_reason) => {
+    const v = line(block({ mode: "allow", auto_reason }));
+    expect(v).toEqual({ tone: "ok", text: "Needs up to 300 Mbps on your local network." });
+    expect(v.text).not.toMatch(/measured network|comfortably|room to spare/);
+  });
+
+  it("leaves the standard codecs' sentence alone", () => {
+    expect(verdict(spaceOf(withBlock(block({ auto_reason: "link_too_slow" }))), draft()).text).toMatch(/room to spare/);
   });
 });
