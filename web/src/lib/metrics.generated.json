@@ -739,7 +739,7 @@
       "n_key": null,
       "deprecated_for": null,
       "since": "P1",
-      "why": "CUMULATIVE receiver packet loss, posted raw. Every rule that uses it takes a delta across the window (falsifier estimator 'delta'); a single sample cannot produce one and reports 'no samples' rather than 0. On a WebTransport session there is no RTP receiver to ask: the value is the video fragments the client found missing, each counted once when it is first NACKed, whether or not the resend then arrived. With FEC on, a fragment a repair datagram rebuilds before its NACK is never counted, so the value is the loss FEC did not heal, not the path's loss."
+      "why": "CUMULATIVE receiver packet loss, posted raw. Every rule that uses it takes a delta across the window (falsifier estimator 'delta'); a single sample cannot produce one and reports 'no samples' rather than 0. On a WebTransport session there is no RTP receiver to ask: the value is the video fragments the client found missing, each counted once when it is first NACKed, whether or not the resend then arrived. With FEC on, a fragment a repair datagram rebuilds before its NACK is never counted, so the value is the loss FEC did not heal, not the path's loss. On a PyroWave session nothing is NACKed: the value is the datagrams missing from each frame the client closed at its deadline or dropped incomplete. A frame none of whose datagrams arrived is not seen and not counted, and a datagram that arrives after its frame closed stays counted."
     },
     {
       "key": "frames_dropped",
@@ -791,7 +791,7 @@
       "n_key": null,
       "deprecated_for": null,
       "since": "AS-05",
-      "why": "The playout/jitter-buffer target this sample was measured UNDER, so a stored sigma is self-describing. A setting, not a measurement."
+      "why": "The playout/jitter-buffer target this sample was measured UNDER, so a stored sigma is self-describing. A setting, not a measurement. On a WebTransport session it is the display cushion in force, 0 on a clean link."
     },
     {
       "key": "present_fps",
@@ -804,7 +804,7 @@
       "n_key": "present_n",
       "deprecated_for": "present_fps_median",
       "since": "#108",
-      "why": "fps from the MEAN RVFC interval. DEPRECATED AS A HEADLINE: at source fps == display Hz one missed vsync doubles one interval and drags the mean \u2014 a healthy 1440p120 session read 88-108 on 2026-08-22 and cost a day of encoder investigation. Kept unchanged so the stored series stays comparable."
+      "why": "fps from the MEAN RVFC interval. DEPRECATED AS A HEADLINE: at source fps == display Hz one missed vsync doubles one interval and drags the mean \u2014 a healthy 1440p120 session read 88-108 on 2026-08-22 and cost a day of encoder investigation. Kept unchanged so the stored series stays comparable. WebTransport: presenter submit times, not display times (see present_interval_median_ms)."
     },
     {
       "key": "present_fps_median",
@@ -817,7 +817,7 @@
       "n_key": "present_n",
       "deprecated_for": null,
       "since": "2026-08-22",
-      "why": "THE READING. fps from the MEDIAN RVFC interval \u2014 the fps a viewer perceives, unmoved by an occasional doubled frame. Its input intervals are display-refresh independent since #263 (2026-08-24): RVFC ticks are deduped by the frame's identity before summarising (metadata.mediaTime, or its rtpTimestamp where a browser reports mediaTime 0 for WebRTC, as Firefox does: #686), so a display whose refresh rate is not an integer multiple of the source fps (e.g. 98 Hz) no longer pollutes the samples with vsync ticks that carry no new frame \u2014 a healthy 60 fps stream on such a display previously read ~43-49."
+      "why": "THE READING. fps from the MEDIAN RVFC interval \u2014 the fps a viewer perceives, unmoved by an occasional doubled frame. Its input intervals are display-refresh independent since #263 (2026-08-24): RVFC ticks are deduped by the frame's identity before summarising (metadata.mediaTime, or its rtpTimestamp where a browser reports mediaTime 0 for WebRTC, as Firefox does: #686), so a display whose refresh rate is not an integer multiple of the source fps (e.g. 98 Hz) no longer pollutes the samples with vsync ticks that carry no new frame \u2014 a healthy 60 fps stream on such a display previously read ~43-49. WebTransport: presenter submit times, not display times (see present_interval_median_ms)."
     },
     {
       "key": "present_interval_median_ms",
@@ -830,7 +830,7 @@
       "n_key": "present_n",
       "deprecated_for": null,
       "since": "2026-08-22",
-      "why": "The median frame-to-frame presentation interval itself. Every other cadence key is defined relative to it (doubled band, long-frame factor)."
+      "why": "The median frame-to-frame presentation interval itself. Every other cadence key is defined relative to it (doubled band, long-frame factor). Not the same instants on both transports: WebRTC measures the times the display showed distinct frames (RVFC); WebTransport measures the times the client submitted frames to the presenter, so the two are comparable in kind, not in value."
     },
     {
       "key": "present_interval_sd_ms",
@@ -843,7 +843,7 @@
       "n_key": "present_n",
       "deprecated_for": null,
       "since": "#108",
-      "why": "Standard deviation of this window's presentation intervals \u2014 the headline judder metric (#108). A hitch is a property of the WINDOW: two samples must reach classifier.hitch_sd_ms, because as a max one 18.058 ms sample out of 54 flipped a healthy session on 2026-08-23."
+      "why": "Standard deviation of this window's presentation intervals \u2014 the headline judder metric (#108). A hitch is a property of the WINDOW: two samples must reach classifier.hitch_sd_ms, because as a max one 18.058 ms sample out of 54 flipped a healthy session on 2026-08-23. WebTransport: presenter submit times, not display times (see present_interval_median_ms)."
     },
     {
       "key": "present_interval_p95_ms",
@@ -856,7 +856,7 @@
       "n_key": "present_n",
       "deprecated_for": null,
       "since": "#108",
-      "why": "p95 presentation interval \u2014 a sustained long-frame tail sigma can stay modest through."
+      "why": "p95 presentation interval \u2014 a sustained long-frame tail sigma can stay modest through. WebTransport: presenter submit times, not display times (see present_interval_median_ms)."
     },
     {
       "key": "present_interval_max_ms",
@@ -869,7 +869,7 @@
       "n_key": "present_n",
       "deprecated_for": null,
       "since": "2026-08-22",
-      "why": "The longest interval in the window: the real stall length, and the source of client.freeze_detected's gap_ms."
+      "why": "The longest interval in the window: the real stall length, and the source of client.freeze_detected's gap_ms. WebTransport: presenter submit times, not display times (see present_interval_median_ms)."
     },
     {
       "key": "present_beat_fraction",
@@ -882,7 +882,7 @@
       "n_key": "present_n",
       "deprecated_for": null,
       "since": "2026-08-22",
-      "why": "Share of intervals within +/-20% of exactly 2x the median \u2014 the inherent vsync beat of two free-running clocks, not stutter. Read it WITH present_long_frames: beat > 0 with long frames 0 is benign; long frames > 0 is a stall the beat does not excuse."
+      "why": "Share of intervals within +/-20% of exactly 2x the median \u2014 the inherent vsync beat of two free-running clocks, not stutter. Read it WITH present_long_frames: beat > 0 with long frames 0 is benign; long frames > 0 is a stall the beat does not excuse. WebTransport: presenter submit times, not display times (see present_interval_median_ms)."
     },
     {
       "key": "present_long_frames",
@@ -895,7 +895,7 @@
       "n_key": "present_n",
       "deprecated_for": null,
       "since": "2026-08-22",
-      "why": "Intervals above 2.5x the median \u2014 above the top of the doubled band, so genuine stalls. Zero is what makes a beat benign."
+      "why": "Intervals above 2.5x the median \u2014 above the top of the doubled band, so genuine stalls. Zero is what makes a beat benign. WebTransport: presenter submit times, not display times (see present_interval_median_ms)."
     },
     {
       "key": "present_n",
@@ -908,7 +908,7 @@
       "n_key": null,
       "deprecated_for": null,
       "since": "2026-08-22",
-      "why": "How many intervals the window actually held. Below 5 every other present_* key is OMITTED rather than computed from a fragment \u2014 this is the key that tells 'quiet' from 'unmeasured'."
+      "why": "How many intervals the window actually held. Below 5 every other present_* key is OMITTED rather than computed from a fragment \u2014 this is the key that tells 'quiet' from 'unmeasured'. WebTransport: presenter submit times, not display times (see present_interval_median_ms)."
     },
     {
       "key": "is_hidden",
@@ -1002,6 +1002,45 @@
       "deprecated_for": null,
       "since": "0.6 (#1035)",
       "why": "keyframe_request messages the WebTransport client put on the wire in the window, whoever asked: the decoder (start-up, a restart, a backlog skip), loss recovery giving a frame up as late, or a tab shown again. Requests inside the client's spacing window are merged into one, so this counts sends, not asks. Each is a recovery the NACK path did not cover; a steady non-zero rate on a clean link means loss recovery or the decoder is struggling."
+    },
+    {
+      "key": "wt_arrival_jitter_ms",
+      "source": "browser",
+      "taxonomy": "transport.wt_arrival_jitter_ms",
+      "unit": "ms",
+      "clock": "client_wall",
+      "window": "snapshot",
+      "estimator": "last",
+      "n_key": null,
+      "deprecated_for": null,
+      "since": "0.6 (#1317)",
+      "why": "A WebTransport session's smoothed video frame arrival jitter (RFC 3550 style: the change in transit time between consecutive decoded frames, averaged over about 16 frames), the input the display cushion follows. Measured at decoder output, so decode time variation is in it. Absent on PyroWave, which has no cushion, and on WebRTC, which reports jitter_buffer_ms instead."
+    },
+    {
+      "key": "audio_concealed_samples",
+      "source": "browser",
+      "taxonomy": "client.audio_concealed_samples",
+      "unit": "count",
+      "clock": "none",
+      "window": "cumulative",
+      "estimator": "raw",
+      "n_key": null,
+      "deprecated_for": null,
+      "since": "0.6 (#1318)",
+      "why": "CUMULATIVE for the page view: audio sample frames played that the stream did not supply. On WebRTC, the browser's inbound-rtp concealedSamples. On WebTransport, frames of silence played because the audio queue had nothing due, plus frames of the fade that replaces a lost packet. 48000 is one second. Absent until the transport has measured audio, so a session without audio posts neither this nor audio_concealment_events."
+    },
+    {
+      "key": "audio_concealment_events",
+      "source": "browser",
+      "taxonomy": "client.audio_concealment_events",
+      "unit": "count",
+      "clock": "none",
+      "window": "cumulative",
+      "estimator": "raw",
+      "n_key": null,
+      "deprecated_for": null,
+      "since": "0.6 (#1318)",
+      "why": "CUMULATIVE for the page view: separate audible dropouts. On WebRTC, the browser's inbound-rtp concealmentEvents. On WebTransport, runs of silence from an empty audio queue (a run counts once however long) plus lost packets concealed (a gap of several lost packets, with the silence after its fade, counts once). The two transports count an event by their own rule; read audio_concealed_samples for the amount."
     },
     {
       "key": "network_pacing_ms",

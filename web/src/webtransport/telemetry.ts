@@ -8,7 +8,7 @@ import { getOrCreateDeviceKey } from "../webrtc/capability";
 import { classifyClientHealth } from "../webrtc/clientHealth";
 import { estimateClockOffset, shouldPostClock, type ClockSample, type PostedClock } from "../webrtc/clockOffset";
 import { summarizePresentWindow } from "../webrtc/presentCadence";
-import { EMPTY_SNAPSHOT, type TelemetrySnapshot } from "../webrtc/telemetry";
+import { addAudioDropouts, EMPTY_SNAPSHOT, newPostedCounters, type PostedCounters, type TelemetrySnapshot } from "../webrtc/telemetry";
 import { CLOCK_REPOST_DELTA_MS, CLOCK_REPOST_INTERVAL_S, PRESENT_MIN_SAMPLES } from "../webrtc/thresholds";
 
 /** capture→present samples kept for the median and p95 (webrtc/telemetry.ts keeps 600 too). */
@@ -32,6 +32,8 @@ export interface WtTelemetryOptions {
   nowMs?: () => number;
   isHidden?: () => boolean;
   deviceKey?: string;
+  /** The page view's posted totals, carried into a WebRTC fallback. */
+  counters?: PostedCounters;
 }
 
 /**
@@ -57,8 +59,8 @@ export class WtTelemetry {
   private bytesTotal = 0;
   private lastTickMs: number;
   private keyframeRequests = 0;
-  private lostTotal = 0;
-  private lostAtTick = 0;
+  private readonly counters: PostedCounters;
+  private lostAtTick: number;
   /** The last window's median interval: what a thin window's freezes are judged against. */
   private typicalMs: number | null = null;
   private decodeMsInWindow: number[] = [];
@@ -68,6 +70,8 @@ export class WtTelemetry {
   private rttMs: number | null = null;
   private codec: string | null = null;
   private decodeFailed = false;
+  private cushionMs = 0;
+  private arrivalJitterMs: number | null = null;
 
   private pending: Record<string, unknown>[] = [];
   private posted: PostedClock = { offsetMs: null, atMs: 0 };
@@ -80,6 +84,8 @@ export class WtTelemetry {
     this.isHidden = opts.isHidden ?? (() => typeof document !== "undefined" && document.visibilityState === "hidden");
     this.deviceKey = opts.deviceKey ?? getOrCreateDeviceKey();
     this.lastTickMs = this.nowMs();
+    this.counters = opts.counters ?? newPostedCounters();
+    this.lostAtTick = this.counters.packetsLost;
   }
 
   /** The first window opens here, when the ticks start: connecting is not part of it. */
@@ -95,6 +101,17 @@ export class WtTelemetry {
     this.decodeFailed = failed;
   }
 
+  /** The display cushion in force and the arrival jitter behind it (null: none measured, as on PyroWave). */
+  setPlayout(cushionMs: number, arrivalJitterMs: number | null): void {
+    this.cushionMs = cushionMs;
+    this.arrivalJitterMs = arrivalJitterMs;
+  }
+
+  /** Audio the stream did not supply since the last call (concealed or silent frames, and runs of it). */
+  addAudioDropouts(samples: number, events: number): void {
+    addAudioDropouts(this.counters, samples, events);
+  }
+
   /** Media bytes off the wire (access units, after reassembly). */
   bytes(n: number): void {
     this.bytesInWindow += n;
@@ -107,10 +124,10 @@ export class WtTelemetry {
   }
 
   /** More video fragments found missing. The session's total is posted cumulative, as the
-   *  contract and the classifier read `packets_lost` (the WebRTC client posts a per-window
-   *  delta instead: #1270). The caller turns each connection's own count into additions. */
+   *  contract and the classifier read `packets_lost`. The caller turns each connection's own
+   *  count into additions. */
   addLost(fragments: number): void {
-    if (fragments > 0) this.lostTotal += fragments;
+    if (fragments > 0) this.counters.packetsLost += fragments;
   }
 
   /** A unit handed to the decoder, keyed by its capture time (the frame's timestamp). */
@@ -180,6 +197,7 @@ export class WtTelemetry {
     this.typicalMs = cadence.medianMs ?? this.typicalMs;
     const typical = this.typicalMs ?? (this.opts.profileFps ? 1000 / this.opts.profileFps : null);
     const freezeCount = typical === null ? 0 : this.intervals.filter((iv) => isFreeze(iv, typical)).length;
+    this.counters.freezeCount += freezeCount;
     const decodeMs = this.decodeMsInWindow.length ? this.decodeMsInWindow.reduce((a, b) => a + b, 0) / this.decodeMsInWindow.length : null;
     const hidden = this.isHidden();
     const health = classifyClientHealth({
@@ -198,14 +216,13 @@ export class WtTelemetry {
       bitrateKbps: (this.bytesInWindow * 8) / 1000 / dtSec,
       rttMs: this.rttMs,
       decodeMs,
-      packetsLost: this.lostTotal - this.lostAtTick,
+      packetsLost: this.counters.packetsLost - this.lostAtTick,
       freezeCount,
       presentFps: cadence.fpsFromMean,
       presentSdMs: cadence.sdMs,
       presentP95Ms: cadence.p95Ms,
       presentCadence: cadence,
-      // Frames are presented as they decode: there is no playout buffer on this path.
-      playoutTargetMs: 0,
+      playoutTargetMs: this.cushionMs,
       g2gMs,
       g2g95Ms: percentile(this.g2g, 95),
       clientHealth: health.health,
@@ -213,6 +230,8 @@ export class WtTelemetry {
       negotiatedCodec: this.codec,
       framesDecodedTotal: this.framesTotal,
       bytesReceivedTotal: this.bytesTotal,
+      audioConcealedSamples: this.counters.audioConcealedSamples,
+      audioConcealmentEvents: this.counters.audioConcealmentEvents,
     };
 
     // The keys are the metric manifest's (docs/session-trace/metrics.json): the shared
@@ -220,10 +239,10 @@ export class WtTelemetry {
     const m: Record<string, number> = {
       fps: snap.fps,
       bitrate_kbps: Math.round(snap.bitrateKbps ?? 0),
-      freeze_count: freezeCount,
-      // Cumulative, as the contract says: the classifier takes its delta across a window (#1270).
-      packets_lost: this.lostTotal,
-      playout_target_ms: 0,
+      // Cumulative, as the contract says: the classifier takes its delta across a window.
+      freeze_count: this.counters.freezeCount,
+      packets_lost: this.counters.packetsLost,
+      playout_target_ms: this.cushionMs,
       present_n: cadence.n,
       wt_keyframe_requests: this.keyframeRequests,
       is_hidden: hidden ? 1 : 0,
@@ -242,6 +261,9 @@ export class WtTelemetry {
     put("present_beat_fraction", cadence.doubledFraction);
     put("present_long_frames", cadence.longFrames);
     put("wt_capture_to_present_ms", g2gMs);
+    put("wt_arrival_jitter_ms", this.arrivalJitterMs);
+    put("audio_concealed_samples", this.counters.audioConcealedSamples);
+    put("audio_concealment_events", this.counters.audioConcealmentEvents);
     // A thin window has no σ: "smooth" there is unmeasured, and posting it would record a pass.
     const unmeasured = health.health === "smooth" && cadence.n < PRESENT_MIN_SAMPLES;
     this.pending.push({
@@ -258,7 +280,7 @@ export class WtTelemetry {
     this.framesInWindow = 0;
     this.bytesInWindow = 0;
     this.keyframeRequests = 0;
-    this.lostAtTick = this.lostTotal;
+    this.lostAtTick = this.counters.packetsLost;
     return snap;
   }
 
