@@ -29,8 +29,11 @@ const TERMINAL = ["stopped", "failed"];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export const DEFAULT_APP = "Quasar Benchapp";
 const LABEL = /^[A-Za-z0-9_.-]{1,64}$/;
-// Writes the page makes on its own that change no preference: the library's keep-alive (control-api.md §Warm Steam, no body, no setting).
-const KEEP_ALIVES = ["PUT /v1/me/steam-warm"];
+// The only writes outside the launch and sign-in calls that the page sends by itself on this path, each by exact method and path:
+// the library's keep-alive (control-api.md §Warm Steam; it can leave a parked Steam session) and the device record every sign-in posts
+// (web/src/auth/AuthProvider.tsx, deviceProbe.ts). Any other write is refused by default (trackLaunches).
+const PAGE_WRITES = ["PUT /v1/me/steam-warm", "POST /v1/me/devices"];
+const MAX_STOP_ROUNDS = 10;
 const PLAN_KEYS = ["name", "scenarios"];
 const ENTRY_KEYS = ["scenario", "params"];
 // A secret this short cannot be taken out of unrelated values (a UUID, a key) without damaging them.
@@ -93,10 +96,20 @@ export function secretTooShort(creds) {
 }
 
 /**
+ * A write is any method but GET, HEAD and OPTIONS (those read; a method this runner has never heard of is a write until proven otherwise,
+ * because a write it does not know is one it cannot put back). Not counted: the launch and the session's own calls (/v1/sessions), the
+ * sign-in calls (/v1/auth/), and the two exact PAGE_WRITES. Methods compare as sent: "patch" is not "GET".
+ */
+export function isUnexpectedWrite(method, pathname) {
+  if (["GET", "HEAD", "OPTIONS"].includes(method)) return false;
+  if (pathname === "/v1/sessions" || pathname.startsWith("/v1/sessions/") || pathname.startsWith("/v1/auth/")) return false;
+  return !PAGE_WRITES.includes(`${method} ${pathname}`);
+}
+
+/**
  * The sessions this run owns: the ids in the 201s of its page's own POST /v1/sessions to the stack's own
- * origin, and nothing else. A page address, a list or a baseline never adds one. `writes` records anything
- * else the page changed on the stack (a PUT, PATCH or DELETE outside /v1/sessions/): the runner does not know
- * how to put it back, so the scenario reports it as left behind.
+ * origin, and nothing else. A page address, a list or a baseline never adds one. `writes` records every other
+ * write the page sent to the stack: the runner does not know how to put it back, so the scenario reports it as left behind.
  */
 export function trackLaunches(page, baseUrl, onOwned = () => {}) {
   const origin = new URL(baseUrl).origin;
@@ -115,25 +128,43 @@ export function trackLaunches(page, baseUrl, onOwned = () => {}) {
         if (typeof id === "string" && UUID.test(id) && !t.owned.has(id)) { t.owned.add(id); onOwned(id); }
         else t.unread += 1;
       })());
-    } else if (["PUT", "PATCH", "DELETE"].includes(method) && r.status() < 400 && u.pathname.startsWith("/v1/") && !u.pathname.startsWith("/v1/sessions/") && !KEEP_ALIVES.includes(`${method} ${u.pathname}`)) {
-      const w = `${method} ${u.pathname.slice(0, 80)}`;
+    } else if (isUnexpectedWrite(method, u.pathname)) {
+      const w = `${method.slice(0, 16)} ${u.pathname.slice(0, 80)}`;
       if (!t.writes.includes(w)) t.writes.push(w);
     }
   });
   return t;
 }
 
-/** Stops every owned session, again for any that arrive while stopping, until the set is stable. A stop counts only once the API confirms it. */
+/**
+ * Stops every owned session, again for any that arrive while stopping, until the set is stable or MAX_STOP_ROUNDS rounds have run
+ * (then every id not stopped is named). A stop counts only once the API confirms it, and only for a row the API returns to this user first:
+ * an id it answers 404 for is not shown to be this user's, so it is neither deleted nor written as stopped.
+ */
 export async function stopOwned(api, launches, rec) {
   const cleanup = [];
   const done = new Set();
-  for (;;) {
+  const unconfirmed = new Set();
+  for (let round = 0; ; round += 1) {
     await launches.settle();
     const todo = [...launches.owned].filter((id) => !done.has(id));
     if (!todo.length) break;
+    if (round >= MAX_STOP_ROUNDS) {
+      for (const id of todo) {
+        rec.step("stop-failed", { session: id, message: `not stopped: launches kept arriving after ${MAX_STOP_ROUNDS} rounds` });
+        cleanup.push(`session ${id} is not stopped (launches kept arriving after ${MAX_STOP_ROUNDS} rounds of stopping)`);
+      }
+      break;
+    }
     for (const id of todo) {
       done.add(id);
       try {
+        if (!(await api.session(id))) {
+          unconfirmed.add(id);
+          rec.step("stop-unconfirmed", { session: id, why: "the API does not return this session to this user, so it was not stopped" });
+          cleanup.push(`session ${id} is not confirmed to be this user's (the API does not return it), so it was not stopped`);
+          continue;
+        }
         await api.stop(id);
         rec.step("stopped", { session: id });
       } catch (e) {
@@ -144,7 +175,7 @@ export async function stopOwned(api, launches, rec) {
   }
   if (launches.unread) cleanup.push(`${launches.unread} session launch(es) were accepted but the id could not be read, so they could not be stopped`);
   for (const w of launches.writes) cleanup.push(`the page changed something on the stack (${w}) that this run cannot put back`);
-  return { sessions: [...launches.owned], cleanup };
+  return { sessions: [...launches.owned].filter((id) => !unconfirmed.has(id)), cleanup };
 }
 
 /** The API as the signed-in user: their own bearer, never an admin token. The bearer goes into `secrets` the moment it is known. */
@@ -251,7 +282,7 @@ async function loadScenario(name) {
  * probeClient(page), browserNow(page), close(), and (optionally) `info` for builds.json. Never throws for a
  * scenario's failure; returns the counts.
  */
-export async function runSuite({ plan, dir, baseUrl, creds, host, api, thresholds, label = null, insecureTls = false, secrets = new Set(), app = DEFAULT_APP, commit = "unknown", abort = new Promise(() => {}), now = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
+export async function runSuite({ plan, dir, baseUrl, creds, host, api, thresholds, label = null, insecureTls = false, secrets = new Set(), app = DEFAULT_APP, commit = "unknown", dirty = false, abort = new Promise(() => {}), now = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
   if (fs.existsSync(dir)) throw new Error(`${dir} already exists: a bundle is never written over another`);
   const suiteRunId = `e2e-${new Date(now()).toISOString().replace(/[-:]|\.\d+/g, "")}-${crypto.randomBytes(2).toString("hex")}`;
   const staging = path.join(path.dirname(path.resolve(dir)), `.${path.basename(dir)}.staging-${crypto.randomBytes(4).toString("hex")}`);
@@ -323,10 +354,12 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
           });
           out = await scenario.run(page, { baseUrl, params: e.params, rec, api, creds, client, thresholds, secrets, launches, now, sleep: racedSleep, clockOffset: () => clock.offset });
         } catch (err) {
-          out = { status: "error", reason: String(err?.message ?? err), criteria: [], sessions: [], clock_offset_ms: null };
+          // A page-derived message is not written while the page's bearer is unknown (the scenario catches its own errors; this is what escapes it).
+          out = { status: "error", reason: page && rec.holding ? "the scenario did not complete (the page's own words are not written before its sign-in is read)" : String(err?.message ?? err), criteria: [], sessions: [], clock_offset_ms: null };
         } finally {
           // Order matters: close the page, wait for every response it was still delivering, then stop what the run owns.
-          if (page) await host.closePage(page).catch((err) => { left = `a page it opened would not close (${err?.message ?? err})`; });
+          // The close error's words are the browser's about a page: held back like the page's own until its bearer is known.
+          if (page) await host.closePage(page).catch((err) => { left = `a page it opened would not close${rec.holding ? "" : ` (${err?.message ?? err})`}`; });
           if (launches) owned = await stopOwned(api, launches, rec);
           const dropped = rec.dropHeld() + (rec.holding ? sink.consoleErrors.length + sink.networkFailures.length : 0);
           if (dropped) rec.step("pre-auth-evidence-dropped", { lines: dropped, why: "the page's bearer was never known, so nothing it said could be written safely" });
@@ -347,7 +380,8 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
     const info = host.info ?? {};
     bundle.json("builds.json", {
       components: { browser: client.browser, os: client.os, web: null, control_plane: null, node_agent: null, reference_app: null, gpu_driver: null },
-      unknown: Object.fromEntries(["web", "control_plane", "node_agent", "reference_app", "gpu_driver"].map((k) => [k, info[k] ?? "the host half (e2e-collect) fills this; the client cannot see it"])),
+      // e2e-collect reads the control plane and the node agent only (collect.mjs).
+      unknown: Object.fromEntries(["web", "control_plane", "node_agent", "reference_app", "gpu_driver"].map((k) => [k, info[k] ?? (["control_plane", "node_agent"].includes(k) ? "the host half (e2e-collect) fills this; the client cannot see it" : "the client cannot see it, and e2e-collect does not read it yet")])),
     });
     bundle.json("network.json", { path: { rtt_ms: null }, shaping: null, tls_verification: insecureTls ? "off (INSECURE_TLS=1)" : "on" });
     bundle.json("manifest.json", {
@@ -356,7 +390,7 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
       plan: { name: plan.name ?? "plan", scenarios: entries.map(({ id, scenario, params }) => ({ id, scenario: String(scenario), params })) },
       started_at_ms: startedAt,
       ended_at_ms: now(),
-      runner: { commit },
+      runner: { commit, ...(dirty ? { dirty: true } : {}) },
       halves: { client: true, host: false },
       scenarios: dirs,
       not_recorded: NOT_RECORDED,
@@ -369,6 +403,12 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
   } finally {
     if (!committed) fs.rmSync(staging, { recursive: true, force: true });
   }
+}
+
+/** The runner's own commit, and whether tracked files differ from it (a run from a tree with uncommitted changes is not the commit it names). */
+export function runnerState(cwd = ROOT) {
+  const git = (...args) => execFileSync("git", args, { cwd, encoding: "utf8", env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" } });
+  try { return { commit: git("rev-parse", "HEAD").trim(), dirty: git("status", "--porcelain", "--untracked-files=no").trim() !== "" }; } catch { return { commit: "unknown", dirty: false }; /* not a checkout */ }
 }
 
 /** Certificate checks stay on unless the caller asks (INSECURE_TLS=1, for a stack with a self-signed certificate): the process-wide switch Node's fetch has. */
@@ -432,8 +472,7 @@ async function main() {
     ? await chromium.connectOverCDP(args.cdp)
     : await chromium.launch({ executablePath: process.env.CHROME || undefined, headless: !(process.env.DISPLAY || process.env.WAYLAND_DISPLAY) });
   const out = path.resolve(typeof args.out === "string" ? args.out : `e2e-bundle-${Date.now()}`);
-  let commit = "unknown";
-  try { commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf8", env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" } }).trim(); } catch { /* not a checkout */ }
+  const { commit, dirty } = runnerState();
 
   let stopRun;
   const abort = new Promise((r) => { stopRun = r; });
@@ -446,7 +485,7 @@ async function main() {
   let opened = null;
   try {
     opened = await openHost(browser, { attached: !!args.cdp, insecureTls });
-    result = await runSuite({ plan, dir: out, baseUrl, creds, host: opened.host, api, thresholds, label, insecureTls, secrets, app: process.env.QUASAR_E2E_APP || DEFAULT_APP, commit, abort });
+    result = await runSuite({ plan, dir: out, baseUrl, creds, host: opened.host, api, thresholds, label, insecureTls, secrets, app: process.env.QUASAR_E2E_APP || DEFAULT_APP, commit, dirty, abort });
   } finally {
     // Attached, only this run's own context is closed; the person's browser keeps running as it was.
     try { await (opened ? opened.close() : args.cdp ? null : browser.close()); } catch (e) { closeFailed = e; }

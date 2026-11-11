@@ -8,6 +8,8 @@ import { scrub } from "./bundle.mjs";
 
 // A key named like a credential is dropped with its value: the validator refuses such a member
 // whatever it holds, and nothing in a bundle needs one.
+const HOLD_MAX_LINES = 2000;
+const HOLD_MAX_BYTES = 1_000_000;
 const CREDENTIAL_KEY = /^(password|passwd|secret|token|authorization|access_token|refresh_token|sig_token|api[_-]?key)$/i;
 
 export class Recorder {
@@ -94,30 +96,46 @@ export class ScenarioRecorder {
     bundle.put(`${dirName}/timeline.jsonl`, "");
     // What the page says (console lines, errors, API bodies) can carry its bearer, which the runner learns only after sign-in:
     // it is held in memory until release() and written then, through the redactor. dropHeld() discards it if the bearer never became known.
+    // The hold is bounded: past HOLD_MAX_LINES or HOLD_MAX_BYTES a line is counted, not kept (`overflow`), so a noisy page cannot grow the runner.
     this.holding = true;
     this.held = [];
+    this.heldBytes = 0;
+    this.overflow = 0;
+  }
+
+  hold(size, write) {
+    if (this.held.length >= HOLD_MAX_LINES || this.heldBytes + size > HOLD_MAX_BYTES) this.overflow += 1;
+    else { this.held.push(write); this.heldBytes += size; }
   }
 
   fromPage(rel, text) {
-    if (this.holding) this.held.push(() => this.bundle.append(`${this.dirName}/${rel}`, text));
+    if (this.holding) this.hold(Buffer.byteLength(text), () => this.bundle.append(`${this.dirName}/${rel}`, text));
     else this.bundle.append(`${this.dirName}/${rel}`, text);
   }
 
   /** A timeline row about what the page did (an API answer's body), held like fromPage. */
   pageStep(ev, data = {}) {
     const row = this.row(ev, data);
-    if (this.holding) this.held.push(() => this.bundle.row(`${this.dirName}/timeline.jsonl`, row));
+    if (this.holding) this.hold(Buffer.byteLength(JSON.stringify(row)), () => this.bundle.row(`${this.dirName}/timeline.jsonl`, row));
     else this.bundle.row(`${this.dirName}/timeline.jsonl`, row);
   }
 
   release() {
     this.holding = false;
+    this.heldBytes = 0;
     for (const write of this.held.splice(0)) write();
+    if (this.overflow) {
+      this.step("pre-auth-evidence-dropped", { lines: this.overflow, why: `more than ${HOLD_MAX_LINES} lines or ${HOLD_MAX_BYTES} bytes arrived before the page's bearer was known, so the rest were not kept` });
+      this.overflow = 0;
+    }
   }
 
-  /** The number of held lines discarded; holding stays on, so nothing later is written either. */
+  /** The number of held lines discarded (kept or not); holding stays on, so nothing later is written either. */
   dropHeld() {
-    return this.held.splice(0).length;
+    const n = this.held.splice(0).length + this.overflow;
+    this.heldBytes = 0;
+    this.overflow = 0;
+    return n;
   }
 
   /** The timeline's clock is the browser's when the offset is known, else the runner's (named in `clock_source`). */

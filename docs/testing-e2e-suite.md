@@ -42,10 +42,22 @@ in the page's address (the address is used to follow a session only when that id
 those; any other is that scenario's `error`, and that session is left alone), not a list, not a
 baseline. Cleanup runs on every exit path, `Ctrl-C` included, in this order: close the page, wait for
 every answer it was still delivering, stop the owned set, and again for any that arrived meanwhile
-until the set is stable. A session is `stopped` in the timeline only after the API says it is over, and
-every owned id is in `scenario.sessions`. Anything that could not be put back (a stop not confirmed, a
-page that would not close, a `PUT`, `PATCH` or `DELETE` the page made on the stack outside
-`/v1/sessions/`, except the library's keep-alive `PUT /v1/me/steam-warm`, which the real page sends and which sets no preference) makes the scenario `error` with a reason that names exactly what was left behind.
+until the set is stable, at most 10 rounds (then every id not stopped is named and the scenario is
+`error`; the bundle is still written). Before it stops an id the runner reads that session from the
+API as the test user; an id the API answers 404 for is not shown to be theirs, so it is not deleted,
+the timeline says `stop-unconfirmed` with the id, and the scenario is `error`. A session is `stopped`
+in the timeline only after the API says it is over, and every confirmed owned id is in
+`scenario.sessions`. Anything that could not be put back (a stop not confirmed, a page that would not
+close, or any write the page sent to the stack: every method except GET, HEAD and OPTIONS, outside
+`/v1/sessions` and `/v1/auth/`, bar two exceptions) makes the scenario `error` with a reason that names
+exactly what was left behind (method and path, never a body). The two exceptions are exact method and
+path: `PUT /v1/me/steam-warm` and `POST /v1/me/devices`. Signing in as the test user therefore has the
+product's own two side effects: the library's keep-alive (`PUT /v1/me/steam-warm`, once a minute) and the
+device record every sign-in posts (`POST /v1/me/devices`). The keep-alive can leave a parked Steam
+session when Hot Loading is on, which a later launch claims or the stack reaps. While the page's own
+bearer is not yet known, nothing the page said is written (an error's words included; the reason names
+the step that failed instead), and at most 2000 lines or 1 MB of it are held; the timeline says how many
+lines were dropped.
 **Known gap:** the game page's Play remembers a non-default choice as that game's own settings; today
 that call is a stub (`web/src/pages/app/game/gameData.ts`, no control-api route), so nothing is
 written. The day it is real the runner will see the write, report the scenario `error`, and cannot
@@ -78,22 +90,22 @@ launched; the bundle is still complete and the run goes on.
 
 | criterion | judged as |
 |---|---|
-| `first_frame_s` | a frame showed within 30 s of the Play click (the runner's budget, not a product limit). Seen on the bench ring, the `<video>` (WebRTC) or the page's own reveal of the stream, which is the only sign on the WebTransport canvas. No frame by the deadline is `pass: false`, and a scenario is never `pass` without this one |
+| `first_frame_s` | the first frame the client decoded came within 30 s of the Play click (the runner's budget, not a product limit). It can still be under the loader: the loader's own reveal comes later and is recorded as the timeline step `revealed`, not judged. A frame is the bench ring's first frame or the visible `<video>`'s first frame; the loader is never one. A scenario with `bench: false` on WebTransport (a canvas) cannot see a frame and is `error` before launch ("bench mode is needed to see a frame on this transport"). No frame by the deadline is `pass: false`, and a scenario is never `pass` without this one |
 | `marker_decoded` | the bench instrument decoded at least one marker frame (`stats().decoded > 0`) |
 | `transport_as_asked` | the session's `transport` is the asked one and `transport_fallback_reason` is empty; `observed` carries the transport and any `transport_reason` or fallback reason |
 | `codec_as_asked` | `negotiated_codec` (or `stream.codec`, or `pyrowave.active/used`) is the asked codec; `observed` names the field read |
 | `profile_as_asked` | the asked height and frame rate against `stream.height` and `stream.fps`, the launch size (not `external_*`). It is not a profile id: the Launch options choose a codec, frame rate and resolution. Only the resolutions the sheet lists can be asked |
-| `frameless_seconds` | the number of one-second bench windows with no frame at all, after the warm-up, excluding any span the page was hidden. Not Chrome's `freeze_count`; a stall shorter than a window is invisible to it. It needs no marker |
+| `frameless_seconds` | the number of one-second bench windows with no frame at all, after the warm-up, excluding any span the page was hidden. Not Chrome's `freeze_count`; a stall shorter than a window is invisible to it. It is the bench callback's view: a stall of the instrument itself also counts (a false fail, never a false pass). It needs no marker |
 | `missing_indices_rate` | recorded, not judged (`pass: null`): `missing / (decoded + missing)` over the judged span is in `expected`. No limit has been calibrated on the marker app (the first 60 s of a healthy bench cell read 6.95 % in `docs/testing-bench-mode.md`) |
-| `present_cadence` | the control plane's hitch rule on the bench ring: per one-second window with at least `web.present_cadence.min_samples` present intervals, sd against `classifier.hitch_sd_ms`, a hitch at `classifier.hitch_min_samples` such windows. It needs no marker. When the bench callback saw under 90 % of the frames the video decoded over the span it is not judged, because the instrument set the cadence (issue #1304) |
+| `present_cadence` | the control plane's hitch rule on the bench ring: per one-second window with at least `web.present_cadence.min_samples` present intervals, sd against `classifier.hitch_sd_ms`, a hitch at `classifier.hitch_min_samples` such windows. It needs no marker. When the bench callback saw under 90 % of the frames the video decoded over the span it is not judged, because the instrument set the cadence (issue #1304); `expected` carries the share as "N of M frames" |
 
 The warm-up is one value for every criterion that has one: `classifier.warmup_exclude_s` in
 `docs/session-trace/thresholds.json` (20 s). The smoke plan holds 90 s so the judged span is at
 least 60 s after it. A scenario is `pass` only when the first frame was seen and no criterion failed;
 if the first frame could not be judged it is `error`; a session that is already `stopped` or `failed` when
-the hold ends is `error` ("the session ended during the hold"), whatever its criteria say. A loader
-that shows the product's failed or ended state is never a first frame. A number the run does not have
-(a negative first-frame time, a bench window with no frame count) is `null`, never a clean zero. `params.bench: false` leaves bench mode off.
+the hold ends is `error` ("the session ended during the hold"), whatever its criteria say. A number
+the run does not have (a negative first-frame time, a bench window whose `n` or `no_image` is missing,
+negative or not finite) is `null`, never a clean zero. `params.bench: false` leaves bench mode off.
 **Use a fresh test user for each run.** A client that cannot keep up at a profile is refused it
 afterwards (`historical_client_performance_failed`; the scenario ends `error: the launch was
 refused: 409 ...`), and on the Mac test client one bench-armed 60 s hold at 1080p60 was enough (a
@@ -255,7 +267,7 @@ A directory, zipped when it is handed between machines.
 
 | file | holds |
 |---|---|
-| `manifest.json` | `format: 1`, `suite_run_id`, the `plan` as run, `started_at_ms` and `ended_at_ms`, the runner's commit, which `halves` are present (`client`, `host`), the scenario directories in order, `not_recorded` (each fact with why), what was `redacted` |
+| `manifest.json` | `format: 1`, `suite_run_id`, the `plan` as run, `started_at_ms` and `ended_at_ms`, the runner's commit (`runner.dirty: true` when tracked files differ from it), which `halves` are present (`client`, `host`), the scenario directories in order, `not_recorded` (each fact with why), what was `redacted` |
 | `client.json` | the test client: `kind` (`web` or `native`), browser, operating system, CPU, GPU adapter, displays, decode support per codec, power source |
 | `builds.json` | `components`: the exact build of each part (control plane, node agent, web client, app image, reference app, GPU driver, ...). A part that cannot say is `null` and `unknown` gives the reason |
 | `network.json` | `path` facts, and `shaping` (`null` when none was applied) |

@@ -10,7 +10,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { benchRows } from "./benchfold.mjs";
 import { Recorder } from "./record.mjs";
-import { configureTls, loadPlan, makeApi, openHost, probeClient, readThresholds, runSuite, secretTooShort, summarise } from "./run.mjs";
+import { configureTls, loadPlan, makeApi, openHost, probeClient, readThresholds, runnerState, runSuite, secretTooShort, summarise } from "./run.mjs";
 import { check, framelessSeconds, hitchCount, instrumentShare, judge, missingRate, observeWindows, shotCovered, verdict } from "./scenarios/stream-hold.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -42,14 +42,15 @@ const matches = (sel, classes) => {
 
 /** A world holding the fake clock, the fake page's state and the fake API's record. */
 function world({ wins = windows(50), session = {}, failScreenshotAt = null, webtransport = true, noBench = false, refuse = false, noFrame = false, revealed = false, stopFails = false, closeFails = false, noUrl = false, url = null, stats = { frames: 100, decoded: 100 }, videoRate = 60, hiddenBetween = null, skew = 0, extraFrames = null, loader = null, onPlay = null, bare = false } = {}) {
-  const w = { t: T0, stopped: [], live: [], url: "about:blank", ls: new Map(), shots: 0, failScreenshotAt, calls: [], secrets: new Set(), handlers: {}, opened: [], closed: [], clicks: [], gotos: [] };
+  const w = { t: T0, stopped: [], live: [], url: "about:blank", ls: new Map(), shots: 0, failScreenshotAt, calls: [], gone: new Set(), secrets: new Set(), handlers: {}, opened: [], closed: [], clicks: [], gotos: [] };
   w.now = () => w.t;
   w.sleep = async (ms) => { w.t += ms; };
   w.emit = (e, m) => (w.handlers[e] ?? []).forEach((fn) => fn(m));
   const rows = { [SID]: { id: SID, app_id: "app-1", state: "running", transport: "webrtc", negotiated_codec: "h264", stream: { height: 1080, fps: 60 }, ...session } };
   w.api = {
     apps: async () => { w.calls.push("apps"); w.secrets.add(API_BEARER); return [{ id: "app-1", name: "Quasar Benchapp" }]; },
-    session: async (id) => { w.calls.push(`session ${id}`); return rows[id]; },
+    // The API returns a row for any id this run was told about, except those a test lists in w.gone (its 404: unknown, or not this user's).
+    session: async (id) => { w.calls.push(`session ${id}`); return rows[id] ?? (w.gone.has(id) ? undefined : { id, app_id: "app-1", state: "running" }); },
     stop: async (id) => {
       w.calls.push(`stop ${id}`);
       if (stopFails) throw new Error("the session did not reach a terminal state in 30 s");
@@ -191,7 +192,7 @@ test("a stream that never shows a frame fails first_frame_s with no value, and s
   const w = world({ noFrame: true });
   const { result, scenario, by } = await run(w);
   assert.deepEqual(result.errors, []);
-  assert.deepEqual(by().first_frame_s, { id: "first_frame_s", pass: false, observed: null, expected: "<= 30" });
+  assert.deepEqual(by().first_frame_s, { id: "first_frame_s", pass: false, observed: null, expected: "<= 30 s: the first frame the client decoded (it can still be under the loader)" });
   assert.equal(scenario().status, "fail");
   assert.deepEqual(w.stopped, [SID]);
 });
@@ -204,11 +205,35 @@ test("with bench mode off a session row alone cannot pass a scenario: the first 
   assert.equal(scenario().status, "fail");
 });
 
-test("the page's own reveal of the stream is a first frame on either transport (the WebTransport canvas has no video)", async () => {
+test("A30: the loader's reveal is not a frame: with no bench frame and no video frame first_frame_s fails", async () => {
+  const shown = await run(world({ noBench: true, revealed: true }), PLAN({ bench: false }));
+  assert.equal(shown.by().first_frame_s.pass, false);
+  assert.equal(shown.scenario().status, "fail");
+  // The seat's input: a matching, non-failed loader, no bench, no video frames.
+  const seat = world({ noBench: true, loader: "sl-root is-streaming" });
+  const r = await run(seat, PLAN({ bench: false }));
+  assert.equal(r.by().first_frame_s.pass, false);
+  assert.notEqual(r.scenario().status, "pass");
+});
+
+test("A30: bench mode off on WebTransport cannot see a frame, so it is an error before anything is launched", async () => {
   const w = world({ noBench: true, revealed: true, session: { transport: "webtransport" } });
-  const { scenario, by } = await run(w, PLAN({ bench: false, transport: "webtransport" }));
-  assert.equal(by().first_frame_s.pass, true);
-  assert.equal(scenario().status, "pass");
+  const { scenario, result } = await run(w, PLAN({ bench: false, transport: "webtransport" }));
+  assert.deepEqual(result.errors, []);
+  assert.equal(scenario().status, "error");
+  assert.match(scenario().reason, /bench mode is needed to see a frame on this transport/);
+  assert.deepEqual(w.clicks, [], "nothing was launched");
+  assert.equal(check({ transport: "webtransport", codec: "h264", profile: "1080p60", hold_s: 30, app: "x", bench: false }), "bench mode is needed to see a frame on this transport");
+  assert.equal(check({ transport: "webtransport", codec: "h264", profile: "1080p60", hold_s: 30, app: "x" }), null);
+});
+
+test("B6: the loader's reveal is noted once as a step when the page shows it, and a failed loader's is not", async () => {
+  const shown = await run(world({ loader: "sl-root is-streaming" }));
+  assert.equal(shown.timeline().filter((r) => r.ev === "revealed").length, 1);
+  assert.equal(shown.by().first_frame_s.pass, true, "the frame came from the bench ring, not the reveal");
+  const failed = await run(world({ loader: "sl-root is-streaming is-failed" }));
+  assert.equal(failed.timeline().filter((r) => r.ev === "revealed").length, 0);
+  assert.equal((await run(world())).timeline().filter((r) => r.ev === "revealed").length, 0);
 });
 
 test("the suite is ok, exit 0, only when something passed; nothing passed is failed with its reason", () => {
@@ -586,13 +611,16 @@ test("present_cadence is the control plane's hitch rule: windows need the produc
 
 test("present_cadence is not judged when the bench callback missed the frames the video decoded (issue #1304)", () => {
   const video = (rate) => Array.from({ length: 50 }, (_, s) => ({ t: T0 + s * 1000, videoFrames: s * rate }));
-  assert.ok(instrumentShare(frames(50), video(60), T0 + 20_000, T0 + 49_000) > 0.99);
-  assert.ok(instrumentShare(frames(50), video(150), T0 + 20_000, T0 + 49_000) < 0.5);
+  const share = (v) => { const i = instrumentShare(frames(50), v, T0 + 20_000, T0 + 49_000); return i.seen / i.decoded; };
+  assert.ok(share(video(60)) > 0.99);
+  assert.ok(share(video(150)) < 0.5);
   assert.equal(instrumentShare(frames(50), [], T0, T0 + 1e6), null);
   const missed = J({ videoSamples: video(150) }).present_cadence;
   assert.equal(missed.pass, null);
-  assert.match(missed.expected, /saw \d+% of the frames the video decoded.*#1304/);
-  assert.equal(J({ videoSamples: video(60) }).present_cadence.pass, true);
+  assert.match(missed.expected, /saw \d+ of \d+ frames the video decoded \(\d+%\).*#1304/);
+  const ok = J({ videoSamples: video(60) }).present_cadence;
+  assert.equal(ok.pass, true);
+  assert.match(ok.expected, /the bench callback saw \d+ of \d+ frames the video decoded/);
 });
 
 test("an app without a marker leaves the marker criteria unjudged or failed, and judges what needs none", async () => {
@@ -849,18 +877,15 @@ test("A19: when the page's bearer never becomes known what was held is dropped, 
   assert.ok(["pass", "error", "fail"].includes(scenario().status));
 });
 
-test("A21: a failed or ended loader is not a first frame, whatever else it carries", async () => {
+test("A21: a failed or ended loader is never a first frame (the stopped session behind it is not a pass)", async () => {
   for (const loader of ["sl-root is-locking is-failed is-over", "sl-root is-streaming is-failed is-over", "sl-root is-streaming is-failed"]) {
     const w = world({ noBench: true, loader });
     const { scenario, by } = await run(w, PLAN({ bench: false }));
     assert.equal(by().first_frame_s.pass, false, loader);
     assert.equal(scenario().status, "fail", loader);
   }
-  // The seat's probe: bench off, no video frames, a stopped session behind the failed loader.
   const stopped = await run(world({ noBench: true, loader: "sl-root is-streaming is-failed is-over", session: { state: "stopped" } }), PLAN({ bench: false }));
   assert.notEqual(stopped.scenario().status, "pass");
-  const live = world({ noBench: true, loader: "sl-root is-streaming" });
-  assert.equal((await run(live, PLAN({ bench: false }))).by().first_frame_s.pass, true);
 });
 
 test("A21: a session that is already stopped or failed when the hold ends is an error, whatever the criteria say", async () => {
@@ -945,4 +970,139 @@ test("A25: an inherited NODE_TLS_REJECT_UNAUTHORIZED=0 is removed unless the cal
   assert.equal(r.status, 0, r.stderr);
   assert.ok(!/NODE_TLS_REJECT_UNAUTHORIZED/.test(fs.readFileSync(path.join(root, "npm.env"), "utf8")), "npm ci got the switch");
   fs.rmSync(root, { recursive: true });
+});
+
+// ── round 4: the third review's list (A26..A32) and the approving seat's small truths ──
+
+const uuid = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
+const noBearerLogin = (w) => onPage(w, (p) => { p.click = async () => {}; return p; }); // the page signs in without ever storing a bearer
+
+test("A26: every write the page sends is refused by default; the launch, the sign-in calls and exactly two named writes are not", async () => {
+  const wrote = (method, p, status = 200) => run(world({ onPlay: (x) => x.emit("response", response(status, p, {}, method)) }));
+  // The two exceptions, by exact method and path (the real sign-in posts the device record; the library keeps warm Steam alive).
+  for (const [m, p] of [["POST", "/v1/me/devices"], ["PUT", "/v1/me/steam-warm"], ["POST", "/v1/auth/login"], ["POST", "/v1/auth/refresh"], ["POST", `/v1/sessions/${SID}/stats`], ["DELETE", `/v1/sessions/${SID}`], ["GET", "/v1/me/anything"], ["OPTIONS", "/v1/me/x"]]) {
+    assert.equal((await wrote(m, p)).scenario().status, "pass", `${m} ${p}`);
+  }
+  // Everything else is a write the run cannot put back: a POST too, a failed one too, any prefix or case trick.
+  for (const [m, p, st] of [["POST", "/v1/me/password"], ["POST", "/v1/me/devices/extra"], ["PUT", "/v1/me/devices"], ["PATCH", "/v1/me/steam-warm"], ["POST", "/v1/me/steam-warm"], ["PUT", "/v1/me/steam-warm/x"], ["POST", "/v1/sessionsx"], ["POST", "/v1/authx/login"], ["POST", "/telemetry"], ["patch", "/v1/me/ui-preferences"], ["POST", "/v1/me/favourites", 500]]) {
+    const r = await wrote(m, p, st);
+    assert.equal(r.scenario().status, "error", `${m} ${p}`);
+    assert.match(r.scenario().reason, new RegExp(`the page changed something on the stack \\(${m} ${p.replace(/\//g, "\\/")}\\) that this run cannot put back`), `${m} ${p}`);
+  }
+});
+
+test("A27: an owned-looking id the API does not return is not deleted and not written as stopped; the scenario is an error naming it", async () => {
+  const w = world({ bare: true, onPlay: (x) => { x.emit("response", response(201, "/v1/sessions", { session: { id: OTHER } })); x.url = `${BASE}/app/session/${OTHER}`; } });
+  w.gone.add(OTHER); // the ordinary-user answer for an unknown id and for another user's
+  const { scenario, timeline, result } = await run(w);
+  assert.deepEqual(result.errors, []);
+  assert.equal(scenario().status, "error");
+  assert.match(scenario().reason, new RegExp(`session ${OTHER} is not confirmed to be this user's`));
+  assert.ok(!w.calls.includes(`stop ${OTHER}`), "no DELETE was sent");
+  assert.deepEqual(w.stopped, []);
+  const evs = timeline();
+  assert.ok(evs.some((r) => r.ev === "stop-unconfirmed" && r.session === OTHER));
+  assert.ok(!evs.some((r) => r.ev === "stopped"));
+  assert.deepEqual(scenario().sessions, [], "the id was never shown to be this run's");
+  // A confirmed row that is then stopped is still `stopped`.
+  const ok = await run(world());
+  assert.ok(ok.timeline().some((r) => r.ev === "stopped" && r.session === SID));
+});
+
+test("A28: while the page's bearer is unknown no page-derived error text is written, in the timeline or in the reason", async () => {
+  const w = world();
+  onPage(w, (p) => { p.click = async () => {}; p.waitForURL = async () => { throw new Error(`page is at https://stack.example.test/callback#${PAGE_BEARER}`); }; return p; });
+  const { dir, scenario, result } = await run(w);
+  assert.deepEqual(result.errors, []);
+  assert.equal(scenario().status, "error");
+  assert.match(scenario().reason, /^sign-in did not complete/);
+  for (const f of everyFile(dir).filter((x) => !x.endsWith(".png"))) assert.ok(!fs.readFileSync(f, "utf8").includes(PAGE_BEARER), path.relative(dir, f));
+  // The same for a page that would not close.
+  const c = world();
+  noBearerLogin(c);
+  c.host.closePage = async (p) => { c.closed.push(p); if (c.opened.indexOf(p) > 0) throw new Error(`target closed at https://stack.example.test/#${PAGE_BEARER}`); };
+  const r = await run(c);
+  assert.match(r.scenario().reason, /left behind: a page it opened would not close(;|$)/);
+  for (const f of everyFile(r.dir).filter((x) => !x.endsWith(".png"))) assert.ok(!fs.readFileSync(f, "utf8").includes(PAGE_BEARER), path.relative(r.dir, f));
+  // Once the bearer is known the words are written in full (and redacted): the close error is as before.
+  const known = await run(world({ closeFails: true }));
+  assert.match(known.scenario().reason, /would not close \(close failed\)/);
+});
+
+test("A29: a count a criterion reads must be a finite, non-negative number", () => {
+  const bad = (w) => windows(50).map((x, i) => (i === 40 ? { ...x, ...w } : x));
+  for (const w of [{ n: 0, no_image: Infinity }, { n: 0, no_image: NaN }, { n: 0, no_image: -1 }, { n: 0, no_image: "3" }, { n: 0, no_image: null }, { n: Infinity }, { n: 0, no_image: undefined }]) {
+    const c = J({ windows: bad(w) }).frameless_seconds;
+    assert.equal(c.pass, null, JSON.stringify(w));
+    assert.equal(c.observed, null);
+  }
+  // A malformed window as the first with frames does not move the warm-up.
+  const shifted = windows(50);
+  shifted[0] = { ...shifted[0], n: Infinity };
+  assert.equal(observeWindows(shifted, 20)[0].t_start_ms, T0 + 21_000);
+  // The marker count is a number too.
+  for (const decoded of [Infinity, -1, NaN, "5"]) assert.equal(J({ stats: { decoded } }).marker_decoded.pass, null, String(decoded));
+  assert.equal(J({ stats: { decoded: 0 } }).marker_decoded.pass, false);
+  assert.equal(J({ stats: { decoded: 3 } }).marker_decoded.pass, true);
+});
+
+test("A31: the drain-and-stop loop runs at most 10 rounds; what is left is named and the bundle is still written", async () => {
+  const w = world();
+  let n = 0;
+  const stop = w.api.stop;
+  w.api.stop = async (id) => { await stop(id); if (n < 40) { n += 1; w.emit("response", response(201, "/v1/sessions", { session: { id: uuid(n) } })); } };
+  const { scenario, result, timeline } = await run(w);
+  assert.deepEqual(result.errors, []);
+  assert.ok(result.bundle, "the bundle was committed");
+  assert.equal(w.stopped.length, 10);
+  assert.equal(scenario().status, "error");
+  assert.match(scenario().reason, new RegExp(`session ${uuid(10)} is not stopped \\(launches kept arriving after 10 rounds`));
+  assert.ok(timeline().some((r) => r.ev === "stop-failed" && r.session === uuid(10)));
+});
+
+test("A32: the pre-auth hold keeps at most 2000 lines and 1 MB, counts the rest, and the timeline says so", async () => {
+  const lines = (w, count, size) => (p) => { let once = false; p.fill = async () => { if (once) return; once = true; for (let i = 0; i < count; i += 1) w.emit("console", { type: () => "log", text: () => "x".repeat(size) }); }; return p; };
+  // Released: the first 2000 are written, the rest counted.
+  const w = world();
+  onPage(w, lines(w, 5000, 10));
+  const a = await run(w);
+  assert.equal(read(a.dir, "01-stream-hold/console.log").trim().split("\n").length, 2000);
+  assert.deepEqual(a.timeline().find((r) => r.ev === "pre-auth-evidence-dropped")?.lines, 3000);
+  // The byte cap: 20 lines of ~100 kB, the ninth is the last that fits under 1 MB.
+  const b = world();
+  onPage(b, lines(b, 20, 100_000));
+  const big = await run(b);
+  assert.equal(read(big.dir, "01-stream-hold/console.log").trim().split("\n").length, 9);
+  assert.equal(big.timeline().find((r) => r.ev === "pre-auth-evidence-dropped")?.lines, 11);
+  // Never released: everything seen, kept or not, is counted as dropped and nothing is written.
+  const c = world();
+  noBearerLogin(c);
+  onPage(c, lines(c, 5000, 10));
+  const d = await run(c);
+  assert.ok(!read(d.dir, "01-stream-hold/console.log").includes("x"));
+  assert.equal(d.timeline().find((r) => r.ev === "pre-auth-evidence-dropped")?.lines, 5000);
+});
+
+test("B7: the manifest says when the runner's tracked files differ from its commit", async () => {
+  assert.equal(JSON.parse(read((await run(world(), PLAN({}), { commit: "abc" })).dir, "manifest.json")).runner.dirty, undefined);
+  assert.deepEqual(JSON.parse(read((await run(world(), PLAN({}), { commit: "abc", dirty: true })).dir, "manifest.json")).runner, { commit: "abc", dirty: true });
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "state-"));
+  const git = (...a) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.test", "-c", "commit.gpgsign=false", ...a], { cwd: repo, encoding: "utf8", env: { PATH: process.env.PATH, HOME: repo, GIT_CONFIG_NOSYSTEM: "1" } });
+  git("init", "-q");
+  fs.writeFileSync(path.join(repo, "f"), "1");
+  git("add", "f");
+  git("commit", "-qm", "x");
+  assert.equal(runnerState(repo).dirty, false);
+  fs.writeFileSync(path.join(repo, "untracked"), "1");
+  assert.equal(runnerState(repo).dirty, false, "an untracked file does not count");
+  fs.writeFileSync(path.join(repo, "f"), "2");
+  assert.deepEqual(runnerState(repo), { commit: git("rev-parse", "HEAD").trim(), dirty: true });
+  assert.deepEqual(runnerState(os.tmpdir()), { commit: "unknown", dirty: false });
+});
+
+test("B8: builds.json says which builds e2e-collect fills and which it does not read yet", async () => {
+  const { dir } = await run(world());
+  const u = JSON.parse(read(dir, "builds.json")).unknown;
+  for (const k of ["control_plane", "node_agent"]) assert.match(u[k], /e2e-collect\) fills this/);
+  for (const k of ["web", "gpu_driver", "reference_app"]) assert.equal(u[k], "the client cannot see it, and e2e-collect does not read it yet");
 });

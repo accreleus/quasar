@@ -10,7 +10,7 @@ import { benchRows } from "../benchfold.mjs";
 const TERMINAL = ["stopped", "failed"];
 
 export const name = "stream-hold";
-// The budget asked of a launched stream. The product publishes none; spec #1271 chose 30 s.
+// The budget asked of a launched stream. The product publishes none: this is the runner's own number, not a product limit.
 export const FIRST_FRAME_LIMIT_S = 30;
 const SHOT_EVERY_S = 10;
 const SESSION_URL = /\/app\/session\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[/?#]|$)/i;
@@ -40,6 +40,8 @@ export function check(p) {
   if (typeof p.profile !== "string" || !/^\d+p\d+$/.test(p.profile)) return `profile must look like 1080p60, got ${shown(p.profile)}`;
   if (!finite(p.hold_s) || p.hold_s <= 0) return `hold_s must be a positive number of seconds, got ${shown(p.hold_s)}`;
   if (typeof p.app !== "string" || !p.app) return `app must be a catalog name, got ${shown(p.app)}`;
+  // WebTransport draws on a canvas: only the bench ring counts its frames, and the page's loader is not a frame.
+  if (p.transport === "webtransport" && p.bench === false) return "bench mode is needed to see a frame on this transport";
   return null;
 }
 
@@ -47,7 +49,7 @@ const overlaps = (w, hidden) => hidden.some(([a, b]) => w.t_start_ms < b && w.t_
 
 /** Windows after the warm-up, on the windows' own clock (the runner's clock may differ from the browser's), minus any the page was hidden for. */
 export function observeWindows(windows, warmupS, hidden = []) {
-  const first = windows.find((w) => w && w.n > 0);
+  const first = windows.find((w) => w && finite(w.n) && w.n > 0 && finite(w.t_start_ms));
   if (!first) return [];
   return windows.filter((w) => w && finite(w.t_start_ms) && finite(w.t_end_ms) && w.t_start_ms >= first.t_start_ms + warmupS * 1000 && !overlaps(w, hidden));
 }
@@ -57,8 +59,8 @@ export function framelessSeconds(obs) {
   return obs.filter((w) => w.n === 0 && !(w.no_image > 0)).length;
 }
 
-/** Every judged window states how many frames it saw; one that does not makes the count unknown, not zero. */
-const countsKnown = (obs) => obs.every((w) => finite(w.n) && w.n >= 0);
+/** Every judged window states how many frames it saw and how many had no image; one that does not (or states a negative or non-finite number) makes the count unknown, not zero. */
+const countsKnown = (obs) => obs.every((w) => [w.n, w.no_image].every((x) => finite(x) && x >= 0));
 
 /** missing / (decoded + missing) over the windows: the indices that were due. Any absent, negative or non-finite count makes it null. */
 export function missingRate(obs) {
@@ -85,13 +87,13 @@ export function hitchCount(frames, fromMs, toMs, hidden, t) {
   return { judged: sds.length, hitches: sds.filter((s) => s >= t.hitch_sd_ms).length };
 }
 
-/** The share of the frames the video element decoded over [a, b] that the bench callback saw; null when there is no video to compare with. */
+/** The frames the bench callback saw (`seen`) of the frames the video element decoded (`decoded`) over [a, b]; null when there is no video to compare with. */
 export function instrumentShare(frames, videoSamples, a, b) {
   const v = videoSamples.filter((s) => finite(s.videoFrames) && s.t >= a && s.t <= b);
   if (v.length < 2) return null;
   const decoded = v.at(-1).videoFrames - v[0].videoFrames;
   if (!(decoded > 0)) return null;
-  return frames.filter((f) => f.present_ms >= v[0].t && f.present_ms <= v.at(-1).t).length / decoded;
+  return { seen: frames.filter((f) => f?.present_ms >= v[0].t && f.present_ms <= v.at(-1).t).length, decoded };
 }
 
 function transportObserved(s) {
@@ -112,18 +114,19 @@ export function judge({ params, session, windows, frames, firstFrameS, stats, hi
   const spanFrom = obs[0]?.t_start_ms;
   const spanTo = obs.at(-1)?.t_end_ms;
   const cad = obs.length ? hitchCount(frames, spanFrom, spanTo, hidden, T) : null;
-  const share = obs.length ? instrumentShare(frames, videoSamples, spanFrom, spanTo) : null;
+  const inst = obs.length ? instrumentShare(frames, videoSamples, spanFrom, spanTo) : null;
+  const saw = inst ? `${inst.seen} of ${inst.decoded} frames` : null;
   let cadence = crit("present_cadence", null, null, `no ${warm} window had ${T.present_min_samples} present intervals`);
-  if (cad?.judged && share !== null && share < INSTRUMENT_MIN_SHARE) {
-    cadence = crit("present_cadence", null, null, `not judged: the bench callback saw ${Math.round(share * 100)}% of the frames the video decoded, so the instrument set the cadence (issue #1304)`);
+  if (cad?.judged && inst && inst.seen / inst.decoded < INSTRUMENT_MIN_SHARE) {
+    cadence = crit("present_cadence", null, null, `not judged: the bench callback saw ${saw} the video decoded (${Math.round((inst.seen / inst.decoded) * 100)}%), so the instrument set the cadence (issue #1304)`);
   } else if (cad?.judged) {
-    cadence = crit("present_cadence", cad.hitches < T.hitch_min_samples, cad.hitches, `< ${T.hitch_min_samples} one-second windows with present-interval sd >= ${T.hitch_sd_ms} ms, after the ${warm}`);
+    cadence = crit("present_cadence", cad.hitches < T.hitch_min_samples, cad.hitches, `< ${T.hitch_min_samples} one-second windows with present-interval sd >= ${T.hitch_sd_ms} ms, after the ${warm}${saw ? `; the bench callback saw ${saw} the video decoded` : ""}`);
   }
   const frameless = framelessSeconds(obs);
 
   return [
-    crit("first_frame_s", finite(firstFrameS) && firstFrameS >= 0 ? firstFrameS <= FIRST_FRAME_LIMIT_S : firstFrameS === null ? false : null, finite(firstFrameS) && firstFrameS >= 0 ? firstFrameS : null, `<= ${FIRST_FRAME_LIMIT_S}`),
-    crit("marker_decoded", stats ? stats.decoded > 0 : null, stats?.decoded ?? null, "> 0 marker frames decoded"),
+    crit("first_frame_s", finite(firstFrameS) && firstFrameS >= 0 ? firstFrameS <= FIRST_FRAME_LIMIT_S : firstFrameS === null ? false : null, finite(firstFrameS) && firstFrameS >= 0 ? firstFrameS : null, `<= ${FIRST_FRAME_LIMIT_S} s: the first frame the client decoded (it can still be under the loader)`),
+    crit("marker_decoded", stats && finite(stats.decoded) && stats.decoded >= 0 ? stats.decoded > 0 : null, stats?.decoded ?? null, "> 0 marker frames decoded"),
     crit("transport_as_asked", s ? s.transport === params.transport && !s.transport_fallback_reason : null, s ? transportObserved(s) : null, params.transport),
     crit("codec_as_asked", codec ? codec[0] === params.codec : null, codec ? `${codec[0]} (${codec[1]})` : null, params.codec),
     crit("profile_as_asked", stream && h ? stream.height === +h && stream.fps === +fps : null, stream ? `${stream.height}p${stream.fps}` : null, `${params.profile} (the launch size, not external_*)`),
@@ -203,9 +206,12 @@ export default {
     });
 
     let result;
+    // What step the run is in, for the one reason that may be written before the page's bearer is known (see the catch).
+    let stage = "sign-in";
     try {
       await signIn(page, ctx);
       rec.step("signed-in");
+      stage = "the launch";
       const app = (await api.apps()).find((a) => a.name === params.app);
       if (!app) return skipped(`app "${params.app}" is not in this user's catalog`);
 
@@ -217,6 +223,7 @@ export default {
       const row0 = await api.session(sid);
       if (!row0 || row0.id !== sid) throw new Error("the API no longer returns the session this run launched");
       rec.step("session-route", { session: sid });
+      stage = "the hold";
 
       const frames = [];
       let lastPresent = 0;
@@ -229,9 +236,12 @@ export default {
       const hidden = [];
       const videoSamples = [];
       let hiddenFrom = null;
+      let revealed = false;
       const look = async () => {
         const p = await probe(page);
         const t = tb();
+        // The loader's reveal comes later than the first decoded frame and is not a frame (the product can open it with none): it is only noted.
+        if (p.revealed && !revealed) { revealed = true; rec.step("revealed", { since_click_s: (now() - tClick) / 1000 }); }
         videoSamples.push({ t, videoFrames: p.videoFrames });
         if (p.visible !== "visible") hiddenFrom ??= t;
         else if (hiddenFrom !== null) { hidden.push([hiddenFrom, t]); hiddenFrom = null; }
@@ -242,7 +252,7 @@ export default {
       const deadline = tClick + (FIRST_FRAME_LIMIT_S + 90) * 1000; // cold hosts launch slowly; the criterion still judges the limit
       while (now() < deadline && firstFrameAt === null) {
         const p = await look();
-        if (p.frames > 0 || p.videoFrames > 0 || p.revealed) firstFrameAt = now();
+        if (p.frames > 0 || p.videoFrames > 0) firstFrameAt = now();
         else await sleep(250);
       }
       const firstFrameS = firstFrameAt === null ? null : (firstFrameAt - tClick) / 1000;
@@ -283,8 +293,12 @@ export default {
       if (TERMINAL.includes(row.state)) result = { ...result, status: "error", reason: `the session ended during the hold (it was ${row.state} before this run stopped it)` };
       rec.step("hold-done");
     } catch (err) {
-      rec.step("error", { message: String(err?.message ?? err) });
-      result = { status: "error", reason: String(err?.message ?? err), criteria: [], clock_offset_ms: null };
+      // Until the page's bearer is known, an error's words (Playwright quotes the page's address and text) are held like any
+      // other page output, and the reason that is written is a fixed one for the step that failed.
+      const message = String(err?.message ?? err);
+      if (rec.holding) rec.pageStep("error", { message });
+      else rec.step("error", { message });
+      result = { status: "error", reason: rec.holding ? `${stage} did not complete (the page's own words are not written before its sign-in is read)` : message, criteria: [], clock_offset_ms: null };
     } finally {
       await Promise.allSettled(pending);
     }
@@ -363,7 +377,7 @@ async function waitForSession(page, ctx) {
 // The loader keeps is-locking / is-streaming on a failed or ended session (SessionLoader.tsx adds is-failed and is-over beside it), so those are not a frame.
 export const REVEALED = ".sl-root.is-locking:not(.is-failed):not(.is-over), .sl-root.is-streaming:not(.is-failed):not(.is-over)";
 
-/** What the page shows right now: bench frames, the playing <video> (WebRTC), the page's own reveal of the stream (either transport), and whether it is visible. */
+/** What the page shows right now: bench frames, the playing <video> (WebRTC), whether the loader has revealed the stream (noted, never a frame), and whether it is visible. */
 const probe = (page) =>
   page.evaluate((sel) => ({
     frames: window.__qBench?.stats().frames ?? 0,
