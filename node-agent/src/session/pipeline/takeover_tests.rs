@@ -980,6 +980,45 @@ fn receives_media(host: &mut Host, peer: &mut Peer) -> bool {
     })
 }
 
+/// #1299: the runner reports the tap's `codec.switched` on its reliable lane, and only once
+/// the session is `running` (the control plane drops a trace event before). This drives the
+/// helper the loop calls at every tick and before every terminal event; the loop's own
+/// call sites are not reached by this harness.
+#[test]
+fn a_queued_codec_switch_reaches_the_reliable_lane_after_running() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let (host, media, _wt) = start_webtransport("switch");
+    media.grant_pyrowave(
+        crate::webtransport::PyroWaveGrant {
+            wanted: true,
+            target_kbps: 200_000,
+            floor_kbps: 100_000,
+            max_rtt_ms: 5,
+        },
+        (320, 192, 60),
+        true,
+    );
+    let _client = media.attach(true, Duration::ZERO).expect("hello accepted");
+    let report = |running| {
+        let seen = Mutex::new(Vec::new());
+        crate::session::runner::report_switches(&host.transports, running, &|e| {
+            seen.lock().unwrap().push(e)
+        });
+        seen.into_inner().unwrap()
+    };
+    assert!(report(false).is_empty(), "nothing before running");
+    let events = report(true);
+    assert!(
+        matches!(&events[..], [SessionEvent::Trace { event: "codec.switched", payload }]
+            if payload["to"] == "pyrowave" && payload["reason"] == "launch"),
+        "{events:?}"
+    );
+    assert!(report(true).is_empty(), "reported once");
+}
+
 /// `transport-webtransport.md` §Takeover across transports, through the runner's own calls: a
 /// WebTransport client takes the session from a streaming WebRTC peer (its media stops and
 /// the client holding signaling is told `taken_over`), and a new WebRTC peer takes it back
