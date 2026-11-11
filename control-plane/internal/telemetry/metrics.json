@@ -791,7 +791,7 @@
       "n_key": null,
       "deprecated_for": null,
       "since": "AS-05",
-      "why": "The playout/jitter-buffer target this sample was measured UNDER, so a stored sigma is self-describing. A setting, not a measurement."
+      "why": "The playout/jitter-buffer target this sample was measured UNDER, so a stored sigma is self-describing. A setting, not a measurement. On a WebTransport session it is the display cushion in force, 0 on a clean link."
     },
     {
       "key": "present_fps",
@@ -1002,6 +1002,45 @@
       "deprecated_for": null,
       "since": "0.6 (#1035)",
       "why": "keyframe_request messages the WebTransport client put on the wire in the window, whoever asked: the decoder (start-up, a restart, a backlog skip), loss recovery giving a frame up as late, or a tab shown again. Requests inside the client's spacing window are merged into one, so this counts sends, not asks. Each is a recovery the NACK path did not cover; a steady non-zero rate on a clean link means loss recovery or the decoder is struggling."
+    },
+    {
+      "key": "wt_arrival_jitter_ms",
+      "source": "browser",
+      "taxonomy": "transport.wt_arrival_jitter_ms",
+      "unit": "ms",
+      "clock": "client_wall",
+      "window": "snapshot",
+      "estimator": "last",
+      "n_key": null,
+      "deprecated_for": null,
+      "since": "0.6 (#1317)",
+      "why": "A WebTransport session's smoothed video frame arrival jitter (RFC 3550 style: the change in transit time between consecutive decoded frames, averaged over about 16 frames), the input the display cushion follows. Measured at decoder output, so decode time variation is in it. Absent on PyroWave, which has no cushion, and on WebRTC, which reports jitter_buffer_ms instead."
+    },
+    {
+      "key": "audio_concealed_samples",
+      "source": "browser",
+      "taxonomy": "client.audio_concealed_samples",
+      "unit": "count",
+      "clock": "none",
+      "window": "cumulative",
+      "estimator": "raw",
+      "n_key": null,
+      "deprecated_for": null,
+      "since": "0.6 (#1318)",
+      "why": "CUMULATIVE for the page view: audio sample frames played that the stream did not supply. On WebRTC, the browser's inbound-rtp concealedSamples. On WebTransport, frames of silence played because the audio queue had nothing due, plus frames of the fade that replaces a lost packet. 48000 is one second. Absent until the transport has measured audio, so a session without audio posts neither this nor audio_concealment_events."
+    },
+    {
+      "key": "audio_concealment_events",
+      "source": "browser",
+      "taxonomy": "client.audio_concealment_events",
+      "unit": "count",
+      "clock": "none",
+      "window": "cumulative",
+      "estimator": "raw",
+      "n_key": null,
+      "deprecated_for": null,
+      "since": "0.6 (#1318)",
+      "why": "CUMULATIVE for the page view: separate audible dropouts. On WebRTC, the browser's inbound-rtp concealmentEvents. On WebTransport, runs of silence from an empty audio queue (a run counts once however long) plus lost packets concealed. The two transports count an event by their own rule; read audio_concealed_samples for the amount."
     },
     {
       "key": "network_pacing_ms",

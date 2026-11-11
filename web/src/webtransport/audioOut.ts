@@ -24,6 +24,10 @@ export interface AudioOutStats {
   /** Audio is heard this much after its video (negative: before). */
   avOffsetMs: number | null;
   underrunMs: number;
+  /** Frames of audio that were not the stream's: silence for want of data, or a concealment fade. Cumulative. */
+  concealedSamples: number;
+  /** Runs of silence plus concealed gaps. Cumulative. */
+  concealmentEvents: number;
   dropped: number;
   decoded: number;
   /** Packets dropped for a sequence number already seen or behind one played. */
@@ -115,7 +119,8 @@ export class AudioOut {
   /** The last chunk decoded, kept to fade out of when a packet is lost. */
   private lastPlanes: Float32Array[] | null = null;
   private lateRun = 0;
-  private worklet = { underrunFrames: 0, dropped: 0 };
+  private concealedFrames = 0;
+  private worklet = { underrunFrames: 0, underrunEvents: 0, dropped: 0 };
   private readonly sync: AudioSync;
   private readonly now: () => number;
 
@@ -148,7 +153,7 @@ export class AudioOut {
     }
     this.ctx = ctx;
     this.out = out;
-    out.port.onmessage = (e: MessageEvent<{ underrunFrames: number; dropped: number }>) => {
+    out.port.onmessage = (e: MessageEvent<{ underrunFrames: number; underrunEvents: number; dropped: number }>) => {
       this.worklet = e.data;
     };
     out.setGain(this.held ? 0 : 1);
@@ -230,6 +235,7 @@ export class AudioOut {
       return faded;
     });
     this.concealed += 1;
+    this.concealedFrames += planes[0]?.length ?? 0;
     this.schedule(captureUs, planes);
   }
 
@@ -240,6 +246,8 @@ export class AudioOut {
       videoLatencyMs: this.sync.videoLatencyMs(),
       avOffsetMs: this.sync.avOffsetMs(this.minDelayMs()),
       underrunMs: (this.worklet.underrunFrames / rate) * 1000,
+      concealedSamples: this.worklet.underrunFrames + this.concealedFrames,
+      concealmentEvents: this.worklet.underrunEvents + this.concealed,
       dropped: this.worklet.dropped,
       decoded: this.decoded,
       stale: this.stale,

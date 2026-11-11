@@ -171,6 +171,27 @@ describe("AudioRing", () => {
     expect(ring.stats.underrunFrames).toBe(128);
   });
 
+  it("counts a queue that ran dry once per run of silence, and every frame of it", () => {
+    const ring = new AudioRing();
+    ring.push(0, chunk(128, 1), 0);
+    quantum(ring, 0);
+    quantum(ring, 128); // dry
+    quantum(ring, 256); // still dry: the same run
+    expect(ring.stats).toMatchObject({ underrunFrames: 256, underrunEvents: 1 });
+    ring.push(512, chunk(128, 2), 0);
+    quantum(ring, 384); // gap before the chunk: silence, the same run (nothing played in between)
+    expect(ring.stats.underrunEvents).toBe(1);
+    quantum(ring, 512); // the chunk plays, the run ends
+    quantum(ring, 640); // dry again: a new run
+    expect(ring.stats).toMatchObject({ underrunFrames: 128 * 4, underrunEvents: 2 });
+  });
+
+  it("does not count the silence before audio has started", () => {
+    const ring = new AudioRing();
+    quantum(ring, 0);
+    expect(ring.stats).toMatchObject({ underrunFrames: 0, underrunEvents: 0 });
+  });
+
   it("orders chunks that arrive out of order and drops the ones that are already past", () => {
     const ring = new AudioRing();
     ring.push(480, chunk(480, 2), 0);
@@ -250,6 +271,7 @@ function setupAudioOut(opts: { running?: boolean; supported?: boolean } = {}) {
   let t = 5_100;
   const posted: { start: number; planes: Float32Array[] }[] = [];
   const gains: number[] = [];
+  const port = { postMessage: (m: { start: number; planes: Float32Array[] }) => posted.push(m), onmessage: null as ((e: unknown) => void) | null };
   const ctx: ContextLike & { resume: ReturnType<typeof vi.fn>; state: string } = {
     state: opts.running === false ? "suspended" : "running",
     sampleRate: 48_000,
@@ -263,7 +285,7 @@ function setupAudioOut(opts: { running?: boolean; supported?: boolean } = {}) {
     }),
     close: vi.fn(async () => {}),
     addOutput: async () => ({
-      port: { postMessage: (m: { start: number; planes: Float32Array[] }) => posted.push(m) } as unknown as MessagePort,
+      port: port as unknown as MessagePort,
       setGain: (g: number) => gains.push(g),
     }),
   };
@@ -279,7 +301,7 @@ function setupAudioOut(opts: { running?: boolean; supported?: boolean } = {}) {
     isConfigSupported: async (c) => ({ supported: opts.supported ?? true, config: c }),
     now: () => t,
   });
-  return { out, ctx, decoders, posted, gains, createContext, at: (ms: number) => void (t = ms) };
+  return { out, ctx, decoders, posted, gains, createContext, port, at: (ms: number) => void (t = ms) };
 }
 
 const STEREO = { channels: 2, sampleRate: 48_000, ptimeMs: 10 };
@@ -392,6 +414,14 @@ describe("AudioOut", () => {
     expect(real.map((p) => p.start)).toEqual([frameAt(5_000_000), frameAt(5_010_000), frameAt(5_030_000)]);
   });
 
+  it("adds the worklet's silence to the concealed gaps in the dropout totals", async () => {
+    const { out, port } = setupAudioOut();
+    await out.start(STEREO);
+    expect(out.stats()).toMatchObject({ concealedSamples: 0, concealmentEvents: 0 });
+    port.onmessage?.({ data: { underrunFrames: 960, underrunEvents: 2, dropped: 0 } });
+    expect(out.stats()).toMatchObject({ concealedSamples: 960, concealmentEvents: 2 });
+  });
+
   it("plays one concealed 10 ms chunk for a lost packet: the last chunk fading to silence, then a fade in", async () => {
     const { out, decoders, posted, at } = setupAudioOut();
     await out.start(STEREO);
@@ -402,6 +432,7 @@ describe("AudioOut", () => {
     at(5_140);
     out.packet(packet(5_040_000, 14)); // 11, 12 and 13 were lost
     expect(out.stats().concealed).toBe(1);
+    expect(out.stats()).toMatchObject({ concealmentEvents: 1, concealedSamples: 480 });
     decoders[0].emit(5_040_000);
     expect(posted).toHaveLength(3);
     const [before, hole, after] = posted;

@@ -15,6 +15,7 @@ import { AudioOut, type AudioOutDeps } from "../../webtransport/audioOut";
 import { MicOut, type MicOutDeps } from "../../webtransport/micOut";
 import { DecodeStage, type DecodeFailure, type DecodeStageOptions } from "../../webtransport/decodeStage";
 import { fallbackReason } from "../../webtransport/fallback";
+import { Playout } from "../../webtransport/playout";
 import { createWebGpuPresenter, type Presenter } from "../../webtransport/presenter";
 import { WtTelemetry, type WtTelemetryOptions } from "../../webtransport/telemetry";
 import { PyroWaveStage, warmPyroWave, type PyroWaveStageOptions } from "../../pyrowave/stage";
@@ -117,6 +118,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   let transport: MediaTransport | null = null;
   let presenter: Presenter | null = null;
   let stage: DecodeStage | null = null;
+  let playout: Playout | null = null;
   let pyroStage: PyroWaveStage | null = null;
   /** Whether `hello` offers PyroWave; decided once, so a reconnect offers the same. */
   let pyroOffer = false;
@@ -134,6 +136,8 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   let benchFrame: VideoFrame | null = null;
   let benchFaulted = false;
   let audioOut: AudioOut | null = null;
+  /** The current AudioOut's dropout totals already given to telemetry; a new AudioOut counts from 0. */
+  let audioSeen = { samples: 0, events: 0 };
   /** The sound starts muted (webrtc/sessionRuntime holdAudio): nothing the app plays before the reveal is heard. */
   let audioHeld = true;
   let micSlot = false;
@@ -172,6 +176,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     audioOut?.close();
     closing = transport?.close() ?? closing;
     stage?.close();
+    playout?.close();
     pyroStage?.close();
     presenter?.destroy();
     return closing;
@@ -206,6 +211,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     // A tab back from hidden gets the whole bound again.
     if (lastVideoAt !== null) lastVideoAt = performance.now();
     telemetry.breakCadence();
+    playout?.reset();
     transport?.requestKeyframe("loss");
   }
 
@@ -225,8 +231,13 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       onEnd(transport, { code: null, reason: "media_silent" });
       if (failed) return;
     }
-    const snap = telemetry.tick();
     const audio = audioOut?.stats();
+    if (audio) {
+      telemetry.addAudioDropouts(audio.concealedSamples - audioSeen.samples, audio.concealmentEvents - audioSeen.events);
+      audioSeen = { samples: audio.concealedSamples, events: audio.concealmentEvents };
+    }
+    telemetry.setPlayout(playout?.cushion() ?? 0, playout?.arrivalJitterMs() ?? null);
+    const snap = telemetry.tick();
     if (audio?.avOffsetMs != null) {
       // Read by the bench and the hardware pass: how much later than its video the sound is heard.
       cfg.canvas.dataset.avOffsetMs = audio.avOffsetMs.toFixed(1);
@@ -291,6 +302,12 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
         load: deps.loadPyroWave,
       });
     }
+    const pl = new Playout({
+      show: (frame, captureUs) => {
+        if (p.present(frame)) presented(captureUs);
+      },
+    });
+    playout = pl;
     const s = new DecodeStage({
       ...deps.decoder,
       onFrame: (frame) => {
@@ -312,7 +329,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
             benchFrame = null;
           }
         }
-        if (p.present(frame)) presented(captureUs);
+        pl.push(frame, captureUs);
       },
       requestKeyframe: (reason) => transport?.requestKeyframe(reason),
       onFatal: (reason: DecodeFailure) => fail(reason),
@@ -328,7 +345,10 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     if (destroyed || failed) return;
     const t = deps.createTransport({ sessionId: cfg.sessionId, coords, mintToken: mintCoords, pyrowave: pyroOffer });
     transport = t;
-    if (reconnecting) telemetry.breakCadence();
+    if (reconnecting) {
+      telemetry.breakCadence();
+      playout?.reset();
+    }
     let lostOnThisConnection = 0;
     try {
       await t.connect({
@@ -337,6 +357,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
           // A reconnect's streams replace the previous connection's player.
           audioOut?.close();
           audioOut = null;
+          audioSeen = { samples: 0, events: 0 };
           if (!streams.audio || failed || destroyed) return;
           const out = (audioOut = new AudioOut(deps.audio));
           if (!audioHeld) out.release();
@@ -353,6 +374,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
           cfg.canvas.dataset.streamH = String(c.height);
           if (c.codec !== "pyrowave") {
             pyroStage?.leave();
+            playout?.setFps(c.fps);
             stage?.config(c);
           } else if (pyroStage) {
             pyroStage.config(c);

@@ -8,7 +8,7 @@ import { getOrCreateDeviceKey } from "../webrtc/capability";
 import { classifyClientHealth } from "../webrtc/clientHealth";
 import { estimateClockOffset, shouldPostClock, type ClockSample, type PostedClock } from "../webrtc/clockOffset";
 import { summarizePresentWindow } from "../webrtc/presentCadence";
-import { EMPTY_SNAPSHOT, newPostedCounters, type PostedCounters, type TelemetrySnapshot } from "../webrtc/telemetry";
+import { addAudioDropouts, EMPTY_SNAPSHOT, newPostedCounters, type PostedCounters, type TelemetrySnapshot } from "../webrtc/telemetry";
 import { CLOCK_REPOST_DELTA_MS, CLOCK_REPOST_INTERVAL_S, PRESENT_MIN_SAMPLES } from "../webrtc/thresholds";
 
 /** capture→present samples kept for the median and p95 (webrtc/telemetry.ts keeps 600 too). */
@@ -70,6 +70,8 @@ export class WtTelemetry {
   private rttMs: number | null = null;
   private codec: string | null = null;
   private decodeFailed = false;
+  private cushionMs = 0;
+  private arrivalJitterMs: number | null = null;
 
   private pending: Record<string, unknown>[] = [];
   private posted: PostedClock = { offsetMs: null, atMs: 0 };
@@ -97,6 +99,17 @@ export class WtTelemetry {
 
   setDecodeFailed(failed: boolean): void {
     this.decodeFailed = failed;
+  }
+
+  /** The display cushion in force and the arrival jitter behind it (null: none measured, as on PyroWave). */
+  setPlayout(cushionMs: number, arrivalJitterMs: number | null): void {
+    this.cushionMs = cushionMs;
+    this.arrivalJitterMs = arrivalJitterMs;
+  }
+
+  /** Audio the stream did not supply since the last call (concealed or silent frames, and runs of it). */
+  addAudioDropouts(samples: number, events: number): void {
+    addAudioDropouts(this.counters, samples, events);
   }
 
   /** Media bytes off the wire (access units, after reassembly). */
@@ -209,8 +222,7 @@ export class WtTelemetry {
       presentSdMs: cadence.sdMs,
       presentP95Ms: cadence.p95Ms,
       presentCadence: cadence,
-      // Frames are presented as they decode: there is no playout buffer on this path.
-      playoutTargetMs: 0,
+      playoutTargetMs: this.cushionMs,
       g2gMs,
       g2g95Ms: percentile(this.g2g, 95),
       clientHealth: health.health,
@@ -218,6 +230,8 @@ export class WtTelemetry {
       negotiatedCodec: this.codec,
       framesDecodedTotal: this.framesTotal,
       bytesReceivedTotal: this.bytesTotal,
+      audioConcealedSamples: this.counters.audioConcealedSamples,
+      audioConcealmentEvents: this.counters.audioConcealmentEvents,
     };
 
     // The keys are the metric manifest's (docs/session-trace/metrics.json): the shared
@@ -228,7 +242,7 @@ export class WtTelemetry {
       // Cumulative, as the contract says: the classifier takes its delta across a window.
       freeze_count: this.counters.freezeCount,
       packets_lost: this.counters.packetsLost,
-      playout_target_ms: 0,
+      playout_target_ms: this.cushionMs,
       present_n: cadence.n,
       wt_keyframe_requests: this.keyframeRequests,
       is_hidden: hidden ? 1 : 0,
@@ -247,6 +261,9 @@ export class WtTelemetry {
     put("present_beat_fraction", cadence.doubledFraction);
     put("present_long_frames", cadence.longFrames);
     put("wt_capture_to_present_ms", g2gMs);
+    put("wt_arrival_jitter_ms", this.arrivalJitterMs);
+    put("audio_concealed_samples", this.counters.audioConcealedSamples);
+    put("audio_concealment_events", this.counters.audioConcealmentEvents);
     // A thin window has no σ: "smooth" there is unmeasured, and posting it would record a pass.
     const unmeasured = health.health === "smooth" && cadence.n < PRESENT_MIN_SAMPLES;
     this.pending.push({

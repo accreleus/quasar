@@ -14,6 +14,8 @@ interface Chunk {
 export interface RingStats {
   /** Frames of silence played while the queue was empty after audio had started. */
   underrunFrames: number;
+  /** Runs of silence: a queue that ran dry (or a gap in it) counts once however long it lasts. */
+  underrunEvents: number;
   /** Chunks dropped because they were due before they arrived, or the queue was full. */
   dropped: number;
 }
@@ -29,7 +31,9 @@ export class AudioRing {
   private queued = 0;
   /** Frame after the last sample played; null before the first chunk. */
   private lastEnd: number | null = null;
-  readonly stats: RingStats = { underrunFrames: 0, dropped: 0 };
+  readonly stats: RingStats = { underrunFrames: 0, underrunEvents: 0, dropped: 0 };
+  /** The last frame rendered was silence for want of audio. */
+  private starving = false;
 
   constructor(
     private readonly slack = SLACK_FRAMES,
@@ -59,7 +63,7 @@ export class AudioRing {
       const f = frame + pos;
       if (!chunk) {
         this.silence(out, pos, n - pos);
-        if (this.lastEnd !== null) this.stats.underrunFrames += n - pos;
+        this.underrun(n - pos);
         return;
       }
       // Back to back with the last chunk when its timestamp is within the slack; an overlap
@@ -72,7 +76,7 @@ export class AudioRing {
       if (at > f) {
         const gap = Math.min(at - f, n - pos);
         this.silence(out, pos, gap);
-        if (this.lastEnd !== null) this.stats.underrunFrames += gap;
+        this.underrun(gap);
         pos += gap;
         continue;
       }
@@ -90,12 +94,20 @@ export class AudioRing {
       }
       chunk.off += take;
       pos += take;
+      this.starving = false;
       this.lastEnd = chunk.start + chunk.off;
       if (chunk.off >= chunk.frames) {
         this.queue.shift();
         this.queued -= chunk.frames;
       }
     }
+  }
+
+  private underrun(frames: number): void {
+    if (this.lastEnd === null) return;
+    this.stats.underrunFrames += frames;
+    if (!this.starving) this.stats.underrunEvents += 1;
+    this.starving = true;
   }
 
   private silence(out: Float32Array[], from: number, count: number): void {
