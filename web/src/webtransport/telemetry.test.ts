@@ -265,6 +265,22 @@ describe("WtTelemetry", () => {
       expect(snap.presentCadence.longFrames).toBe(0);
       expect(snap.freezeCount).toBe(0);
     });
+
+    it("ignores a display callback asked for before a break: the wait for the first new picture is no long frame", () => {
+      // A hidden tab runs no callback, so the one asked for before hiding fires at the first
+      // display frame after the tab is shown, after the runtime broke the cadence. A reconnect
+      // whose old connection's callback is still pending is the same order.
+      const h = harness(120);
+      stream(h, 30, 1);
+      h.t.presented(0); // its callback stays pending
+      h.t.breakCadence();
+      const back = 10_000 / VSYNC;
+      h.vsync(back * VSYNC); // the stale callback
+      stream(h, 30, 1, back + 12); // the first new picture comes 100 ms later
+      const snap = h.t.tick();
+      expect(snap.presentCadence.longFrames).toBe(0);
+      expect(snap.freezeCount).toBe(0);
+    });
   });
 
   it("opens its first window when the ticks start, not when it was made", () => {

@@ -58,6 +58,8 @@ export class WtTelemetry {
   /** A picture was submitted and the display frame it lands in has not started: one flag, so a
    *  hidden tab (no frames) holds nothing and several submits in a frame are one displayed frame. */
   private awaitingDisplay = false;
+  /** The cadence run: a display callback asked for before a break must not start the next run. */
+  private run = 0;
   /** Start of the display frame the last picture landed in. */
   private lastPresentMs: number | null = null;
   private intervals: number[] = [];
@@ -149,6 +151,7 @@ export class WtTelemetry {
    *  was replaced): the next displayed frame starts a new run of intervals. */
   breakCadence(): void {
     this.lastPresentMs = null;
+    this.run += 1;
   }
 
   /** That unit's frame came out of the decoder. */
@@ -187,7 +190,8 @@ export class WtTelemetry {
     this.framesTotal += 1;
     if (!this.awaitingDisplay) {
       this.awaitingDisplay = true;
-      this.requestFrame((displayMs) => this.displayed(displayMs));
+      const run = this.run;
+      this.requestFrame((displayMs) => this.displayed(displayMs, run));
     }
     const offset = this.clockOffsetMs();
     if (offset === null) return;
@@ -200,8 +204,11 @@ export class WtTelemetry {
 
   /** A display frame started with a picture submitted before it: the pictures submitted since the
    *  last display frame are one displayed frame (the later ones cover the earlier). */
-  private displayed(displayMs: number): void {
+  private displayed(displayMs: number, run: number): void {
     this.awaitingDisplay = false;
+    // Asked for before a break (a hidden tab runs no callback until it is shown; a reconnect): the
+    // wait for the first new picture is not an interval.
+    if (run !== this.run) return;
     // A throttled background tab can still run a callback: its seconds-long gaps are not stalls.
     if (this.isHidden()) return this.breakCadence();
     if (this.lastPresentMs !== null) this.intervals.push(displayMs - this.lastPresentMs);
