@@ -1,84 +1,141 @@
-// Scenario stream-hold: sign in, launch the reference app from the library in bench mode,
+// Scenario stream-hold: sign in, launch the reference app from the game page in bench mode,
 // wait for the first frame, hold, stop the session. Reads only what the product exposes
-// (window.__qBench, the DOM, the API); it wraps no browser API.
+// (window.__qBench, the DOM, the API); it wraps no browser API and changes no preference.
 //
 // ctx (the runner builds it; the tests pass a fake): { baseUrl, params, rec, api, creds, client,
-// thresholds, now(), sleep(ms) }. Returns { status, reason?, criteria, sessions, clock_offset_ms }.
+// thresholds, secrets, now(), clockOffset(), sleep(ms) }.
+// Returns { status, reason?, criteria, sessions, clock_offset_ms, cleanup? }; `cleanup` lists what
+// the scenario could not put back, and the runner turns any entry into an `error`.
 import { benchRows } from "../benchfold.mjs";
 
 export const name = "stream-hold";
-export const WARMUP_S = 10; // the first seconds of a stream judder by construction (testing-bench-mode.md)
+// The budget asked of a launched stream. The product publishes none; spec #1271 chose 30 s.
 export const FIRST_FRAME_LIMIT_S = 30;
-export const MISSING_RATE_LIMIT = 0.01;
 const SHOT_EVERY_S = 10;
-const TERMINAL = ["stopped", "failed"];
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SESSION_URL = /\/app\/session\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[/?#]|$)/i;
+const CODEC_LABEL = { h264: "H.264", h265: "HEVC", av1: "AV1", pyrowave: "Auto" };
+// The bench callback seeing fewer frames than the video decoded means the instrument, not the stream, set the cadence (#1304).
+const INSTRUMENT_MIN_SHARE = 0.9;
 
-// Steam's sign-in QR, as fractions of the 16:9 picture (measured on the lab; the same box the lab proofs cover).
+// Steam's sign-in QR, as fractions of the picture (measured on the lab; the same box the lab proofs cover).
 const QR = { x: 0.14, y: 0.185, w: 0.22, h: 0.545 };
 
+const finite = (x) => typeof x === "number" && Number.isFinite(x);
 const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
 const sd = (xs) => Math.sqrt(mean(xs.map((x) => (x - mean(xs)) ** 2)));
+const shown = (v) => JSON.stringify(v)?.slice(0, 40);
+// A criterion that was not judged has no observed value (the validator's rule).
 const crit = (id, pass, observed, expected) => ({ id, pass, observed: pass === null ? null : observed, expected });
 
-/** Windows after the warm-up, on the windows' own clock (the runner's clock may differ from the browser's). */
-export function observeWindows(windows) {
-  const first = windows.find((w) => w.n > 0);
-  return first ? windows.filter((w) => w.t_start_ms >= first.t_start_ms + WARMUP_S * 1000) : [];
+/** Why `p` cannot be run, or null. The runner asks before it opens a page. */
+export function check(p) {
+  if (!["webrtc", "webtransport"].includes(p.transport)) return `transport must be webrtc or webtransport, got ${shown(p.transport)}`;
+  if (!Object.hasOwn(CODEC_LABEL, p.codec)) return `codec must be one of ${Object.keys(CODEC_LABEL).join(", ")}, got ${shown(p.codec)}`;
+  if (typeof p.profile !== "string" || !/^\d+p\d+$/.test(p.profile)) return `profile must look like 1080p60, got ${shown(p.profile)}`;
+  if (!finite(p.hold_s) || p.hold_s <= 0) return `hold_s must be a positive number of seconds, got ${shown(p.hold_s)}`;
+  if (typeof p.app !== "string" || !p.app) return `app must be a catalog name, got ${shown(p.app)}`;
+  return null;
 }
 
-/** Runs of consecutive seconds with no frame at all (a second of undecodable frames is not a freeze). */
-export function freezes(windows) {
-  let runs = 0;
-  let inRun = false;
-  for (const w of windows) {
-    const frameless = w.n === 0 && !w.undecoded && !w.no_image;
-    if (frameless && !inRun) runs += 1;
-    inRun = frameless;
+const overlaps = (w, hidden) => hidden.some(([a, b]) => w.t_start_ms < b && w.t_end_ms > a);
+
+/** Windows after the warm-up, on the windows' own clock (the runner's clock may differ from the browser's), minus any the page was hidden for. */
+export function observeWindows(windows, warmupS, hidden = []) {
+  const first = windows.find((w) => w && w.n > 0);
+  if (!first) return [];
+  return windows.filter((w) => w && finite(w.t_start_ms) && finite(w.t_end_ms) && w.t_start_ms >= first.t_start_ms + warmupS * 1000 && !overlaps(w, hidden));
+}
+
+/** One-second bench windows in which no frame reached the bench callback. A stall shorter than a window is invisible here. */
+export function framelessSeconds(obs) {
+  return obs.filter((w) => w.n === 0 && !(w.no_image > 0)).length;
+}
+
+/** missing / (decoded + missing) over the windows: the indices that were due. Any absent, negative or non-finite count makes it null. */
+export function missingRate(obs) {
+  let missing = 0;
+  let decoded = 0;
+  for (const w of obs) {
+    if (![w.missing_indices, w.decoded].every((x) => finite(x) && x >= 0)) return null;
+    missing += w.missing_indices;
+    decoded += w.decoded;
   }
-  return runs;
+  return decoded + missing > 0 ? missing / (decoded + missing) : null;
 }
 
-/** One-second groups of present intervals whose spread reaches the hitch threshold. */
-export function hitchWindows(frames, fromMs, hitchSdMs) {
-  const bySecond = new Map();
-  const ps = frames.map((f) => f.present_ms).filter((p) => Number.isFinite(p) && p >= fromMs);
+/** The control plane's hitch rule on the bench ring: one-second groups with at least `present_min_samples` intervals, sd against the hitch threshold. */
+export function hitchCount(frames, fromMs, toMs, hidden, t) {
+  const ps = frames.map((f) => f?.present_ms).filter((p) => finite(p) && p >= fromMs && p <= toMs).sort((a, b) => a - b);
+  const by = new Map();
   for (let i = 1; i < ps.length; i += 1) {
+    if (hidden.some(([a, b]) => ps[i - 1] < b && ps[i] > a)) continue;
     const k = Math.floor(ps[i] / 1000);
-    bySecond.set(k, [...(bySecond.get(k) ?? []), ps[i] - ps[i - 1]]);
+    by.set(k, [...(by.get(k) ?? []), ps[i] - ps[i - 1]]);
   }
-  return [...bySecond.values()].filter((iv) => iv.length >= 2 && sd(iv) >= hitchSdMs).length;
+  const sds = [...by.values()].filter((iv) => iv.length >= t.present_min_samples).map(sd);
+  return { judged: sds.length, hitches: sds.filter((s) => s >= t.hitch_sd_ms).length };
 }
 
-export function judge({ params, session, windows, frames, firstFrameS, located, thresholds }) {
-  const obs = observeWindows(windows);
-  const judged = located && obs.length > 0;
-  const missing = obs.reduce((a, w) => a + (w.missing_indices ?? 0), 0);
-  const shown = obs.reduce((a, w) => a + (w.n ?? 0), 0);
-  const rate = shown + missing > 0 ? missing / (shown + missing) : null;
-  const codec = session ? (session.pyrowave?.active || session.pyrowave?.used ? "pyrowave" : String(session.negotiated_codec ?? session.stream?.codec ?? "").replace("hevc", "h265") || null) : null;
-  const [, h, fps] = /^(\d+)p(\d+)/.exec(params.profile ?? "") ?? [];
-  const stream = session?.stream;
-  const hitchSd = thresholds.hitch_sd_ms;
-  const minHitch = thresholds.hitch_min_samples;
-  const cadence = judged ? hitchWindows(frames, obs[0].t_start_ms, hitchSd) : null;
+/** The share of the frames the video element decoded over [a, b] that the bench callback saw; null when there is no video to compare with. */
+export function instrumentShare(frames, videoSamples, a, b) {
+  const v = videoSamples.filter((s) => finite(s.videoFrames) && s.t >= a && s.t <= b);
+  if (v.length < 2) return null;
+  const decoded = v.at(-1).videoFrames - v[0].videoFrames;
+  if (!(decoded > 0)) return null;
+  return frames.filter((f) => f.present_ms >= v[0].t && f.present_ms <= v.at(-1).t).length / decoded;
+}
+
+function transportObserved(s) {
+  if (s.transport_fallback_reason) return `${s.transport} (the client fell back to webrtc: ${s.transport_fallback_reason})`;
+  if (s.transport_reason) return `${s.transport} (stream plan: ${s.transport_reason})`;
+  return String(s.transport);
+}
+
+export function judge({ params, session, windows, frames, firstFrameS, stats, hidden = [], videoSamples = [], thresholds: T }) {
+  const obs = observeWindows(windows, T.warmup_exclude_s, hidden);
+  const warm = `${T.warmup_exclude_s} s warm-up`;
+  const s = session;
+  const codec = !s ? null : s.pyrowave?.active || s.pyrowave?.used ? ["pyrowave", "pyrowave.active/used"] : s.negotiated_codec ? [String(s.negotiated_codec), "negotiated_codec"] : s.stream?.codec ? [String(s.stream.codec), "stream.codec"] : null;
+  const [, h, fps] = /^(\d+)p(\d+)$/.exec(params.profile ?? "") ?? [];
+  const stream = s?.stream;
+
+  const rate = missingRate(obs);
+  const spanFrom = obs[0]?.t_start_ms;
+  const spanTo = obs.at(-1)?.t_end_ms;
+  const cad = obs.length ? hitchCount(frames, spanFrom, spanTo, hidden, T) : null;
+  const share = obs.length ? instrumentShare(frames, videoSamples, spanFrom, spanTo) : null;
+  let cadence = crit("present_cadence", null, null, `no ${warm} window had ${T.present_min_samples} present intervals`);
+  if (cad?.judged && share !== null && share < INSTRUMENT_MIN_SHARE) {
+    cadence = crit("present_cadence", null, null, `not judged: the bench callback saw ${Math.round(share * 100)}% of the frames the video decoded, so the instrument set the cadence (issue #1304)`);
+  } else if (cad?.judged) {
+    cadence = crit("present_cadence", cad.hitches < T.hitch_min_samples, cad.hitches, `< ${T.hitch_min_samples} one-second windows with present-interval sd >= ${T.hitch_sd_ms} ms, after the ${warm}`);
+  }
+  const frameless = framelessSeconds(obs);
+
   return [
-    crit("first_frame_s", firstFrameS === null ? null : firstFrameS <= FIRST_FRAME_LIMIT_S, firstFrameS, `<= ${FIRST_FRAME_LIMIT_S}`),
-    crit("marker_decoded", located === null ? null : located, located, "true"),
-    crit("transport_as_asked", session ? session.transport === params.transport : null, session?.transport ?? null, params.transport),
-    crit("codec_as_asked", codec ? codec === params.codec : null, codec, params.codec),
-    crit("profile_as_asked", stream && h ? stream.height === +h && stream.fps === +fps : null, stream ? `${stream.height}p${stream.fps}` : null, params.profile),
-    crit("freeze_count", obs.length ? freezes(obs) === 0 : null, obs.length ? freezes(obs) : null, "0 after the warm-up"),
-    crit("missing_indices_rate", judged && rate !== null ? rate <= MISSING_RATE_LIMIT : null, rate, `<= ${MISSING_RATE_LIMIT} after the warm-up`),
-    crit("present_cadence", cadence !== null ? cadence < minHitch : null, cadence, `< ${minHitch} windows with present-interval sd >= ${hitchSd} ms`),
+    crit("first_frame_s", firstFrameS !== null && firstFrameS <= FIRST_FRAME_LIMIT_S, firstFrameS, `<= ${FIRST_FRAME_LIMIT_S}`),
+    crit("marker_decoded", stats ? stats.decoded > 0 : null, stats?.decoded ?? null, "> 0 marker frames decoded"),
+    crit("transport_as_asked", s ? s.transport === params.transport && !s.transport_fallback_reason : null, s ? transportObserved(s) : null, params.transport),
+    crit("codec_as_asked", codec ? codec[0] === params.codec : null, codec ? `${codec[0]} (${codec[1]})` : null, params.codec),
+    crit("profile_as_asked", stream && h ? stream.height === +h && stream.fps === +fps : null, stream ? `${stream.height}p${stream.fps}` : null, `${params.profile} (the launch size, not external_*)`),
+    crit("frameless_seconds", obs.length ? frameless === 0 : null, frameless, `0 one-second bench windows without a frame, after the ${warm}`),
+    {
+      id: "missing_indices_rate",
+      pass: null,
+      observed: null,
+      expected: `not judged: no limit calibrated on the marker app yet${rate === null ? " (no usable counts)" : `; measured ${(rate * 100).toFixed(2)} % over ${obs.length} windows`}`,
+    },
+    cadence,
   ];
 }
 
-/** pass needs a criterion that held and none that failed; if nothing could be judged the run says so rather than pass. */
+/** pass needs the first frame and no failed criterion; a first frame that could not be judged is an error with its reason. */
 export function verdict({ status, reason, criteria = [] }) {
   if (status) return { status, ...(reason ? { reason } : {}) };
   if (criteria.some((c) => c.pass === false)) return { status: "fail" };
-  if (criteria.some((c) => c.pass === true)) return { status: "pass" };
-  return { status: "error", reason: "nothing could be judged" };
+  if (criteria.find((c) => c.id === "first_frame_s")?.pass === true) return { status: "pass" };
+  return { status: "error", reason: "no first frame could be judged" };
 }
 
 /** A screenshot with a black box over the QR a launcher shows; no stream surface to place it on means no shot at all. */
@@ -88,7 +145,7 @@ export async function shotCovered(page, rec, label, cover) {
     const el = [...document.querySelectorAll(".session-video")].find((e) => e.videoWidth || e.tagName === "CANVAS");
     if (!el) return false;
     const r = el.getBoundingClientRect();
-    const ar = 16 / 9;
+    const ar = +el.dataset.compositorW / +el.dataset.compositorH || 16 / 9;
     const mode = el.dataset.scalingMode || "contain";
     const k = mode === "stretch" ? null : mode === "cover" ? Math.max(r.width / ar, r.height) : Math.min(r.width / ar, r.height);
     const pw = k ? k * ar : r.width;
@@ -109,6 +166,7 @@ export async function shotCovered(page, rec, label, cover) {
 
 export default {
   name,
+  check,
   async run(page, ctx) {
     const { params, rec, api, client, now, sleep } = ctx;
     const skipped = (reason) => ({ status: "skipped", reason, criteria: [], sessions: [], clock_offset_ms: null });
@@ -119,35 +177,50 @@ export default {
 
     const cover = params.cover_qr ?? params.app === "Steam";
     const shot = (label) => shotCovered(page, rec, label, cover);
+    const tb = () => now() + (ctx.clockOffset?.() ?? 0); // the browser's clock, which the bench windows are stamped on
     ctx.refused = null;
-    page.on("response", async (r) => {
+
+    // The sessions this run owns: the ids in the 201s of its own POST /v1/sessions, plus the id of its own
+    // page's URL once the API confirms it. The listener reads; it wraps nothing.
+    const owned = new Set();
+    const cleanup = [];
+    const pending = [];
+    page.on("response", (r) => {
       const { pathname } = new URL(r.url());
+      const method = r.request().method();
+      if (r.status() === 201 && method === "POST" && pathname === "/v1/sessions") {
+        pending.push((async () => {
+          const id = (await r.json().catch(() => null))?.session?.id;
+          if (typeof id === "string" && UUID.test(id)) { owned.add(id); rec.step("session-started", { session: id }); }
+          else cleanup.push("a session launch was accepted but its id could not be read, so it could not be stopped");
+        })());
+      }
       if (r.status() < 400 || !pathname.startsWith("/v1/")) return;
-      const body = (await r.text().catch(() => "")).slice(0, 300);
-      rec.step("api-error", { method: r.request().method(), path: pathname, status: r.status(), body });
-      if (r.request().method() === "POST" && pathname === "/v1/sessions") ctx.refused = `the launch was refused: ${r.status()} ${body.trim()}`;
+      pending.push((async () => {
+        const body = (await r.text().catch(() => "")).slice(0, 300);
+        rec.step("api-error", { method, path: pathname, status: r.status(), body });
+        if (method === "POST" && pathname === "/v1/sessions") ctx.refused = `the launch was refused: ${r.status()} ${body.trim()}`;
+      })());
     });
-    const sessions = new Set();
-    const before = new Set((await api.liveSessions().catch(() => [])).map((s) => s.id));
-    let sid = null;
-    let wasClassic = true;
+
     let result;
     try {
       await signIn(page, ctx);
       rec.step("signed-in");
-      const apps = await api.apps();
-      const app = apps.find((a) => a.name === params.app);
+      const app = (await api.apps()).find((a) => a.name === params.app);
       if (!app) return skipped(`app "${params.app}" is not in this user's catalog`);
 
       const switches = [params.transport === "webtransport" && "transport=webtransport", params.codec === "pyrowave" && "codec=pyrowave"].filter(Boolean);
-      await page.goto(`${ctx.baseUrl}/app${switches.length ? `?${switches.join("&")}` : ""}`, { waitUntil: "domcontentloaded" });
-      const tClick = await pickAndPlay(page, ctx, async () => {
-        wasClassic = await api.classicLayout();
-        if (!wasClassic) await api.setClassicLayout(true);
-      });
+      await page.goto(`${ctx.baseUrl}/app/game/${encodeURIComponent(app.id)}${switches.length ? `?${switches.join("&")}` : ""}`, { waitUntil: "domcontentloaded" });
+      const tClick = await pickAndPlay(page, ctx);
       rec.step("play-clicked", { app: params.app });
-      sid = await waitForSession(page, ctx);
-      sessions.add(sid);
+      const sid = await waitForSession(page, ctx);
+      const row0 = await api.session(sid);
+      if (!row0 || row0.id !== sid) {
+        rec.step("session-unattributed", { session: sid, why: "the API has no such session for this user" });
+        throw new Error("the page's session id is not a session of this user, so it was left alone");
+      }
+      owned.add(sid);
       rec.step("session-route", { session: sid });
 
       const frames = [];
@@ -157,28 +230,43 @@ export default {
         for (const f of dump?.frames ?? []) if (f.present_ms > lastPresent) { frames.push(f); lastPresent = f.present_ms; }
         return dump;
       };
+      // One look at the page per second: is a frame showing, is the page visible. The hidden spans leave the judged span.
+      const hidden = [];
+      const videoSamples = [];
+      let hiddenFrom = null;
+      const look = async () => {
+        const p = await probe(page);
+        const t = tb();
+        videoSamples.push({ t, videoFrames: p.videoFrames });
+        if (p.visible !== "visible") hiddenFrom ??= t;
+        else if (hiddenFrom !== null) { hidden.push([hiddenFrom, t]); hiddenFrom = null; }
+        return p;
+      };
+
       let firstFrameAt = null;
       const deadline = tClick + (FIRST_FRAME_LIMIT_S + 90) * 1000; // cold hosts launch slowly; the criterion still judges the limit
       while (now() < deadline && firstFrameAt === null) {
-        const p = await probe(page);
-        if (p.frames > 0 || p.videoFrames > 0) firstFrameAt = now();
-        else await sleep(500);
+        const p = await look();
+        if (p.frames > 0 || p.videoFrames > 0 || p.revealed) firstFrameAt = now();
+        else await sleep(250);
       }
       const firstFrameS = firstFrameAt === null ? null : (firstFrameAt - tClick) / 1000;
       rec.step("first-frame", { first_frame_s: firstFrameS });
-      if (firstFrameAt !== null) await shot("first-frame");
+      await shot(firstFrameAt === null ? "no-frame" : "first-frame");
 
-      const holdUntil = (firstFrameAt ?? now()) + params.hold_s * 1000;
+      const holdUntil = firstFrameAt === null ? now() : firstFrameAt + params.hold_s * 1000;
       let nextShot = (firstFrameAt ?? now()) + SHOT_EVERY_S * 1000;
       while (now() < holdUntil) {
         await sleep(Math.min(1000, holdUntil - now()));
+        const p = await look();
         if (now() >= nextShot) {
           nextShot += SHOT_EVERY_S * 1000;
           await shot(`t${Math.round((now() - firstFrameAt) / 1000)}s`);
           await pullFrames();
-          rec.step("held", { stats: await probe(page) });
+          rec.step("held", { stats: p });
         }
       }
+      if (hiddenFrom !== null) hidden.push([hiddenFrom, tb()]);
       const dump = await pullFrames();
       await shot("end");
       const windows = dump?.windows ?? [];
@@ -188,10 +276,12 @@ export default {
       rec.jsonl("metrics.jsonl", benchRows(windows, 0));
 
       const row = await api.session(sid);
+      if (!row || row.id !== sid) throw new Error("the API no longer returns the session this run started");
+      if (row.app_id !== undefined && row.app_id !== app.id) throw new Error("the launched session is for another app than the one asked for");
       rec.json("session.json", { session: row });
-      const known = [...windows].reverse().find((w) => w.offset_unknown === false && Number.isFinite(w.offset_ms));
+      const known = [...windows].reverse().find((w) => w?.offset_unknown === false && Number.isFinite(w.offset_ms));
       result = {
-        criteria: judge({ params, session: row, windows, frames, firstFrameS, located: stats ? stats.located : null, thresholds: ctx.thresholds }),
+        criteria: judge({ params, session: row, windows, frames, firstFrameS, stats, hidden, videoSamples, thresholds: ctx.thresholds }),
         clock_offset_ms: known ? known.offset_ms : null,
       };
       rec.step("hold-done");
@@ -199,16 +289,19 @@ export default {
       rec.step("error", { message: String(err?.message ?? err) });
       result = { status: "error", reason: String(err?.message ?? err), criteria: [], clock_offset_ms: null };
     } finally {
-      if (!wasClassic) await api.setClassicLayout(false).catch((e) => rec.step("layout-restore-failed", { message: String(e?.message ?? e) }));
-      // Every exit path: the session this run started is stopped, whatever else went wrong.
-      const started = [...sessions, ...(await api.liveSessions().catch(() => [])).map((s) => s.id).filter((id) => !before.has(id))];
-      for (const id of new Set(started)) {
-        sessions.add(id);
-        await api.stop(id).catch((e) => rec.step("stop-failed", { session: id, message: String(e?.message ?? e) }));
-        rec.step("stopped", { session: id });
+      // Every exit path: the sessions this run started are stopped, and a stop is "stopped" only once the API says so.
+      await Promise.allSettled(pending);
+      for (const id of owned) {
+        try {
+          await api.stop(id);
+          rec.step("stopped", { session: id });
+        } catch (e) {
+          rec.step("stop-failed", { session: id, message: String(e?.message ?? e) });
+          cleanup.push(`session ${id} is not confirmed stopped (${String(e?.message ?? e)})`);
+        }
       }
     }
-    return { sessions: [...sessions], ...result, ...verdict(result) };
+    return { sessions: [...owned], ...result, ...verdict(result), ...(cleanup.length ? { cleanup } : {}) };
   },
 };
 
@@ -223,59 +316,61 @@ async function signIn(page, ctx) {
   await page.fill("#login-password", ctx.creds.password);
   await page.click('button[type="submit"]');
   await page.waitForURL((u) => !new URL(u).pathname.startsWith("/login"), { timeout: 20000 });
+  // The page's own bearer is a secret of this run too: removed from everything written, as a value.
+  const bearer = await page.evaluate(() => localStorage.getItem("quasar.auth.token") ?? sessionStorage.getItem("quasar.auth.token"));
+  if (typeof bearer === "string" && bearer) ctx.secrets?.add(bearer);
 }
 
-const CODEC_LABEL = { h264: "H.264", h265: "HEVC", av1: "AV1", pyrowave: "Auto" };
-
-/** Click as a script, not as a pointer: an untrusted click cannot start full screen or take the pointer lock. Waits for the element to be enabled. */
+/** Waits for the control to be enabled, then clicks it as a script, not as a pointer (an untrusted click cannot start full screen or take the pointer lock). Returns the time of the click. */
 async function press(locator, ctx, what) {
   const stop = ctx.now() + 30000;
   for (;;) {
     const ready = await locator.first().evaluate((el) => !el.disabled && el.getAttribute("aria-disabled") !== "true").catch(() => false);
-    if (ready) return locator.first().evaluate((el) => el.click());
+    if (ready) {
+      const t = ctx.now();
+      await locator.first().evaluate((el) => el.click());
+      return t;
+    }
     if (ctx.now() > stop) throw new Error(`${what} never became available on the page`);
     await ctx.sleep(300);
   }
 }
 
 /**
- * Asks for the codec, frame rate and resolution through the page's own Launch options (the classic library
- * layout, a per-user setting that `enableClassic` turns on and the caller puts back), then Play now.
- * Returns the time of the Play click.
+ * Asks for the codec, frame rate and resolution through the game page's own Launch options ("Change"
+ * opens the sheet), then Play now. No preference of the user is touched. Returns the time of the Play click.
  */
-async function pickAndPlay(page, ctx, enableClassic) {
+async function pickAndPlay(page, ctx) {
   const { params } = ctx;
-  const [, height, fps] = /^(\d+)p(\d+)/.exec(params.profile ?? "") ?? [];
-  if (!height || !CODEC_LABEL[params.codec]) throw new Error(`cannot ask the page for codec ${params.codec} at ${params.profile}`);
-  await enableClassic();
-  await page.goto(page.url(), { waitUntil: "domcontentloaded" });
-  await press(page.locator(`button[aria-label="${params.app}"]`), ctx, `the ${params.app} tile`);
-  await press(page.getByRole("button", { name: /^Adjust/ }), ctx, "Adjust (Launch options)");
-  for (const [group, label] of [["Codec", CODEC_LABEL[params.codec]], ["Frame rate", `${fps} fps`], ["Resolution", `${height}p`]]) {
-    await press(page.getByRole("radiogroup", { name: group }).getByRole("radio", { name: new RegExp(`^${label.replace(/\./g, "\\.")}`) }), ctx, `${group} "${label}"`);
+  const [, height, fps] = /^(\d+)p(\d+)$/.exec(params.profile);
+  if (!new URL(page.url(), ctx.baseUrl).pathname.startsWith("/app/game/")) {
+    throw new Error(`the page did not open the game page for ${params.app} (it is at ${new URL(page.url(), ctx.baseUrl).pathname}; an account with the Classic layout on is sent to the library instead)`);
   }
-  const t = ctx.now();
-  await press(page.getByRole("button", { name: /^Play now/ }), ctx, "Play now");
-  return t;
+  await press(page.getByRole("button", { name: "Change", exact: true }), ctx, "Change (Launch options)");
+  const sheet = page.getByRole("dialog", { name: /^Launch options/ });
+  for (const [group, label] of [["Codec", CODEC_LABEL[params.codec]], ["Frame rate", `${fps} fps`], ["Resolution", `${height}p`]]) {
+    await press(sheet.getByRole("radiogroup", { name: group }).getByRole("radio", { name: new RegExp(`^${label.replace(/\./g, "\\.")}`) }), ctx, `${group} "${label}"`);
+  }
+  return press(sheet.getByRole("button", { name: /^Play now/ }), ctx, "Play now");
 }
 
 async function waitForSession(page, ctx) {
   const stop = ctx.now() + 90000;
   while (ctx.now() < stop) {
-    const url = page.url();
-    const m = /\/app\/session\/([0-9a-f-]{36})/.exec(url);
+    const m = SESSION_URL.exec(new URL(page.url(), ctx.baseUrl).pathname);
     if (m) return m[1];
     if (ctx.refused) throw new Error(ctx.refused);
-    if (/\/app\/game\//.test(url)) await page.getByRole("button", { name: /^(play|resume)\b/i }).first().evaluate((el) => el.click()).catch(() => {});
     await ctx.sleep(300);
   }
   throw new Error("the Play click never reached a session page");
 }
 
+/** What the page shows right now: bench frames, the playing <video> (WebRTC), the page's own reveal of the stream (either transport), and whether it is visible. */
 const probe = (page) =>
   page.evaluate(() => ({
     frames: window.__qBench?.stats().frames ?? 0,
-    videoFrames: document.querySelector("video")?.getVideoPlaybackQuality?.().totalVideoFrames ?? 0,
+    videoFrames: document.querySelector("video.session-video:not([hidden])")?.getVideoPlaybackQuality?.().totalVideoFrames ?? 0,
+    revealed: !!document.querySelector(".sl-root.is-locking, .sl-root.is-streaming"),
     visible: document.visibilityState,
     focused: document.hasFocus?.(),
   }));

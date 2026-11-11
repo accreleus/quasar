@@ -5,64 +5,105 @@ loop, leaving one **run bundle** that an agent or a person reviews afterwards. S
 
 > **Status.** The bundle format and its validator (#1272), the runner (#1273, `make e2e-run`) and
 > the review that summarises a bundle (#1275, `make e2e-review`) exist. `e2e-collect`, `e2e-post`,
-> `e2e-compare` and `e2e-pack` are the spec's later
-> tickets; this page grows with them.
+> `e2e-compare` and `e2e-pack` are the spec's later tickets; this page grows with them.
 
 ## What you need
 
 - Node 22. The validator and the review have no dependencies.
-- To run a plan (`e2e-run`): Chrome or Chromium, `npm ci` in `scripts/validate` (the verb does it on first use), and the stack's URL.
-- A test user: an ordinary user's sign-in in `QUASAR_E2E_EMAIL` and `QUASAR_E2E_PASSWORD`, or in a file of `KEY=value` lines named by `QUASAR_E2E_CRED_FILE`. No admin token is needed or used.
+- To run a plan (`e2e-run`): Chrome or Chromium, `npm ci` in `scripts/validate` (the verb does it on first use, without your sign-in in its environment), and the stack's URL.
+- A test user: an ordinary user's sign-in in `QUASAR_E2E_EMAIL` and `QUASAR_E2E_PASSWORD`, or in a file of `KEY=value` lines named by `QUASAR_E2E_CRED_FILE`. No admin token is needed or used. The account must not have the Classic layout on (the runner changes no preference and needs the game page).
 - The reference app in that user's library (`QUASAR_E2E_APP` names it, default `Quasar Benchapp`).
+- `CLIENT=<label>`: a name for this test client, by role (`mac-test-client`), never a host name. Letters, digits, `_`, `.`, `-`.
+- A stack with a self-signed certificate: `INSECURE_TLS=1`. Certificate checks are on otherwise, for the runner's own requests and for a browser it launches; `network.json` records which.
 
 ## What to do
 
 Run a plan from the machine you are testing from:
 
 ```
-make e2e-run TARGET=<stack url> PLAN=smoke [CDP=<DevTools http endpoint>] [OUT=<dir>]
+make e2e-run TARGET=<stack url> PLAN=smoke [CDP=<DevTools http endpoint>] [OUT=<dir>] [CLIENT=<label>] [INSECURE_TLS=1]
 ```
 
-`PLAN` is a name under `scripts/validate/stream/plans/` or a path to a plan file. With `CDP=` the
-runner attaches to a browser that is already running (the Mac test client), uses its default
-context and a real window, and closes only the pages it opened. Without it, it launches `CHROME=`
-(or Playwright's Chromium). Each `stream-hold` signs in through the login form, launches the
-reference app through the page's own Launch options (codec, frame rate and resolution; that dialog
-exists only in the classic library layout, so the runner turns the test user's `classic_layout`
-setting on and puts it back) with the product's `?transport=` and `?codec=pyrowave` switches and bench
-mode on, holds, and stops the session; the session is stopped on every exit path, `Ctrl-C`
-included. The run ends with one line:
+`PLAN` is a name under `scripts/validate/stream/plans/` or a path to a plan file. The runner works
+in a browser context of its own: with `CDP=` it attaches to a browser that is already running
+(the Mac test client) and opens a separate context in it, a separate storage partition in the same
+real browser, so the person's tabs, storage and sign-in on the stack are never read or written; it
+closes that context at the end and nothing else. Without `CDP=` it launches `CHROME=` (or
+Playwright's Chromium). Each `stream-hold` signs in through the login form, opens the game page,
+asks for the codec, frame rate and resolution through the page's own Launch options ("Change"), and
+presses Play now, with the product's `?transport=` and `?codec=pyrowave` switches and bench mode
+on. It holds, then stops the session.
+
+The runner owns what it created and nothing else. The sessions it stops are the ones whose
+ids came back in the `201` of its own page's launch, plus the id in its own page's URL once the API
+confirms that session is the user's; a live session it cannot attribute is left alone and named
+in the timeline. A session is `stopped` in the timeline only after the API says it is over, and the
+stop is attempted on every exit path, `Ctrl-C` included. Anything that could not be put back
+(a stop not confirmed, a page that would not close) makes the scenario `error` with a reason that
+names exactly what was left behind. `OUT` must not exist: the bundle is built in a staging
+directory beside it, checked with the validator, and only then renamed to `OUT`; a bundle that
+fails the check is deleted, its problems are printed, and the run exits 2.
+
+The run ends with one line:
 
 ```
-RESULT status=ok|failed|error target=e2e-run bundle=<dir> pass=N fail=N error=N skipped=N
+RESULT status=ok|failed|error target=e2e-run bundle=<dir> pass=N fail=N error=N skipped=N [reason=nothing-passed]
 ```
 
-Exit 0 when no scenario failed or errored (skipped ones are counted, never hidden), 1 when one did,
-2 for a usage error or a bundle that does not pass the check below. Start reading at
-`<bundle>/<NN>-stream-hold/scenario.json`: its `criteria` each say `pass`, `observed` and `expected`;
-`pass: null` means it could not be judged here (and `observed` is `null`).
+Exit 0 only when at least one scenario passed and none failed or errored (skipped ones are
+counted, never hidden); 1 when one did, and also when nothing passed (`reason=nothing-passed`); 2 for
+a usage error, a bundle that does not pass the check below, or a browser context that would not
+close. Start reading at `<bundle>/<NN>-stream-hold/scenario.json`: its `criteria` each say `pass`,
+`observed` and `expected`; `pass: null` means it was recorded or could not be judged here (and
+`observed` is `null`). A plan entry that cannot be run (an unknown scenario, a `hold_s` that is not
+a positive number, a codec the runner does not know) is an `error` with the reason before anything is
+launched; the bundle is still complete and the run goes on.
 
-`stream-hold` criteria: `first_frame_s` within 30; `marker_decoded`; `transport_as_asked`,
-`codec_as_asked` and `profile_as_asked` against the session row; `freeze_count` 0, `missing_indices_rate`
-at most 1 % and `present_cadence` (fewer than `classifier.hitch_min_samples` seconds whose
-present-interval sd reaches `classifier.hitch_sd_ms`) over the stream after its first 10 s. The
-profile is not a control the user has (the Launch options pick a codec, frame rate and resolution),
-so `profile_as_asked` compares the asked profile with the stream the session got. `freeze_count` is
-judged from the bench windows with or without a marker; the other two bench criteria need one.
-A scenario is `pass` only when at least one criterion held and none failed; if nothing could be
-judged it is `error` ("nothing could be judged"). `params.bench: false` leaves bench mode off. In attach mode the runner
-puts the stack origin's `localStorage` back as it found it after each scenario, on every exit path.
+`stream-hold` criteria, each meaning what its name says:
+
+| criterion | judged as |
+|---|---|
+| `first_frame_s` | a frame showed within 30 s of the Play click (the runner's budget, not a product limit). Seen on the bench ring, the `<video>` (WebRTC) or the page's own reveal of the stream, which is the only sign on the WebTransport canvas. No frame by the deadline is `pass: false`, and a scenario is never `pass` without this one |
+| `marker_decoded` | the bench instrument decoded at least one marker frame (`stats().decoded > 0`) |
+| `transport_as_asked` | the session's `transport` is the asked one and `transport_fallback_reason` is empty; `observed` carries the transport and any `transport_reason` or fallback reason |
+| `codec_as_asked` | `negotiated_codec` (or `stream.codec`, or `pyrowave.active/used`) is the asked codec; `observed` names the field read |
+| `profile_as_asked` | the asked height and frame rate against `stream.height` and `stream.fps`, the launch size (not `external_*`). It is not a profile id: the Launch options choose a codec, frame rate and resolution. Only the resolutions the sheet lists can be asked |
+| `frameless_seconds` | the number of one-second bench windows with no frame at all, after the warm-up, excluding any span the page was hidden. Not Chrome's `freeze_count`; a stall shorter than a window is invisible to it. It needs no marker |
+| `missing_indices_rate` | recorded, not judged (`pass: null`): `missing / (decoded + missing)` over the judged span is in `expected`. No limit has been calibrated on the marker app (the first 60 s of a healthy bench cell read 6.95 % in `docs/testing-bench-mode.md`) |
+| `present_cadence` | the control plane's hitch rule on the bench ring: per one-second window with at least `web.present_cadence.min_samples` present intervals, sd against `classifier.hitch_sd_ms`, a hitch at `classifier.hitch_min_samples` such windows. It needs no marker. When the bench callback saw under 90 % of the frames the video decoded over the span it is not judged, because the instrument set the cadence (issue #1304) |
+
+The warm-up is one value for every criterion that has one: `classifier.warmup_exclude_s` in
+`docs/session-trace/thresholds.json` (20 s). The smoke plan holds 90 s so the judged span is at
+least 60 s after it. A scenario is `pass` only when the first frame was seen and no criterion failed;
+if the first frame could not be judged it is `error`. `params.bench: false` leaves bench mode off.
 **Use a fresh test user for each run.** A client that cannot keep up at a profile is refused it
 afterwards (`historical_client_performance_failed`; the scenario ends `error: the launch was
-refused: 409 ...`), and on the Mac test client one bench-armed 60 s hold at 1080p60 was enough (a hold with
-`bench: false` was not). A scenario the
-client cannot run (no WebTransport, a codec it cannot decode, the app not in the catalog) is
-`skipped` with the reason.
+refused: 409 ...`), and on the Mac test client one bench-armed 60 s hold at 1080p60 was enough (a
+hold with `bench: false` was not). A scenario the client cannot run (no WebTransport, a codec it
+cannot decode, the app not in the catalog) is `skipped` with the reason.
+
+`client.json` carries the label, the browser, OS and CPU (from client hints; `user_agent` is Chrome's
+reduced string), the GPU (the unmasked WebGL renderer where the browser offers it), decode support per
+codec (`supported`, `power_efficient`, and WebCodecs), `power` (`null` when the Battery API only reports
+a full, charging battery, which is also what a machine with no battery says), and `clock`: the
+browser's clock minus the runner's, measured around one round trip. Timeline stamps are put on the
+browser's clock with it, and each row says `clock_source`.
 
 The runner reads only what the product exposes (`window.__qBench`, the page, the API) and wraps no
-browser API. What it cannot see is in `manifest.json` `not_recorded`, each with a reason. Every file
-is scrubbed when written: addresses, tokens and the test user's sign-in become markers, the
-stack's host name becomes `<stack>`, and the manifest counts what was replaced.
+browser API. What it cannot see is in `manifest.json` `not_recorded`, each with a reason. The
+issue also asked for a decoded-frame grab every 10 s, the client's own telemetry and the bundle
+attached to the issue; none is done (the screenshot every 10 s stands in for the first, the bench
+windows for the second, and posting is `e2e-post`, #1276).
+
+**Redaction.** Every secret the run holds is an exact literal removed from every string before
+anything is serialised: the password, the e-mail, the stack's host name, the bearer the API sign-in
+returned and the one the page stored after its own sign-in (also in their URL- and JSON-escaped
+spellings). The validator's patterns for addresses and tokens run after that as defence in depth.
+A member named like a credential (`password`, `token`, `authorization`, `sig_token`, ...) is dropped.
+The manifest's `redacted` names the kinds replaced. A picture is binary and is not scrubbed:
+the runner only photographs the stream page. Known limit: a secret the page prints in the
+milliseconds between receiving it and the runner reading it is caught by the validator's patterns
+only.
 
 Check a bundle:
 
