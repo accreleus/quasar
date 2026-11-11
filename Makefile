@@ -75,6 +75,10 @@ TARGET ?= local
 KEEP ?= 0
 export LEVEL TARGET KEEP
 
+# e2e-review passthrough: make e2e-review BUNDLE=<bundle-dir>
+BUNDLE ?=
+export BUNDLE
+
 # bench passthrough: make bench-submit DIR=<run dir> ARGS='--suite ... --tag k=v'
 DIR ?=
 export DIR
@@ -103,7 +107,7 @@ export VERSION DRY_RUN
 	test test-go test-rust test-uinput test-web test-webgpu test-engines test-engines-build \
         test-db preflight release up down restart rebuild redeploy-cp status health logs logs-follow \
         dev-web dev-cp diagnose diagnose-bundle clean reset agent-creds validate \
-        e2e-collect \
+        e2e-collect e2e-review \
         ui-audit ui-audit-routes ui-audit-ab session-display session-soak abr-ladder \
         bench-submit bench-retro bench-run bench-suite bench-budget bench-baseline \
         homes-gc \
@@ -313,6 +317,9 @@ validate: ## End-to-end validation report — LEVEL=ui|api|session|all TARGET=lo
 
 e2e-collect: ## The host half of a run bundle, by session id — BUNDLE=<dir> [HOST=<role|name>] [RESUME=1: finish a collection this machine started]
 	@bash $(DX)/e2e_collect.sh
+
+e2e-review: ## The deterministic summary an agent reads first — BUNDLE=<bundle-dir>
+	@node scripts/validate/stream/review.mjs "$$BUNDLE"
 
 ## ── Image QA ────────────────────────────────────────────────────────────────
 

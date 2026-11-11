@@ -1156,6 +1156,7 @@ pub(crate) fn feedback_abr(
     let latest = Arc::new(std::sync::atomic::AtomicU64::new(ceiling_kbps.to_bits()));
     let mode = cfg.abr_mode;
     let observe_loop = abr_loop.clone();
+    let floor_loop = abr_loop.clone();
     let observed = latest.clone();
     let begin: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         let latest = latest.clone();
@@ -1175,6 +1176,9 @@ pub(crate) fn feedback_abr(
     let retake = begin.clone();
     Some(crate::webtransport::Rate {
         ceiling_kbps,
+        // The governor's lock, alone and released: `observe` takes it again after.
+        floor_kbps: Box::new(move || f64::from(floor_loop.governor.lock().unwrap().floor_kbps())),
+        retargets: mode != AbrMode::Off,
         // Each client starts afresh: it takes the encoder over (a WebRTC peer that started
         // since owns it until then) and registers new hooks.
         start: Box::new(move || begin()),

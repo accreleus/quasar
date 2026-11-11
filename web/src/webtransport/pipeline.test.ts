@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ControlDecoder, ControlProtocolError, encodeControl, parseVideoDatagram, serialAfter } from "./framing";
-import { FrameAssembler, INITIAL_RTT_MS, KEY_REASK_MS, MAX_PENDING, MAX_PENDING_AGE_MS, RTT_SLACK_MS } from "./reassembly";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { ControlDecoder, ControlProtocolError, encodeControl, parseFecDatagram, parseVideoDatagram, serialAfter } from "./framing";
+import { FEC_ACTIVE_MS, FEC_HOLD_MS, FrameAssembler, INITIAL_RTT_MS, KEY_REASK_MS, MAX_PENDING, MAX_PENDING_AGE_MS, RTT_SLACK_MS } from "./reassembly";
 import {
   BACKLOG_MS,
   DecodeStage,
@@ -14,7 +16,7 @@ import {
   hevcCodecString,
 } from "./decodeStage";
 import { containRect, createWebGpuPresenter, presentGeometry } from "./presenter";
-import { avcC, bytes, FakeChunk, FakeDecoder, fakeFrame, flush, packetize, type FakeFrame, type UnitSpec } from "./testSupport";
+import { avcC, bytes, FakeChunk, FakeDecoder, fakeFrame, flush, packetize, repairOf, type FakeFrame, type UnitSpec } from "./testSupport";
 
 beforeEach(() => {
   vi.stubGlobal("EncodedVideoChunk", FakeChunk);
@@ -81,6 +83,182 @@ describe("FrameAssembler", () => {
     const { units } = a.push(f[1]);
     expect(seqs({ units })).toEqual([9]);
     expect(Array.from(units[0].data)).toEqual(Array.from(data));
+  });
+
+  describe("FEC, scheme xor (#1046)", () => {
+    // Five fragments; the last is shorter than the rest.
+    const data = bytes(5000, 7);
+    const five = () => frags({ configId: 0, frameSeq: 4, keyframe: true, data });
+    const whole = (r: { units: { data: Uint8Array }[] }) => r.units.length === 1 && Array.from(r.units[0].data).join() === Array.from(data).join();
+
+    it("rebuilds the one fragment its group lacks, byte for byte, and asks for nothing more", () => {
+      const f = five();
+      expect(f).toHaveLength(5);
+      const a = new FrameAssembler(() => 0);
+      for (const i of [0, 1, 3]) a.push(f[i]);
+      // Fragment 2 was NACKed when fragment 3 showed the gap (the repair comes after the
+      // fragments it protects); once rebuilt, nothing is asked again.
+      const r = a.repair(parseFecDatagram(repairOf(f, 0, 4))!);
+      expect(r.nacks).toEqual([]);
+      expect(whole(a.push(f[4]))).toBe(true);
+      expect(a.repaired).toBe(1);
+    });
+
+    it("rebuilds the last, shorter fragment at its own length", () => {
+      const f = five();
+      const a = new FrameAssembler(() => 0);
+      for (const i of [0, 1, 2, 3]) a.push(f[i]);
+      expect(whole(a.repair(parseFecDatagram(repairOf(f, 2, 3))!))).toBe(true);
+    });
+
+    it("holds a repair that arrives while two of its group are missing, and uses it when one of them arrives", () => {
+      const f = five();
+      const a = new FrameAssembler(() => 0);
+      for (const i of [0, 3, 4]) a.push(f[i]);
+      expect(a.repair(parseFecDatagram(repairOf(f, 0, 4))!).units).toEqual([]);
+      expect(a.repaired).toBe(0);
+      expect(whole(a.push(f[1]))).toBe(true); // fragment 2 comes from the held repair
+      expect(a.repaired).toBe(1);
+    });
+
+    it("repairs a burst of two adjacent fragments with two interleaved groups", () => {
+      const f = five();
+      const a = new FrameAssembler(() => 0);
+      for (const i of [0, 3, 4]) a.push(f[i]);
+      a.repair(parseFecDatagram(repairOf(f, 0, 2, 2))!); // protects 0 and 2
+      expect(whole(a.repair(parseFecDatagram(repairOf(f, 1, 2, 2))!))).toBe(true); // 1 and 3
+      expect(a.repaired).toBe(2);
+    });
+
+    it("leaves a group with two missing to NACK", () => {
+      const f = five();
+      const a = new FrameAssembler(() => 0);
+      for (const i of [0, 3, 4]) a.push(f[i]);
+      const first = a.repair(parseFecDatagram(repairOf(f, 0, 4))!);
+      // Asked once when fragment 3 arrived; nothing rebuilt, nothing released.
+      expect(first.units).toEqual([]);
+      expect(a.repaired).toBe(0);
+    });
+
+    it("drops a repair for a frame it is not waiting for, one past the frame's end, and one whose length does not fit", () => {
+      const f = five();
+      const a = new FrameAssembler(() => 0);
+      // Nothing of the frame has arrived: there is no sibling header to give a rebuilt fragment.
+      expect(a.repair(parseFecDatagram(repairOf(f, 0, 4))!)).toEqual(NONE);
+      for (const i of [0, 1, 3, 4]) a.push(f[i]);
+      const past = parseFecDatagram(repairOf(f, 0, 4))!;
+      a.repair({ ...past, firstFrag: 3 }); // would cover fragments 3 … 6 of 5
+      const bad = parseFecDatagram(repairOf(f, 0, 4))!;
+      a.repair({ ...bad, lengthXor: bad.lengthXor ^ 0x4000 }); // a length the payload cannot hold
+      expect(a.repaired).toBe(0);
+      // The frame is still waiting, and a good repair still completes it.
+      expect(whole(a.repair(parseFecDatagram(repairOf(f, 0, 4))!))).toBe(true);
+    });
+
+    it("refuses a repair datagram of another scheme, or with a count or stride the contract excludes", () => {
+      const good = repairOf(five(), 0, 4);
+      expect(parseFecDatagram(good)).toMatchObject({ frameSeq: 4, firstFrag: 0, count: 4, stride: 1 });
+      const with_ = (at: number, v: number) => {
+        const d = good.slice();
+        d[at] = v;
+        return parseFecDatagram(d);
+      };
+      expect(with_(5, 2)).toBeNull(); // unknown scheme
+      expect(with_(10, 1)).toBeNull(); // count below 2
+      expect(with_(10, 49)).toBeNull(); // count above 48
+      expect(with_(11, 0)).toBeNull(); // stride 0
+      expect(parseFecDatagram(good.subarray(0, 14))).toBeNull(); // no payload
+      expect(with_(0, 0x01)).toBeNull(); // not the FEC channel
+    });
+
+    it("rebuilds any one fragment from the agent's own repair datagrams (testdata/webtransport/fec-xor.json)", () => {
+      const hex = (s: string) => Uint8Array.from(s.match(/../g)!, (b) => parseInt(b, 16));
+      const vectors = JSON.parse(readFileSync(resolve(__dirname, "../../../testdata/webtransport/fec-xor.json"), "utf8")) as {
+        fragments: string[];
+        cases: { repairs: string[] }[];
+      };
+      const f = vectors.fragments.map((d) => parseVideoDatagram(hex(d))!);
+      const unit = f.flatMap((x) => Array.from(x.payload)).join();
+      const groups: number[] = [];
+      for (const c of vectors.cases) {
+        for (const d of c.repairs) {
+          const r = parseFecDatagram(hex(d))!;
+          groups.push(r.count);
+          for (let k = r.firstFrag; k < r.firstFrag + r.count * r.stride; k += r.stride) {
+            const a = new FrameAssembler(() => 0);
+            f.forEach((x, i) => i !== k && a.push(x));
+            expect(a.repair(r).units.map((u) => Array.from(u.data).join())).toEqual([unit]);
+          }
+        }
+      }
+      // One group over the frame, then two and three interleaved: each case covers all seven.
+      expect(groups).toEqual([7, 4, 3, 3, 2, 2]);
+    });
+
+    describe("while the agent sends FEC, a gap's first NACK waits for the frame's repairs", () => {
+      /** An assembler that has just had a whole frame and its repair: the agent is sending FEC. */
+      const sending = (clock: { t: number }) => {
+        const a = new FrameAssembler(() => clock.t);
+        const k = frags({ configId: 0, frameSeq: 3, keyframe: true, data: bytes(3000, 1) });
+        for (const x of k) a.push(x);
+        a.repair(parseFecDatagram(repairOf(k, 0, 3))!);
+        return a;
+      };
+
+      it("sends no NACK for a fragment the repair rebuilds, and does not count it lost", () => {
+        const clock = { t: 0 };
+        const a = sending(clock);
+        const f = five();
+        clock.t = 1;
+        a.push(f[0]);
+        a.push(f[1]);
+        expect(a.push(f[3])).toMatchObject({ nacks: [], wakeMs: FEC_HOLD_MS });
+        clock.t = 2;
+        expect(a.push(f[4]).nacks).toEqual([]);
+        clock.t = 3;
+        const r = a.repair(parseFecDatagram(repairOf(f, 0, 5))!);
+        expect(r.nacks).toEqual([]);
+        expect(whole(r)).toBe(true);
+        expect([a.lost, a.repaired]).toEqual([0, 1]);
+      });
+
+      it(`NACKs a loss the repair cannot cover ${FEC_HOLD_MS} ms after the gap showed, not later`, () => {
+        const clock = { t: 0 };
+        const a = sending(clock);
+        const f = five();
+        clock.t = 1;
+        a.push(f[0]);
+        expect(a.push(f[3]).nacks).toEqual([]); // 1 and 2 are missing
+        a.push(f[4]);
+        clock.t = 2;
+        expect(a.repair(parseFecDatagram(repairOf(f, 0, 5))!).nacks).toEqual([]); // two of its group: no rebuild
+        clock.t = 1 + FEC_HOLD_MS - 0.5;
+        expect(a.tick()).toMatchObject({ nacks: [], wakeMs: 0.5 });
+        clock.t = 1 + FEC_HOLD_MS;
+        expect(a.tick().nacks).toEqual([{ frameSeq: 4, frags: [[1, 2]] }]);
+        expect(a.lost).toBe(2);
+      });
+
+      it("NACKs at once when a later frame shows the repairs are not coming", () => {
+        const clock = { t: 0 };
+        const a = sending(clock);
+        const f = five();
+        clock.t = 1;
+        a.push(f[0]);
+        expect(a.push(f[2]).nacks).toEqual([]);
+        const next = frags({ configId: 0, frameSeq: 5, keyframe: false, data: bytes(10, 9) });
+        expect(a.push(next[0]).nacks).toEqual([{ frameSeq: 4, frags: [[1, 1], [3, 4]] }]);
+      });
+
+      it("does not wait once no repair has arrived for a second", () => {
+        const clock = { t: 0 };
+        const a = sending(clock);
+        const f = five();
+        clock.t = FEC_ACTIVE_MS + 1;
+        a.push(f[0]);
+        expect(a.push(f[2]).nacks).toEqual([{ frameSeq: 4, frags: [[1, 1]] }]);
+      });
+    });
   });
 
   it("carries on across the frame_seq wrap", () => {

@@ -2,12 +2,11 @@
 //! amendment 54). One QUIC listener per agent serves every session on the host; a
 //! session's client authenticates with a single-use token the control plane minted and
 //! then gets the session's video as datagrams.
-//!
-//! Not here yet: FEC.
 
 mod audio;
 mod cert;
 mod congestion;
+mod fec;
 mod media;
 mod mic_jitter;
 mod pyrowave;
@@ -105,6 +104,11 @@ impl Input {
 pub(crate) struct Rate {
     /// The estimate never goes above this: the ABR's ceiling.
     pub(crate) ceiling_kbps: f64,
+    /// The floor the ABR's setpoint is clamped to now; it moves with the ladder's rung.
+    pub(crate) floor_kbps: Box<dyn Fn() -> f64 + Send + Sync>,
+    /// False with the ABR off: the estimate is tracked and never written to the encoder,
+    /// so nothing would pay for FEC.
+    pub(crate) retargets: bool,
     /// A client's first estimate: its loop takes the encoder over (one writer per encoder).
     pub(crate) start: Box<dyn Fn() + Send + Sync>,
     pub(crate) observe: Box<dyn Fn(f64) + Send + Sync>,
@@ -121,10 +125,14 @@ struct Control<'a> {
     refused: u64,
     /// Set once the client is displaced or the session ended.
     gone: Arc<OnceLock<Gone>>,
+    /// §FEC: `Some` when `hello_ack.fec` named `xor`.
+    fec: Option<fec::Policy>,
+    /// The FEC overhead the ABR was last charged for, which is all the repairs may spend.
+    charged: f64,
 }
 
 impl<'a> Control<'a> {
-    fn new(rate: &'a Rate, gone: Arc<OnceLock<Gone>>) -> Self {
+    fn new(rate: &'a Rate, gone: Arc<OnceLock<Gone>>, fec: bool) -> Self {
         let now = std::time::Instant::now();
         Self {
             rate,
@@ -133,6 +141,8 @@ impl<'a> Control<'a> {
             started: false,
             refused: 0,
             gone,
+            fec: fec.then(fec::Policy::default),
+            charged: 0.0,
         }
     }
 
@@ -159,7 +169,21 @@ impl<'a> Control<'a> {
             congestion_events: path.congestion_events,
         };
         let now = std::time::Instant::now();
-        if let Some(kbps) = self.estimator.on_feedback(&fb, &mut self.log, now, path) {
+        let estimate = self.estimator.on_feedback(&fb, &mut self.log, now, path);
+        // Before the estimate is fed: the encoder's share follows the level this loss sets.
+        if let (Some(fec), Some(loss)) = (self.fec.as_mut(), self.estimator.loss()) {
+            let was = fec.overhead();
+            fec.observe(loss, now);
+            if fec.overhead() != was {
+                tracing::debug!(
+                    token = "webtransport-fec-overhead",
+                    "WebTransport FEC overhead {was:.2} → {:.2} at {:.1} % loss",
+                    fec.overhead(),
+                    loss * 100.0
+                );
+            }
+        }
+        if let Some(kbps) = estimate {
             self.feed(kbps);
         }
     }
@@ -182,7 +206,30 @@ impl<'a> Control<'a> {
         if !std::mem::replace(&mut self.started, true) {
             (self.rate.start)();
         }
-        (self.rate.observe)(kbps);
+        // Fed estimate / (1 + share). The governor holds while that is at least (1 − deadband)
+        // × its setpoint, so a share inside the deadband moves nothing and video plus FEC is
+        // at most estimate / (1 − deadband), the bound video alone has (tests: `governed`).
+        // The ABR never goes under its floor: the share is at most what the estimate leaves
+        // above that.
+        self.charged = self.fec.as_ref().map_or(0.0, |fec| {
+            let room = (kbps / (self.rate.floor_kbps)() - 1.0).max(0.0);
+            fec.overhead().min(room)
+        });
+        (self.rate.observe)(kbps / (1.0 + self.charged));
+    }
+
+    /// The repair datagrams that follow one frame's video datagrams. A PyroWave frame gets
+    /// none: no loss is measured while it is active (§Feedback), so nothing sizes them.
+    fn protect(
+        &mut self,
+        pyrowave: bool,
+        fragments: &[bytes::Bytes],
+        pkt_seq: &mut u32,
+    ) -> Vec<bytes::Bytes> {
+        match self.fec.as_mut().filter(|_| !pyrowave) {
+            Some(fec) => fec.protect(fragments, self.charged, pkt_seq),
+            None => Vec::new(),
+        }
     }
 }
 
@@ -256,6 +303,18 @@ struct Hello {
     /// Amendment 55: this connection can decode PyroWave.
     #[serde(default)]
     pyrowave: bool,
+    /// The FEC schemes the client decodes (§Hello). Anything but a list names none: FEC is
+    /// optional, so a malformed offer costs the client its repairs, not its session.
+    #[serde(default)]
+    fec: Value,
+}
+
+impl Hello {
+    fn decodes(&self, scheme: &str) -> bool {
+        self.fec
+            .as_array()
+            .is_some_and(|schemes| schemes.iter().any(|s| s == scheme))
+    }
 }
 
 fn token_hash(token: &str) -> String {
@@ -981,7 +1040,12 @@ fn pong(ping: &Value) -> Value {
     })
 }
 
-fn hello_ack(config: &media::VideoConfig, audio: &Audio, switch_reason: Option<&str>) -> Value {
+fn hello_ack(
+    config: &media::VideoConfig,
+    audio: &Audio,
+    switch_reason: Option<&str>,
+    fec: bool,
+) -> Value {
     let (stream_audio, mic) = audio.describe();
     let mut ack = json!({
         "type": "hello_ack",
@@ -996,7 +1060,7 @@ fn hello_ack(config: &media::VideoConfig, audio: &Audio, switch_reason: Option<&
         },
         "audio": stream_audio,
         "mic": mic,
-        "fec": null,
+        "fec": fec.then_some("xor"),
         "retransmit_window_ms": retransmit::WINDOW.as_millis() as u64,
     });
     // codec-pyrowave.md §`hello_ack`: required for PyroWave, and always BT.709.
@@ -1234,6 +1298,9 @@ async fn authenticate(
             return;
         }
     };
+    // §FEC: repairs are paid for by lowering the encoder's rate, so only an ABR that
+    // writes it sends them.
+    let fec = media.rate().is_some_and(|rate| rate.retargets) && hello.decodes("xor");
     tracing::info!(
         token = "webtransport-client-connected",
         session_id = %hello.session_id,
@@ -1245,7 +1312,7 @@ async fn authenticate(
             deadline,
             write_message(
                 &mut send,
-                &hello_ack(&client.config, media.audio(), client.reason)
+                &hello_ack(&client.config, media.audio(), client.reason, fec)
             )
         )
         .await,
@@ -1257,7 +1324,7 @@ async fn authenticate(
     }
     drop(slot);
     let _ = authed.set((media.clone(), client.id));
-    stream(session, send, recv, &media, client).await;
+    stream(session, send, recv, &media, client, fec).await;
 }
 
 /// Hand the client its video until it leaves, is displaced or the session ends.
@@ -1267,6 +1334,7 @@ async fn stream(
     mut recv: RecvStream,
     media: &Arc<Media>,
     mut client: Attached,
+    fec: bool,
 ) {
     let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(16);
     let reader = tokio::spawn(async move {
@@ -1286,7 +1354,7 @@ async fn stream(
     let mut warned_oversized = false;
     let mut control = media
         .rate()
-        .map(|rate| Control::new(rate, client.gone.clone()));
+        .map(|rate| Control::new(rate, client.gone.clone(), fec));
     let mut control_tick = tokio::time::interval(congestion::REPORT_EVERY);
     control_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Nothing is sent before `hello_ack`: what queued up behind it is stale.
@@ -1331,7 +1399,7 @@ async fn stream(
                 Some(Out::Unit(unit)) if unit.config_id != current.config_id => {}
                 Some(Out::Unit(unit)) => {
                     let max = session.max_datagram_size().min(media::MAX_DATAGRAM);
-                    let Some(datagrams) = media::packetize(&unit, &current, max, &mut pkt_seq) else {
+                    let Some(mut datagrams) = media::packetize(&unit, &current, max, &mut pkt_seq) else {
                         if !warned_oversized {
                             warned_oversized = true;
                             tracing::warn!(
@@ -1356,6 +1424,13 @@ async fn stream(
                     } else {
                         sent.keep(unit.frame_seq, &datagrams, now, retransmit_window(session));
                     }
+                    // shortcut: repairs follow the whole frame, so past 48 fragments they can
+                    // arrive after the client's NACK hold; send them per block if keyframe
+                    // loss shows in the bench.
+                    if let Some(control) = control.as_mut() {
+                        let repairs = control.protect(unit.pyrowave, &datagrams, &mut pkt_seq);
+                        datagrams.extend(repairs);
+                    }
                     // shortcut: a PyroWave frame (~380 datagrams at 1080p/200) goes as one burst;
                     // §Rate's SHOULD pace over half a frame interval is B09 (#1058).
                     let mut log = control.as_mut().filter(|_| !unit.pyrowave).map(|c| &mut c.log);
@@ -1374,7 +1449,7 @@ async fn stream(
                         pyrowave_frames.forget();
                     }
                     current = config.clone();
-                    let ack = hello_ack(&config, media.audio(), reason);
+                    let ack = hello_ack(&config, media.audio(), reason, fec);
                     let write = write_message(&mut send, &ack);
                     if !matches!(tokio::time::timeout(CONTROL_WRITE, write).await, Ok(Ok(()))) {
                         break QUIET;

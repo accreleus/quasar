@@ -44,6 +44,7 @@ import { PlayoutController, resolveInitialPlayoutMs } from "../../webrtc/playout
 import {
   SessionTelemetry,
   ABS_CAPTURE_TIME_URI,
+  type PostedCounters,
   type TelemetrySnapshot,
 } from "../../webrtc/telemetry";
 import { TraceEventEmitter } from "../../webrtc/traceEvents";
@@ -252,6 +253,7 @@ export interface TelemetryFactoryArgs {
   getCaptureMetrics: Parameters<typeof setupCapture> extends never ? never : () => unknown;
   tierFps?: number;
   hasAbsCaptureTime: () => boolean;
+  counters?: PostedCounters;
 }
 
 export interface TelemetryLike {
@@ -295,6 +297,7 @@ const productionDeps: SessionRuntimeDeps = {
       a.getCaptureMetrics as never,
       a.tierFps,
       a.hasAbsCaptureTime,
+      a.counters,
     ) as unknown as TelemetryLike,
   createTracer: (sessionId, authToken) =>
     new TraceEventEmitter(sessionId, authToken) as unknown as TracerLike,
@@ -321,6 +324,8 @@ export interface SessionRuntimeConfig {
   /** The launched profile's fps, for the client-health classifier's per-frame
    *  budget. Undefined when unknown. */
   tierFps?: number;
+  /** The page view's posted cumulative counters; each runtime it builds continues them. */
+  counters?: PostedCounters;
   callbacks: SessionRuntimeCallbacks;
   deps?: Partial<SessionRuntimeDeps>;
 }
@@ -524,6 +529,7 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
       getCaptureMetrics: capture.getMetrics as never,
       tierFps: cfg.tierFps,
       hasAbsCaptureTime: () => transport!.hasAbsCaptureTimeExtension(ABS_CAPTURE_TIME_URI),
+      counters: cfg.counters,
     });
     tm.onUpdate((snap) => sink.push(snap));
     tm.start();
