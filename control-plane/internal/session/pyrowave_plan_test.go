@@ -6,6 +6,7 @@ package session
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -281,4 +282,69 @@ func TestAClaimWhoseReplanFailsIsBusyOnWebRTC(t *testing.T) {
 	if !first.Update.KeepPyroWaveSlot || first.Update.Transport != "webtransport" {
 		t.Error("the first plan was changed in place")
 	}
+}
+
+// The block and the launch decide alike: the same inputs through the preview and through the
+// stream plan's intent for an Auto launch that holds a slot.
+func TestPyroWaveOfferAgreesWithTheLaunchDecision(t *testing.T) {
+	probes := map[string]func(*DeviceProbe){
+		"passes":       func(*DeviceProbe) {},
+		"no webgpu":    func(p *DeviceProbe) { p.WebGPU = false },
+		"stale":        func(p *DeviceProbe) { p.MeasuredAt = fixedNow.Add(-11 * time.Minute) },
+		"no bandwidth": func(p *DeviceProbe) { p.BandwidthKbps = 0 },
+		"absurd":       func(p *DeviceProbe) { p.BandwidthKbps = 20_000_000 },
+		"no rtt":       func(p *DeviceProbe) { p.RTTMsExact = 0 },
+		"rtt high":     func(p *DeviceProbe) { p.RTTMsExact = 5.1 },
+		"slow":         func(p *DeviceProbe) { p.BandwidthKbps = 199_999 },
+	}
+	for _, mode := range []string{"off", "allow", "prefer"} {
+		for _, transport := range []string{"webrtc", "webtransport_opt_in"} {
+			for _, hostLists := range []bool{true, false} {
+				for _, nilProbe := range []bool{false, true} {
+					for name, mutate := range probes {
+						probe := pwProbe()
+						mutate(probe)
+						if nilProbe {
+							probe = nil
+						}
+						in := pwInputs(mode, transport, false)
+						in.Probe = probe
+						in.GPUCodecs = []string{"h264"}
+						if hostLists {
+							in.GPUCodecs = append(in.GPUCodecs, "pyrowave")
+						}
+						lp := in.Chain
+						offer := pyrowaveOffer(lp, hostLists, probe, 1080, 60, fixedNow)
+						it := in.pyrowaveIntent(1080, 60)
+						label := fmt.Sprintf("%s/%s/host=%v/nilProbe=%v/%s", mode, transport, hostLists, nilProbe, name)
+
+						if offer.Available != it.eligible {
+							t.Errorf("%s: available %v but launch eligible %v", label, offer.Available, it.eligible)
+						}
+						if !offer.Available {
+							// The preview adds the device's WebTransport check; the launch leaves it to
+							// the transport step, so only the shared checks must name the same reason.
+							if it.reason != "" && *offer.Reason != it.reason {
+								t.Errorf("%s: reason %q but launch %q", label, *offer.Reason, it.reason)
+							}
+							continue
+						}
+						if offer.Auto != (it.wanted && it.choice == choiceAuto) {
+							t.Errorf("%s: auto %v but launch wanted=%v choice=%q", label, offer.Auto, it.wanted, it.choice)
+						}
+						if !eqStr(offer.AutoReason, strPtrOrNil(it.autoReason)) {
+							t.Errorf("%s: auto_reason %v but launch %q", label, offer.AutoReason, it.autoReason)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func strPtrOrNil(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }

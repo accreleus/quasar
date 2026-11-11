@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/audit"
 	"github.com/accreleus/quasar/control-plane/internal/auth"
@@ -65,6 +66,7 @@ type launchProfileEvalJSON struct {
 	Eligibility string           `json:"eligibility"`
 	Reasons     []profile.Reason `json:"reasons"`
 	Rungs       []rungEvalJSON   `json:"rungs"`
+	PyroWave    PyroWaveOffer    `json:"pyrowave"`
 }
 
 // profilesResponse is the GET /v1/me/profiles body.
@@ -157,11 +159,27 @@ func (h *Handler) handleListProfiles(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("profile host codecs load failed, evaluating without host capabilities", "err", err)
 	}
 	ev := profile.EvaluateLaunchProfiles(catalog, profile.EvalInput{Probe: pr, HostCaps: hostCaps, HistoricalFailures: historical})
-	httpx.WriteJSON(w, http.StatusOK, toProfilesResponse(ev))
+	// The effective transport is read once, as a launch does; a failed read plans WebRTC.
+	defaultTransport, err := h.store.DefaultTransport(r.Context())
+	if err != nil {
+		slog.Warn("transport: instance default load failed, previewing WebRTC", "err", err)
+		defaultTransport = transportWebRTC
+	}
+	httpx.WriteJSON(w, http.StatusOK, toProfilesResponse(ev, pyrowaveMenuInputs{
+		probe: scope.Probe, hostLists: !hostCaps.NoPyroWave, defaultTransport: defaultTransport, now: time.Now(),
+	}))
+}
+
+// pyrowaveMenuInputs is everything the pyrowave block reads, gathered by the handler.
+type pyrowaveMenuInputs struct {
+	probe            *DeviceProbe
+	hostLists        bool
+	defaultTransport string
+	now              time.Time
 }
 
 // toProfilesResponse maps the engine result to the wire shape.
-func toProfilesResponse(ev profile.LaunchEvaluation) profilesResponse {
+func toProfilesResponse(ev profile.LaunchEvaluation, pw pyrowaveMenuInputs) profilesResponse {
 	resp := profilesResponse{
 		RecommendedID: ev.RecommendedID,
 		Confidence:    string(ev.Confidence),
@@ -178,6 +196,11 @@ func toProfilesResponse(ev profile.LaunchEvaluation) profilesResponse {
 			Reasons:     nonNilReasons(pe.Reasons),
 			Rungs:       make([]rungEvalJSON, 0, len(pe.Rungs)),
 		}
+		lp := pe.LaunchProfile
+		if lp.Transport == transportDefault {
+			lp.Transport = pw.defaultTransport
+		}
+		entry.PyroWave = pyrowaveOffer(lp, pw.hostLists, pw.probe, pe.Nominal.Height, pe.Nominal.FPS, pw.now)
 		for _, re := range pe.Rungs {
 			entry.Rungs = append(entry.Rungs, rungEvalJSON{
 				profileJSON: toProfileJSON(re.Profile),
