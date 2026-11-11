@@ -4,9 +4,9 @@ A fixed list of scenarios run against a Quasar stack from a test client, with no
 loop, leaving one **run bundle** that an agent or a person reviews afterwards. Spec: #1271.
 
 > **Status.** The bundle format and its validator (#1272), the runner (#1273, `make e2e-run`), the
-> host half of a bundle (#1274, `make e2e-collect`) and the review that summarises a bundle (#1275,
-> `make e2e-review`) exist. `e2e-post`, `e2e-compare` and `e2e-pack` are the spec's later tickets;
-> this page grows with them.
+> host half of a bundle (#1274, `make e2e-collect`), the review that summarises a bundle (#1275,
+> `make e2e-review`) and posting a run to quasar-bench (#1276, `make e2e-post`) exist. `e2e-compare`
+> and `e2e-pack` are the spec's later tickets; this page grows with them.
 
 ## What you need
 
@@ -111,6 +111,44 @@ afterwards (`historical_client_performance_failed`; the scenario ends `error: th
 refused: 409 ...`), and on the Mac test client one bench-armed 60 s hold at 1080p60 was enough (a
 hold with `bench: false` was not). A scenario the client cannot run (no WebTransport, a codec it
 cannot decode, the app not in the catalog) is `skipped` with the reason.
+
+### Hooks
+
+A scenario that needs a step it cannot do itself, such as cutting the WebTransport path or shaping the
+network, names it as a hook (`fault:webtransport-block`, `shape:<level>`: lower-case word, a colon, then
+letters, digits and dashes). You supply the scripts; the repository ships none, because a real one knows a
+lab address (`scripts/validate/stream/fixtures/hooks/` has two that only print what they were asked).
+
+```
+make e2e-run TARGET=... PLAN=... HOOKS=<dir>        # or QUASAR_E2E_HOOKS=<dir>
+```
+
+- **Script.** `<dir>/<name with ':' as '-'>` (`fault:webtransport-block` is `<dir>/fault-webtransport-block`),
+  an executable file inside `<dir>`. It is run with one argument, `apply` or `clear`, no shell, 30 s to
+  finish (then it and its children are killed). Exit 0 is success; anything else, or the timeout, is a
+  failure. Its environment is yours, without the test user's sign-in (`QUASAR_E2E_EMAIL`,
+  `QUASAR_E2E_PASSWORD`, `QUASAR_E2E_CRED_FILE`), plus `QUASAR_E2E_SCENARIO` (the scenario directory name),
+  `QUASAR_E2E_SESSION` (only once a session was launched), `QUASAR_E2E_TRANSPORT` and `QUASAR_E2E_PHASE`.
+  `clear` must be safe to run when `apply` did nothing or only half of it.
+- **Timeline.** Each run is a `hook` row: hook, phase, exit code, `timed_out`, milliseconds, and the first
+  2000 characters of its output, redacted like everything the bundle holds.
+- **Cleared on every exit path.** The scenario asks for `apply` when it needs the fault, so it can be
+  applied mid-stream. Whatever a scenario does not clear itself, the runner clears when the scenario ends,
+  however it ended (a throw, Ctrl-C, SIGTERM). A clear that fails makes the scenario `error`, names the
+  hook under "left behind", and the following scenarios are `skipped` until it clears.
+- **A runner killed between apply and clear** (`kill -9`) cannot clear. Before each apply it writes
+  `.e2e-hooks-applied.json` in the directory that holds `OUT`; the next run with the same `HOOKS=` and
+  an `OUT` in the same directory runs `clear` for every entry first and says so on stderr. A run with
+  no `HOOKS=` that finds the file only warns: it cannot clear anything. A hook that was still running
+  when its runner died keeps running; the next run waits for it to end (up to the hook's 30 s) before
+  it clears, and does not start if it does not end. If one will not clear, or the process that wrote it is
+  still running, the run does not start. A damaged ledger also stops it: remove the file once the hooks are
+  known to be clear.
+- **No script.** A scenario whose hook has no executable script (or no `HOOKS=`) is `skipped`; the reason
+  names the hook. Nothing is launched.
+
+The hooks directory is yours and trusted. The plan is not: it can only choose a scenario and its params,
+never a script.
 
 `client.json` carries the label, the browser, OS and CPU (from client hints; `user_agent` is Chrome's
 reduced string), the GPU (the unmasked WebGL renderer where the browser offers it), decode support per
@@ -260,6 +298,67 @@ A scenario passed when its status is `pass` and none of its criteria has `pass: 
 page's verdict is derived from the two, never copied from the run's own word, and nothing
 short of a pass is a success. Both files are rendered in memory and renamed into place, so a
 failed write leaves no half a review.
+
+Post it on quasar-bench:
+
+```
+make e2e-post BUNDLE=<bundle-dir> HOST=<role> [DRY_RUN=1]
+```
+
+**What you need.** A collected bundle — its `builds.json` must name the node agent's commit, so
+run `e2e-collect` first if it does not — the role name of the host it ran on (`HOST`; the bundle
+holds no host name, so the role is the caller's word), and the bench server and key `bench-submit`
+uses (`BENCH_URL` / `BENCH_KEY`, else qbench's own config). `scripts/dx/bench_submit.py` reads
+those; this verb never sees them.
+
+**What it does.** One quasar-bench run per scenario whose status is not `skipped`, through
+`scripts/dx/bench_submit.py`, so the server and the API are the ones that script already posts to.
+The bench scenario is the scenario's name followed by its transport, codec and profile
+(`stream-hold.webrtc.h264.1080p60`): the server compares the newest run per suite, scenario and
+host, so the same scenario on another transport must not share a name.
+Each run is created with `repo=accreleus/quasar` and `commit` the node agent's commit from
+`builds.json` — never this checkout's HEAD, which is why a bundle without one is refused rather
+than posted under the wrong build. The tags are `suite_run` (the suite run id), `client` (the label
+from `client.json`), `transport`, `codec` and `profile` (the scenario's params), and `clock=raw`:
+the collected `trace.json` keeps client-clock browser events, so these runs are not comparable with
+host-aligned ones event for event. `git_quasar` is the bundle's commit and `git_protocol` is
+`unknown` (the bundle does not hold the build's protocol pin, and the posting checkout's would be a
+false fact); `bench_submit.py` adds its own tags from `session.json`. The run's notes carry the criteria, one line each,
+`<id> pass|fail|not-judged <observed>`; `expected`, a scenario's `reason` and any other free text
+are not copied into the notes or the tags. They do reach the server inside the artifacts, which
+are `review/summary.json`, the scenario's `scenario.json` and
+`timeline.jsonl`, its `shots/*.png`, and on the first run only a `tar.gz` of the whole bundle. The
+verdict is PASS for a `pass` and FAIL for a `fail` or an `error`; an error also carries the tag
+`status=error`. A failed scenario is posted, never withheld, and is not marked invalid. A skipped
+scenario posts nothing.
+
+**The host pairs the runs.** A run's host is `<HOST>@<client label>`: the server takes the host
+string as a whole, so two test clients on one host
+never compare with each other. **Posting twice updates the same runs** — `bench_submit.py` upserts
+on an external id built from the scenario's session id and the suite run id, so a re-post converges
+instead of forking a second run. A scenario that never had a session (an error before the launch)
+has no `session.json`; its id comes from the directory's path, so post it from the same place.
+
+**A value taken from the bundle is used only in the shape its field has** (an identifier, a UUID, a
+commit); one that does not match is left out and counted in `left_out=N`, so a tag is never free
+text. The bundle is validated before anything is posted, and every value reaches
+`bench_submit.py` as its own argument, never through a shell. A scenario is not posted
+(`failed=N`) when its name is not a name, or when its `session.json` does not carry one of the
+scenario's own session ids or holds a codec, profile or host id that is not a plain name: the
+script builds the run's identity and tags from that file. If the bundle cannot be archived, nothing
+is posted (`reason=no-archive`).
+
+The run ends with:
+
+```
+RESULT status=ok|failed|error target=e2e-post posted=N skipped=N [failed=N] [left_out=N] [dry_run=1] [reason=...]
+```
+
+Exit 0 every scenario posted (or planned, with `DRY_RUN=1`), 1 the bundle is not valid, the build
+has no commit, or a post failed, 2 usage. `DRY_RUN=1` runs `bench_submit.py --dry-run` for each
+scenario: it posts nothing (with a bench server configured the script still asks it for its
+version) and prints each run's plan, tags and external id — the way to see
+what a bundle would post.
 
 ## The run bundle, format 1
 

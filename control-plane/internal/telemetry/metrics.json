@@ -804,7 +804,7 @@
       "n_key": "present_n",
       "deprecated_for": "present_fps_median",
       "since": "#108",
-      "why": "fps from the MEAN RVFC interval. DEPRECATED AS A HEADLINE: at source fps == display Hz one missed vsync doubles one interval and drags the mean \u2014 a healthy 1440p120 session read 88-108 on 2026-08-22 and cost a day of encoder investigation. Kept unchanged so the stored series stays comparable. WebTransport: presenter submit times, not display times (see present_interval_median_ms)."
+      "why": "fps from the MEAN RVFC interval. DEPRECATED AS A HEADLINE: at source fps == display Hz one missed vsync doubles one interval and drags the mean \u2014 a healthy 1440p120 session read 88-108 on 2026-08-22 and cost a day of encoder investigation. Kept unchanged so the stored series stays comparable. WebTransport: stamped at the display frame, as WebRTC's are (see present_interval_median_ms)."
     },
     {
       "key": "present_fps_median",
@@ -817,7 +817,7 @@
       "n_key": "present_n",
       "deprecated_for": null,
       "since": "2026-08-22",
-      "why": "THE READING. fps from the MEDIAN RVFC interval \u2014 the fps a viewer perceives, unmoved by an occasional doubled frame. Its input intervals are display-refresh independent since #263 (2026-08-24): RVFC ticks are deduped by the frame's identity before summarising (metadata.mediaTime, or its rtpTimestamp where a browser reports mediaTime 0 for WebRTC, as Firefox does: #686), so a display whose refresh rate is not an integer multiple of the source fps (e.g. 98 Hz) no longer pollutes the samples with vsync ticks that carry no new frame \u2014 a healthy 60 fps stream on such a display previously read ~43-49. WebTransport: presenter submit times, not display times (see present_interval_median_ms)."
+      "why": "THE READING. fps from the MEDIAN RVFC interval \u2014 the fps a viewer perceives, unmoved by an occasional doubled frame. Its input intervals are display-refresh independent since #263 (2026-08-24): RVFC ticks are deduped by the frame's identity before summarising (metadata.mediaTime, or its rtpTimestamp where a browser reports mediaTime 0 for WebRTC, as Firefox does: #686), so a display whose refresh rate is not an integer multiple of the source fps (e.g. 98 Hz) no longer pollutes the samples with vsync ticks that carry no new frame \u2014 a healthy 60 fps stream on such a display previously read ~43-49. WebTransport: stamped at the display frame, as WebRTC's are (see present_interval_median_ms)."
     },
     {
       "key": "present_interval_median_ms",
@@ -830,7 +830,7 @@
       "n_key": "present_n",
       "deprecated_for": null,
       "since": "2026-08-22",
-      "why": "The median frame-to-frame presentation interval itself. Every other cadence key is defined relative to it (doubled band, long-frame factor). Not the same instants on both transports: WebRTC measures the times the display showed distinct frames (RVFC); WebTransport measures the times the client submitted frames to the presenter, so the two are comparable in kind, not in value."
+      "why": "The median frame-to-frame presentation interval itself. Every other cadence key is defined relative to it (doubled band, long-frame factor). Stamped the same way on both transports: WebRTC at the times the display showed distinct frames (RVFC); WebTransport at the start of the display frame (requestAnimationFrame) each picture lands in, pictures submitted within one display frame counting as one displayed frame. Neither is scan-out. A tab with no display frames (hidden) reports none."
     },
     {
       "key": "present_interval_sd_ms",
@@ -843,7 +843,7 @@
       "n_key": "present_n",
       "deprecated_for": null,
       "since": "#108",
-      "why": "Standard deviation of this window's presentation intervals \u2014 the headline judder metric (#108). A hitch is a property of the WINDOW: two samples must reach classifier.hitch_sd_ms, because as a max one 18.058 ms sample out of 54 flipped a healthy session on 2026-08-23. WebTransport: presenter submit times, not display times (see present_interval_median_ms)."
+      "why": "Standard deviation of this window's presentation intervals \u2014 the headline judder metric (#108). A hitch is a property of the WINDOW: two samples must reach classifier.hitch_sd_ms, because as a max one 18.058 ms sample out of 54 flipped a healthy session on 2026-08-23. WebTransport: stamped at the display frame, as WebRTC's are (see present_interval_median_ms)."
     },
     {
       "key": "present_interval_p95_ms",
@@ -856,7 +856,7 @@
       "n_key": "present_n",
       "deprecated_for": null,
       "since": "#108",
-      "why": "p95 presentation interval \u2014 a sustained long-frame tail sigma can stay modest through. WebTransport: presenter submit times, not display times (see present_interval_median_ms)."
+      "why": "p95 presentation interval \u2014 a sustained long-frame tail sigma can stay modest through. WebTransport: stamped at the display frame, as WebRTC's are (see present_interval_median_ms)."
     },
     {
       "key": "present_interval_max_ms",
@@ -869,7 +869,7 @@
       "n_key": "present_n",
       "deprecated_for": null,
       "since": "2026-08-22",
-      "why": "The longest interval in the window: the real stall length, and the source of client.freeze_detected's gap_ms. WebTransport: presenter submit times, not display times (see present_interval_median_ms)."
+      "why": "The longest interval in the window: the real stall length, and the source of client.freeze_detected's gap_ms. WebTransport: stamped at the display frame, as WebRTC's are (see present_interval_median_ms)."
     },
     {
       "key": "present_beat_fraction",
@@ -882,7 +882,7 @@
       "n_key": "present_n",
       "deprecated_for": null,
       "since": "2026-08-22",
-      "why": "Share of intervals within +/-20% of exactly 2x the median \u2014 the inherent vsync beat of two free-running clocks, not stutter. Read it WITH present_long_frames: beat > 0 with long frames 0 is benign; long frames > 0 is a stall the beat does not excuse. WebTransport: presenter submit times, not display times (see present_interval_median_ms)."
+      "why": "Share of intervals within +/-20% of exactly 2x the median \u2014 the inherent vsync beat of two free-running clocks, not stutter. Read it WITH present_long_frames: beat > 0 with long frames 0 is benign; long frames > 0 is a stall the beat does not excuse. WebTransport: stamped at the display frame, as WebRTC's are (see present_interval_median_ms)."
     },
     {
       "key": "present_long_frames",
@@ -895,7 +895,7 @@
       "n_key": "present_n",
       "deprecated_for": null,
       "since": "2026-08-22",
-      "why": "Intervals above 2.5x the median \u2014 above the top of the doubled band, so genuine stalls. Zero is what makes a beat benign. WebTransport: presenter submit times, not display times (see present_interval_median_ms)."
+      "why": "Intervals above 2.5x the median \u2014 above the top of the doubled band, so genuine stalls. Zero is what makes a beat benign. WebTransport: stamped at the display frame, as WebRTC's are (see present_interval_median_ms)."
     },
     {
       "key": "present_n",
@@ -908,7 +908,7 @@
       "n_key": null,
       "deprecated_for": null,
       "since": "2026-08-22",
-      "why": "How many intervals the window actually held. Below 5 every other present_* key is OMITTED rather than computed from a fragment \u2014 this is the key that tells 'quiet' from 'unmeasured'. WebTransport: presenter submit times, not display times (see present_interval_median_ms)."
+      "why": "How many intervals the window actually held. Below 5 every other present_* key is OMITTED rather than computed from a fragment \u2014 this is the key that tells 'quiet' from 'unmeasured'. WebTransport: stamped at the display frame, as WebRTC's are (see present_interval_median_ms)."
     },
     {
       "key": "is_hidden",
@@ -988,7 +988,7 @@
       "n_key": null,
       "deprecated_for": null,
       "since": "0.6 (#1035)",
-      "why": "A WebTransport session's counterpart of rvfc_capture_to_display_ms: the agent's capture_us to the moment the frame is handed to the WebGPU presenter, median over a rolling ring of up to 600 frames. capture_us is stamped at ENCODER OUTPUT (quasar-protocol#29 item 13), as abs-capture-time is on WebRTC, so capture and encode are not in it; the bench marker is the number that includes them. Compared on the agent's clock through the control-stream ping/pong offset, so it is absent until that offset is stable. It ends at present submission, not at display scan-out, and is not RVFC-qualified: do not read it against the RVFC key as if the two ended at the same instant."
+      "why": "A WebTransport session's counterpart of rvfc_capture_to_display_ms: the agent's capture_us to the moment the frame is handed to the WebGPU presenter, median over a rolling ring of up to 600 frames. capture_us is stamped at ENCODER OUTPUT (quasar-protocol#29 item 13), as abs-capture-time is on WebRTC, so capture and encode are not in it; the bench marker is the number that includes them. Compared on the agent's clock through the control-stream ping/pong offset, so it is absent until that offset is stable. It ends at present submission, not at display scan-out, and is not RVFC-qualified: do not read it against the RVFC key as if the two ended at the same instant. It ends at submission, before the wait for the display frame that the present_* cadence keys are stamped at."
     },
     {
       "key": "wt_keyframe_requests",
