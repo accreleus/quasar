@@ -77,7 +77,7 @@ function world({ wins = windows(50), session = {}, failScreenshotAt = null, webt
     on: (ev, fn) => { (w.handlers[ev] ??= []).push(fn); },
     goto: async (u) => { w.gotos.push(u); w.url = u; },
     fill: async () => {},
-    click: async () => { w.ls.set("quasar.auth.token", PAGE_BEARER); w.ls.set("quasar.auth.user", "{}"); w.emit("response", response(200, "/v1/auth/login", { access_token: PAGE_BEARER })); },
+    click: async () => { w.ls.set("quasar.auth.token", PAGE_BEARER); w.ls.set("quasar.auth.user", "{}"); w.emit("response", response(200, "/v1/auth/login", { access_token: PAGE_BEARER })); w.afterLogin?.(w); },
     waitForURL: async () => {},
     url: () => w.url,
     close: async () => {},
@@ -818,11 +818,8 @@ test("A18: a launch 201 delivered while the page is closing is still stopped and
 
 test("A19: what the page says before its bearer is known is held, then written without it", async () => {
   const w = world();
-  onPage(w, (p) => {
-    const click = p.click;
-    p.click = async (...a) => { await click(...a); w.emit("console", { type: () => "log", text: () => `quasar.auth.token=${PAGE_BEARER}` }); w.emit("pageerror", { message: `boom ${PAGE_BEARER}` }); };
-    return p;
-  });
+  // In the same turn as the login answer, before the runner has read the answer's body (the seat's input).
+  w.afterLogin = () => { w.emit("console", { type: () => "log", text: () => `quasar.auth.token=${PAGE_BEARER}` }); w.emit("pageerror", { message: `boom ${PAGE_BEARER}` }); };
   const { dir, scenario, result } = await run(w);
   assert.deepEqual(result.errors, []);
   assert.equal(scenario().status, "pass");

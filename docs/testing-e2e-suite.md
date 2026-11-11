@@ -12,10 +12,10 @@ loop, leaving one **run bundle** that an agent or a person reviews afterwards. S
 
 - Node 22. The validator, the review and the collector have no dependencies.
 - To run a plan (`e2e-run`): Chrome or Chromium, `npm ci` in `scripts/validate` (the verb does it on first use, without your sign-in in its environment), and the stack's URL.
-- A test user: an ordinary user's sign-in in `QUASAR_E2E_EMAIL` and `QUASAR_E2E_PASSWORD`, or in a file of `KEY=value` lines named by `QUASAR_E2E_CRED_FILE`. No admin token is needed or used. The account must not have the Classic layout on (the runner changes no preference and needs the game page).
+- A test user: an ordinary user's sign-in in `QUASAR_E2E_EMAIL` and `QUASAR_E2E_PASSWORD`, or in a file of `KEY=value` lines named by `QUASAR_E2E_CRED_FILE`. No admin token is needed or used. The password and the e-mail's local part must each be at least 8 characters: a shorter secret cannot be removed from the bundle without damaging unrelated values, so the runner refuses to start with one (exit 2). The account must not have the Classic layout on (the runner needs the game page).
 - The reference app in that user's library (`QUASAR_E2E_APP` names it, default `Quasar Benchapp`).
 - `CLIENT=<label>`: a name for this test client, by role (`mac-test-client`), never a host name. Letters, digits, `_`, `.`, `-`.
-- A stack with a self-signed certificate: `INSECURE_TLS=1`. Certificate checks are on otherwise, for the runner's own requests and for a browser it launches; `network.json` records which.
+- A stack with a self-signed certificate: `INSECURE_TLS=1`. Certificate checks are on otherwise, for the runner's own requests and for a browser it launches, whatever `NODE_TLS_REJECT_UNAUTHORIZED` says in your environment (the runner removes it, and the verb keeps it out of `npm ci`); `network.json` records what was in force.
 - The host half (`e2e-collect`) also needs an admin bearer for the stack, and a certificate Node trusts (the fleet's certs are; set `NODE_EXTRA_CA_CERTS` otherwise).
 
 ## What to do
@@ -36,15 +36,28 @@ asks for the codec, frame rate and resolution through the page's own Launch opti
 presses Play now, with the product's `?transport=` and `?codec=pyrowave` switches and bench mode
 on. It holds, then stops the session.
 
-The runner owns what it created and nothing else. The sessions it stops are the ones whose
-ids came back in the `201` of its own page's launch, plus the id in its own page's URL once the API
-confirms that session is the user's; a live session it cannot attribute is left alone and named
-in the timeline. A session is `stopped` in the timeline only after the API says it is over, and the
-stop is attempted on every exit path, `Ctrl-C` included. Anything that could not be put back
-(a stop not confirmed, a page that would not close) makes the scenario `error` with a reason that
-names exactly what was left behind. `OUT` must not exist: the bundle is built in a staging
-directory beside it, checked with the validator, and only then renamed to `OUT`; a bundle that
-fails the check is deleted, its problems are printed, and the run exits 2.
+The runner owns what it created and nothing else. The sessions it stops are exactly the ids in the
+`201` answers to `POST /v1/sessions` that its own page received from the stack's own origin: not an id
+in the page's address (the address is used to follow a session only when that id is already one of
+those; any other is that scenario's `error`, and that session is left alone), not a list, not a
+baseline. Cleanup runs on every exit path, `Ctrl-C` included, in this order: close the page, wait for
+every answer it was still delivering, stop the owned set, and again for any that arrived meanwhile
+until the set is stable. A session is `stopped` in the timeline only after the API says it is over, and
+every owned id is in `scenario.sessions`. Anything that could not be put back (a stop not confirmed, a
+page that would not close, a `PUT`, `PATCH` or `DELETE` the page made on the stack outside
+`/v1/sessions/`) makes the scenario `error` with a reason that names exactly what was left behind.
+**Known gap:** the game page's Play remembers a non-default choice as that game's own settings; today
+that call is a stub (`web/src/pages/app/game/gameData.ts`, no control-api route), so nothing is
+written. The day it is real the runner will see the write, report the scenario `error`, and cannot
+put it back: it needs an API read for those settings first. `OUT` must not exist: the bundle is built
+in a staging directory beside it, checked with the validator, and only then renamed to `OUT`; a bundle
+that fails the check is deleted, its problems are printed, and the run exits 2.
+
+A plan is strict. The plan has `name` and `scenarios`; an entry has `scenario` and `params`. A key the
+runner or the scenario does not define is that entry's `error` (an unknown top-level key is a usage
+error, exit 2), so a typo cannot silently select a default. `params` may be omitted. The defaults of
+`stream-hold`: `transport: "webrtc"`, `codec: "h264"`, `profile: "1080p60"`, `hold_s: 90`, `app`: the
+`QUASAR_E2E_APP` app (`Quasar Benchapp`), `bench: true`, `cover_qr`: true for an app named `Steam`.
 
 The run ends with one line:
 
@@ -77,7 +90,10 @@ launched; the bundle is still complete and the run goes on.
 The warm-up is one value for every criterion that has one: `classifier.warmup_exclude_s` in
 `docs/session-trace/thresholds.json` (20 s). The smoke plan holds 90 s so the judged span is at
 least 60 s after it. A scenario is `pass` only when the first frame was seen and no criterion failed;
-if the first frame could not be judged it is `error`. `params.bench: false` leaves bench mode off.
+if the first frame could not be judged it is `error`; a session that is already `stopped` or `failed` when
+the hold ends is `error` ("the session ended during the hold"), whatever its criteria say. A loader
+that shows the product's failed or ended state is never a first frame. A number the run does not have
+(a negative first-frame time, a bench window with no frame count) is `null`, never a clean zero. `params.bench: false` leaves bench mode off.
 **Use a fresh test user for each run.** A client that cannot keep up at a profile is refused it
 afterwards (`historical_client_performance_failed`; the scenario ends `error: the launch was
 refused: 409 ...`), and on the Mac test client one bench-armed 60 s hold at 1080p60 was enough (a
@@ -98,14 +114,17 @@ attached to the issue; none is done (the screenshot every 10 s stands in for the
 windows for the second, and posting is `e2e-post`, #1276).
 
 **Redaction.** Every secret the run holds is an exact literal removed from every string before
-anything is serialised: the password, the e-mail, the stack's host name, the bearer the API sign-in
-returned and the one the page stored after its own sign-in (also in their URL- and JSON-escaped
-spellings). The validator's patterns for addresses and tokens run after that as defence in depth.
-A member named like a credential (`password`, `token`, `authorization`, `sig_token`, ...) is dropped.
-The manifest's `redacted` names the kinds replaced. A picture is binary and is not scrubbed:
-the runner only photographs the stream page. Known limit: a secret the page prints in the
-milliseconds between receiving it and the runner reading it is caught by the validator's patterns
-only.
+anything is serialised: the password, the e-mail and its local part, the stack's host name, the bearer
+the API sign-in returned and the one the page stored after its own sign-in, each in three spellings: as
+is, URL-encoded and JSON-escaped. The validator's patterns for addresses and tokens run after that as
+defence in depth. **Limits:** other encodings of a secret (base64 and the like) are not looked for. A
+key name is never rewritten (a member named like a credential, `password`, `token`, `authorization`,
+`sig_token`, ..., or equal to a secret, is dropped), and two keys the patterns would make equal make
+the bundle invalid (exit 2) rather than merge them. What the page says (console lines, errors, API
+answers' bodies) is held in memory until the page's own bearer is known and written only then; if the
+scenario ends before that, it is dropped and the timeline says how many lines
+(`pre-auth-evidence-dropped`). The manifest's `redacted` names the kinds replaced. A picture is binary
+and is not scrubbed: the runner only photographs the stream page.
 
 Check a bundle:
 
