@@ -44,6 +44,8 @@ const SETTING = /^[A-Za-z0-9_.:+-]{1,64}$/;
 // write path, so anything that is not this shape is refused before it is used.
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isId = (v) => typeof v === "string" && UUID.test(v);
+/** The same field shapes, for a later verb that uses a bundle value: post.mjs puts one in a tag. */
+export const SHAPES = { identifier: IDENT, uuid: UUID, commit: COMMIT };
 const fits = (re, v) => typeof v === "string" && re.test(v);
 /** A time as ISO, or null when the text is not one: what is written back is never the answer's own text. */
 const isoTime = (v) => {

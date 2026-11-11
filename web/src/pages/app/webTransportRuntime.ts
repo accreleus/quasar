@@ -337,7 +337,8 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   /** ?bench=1 only: the marker is read off the frame about to be presented, at its own size, before
    *  the presenter takes (and closes) it. A fault in the instrument must not cost the frame.
    *  The window's present_ms is therefore the presenter's submit, where a WebRTC session's is
-   *  RVFC's expectedDisplayTime: an A/B between the two must say so (#1035). */
+   *  RVFC's expectedDisplayTime: an A/B between the two must say so (#1035). The stats' present
+   *  cadence is not: telemetry stamps it at the display frame (#1328), the marker cannot wait for it. */
   function readBench(frame: VideoFrame): void {
     if (!bench) return;
     benchFrame = frame;
