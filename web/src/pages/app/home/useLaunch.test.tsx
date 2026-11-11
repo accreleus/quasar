@@ -41,6 +41,56 @@ function renderLaunch() {
   );
 }
 
+describe("useLaunch PyroWave request", () => {
+  const launched = {
+    session: { id: "new-1", stream: { width: 1920, height: 1080, fps: 60, codec: "h264" } },
+    signaling: { url: "ws://x", token: "t" },
+  } as never;
+  const body = () => vi.mocked(libraryApi.launchSession).mock.calls[0][1];
+  beforeEach(() => {
+    sessionStorage.clear();
+    vi.mocked(libraryApi.launchSession).mockResolvedValue(launched);
+  });
+  afterEach(() => {
+    sessionStorage.clear();
+    vi.resetAllMocks();
+  });
+
+  it("asks for pyrowave and sends no codec when the pick says so", async () => {
+    const { result } = renderLaunch();
+    await act(async () => {
+      await result.current.launchApp(app, "1080p60", undefined, true);
+    });
+    expect(body()).toEqual({ app_id: "app-1", mic: true, profile_id: "1080p60", pyrowave: true });
+  });
+
+  it("does not ask for it on an ordinary launch", async () => {
+    const { result } = renderLaunch();
+    await act(async () => {
+      await result.current.launchApp(app, "1080p60", "h264");
+    });
+    expect(body()).not.toHaveProperty("pyrowave");
+  });
+
+  it("lets an explicit standard codec win over the remembered ?codec=pyrowave switch", async () => {
+    sessionStorage.setItem("quasar.switch.codec", "pyrowave");
+    const { result } = renderLaunch();
+    await act(async () => {
+      await result.current.launchApp(app, "1080p60", "av1");
+    });
+    expect(body()).toEqual({ app_id: "app-1", mic: true, profile_id: "1080p60", stream: { codec: "av1" } });
+  });
+
+  it("still applies the remembered ?codec=pyrowave switch to an Auto launch", async () => {
+    sessionStorage.setItem("quasar.switch.codec", "pyrowave");
+    const { result } = renderLaunch();
+    await act(async () => {
+      await result.current.launchApp(app, "1080p60");
+    });
+    expect(body()).toMatchObject({ pyrowave: true });
+  });
+});
+
 describe("useLaunch waiting toast", () => {
   afterEach(() => vi.resetAllMocks());
 

@@ -20,6 +20,8 @@ vi.mock("../../../settings/OverlayPreferencesContext", async (orig) => ({
   ...(await orig<typeof import("../../../settings/OverlayPreferencesContext")>()),
   useNewDesign: () => design.on,
 }));
+const gameData = vi.hoisted(() => ({ putGameSettings: vi.fn() }));
+vi.mock("./gameData", async (orig) => ({ ...(await orig<typeof import("./gameData")>()), ...gameData }));
 const caps = vi.hoisted(() => ({ h264: true, hevc: true, av1: true }));
 vi.mock("../../../webrtc/capability", () => ({ probeCodecs: () => ({ ...caps }) }));
 
@@ -332,6 +334,32 @@ describe("game page", () => {
     expect(sent(1)).toEqual({ app_id: "a1", mic: true, profile_id: "p-1440" });
   });
 
+  it("a PyroWave pick sends pyrowave true with no codec, and is not saved as the game's settings", async () => {
+    mocked.getProfiles.mockResolvedValue({
+      ...profiles,
+      profiles: profiles.profiles.map((p) => ({
+        ...p,
+        pyrowave: { mode: "allow", available: true, reason: null, auto: false, auto_reason: null },
+      })),
+    } as never);
+    await ready();
+    const sheet = await openChange();
+    fireEvent.click(within(sheet).getByRole("radio", { name: /^Ultra-low latency/ }));
+    fireEvent.click(within(sheet).getByRole("button", { name: "Play now" }));
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(1));
+    expect(sent(0)).toEqual({ app_id: "a1", mic: true, profile_id: "p-1440", pyrowave: true });
+    expect(gameData.putGameSettings).not.toHaveBeenCalled();
+  });
+
+  it("a standard codec pick is still remembered as the game's settings", async () => {
+    await ready();
+    const sheet = await openChange();
+    fireEvent.click(within(sheet).getByRole("radio", { name: /H\.264/ }));
+    fireEvent.click(within(sheet).getByRole("button", { name: "Play now" }));
+    await waitFor(() => expect(mocked.launchSession).toHaveBeenCalledTimes(1));
+    expect(gameData.putGameSettings).toHaveBeenCalledWith("tok", "a1", expect.objectContaining({ codec: "h264" }));
+  });
+
   it("opens Change on the account default, which is what Play without a profile starts", async () => {
     policy({ default_profile_id: "p-720" });
     await ready();
@@ -575,7 +603,7 @@ describe("game page", () => {
     );
     await act(async () => {});
     fireEvent.click(screen.getByRole("button", { name: "Play" }));
-    expect(confirm).toHaveBeenCalledWith("p-1440", undefined);
+    expect(confirm).toHaveBeenCalledWith("p-1440", undefined, false);
   });
 
   it("a forced app launches on its pin: no profile by default or from an unchanged Change, the pin with a codec", async () => {

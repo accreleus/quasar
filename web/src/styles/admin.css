@@ -540,6 +540,10 @@
   margin-top: var(--s4);
 }
 
+.lp-kbps {
+  width: 110px;
+}
+
 .lp-desc {
   margin-top: calc(var(--s1) * -1);
   margin-bottom: var(--s3);

@@ -5,8 +5,8 @@ export function transportPreference(search: string = location.search): "webrtc" 
   return raw === "webrtc" || raw === "webtransport" ? raw : undefined;
 }
 
-/** The `?codec=pyrowave` URL switch (#1057): the launch request's `pyrowave: true`, as the
- *  Launch options Codec entry will send it (B11). The stream plan still decides. */
+/** The `?codec=pyrowave` dev switch (#1057): the launch request's `pyrowave: true`, as the
+ *  Launch options Codec entry sends it. The stream plan still decides. */
 export function pyrowavePreference(search: string = location.search): boolean {
   return switchValue(search, "codec", CODEC_KEY) === "pyrowave";
 }
