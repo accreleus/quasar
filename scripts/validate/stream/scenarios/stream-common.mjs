@@ -192,19 +192,45 @@ export const openCdp = (page) => page.context().newCDPSession(page);
 export const keyEvent = (cdp, type, k) => cdp.send("Input.dispatchKeyEvent", { type, code: k.code, key: k.key, windowsVirtualKeyCode: k.vk });
 export const mouseEvent = (cdp, params) => cdp.send("Input.dispatchMouseEvent", params);
 
-/** The middle of the stream surface in page pixels, or null when there is none. */
+/** The middle of the stream surface in page pixels, or null when there is none. The surface is the one `shotCovered` places its cover on: on WebTransport the first .session-video is a hidden <video> and the picture is the canvas. */
 export const streamCentre = (page) =>
   page.evaluate(() => {
-    const r = document.querySelector(".session-video")?.getBoundingClientRect?.();
+    const el = [...document.querySelectorAll(".session-video")].find((e) => e.videoWidth || e.tagName === "CANVAS");
+    const r = el?.getBoundingClientRect?.();
     return r && r.width > 0 && r.height > 0 ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
   });
 
-/** A trusted click on the stream surface (the gesture that lets the page take the pointer lock). False when there is no surface. */
-export async function clickStream(page, cdp) {
-  const c = await streamCentre(page);
-  if (!c) return false;
-  await mouseEvent(cdp, { type: "mouseMoved", x: c.x, y: c.y });
-  await mouseEvent(cdp, { type: "mousePressed", x: c.x, y: c.y, button: "left", buttons: 1, clickCount: 1 });
-  await mouseEvent(cdp, { type: "mouseReleased", x: c.x, y: c.y, button: "left", buttons: 0, clickCount: 1 });
-  return true;
+export const LOCK_WAIT_S = 5; // how long the pointer lock, or the layer that takes it, is waited for
+const LOCK_TRIES = 3; // clicks on that layer before giving up
+
+/**
+ * Takes the pointer lock the way the product does (SessionPage.tsx): a stage click while input is not captured only opens the HUD
+ * shelf; the lock is requested from the "Click to play" layer (`.session-play`), which the page raises once the loader is inert and the
+ * channel is open (and only when Play went immersive, the default). So this waits for the layer, clicks IT with a trusted click, and
+ * clicks again while the lock is not held, up to LOCK_TRIES times within LOCK_WAIT_S. Returns { held, clicks, at } (`at` is where the last click was): no layer within the wait
+ * and no lock (auto-capture can take it with no click) is { held: false, clicks: 0 }.
+ */
+export async function takeLock(page, cdp, { now, sleep }) {
+  const held = () => page.evaluate(() => document.pointerLockElement?.classList?.contains("session-video") === true);
+  const layer = () =>
+    page.evaluate(() => {
+      const r = document.querySelector(".session-play")?.getBoundingClientRect?.();
+      return r && r.width > 0 && r.height > 0 ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
+    });
+  const until = now() + LOCK_WAIT_S * 1000;
+  let clicks = 0;
+  let at = null;
+  for (;;) {
+    if (await held()) return { held: true, clicks, at };
+    if (now() >= until) return { held: false, clicks, at };
+    const spot = clicks < LOCK_TRIES ? await layer() : null;
+    if (spot) {
+      at = spot;
+      await mouseEvent(cdp, { type: "mouseMoved", x: at.x, y: at.y });
+      await mouseEvent(cdp, { type: "mousePressed", x: at.x, y: at.y, button: "left", buttons: 1, clickCount: 1 });
+      await mouseEvent(cdp, { type: "mouseReleased", x: at.x, y: at.y, button: "left", buttons: 0, clickCount: 1 });
+      clicks += 1;
+    }
+    await sleep(250);
+  }
 }

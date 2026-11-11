@@ -6,11 +6,10 @@
 // exposed, and the reference app echoes one bit, so what the HOST received per key, button and motion unit is not
 // known here. input-sent.json holds what was sent and what the page received, for the host half to compare.
 import { check as holdCheck } from "./stream-hold.mjs";
-import { cannotRun, clickStream, crit, finite, firstFrameCriterion, keyEvent, mouseEvent, openCdp, play, shotCovered, signIn, skipped, streamCentre, verdict, waitFirstFrame, watchApiErrors } from "./stream-common.mjs";
+import { cannotRun, crit, finite, firstFrameCriterion, keyEvent, mouseEvent, openCdp, play, shotCovered, signIn, skipped, streamCentre, takeLock, verdict, waitFirstFrame, watchApiErrors } from "./stream-common.mjs";
 
 export const name = "input-kbm";
 const STEP_MS = 60; // between two steps of the sequence
-const LOCK_WAIT_S = 3;
 const I2P_PRESSES = 8; // __qBench.pressKey rounds, spaced so each echo is matched on its own
 const I2P_GAP_MS = 600;
 const I2P_KEY = "Space";
@@ -54,8 +53,9 @@ export const check = holdCheck;
 const median = (xs) => { const s = [...xs].sort((a, b) => a - b); return s[Math.floor((s.length - 1) / 2)]; };
 
 /**
- * `seen`: `locked` (the stream surface holds the pointer lock), `held` ({ keys, buttons } the page was left holding, or null when the
- * recorder could not be read), `i2p` (finite samples, ms), `i2pMissed`.
+ * `seen`: `locked` (the stream surface holds the pointer lock), `lockClicks` (clicks made on the layer that takes it), `sequenceRan` (the
+ * sequence was sent), `held` ({ keys, buttons } the page was left holding, or null when the recorder could not be read), `i2p` (finite
+ * samples, ms), `i2pMissed`.
  */
 export function judge({ firstFrameS, seen }) {
   const s = seen;
@@ -63,13 +63,18 @@ export function judge({ firstFrameS, seen }) {
   const noLog = "not judged: the reference app does not log individual keys, buttons or motion today (its echo is one bit), and the runner cannot see the page's input channel. What was sent, and what the page received, is in input-sent.json for the host half to compare";
   let i2p = crit("input_to_photon_ms", null, null, `not judged: the marker echoed no key (${s.i2pMissed ?? 0} abandoned): the app has no echo, or no marker was found`);
   if (s.i2p.length) i2p = crit("input_to_photon_ms", null, null, `not judged: no limit is calibrated for input-to-photon. Measured ${s.i2p.length} samples, median ${median(s.i2p)} ms, max ${Math.max(...s.i2p)} ms (${s.i2pMissed ?? 0} abandoned)`);
+  const unsent = "not judged: no first frame, so the input sequence was not sent";
   return [
     firstFrameCriterion(firstFrameS),
-    crit("pointer_lock_taken", s.locked, s.locked ? "the stream surface holds the pointer lock" : "no pointer lock", "document.pointerLockElement is the stream surface after a trusted click on it"),
+    s.sequenceRan
+      ? crit("pointer_lock_taken", s.locked, s.locked ? "the stream surface holds the pointer lock" : s.lockClicks ? `no pointer lock after ${s.lockClicks} click(s) on the "Click to play" layer` : `no pointer lock, and no "Click to play" layer to click`, `document.pointerLockElement is the stream surface (the product takes it from a trusted click on its "Click to play" layer)`)
+      : crit("pointer_lock_taken", null, null, unsent),
     crit("keys_match", null, null, noLog),
     crit("buttons_match", null, null, noLog),
     crit("motion_sum_matches", null, null, noLog),
-    s.held === null
+    !s.sequenceRan
+      ? crit("nothing_held_at_end", null, null, unsent)
+      : s.held === null
       ? crit("nothing_held_at_end", null, null, "not judged: the page's input record could not be read")
       : crit("nothing_held_at_end", s.held.keys.length === 0 && s.held.buttons.length === 0, s.held.keys.length || s.held.buttons.length ? `still down: keys ${JSON.stringify(s.held.keys)}, buttons ${JSON.stringify(s.held.buttons)}` : "nothing down", nothing),
     i2p,
@@ -89,6 +94,23 @@ export default {
 
     let result;
     let stage = "sign-in";
+    let cdp = null;
+    let down = null; // the key or button currently down: { kind, ...step, pos }
+    const cleanup = [];
+    // Releases whatever is down; a release that fails is a step and a "left behind" line, never swallowed.
+    const release = async (by) => {
+      if (!down) return;
+      const d = down;
+      down = null;
+      try {
+        if (d.kind === "key") await keyEvent(cdp, "keyUp", d);
+        else await mouseEvent(cdp, { type: "mouseReleased", x: d.pos.x, y: d.pos.y, button: d.button, buttons: 0, clickCount: 1 });
+        rec.step("released", { what: d.code ?? d.button, by });
+      } catch (err) {
+        rec.step("release-failed", { what: d.code ?? d.button, message: String(err?.message ?? err) });
+        cleanup.push(`${d.kind === "key" ? `key ${d.code}` : `mouse button ${d.button}`} could not be released (${String(err?.message ?? err)})`);
+      }
+    };
     try {
       await signIn(page, ctx);
       rec.step("signed-in");
@@ -102,31 +124,38 @@ export default {
       rec.step("first-frame", { first_frame_s: firstFrameS });
       await shot(firstFrameAt === null ? "no-frame" : "first-frame");
 
-      const seen = { locked: false, held: null, i2p: [], i2pMissed: 0 };
+      const seen = { locked: false, lockClicks: 0, sequenceRan: false, held: null, i2p: [], i2pMissed: 0 };
       if (firstFrameAt !== null) {
-        const cdp = await openCdp(page);
+        cdp = await openCdp(page);
         await page.evaluate(installRecorder);
-        const lockHeld = () => page.evaluate(() => document.pointerLockElement?.classList?.contains("session-video") === true);
-        if (!(await lockHeld())) await clickStream(page, cdp);
-        for (let i = 0; i < LOCK_WAIT_S * 4 && !(await lockHeld()); i += 1) await sleep(250);
-        seen.locked = await lockHeld();
-        rec.step("pointer-lock", { held: seen.locked });
+        const lock = await takeLock(page, cdp, ctx);
+        seen.locked = lock.held;
+        seen.lockClicks = lock.clicks;
+        rec.step("pointer-lock", { held: lock.held, clicks: lock.clicks });
 
-        const centre = (await streamCentre(page)) ?? { x: 0, y: 0 };
+        // The pointer starts where the lock click left it; with no click, on the visible stream surface.
+        let centre = lock.at ?? (await streamCentre(page));
+        if (!centre) {
+          rec.step("no-stream-surface", { why: "no visible stream surface: the pointer events go to 0,0" });
+          centre = { x: 0, y: 0 };
+        }
+        seen.sequenceRan = true;
         const sent = [];
         const tStart = now();
         let pos = { ...centre };
         for (const [seq, step] of SEQUENCE.entries()) {
           const t = now() - tStart;
           if (step.kind === "key") {
+            down = { ...step };
             await keyEvent(cdp, "keyDown", step);
             await sleep(40);
-            await keyEvent(cdp, "keyUp", step);
+            await release("the sequence");
           } else if (step.kind === "button") {
             const [, bits] = BUTTONS[step.button];
+            down = { ...step, pos: { ...pos } };
             await mouseEvent(cdp, { type: "mousePressed", x: pos.x, y: pos.y, button: step.button, buttons: bits, clickCount: 1 });
             await sleep(40);
-            await mouseEvent(cdp, { type: "mouseReleased", x: pos.x, y: pos.y, button: step.button, buttons: 0, clickCount: 1 });
+            await release("the sequence");
           } else if (step.kind === "wheel") {
             await mouseEvent(cdp, { type: "mouseWheel", x: pos.x, y: pos.y, deltaX: 0, deltaY: step.dy });
           } else {
@@ -164,7 +193,8 @@ export default {
         });
       }
       const row = await api.session(sid);
-      if (row) rec.json("session.json", { session: row });
+      if (!row || row.id !== sid) throw new Error("the API no longer returns the session this run started");
+      rec.json("session.json", { session: row });
       result = { criteria: judge({ firstFrameS, seen }), clock_offset_ms: null };
       if (row && ["stopped", "failed"].includes(row.state)) result = { ...result, status: "error", reason: `the session ended during the run (it was ${row.state} before this run stopped it)` };
     } catch (err) {
@@ -173,8 +203,9 @@ export default {
       else rec.step("error", { message });
       result = { status: "error", reason: rec.holding ? `${stage} did not complete (the page's own words are not written before its sign-in is read)` : message, criteria: [], clock_offset_ms: null };
     } finally {
+      await release("the runner, on the way out");
       await Promise.allSettled(pending);
     }
-    return { ...result, ...verdict(result) };
+    return { ...result, ...verdict(result), ...(cleanup.length ? { cleanup } : {}) };
   },
 };

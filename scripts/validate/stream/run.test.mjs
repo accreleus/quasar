@@ -42,8 +42,10 @@ const matches = (sel, classes) => {
 };
 
 /** A world holding the fake clock, the fake page's state and the fake API's record. */
-function world({ wins = windows(50), session = {}, failScreenshotAt = null, webtransport = true, noBench = false, refuse = false, noFrame = false, revealed = false, stopFails = false, closeFails = false, noUrl = false, url = null, stats = { frames: 100, decoded: 100 }, videoRate = 60, hiddenBetween = null, skew = 0, extraFrames = null, loader = null, onPlay = null, bare = false, hooksDir = null, lockOnClick = true, swallowKeyUp = null, fallbackDelayMs = 3000, fallbackReason = "stream_lost", noFallback = false } = {}) {
-  const w = { cdp: [], listeners: {}, locked: false, lastX: null, videoStart: T0, hooksDir, faultSeenAt: null, t: T0, stopped: [], live: [], url: "about:blank", ls: new Map(), shots: 0, failScreenshotAt, calls: [], gone: new Set(), secrets: new Set(), handlers: {}, opened: [], closed: [], clicks: [], gotos: [] };
+function world({ wins = windows(50), session = {}, failScreenshotAt = null, webtransport = true, noBench = false, refuse = false, noFrame = false, revealed = false, stopFails = false, closeFails = false, noUrl = false, url = null, stats = { frames: 100, decoded: 100 }, videoRate = 60, hiddenBetween = null, skew = 0, extraFrames = null, loader = null, onPlay = null, bare = false, hooksDir = null, lockOnClick = true, lockOnNth = 1, layerAfterMs = 0, noLayer = false, keyUpFails = null, swallowKeyUp = null, fallbackDelayMs = 3000, fallbackReason = "stream_lost", noFallback = false } = {}) {
+  const w = { cdp: [], listeners: {}, locked: false, lastX: null, videoStart: T0, hooksDir, faultSeenAt: null, t: T0, stopped: [], live: [], url: "about:blank", ls: new Map(), shots: 0, failScreenshotAt, calls: [], gone: new Set(), secrets: new Set(), handlers: {}, opened: [], closed: [], clicks: [], gotos: [], playAt: null, stageClicks: 0, layerClicks: 0 };
+  // The page's "Click to play" layer (SessionPage.tsx): raised some time after Play, until the lock is held; a click before it only opens the HUD shelf.
+  const layerUp = () => !noLayer && w.playAt !== null && w.t >= w.playAt + layerAfterMs && !w.locked;
   w.now = () => w.t;
   w.sleep = async (ms) => { w.t += ms; };
   w.emit = (e, m) => (w.handlers[e] ?? []).forEach((fn) => fn(m));
@@ -55,7 +57,7 @@ function world({ wins = windows(50), session = {}, failScreenshotAt = null, webt
       w.calls.push(`session ${id}`);
       // A scenario's fault takes effect when its hook has run (the hook scripts log "apply" in their directory): the stack then reports a fallback and the <video> starts.
       if (w.hooksDir && fs.existsSync(path.join(w.hooksDir, "log")) && fs.readFileSync(path.join(w.hooksDir, "log"), "utf8").includes("apply")) {
-        w.faultSeenAt ??= w.t;
+        if (w.faultSeenAt === null) { w.faultSeenAt = w.t; w.onFault?.(w); }
         if (!noFallback && w.t >= w.faultSeenAt + fallbackDelayMs && rows[SID] && !rows[SID].transport_fallback_reason) {
           rows[SID].transport_fallback_reason = fallbackReason;
           w.videoStart = w.t;
@@ -79,6 +81,7 @@ function world({ wins = windows(50), session = {}, failScreenshotAt = null, webt
     evaluate: async (fn) => fn({ disabled: false, getAttribute: () => null, click: () => {
       w.clicks.push(desc);
       if (!/Play now/.test(desc)) return;
+      w.playAt = w.t;
       if (onPlay) onPlay(w);
       if (bare) return;
       if (refuse) return w.emit("response", response(409, "/v1/sessions", { error: { code: "profile_ineligible" } }));
@@ -93,12 +96,13 @@ function world({ wins = windows(50), session = {}, failScreenshotAt = null, webt
     send: async (method, p) => {
       w.cdp.push([method, p]);
       if (method === "Input.dispatchKeyEvent") {
+        if (p.type === "keyUp" && p.code === keyUpFails) throw new Error("the DevTools session is gone");
         if (p.type === "keyDown") deliver("keydown", { code: p.code });
         else if (p.type === "keyUp" && p.code !== swallowKeyUp) deliver("keyup", { code: p.code });
       } else if (method === "Input.dispatchMouseEvent") {
         const idx = { left: 0, middle: 1, right: 2 }[p.button];
         if (p.type === "mousePressed") {
-          if (idx === 0 && lockOnClick && !w.locked) w.locked = true;
+          if (idx === 0 && layerUp()) { w.layerClicks += 1; if (lockOnClick && w.layerClicks >= lockOnNth) w.locked = true; } else if (idx === 0 && !w.locked) w.stageClicks += 1;
           deliver("mousedown", { button: idx });
         } else if (p.type === "mouseReleased") deliver("mouseup", { button: idx });
         else if (p.type === "mouseWheel") deliver("wheel", { deltaX: p.deltaX, deltaY: p.deltaY });
@@ -130,8 +134,11 @@ function world({ wins = windows(50), session = {}, failScreenshotAt = null, webt
       for (const [k, v] of w.ls) store[k] = v;
       const saved = Object.fromEntries(["window", "localStorage", "sessionStorage", "document"].map((k) => [k, globalThis[k]]));
       const hidden = hiddenBetween && w.t >= hiddenBetween[0] && w.t < hiddenBetween[1];
-      const video = { getVideoPlaybackQuality: () => ({ totalVideoFrames: w.t < w.videoStart ? 0 : Math.round(((w.t - w.videoStart) / 1000) * videoRate) }), getBoundingClientRect: () => ({ left: 100, top: 50, width: 800, height: 600 }) };
-      const doc = { pointerLockElement: w.locked ? { classList: { contains: (c) => c === "session-video" } } : null, visibilityState: hidden ? "hidden" : "visible", hasFocus: () => true, querySelector: (sel) => (/sl-root/.test(sel) ? (loader ? matches(sel, loader) : revealed ? {} : null) : /video/.test(sel) && !noBench && !revealed && !noFrame ? video : null) };
+      // On WebTransport the first .session-video is a hidden <video> and the picture is a canvas (SessionPage.tsx); after the fallback it is the <video>.
+      const hiddenVideo = { tagName: "VIDEO", videoWidth: 0, getBoundingClientRect: () => ({ left: 0, top: 0, width: 0, height: 0 }) };
+      const canvas = { tagName: "CANVAS", getBoundingClientRect: () => ({ left: 100, top: 50, width: 800, height: 600 }) };
+      const video = { tagName: "VIDEO", videoWidth: 1920, getVideoPlaybackQuality: () => ({ totalVideoFrames: w.t < w.videoStart ? 0 : Math.round(((w.t - w.videoStart) / 1000) * videoRate) }), getBoundingClientRect: () => ({ left: 100, top: 50, width: 800, height: 600 }) };
+      const doc = { pointerLockElement: w.locked ? { classList: { contains: (c) => c === "session-video" } } : null, visibilityState: hidden ? "hidden" : "visible", hasFocus: () => true, querySelectorAll: () => (noFrame ? [] : w.t < w.videoStart ? [hiddenVideo, canvas] : [video]), querySelector: (sel) => (sel === ".session-video" ? (noFrame ? [] : w.t < w.videoStart ? [hiddenVideo, canvas] : [video])[0] ?? null : /session-play/.test(sel) ? (layerUp() ? { getBoundingClientRect: () => ({ left: 0, top: 0, width: 1280, height: 720 }) } : null) : /sl-root/.test(sel) ? (loader ? matches(sel, loader) : revealed ? {} : null) : /video/.test(sel) && !noBench && !revealed && !noFrame ? video : null) };
       w.win ??= { addEventListener: (type, fn) => { (w.listeners[type] ??= []).push(fn); } };
       w.win.__qBench = noBench ? undefined : qbench;
       Object.assign(globalThis, { window: w.win, localStorage: store, sessionStorage: { getItem: () => null }, document: doc });
@@ -1564,19 +1571,20 @@ test("transport-fallback: the event the page posts counts, and only a well-forme
   assert.deepEqual(fallbackEvents(body([{ type: "transport.fallback", payload: { reason: "Bad Reason!" } }, { type: "playout.changed", payload: { reason: "x" } }, null, { type: "transport.fallback", payload: {} }])), []);
   assert.deepEqual(fallbackEvents("{not json"), []);
   assert.deepEqual(fallbackEvents(body([{ ts_unix_ms: "soon", type: "transport.fallback", payload: { reason: "internal" } }])), [{ ts_unix_ms: null, reason: "internal" }]);
-  // Through the page: a POST to the session's trace endpoint is read; the same body to another path is not.
-  for (const [path_, seen] of [[`/v1/sessions/${SID}/trace/events`, true], ["/v1/other", false]]) {
+  // Through the page: a POST to this session's trace endpoint AFTER the fault is read; the same body to another path, or to another session's endpoint, is not.
+  for (const [path_, seen] of [[`/v1/sessions/${SID}/trace/events`, true], [`/v1/sessions/${OTHER}/trace/events`, false], ["/v1/other", false]]) {
     const { w, hooksDir } = fallbackWorld({ noFallback: true });
-    w.afterLogin = () => w.emit("request", { url: () => `${BASE}${path_}`, method: () => "POST", postData: () => body([{ ts_unix_ms: 5, type: "transport.fallback", payload: { reason: "stream_lost" } }]) });
+    w.onFault = () => w.emit("request", { url: () => `${BASE}${path_}`, method: () => "POST", postData: () => body([{ ts_unix_ms: 5, type: "transport.fallback", payload: { reason: "stream_lost" } }]) });
     const r = await runReal(w, FALLBACK("mid", { hold_s: 10 }), { hooksDir });
-    assert.equal(r.by().fallback_event.pass, seen);
+    assert.equal(r.by().fallback_event.pass, seen, path_);
     if (seen) assert.match(r.by().fallback_event.observed, /^stream_lost \(the page's own post only/);
+    assert.deepEqual(JSON.parse(read(r.dir, `${r.id()}/fallback.json`)).posted_events, seen ? [{ ts_unix_ms: 5, reason: "stream_lost" }] : []);
   }
 });
 
 test("transport-fallback: judge reads the tail, a session that ended and an unreadable row", () => {
   const base = { params: { hold_s: 30 }, firstFrameS: 1 };
-  const good = { row: { state: "running" }, fallbackReason: "stream_lost", posted: [], videoAfterS: 4, tail: { before: 10, after: 70 }, keyHeld: true };
+  const good = { row: { state: "running" }, fallbackReason: "stream_lost", posted: [], videoAfterS: 4, tail: { before: 10, after: 70 }, keyHeld: true, faultApplied: true, watched: true };
   const get = (seen) => Object.fromEntries(judgeFallback({ ...base, seen: { ...good, ...seen } }).map((c) => [c.id, c]));
   assert.equal(get({}).continues_on_webrtc.pass, true);
   assert.equal(get({ tail: { before: 70, after: 70 } }).continues_on_webrtc.pass, false, "frames stopped");
@@ -1587,6 +1595,10 @@ test("transport-fallback: judge reads the tail, a session that ended and an unre
   assert.equal(get({ fallbackReason: null }).fallback_event.pass, false);
   assert.equal(get({ videoAfterS: NaN }).frame_after_fallback.pass, false);
   assert.equal(get({ keyHeld: false }).held_key_released.pass, null);
+  // B6: no fallback reported is never "continues on WebRTC", however the tail looks.
+  const none = get({ fallbackReason: null, posted: [] }).continues_on_webrtc;
+  assert.equal(none.pass, false);
+  assert.equal(none.observed, "no fallback was reported");
 });
 
 test("transport-fallback: a plan that cannot run is refused before a page opens; no hook script skips it", async () => {
@@ -1653,7 +1665,7 @@ test("input-kbm: no pointer lock fails pointer_lock_taken; an unreadable record 
   assert.equal(r.by().pointer_lock_taken.pass, false);
   assert.equal(r.sc().status, "fail");
   assert.match(r.by().input_to_photon_ms.expected, /marker echoed no key/);
-  const get = (seen) => Object.fromEntries(judgeInput({ firstFrameS: 1, seen: { locked: true, held: { keys: [], buttons: [] }, i2p: [], i2pMissed: 0, ...seen } }).map((c) => [c.id, c]));
+  const get = (seen) => Object.fromEntries(judgeInput({ firstFrameS: 1, seen: { locked: true, lockClicks: 1, sequenceRan: true, held: { keys: [], buttons: [] }, i2p: [], i2pMissed: 0, ...seen } }).map((c) => [c.id, c]));
   assert.equal(get({ held: null }).nothing_held_at_end.pass, null);
   assert.equal(get({ held: { keys: [], buttons: [0] } }).nothing_held_at_end.pass, false);
   assert.equal(checkInput({ transport: "webrtc", codec: "h264", profile: "1080p60", hold_s: 5, app: "x" }), null);
@@ -1663,6 +1675,186 @@ test("input-kbm: a sample that is not a number is not counted", async () => {
   const w = world({ wins: echoWindows([40, "55", null, Infinity]) });
   const r = await runReal(w, INPUT());
   assert.match(r.by().input_to_photon_ms.expected, /Measured 1 samples, median 40 ms/);
+});
+
+// ── review round 1 on #1338 ─────────────────────────────────────────────────
+
+import { streamCentre } from "./scenarios/stream-common.mjs";
+const keyEvents = (w) => w.cdp.filter(([m]) => m === "Input.dispatchKeyEvent").map(([, p]) => `${p.type}:${p.code}`);
+const posts = (reason = "stream_lost") => JSON.stringify({ client: "browser", events: [{ ts_unix_ms: 5, type: "transport.fallback", payload: { reason } }] });
+const post = (w, body) => w.emit("request", { url: () => `${BASE}/v1/sessions/${SID}/trace/events`, method: () => "POST", postData: () => body });
+
+test("B1: a mid run whose session fell back at connect is an error, the hook is not applied, and nothing before the fault counts", async () => {
+  // Each way the run can already know: the page posted the event after login, the row has a reason, the <video> plays from the start.
+  const cases = {
+    "the page's post": (o) => { const f = fallbackWorld(o); f.w.afterLogin = () => post(f.w, posts("connect_failed")); return f; },
+    "the session row": (o) => fallbackWorld({ session: { transport_fallback_reason: "connect_timeout" }, ...o }),
+    "a <video> playing from the start": (o) => { const f = fallbackWorld(o); f.w.videoStart = T0; return f; },
+  };
+  for (const [what, make] of Object.entries(cases)) {
+    const { w, hooksDir } = make({ noFallback: true });
+    const r = await runReal(w, FALLBACK("mid", { hold_s: 10 }), { hooksDir });
+    assert.equal(r.sc().status, "error", what);
+    assert.match(r.sc().reason, /fell back at connect \((connect_failed|connect_timeout|no reason reported)\) before the fault; the mid-stream fallback was not exercised/, what);
+    assert.deepEqual(logOf(hooksDir), [], `${what}: the hook was not applied`);
+    assert.deepEqual(keyEvents(w), ["keyDown:KeyW", "keyUp:KeyW"], `${what}: the held key is still released`);
+  }
+  // An event posted AFTER the fault is the evidence; the same one posted before it is not (covered above) and is not double counted.
+  const { w, hooksDir } = fallbackWorld({ noFallback: true });
+  w.onFault = () => post(w, posts());
+  const r = await runReal(w, FALLBACK("mid", { hold_s: 10 }), { hooksDir });
+  assert.equal(r.by().fallback_event.pass, true);
+});
+
+test("M1: with no first frame the fault is never applied and the rows after it are not judged, not failed", async () => {
+  const { w, hooksDir } = fallbackWorld({ noFrame: true });
+  const r = await runReal(w, FALLBACK("mid", { hold_s: 10 }), { hooksDir });
+  assert.deepEqual(logOf(hooksDir), [], "no hook ran");
+  assert.deepEqual(keyEvents(w), []);
+  for (const k of ["continues_on_webrtc", "fallback_event", "frame_after_fallback", "held_key_released"]) {
+    assert.equal(r.by()[k].pass, null, k);
+    assert.match(r.by()[k].expected, /^not judged: no first frame, so the fault was never applied$/, k);
+  }
+  assert.equal(r.by().first_frame_s.pass, false);
+  assert.equal(r.sc().status, "fail");
+  // In `connect` the fault is on before the launch, but nothing was watched after it.
+  const c = fallbackWorld({ noFrame: true });
+  const rc = await runReal(c.w, FALLBACK("connect", { hold_s: 10 }), { hooksDir: c.hooksDir });
+  assert.deepEqual(logOf(c.hooksDir).map((l) => l.split(" ")[0]), ["apply", "clear"]);
+  for (const k of ["continues_on_webrtc", "fallback_event", "frame_after_fallback", "held_key_released"]) assert.equal(rc.by()[k].pass, null, k);
+  assert.match(rc.by().fallback_event.expected, /the stream was not watched after the fault/);
+});
+
+test("M1: input-kbm with no first frame sends nothing and judges neither the lock nor the held keys", async () => {
+  const w = world({ noFrame: true });
+  const r = await runReal(w, INPUT());
+  assert.deepEqual(w.cdp, [], "nothing went over the DevTools protocol");
+  for (const k of ["pointer_lock_taken", "nothing_held_at_end"]) {
+    assert.equal(r.by()[k].pass, null, k);
+    assert.match(r.by()[k].expected, /^not judged: no first frame, so the input sequence was not sent$/, k);
+  }
+  assert.equal(r.sc().status, "fail");
+});
+
+test("B2: the stream surface is the visible one: on WebTransport the hidden <video> is skipped for the canvas", async () => {
+  const el = (tag, vw, rect) => ({ tagName: tag, videoWidth: vw, getBoundingClientRect: () => rect });
+  const hidden = el("VIDEO", 0, { left: 0, top: 0, width: 0, height: 0 });
+  const canvas = el("CANVAS", undefined, { left: 100, top: 50, width: 800, height: 600 });
+  const video = el("VIDEO", 1920, { left: 0, top: 0, width: 1000, height: 500 });
+  const at = (list) => streamCentre({ evaluate: async (fn) => { const saved = globalThis.document; globalThis.document = { querySelectorAll: () => list }; try { return await fn(); } finally { globalThis.document = saved; } } });
+  assert.deepEqual(await at([hidden, canvas]), { x: 500, y: 350 });
+  assert.deepEqual(await at([video]), { x: 500, y: 250 });
+  assert.equal(await at([hidden]), null, "no visible surface");
+  assert.equal(await at([]), null);
+  // Through the scenario: with no layer to click, the sequence's pointer starts on the canvas, not at 0,0.
+  const w = world({ noLayer: true });
+  w.videoStart = Infinity;
+  await runReal(w, INPUT());
+  const press = w.cdp.find(([m, p]) => m === "Input.dispatchMouseEvent" && p.type === "mousePressed");
+  assert.deepEqual([press[1].x, press[1].y], [500, 350]);
+});
+
+test("B3: the lock is taken from the \"Click to play\" layer: waited for, clicked, clicked again while not held, and never by a stage click", async () => {
+  // The layer is raised 2 s after Play: a stage click before it would only open the HUD shelf.
+  const late = world({ layerAfterMs: 2000 });
+  const r = await runReal(late, INPUT());
+  assert.equal(r.by().pointer_lock_taken.pass, true);
+  assert.equal(late.layerClicks, 1);
+  assert.equal(late.stageClicks, 0, "the stage was never clicked to take the lock");
+  // A first click that does not lock is repeated, within a bound.
+  const second = world({ lockOnNth: 2 });
+  assert.equal((await runReal(second, INPUT())).by().pointer_lock_taken.pass, true);
+  assert.equal(second.layerClicks, 2);
+  const never = world({ lockOnClick: false });
+  const rn = await runReal(never, INPUT());
+  assert.equal(never.layerClicks >= 3, true);
+  assert.equal(rn.by().pointer_lock_taken.pass, false);
+  assert.match(rn.by().pointer_lock_taken.observed, /after 3 click\(s\) on the "Click to play" layer/);
+  // No layer at all (Play did not go immersive): nothing to click, no stage click, and it says so.
+  const bare = world({ noLayer: true });
+  const rb = await runReal(bare, INPUT());
+  assert.equal(rb.by().pointer_lock_taken.pass, false);
+  assert.match(rb.by().pointer_lock_taken.observed, /no "Click to play" layer to click/);
+  assert.equal(bare.stageClicks > 0, true, "only the sequence's own left button reached the stage");
+  assert.ok(bare.cdp.findIndex(([, p]) => p.type === "keyDown") < bare.cdp.findIndex(([, p]) => p.type === "mousePressed"), "no click before the sequence starts");
+  // transport-fallback takes the lock the same way before it holds a key.
+  const f = fallbackWorld({ layerAfterMs: 2000 });
+  await runReal(f.w, FALLBACK("mid", { hold_s: 10 }), { hooksDir: f.hooksDir });
+  assert.equal(f.w.layerClicks, 1);
+  assert.equal(f.w.stageClicks, 0);
+  const none = fallbackWorld({ noLayer: true });
+  const rf = await runReal(none.w, FALLBACK("mid", { hold_s: 10 }), { hooksDir: none.hooksDir });
+  assert.deepEqual(keyEvents(none.w), [], "no lock, so no key is held");
+  assert.match(rf.by().held_key_released.expected, /pointer lock was not taken/);
+});
+
+test("B4: input-kbm releases the key or button it holds when the run is interrupted mid-hold; a release that fails is named", async () => {
+  for (const [held, up] of [["KeyS", "KeyS"], ["right", "right"]]) {
+    const w = world();
+    const orig = w.sleep;
+    // The run is cut during the 40 ms hold of this key (or button): after its press, before its release.
+    w.sleep = async (ms) => {
+      const down = w.cdp.some(([, p]) => p.code === held || (p.type === "mousePressed" && p.button === held));
+      const upSent = w.cdp.some(([, p]) => p.type === "keyUp" ? p.code === held : p.type === "mouseReleased" && p.button === held);
+      if (down && !upSent) throw new Error("interrupted");
+      return orig(ms);
+    };
+    const r = await runReal(w, INPUT());
+    assert.equal(r.sc().status, "error", held);
+    assert.equal(w.cdp.some(([, p]) => (p.type === "keyUp" && p.code === up) || (p.type === "mouseReleased" && p.button === up)), true, `${held} was released on the way out`);
+    assert.ok(r.timeline().some((x) => x.ev === "released" && /on the way out/.test(x.by)), held);
+  }
+  // A key that cannot be released: recorded as a step and as left behind, and the scenario is an error whatever the criteria say.
+  const w = world({ keyUpFails: "KeyD" });
+  const r = await runReal(w, INPUT());
+  assert.equal(r.sc().status, "error");
+  assert.match(r.sc().reason, /left behind: key KeyD could not be released \(the DevTools session is gone\)/);
+  assert.ok(r.timeline().some((x) => x.ev === "release-failed" && x.what === "KeyD"));
+});
+
+test("B5: transport-fallback releases its held key on a thrown path; a release that fails is a step, left behind, and not a clean release in fallback.json", async () => {
+  // Thrown after the key went down: the key comes up on the way out.
+  const t = fallbackWorld();
+  const orig = t.w.api.session;
+  t.w.api.session = async (id) => { if (keyEvents(t.w).includes("keyDown:KeyW")) throw new Error("the API is down"); return orig(id); };
+  const r = await runReal(t.w, FALLBACK("mid"), { hooksDir: t.hooksDir });
+  assert.equal(r.sc().status, "error");
+  assert.match(r.sc().reason, /the API is down/);
+  assert.deepEqual(keyEvents(t.w), ["keyDown:KeyW", "keyUp:KeyW"]);
+  assert.ok(r.timeline().some((x) => x.ev === "key-released" && /on the way out/.test(x.by)));
+  assert.deepEqual(logOf(t.hooksDir), [], "never applied");
+  // A release that fails, on the thrown path and on the normal one.
+  const f = fallbackWorld({ keyUpFails: "KeyW" });
+  const rf = await runReal(f.w, FALLBACK("mid"), { hooksDir: f.hooksDir });
+  assert.equal(rf.sc().status, "error");
+  assert.match(rf.sc().reason, /left behind: key KeyW could not be released \(the DevTools session is gone\)/);
+  assert.ok(rf.timeline().some((x) => x.ev === "key-release-failed"));
+  const rec = JSON.parse(read(rf.dir, `${rf.id()}/fallback.json`));
+  assert.equal(rec.key_held, true);
+  assert.equal(rec.key_released_by_runner, false);
+  const g = fallbackWorld({ keyUpFails: "KeyW" });
+  const gr = g.w.api.session;
+  g.w.api.session = async (id) => { if (keyEvents(g.w).includes("keyDown:KeyW")) throw new Error("the API is down"); return gr(id); };
+  const rg = await runReal(g.w, FALLBACK("mid"), { hooksDir: g.hooksDir });
+  assert.match(rg.sc().reason, /the API is down; left behind: key KeyW could not be released/);
+});
+
+test("B7/N2: a session row that cannot be read at the end, or is another session, is an error in both scenarios", async () => {
+  const unread = fallbackWorld();
+  const orig = unread.w.api.session;
+  unread.w.api.session = async (id) => (unread.w.faultSeenAt !== null && unread.w.t >= unread.w.faultSeenAt + 7000 ? undefined : orig(id));
+  const r = await runReal(unread.w, FALLBACK("mid"), { hooksDir: unread.hooksDir });
+  assert.equal(r.sc().status, "error");
+  assert.match(r.sc().reason, /the API no longer returns the session this run started/);
+  for (const reply of [undefined, { id: OTHER, app_id: "app-1", state: "running" }]) {
+    const w = world();
+    const first = w.api.session;
+    let n = 0;
+    w.api.session = async (id) => (++n === 1 ? first(id) : reply);
+    const ri = await runReal(w, INPUT());
+    assert.equal(ri.sc().status, "error", JSON.stringify(reply));
+    assert.match(ri.sc().reason, /the API no longer returns the session this run started/);
+  }
 });
 
 test("input and fallback plans load and name only scenarios that exist", () => {
