@@ -64,8 +64,14 @@ func getVerdict(t *testing.T, url, token string) (int, verdictBody) {
 // 5-minute window catches it.
 func seedCongestion(t *testing.T, store *Store, sid string) {
 	t.Helper()
+	seedCongestionAt(t, store, sid, time.Now().Add(-30*time.Second).UnixMilli())
+}
+
+// seedCongestionAt is seedCongestion anchored on an explicit first-sample
+// timestamp, for tests whose samples are not "the last 30 s".
+func seedCongestionAt(t *testing.T, store *Store, sid string, base int64) {
+	t.Helper()
 	ctx := context.Background()
-	base := time.Now().Add(-30 * time.Second).UnixMilli()
 	loss := []float64{0, 6, 16, 34, 60}
 	rtt := []float64{45, 75, 95, 110, 130}
 	for i := range loss {
@@ -292,5 +298,113 @@ func TestVerdictEmptyWindowIsInsufficient(t *testing.T) {
 		if f.Note == "" {
 			t.Errorf("falsifier %q has no note over an empty window", f.Name)
 		}
+	}
+}
+
+// An ended session reads its OWN last window, never a window measured back from
+// now (#1319). A stopped session's samples are older than the default 5 min, so
+// a now-anchored default answered "insufficient, 0 host, 0 client samples" over
+// hundreds of rows the store still held.
+func TestEndedSessionReadsItsOwnLastWindow(t *testing.T) {
+	pool := testDB(t)
+	srv, svc, st := newMetricsServer(t, pool)
+	ctx := context.Background()
+	_ = seed(t, pool, 4)
+	owner, err := svc.Register(ctx, "owner@test.local", "owner", "quasar-fixture-pw-03")
+	if err != nil {
+		t.Fatalf("register owner: %v", err)
+	}
+	if _, err := svc.Register(ctx, "admin@test.local", "admin", "quasar-fixture-pw-01"); err != nil {
+		t.Fatalf("register admin: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE users SET role='admin' WHERE email='admin@test.local'`); err != nil {
+		t.Fatalf("promote admin: %v", err)
+	}
+	adminTok := loginTok(t, svc, "admin@test.local", "quasar-fixture-pw-01")
+	s := currentSeed(t, pool)
+
+	// One session ends: it ran 2 h ago (well outside any window measured back
+	// from now) with host+client samples spread over its last four minutes.
+	// Transition stamps ended_at=now(), so the row's clock is set back to when
+	// the session really ended. It is created (and stopped) first because the
+	// fixture has one GPU and two live sessions cannot share it.
+	endedID := sessionForUser(t, st, s, owner.ID)
+	if _, err := st.Transition(ctx, endedID, StateStopped, nil, nil); err != nil {
+		t.Fatalf("stop session: %v", err)
+	}
+	endedAt := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	base := endedAt.Add(-4 * time.Minute).UnixMilli()
+	seedCongestionAt(t, st, endedID, base)
+	if _, err := pool.Exec(ctx,
+		`UPDATE sessions SET started_at = $2, ended_at = $3 WHERE id = $1::uuid`,
+		endedID, endedAt.Add(-10*time.Minute), endedAt); err != nil {
+		t.Fatalf("backdate ended session: %v", err)
+	}
+	if err := st.Telemetry().AppendEvent(ctx, endedID, telemetry.SourceAgent, telemetry.EventInput{
+		TsUnixMs: base + 2000, Type: "abr.retarget",
+		Payload: json.RawMessage(`{"from_kbps":14000,"to_kbps":9000,"reason":"gcc_downshift"}`)}); err != nil {
+		t.Fatalf("insert event: %v", err)
+	}
+	liveID := sessionForUser(t, st, s, owner.ID)
+
+	// The verdict is built from those samples, not from an empty window.
+	code, v := getVerdict(t, srv.URL+"/v1/admin/sessions/"+endedID+"/verdict", adminTok)
+	if code != http.StatusOK {
+		t.Fatalf("ended session verdict: got %d want 200", code)
+	}
+	if v.Window.NHost != 5 || v.Window.NClient != 5 {
+		t.Fatalf("ended session verdict counts = %d host / %d client, want 5 / 5 (window %+v)",
+			v.Window.NHost, v.Window.NClient, v.Window)
+	}
+	if v.Window.ToMs != endedAt.UnixMilli() {
+		t.Errorf("default window ends at %d, want the session's end %d",
+			v.Window.ToMs, endedAt.UnixMilli())
+	}
+	if v.Verdict != verdictNetworkCongestion {
+		t.Errorf("verdict = %q want %q (evidence: %v)", v.Verdict, verdictNetworkCongestion, v.Evidence)
+	}
+
+	// The bundle and the trace/events read share that window: both carry the
+	// samples and the event rather than an empty series and no events.
+	resp := doJSON(t, http.MethodGet, srv.URL+"/v1/admin/sessions/"+endedID+"/diagnostic-bundle", adminTok, nil)
+	var bundle struct {
+		Window struct {
+			ToMs int64 `json:"to_ms"`
+		} `json:"window"`
+		Series     map[string][]seriesPoint `json:"series"`
+		Events     []json.RawMessage        `json:"events"`
+		Classifier verdictBody              `json:"classifier"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&bundle); err != nil {
+		t.Fatalf("decode bundle: %v", err)
+	}
+	resp.Body.Close()
+	if len(bundle.Series["transport.rtt_ms"]) != 5 {
+		t.Errorf("bundle rtt series has %d points, want 5", len(bundle.Series["transport.rtt_ms"]))
+	}
+	if len(bundle.Events) == 0 {
+		t.Error("bundle carries no events for the ended session")
+	}
+	if bundle.Classifier.Verdict != v.Verdict || bundle.Window.ToMs != endedAt.UnixMilli() {
+		t.Errorf("bundle (verdict %q, to_ms %d) disagrees with the verdict route (verdict %q, to_ms %d)",
+			bundle.Classifier.Verdict, bundle.Window.ToMs, v.Verdict, v.Window.ToMs)
+	}
+
+	resp = doJSON(t, http.MethodGet, srv.URL+"/v1/admin/sessions/"+endedID+"/trace/events", adminTok, nil)
+	var ev struct {
+		Events []json.RawMessage `json:"events"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&ev); err != nil {
+		t.Fatalf("decode trace events: %v", err)
+	}
+	resp.Body.Close()
+	if len(ev.Events) != 1 {
+		t.Errorf("trace/events for the ended session returned %d events, want 1", len(ev.Events))
+	}
+
+	// A LIVE session is unchanged: its default window still ends "now".
+	_, lv := getVerdict(t, srv.URL+"/v1/admin/sessions/"+liveID+"/verdict", adminTok)
+	if age := time.Now().UnixMilli() - lv.Window.ToMs; age < 0 || age > 5000 {
+		t.Errorf("live session default window ends %d ms before now, want ~now", age)
 	}
 }

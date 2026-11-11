@@ -11,7 +11,7 @@ import {
 import type { InputMsg } from "../input/inputSender";
 import type { Presenter } from "./presenter";
 import { TransportError, type MediaSink, type MediaTransport, type TransportEnd } from "./transport";
-import { createWebTransportRuntime, type WebTransportRuntimeDeps } from "../pages/app/webTransportRuntime";
+import { createWebTransportRuntime, MEDIA_SILENCE_MS, type WebTransportRuntimeDeps } from "../pages/app/webTransportRuntime";
 import type { BenchDeps } from "../bench/benchController";
 import { mintTransportToken } from "../api/library";
 import {
@@ -25,8 +25,11 @@ import {
   flush,
   helloAck,
   packetize,
+  repairOf,
   type FakeFrame,
 } from "./testSupport";
+import { parseVideoDatagram } from "./framing";
+import { FEC_HOLD_MS } from "./reassembly";
 
 beforeEach(() => {
   vi.stubGlobal("EncodedVideoChunk", FakeChunk);
@@ -67,7 +70,7 @@ describe("WebTransportMedia connect", () => {
       [1, 2, 3, 4],
       [9, 9],
     ]);
-    expect(agent.sent("hello")[0]).toEqual({ type: "hello", wt_proto: 1, token: "tok-1", session_id: "s1", client: "browser" });
+    expect(agent.sent("hello")[0]).toEqual({ type: "hello", wt_proto: 1, token: "tok-1", session_id: "s1", client: "browser", fec: ["xor"] });
   });
 
   it("sends no certificate hashes for an edge URL", async () => {
@@ -260,6 +263,27 @@ describe("WebTransportMedia loss recovery", () => {
     // Nothing more arrives: a still picture. The repeat and the lateness come off the timer.
     await vi.waitFor(() => expect(agent.sent("nack")).toHaveLength(2));
     await vi.waitFor(() => expect(agent.sent("keyframe_request")).toEqual([{ type: "keyframe_request", reason: "late" }]));
+    t.close();
+  });
+
+  it(`sends a NACK held for FEC ${FEC_HOLD_MS} ms after the gap showed, with no datagram to carry it`, async () => {
+    const agent = new FakeAgent();
+    agent.replies = [[helloAck(0, avcC())]];
+    let now = 1_000;
+    const t = transport(agent, { now: () => now });
+    await t.connect(NO_SINK);
+    vi.useFakeTimers();
+    const pkt = { n: 0 };
+    const key = packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(3000, 0) }, pkt);
+    // A whole frame and its repair (the agent is sending FEC), then a frame with a gap.
+    agent.last.datagrams([...key, repairOf(key.map((d) => parseVideoDatagram(d)!), 0, 3)]);
+    const gapped = packetize({ configId: 0, frameSeq: 1, keyframe: false, data: bytes(3000, 1) }, pkt);
+    agent.last.datagrams([gapped[0], gapped[2]]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(agent.sent("nack")).toEqual([]);
+    now += FEC_HOLD_MS;
+    await vi.advanceTimersByTimeAsync(FEC_HOLD_MS);
+    expect(agent.sent("nack")).toEqual([{ type: "nack", frame_seq: 1, frags: [[1, 1]] }]);
     t.close();
   });
 });
@@ -884,6 +908,77 @@ describe("createWebTransportRuntime fallback", () => {
     agent.last.closeWith(4400);
     await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost"));
     expect(callbacks.onFallback).toHaveBeenCalledTimes(1);
+  });
+
+  describe("media watchdog (#1297)", () => {
+    const frame = (agent: FakeAgent, frameSeq: number) =>
+      agent.last.datagrams(packetize({ configId: 0, frameSeq, keyframe: true, data: bytes(10, frameSeq) }));
+    async function streaming() {
+      vi.useFakeTimers();
+      const s = setup();
+      s.rt.start();
+      await vi.advanceTimersByTimeAsync(10);
+      expect(s.rt.getSnapshot().channelOpen).toBe(true);
+      frame(s.agent, 0);
+      await vi.advanceTimersByTimeAsync(10);
+      return s;
+    }
+    const SILENT = MEDIA_SILENCE_MS + 1_100; // the bound, and the 1 s tick that checks it
+
+    it("control stream alive, video stopped: one reconnect, then falls back with stream_lost", async () => {
+      const { agent, callbacks } = await streaming();
+      await vi.advanceTimersByTimeAsync(SILENT);
+      expect(agent.sent("hello").map((h) => h.token)).toEqual(["tok-1", "tok-2"]);
+      expect(callbacks.onFallback).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(SILENT + BYE_FLUSH_MS);
+      expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost");
+      expect(agent.conns).toHaveLength(2);
+    });
+
+    it("does not fire on a still screen's cadence, nor before the stream has started", async () => {
+      const { agent, rt } = await streaming();
+      for (let seq = 1; seq <= 12; seq++) {
+        await vi.advanceTimersByTimeAsync(1_000);
+        frame(agent, seq);
+      }
+      expect(agent.sent("hello")).toHaveLength(1);
+      rt.destroy();
+
+      const idle = setup();
+      idle.rt.start();
+      await vi.advanceTimersByTimeAsync(3 * SILENT);
+      expect(idle.agent.sent("hello")).toHaveLength(1);
+      idle.rt.destroy();
+    });
+
+    it("does not fire on a tick that ran late: a stalled page has its datagrams still queued", async () => {
+      const { agent, rt } = await streaming();
+      const real = performance.now.bind(performance);
+      const stall = vi.spyOn(performance, "now").mockImplementation(() => real() + MEDIA_SILENCE_MS + 1_000);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(agent.sent("hello")).toHaveLength(1);
+      // Still silent a whole bound after the stall: that is a lost stream.
+      await vi.advanceTimersByTimeAsync(SILENT);
+      expect(agent.sent("hello")).toHaveLength(2);
+      stall.mockRestore();
+      rt.destroy();
+    });
+
+    it("does not fire in a hidden tab, and gives a tab that shows again the whole bound", async () => {
+      const { agent, rt } = await streaming();
+      const vis = vi.spyOn(document, "visibilityState", "get");
+      vis.mockReturnValue("hidden");
+      document.dispatchEvent(new Event("visibilitychange"));
+      await vi.advanceTimersByTimeAsync(3 * SILENT);
+      expect(agent.sent("hello")).toHaveLength(1);
+      vis.mockReturnValue("visible");
+      document.dispatchEvent(new Event("visibilitychange"));
+      await vi.advanceTimersByTimeAsync(MEDIA_SILENCE_MS - 1_000);
+      expect(agent.sent("hello")).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(2_100);
+      expect(agent.sent("hello")).toHaveLength(2);
+      rt.destroy();
+    });
   });
 
   it("a reconnect that cannot be made reports stream_lost, whatever refused it", async () => {

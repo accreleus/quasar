@@ -5,12 +5,15 @@
 import {
   base64Bytes,
   CHANNEL_AUDIO,
+  CHANNEL_FEC,
   ControlDecoder,
   ControlProtocolError,
   encodeControl,
   parseAudioDatagram,
+  parseFecDatagram,
   parseVideoDatagram,
   serialAfter,
+  type FecRepair,
   type VideoFragment,
 } from "./framing";
 import { blockLayout } from "../pyrowave/bitstream";
@@ -151,6 +154,8 @@ export const audioStreamsFrom = (ack: Record<string, unknown>): AudioStreams => 
  *  access-unit assembler. Also the order of configurations for both. */
 interface Router {
   datagram(f: VideoFragment): void;
+  /** A repair datagram (§FEC), for the frame it protects. */
+  repair(r: FecRepair): void;
   config(c: VideoConfig): void;
   /** `nack_miss`: the agent no longer holds those fragments. */
   miss(frameSeq: number, frags: [number, number][]): void;
@@ -185,6 +190,8 @@ export class WebTransportMedia implements MediaTransport {
   private keyTimer: ReturnType<typeof setTimeout> | null = null;
   /** §Loss recovery's tick: releases and late frames wait for no datagram. */
   private recoveryTimer: ReturnType<typeof setInterval> | null = null;
+  /** Fires when a NACK held for FEC falls due with no datagram to carry it. */
+  private holdTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingKey: KeyframeReason | null = null;
   private router: Router | null = null;
   private readonly sleep: (ms: number) => Promise<void>;
@@ -265,6 +272,8 @@ export class WebTransportMedia implements MediaTransport {
   private stopRecovery(): void {
     if (this.recoveryTimer !== null) clearInterval(this.recoveryTimer);
     this.recoveryTimer = null;
+    if (this.holdTimer !== null) clearTimeout(this.holdTimer);
+    this.holdTimer = null;
   }
 
   close(): Promise<void> {
@@ -376,6 +385,8 @@ export class WebTransportMedia implements MediaTransport {
           token: this.coords.token,
           session_id: this.opts.sessionId,
           client: "browser",
+          // The schemes this client decodes (§FEC); the agent names one in hello_ack, or null.
+          fec: ["xor"],
           ...(this.opts.pyrowave ? { pyrowave: true } : {}),
         }),
       );
@@ -504,6 +515,11 @@ export class WebTransportMedia implements MediaTransport {
         if (packet) sink.audio?.(packet);
         continue;
       }
+      if ((value as Uint8Array)[0] === CHANNEL_FEC) {
+        const repair = parseFecDatagram(value as Uint8Array);
+        if (repair) router.repair(repair);
+        continue;
+      }
       const frag = parseVideoDatagram(value as Uint8Array);
       if (!frag) continue; // another channel, or malformed: dropped (§Channels)
       router.datagram(frag);
@@ -515,6 +531,14 @@ export class WebTransportMedia implements MediaTransport {
     const configs = new Map<number, VideoConfig>();
     let latest: number | null = null;
     let pyro: PyroWaveReceiver | null = null;
+    /** What the PyroWave receivers already replaced counted lost. */
+    let pyroLost = 0;
+    let reported = 0;
+    // PyroWave loss is never NACKed, so it is reported as its frames close.
+    const reportLost = () => {
+      const n = this.lostSoFar();
+      if (n !== reported) sink.lost?.((reported = n));
+    };
     let held: { f: VideoFragment; at: number }[] = [];
     let timer: ReturnType<typeof setTimeout> | null = null;
     let armedAt: number | null = null;
@@ -536,6 +560,7 @@ export class WebTransportMedia implements MediaTransport {
         armedAt = null;
         const frame = live.on ? pyro?.due(this.now()) : null;
         if (frame) sink.pyrowave(frame);
+        reportLost();
         arm();
       }, Math.max(0, at - this.now()));
     };
@@ -547,12 +572,14 @@ export class WebTransportMedia implements MediaTransport {
         const r =
           pyro?.configId === c.configId
             ? pyro
-            : (pyro = new PyroWaveReceiver(c.configId, blockLayout(c.width, c.height).totalBlocks, 1000 / (c.fps || 60)));
+            : ((pyroLost += pyro?.lost ?? 0),
+              (pyro = new PyroWaveReceiver(c.configId, blockLayout(c.width, c.height).totalBlocks, 1000 / (c.fps || 60))));
         const now = this.now();
         const due = r.due(now);
         if (due) sink.pyrowave(due);
         const done = r.push(f, now);
         if (done) sink.pyrowave(done);
+        reportLost();
         arm();
         return;
       }
@@ -578,12 +605,20 @@ export class WebTransportMedia implements MediaTransport {
     };
     const miss = (frameSeq: number, frags: [number, number][]) => this.recovered(assembler.miss(frameSeq, frags), sink);
     const tick = () => this.recovered(assembler.tick(), sink);
-    this.lostSoFar = () => assembler.lost;
-    return { datagram, config, miss, tick, stop };
+    // PyroWave frames never reach the assembler, so a repair for one finds no frame and is dropped.
+    const repair = (r: FecRepair) => this.recovered(assembler.repair(r), sink);
+    this.lostSoFar = () => assembler.lost + pyroLost + (pyro?.lost ?? 0);
+    return { datagram, repair, config, miss, tick, stop };
   }
 
   /** §Loss recovery: NACKs out, a keyframe asked for a late frame, whole units to the sink. */
-  private recovered({ units, nacks, needKeyframe }: Reassembled, sink: MediaSink): void {
+  private recovered({ units, nacks, needKeyframe, wakeMs }: Reassembled, sink: MediaSink): void {
+    if (wakeMs !== undefined && this.holdTimer === null) {
+      this.holdTimer = setTimeout(() => {
+        this.holdTimer = null;
+        if (this.live?.on && !this.closed) this.router?.tick();
+      }, wakeMs);
+    }
     for (const n of nacks) this.send({ type: "nack", frame_seq: n.frameSeq, frags: n.frags });
     if (nacks.length) sink.lost?.(this.lostSoFar());
     if (needKeyframe) this.requestKeyframe("late");

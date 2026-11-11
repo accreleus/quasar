@@ -151,7 +151,7 @@ struct Slot {
     status: Status,
 }
 
-/// When, and how big, each recent agent → client video datagram was sent, by its `pkt_seq`,
+/// When, and how big, each recent agent → client video or FEC datagram was sent, by its `pkt_seq`,
 /// and what feedback has said of it: each is counted once, whatever is reported again. A
 /// `pkt_seq` never recorded (audio shares the counter) is skipped when feedback names it.
 pub(crate) struct SendLog {
@@ -407,6 +407,7 @@ pub(crate) struct Estimator {
     last_feedback: Option<Instant>,
     last_decay: Option<Instant>,
     quic_cap_kbps: Option<f64>,
+    loss: Option<f64>,
 }
 
 /// What one message measured, for the tests.
@@ -438,12 +439,19 @@ impl Estimator {
             last_feedback: None,
             last_decay: None,
             quic_cap_kbps: None,
+            loss: None,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn estimate_kbps(&self) -> f64 {
         self.estimate_kbps
+    }
+
+    /// The loss fraction the last message's window measured; `None` on too few datagrams.
+    /// Lost repair datagrams count: they crossed the same path.
+    pub(crate) fn loss(&self) -> Option<f64> {
+        self.loss
     }
 
     /// Take one message; `Some(estimate)` when it is time to feed the ABR.
@@ -458,6 +466,7 @@ impl Estimator {
         self.last_decay = None;
         log.unanswered_since = None;
         let m = self.measure(fb, log, now);
+        self.loss = m.loss;
         let dt = now
             .saturating_duration_since(self.last_update)
             .as_secs_f64()

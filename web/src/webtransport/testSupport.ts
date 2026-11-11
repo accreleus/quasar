@@ -2,7 +2,7 @@
 // node-agent/src/webtransport/{mod,media}.rs speaks it, and a fake WebCodecs.
 // Imported by tests only.
 
-import { ControlDecoder, encodeControl } from "./framing";
+import { ControlDecoder, encodeControl, type VideoFragment } from "./framing";
 import type { WebTransportCoords } from "../api/types";
 
 const HEADER = 25;
@@ -39,6 +39,29 @@ export function packetize(u: UnitSpec, pktSeq = { n: 0 }): Uint8Array[] {
     d.set(frag, HEADER);
     return d;
   });
+}
+
+/** `fec::repair` (node-agent/src/webtransport/fec.rs): the `0x04` datagram for fragments
+ *  `first + i * stride` of `f`. */
+export function repairOf(f: VideoFragment[], first: number, count: number, stride = 1): Uint8Array {
+  const group = Array.from({ length: count }, (_, i) => f[first + i * stride].payload);
+  const payload = new Uint8Array(Math.max(...group.map((g) => g.length)));
+  let lengthXor = 0;
+  for (const g of group) {
+    lengthXor ^= g.length;
+    g.forEach((b, i) => (payload[i] ^= b));
+  }
+  const d = new Uint8Array(14 + payload.length);
+  const v = new DataView(d.buffer);
+  d[0] = 0x04;
+  d[5] = 1;
+  v.setUint16(6, f[0].frameSeq, true);
+  v.setUint16(8, first, true);
+  d[10] = count;
+  d[11] = stride;
+  v.setUint16(12, lengthXor, true);
+  d.set(payload, 14);
+  return d;
 }
 
 /**

@@ -75,7 +75,8 @@ export interface MediaSink {
   /** A `keyframe_request` went on the wire (requests inside the spacing window are merged). */
   keyframeRequested?(reason: KeyframeReason): void;
   /** Video fragments the client has found missing since connect, cumulative: each counted once,
-   *  when it is first NACKed, whether or not the resend then arrives. */
+   *  when it is first NACKed, whether or not the resend then arrives. PyroWave: the datagrams
+   *  missing from each frame closed or dropped incomplete. */
   lost?(fragments: number): void;
 }
 

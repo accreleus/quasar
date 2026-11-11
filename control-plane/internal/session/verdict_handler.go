@@ -60,15 +60,15 @@ func assess(raw telemetry.Slice, runningAt *time.Time, fromMs, toMs int64) asses
 
 // computeVerdict does the read + assembly. Returns false having already
 // written the error response.
-func (h *Handler) computeVerdict(w http.ResponseWriter, r *http.Request, id string, runningAt *time.Time) (Verdict, bool) {
-	fromMs, toMs := resolveWindow(r)
+func (h *Handler) computeVerdict(w http.ResponseWriter, r *http.Request, id string, sess Session) (Verdict, bool) {
+	fromMs, toMs := resolveWindow(r, sess)
 	raw, err := h.store.Telemetry().Window(r.Context(), id,
 		telemetry.Range{FromMs: fromMs, ToMs: toMs}, telemetry.Filter{Limit: traceReadLimit})
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not assemble verdict")
 		return Verdict{}, false
 	}
-	return assess(raw, runningAt, fromMs, toMs).Verdict, true
+	return assess(raw, sess.StartedAt, fromMs, toMs).Verdict, true
 }
 
 // handleAdminVerdict — GET /v1/admin/sessions/{id}/verdict (admin).
@@ -78,7 +78,7 @@ func (h *Handler) handleAdminVerdict(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	verdict, ok := h.computeVerdict(w, r, id, sess.StartedAt)
+	verdict, ok := h.computeVerdict(w, r, id, sess)
 	if !ok {
 		return
 	}
@@ -117,7 +117,7 @@ func (h *Handler) handleSessionVerdict(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	verdict, ok := h.computeVerdict(w, r, id, sess.StartedAt)
+	verdict, ok := h.computeVerdict(w, r, id, sess)
 	if !ok {
 		return
 	}

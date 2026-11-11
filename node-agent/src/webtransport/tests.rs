@@ -26,6 +26,7 @@ fn hello_for(session_id: &str, token: &str, wt_proto: u32) -> Hello {
         token: token.into(),
         session_id: session_id.into(),
         pyrowave: false,
+        fec: Value::Null,
     }
 }
 
@@ -706,10 +707,21 @@ impl Agent {
 
     /// Connect, open the control stream and send `hello`; the first reply.
     async fn hello(&self, token: &str) -> (Session, SendStream, RecvStream, Value) {
+        self.hello_with(token, json!({"fec": []})).await
+    }
+
+    /// A `hello` with `extra`'s fields beside the required ones.
+    async fn hello_with(
+        &self,
+        token: &str,
+        extra: Value,
+    ) -> (Session, SendStream, RecvStream, Value) {
         let session = self.connect().await;
         let (mut send, mut recv) = session.open_bi().await.unwrap();
-        let hello = json!({"type": "hello", "wt_proto": 1, "token": token,
-                           "session_id": SESSION, "client": "browser", "fec": []});
+        let mut hello = json!({"type": "hello", "wt_proto": 1, "token": token,
+                               "session_id": SESSION, "client": "browser"});
+        let extra = extra.as_object().unwrap().clone();
+        hello.as_object_mut().unwrap().extend(extra);
         write_message(&mut send, &hello).await.unwrap();
         let reply = read_message(&mut recv).await.unwrap();
         (session, send, recv, reply)
@@ -1387,6 +1399,8 @@ async fn feedback_while_pyrowave_is_active_feeds_no_estimate() {
         move |_| {
             Some(Rate {
                 ceiling_kbps: 4000.0,
+                floor_kbps: Box::new(|| 500.0),
+                retargets: true,
                 start: Box::new(|| {}),
                 observe: Box::new(move |_| {
                     count.fetch_add(1, Ordering::SeqCst);
@@ -1478,6 +1492,8 @@ async fn audio_alone_never_moves_the_video_estimate() {
     let mut agent = agent_built(Stream::H264, Limits::default(), plan, "ball", move |_| {
         Some(Rate {
             ceiling_kbps: 4000.0,
+            floor_kbps: Box::new(|| 500.0),
+            retargets: true,
             start: Box::new(|| {}),
             observe: Box::new(move |kbps| seen.lock().unwrap().push(kbps)),
         })
@@ -1524,6 +1540,8 @@ fn a_client_that_is_gone_neither_starts_nor_feeds_the_abr() {
     let (started, fed) = (calls.clone(), calls.clone());
     let rate = Rate {
         ceiling_kbps: 4000.0,
+        floor_kbps: Box::new(|| 500.0),
+        retargets: true,
         start: Box::new(move || {
             started.fetch_add(1, SeqCst);
         }),
@@ -1532,13 +1550,431 @@ fn a_client_that_is_gone_neither_starts_nor_feeds_the_abr() {
         }),
     };
     let gone = Arc::new(OnceLock::new());
-    let mut control = Control::new(&rate, gone.clone());
+    let mut control = Control::new(&rate, gone.clone(), false);
     control.feed(3000.0);
     assert_eq!(calls.load(SeqCst), 2, "a live client starts and feeds");
     gone.set(Gone::TakenOver).unwrap();
     control.feed(3000.0);
-    Control::new(&rate, gone).feed(3000.0);
+    Control::new(&rate, gone, false).feed(3000.0);
     assert_eq!(calls.load(SeqCst), 2);
+}
+
+/// A path with room that loses every 25th datagram (4 %), as the client's feedback
+/// reports it (§Feedback). True when `d` is one it lost.
+struct Lossy {
+    path: Bottleneck,
+    reported: Instant,
+}
+
+impl Lossy {
+    fn new() -> Self {
+        Self {
+            path: Bottleneck::new(1e6),
+            reported: Instant::now(),
+        }
+    }
+
+    async fn receive(&mut self, d: &[u8], send: &mut SendStream) -> bool {
+        let lost = u32::from_le_bytes(d[1..5].try_into().unwrap()) % 25 == 24;
+        if !lost {
+            // The gap a lost one leaves is what `Bottleneck` reports as not received.
+            self.path.receive(d);
+        }
+        if self.reported.elapsed() >= Duration::from_millis(50) {
+            self.reported = Instant::now();
+            if let Some(feedback) = self.path.feedback() {
+                write_message(send, &feedback).await.unwrap();
+            }
+        }
+        lost
+    }
+}
+
+/// #1046: repair datagrams are paid for out of the estimate. At 4 % loss they are a fifth
+/// on top of the video, so the ABR is fed the estimate over 1.2; a client that takes no FEC
+/// leaves it whole.
+#[test]
+fn the_abr_is_fed_the_estimate_less_the_fec_share() {
+    let fed = Arc::new(Mutex::new(Vec::new()));
+    let seen = fed.clone();
+    let rate = Rate {
+        ceiling_kbps: 6000.0,
+        floor_kbps: Box::new(|| 500.0),
+        retargets: true,
+        start: Box::new(|| {}),
+        observe: Box::new(move |kbps: f64| seen.lock().unwrap().push(kbps.round())),
+    };
+    let mut control = Control::new(&rate, Arc::default(), true);
+    control.feed(4200.0);
+    let fec = control.fec.as_mut().unwrap();
+    fec.observe(0.04, std::time::Instant::now());
+    control.feed(4200.0);
+    Control::new(&rate, Arc::default(), false).feed(4200.0);
+    assert_eq!(*fed.lock().unwrap(), [4200.0, 3500.0, 4200.0]);
+}
+
+/// A session whose frames take several datagrams (snow does not compress), with an ABR
+/// that writes the encoder (`retargets`) or only tracks the estimate.
+async fn lossy_session(retargets: bool) -> Agent {
+    agent_built(
+        Stream::H264,
+        Limits::default(),
+        audio::Plan::default(),
+        "snow",
+        move |_| {
+            Some(Rate {
+                ceiling_kbps: 4000.0,
+                floor_kbps: Box::new(|| 500.0),
+                retargets,
+                start: Box::new(|| {}),
+                observe: Box::new(|_| {}),
+            })
+        },
+    )
+    .await
+}
+
+/// #1046, §FEC: a client that offered `xor` and reports loss is sent repair datagrams, and
+/// a fragment it lost is rebuilt from one by the contract's rule, with no NACK and so no
+/// retransmission.
+#[tokio::test]
+async fn a_client_that_offers_xor_and_reports_loss_rebuilds_a_fragment_without_a_nack() {
+    let agent = lossy_session(true).await;
+    let session = agent.connect().await;
+    let (mut send, mut recv) = session.open_bi().await.unwrap();
+    let hello = json!({"type": "hello", "wt_proto": 1, "token": TOKEN,
+                       "session_id": SESSION, "client": "browser", "fec": ["xor"]});
+    write_message(&mut send, &hello).await.unwrap();
+    assert_eq!(read_message(&mut recv).await.unwrap()["fec"], "xor");
+
+    let mut path = Lossy::new();
+    let mut frames: HashMap<u16, BTreeMap<u16, Bytes>> = HashMap::new();
+    let mut lost: HashMap<(u16, u16), Bytes> = HashMap::new();
+    let (mut repairs, mut rebuilt) = (0, 0);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while rebuilt < 3 {
+        let d = tokio::time::timeout_at(deadline, session.read_datagram())
+            .await
+            .unwrap_or_else(|_| panic!("{repairs} repairs and {rebuilt} rebuilt in 20 s"))
+            .unwrap();
+        let dropped = path.receive(&d, &mut send).await;
+        let at = |i: usize| u16::from_le_bytes([d[i], d[i + 1]]);
+        if d[0] == 0x01 {
+            assert_eq!(d[5] & 4, 0, "no NACK was sent, so nothing is resent");
+            if dropped {
+                lost.insert((at(7), at(9)), d.slice(media::HEADER..));
+            } else {
+                frames
+                    .entry(at(7))
+                    .or_default()
+                    .insert(at(9), d.slice(media::HEADER..));
+            }
+            continue;
+        }
+        assert_eq!(d[0], 0x04, "video and FEC only");
+        repairs += 1;
+        if dropped {
+            continue;
+        }
+        assert!(d.len() <= media::MAX_DATAGRAM);
+        assert_eq!(d[5], 0x01, "scheme xor");
+        let (frame_seq, first, count, stride) = (at(6), at(8), d[10] as u16, d[11] as u16);
+        assert!((2..=48).contains(&count) && stride >= 1);
+        // §FEC: the one missing fragment is the repair payload XOR every other protected
+        // payload, truncated to `length_xor` XOR every other protected length.
+        let Some(have) = frames.get(&frame_seq) else {
+            continue;
+        };
+        let group: Vec<u16> = (0..count).map(|i| first + i * stride).collect();
+        let missing: Vec<u16> = group
+            .iter()
+            .copied()
+            .filter(|i| !have.contains_key(i))
+            .collect();
+        let [k] = missing[..] else { continue };
+        let mut payload = d[14..].to_vec();
+        let mut len = at(12);
+        for other in group.iter().filter(|&&i| i != k).map(|i| &have[i]) {
+            len ^= other.len() as u16;
+            for (out, byte) in payload.iter_mut().zip(other.iter()) {
+                *out ^= byte;
+            }
+        }
+        payload.truncate(len as usize);
+        // One the loopback itself dropped (a loaded machine) left nothing to compare with.
+        let Some(original) = lost.get(&(frame_seq, k)) else {
+            continue;
+        };
+        assert_eq!(payload, original[..], "fragment {k} of frame {frame_seq}");
+        rebuilt += 1;
+    }
+}
+
+/// §Hello: a client that offers no scheme is answered `fec: null` and sent no repair
+/// datagram, whatever loss it reports.
+#[tokio::test]
+async fn a_client_that_offers_no_fec_gets_none_whatever_it_loses() {
+    let agent = lossy_session(true).await;
+    let (session, mut send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["fec"], Value::Null);
+    let mut path = Lossy::new();
+    for _ in 0..800 {
+        let d = datagram(&session).await.3;
+        assert_eq!(d[0], 0x01, "only video is sent");
+        path.receive(&d, &mut send).await;
+    }
+}
+
+/// §Hello ack: a session with no ABR reads no feedback, so it has no loss to size FEC by
+/// and names no scheme.
+#[tokio::test]
+async fn a_session_without_an_abr_names_no_fec_scheme() {
+    let agent = agent().await;
+    let session = agent.connect().await;
+    let (mut send, mut recv) = session.open_bi().await.unwrap();
+    let hello = json!({"type": "hello", "wt_proto": 1, "token": TOKEN,
+                       "session_id": SESSION, "client": "browser", "fec": ["xor"]});
+    write_message(&mut send, &hello).await.unwrap();
+    assert_eq!(read_message(&mut recv).await.unwrap()["fec"], Value::Null);
+}
+
+/// `QUASAR_ABR_MODE=off` still tracks the estimate and never writes it to the encoder, so
+/// nothing would pay for repairs: such a session names no scheme and sends none.
+#[tokio::test]
+async fn a_session_whose_abr_does_not_retarget_gets_no_fec_whatever_it_loses() {
+    let agent = lossy_session(false).await;
+    let (session, mut send, _recv, ack) = agent.hello_with(TOKEN, json!({"fec": ["xor"]})).await;
+    assert_eq!(ack["fec"], Value::Null);
+    let mut path = Lossy::new();
+    for _ in 0..800 {
+        let d = datagram(&session).await.3;
+        assert_eq!(d[0], 0x01, "only video is sent");
+        path.receive(&d, &mut send).await;
+    }
+}
+
+/// §Hello: `fec` is a list. No list, an empty one or one of schemes this agent does not
+/// know is a client that takes no FEC, never a refused hello.
+#[tokio::test]
+async fn a_hello_that_names_no_known_fec_scheme_is_served_without_fec() {
+    for offer in [
+        json!({}),
+        json!({ "fec": null }),
+        json!({"fec": []}),
+        json!({"fec": ["fec2"]}),
+        json!({"fec": "xor"}),
+    ] {
+        let agent = lossy_session(true).await;
+        let (session, _send, _recv, ack) = agent.hello_with(TOKEN, offer.clone()).await;
+        assert_eq!(ack["type"], "hello_ack", "{offer}");
+        assert_eq!(ack["fec"], Value::Null, "{offer}");
+        assert_eq!(datagram(&session).await.3[0], 0x01, "{offer}: video flows");
+    }
+}
+
+/// 40 full video datagrams: 25 % of them pays for ten repairs, 4 % for one.
+fn forty_fragments() -> Vec<Bytes> {
+    vec![Bytes::from(vec![1; media::MAX_DATAGRAM]); 40]
+}
+
+/// #1046: the ABR's setpoint never goes under its floor, so repairs may spend only what the
+/// estimate leaves above it; under that, video alone already fills the path.
+#[test]
+fn repairs_spend_only_what_the_estimate_leaves_above_the_abr_floor() {
+    let fed = Arc::new(Mutex::new(Vec::new()));
+    let seen = fed.clone();
+    let rate = Rate {
+        ceiling_kbps: 6000.0,
+        floor_kbps: Box::new(|| 2500.0),
+        retargets: true,
+        start: Box::new(|| {}),
+        observe: Box::new(move |kbps: f64| seen.lock().unwrap().push(kbps.round())),
+    };
+    let mut control = Control::new(&rate, Arc::default(), true);
+    let fec = control.fec.as_mut().unwrap();
+    fec.observe(0.05, std::time::Instant::now());
+    assert_eq!(fec.overhead(), 0.25);
+    let frame = forty_fragments();
+    let mut repairs = |estimate_kbps| {
+        control.feed(estimate_kbps);
+        control.protect(false, &frame, &mut 0).len()
+    };
+    assert_eq!(repairs(2000.0), 0, "under the floor");
+    assert_eq!(repairs(2500.0), 0, "at the floor");
+    assert_eq!(repairs(2600.0), 1, "4 % above the floor");
+    assert_eq!(repairs(5000.0), 10, "room for all 25 %");
+    assert_eq!(*fed.lock().unwrap(), [2000.0, 2500.0, 2500.0, 4000.0]);
+}
+
+/// What a session on a real smooth governor (2500 to 8000 kbit/s) sends in each of `seconds`
+/// at `estimate_kbps` and FEC `level`: the setpoint, and that plus the repairs
+/// `Control::protect` makes for a second of 60 fps video at it, in kbit/s. The clock is the
+/// test's, one estimate a second.
+fn governed(level: u8, estimate_kbps: f64, seconds: u64) -> Vec<(u32, f64)> {
+    use crate::session::abr::{AbrConfig, Governor};
+    let base = std::time::Instant::now();
+    let governor = Arc::new(Mutex::new((
+        Governor::new(AbrConfig::new_smooth(2500, 8000, 60), base),
+        base,
+    )));
+    let (floor, observed) = (governor.clone(), governor.clone());
+    let rate = Rate {
+        ceiling_kbps: 8000.0,
+        floor_kbps: Box::new(move || f64::from(floor.lock().unwrap().0.floor_kbps())),
+        retargets: true,
+        start: Box::new(|| {}),
+        observe: Box::new(move |kbps| {
+            let mut governor = observed.lock().unwrap();
+            let now = governor.1;
+            governor.0.observe(kbps, now);
+        }),
+    };
+    let mut control = Control::new(&rate, Arc::default(), true);
+    let fec = control.fec.as_mut().unwrap();
+    fec.observe(f64::from(level) / 100.0, base);
+    assert_eq!(fec.overhead(), f64::from(level) * 0.05);
+    (1..=seconds)
+        .map(|second| {
+            governor.lock().unwrap().1 = base + Duration::from_secs(second);
+            control.feed(estimate_kbps);
+            let setpoint = governor.lock().unwrap().0.setpoint_kbps();
+            let fragments = (setpoint as usize * 125 / 60).div_ceil(media::MAX_DATAGRAM);
+            let frame = vec![Bytes::from(vec![1; media::MAX_DATAGRAM]); fragments];
+            let repairs: usize = (0..60)
+                .flat_map(|_| control.protect(false, &frame, &mut 0))
+                .map(|repair| repair.len())
+                .sum();
+            let video = 60 * fragments * media::MAX_DATAGRAM;
+            let sent = f64::from(setpoint) * (1.0 + repairs as f64 / video as f64);
+            (setpoint, sent)
+        })
+        .collect()
+}
+
+/// What the governor lets video alone reach before it steps down: the estimate over
+/// 1 − its deadband. Video plus FEC is held to the same.
+fn governor_bound(estimate_kbps: f64) -> f64 {
+    estimate_kbps / (1.0 - crate::session::abr::AbrConfig::DEFAULT_DEADBAND)
+}
+
+/// #1046: a FEC share inside the governor's deadband (levels 1 to 3, up to 15 %) does not
+/// move the encoder. At the ceiling the repairs go on top of it, so the session sends more
+/// than its ceiling, and no more than the governor's own bound.
+#[test]
+fn a_fec_share_inside_the_deadband_rides_on_top_of_the_ceiling() {
+    for level in 1..=3 {
+        for (setpoint, sent) in governed(level, 8000.0, 30) {
+            assert_eq!(setpoint, 8000, "level {level}");
+            assert!(
+                sent > 8000.0 && sent <= governor_bound(8000.0),
+                "level {level}: {sent:.0} kbit/s"
+            );
+        }
+    }
+}
+
+/// Levels 4 and 5 are outside the deadband: from the ceiling a smooth governor takes its
+/// one 12.5 % step and holds there, the total back inside the bound.
+#[test]
+fn a_fec_share_outside_the_deadband_steps_the_setpoint_down() {
+    for level in 4..=5 {
+        for (setpoint, sent) in governed(level, 8000.0, 30) {
+            assert_eq!(setpoint, 7000, "level {level}");
+            assert!(
+                sent > 8000.0 && sent <= governor_bound(8000.0),
+                "level {level}: {sent:.0} kbit/s"
+            );
+        }
+    }
+}
+
+/// On a link that carries less than the ceiling the governor settles (12.5 % per 7 s) where
+/// video plus FEC is inside the bound video alone has (level 0), at every level.
+#[test]
+fn on_a_constrained_link_video_plus_fec_settles_inside_the_governors_bound() {
+    for estimate_kbps in [3000.0, 5000.0, 6500.0] {
+        for level in 0..=5 {
+            let sent = governed(level, estimate_kbps, 90);
+            let settled = &sent[80..];
+            let (setpoint, _) = settled[0];
+            for &(at, sent) in settled {
+                assert_eq!(
+                    at, setpoint,
+                    "{estimate_kbps} kbit/s, level {level}: settled"
+                );
+                assert!(
+                    sent <= governor_bound(estimate_kbps) && (level == 0 || sent > f64::from(at)),
+                    "{estimate_kbps} kbit/s, level {level}: {at} + FEC = {sent:.0}"
+                );
+            }
+        }
+    }
+}
+
+/// A PyroWave frame gets no repair even at a level an earlier loss left.
+#[test]
+fn a_pyrowave_frame_gets_no_repair_at_any_overhead() {
+    let rate = Rate {
+        ceiling_kbps: 6000.0,
+        floor_kbps: Box::new(|| 500.0),
+        retargets: true,
+        start: Box::new(|| {}),
+        observe: Box::new(|_| {}),
+    };
+    let mut control = Control::new(&rate, Arc::default(), true);
+    let fec = control.fec.as_mut().unwrap();
+    fec.observe(0.05, std::time::Instant::now());
+    control.feed(6000.0);
+    let frame = forty_fragments();
+    assert_eq!(control.protect(false, &frame, &mut 0).len(), 10);
+    assert!(control.protect(true, &frame, &mut 0).is_empty());
+}
+
+/// codec-pyrowave.md §Loss, §Feedback: a client that offered `xor` and is sent PyroWave
+/// frames gets no repair datagram, whatever loss it reports. `hello_ack.fec` still names
+/// the scheme: the connection may fall back to the standard codec.
+#[tokio::test]
+async fn a_pyrowave_client_that_offers_xor_is_sent_no_repair_whatever_it_loses() {
+    let agent = lossy_session(true).await;
+    let media = agent.listener.registry().lock()[SESSION]
+        .media
+        .clone()
+        .unwrap();
+    media.grant_pyrowave(
+        PyroWaveGrant {
+            wanted: true,
+            target_kbps: 200_000,
+            floor_kbps: 100_000,
+            max_rtt_ms: 1_000,
+        },
+        (320, 192, 60),
+        true,
+    );
+    let raw = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../testdata/pyrowave/detail_320x192_xhi.pwv1"
+    ))
+    .unwrap();
+    let offer = json!({"pyrowave": true, "fec": ["xor"]});
+    let (session, mut send, _recv, ack) = agent.hello_with(TOKEN, offer).await;
+    assert_eq!(ack["video"]["codec"], "pyrowave");
+    assert_eq!(ack["fec"], "xor");
+
+    // A second of frames: twice the window the estimator measures loss over.
+    let mut path = Lossy::new();
+    let mut video = 0;
+    for _ in 0..60 {
+        media.on_pyrowave_frame(&gst::Buffer::from_slice(raw[28..].to_vec()));
+        while let Ok(d) =
+            tokio::time::timeout(Duration::from_millis(16), session.read_datagram()).await
+        {
+            let d = d.unwrap();
+            assert_eq!(d[0], 0x01, "only video is sent");
+            video += 1;
+            path.receive(&d, &mut send).await;
+        }
+    }
+    assert!(video > 1000, "the frames arrived ({video} datagrams)");
 }
 
 #[tokio::test]

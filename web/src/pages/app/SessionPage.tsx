@@ -38,7 +38,7 @@ import { MicCapture, MicCaptureError, withUntrustedCertContext } from "../../web
 import { probeCertificateTrust, type CertTrust } from "../../lib/certTrust";
 import { useToast } from "../../components/Toast";
 import { playoutOverride } from "../../webrtc/playout";
-import type { TelemetrySnapshot } from "../../webrtc/telemetry";
+import { newPostedCounters, type TelemetrySnapshot } from "../../webrtc/telemetry";
 import { Button } from "../../components/Button";
 import { Hud, type HudHandle } from "./hud/Hud";
 import {
@@ -171,6 +171,8 @@ function SessionPageBody() {
   // handler here. SessionPage never holds the per-tick snapshot itself, keeping
   // the video/input subtree off the 1 Hz telemetry path (#139).
   const telemetrySubsRef = useRef<Set<(snap: TelemetrySnapshot) => void>>(new Set());
+  // One for the page view: every runtime built here (re-seat, fallback) continues it.
+  const postedCountersRef = useRef(newPostedCounters());
 
   const [signalCoords, setSignalCoords] = useState(() => ({
     // Empty after a remembered fallback: the launch token was meant for WebTransport's fallback
@@ -454,7 +456,8 @@ function SessionPageBody() {
   const fallBackToWebRtc = async (reason: string) => {
     setSwitching(true);
     // Capture went with the WebTransport connection: ask for it again once WebRTC is up.
-    autoArmedRef.current = true;
+    // `||`: a first reveal still owed keeps its "Click to play".
+    autoArmedRef.current ||= "resume";
     rememberFallback(sessionId ?? "", reason);
     new TraceEventEmitter(sessionId ?? "", authToken ?? "").emitTransportFallback(reason);
     try {
@@ -521,6 +524,7 @@ function SessionPageBody() {
           canvas: canvasRef.current,
           pyrowave: state?.pyrowave === true,
           tierFps: state?.tier ? parseInt(state.tier.split("@")[1] ?? "", 10) || undefined : undefined,
+          counters: postedCountersRef.current,
           callbacks: {
             ...inputCallbacks,
             onDisconnectSuspected: () => void pollEndReason(),
@@ -540,6 +544,7 @@ function SessionPageBody() {
       playoutOverrideMs: state?.playoutOverride ?? playoutOverride(),
       // Parsed from tier "W×H@fps"; undefined falls back to an absolute decode ceiling.
       tierFps: state?.tier ? parseInt(state.tier.split("@")[1] ?? "", 10) || undefined : undefined,
+      counters: postedCountersRef.current,
       callbacks: {
         ...inputCallbacks,
         onDisconnectSuspected: () => void pollEndReason(),
@@ -981,12 +986,14 @@ function SessionPageBody() {
   // never went full screen) gets one "Click to play" layer, never a retry loop.
   // Armed again by a quick switch, which spends its own click the same way.
   const [immersive] = useState(launchImmersive);
-  const autoArmedRef = useRef(immersive);
+  // `resume`: armed mid-session by a transport that changed under a picture already showing.
+  // It takes capture back when the browser allows it with no click, and never raises the layer.
+  const autoArmedRef = useRef<false | "reveal" | "resume">(immersive ? "reveal" : false);
   const [clickToPlay, setClickToPlay] = useState(false);
   // A WebTransport connection lost and rebuilt takes capture with it: arm again for the new one.
   const wasOpenRef = useRef(false);
   useEffect(() => {
-    if (webtransport && wasOpenRef.current && !channelOpen) autoArmedRef.current = true;
+    if (webtransport && wasOpenRef.current && !channelOpen) autoArmedRef.current ||= "resume";
     wasOpenRef.current = channelOpen;
   }, [channelOpen, webtransport]);
   useEffect(() => {
@@ -994,10 +1001,11 @@ function SessionPageBody() {
     if (!autoArmedRef.current || !loaderInert || !channelOpen || swapScreenUp || sessionOver) return;
     const rt = runtimeRef.current;
     if (!rt || !videoRef.current) return; // stays armed for the runtime to arrive
+    const offerClick = autoArmedRef.current === "reveal";
     autoArmedRef.current = false;
     if (rt.isCaptured()) return;
     // No Pointer Lock (touch, gesture mode): engaging needs no gesture at all.
-    if (pointerLockSupported() && !document.fullscreenElement) {
+    if (offerClick && pointerLockSupported() && !document.fullscreenElement) {
       setClickToPlay(true);
       return;
     }
@@ -1006,12 +1014,12 @@ function SessionPageBody() {
     if (ua?.hasBeenActive) unmute();
     const engaging = rt.engage();
     if (!engaging) {
-      setClickToPlay(true);
+      if (offerClick) setClickToPlay(true);
       return;
     }
     void engaging.then((result) => {
       noteRawUnavailable(result);
-      if (result.mode === "failed") setClickToPlay(true);
+      if (result.mode === "failed" && offerClick) setClickToPlay(true);
     });
   }, [loaderInert, channelOpen, swapScreenUp, sessionOver, runtimeSnap, unmute, noteRawUnavailable]);
   useEffect(() => {
@@ -1308,7 +1316,7 @@ function SessionPageBody() {
         onSwapStart={() => {
           hudRef.current?.close();
           // #647: the tile click is a gesture; spend it like Play does.
-          if (immersive && enterLaunchFullscreen()) autoArmedRef.current = true;
+          if (immersive && enterLaunchFullscreen()) autoArmedRef.current = "reveal";
         }}
         onScreenChange={setSwapScreenUp}
       >
