@@ -5,13 +5,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createWebTransportRuntime } from "../pages/app/webTransportRuntime";
 import { mintTransportToken } from "../api/library";
 import { MicCaptureError } from "../webrtc/mic";
+import { newPostedCounters, type PostedCounters } from "../webrtc/telemetry";
 import { AudioOut, LATE_RUN_RESET, type ContextLike } from "./audioOut";
 import { AudioRing, SLACK_FRAMES } from "./audioRing";
 import { AudioSync, MAX_TARGET_MS, MIN_TARGET_MS } from "./audioSync";
 import { CHANNEL_AUDIO, encodeMicDatagram, parseAudioDatagram } from "./framing";
 import { MicOut } from "./micOut";
 import type { Presenter } from "./presenter";
-import { avcC, COORDS, FakeAgent, FakeChunk, FakeDecoder, flush, helloAck } from "./testSupport";
+import { avcC, bytes, COORDS, FakeAgent, FakeChunk, FakeDecoder, flush, helloAck, packetize } from "./testSupport";
 import { WebTransportMedia } from "./webTransportMedia";
 import type { AudioStreams } from "./transport";
 
@@ -43,6 +44,7 @@ beforeEach(() => {
   vi.stubGlobal("EncodedAudioChunk", FakeChunk);
 });
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -184,6 +186,41 @@ describe("AudioRing", () => {
     quantum(ring, 512); // the chunk plays, the run ends
     quantum(ring, 640); // dry again: a new run
     expect(ring.stats).toMatchObject({ underrunFrames: 128 * 4, underrunEvents: 2 });
+  });
+
+  it("counts a concealment fade's frames, and with the silence of a longer gap after it one event", () => {
+    const ring = new AudioRing();
+    ring.push(0, chunk(128, 1), 0);
+    quantum(ring, 0);
+    // Three packets lost: one 10 ms (480 frame) fade, then the rest of the gap is silence.
+    ring.push(128, chunk(480, 0.5), 0, true);
+    for (let f = 128; f < 128 + 480 + 256; f += 128) quantum(ring, f);
+    ring.push(1_000, chunk(128, 1), 0);
+    quantum(ring, 1_000);
+    expect(ring.stats).toMatchObject({ concealedFrames: 480, underrunEvents: 1 });
+    expect(ring.stats.underrunFrames).toBeGreaterThan(200);
+  });
+
+  it("counts a fade that fills its whole gap as one event, and the next gap as another", () => {
+    const ring = new AudioRing();
+    ring.push(0, chunk(128, 1), 0);
+    quantum(ring, 0);
+    ring.push(128, chunk(128, 0.5), 0, true);
+    quantum(ring, 128);
+    ring.push(256, chunk(128, 1), 0);
+    quantum(ring, 256);
+    expect(ring.stats).toMatchObject({ concealedFrames: 128, underrunFrames: 0, underrunEvents: 1 });
+    quantum(ring, 384); // dry
+    expect(ring.stats.underrunEvents).toBe(2);
+  });
+
+  it("counts a fade the queue dropped as the silence it left, once", () => {
+    const ring = new AudioRing(240, 200);
+    ring.push(0, chunk(128, 1), 0);
+    quantum(ring, 0);
+    ring.push(128, chunk(480, 0.5), 0, true); // over the queue's room: dropped
+    quantum(ring, 128);
+    expect(ring.stats).toMatchObject({ dropped: 1, concealedFrames: 0, underrunFrames: 128, underrunEvents: 1 });
   });
 
   it("does not count the silence before audio has started", () => {
@@ -414,12 +451,25 @@ describe("AudioOut", () => {
     expect(real.map((p) => p.start)).toEqual([frameAt(5_000_000), frameAt(5_010_000), frameAt(5_030_000)]);
   });
 
-  it("adds the worklet's silence to the concealed gaps in the dropout totals", async () => {
+  it("takes the dropout totals from what the worklet played: silence and concealment fades", async () => {
     const { out, port } = setupAudioOut();
     await out.start(STEREO);
     expect(out.stats()).toMatchObject({ concealedSamples: 0, concealmentEvents: 0 });
-    port.onmessage?.({ data: { underrunFrames: 960, underrunEvents: 2, dropped: 0 } });
-    expect(out.stats()).toMatchObject({ concealedSamples: 960, concealmentEvents: 2 });
+    port.onmessage?.({ data: { underrunFrames: 960, concealedFrames: 480, underrunEvents: 3, dropped: 0 } });
+    expect(out.stats()).toMatchObject({ concealedSamples: 1_440, concealmentEvents: 3 });
+  });
+
+  it("is measured only once a running context has the worklet: not before start, after a failed start, or while suspended", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const failed = setupAudioOut({ supported: false });
+    await failed.out.start(STEREO);
+    expect(failed.out.stats().measured).toBe(false);
+    const suspended = setupAudioOut({ running: false });
+    expect(suspended.out.stats().measured).toBe(false);
+    await suspended.out.start(STEREO);
+    expect(suspended.out.stats().measured).toBe(false);
+    suspended.ctx.state = "running";
+    expect(suspended.out.stats().measured).toBe(true);
   });
 
   it("plays one concealed 10 ms chunk for a lost packet: the last chunk fading to silence, then a fade in", async () => {
@@ -432,10 +482,12 @@ describe("AudioOut", () => {
     at(5_140);
     out.packet(packet(5_040_000, 14)); // 11, 12 and 13 were lost
     expect(out.stats().concealed).toBe(1);
-    expect(out.stats()).toMatchObject({ concealmentEvents: 1, concealedSamples: 480 });
+    // Counted by the worklet when the fade is played, not here when it is posted.
+    expect(out.stats()).toMatchObject({ concealmentEvents: 0, concealedSamples: 0 });
     decoders[0].emit(5_040_000);
     expect(posted).toHaveLength(3);
     const [before, hole, after] = posted;
+    expect((posted as { concealed?: boolean }[]).map((m) => m.concealed)).toEqual([false, true, false]);
     // The concealment sits where the packet before the next one would have been.
     expect(hole.start).toBe(frameAt(5_030_000));
     expect(hole.planes[0][0]).toBeCloseTo(1, 1);
@@ -740,16 +792,18 @@ class IdleEncoder {
 }
 
 describe("createWebTransportRuntime audio and microphone", () => {
-  function setup(ack: Record<string, unknown>) {
+  function setup(ack: Record<string, unknown>, audioOpts: { running?: boolean; supported?: boolean } = {}, counters?: PostedCounters) {
     const agent = new FakeAgent();
     agent.replies = [[ack]];
     const presenter: Presenter = { present: (f) => (f.close(), true), destroy: vi.fn() };
-    const audio = setupAudioOut();
+    const audio = setupAudioOut(audioOpts);
+    const posts: { url: string; body: { samples?: { metrics: Record<string, number> }[] } }[] = [];
     const rt = createWebTransportRuntime({
       sessionId: "s1",
       authToken: "auth",
       coords: COORDS,
       canvas: { dataset: {} } as unknown as HTMLCanvasElement,
+      counters,
       callbacks: { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn(), onFallback: vi.fn() },
       deps: {
         createTransport: (o) =>
@@ -766,13 +820,21 @@ describe("createWebTransportRuntime audio and microphone", () => {
             audio.decoders.push(d);
             return d as unknown as AudioDecoder;
           },
-          isConfigSupported: async (c) => ({ supported: true, config: c }),
+          isConfigSupported: async (c) => ({ supported: audioOpts.supported ?? true, config: c }),
           now: () => performance.now(),
         },
         mic: { createEncoder: () => new IdleEncoder() as unknown as AudioEncoder, createProcessor: () => ({ readable: new ReadableStream<AudioData>() }) },
+        telemetry: {
+          fetch: (async (url: string, init: RequestInit) => {
+            posts.push({ url, body: JSON.parse(init.body as string) });
+            return new Response("{}");
+          }) as unknown as typeof fetch,
+        },
       },
     });
-    return { agent, rt, audio };
+    /** Every stats sample posted so far, oldest first. */
+    const metrics = () => posts.filter((p) => p.url.endsWith("/stats")).flatMap((p) => p.body.samples!.map((m) => m.metrics));
+    return { agent, rt, audio, metrics };
   }
 
   it("a session with a microphone grant offers the mic slot, one without does not", async () => {
@@ -845,6 +907,76 @@ describe("createWebTransportRuntime audio and microphone", () => {
     expect(rt.getSnapshot().channelOpen).toBe(true);
     expect(audio.ctx.close).toHaveBeenCalledTimes(1);
     rt.destroy();
+  });
+
+  it("keeps the dropouts a replaced audio player counted since the last tick", async () => {
+    vi.useFakeTimers();
+    vi.mocked(mintTransportToken).mockResolvedValueOnce({
+      transport_options: { webtransport: { ...COORDS, token: "tok-2" } },
+    } as never);
+    const { agent, rt, audio } = setup({ ...helloAck(0, avcC()), audio: OPUS, mic: null });
+    const snaps: { audioConcealedSamples: number | null; audioConcealmentEvents: number | null }[] = [];
+    rt.registerTelemetry((sn) => snaps.push(sn));
+    rt.start();
+    await vi.advanceTimersByTimeAsync(1_100);
+    expect(snaps.at(-1)).toMatchObject({ audioConcealedSamples: 0, audioConcealmentEvents: 0 });
+    audio.port.onmessage?.({ data: { underrunFrames: 960, concealedFrames: 0, underrunEvents: 2, dropped: 0 } });
+    agent.last.closeWith(4400); // a reconnect before the next tick: the player is replaced
+    await vi.advanceTimersByTimeAsync(50);
+    expect(audio.createContext).toHaveBeenCalledTimes(2);
+    audio.port.onmessage?.({ data: { underrunFrames: 480, concealedFrames: 0, underrunEvents: 1, dropped: 0 } });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(snaps.at(-1)).toMatchObject({ audioConcealedSamples: 1_440, audioConcealmentEvents: 3 });
+    rt.destroy();
+  });
+
+  it("keeps a player's dropouts in the page view's totals when the session closes, for a fallback to continue", async () => {
+    vi.useFakeTimers();
+    const counters = newPostedCounters();
+    const { rt, audio } = setup({ ...helloAck(0, avcC()), audio: OPUS, mic: null }, {}, counters);
+    rt.start();
+    await vi.advanceTimersByTimeAsync(1_100);
+    audio.port.onmessage?.({ data: { underrunFrames: 960, concealedFrames: 0, underrunEvents: 2, dropped: 0 } });
+    rt.destroy(); // before the next tick
+    expect(counters).toMatchObject({ audioConcealedSamples: 960, audioConcealmentEvents: 2 });
+  });
+
+  it("posts no audio keys until audio is measured: not for a failed start, not while the context is suspended", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const failed = setup({ ...helloAck(0, avcC()), audio: OPUS, mic: null }, { supported: false });
+    failed.rt.start();
+    await vi.advanceTimersByTimeAsync(2_100);
+    failed.rt.destroy();
+    expect(failed.metrics().length).toBeGreaterThan(0);
+    expect(failed.metrics().filter((m) => "audio_concealed_samples" in m || "audio_concealment_events" in m)).toEqual([]);
+
+    const suspended = setup({ ...helloAck(0, avcC()), audio: OPUS, mic: null }, { running: false });
+    suspended.rt.start();
+    await vi.advanceTimersByTimeAsync(2_100);
+    suspended.audio.ctx.state = "running";
+    await vi.advanceTimersByTimeAsync(1_000);
+    suspended.rt.destroy();
+    const posted = suspended.metrics().map((m) => m.audio_concealed_samples);
+    expect(posted.slice(0, 2)).toEqual([undefined, undefined]);
+    expect(posted.at(-1)).toBe(0);
+  });
+
+  it("posts the arrival jitter only once two frames have been measured", async () => {
+    vi.useFakeTimers();
+    const { agent, rt, metrics } = setup(helloAck(0, avcC()));
+    rt.start();
+    await vi.advanceTimersByTimeAsync(1_100);
+    const pkt = { n: 0 };
+    const send = (frameSeq: number) => agent.last.datagrams(packetize({ configId: 0, frameSeq, keyframe: frameSeq === 0, data: bytes(10, frameSeq) }, pkt));
+    send(0);
+    await vi.advanceTimersByTimeAsync(1_000); // one frame: nothing to compare it with
+    send(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    rt.destroy();
+    const jitter = metrics().map((m) => m.wt_arrival_jitter_ms);
+    expect(jitter.slice(0, 2)).toEqual([undefined, undefined]);
+    expect(jitter.at(-1)).toBeGreaterThan(0);
   });
 
   it("a session without audio builds no audio context", async () => {

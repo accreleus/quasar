@@ -1,5 +1,5 @@
 // The display cushion for WebTransport video: decoded frames are shown at their capture time plus
-// the fastest path delay seen plus a cushion that follows measured arrival jitter, instead of the
+// the fastest path delay of the last 1.5 s plus a cushion that follows measured arrival jitter, instead of the
 // moment the decoder returns them. On a clean link the cushion is 0 and a frame is shown on
 // arrival, as before. Not used by PyroWave, whose stage presents its own textures.
 
@@ -16,9 +16,9 @@ const DEADBAND_MS = 2;
 const SHRINK_MS_PER_FRAME = 0.05;
 /** Frames waiting at once; a decoder holds few output frames, so more are dropped oldest first. */
 const MAX_QUEUED = 6;
-/** The fastest-path delay creeps up this much per frame, so clock drift cannot pin it low
- *  (shortcut: a permanent step up in path delay is followed only at this rate). */
-const BASE_CREEP_MS = 0.002;
+/** The fastest path delay is the minimum over this window, so a delay that rises and stays up
+ *  (bufferbloat, a route change) becomes the new base within it, and clock drift cannot pin it low. */
+const BASE_WINDOW_MS = 1500;
 /** A frame due within this is shown now: a timer cannot land closer, and would only add its own jitter. */
 const TIMER_SLACK_MS = 1;
 /** RFC 3550 jitter smoothing. */
@@ -42,7 +42,9 @@ export class Playout {
   private queue: Queued[] = [];
   private jitterMs = 0;
   private cushionMs = 0;
-  private baseMs: number | null = null;
+  /** Offsets (arrival − capture) over the base window, ascending: the head is the minimum. */
+  private offsets: { atMs: number; offsetMs: number }[] = [];
+  private measured = false;
   private last: { arrivalMs: number; captureMs: number } | null = null;
   private timer: unknown = null;
   private maxCushionMs = MAX_CUSHION_MS;
@@ -58,9 +60,10 @@ export class Playout {
     this.cushionMs = Math.min(this.cushionMs, this.maxCushionMs);
   }
 
-  /** Smoothed frame arrival jitter (ms): the transit time's change between consecutive frames. */
-  arrivalJitterMs(): number {
-    return this.jitterMs;
+  /** Smoothed frame arrival jitter (ms): the transit time's change between consecutive frames;
+   *  null until two frames have been measured. */
+  arrivalJitterMs(): number | null {
+    return this.measured ? this.jitterMs : null;
   }
 
   /** The cushion frames are held for beyond the path's fastest delay (ms). */
@@ -75,7 +78,7 @@ export class Playout {
     this.update(arrival, captureMs);
     // No cushion, nothing waiting: shown on arrival, with no timer in the path (a clean link).
     if (this.cushionMs === 0 && this.queue.length === 0) return this.opts.show(frame, captureUs);
-    this.queue.push({ frame, captureUs, dueMs: captureMs + (this.baseMs ?? 0) + this.cushionMs });
+    this.queue.push({ frame, captureUs, dueMs: captureMs + this.offsets[0].offsetMs + this.cushionMs });
     while (this.queue.length > MAX_QUEUED) this.queue.shift()?.frame.close();
     this.pump();
   }
@@ -83,7 +86,8 @@ export class Playout {
   /** Drops what is waiting and forgets the path: after a reconnect, a hidden tab or a new configuration. */
   reset(): void {
     this.clear();
-    this.baseMs = null;
+    this.offsets = [];
+    this.measured = false;
     this.last = null;
     this.jitterMs = 0;
     this.cushionMs = 0;
@@ -102,8 +106,11 @@ export class Playout {
 
   private update(arrival: number, captureMs: number): void {
     const offset = arrival - captureMs;
-    this.baseMs = this.baseMs === null ? offset : Math.min(this.baseMs + BASE_CREEP_MS, offset);
+    while (this.offsets.length > 0 && this.offsets[this.offsets.length - 1].offsetMs >= offset) this.offsets.pop();
+    this.offsets.push({ atMs: arrival, offsetMs: offset });
+    while (this.offsets[0].atMs < arrival - BASE_WINDOW_MS) this.offsets.shift();
     if (this.last) {
+      this.measured = true;
       const d = arrival - this.last.arrivalMs - (captureMs - this.last.captureMs);
       this.jitterMs += (Math.abs(d) - this.jitterMs) / JITTER_SMOOTHING;
     }

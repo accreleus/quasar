@@ -24,9 +24,11 @@ export interface AudioOutStats {
   /** Audio is heard this much after its video (negative: before). */
   avOffsetMs: number | null;
   underrunMs: number;
-  /** Frames of audio that were not the stream's: silence for want of data, or a concealment fade. Cumulative. */
+  /** The context is running, so the counts below are measured; false: do not post them. */
+  measured: boolean;
+  /** Frames of audio that were not the stream's: silence for want of data, or a concealment fade that played. Cumulative. */
   concealedSamples: number;
-  /** Runs of silence plus concealed gaps. Cumulative. */
+  /** Gaps in the stream's audio, a run of silence and the fade before it counting once. Cumulative. */
   concealmentEvents: number;
   dropped: number;
   decoded: number;
@@ -119,8 +121,7 @@ export class AudioOut {
   /** The last chunk decoded, kept to fade out of when a packet is lost. */
   private lastPlanes: Float32Array[] | null = null;
   private lateRun = 0;
-  private concealedFrames = 0;
-  private worklet = { underrunFrames: 0, underrunEvents: 0, dropped: 0 };
+  private worklet = { underrunFrames: 0, concealedFrames: 0, underrunEvents: 0, dropped: 0 };
   private readonly sync: AudioSync;
   private readonly now: () => number;
 
@@ -153,7 +154,7 @@ export class AudioOut {
     }
     this.ctx = ctx;
     this.out = out;
-    out.port.onmessage = (e: MessageEvent<{ underrunFrames: number; underrunEvents: number; dropped: number }>) => {
+    out.port.onmessage = (e: MessageEvent<{ underrunFrames: number; concealedFrames: number; underrunEvents: number; dropped: number }>) => {
       this.worklet = e.data;
     };
     out.setGain(this.held ? 0 : 1);
@@ -235,8 +236,7 @@ export class AudioOut {
       return faded;
     });
     this.concealed += 1;
-    this.concealedFrames += planes[0]?.length ?? 0;
-    this.schedule(captureUs, planes);
+    this.schedule(captureUs, planes, true);
   }
 
   stats(): AudioOutStats {
@@ -246,8 +246,9 @@ export class AudioOut {
       videoLatencyMs: this.sync.videoLatencyMs(),
       avOffsetMs: this.sync.avOffsetMs(this.minDelayMs()),
       underrunMs: (this.worklet.underrunFrames / rate) * 1000,
-      concealedSamples: this.worklet.underrunFrames + this.concealedFrames,
-      concealmentEvents: this.worklet.underrunEvents + this.concealed,
+      measured: this.out !== null && this.ctx?.state === "running",
+      concealedSamples: this.worklet.underrunFrames + this.worklet.concealedFrames,
+      concealmentEvents: this.worklet.underrunEvents,
       dropped: this.worklet.dropped,
       decoded: this.decoded,
       stale: this.stale,
@@ -331,7 +332,7 @@ export class AudioOut {
 
   /** Post `planes` for the render frame `captureUs` maps to. A chunk whose time has passed is not
    *  posted; a run of them means the delay floor is stale, and it is measured again. */
-  private schedule(captureUs: number, planes: Float32Array[]): void {
+  private schedule(captureUs: number, planes: Float32Array[], concealed = false): void {
     const ctx = this.ctx;
     const out = this.out;
     if (!ctx || !out) return;
@@ -353,6 +354,6 @@ export class AudioOut {
     const contextTime = ts.contextTime || ctx.currentTime;
     const performanceTime = ts.performanceTime || now;
     const start = Math.round((contextTime + (playAt - performanceTime) / 1000) * ctx.sampleRate);
-    out.port.postMessage({ start, planes }, planes.map((p) => p.buffer));
+    out.port.postMessage({ start, planes, concealed }, planes.map((p) => p.buffer));
   }
 }

@@ -4,12 +4,15 @@ import { Playout } from "./playout";
 
 const FRAME_MS = 1000 / 120;
 
-/** A fake frame; `closed` says whether the playout gave it up without showing it. */
-type FakeFrame = VideoFrame & { closed: boolean };
+/** A fake frame; `closes` counts the playout giving it up without showing it, `shows` its being shown. */
+type FakeFrame = VideoFrame & { closed: boolean; closes: number; shows: number; shownAt: number };
 const fakeFrame = (): FakeFrame => {
-  const f = { closed: false, close: () => void (f.closed = true) };
+  const f = { closed: false, closes: 0, shows: 0, shownAt: NaN, close: () => void ((f.closed = true), f.closes++) };
   return f as unknown as FakeFrame;
 };
+/** Every frame was shown exactly once or closed exactly once, never both and never neither. */
+const exactlyOnce = (frames: FakeFrame[]) =>
+  expect(frames.filter((f) => f.shows + f.closes !== 1 || f.shows > 1 || f.closes > 1)).toHaveLength(0);
 
 /**
  * Runs a stream through a Playout on a fake clock. `arrivals` are (wall ms, capture ms) pairs in
@@ -20,8 +23,13 @@ function run(arrivals: [number, number][], fps = 120) {
   const timers: { at: number; fn: () => void; id: number }[] = [];
   let nextId = 1;
   const shown: number[] = [];
+  const frames: FakeFrame[] = [];
   const p = new Playout({
-    show: () => shown.push(clock),
+    show: (f) => {
+      (f as FakeFrame).shows++;
+      (f as FakeFrame).shownAt = clock;
+      shown.push(clock);
+    },
     now: () => clock,
     setTimer: (fn, ms) => {
       const id = nextId++;
@@ -48,11 +56,13 @@ function run(arrivals: [number, number][], fps = 120) {
   for (const [at, captureMs] of arrivals) {
     fire(at);
     clock = at;
-    p.push(fakeFrame(), captureMs * 1000);
+    const f = fakeFrame();
+    frames.push(f);
+    p.push(f, captureMs * 1000);
     maxCushion = Math.max(maxCushion, p.cushion());
   }
   fire(Infinity);
-  return { shown, p, maxCushion, endClock: () => clock };
+  return { shown, frames, p, maxCushion, endClock: () => clock };
 }
 
 /** Frames captured every 1/120 s, arriving after a transit time from `transit(i)`, in capture order. */
@@ -128,6 +138,111 @@ describe("Playout", () => {
     const both = run([...a, ...b]);
     expect(both.p.cushion()).toBe(0);
     expect(both.p.arrivalJitterMs()).toBeLessThan(0.5);
+  });
+
+  it("shows every frame once or closes it once, on a bumpy link and on a bound-hit one", () => {
+    exactlyOnce(run(stream(600, bumpy)).frames);
+    exactlyOnce(run(stream(300, (i) => (i % 2 ? 80 : 20)), 30).frames);
+  });
+
+  it("gets fewer long frames again within the window after a delay that rose and stayed up", () => {
+    // 2 s clean at 20 ms, then the path delay is 120 ms for good, and bumpy.
+    const a = stream(1100, (i) => (i < 240 ? 20 + noise(i) * 0.3 : 100 + bumpy(i)));
+    const { shown, frames } = run(a);
+    exactlyOnce(frames);
+    const cut = a[800][0]; // 560 frames (4.7 s) after the step: well past the base window
+    const tail = (times: number[]) => times.filter((t) => t >= cut);
+    const asArrived = a.map(([at]) => at);
+    expect(longFrames(tail(asArrived))).toBeGreaterThan(8);
+    expect(longFrames(tail(shown))).toBeLessThan(longFrames(tail(asArrived)) / 4);
+  });
+
+  it("follows a delay that fell at once: the old, higher base is not held", () => {
+    const a = stream(900, (i) => (i < 300 ? 120 + noise(i) * 0.3 : 20 + noise(i) * 0.3));
+    const { frames } = run(a);
+    exactlyOnce(frames);
+    // Past the frames bunched up by the step, a shown frame is at most the new path delay plus the
+    // cushion bound old, never the old 120 ms.
+    for (let i = 330; i < 900; i++) {
+      if (frames[i].shows) expect(frames[i].shownAt - a[i][1]).toBeLessThanOrEqual(20.3 + 3 * FRAME_MS + 1e-6);
+    }
+    expect(frames.slice(330).filter((f) => f.shows).length).toBeGreaterThan(300);
+  });
+
+  it("drains a burst after a 300 ms outage at once and leaves no standing latency", () => {
+    // Frames 300 to 335 are held by the outage and arrive together; the rest are on time.
+    const a = stream(1500, (i) => (i >= 300 && i < 336 ? 20 + (336 - i) * FRAME_MS : 20 + noise(i) * 0.3));
+    const { frames } = run(a);
+    exactlyOnce(frames);
+    // The burst is drained, not dropped: each frame is shown. Those already overdue on arrival are
+    // shown at that instant (the presenter keeps the last), the newest few when their cushion is up.
+    const at = a[335][0];
+    expect(frames.slice(300, 336).every((f) => f.shows === 1)).toBe(true);
+    expect(frames.slice(300, 320).every((f) => f.shownAt === at)).toBe(true);
+    expect(frames.slice(300, 336).every((f) => f.shownAt - at <= 3 * FRAME_MS + 1e-6)).toBe(true);
+    // After it, the delay is the path's plus a cushion no larger than its bound, and shrinks to nothing.
+    for (let i = 336; i < 1500; i++) expect(frames[i].shownAt - a[i][1]).toBeLessThanOrEqual(20.3 + 3 * FRAME_MS + 1e-6);
+    expect(frames[1499].shownAt - a[1499][1]).toBeLessThan(21);
+  });
+
+  it("counts a frame superseded by a later due one as closed, not shown", () => {
+    let clock = 0;
+    const p = new Playout({ show: (f) => void (f as FakeFrame).shows++, now: () => clock, setTimer: () => 1, clearTimer: () => {} });
+    p.setFps(120);
+    const fs: FakeFrame[] = [];
+    // Teach it a bumpy link so a cushion is in force, then push two frames that fall due together.
+    for (const [at, c] of stream(120, bumpy)) {
+      clock = at;
+      const f = fakeFrame();
+      fs.push(f);
+      p.push(f, c * 1000);
+    }
+    exactlyOnce(fs.filter((f) => f.shows + f.closes > 0));
+    const a = fakeFrame();
+    const b = fakeFrame();
+    clock += 1;
+    p.push(a, (clock - 20) * 1000 + 1_000); // not yet due
+    p.push(b, (clock - 20) * 1000 + 2_000); // due a ms later than a
+    clock += 100; // both overdue, the timer being the thing that never fired
+    const c = fakeFrame();
+    p.push(c, (clock - 20) * 1000);
+    expect([a.shows, a.closes, b.shows, b.closes]).toEqual([0, 1, 1, 0]);
+    expect([c.shows, c.closes]).toEqual([0, 0]); // not due yet
+    p.close();
+    exactlyOnce([a, b, c]);
+  });
+
+  it("closes the oldest when more are waiting than it holds, and every one still waiting on close", () => {
+    let clock = 0;
+    const p = new Playout({ show: (f) => void (f as FakeFrame).shows++, now: () => clock, setTimer: () => 1, clearTimer: () => {} });
+    p.setFps(120);
+    for (const [at, c] of stream(120, bumpy)) {
+      clock = at;
+      p.push(fakeFrame(), c * 1000);
+    }
+    expect(p.cushion()).toBeGreaterThan(1);
+    // Twenty frames all captured "now", so each is due a cushion from now: none is.
+    const held = Array.from({ length: 20 }, () => {
+      const f = fakeFrame();
+      p.push(f, (clock - 20) * 1000);
+      return f;
+    });
+    expect(held.filter((f) => f.closes === 1)).toHaveLength(14);
+    expect(held.slice(14).every((f) => f.closes === 0 && f.shows === 0)).toBe(true);
+    p.close();
+    exactlyOnce(held);
+    expect(held.every((f) => f.closes === 1 && f.shows === 0)).toBe(true);
+  });
+
+  it("reports no arrival jitter until two frames have been measured, and again after a reset", () => {
+    const p = new Playout({ show: () => {}, now: () => 0 });
+    expect(p.arrivalJitterMs()).toBeNull();
+    p.push(fakeFrame(), 0);
+    expect(p.arrivalJitterMs()).toBeNull();
+    p.push(fakeFrame(), 1000);
+    expect(p.arrivalJitterMs()).not.toBeNull();
+    p.reset();
+    expect(p.arrivalJitterMs()).toBeNull();
   });
 
   it("closes every frame it did not show, on reset and on close", () => {
