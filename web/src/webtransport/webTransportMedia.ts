@@ -531,6 +531,14 @@ export class WebTransportMedia implements MediaTransport {
     const configs = new Map<number, VideoConfig>();
     let latest: number | null = null;
     let pyro: PyroWaveReceiver | null = null;
+    /** What the PyroWave receivers already replaced counted lost. */
+    let pyroLost = 0;
+    let reported = 0;
+    // PyroWave loss is never NACKed, so it is reported as its frames close.
+    const reportLost = () => {
+      const n = this.lostSoFar();
+      if (n !== reported) sink.lost?.((reported = n));
+    };
     let held: { f: VideoFragment; at: number }[] = [];
     let timer: ReturnType<typeof setTimeout> | null = null;
     let armedAt: number | null = null;
@@ -552,6 +560,7 @@ export class WebTransportMedia implements MediaTransport {
         armedAt = null;
         const frame = live.on ? pyro?.due(this.now()) : null;
         if (frame) sink.pyrowave(frame);
+        reportLost();
         arm();
       }, Math.max(0, at - this.now()));
     };
@@ -563,12 +572,14 @@ export class WebTransportMedia implements MediaTransport {
         const r =
           pyro?.configId === c.configId
             ? pyro
-            : (pyro = new PyroWaveReceiver(c.configId, blockLayout(c.width, c.height).totalBlocks, 1000 / (c.fps || 60)));
+            : ((pyroLost += pyro?.lost ?? 0),
+              (pyro = new PyroWaveReceiver(c.configId, blockLayout(c.width, c.height).totalBlocks, 1000 / (c.fps || 60))));
         const now = this.now();
         const due = r.due(now);
         if (due) sink.pyrowave(due);
         const done = r.push(f, now);
         if (done) sink.pyrowave(done);
+        reportLost();
         arm();
         return;
       }
@@ -596,7 +607,7 @@ export class WebTransportMedia implements MediaTransport {
     const tick = () => this.recovered(assembler.tick(), sink);
     // PyroWave frames never reach the assembler, so a repair for one finds no frame and is dropped.
     const repair = (r: FecRepair) => this.recovered(assembler.repair(r), sink);
-    this.lostSoFar = () => assembler.lost;
+    this.lostSoFar = () => assembler.lost + pyroLost + (pyro?.lost ?? 0);
     return { datagram, repair, config, miss, tick, stop };
   }
 
