@@ -3717,6 +3717,7 @@ fi
 # The end-to-end suite's run bundle (#1272): the fixture is valid, each rule has a bundle that breaks it.
 if command -v node >/dev/null 2>&1; then
   rc_of 0 "e2e:bundle-format" -- node --test "$ROOT/scripts/validate/stream/bundle.test.mjs"
+  rc_of 0 "e2e:runner" -- node --test "$ROOT/scripts/validate/stream/run.test.mjs"
   # Its host half (#1274), driven against a fake API as an in-process fetch — no stack, no sockets.
   rc_of 0 "e2e:collect" -- node --test "$ROOT/scripts/validate/stream/collect.test.mjs"
 else
