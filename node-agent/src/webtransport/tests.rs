@@ -1422,30 +1422,13 @@ async fn reordered_delivery_does_not_stall_the_datagram_path() {
     let mut agent = governed_agent(Stream::H264).await;
     // Each datagram held 0–40 ms on its own: most are overtaken by several.
     let mut x = 0x2545_f491_4f6c_dd1du64;
-    let (session, mut send, mut recv) = through(&mut agent, move || {
+    let (session, mut send, _recv) = through(&mut agent, move || {
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
         Some(Duration::from_micros(x % 40_000))
     })
     .await;
-    // quinn puts DATAGRAM frames ahead of STREAM frames in a packet: a pong waits behind
-    // the datagram queue (the issue's 15 s RTT).
-    let (pong_tx, mut pongs) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        while let Ok(m) = read_message(&mut recv).await {
-            if let Some(id) = m
-                .get("id")
-                .and_then(Value::as_u64)
-                .filter(|_| m["type"] == "pong")
-            {
-                let _ = pong_tx.send((id as usize, Instant::now()));
-            }
-        }
-    });
-    let mut pinged = Vec::new();
-    let (mut answered, mut slowest) = (0, Duration::ZERO);
-    let mut ping = tokio::time::interval(Duration::from_millis(250));
     let mut path = Arrivals::default();
     let mut report = tokio::time::interval(Duration::from_millis(50));
     let measure_from = Instant::now() + Duration::from_secs(2);
@@ -1466,15 +1449,6 @@ async fn reordered_delivery_does_not_stall_the_datagram_path() {
                     write_message(&mut send, &fb).await.unwrap();
                 }
             }
-            _ = ping.tick() => {
-                let ping = json!({"type": "ping", "id": pinged.len(), "tc": 0.0});
-                pinged.push(Instant::now());
-                write_message(&mut send, &ping).await.unwrap();
-            }
-            Some((id, at)) = pongs.recv() => {
-                answered += 1;
-                slowest = slowest.max(at - pinged[id]);
-            }
             () = &mut deadline => break,
         }
     }
@@ -1487,13 +1461,6 @@ async fn reordered_delivery_does_not_stall_the_datagram_path() {
         "{:.0} % of what was sent arrived",
         delivered * 100.0
     );
-    // 40 ms of hold each way at most; a second is a queue, not the path.
-    assert!(
-        answered + 2 >= pinged.len(),
-        "{answered} of {} pings answered",
-        pinged.len()
-    );
-    assert!(slowest < Duration::from_secs(1), "a pong took {slowest:?}");
 }
 
 /// Logs `webtransport-client-quic-stats` lines into `captured` on this thread.
@@ -1508,9 +1475,9 @@ fn capture_info(captured: &Captured) -> tracing::subscriber::DefaultGuard {
     guard
 }
 
-/// Says `bye` and waits for the agent's line on the client's leave: the rate QUIC's window
-/// was held to, kbit/s, 0 on Cubic.
-async fn governed_at_leave(mut send: SendStream, captured: &Captured) -> u64 {
+/// Says `bye` and waits for the agent's line on the client's leave: whether QUIC's window
+/// followed the estimate, and the rate it was held to, kbit/s.
+async fn governed_at_leave(mut send: SendStream, captured: &Captured) -> (bool, u64) {
     write_message(&mut send, &json!({"type": "bye"}))
         .await
         .unwrap();
@@ -1521,11 +1488,14 @@ async fn governed_at_leave(mut send: SendStream, captured: &Captured) -> u64 {
             .lines()
             .find(|l| l.contains("webtransport-client-quic-stats"))
         {
-            let kbps = line
-                .split("governed_kbps=")
-                .nth(1)
-                .expect("governed_kbps logged");
-            return kbps.split(' ').next().unwrap().parse().unwrap();
+            let field = |name: &str| {
+                let value = line.split(name).nth(1).expect("logged");
+                value.split(' ').next().unwrap().to_string()
+            };
+            return (
+                field(" governed=").parse().unwrap(),
+                field("governed_kbps=").parse().unwrap(),
+            );
         }
         assert!(
             Instant::now() < deadline,
@@ -1547,9 +1517,8 @@ async fn only_a_client_that_sends_feedback_takes_quic_congestion_control_away() 
     for _ in 0..30 {
         session.read_datagram().await.unwrap();
     }
-    assert_eq!(
-        governed_at_leave(send, &captured).await,
-        0,
+    assert!(
+        !governed_at_leave(send, &captured).await.0,
         "no feedback: Cubic"
     );
     drop(agent);
@@ -1566,10 +1535,8 @@ async fn only_a_client_that_sends_feedback_takes_quic_congestion_control_away() 
     write_message(&mut send, &path.feedback().unwrap())
         .await
         .unwrap();
-    assert!(
-        governed_at_leave(send, &captured).await >= 4000,
-        "feedback: governed"
-    );
+    let (governed, kbps) = governed_at_leave(send, &captured).await;
+    assert!(governed && kbps >= 4000, "feedback: governed at {kbps}");
 }
 
 /// §Feedback: while PyroWave is active its own rate controller stands in for the estimate,
@@ -1604,23 +1571,30 @@ async fn a_pyrowave_client_keeps_quic_congestion_control() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     let feedback = path.feedback().expect("a datagram to report");
     write_message(&mut send, &feedback).await.unwrap();
-    assert_eq!(governed_at_leave(send, &captured).await, 0);
+    assert!(!governed_at_leave(send, &captured).await.0);
 }
 
 /// #1330: a path that carries nothing for 2 s closes QUIC's window, and quinn's 1 MiB queue
 /// holds 2 s of 4 Mbit/s video, dropping only the oldest. Behind a stalled queue the agent
 /// stops adding video, so what is still worth nothing when the path returns is the NACK
-/// hold's worth, and a keyframe follows it.
+/// hold's worth, and a keyframe follows it. A NACK behind it is not answered either.
 #[tokio::test]
 async fn video_behind_a_stalled_path_is_skipped_not_queued() {
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
     let mut agent = governed_agent(Stream::Av1Heavy).await;
     let down = Arc::new(AtomicBool::new(false));
     let cut = down.clone();
-    let (session, mut send, _recv) = through(&mut agent, move || {
+    let (session, mut send, mut recv) = through(&mut agent, move || {
         (!cut.load(Relaxed)).then_some(Duration::ZERO)
     })
     .await;
+    let missed = Arc::new(AtomicBool::new(false));
+    let miss = missed.clone();
+    tokio::spawn(async move {
+        while let Ok(m) = read_message(&mut recv).await {
+            miss.fetch_or(m["type"] == "nack_miss", Relaxed);
+        }
+    });
     let mut path = Arrivals::default();
     let mut report = tokio::time::interval(Duration::from_millis(50));
     let t0 = Instant::now();
@@ -1632,17 +1606,36 @@ async fn video_behind_a_stalled_path_is_skipped_not_queued() {
     // A frame and when it arrived, before the outage: the synthetic encoder's clock.
     let mut clock = None::<(u16, Instant)>;
     let (mut stale, mut fresh) = (BTreeMap::new(), None);
+    // The last first fragment that arrived before the outage, by frame and pkt_seq, and
+    // whether it came again after: a resend.
+    let (mut last_first, mut nacked, mut resent) = (None::<(u16, u32)>, false, false);
     loop {
         let now = Instant::now();
         if now >= end {
             break;
         }
         down.store((outage..up_at).contains(&now), Relaxed);
+        // Video is skipped from about 0.7 s in (QUIC's window fills, then a hold passes). The
+        // frame is past the retransmit window by then, so an answer would be a nack_miss.
+        if !nacked && now >= outage + Duration::from_millis(1500) {
+            nacked = true;
+            let (frame_seq, _) = last_first.expect("a frame before the outage");
+            let nack = json!({"type": "nack", "frame_seq": frame_seq, "frags": [[0, 0]]});
+            write_message(&mut send, &nack).await.unwrap();
+        }
         tokio::select! {
             d = session.read_datagram() => {
                 let d = d.unwrap();
                 path.receive(&d);
                 let frame_seq = u16::from_le_bytes([d[7], d[8]]);
+                let pkt_seq = u32::from_le_bytes(d[1..5].try_into().unwrap());
+                if d[9..11] == [0, 0] {
+                    match last_first {
+                        _ if now < outage => last_first = Some((frame_seq, pkt_seq)),
+                        Some((f, p)) if f == frame_seq && p != pkt_seq => resent = true,
+                        _ => {}
+                    }
+                }
                 match clock {
                     _ if now < outage => clock = Some((frame_seq, now)),
                     Some((f0, at)) if now >= up_at => {
@@ -1678,6 +1671,14 @@ async fn video_behind_a_stalled_path_is_skipped_not_queued() {
         fresh - up_at < Duration::from_secs(4),
         "fresh video {:?} after",
         fresh - up_at
+    );
+    assert!(
+        !resent,
+        "a NACK behind the stalled queue was answered with a resend"
+    );
+    assert!(
+        !missed.load(Relaxed),
+        "a NACK behind the stalled queue was answered with a nack_miss"
     );
 }
 

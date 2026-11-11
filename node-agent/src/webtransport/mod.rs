@@ -1141,7 +1141,8 @@ fn admit(
 }
 
 /// How a stream ends when no keyframe gets through its datagram queue: as an unusable
-/// encoder ends it, so the client falls back to WebRTC.
+/// encoder ends it. The browser ignores the `error` and reconnects over WebTransport once on
+/// the close; a second loss falls back to WebRTC (`stream_lost`).
 fn stalled() -> (Option<Value>, u32, &'static str) {
     let message = "no keyframe got through the datagram queue";
     (
@@ -1520,9 +1521,6 @@ async fn stream(
                 Some(Out::Config(config, reason)) => {
                     if config.codec != "pyrowave" {
                         pyrowave_frames.forget();
-                    } else {
-                        // Its own rate controller stands in for the estimate (§Feedback).
-                        governor.release();
                     }
                     current = config.clone();
                     let ack = hello_ack(&config, media.audio(), reason, fec);
@@ -1618,6 +1616,7 @@ async fn stream(
         datagrams_handed_incl_audio_and_resends = handed,
         datagrams_sent = quic.frame_tx.datagram,
         units_and_nack_answers_skipped_total = backlog.skipped,
+        governed = governor.governs(),
         governed_kbps = governor.kbps(),
         lost_packets = quic.path.lost_packets,
         congestion_events = quic.path.congestion_events,

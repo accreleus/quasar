@@ -870,7 +870,12 @@ impl Governor {
         self.0.store(0, Ordering::Relaxed);
     }
 
-    /// The rate the window is held to, kbit/s; 0 on Cubic.
+    /// The window follows the estimate, not Cubic.
+    pub(crate) fn governs(&self) -> bool {
+        self.0.load(Ordering::Relaxed) > 0
+    }
+
+    /// The rate the window is held to, kbit/s.
     pub(crate) fn kbps(&self) -> u64 {
         self.0.load(Ordering::Relaxed) / 1000
     }
@@ -1014,17 +1019,44 @@ pub(crate) enum Admit {
     Skip,
     /// Skip, and ask the encoder for a keyframe to resume on.
     SkipForKeyframe,
-    /// No keyframe got through for `GIVE_UP_HOLDS` holds: end the WebTransport media so the
-    /// client falls back to WebRTC.
+    /// No keyframe got through for `GIVE_UP_HOLDS` holds: end the WebTransport media. The
+    /// browser reconnects over WebTransport once; a second loss falls back to WebRTC
+    /// (`stream_lost`).
     GiveUp,
 }
 
 /// Bytes in QUIC's datagram queue under one fragment: nothing is waiting.
 const BACKLOG_EMPTY: usize = super::media::MAX_DATAGRAM;
-/// Holds of skipping with no keyframe admitted before the media is given up: 6 s at the
-/// 250 ms hold, past a 2 s outage and quinn's probe backoff after it (about 2 s), and under
-/// the 10 s idle timeout that ends a dead path.
+/// Holds in which units came while the queue stayed backed up, or keyframe asks went
+/// unanswered on a drained one, before the media is given up. About 6 s at the 250 ms
+/// hold, past a 2 s outage and quinn's probe backoff after it (about 2 s). The hold is
+/// max(250 ms, 2 x RTT), so this scales with RTT, and stays under the 10 s idle timeout
+/// only below about 208 ms. An outage longer than this ends the media mid-outage and uses
+/// the view's one reconnect, where it used to recover on WebTransport: the accepted trade
+/// for not sitting on a frozen picture.
 const GIVE_UP_HOLDS: u32 = 24;
+
+/// Holds counted at most once each, and only when a unit comes: a still screen sends
+/// nothing, and its silence counts for nothing.
+#[derive(Default)]
+struct Holds {
+    at: Option<Instant>,
+    n: u32,
+}
+
+impl Holds {
+    /// Counts `now` when a hold has passed since the last count; true when it did.
+    fn count(&mut self, now: Instant, hold: Duration) -> bool {
+        let due = self
+            .at
+            .is_none_or(|at| now.saturating_duration_since(at) >= hold);
+        if due {
+            self.at = Some(now);
+            self.n += 1;
+        }
+        due
+    }
+}
 
 /// Video behind a closed window (a stalled path) is worthless once it is older than the
 /// client's NACK hold, and quinn's queue holds a MiB of it, dropping only the oldest
@@ -1036,9 +1068,11 @@ const GIVE_UP_HOLDS: u32 = 24;
 pub(crate) struct Backlog {
     last: usize,
     growing_since: Option<Instant>,
-    /// When skipping began.
-    skipping: Option<Instant>,
-    asked: Option<Instant>,
+    skipping: bool,
+    backed_up: Holds,
+    /// Keyframe asks: one each hold while the queue is drained, since a keyframe that came
+    /// while it still held a datagram was skipped like the rest.
+    asks: Holds,
     /// Video units and `nack` answers skipped over the connection.
     pub(crate) skipped: u64,
 }
@@ -1060,50 +1094,47 @@ impl Backlog {
             self.growing_since.get_or_insert(now);
         }
         self.last = queued;
-        let since = match self.skipping {
-            Some(since) => since,
-            None => {
-                let since = match self.growing_since {
-                    Some(at) if now.saturating_duration_since(at) > hold => at,
-                    _ => return Admit::Send,
-                };
-                tracing::info!(
-                    token = "webtransport-video-stalled",
-                    queued,
-                    stalled_ms = now.saturating_duration_since(since).as_millis() as u64,
-                    "WebTransport datagram queue has not drained; video skipped until it does"
-                );
-                self.asked = None;
-                *self.skipping.insert(now)
-            }
-        };
+        if !self.skipping {
+            let since = match self.growing_since {
+                Some(at) if now.saturating_duration_since(at) > hold => at,
+                _ => return Admit::Send,
+            };
+            tracing::info!(
+                token = "webtransport-video-stalled",
+                queued,
+                stalled_ms = now.saturating_duration_since(since).as_millis() as u64,
+                "WebTransport datagram queue has not drained; video skipped until it does"
+            );
+            self.skipping = true;
+            self.backed_up = Holds::default();
+            self.asks = Holds::default();
+        }
         if empty && keyframe {
             tracing::info!(
                 token = "webtransport-video-resumed",
                 skipped = self.skipped,
                 "WebTransport datagram queue drained; video resumes at a keyframe"
             );
-            self.skipping = None;
+            self.skipping = false;
             return Admit::Send;
         }
-        if now.saturating_duration_since(since) > hold * GIVE_UP_HOLDS {
+        let holds = if empty {
+            &mut self.asks
+        } else {
+            &mut self.backed_up
+        };
+        let counted = holds.count(now, hold);
+        if holds.n > GIVE_UP_HOLDS {
             tracing::warn!(
                 token = "webtransport-video-unrecoverable",
                 queued,
                 "no keyframe got through the WebTransport datagram queue; ending the \
-                 WebTransport media so the client falls back"
+                 WebTransport media"
             );
             return Admit::GiveUp;
         }
         self.skipped += 1;
-        // Again every hold: a keyframe that came while the queue still held a datagram was
-        // skipped like the rest.
-        if empty
-            && self
-                .asked
-                .is_none_or(|at| now.saturating_duration_since(at) >= hold)
-        {
-            self.asked = Some(now);
+        if empty && counted {
             Admit::SkipForKeyframe
         } else {
             Admit::Skip

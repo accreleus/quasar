@@ -769,23 +769,22 @@ fn a_keyframe_skipped_behind_a_datagram_is_asked_for_again_every_hold() {
 }
 
 #[test]
-fn a_queue_no_keyframe_gets_through_ends_the_media() {
+fn a_queue_that_never_drains_ends_the_media() {
     let start = Instant::now();
     let mut b = Backlog::default();
     let at = stalled(&mut b, start);
     let give_up = HOLD * GIVE_UP_HOLDS;
     // Keyframes keep coming, but the queue never empties.
     let mut t = at;
-    while t <= at + give_up {
-        assert_ne!(
-            b.admit(400_000, true, t, HOLD),
-            Admit::GiveUp,
-            "{:?}",
-            t - at
-        );
+    while b.admit(400_000, true, t, HOLD) != Admit::GiveUp {
         t += FRAME;
     }
-    assert_eq!(b.admit(400_000, true, t, HOLD), Admit::GiveUp);
+    // One count a hold, each on the first frame past it.
+    assert!(
+        (give_up..give_up + (FRAME + HOLD) * 2).contains(&(t - at)),
+        "{:?}",
+        t - at
+    );
     // A keyframe admitted before then ends the episode, and the next one starts afresh.
     let mut b = Backlog::default();
     let at = stalled(&mut b, start);
@@ -795,6 +794,28 @@ fn a_queue_no_keyframe_gets_through_ends_the_media() {
         b.admit(400_000, false, again + give_up - FRAME, HOLD),
         Admit::Skip
     );
+}
+
+#[test]
+fn a_still_screen_after_the_queue_drained_asks_for_a_keyframe_before_giving_up() {
+    let start = Instant::now();
+    let mut b = Backlog::default();
+    let at = stalled(&mut b, start);
+    // The path recovered and the queue drained, but nothing came for 7 s.
+    let mut t = at + Duration::from_secs(7);
+    assert_eq!(b.admit(0, false, t, HOLD), Admit::SkipForKeyframe);
+    // Asks that go unanswered end it after the full count, however long the screen was still.
+    let mut asks = 1;
+    loop {
+        t += FRAME;
+        match b.admit(0, false, t, HOLD) {
+            Admit::SkipForKeyframe => asks += 1,
+            Admit::Skip => {}
+            Admit::GiveUp => break,
+            Admit::Send => panic!("no keyframe was admitted"),
+        }
+    }
+    assert_eq!(asks, GIVE_UP_HOLDS);
 }
 
 /// A known limit, not a guarantee: inside the 500 ms hold a quiet sender cannot be told
