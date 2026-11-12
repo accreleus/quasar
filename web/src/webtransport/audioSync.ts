@@ -15,6 +15,12 @@ export const MIN_TARGET_MS = 40;
 export const MAX_TARGET_MS = 150;
 /** Audio packets behind the jitter estimate: ten seconds at 10 ms. */
 const JITTER_SAMPLES = 1_000;
+/** One packet later than this past the floor is a stall, not jitter to cover: it is lost to
+ *  playback either way, and covering it would hold audio that far behind its video for the
+ *  whole window. Lateness that keeps recurring is still covered in full. */
+export const MAX_JITTER_MS = 40;
+/** Packets behind the recurring-lateness percentile: two seconds at 10 ms. */
+const RECURRING_SAMPLES = 200;
 /** Used until a video frame has been presented. */
 const DEFAULT_TARGET_MS = 50;
 
@@ -51,12 +57,15 @@ export class AudioSync {
     this.excess.length = 0;
   }
 
-  /** The furthest a recent packet ran past the floor: what the playout delay must cover for all
-   *  of them to arrive in time. Not a percentile: at 100 packets a second the 5 % a 95th
-   *  percentile leaves out is five dropouts a second (#1346). */
+  /** What the playout delay must cover for recent packets to arrive in time: the furthest any
+   *  ran past the floor in the window, up to {@link MAX_JITTER_MS}, and without that bound the
+   *  95th percentile of the last two seconds (a link that bunches one packet in five). The
+   *  percentile alone leaves five packets a second uncovered at 100 a second (#1346). */
   jitterMs(): number {
     if (this.excess.length < 20) return 0;
-    return this.excess.reduce((a, b) => Math.max(a, b), 0);
+    const furthest = this.excess.reduce((a, b) => Math.max(a, b), 0);
+    const s = this.excess.slice(-RECURRING_SAMPLES).sort((a, b) => a - b);
+    return Math.max(Math.min(MAX_JITTER_MS, furthest), s[Math.min(s.length - 1, Math.floor(s.length * 0.95))]);
   }
 
   /** A video frame captured at `captureUs` was presented at `presentMs`. */

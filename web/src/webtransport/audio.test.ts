@@ -8,7 +8,7 @@ import { MicCaptureError } from "../webrtc/mic";
 import { newPostedCounters, type PostedCounters } from "../webrtc/telemetry";
 import { AudioOut, LATE_RUN_RESET, type ContextLike } from "./audioOut";
 import { AudioRing, SLACK_FRAMES } from "./audioRing";
-import { AudioSync, MAX_TARGET_MS, MIN_TARGET_MS } from "./audioSync";
+import { AudioSync, MAX_JITTER_MS, MAX_TARGET_MS, MIN_TARGET_MS } from "./audioSync";
 import { CHANNEL_AUDIO, encodeMicDatagram, parseAudioDatagram } from "./framing";
 import { MicOut } from "./micOut";
 import type { Presenter } from "./presenter";
@@ -117,13 +117,25 @@ describe("AudioSync", () => {
 
   it("covers the latest packet of the last ten seconds, not most of them (#1346)", () => {
     const s = new AudioSync();
-    // One packet in fifty runs 8 ms late: a 95th percentile reads 0 and drops two chunks a second.
-    for (let i = 0; i < 1_000; i++) s.noteAudio(1_000_000 + i * 10_000, 1_000 + i * 10 + 100 + (i % 50 === 49 ? 8 : 0));
+    const clean = (i: number) => s.noteAudio(1_000_000 + i * 10_000, 1_000 + i * 10 + 100);
+    for (let i = 0; i < 100; i++) clean(i);
+    // One packet 8 ms late: a 95th percentile reads 0.
+    s.noteAudio(1_000_000 + 100 * 10_000, 1_000 + 100 * 10 + 100 + 8);
     expect(s.jitterMs()).toBe(8);
     expect(s.targetDelayMs(45)).toBe(53);
-    // Ten clean seconds later the late packets are forgotten.
-    for (let i = 1_000; i < 2_000; i++) s.noteAudio(1_000_000 + i * 10_000, 1_000 + i * 10 + 100);
+    // Still covered 999 packets later, forgotten at 1,000.
+    for (let i = 101; i < 1_100; i++) clean(i);
+    expect(s.jitterMs()).toBe(8);
+    clean(1_100);
     expect(s.jitterMs()).toBe(0);
+  });
+
+  it("does not hold audio back for a stall: one packet 200 ms late adds no more than the bound", () => {
+    const s = new AudioSync();
+    for (let i = 0; i < 100; i++) s.noteAudio(1_000_000 + i * 10_000, 1_000 + i * 10 + 100);
+    s.noteAudio(1_000_000 + 100 * 10_000, 1_000 + 100 * 10 + 100 + 200);
+    expect(s.jitterMs()).toBe(MAX_JITTER_MS);
+    expect(s.targetDelayMs(25)).toBe(25 + MAX_JITTER_MS);
   });
 
   it("forgets the floor and everything measured against it on reset", () => {
