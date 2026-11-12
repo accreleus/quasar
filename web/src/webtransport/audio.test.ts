@@ -9,7 +9,7 @@ import { newPostedCounters, type PostedCounters } from "../webrtc/telemetry";
 import { AudioOut, LATE_RUN_RESET, type ContextLike } from "./audioOut";
 import { AudioRing, SLACK_FRAMES } from "./audioRing";
 import { AudioSync, MAX_JITTER_MS, MAX_TARGET_MS, MIN_TARGET_MS } from "./audioSync";
-import { CHANNEL_AUDIO, encodeMicDatagram, parseAudioDatagram } from "./framing";
+import { CHANNEL_AUDIO, CHANNEL_AUDIO_RED, encodeMicDatagram, parseAudioDatagram } from "./framing";
 import { MicOut } from "./micOut";
 import type { Presenter } from "./presenter";
 import { avcC, bytes, COORDS, FakeAgent, FakeChunk, FakeDecoder, flush, helloAck, packetize } from "./testSupport";
@@ -61,6 +61,16 @@ describe("audio framing", () => {
     expect(parseAudioDatagram(Uint8Array.from([0x01, ...new Array(30).fill(0)]))).toBeNull();
     expect(parseAudioDatagram(audioDatagram(1, 1, 1, new Uint8Array(0)))).toBeNull();
     expect(parseAudioDatagram(new Uint8Array(5))).toBeNull();
+  });
+
+  it("reads a 0x06 copy as the audio packet it repeats (§Audio redundancy)", () => {
+    const d = audioDatagram(0xfffe, 0x01020304, 1_762_400_000_123_456, Uint8Array.from([0xf4, 1]));
+    d[0] = CHANNEL_AUDIO_RED;
+    expect(parseAudioDatagram(d)).toMatchObject({
+      packetSeq: 0xfffe,
+      ts48k: 0x01020304,
+      captureUs: 1_762_400_000_123_456,
+    });
   });
 
   it("writes the microphone datagram as §Microphone: channel, u16 seq, u32 ts, Opus", () => {
@@ -544,6 +554,29 @@ describe("AudioOut", () => {
     expect(out.stats().stale).toBe(3);
   });
 
+  it("plays a packet whose original was lost from its 0x06 copy, concealing nothing (#1346)", async () => {
+    const { out, decoders } = setupAudioOut();
+    await out.start(STEREO);
+    out.packet(packet(5_000_000, 0));
+    decoders[0].emit(5_000_000); // a chunk has played, so a gap would be concealed
+    // 0x02 for 1 was lost; the agent's 0x06 copy of it arrives just before 0x02 for 2.
+    out.packet(packet(5_010_000, 1));
+    out.packet(packet(5_020_000, 2));
+    expect(decoders[0].chunks.map((c) => c.timestamp)).toEqual([5_000_000, 5_010_000, 5_020_000]);
+    expect(out.stats()).toMatchObject({ concealed: 0, stale: 0 });
+  });
+
+  it("decodes a packet once when its 0x06 copy follows it, counting the copy stale (#1346)", async () => {
+    const { out, decoders } = setupAudioOut();
+    await out.start(STEREO);
+    out.packet(packet(5_000_000, 0));
+    decoders[0].emit(5_000_000);
+    out.packet(packet(5_010_000, 1));
+    out.packet(packet(5_010_000, 1)); // its copy, after the packet was already taken
+    expect(decoders[0].chunks.map((c) => c.timestamp)).toEqual([5_000_000, 5_010_000]);
+    expect(out.stats()).toMatchObject({ stale: 1, concealed: 0 });
+  });
+
   it("makes up no packets for a pause of seconds", async () => {
     const { out, decoders } = setupAudioOut();
     await out.start(STEREO);
@@ -794,6 +827,23 @@ describe("WebTransportMedia audio", () => {
       audioDatagram(4, 1_920, 4_000_000, Uint8Array.from([1])),
     ]);
     await vi.waitFor(() => expect(got).toEqual([2, 1, 4]));
+  });
+
+  it("hands a 0x06 copy to the sink as the packet it repeats (§Audio redundancy)", async () => {
+    const agent = new FakeAgent();
+    agent.replies = [[withAudio()]];
+    const got: { seq: number; opus: number[] }[] = [];
+    await make(agent).connect({
+      audio: (p) => got.push({ seq: p.packetSeq, opus: Array.from(p.opus) }),
+      config: () => {},
+      unit: () => {},
+      pyrowave: () => {},
+      end: () => {},
+    });
+    const copy = audioDatagram(1, 480, 2_000_000, Uint8Array.from([7]));
+    copy[0] = CHANNEL_AUDIO_RED;
+    agent.last.datagrams([copy]);
+    await vi.waitFor(() => expect(got).toEqual([{ seq: 1, opus: [7] }]));
   });
 
   it("sends a microphone datagram on the datagram writer, within the size the path allows", async () => {

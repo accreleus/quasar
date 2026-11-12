@@ -21,6 +21,8 @@ use crate::session::SessionConfig;
 
 pub(crate) const CHANNEL_AUDIO: u8 = 0x02;
 pub(crate) const CHANNEL_MIC: u8 = 0x05;
+/// The copy of the previous audio packet (§Audio redundancy, amendment 67).
+pub(crate) const CHANNEL_AUDIO_RED: u8 = 0x06;
 pub(crate) const AUDIO_HEADER: usize = 19;
 pub(crate) const MIC_HEADER: usize = 7;
 /// Packets queued for the client before new ones are dropped: 160 ms of 10 ms packets.
@@ -29,6 +31,10 @@ const CLIENT_QUEUE: usize = 16;
 const PACKET_TICKS: u32 = 480;
 /// The most a packet is believed to differ from the clock when the encoder outputs it.
 const MAX_AGE_US: i64 = 1_000_000;
+/// The longest gap between two packets across which the earlier one is still worth repeating
+/// (§Audio redundancy): past it the stream paused, and the copy would arrive where its own
+/// packet's time has already gone.
+pub(crate) const REPEAT_MAX_GAP_US: u64 = 100_000;
 /// The longest Opus packet (RFC 6716).
 const MAX_OPUS_PACKET: usize = 1275;
 
@@ -66,14 +72,29 @@ pub(crate) struct Packet {
 
 /// The `0x02` datagram (§Audio).
 pub(crate) fn datagram(p: &Packet, pkt_seq: u32) -> Bytes {
+    onto(CHANNEL_AUDIO, p, pkt_seq)
+}
+
+/// The `0x06` copy of `p`, for a client that takes channel `0x06` (§Audio redundancy): the same
+/// bytes as its `0x02` datagram but for the channel, with a `pkt_seq` of its own.
+pub(crate) fn repeated(p: &Packet, pkt_seq: u32) -> Bytes {
+    onto(CHANNEL_AUDIO_RED, p, pkt_seq)
+}
+
+fn onto(channel: u8, p: &Packet, pkt_seq: u32) -> Bytes {
     let mut d = BytesMut::with_capacity(AUDIO_HEADER + p.data.len());
-    d.put_u8(CHANNEL_AUDIO);
+    d.put_u8(channel);
     d.put_u32_le(pkt_seq);
     d.put_u16_le(p.packet_seq);
     d.put_u32_le(p.ts_48khz);
     d.put_u64_le(p.capture_us);
     d.put_slice(&p.data);
     d.freeze()
+}
+
+/// Whether `next`'s datagram repeats `prev`: false across a pause (§Audio redundancy).
+pub(crate) fn repeats(prev: &Packet, next: &Packet) -> bool {
+    next.capture_us.saturating_sub(prev.capture_us) <= REPEAT_MAX_GAP_US
 }
 
 fn wall_us() -> u64 {
@@ -471,6 +492,47 @@ mod tests {
         assert_eq!(&d[7..11], &0x0102_0304_u32.to_le_bytes());
         assert_eq!(&d[11..19], &0x1122_3344_5566_7788_u64.to_le_bytes());
         assert_eq!(&d[19..], &[9, 8, 7]);
+    }
+
+    /// §Audio redundancy: the copy is the packet, its own `pkt_seq`, and channel `0x06`.
+    #[test]
+    fn the_redundant_datagram_is_the_same_packet_on_its_own_channel_and_pkt_seq() {
+        let p = Packet {
+            data: Bytes::from_static(&[9, 8, 7]),
+            packet_seq: 0xfffe,
+            ts_48khz: 0x0102_0304,
+            capture_us: 0x1122_3344_5566_7788,
+        };
+        let original = datagram(&p, 41);
+        let copy = repeated(&p, 40);
+        assert_eq!(copy.len(), original.len());
+        assert_eq!(copy[0], 0x06);
+        assert_eq!(&copy[1..5], &40u32.to_le_bytes());
+        assert_eq!(
+            &copy[5..],
+            &original[5..],
+            "packet_seq, ts, capture_us and the Opus packet are the repeated packet's"
+        );
+    }
+
+    #[test]
+    fn a_packet_is_not_repeated_across_a_pause_of_more_than_100_ms() {
+        let at = |capture_us| Packet {
+            data: Bytes::from_static(&[1]),
+            packet_seq: 0,
+            ts_48khz: 0,
+            capture_us,
+        };
+        let (first, next) = (at(1_000_000), at(1_010_000));
+        assert!(repeats(&first, &next), "10 ms apart: repeated");
+        assert!(
+            repeats(&first, &at(1_100_000)),
+            "exactly 100 ms apart is still repeated"
+        );
+        assert!(
+            !repeats(&first, &at(1_100_001)),
+            "a pause over 100 ms is not: its copy would be stale"
+        );
     }
 
     #[test]

@@ -312,6 +312,10 @@ struct Hello {
     /// Amendment 55: this connection can decode PyroWave.
     #[serde(default)]
     pyrowave: bool,
+    /// Amendment 67: this connection takes channel `0x06`, the repeat of the previous audio
+    /// packet (§Audio redundancy). Absent, as an older client sends it: no copies.
+    #[serde(default)]
+    audio_red: bool,
     /// The FEC schemes the client decodes (§Hello). Anything but a list names none: FEC is
     /// optional, so a malformed offer costs the client its repairs, not its session.
     #[serde(default)]
@@ -1069,6 +1073,7 @@ fn hello_ack(
     audio: &Audio,
     switch_reason: Option<&str>,
     fec: bool,
+    audio_red: bool,
 ) -> Value {
     let (stream_audio, mic) = audio.describe();
     let mut ack = json!({
@@ -1087,6 +1092,10 @@ fn hello_ack(
         "fec": fec.then_some("xor"),
         "retransmit_window_ms": retransmit::WINDOW.as_millis() as u64,
     });
+    // §Audio redundancy: only a client that asked, and only where the session has stream audio.
+    if audio_red && ack["audio"].is_object() {
+        ack["audio"]["redundancy"] = json!(1);
+    }
     // codec-pyrowave.md §`hello_ack`: required for PyroWave, and always BT.709.
     if config.codec == "pyrowave" {
         ack["video"]["color_space"] = json!({
@@ -1375,7 +1384,13 @@ async fn authenticate(
             deadline,
             write_message(
                 &mut send,
-                &hello_ack(&client.config, media.audio(), client.reason, fec)
+                &hello_ack(
+                    &client.config,
+                    media.audio(),
+                    client.reason,
+                    fec,
+                    hello.audio_red
+                )
             )
         )
         .await,
@@ -1387,10 +1402,21 @@ async fn authenticate(
     }
     drop(slot);
     let _ = authed.set((media.clone(), client.id));
-    stream(session, send, recv, &media, client, fec, governor).await;
+    stream(
+        session,
+        send,
+        recv,
+        &media,
+        client,
+        fec,
+        hello.audio_red,
+        governor,
+    )
+    .await;
 }
 
 /// Hand the client its video until it leaves, is displaced or the session ends.
+#[allow(clippy::too_many_arguments)]
 async fn stream(
     session: &Session,
     mut send: SendStream,
@@ -1398,6 +1424,7 @@ async fn stream(
     media: &Arc<Media>,
     mut client: Attached,
     fec: bool,
+    audio_red: bool,
     governor: congestion::Governor,
 ) {
     let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(16);
@@ -1427,6 +1454,8 @@ async fn stream(
     // Nothing is sent before `hello_ack`: what queued up behind it is stale.
     while client.audio.try_recv().is_ok() {}
     let mut audio_open = true;
+    // §Audio redundancy: the packet the next one repeats; a connection starts with none.
+    let mut previous_audio: Option<audio::Packet> = None;
     // The configuration the client was last sent: a PyroWave unit packs for its size.
     let mut current = client.config.clone();
     // What ends the stream: an optional last message, the close code and its reason.
@@ -1443,14 +1472,27 @@ async fn stream(
             }
             packet = client.audio.recv(), if audio_open => match packet {
                 Some(packet) => {
+                    // §Audio redundancy: the packet before this one, immediately before it.
+                    if let Some(previous) = previous_audio.as_ref().filter(|p| audio::repeats(p, &packet)) {
+                        let seq = pkt_seq;
+                        pkt_seq = pkt_seq.wrapping_add(1);
+                        handed += 1;
+                        if session.send_datagram(audio::repeated(previous, seq)).is_err() {
+                            break QUIET;
+                        }
+                    }
                     let seq = pkt_seq;
                     pkt_seq = pkt_seq.wrapping_add(1);
                     // Not in the send log: the estimate is the video ABR's, and on WebRTC
                     // audio is a peer connection GCC never sees. Feedback naming an audio
-                    // `pkt_seq` finds no record and counts for nothing.
+                    // `pkt_seq` finds no record and counts for nothing. The `0x06` copy above is
+                    // an audio datagram too, and is left out for the same reason.
                     handed += 1;
                     if session.send_datagram(audio::datagram(&packet, seq)).is_err() {
                         break QUIET;
+                    }
+                    if audio_red {
+                        previous_audio = Some(packet);
                     }
                 }
                 // Displaced or ended: the video queue says which, next.
@@ -1523,7 +1565,7 @@ async fn stream(
                         pyrowave_frames.forget();
                     }
                     current = config.clone();
-                    let ack = hello_ack(&config, media.audio(), reason, fec);
+                    let ack = hello_ack(&config, media.audio(), reason, fec, audio_red);
                     let write = write_message(&mut send, &ack);
                     if !matches!(tokio::time::timeout(CONTROL_WRITE, write).await, Ok(Ok(()))) {
                         break QUIET;

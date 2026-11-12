@@ -79,7 +79,16 @@ describe("WebTransportMedia connect", () => {
       [1, 2, 3, 4],
       [9, 9],
     ]);
-    expect(agent.sent("hello")[0]).toEqual({ type: "hello", wt_proto: 1, token: "tok-1", session_id: "s1", client: "browser", fec: ["xor"] });
+    expect(agent.sent("hello")[0]).toEqual({
+      type: "hello",
+      wt_proto: 1,
+      token: "tok-1",
+      session_id: "s1",
+      client: "browser",
+      fec: ["xor"],
+      // §Audio redundancy: the client takes channel 0x06, so the agent repeats the packet before.
+      audio_red: true,
+    });
   });
 
   it("sends no certificate hashes for an edge URL", async () => {
