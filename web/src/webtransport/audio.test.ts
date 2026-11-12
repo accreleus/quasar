@@ -7,7 +7,7 @@ import { mintTransportToken } from "../api/library";
 import { MicCaptureError } from "../webrtc/mic";
 import { newPostedCounters, type PostedCounters } from "../webrtc/telemetry";
 import { AudioOut, LATE_RUN_RESET, type ContextLike } from "./audioOut";
-import { AudioRing, SLACK_FRAMES } from "./audioRing";
+import { AudioRing, MAX_STRETCH_FRAMES, SLACK_FRAMES, STRETCH_DONE_FRAMES } from "./audioRing";
 import { AudioSync, MAX_JITTER_MS, MAX_TARGET_MS, MIN_TARGET_MS } from "./audioSync";
 import { CHANNEL_AUDIO, CHANNEL_AUDIO_RED, encodeMicDatagram, parseAudioDatagram } from "./framing";
 import { MicOut } from "./micOut";
@@ -207,7 +207,8 @@ describe("AudioRing", () => {
   it("leaves a real gap as silence and counts it as an underrun once audio has started", () => {
     const ring = new AudioRing();
     ring.push(0, chunk(128, 1), 0);
-    ring.push(128 + SLACK_FRAMES + 128, chunk(128, 2), 0);
+    // Over the bound a gap is a hole, not a playout-delay change: it stays silence.
+    ring.push(128 + MAX_STRETCH_FRAMES + 128, chunk(128, 2), 0);
     quantum(ring, 0);
     const gap = quantum(ring, 128);
     expect(gap.every((x) => x === 0)).toBe(true);
@@ -270,9 +271,10 @@ describe("AudioRing", () => {
     expect(ring.stats).toMatchObject({ underrunFrames: 0, underrunEvents: 0 });
   });
 
-  it("orders chunks that arrive out of order and drops the ones that are already past", () => {
+  it("puts a real chunk ahead of a concealment fade posted before it, and drops what is already past", () => {
     const ring = new AudioRing();
-    ring.push(480, chunk(480, 2), 0);
+    // The fade for a lost packet is posted at once; the chunk before it is still in the decoder.
+    ring.push(480, chunk(480, 2), 0, true);
     ring.push(0, chunk(480, 1), 0);
     ring.push(0, chunk(100, 9), 5_000); // wholly past the render position
     expect(ring.stats.dropped).toBe(1);
@@ -300,6 +302,160 @@ describe("AudioRing", () => {
     ring.push(0, chunk(600, 1), 0);
     ring.push(600, chunk(600, 1), 0);
     expect(ring.stats.dropped).toBe(1);
+  });
+});
+
+// ── AudioRing across a playout delay change (#1346, step 3) ─────────────────
+
+describe("AudioRing across a playout delay change", () => {
+  /** One 10 ms chunk, both channels the same. */
+  const PTIME = 480;
+  /** A chunk is posted this far ahead of the render position, as the player posts it (100 ms). */
+  const LEAD = 4_800;
+
+  /** The stream's own start for each of `count` chunks, stepped by `step` frames at chunk `at`. */
+  const stepped = (count: number, at: number, step: number): number[] =>
+    Array.from({ length: count }, (_, k) => k * PTIME + (k >= at ? step : 0));
+
+  /** Streams `starts` through a fresh ring, posting each chunk 100 ms before it is due and
+   *  rendering 128-frame quanta; chunk `marker` plays 2 and the rest 1. A long chunk after the
+   *  last one keeps audio queued to the end, so silence here would only be what the ring chose.
+   *  Returns every frame the worklet played, and the counters. */
+  function play(starts: number[], marker: number, quanta: number) {
+    const ring = new AudioRing();
+    const out: number[] = [];
+    const chunk = (k: number) => {
+      const v = k === marker ? 2 : 1;
+      return [new Float32Array(PTIME).fill(v), new Float32Array(PTIME).fill(v)];
+    };
+    let next = 0;
+    let tail = false;
+    for (let q = 0; q < quanta; q++) {
+      const f = q * 128;
+      while (next < starts.length && starts[next] <= f + LEAD) {
+        ring.push(starts[next], chunk(next), f);
+        next += 1;
+      }
+      if (!tail && next === starts.length && starts[starts.length - 1] + PTIME <= f + LEAD) {
+        tail = true;
+        ring.push(starts[starts.length - 1] + PTIME, [new Float32Array(9_600).fill(1), new Float32Array(9_600).fill(1)], f);
+      }
+      const buf = [new Float32Array(128), new Float32Array(128)];
+      ring.render(buf, f);
+      for (const x of buf[0]) out.push(x);
+    }
+    return { out: Float32Array.from(out), ring };
+  }
+
+  /** Where the marker chunk was first heard. */
+  const heard = (out: Float32Array): number => out.findIndex((x) => x >= 1.5);
+
+  it("closes a 12 ms rise in the playout delay by stretching: no silence, no dropout, timeline converges", () => {
+    const starts = stepped(120, 20, 576);
+    const { out, ring } = play(starts, 90, 470);
+    expect(ring.stats).toMatchObject({ underrunFrames: 0, underrunEvents: 0, dropped: 0 });
+    expect(out.includes(0)).toBe(false);
+    // 576 frames at 2 % of 480 a chunk is 60 chunks; 70 chunks after the step the stretch has
+    // caught up: a marker is heard at its own start, not the 12 ms early the stretch began from.
+    expect(Math.abs(heard(out) - starts[90])).toBeLessThanOrEqual(STRETCH_DONE_FRAMES + 10);
+  });
+
+  it("closes a 42 ms rise the same way, at 2 % until the timeline has caught up", () => {
+    const starts = stepped(260, 20, 2016);
+    const { out, ring } = play(starts, 240, 1_000);
+    expect(ring.stats).toMatchObject({ underrunFrames: 0, underrunEvents: 0, dropped: 0 });
+    expect(out.includes(0)).toBe(false);
+    // 2,016 frames at 2 % of 480 a chunk is 210 chunks; the marker sits 220 after the step.
+    expect(Math.abs(heard(out) - starts[240])).toBeLessThanOrEqual(STRETCH_DONE_FRAMES + 10);
+  });
+
+  /** Streams 120 chunks whose samples are their own index, the starts stepped by `step` at chunk 20. */
+  function indexed(step: number) {
+    const starts = stepped(120, 20, step);
+    const ring = new AudioRing();
+    const out: number[] = [];
+    let next = 0;
+    let tail = false;
+    for (let q = 0; q < 470; q++) {
+      const f = q * 128;
+      while (next < starts.length && starts[next] <= f + LEAD) {
+        const k = next;
+        const plane = Float32Array.from({ length: PTIME }, (_, i) => k * PTIME + i);
+        ring.push(starts[k], [plane, plane.slice()], f);
+        next += 1;
+      }
+      if (!tail && next === starts.length && starts[starts.length - 1] + PTIME <= f + LEAD) {
+        tail = true;
+        const plane = Float32Array.from({ length: 9_600 }, (_, i) => starts.length * PTIME + i);
+        ring.push(starts[starts.length - 1] + PTIME, [plane, plane.slice()], f);
+      }
+      const buf = [new Float32Array(128), new Float32Array(128)];
+      ring.render(buf, f);
+      for (const x of buf[0]) out.push(x);
+    }
+    return { out, ring };
+  }
+
+  // 8 ms keeps the stream's starts in order; 12 ms and 40 ms make a later chunk's start the
+  // earlier one, which a queue sorted on start alone would play out of order.
+  it.each([-384, -576, -1920])("closes a fall of %i frames by playing slightly faster: no cut, nothing out of order", (step) => {
+    const { out, ring } = indexed(step);
+    expect(ring.stats).toMatchObject({ underrunFrames: 0, underrunEvents: 0, dropped: 0 });
+    // Each sample is its own index: a cut head or a reordered chunk is a jump (back, or by the
+    // whole overlap); a squeeze steps by about one sample, and its last millisecond is closed
+    // back to back.
+    let jump = 0;
+    let back = 0;
+    for (let i = 1; i < out.length; i++) {
+      jump = Math.max(jump, out[i] - out[i - 1]);
+      back = Math.min(back, out[i] - out[i - 1]);
+    }
+    expect(back).toBeGreaterThanOrEqual(0);
+    expect(jump).toBeLessThanOrEqual(STRETCH_DONE_FRAMES + 12);
+  });
+
+  it("leaves a step over the bound as the silence it was: a stall or a reset, not a delay", () => {
+    const starts = stepped(60, 20, 4_800); // 100 ms, over the 60 ms bound
+    const { out, ring } = play(starts, -1, 280);
+    expect(ring.stats).toMatchObject({ underrunFrames: 4_800, underrunEvents: 1, dropped: 0 });
+    expect(out[starts[19] + 480]).toBe(0); // the gap is heard as silence
+  });
+
+  it("still counts a chunk that never arrived as an underrun", () => {
+    // Chunks 0..19, then 21 onwards: chunk 20 is missing from the stream's own timeline.
+    const starts = [...Array.from({ length: 20 }, (_, k) => k * PTIME), ...Array.from({ length: 40 }, (_, k) => (21 + k) * PTIME)];
+    const { ring } = play(starts, -1, 200);
+    expect(ring.stats).toMatchObject({ underrunFrames: PTIME, underrunEvents: 1, dropped: 0 });
+  });
+
+  it("plays a rise of a whole number of chunks as the silence it was: it cannot be told from lost packets", () => {
+    const starts = stepped(60, 20, 1920); // 40 ms: four chunks exactly
+    const { ring } = play(starts, -1, 280);
+    expect(ring.stats).toMatchObject({ underrunFrames: 1920, underrunEvents: 1, dropped: 0 });
+  });
+
+  it("still counts two chunks in a row that never arrived: lost audio is not a delay change", () => {
+    const starts = [...Array.from({ length: 20 }, (_, k) => k * PTIME), ...Array.from({ length: 40 }, (_, k) => (22 + k) * PTIME)];
+    const { ring } = play(starts, -1, 200);
+    expect(ring.stats).toMatchObject({ underrunFrames: 2 * PTIME, underrunEvents: 1, dropped: 0 });
+  });
+
+  it("plays steady state back to back sample for sample, with no resampling at all", () => {
+    const ring = new AudioRing();
+    const source: number[] = [];
+    for (let k = 0; k < 40; k++) {
+      const plane = Float32Array.from({ length: PTIME }, (_, i) => k * PTIME + i);
+      source.push(...plane);
+      ring.push(k * PTIME, [plane, plane.slice()], 0);
+    }
+    const out: number[] = [];
+    for (let q = 0; q < (40 * PTIME) / 128; q++) {
+      const buf = [new Float32Array(128), new Float32Array(128)];
+      ring.render(buf, q * 128);
+      for (const x of buf[0]) out.push(x);
+    }
+    expect(out).toEqual(source);
+    expect(ring.stats).toMatchObject({ underrunFrames: 0, underrunEvents: 0, dropped: 0 });
   });
 });
 

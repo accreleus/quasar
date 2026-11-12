@@ -195,6 +195,8 @@ export function OverlayPreview() {
             games={null}
             scalingMode="contain"
             onScalingChange={noop}
+            upscaleSharpen
+            onUpscaleSharpenChange={noop}
             streamSize={null}
             renderSize={null}
             onRenderSizeChange={noop}

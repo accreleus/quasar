@@ -15,7 +15,7 @@ import {
   codecString,
   hevcCodecString,
 } from "./decodeStage";
-import { containRect, createWebGpuPresenter, presentGeometry } from "./presenter";
+import { containRect, createWebGpuPresenter, presentGeometry, shouldUpscaleSharpen } from "./presenter";
 import { avcC, bytes, FakeChunk, FakeDecoder, fakeFrame, flush, packetize, repairOf, type FakeFrame, type UnitSpec } from "./testSupport";
 
 beforeEach(() => {
@@ -780,14 +780,26 @@ describe("DecodeStage", () => {
 // ── Presenter ───────────────────────────────────────────────────────────────
 
 describe("createWebGpuPresenter", () => {
-  function fakeGpu(importFails: boolean) {
+  function fakeGpu(importFails: boolean, opts: { compileFails?: boolean } = {}) {
     const calls: string[] = [];
     let lose!: (info: { reason: string; message: string }) => void;
     const listeners: Record<string, (e: unknown) => void> = {};
     const viewports: number[][] = [];
     const crops: number[][] = [];
     const samplers: string[] = [];
-    const pass = { setPipeline() {}, setBindGroup() {}, setViewport: (...v: number[]) => void viewports.push(v.slice(0, 4)), draw() {}, end() {} };
+    /** Every pipeline the presenter drew with, by its fragment shader's source. */
+    const drawn: string[] = [];
+    /** Bind group sizes, so a test can see whether the texel uniform was bound. */
+    const bindings: number[] = [];
+    const pass = {
+      setPipeline(p: { code: string }) {
+        drawn.push(p.code);
+      },
+      setBindGroup() {},
+      setViewport: (...v: number[]) => void viewports.push(v.slice(0, 4)),
+      draw() {},
+      end() {},
+    };
     const device = {
       lost: new Promise((r) => (lose = r)),
       addEventListener: (type: string, fn: (e: unknown) => void) => void (listeners[type] = fn),
@@ -797,8 +809,18 @@ describe("createWebGpuPresenter", () => {
         writeBuffer: (_b: unknown, _o: number, d: Float32Array) => void crops.push([...d]),
       },
       createBuffer: () => ({}),
-      createShaderModule: () => ({}),
-      createRenderPipeline: () => ({ getBindGroupLayout: () => ({}) }),
+      // A module carries its own source, so a test can tell the plain pass from the
+      // upscale pass; `compileFails` is a browser rejecting the shader (#1349).
+      createShaderModule: (d: { code: string }) => ({
+        code: d.code,
+        getCompilationInfo: async () => ({
+          messages: opts.compileFails && d.code.includes("upscaleSharpen") ? [{ type: "error", message: "expected ;" }] : [],
+        }),
+      }),
+      createRenderPipeline: (d: { vertex: { module: { code: string } } }) => ({ code: d.vertex.module.code, getBindGroupLayout: () => ({}) }),
+      createRenderPipelineAsync: async (d: { vertex: { module: { code: string } } }) => ({ code: d.vertex.module.code, getBindGroupLayout: () => ({}) }),
+      pushErrorScope: () => {},
+      popErrorScope: async () => null,
       createSampler: (d: { magFilter: string }) => d.magFilter,
       importExternalTexture: () => {
         calls.push("import");
@@ -806,7 +828,10 @@ describe("createWebGpuPresenter", () => {
         return {};
       },
       createTexture: (d: { size: number[] }) => ({ width: d.size[0], height: d.size[1], createView: () => ({}), destroy() {} }),
-      createBindGroup: (d: { entries: { resource: unknown }[] }) => void samplers.push(d.entries[0].resource as string),
+      createBindGroup: (d: { entries: { resource: unknown }[] }) => {
+        samplers.push(d.entries[0].resource as string);
+        bindings.push(d.entries.length);
+      },
       createCommandEncoder: () => ({ beginRenderPass: () => pass, finish: () => ({}) }),
       destroy() {},
     };
@@ -823,7 +848,7 @@ describe("createWebGpuPresenter", () => {
       dataset: {} as Record<string, string>,
       getContext: () => ({ configure() {}, getCurrentTexture: () => ({ createView: () => ({}) }) }),
     } as unknown as HTMLCanvasElement;
-    return { calls, canvas, lose, viewports, crops, samplers, uncaptured: (message: string) => listeners.uncapturederror({ error: { message } }) };
+    return { calls, canvas, lose, viewports, crops, samplers, drawn, bindings, uncaptured: (message: string) => listeners.uncapturederror({ error: { message } }) };
   }
 
   it("falls back to copying each frame once an import fails, and closes every frame", async () => {
@@ -902,6 +927,118 @@ describe("createWebGpuPresenter", () => {
     it("crops top and bottom when the frame is taller than the canvas", () => {
       expect(presentGeometry("cover", 1000, 500, 1000, 1000).crop).toEqual([1, 0.5, 0, 0.25]);
     });
+  });
+
+  // ── The upscale + sharpen pass (#1349) ────────────────────────────────────
+  describe("the upscale + sharpen pass", () => {
+    // In the fake's 1600x1000 canvas: 1280x720 is drawn at 1600x900 (1.25x up),
+    // 1600x900 at 1600x900 (1:1) and 1920x1080 at 1600x900 (a downscale).
+    const frame = (w: number, h: number) => ({ ...fakeFrame(), displayWidth: w, displayHeight: h });
+    const SHARPEN = "upscaleSharpen";
+
+    const present = async (
+      w: number,
+      h: number,
+      opts: { mode?: string; off?: boolean; compileFails?: boolean } = {},
+    ) => {
+      const g = fakeGpu(false, { compileFails: opts.compileFails });
+      if (opts.mode) g.canvas.dataset.scalingMode = opts.mode;
+      if (opts.off) g.canvas.dataset.upscaleSharpen = "off";
+      const fatal: string[] = [];
+      const p = (await createWebGpuPresenter(g.canvas, (m) => fatal.push(m)))!;
+      expect(p).not.toBeNull();
+      expect(p.present(frame(w, h) as unknown as VideoFrame)).toBe(true);
+      return { ...g, fatal, sharpened: g.drawn[0].includes(SHARPEN) };
+    };
+
+    it("draws an upscaled frame through the pass, with the source texel size bound", async () => {
+      const g = await present(1280, 720);
+      expect(g.sharpened).toBe(true);
+      expect(g.samplers[0]).toBe("linear");
+      expect(g.bindings[0]).toBe(4);
+      // Crop first, then the texel uniform: one texel in uv, then the strength.
+      expect(g.crops[1][0]).toBeCloseTo(1 / 1280, 6);
+      expect(g.crops[1][1]).toBeCloseTo(1 / 720, 6);
+    });
+
+    it("keeps the plain pass at 1:1", async () => {
+      const g = await present(1600, 900);
+      expect(g.sharpened).toBe(false);
+      expect(g.bindings[0]).toBe(3);
+    });
+
+    it("keeps the plain pass when the picture is downscaled", async () => {
+      expect((await present(1920, 1080)).sharpened).toBe(false);
+    });
+
+    it("keeps the pixel-exact 1:1 mode out of it, nearest sampler and all", async () => {
+      const g = await present(1280, 720, { mode: "integer" });
+      expect(g.sharpened).toBe(false);
+      expect(g.samplers[0]).toBe("nearest");
+    });
+
+    it("upscales through the pass in every other mode", async () => {
+      for (const mode of ["contain", "cover", "stretch"]) {
+        expect((await present(1280, 720, { mode })).sharpened).toBe(true);
+      }
+    });
+
+    it("honours the switch the HUD writes", async () => {
+      const g = await present(1280, 720, { off: true });
+      expect(g.sharpened).toBe(false);
+      expect(g.bindings[0]).toBe(3);
+    });
+
+    it("sharpens the PyroWave decoder's texture too", async () => {
+      const g = fakeGpu(false);
+      const p = (await createWebGpuPresenter(g.canvas, () => {}))!;
+      const texture = { width: 1280, height: 720, createView: () => ({}) } as unknown as GPUTexture;
+      expect(p.presentTexture!(texture)).toBe(true);
+      expect(g.drawn[0]).toContain(SHARPEN);
+      expect(g.samplers[0]).toBe("linear");
+    });
+
+    it("draws the plain way when the shader does not compile, logs once, and keeps going", async () => {
+      const g = await present(1280, 720, { compileFails: true });
+      expect(g.sharpened).toBe(false);
+      expect(g.fatal).toEqual([]);
+      expect(g.bindings[0]).toBe(3);
+      expect(console.warn).toHaveBeenCalledTimes(1);
+      expect(String((console.warn as unknown as { mock: { calls: unknown[][] } }).mock.calls[0][0])).toContain("upscale+sharpen");
+    });
+  });
+});
+
+describe("shouldUpscaleSharpen (#1349)", () => {
+  // 1280x720 in a 1600x1000 canvas: 1.25x up in contain.
+  it("runs when the frame is smaller than the picture on both axes", () => {
+    expect(shouldUpscaleSharpen("contain", 1600, 1000, 1280, 720)).toBe(true);
+    expect(shouldUpscaleSharpen(undefined, 1600, 1000, 1280, 720)).toBe(true);
+  });
+
+  it("never runs at 1:1 or when downscaling", () => {
+    expect(shouldUpscaleSharpen("contain", 1600, 1000, 1600, 900)).toBe(false);
+    expect(shouldUpscaleSharpen("contain", 1600, 1000, 1920, 1080)).toBe(false);
+    expect(shouldUpscaleSharpen("stretch", 1600, 1000, 1600, 1000)).toBe(false);
+  });
+
+  it("never runs in the pixel-exact integer mode, upscaling or not", () => {
+    expect(shouldUpscaleSharpen("integer", 1600, 1000, 1280, 720)).toBe(false);
+    expect(shouldUpscaleSharpen("integer", 1600, 1000, 1920, 1080)).toBe(false);
+  });
+
+  it("never runs when the user turned it off", () => {
+    expect(shouldUpscaleSharpen("contain", 1600, 1000, 1280, 720, false)).toBe(false);
+  });
+
+  it("counts an upscale into a cropped cover rect as an upscale", () => {
+    // A 4:3 frame in a 16:10 canvas: cover crops the top and bottom and scales 1.25x.
+    expect(shouldUpscaleSharpen("cover", 1600, 1000, 1280, 960)).toBe(true);
+  });
+
+  it("ignores a rounded layout's sub-percent difference, and a frame with no size", () => {
+    expect(shouldUpscaleSharpen("stretch", 1601, 1000, 1600, 1000)).toBe(false);
+    expect(shouldUpscaleSharpen("contain", 1600, 1000, 0, 0)).toBe(false);
   });
 });
 

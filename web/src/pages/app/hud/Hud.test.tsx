@@ -68,6 +68,8 @@ const base = {
   games: <div data-testid="games-pane">Switch game</div>,
   scalingMode: "contain" as const,
   onScalingChange: vi.fn(),
+  upscaleSharpen: true,
+  onUpscaleSharpenChange: vi.fn(),
   streamSize: { w: 1920, h: 1080 },
   renderSize: { w: 1920, h: 1080 },
   onRenderSizeChange: vi.fn(),
