@@ -453,7 +453,9 @@ func TestCleanupDuplicateUnresolvedAttemptRequestsRecoveryWithoutSecondDelete(t 
 	install(t, env.pool, false)
 	env.cleanupWire.cleanup = make(chan agentws.ImageCleanupCmd, 2)
 	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 3)
-	env.cleanupWire.journalRequests = make(chan agentws.ImageCleanupJournalRequestCmd, 1)
+	// Journal requests can be emitted by overlapping cleanup/reconcile callbacks;
+	// leave room for the burst so this fake does not make the test timing-dependent.
+	env.cleanupWire.journalRequests = make(chan agentws.ImageCleanupJournalRequestCmd, 32)
 	entry := agentws.ImageVersionEntry{ImageID: imgID, Version: imgVer2, ImageRef: imgDigest2, RuntimeImageID: "sha256:lost-dispatch", State: "present"}
 	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "current", Capable: true, Complete: true,
 		ReconciledRevision: 1, Versions: []agentws.ImageVersionEntry{entry}})
