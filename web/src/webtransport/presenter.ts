@@ -30,8 +30,7 @@ const shader = (texture: string, upscaleSharpen = false) => /* wgsl */ `
 @group(0) @binding(2) var<uniform> crop: vec4f;
 ${
   upscaleSharpen
-    ? `// One source texel in uv (xy), the reconstruction's edge gain (z) and the sharpen
-// strength (w), for the upscale pass.
+    ? `// One source texel in uv (xy) and the sharpen strength (z), for the upscale pass.
 @group(0) @binding(3) var<uniform> texel: vec4f;`
     : ""
 }
@@ -47,43 +46,41 @@ ${
   upscaleSharpen
     ? `
 fn tap(uv: vec2f) -> vec4f { return textureSampleBaseClampToEdge(t, s, uv); }
-fn luma(c: vec3f) -> f32 { return dot(c, vec3f(0.2126, 0.7152, 0.0722)); }
 
 // The upscale + sharpen pass (#1349), drawn only when the frame is smaller than the
-// rect it is drawn into, so every output pixel sits between source texels. Four filtered
-// taps — the quad the bilinear tap would have blended — in the class of AMD's FSR 1 and
-// CAS, written from the published descriptions of those algorithms rather than ported
-// from either implementation:
+// rect it is drawn into. Written from the published descriptions, not ported:
 //
-//  - Edge-aware upscale: bilinear blends the two sides of an edge into a one-texel ramp,
-//    which is the whole reason a stepped-down stream looks soft. This narrows the blend
-//    weights toward the nearer texel, so an edge comes back tight instead of ramped. The
-//    weights stay in [0,1], so the reconstruction can never leave the quad.
-//  - Contrast-adaptive sharpening (CAS's formula): one term whose amplitude falls as
-//    local contrast rises, so mid-contrast detail — texture, fine text, compression softness
-//    — is sharpened while a hard edge is left to the reconstruction above instead of being
-//    pushed into a halo. That falloff is what makes it adaptive to the picture.
-//  - The anti-ringing bound (RCAS's): the result never leaves the quad's range, so no
-//    amount of sharpening can invent a value the frame did not have.
+//  - Upscale: Catmull-Rom (bicubic) over the 4x4 texels around the pixel, in nine
+//    filtered taps. Its transitions are steeper than bilinear's, and unlike a narrowed
+//    bilinear blend it varies smoothly with position, so thin strokes keep an even width.
+//  - Sharpen: the difference between that and the plain bilinear tap is added back
+//    (an unsharp mask whose blur is the stretch this pass replaces).
+//  - Anti-ringing bound: the result never leaves the range of the four texels around
+//    the pixel, so neither step can draw a halo or a value the frame did not have.
 fn upscaleSharpen(uv: vec2f) -> vec4f {
   let ts = texel.xy;
-  let sp = uv / ts - vec2f(0.5);
-  let base = (floor(sp) + vec2f(0.5)) * ts;
-  let f = sp - floor(sp);
-  let tl = tap(base);
-  let tr = tap(base + vec2f(ts.x, 0.0));
-  let bl = tap(base + vec2f(0.0, ts.y));
-  let br = tap(base + vec2f(ts.x, ts.y));
-  // 1. The reconstruction: narrowed bilinear weights, 1.0 being plain bilinear.
-  let w = clamp((f - vec2f(0.5)) * texel.z + vec2f(0.5), vec2f(0.0), vec2f(1.0));
-  let rec = mix(mix(tl, tr, w.x), mix(bl, br, w.x), w.y);
-  // 2. The sharpen: amplitude from the quad's luma range, in the published CAS shape.
-  let mn = min(min(luma(tl.rgb), luma(tr.rgb)), min(luma(bl.rgb), luma(br.rgb)));
-  let mx = max(max(luma(tl.rgb), luma(tr.rgb)), max(luma(bl.rgb), luma(br.rgb)));
-  let amp = sqrt(clamp(min(mn, 2.0 - mx) / max(mx, 1.0e-3), 0.0, 1.0));
-  let cw = -amp * texel.w * 0.125;
-  let o = (rec + (tl + tr + bl + br) * cw) / (1.0 + 4.0 * cw);
-  return vec4f(clamp(o, min(min(tl, tr), min(bl, br)), max(max(tl, tr), max(bl, br))).rgb, rec.a);
+  let sp = uv / ts;
+  let tc = floor(sp - vec2f(0.5)) + vec2f(0.5);
+  let f = sp - tc;
+  let w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+  let w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+  let w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+  let w3 = f * f * (-0.5 + 0.5 * f);
+  let w12 = w1 + w2;
+  let p0 = (tc - vec2f(1.0)) * ts;
+  let p3 = (tc + vec2f(2.0)) * ts;
+  let p12 = (tc + w2 / w12) * ts;
+  let cr =
+    tap(vec2f(p0.x, p0.y)) * w0.x * w0.y + tap(vec2f(p12.x, p0.y)) * w12.x * w0.y + tap(vec2f(p3.x, p0.y)) * w3.x * w0.y +
+    tap(vec2f(p0.x, p12.y)) * w0.x * w12.y + tap(vec2f(p12.x, p12.y)) * w12.x * w12.y + tap(vec2f(p3.x, p12.y)) * w3.x * w12.y +
+    tap(vec2f(p0.x, p3.y)) * w0.x * w3.y + tap(vec2f(p12.x, p3.y)) * w12.x * w3.y + tap(vec2f(p3.x, p3.y)) * w3.x * w3.y;
+  let bil = tap(uv);
+  let tl = tap(tc * ts);
+  let tr = tap((tc + vec2f(1.0, 0.0)) * ts);
+  let bl = tap((tc + vec2f(0.0, 1.0)) * ts);
+  let br = tap((tc + vec2f(1.0, 1.0)) * ts);
+  let o = cr + (cr - bil) * texel.z;
+  return vec4f(clamp(o, min(min(tl, tr), min(bl, br)), max(max(tl, tr), max(bl, br))).rgb, bil.a);
 }
 `
     : ""
@@ -146,11 +143,7 @@ function upscaleFactor(mode: string | undefined, cw: number, ch: number, fw: num
  */
 const UPSCALE_SHARPEN_MIN_SCALE = 1.01;
 
-/** How far the reconstruction narrows the bilinear blend toward the nearer texel:
- *  1 is plain bilinear, higher is tighter edges. */
-const UPSCALE_SHARPEN_EDGE = 1.7;
-
-/** CAS's own amount: the published formula's `w`, before the amplitude falloff. */
+/** How much of (bicubic − bilinear) is added back: 0 is bicubic alone. */
 const UPSCALE_SHARPEN_STRENGTH = 1;
 
 export function shouldUpscaleSharpen(
@@ -323,7 +316,7 @@ export async function createWebGpuPresenter(
       { binding: 2, resource: { buffer: cropBuffer } },
     ];
     if (sharpen) {
-      texelData.set([1 / fw, 1 / fh, UPSCALE_SHARPEN_EDGE, UPSCALE_SHARPEN_STRENGTH]);
+      texelData.set([1 / fw, 1 / fh, UPSCALE_SHARPEN_STRENGTH, 0]);
       device.queue.writeBuffer(texelBuffer, 0, texelData);
       entries.push({ binding: 3, resource: { buffer: texelBuffer } });
     }
