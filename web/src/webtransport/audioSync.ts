@@ -13,7 +13,7 @@ const VIDEO_SAMPLES = 120;
 export const MIN_TARGET_MS = 40;
 /** A video latency this long is a stall, not a delay to match. */
 export const MAX_TARGET_MS = 150;
-/** Audio packets behind the jitter estimate: ten seconds at 10 ms. */
+/** Audio packets behind the jitter estimate: ten seconds at the contract's one 10 ms packet per datagram. */
 const JITTER_SAMPLES = 1_000;
 /** One packet later than this past the floor is a stall, not jitter to cover: it is lost to
  *  playback either way, and covering it would hold audio that far behind its video for the
@@ -38,12 +38,14 @@ export class AudioSync {
   /** An audio packet arrived at `arrivalMs`: updates the delay floor (arrival − capture). */
   noteAudio(captureUs: number, arrivalMs: number): void {
     const owd = arrivalMs - captureUs / 1000;
-    const before = this.floor();
     const bucket = Math.floor(arrivalMs / BUCKET_MS);
+    // Before the lateness is read: a floor older than the window (a frozen tab, a long silence)
+    // says nothing about this packet.
+    while (this.floors.length > 0 && this.floors[0].bucket <= bucket - BUCKETS) this.floors.shift();
+    const before = this.floor();
     const last = this.floors[this.floors.length - 1];
     if (last?.bucket === bucket) last.min = Math.min(last.min, owd);
     else this.floors.push({ bucket, min: owd });
-    while (this.floors.length > 0 && this.floors[0].bucket <= bucket - BUCKETS) this.floors.shift();
     this.excess.push(Math.max(0, owd - (before ?? owd)));
     if (this.excess.length > JITTER_SAMPLES) this.excess.shift();
   }

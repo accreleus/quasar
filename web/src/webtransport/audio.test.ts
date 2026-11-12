@@ -130,6 +130,14 @@ describe("AudioSync", () => {
     expect(s.jitterMs()).toBe(0);
   });
 
+  it("reads no lateness off a floor older than its window (a frozen tab)", () => {
+    const s = new AudioSync();
+    for (let i = 0; i < 100; i++) s.noteAudio(1_000_000 + i * 10_000, 1_000 + i * 10 + 100);
+    // Thirty seconds of nothing, then packets again with the path 30 ms longer.
+    for (let i = 0; i < 30; i++) s.noteAudio(40_000_000 + i * 10_000, 40_000 + i * 10 + 130);
+    expect(s.jitterMs()).toBe(0);
+  });
+
   it("does not hold audio back for a stall: one packet 200 ms late adds no more than the bound", () => {
     const s = new AudioSync();
     for (let i = 0; i < 100; i++) s.noteAudio(1_000_000 + i * 10_000, 1_000 + i * 10 + 100);
