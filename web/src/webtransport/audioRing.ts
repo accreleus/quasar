@@ -45,6 +45,10 @@ export const MAX_STRETCH_FRAMES = 2_880;
  *  two it takes, that shifts pitch by a third of a semitone, not a click — the accepted trade
  *  here, where a resampler is all this needs and a phase vocoder or WSOLA is not. */
 export const STRETCH_RATE = 0.02;
+/** A correction under way runs until the step is this small (1 ms at 48 kHz), not until it is
+ *  inside the slack: stopping there would leave the queue 5 ms ahead of the delay it was given,
+ *  which is 5 ms of the jitter cover gone. */
+export const STRETCH_DONE_FRAMES = 48;
 
 export class AudioRing {
   private queue: Chunk[] = [];
@@ -77,8 +81,12 @@ export class AudioRing {
       this.stats.dropped += 1;
       return;
     }
+    // By start time only around a concealment fade, which is posted ahead of real chunks still
+    // in the decoder. Real chunks arrive in stream order and keep it: a fall in the playout
+    // delay of a chunk or more makes a later chunk's start the earlier one, and sorting on it
+    // would play them out of order.
     let at = this.queue.length;
-    while (at > 0 && this.queue[at - 1].start > start) at--;
+    while (at > 0 && this.queue[at - 1].start > start && (concealed || this.queue[at - 1].concealed)) at--;
     this.queue.splice(at, 0, { start, nominal: start, planes, frames, off: 0, out: 0, concealed, settled: false });
     this.queued += frames;
   }
@@ -139,8 +147,8 @@ export class AudioRing {
    *  back to back; it is closed by playing slightly slower (a rise: the audio we have is now
    *  early) or faster (a fall) from where the last chunk ended, instead of by a gap of silence
    *  or a cut head. Everything else keeps the old behaviour: the queue ran dry, audio is lost
-   *  behind a concealment fade, the stream skipped exactly one chunk (a packet that never
-   *  arrived), or the step is over the bound (a stall or a reset). */
+   *  behind a concealment fade, the stream skipped a whole number of chunks (packets that
+   *  never arrived), or the step is over the bound (a stall or a reset). */
   private align(chunk: Chunk, f: number): void {
     const end = this.lastEnd;
     const correcting = this.rate !== 1;
@@ -155,9 +163,9 @@ export class AudioRing {
     const jump = this.prevStart === null ? obs : chunk.start - (this.prevStart + this.prevFrames);
     const step =
       end === f &&
-      !this.oneChunk(jump) &&
+      !this.lostChunks(jump) &&
       !(this.prevConcealed && jump > this.slack) &&
-      Math.abs(obs) > this.slack &&
+      Math.abs(obs) > (correcting ? STRETCH_DONE_FRAMES : this.slack) &&
       Math.abs(obs) <= MAX_STRETCH_FRAMES &&
       (correcting || Math.abs(obs - jump) <= this.slack);
     if (step) {
@@ -179,12 +187,15 @@ export class AudioRing {
     }
   }
 
-  /** Exactly one chunk's worth of the stream's starts skipped (within an eighth of a chunk,
-   *  1.25 ms): a packet that never arrived, not a delay change, which lands on any offset. A
-   *  delay that happens to be exactly one chunk plays as it did before this, as silence. */
-  private oneChunk(jump: number): boolean {
+  /** A whole number of chunks of the stream's starts skipped (within a twentieth of a chunk,
+   *  0.5 ms): packets that never arrived or came too late to post, not a delay change, which
+   *  lands on any offset. A rise in the delay that happens to be a whole number of chunks plays
+   *  as it did before this, as silence. A fall is never lost audio. */
+  private lostChunks(jump: number): boolean {
     const frames = this.prevFrames;
-    return frames > 0 && Math.abs(Math.abs(jump) - frames) <= frames / 8;
+    if (frames <= 0 || jump <= 0) return false;
+    const k = Math.round(jump / frames);
+    return k >= 1 && Math.abs(jump - k * frames) <= frames / 20;
   }
 
   /** Play `chunk` on from `pos`, at real time. */

@@ -7,7 +7,7 @@ import { mintTransportToken } from "../api/library";
 import { MicCaptureError } from "../webrtc/mic";
 import { newPostedCounters, type PostedCounters } from "../webrtc/telemetry";
 import { AudioOut, LATE_RUN_RESET, type ContextLike } from "./audioOut";
-import { AudioRing, MAX_STRETCH_FRAMES, SLACK_FRAMES } from "./audioRing";
+import { AudioRing, MAX_STRETCH_FRAMES, SLACK_FRAMES, STRETCH_DONE_FRAMES } from "./audioRing";
 import { AudioSync, MAX_JITTER_MS, MAX_TARGET_MS, MIN_TARGET_MS } from "./audioSync";
 import { CHANNEL_AUDIO, encodeMicDatagram, parseAudioDatagram } from "./framing";
 import { MicOut } from "./micOut";
@@ -261,9 +261,10 @@ describe("AudioRing", () => {
     expect(ring.stats).toMatchObject({ underrunFrames: 0, underrunEvents: 0 });
   });
 
-  it("orders chunks that arrive out of order and drops the ones that are already past", () => {
+  it("puts a real chunk ahead of a concealment fade posted before it, and drops what is already past", () => {
     const ring = new AudioRing();
-    ring.push(480, chunk(480, 2), 0);
+    // The fade for a lost packet is posted at once; the chunk before it is still in the decoder.
+    ring.push(480, chunk(480, 2), 0, true);
     ring.push(0, chunk(480, 1), 0);
     ring.push(0, chunk(100, 9), 5_000); // wholly past the render position
     expect(ring.stats.dropped).toBe(1);
@@ -341,28 +342,26 @@ describe("AudioRing across a playout delay change", () => {
 
   it("closes a 12 ms rise in the playout delay by stretching: no silence, no dropout, timeline converges", () => {
     const starts = stepped(120, 20, 576);
-    const { out, ring } = play(starts, 60, 470);
+    const { out, ring } = play(starts, 90, 470);
     expect(ring.stats).toMatchObject({ underrunFrames: 0, underrunEvents: 0, dropped: 0 });
     expect(out.includes(0)).toBe(false);
-    // 40 chunks after the step the stretch has caught up: a marker is heard at its own start,
-    // not the 12 ms early the stretch began from.
-    expect(Math.abs(heard(out) - starts[60])).toBeLessThanOrEqual(SLACK_FRAMES);
+    // 576 frames at 2 % of 480 a chunk is 60 chunks; 70 chunks after the step the stretch has
+    // caught up: a marker is heard at its own start, not the 12 ms early the stretch began from.
+    expect(Math.abs(heard(out) - starts[90])).toBeLessThanOrEqual(STRETCH_DONE_FRAMES + 10);
   });
 
-  it("closes a 40 ms rise the same way, at 2 % until the timeline has caught up", () => {
-    const starts = stepped(260, 20, 1920);
-    const { out, ring } = play(starts, 200, 1_000);
+  it("closes a 42 ms rise the same way, at 2 % until the timeline has caught up", () => {
+    const starts = stepped(260, 20, 2016);
+    const { out, ring } = play(starts, 240, 1_000);
     expect(ring.stats).toMatchObject({ underrunFrames: 0, underrunEvents: 0, dropped: 0 });
     expect(out.includes(0)).toBe(false);
-    // 168 chunks at 2 % of 480 frames is 180 chunks of 10 ms; the marker sits 180 after the step.
-    expect(Math.abs(heard(out) - starts[200])).toBeLessThanOrEqual(SLACK_FRAMES);
+    // 2,016 frames at 2 % of 480 a chunk is 210 chunks; the marker sits 220 after the step.
+    expect(Math.abs(heard(out) - starts[240])).toBeLessThanOrEqual(STRETCH_DONE_FRAMES + 10);
   });
 
-  it("closes a fall in the playout delay by playing slightly faster: no head cut out of the stream", () => {
-    // A fall of a whole chunk or more makes consecutive starts run backwards, which reorders the
-    // queue; 8 ms is the largest fall that keeps the stream's own order. Each chunk carries its
-    // samples' index, so a cut head shows as a jump in what is played instead of a smooth 2 %.
-    const starts = stepped(120, 20, -384);
+  /** Streams 120 chunks whose samples are their own index, the starts stepped by `step` at chunk 20. */
+  function indexed(step: number) {
+    const starts = stepped(120, 20, step);
     const ring = new AudioRing();
     const out: number[] = [];
     let next = 0;
@@ -384,12 +383,25 @@ describe("AudioRing across a playout delay change", () => {
       ring.render(buf, f);
       for (const x of buf[0]) out.push(x);
     }
+    return { out, ring };
+  }
+
+  // 8 ms keeps the stream's starts in order; 12 ms and 40 ms make a later chunk's start the
+  // earlier one, which a queue sorted on start alone would play out of order.
+  it.each([-384, -576, -1920])("closes a fall of %i frames by playing slightly faster: no cut, nothing out of order", (step) => {
+    const { out, ring } = indexed(step);
     expect(ring.stats).toMatchObject({ underrunFrames: 0, underrunEvents: 0, dropped: 0 });
-    // A cut head jumps by the whole overlap (384 frames); a squeeze steps by about one sample, and
-    // the last of it, within the slack, is closed back to back as everything that close is.
+    // Each sample is its own index: a cut head or a reordered chunk is a jump (back, or by the
+    // whole overlap); a squeeze steps by about one sample, and its last millisecond is closed
+    // back to back.
     let jump = 0;
-    for (let i = 1; i < out.length; i++) jump = Math.max(jump, Math.abs(out[i] - out[i - 1]));
-    expect(jump).toBeLessThanOrEqual(SLACK_FRAMES + 2);
+    let back = 0;
+    for (let i = 1; i < out.length; i++) {
+      jump = Math.max(jump, out[i] - out[i - 1]);
+      back = Math.min(back, out[i] - out[i - 1]);
+    }
+    expect(back).toBeGreaterThanOrEqual(0);
+    expect(jump).toBeLessThanOrEqual(STRETCH_DONE_FRAMES + 12);
   });
 
   it("leaves a step over the bound as the silence it was: a stall or a reset, not a delay", () => {
@@ -404,6 +416,18 @@ describe("AudioRing across a playout delay change", () => {
     const starts = [...Array.from({ length: 20 }, (_, k) => k * PTIME), ...Array.from({ length: 40 }, (_, k) => (21 + k) * PTIME)];
     const { ring } = play(starts, -1, 200);
     expect(ring.stats).toMatchObject({ underrunFrames: PTIME, underrunEvents: 1, dropped: 0 });
+  });
+
+  it("plays a rise of a whole number of chunks as the silence it was: it cannot be told from lost packets", () => {
+    const starts = stepped(60, 20, 1920); // 40 ms: four chunks exactly
+    const { ring } = play(starts, -1, 280);
+    expect(ring.stats).toMatchObject({ underrunFrames: 1920, underrunEvents: 1, dropped: 0 });
+  });
+
+  it("still counts two chunks in a row that never arrived: lost audio is not a delay change", () => {
+    const starts = [...Array.from({ length: 20 }, (_, k) => k * PTIME), ...Array.from({ length: 40 }, (_, k) => (22 + k) * PTIME)];
+    const { ring } = play(starts, -1, 200);
+    expect(ring.stats).toMatchObject({ underrunFrames: 2 * PTIME, underrunEvents: 1, dropped: 0 });
   });
 
   it("plays steady state back to back sample for sample, with no resampling at all", () => {
