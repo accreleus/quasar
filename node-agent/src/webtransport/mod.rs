@@ -59,6 +59,8 @@ const TOKEN_SKEW: Duration = Duration::from_secs(15);
 const TOKEN_TTL: Duration = Duration::from_secs(60);
 const ROTATION_CHECK: Duration = Duration::from_secs(60);
 const DEFAULT_PORT: u16 = 4433;
+/// quinn's own default; `congestion::Backlog` reads the queue's fill against it.
+const DATAGRAM_BUFFER: usize = 1 << 20;
 
 const CLOSE_NORMAL: u32 = 0;
 const CLOSE_PROTOCOL: u32 = 4400;
@@ -129,10 +131,16 @@ struct Control<'a> {
     fec: Option<fec::Policy>,
     /// The FEC overhead the ABR was last charged for, which is all the repairs may spend.
     charged: f64,
+    governor: congestion::Governor,
 }
 
 impl<'a> Control<'a> {
-    fn new(rate: &'a Rate, gone: Arc<OnceLock<Gone>>, fec: bool) -> Self {
+    fn new(
+        rate: &'a Rate,
+        gone: Arc<OnceLock<Gone>>,
+        fec: bool,
+        governor: congestion::Governor,
+    ) -> Self {
         let now = std::time::Instant::now();
         Self {
             rate,
@@ -143,10 +151,11 @@ impl<'a> Control<'a> {
             gone,
             fec: fec.then(fec::Policy::default),
             charged: 0.0,
+            governor,
         }
     }
 
-    fn feedback(&mut self, message: &Value, session: &Session) {
+    fn feedback(&mut self, message: &Value, path: congestion::QuicPath, now: std::time::Instant) {
         let fb = match congestion::feedback_of(message) {
             Ok(fb) => fb,
             Err(field) => {
@@ -162,13 +171,6 @@ impl<'a> Control<'a> {
                 return;
             }
         };
-        let path = quinn::Connection::stats(session).path;
-        let path = congestion::QuicPath {
-            rtt: path.rtt,
-            cwnd_bytes: path.cwnd,
-            congestion_events: path.congestion_events,
-        };
-        let now = std::time::Instant::now();
         let estimate = self.estimator.on_feedback(&fb, &mut self.log, now, path);
         // Before the estimate is fed: the encoder's share follows the level this loss sets.
         if let (Some(fec), Some(loss)) = (self.fec.as_mut(), self.estimator.loss()) {
@@ -185,13 +187,20 @@ impl<'a> Control<'a> {
         }
         if let Some(kbps) = estimate {
             self.feed(kbps);
+            // QUIC's loss response is given up only while the estimate drives the encoder
+            // from live feedback; the encoder never goes under the ABR's floor, so neither
+            // does the window.
+            if self.rate.retargets && self.gone.get().is_none() {
+                self.governor.govern(kbps.max((self.rate.floor_kbps)()));
+            }
         }
     }
 
-    fn tick(&mut self, session: &Session) {
-        let rtt = quinn::Connection::rtt(session);
-        let now = std::time::Instant::now();
+    fn tick(&mut self, rtt: Duration, now: std::time::Instant) {
         if let Some(kbps) = self.estimator.on_tick(now, &self.log, rtt) {
+            // Feedback has gone silent: the decay holds the encoder at the floor at best, and
+            // that may still overrun the path, so Cubic takes it back until feedback returns.
+            self.governor.release();
             self.feed(kbps);
         }
     }
@@ -690,6 +699,8 @@ pub struct Listener {
     /// The certificate a failed swap last warned about.
     reload_failed: Mutex<Option<String>>,
     quic: quinn::Endpoint,
+    /// What each connection is accepted with, but for its own transport.
+    config: quinn::ServerConfig,
     port: u16,
     limits: Limits,
 }
@@ -824,6 +835,17 @@ fn tls_config(served: Arc<Served>) -> Result<rustls::ServerConfig> {
 fn server_config(served: Arc<Served>) -> Result<quinn::ServerConfig> {
     let tls = tls_config(served)?;
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    // A placeholder: a transport's congestion factory, and so its `Governor`, would be shared
+    // by every connection, so `serve` accepts each with its own (`accept_with`).
+    config
+        .transport_config(Arc::new(transport(congestion::Governor::default())))
+        .max_incoming(4 * MAX_UNAUTHENTICATED);
+    Ok(config)
+}
+
+/// One connection's transport: its congestion window is set through `governor`.
+fn transport(governor: congestion::Governor) -> quinn::TransportConfig {
     // Bounds on what one peer can make the agent hold. Two bidirectional streams are the
     // CONNECT stream and the control stream; HTTP/3 needs three unidirectional ones.
     let mut transport = quinn::TransportConfig::default();
@@ -832,14 +854,12 @@ fn server_config(served: Arc<Served>) -> Result<quinn::ServerConfig> {
         .max_concurrent_uni_streams(8u32.into())
         .stream_receive_window(65_536u32.into())
         .receive_window((1u32 << 20).into())
-        .max_idle_timeout(Some(Duration::from_secs(10).try_into()?))
+        .max_idle_timeout(Some(quinn::VarInt::from_u32(10_000).into()))
         .keep_alive_interval(Some(Duration::from_secs(3)))
-        .datagram_receive_buffer_size(Some(65_536));
-    let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-    config
-        .transport_config(Arc::new(transport))
-        .max_incoming(4 * MAX_UNAUTHENTICATED);
-    Ok(config)
+        .datagram_receive_buffer_size(Some(65_536))
+        .datagram_send_buffer_size(DATAGRAM_BUFFER)
+        .congestion_controller_factory(Arc::new(congestion::WindowFactory(governor)));
+    transport
 }
 
 impl Listener {
@@ -851,7 +871,8 @@ impl Listener {
         let certs = CertSet::new(SystemTime::now())?;
         let served = Served::new(certs.presented(SystemTime::now()))?;
         let config = server_config(served.clone())?;
-        let quic = quinn::Endpoint::server(config, addr).context("bind the QUIC listener")?;
+        let quic =
+            quinn::Endpoint::server(config.clone(), addr).context("bind the QUIC listener")?;
         let port = quic.local_addr()?.port();
         Ok(Arc::new(Self {
             registry,
@@ -859,6 +880,7 @@ impl Listener {
             served,
             reload_failed: Mutex::default(),
             quic,
+            config,
             port,
             limits,
         }))
@@ -951,7 +973,16 @@ impl Listener {
             }
             match gate.take(incoming.remote_address().ip()) {
                 Some(slot) => {
-                    tokio::spawn(connection(incoming, self.registry.clone(), slot));
+                    let governor = congestion::Governor::default();
+                    let mut config = self.config.clone();
+                    config.transport_config(Arc::new(transport(governor.clone())));
+                    tokio::spawn(connection(
+                        incoming,
+                        Arc::new(config),
+                        governor,
+                        self.registry.clone(),
+                        slot,
+                    ));
                 }
                 None => incoming.refuse(),
             }
@@ -1092,6 +1123,35 @@ fn retransmit_window(session: &Session) -> Duration {
     retransmit::WINDOW.max(quinn::Connection::rtt(session) * 2)
 }
 
+/// The backlog guard's verdict on the next video unit or `nack` answer; a skip that wants a
+/// keyframe has asked for it.
+fn admit(
+    backlog: &mut congestion::Backlog,
+    session: &Session,
+    media: &Media,
+    keyframe: bool,
+) -> congestion::Admit {
+    let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
+    let hold = retransmit_window(session);
+    let admit = backlog.admit(queued, keyframe, std::time::Instant::now(), hold);
+    if admit == congestion::Admit::SkipForKeyframe {
+        media.keyframe();
+    }
+    admit
+}
+
+/// How a stream ends when no keyframe gets through its datagram queue: as an unusable
+/// encoder ends it. The browser ignores the `error` and reconnects over WebTransport once on
+/// the close; a second loss falls back to WebRTC (`stream_lost`).
+fn stalled() -> (Option<Value>, u32, &'static str) {
+    let message = "no keyframe got through the datagram queue";
+    (
+        Some(json!({"type": "error", "code": "internal", "message": message})),
+        CLOSE_NORMAL,
+        "",
+    )
+}
+
 /// Send `nack` answers; false when the connection is gone. A resend the path's maximum
 /// datagram size has shrunk below is dropped and counted: the client gives that frame up.
 fn resend(
@@ -1165,9 +1225,18 @@ async fn datagrams(session: Session, authed: Arc<OnceLock<(Arc<Media>, u64)>>) {
 
 /// One connection, from QUIC accept. The 5 s hello deadline runs from here, over the
 /// QUIC and HTTP/3 handshakes as well as the `hello` itself.
-async fn connection(incoming: quinn::Incoming, registry: Arc<Registry>, slot: Slot) {
+async fn connection(
+    incoming: quinn::Incoming,
+    config: Arc<quinn::ServerConfig>,
+    governor: congestion::Governor,
+    registry: Arc<Registry>,
+    slot: Slot,
+) {
     let deadline = Instant::now() + HELLO_DEADLINE;
-    let Ok(Ok(conn)) = timeout_at(deadline, incoming).await else {
+    let Ok(connecting) = incoming.accept_with(config) else {
+        return;
+    };
+    let Ok(Ok(conn)) = timeout_at(deadline, connecting).await else {
         return;
     };
     let session = async { Request::accept(conn.clone()).await.ok()?.ok().await.ok() };
@@ -1201,7 +1270,7 @@ async fn connection(incoming: quinn::Incoming, registry: Arc<Registry>, slot: Sl
         Ok(Ok((send, recv, message))) => match serde_json::from_value::<Hello>(message) {
             Ok(hello) if hello.kind == "hello" => {
                 authenticate(
-                    &session, send, recv, &registry, hello, slot, deadline, &authed,
+                    &session, send, recv, &registry, hello, slot, deadline, &authed, governor,
                 )
                 .await;
             }
@@ -1263,6 +1332,7 @@ async fn authenticate(
     slot: Slot,
     deadline: Instant,
     authed: &OnceLock<(Arc<Media>, u64)>,
+    governor: congestion::Governor,
 ) {
     // Checked before the token is spent: a peer that cannot take 1200-byte-budget
     // datagrams (or none) could never be sent video.
@@ -1317,7 +1387,7 @@ async fn authenticate(
     }
     drop(slot);
     let _ = authed.set((media.clone(), client.id));
-    stream(session, send, recv, &media, client, fec).await;
+    stream(session, send, recv, &media, client, fec, governor).await;
 }
 
 /// Hand the client its video until it leaves, is displaced or the session ends.
@@ -1328,6 +1398,7 @@ async fn stream(
     media: &Arc<Media>,
     mut client: Attached,
     fec: bool,
+    governor: congestion::Governor,
 ) {
     let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(16);
     let reader = tokio::spawn(async move {
@@ -1347,7 +1418,10 @@ async fn stream(
     let mut warned_oversized = false;
     let mut control = media
         .rate()
-        .map(|rate| Control::new(rate, client.gone.clone(), fec));
+        .map(|rate| Control::new(rate, client.gone.clone(), fec, governor.clone()));
+    let mut backlog = congestion::Backlog::default();
+    // Every datagram given to quinn: what it put on the wire is in its stats.
+    let mut handed = 0u64;
     let mut control_tick = tokio::time::interval(congestion::REPORT_EVERY);
     control_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Nothing is sent before `hello_ack`: what queued up behind it is stale.
@@ -1364,7 +1438,7 @@ async fn stream(
             // ABR (B09, #1058), so nothing sent then is logged, and no estimate is fed.
             _ = control_tick.tick(), if control.is_some() && current.codec != "pyrowave" => {
                 if let Some(control) = control.as_mut() {
-                    control.tick(session);
+                    control.tick(quinn::Connection::rtt(session), std::time::Instant::now());
                 }
             }
             packet = client.audio.recv(), if audio_open => match packet {
@@ -1374,6 +1448,7 @@ async fn stream(
                     // Not in the send log: the estimate is the video ABR's, and on WebRTC
                     // audio is a peer connection GCC never sees. Feedback naming an audio
                     // `pkt_seq` finds no record and counts for nothing.
+                    handed += 1;
                     if session.send_datagram(audio::datagram(&packet, seq)).is_err() {
                         break QUIET;
                     }
@@ -1391,6 +1466,12 @@ async fn stream(
             out = client.rx.recv() => match out {
                 Some(Out::Unit(unit)) if unit.config_id != current.config_id => {}
                 Some(Out::Unit(unit)) => {
+                    match admit(&mut backlog, session, media, unit.keyframe || unit.pyrowave) {
+                        congestion::Admit::Send => {}
+                        congestion::Admit::GiveUp => break stalled(),
+                        _ => continue,
+                    }
+                    let now = std::time::Instant::now();
                     let max = session.max_datagram_size().min(media::MAX_DATAGRAM);
                     let Some(mut datagrams) = media::packetize(&unit, &current, max, &mut pkt_seq) else {
                         if !warned_oversized {
@@ -1411,7 +1492,6 @@ async fn stream(
                     };
                     // codec-pyrowave.md §Loss: a PyroWave frame is never retransmitted, so it is
                     // never kept; a NACK naming it is ignored (`pyrowave_frames`).
-                    let now = std::time::Instant::now();
                     if unit.pyrowave {
                         pyrowave_frames.remember(unit.frame_seq);
                     } else {
@@ -1427,6 +1507,7 @@ async fn stream(
                     // shortcut: a PyroWave frame (~380 datagrams at 1080p/200) goes as one burst;
                     // §Rate's SHOULD pace over half a frame interval is B09 (#1058).
                     let mut log = control.as_mut().filter(|_| !unit.pyrowave).map(|c| &mut c.log);
+                    handed += datagrams.len() as u64;
                     let sent = datagrams.into_iter().try_for_each(|d| {
                         if let Some(log) = log.as_deref_mut() {
                             log.record(&d, now, false);
@@ -1469,29 +1550,41 @@ async fn stream(
                         // retransmission and no nack_miss.
                         Some("nack") if nack_of(&message).is_some_and(|(seq, _)| pyrowave_frames.ignores(seq)) => {}
                         Some("nack") if !nack_budget.take(std::time::Instant::now()) => nacks_capped += 1,
-                        Some("nack") => {
-                            let answer = nack_of(&message).map(|(frame_seq, ranges)| {
-                                let window = retransmit_window(session);
-                                let now = std::time::Instant::now();
-                                (frame_seq, sent.answer(frame_seq, &ranges, &mut pkt_seq, now, window))
-                            });
-                            if let Some((frame_seq, answer)) = answer {
-                                let log = control.as_mut().map(|c| &mut c.log);
-                                if !resend(session, answer.resend, log, &mut resends_too_large) {
-                                    break QUIET;
-                                }
-                                if !answer.missed.is_empty() {
-                                    let miss = json!({"type": "nack_miss", "frame_seq": frame_seq, "frags": answer.missed});
-                                    let write = write_message(&mut send, &miss);
-                                    if !matches!(tokio::time::timeout(CONTROL_WRITE, write).await, Ok(Ok(()))) {
+                        Some("nack") => match admit(&mut backlog, session, media, false) {
+                            congestion::Admit::GiveUp => break stalled(),
+                            // Behind a stalled queue a resend is as stale as new video.
+                            congestion::Admit::Skip | congestion::Admit::SkipForKeyframe => {}
+                            congestion::Admit::Send => {
+                                let answer = nack_of(&message).map(|(frame_seq, ranges)| {
+                                    let window = retransmit_window(session);
+                                    let now = std::time::Instant::now();
+                                    (frame_seq, sent.answer(frame_seq, &ranges, &mut pkt_seq, now, window))
+                                });
+                                if let Some((frame_seq, answer)) = answer {
+                                    let log = control.as_mut().map(|c| &mut c.log);
+                                    handed += answer.resend.len() as u64;
+                                    if !resend(session, answer.resend, log, &mut resends_too_large) {
                                         break QUIET;
+                                    }
+                                    if !answer.missed.is_empty() {
+                                        let miss = json!({"type": "nack_miss", "frame_seq": frame_seq, "frags": answer.missed});
+                                        let write = write_message(&mut send, &miss);
+                                        if !matches!(tokio::time::timeout(CONTROL_WRITE, write).await, Ok(Ok(()))) {
+                                            break QUIET;
+                                        }
                                     }
                                 }
                             }
-                        }
+                        },
                         Some("feedback") if current.codec != "pyrowave" => {
                             if let Some(control) = control.as_mut() {
-                                control.feedback(&message, session);
+                                let path = quinn::Connection::stats(session).path;
+                                let path = congestion::QuicPath {
+                                    rtt: path.rtt,
+                                    cwnd_bytes: path.cwnd,
+                                    congestion_events: path.congestion_events,
+                                };
+                                control.feedback(&message, path, std::time::Instant::now());
                             }
                         }
                         Some("input") => {
@@ -1517,6 +1610,20 @@ async fn stream(
     };
     reader.abort();
     media.detach(client.id);
+    let quic = quinn::Connection::stats(session);
+    tracing::info!(
+        token = "webtransport-client-quic-stats",
+        datagrams_handed_incl_audio_and_resends = handed,
+        datagrams_sent = quic.frame_tx.datagram,
+        units_and_nack_answers_skipped_total = backlog.skipped,
+        governed = governor.governs(),
+        governed_kbps = governor.kbps(),
+        lost_packets = quic.path.lost_packets,
+        congestion_events = quic.path.congestion_events,
+        cwnd_bytes = quic.path.cwnd,
+        rtt_ms = quic.path.rtt.as_millis() as u64,
+        "WebTransport client left; what quinn did with its datagrams"
+    );
     if nacks_capped + resends_too_large > 0 {
         tracing::debug!(
             token = "webtransport-nack-dropped",

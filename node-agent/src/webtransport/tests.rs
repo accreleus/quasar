@@ -519,6 +519,8 @@ enum Stream {
     Av1,
     /// An AV1 encoder whose keyframes carry no sequence header.
     Av1NoSequenceHeader,
+    /// AV1 at about 4 Mbit/s: 16 kB frames.
+    Av1Heavy,
 }
 
 /// A stand-in for an encoder and parser the image does not have: one unit every 33 ms,
@@ -552,7 +554,12 @@ fn synthetic(stream: Stream) -> gst::Pipeline {
     std::thread::spawn(move || {
         for n in 0u64.. {
             let key = n == 0 || forced.swap(false, std::sync::atomic::Ordering::SeqCst);
-            let body = if key { 3000 } else { 400 };
+            let body = match (stream, key) {
+                (Stream::Av1Heavy, true) => 48_000,
+                (Stream::Av1Heavy, false) => 16_000,
+                (_, true) => 3000,
+                (_, false) => 400,
+            };
             let data = match stream {
                 Stream::H265 => streams::hevc_au(key.then_some(if n == 0 { 19 } else { 21 }), body),
                 Stream::Av1NoSequenceHeader => streams::av1_tu(false, body),
@@ -1045,7 +1052,9 @@ fn carries_random_access(stream: Stream, data: &[u8]) -> bool {
         Stream::H265 => streams::hevc_types(data)
             .iter()
             .any(|t| (16..=23).contains(t)),
-        Stream::Av1 | Stream::Av1NoSequenceHeader => streams::obu_types(data).contains(&1),
+        Stream::Av1 | Stream::Av1NoSequenceHeader | Stream::Av1Heavy => {
+            streams::obu_types(data).contains(&1)
+        }
     }
 }
 
@@ -1282,6 +1291,395 @@ impl Bottleneck {
             "recv_kbps": 0, "lost": lost, "interval_ms": 50,
         }))
     }
+}
+
+/// A UDP hop between the test client and the agent. Each datagram the agent sends is held
+/// as long as `impair` says, or dropped on `None`; the client's go straight through.
+async fn relay(agent: u16, mut impair: impl FnMut() -> Option<Duration> + Send + 'static) -> u16 {
+    use tokio::net::UdpSocket;
+    let front = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let back = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    back.connect(("127.0.0.1", agent)).await.unwrap();
+    let port = front.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut up, mut down) = ([0u8; 2048], [0u8; 2048]);
+        let mut client = None;
+        loop {
+            tokio::select! {
+                r = front.recv_from(&mut up) => {
+                    let Ok((n, from)) = r else { return };
+                    client = Some(from);
+                    let _ = back.send(&up[..n]).await;
+                }
+                r = back.recv(&mut down) => {
+                    let Ok(n) = r else { return };
+                    let (Some(to), Some(hold)) = (client, impair()) else { continue };
+                    let (front, bytes) = (front.clone(), down[..n].to_vec());
+                    tokio::spawn(async move {
+                        tokio::time::sleep(hold).await;
+                        let _ = front.send_to(&bytes, to).await;
+                    });
+                }
+            }
+        }
+    });
+    port
+}
+
+/// The client's §Feedback on a path that may reorder: arrivals by `pkt_seq`, each range
+/// reported once everything in it has arrived or a later datagram has.
+#[derive(Default)]
+struct Arrivals {
+    start: Option<std::time::Instant>,
+    /// `pkt_seq` → µs after `start`.
+    seen: BTreeMap<u32, u64>,
+    next: Option<u32>,
+    seq: u64,
+}
+
+impl Arrivals {
+    fn receive(&mut self, d: &[u8]) {
+        let pkt_seq = u32::from_le_bytes(d[1..5].try_into().unwrap());
+        let start = *self.start.get_or_insert_with(std::time::Instant::now);
+        self.next.get_or_insert(pkt_seq);
+        self.seen
+            .insert(pkt_seq, start.elapsed().as_micros() as u64);
+    }
+
+    fn feedback(&mut self) -> Option<Value> {
+        let first = self.next?;
+        let last = *self.seen.keys().next_back()?;
+        let count = (last.checked_sub(first)? + 1).min(8192);
+        let ref_us = self
+            .seen
+            .range(first..first + count)
+            .map(|(_, &t)| t)
+            .min()?;
+        let mut bytes = Vec::new();
+        let mut lost = 0;
+        for s in first..first + count {
+            let unit = match self.seen.remove(&s) {
+                Some(t) => (((t - ref_us) / 50).min(0xFFFE)) as u16,
+                None => {
+                    lost += 1;
+                    0xFFFF
+                }
+            };
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        self.next = Some(first + count);
+        self.seen.retain(|&s, _| s >= first + count);
+        self.seq += 1;
+        Some(json!({
+            "type": "feedback", "seq": self.seq,
+            "first_pkt_seq": first, "count": count,
+            "ref_us": ref_us,
+            "arrivals_b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+            "recv_kbps": 0, "lost": lost, "interval_ms": 50,
+        }))
+    }
+}
+
+/// An agent whose ABR is armed with a 4 Mbit/s floor and an encoder that never moves: what
+/// reaches the client is the transport's doing.
+async fn governed_agent(stream: Stream) -> Agent {
+    agent_built(
+        stream,
+        Limits::default(),
+        audio::Plan::default(),
+        "snow",
+        |_| {
+            Some(Rate {
+                ceiling_kbps: 8000.0,
+                floor_kbps: Box::new(|| 4000.0),
+                retargets: true,
+                start: Box::new(|| {}),
+                observe: Box::new(|_| {}),
+            })
+        },
+    )
+    .await
+}
+
+/// A client on the end of `impair`ed path, sending its feedback every 50 ms.
+async fn through(
+    agent: &mut Agent,
+    impair: impl FnMut() -> Option<Duration> + Send + 'static,
+) -> (Session, SendStream, RecvStream) {
+    let port = relay(agent.url.port().unwrap(), impair).await;
+    agent.url.set_port(Some(port)).unwrap();
+    let (session, send, recv, reply) = agent.hello(TOKEN).await;
+    assert_eq!(reply["type"], "hello_ack");
+    (session, send, recv)
+}
+
+/// #1330: netem's jitter without a rate reorders almost every datagram. QUIC's loss
+/// detection read each one overtaken by three as lost, its window collapsed, and the video
+/// waited and was dropped behind it: the browser got nothing for minutes.
+#[tokio::test]
+async fn reordered_delivery_does_not_stall_the_datagram_path() {
+    // Snow does not compress: well over 4 Mbit/s.
+    let mut agent = governed_agent(Stream::H264).await;
+    // Each datagram held 0–40 ms on its own: most are overtaken by several.
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    let (session, mut send, _recv) = through(&mut agent, move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        Some(Duration::from_micros(x % 40_000))
+    })
+    .await;
+    let mut path = Arrivals::default();
+    let mut report = tokio::time::interval(Duration::from_millis(50));
+    let measure_from = Instant::now() + Duration::from_secs(2);
+    let deadline = tokio::time::sleep(Duration::from_secs(6));
+    tokio::pin!(deadline);
+    let mut got: Vec<u32> = Vec::new();
+    loop {
+        tokio::select! {
+            d = session.read_datagram() => {
+                let d = d.unwrap();
+                if Instant::now() >= measure_from {
+                    got.push(u32::from_le_bytes(d[1..5].try_into().unwrap()));
+                }
+                path.receive(&d);
+            }
+            _ = report.tick() => {
+                if let Some(fb) = path.feedback() {
+                    write_message(&mut send, &fb).await.unwrap();
+                }
+            }
+            () = &mut deadline => break,
+        }
+    }
+    let span = got.iter().max().unwrap() - got.iter().min().unwrap() + 1;
+    let delivered = got.len() as f64 / span as f64;
+    // About 6500 here; plain Cubic delivered about 600 (measured, five runs each).
+    assert!(got.len() > 2000, "{} datagrams in 4 s", got.len());
+    assert!(
+        delivered > 0.95,
+        "{:.0} % of what was sent arrived",
+        delivered * 100.0
+    );
+}
+
+/// Logs `webtransport-client-quic-stats` lines into `captured` on this thread.
+fn capture_info(captured: &Captured) -> tracing::subscriber::DefaultGuard {
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .with_writer(captured.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
+    guard
+}
+
+/// Says `bye` and waits for the agent's line on the client's leave: whether QUIC's window
+/// followed the estimate, and the rate it was held to, kbit/s.
+async fn governed_at_leave(mut send: SendStream, captured: &Captured) -> (bool, u64) {
+    write_message(&mut send, &json!({"type": "bye"}))
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        if let Some(line) = logs
+            .lines()
+            .find(|l| l.contains("webtransport-client-quic-stats"))
+        {
+            let field = |name: &str| {
+                let value = line.split(name).nth(1).expect("logged");
+                value.split(' ').next().unwrap().to_string()
+            };
+            return (
+                field(" governed=").parse().unwrap(),
+                field("governed_kbps=").parse().unwrap(),
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the client's leave was not logged"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// §Feedback: a client that sends no feedback follows QUIC congestion control alone; one
+/// that does hands the window to the estimate.
+#[tokio::test]
+async fn only_a_client_that_sends_feedback_takes_quic_congestion_control_away() {
+    let captured = Captured::default();
+    let _logs = capture_info(&captured);
+    let agent = governed_agent(Stream::H264).await;
+    let (session, send, _recv, reply) = agent.hello(TOKEN).await;
+    assert_eq!(reply["type"], "hello_ack");
+    for _ in 0..30 {
+        session.read_datagram().await.unwrap();
+    }
+    assert!(
+        !governed_at_leave(send, &captured).await.0,
+        "no feedback: Cubic"
+    );
+    drop(agent);
+
+    let captured = Captured::default();
+    let _logs = capture_info(&captured);
+    let agent = governed_agent(Stream::H264).await;
+    let (session, mut send, _recv, reply) = agent.hello(TOKEN).await;
+    assert_eq!(reply["type"], "hello_ack");
+    let mut path = Arrivals::default();
+    for _ in 0..30 {
+        path.receive(&session.read_datagram().await.unwrap());
+    }
+    write_message(&mut send, &path.feedback().unwrap())
+        .await
+        .unwrap();
+    let (governed, kbps) = governed_at_leave(send, &captured).await;
+    assert!(governed && kbps >= 4000, "feedback: governed at {kbps}");
+}
+
+/// §Feedback: while PyroWave is active its own rate controller stands in for the estimate,
+/// so its feedback leaves QUIC congestion control in place.
+#[tokio::test]
+async fn a_pyrowave_client_keeps_quic_congestion_control() {
+    let captured = Captured::default();
+    let _logs = capture_info(&captured);
+    let agent = governed_agent(Stream::H264).await;
+    let media = agent.listener.registry().lock()[SESSION]
+        .media
+        .clone()
+        .unwrap();
+    let grant = PyroWaveGrant {
+        wanted: true,
+        target_kbps: 200_000,
+        floor_kbps: 100_000,
+        max_rtt_ms: 1_000,
+    };
+    media.grant_pyrowave(grant, (320, 192, 60), true);
+    let raw = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../testdata/pyrowave/detail_320x192_xhi.pwv1"
+    ))
+    .unwrap();
+    let (session, mut send, _recv, reply) =
+        agent.hello_with(TOKEN, json!({"pyrowave": true})).await;
+    assert_eq!(reply["video"]["codec"], "pyrowave");
+    let mut path = Bottleneck::new(1e6);
+    media.on_pyrowave_frame(&gst::Buffer::from_slice(raw[28..].to_vec()));
+    path.receive(&session.read_datagram().await.unwrap());
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let feedback = path.feedback().expect("a datagram to report");
+    write_message(&mut send, &feedback).await.unwrap();
+    assert!(!governed_at_leave(send, &captured).await.0);
+}
+
+/// #1330: a path that carries nothing for 2 s closes QUIC's window, and quinn's 1 MiB queue
+/// holds 2 s of 4 Mbit/s video, dropping only the oldest. Behind a stalled queue the agent
+/// stops adding video, so what is still worth nothing when the path returns is the NACK
+/// hold's worth, and a keyframe follows it. A NACK behind it is not answered either.
+#[tokio::test]
+async fn video_behind_a_stalled_path_is_skipped_not_queued() {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let mut agent = governed_agent(Stream::Av1Heavy).await;
+    let down = Arc::new(AtomicBool::new(false));
+    let cut = down.clone();
+    let (session, mut send, mut recv) = through(&mut agent, move || {
+        (!cut.load(Relaxed)).then_some(Duration::ZERO)
+    })
+    .await;
+    let missed = Arc::new(AtomicBool::new(false));
+    let miss = missed.clone();
+    tokio::spawn(async move {
+        while let Ok(m) = read_message(&mut recv).await {
+            miss.fetch_or(m["type"] == "nack_miss", Relaxed);
+        }
+    });
+    let mut path = Arrivals::default();
+    let mut report = tokio::time::interval(Duration::from_millis(50));
+    let t0 = Instant::now();
+    let (outage, up_at, end) = (
+        t0 + Duration::from_secs(2),
+        t0 + Duration::from_secs(4),
+        t0 + Duration::from_secs(9),
+    );
+    // A frame and when it arrived, before the outage: the synthetic encoder's clock.
+    let mut clock = None::<(u16, Instant)>;
+    let (mut stale, mut fresh) = (BTreeMap::new(), None);
+    // The last first fragment that arrived before the outage, by frame and pkt_seq, and
+    // whether it came again after: a resend.
+    let (mut last_first, mut nacked, mut resent) = (None::<(u16, u32)>, false, false);
+    loop {
+        let now = Instant::now();
+        if now >= end {
+            break;
+        }
+        down.store((outage..up_at).contains(&now), Relaxed);
+        // Video is skipped from about 0.7 s in (QUIC's window fills, then a hold passes). The
+        // frame is past the retransmit window by then, so an answer would be a nack_miss.
+        if !nacked && now >= outage + Duration::from_millis(1500) {
+            nacked = true;
+            let (frame_seq, _) = last_first.expect("a frame before the outage");
+            let nack = json!({"type": "nack", "frame_seq": frame_seq, "frags": [[0, 0]]});
+            write_message(&mut send, &nack).await.unwrap();
+        }
+        tokio::select! {
+            d = session.read_datagram() => {
+                let d = d.unwrap();
+                path.receive(&d);
+                let frame_seq = u16::from_le_bytes([d[7], d[8]]);
+                let pkt_seq = u32::from_le_bytes(d[1..5].try_into().unwrap());
+                if d[9..11] == [0, 0] {
+                    match last_first {
+                        _ if now < outage => last_first = Some((frame_seq, pkt_seq)),
+                        Some((f, p)) if f == frame_seq && p != pkt_seq => resent = true,
+                        _ => {}
+                    }
+                }
+                match clock {
+                    _ if now < outage => clock = Some((frame_seq, now)),
+                    Some((f0, at)) if now >= up_at => {
+                        let made = at + Duration::from_millis(33) * u32::from(frame_seq.wrapping_sub(f0));
+                        if now.saturating_duration_since(made) > Duration::from_millis(200) {
+                            stale.entry(frame_seq).or_insert(now);
+                        } else {
+                            fresh.get_or_insert(now);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ = report.tick() => {
+                if let Some(fb) = path.feedback() {
+                    write_message(&mut send, &fb).await.unwrap();
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+    // The NACK hold (250 ms) plus the frames the closing window swallowed, at 30 fps.
+    assert!(
+        stale.len() <= 15,
+        "{} frames over 200 ms old arrived after the path came back",
+        stale.len()
+    );
+    // Measured 0.12–0.16 s; QUIC's probe, backed off over the outage, can make it about 2 s.
+    // Under the guard's give-up (6 s of skipping from 250 ms into the outage): video resumes
+    // on a keyframe and the media is not ended.
+    let fresh = fresh.expect("no fresh video after the path came back");
+    assert!(
+        fresh - up_at < Duration::from_secs(4),
+        "fresh video {:?} after",
+        fresh - up_at
+    );
+    assert!(
+        !resent,
+        "a NACK behind the stalled queue was answered with a resend"
+    );
+    assert!(
+        !missed.load(Relaxed),
+        "a NACK behind the stalled queue was answered with a nack_miss"
+    );
 }
 
 /// #1040: receiver feedback from a rate-capped client drives the session's real ABR
@@ -1523,6 +1921,78 @@ async fn audio_alone_never_moves_the_video_estimate() {
     );
 }
 
+fn rate(retargets: bool) -> Rate {
+    Rate {
+        ceiling_kbps: 8000.0,
+        floor_kbps: Box::new(|| 4000.0),
+        retargets,
+        start: Box::new(|| {}),
+        observe: Box::new(|_| {}),
+    }
+}
+
+/// 200 video datagrams logged as sent 1 ms apart from `at`, then feedback that names them
+/// all as arrived 1 ms apart, read 250 ms after `at`.
+fn answered(control: &mut Control, first: u32, at: std::time::Instant) {
+    let mut arrivals = Vec::new();
+    for i in 0..200u32 {
+        let mut d = vec![0u8; media::MAX_DATAGRAM];
+        d[1..5].copy_from_slice(&(first + i).to_le_bytes());
+        control
+            .log
+            .record(&d, at + Duration::from_millis(i.into()), false);
+        arrivals.extend_from_slice(&((i * 20) as u16).to_le_bytes());
+    }
+    let fb = json!({
+        "type": "feedback", "seq": first / 200 + 1,
+        "first_pkt_seq": first, "count": 200,
+        "ref_us": u64::from(first) * 1000,
+        "arrivals_b64": base64::engine::general_purpose::STANDARD.encode(&arrivals),
+        "recv_kbps": 0, "lost": 0, "interval_ms": 50,
+    });
+    let path = congestion::QuicPath {
+        rtt: Duration::from_millis(20),
+        cwnd_bytes: 0,
+        congestion_events: 0,
+    };
+    control.feedback(&fb, path, at + Duration::from_millis(250));
+}
+
+/// §Feedback: with the ABR off the estimate never reaches the encoder, so QUIC keeps its
+/// own congestion control.
+#[test]
+fn with_the_abr_off_feedback_never_takes_quic_congestion_control_away() {
+    let rate = rate(false);
+    let governor = congestion::Governor::default();
+    let mut control = Control::new(&rate, Arc::default(), false, governor.clone());
+    answered(&mut control, 0, std::time::Instant::now());
+    assert_eq!(governor.kbps(), 0);
+}
+
+/// Feedback that stops hands the window back to Cubic, and the next feedback takes it again.
+#[test]
+fn silent_feedback_hands_the_window_back_to_cubic_until_feedback_returns() {
+    let rate = rate(true);
+    let governor = congestion::Governor::default();
+    let mut control = Control::new(&rate, Arc::default(), false, governor.clone());
+    let t0 = std::time::Instant::now();
+    let rtt = Duration::from_millis(20);
+    answered(&mut control, 0, t0);
+    assert!(governor.kbps() >= 4000, "the estimate governs");
+    // Media goes on; no feedback answers it.
+    let mut d = vec![0u8; media::MAX_DATAGRAM];
+    d[1..5].copy_from_slice(&200u32.to_le_bytes());
+    control
+        .log
+        .record(&d, t0 + Duration::from_millis(300), false);
+    control.tick(rtt, t0 + Duration::from_millis(700));
+    assert!(governor.kbps() >= 4000, "inside the silence timeout");
+    control.tick(rtt, t0 + Duration::from_millis(900));
+    assert_eq!(governor.kbps(), 0, "the decay began: Cubic");
+    answered(&mut control, 201, t0 + Duration::from_secs(2));
+    assert!(governor.kbps() >= 4000, "feedback is back: governed again");
+}
+
 /// A client displaced, or told the session ended, neither starts nor feeds the ABR: the
 /// encoder is its successor's, and a start after the session ended would register hooks
 /// that keep the encoder alive.
@@ -1543,12 +2013,12 @@ fn a_client_that_is_gone_neither_starts_nor_feeds_the_abr() {
         }),
     };
     let gone = Arc::new(OnceLock::new());
-    let mut control = Control::new(&rate, gone.clone(), false);
+    let mut control = Control::new(&rate, gone.clone(), false, Default::default());
     control.feed(3000.0);
     assert_eq!(calls.load(SeqCst), 2, "a live client starts and feeds");
     gone.set(Gone::TakenOver).unwrap();
     control.feed(3000.0);
-    Control::new(&rate, gone, false).feed(3000.0);
+    Control::new(&rate, gone, false, Default::default()).feed(3000.0);
     assert_eq!(calls.load(SeqCst), 2);
 }
 
@@ -1597,12 +2067,12 @@ fn the_abr_is_fed_the_estimate_less_the_fec_share() {
         start: Box::new(|| {}),
         observe: Box::new(move |kbps: f64| seen.lock().unwrap().push(kbps.round())),
     };
-    let mut control = Control::new(&rate, Arc::default(), true);
+    let mut control = Control::new(&rate, Arc::default(), true, Default::default());
     control.feed(4200.0);
     let fec = control.fec.as_mut().unwrap();
     fec.observe(0.04, std::time::Instant::now());
     control.feed(4200.0);
-    Control::new(&rate, Arc::default(), false).feed(4200.0);
+    Control::new(&rate, Arc::default(), false, Default::default()).feed(4200.0);
     assert_eq!(*fed.lock().unwrap(), [4200.0, 3500.0, 4200.0]);
 }
 
@@ -1783,7 +2253,7 @@ fn repairs_spend_only_what_the_estimate_leaves_above_the_abr_floor() {
         start: Box::new(|| {}),
         observe: Box::new(move |kbps: f64| seen.lock().unwrap().push(kbps.round())),
     };
-    let mut control = Control::new(&rate, Arc::default(), true);
+    let mut control = Control::new(&rate, Arc::default(), true, Default::default());
     let fec = control.fec.as_mut().unwrap();
     fec.observe(0.05, std::time::Instant::now());
     assert_eq!(fec.overhead(), 0.25);
@@ -1822,7 +2292,7 @@ fn governed(level: u8, estimate_kbps: f64, seconds: u64) -> Vec<(u32, f64)> {
             governor.0.observe(kbps, now);
         }),
     };
-    let mut control = Control::new(&rate, Arc::default(), true);
+    let mut control = Control::new(&rate, Arc::default(), true, Default::default());
     let fec = control.fec.as_mut().unwrap();
     fec.observe(f64::from(level) / 100.0, base);
     assert_eq!(fec.overhead(), f64::from(level) * 0.05);
@@ -1914,7 +2384,7 @@ fn a_pyrowave_frame_gets_no_repair_at_any_overhead() {
         start: Box::new(|| {}),
         observe: Box::new(|_| {}),
     };
-    let mut control = Control::new(&rate, Arc::default(), true);
+    let mut control = Control::new(&rate, Arc::default(), true, Default::default());
     let fec = control.fec.as_mut().unwrap();
     fec.observe(0.05, std::time::Instant::now());
     control.feed(6000.0);

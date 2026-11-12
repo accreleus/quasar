@@ -317,36 +317,6 @@ fn overuse_with_sparse_arrivals_still_cuts() {
 }
 
 #[test]
-fn quic_bounds_the_estimate_only_once_it_has_seen_congestion() {
-    let start = Instant::now();
-    let mut log = SendLog::new(start);
-    let mut est = Estimator::new(CEILING, start);
-    let fb = Feedback {
-        first_pkt_seq: 0,
-        ref_us: 0,
-        arrivals: vec![],
-    };
-    let slow_start = QuicPath {
-        rtt: RTT,
-        cwnd_bytes: 5000,
-        congestion_events: 0,
-    };
-    est.on_feedback(&fb, &mut log, start, slow_start);
-    assert_eq!(
-        est.estimate_kbps(),
-        CEILING,
-        "a window still in slow start is no evidence"
-    );
-    let congested = QuicPath {
-        congestion_events: 1,
-        ..slow_start
-    };
-    est.on_feedback(&fb, &mut log, start, congested);
-    // 1.5 × 5000 B × 8 / 20 ms.
-    assert_eq!(est.estimate_kbps(), 3000.0);
-}
-
-#[test]
 fn feedback_silence_while_media_is_sent_decays_the_estimate() {
     let mut s = Sim::new(50_000.0);
     s.send_kbps = Some(6000.0);
@@ -639,6 +609,215 @@ fn a_link_that_drops_to_a_third_drives_the_estimate_down() {
     assert!((2000.0..3300.0).contains(&mean), "mean {mean:.0}");
 }
 
+fn window(governor: &Governor, now: Instant) -> Box<Window> {
+    Arc::new(WindowFactory(governor.clone()))
+        .build(now, 1200)
+        .into_any()
+        .downcast()
+        .unwrap()
+}
+
+/// What `on_ack` takes from quinn's `RttEstimator`, which a test cannot make.
+fn acked(w: &mut Window, srtt: Duration, min_rtt: Duration) {
+    w.srtt = srtt;
+    w.min_rtt = min_rtt;
+}
+
+#[test]
+fn a_governed_window_follows_the_estimate_and_no_loss_shrinks_it() {
+    let start = Instant::now();
+    let governor = Governor::default();
+    let mut w = window(&governor, start);
+    let cubic = w.window();
+    w.on_congestion_event(start, start, true, 1200);
+    let collapsed = w.window();
+    assert!(
+        collapsed < cubic,
+        "ungoverned, it is Cubic: loss shrinks it"
+    );
+    governor.govern(8000.0);
+    assert_eq!(w.window(), collapsed, "no RTT yet: Cubic until an ack");
+    acked(&mut w, Duration::from_millis(5), Duration::from_millis(5));
+    // 2 × 8 Mbit/s × the 100 ms RTT floor.
+    assert_eq!(w.window(), 200_000);
+    w.on_congestion_event(start, start + Duration::from_secs(1), true, 1200);
+    assert_eq!(w.window(), 200_000, "a governed window ignores loss");
+    governor.govern(100.0);
+    assert_eq!(
+        w.window(),
+        w.initial_window(),
+        "never under Cubic's first window"
+    );
+}
+
+#[test]
+fn a_release_starts_cubic_afresh_from_the_paths_bdp() {
+    let start = Instant::now();
+    let governor = Governor::default();
+    let mut w = window(&governor, start);
+    // Queueing put the smoothed RTT at 2 s; the path's own is 20 ms.
+    acked(&mut w, Duration::from_secs(2), Duration::from_millis(20));
+    governor.govern(8000.0);
+    w.on_sent(start, 1200, 1);
+    // Losses while governed collapse the Cubic underneath to its minimum.
+    for n in 1..5 {
+        let at = start + Duration::from_secs(n);
+        w.on_congestion_event(at, at, true, 1200);
+    }
+    assert_eq!(w.cubic.window(), 2400);
+    governor.release();
+    // 8 Mbit/s × 20 ms: neither 2 × MTU nor the governed 2 × rate × 2 s.
+    assert_eq!(w.window(), 20_000, "before quinn calls in again");
+    let later = start + Duration::from_secs(10);
+    w.on_sent(later, 1200, 2);
+    assert_eq!(w.window(), 20_000);
+    assert_eq!(w.initial_window(), 12_000, "quinn's first window is kept");
+    // A real Cubic: the next loss takes it to 0.7 ×.
+    w.on_congestion_event(later, later, false, 1200);
+    assert_eq!(w.window(), 14_000);
+    // A slow path's BDP is under Cubic's first window: that is the floor.
+    governor.govern(1000.0);
+    w.on_sent(later, 1200, 3);
+    governor.release();
+    assert_eq!(w.window(), 12_000);
+}
+
+const HOLD: Duration = Duration::from_millis(250);
+const FRAME: Duration = Duration::from_millis(33);
+
+#[test]
+fn a_keyframe_being_paced_out_is_never_read_as_a_stall() {
+    let start = Instant::now();
+    let mut b = Backlog::default();
+    // A 300 KB keyframe drained at 20 KB a frame interval, 10 KB frames behind it.
+    let mut queued = 0usize;
+    for n in 0..60u32 {
+        let at = start + FRAME * n;
+        assert_eq!(b.admit(queued, n == 0, at, HOLD), Admit::Send, "unit {n}");
+        queued += if n == 0 { 300_000 } else { 10_000 };
+        queued = queued.saturating_sub(20_000);
+    }
+    assert_eq!(b.skipped, 0);
+}
+
+#[test]
+fn a_queue_that_stops_draining_skips_video_until_it_drains_and_a_keyframe_comes() {
+    let start = Instant::now();
+    let mut b = Backlog::default();
+    let mut queued = 0usize;
+    let mut n = 0u32;
+    let mut admit = |b: &mut Backlog, queued: usize, key: bool| {
+        n += 1;
+        b.admit(queued, key, start + FRAME * n, HOLD)
+    };
+    // The window closes: every frame stays in the queue.
+    let mut sent = 0;
+    while admit(&mut b, queued, false) == Admit::Send {
+        queued += 10_000;
+        sent += 1;
+    }
+    // Growing since the second frame; skipping starts once that is longer than the hold.
+    assert_eq!(sent, 9, "the queue holds the hold's worth, not a MiB");
+    assert_eq!(
+        admit(&mut b, queued, true),
+        Admit::Skip,
+        "not while it is backed up"
+    );
+    assert_eq!(
+        admit(&mut b, 0, false),
+        Admit::SkipForKeyframe,
+        "drained: ask once"
+    );
+    assert_eq!(admit(&mut b, 0, false), Admit::Skip);
+    assert_eq!(
+        admit(&mut b, 0, true),
+        Admit::Send,
+        "resumes at the keyframe"
+    );
+    assert_eq!(admit(&mut b, 10_000, false), Admit::Send);
+    assert_eq!(b.skipped, 4);
+}
+
+/// Backed up for more than the hold: skipping from `start + 9 frames`.
+fn stalled(b: &mut Backlog, start: Instant) -> Instant {
+    let mut queued = 0;
+    for n in 0..20u32 {
+        let at = start + FRAME * n;
+        if b.admit(queued, false, at, HOLD) != Admit::Send {
+            return at;
+        }
+        queued += 10_000;
+    }
+    panic!("never stalled");
+}
+
+#[test]
+fn a_keyframe_skipped_behind_a_datagram_is_asked_for_again_every_hold() {
+    let start = Instant::now();
+    let mut b = Backlog::default();
+    let at = stalled(&mut b, start);
+    assert_eq!(b.admit(0, false, at + FRAME, HOLD), Admit::SkipForKeyframe);
+    // The keyframe comes while an audio datagram and a resend still wait.
+    assert_eq!(b.admit(2400, true, at + FRAME * 2, HOLD), Admit::Skip);
+    assert_eq!(b.admit(0, false, at + FRAME * 3, HOLD), Admit::Skip);
+    assert_eq!(
+        b.admit(0, false, at + FRAME + HOLD, HOLD),
+        Admit::SkipForKeyframe,
+        "asked again a hold later"
+    );
+    assert_eq!(b.admit(0, true, at + FRAME * 2 + HOLD, HOLD), Admit::Send);
+}
+
+#[test]
+fn a_queue_that_never_drains_ends_the_media() {
+    let start = Instant::now();
+    let mut b = Backlog::default();
+    let at = stalled(&mut b, start);
+    let give_up = HOLD * GIVE_UP_HOLDS;
+    // Keyframes keep coming, but the queue never empties.
+    let mut t = at;
+    while b.admit(400_000, true, t, HOLD) != Admit::GiveUp {
+        t += FRAME;
+    }
+    // One count a hold, each on the first frame past it.
+    assert!(
+        (give_up..give_up + (FRAME + HOLD) * 2).contains(&(t - at)),
+        "{:?}",
+        t - at
+    );
+    // A keyframe admitted before then ends the episode, and the next one starts afresh.
+    let mut b = Backlog::default();
+    let at = stalled(&mut b, start);
+    assert_eq!(b.admit(0, true, at + give_up / 2, HOLD), Admit::Send);
+    let again = stalled(&mut b, at + give_up);
+    assert_eq!(
+        b.admit(400_000, false, again + give_up - FRAME, HOLD),
+        Admit::Skip
+    );
+}
+
+#[test]
+fn a_still_screen_after_the_queue_drained_asks_for_a_keyframe_before_giving_up() {
+    let start = Instant::now();
+    let mut b = Backlog::default();
+    let at = stalled(&mut b, start);
+    // The path recovered and the queue drained, but nothing came for 7 s.
+    let mut t = at + Duration::from_secs(7);
+    assert_eq!(b.admit(0, false, t, HOLD), Admit::SkipForKeyframe);
+    // Asks that go unanswered end it after the full count, however long the screen was still.
+    let mut asks = 1;
+    loop {
+        t += FRAME;
+        match b.admit(0, false, t, HOLD) {
+            Admit::SkipForKeyframe => asks += 1,
+            Admit::Skip => {}
+            Admit::GiveUp => break,
+            Admit::Send => panic!("no keyframe was admitted"),
+        }
+    }
+    assert_eq!(asks, GIVE_UP_HOLDS);
+}
+
 /// A known limit, not a guarantee: inside the 500 ms hold a quiet sender cannot be told
 /// from a link that dropped, so a spike of 800 ms in a quiet scene cuts to what arrived.
 #[test]
@@ -822,72 +1001,67 @@ fn logged(run: impl FnOnce()) -> Vec<String> {
 #[test]
 fn a_bound_flipping_at_the_feedback_rate_is_logged_at_most_once_a_second() {
     let start = Instant::now();
-    let mut log = SendLog::new(start);
     let mut est = Estimator::new(CEILING, start);
     est.delay_kbps = 3000.0;
+    est.loss_kbps = 3000.0;
     est.settle();
-    let empty = Feedback {
-        first_pkt_seq: 0,
-        ref_us: 0,
-        arrivals: vec![],
-    };
-    // QUIC's cap alternates between 2880 and 3600 kbps around the delay bound, for 2 s.
+    // For 2 s, a message every 50 ms grows the delay bound and the next the loss bound,
+    // so the lower one, the estimate's bound, flips at every message.
     let lines = logged(|| {
-        for i in 0..40u32 {
-            let path = QuicPath {
-                rtt: RTT,
-                cwnd_bytes: if i % 2 == 0 { 4800 } else { 6000 },
-                congestion_events: 1,
+        for i in 1..=40u32 {
+            let delay_grows = i % 2 == 1;
+            let m = Measured {
+                usage: if delay_grows {
+                    Usage::Normal
+                } else {
+                    Usage::Underusing
+                },
+                rate_kbps: None,
+                sent_kbps: None,
+                fresh: false,
+                loss: delay_grows.then_some(0.05),
             };
-            est.on_feedback(
-                &empty,
-                &mut log,
-                start + 50 * Duration::from_millis(i.into()),
-                path,
-            );
+            est.apply(m, start + 50 * Duration::from_millis(i.into()), NO_QUIC);
         }
     });
     assert!((1..=3).contains(&lines.len()), "{} lines", lines.len());
 }
 
 #[test]
-fn a_quic_cap_that_falls_per_message_is_logged_at_most_once_a_second() {
+fn a_late_report_of_a_datagram_behind_the_rate_window_is_not_fresh() {
     let start = Instant::now();
     let mut log = SendLog::new(start);
     let mut est = Estimator::new(CEILING, start);
-    let empty = Feedback {
-        first_pkt_seq: 0,
-        ref_us: 0,
-        arrivals: vec![],
-    };
-    // One congestion event, then cwnd falls 5000 → 3000 bytes over 2 s, a message every
-    // 50 ms: the estimate falls at every one.
-    let lines = logged(|| {
-        for i in 0..=40u64 {
-            let path = QuicPath {
-                rtt: RTT,
-                cwnd_bytes: 5000 - 50 * i,
-                congestion_events: 1,
-            };
-            let at = start + Duration::from_millis(50 * i);
-            est.on_feedback(&empty, &mut log, at, path);
-        }
-    });
-    assert_eq!(lines.len(), 3, "{lines:?}");
-    for (line, span) in lines
+    // Arrivals at 1.00–1.09 s.
+    let fb = paced(&mut log, start, 0, 10, 1_000_000, 10_000);
+    assert!(est.measure(&fb, &mut log, start).fresh);
+    // First reported now, but it arrived 1.09 s before the newest arrival.
+    let late = paced(&mut log, start, 10, 1, 0, 10_000);
+    assert!(!est.measure(&late, &mut log, start).fresh);
+    // 290 ms behind: in the 500 ms window.
+    let recent = paced(&mut log, start, 11, 1, 800_000, 10_000);
+    assert!(est.measure(&recent, &mut log, start).fresh);
+}
+
+/// Every `webtransport-cc-bound` line as (cut, from, to).
+fn cuts(lines: &[String]) -> Vec<(String, f64, f64)> {
+    lines
         .iter()
-        .zip(["8000 → 3000", "3000 → 2400", "2400 → 1800"])
-    {
-        assert!(
-            line.contains(&format!("{span} kbps")) && line.contains("cut=\"quic\""),
-            "{span}: {line}"
-        );
-    }
+        .filter(|l| l.contains("webtransport-cc-bound"))
+        .map(|l| {
+            let cut = l.split("cut=\"").nth(1).unwrap().split('"').next().unwrap();
+            let span = l.split("estimate ").nth(1).unwrap();
+            let mut kbps = span.split(" kbps").next().unwrap().split(" → ");
+            let mut next = || kbps.next().unwrap().parse::<f64>().unwrap();
+            (cut.to_string(), next(), next())
+        })
+        .collect()
 }
 
 #[test]
-fn a_quic_congestion_event_that_does_not_lower_the_estimate_is_not_logged() {
+fn each_line_names_every_cause_of_the_fall_it_covers() {
     let start = Instant::now();
+    let at = |ms: u64| start + Duration::from_millis(ms);
     let mut log = SendLog::new(start);
     let mut est = Estimator::new(CEILING, start);
     let empty = Feedback {
@@ -895,18 +1069,41 @@ fn a_quic_congestion_event_that_does_not_lower_the_estimate_is_not_logged() {
         ref_us: 0,
         arrivals: vec![],
     };
-    // The count rises every 2 s; cwnd stays put.
+    let send = |log: &mut SendLog, seq: u32, when: Instant| {
+        let mut d = vec![0u8; SIZE];
+        d[1..5].copy_from_slice(&seq.to_le_bytes());
+        log.record(&d, when, false);
+    };
     let lines = logged(|| {
-        for events in 1..=3 {
-            let path = QuicPath {
-                rtt: RTT,
-                cwnd_bytes: 5000,
-                congestion_events: events,
-            };
-            let at = start + Duration::from_secs(2 * events);
-            est.on_feedback(&empty, &mut log, at, path);
+        est.on_feedback(&empty, &mut log, at(0), NO_QUIC);
+        // Feedback stops: the first decay is logged, the next waits out the second.
+        send(&mut log, 0, at(0));
+        est.on_tick(at(600), &log, RTT);
+        est.on_tick(at(1100), &log, RTT);
+        // Feedback for 200 ms with no cut logs nothing yet; then it stops again, and the
+        // silence path logs the decay from the last second along with its own.
+        for ms in [1150, 1200, 1250, 1300] {
+            est.on_feedback(&empty, &mut log, at(ms), NO_QUIC);
         }
+        send(&mut log, 1, at(1300));
+        est.on_tick(at(1900), &log, RTT);
+        // A decay waiting when a loss cut comes: the line names both.
+        est.on_tick(at(2400), &log, RTT);
+        let m = Measured {
+            usage: Usage::Normal,
+            rate_kbps: None,
+            sent_kbps: None,
+            fresh: false,
+            loss: Some(0.5),
+        };
+        est.apply(m, at(2450), NO_QUIC);
     });
-    assert_eq!(lines.len(), 1, "only 8000 → 3000: {lines:?}");
-    assert_eq!(est.estimate_kbps(), 3000.0);
+    let cuts = cuts(&lines);
+    let labels: Vec<_> = cuts.iter().map(|c| c.0.as_str()).collect();
+    assert_eq!(labels, ["silence", "silence", "silence+loss"], "{lines:?}");
+    assert_eq!(cuts[0].1, CEILING);
+    for pair in cuts.windows(2) {
+        assert_eq!(pair[1].1, pair[0].2, "no fall left out: {lines:?}");
+    }
+    assert_eq!(cuts[2].2, est.estimate_kbps().round());
 }

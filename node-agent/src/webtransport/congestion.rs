@@ -16,15 +16,19 @@
 //!   outlasts a spike with no such window cuts from the receive rate, so a quiet sender
 //!   still follows a link that carries less.
 //! - **Loss.** Over 10 % scales by (1 − loss/2); under 2 % lets it grow.
-//! - The estimate is the least of the two, of 1.5 × QUIC's own cwnd/RTT once QUIC has
-//!   seen congestion, and of the ceiling.
+//! - The estimate is the least of the two and of the ceiling. QUIC's own window follows it
+//!   (`Window`), so it is no bound here.
 //! - Feedback that stops while media is being sent decays it.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
+use quinn_proto::RttEstimator;
 use serde_json::Value;
+use web_transport_quinn::quinn::congestion::{Controller, ControllerFactory, CubicConfig};
 
 /// §Feedback: `count` is at most 8192; arrivals are in 50 µs units, `0xFFFF` not received.
 const MAX_COUNT: usize = 8192;
@@ -84,18 +88,15 @@ const THROUGHPUT_SAMPLES: usize = 20;
 /// Overuse held this long, with no throughput sample for as long, cuts from the receive
 /// rate: longer than a delay spike's stall, shorter than a full queue takes to fill.
 const SUSTAINED_OVERUSE: Duration = Duration::from_millis(500);
-/// Overusing messages this close together are one episode: a `Normal` of up to 150 ms at
-/// the slowest feedback cadence (100 ms) does not restart the hold. Half the hold, so a
-/// detector that flickers cannot hide a link that dropped.
+/// Overusing messages this close together are one episode: at the browser's 50 ms cadence
+/// (`FEEDBACK_MS` in `web/src/webtransport/feedback.ts`) a `Normal` of up to 200 ms does not
+/// restart the hold. Half the hold, so a detector that flickers cannot hide a link that
+/// dropped.
 const OVERUSE_GAP: Duration = Duration::from_millis(250);
 /// A window whose datagrams were sent under this share of the estimate is
 /// application-limited, and is no throughput sample.
 const APP_LIMITED: f64 = 0.8;
 const MAX_ARRIVALS: usize = 1 << 14;
-
-/// QUIC's own estimate bounds ours with this headroom. An exact cap would deadlock: once
-/// the ABR sends under cwnd/RTT, QUIC is application-limited and its window stops growing.
-const QUIC_CAP: f64 = 1.5;
 
 /// Feedback silence while media is sent: past max(this, 2 intervals + RTT), the estimate
 /// decays by `SILENCE_DECAY` every `SILENCE_STEP`.
@@ -107,8 +108,8 @@ const SILENCE_STEP: Duration = Duration::from_millis(500);
 const MIN_KBPS: f64 = 150.0;
 /// The ABR is fed at most this often, about as often as `rtpgccbwe` notifies.
 pub(crate) const REPORT_EVERY: Duration = Duration::from_millis(100);
-/// A bound flip, a QUIC lowering or a silence decay is logged at most this often; both of
-/// the last move per message or per tick.
+/// A bound flip or a silence decay is logged at most this often: a bound can flip per
+/// message, a decay steps per tick.
 const LOG_EVERY: Duration = Duration::from_secs(1);
 
 /// One `feedback` message, validated.
@@ -228,7 +229,6 @@ pub(crate) enum Bound {
     Ceiling,
     Delay,
     Loss,
-    Quic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -439,13 +439,12 @@ pub(crate) struct Estimator {
     last_report: Option<Instant>,
     last_feedback: Option<Instant>,
     last_decay: Option<Instant>,
-    quic_cap_kbps: Option<f64>,
     loss: Option<f64>,
     bound: Bound,
     /// The bound the log last named, and when.
     logged: (Bound, Option<Instant>),
-    /// A fall not logged yet: its cause and the estimate before it.
-    unlogged: Option<(&'static str, f64)>,
+    /// The estimate before a silence decay not logged yet; delay and loss cuts always log.
+    unlogged: Option<f64>,
 }
 
 /// What one message measured, for the tests.
@@ -483,7 +482,6 @@ impl Estimator {
             last_report: None,
             last_feedback: None,
             last_decay: None,
-            quic_cap_kbps: None,
             loss: None,
             bound: Bound::Ceiling,
             logged: (Bound::Ceiling, None),
@@ -559,7 +557,7 @@ impl Estimator {
             .filter(|_| quiet_overuse && m.fresh)
             .or(self.throughput.iter().map(|&(_, r)| r).reduce(f64::max))
             .unwrap_or(self.ceiling_kbps);
-        let mut cut_by = None;
+        let mut cut_by = Vec::new();
 
         match m.usage {
             Usage::Overusing => {
@@ -571,7 +569,7 @@ impl Estimator {
                     let cut = BETA * base;
                     if cut < self.delay_kbps {
                         self.delay_kbps = cut;
-                        cut_by = Some("delay");
+                        cut_by.push("delay");
                     }
                     self.last_decrease = Some(now);
                 }
@@ -597,7 +595,7 @@ impl Estimator {
                 {
                     self.loss_kbps = self.estimate_kbps * (1.0 - 0.5 * loss);
                     self.last_loss_decrease = Some(now);
-                    cut_by = Some("loss");
+                    cut_by.push("loss");
                     // These losses are spent; the next decision reads new ones.
                     self.losses.clear();
                 }
@@ -606,27 +604,28 @@ impl Estimator {
             _ => self.loss_kbps *= GROWTH_PER_S.powf(dt),
         }
 
-        self.quic_cap_kbps = (path.congestion_events > 0).then(|| {
-            let rtt_ms = path.rtt.as_secs_f64().max(0.001) * 1000.0;
-            QUIC_CAP * path.cwnd_bytes as f64 * 8.0 / rtt_ms
-        });
         let was = self.estimate_kbps;
         self.settle();
-        if self.bound == Bound::Quic && self.estimate_kbps < was {
-            self.unlogged.get_or_insert(("quic", was));
-        }
         let due = self.log_due(now) && (self.unlogged.is_some() || self.bound != self.logged.0);
-        if cut_by.is_some() || due {
-            let (pending, from) = self
-                .unlogged
-                .take()
-                .map_or((None, was), |(c, f)| (Some(c), f));
-            let cut_by = cut_by.or(pending);
+        if !cut_by.is_empty() || due {
+            // A silence fall not logged yet is part of this line's "from → to".
+            let from = match self.unlogged.take() {
+                Some(from) => {
+                    cut_by.insert(0, "silence");
+                    from
+                }
+                None => was,
+            };
             self.logged = (self.bound, Some(now));
+            let cut = if cut_by.is_empty() {
+                "none".to_string()
+            } else {
+                cut_by.join("+")
+            };
             tracing::info!(
                 token = "webtransport-cc-bound",
                 bound = ?self.bound,
-                cut = cut_by.unwrap_or("none"),
+                cut = cut.as_str(),
                 usage = ?m.usage,
                 recv_kbps = m.rate_kbps.unwrap_or(0.0) as u64,
                 sent_kbps = m.sent_kbps.unwrap_or(0.0) as u64,
@@ -635,7 +634,6 @@ impl Estimator {
                 loss_pct = m.loss.unwrap_or(0.0) * 100.0,
                 delay_kbps = self.delay_kbps as u64,
                 loss_kbps = self.loss_kbps as u64,
-                quic_kbps = self.quic_cap_kbps.unwrap_or(0.0) as u64,
                 rtt_ms = path.rtt.as_millis() as u64,
                 cwnd_bytes = path.cwnd_bytes,
                 quic_congestion_events = path.congestion_events,
@@ -666,15 +664,15 @@ impl Estimator {
         self.settle();
         self.last_decay = Some(now);
         if self.estimate_kbps < was {
-            self.unlogged.get_or_insert(("silence", was));
+            self.unlogged.get_or_insert(was);
         }
-        if let Some((cut, from)) = self.unlogged.filter(|_| self.log_due(now)) {
+        if let Some(from) = self.unlogged.filter(|_| self.log_due(now)) {
             self.unlogged = None;
             self.logged = (self.bound, Some(now));
             tracing::info!(
                 token = "webtransport-cc-bound",
                 bound = ?self.bound,
-                cut,
+                cut = "silence",
                 silent_ms = now.saturating_duration_since(sent).as_millis() as u64,
                 rtt_ms = rtt.as_millis() as u64,
                 "WebTransport estimate {from:.0} → {:.0} kbps: no feedback for media sent",
@@ -694,11 +692,9 @@ impl Estimator {
         let clamp = |k: f64| k.clamp(MIN_KBPS, self.ceiling_kbps);
         self.delay_kbps = clamp(self.delay_kbps);
         self.loss_kbps = clamp(self.loss_kbps);
-        let quic = self.quic_cap_kbps.unwrap_or(f64::MAX);
         let (kbps, bound) = [
             (self.delay_kbps, Bound::Delay),
             (self.loss_kbps, Bound::Loss),
-            (quic, Bound::Quic),
         ]
         .into_iter()
         .fold((self.ceiling_kbps, Bound::Ceiling), |a, b| {
@@ -826,6 +822,322 @@ impl Estimator {
             sent_kbps,
             fresh,
             loss,
+        }
+    }
+}
+
+/// QUIC's window over the estimate's rate × RTT: a keyframe burst and RTT jitter fit under
+/// it, and quinn paces at 1.25 × window / RTT, 2.5 × the rate.
+const WINDOW_GAIN: f64 = 2.0;
+/// A LAN's RTT would make the window a few datagrams, and a keyframe wait behind them.
+const WINDOW_RTT_MIN: Duration = Duration::from_millis(100);
+
+/// One connection's QUIC congestion window. It is quinn's Cubic unless the estimate is
+/// governing the encoder from live feedback (`Governor`): a client that sends no feedback,
+/// one whose feedback stopped, a session with the ABR off and a PyroWave session all follow
+/// QUIC congestion control alone (§Feedback). While governed the window follows the
+/// estimate and no loss shrinks it: Cubic read packets reordered or late from jitter, and
+/// 0.1 % random loss, as congestion, and held video to a few Mbit/s while the datagrams over
+/// its window waited or were dropped in the send queue (#1330). The estimate is then the
+/// only controller, as `rtpgccbwe` is on WebRTC.
+pub(crate) struct Window {
+    cubic: Box<dyn Controller>,
+    governed: Arc<AtomicU64>,
+    /// The rate it was last governed at, bit/s; 0 while Cubic has it.
+    held: u64,
+    srtt: Duration,
+    min_rtt: Duration,
+    mtu: u16,
+    /// Cubic's first window, which quinn also reads at a path change.
+    first: u64,
+}
+
+/// Builds a connection's [`Window`]; its handle is the connection's [`Governor`].
+pub(crate) struct WindowFactory(pub(crate) Governor);
+
+/// What sets a connection's window: the estimate, while it governs the encoder.
+#[derive(Clone, Default)]
+pub(crate) struct Governor(Arc<AtomicU64>);
+
+impl Governor {
+    pub(crate) fn govern(&self, kbps: f64) {
+        self.0
+            .store((kbps * 1000.0).max(1.0) as u64, Ordering::Relaxed);
+    }
+
+    /// Back to Cubic.
+    pub(crate) fn release(&self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
+
+    /// The window follows the estimate, not Cubic.
+    pub(crate) fn governs(&self) -> bool {
+        self.0.load(Ordering::Relaxed) > 0
+    }
+
+    /// The rate the window is held to, kbit/s.
+    pub(crate) fn kbps(&self) -> u64 {
+        self.0.load(Ordering::Relaxed) / 1000
+    }
+}
+
+fn cubic(window: u64, now: Instant, mtu: u16) -> Box<dyn Controller> {
+    let mut config = CubicConfig::default();
+    config.initial_window(window);
+    Arc::new(config).build(now, mtu)
+}
+
+impl ControllerFactory for WindowFactory {
+    fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+        let cubic = Arc::new(CubicConfig::default()).build(now, current_mtu);
+        Box::new(Window {
+            first: cubic.initial_window(),
+            cubic,
+            governed: self.0 .0.clone(),
+            held: 0,
+            srtt: Duration::ZERO,
+            min_rtt: Duration::ZERO,
+            mtu: current_mtu,
+        })
+    }
+}
+
+impl Window {
+    /// The governed rate, once an ack has given the window an RTT to size it by.
+    fn governing(&self) -> Option<u64> {
+        Some(self.governed.load(Ordering::Relaxed)).filter(|&bps| bps > 0 && !self.srtt.is_zero())
+    }
+
+    /// Cubic's window on release: the path's delay-free BDP at the rate it last carried, so
+    /// it neither starts collapsed (Cubic took every loss while governed) nor keeps the
+    /// governed window's headroom. In slow start, as a new connection is.
+    fn seed(&self) -> u64 {
+        ((self.held as f64 / 8.0 * self.min_rtt.as_secs_f64()) as u64).max(self.first)
+    }
+
+    /// Follows the governor: a release starts a new Cubic from `seed`.
+    fn sync(&mut self, now: Instant) {
+        match self.governing() {
+            Some(bps) => self.held = bps,
+            None if self.held != 0 => {
+                self.cubic = cubic(self.seed(), now, self.mtu);
+                self.held = 0;
+            }
+            None => {}
+        }
+    }
+}
+
+impl Controller for Window {
+    fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
+        self.sync(now);
+        self.cubic.on_sent(now, bytes, last_packet_number);
+    }
+
+    fn on_ack(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        bytes: u64,
+        app_limited: bool,
+        rtt: &RttEstimator,
+    ) {
+        // Before quinn's first sample this is its initial RTT; by `hello` the handshake gave one.
+        self.srtt = rtt.get();
+        self.min_rtt = rtt.min();
+        self.sync(now);
+        self.cubic.on_ack(now, sent, bytes, app_limited, rtt);
+    }
+
+    fn on_end_acks(
+        &mut self,
+        now: Instant,
+        in_flight: u64,
+        app_limited: bool,
+        largest_packet_num_acked: Option<u64>,
+    ) {
+        self.sync(now);
+        self.cubic
+            .on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
+    }
+
+    fn on_congestion_event(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        is_persistent_congestion: bool,
+        lost_bytes: u64,
+    ) {
+        self.sync(now);
+        self.cubic
+            .on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
+    }
+
+    fn on_mtu_update(&mut self, new_mtu: u16) {
+        self.mtu = new_mtu;
+        self.cubic.on_mtu_update(new_mtu);
+    }
+
+    fn window(&self) -> u64 {
+        match self.governing() {
+            Some(bps) => {
+                let rtt = self.srtt.max(WINDOW_RTT_MIN).as_secs_f64();
+                ((WINDOW_GAIN * bps as f64 / 8.0 * rtt) as u64).max(self.first)
+            }
+            // Released since the last call that could rebuild Cubic.
+            None if self.held != 0 => self.seed(),
+            None => self.cubic.window(),
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn Controller> {
+        Box::new(Window {
+            cubic: self.cubic.clone_box(),
+            governed: self.governed.clone(),
+            held: self.held,
+            srtt: self.srtt,
+            min_rtt: self.min_rtt,
+            mtu: self.mtu,
+            first: self.first,
+        })
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.first
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
+
+/// What to do with the next video unit or `nack` answer while QUIC's datagram queue is
+/// backed up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Admit {
+    Send,
+    Skip,
+    /// Skip, and ask the encoder for a keyframe to resume on.
+    SkipForKeyframe,
+    /// No keyframe got through for `GIVE_UP_HOLDS` holds: end the WebTransport media. The
+    /// browser reconnects over WebTransport once; a second loss falls back to WebRTC
+    /// (`stream_lost`).
+    GiveUp,
+}
+
+/// Bytes in QUIC's datagram queue under one fragment: nothing is waiting.
+const BACKLOG_EMPTY: usize = super::media::MAX_DATAGRAM;
+/// Holds in which units came while the queue stayed backed up, or keyframe asks went
+/// unanswered on a drained one, before the media is given up. About 6 s at the 250 ms
+/// hold, past a 2 s outage and quinn's probe backoff after it (about 2 s). The hold is
+/// max(250 ms, 2 x RTT), so this scales with RTT, and stays under the 10 s idle timeout
+/// only below about 208 ms. An outage longer than this ends the media mid-outage and uses
+/// the view's one reconnect, where it used to recover on WebTransport: the accepted trade
+/// for not sitting on a frozen picture.
+const GIVE_UP_HOLDS: u32 = 24;
+
+/// Holds counted at most once each, and only when a unit comes: a still screen sends
+/// nothing, and its silence counts for nothing.
+#[derive(Default)]
+struct Holds {
+    at: Option<Instant>,
+    n: u32,
+}
+
+impl Holds {
+    /// Counts `now` when a hold has passed since the last count; true when it did.
+    fn count(&mut self, now: Instant, hold: Duration) -> bool {
+        let due = self
+            .at
+            .is_none_or(|at| now.saturating_duration_since(at) >= hold);
+        if due {
+            self.at = Some(now);
+            self.n += 1;
+        }
+        due
+    }
+}
+
+/// Video behind a closed window (a stalled path) is worthless once it is older than the
+/// client's NACK hold, and quinn's queue holds a MiB of it, dropping only the oldest
+/// datagram when full. A queue that has not shrunk for that long is stalled: video and NACK
+/// answers are skipped until it empties and a keyframe comes, so it never holds more than
+/// the hold's worth. A keyframe being paced out shrinks it, so it is never mistaken for a
+/// stall.
+#[derive(Default)]
+pub(crate) struct Backlog {
+    last: usize,
+    growing_since: Option<Instant>,
+    skipping: bool,
+    backed_up: Holds,
+    /// Keyframe asks: one each hold while the queue is drained, since a keyframe that came
+    /// while it still held a datagram was skipped like the rest.
+    asks: Holds,
+    /// Video units and `nack` answers skipped over the connection.
+    pub(crate) skipped: u64,
+}
+
+impl Backlog {
+    /// `queued`: bytes in QUIC's datagram queue now; `keyframe`: the unit can be decoded
+    /// alone; `hold`: how long video stays worth sending.
+    pub(crate) fn admit(
+        &mut self,
+        queued: usize,
+        keyframe: bool,
+        now: Instant,
+        hold: Duration,
+    ) -> Admit {
+        let empty = queued < BACKLOG_EMPTY;
+        if empty || queued < self.last {
+            self.growing_since = None;
+        } else {
+            self.growing_since.get_or_insert(now);
+        }
+        self.last = queued;
+        if !self.skipping {
+            let since = match self.growing_since {
+                Some(at) if now.saturating_duration_since(at) > hold => at,
+                _ => return Admit::Send,
+            };
+            tracing::info!(
+                token = "webtransport-video-stalled",
+                queued,
+                stalled_ms = now.saturating_duration_since(since).as_millis() as u64,
+                "WebTransport datagram queue has not drained; video skipped until it does"
+            );
+            self.skipping = true;
+            self.backed_up = Holds::default();
+            self.asks = Holds::default();
+        }
+        if empty && keyframe {
+            tracing::info!(
+                token = "webtransport-video-resumed",
+                skipped = self.skipped,
+                "WebTransport datagram queue drained; video resumes at a keyframe"
+            );
+            self.skipping = false;
+            return Admit::Send;
+        }
+        let holds = if empty {
+            &mut self.asks
+        } else {
+            &mut self.backed_up
+        };
+        let counted = holds.count(now, hold);
+        if holds.n > GIVE_UP_HOLDS {
+            tracing::warn!(
+                token = "webtransport-video-unrecoverable",
+                queued,
+                "no keyframe got through the WebTransport datagram queue; ending the \
+                 WebTransport media"
+            );
+            return Admit::GiveUp;
+        }
+        self.skipped += 1;
+        if empty && counted {
+            Admit::SkipForKeyframe
+        } else {
+            Admit::Skip
         }
     }
 }
