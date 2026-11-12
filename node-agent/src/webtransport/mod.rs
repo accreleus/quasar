@@ -61,6 +61,8 @@ const ROTATION_CHECK: Duration = Duration::from_secs(60);
 const DEFAULT_PORT: u16 = 4433;
 /// quinn's own default; `congestion::Backlog` reads the queue's fill against it.
 const DATAGRAM_BUFFER: usize = 1 << 20;
+/// One packet per 100 ms only behind a stalled queue: at most 10 × the path MTU/s.
+const STARVED_PROBE_INTERVAL: Duration = Duration::from_millis(100);
 
 const CLOSE_NORMAL: u32 = 0;
 const CLOSE_PROTOCOL: u32 = 4400;
@@ -1133,6 +1135,7 @@ fn admit(
 ) -> congestion::Admit {
     let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
     let hold = retransmit_window(session);
+    backlog.acknowledge(quinn::Connection::stats(session).frame_rx.acks);
     let admit = backlog.admit(queued, keyframe, std::time::Instant::now(), hold);
     if admit == congestion::Admit::SkipForKeyframe {
         media.keyframe();
@@ -1422,6 +1425,9 @@ async fn stream(
     let mut backlog = congestion::Backlog::default();
     // Every datagram given to quinn: what it put on the wire is in its stats.
     let mut handed = 0u64;
+    let mut starved_probes = 0u64;
+    let mut probe_tick = tokio::time::interval(STARVED_PROBE_INTERVAL);
+    probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut control_tick = tokio::time::interval(congestion::REPORT_EVERY);
     control_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Nothing is sent before `hello_ack`: what queued up behind it is stale.
@@ -1434,6 +1440,23 @@ async fn stream(
     let mut idle = pin!(tokio::time::sleep(CONTROL_IDLE));
     let (message, code, why) = loop {
         tokio::select! {
+            _ = probe_tick.tick() => {
+                let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
+                let acks = quinn::Connection::stats(session).frame_rx.acks;
+                backlog.acknowledge(acks);
+                let starved = backlog.starved(queued);
+                governor.probe(starved);
+                if starved {
+                    // An empty WT datagram wakes Quinn; the client ignores it. The single
+                    // packet allowance lets queued data probe even a closed Cubic window.
+                    backlog.probed(acks);
+                    starved_probes += 1;
+                    handed += 1;
+                    if session.send_datagram(bytes::Bytes::new()).is_err() {
+                        break QUIET;
+                    }
+                }
+            }
             // §Feedback: while PyroWave is active its own rate controller stands in for the
             // ABR (B09, #1058), so nothing sent then is logged, and no estimate is fed.
             _ = control_tick.tick(), if control.is_some() && current.codec != "pyrowave" => {
@@ -1616,6 +1639,7 @@ async fn stream(
         datagrams_handed_incl_audio_and_resends = handed,
         datagrams_sent = quic.frame_tx.datagram,
         units_and_nack_answers_skipped_total = backlog.skipped,
+        starved_probes,
         governed = governor.governs(),
         governed_kbps = governor.kbps(),
         lost_packets = quic.path.lost_packets,

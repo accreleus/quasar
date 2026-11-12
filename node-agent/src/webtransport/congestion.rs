@@ -21,7 +21,7 @@
 //! - Feedback that stops while media is being sent decays it.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -843,6 +843,7 @@ const WINDOW_RTT_MIN: Duration = Duration::from_millis(100);
 pub(crate) struct Window {
     cubic: Box<dyn Controller>,
     governed: Arc<AtomicU64>,
+    probe: Arc<AtomicBool>,
     /// The rate it was last governed at, bit/s; 0 while Cubic has it.
     held: u64,
     srtt: Duration,
@@ -857,9 +858,13 @@ pub(crate) struct WindowFactory(pub(crate) Governor);
 
 /// What sets a connection's window: the estimate, while it governs the encoder.
 #[derive(Clone, Default)]
-pub(crate) struct Governor(Arc<AtomicU64>);
+pub(crate) struct Governor(Arc<AtomicU64>, Arc<AtomicBool>);
 
 impl Governor {
+    pub(crate) fn probe(&self, due: bool) {
+        self.1.store(due, Ordering::Relaxed);
+    }
+
     pub(crate) fn govern(&self, kbps: f64) {
         self.0
             .store((kbps * 1000.0).max(1.0) as u64, Ordering::Relaxed);
@@ -894,6 +899,7 @@ impl ControllerFactory for WindowFactory {
             first: cubic.initial_window(),
             cubic,
             governed: self.0 .0.clone(),
+            probe: self.0 .1.clone(),
             held: 0,
             srtt: Duration::ZERO,
             min_rtt: Duration::ZERO,
@@ -930,6 +936,7 @@ impl Window {
 
 impl Controller for Window {
     fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
+        self.probe.store(false, Ordering::Relaxed);
         self.sync(now);
         self.cubic.on_sent(now, bytes, last_packet_number);
     }
@@ -979,6 +986,11 @@ impl Controller for Window {
     }
 
     fn window(&self) -> u64 {
+        // Quinn checks the window before each packet and calls on_sent after it. Only
+        // this one probe bypasses the window, including after release back to Cubic.
+        if self.probe.load(Ordering::Relaxed) {
+            return u64::MAX;
+        }
         match self.governing() {
             Some(bps) => {
                 let rtt = self.srtt.max(WINDOW_RTT_MIN).as_secs_f64();
@@ -994,6 +1006,7 @@ impl Controller for Window {
         Box::new(Window {
             cubic: self.cubic.clone_box(),
             governed: self.governed.clone(),
+            probe: self.probe.clone(),
             held: self.held,
             srtt: self.srtt,
             min_rtt: self.min_rtt,
@@ -1067,6 +1080,7 @@ impl Holds {
 #[derive(Default)]
 pub(crate) struct Backlog {
     last: usize,
+    probe_acks: Option<u64>,
     growing_since: Option<Instant>,
     skipping: bool,
     backed_up: Holds,
@@ -1078,6 +1092,20 @@ pub(crate) struct Backlog {
 }
 
 impl Backlog {
+    pub(crate) fn probed(&mut self, acks: u64) {
+        self.probe_acks.get_or_insert(acks);
+    }
+
+    pub(crate) fn acknowledge(&mut self, acks: u64) {
+        if self.probe_acks.is_some_and(|before| before != acks) {
+            self.probe_acks = None;
+        }
+    }
+
+    pub(crate) fn starved(&self, queued: usize) -> bool {
+        self.skipping && (queued >= BACKLOG_EMPTY || self.probe_acks.is_some())
+    }
+
     /// `queued`: bytes in QUIC's datagram queue now; `keyframe`: the unit can be decoded
     /// alone; `hold`: how long video stays worth sending.
     pub(crate) fn admit(
@@ -1087,7 +1115,9 @@ impl Backlog {
         now: Instant,
         hold: Duration,
     ) -> Admit {
-        let empty = queued < BACKLOG_EMPTY;
+        // Sending a probe can empty a small queue even while the path is down. Only
+        // an ACK proves recovery; otherwise the original give-up clock must keep running.
+        let empty = queued < BACKLOG_EMPTY && self.probe_acks.is_none();
         if empty || queued < self.last {
             self.growing_since = None;
         } else {
