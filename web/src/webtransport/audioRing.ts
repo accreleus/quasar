@@ -3,14 +3,22 @@
 // quanta. Lives apart from the processor so it can be tested. The processor file imports it.
 
 interface Chunk {
-  /** Render frame (the AudioWorkletGlobalScope's `currentFrame` timeline) of its first sample. */
+  /** Render frame (the AudioWorkletGlobalScope's `currentFrame` timeline) it plays at; moved to
+   *  the last chunk's end while a change in the playout delay is being closed. */
   start: number;
+  /** The frame the stream scheduled it at: what its own timeline's steps are measured against. */
+  nominal: number;
   planes: Float32Array[];
   frames: number;
-  /** Frames already played or skipped from its head. */
+  /** Source frames already played or skipped from its head; fractional while the rate is off. */
   off: number;
+  /** Output frames already played from it: what places it on the render timeline, where `off`
+   *  does not while its samples are played at an off-real-time rate. */
+  out: number;
   /** A fade standing in for a lost packet. */
   concealed: boolean;
+  /** Its start and rate are decided; a chunk spans quanta and must be aligned only once. */
+  settled: boolean;
 }
 
 export interface RingStats {
@@ -29,6 +37,18 @@ export interface RingStats {
 export const SLACK_FRAMES = 240;
 /** The most audio queued (one second at 48 kHz). */
 export const MAX_QUEUED_FRAMES = 48_000;
+/** A step in the playout delay up to this size is closed by playing slightly off real time
+ *  (60 ms at 48 kHz). A larger one is a stall or a reset, not a delay to follow: it keeps the
+ *  old behaviour, the whole gap as silence or the whole overlap cut. */
+export const MAX_STRETCH_FRAMES = 2_880;
+/** How far off real time the queue plays while it closes such a step: 2 %. Over the second or
+ *  two it takes, that shifts pitch by a third of a semitone, not a click — the accepted trade
+ *  here, where a resampler is all this needs and a phase vocoder or WSOLA is not. */
+export const STRETCH_RATE = 0.02;
+/** A correction under way runs until the step is this small (1 ms at 48 kHz), not until it is
+ *  inside the slack: stopping there would leave the queue 5 ms ahead of the delay it was given,
+ *  which is 5 ms of the jitter cover gone. */
+export const STRETCH_DONE_FRAMES = 48;
 
 export class AudioRing {
   private queue: Chunk[] = [];
@@ -38,6 +58,15 @@ export class AudioRing {
   readonly stats: RingStats = { underrunFrames: 0, concealedFrames: 0, underrunEvents: 0, dropped: 0 };
   /** The last frame rendered was silence for want of audio. */
   private starving = false;
+  /** Source frames played per output frame: 1, or 2 % off while a delay change is closed. */
+  private rate = 1;
+  /** The stream's own start of the last chunk finished, and its length: what a step in the
+   *  stream's timeline, rather than in ours, is measured against. */
+  private prevStart: number | null = null;
+  private prevFrames = 0;
+  /** The last chunk finished was a concealment fade: audio is missing, so the next gap is not
+   *  a delay change. */
+  private prevConcealed = false;
 
   constructor(
     private readonly slack = SLACK_FRAMES,
@@ -52,9 +81,13 @@ export class AudioRing {
       this.stats.dropped += 1;
       return;
     }
+    // By start time only around a concealment fade, which is posted ahead of real chunks still
+    // in the decoder. Real chunks arrive in stream order and keep it: a fall in the playout
+    // delay of a chunk or more makes a later chunk's start the earlier one, and sorting on it
+    // would play them out of order.
     let at = this.queue.length;
-    while (at > 0 && this.queue[at - 1].start > start) at--;
-    this.queue.splice(at, 0, { start, planes, frames, off: 0, concealed });
+    while (at > 0 && this.queue[at - 1].start > start && (concealed || this.queue[at - 1].concealed)) at--;
+    this.queue.splice(at, 0, { start, nominal: start, planes, frames, off: 0, out: 0, concealed, settled: false });
     this.queued += frames;
   }
 
@@ -70,13 +103,11 @@ export class AudioRing {
         this.underrun(n - pos);
         return;
       }
-      // Back to back with the last chunk when its timestamp is within the slack; an overlap
-      // (a duplicate, or a late reorder) loses its head instead of playing twice.
-      if (this.lastEnd !== null && chunk.start + chunk.off < this.lastEnd + this.slack) {
-        if (chunk.start + chunk.off >= this.lastEnd) chunk.start = this.lastEnd - chunk.off;
-        else chunk.off = this.lastEnd - chunk.start;
+      if (!chunk.settled) {
+        chunk.settled = true;
+        this.align(chunk, f);
       }
-      const at = chunk.start + chunk.off;
+      const at = chunk.start + chunk.out;
       if (at > f) {
         const gap = Math.min(at - f, n - pos);
         this.silence(out, pos, gap);
@@ -85,33 +116,123 @@ export class AudioRing {
         continue;
       }
       // Due before it could be played: its head is skipped, all of it if it is wholly past.
-      if (at < f) chunk.off += f - at;
+      if (at < f) {
+        chunk.out += f - at;
+        chunk.off += (f - at) * this.rate;
+      }
       if (chunk.off >= chunk.frames) {
-        this.queue.shift();
-        this.queued -= chunk.frames;
-        this.stats.dropped += 1;
+        this.finish(chunk, true);
         continue;
       }
-      const take = Math.min(chunk.frames - chunk.off, n - pos);
-      for (let c = 0; c < out.length; c++) {
-        out[c].set(chunk.planes[Math.min(c, chunk.planes.length - 1)].subarray(chunk.off, chunk.off + take), pos);
-      }
-      chunk.off += take;
-      pos += take;
+      const written =
+        this.rate === 1 ? this.copy(chunk, out, pos, n - pos) : this.resample(chunk, out, pos, n - pos);
+      pos += written;
+      chunk.out += written;
       if (chunk.concealed) {
         // The fade opens the gap's one event unless silence already did; the silence after it joins it.
-        this.stats.concealedFrames += take;
+        this.stats.concealedFrames += written;
         if (!this.starving) this.stats.underrunEvents += 1;
         this.starving = true;
       } else {
         this.starving = false;
       }
-      this.lastEnd = chunk.start + chunk.off;
-      if (chunk.off >= chunk.frames) {
-        this.queue.shift();
-        this.queued -= chunk.frames;
+      // Where the next chunk must start to be heard back to back.
+      this.lastEnd = frame + pos;
+      if (chunk.off >= chunk.frames) this.finish(chunk, false);
+    }
+  }
+
+  /** Decide where the incoming chunk plays and at what rate. A change in the playout delay
+   *  shows as a step in the stream's own start times between two chunks that are otherwise
+   *  back to back; it is closed by playing slightly slower (a rise: the audio we have is now
+   *  early) or faster (a fall) from where the last chunk ended, instead of by a gap of silence
+   *  or a cut head. Everything else keeps the old behaviour: the queue ran dry, audio is lost
+   *  behind a concealment fade, the stream skipped a whole number of chunks (packets that
+   *  never arrived), or the step is over the bound (a stall or a reset). */
+  private align(chunk: Chunk, f: number): void {
+    const end = this.lastEnd;
+    const correcting = this.rate !== 1;
+    if (end === null) {
+      this.rate = 1;
+      return;
+    }
+    const obs = chunk.start - end;
+    // The stream's own step: where it says this chunk starts against where the one before ended.
+    // A step that is not also there (audio dropped behind the playhead) is lost audio, not a
+    // delay change, and stays counted.
+    const jump = this.prevStart === null ? obs : chunk.start - (this.prevStart + this.prevFrames);
+    const step =
+      end === f &&
+      !this.lostChunks(jump) &&
+      !(this.prevConcealed && jump > this.slack) &&
+      Math.abs(obs) > (correcting ? STRETCH_DONE_FRAMES : this.slack) &&
+      Math.abs(obs) <= MAX_STRETCH_FRAMES &&
+      (correcting || Math.abs(obs - jump) <= this.slack);
+    if (step) {
+      chunk.start = end;
+      this.rate = obs > 0 ? 1 - STRETCH_RATE : 1 + STRETCH_RATE;
+      return;
+    }
+    this.rate = 1;
+    // Back to back with the last chunk when its timestamp is within the slack; an overlap
+    // (a duplicate, or a late reorder) loses its head instead of playing twice.
+    if (chunk.start + chunk.out <= end + this.slack) {
+      if (chunk.start + chunk.out >= end) chunk.start = end - chunk.out;
+      else {
+        // An overlap: its head is lost rather than played twice.
+        const skip = end - chunk.start - chunk.out;
+        chunk.out += skip;
+        chunk.off += skip * this.rate;
       }
     }
+  }
+
+  /** A whole number of chunks of the stream's starts skipped (within a twentieth of a chunk,
+   *  0.5 ms): packets that never arrived or came too late to post, not a delay change, which
+   *  lands on any offset. A rise in the delay that happens to be a whole number of chunks plays
+   *  as it did before this, as silence. A fall is never lost audio. */
+  private lostChunks(jump: number): boolean {
+    const frames = this.prevFrames;
+    if (frames <= 0 || jump <= 0) return false;
+    const k = Math.round(jump / frames);
+    return k >= 1 && Math.abs(jump - k * frames) <= frames / 20;
+  }
+
+  /** Play `chunk` on from `pos`, at real time. */
+  private copy(chunk: Chunk, out: Float32Array[], pos: number, room: number): number {
+    const take = Math.min(chunk.frames - chunk.off, room);
+    for (let c = 0; c < out.length; c++) {
+      out[c].set(chunk.planes[Math.min(c, chunk.planes.length - 1)].subarray(chunk.off, chunk.off + take), pos);
+    }
+    chunk.off += take;
+    return take;
+  }
+
+  /** Play `chunk` on from `pos`, `rate` source frames per output frame: linear interpolation,
+   *  which for the 2 % above is a pitch shift of a third of a semitone, not a click. */
+  private resample(chunk: Chunk, out: Float32Array[], pos: number, room: number): number {
+    let written = 0;
+    while (written < room && chunk.off < chunk.frames) {
+      const i = Math.floor(chunk.off);
+      const t = chunk.off - i;
+      const j = i + 1 < chunk.frames ? i + 1 : i;
+      for (let c = 0; c < out.length; c++) {
+        const src = chunk.planes[Math.min(c, chunk.planes.length - 1)];
+        out[c][pos + written] = t === 0 ? src[i] : src[i] + (src[j] - src[i]) * t;
+      }
+      chunk.off += this.rate;
+      written += 1;
+    }
+    return written;
+  }
+
+  private finish(chunk: Chunk, dropped: boolean): void {
+    this.queue.shift();
+    this.queued -= chunk.frames;
+    if (dropped) this.stats.dropped += 1;
+    this.prevStart = chunk.nominal;
+    this.prevFrames = chunk.frames;
+    this.prevConcealed = chunk.concealed;
   }
 
   private underrun(frames: number): void {
