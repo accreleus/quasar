@@ -26,7 +26,31 @@ echo "debs restored from cache: $(find "$debs" -maxdepth 1 -name '*.deb' | wc -l
 [ -s "$list" ] || { echo "ci-apt-install: missing or empty package list: $list" >&2; exit 2; }
 mapfile -t packages < <(grep -v -e '^#' -e '^$' "$list")
 [ "${#packages[@]}" -gt 0 ] || { echo "ci-apt-install: $list names no packages" >&2; exit 2; }
-sudo timeout 120 apt-get update
+# The mirrors can stop answering altogether (2026-11-11: the runner's first mirror timed out and
+# the archive did not resolve, on every run). With the .deb set restored from the cache nothing
+# needs them: install the cached files as they are. apt takes the named files as its
+# candidates and resolves their dependencies among them and what is installed.
+# shortcut: this installs every cached .deb, a superset of the list, so a package the list no
+# longer names (or never did) still installs here and only shows on the next online run;
+# install from a local flat repository of the cache if that ever hides a real omission.
+offline_install() {
+  local n
+  n=$(find "$debs" -maxdepth 1 -name '*.deb' | wc -l)
+  [ "$n" -gt 0 ] || return 1
+  echo "ci-apt-install: apt-get update did not finish; installing the $n cached .debs offline"
+  (cd "$debs" && sudo timeout 300 apt-get install -y --no-install-recommends --no-download ./*.deb) || return 1
+  # The restored set may be another job's or an older list's: every package asked for must be in.
+  local p
+  for p in "${packages[@]}"; do
+    dpkg-query -W -f='${Status}' "${p%%=*}" 2>/dev/null | grep -qx 'install ok installed' ||
+      { echo "ci-apt-install: the cached set lacks $p" >&2; return 1; }
+  done
+}
+if ! sudo timeout 120 apt-get update; then
+  offline_install && exit 0
+  echo "ci-apt-install: apt-get update did not finish and no cached .deb set installs" >&2
+  exit 1
+fi
 for attempt in 1 2 3; do
   sudo timeout 180 apt-get install -y --no-install-recommends --download-only "${packages[@]}" && break
   [ "$attempt" -lt 3 ] || { echo "ci-apt-install: download still stalled after $attempt attempts" >&2; exit 1; }
