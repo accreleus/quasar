@@ -115,6 +115,17 @@ describe("AudioSync", () => {
     expect(s.targetDelayMs(25)).toBe(85);
   });
 
+  it("covers the latest packet of the last ten seconds, not most of them (#1346)", () => {
+    const s = new AudioSync();
+    // One packet in fifty runs 8 ms late: a 95th percentile reads 0 and drops two chunks a second.
+    for (let i = 0; i < 1_000; i++) s.noteAudio(1_000_000 + i * 10_000, 1_000 + i * 10 + 100 + (i % 50 === 49 ? 8 : 0));
+    expect(s.jitterMs()).toBe(8);
+    expect(s.targetDelayMs(40)).toBe(48);
+    // Ten clean seconds later the late packets are forgotten.
+    for (let i = 1_000; i < 2_000; i++) s.noteAudio(1_000_000 + i * 10_000, 1_000 + i * 10 + 100);
+    expect(s.jitterMs()).toBe(0);
+  });
+
   it("forgets the floor and everything measured against it on reset", () => {
     const s = new AudioSync();
     s.noteAudio(1_000_000, 1_100);

@@ -13,8 +13,8 @@ const VIDEO_SAMPLES = 120;
 export const MIN_TARGET_MS = 40;
 /** A video latency this long is a stall, not a delay to match. */
 export const MAX_TARGET_MS = 150;
-/** Audio packets behind the jitter estimate: two seconds at 10 ms. */
-const JITTER_SAMPLES = 200;
+/** Audio packets behind the jitter estimate: ten seconds at 10 ms. */
+const JITTER_SAMPLES = 1_000;
 /** Used until a video frame has been presented. */
 const DEFAULT_TARGET_MS = 50;
 
@@ -51,12 +51,12 @@ export class AudioSync {
     this.excess.length = 0;
   }
 
-  /** The 95th percentile of how late recent packets ran past the floor: what the playout delay
-   *  must cover for them to arrive in time. */
+  /** The furthest a recent packet ran past the floor: what the playout delay must cover for all
+   *  of them to arrive in time. Not a percentile: at 100 packets a second the 5 % a 95th
+   *  percentile leaves out is five dropouts a second (#1346). */
   jitterMs(): number {
     if (this.excess.length < 20) return 0;
-    const s = [...this.excess].sort((a, b) => a - b);
-    return s[Math.min(s.length - 1, Math.floor(s.length * 0.95))];
+    return this.excess.reduce((a, b) => Math.max(a, b), 0);
   }
 
   /** A video frame captured at `captureUs` was presented at `presentMs`. */
