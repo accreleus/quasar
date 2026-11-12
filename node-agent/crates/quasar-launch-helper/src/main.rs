@@ -65,6 +65,10 @@ const RELAUNCH_MAX: Duration = Duration::from_secs(600);
 /// another app's update suspended that, and Steam dropped the app from its schedule without
 /// running it (#1314). That launch is sent again, at most this many times.
 const DROPPED_RETRIES: u8 = 2;
+/// How long the dropped state must stand before the launch is sent again. Steam writes
+/// "removed from schedule" a moment before the launch's next step when it does carry on, and a
+/// pass that lands between the two lines must not launch a second time.
+const DROPPED_SETTLE: Duration = Duration::from_secs(5);
 /// X keysym `Return`.
 const XK_RETURN: u32 = 0xff0d;
 
@@ -165,6 +169,8 @@ struct Relaunch {
     /// How many times a launch Steam took up and then dropped with a suspended update has been
     /// sent again (#1314).
     dropped_retries: u8,
+    /// Since when the watcher has read the launch as dropped, without a break.
+    dropped_since: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,6 +338,7 @@ impl Helper {
                 stepped: now,
                 taken: false,
                 dropped_retries: 0,
+                dropped_since: None,
             });
         }
         agent.done(Done::Launch { appid, ok });
@@ -420,6 +427,10 @@ impl Helper {
         // schedule without running it. Read here, before anything in the pass changes it, and
         // only for a launch Steam did take up.
         let dropped = taken && watcher.launch_dropped();
+        relaunch.dropped_since = dropped.then(|| relaunch.dropped_since.unwrap_or(now));
+        let dropped = relaunch
+            .dropped_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= DROPPED_SETTLE);
         // Progress on the launch stops the retry for as long as it stands; Steam then failing
         // that action starts a fresh window, inside the same hard end.
         if relaunch.taken && !taken {
@@ -456,6 +467,8 @@ impl Helper {
             // once per detection, and the count bounds a lost launch that keeps being lost.
             relaunch.dropped_retries += 1;
             relaunch.next = now + RELAUNCH_EVERY;
+            // The next retry waits for the state to stand again after this one.
+            relaunch.dropped_since = Some(now);
             if self.run_steam(&["-applaunch", &relaunch.appid.to_string()]) {
                 eprintln!(
                     "quasar-launch-helper: token=\"launch-dropped\" Steam dropped app {}'s launch \
@@ -2499,6 +2512,12 @@ mod tests {
         assert!(helper.relaunch.is_some(), "and the retry stays armed");
         schedule_dropped(dir.path());
         helper.pass(at(30), &mut agent);
+        assert_eq!(
+            runs(dir.path(), 1),
+            1,
+            "just dropped: Steam's next step may be a line away"
+        );
+        helper.pass(at(36), &mut agent);
         assert_eq!(runs(dir.path(), 2), 2, "the lost launch is sent again");
     }
 
@@ -2610,11 +2629,17 @@ mod tests {
         shader_download_suspended(dir.path());
         schedule_dropped(dir.path());
         helper.pass(at(2), &mut agent);
-        assert_eq!(runs(dir.path(), 1), 1, "not before the retry interval");
-        helper.pass(at(6), &mut agent);
+        assert_eq!(runs(dir.path(), 1), 1, "not before it has stood a while");
+        helper.pass(at(8), &mut agent);
         assert_eq!(runs(dir.path(), 2), 2, "the first retry");
         assert!(helper.relaunch.is_some(), "still armed while it stands");
-        helper.pass(at(12), &mut agent);
+        helper.pass(at(10), &mut agent);
+        assert_eq!(
+            runs(dir.path(), 2),
+            2,
+            "not again before it has stood a while"
+        );
+        helper.pass(at(14), &mut agent);
         assert_eq!(runs(dir.path(), 3), 3, "the second retry");
         helper.pass(at(20), &mut agent);
         helper.pass(at(60), &mut agent);
