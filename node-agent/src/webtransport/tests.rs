@@ -26,6 +26,7 @@ fn hello_for(session_id: &str, token: &str, wt_proto: u32) -> Hello {
         token: token.into(),
         session_id: session_id.into(),
         pyrowave: false,
+        audio_red: false,
         fec: Value::Null,
     }
 }
@@ -960,6 +961,154 @@ async fn audio_for(session: &Session, span: Duration) -> (Vec<AudioPacket>, usiz
         }
     }
     (audio, video)
+}
+
+/// Every datagram from `session` for `span`, in arrival order: each audio one with its channel
+/// (`0x02`, or its `0x06` copy), and the video ones counted. Asserts that one `pkt_seq` counts
+/// every datagram without a gap, so a copy takes one of its own.
+async fn audio_with_copies_for(
+    session: &Session,
+    span: Duration,
+) -> (Vec<(u8, AudioPacket)>, usize) {
+    let (mut audio, mut video) = (Vec::new(), 0);
+    let mut last: Option<u32> = None;
+    let until = Instant::now() + span;
+    while let Ok(Ok(d)) = tokio::time::timeout_at(until, session.read_datagram()).await {
+        assert!(
+            d.len() <= media::MAX_DATAGRAM,
+            "a {} byte datagram",
+            d.len()
+        );
+        let pkt_seq = u32::from_le_bytes(d[1..5].try_into().unwrap());
+        if let Some(last) = last {
+            assert_eq!(
+                pkt_seq,
+                last.wrapping_add(1),
+                "one pkt_seq for video, audio and its copy"
+            );
+        }
+        last = Some(pkt_seq);
+        match d[0] {
+            0x01 => video += 1,
+            0x02 | 0x06 => audio.push((
+                d[0],
+                AudioPacket {
+                    pkt_seq,
+                    packet_seq: u16::from_le_bytes([d[5], d[6]]),
+                    ts_48khz: u32::from_le_bytes(d[7..11].try_into().unwrap()),
+                    capture_us: u64::from_le_bytes(d[11..19].try_into().unwrap()),
+                    opus: d[audio::AUDIO_HEADER..].to_vec(),
+                },
+            )),
+            other => panic!("channel {other:#x} is not sent to a client"),
+        }
+    }
+    (audio, video)
+}
+
+/// The session's audio hub, which a test feeds by hand: no pipeline, so every packet and its
+/// capture time are the test's.
+fn audio_hub(agent: &Agent) -> Arc<audio::Audio> {
+    agent.tap.as_ref().unwrap().audio().clone()
+}
+
+/// §Audio redundancy: a client that asks gets the packet before this one, immediately before it.
+#[tokio::test]
+async fn an_audio_red_client_gets_each_packet_behind_a_copy_of_the_one_before_it() {
+    let plan = audio::Plan {
+        audio: true,
+        ..Default::default()
+    };
+    let agent = agent_with_plan(Limits::default(), plan).await;
+    let hub = audio_hub(&agent);
+    let (session, _send, _recv, ack) = agent.hello_with(TOKEN, json!({"audio_red": true})).await;
+    assert_eq!(
+        ack["audio"]["redundancy"], 1,
+        "the ack names the copies the agent will send"
+    );
+    for byte in 1..=4u8 {
+        hub.on_packet(Bytes::from(vec![byte; 4]), None, 0);
+    }
+    let (got, _) = audio_with_copies_for(&session, Duration::from_millis(500)).await;
+    let channels: Vec<u8> = got.iter().map(|(c, _)| *c).collect();
+    let packets: Vec<u16> = got.iter().map(|(_, p)| p.packet_seq).collect();
+    assert_eq!(
+        channels,
+        [0x02, 0x06, 0x02, 0x06, 0x02, 0x06, 0x02],
+        "nothing before the first packet, then a copy of N − 1 before N"
+    );
+    assert_eq!(packets, [0, 0, 1, 1, 2, 2, 3]);
+    for (copy_at, original_at) in [(1, 0), (3, 2), (5, 4)] {
+        let (_, copy) = &got[copy_at];
+        let (_, original) = &got[original_at];
+        assert_eq!(copy.packet_seq, original.packet_seq);
+        assert_eq!(copy.ts_48khz, original.ts_48khz);
+        assert_eq!(copy.capture_us, original.capture_us);
+        assert_eq!(
+            copy.opus, original.opus,
+            "the copy is the packet, unchanged"
+        );
+    }
+}
+
+/// The other direction: a client that does not ask is sent no `0x06` at all, since it would drop
+/// it as an unknown channel and report its `pkt_seq` as lost (§Channels).
+#[tokio::test]
+async fn a_client_that_does_not_ask_for_copies_is_sent_none() {
+    let plan = audio::Plan {
+        audio: true,
+        ..Default::default()
+    };
+    let agent = agent_with_plan(Limits::default(), plan).await;
+    let hub = audio_hub(&agent);
+    let (session, _send, _recv, ack) = agent.hello(TOKEN).await;
+    assert!(
+        ack["audio"].get("redundancy").is_none(),
+        "the ack promises no copies"
+    );
+    for byte in 1..=4u8 {
+        hub.on_packet(Bytes::from(vec![byte; 4]), None, 0);
+    }
+    let (got, _) = audio_with_copies_for(&session, Duration::from_millis(500)).await;
+    assert_eq!(got.len(), 4, "four packets, nothing else");
+    assert!(
+        got.iter().all(|(channel, _)| *channel == 0x02),
+        "no 0x06 channel: {:?}",
+        got.iter().map(|(c, _)| *c).collect::<Vec<_>>()
+    );
+}
+
+/// A pause is not covered: a copy of a packet that began over 100 ms before the next one would
+/// arrive where its own time has gone.
+#[tokio::test]
+async fn no_copy_is_sent_across_a_pause_of_more_than_100_ms() {
+    let plan = audio::Plan {
+        audio: true,
+        ..Default::default()
+    };
+    let agent = agent_with_plan(Limits::default(), plan).await;
+    let hub = audio_hub(&agent);
+    let (session, _send, _recv, _ack) = agent.hello_with(TOKEN, json!({"audio_red": true})).await;
+    // The first packet began 300 ms ago: the stream paused before the three that follow.
+    hub.on_packet(Bytes::from_static(b"old"), None, 300_000);
+    for byte in 1..=2u8 {
+        hub.on_packet(Bytes::from(vec![byte; 4]), None, 0);
+    }
+    let (got, _) = audio_with_copies_for(&session, Duration::from_millis(500)).await;
+    let channels: Vec<u8> = got.iter().map(|(c, _)| *c).collect();
+    assert_eq!(
+        channels,
+        [0x02, 0x02, 0x06, 0x02],
+        "no copy of the packet before the pause, a copy of each after it"
+    );
+}
+
+/// Only where the session has stream audio: there is nothing to repeat otherwise.
+#[tokio::test]
+async fn redundancy_is_not_named_for_a_session_without_audio() {
+    let agent = agent_for(Stream::H264, Limits::default()).await;
+    let (_session, _send, _recv, ack) = agent.hello_with(TOKEN, json!({"audio_red": true})).await;
+    assert_eq!(ack["audio"], Value::Null);
 }
 
 #[tokio::test]

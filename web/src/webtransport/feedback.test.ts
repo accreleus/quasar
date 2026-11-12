@@ -55,6 +55,14 @@ describe("FeedbackRecorder", () => {
     expect(r.take(50)).toMatchObject({ first_pkt_seq: 0xffff_ffff, count: 2, lost: 0 });
   });
 
+  it("reports a 0x06 audio copy by its own pkt_seq, so the agent does not read it as lost", () => {
+    const r = new FeedbackRecorder(0);
+    r.record(dgram(1, 0x02), 1);
+    r.record(dgram(2, 0x06), 2);
+    r.record(dgram(3, 0x02), 3);
+    expect(r.take(50)).toMatchObject({ first_pkt_seq: 1, count: 3, lost: 0 });
+  });
+
   it("reports at most 8192 per message and the rest in the next", () => {
     const r = new FeedbackRecorder(0);
     for (let s = 0; s < 9000; s++) r.record(dgram(s, 0x01, 5), 1);

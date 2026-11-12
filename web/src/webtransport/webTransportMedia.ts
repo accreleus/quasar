@@ -5,6 +5,7 @@
 import {
   base64Bytes,
   CHANNEL_AUDIO,
+  CHANNEL_AUDIO_RED,
   CHANNEL_FEC,
   ControlDecoder,
   ControlProtocolError,
@@ -387,6 +388,8 @@ export class WebTransportMedia implements MediaTransport {
           client: "browser",
           // The schemes this client decodes (§FEC); the agent names one in hello_ack, or null.
           fec: ["xor"],
+          // §Audio redundancy: this client takes channel 0x06, the repeat of the previous packet.
+          audio_red: true,
           ...(this.opts.pyrowave ? { pyrowave: true } : {}),
         }),
       );
@@ -510,12 +513,15 @@ export class WebTransportMedia implements MediaTransport {
         return;
       }
       feedback.record(value as Uint8Array, this.now());
-      if ((value as Uint8Array)[0] === CHANNEL_AUDIO) {
+      const channel = (value as Uint8Array)[0];
+      // §Audio redundancy: a `0x06` copy is the packet it repeats, so it takes the same path —
+      // audioOut drops it by `packet_seq` if that packet was already taken.
+      if (channel === CHANNEL_AUDIO || channel === CHANNEL_AUDIO_RED) {
         const packet = parseAudioDatagram(value as Uint8Array);
         if (packet) sink.audio?.(packet);
         continue;
       }
-      if ((value as Uint8Array)[0] === CHANNEL_FEC) {
+      if (channel === CHANNEL_FEC) {
         const repair = parseFecDatagram(value as Uint8Array);
         if (repair) router.repair(repair);
         continue;

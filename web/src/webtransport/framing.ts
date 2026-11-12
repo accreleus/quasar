@@ -6,6 +6,8 @@ export const MAX_CONTROL_MESSAGE = 65_536;
 export const CHANNEL_VIDEO = 0x01;
 export const CHANNEL_INPUT = 0x03;
 export const CHANNEL_AUDIO = 0x02;
+/** §Audio redundancy: the previous audio packet, a second time (amendment 67). */
+export const CHANNEL_AUDIO_RED = 0x06;
 export const CHANNEL_MIC = 0x05;
 export const CHANNEL_FEC = 0x04;
 const FEC_HEADER = 14;
@@ -141,9 +143,10 @@ export interface AudioPacket {
   opus: Uint8Array;
 }
 
-/** A `0x02` datagram's header and Opus packet; null for another channel or a malformed one. */
+/** A `0x02` datagram's header and Opus packet, or a `0x06` copy of one (§Audio redundancy);
+ *  null for another channel or a malformed one. */
 export function parseAudioDatagram(d: Uint8Array): AudioPacket | null {
-  if (d.length <= AUDIO_HEADER || d[0] !== CHANNEL_AUDIO) return null;
+  if (d.length <= AUDIO_HEADER || (d[0] !== CHANNEL_AUDIO && d[0] !== CHANNEL_AUDIO_RED)) return null;
   const v = new DataView(d.buffer, d.byteOffset, d.byteLength);
   return {
     packetSeq: v.getUint16(5, true),

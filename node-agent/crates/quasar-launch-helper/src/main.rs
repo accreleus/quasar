@@ -61,6 +61,14 @@ const RELAUNCH_FOR: Duration = Duration::from_secs(120);
 /// The retry waits out a need for the user (a sign-in), which does not count against
 /// [`RELAUNCH_FOR`], but never beyond this after the launch.
 const RELAUNCH_MAX: Duration = Duration::from_secs(600);
+/// A launch Steam took up can still be lost: it moved the app into a shader or depot update,
+/// another app's update suspended that, and Steam dropped the app from its schedule without
+/// running it (#1314). That launch is sent again, at most this many times.
+const DROPPED_RETRIES: u8 = 2;
+/// How long the dropped state must stand before the launch is sent again. Steam writes
+/// "removed from schedule" a moment before the launch's next step when it does carry on, and a
+/// pass that lands between the two lines must not launch a second time.
+const DROPPED_SETTLE: Duration = Duration::from_secs(5);
 /// X keysym `Return`.
 const XK_RETURN: u32 = 0xff0d;
 
@@ -158,6 +166,11 @@ struct Relaunch {
     stepped: Instant,
     /// Steam had taken the launch up at the previous step; a failure of it re-arms the retry.
     taken: bool,
+    /// How many times a launch Steam took up and then dropped with a suspended update has been
+    /// sent again (#1314).
+    dropped_retries: u8,
+    /// Since when the watcher has read the launch as dropped, without a break.
+    dropped_since: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -324,6 +337,8 @@ impl Helper {
                 last: now + RELAUNCH_MAX,
                 stepped: now,
                 taken: false,
+                dropped_retries: 0,
+                dropped_since: None,
             });
         }
         agent.done(Done::Launch { appid, ok });
@@ -386,6 +401,11 @@ impl Helper {
     /// launch moving it holds; if Steam then logs that action as failed, the retry goes on.
     /// While Steam needs the user (a sign-in) it waits, and that time is not counted, up to
     /// [`RELAUNCH_MAX`] in all.
+    ///
+    /// A launch Steam did take up is also sent again when Steam then loses it: the app went into
+    /// a shader or depot update, another app's update suspended that, and Steam dropped the app
+    /// from its schedule without running it (#1314). [`DROPPED_RETRIES`] bounds that, and the
+    /// watcher's evidence is all of it against a launch in progress.
     fn step_relaunch(&mut self, now: Instant) {
         let Some(mut relaunch) = self.relaunch else {
             return;
@@ -402,6 +422,15 @@ impl Helper {
             );
         let paused = watcher.needs_now().is_some();
         let taken = watcher.launch_taken();
+        // A launch Steam took up can still be lost (#1314): it moved the app into a shader or
+        // depot update, another app's update suspended that, and Steam dropped the app from its
+        // schedule without running it. Read here, before anything in the pass changes it, and
+        // only for a launch Steam did take up.
+        let dropped = taken && watcher.launch_dropped();
+        relaunch.dropped_since = dropped.then(|| relaunch.dropped_since.unwrap_or(now));
+        let dropped = relaunch
+            .dropped_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= DROPPED_SETTLE);
         // Progress on the launch stops the retry for as long as it stands; Steam then failing
         // that action starts a fresh window, inside the same hard end.
         if relaunch.taken && !taken {
@@ -426,6 +455,25 @@ impl Helper {
                 eprintln!(
                     "quasar-launch-helper: Steam has not taken up app {}; launched it again",
                     relaunch.appid
+                );
+            }
+        } else if !paused
+            && now >= relaunch.next
+            && dropped
+            && relaunch.dropped_retries < DROPPED_RETRIES
+        {
+            // Steam took the launch up and then lost it: sending it again is what runs the game.
+            // `dropped` clears on any newer line for the app or when the game runs, so this is
+            // once per detection, and the count bounds a lost launch that keeps being lost.
+            relaunch.dropped_retries += 1;
+            relaunch.next = now + RELAUNCH_EVERY;
+            // The next retry waits for the state to stand again after this one.
+            relaunch.dropped_since = Some(now);
+            if self.run_steam(&["-applaunch", &relaunch.appid.to_string()]) {
+                eprintln!(
+                    "quasar-launch-helper: token=\"launch-dropped\" Steam dropped app {}'s launch \
+                     with a suspended shader or depot update; launched it again (retry {}/{DROPPED_RETRIES})",
+                    relaunch.appid, relaunch.dropped_retries
                 );
             }
         }
@@ -2387,5 +2435,216 @@ mod tests {
                 r#"{"type":"game_window","v":1,"on_screen":true}"#,
             ]
         );
+    }
+
+    /// A `content_log.txt` line for a helper whose logs are in `dir`.
+    fn content_line(dir: &std::path::Path, line: &str) {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("logs/content_log.txt"))
+            .unwrap();
+        writeln!(file, "{line}").unwrap();
+    }
+
+    /// #1314's failed launch, as Steam wrote it, for the game this helper launched: the launch
+    /// moved into the shader download (`console_log.txt`), another app's update took priority
+    /// and suspended it (`content_log.txt`). The other app's lines are kept because they are
+    /// what suspended it.
+    fn shader_download_suspended(dir: &std::path::Path) {
+        log_line(
+            dir,
+            "[2026-11-11 18:58:06] GameAction [AppID 1145360, ActionID 1] : LaunchApp changed task to CheckShaderDepotManifest with \"\"",
+        );
+        log_line(
+            dir,
+            "[2026-11-11 18:58:07] GameAction [AppID 1145360, ActionID 1] : LaunchApp changed task to DownloadingDepots with \"\"",
+        );
+        for line in [
+            "[2026-11-11 18:58:06] AppID 1145360 state changed : Fully Installed,Update Queued,Update Running,",
+            "[2026-11-11 18:58:06] AppID 1145360 Shader update changed : Running Update,Reconfiguring,",
+            "[2026-11-11 18:58:07] AppID 1145360 scheduler update : Priority First, not played for 150781 seconds, update disabled for 0 seconds",
+            "[2026-11-11 18:58:07] AppID 1493710 scheduler update : Priority First, not played for 5695302 seconds, update disabled for 0 seconds",
+            "[2026-11-11 18:58:07] AppID 1493710 state changed : Update Required,Fully Installed,Update Queued, (Update delayed for 465794 secs)",
+            "[2026-11-11 18:58:07] AppID 1145360 Shader update changed : Running Update,Reconfiguring,Stopping,",
+            "[2026-11-11 18:58:07] AppID 1145360 Shader update changed : Running Update,Stopping,",
+            "[2026-11-11 18:58:07] AppID 1145360 Shader update changed : None",
+            "[2026-11-11 18:58:07] AppID 1145360 state changed : Fully Installed,Update Queued,",
+            "[2026-11-11 18:58:07] AppID 1145360 scheduler finished : staying in schedule (result Suspended, state 0xc) ",
+        ] {
+            content_line(dir, line);
+        }
+    }
+
+    /// What followed on the same failed launch: the other app's update finished, the shader
+    /// download completed, and Steam dropped the app from its schedule with nothing after it.
+    fn schedule_dropped(dir: &std::path::Path) {
+        for line in [
+            "[2026-11-11 18:58:34] AppID 1493710 state changed : Fully Installed,",
+            "[2026-11-11 18:58:34] AppID 1493710 scheduler finished : removed from schedule (result No Error, state 0xc) ",
+            "[2026-11-11 18:58:35] AppID 1145360 state changed : Fully Installed,Update Queued,",
+            "[2026-11-11 18:58:35] AppID 1145360 state changed : Fully Installed,",
+            "[2026-11-11 18:58:35] AppID 1145360 scheduler finished : removed from schedule (result No Error, state 0xc) ",
+        ] {
+            content_line(dir, line);
+        }
+    }
+
+    /// #1314: Steam took the launch up, another app's update suspended the shader download, and
+    /// Steam then dropped the app from its schedule without ever running it. That launch request
+    /// is lost, so the helper sends it again once the drop is in the content log.
+    #[test]
+    fn a_launch_dropped_with_its_shader_download_suspended_is_sent_again() {
+        let _scripts = scripts();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let (mut helper, mut agent, t0) = launched(dir.path());
+        let at = |secs| t0 + Duration::from_secs(secs);
+        assert_eq!(runs(dir.path(), 1), 1);
+        shader_download_suspended(dir.path());
+        helper.pass(at(2), &mut agent);
+        assert_eq!(
+            runs(dir.path(), 1),
+            1,
+            "a suspended update is not yet a dropped launch"
+        );
+        assert!(helper.relaunch.is_some(), "and the retry stays armed");
+        schedule_dropped(dir.path());
+        helper.pass(at(30), &mut agent);
+        assert_eq!(
+            runs(dir.path(), 1),
+            1,
+            "just dropped: Steam's next step may be a line away"
+        );
+        helper.pass(at(36), &mut agent);
+        assert_eq!(runs(dir.path(), 2), 2, "the lost launch is sent again");
+    }
+
+    /// #1314's successful launch of the same game, for comparison: the same shader task, then
+    /// the whole launch through to the game running. Nothing of it is a lost launch, so the
+    /// helper sends nothing again.
+    #[test]
+    fn a_normal_launch_of_the_same_game_is_not_sent_again() {
+        let _scripts = scripts();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let (mut helper, mut agent, t0) = launched(dir.path());
+        let at = |secs| t0 + Duration::from_secs(secs);
+        for text in [
+            "changed task to CheckShaderDepotManifest with \"\"",
+            "changed task to ProcessingInstallScript with \"\"",
+            "changed task to SynchronizingCloud with \"\"",
+            "changed task to SynchronizingStats with \"\"",
+            "changed task to ShowInterstitials with \"\"",
+            "waiting for user response to ShowInterstitials \"\"",
+            "continues with user response \"ShowInterstitials\"",
+            "changed task to SynchronizingControllerConfig with \"\"",
+            "changed task to ProcessingShaderCache with \"\"",
+            "waiting for user response to ProcessingShaderCache \"\"",
+            "changed task to SiteLicenseSeatCheckout with \"\"",
+            "changed task to DelayLaunch with \"\"",
+            "changed task to CreatingProcess with \"\"",
+            "waiting for user response to CreatingProcess \"\"",
+            "continues with user response \"CreatingProcess\"",
+            "changed task to WaitingGameWindow with \"\"",
+            "changed task to Completed with \"\"",
+        ] {
+            log_line(
+                dir.path(),
+                &format!("[2026-11-11 19:34:15] GameAction [AppID 1145360, ActionID 1] : LaunchApp {text}"),
+            );
+        }
+        content_line(
+            dir.path(),
+            "[2026-11-11 19:34:25] AppID 1145360 state changed : Fully Installed,App Running,",
+        );
+        helper.pass(at(1), &mut agent);
+        helper.pass(at(6), &mut agent);
+        helper.pass(at(30), &mut agent);
+        assert_eq!(runs(dir.path(), 1), 1, "nothing is sent again");
+    }
+
+    /// #1314: the same dropped sequence, but the game is running. A launch of a game that is
+    /// already up is never sent again, and the old outcome is kept.
+    #[test]
+    fn a_launch_of_a_game_already_running_is_not_sent_again() {
+        let _scripts = scripts();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let (mut helper, mut agent, t0) = launched(dir.path());
+        let at = |secs| t0 + Duration::from_secs(secs);
+        shader_download_suspended(dir.path());
+        schedule_dropped(dir.path());
+        log_line(
+            dir.path(),
+            "[2026-11-11 18:58:36] Game process added : AppID 1145360 \"reaper SteamLaunch AppId=1145360 -- game\"",
+        );
+        helper.pass(at(2), &mut agent);
+        helper.pass(at(30), &mut agent);
+        assert_eq!(runs(dir.path(), 1), 1);
+        assert!(
+            helper.relaunch.is_none(),
+            "and there is nothing left to retry"
+        );
+    }
+
+    /// #1314: the launch was dropped while Steam waits for the user (a sign-in). The retry must
+    /// not run over the dialog; it goes once the need is gone.
+    #[test]
+    fn a_dropped_launch_waits_out_a_sign_in_before_it_is_sent_again() {
+        let _scripts = scripts();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let (mut helper, mut agent, t0) = launched(dir.path());
+        let at = |secs| t0 + Duration::from_secs(secs);
+        // X is absent here, and an unreadable window list never clears a need: use a list.
+        let mut watcher = helper.new_watcher(1145360, Box::new(Fake(vec![])));
+        watcher.poll_at(t0);
+        helper.watcher = Some(watcher);
+        let login =
+            |text: &str| std::fs::write(dir.path().join("logs/steamui_login.txt"), text).unwrap();
+        shader_download_suspended(dir.path());
+        schedule_dropped(dir.path());
+        login("SetLoginState: WaitingForCredentials\n");
+        helper.pass(at(2), &mut agent);
+        helper.pass(at(30), &mut agent);
+        assert_eq!(runs(dir.path(), 1), 1, "nothing is sent at a sign-in");
+        assert!(helper.relaunch.is_some(), "and the retry is kept");
+        login("SetLoginState: WaitingForCredentials\nSetLoginState: LoggedIn\n");
+        helper.pass(at(35), &mut agent);
+        assert_eq!(runs(dir.path(), 2), 2, "signed in: the lost launch is sent");
+    }
+
+    /// #1314: a launch that is dropped again after each retry is sent at most
+    /// [`DROPPED_RETRIES`] times, and then nothing more: the reveal at the cap is the old
+    /// outcome, unchanged.
+    #[test]
+    fn a_dropped_launch_is_sent_again_at_most_twice() {
+        let _scripts = scripts();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let (mut helper, mut agent, t0) = launched(dir.path());
+        let at = |secs| t0 + Duration::from_secs(secs);
+        shader_download_suspended(dir.path());
+        schedule_dropped(dir.path());
+        helper.pass(at(2), &mut agent);
+        assert_eq!(runs(dir.path(), 1), 1, "not before it has stood a while");
+        helper.pass(at(8), &mut agent);
+        assert_eq!(runs(dir.path(), 2), 2, "the first retry");
+        assert!(helper.relaunch.is_some(), "still armed while it stands");
+        helper.pass(at(10), &mut agent);
+        assert_eq!(
+            runs(dir.path(), 2),
+            2,
+            "not again before it has stood a while"
+        );
+        helper.pass(at(14), &mut agent);
+        assert_eq!(runs(dir.path(), 3), 3, "the second retry");
+        helper.pass(at(20), &mut agent);
+        helper.pass(at(60), &mut agent);
+        assert_eq!(runs(dir.path(), 4), 3, "and no more than two");
+        helper.pass(at(RELAUNCH_MAX.as_secs() + 1), &mut agent);
+        assert!(helper.relaunch.is_none(), "the hard end is unchanged");
     }
 }
