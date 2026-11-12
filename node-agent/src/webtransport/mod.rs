@@ -61,7 +61,8 @@ const ROTATION_CHECK: Duration = Duration::from_secs(60);
 const DEFAULT_PORT: u16 = 4433;
 /// quinn's own default; `congestion::Backlog` reads the queue's fill against it.
 const DATAGRAM_BUFFER: usize = 1 << 20;
-/// One packet per 100 ms only behind a stalled queue: at most 10 × the path MTU/s.
+/// One transmit (up to ten packets where the socket batches them) per 100 ms, only behind a
+/// stalled queue on a path that acknowledges nothing: at most about 145 kB/s.
 const STARVED_PROBE_INTERVAL: Duration = Duration::from_millis(100);
 
 const CLOSE_NORMAL: u32 = 0;
@@ -1443,13 +1444,19 @@ async fn stream(
             _ = probe_tick.tick() => {
                 let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
                 let acks = quinn::Connection::stats(session).frame_rx.acks;
-                backlog.acknowledge(acks);
-                let starved = backlog.starved(queued);
-                governor.probe(starved);
-                if starved {
-                    // An empty WT datagram wakes Quinn; the client ignores it. The single
-                    // packet allowance lets queued data probe even a closed Cubic window.
-                    backlog.probed(acks);
+                // Only a session the estimate can govern (#1332's invariant): with ABR off, and
+                // while PyroWave is active, QUIC's own congestion control stands untouched. The
+                // estimate itself lets go during an outage (its feedback is silent), which is
+                // when this must still run, so it asks what the session is, not who governs now.
+                let probe = control.is_some()
+                    && current.codec != "pyrowave"
+                    && backlog.probe(queued, acks);
+                governor.probe(probe);
+                if probe {
+                    // An empty WT datagram wakes quinn; the client drops it. The allowance lets
+                    // one transmit of what is queued past a closed window: up to ten packets
+                    // where the socket batches them, so at most about 145 kB/s, and only while
+                    // nothing at all is being acknowledged.
                     starved_probes += 1;
                     handed += 1;
                     if session.send_datagram(bytes::Bytes::new()).is_err() {

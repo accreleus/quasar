@@ -986,8 +986,10 @@ impl Controller for Window {
     }
 
     fn window(&self) -> u64 {
-        // Quinn checks the window before each packet and calls on_sent after it. Only
-        // this one probe bypasses the window, including after release back to Cubic.
+        // Quinn checks the window before each packet of a transmit and calls on_sent once
+        // after it, so this lets one transmit past the window: up to ten packets where the
+        // socket batches them. Including after release back to Cubic, which is where an
+        // outage leaves the connection (silent feedback releases the estimate).
         if self.probe.load(Ordering::Relaxed) {
             return u64::MAX;
         }
@@ -1081,6 +1083,8 @@ impl Holds {
 pub(crate) struct Backlog {
     last: usize,
     probe_acks: Option<u64>,
+    /// The ACK count at the last probe tick: unchanged at the next one, the path is silent.
+    tick_acks: Option<u64>,
     growing_since: Option<Instant>,
     skipping: bool,
     backed_up: Holds,
@@ -1100,6 +1104,20 @@ impl Backlog {
         if self.probe_acks.is_some_and(|before| before != acks) {
             self.probe_acks = None;
         }
+    }
+
+    /// Called every probe tick with QUIC's ACK count. Whether to probe the path now: video is
+    /// held behind a stalled queue and no ACK has arrived since the last tick. A path that
+    /// still acknowledges, however slowly, opens its own window; probing past the window is
+    /// for a path that says nothing, where the only cost is a packet lost.
+    pub(crate) fn probe(&mut self, queued: usize, acks: u64) -> bool {
+        self.acknowledge(acks);
+        let silent = self.tick_acks.replace(acks) == Some(acks);
+        let due = silent && self.starved(queued);
+        if due {
+            self.probed(acks);
+        }
+        due
     }
 
     pub(crate) fn starved(&self, queued: usize) -> bool {

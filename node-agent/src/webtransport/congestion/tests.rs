@@ -774,6 +774,29 @@ fn stalled(b: &mut Backlog, start: Instant) -> Instant {
 }
 
 #[test]
+fn a_path_that_still_acknowledges_is_not_probed_past_its_window() {
+    let start = Instant::now();
+    let mut b = Backlog::default();
+    stalled(&mut b, start);
+    let queued = 10 * BACKLOG_EMPTY;
+    assert!(
+        !b.probe(queued, 5),
+        "the first tick has nothing to compare against"
+    );
+    assert!(
+        !b.probe(queued, 6),
+        "an ACK arrived since the last tick: QUIC opens its own window"
+    );
+    assert!(b.probe(queued, 6), "nothing acknowledged for a tick: probe");
+    assert!(b.probe(queued, 6));
+    assert!(!b.probe(queued, 7), "the probe was answered");
+    assert!(
+        !b.probe(0, 7),
+        "and with the queue drained there is nothing to probe for"
+    );
+}
+
+#[test]
 fn a_probe_emptying_the_queue_does_not_restart_the_give_up_clock() {
     let start = Instant::now();
     let mut b = Backlog::default();
