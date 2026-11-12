@@ -1533,3 +1533,282 @@ fn a_failed_line_without_progress_before_it_changes_nothing() {
     rig.watcher.poll();
     assert!(!rig.watcher.launch_taken());
 }
+
+// --- a launch Steam took up and then dropped (#1314) --------------------------
+
+/// A line as Steam writes it, stamped with the observed session's date (#1314).
+fn stamped(time: &str, rest: &str) -> String {
+    format!("[2026-11-11 {time}] {rest}")
+}
+
+/// `content_log.txt` beside the console log, which every case here needs.
+trait ContentLog {
+    fn append_content(&self, line: &str);
+}
+
+impl ContentLog for Rig {
+    fn append_content(&self, line: &str) {
+        self.append("content_log.txt", &format!("{line}\n"));
+    }
+}
+
+/// #1314's failed sequence, verbatim for the target and the app whose update pre-empted it:
+/// the launch moved into the shader download, the update was suspended, and Steam later
+/// finished the download and dropped the app from its schedule. The other app's lines are
+/// included because they are what suspended it, and the parser must not mistake them for the
+/// target's.
+fn suspended_shader_download(rig: &Rig) {
+    rig.append_log(&stamped(
+        "18:58:06",
+        &format!(
+            "GameAction [AppID {APPID}, ActionID 1] : LaunchApp changed task to CheckShaderDepotManifest with \"\""
+        ),
+    ));
+    rig.append_log(&stamped(
+        "18:58:07",
+        &format!(
+            "GameAction [AppID {APPID}, ActionID 1] : LaunchApp changed task to DownloadingDepots with \"\""
+        ),
+    ));
+    for (time, line) in [
+        (
+            "18:58:06",
+            format!("AppID {APPID} scheduler update : Priority Auto Update, not played for 150780 seconds, update disabled for 0 seconds"),
+        ),
+        (
+            "18:58:06",
+            format!("AppID {APPID} state changed : Fully Installed,Update Queued,"),
+        ),
+        (
+            "18:58:06",
+            format!("AppID {APPID} state changed : Fully Installed,Update Queued,Update Running,"),
+        ),
+        (
+            "18:58:06",
+            format!("AppID {APPID} Shader update changed : Running Update,"),
+        ),
+        (
+            "18:58:06",
+            format!("AppID {APPID} Shader update changed : Running Update,Reconfiguring,"),
+        ),
+        (
+            "18:58:07",
+            format!("AppID {APPID} scheduler update : Priority First, not played for 150781 seconds, update disabled for 0 seconds"),
+        ),
+        // The other app's update takes priority and suspends the target's download.
+        (
+            "18:58:07",
+            "AppID 1493710 scheduler update : Priority First, not played for 5695302 seconds, update disabled for 0 seconds".to_owned(),
+        ),
+        (
+            "18:58:07",
+            "AppID 1493710 state changed : Update Required,Fully Installed,Update Queued, (Update delayed for 465794 secs)".to_owned(),
+        ),
+        (
+            "18:58:07",
+            format!("AppID {APPID} Shader update changed : Running Update,Reconfiguring,Stopping,"),
+        ),
+        (
+            "18:58:07",
+            format!("AppID {APPID} Shader update changed : Running Update,Stopping,"),
+        ),
+        ("18:58:07", format!("AppID {APPID} Shader update changed : None")),
+        (
+            "18:58:07",
+            format!("AppID {APPID} state changed : Fully Installed,Update Queued,"),
+        ),
+        // The suspension itself, with Steam's trailing space.
+        (
+            "18:58:07",
+            format!("AppID {APPID} scheduler finished : staying in schedule (result Suspended, state 0xc) "),
+        ),
+        (
+            "18:58:07",
+            "AppID 1493710 state changed : Update Required,Fully Installed,Update Queued,Update Running,".to_owned(),
+        ),
+        (
+            "18:58:09",
+            "AppID 1493710 update started : download 0/443296, store 0/0, reuse 0/741735296, delta 0/636484379, stage 0/790837483 ".to_owned(),
+        ),
+        ("18:58:34", "AppID 1493710 state changed : Fully Installed,".to_owned()),
+        (
+            "18:58:34",
+            "AppID 1493710 scheduler finished : removed from schedule (result No Error, state 0xc) ".to_owned(),
+        ),
+    ] {
+        rig.append_content(&stamped(time, &line));
+    }
+}
+
+/// What Steam does next on the failed sequence: the other app's update is out of the way, the
+/// shader download runs to the end, and the app leaves the schedule with nothing after it.
+fn schedule_dropped(rig: &Rig) {
+    for line in [
+        format!("AppID {APPID} state changed : Fully Installed,Update Queued,Update Running,"),
+        format!("AppID {APPID} Shader update changed : Running Update,"),
+        format!("AppID {APPID} Shader update changed : Running Update,Reconfiguring,"),
+        format!("AppID {APPID} Shader update changed : Running Update,Preallocating,"),
+        format!("AppID {APPID} update started : download 0/484688, store 0/0, reuse 0/0, delta 0/0, stage 0/553677 "),
+        format!("AppID {APPID} Shader update changed : Running Update,Downloading,Staging,"),
+        format!("AppID {APPID} Shader update changed : Running Update,Committing,"),
+        format!("AppID {APPID} Shader update changed : None"),
+        format!("AppID {APPID} state changed : Fully Installed,Update Queued,"),
+        format!("AppID {APPID} state changed : Fully Installed,"),
+        format!("AppID {APPID} scheduler finished : removed from schedule (result No Error, state 0xc) "),
+    ] {
+        rig.append_content(&stamped("18:58:35", &line));
+    }
+}
+
+/// #1314: the launch Steam took up, suspended with the shader download and then dropped from
+/// the schedule, is a lost launch — and the caller may send it again.
+#[test]
+fn a_launch_dropped_with_its_shader_download_suspended_is_read_as_dropped() {
+    let mut rig = Rig::new();
+    rig.watcher.poll();
+    suspended_shader_download(&rig);
+    rig.watcher.poll();
+    assert!(rig.watcher.launch_taken(), "Steam took the launch up");
+    assert!(
+        !rig.watcher.launch_dropped(),
+        "a suspended update is not yet a dropped launch"
+    );
+    schedule_dropped(&rig);
+    rig.watcher.poll();
+    assert!(
+        rig.watcher.launch_dropped(),
+        "the app left the schedule and nothing followed it"
+    );
+    // The state stays the client's: nothing about this is the game running.
+    assert_ne!(rig.watcher.launch_state(), LaunchState::GameRunning);
+}
+
+/// #1314's successful launch of the same game, for comparison: the same shader task, then the
+/// whole launch through to the game running. Steam logs the game's own start; nothing of it
+/// reads as dropped.
+#[test]
+fn a_normal_launch_is_never_read_as_dropped() {
+    let mut rig = Rig::new();
+    rig.watcher.poll();
+    let action = |time: &str, id: u32, text: &str| {
+        stamped(
+            time,
+            &format!("GameAction [AppID {APPID}, ActionID {id}] : LaunchApp {text}"),
+        )
+    };
+    for text in [
+        "changed task to CheckShaderDepotManifest with \"\"",
+        "changed task to ProcessingInstallScript with \"\"",
+        "changed task to SynchronizingCloud with \"\"",
+        "changed task to SynchronizingStats with \"\"",
+        "changed task to ShowInterstitials with \"\"",
+        "waiting for user response to ShowInterstitials \"\"",
+        "continues with user response \"ShowInterstitials\"",
+        "changed task to SynchronizingControllerConfig with \"\"",
+        "changed task to ProcessingShaderCache with \"\"",
+        "waiting for user response to ProcessingShaderCache \"\"",
+        "changed task to SiteLicenseSeatCheckout with \"\"",
+        "changed task to DelayLaunch with \"\"",
+        "changed task to CreatingProcess with \"\"",
+        "waiting for user response to CreatingProcess \"\"",
+        "continues with user response \"CreatingProcess\"",
+        "changed task to WaitingGameWindow with \"\"",
+        "changed task to Completed with \"\"",
+    ] {
+        rig.append_log(&action("19:34:15", 1, text));
+    }
+    rig.append_log(&stamped(
+        "19:34:25",
+        &format!("Game process added : AppID {APPID} \"steam-launch-wrapper -- reaper SteamLaunch AppId={APPID} -- ...\""),
+    ));
+    rig.append_content(&stamped(
+        "19:34:25",
+        &format!("AppID {APPID} state changed : Fully Installed,App Running,"),
+    ));
+    rig.watcher.poll();
+    assert!(rig.watcher.launch_taken());
+    assert!(!rig.watcher.launch_dropped());
+    assert_eq!(rig.watcher.launch_state(), LaunchState::GameRunning);
+}
+
+/// #1314: the same dropped sequence, but the game is running. A running game is never a lost
+/// launch, whether Steam's log says so or the content log does.
+#[test]
+fn a_launch_of_a_game_already_running_is_never_read_as_dropped() {
+    for running in ["content", "console"] {
+        let mut rig = Rig::new();
+        rig.watcher.poll();
+        suspended_shader_download(&rig);
+        schedule_dropped(&rig);
+        if running == "content" {
+            // `App Running` is what the content log says while a game runs; it is not the
+            // console log's `Game process added`, so the launch state stays the client's.
+            rig.append_content(&stamped(
+                "18:58:36",
+                &format!("AppID {APPID} state changed : Fully Installed,App Running,"),
+            ));
+        } else {
+            rig.append_log(&stamped(
+                "18:58:36",
+                &format!("Game process added : AppID {APPID} \"reaper SteamLaunch AppId={APPID} -- game\""),
+            ));
+        }
+        rig.watcher.poll();
+        assert!(!rig.watcher.launch_dropped(), "the game runs ({running})");
+    }
+}
+
+/// #1314: a newer `GameAction` for the app is a launch in progress again, so the drop behind it
+/// is spent; when that attempt is suspended and dropped in its turn, it reads as dropped again.
+/// This is what lets the helper's second retry be evidence, not a guess.
+#[test]
+fn a_new_launch_attempt_after_the_drop_clears_it_and_a_second_drop_reads_again() {
+    let mut rig = Rig::new();
+    rig.watcher.poll();
+    suspended_shader_download(&rig);
+    schedule_dropped(&rig);
+    rig.watcher.poll();
+    assert!(rig.watcher.launch_dropped());
+
+    rig.append_log(&stamped(
+        "19:00:00",
+        &format!("GameAction [AppID {APPID}, ActionID 2] : LaunchApp changed task to CheckShaderDepotManifest with \"\""),
+    ));
+    rig.watcher.poll();
+    assert!(
+        !rig.watcher.launch_dropped(),
+        "a later launch attempt is in progress"
+    );
+
+    rig.append_content(&stamped(
+        "19:00:01",
+        &format!(
+            "AppID {APPID} scheduler finished : staying in schedule (result Suspended, state 0xc) "
+        ),
+    ));
+    rig.append_content(&stamped(
+        "19:00:30",
+        &format!("AppID {APPID} scheduler finished : removed from schedule (result No Error, state 0xc) "),
+    ));
+    rig.watcher.poll();
+    assert!(rig.watcher.launch_dropped(), "dropped a second time");
+}
+
+/// A missing or unreadable `content_log.txt` is no evidence, and never an error: the console
+/// log alone cannot show a launch was dropped, so nothing is read as dropped.
+#[test]
+fn a_missing_content_log_is_no_evidence() {
+    let mut rig = Rig::new();
+    rig.watcher.poll();
+    rig.append_log(&stamped(
+        "18:58:07",
+        &format!("GameAction [AppID {APPID}, ActionID 1] : LaunchApp changed task to DownloadingDepots with \"\""),
+    ));
+    rig.watcher.poll();
+    assert!(rig.watcher.launch_taken());
+    assert!(!rig.watcher.launch_dropped());
+    // A `content_log.txt` that appears later but is not a file is still no evidence.
+    std::fs::create_dir_all(rig.log_dir.join("content_log.txt")).unwrap();
+    rig.watcher.poll();
+    assert!(!rig.watcher.launch_dropped());
+}
