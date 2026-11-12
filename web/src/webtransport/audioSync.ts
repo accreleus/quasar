@@ -13,8 +13,14 @@ const VIDEO_SAMPLES = 120;
 export const MIN_TARGET_MS = 40;
 /** A video latency this long is a stall, not a delay to match. */
 export const MAX_TARGET_MS = 150;
-/** Audio packets behind the jitter estimate: two seconds at 10 ms. */
-const JITTER_SAMPLES = 200;
+/** Audio packets behind the jitter estimate: ten seconds at the contract's one 10 ms packet per datagram. */
+const JITTER_SAMPLES = 1_000;
+/** One packet later than this past the floor is a stall, not jitter to cover: it is lost to
+ *  playback either way, and covering it would hold audio that far behind its video for the
+ *  whole window. Lateness that keeps recurring is still covered in full. */
+export const MAX_JITTER_MS = 40;
+/** Packets behind the recurring-lateness percentile: two seconds at 10 ms. */
+const RECURRING_SAMPLES = 200;
 /** Used until a video frame has been presented. */
 const DEFAULT_TARGET_MS = 50;
 
@@ -32,12 +38,14 @@ export class AudioSync {
   /** An audio packet arrived at `arrivalMs`: updates the delay floor (arrival − capture). */
   noteAudio(captureUs: number, arrivalMs: number): void {
     const owd = arrivalMs - captureUs / 1000;
-    const before = this.floor();
     const bucket = Math.floor(arrivalMs / BUCKET_MS);
+    // Before the lateness is read: a floor older than the window (a frozen tab, a long silence)
+    // says nothing about this packet.
+    while (this.floors.length > 0 && this.floors[0].bucket <= bucket - BUCKETS) this.floors.shift();
+    const before = this.floor();
     const last = this.floors[this.floors.length - 1];
     if (last?.bucket === bucket) last.min = Math.min(last.min, owd);
     else this.floors.push({ bucket, min: owd });
-    while (this.floors.length > 0 && this.floors[0].bucket <= bucket - BUCKETS) this.floors.shift();
     this.excess.push(Math.max(0, owd - (before ?? owd)));
     if (this.excess.length > JITTER_SAMPLES) this.excess.shift();
   }
@@ -51,12 +59,15 @@ export class AudioSync {
     this.excess.length = 0;
   }
 
-  /** The 95th percentile of how late recent packets ran past the floor: what the playout delay
-   *  must cover for them to arrive in time. */
+  /** What the playout delay must cover for recent packets to arrive in time: the furthest any
+   *  ran past the floor in the window, up to {@link MAX_JITTER_MS}, and without that bound the
+   *  95th percentile of the last two seconds (a link that bunches one packet in five). The
+   *  percentile alone leaves five packets a second uncovered at 100 a second (#1346). */
   jitterMs(): number {
     if (this.excess.length < 20) return 0;
-    const s = [...this.excess].sort((a, b) => a - b);
-    return s[Math.min(s.length - 1, Math.floor(s.length * 0.95))];
+    const furthest = this.excess.reduce((a, b) => Math.max(a, b), 0);
+    const s = this.excess.slice(-RECURRING_SAMPLES).sort((a, b) => a - b);
+    return Math.max(Math.min(MAX_JITTER_MS, furthest), s[Math.min(s.length - 1, Math.floor(s.length * 0.95))]);
   }
 
   /** A video frame captured at `captureUs` was presented at `presentMs`. */
