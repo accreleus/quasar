@@ -251,7 +251,11 @@ impl Watcher {
         };
         // The stamps are seconds: Steam wrote the shader task and the suspension of it in the
         // same second on the observed run, so a suspension not *older* than the task counts.
-        suspended >= action_at
+        // A log that is not there right now (mid-rotation, or gone) may be hiding the line
+        // that says Steam carried the launch on: no retry on what cannot be read.
+        !self.console.absent
+            && !self.content.absent
+            && suspended >= action_at
             && dropped > suspended
             && !self.content_running
             && self.log_game != Some(true)
@@ -686,6 +690,8 @@ struct LogTail {
     file_id: Option<u64>,
     pending: Vec<u8>,
     discarding: bool,
+    /// The file was not there at the last read: what it would have said since is unknown.
+    absent: bool,
 }
 
 impl LogTail {
@@ -698,6 +704,7 @@ impl LogTail {
             file_id: None,
             pending: Vec::new(),
             discarding: false,
+            absent: false,
         }
     }
 
@@ -713,6 +720,7 @@ impl LogTail {
 
     fn read_pass(&mut self, lines: &mut Vec<String>, forgot: &mut bool) {
         let metadata = std::fs::metadata(&self.path);
+        self.absent = metadata.is_err();
 
         // Decided on the first poll, not the first sighting: the home
         // persists between sessions and the helper polls before Steam

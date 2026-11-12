@@ -1683,6 +1683,29 @@ fn a_launch_dropped_with_its_shader_download_suspended_is_read_as_dropped() {
     assert_ne!(rig.watcher.launch_state(), LaunchState::GameRunning);
 }
 
+/// #1314: a dropped launch is believed only while both logs can be read. A log that is missing
+/// at the poll (Steam is rotating it, or it is gone) may hold the line that says the launch
+/// went on.
+#[test]
+fn a_dropped_launch_is_not_believed_while_a_log_is_missing() {
+    for log in ["console_log.txt", "content_log.txt"] {
+        let mut rig = Rig::new();
+        rig.watcher.poll();
+        suspended_shader_download(&rig);
+        schedule_dropped(&rig);
+        rig.watcher.poll();
+        assert!(rig.watcher.launch_dropped());
+        let path = rig.log_dir.join(log);
+        let held = rig.log_dir.join("held");
+        std::fs::rename(&path, &held).unwrap();
+        rig.watcher.poll();
+        assert!(!rig.watcher.launch_dropped(), "{log} is missing");
+        std::fs::rename(&held, &path).unwrap();
+        rig.watcher.poll();
+        assert!(rig.watcher.launch_dropped(), "{log} is back, unchanged");
+    }
+}
+
 /// #1314's successful launch of the same game, for comparison: the same shader task, then the
 /// whole launch through to the game running. Steam logs the game's own start; nothing of it
 /// reads as dropped.
