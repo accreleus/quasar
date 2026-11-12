@@ -1444,11 +1444,12 @@ async fn stream(
             _ = probe_tick.tick() => {
                 let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
                 let acks = quinn::Connection::stats(session).frame_rx.acks;
-                // Only a session the estimate can govern (#1332's invariant): with ABR off, and
-                // while PyroWave is active, QUIC's own congestion control stands untouched. The
-                // estimate itself lets go during an outage (its feedback is silent), which is
-                // when this must still run, so it asks what the session is, not who governs now.
-                let probe = control.is_some()
+                // Only a session the estimate can govern (#1332's invariant): with ABR off (an
+                // ABR loop exists then, but retargets nothing), and while PyroWave is active,
+                // QUIC's own congestion control stands untouched. The estimate itself lets go
+                // during an outage (its feedback is silent), which is when this must still run,
+                // so it asks what the session is, not who governs now.
+                let probe = media.rate().is_some_and(|r| r.retargets)
                     && current.codec != "pyrowave"
                     && backlog.probe(queued, acks);
                 governor.probe(probe);
