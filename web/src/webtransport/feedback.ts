@@ -9,8 +9,8 @@ const MAX_HELD = 4 * MAX_COUNT;
 const NOT_RECEIVED = 0xffff;
 /** A datagram is reported only once it is this old: one reordered by less is not a loss. */
 export const HOLD_BACK_MS = 5;
-/** Channels whose datagrams carry `pkt_seq` (§Channels): video, audio, FEC. */
-const COUNTED = new Set([0x01, 0x02, 0x04]);
+/** Channels whose datagrams carry `pkt_seq` (§Channels): video, audio, audio redundancy, FEC. */
+const COUNTED = new Set([0x01, 0x02, 0x04, 0x06]);
 
 /** Is `a` after `b`, in u32 serial-number arithmetic (§Channels, "Wrap-around")? */
 const after = (a: number, b: number) => {
