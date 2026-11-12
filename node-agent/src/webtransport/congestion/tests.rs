@@ -682,6 +682,24 @@ fn a_release_starts_cubic_afresh_from_the_paths_bdp() {
     assert_eq!(w.window(), 12_000);
 }
 
+#[test]
+fn a_starved_probe_allows_one_packet_then_restores_cubics_loss_response() {
+    let start = Instant::now();
+    let governor = Governor::default();
+    let mut w = window(&governor, start);
+    let before = w.window();
+    governor.probe(true);
+    assert_eq!(w.window(), u64::MAX);
+    // Even a loss while the probe is pending still reaches Cubic.
+    w.on_congestion_event(start, start, true, 1200);
+    w.on_sent(start, 1200, 1);
+    assert!(w.window() < before);
+    assert_eq!(w.window(), w.cubic.window());
+    governor.probe(true);
+    governor.probe(false);
+    assert_eq!(w.window(), w.cubic.window(), "cancelling an unsent probe");
+}
+
 const HOLD: Duration = Duration::from_millis(250);
 const FRAME: Duration = Duration::from_millis(33);
 
@@ -704,6 +722,7 @@ fn a_keyframe_being_paced_out_is_never_read_as_a_stall() {
 fn a_queue_that_stops_draining_skips_video_until_it_drains_and_a_keyframe_comes() {
     let start = Instant::now();
     let mut b = Backlog::default();
+    assert!(!b.starved(10_000), "a healthy queue needs no probe");
     let mut queued = 0usize;
     let mut n = 0u32;
     let mut admit = |b: &mut Backlog, queued: usize, key: bool| {
@@ -718,6 +737,8 @@ fn a_queue_that_stops_draining_skips_video_until_it_drains_and_a_keyframe_comes(
     }
     // Growing since the second frame; skipping starts once that is longer than the hold.
     assert_eq!(sent, 9, "the queue holds the hold's worth, not a MiB");
+    assert!(b.starved(queued));
+    assert!(!b.starved(0), "waiting for a keyframe needs no path probe");
     assert_eq!(
         admit(&mut b, queued, true),
         Admit::Skip,
@@ -735,6 +756,7 @@ fn a_queue_that_stops_draining_skips_video_until_it_drains_and_a_keyframe_comes(
         "resumes at the keyframe"
     );
     assert_eq!(admit(&mut b, 10_000, false), Admit::Send);
+    assert!(!b.starved(10_000), "recovered: stop probing");
     assert_eq!(b.skipped, 4);
 }
 
@@ -749,6 +771,50 @@ fn stalled(b: &mut Backlog, start: Instant) -> Instant {
         queued += 10_000;
     }
     panic!("never stalled");
+}
+
+#[test]
+fn a_path_that_still_acknowledges_is_not_probed_past_its_window() {
+    let start = Instant::now();
+    let mut b = Backlog::default();
+    stalled(&mut b, start);
+    let queued = 10 * BACKLOG_EMPTY;
+    assert!(
+        !b.probe(queued, 5),
+        "the first tick has nothing to compare against"
+    );
+    assert!(
+        !b.probe(queued, 6),
+        "an ACK arrived since the last tick: QUIC opens its own window"
+    );
+    assert!(b.probe(queued, 6), "nothing acknowledged for a tick: probe");
+    assert!(b.probe(queued, 6));
+    assert!(!b.probe(queued, 7), "the probe was answered");
+    assert!(
+        !b.probe(0, 7),
+        "and with the queue drained there is nothing to probe for"
+    );
+}
+
+#[test]
+fn a_probe_emptying_the_queue_does_not_restart_the_give_up_clock() {
+    let start = Instant::now();
+    let mut b = Backlog::default();
+    let at = stalled(&mut b, start);
+    b.probed(10);
+    b.probed(11); // Later probes must not replace the first one's ACK snapshot.
+    b.acknowledge(10);
+    assert!(b.starved(0));
+    for n in 1..GIVE_UP_HOLDS {
+        assert_eq!(b.admit(0, true, at + HOLD * n, HOLD), Admit::Skip);
+    }
+    assert_eq!(
+        b.admit(0, true, at + HOLD * GIVE_UP_HOLDS, HOLD),
+        Admit::GiveUp
+    );
+    b.acknowledge(11);
+    assert!(!b.starved(0));
+    assert_eq!(b.admit(0, true, at + HOLD * 25, HOLD), Admit::Send);
 }
 
 #[test]

@@ -1723,14 +1723,53 @@ async fn a_pyrowave_client_keeps_quic_congestion_control() {
     assert!(!governed_at_leave(send, &captured).await.0);
 }
 
+#[tokio::test]
+async fn a_healthy_video_path_sends_no_starved_probes() {
+    let captured = Captured::default();
+    let _logs = capture_info(&captured);
+    let agent = governed_agent(Stream::H264).await;
+    let (session, mut send, _recv, _) = agent.hello(TOKEN).await;
+    let mut path = Arrivals::default();
+    let mut report = tokio::time::interval(Duration::from_millis(50));
+    let end = tokio::time::sleep(Duration::from_secs(2));
+    tokio::pin!(end);
+    loop {
+        tokio::select! {
+            d = session.read_datagram() => {
+                let d = d.unwrap();
+                assert!(!d.is_empty(), "an unnecessary probe on a healthy path");
+                path.receive(&d);
+            }
+            _ = report.tick() => {
+                if let Some(fb) = path.feedback() {
+                    write_message(&mut send, &fb).await.unwrap();
+                }
+            }
+            () = &mut end => break,
+        }
+    }
+    governed_at_leave(send, &captured).await;
+    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("starved_probes=0"));
+}
+
 /// #1330: a path that carries nothing for 2 s closes QUIC's window, and quinn's 1 MiB queue
 /// holds 2 s of 4 Mbit/s video, dropping only the oldest. Behind a stalled queue the agent
 /// stops adding video, so what is still worth nothing when the path returns is the NACK
 /// hold's worth, and a keyframe follows it. A NACK behind it is not answered either.
 #[tokio::test]
 async fn video_behind_a_stalled_path_is_skipped_not_queued() {
+    outage_recovers(Stream::Av1Heavy).await;
+}
+
+#[tokio::test]
+async fn video_resumes_promptly_after_an_outage_with_a_smaller_frame() {
+    outage_recovers(Stream::H264).await;
+}
+
+async fn outage_recovers(stream: Stream) {
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-    let mut agent = governed_agent(Stream::Av1Heavy).await;
+    let mut agent = governed_agent(stream).await;
     let down = Arc::new(AtomicBool::new(false));
     let cut = down.clone();
     let (session, mut send, mut recv) = through(&mut agent, move || {
@@ -1775,6 +1814,7 @@ async fn video_behind_a_stalled_path_is_skipped_not_queued() {
         tokio::select! {
             d = session.read_datagram() => {
                 let d = d.unwrap();
+                if d.is_empty() { continue; }
                 path.receive(&d);
                 let frame_seq = u16::from_le_bytes([d[7], d[8]]);
                 let pkt_seq = u32::from_le_bytes(d[1..5].try_into().unwrap());
@@ -1812,12 +1852,11 @@ async fn video_behind_a_stalled_path_is_skipped_not_queued() {
         "{} frames over 200 ms old arrived after the path came back",
         stale.len()
     );
-    // Measured 0.12–0.16 s; QUIC's probe, backed off over the outage, can make it about 2 s.
-    // Under the guard's give-up (6 s of skipping from 250 ms into the outage): video resumes
-    // on a keyframe and the media is not ended.
+    // A probe within 100 ms, its ACK, queue drain and a fresh keyframe.
     let fresh = fresh.expect("no fresh video after the path came back");
+    eprintln!("fresh video {:?} after path recovery", fresh - up_at);
     assert!(
-        fresh - up_at < Duration::from_secs(4),
+        fresh - up_at < Duration::from_millis(300),
         "fresh video {:?} after",
         fresh - up_at
     );
