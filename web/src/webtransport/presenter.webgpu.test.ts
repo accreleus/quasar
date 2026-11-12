@@ -116,8 +116,13 @@ async function shoot(opts: { sharpen: boolean; w?: number; h?: number }): Promis
     getContext: () => ({ configure() {}, getCurrentTexture: () => target }),
   } as unknown as HTMLCanvasElement;
   const fatal: string[] = [];
+  const warn = vi.spyOn(console, "warn");
   const presenter: Presenter = (await createWebGpuPresenter(canvas, (m) => fatal.push(m)))!;
   expect(presenter).not.toBeNull();
+  // Both kinds of the pass compiled on a real device: a rejected one only logs, and the pass
+  // would then be off for every session with nothing else failing.
+  expect(warn).not.toHaveBeenCalled();
+  warn.mockRestore();
   const device = presenter.device!;
   target = device.createTexture({
     size: [w, h],

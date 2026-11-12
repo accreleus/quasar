@@ -308,8 +308,7 @@ export function InputPane(props: InputPaneProps) {
             />
           </div>
           <div className="col-note" id="hud-upscale-sharpen-hint">
-            Rebuilds detail when the stream is smaller than the picture. Off stretches it as
-            before.
+            Rebuilds detail when a WebTransport stream is smaller than the picture.
           </div>
         </div>
       </div>

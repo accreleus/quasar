@@ -205,38 +205,41 @@ export async function createWebGpuPresenter(
   let sharpenUnavailable: string | null = null;
   /**
    * The upscale + sharpen pipeline for one texture kind, or null when it cannot be built
-   * (#1349). Its shader is compiled here, at creation, so a browser that rejects it is known
-   * before the first frame: the pass is then off for this session and every frame is drawn the
-   * plain way. A shader nobody can run is not a broken session.
+   * (#1349): the pass is then off for this session and every frame is drawn the plain way.
+   * A shader nobody can run is not a broken session, so everything the device has to say
+   * about it is caught here: a compile or pipeline error raised on the device would
+   * otherwise reach `uncapturederror` and end the presenter.
    */
   const makeSharpenPipeline = async (texture: string): Promise<GPURenderPipeline | null> => {
+    let pipeline: GPURenderPipeline | null = null;
+    device.pushErrorScope("validation");
     try {
       const module = device.createShaderModule({ code: shader(texture, true) });
       const info = await module.getCompilationInfo?.();
-      const errors = info?.messages.filter((m) => m.type === "error") ?? [];
-      if (errors.length > 0) {
-        sharpenUnavailable ??= errors[0].message;
-        return null;
+      const error = info?.messages.find((m) => m.type === "error");
+      if (error) sharpenUnavailable ??= error.message;
+      else {
+        pipeline = await device.createRenderPipelineAsync({
+          layout: "auto",
+          vertex: { module, entryPoint: "vs" },
+          fragment: { module, entryPoint: "fs", targets: [{ format }] },
+          primitive: { topology: "triangle-list" },
+        });
       }
-      return device.createRenderPipeline({
-        layout: "auto",
-        vertex: { module, entryPoint: "vs" },
-        fragment: { module, entryPoint: "fs", targets: [{ format }] },
-        primitive: { topology: "triangle-list" },
-      });
     } catch (err) {
       sharpenUnavailable ??= err instanceof Error ? err.message : String(err);
-      return null;
     }
+    const raised = await device.popErrorScope().catch(() => null);
+    if (raised) sharpenUnavailable ??= raised.message;
+    return raised ? null : pipeline;
   };
 
   const external = makePipeline("texture_external");
   // Both kinds up front: the copy fallback below is synchronous, and knowing now whether the
   // pass compiles is what lets it be a fallback rather than a surprise. Either may be null.
-  const [externalSharpen, textureSharpen] = await Promise.all([
-    makeSharpenPipeline("texture_external"),
-    makeSharpenPipeline("texture_2d<f32>"),
-  ]);
+  // One after the other: error scopes are a stack, and two builds awaiting at once would pop each other's.
+  const externalSharpen = await makeSharpenPipeline("texture_external");
+  const textureSharpen = await makeSharpenPipeline("texture_2d<f32>");
   if (sharpenUnavailable != null) {
     console.warn("presenter: the upscale+sharpen pass is unavailable; drawing without it", sharpenUnavailable);
   }

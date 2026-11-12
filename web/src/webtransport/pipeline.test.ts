@@ -818,6 +818,9 @@ describe("createWebGpuPresenter", () => {
         }),
       }),
       createRenderPipeline: (d: { vertex: { module: { code: string } } }) => ({ code: d.vertex.module.code, getBindGroupLayout: () => ({}) }),
+      createRenderPipelineAsync: async (d: { vertex: { module: { code: string } } }) => ({ code: d.vertex.module.code, getBindGroupLayout: () => ({}) }),
+      pushErrorScope: () => {},
+      popErrorScope: async () => null,
       createSampler: (d: { magFilter: string }) => d.magFilter,
       importExternalTexture: () => {
         calls.push("import");
