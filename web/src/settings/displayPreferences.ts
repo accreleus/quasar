@@ -21,6 +21,10 @@ export interface DisplayPreferences {
   /** #647: Play goes full screen and the reveal captures input. Per device (a
    *  phone and a desktop want different things); absent means on. */
   launchImmersive?: boolean;
+  /** #1349: reconstruct and sharpen a stream smaller than the picture it is drawn
+   *  into, instead of stretching it. Per device like the scaling mode beside it;
+   *  absent means on. */
+  upscaleSharpen?: boolean;
 }
 
 const DEFAULT_PREFS: DisplayPreferences = {
@@ -46,6 +50,7 @@ export function loadDisplayPreferences(): DisplayPreferences {
       scalingMode,
       ...(preferredMicDeviceId ? { preferredMicDeviceId } : {}),
       ...(parsed.launchImmersive === false ? { launchImmersive: false } : {}),
+      ...(parsed.upscaleSharpen === false ? { upscaleSharpen: false } : {}),
     };
   } catch {
     return { ...DEFAULT_PREFS };
@@ -68,4 +73,9 @@ export function saveDisplayPreferences(prefs: Partial<DisplayPreferences>): void
 /** #647: whether a launch goes full screen and captures input on this device. */
 export function launchImmersive(): boolean {
   return loadDisplayPreferences().launchImmersive !== false;
+}
+
+/** #1349: whether an upscaled stream is reconstructed and sharpened on this device. */
+export function upscaleSharpen(): boolean {
+  return loadDisplayPreferences().upscaleSharpen !== false;
 }

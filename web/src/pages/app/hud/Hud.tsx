@@ -89,6 +89,9 @@ export interface HudProps {
 
   scalingMode: ScalingMode;
   onScalingChange: (m: ScalingMode) => void;
+  /** #1349: the upscale + sharpen pass, on unless this device turned it off. */
+  upscaleSharpen: boolean;
+  onUpscaleSharpenChange: (on: boolean) => void;
   /** `session.started_at`, for the stats pane's elapsed row. */
   startedAt?: string | null;
 
@@ -402,6 +405,8 @@ export const Hud = forwardRef<HudHandle, HudProps>(function Hud(props, ref) {
             touchLook={props.touchLook}
             scalingMode={props.scalingMode}
             onScalingChange={props.onScalingChange}
+            upscaleSharpen={props.upscaleSharpen}
+            onUpscaleSharpenChange={props.onUpscaleSharpenChange}
           />
         );
       case "stats":

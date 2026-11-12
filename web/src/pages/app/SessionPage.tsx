@@ -68,6 +68,7 @@ import {
   launchImmersive,
   loadDisplayPreferences,
   saveDisplayPreferences,
+  upscaleSharpen,
   type ScalingMode,
 } from "../../settings/displayPreferences";
 import { reportBestEffortFailure } from "../../lib/reportBestEffortFailure";
@@ -193,6 +194,8 @@ function SessionPageBody() {
   const [scalingMode, setScalingMode] = useState<ScalingMode>(
     () => loadDisplayPreferences().scalingMode,
   );
+  // #1349: the upscale + sharpen pass, device-local beside the scaling mode.
+  const [sharpenOn, setSharpenOn] = useState(upscaleSharpen);
   // Mic spec §3.4: never persisted/restored — every session starts mic-off.
   const [micOn, setMicOn] = useState(false);
   const [micBusy, setMicBusy] = useState(false);
@@ -870,6 +873,12 @@ function SessionPageBody() {
     saveDisplayPreferences({ scalingMode: mode });
   }, []);
 
+  // #1349: the presenter reads this off the canvas per frame, so it applies at once.
+  const handleUpscaleSharpenChange = useCallback((on: boolean) => {
+    setSharpenOn(on);
+    saveDisplayPreferences({ upscaleSharpen: on });
+  }, []);
+
   // Render resolution + interface size (control-api.md session-display-update)
   // lives in useDisplayPatch.ts. `externalSize`/`externalResizeSupported` live
   // in useSessionStatus above (the 5s poll can also change them); this hook
@@ -1146,6 +1155,7 @@ function SessionPageBody() {
             ref={canvasRef}
             className="session-video"
             data-scaling-mode={scalingMode}
+            data-upscale-sharpen={sharpenOn ? undefined : "off"}
             data-compositor-w={compositorSize?.w}
             data-compositor-h={compositorSize?.h}
           />
@@ -1365,6 +1375,8 @@ function SessionPageBody() {
             games={quickSwitch}
             scalingMode={scalingMode}
             onScalingChange={handleScalingChange}
+            upscaleSharpen={sharpenOn}
+            onUpscaleSharpenChange={handleUpscaleSharpenChange}
             startedAt={startedAt}
             streamSize={streamSize}
             // Null = "match the stream" / still at launch size — the pane

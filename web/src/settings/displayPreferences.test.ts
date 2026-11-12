@@ -3,6 +3,7 @@ import {
   launchImmersive,
   loadDisplayPreferences,
   saveDisplayPreferences,
+  upscaleSharpen,
   type DisplayPreferences,
 } from "./displayPreferences";
 
@@ -88,6 +89,24 @@ describe("preferredMicDeviceId (microphone spec §3.4)", () => {
     const prefs = loadDisplayPreferences();
     expect(prefs.scalingMode).toBe("cover");
     expect(prefs.preferredMicDeviceId).toBe("dev-abc");
+  });
+});
+
+describe("upscaleSharpen (#1349)", () => {
+  it("defaults on, and reads back a stored off", () => {
+    expect(upscaleSharpen()).toBe(true);
+    saveDisplayPreferences({ upscaleSharpen: false });
+    expect(upscaleSharpen()).toBe(false);
+    saveDisplayPreferences({ upscaleSharpen: true });
+    expect(upscaleSharpen()).toBe(true);
+  });
+
+  it("survives a scaling-only save, and a scaling save survives it", () => {
+    saveDisplayPreferences({ upscaleSharpen: false });
+    saveDisplayPreferences({ scalingMode: "cover" });
+    expect(loadDisplayPreferences()).toEqual({ scalingMode: "cover", upscaleSharpen: false });
+    saveDisplayPreferences({ upscaleSharpen: true });
+    expect(loadDisplayPreferences().scalingMode).toBe("cover");
   });
 });
 
