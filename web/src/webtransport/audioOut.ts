@@ -380,9 +380,9 @@ export class AudioOut {
     const out = this.out;
     if (!ctx || !out) return;
     const minDelayMs = this.minDelayMs();
-    const targetDelayFrames = (this.sync.targetDelayMs(minDelayMs) / 1000) * ctx.sampleRate;
     const playAt = this.sync.playAtMs(captureUs, minDelayMs);
     if (playAt === null) return;
+    const targetDelayFrames = (this.sync.targetDelayMs(minDelayMs) / 1000) * ctx.sampleRate;
     const now = this.now();
     const outputLatencyMs = (ctx.outputLatency || ctx.baseLatency || 0) * 1000;
     if (playAt - now < outputLatencyMs) {

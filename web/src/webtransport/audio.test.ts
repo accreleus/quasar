@@ -114,6 +114,7 @@ describe("AudioSync", () => {
     for (let i = 0; i < 20; i++) s.noteVideo(2_000_000 + i * 16_667, 2_000 + i * 16.667 + 100 + 80);
     s.noteVideo(2_400_000, 2_400 + 100 + 900); // one slow keyframe is not the median
     expect(s.videoLatencyMs()).toBeCloseTo(80, 0);
+    s.playAtMs(2_400_000);
     expect(s.targetDelayMs()).toBeCloseTo(80, 0);
     expect(s.avOffsetMs()).toBeCloseTo(0, 0);
   });
@@ -428,22 +429,22 @@ describe("AudioRing across a playout delay change", () => {
   const heard = (out: Float32Array): number => out.findIndex((x) => x >= 1.5);
 
   it("closes a 12 ms rise in the playout delay by stretching: no silence, no dropout, timeline converges", () => {
-    const starts = stepped(120, 20, 576);
-    const { out, ring } = play(starts, 90, 470);
+    const starts = stepped(320, 20, 576);
+    const { out, ring } = play(starts, 290, 1_220);
     expect(ring.stats).toMatchObject({ underrunFrames: 0, underrunEvents: 0, dropped: 0 });
     expect(out.includes(0)).toBe(false);
-    // 576 frames at 2 % of 480 a chunk is 60 chunks; 70 chunks after the step the stretch has
+    // 576 frames at 0.5 % of 480 a chunk is 240 chunks; 270 chunks after the step the stretch has
     // caught up: a marker is heard at its own start, not the 12 ms early the stretch began from.
-    expect(Math.abs(heard(out) - starts[90])).toBeLessThanOrEqual(STRETCH_DONE_FRAMES + 10);
+    expect(Math.abs(heard(out) - starts[290])).toBeLessThanOrEqual(STRETCH_DONE_FRAMES + 10);
   });
 
-  it("closes a 42 ms rise the same way, at 2 % until the timeline has caught up", () => {
-    const starts = stepped(260, 20, 2016);
-    const { out, ring } = play(starts, 240, 1_000);
+  it("closes a 42 ms rise the same way, at 0.5 % until the timeline has caught up", () => {
+    const starts = stepped(940, 20, 2016);
+    const { out, ring } = play(starts, 920, 3_600);
     expect(ring.stats).toMatchObject({ underrunFrames: 0, underrunEvents: 0, dropped: 0 });
     expect(out.includes(0)).toBe(false);
-    // 2,016 frames at 2 % of 480 a chunk is 210 chunks; the marker sits 220 after the step.
-    expect(Math.abs(heard(out) - starts[240])).toBeLessThanOrEqual(STRETCH_DONE_FRAMES + 10);
+    // 2,016 frames at 0.5 % of 480 a chunk is 840 chunks; the marker sits 900 after the step.
+    expect(Math.abs(heard(out) - starts[920])).toBeLessThanOrEqual(STRETCH_DONE_FRAMES + 10);
   });
 
   /** Streams 120 chunks whose samples are their own index, the starts stepped by `step` at chunk 20. */
@@ -492,7 +493,7 @@ describe("AudioRing across a playout delay change", () => {
   });
 
   it("leaves a step over the bound as the silence it was: a stall or a reset, not a delay", () => {
-    const starts = stepped(60, 20, 4_800); // 100 ms, over the 60 ms bound
+    const starts = stepped(60, 20, 4_800); // 100 ms, over the unmarked 60 ms bound
     const { out, ring } = play(starts, -1, 280);
     expect(ring.stats).toMatchObject({ underrunFrames: 4_800, underrunEvents: 1, dropped: 0 });
     expect(out[starts[19] + 480]).toBe(0); // the gap is heard as silence
@@ -554,7 +555,7 @@ describe("AudioRing across a playout delay change", () => {
   it("keeps the stretch bound for a known target change", () => {
     const ring = new AudioRing();
     ring.push(0, [new Float32Array(480).fill(1)], 0, false, 0);
-    const delay = MAX_STRETCH_FRAMES + 1;
+    const delay = (MAX_TARGET_MS - MIN_TARGET_MS) * 48 + STRETCH_DONE_FRAMES + 1;
     ring.push(480 + delay, [new Float32Array(480).fill(1)], 0, false, delay);
     ring.render([new Float32Array(960 + delay)], 0);
     expect(ring.stats).toMatchObject({ silenceRuns: 1, underrunFrames: delay });
@@ -677,7 +678,6 @@ describe("AudioOut", () => {
     ring.render(buf, 128);
     let next = 10;
     let seen = 0;
-    let firstReportMs = 0;
     for (let q = 2; q < 1_000; q++) {
       const frame = q * 128;
       const now = frame / 48;
@@ -695,14 +695,52 @@ describe("AudioOut", () => {
       }
       ring.render(buf, frame);
       if (q % 50 === 0) {
-        if (!firstReportMs) firstReportMs = now;
         port.onmessage?.({ data: ring.takeStats() });
       }
     }
-    // One step, minus only the specified decay since the first report; never the 60 ms cap.
-    expect(out.stats().targetDelayMs).toBeCloseTo(55 + UNDERRUN_STEP_MS - (999 * 128 / 48 - firstReportMs) * 0.0001, 8);
+    // The decay stays inside the deadband: exactly one scheduled step.
+    expect(out.stats().targetDelayMs).toBeCloseTo(55 + UNDERRUN_STEP_MS, 2);
     expect(ring.stats.silenceRuns).toBe(1);
     expect(ring.stats.dropped).toBe(0);
+    out.close();
+  });
+
+  it("keeps posting through long rises and falls and reports only the scheduled target", async () => {
+    const { out, ctx, decoders, posted, at } = setupAudioOut({ outputLatency: 0.04 });
+    let now = 0;
+    ctx.getOutputTimestamp = () => ({ contextTime: now / 1_000 - 0.04, performanceTime: now });
+    await out.start(STEREO);
+    const ring = new AudioRing();
+    const buf = [new Float32Array(128)];
+    let next = 100;
+    let seen = 0;
+    let maxQueued = 0;
+    let firstTarget = 0;
+    for (let frame = 100 * 48; frame < 45_000 * 48; frame += 128) {
+      now = frame / 48;
+      while (next <= now) {
+        at(next);
+        const videoDelay = next >= 3_000 && next < 15_000 ? 150 : 55;
+        out.packet(packet(next * 1_000));
+        out.noteVideo((next - videoDelay) * 1_000);
+        decoders[0].emit(next * 1_000);
+        next += 10;
+      }
+      at(now);
+      while (seen < posted.length) {
+        const message = posted[seen++];
+        ring.push(message.start, message.planes, frame, message.concealed, message.targetDelayFrames);
+      }
+      ring.render(buf, frame);
+      const target = posted.at(-1)!.targetDelayFrames! / 48;
+      if (!firstTarget) firstTarget = target;
+      expect(out.stats().targetDelayMs).toBe(target);
+      maxQueued = Math.max(maxQueued, Reflect.get(ring, "queued") as number);
+    }
+    expect(firstTarget).toBe(55);
+    expect(out.stats()).toMatchObject({ late: 0, targetDelayMs: 55 });
+    expect(ring.stats).toMatchObject({ dropped: 0, silenceRuns: 0 });
+    expect(maxQueued).toBeLessThan(48_000);
     out.close();
   });
 

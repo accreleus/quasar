@@ -30,6 +30,9 @@ export const MAX_UNDERRUN_MARGIN_MS = 60;
 const UNDERRUN_DECAY_MS_PER_S = 0.1;
 /** Used until a video frame has been presented. */
 const DEFAULT_TARGET_MS = 50;
+/** Keep the margin's continuous decay from continuously changing the playback rate. */
+const TARGET_DEADBAND_MS = 5;
+const TARGET_FALL_HOLD_MS = 5_000;
 
 const median = (xs: number[]): number => {
   const s = [...xs].sort((a, b) => a - b);
@@ -44,6 +47,9 @@ export class AudioSync {
   /** The underrun margin as it stood at `marginAt`; it decays from there. */
   private margin = 0;
   private marginAt = 0;
+  private audioAt = 0;
+  private scheduledTarget: number | null = null;
+  private lowerSince: number | null = null;
 
   /** The ring ran dry and played silence: deepen the buffer by one step. */
   noteUnderrun(nowMs: number): void {
@@ -59,6 +65,7 @@ export class AudioSync {
 
   /** An audio packet arrived at `arrivalMs`: updates the delay floor (arrival − capture). */
   noteAudio(captureUs: number, arrivalMs: number): void {
+    this.audioAt = arrivalMs;
     const owd = arrivalMs - captureUs / 1000;
     const bucket = Math.floor(arrivalMs / BUCKET_MS);
     // Before the lateness is read: a floor older than the window (a frozen tab, a long silence)
@@ -79,6 +86,8 @@ export class AudioSync {
     this.floors.length = 0;
     this.video.length = 0;
     this.excess.length = 0;
+    this.scheduledTarget = null;
+    this.lowerSince = null;
   }
 
   /** What the playout delay must cover for recent packets to arrive in time: the furthest any
@@ -111,10 +120,14 @@ export class AudioSync {
     return this.video.length === 0 ? null : median(this.video);
   }
 
-  /** D: how long after capture audio plays. `minMs`: the output device's own latency plus
-   *  what it needs to be posted to the audio thread in time; the jitter the path shows is
-   *  added to it, so a link that bunches packets gets a deeper buffer. */
+  /** The last scheduled delay, so telemetry cannot move a target no chunk has been given.
+   *  Before the first chunk, returns the computed target. */
   targetDelayMs(minMs = 0): number {
+    return this.scheduledTarget ?? this.computedTargetMs(minMs);
+  }
+
+  /** Device and posting floor plus jitter, bounded by the video match and the delay cap. */
+  private computedTargetMs(minMs: number): number {
     const wanted = this.videoLatencyMs() ?? DEFAULT_TARGET_MS;
     return Math.min(MAX_TARGET_MS, Math.max(wanted, MIN_TARGET_MS, minMs + this.jitterMs()));
   }
@@ -123,7 +136,22 @@ export class AudioSync {
    *  null before the first audio packet has fixed the floor. */
   playAtMs(captureUs: number, minMs = 0): number | null {
     const floor = this.floor();
-    return floor === null ? null : captureUs / 1000 + floor + this.targetDelayMs(minMs);
+    if (floor === null) return null;
+    const computed = this.computedTargetMs(minMs);
+    const scheduled = this.scheduledTarget;
+    if (scheduled === null || computed > scheduled + TARGET_DEADBAND_MS) {
+      this.scheduledTarget = computed;
+      this.lowerSince = null;
+    } else if (computed < scheduled - TARGET_DEADBAND_MS) {
+      this.lowerSince ??= this.audioAt;
+      if (this.audioAt - this.lowerSince >= TARGET_FALL_HOLD_MS) {
+        this.scheduledTarget = computed;
+        this.lowerSince = null;
+      }
+    } else {
+      this.lowerSince = null;
+    }
+    return captureUs / 1000 + floor + this.targetDelayMs(minMs);
   }
 
   /** How much later than its video the audio is heard (positive: audio lags). */
