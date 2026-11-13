@@ -2904,13 +2904,13 @@ mod tests {
         // The lowest rate of the run decides: one dip to 6000 at 9000 is 1080p.
         let mut p = rate_planner(LadderOrder::ResFirst, false, 120, t);
         rates(&mut p, t, 0, 4, |_| 1000.0);
-        let steps = rates(
-            &mut p,
-            t,
-            4000,
-            11,
-            |ms| if ms == 4500 { 6000.0 } else { 9000.0 },
-        );
+        let steps = rates(&mut p, t, 4000, 11, |ms| {
+            if ms == 4500 {
+                6000.0
+            } else {
+                9000.0
+            }
+        });
         assert_eq!(steps, vec![(14_000, "res->1".to_string())]);
         // An up after an up confirms in `RATE_CONFIRM`.
         assert_eq!(
