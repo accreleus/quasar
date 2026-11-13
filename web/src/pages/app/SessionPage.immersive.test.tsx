@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionPage } from "./SessionPage";
 import { ToastProvider } from "../../components/Toast";
 import { ThemeProvider } from "../../settings/ThemeContext";
+import { enterLaunchFullscreen } from "../../input/launchFullscreen";
 
 const getSession = vi.fn();
 const stopSession = vi.fn();
@@ -459,6 +460,59 @@ describe("SessionPage — #647 straight-in capture", () => {
     await reveal();
     expect(typeof lastDrawerProps?.releaseHint).toBe("string");
     expect((lastDrawerProps?.releaseHint as string).length).toBeGreaterThan(0);
+  });
+});
+
+// The owner's flow on the WebTransport transport: Play spends its click on full screen,
+// the route change to the session page keeps it, and the reveal captures with no second
+// click. Every other test in this file sets `document.fullscreenElement` by hand, which
+// cannot tell the launch's own full screen from any other grant — and a WebTransport page
+// differs in what it captures (a canvas, not the <video>) and in how its channel opens.
+describe("SessionPage — a WebTransport launch goes straight in (#647)", () => {
+  const webtransport = { url: "https://agent/wt", token: "w", expires_at: "2026-11-06T12:01:00Z", cert_hashes: [] };
+
+  /** The Play click's full screen, as the browser does it: the element is only full
+   *  screen once the request settles, which is after the click, not inside it. */
+  function playClick(settle = true) {
+    requestFullscreen.mockImplementation(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          setTimeout(() => {
+            if (!settle) return reject(new TypeError("fullscreen refused"));
+            fsEl = document.documentElement;
+            resolve();
+          }, 0);
+        }),
+    );
+    act(() => {
+      enterLaunchFullscreen();
+    });
+  }
+
+  async function revealOverWebTransport() {
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    renderPage({ webtransport });
+    await advance(1_000);
+    await act(async () => {
+      wt.set!({ channelOpen: true, wsOpen: true, pcConnected: true, firstFrame: true });
+    });
+    await advance(1_500);
+  }
+
+  it("engages once at the reveal, under the full screen Play asked for, with no Click to play", async () => {
+    playClick();
+    await revealOverWebTransport();
+    expect(document.fullscreenElement).toBe(document.documentElement);
+    expect(engageSpy).toHaveBeenCalledTimes(1);
+    expect(playLayer()).toBeNull();
+  });
+
+  it("offers one Click to play when the browser refused that full screen", async () => {
+    playClick(false);
+    await revealOverWebTransport();
+    expect(document.fullscreenElement).toBeNull();
+    expect(engageSpy).not.toHaveBeenCalled();
+    expect(playLayer()).not.toBeNull();
   });
 });
 

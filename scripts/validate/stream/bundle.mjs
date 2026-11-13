@@ -118,6 +118,21 @@ export function manifestKeys(file = path.join(ROOT, "docs/session-trace/metrics.
   return keys;
 }
 
+/**
+ * How the manifest says each key is read, per the source a bundle's row carries it on: its
+ * `estimator` (`delta` for a count already taken over a window) and its `window` (`cumulative`
+ * for a running total such as `packets_lost`). `e2e-compare` differences a counter and takes
+ * the median of a gauge, so it needs both words.
+ */
+export function manifestEstimators(file = path.join(ROOT, "docs/session-trace/metrics.json")) {
+  const out = new Map();
+  for (const m of JSON.parse(fs.readFileSync(file, "utf8")).metrics) {
+    const source = m.source === "agent" ? "agent" : "browser"; // browser and bench
+    out.set(`${source}\u0000${m.key}`, { estimator: m.estimator ?? null, window: m.window ?? null });
+  }
+  return out;
+}
+
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 
 /** Every way `dir` is not a valid bundle. An empty list means valid. It never throws. */
@@ -208,6 +223,20 @@ function check(dir, errors, { keys = manifestKeys() } = {}) {
     if (!isObj(builds.components)) err("builds.json", "no components");
     for (const [name, v] of Object.entries(builds.components ?? {})) {
       if (v === null && !builds.unknown?.[name]) err("builds.json", `${name} is null with no reason in unknown`);
+    }
+    // A web build the runner served from a local directory (WEB_DIST): its digest and file count, never a path or a file name.
+    const web = builds.components?.web;
+    const served = manifest?.web_build;
+    if (served !== undefined && (!isObj(served) || served.served_by !== "runner" || served.source !== "web-dist" || Object.keys(served).length !== 2)) {
+      err("manifest.json", 'web_build must be {"served_by":"runner","source":"web-dist"}');
+    }
+    if (isObj(web) && web.source === "web-dist") {
+      if (Object.keys(web).sort().join() !== "files,sha256,source" || !/^[0-9a-f]{64}$/.test(web.sha256) || !Number.isInteger(web.files) || web.files < 1) {
+        err("builds.json", "web (web-dist) must be exactly source, sha256 (64 hex) and files (a count)");
+      }
+      if (served === undefined) err("manifest.json", "builds.json says the runner served the web build, and the manifest has no web_build");
+    } else if (served !== undefined) {
+      err("manifest.json", "web_build is set and builds.json has no web-dist web build");
     }
   }
   if (network && !("shaping" in network)) err("network.json", "no shaping (null when none was applied)");

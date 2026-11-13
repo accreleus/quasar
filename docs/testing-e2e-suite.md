@@ -6,9 +6,9 @@ loop, leaving one **run bundle** that an agent or a person reviews afterwards. S
 > **Status.** The bundle format and its validator (#1272), the runner (#1273, `make e2e-run`), the
 > host half of a bundle (#1274, `make e2e-collect`), the review that summarises a bundle (#1275,
 > `make e2e-review`) posting a run to quasar-bench (#1276, `make e2e-post`), the client half as one archive for a
-> remote tester (#1280, `make e2e-pack`) and two bundles compared (#1284, `make e2e-compare`) exist.
-> Serving a web build to the browser on the stack's own origin and the UI journeys in a plan are the
-> spec's later tickets (#1284); this page grows with them.
+> remote tester (#1280, `make e2e-pack`), two bundles compared (#1284, `make e2e-compare`) and a
+> local web build served to the browser on the stack's own origin (#1284, `WEB_DIST=`) exist.
+> The UI journeys in a plan are a later ticket (#1284); this page grows with it.
 
 ## What you need
 
@@ -17,6 +17,7 @@ loop, leaving one **run bundle** that an agent or a person reviews afterwards. S
 - A test user: an ordinary user's sign-in in `QUASAR_E2E_EMAIL` and `QUASAR_E2E_PASSWORD`, or in a file of `KEY=value` lines named by `QUASAR_E2E_CRED_FILE`. No admin token is needed or used. The password and the e-mail's local part must each be at least 8 characters: a shorter secret cannot be removed from the bundle without damaging unrelated values, so the runner refuses to start with one (exit 2). The account must not have the Classic layout on (the runner needs the game page).
 - The reference app in that user's library (`QUASAR_E2E_APP` names it, default `Quasar Benchapp`).
 - `CLIENT=<label>`: a name for this test client, by role (`mac-test-client`), never a host name. Letters, digits, `_`, `.`, `-`.
+- A web build served from your machine instead of the stack's own copy: `WEB_DIST=<dir>` (also `QUASAR_E2E_WEB_DIST`); see "Testing a web build against a running stack" below. Use an absolute path: `make` runs from the repo root.
 - A stack with a self-signed certificate: `INSECURE_TLS=1`. Certificate checks are on otherwise, for the runner's own requests and for a browser it launches, whatever `NODE_TLS_REJECT_UNAUTHORIZED` says in your environment (the runner removes it, and the verb keeps it out of `npm ci`); `network.json` records what was in force.
 - The host half (`e2e-collect`) also needs an admin bearer for the stack, and a certificate Node trusts (the fleet's certs are; set `NODE_EXTRA_CA_CERTS` otherwise).
 
@@ -25,7 +26,7 @@ loop, leaving one **run bundle** that an agent or a person reviews afterwards. S
 Run a plan from the machine you are testing from:
 
 ```
-make e2e-run TARGET=<stack url> PLAN=smoke [CDP=<DevTools http endpoint>] [OUT=<dir>] [CLIENT=<label>] [INSECURE_TLS=1]
+make e2e-run TARGET=<stack url> PLAN=smoke [CDP=<DevTools http endpoint>] [OUT=<dir>] [CLIENT=<label>] [WEB_DIST=<dir>] [INSECURE_TLS=1]
 ```
 
 `PLAN` is a name under `scripts/validate/stream/plans/` or a path to a plan file. The runner works
@@ -315,22 +316,30 @@ those; this verb never sees them.
 
 **What it does.** One quasar-bench run per scenario whose status is not `skipped`, through
 `scripts/dx/bench_submit.py`, so the server and the API are the ones that script already posts to.
-The bench scenario is the scenario's name, then `transport`, `codec` and `profile`, then every
-other param of the scenario in sorted key order, as `<k>=<v>` joined with `/`
-(`transport-fallback/transport=webtransport/codec=h264/profile=1080p60/when=mid`): the server
+The bench scenario is the scenario's name, then `transport`, `codec` and `profile`, then the app,
+then every other param of the scenario in sorted key order, as `<k>=<v>` joined with `/`
+(`transport-fallback/transport=webtransport/codec=h264/profile=1080p60/app=steam/when=mid`): the server
 compares the newest run per suite, scenario and host, so two runs that measured different things
 must not share a name. `/` and `=` are the separators because an identifier and a UUID hold
-neither, so a scenario's own name can never spell another scenario's params. `app`, `bench`,
-`cover_qr` and `hold_s` are not in the name — they do not change what the bench compares, and
-`hold_s` is a tag — and a param takes part only when its value is an identifier, a finite number
-or a boolean; anything else is left out and counted in `left_out=N`. The whole name may not pass
-200 characters: a longer one is refused (`failed=N`), never truncated.
+neither, so a scenario's own name can never spell another scenario's params. An app's name may
+hold spaces and capitals, so it enters the name as a slug — lower case, every run of characters
+outside `[a-z0-9]` replaced by one `-`, trimmed, at most 40 characters (`Quasar Benchapp` is
+`quasar-benchapp`) — and is posted as the tag `app=<slug>` as well; an app name with nothing to
+slug is left out of the name and counted. `bench`, `cover_qr` and `hold_s` are not in the name —
+they are how the app was presented and how long it ran, and `hold_s` is a tag. **A run posted
+before this change has another name**: an app is part of it now, so re-posting an older bundle
+creates a second run. A param whose value is not an identifier, a finite number or a boolean
+refuses its scenario (`failed=N`, and the reason names the key) instead of being left out: two
+cases that differ in such a param would otherwise share one name. A `params` that is not an object
+is refused the same way. The whole name may not pass 200 characters: a longer one is refused
+(`failed=N`), never truncated.
 Each run is created with `repo=accreleus/quasar` and `commit` the node agent's commit from
 `builds.json` — never this checkout's HEAD, which is why a bundle without one is refused rather
 than posted under the wrong build. The tags are `suite_run` (the suite run id), `client` (the label
-from `client.json`), `transport`, `codec` and `profile` (the scenario's params), `hold_s` (how long
-it ran) and `clock=raw`: the collected `trace.json` keeps client-clock browser events, so these runs
-are not comparable with host-aligned ones event for event. `git_quasar` is the bundle's commit and
+from `client.json`), `transport`, `codec` and `profile` (the scenario's params), `app` (the app's
+slug), `hold_s` (how long it ran) and `clock=raw`: the collected `trace.json` keeps client-clock
+browser events, so these runs are not comparable with host-aligned ones event for event.
+`git_quasar` is the bundle's commit and
 `git_protocol` is `unknown` (the bundle does not hold the build's protocol pin, and the posting
 checkout's would be a false fact). **`bench_submit.py` adds its own**, and posts them too: from
 `session.json` the tags `launch`, `height`, `fps`, `codec`, `profile`, `session_id`,
@@ -338,7 +347,9 @@ checkout's would be a false fact). **`bench_submit.py` adds its own**, and posts
 above win over its own); the files it uploads from the scenario directory — `summary.json`,
 `steps.jsonl`, `marks.jsonl`, `session.json`, `conditions.json`, `verdict.json`,
 `caps-negotiated.json`, and any `REPORT.md`, `LADDER.md` or other `.md` there; and the run's own
-samples and events, read from `metrics.jsonl`, `trace.json`, `marks.jsonl` and `steps.jsonl`. The
+samples and events, read from `metrics.jsonl`, `trace.json`, `marks.jsonl` and `steps.jsonl` (the
+last two, and `verdict.json` and `caps-negotiated.json`, are refused when present: this suite writes
+none of them). The
 run's notes carry the criteria, one line each, `<id> pass|fail|not-judged <observed>`;
 `expected`, a scenario's `reason` and any other free text are not copied into the notes or the
 tags. They do reach the server inside the artifacts: this verb adds `review/summary.json`, the
@@ -355,15 +366,37 @@ instead of forking a second run. A scenario that never had a session (an error b
 has no `session.json`; its id comes from the directory's path, so post it from the same place.
 
 **A value taken from the bundle is used only in the shape its field has** (an identifier, a UUID, a
-commit); one that does not match is left out and counted in `left_out=N`, so a tag is never free
-text. The bundle is validated before anything is posted, and every value reaches
-`bench_submit.py` as its own argument, never through a shell. A scenario is not posted
-(`failed=N`) when its name is not a name, when its bench scenario name would pass 200 characters,
-or when its `session.json` does not carry one of the scenario's own session ids in the lower-case
-form the collector writes (an id in another case is another external id, so a re-post would fork a
-second run), or holds a codec, profile, host id, `encoder` or `profile_id` that is not a plain
-name: the script builds the run's identity, its tags and its `conditions.negotiated` from that
-file. If the bundle cannot be archived, nothing is posted (`reason=no-archive`).
+commit, a finite number, a boolean); one that does not is left out and counted in `left_out=N`
+where it is only a tag or a fact, and refuses its scenario where it would stand in the bench
+scenario's name (above). So no tag, no condition and no argument holds free text; the run's summary and its artifacts are the bundle's own files and do. The bundle is
+validated before anything is posted, and every value reaches `bench_submit.py` as its own argument,
+never through a shell. A scenario is not posted (`failed=N`, and the reason says which) when:
+
+- its name is not a name, or begins with `-` (the script's parser would read it as an option);
+- its bench scenario name would pass 200 characters;
+- a param of it is not one the name may hold (above), or its `params` is not an object;
+- its `session.json` does not carry one of the scenario's own session ids in the lower-case form
+  the collector writes (an id in another case is another external id, so a re-post would fork a
+  second run), or holds a codec, profile, host id, `encoder` or `profile_id` that is not a plain
+  name, or a `launch`, `fps`, `bitrate_kbps` or `started_at_ms` that is not a finite number: the
+  script builds the run's identity, its tags and its `conditions.negotiated` from that file;
+- the scenario directory holds a file `bench_submit.py` reads that this suite does not write
+  (below), or one of its own files in a shape it does not write.
+
+If the bundle cannot be archived, nothing is posted (`reason=no-archive`).
+
+**Every file `bench_submit.py` reads in a scenario directory is checked, or the scenario is
+refused**, because each field it takes from one reaches the run's tags, its `conditions` or its
+validity:
+
+| file | what the poster does |
+|---|---|
+| `session.json` | checked: `id`, `codec`, `profile`, `host_id`, `encoder`, `profile_id`, and `launch`, `fps`, `bitrate_kbps`, `started_at_ms` as finite numbers |
+| `metrics.jsonl` | checked by the bundle validator, row by row: a numeric `ts_unix_ms`, a source quasar-bench accepts, keys the metric manifest defines |
+| `trace.json` | checked: an object whose `events` are objects, each `payload` an object |
+| `conditions.json` | checked, member by member (the script posts the whole file as the run's conditions): only `effective`, `negotiated` and `unknown` may be there; `effective` maps identifiers to a setting or `[omitted]` (what the collector writes); `unknown` is the collector's one sentence; and `negotiated`'s members are in the shapes `session.json` was checked for — `width`, `height` and `fps` finite numbers, `codec`, `codec_profile` and `profile_id` identifiers, `encoder` and `encoder_negotiated` settings. A member this suite does not write is refused |
+| `summary.json` | checked: an object (the script posts it as the run's summary as it is, text included) |
+| `caps-negotiated.json`, `verdict.json`, `steps.jsonl`, `marks.jsonl`, any `.md` | **refused**: this suite writes none of them, so a bundle that carries one is not posted and the file is named |
 
 The run ends with:
 
@@ -407,21 +440,33 @@ two bundles give the same bytes out, in any directory.
   (a second run of one build), it says so in one line; when nothing does (a bundle compared with
   itself), it says that.
 - **Then, per scenario**: the criteria. Scenarios pair by the identity `e2e-post` would post them
-  under — the scenario's name, then `transport`, `codec`, `profile` and every other param — so two
-  scenarios pair exactly when quasar-bench would compare them, and a scenario in only one bundle is
-  listed, not compared. Every criterion id in either side is one row: A's verdict and observed value,
+  under — the scenario's name, then `transport`, `codec`, `profile`, the app and every other param —
+  so two scenarios pair exactly when quasar-bench would compare them, and a scenario whose name or
+  params either verb refuses is not paired (the poster's other refusals, such as a file it does not
+  write, do not stop a comparison). Within one identity the scenarios whose params are exactly
+  equal pair first (a 60 s hold with the 60 s hold, wherever each plan put it); the rest pair
+  n-th with n-th in plan order, and the pairs are listed in A's plan order. A scenario in only one
+  bundle is listed with its directory name beside its identity, not compared. Every criterion id in
+  either side is one row: A's verdict and observed value,
   B's, and a class — `same`, `regressed` (true to false), `fixed` (false to true), `now_judged` or
   `no_longer_judged` (to or from not judged), `observed_changed` (same verdict, a different value), or
   `only_a` / `only_b`.
 - **Then the metric deltas**: for every key `docs/session-trace/metrics.json` defines for a source
-  both sides carry, the median on each side, B minus A and the percent change, sorted by the size of
-  the change. The medians are read after the same warm-up the review judges a scenario's samples
-  after (`classifier.warmup_exclude_s` in `docs/session-trace/thresholds.json`, after each side's own
-  first browser sample), so the first seconds of a run do not decide the number; when either side has no browser sample to anchor it on, neither side is cut and the page says so. A key with fewer
+  both sides carry, the value on each side, B minus A and the percent change, sorted by the size of
+  the change. The value is the median of the samples after the same warm-up the review judges a
+  scenario's samples after (`classifier.warmup_exclude_s` in `docs/session-trace/thresholds.json`,
+  after each side's own first browser sample), so the first seconds of a run do not decide the
+  number; when either side has no browser sample to anchor it on, neither side is cut and the page
+  says so. A running total is not a median: the manifest marks one with `window: cumulative` (such as
+  `packets_lost`), and it is compared as its last sample minus its first. A count already taken per
+  window (`estimator: delta` in the manifest) stays a median: its samples are already differences. The row's
+  `estimator` column says which was used (`delta` or `median`). A percent is rounded before it is
+  tested, so a rounding that overflows is no percent: the cell is a dash, never `+Infinity`, and
+  `compare.json` has `null`. A key with fewer
   than five samples on a side is listed as too few, not compared.
 - **Then the pictures**: `shots/<label>.png` paired by label, whether the bytes are identical, and
   the two sizes; a picture only one side took is listed.
-- **Last**, the one line this unit does not do: serving a web build (`WEB_DIST=`), UI journeys in a
+- **Last**, what this verb does not do: UI journeys in a
   plan, decoded-frame pairs at the same reference-app tick, and a pixel difference in pictures.
 
 **How to read the result.** Read `COMPARE.md` first: what the runs differed in, then what moved. It
@@ -438,10 +483,64 @@ page says it was truncated.
 RESULT status=ok target=e2e-compare changed=N scenarios=N only_a=N only_b=N [left_out=N] [truncated=1]
 ```
 
-`changed` counts the criteria whose class is not `same`, `scenarios` the pairs compared. Exit 0 both
+`changed` counts the criteria whose class is not `same` plus the pairs whose scenario status differs
+(pass, fail, error, skipped) — a scenario that went from pass to fail is a change even when every
+criterion reads the same, and the page's `Changed:` line gives the two counts apart. `scenarios`
+is the pairs compared. Exit 0 both
 bundles are valid and the comparison was written (whether or not anything changed), 1 a bundle is not
 valid (`reason=invalid-a` or `invalid-b`), 2 usage, or a comparison that cannot be written
 (`reason=out-exists`, `out-inside-bundle`, `cannot-write`). A bundle zip is not read: unzip it first.
+
+### Testing a web build against a running stack
+
+```
+make e2e-run TARGET=<stack url> PLAN=<plan> WEB_DIST=<dir> OUT=<dir>
+```
+
+**What you need.** A build of the web client (`cd web && npm ci && npm run build` writes `web/dist/`; build
+each variant into its own directory), and a running stack with its test user, as for any run. Nothing is
+deployed and nothing on the stack changes.
+
+**What it does.** In the runner's own browser context (with `CDP=` that is still a separate context, never
+your tabs), every same-origin `GET` or `HEAD` for a document or a static file is answered from `<dir>`
+with `cache-control: no-store`. Everything else goes to the stack as before. Never answered from the
+directory, because the control plane routes them: `/v1/*` (the API and the signaling socket),
+`/health`, `/agent/*`, `/wt`, `/debug/*` and `/enroll-host.sh`. It follows the control plane's own static
+handler (`control-plane/internal/httpx/spa.go`): a file in the directory is served; an `/assets/*` path with no file is a 404
+(never `index.html`); any other path with no file, such as `/app/...`, `/admin/...` and `/login`, gets `index.html`.
+A document carries the stack's own security headers, copied from the stack's answer for that address, so a build that the stack's
+content security policy would block is blocked in the run too (that policy pins the two inline scripts in `web/index.html` by hash; changing one
+needs the control plane's hash changed with it, and the run will show the block). The page registers no service worker of its own (it
+registers one empty probe worker and unregisters it at once), and the run's browser context is fresh, so the stack's copy cannot be cached
+behind the directory's. A write (`POST`, `PUT`, ...) to a static path is not answered here: it goes to the stack and the page-write watch counts it as before.
+
+**Trust.** The directory is as trusted as the stack's own web client: its scripts run in the browser
+as the stack's origin, with the test user's session. The runner serves it only to the stack's origin and
+only in its own context. A request path is decoded as the server does and must be a plain name: `..`, an
+encoded `/` or `\`, a NUL or an empty segment is refused with a 400 and never reaches the file system. The
+directory is read once at the start, so the bytes served are the bytes digested. It is refused (exit 2, nothing run)
+when `index.html` is missing, when anything in it is a link or other non-regular file, when it holds more
+than 200 MB, or when a file has an extension outside the table the runner knows (what Vite emits: html, js, css, json, webmanifest, svg, images, fonts, wasm, map, txt, sh).
+
+**How to read the result.** `builds.json` says `web: {"source": "web-dist", "sha256": ..., "files": N}`
+and `manifest.json` has `web_build: {"served_by": "runner", "source": "web-dist"}`. The digest is of the sorted file paths and file
+hashes: the same build in another directory has the same digest, one changed byte has a different one.
+No path or file name from your machine is written. `make e2e-review` and `e2e-compare` show it as the web build.
+
+**A/B of a web change**, two runs on the same stack, then the comparison:
+
+```
+make e2e-run TARGET=<stack url> PLAN=smoke WEB_DIST=/abs/path/build-a OUT=/abs/path/run-a
+make e2e-run TARGET=<stack url> PLAN=smoke WEB_DIST=/abs/path/build-b OUT=/abs/path/run-b
+make e2e-compare A=/abs/path/run-a B=/abs/path/run-b
+```
+
+`COMPARE.md` opens with `builds.web.build` differing between the two (the two digests), and then what moved. One pair of runs is not a regression: repeat each side.
+Both sides of an A/B must be `WEB_DIST` runs: compare a build against the stack's own copy by building that copy too. A run with `WEB_DIST` loads
+the web client's files from the runner's memory with the browser's HTTP cache off, so the page's own download-speed probe (it times the main script
+bundle) says nothing about the path to the stack; requests the stack answers, such as its health probe, are not touched.
+A stray file with no known extension in the directory (a `.DS_Store` from a Mac) refuses the run: remove it.
+The pack for a remote tester takes the same variable in its environment (`QUASAR_E2E_WEB_DIST`); it has no flag for it.
 
 ### The fallback and keyboard-and-mouse scenarios
 
@@ -560,7 +659,7 @@ A directory, zipped when it is handed between machines.
 - **Not measured is `null`, never `0`.** A criterion that was not judged has `observed: null`. A fact listed in `not_recorded` has no value as a criterion or as a sample.
 - **Keys are the metric manifest's.** An `agent` or `browser` sample key must be in `docs/session-trace/metrics.json` (bench-mode keys ride in `browser` samples, with the six keys `scripts/dx/bench_app_samples.py` derives: `bench_n`, `bench_decoded`, `i2p_p50_ms`, `i2p_max_ms`, `i2p_n`, `ts_nudged`). Sample sources are the five quasar-bench accepts: `agent`, `browser`, `app`, `netem`, `harness`.
 - **Every timestamp names its clock.** A timeline row says `client` or `host`; a sample's clock is its key's clock in the metric manifest. `clock_offset_ms` is the measured client-to-host offset, or `null`.
-- **A missing build has a reason.**
+- **A missing build has a reason.** A web build the runner served is `web: {source: "web-dist", sha256, files}` and nothing else, with `manifest.web_build: {served_by: "runner", source: "web-dist"}`; each without the other is refused.
 - **No address, token or password** in any text file, whatever its name. A JSON field whose name says it holds a credential (`authorization`, `cookie`, any `*token`, `password`, `secret`, `api key`, `private key`; any case, hyphen or camelCase) and whose value is not a "there is none" word is a credential too. A bundle's text is UTF-8: a file whose first two or four bytes are a UTF-16 or UTF-32 byte-order mark is not valid, and any other file with a NUL byte in its first 4 KB is taken as binary (a picture, a video, an archive) and not read. Documentation addresses (RFC 5737) pass. Known limits: the address check knows IPv4 only, reads a four-part version such as `1.2.3.4` as an address, and lets `x.0.0.0` and `127.0.0.1` through (a browser's version looks like the first); a bearer token made of letters only is not seen, nor is UTF-16 text with no byte-order mark (it reads as binary); host names and home paths are not looked for (a session container's own home is a real path in app logs). `scripts/dev/leak-scan.sh` with the operator's patterns still runs before a bundle goes anywhere public.
 
 The test (`node --test scripts/validate/stream/bundle.test.mjs`, part of `make verify`) breaks the

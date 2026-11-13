@@ -47,6 +47,8 @@ const isId = (v) => typeof v === "string" && UUID.test(v);
 /** The same field shapes, for a later verb that uses a bundle value: post.mjs puts one in a tag
  *  and checks the session fields bench_submit.py copies into the run's conditions; compare.mjs
  *  keeps only the values that fit one of these (there and in `version`'s shape) in its JSON. */
+/** What conditions.json says when the host reported no effective settings (post.mjs accepts this sentence and no other). */
+export const EFFECTIVE_UNKNOWN = "the host has not reported its effective settings";
 export const SHAPES = { identifier: IDENT, uuid: UUID, commit: COMMIT, setting: SETTING, version: VERSION };
 const fits = (re, v) => typeof v === "string" && re.test(v);
 /** A time as ISO, or null when the text is not one: what is written back is never the answer's own text. */
@@ -233,7 +235,7 @@ const flag = (v) => (String(v).toLowerCase() === "true" ? "on" : String(v).toLow
 // a host path or free text becomes "[omitted]". Both are counted once per answer value left out
 // (an alias repeats the same value and is not a second one).
 function conditions(effective, note) {
-  if (effective === null) return { unknown: { effective: "the host has not reported its effective settings" } };
+  if (effective === null) return { unknown: { effective: EFFECTIVE_UNKNOWN } };
   const projected = Object.create(null);
   for (const k of Object.keys(effective).sort()) {
     if (!fits(IDENT, k)) {
