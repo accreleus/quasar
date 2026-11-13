@@ -5,8 +5,9 @@ loop, leaving one **run bundle** that an agent or a person reviews afterwards. S
 
 > **Status.** The bundle format and its validator (#1272), the runner (#1273, `make e2e-run`), the
 > host half of a bundle (#1274, `make e2e-collect`), the review that summarises a bundle (#1275,
-> `make e2e-review`) and posting a run to quasar-bench (#1276, `make e2e-post`) exist. `e2e-compare`
-> and `e2e-pack` are the spec's later tickets; this page grows with them.
+> `make e2e-review`) posting a run to quasar-bench (#1276, `make e2e-post`) and the client half as one archive for a
+> remote tester (#1280, `make e2e-pack`) exist. `e2e-compare` is the spec's later ticket; this page
+> grows with it.
 
 ## What you need
 
@@ -402,6 +403,45 @@ received, for the host half to compare.
 | `keys_match`, `buttons_match`, `motion_sum_matches` | `pass: null`. The reference app does not log individual keys, buttons or motion (its echo is one bit) and the runner cannot see the page's input channel. Needs the app's own input log on the host |
 | `nothing_held_at_end` | every key and button the page was sent down was also sent up, as the page received them. The product's own held-key set is not exposed, so a key the page failed to release on the host is not seen here |
 | `input_to_photon_ms` | `pass: null` (no limit is calibrated); `expected` carries the count, median and max of the samples from eight `__qBench.pressKey` rounds. A sample that is not a finite number is not counted; none at all says the marker echoed no key |
+
+### The pack for a remote tester
+
+`make e2e-pack [OUT=<path without extension>]` writes the client half as one archive, `OUT.tar.gz`
+and `OUT.zip` (the same files; Windows opens the zip, macOS and Linux either), about 70 KB. It holds
+the runner and every file it imports (worked out from the code, not listed by hand), the plans,
+`thresholds.json` and `metrics.json`, `package.json` and a lockfile for `playwright-core` alone,
+`run.sh` and `run.cmd`, a plain `README.txt` and `VERSION` (the commit it was made from, `dirty`
+after it if tracked files differed). No tests, no hooks, no host or `.env` file, nothing from
+`.claude/`. The tester needs Node 22 and Chrome, nothing from this repository.
+
+What the tester does (they are also told in `README.txt`): unpack, make `signin.txt` in the folder
+with `QUASAR_E2E_EMAIL=` and `QUASAR_E2E_PASSWORD=` lines (the sign-in is never a command-line
+argument and never goes into what comes back), then one command with the stack's address:
+
+```
+bash run.sh https://<stack> [<plan>] [--insecure]     # macOS, Linux
+run.cmd https://<stack> [<plan>] [--insecure]         # Windows
+```
+
+`--insecure` is `INSECURE_TLS=1`. The first run fetches `playwright-core` with `npm ci` (online,
+without the sign-in in that process' environment). Then `doctor` checks, in order, Node, Chrome, the
+plan, that the stack answers, that the sign-in is accepted, that the reference app is in the user's
+library, that Chrome can open the stack's page (on a Mac a failure here is most often the Local
+Network permission, and the message says so) and that this Chrome can decode what the plan asks
+(a scenario it cannot run is a note; none that it can is a failure). Each line is `ok` or
+`FAIL` with a sentence in plain words. `run.sh doctor https://<stack>` stops there. A failed check
+ends the command (exit 1, `zip=` empty); otherwise it runs the plan (default `smoke`, in a headed
+Chrome on Mac and Windows, since a desktop there has no `DISPLAY`), validates the bundle with
+`validateBundle`, and writes `results/quasar-e2e-<time>.zip`: the bundle and nothing else. Hooks
+are not part of the pack, so a scenario that needs one is `skipped`.
+
+```
+RESULT status=ok|failed|error target=e2e-pack zip=<file> run=ok|failed pass=N fail=N error=N skipped=N
+```
+
+Exit 0 only when that zip was written, whether or not the streams passed: the result is in the
+bundle, and the tester sends the file back either way. `make e2e-review BUNDLE=<unzipped dir>`
+reads it.
 
 ## The run bundle, format 1
 
