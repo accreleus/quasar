@@ -2361,29 +2361,39 @@ mod tests {
         assert_eq!(wt.rung_steps(), vec![(0, 3)]);
     }
 
-    /// #1376 review A1, seat A's replay on the owner's profile: at 900p a link alternating
-    /// 2900 and 4200 kbit/s every 6 s crosses 900p's engage line (2965) in its low phase and
-    /// 720p's recover line (3953) in its high one. Old code (24ad172a): down and back up
-    /// every cycle. Now the first up after a down needs `min_step_s` (10 s) over the line, a
-    /// 6 s phase never gives it, so one step in the minute. A down stays prompt: 1 s after
-    /// the first low phase begins.
+    /// #1376 review A1/R1, seat A's replay on the owner's profile: at 900p a link
+    /// alternating 2900 and 4200 kbit/s every 6 s crosses 900p's engage line (2965) in its
+    /// low phase and 720p's recover line (3953) in its high one. Old code (24ad172a): down
+    /// and back up every cycle. Now the first up after a down waits until the down is
+    /// `min_step_s` (10 s) old, so every down comes at least `min_step_s + STEP_SETTLE +
+    /// RATE_CONFIRM` (14 s) after the one before. A down stays prompt: 1 s after the first
+    /// low phase begins.
     #[test]
-    fn a_slow_oscillation_across_the_band_steps_once_and_holds() {
+    fn a_slow_oscillation_across_the_band_is_bounded() {
         let mut wt = Wt::new(true);
         wt.link(0, 5000, |_| 20_000.0);
         wt.link(5000, 20_000, |_| 4000.0);
         assert_eq!(wt.size(), (1600, 900), "0.85 × 4000 fits 900p");
         let before = wt.rung_steps().len();
-        let mut down_at = None;
+        let mut downs = Vec::new();
         for ms in (20_000..80_000).step_by(100) {
             let low = ((ms - 20_000) / 6000) % 2 == 0;
+            let was = wt.size();
             wt.report(ms, if low { 2900.0 } else { 4200.0 });
-            if wt.size() == (1280, 720) {
-                down_at.get_or_insert(ms);
+            if was != (1280, 720) && wt.size() == (1280, 720) {
+                downs.push(ms);
             }
         }
-        assert_eq!(wt.rung_steps()[before..], [(2, 3)]);
-        assert!(down_at.unwrap() <= 21_200, "down at {down_at:?}");
+        let steps = &wt.rung_steps()[before..];
+        assert!(
+            steps.iter().all(|s| *s == (2, 3) || *s == (3, 2)),
+            "{steps:?}"
+        );
+        assert!(downs[0] <= 21_200, "down at {downs:?}");
+        assert!(
+            downs.len() >= 2 && downs.windows(2).all(|d| d[1] - d[0] >= 14_000),
+            "{downs:?} {steps:?}"
+        );
     }
 
     /// #1376 review A5 and S2: while a step has not landed (the encoder still reports the

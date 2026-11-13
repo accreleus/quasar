@@ -839,7 +839,7 @@ which was deliberately not carried over to the public repository).
 | `QUASAR_ABR_EWMA_ALPHA` | `0.3` | Up-path EWMA smoothing factor, `(0, 1]`. Higher tracks the estimate up faster. Not used by WebTransport's per-report loop. Operator tuning knob; default matches the previous hardcoded value. Settable via Host Settings since 2026-08-18. |
 | `QUASAR_ABR_DEADBAND` | `0.15` | Relative departure from the setpoint that must be exceeded before any retarget, `(0, 1)`. WebTransport's per-report loop: how far under the rate a reading must be, and the least up move. Operator tuning knob; default matches the previous hardcoded value. Settable via Host Settings since 2026-08-18. |
 | `QUASAR_ABR_MAX_UP_STEP` | `0.25` | Max fractional increase per up-step, `>0`. **2026-08-18 flip** (was `0.10`; T3 `abr_up_fast` — post-impairment setpoint ramp 37.8s → 14.0s, client-present drops 12.2% → 1.7%, 0 oscillations; the T3 report, `docs/reports/2026-08-18-overnight-optimisation/t3-ladder-step-recovery.md`, was deliberately not carried over to the public repository). Settable via Host Settings since 2026-08-18. |
-| `QUASAR_ABR_MIN_INTERVAL_MS` | `1000` | Minimum wall-time (ms) between retargets, both directions (anti-thrash), `>= 1`. WebTransport's per-report loop: with `QUASAR_ABR_MAX_UP_STEP` the up slew (max rise per this interval), and the least time between two writes on NVENC and VA only. **2026-08-18 flip** (was `2000`; moved together with `QUASAR_ABR_MAX_UP_STEP` above as the `abr_up_fast` arm). Settable via Host Settings since 2026-08-18. |
+| `QUASAR_ABR_MIN_INTERVAL_MS` | `1000` | Minimum wall-time (ms) between retargets, both directions (anti-thrash), `>= 1`. WebTransport's per-report loop: with `QUASAR_ABR_MAX_UP_STEP` the up slew (max rise per this interval), and the least time between two writes on NVENC and VA only, floored at 1 s there (each write costs a keyframe), on the per-report paths and the silence decay alike. **2026-08-18 flip** (was `2000`; moved together with `QUASAR_ABR_MAX_UP_STEP` above as the `abr_up_fast` arm). Settable via Host Settings since 2026-08-18. |
 | `QUASAR_ABR_MAX_DOWN_STEP` | `0.125` | **`smooth` only.** Max fractional down-step per non-emergency retarget, `(0, 1)`. On WebTransport only for the silence decay's steps. Operator tuning knob; default matches the previous hardcoded −12.5%. Settable via Host Settings since 2026-08-18. |
 | `QUASAR_ABR_DOWN_DWELL_MS` | `7000` | **`smooth` only.** Minimum wall-time (ms) between non-emergency downshifts, `>= 0` (`0` disables the dwell). Emergency drops on confirmed congestion bypass it. On WebTransport only for the silence decay's steps. Operator tuning knob; default matches the previous hardcoded 7 s. Settable via Host Settings since 2026-08-18. |
 | `QUASAR_ABR_CLIFF_GUARD_FRAC` | `0.50` | **`smooth` only.** Under fresh encoder saturation, GCC alone never drives the setpoint below this fraction of the current setpoint in one move, `(0, 1)`. On WebTransport only for the silence decay's steps. Operator tuning knob; default matches the previous hardcoded 50%. Settable via Host Settings since 2026-08-18. |
@@ -2859,17 +2859,19 @@ rung the rate fits (`engage_frac × B` at or under it; the floor rung when none 
 step and one encoder restart, several rungs at once if need be. At or over
 `abr_ladder_res_recover_frac × B(r−1)` for 1 s, it steps up to the least-deep rung the lowest
 rate of that second reaches by `recover_frac × B`, again in one step. Between the two lines
-it holds, so a rate noisy at a line never steps. The first step up after a step down needs
-the rate over the line for `abr_ladder_res_min_step_s` (10 s) instead of 1 s: a link swinging
-across the whole band completes at most one down-and-up cycle per 17 s at the defaults (3 s
-settle, 10 s, 3 s settle, 1 s; about 7 restarts a minute at worst), and one whose good phase
-lasts under 10 s steps down once and stays there. A step down never waits longer than the
+it holds, so a rate noisy at a line never steps. The first step up after a step down also
+waits until that step down is `abr_ladder_res_min_step_s` (10 s) old; a dip under the line
+inside those 10 s only restarts the 1 s, not the 10 s. A link swinging across the whole band
+therefore completes at most one down-and-up cycle per 14 s at the defaults (10 s, 3 s settle,
+1 s; about 8.6 restarts a minute at worst). A step down never waits longer than the
 1 s: a queue costs more than a size. `abr_ladder_res_engage_dwell` and
 `abr_ladder_res_recover_dwell` are not used. The floor follows the new size, and the setpoint
 and the encoder's bitrate move with it in the same action. On a 1440p120 session at 10 Mbit/s a cut to 6 Mbit/s lands on
 1080p and a cut to 1.5 Mbit/s on 720p, each about 1.1 s after the first report that shows the
-link short. Nothing counts while a step has not finished negotiating, or for 3 s after any
-step of either lever or a manual resize: the encoder restart pauses the stream and then sends
+link short. Nothing counts while a step has not finished negotiating (a step that never
+negotiates is given up at the next agent heartbeat window, so up to 5 s, then the 3 s settle:
+the rate path is deaf for up to about 8 s), or for 3 s after any step of either lever or a
+manual resize: the encoder restart pauses the stream and then sends
 a keyframe burst, so what the receiver measures then is the restart, not the link (a chosen
 bound, not a measured one). The step is traced as `abr.ladder.step` with reason `rate`. It
 never moves the frame rate, and it follows the order: under `fps_first` the frame rate goes

@@ -536,7 +536,8 @@ impl Governor {
     /// never above the estimate, at most `max_up_step` per `min_interval` (the slew, no
     /// timer), in moves of more than the deadband. Down is [`Self::observe_report`]'s;
     /// only after `REPORT_GAP` with no report (the silence decay) does the window down
-    /// path still lower the setpoint, and never the rate: silence is not evidence.
+    /// path still lower the setpoint, and never the rate: silence is not evidence. That
+    /// path is paced by `per_report` too, not only by `min_interval` (#1376 review R3).
     fn observe_per_report(&mut self, estimate: f64, now: Instant) -> Option<u32> {
         let dt = self.fed.map_or(0.0, |at| {
             now.saturating_duration_since(at).as_secs_f64().min(1.0)
@@ -547,7 +548,10 @@ impl Governor {
             .last_report
             .is_none_or(|at| now.saturating_duration_since(at) >= REPORT_GAP);
         if silent && estimate < sp * (1.0 - self.cfg.deadband) {
-            return self.observe_window(estimate, now);
+            return self
+                .write_due(now)
+                .then(|| self.observe_window(estimate, now))
+                .flatten();
         }
         let slew = self.cfg.max_up_step / self.cfg.min_interval.as_secs_f64();
         if estimate > self.rate {
@@ -1378,6 +1382,33 @@ mod tests {
         g.observe_report(Some(2000.0), ms(base, 1100));
         assert_eq!(g.observe_report(Some(2000.0), ms(base, 1200)), None);
         assert_eq!(g.observe_report(Some(2000.0), ms(base, 2000)), Some(2000));
+    }
+
+    /// #1376 review R3: the silence decay is paced by `per_report` as well. With a 100 ms
+    /// `min_interval` and confirmed congestion (no dwell), a falling estimate on silence
+    /// ticks 100 ms apart is written at most once a second. Old code: every tick.
+    #[test]
+    fn per_report_the_silence_decay_waits_out_the_gap() {
+        let base = Instant::now();
+        let mut g = Governor::new(
+            AbrConfig {
+                min_interval: Duration::from_millis(100),
+                ..per_report(1000)
+            },
+            base,
+        );
+        g.set_adaptation_hint(AdaptationHint {
+            network_congested: true,
+            encoder_saturation_fresh: false,
+        });
+        let writes: Vec<u64> = (10..40u64)
+            .filter(|i| {
+                g.observe(9000.0 - *i as f64 * 200.0, ms(base, i * 100))
+                    .is_some()
+            })
+            .map(|i| i * 100)
+            .collect();
+        assert_eq!(writes, vec![1000, 2000, 3000], "{writes:?}");
     }
 
     /// The window loop (WebRTC, `protective`) never reads a report.
