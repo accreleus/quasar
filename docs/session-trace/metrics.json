@@ -1066,7 +1066,7 @@
       "n_key": null,
       "deprecated_for": null,
       "since": "0.6 (#1346)",
-      "why": "The depth the WebTransport audio ring is aiming for, ms: the largest of its base target (the median video capture-to-present latency, 50 ms before a frame has been shown), 40 ms, and what the output device and posting take plus the jitter allowance audioSync measures from audio packet arrival; capped at 150 ms. A setting, not a measurement: read it beside wt_audio_buffer_ms, where the gap between the two is the cover that was left. Absent before any audio has played."
+      "why": "The depth the WebTransport audio ring is aiming for, ms: the largest of its base target (the median video capture-to-present latency, 50 ms before a frame has been shown), 40 ms, and what the output device and posting take plus the jitter allowance audioSync measures from audio packet arrival and the margin recent underruns added (10 ms each, at most 60 ms, given back over minutes); capped at 150 ms. A setting, not a measurement: read it beside wt_audio_buffer_ms, where the gap between the two is the cover that was left. Absent before any audio has played."
     },
     {
       "key": "wt_audio_underruns",

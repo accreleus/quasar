@@ -8,7 +8,7 @@ import { MicCaptureError } from "../webrtc/mic";
 import { newPostedCounters, type PostedCounters } from "../webrtc/telemetry";
 import { AudioOut, LATE_RUN_RESET, type ContextLike } from "./audioOut";
 import { AudioRing, MAX_STRETCH_FRAMES, SLACK_FRAMES, STRETCH_DONE_FRAMES } from "./audioRing";
-import { AudioSync, MAX_JITTER_MS, MAX_TARGET_MS, MIN_TARGET_MS } from "./audioSync";
+import { AudioSync, MAX_JITTER_MS, MAX_TARGET_MS, MAX_UNDERRUN_MARGIN_MS, MIN_TARGET_MS, UNDERRUN_STEP_MS } from "./audioSync";
 import { CHANNEL_AUDIO, CHANNEL_AUDIO_RED, encodeMicDatagram, parseAudioDatagram } from "./framing";
 import { MicOut } from "./micOut";
 import type { Presenter } from "./presenter";
@@ -80,6 +80,21 @@ describe("audio framing", () => {
 });
 
 describe("AudioSync", () => {
+  it("adds a step of margin per underrun up to the cap, gives it back slowly, and keeps it across a reset (#1346)", () => {
+    const s = new AudioSync();
+    expect(s.underrunMarginMs(0)).toBe(0);
+    s.noteUnderrun(1_000);
+    expect(s.underrunMarginMs(1_000)).toBe(UNDERRUN_STEP_MS);
+    expect(s.underrunMarginMs(51_000)).toBeCloseTo(UNDERRUN_STEP_MS / 2, 6); // half a step back after 50 s
+    expect(s.underrunMarginMs(500_000)).toBe(0); // and never below nothing
+    s.noteUnderrun(51_000); // a step on top of what is left
+    expect(s.underrunMarginMs(51_000)).toBeCloseTo(UNDERRUN_STEP_MS * 1.5, 6);
+    for (let i = 0; i < 20; i++) s.noteUnderrun(51_000);
+    expect(s.underrunMarginMs(51_000)).toBe(MAX_UNDERRUN_MARGIN_MS);
+    s.reset();
+    expect(s.underrunMarginMs(51_000)).toBe(MAX_UNDERRUN_MARGIN_MS);
+  });
+
   it("fixes the delay floor from the smallest arrival − capture and forgets it after 10 s", () => {
     const s = new AudioSync();
     s.noteAudio(1_000_000, 1_130); // 130 ms
@@ -728,6 +743,21 @@ describe("AudioOut", () => {
     expect(out.stats().buffer).toEqual({ minMs: 25, targetMs: 50, underruns: 1 });
     // Reading it started the next window, and no report has arrived in it.
     expect(out.stats().buffer).toBeNull();
+  });
+
+  it("deepens the buffer one step per report with a new silence run, and not for a report without one (#1346)", async () => {
+    const { out, port } = setupAudioOut();
+    await out.start(STEREO);
+    const report = (silenceRuns: number) =>
+      port.onmessage?.({ data: { underrunFrames: 0, concealedFrames: 0, underrunEvents: 0, silenceRuns, dropped: 0, minQueuedFrames: 0 } });
+    expect(out.stats().targetDelayMs).toBe(50); // the default, above the 15 ms posting margin
+    report(3); // several runs in one report are one step
+    report(3); // no new run: no step
+    report(4);
+    report(5);
+    expect(out.stats().targetDelayMs).toBe(50); // 15 + 30 is still under the default
+    report(6);
+    expect(out.stats().targetDelayMs).toBeCloseTo(55, 6); // 15 + 4 steps of 10
   });
 
   it("is measured only once a running context has the worklet: not before start, after a failed start, or while suspended", async () => {
