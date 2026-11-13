@@ -20,6 +20,9 @@ TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DX="$(cd "$TESTS_DIR/.." && pwd)"
 ROOT="$(cd "$DX/../.." && pwd)"
 FIXTURES="$TESTS_DIR/fixtures"
+# `qses` is the quasar-session skill's CLI, operator-local and not in this
+# repository; tests that assert its own behaviour SKIP by name without it (#1267).
+QSES="$ROOT/.claude/skills/quasar-session/scripts/qses"
 
 PASS_N=0; FAIL_N=0; WARN_N=0
 pass() { PASS_N=$((PASS_N + 1)); printf 'PASS %s — %s\n' "$1" "${2:-ok}"; }
@@ -1347,8 +1350,15 @@ rc_of 2 "bench:run-pulse-without-bench" -- env -u HOST bash "$DX/bench_run.sh" -
 QSES_FIX_HOSTS="$WORK/qses-guard-hosts.json"
 printf '{"_schema":"quasar-skills/hosts@2","roles":{"aux-infra":"faked","gpu-test":"faked"},"hosts":{"faked":{"ssh_alias":"ignored","dir":"%s","api":"http://127.0.0.1:1","api_external":"http://127.0.0.1:1"}}}\n' \
   "$WORK" > "$QSES_FIX_HOSTS"
-rc_of 2 "bench:qses-bad-codec" -- env QUASAR_HOSTS_JSON="$QSES_FIX_HOSTS" bash "$ROOT/.claude/skills/quasar-session/scripts/qses" run --codec vp9
-rc_of 2 "bench:qses-pulse-without-bench" -- env QUASAR_HOSTS_JSON="$QSES_FIX_HOSTS" bash "$ROOT/.claude/skills/quasar-session/scripts/qses" run --input-pulse-every 5
+# These two assert qses's own argument handling: with no file there is nothing
+# to test, so they SKIP by name rather than fail or pass (#1267).
+if [ -f "$QSES" ]; then
+  rc_of 2 "bench:qses-bad-codec" -- env QUASAR_HOSTS_JSON="$QSES_FIX_HOSTS" bash "$QSES" run --codec vp9
+  rc_of 2 "bench:qses-pulse-without-bench" -- env QUASAR_HOSTS_JSON="$QSES_FIX_HOSTS" bash "$QSES" run --input-pulse-every 5
+else
+  warn "bench:qses-bad-codec" "the quasar-session skill's qses is not in this checkout (operator-local) — SKIPPED"
+  warn "bench:qses-pulse-without-bench" "the quasar-session skill's qses is not in this checkout (operator-local) — SKIPPED"
+fi
 
 # ── --peer (2026-08-19, docs/reports/2026-08-19-peer-path/REPORT.md) ─────────
 rc_of 2 "bench:run-peer-bogus" -- env -u HOST bash "$DX/bench_run.sh" --profile 1080p60-h264 --peer bogus
@@ -1443,12 +1453,17 @@ fi
 # qses itself must parse the flag without error: pair it with a KNOWN-bad
 # --codec so the run still exits 2, but the failure text must be the codec
 # guard, not "unknown arg --peer-unlock-fps" (which would mean the parser
-# never reached the --peer-unlock-fps case at all).
-qses_punlock_out="$(env -u HOST QUASAR_HOSTS_JSON="$QSES_FIX_HOSTS" bash "$ROOT/.claude/skills/quasar-session/scripts/qses" run --peer-unlock-fps --codec vp9 2>&1 || true)"
-if printf '%s' "$qses_punlock_out" | grep -q -- '--codec must be' && ! printf '%s' "$qses_punlock_out" | grep -q 'unknown arg --peer-unlock-fps'; then
-  pass "bench:qses-peer-unlock-fps-parses" "--peer-unlock-fps is recognized, parsing continues to the codec guard"
+# never reached the --peer-unlock-fps case at all). qses is operator-local and
+# not in this repository, so a worktree without it SKIPs by name (#1267).
+if [ -f "$QSES" ]; then
+  qses_punlock_out="$(env -u HOST QUASAR_HOSTS_JSON="$QSES_FIX_HOSTS" bash "$QSES" run --peer-unlock-fps --codec vp9 2>&1 || true)"
+  if printf '%s' "$qses_punlock_out" | grep -q -- '--codec must be' && ! printf '%s' "$qses_punlock_out" | grep -q 'unknown arg --peer-unlock-fps'; then
+    pass "bench:qses-peer-unlock-fps-parses" "--peer-unlock-fps is recognized, parsing continues to the codec guard"
+  else
+    fail "bench:qses-peer-unlock-fps-parses" "$qses_punlock_out"
+  fi
 else
-  fail "bench:qses-peer-unlock-fps-parses" "$qses_punlock_out"
+  warn "bench:qses-peer-unlock-fps-parses" "the quasar-session skill's qses is not in this checkout (operator-local) — SKIPPED"
 fi
 
 # bench_app_samples.py: frames.jsonl -> `app` samples, events.jsonl -> app.event,
@@ -2704,7 +2719,6 @@ printf '\n== qses stop ==\n'
 #
 # Driven against fake_cp_server.py through an `ssh` stub that runs the remote
 # command locally. Nothing leaves this machine.
-QSES="$ROOT/.claude/skills/quasar-session/scripts/qses"
 if [ -x "$QSES" ] || [ -f "$QSES" ]; then
   QSTUB="$WORK/qses-stubbin"
   mkdir -p "$QSTUB"
