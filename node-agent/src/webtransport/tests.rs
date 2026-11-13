@@ -1873,9 +1873,10 @@ async fn outage_recovers(stream: Stream) {
 
 /// #1040: receiver feedback from a rate-capped client drives the session's real ABR
 /// (governor, smooth mode) until the encoder sends below the cap. #1376: the per-report
-/// loop takes it there within about a second, before any window has named the congestion;
-/// smooth's window path needed the #68 emergency drop through the classifier, and its
-/// capped steps (−12.5 % per 7 s dwell) alone take over 30 s.
+/// loop takes it there with no window naming the congestion (measured alone: by the 1 s
+/// check; with the per-report loop off, 3 s through the classifier's #68 emergency drop).
+/// The timing is wall-clock and a loaded machine stretches it, so the deterministic replays
+/// in `abr_glue` carry the bound. Smooth's capped steps alone (−12.5 % per 7 s) take 30 s.
 #[tokio::test]
 async fn a_rate_capped_client_steps_the_encoder_below_the_cap() {
     const CAP_KBPS: f64 = 1500.0;
@@ -1935,7 +1936,6 @@ async fn a_rate_capped_client_steps_the_encoder_below_the_cap() {
     let mut path = Bottleneck::new(CAP_KBPS);
     let mut report = tokio::time::interval(Duration::from_millis(50));
     let mut drain = tokio::time::interval(Duration::from_secs(1));
-    let started = std::time::Instant::now();
     let deadline = tokio::time::sleep(Duration::from_secs(10));
     tokio::pin!(deadline);
     let kbps = loop {
@@ -1960,11 +1960,6 @@ async fn a_rate_capped_client_steps_the_encoder_below_the_cap() {
             ),
         }
     };
-    assert!(
-        started.elapsed() < Duration::from_millis(1500),
-        "under the cap at the first check after a second, not after windows: {:?}",
-        started.elapsed()
-    );
     assert!(kbps >= 500, "never below the ABR floor ({kbps} kbps)");
 }
 
