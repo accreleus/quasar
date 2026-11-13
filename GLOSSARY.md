@@ -228,6 +228,11 @@ the node agent's listener and terminating the browser's public certificate. Quas
 not run one. _Avoid_: "relay" (a Quasar-run server that carries media for peers that
 cannot connect, planned, is a different thing).
 
+**Active rectangle** — on a WebTransport session that moves resolution inside a fixed coded
+size, the part of each encoded frame that holds the game picture; the rest is padding the client
+never shows. It changes per frame without a configuration change (ADR 0014). _Avoid_: "viewport",
+"crop" (the crop is what the presenter does with it).
+
 **Presenter** — the client-side component that draws decoded frames to the screen and owns
 the scaling modes and the present-cadence readout (**Present cadence**, under Stream health); on WebTransport it is a WebGPU
 canvas Quasar owns, in place of the browser's `<video>` element. _Avoid_: "renderer",
