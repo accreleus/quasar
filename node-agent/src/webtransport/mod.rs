@@ -117,10 +117,10 @@ pub(crate) struct Rate {
     /// A client's first estimate: its loop takes the encoder over (one writer per encoder).
     pub(crate) start: Box<dyn Fn() + Send + Sync>,
     pub(crate) observe: Box<dyn Fn(f64) + Send + Sync>,
-    /// After `observe`, for an estimate that came from a receiver report: what that report
-    /// showed the link carrying (`congestion::Estimator::measured`). Never for the silence
-    /// decay, nor for an application-limited report.
-    pub(crate) measured: Box<dyn Fn(f64) + Send + Sync>,
+    /// After `observe`, for every estimate that came from a receiver report, never for the
+    /// silence decay: what the report showed the link carrying when the link held the
+    /// sender back (`congestion::Estimator::measured`), `None` when it did not.
+    pub(crate) measured: Box<dyn Fn(Option<f64>) + Send + Sync>,
 }
 
 /// One client's congestion control: its feedback and the agent's silence clock into an
@@ -194,12 +194,12 @@ impl<'a> Control<'a> {
         }
         if let Some(kbps) = estimate {
             self.feed(kbps);
-            if let Some(link) = self
-                .estimator
-                .measured()
-                .filter(|_| self.gone.get().is_none())
-            {
-                (self.rate.measured)(link / (1.0 + self.charged));
+            if self.gone.get().is_none() {
+                (self.rate.measured)(
+                    self.estimator
+                        .measured()
+                        .map(|link| link / (1.0 + self.charged)),
+                );
             }
             // QUIC's loss response is given up only while the estimate drives the encoder
             // from live feedback; the encoder never goes under the ABR's floor, so neither
