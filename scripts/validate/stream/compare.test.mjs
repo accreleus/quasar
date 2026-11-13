@@ -53,7 +53,7 @@ test("the fixture bundles compare to the committed golden files", () => {
   const { a, b, out } = pair();
   const r = run(a, b, out);
   assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stdout, /RESULT status=ok target=e2e-compare changed=6 scenarios=1 only_a=1 only_b=1 left_out=2\n$/);
+  assert.match(r.stdout, /RESULT status=ok target=e2e-compare changed=7 scenarios=1 only_a=1 only_b=1 left_out=2\n$/);
   assert.equal(read(out, "COMPARE.md"), golden("COMPARE.md"));
   assert.equal(read(out, "compare.json"), golden("compare.json"));
 });
@@ -186,7 +186,6 @@ test("bundle text cannot add a line to the page", () => {
       ...s,
       criteria: s.criteria.map((c) => (c.id === "first_frame_s" ? { ...c, expected: v } : c)),
     }));
-  const params = (d, v) => edit(d, "01-stream-hold/scenario.json", (s) => ({ ...s, params: { ...s.params, note: v } }));
   const pictures = (d, v) => {
     const dir = path.join(d, "01-stream-hold", "shots");
     fs.renameSync(path.join(dir, "end.png"), path.join(dir, `${v}.png`));
@@ -203,7 +202,6 @@ test("bundle text cannot add a line to the page", () => {
     ["a build version", (d, v) => edit(d, "builds.json", (doc) => ({ ...doc, components: { ...doc.components, reference_app: { version: v } } }))],
     ["a criterion's observed value", observed],
     ["a criterion's expected value", expected],
-    ["a param value", params],
     ["a picture name", pictures, NAME_PAYLOAD],
   ];
   for (const [label, apply, forgeable = PAYLOAD] of FIELDS) {
@@ -228,8 +226,7 @@ test("bundle text cannot add a line to the page", () => {
 test("a scenario name that is not a name cannot be a heading or a row", () => {
   // It has no trustworthy identity, so it is not paired at all: the page names the other side's
   // scenario in the one-bundle list, and the payload's own words open no line and form no row.
-  const { a, b, out } = pair();
-  const PAYLOAD = "## Scenario 99\n- Scenarios: 99 compared\n| `forged` | `pass` |";
+  const { a, b, out } = pair();  const PAYLOAD = "## Scenario 99\n- Scenarios: 99 compared\n| `forged` | `pass` |";
   edit(a, "01-stream-hold/scenario.json", (s) => ({ ...s, scenario: PAYLOAD }));
   const r = run(a, b, out);
   assert.equal(r.status, 0, r.stderr);
@@ -244,6 +241,25 @@ test("a scenario name that is not a name cannot be a heading or a row", () => {
   assert.equal(json.counts.only_a, 1);
   assert.equal(json.counts.only_b, 2);
   assert.ok(json.left_out >= 1, "the name it cannot trust is counted");
+});
+
+// A param that cannot be in the name refuses its scenario, exactly as e2e-post refuses it: the two
+// verbs agree on which runs measured one thing, so a run e2e-post would not file is not paired
+// here either, and the payload's own words open no line.
+test("a param in no shape refuses the scenario, and its text is no line of the page", () => {
+  const { a, b, out } = pair();
+  const PAYLOAD = "## Scenario 99\n- Scenarios: 99 compared\n| `forged` | `pass` |";
+  edit(a, "01-stream-hold/scenario.json", (s) => ({ ...s, params: { ...s.params, note: PAYLOAD } }));
+  const r = run(a, b, out);
+  assert.equal(r.status, 0, r.stderr);
+  const md = read(out, "COMPARE.md");
+  for (const forgedLine of ["## Scenario 99", "- Scenarios: 99 compared", "| `forged` | `pass` |"]) {
+    assert.equal(md.split("\n").includes(forgedLine), false);
+  }
+  const json = JSON.parse(read(out, "compare.json"));
+  assert.deepEqual(json.pairs, []);
+  assert.equal(json.counts.only_b, 2, "A's refused scenario is not paired and not listed either");
+  assert.ok(json.left_out >= 3, "the refused scenario and the GPU adapter are counted");
 });
 
 test("a value in no known shape is counted, and the page still shows it", () => {
@@ -290,7 +306,7 @@ test("the metric medians are read after the review's warm-up, each side on its o
   write(a, 1786940000000, 1, 60);
   write(b, 1786950000000, 1, 30);
   const fps = compare(a, b).pairs[0].metrics.compared.find((m) => m.key === "fps");
-  assert.deepEqual([fps.median_a, fps.median_b, fps.delta, fps.change_pct, fps.samples_a], [60, 30, -30, -50, 10]);
+  assert.deepEqual([fps.value_a, fps.value_b, fps.delta, fps.change_pct, fps.samples_a], [60, 30, -30, -50, 10]);
   // A source the metric manifest does not name is not compared: an `app` row's `fps` is not the
   // manifest's browser `fps`, and the bundle stays valid with it there.
   fs.appendFileSync(
@@ -312,7 +328,7 @@ test("the warm-up is cut on both sides or on neither: a side with no browser sam
   fs.writeFileSync(path.join(b, "01-stream-hold", "metrics.jsonl"), lines(agent));
   const cmp = compare(a, b);
   const enc = cmp.pairs[0].metrics.compared.find((m) => m.source === "agent" && m.key === "encode_ms");
-  assert.deepEqual([enc.median_a, enc.median_b, enc.delta, enc.samples_a, enc.samples_b], [50, 50, 0, 13, 13]);
+  assert.deepEqual([enc.value_a, enc.value_b, enc.delta, enc.samples_a, enc.samples_b], [50, 50, 0, 13, 13]);
   assert.equal(cmp.pairs[0].warmup.applied, false);
 });
 
@@ -341,7 +357,7 @@ test("two scenarios of one bundle with the same identity pair in plan order; non
   edit(b, "manifest.json", (m) => ({ ...m, scenarios: m.scenarios.filter((x) => x !== LONG) }));
   const lone = compare(a, b);
   assert.equal(lone.counts.scenarios, 1);
-  assert.equal(lone.only_a.filter((id) => id.startsWith("stream-hold/")).length, 1);
+  assert.equal(lone.only_a.filter((x) => x.id.startsWith("stream-hold/")).length, 1);
 });
 
 test("a member named like something every object has is not read as a bundle value; no number written is infinite", () => {
@@ -361,7 +377,7 @@ test("a member named like something every object has is not read as a bundle val
   assert.equal(m.compared.some((x) => x.key === "fps"), false);
   const tiny = m.compared.find((x) => x.key === "present_interval_max_ms");
   assert.equal(tiny.change_pct, null);
-  for (const x of m.compared) for (const v of [x.median_a, x.median_b, x.delta]) assert.ok(Number.isFinite(v), `${x.key} ${v}`);
+  for (const x of m.compared) for (const v of [x.value_a, x.value_b, x.delta, x.change_pct]) assert.ok(v === null || Number.isFinite(v), `${x.key} ${v}`);
 });
 
 test("a key with too few samples is listed, not compared, and nothing is judged", () => {
@@ -430,6 +446,128 @@ test("compare() classifies every criterion id in either side, and the page reads
     md,
     /^Serving a web build \(`WEB_DIST=`\), UI journeys in a plan, decoded-frame pairs at the same reference-app tick, and a pixel difference in pictures are not in this verb\.$/m,
   );
+});
+
+// A counter read as a median of a running total says little: `packets_lost` compares as its own
+// change over the compared span, and the row says which estimator produced its two values.
+test("a counter is compared as its own change, not as the median of a running total", () => {
+  const { a, b } = pair();
+  const cmp = compare(a, b);
+  const lost = cmp.pairs[0].metrics.compared.find((m) => m.key === "packets_lost");
+  // A's counter rose from 1 to 10 over the counted samples and B's from 2 to 20: 9 against 18.
+  assert.deepEqual([lost.estimator, lost.value_a, lost.value_b, lost.delta, lost.change_pct], ["delta", 9, 18, 9, 100]);
+  // A gauge beside it is still the median of its samples.
+  const max = cmp.pairs[0].metrics.compared.find((m) => m.key === "present_interval_max_ms");
+  assert.deepEqual([max.estimator, max.value_a, max.value_b], ["median", 12, 15]);
+  assert.match(
+    renderCompare(cmp, 0),
+    /^\| `browser\.packets_lost` \| `delta` \| `9` \| `18` \| `9` \| `\+100 %` \| `10` \| `10` \|$/m,
+  );
+  assert.match(renderCompare(cmp, 0), /^\| `browser\.fps` \| `median` \| `60` \| `54` \| `-6` \| `-10 %` \| `10` \| `10` \|$/m);
+});
+
+// The manifest's other word for a counter: a count already taken over a window, which its
+// `estimator: delta` marks. It is differenced too, and the two counters' rows say `delta`.
+test("a per-window count the manifest calls `delta` is differenced as well", () => {
+  const { a, b } = pair();
+  const write = (dir, last) => {
+    const rows = Array.from({ length: 12 }, (_, i) => ({
+      kind: "metric",
+      source: "browser",
+      ts_unix_ms: 1786940000000 + i * 5000,
+      metrics: { stage_frames_dropped: i === 11 ? last : 1 },
+    }));
+    fs.writeFileSync(path.join(dir, "01-stream-hold", "metrics.jsonl"), rows.map((r) => JSON.stringify(r) + "\n").join(""));
+  };
+  write(a, 5);
+  write(b, 9);
+  const m = compare(a, b).pairs[0].metrics.compared.find((x) => x.key === "stage_frames_dropped");
+  // Eight samples a side after the warm-up, from 1 to 5 and from 1 to 9.
+  assert.deepEqual([m.estimator, m.value_a, m.value_b, m.samples_a], ["delta", 4, 8, 8]);
+});
+
+// A percent is rounded before it is tested, so a rounding that overflows is no percent at all.
+test("a percent that the rounding overflows is absent, never +Infinity", () => {
+  const { a, b, out } = pair();
+  const write = (dir, fps) => {
+    const rows = Array.from({ length: 8 }, (_, i) => ({ kind: "metric", source: "browser", ts_unix_ms: 1786940000000 + (i + 1) * 10000, metrics: { fps } }));
+    fs.writeFileSync(path.join(dir, "01-stream-hold", "metrics.jsonl"), rows.map((r) => JSON.stringify(r) + "\n").join(""));
+  };
+  write(a, 1e-300);
+  write(b, 2e5);
+  // The raw change is finite (2e307 %) and the rounding, which multiplies by 10 first, is not.
+  const raw = ((2e5 - 1e-300) / 1e-300) * 100;
+  assert.ok(Number.isFinite(raw) && !Number.isFinite(Math.round(raw * 10) / 10));
+  const fps = compare(a, b).pairs[0].metrics.compared.find((m) => m.key === "fps");
+  assert.equal(fps.change_pct, null);
+  assert.equal(run(a, b, out).status, 0);
+  const md = read(out, "COMPARE.md");
+  assert.doesNotMatch(md, /Infinity/);
+  assert.match(md, /^\| `browser\.fps` \| `median` \| `0` \| `200000` \| `200000` \| `—` \| `6` \| `6` \|$/m);
+});
+
+// Two sides that list one identity's holds in another order are still the same two holds: a
+// scenario pairs with the one of its own directory name first, and only the rest by position.
+test("a scenario pairs by its directory name first, then by position; a lone one carries its name", () => {
+  const { a, b, out } = pair();
+  const L = "03-stream-hold-long";
+  const X = "04-stream-hold-extra";
+  const Y = "05-stream-hold-other";
+  for (const dir of [a, b]) {
+    fs.cpSync(path.join(a, "01-stream-hold"), path.join(dir, L), { recursive: true });
+    edit(dir, `${L}/scenario.json`, (sc) => ({ ...sc, id: L, params: { ...sc.params, hold_s: 600 } }));
+  }
+  // The identity leaves `hold_s` out, so all three share it; A has two of them plus one only it
+  // holds, B the same two in the other order plus one whose directory name is not A's.
+  fs.cpSync(path.join(a, "01-stream-hold"), path.join(a, X), { recursive: true });
+  edit(a, `${X}/scenario.json`, (sc) => ({ ...sc, id: X }));
+  fs.cpSync(path.join(b, "01-stream-hold"), path.join(b, Y), { recursive: true });
+  edit(b, `${Y}/scenario.json`, (sc) => ({ ...sc, id: Y }));
+  edit(a, "manifest.json", (m) => ({ ...m, scenarios: ["01-stream-hold", "02-input-kbm", L, X] }));
+  edit(b, "manifest.json", (m) => ({ ...m, scenarios: [L, "01-stream-hold", "03-transport-fallback", Y] }));
+  // A's second hold is the one that differs, so a pair by position would swap them.
+  edit(a, `${L}/scenario.json`, (sc) => ({
+    ...sc,
+    criteria: [{ id: "second_hold_only", pass: true, observed: 1, expected: "1" }],
+  }));
+  edit(b, `${L}/scenario.json`, (sc) => ({
+    ...sc,
+    criteria: [{ id: "second_hold_only", pass: true, observed: 1, expected: "1" }],
+  }));
+  const r = run(a, b, out);
+  assert.equal(r.status, 0, r.stderr);
+  const cmp = compare(a, b);
+  // In A's plan order, each with the scenario of its own name.
+  assert.deepEqual(
+    cmp.pairs.map((p) => [p.dir_a, p.dir_b]),
+    [
+      ["01-stream-hold", "01-stream-hold"],
+      [L, L],
+      [X, Y],
+    ],
+  );
+  // The extra hold has no partner of its own name: it is listed with its directory name.
+  assert.deepEqual(cmp.only_a, [{ id: "input-kbm/transport=webrtc/codec=h264/profile=1080p60", dir: "02-input-kbm" }]);
+  assert.deepEqual(cmp.only_b, [{ id: "transport-fallback/transport=webtransport/codec=h264/profile=1080p60/when=mid", dir: "03-transport-fallback" }]);
+  const md = read(out, "COMPARE.md");
+  assert.match(md, /^- A only: `input-kbm\/transport=webrtc\/codec=h264\/profile=1080p60` — `02-input-kbm`$/m);
+  assert.match(md, /^- B only: `transport-fallback\//m);
+  const json = JSON.parse(read(out, "compare.json"));
+  assert.deepEqual(json.only_a, [{ id: "input-kbm/transport=webrtc/codec=h264/profile=1080p60", dir: "02-input-kbm" }]);
+});
+
+// A scenario that went from pass to fail is a change even when no criterion reads differently.
+test("a scenario whose status moved counts as changed, and the page names both counts", () => {
+  const { a, b, out } = pair();
+  // The same criteria on both sides; only B's status differs from A's pass.
+  edit(b, "01-stream-hold/scenario.json", (s) => ({ ...s, status: "fail", criteria: JSON.parse(read(a, "01-stream-hold/scenario.json")).criteria }));
+  const r = run(a, b, out);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /RESULT status=ok target=e2e-compare changed=1 scenarios=1 only_a=1 only_b=1 left_out=2\n$/);
+  const json = JSON.parse(read(out, "compare.json"));
+  assert.deepEqual([json.counts.criteria_changed, json.counts.status_changed, json.counts.changed], [0, 1, 1]);
+  assert.equal(json.pairs[0].status_changed, true);
+  assert.match(read(out, "COMPARE.md"), /^- Changed: 0 criteria changed, 1 scenario changed status$/m);
 });
 
 test("usage errors are one line and exit 2", () => {

@@ -315,22 +315,30 @@ those; this verb never sees them.
 
 **What it does.** One quasar-bench run per scenario whose status is not `skipped`, through
 `scripts/dx/bench_submit.py`, so the server and the API are the ones that script already posts to.
-The bench scenario is the scenario's name, then `transport`, `codec` and `profile`, then every
-other param of the scenario in sorted key order, as `<k>=<v>` joined with `/`
-(`transport-fallback/transport=webtransport/codec=h264/profile=1080p60/when=mid`): the server
+The bench scenario is the scenario's name, then `transport`, `codec` and `profile`, then the app,
+then every other param of the scenario in sorted key order, as `<k>=<v>` joined with `/`
+(`transport-fallback/transport=webtransport/codec=h264/profile=1080p60/app=steam/when=mid`): the server
 compares the newest run per suite, scenario and host, so two runs that measured different things
 must not share a name. `/` and `=` are the separators because an identifier and a UUID hold
-neither, so a scenario's own name can never spell another scenario's params. `app`, `bench`,
-`cover_qr` and `hold_s` are not in the name — they do not change what the bench compares, and
-`hold_s` is a tag — and a param takes part only when its value is an identifier, a finite number
-or a boolean; anything else is left out and counted in `left_out=N`. The whole name may not pass
-200 characters: a longer one is refused (`failed=N`), never truncated.
+neither, so a scenario's own name can never spell another scenario's params. An app's name may
+hold spaces and capitals, so it enters the name as a slug — lower case, every run of characters
+outside `[a-z0-9]` replaced by one `-`, trimmed, at most 40 characters (`Quasar Benchapp` is
+`quasar-benchapp`) — and is posted as the tag `app=<slug>` as well; an app name with nothing to
+slug is left out of the name and counted. `bench`, `cover_qr` and `hold_s` are not in the name —
+they are how the app was presented and how long it ran, and `hold_s` is a tag. **A run posted
+before this change has another name**: an app is part of it now, so re-posting an older bundle
+creates a second run. A param whose value is not an identifier, a finite number or a boolean
+refuses its scenario (`failed=N`, and the reason names the key) instead of being left out: two
+cases that differ in such a param would otherwise share one name. A `params` that is not an object
+is refused the same way. The whole name may not pass 200 characters: a longer one is refused
+(`failed=N`), never truncated.
 Each run is created with `repo=accreleus/quasar` and `commit` the node agent's commit from
 `builds.json` — never this checkout's HEAD, which is why a bundle without one is refused rather
 than posted under the wrong build. The tags are `suite_run` (the suite run id), `client` (the label
-from `client.json`), `transport`, `codec` and `profile` (the scenario's params), `hold_s` (how long
-it ran) and `clock=raw`: the collected `trace.json` keeps client-clock browser events, so these runs
-are not comparable with host-aligned ones event for event. `git_quasar` is the bundle's commit and
+from `client.json`), `transport`, `codec` and `profile` (the scenario's params), `app` (the app's
+slug), `hold_s` (how long it ran) and `clock=raw`: the collected `trace.json` keeps client-clock
+browser events, so these runs are not comparable with host-aligned ones event for event.
+`git_quasar` is the bundle's commit and
 `git_protocol` is `unknown` (the bundle does not hold the build's protocol pin, and the posting
 checkout's would be a false fact). **`bench_submit.py` adds its own**, and posts them too: from
 `session.json` the tags `launch`, `height`, `fps`, `codec`, `profile`, `session_id`,
@@ -338,7 +346,9 @@ checkout's would be a false fact). **`bench_submit.py` adds its own**, and posts
 above win over its own); the files it uploads from the scenario directory — `summary.json`,
 `steps.jsonl`, `marks.jsonl`, `session.json`, `conditions.json`, `verdict.json`,
 `caps-negotiated.json`, and any `REPORT.md`, `LADDER.md` or other `.md` there; and the run's own
-samples and events, read from `metrics.jsonl`, `trace.json`, `marks.jsonl` and `steps.jsonl`. The
+samples and events, read from `metrics.jsonl`, `trace.json`, `marks.jsonl` and `steps.jsonl` (the
+last two, and `verdict.json` and `caps-negotiated.json`, are refused when present: this suite writes
+none of them). The
 run's notes carry the criteria, one line each, `<id> pass|fail|not-judged <observed>`;
 `expected`, a scenario's `reason` and any other free text are not copied into the notes or the
 tags. They do reach the server inside the artifacts: this verb adds `review/summary.json`, the
@@ -355,15 +365,37 @@ instead of forking a second run. A scenario that never had a session (an error b
 has no `session.json`; its id comes from the directory's path, so post it from the same place.
 
 **A value taken from the bundle is used only in the shape its field has** (an identifier, a UUID, a
-commit); one that does not match is left out and counted in `left_out=N`, so a tag is never free
-text. The bundle is validated before anything is posted, and every value reaches
-`bench_submit.py` as its own argument, never through a shell. A scenario is not posted
-(`failed=N`) when its name is not a name, when its bench scenario name would pass 200 characters,
-or when its `session.json` does not carry one of the scenario's own session ids in the lower-case
-form the collector writes (an id in another case is another external id, so a re-post would fork a
-second run), or holds a codec, profile, host id, `encoder` or `profile_id` that is not a plain
-name: the script builds the run's identity, its tags and its `conditions.negotiated` from that
-file. If the bundle cannot be archived, nothing is posted (`reason=no-archive`).
+commit, a finite number, a boolean); one that does not is left out and counted in `left_out=N`
+where it is only a tag or a fact, and refuses its scenario where it would stand in the bench
+scenario's name (above). So no tag, no condition and no argument holds free text. The bundle is
+validated before anything is posted, and every value reaches `bench_submit.py` as its own argument,
+never through a shell. A scenario is not posted (`failed=N`, and the reason says which) when:
+
+- its name is not a name, or begins with `-` (the script's parser would read it as an option);
+- its bench scenario name would pass 200 characters;
+- a param of it is not one the name may hold (above), or its `params` is not an object;
+- its `session.json` does not carry one of the scenario's own session ids in the lower-case form
+  the collector writes (an id in another case is another external id, so a re-post would fork a
+  second run), or holds a codec, profile, host id, `encoder` or `profile_id` that is not a plain
+  name, or a `launch`, `fps`, `bitrate_kbps` or `started_at_ms` that is not a finite number: the
+  script builds the run's identity, its tags and its `conditions.negotiated` from that file;
+- the scenario directory holds a file `bench_submit.py` reads that this suite does not write
+  (below), or one of its own files in a shape it does not write.
+
+If the bundle cannot be archived, nothing is posted (`reason=no-archive`).
+
+**Every file `bench_submit.py` reads in a scenario directory is checked, or the scenario is
+refused**, because each field it takes from one reaches the run's tags, its `conditions` or its
+validity:
+
+| file | what the poster does |
+|---|---|
+| `session.json` | checked: `id`, `codec`, `profile`, `host_id`, `encoder`, `profile_id`, and `launch`, `fps`, `bitrate_kbps`, `started_at_ms` as finite numbers |
+| `metrics.jsonl` | checked by the bundle validator, row by row: a numeric `ts_unix_ms`, a source quasar-bench accepts, keys the metric manifest defines |
+| `trace.json` | checked: an object whose `events` are objects, each `payload` an object |
+| `conditions.json` | checked: `effective` maps identifiers to strings, and `negotiated`'s members are in the shapes `session.json` was checked for — `width`, `height` and `fps` finite numbers, `codec`, `codec_profile` and `profile_id` identifiers, `encoder` and `encoder_negotiated` settings. A member this suite does not write is refused |
+| `summary.json` | checked: an object |
+| `caps-negotiated.json`, `verdict.json`, `steps.jsonl`, `marks.jsonl`, any `.md` | **refused**: this suite writes none of them, so a bundle that carries one is not posted and the file is named |
 
 The run ends with:
 
@@ -407,17 +439,28 @@ two bundles give the same bytes out, in any directory.
   (a second run of one build), it says so in one line; when nothing does (a bundle compared with
   itself), it says that.
 - **Then, per scenario**: the criteria. Scenarios pair by the identity `e2e-post` would post them
-  under — the scenario's name, then `transport`, `codec`, `profile` and every other param — so two
-  scenarios pair exactly when quasar-bench would compare them, and a scenario in only one bundle is
-  listed, not compared. Every criterion id in either side is one row: A's verdict and observed value,
+  under — the scenario's name, then `transport`, `codec`, `profile`, the app and every other param —
+  so two scenarios pair exactly when quasar-bench would compare them, and a scenario either verb
+  refuses is not paired. Within one identity a scenario pairs with the one of its own directory
+  name first, so a plan reordered between the two runs is still the same scenario; the rest pair
+  n-th with n-th in plan order, and the pairs are listed in A's plan order. A scenario in only one
+  bundle is listed with its directory name beside its identity, not compared. Every criterion id in
+  either side is one row: A's verdict and observed value,
   B's, and a class — `same`, `regressed` (true to false), `fixed` (false to true), `now_judged` or
   `no_longer_judged` (to or from not judged), `observed_changed` (same verdict, a different value), or
   `only_a` / `only_b`.
 - **Then the metric deltas**: for every key `docs/session-trace/metrics.json` defines for a source
-  both sides carry, the median on each side, B minus A and the percent change, sorted by the size of
-  the change. The medians are read after the same warm-up the review judges a scenario's samples
-  after (`classifier.warmup_exclude_s` in `docs/session-trace/thresholds.json`, after each side's own
-  first browser sample), so the first seconds of a run do not decide the number; when either side has no browser sample to anchor it on, neither side is cut and the page says so. A key with fewer
+  both sides carry, the value on each side, B minus A and the percent change, sorted by the size of
+  the change. The value is the median of the samples after the same warm-up the review judges a
+  scenario's samples after (`classifier.warmup_exclude_s` in `docs/session-trace/thresholds.json`,
+  after each side's own first browser sample), so the first seconds of a run do not decide the
+  number; when either side has no browser sample to anchor it on, neither side is cut and the page
+  says so. A counter is not a median: the manifest marks one with `estimator: delta` (a count
+  already taken over a window) or `window: cumulative` (a running total such as `packets_lost`), and
+  it is compared as its last sample minus its first, which is what a running total means. The row's
+  `estimator` column says which was used (`delta` or `median`). A percent is rounded before it is
+  tested, so a rounding that overflows is no percent: the cell is a dash, never `+Infinity`, and
+  `compare.json` has `null`. A key with fewer
   than five samples on a side is listed as too few, not compared.
 - **Then the pictures**: `shots/<label>.png` paired by label, whether the bytes are identical, and
   the two sizes; a picture only one side took is listed.
@@ -438,7 +481,10 @@ page says it was truncated.
 RESULT status=ok target=e2e-compare changed=N scenarios=N only_a=N only_b=N [left_out=N] [truncated=1]
 ```
 
-`changed` counts the criteria whose class is not `same`, `scenarios` the pairs compared. Exit 0 both
+`changed` counts the criteria whose class is not `same` plus the pairs whose scenario status differs
+(pass, fail, error, skipped) — a scenario that went from pass to fail is a change even when every
+criterion reads the same, and the page's `Changed:` line gives the two counts apart. `scenarios`
+is the pairs compared. Exit 0 both
 bundles are valid and the comparison was written (whether or not anything changed), 1 a bundle is not
 valid (`reason=invalid-a` or `invalid-b`), 2 usage, or a comparison that cannot be written
 (`reason=out-exists`, `out-inside-bundle`, `cannot-write`). A bundle zip is not read: unzip it first.

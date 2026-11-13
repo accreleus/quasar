@@ -6,9 +6,12 @@
 //
 // The bundle is untrusted: it is validated first, and every value taken from it reaches
 // bench_submit.py as its own argv element (never a shell string) and only when it matches
-// the shape its field has in bundle.mjs / collect.mjs. A value that does not is left out
-// and counted. Notes carry criterion ids (identifiers the validator enforced) and numbers
-// only: `expected`, `reason` and any other free text is never copied.
+// the shape its field has in bundle.mjs / collect.mjs. A param in no shape refuses its
+// scenario rather than being left out (two cases that differ in it would share one name), and
+// so does a file in a scenario directory that this suite does not write: bench_submit.py opens
+// several, and each would reach the run unchecked. Notes carry criterion ids (identifiers the
+// validator enforced) and numbers only: `expected`, `reason` and any other free text is never
+// copied.
 //
 // bench_submit.py owns the server, the key and the API (BENCH_URL / BENCH_KEY, else
 // qbench's config); this script never reads, prints or passes either.
@@ -57,11 +60,12 @@ export function criteriaNotes(criteria) {
 // `<scenario>/<k>=<v>/<k>=<v>...`: a separator (`/`) and a joiner (`=`) that a name
 // (`[A-Za-z0-9_.-]{1,64}`) and a UUID cannot hold, so a scenario whose name reads like
 // another's params is still another name. What decides comparison comes first, in this
-// order; every other param follows, sorted.
+// order; the app follows, then every other param, sorted.
 const NAME_KEYS = ["transport", "codec", "profile"];
-// The four that do not change what is measured in a way the bench splits on: `hold_s` is
-// kept as a tag (how long it ran), the other three pick the app and its presentation.
-const NOT_IN_NAME = new Set(["app", "bench", "cover_qr", "hold_s"]);
+// The three that do not change what is measured in a way the bench splits on: `hold_s` is
+// kept as a tag (how long it ran), the other two are how the app was presented. A plan run
+// against another app measured another thing, so `app` is in the name (`appSlug`).
+const NOT_IN_NAME = new Set(["bench", "cover_qr", "hold_s"]);
 /** A bench scenario's whole name; the service takes it as text, and this is our own cap. */
 const NAME_MAX = 200;
 /** The shape such a name has: what `[scenario, k=v, ...].join("/")` can make out of identifiers,
@@ -78,39 +82,60 @@ function paramValue(v) {
   return null;
 }
 
+/** How long an app's slug may be in a scenario's name. */
+const APP_MAX = 40;
+/** An app's name as it may stand in a scenario's name: `Quasar Benchapp` is `quasar-benchapp`. */
+export function appSlug(name) {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, APP_MAX)
+    .replace(/-+$/, "");
+}
+
 /**
- * The name to post under, the tags, and the params left out. A value (or a key) in any other
- * shape is left out and counted, never passed on: the bundle is untrusted. `e2e-compare` pairs
- * two bundles' scenarios by `name`, so the two verbs agree on when two runs measured one thing.
+ * The name to post under, the tags, the params left out, and the reason a scenario cannot be
+ * posted at all (`refused`, null when it can). A param whose value is not an identifier, a
+ * finite number or a boolean is refused rather than left out, and a `params` that is not an
+ * object with it: two cases that differ in it would otherwise share one name. `e2e-compare`
+ * pairs two bundles' scenarios by `name`, so the two verbs agree on when two runs measured one
+ * thing, and it refuses the same scenarios.
  */
 export function benchIdentity(sc) {
-  const params = isObj(sc.params) ? sc.params : {};
+  const noName = (refused) => ({ name: null, tags: [], leftOut: 0, refused });
+  if (!isObj(sc.params)) return noName("its params is not an object");
+  const params = sc.params;
   const pairs = [];
   const leftOut = [];
-  const take = (k) => {
-    const v = paramValue(params[k]);
-    if (v !== null) return v;
-    if (params[k] !== undefined) leftOut.push(k);
-    return null;
-  };
+  // A key names the param in the reason; a key that is not an identifier cannot, so it is not echoed.
+  const badValue = (k) => `its param ${k} is not an identifier, a finite number or a boolean (the bench scenario name cannot hold it)`;
   for (const k of NAME_KEYS) {
-    const v = take(k);
-    if (v !== null) pairs.push([k, v]);
+    if (params[k] === undefined) continue;
+    const v = paramValue(params[k]);
+    if (v === null) return noName(badValue(k));
+    pairs.push([k, v]);
+  }
+  // The app is what was on the screen: a slug of its own name, which may hold spaces and capitals.
+  if (params.app !== undefined) {
+    if (typeof params.app !== "string") return noName("its param app is not an app name (a string)");
+    const slug = appSlug(params.app);
+    if (slug) pairs.push(["app", slug]);
+    else leftOut.push("app"); // a name with nothing to slug: no app in the name, and counted
   }
   for (const k of Object.keys(params).sort()) {
-    if (NAME_KEYS.includes(k) || NOT_IN_NAME.has(k)) continue;
-    if (!fits(SHAPES.identifier, k)) {
-      leftOut.push(k);
-      continue;
-    }
-    const v = take(k);
-    if (v !== null) pairs.push([k, v]);
+    if (NAME_KEYS.includes(k) || NOT_IN_NAME.has(k) || k === "app") continue;
+    if (!fits(SHAPES.identifier, k)) return noName("one of its params has a name that is not an identifier (the bench scenario name cannot hold it)");
+    const v = paramValue(params[k]);
+    if (v === null) return noName(badValue(k));
+    pairs.push([k, v]);
   }
-  const tags = pairs.filter(([k]) => NAME_KEYS.includes(k));
-  const hold = take("hold_s");
+  const tags = pairs.filter(([k]) => NAME_KEYS.includes(k) || k === "app");
+  const hold = paramValue(params.hold_s);
   if (hold !== null) tags.push(["hold_s", hold]);
+  else if (params.hold_s !== undefined) leftOut.push("hold_s");
   const name = [sc.scenario, ...pairs.map(([k, v]) => `${k}=${v}`)].join("/");
-  return { name, tags, leftOut };
+  return { name, tags, leftOut, refused: null };
 }
 
 /**
@@ -133,6 +158,96 @@ function sessionProblem(file, sc) {
   if (s.encoder !== undefined && s.encoder !== null && !fits(SHAPES.setting, s.encoder)) return "session.json's encoder is not a plain name";
   // A launch profile's id: an identifier or a UUID, both of which an identifier covers.
   if (s.profile_id !== undefined && s.profile_id !== null && !fits(SHAPES.identifier, s.profile_id)) return "session.json's profile_id is not an identifier or a UUID";
+  // The rest of what bench_submit.py copies out of this file: `launch` and `fps` into
+  // conditions.negotiated and the tags `launch`, `height` and `fps`, `bitrate_kbps` into a tag,
+  // `started_at_ms` into an event's anchor. It casts each to an integer, so a string is a crash
+  // and a non-finite number is not a size or a rate.
+  const launch = s.launch;
+  if (launch !== undefined && launch !== null && (!Array.isArray(launch) || launch.length !== 2 || !launch.every((v) => typeof v === "number" && Number.isFinite(v)))) {
+    return "session.json's launch is not two finite numbers";
+  }
+  for (const k of ["fps", "bitrate_kbps", "started_at_ms"]) {
+    if (s[k] !== undefined && s[k] !== null && !(typeof s[k] === "number" && Number.isFinite(s[k]))) return `session.json's ${k} is not a finite number`;
+  }
+  return null;
+}
+
+/**
+ * Files `bench_submit.py` reads from or uploads out of a scenario directory that this suite
+ * never writes: another harness's session verdict, its caps.negotiated trace, the soak's marks
+ * and steps, and a hand-written report. Each would reach the run without passing a shape — the
+ * verdict as the run's validity and its free-text reason, the caps as the tags `codec`,
+ * `codec_profile` and `encoder_negotiated`, the marks and steps as events, the report as an
+ * artifact — so a bundle that carries one is refused, and the file is named.
+ */
+const FOREIGN_FILES = ["caps-negotiated.json", "verdict.json", "steps.jsonl", "marks.jsonl"];
+// A name a reason may echo: a file the bundle wrote may be called anything.
+const PLAIN_NAME = /^[A-Za-z0-9_.-]{1,64}$/;
+
+/** The first file in a scenario directory that a post may not carry, or null. */
+function foreignFileProblem(sdir) {
+  for (const f of FOREIGN_FILES) {
+    if (fs.existsSync(path.join(sdir, f))) return `${f} is not a file this suite writes`;
+  }
+  let entries = [];
+  try {
+    entries = fs.readdirSync(sdir, { withFileTypes: true });
+  } catch {}
+  const md = entries.filter((e) => e.isFile() && e.name.endsWith(".md")).map((e) => e.name).sort()[0];
+  if (md) return `${PLAIN_NAME.test(md) ? md : "a .md file"} is not a file this suite writes`;
+  return null;
+}
+
+// The shapes of `conditions.json`'s `negotiated` members: what `session.json` was checked for
+// above, which bench_submit.py copies into the same map.
+const NEGOTIATED_SHAPES = new Map([
+  ["width", "number"],
+  ["height", "number"],
+  ["fps", "number"],
+  ["codec", SHAPES.identifier],
+  ["codec_profile", SHAPES.identifier],
+  ["encoder", SHAPES.setting],
+  ["encoder_negotiated", SHAPES.setting],
+  ["profile_id", SHAPES.identifier],
+]);
+
+/**
+ * The other files `bench_submit.py` reads from the scenario directory, checked where a field
+ * reaches the run's tags or `conditions`: `trace.json` (events), `conditions.json` (`effective`
+ * and `negotiated`, which the service compares against the tags) and `summary.json` (the run's
+ * summary and, with no `--verdict`, its verdict). `metrics.jsonl` is the bundle validator's.
+ * Null when the directory may be posted.
+ */
+function filesProblem(sdir) {
+  const present = (f) => fs.existsSync(path.join(sdir, f));
+  if (present("trace.json")) {
+    const trace = readJson(path.join(sdir, "trace.json"));
+    const events = isObj(trace) ? trace.events : undefined;
+    if (!isObj(trace) || (events !== undefined && (!Array.isArray(events) || events.some((e) => !isObj(e) || !isObj(e.payload ?? {}))))) {
+      return "trace.json is not a trace this suite writes (an object whose events carry an object payload)";
+    }
+  }
+  if (present("conditions.json")) {
+    const cond = readJson(path.join(sdir, "conditions.json"));
+    if (!isObj(cond)) return "conditions.json is not an object";
+    const effective = cond.effective;
+    if (effective !== undefined && !isObj(effective)) return "conditions.json's effective is not a map";
+    for (const [k, v] of Object.entries(effective ?? {})) {
+      if (!fits(SHAPES.identifier, k)) return "conditions.json's effective holds a key that is not an identifier";
+      if (typeof v !== "string") return "conditions.json's effective holds a value that is not a string";
+    }
+    const negotiated = cond.negotiated;
+    if (negotiated !== undefined) {
+      if (!isObj(negotiated)) return "conditions.json's negotiated is not an object";
+      for (const [k, v] of Object.entries(negotiated)) {
+        const shape = NEGOTIATED_SHAPES.get(k);
+        if (!shape) return `conditions.json's negotiated holds ${PLAIN_NAME.test(k) ? k : "a member"} this suite does not write`;
+        const ok = shape === "number" ? typeof v === "number" && Number.isFinite(v) : fits(shape, v);
+        if (!ok) return `conditions.json's negotiated ${k} is not the shape session.json was checked for`;
+      }
+    }
+  }
+  if (present("summary.json") && !isObj(readJson(path.join(sdir, "summary.json")))) return "summary.json is not an object";
   return null;
 }
 
@@ -212,15 +327,27 @@ export function postBundle(
         continue;
       }
       // The run's name and identity are the bundle's own words or nothing: no stand-in is posted.
-      const problem = fits(SHAPES.identifier, sc.scenario) ? sessionProblem(path.join(dir, name, "session.json"), sc) : "its scenario is not a name (letters, digits, _ . -, at most 64)";
+      // A scenario name that reads as an option would reach bench_submit.py's parser as one, and
+      // a name in no shape is no name; both are refused here, before anything runs.
+      let problem = null;
+      if (!fits(SHAPES.identifier, sc.scenario)) {
+        problem = "its scenario is not a name (letters, digits, _ . -, at most 64)";
+      } else if (sc.scenario.startsWith("-")) {
+        problem = "its scenario name begins with '-' (bench_submit.py would read it as an option)";
+      } else {
+        problem = sessionProblem(path.join(dir, name, "session.json"), sc) ?? filesProblem(path.join(dir, name)) ?? foreignFileProblem(path.join(dir, name));
+      }
+      // The name and its tags are the bundle's own words or nothing: a param in no shape refuses
+      // the scenario (two cases that differ in it would otherwise share one name), and a name over
+      // the cap is refused, never truncated.
+      const identity = problem ? null : benchIdentity(sc);
+      if (!problem && identity.refused) problem = identity.refused;
       if (problem) {
         console.error(`${name}: ${problem}; nothing posted for it`);
         out.failed += 1;
         continue;
       }
-      // The name and its tags are the bundle's own words or nothing: a param in another shape
-      // is left out and counted, and a name over the cap is refused, never truncated.
-      const { name: benchScenario, tags, leftOut } = benchIdentity(sc);
+      const { name: benchScenario, tags, leftOut } = identity;
       out.leftOut += leftOut.length;
       if (benchScenario.length > NAME_MAX) {
         console.error(`${name}: its bench scenario name is ${benchScenario.length} characters (at most ${NAME_MAX}); nothing posted for it`);
