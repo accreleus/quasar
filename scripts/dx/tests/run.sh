@@ -1179,10 +1179,10 @@ printf '\n== session soak ==\n'
 # fully offline (it never constructs an API client), and testdata/soak-* is a
 # synthetic run of a 1920x1080 ladder walk.
 soak_sched="$(bash "$DX/session_soak.sh" --dry-run --launch 1920x1080 --duration 180 2>&1 || true)"
-if printf '%s' "$soak_sched" | grep -qE '1280x720 +floor hold' \
+if printf '%s' "$soak_sched" | grep -qE '640x360 +floor hold' \
    && printf '%s' "$soak_sched" | grep -qE 'TOTAL +180\.0s' \
-   && printf '%s' "$soak_sched" | grep -qE '5 +1920x1080 +restore'; then
-  pass "soak:schedule" "ladder 1920x1080/180s: launch > 1600x900 > 1280x720 > back, fits the duration"
+   && printf '%s' "$soak_sched" | grep -qE '9 +1920x1080 +restore'; then
+  pass "soak:schedule" "ladder 1920x1080/180s: launch > 1600x900 > 1280x720 > 960x540 > 640x360 > back, fits the duration"
 else
   fail "soak:schedule" "$(printf '%s' "$soak_sched" | tail -n 5 | tr '\n' ' ')"
 fi

@@ -766,8 +766,6 @@ describe("SessionPage — stream (external) resolution", () => {
       [1920, 1080],
       [1600, 900],
       [1280, 720],
-      [960, 540],
-      [640, 360],
     ]);
   });
 

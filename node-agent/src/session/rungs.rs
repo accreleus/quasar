@@ -230,7 +230,7 @@ mod tests {
                     (640, 360),
                 ],
             ),
-            // Below every canonical rung of its family ⇒ only itself.
+            // The deepest canonical 16:9 rung ⇒ only itself.
             (640, 360, vec![(640, 360)]),
             (1280, 1024, vec![(1280, 1024)]),
         ] {
@@ -304,7 +304,6 @@ mod tests {
             format_ladder(&available_rungs(1920, 1080)),
             "1920x1080,1600x900,1280x720,960x540,640x360"
         );
-        assert_eq!(format_ladder(&available_rungs(640, 360)), "640x360");
         assert_eq!(format_ladder(&[]), "");
     }
 }

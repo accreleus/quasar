@@ -2712,7 +2712,7 @@ session's stream size at connect time, unchanged):
 
 - `16:9`: 3840x2160, 2560x1440, 1920x1080, 1600x900, 1280x720, 960x540, 640x360
 - `16:10`, `21:9`, `4:3`: equivalent per-family rungs (same construction,
-  scaled to each family's aspect), none of them under their 720p-class size yet
+  scaled to each family's aspect), unchanged by the 16:9 rungs under 720p
 
 A session's available rungs are the family's list filtered `≤` the launch
 WxH. Custom rungs and a client-aspect-driven family pick are architected for
@@ -2959,7 +2959,9 @@ an undersized image.
 The compositor also advertises a **mode ladder** on the `wl_output` (one
 mode per rung ≤ the session's current external size, in the profile's
 aspect family), so in-app resolution menus and desktop display settings can
-list real choices instead of one fixed mode.
+list real choices instead of one fixed mode. On a 16:9 session that now
+includes 960x540 and 640x360, so a game's resolution menu gains those two
+entries.
 
 **KDE Display Settings** lists the ladder and applies a chosen mode only
 with the **patched KWin shipped in the KDE image** (`quasar-images`); a

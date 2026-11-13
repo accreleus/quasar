@@ -67,7 +67,7 @@ func TestAvailableRungs(t *testing.T) {
 		{"4:3 1600x1200", 1600, 1200, []Rung{{1600, 1200}, {1280, 960}, {1024, 768}}},
 		// Non-canonical 16:9 launch: itself first, then the family below it.
 		{"non-canonical 16:9", 2000, 1125, []Rung{{2000, 1125}, {1920, 1080}, {1600, 900}, {1280, 720}, {960, 540}, {640, 360}}},
-		// Below every canonical rung of its family ⇒ only itself.
+		// The deepest canonical 16:9 rung ⇒ only itself.
 		{"tiny 16:9", 640, 360, []Rung{{640, 360}}},
 		{"unknown ratio", 1280, 1024, []Rung{{1280, 1024}}},
 	}
