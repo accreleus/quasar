@@ -52,6 +52,10 @@ func TestConsoleRevocationOnFullQueueReconnectsAndDelivers(t *testing.T) {
 	if err := consoleStore.Upsert(ctx, reg.HostID, map[string]any{"enabled": true}, nil); err != nil {
 		t.Fatal(err)
 	}
+	// handleRegister writes `registered` before handleConn adds the connection to
+	// the registry (the release-events DB call sits between them), so reading the
+	// reply does not yet mean the host can be sent to (#1222).
+	waitUntil(t, "the registered host to reach the registry", func() bool { return h.registry.IsConnected(reg.HostID) })
 	// The test agent stops reading, so the writer blocks once the socket
 	// buffers fill and the 32-slot queue backs up behind it.
 	pad := strings.Repeat("x", 1<<20)
