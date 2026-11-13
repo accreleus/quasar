@@ -560,6 +560,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     recoveryDeadline = setTimeout(() => fail("stream_lost", true), 60_000);
     let attempt = 0;
     let connectivityFailed = false;
+    let endedAtOnce = 0;
     try {
       while (!destroyed && !failed) {
         const attemptedAt = performance.now();
@@ -578,7 +579,16 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
           if (destroyed || failed) return;
           await connectTransport(coords, true);
           if (destroyed || failed) return;
-          if (transport === null) continue;
+          if (transport === null) {
+            // The replacement connected and ended at once. With the network up that is a broken
+            // media path: one more try, then fall back, never a tight loop of token mints.
+            if (connectivityFailed) await retryWait(Math.min(1_000 * 2 ** attempt++, 4_000), attemptedAt);
+            else if (endedAtOnce++ >= 1) {
+              fail("stream_lost");
+              return;
+            }
+            continue;
+          }
           // A network outage is independent of the bounded retry for a broken media path.
           if (!connectivityFailed) reconnected = true;
           set({ recovery: { phase: "recovered", attempt: 1, maxAttempts: 1, message: "Connection recovered" },

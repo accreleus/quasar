@@ -980,6 +980,31 @@ describe("createWebTransportRuntime fallback", () => {
     expect(callbacks.onFallback).toHaveBeenCalledTimes(1);
   });
 
+  it("falls back after two replacements end at once with the network up, without a mint loop", async () => {
+    let connections = 0;
+    const onFallback = vi.fn();
+    const rt = createWebTransportRuntime({
+      sessionId: "s1", authToken: "auth", coords: COORDS, canvas: document.createElement("canvas"),
+      callbacks: { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn(), onFallback },
+      deps: {
+        createPresenter: async () => ({ present: () => true, destroy() {} }),
+        createTransport: () => ({
+          // Every connection after the first is accepted and ended by the agent at once.
+          connect: async (s) => { if (++connections > 1) s.end({ code: null, reason: "closed at once" }); else first = s; },
+          close() {}, requestKeyframe() {}, sendMic: () => false, codecFallback() {},
+          input: { reliable() {}, datagram: () => false },
+        }),
+      },
+    });
+    let first!: MediaSink;
+    rt.start();
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    first.end({ code: null, reason: "lost" });
+    await vi.waitFor(() => expect(onFallback).toHaveBeenCalledWith("stream_lost"));
+    expect(connections).toBe(3); // the lost one and two replacements, not hundreds
+    rt.destroy();
+  });
+
   it("handles the replacement ending before its recovery connect finishes", async () => {
     let sink!: MediaSink;
     let finish!: () => void;
