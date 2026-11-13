@@ -253,15 +253,18 @@ impl AbrLoop {
 
     /// Per-report loop (#1376), once per WebTransport receiver report, after its estimate
     /// (`webtransport::Rate::measured`), never for the silence decay: the governor's down
-    /// path, then the resolution rung. A reading taken within `LadderPlanner::STEP_SETTLE`
-    /// of a step or a manual resize is the encoder restart's pause and keyframe burst, not
-    /// the link, so it counts as none.
+    /// path, then the resolution rung. A reading taken while a step is in flight or within
+    /// `LadderPlanner::STEP_SETTLE` of a step or a manual resize is the encoder restart's
+    /// pause and keyframe burst, not the link, so it counts as none.
     fn report(&self, reading: Option<f64>, now: std::time::Instant) {
         if !self.per_report || self.mode == AbrMode::Off || !self.owns_encoder() {
             return;
         }
         let rungs = self.rungs.lock().unwrap().clone();
-        let settling = rungs.is_some_and(|r| r.state.lock().unwrap().planner.settling(now));
+        let settling = rungs.is_some_and(|r| {
+            let st = r.state.lock().unwrap();
+            st.in_flight || st.planner.settling(now)
+        });
         let (prev, cut) = {
             let mut gov = self.governor.lock().unwrap();
             let prev = gov.setpoint_kbps();
@@ -352,6 +355,19 @@ impl AbrLoop {
                 },
             );
         }
+    }
+}
+
+/// #1376: the least time between two per-report bitrate writes on `encoder` (see `arm`).
+fn report_write_gap(
+    encoder: EncoderChoice,
+    min_interval: std::time::Duration,
+) -> std::time::Duration {
+    match encoder {
+        EncoderChoice::Nvenc | EncoderChoice::Va => {
+            min_interval.max(std::time::Duration::from_secs(1))
+        }
+        EncoderChoice::Vulkan | EncoderChoice::Openh264 => std::time::Duration::ZERO,
     }
 }
 
@@ -852,13 +868,12 @@ fn arm(
     // #1376: WebTransport's receiver reports drive `smooth` per report. A live bitrate
     // write re-initialises NVENC (the VBV write is an rc-param change) and VA (any
     // rate-control write), each with a keyframe, so those are written at most once per
-    // `min_interval`; the Vulkan encoders' write is rate-control only
-    // (`deploy/patches/vulkan/README.md`, rc-fix).
+    // `min_interval` and never more than once a second, whatever that knob says; the Vulkan
+    // encoders' write is rate-control only (`deploy/patches/vulkan/README.md`, rc-fix), and
+    // openh264enc's (`gstopenh264enc.cpp` `handle_frame`) is a `SetOption` that
+    // `WelsEncoderParamAdjust` applies without the reset that would force an IDR.
     if source != RTPGCCBWE && mode == AbrMode::Smooth {
-        abr_cfg.per_report = Some(match cfg.encoder {
-            EncoderChoice::Nvenc | EncoderChoice::Va => abr_cfg.min_interval,
-            EncoderChoice::Vulkan | EncoderChoice::Openh264 => std::time::Duration::ZERO,
-        });
+        abr_cfg.per_report = Some(report_write_gap(cfg.encoder, abr_cfg.min_interval));
     }
 
     if mode != AbrMode::Off && !encoder_abr_writable(encoder, cfg.encoder) {
@@ -2107,8 +2122,8 @@ mod tests {
         /// with `webtransport::congestion`'s estimator coarsely modelled: the encoder sends
         /// at the setpoint; a link that holds it back cuts the estimate to 0.85 × what
         /// arrived and makes the report a reading (`Estimator::measured`), otherwise the
-        /// estimate grows 8 %/s, never past 1.5 × what arrived. `Control::feedback`'s order:
-        /// the estimate, then the reading.
+        /// estimate grows 8 %/s, never past 1.5 × what arrived. `Control::feed`'s order: the
+        /// reading, then the estimate.
         fn report(&mut self, ms: u64, link_kbps: f64) {
             let sent = self.setpoint() as f64;
             let recv = sent.min(link_kbps);
@@ -2126,8 +2141,8 @@ mod tests {
 
         fn feed(&mut self, ms: u64, est: f64, reading: Option<f64>) {
             let now = self.t0 + std::time::Duration::from_millis(ms);
-            self.abr_loop.observe(est, true, now);
             self.abr_loop.report(reading, now);
+            self.abr_loop.observe(est, true, now);
             while let Ok((_, e)) = self.traces.try_recv() {
                 self.seen.push(e);
             }
@@ -2151,6 +2166,29 @@ mod tests {
 
         fn size(&self) -> (i32, i32) {
             self.lever.stage().requested()
+        }
+
+        /// Make the scale stage report `size` as negotiated (`ScaleStage::current`), as a
+        /// running pipeline does until a resize lands; without it the stage reports the
+        /// size it was asked for, so every step lands at once.
+        fn negotiated(&self, (w, h): (i32, i32)) {
+            let pad = self.lever.stage().filter.as_ref().unwrap();
+            let pad = pad.static_pad("src").unwrap();
+            pad.set_active(true).unwrap();
+            pad.push_event(gst::event::StreamStart::new("s"));
+            let caps = gst::Caps::builder("video/x-raw")
+                .field("width", w)
+                .field("height", h)
+                .build();
+            pad.push_event(gst::event::Caps::new(&caps));
+            assert_eq!(self.lever.current(), (w, h));
+        }
+
+        fn rung_steps(&self) -> Vec<(i64, i64)> {
+            self.events("abr.ladder.step")
+                .iter()
+                .map(|s| (s["from"].as_i64().unwrap(), s["to"].as_i64().unwrap()))
+                .collect()
         }
 
         fn events(&self, name: &str) -> Vec<&serde_json::Value> {
@@ -2306,10 +2344,11 @@ mod tests {
         assert!(rate_8000_at.is_some());
     }
 
-    /// A link oscillating 3 ↔ 5 Mbit/s at 0.5 Hz for a minute moves the rung once (to the
-    /// size the low phase fits) and never back: the band and the up confirmation hold it.
+    /// A link oscillating 3 ↔ 5 Mbit/s at 0.5 Hz for a minute moves the rung exactly once
+    /// (to 720p, the size the low phase fits) and never back: the band and the up hold keep
+    /// it. Old assertion (24ad172a): `<= 1`, which zero steps also passed.
     #[test]
-    fn an_oscillating_link_changes_the_rung_at_most_once() {
+    fn an_oscillating_link_changes_the_rung_exactly_once() {
         let mut wt = Wt::new(true);
         wt.link(0, 5000, |_| 20_000.0);
         wt.link(5000, 65_000, |ms| {
@@ -2319,8 +2358,86 @@ mod tests {
                 5000.0
             }
         });
-        let steps = wt.events("abr.ladder.step");
-        assert!(steps.len() <= 1, "{steps:?}");
+        assert_eq!(wt.rung_steps(), vec![(0, 3)]);
+    }
+
+    /// #1376 review A1, seat A's replay on the owner's profile: at 900p a link alternating
+    /// 2900 and 4200 kbit/s every 6 s crosses 900p's engage line (2965) in its low phase and
+    /// 720p's recover line (3953) in its high one. Old code (24ad172a): down and back up
+    /// every cycle. Now the first up after a down needs `min_step_s` (10 s) over the line, a
+    /// 6 s phase never gives it, so one step in the minute. A down stays prompt: 1 s after
+    /// the first low phase begins.
+    #[test]
+    fn a_slow_oscillation_across_the_band_steps_once_and_holds() {
+        let mut wt = Wt::new(true);
+        wt.link(0, 5000, |_| 20_000.0);
+        wt.link(5000, 20_000, |_| 4000.0);
+        assert_eq!(wt.size(), (1600, 900), "0.85 × 4000 fits 900p");
+        let before = wt.rung_steps().len();
+        let mut down_at = None;
+        for ms in (20_000..80_000).step_by(100) {
+            let low = ((ms - 20_000) / 6000) % 2 == 0;
+            wt.report(ms, if low { 2900.0 } else { 4200.0 });
+            if wt.size() == (1280, 720) {
+                down_at.get_or_insert(ms);
+            }
+        }
+        assert_eq!(wt.rung_steps()[before..], [(2, 3)]);
+        assert!(down_at.unwrap() <= 21_200, "down at {down_at:?}");
+    }
+
+    /// #1376 review A5 and S2: while a step has not landed (the encoder still reports the
+    /// old size) nothing moves: the readings neither move the setpoint (old code, 24ad172a:
+    /// they did once the 3 s settle ran out) nor step the rung again; when it lands the
+    /// settle starts and the next step follows the rate. Deleting the `in_flight` latch in
+    /// `step_rung` leaves the latch set and the session deaf to the rate.
+    #[test]
+    fn a_step_in_flight_holds_the_rate_and_the_rung_until_it_lands() {
+        let mut wt = Wt::new(true);
+        wt.negotiated((2560, 1440));
+        wt.link(0, 5000, |_| 20_000.0);
+        wt.link(5000, 6200, |_| 6000.0);
+        assert_eq!(wt.size(), (1920, 1080), "asked for");
+        assert_eq!(wt.lever.current(), (2560, 1440), "not landed");
+        let setpoint = wt.setpoint();
+        wt.link(6200, 12_000, |_| 1500.0);
+        assert_eq!(wt.setpoint(), setpoint, "no reading counts in flight");
+        assert_eq!(wt.rung_steps(), vec![(0, 1)]);
+        wt.negotiated((1920, 1080));
+        wt.link(12_000, 14_900, |_| 1500.0);
+        assert_eq!(wt.setpoint(), setpoint, "the settle after it lands");
+        wt.link(14_900, 20_000, |_| 1500.0);
+        assert_eq!(wt.rung_steps(), vec![(0, 1), (1, 3)]);
+    }
+
+    /// #1376 review S2: a manual resize starts the settle (`mark_resized`), so the rate's
+    /// next step waits 3 s after the size moved. Deleting the call steps 1 s after the cut.
+    #[test]
+    fn a_manual_resize_settles_before_the_rate_steps() {
+        let mut wt = Wt::new(true);
+        wt.link(0, 5000, |_| 20_000.0);
+        wt.lever.set_rung_tagged(1600, 900, "test").unwrap();
+        wt.link(5000, 7900, |_| 1500.0);
+        assert!(wt.rung_steps().is_empty());
+        assert_eq!(wt.setpoint(), 10_000, "no reading counts in the settle");
+        wt.link(7900, 12_000, |_| 1500.0);
+        assert_eq!(wt.rung_steps(), vec![(2, 3)]);
+    }
+
+    /// #1376 review A3: an encoder whose bitrate write costs a keyframe is written at most
+    /// once a second however low `QUASAR_ABR_MIN_INTERVAL_MS` is set. Old code (24ad172a):
+    /// the gap was `min_interval` itself, down to 1 ms.
+    #[test]
+    fn a_keyframe_costing_write_is_at_most_once_a_second() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        for enc in [EncoderChoice::Nvenc, EncoderChoice::Va] {
+            assert_eq!(report_write_gap(enc, ms(1)), ms(1000), "{enc:?}");
+            assert_eq!(report_write_gap(enc, ms(3000)), ms(3000), "{enc:?}");
+        }
+        for enc in [EncoderChoice::Vulkan, EncoderChoice::Openh264] {
+            assert_eq!(report_write_gap(enc, ms(1)), Duration::ZERO, "{enc:?}");
+        }
     }
 
     /// #68: a clean link whose delay detector misreads it (the estimate under the setpoint

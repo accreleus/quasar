@@ -1352,6 +1352,9 @@ pub struct LadderPlanner {
     /// [`Self::observe_rate`]: since when the rate has been out of the rung's band, which
     /// way, and the lowest rate of that run.
     run: Option<(Instant, StepDir, f64)>,
+    /// The last rate step went down: the next up needs the rate held over the line for
+    /// `min_step_s`, not [`Self::RATE_CONFIRM`] (the restart budget, #1376 review A1).
+    after_down: bool,
     /// The last size change made outside the ladder (a manual resize), for the settle.
     resized: Option<Instant>,
 }
@@ -1387,6 +1390,7 @@ impl LadderPlanner {
             fps_retired: false,
             per_report: false,
             run: None,
+            after_down: false,
             resized: None,
         }
     }
@@ -1557,8 +1561,12 @@ impl LadderPlanner {
     /// [`Self::RATE_CONFIRM`]: down to the least-deep rung the rate fits (`engage_frac ×
     /// B(r)` at or under it), the floor rung when none does, in one step. At or over
     /// `recover_frac × B(current − 1)` for as long: up to the least-deep rung the lowest rate
-    /// of that run reaches by `recover_frac × B(r)`, in one step. The band between the two
-    /// thresholds is what keeps a link oscillating around a boundary from flapping. Nothing
+    /// of that run reaches by `recover_frac × B(r)`, in one step; the first up after a down
+    /// needs the run to last `min_step_s` (10 s) instead. The band holds a link noisy at a
+    /// line; the up hold bounds a slow oscillation across the band to one down-and-up cycle
+    /// per `STEP_SETTLE + min_step_s + STEP_SETTLE + RATE_CONFIRM` (17 s at the defaults),
+    /// and a link whose good phase is shorter than `min_step_s` never steps back up. A down
+    /// step is never held longer than `RATE_CONFIRM`: a queue costs more than a size. Nothing
     /// within [`Self::STEP_SETTLE`] of a step; only when resolution is the lever the order
     /// moves next, and under `hybrid` never past the pivot while 120 → 60 is still to come
     /// (down) or still engaged (up). Never moves the frame rate.
@@ -1593,8 +1601,13 @@ impl LadderPlanner {
             _ => (now, dir, rate),
         };
         self.run = Some(run);
+        let confirm = if dir == StepDir::Up && self.after_down {
+            std::time::Duration::from_secs(policy.min_step_s)
+        } else {
+            Self::RATE_CONFIRM
+        };
         // A pin holds the step, not the run: released, it steps at once.
-        if now.saturating_duration_since(run.0) < Self::RATE_CONFIRM || self.res.pinned {
+        if now.saturating_duration_since(run.0) < confirm || self.res.pinned {
             return None;
         }
         let hybrid = self.order == LadderOrder::Hybrid;
@@ -1604,6 +1617,9 @@ impl LadderPlanner {
                 if hybrid && self.can_step(Lever::Fps, StepDir::Down) {
                     deepest = deepest.min(self.pivot_rung());
                 }
+                // Capped at the pivot, the run stays armed (deliberate, as for a pin). The fps
+                // step that frees it starts the settle, which drops the run; a retired fps
+                // lever frees it with no step, and then it fires on the next report.
                 if deepest <= cur {
                     return None;
                 }
@@ -1623,6 +1639,7 @@ impl LadderPlanner {
         self.res.engage_run = 0;
         self.res.recover_run = 0;
         self.run = None;
+        self.after_down = dir == StepDir::Down;
         Some(PlannedStep::Resolution(self.res.step_to(
             to,
             StepReason::Rate,
@@ -2856,10 +2873,11 @@ mod tests {
         assert_eq!(p.res_rung(), 0);
     }
 
-    /// Up waits `RATE_CONFIRM` over the next rung's recover line, then goes to the
-    /// least-deep rung the lowest rate of that second reaches, in one step: from 720p, 9000
-    /// reaches the launch rung (8000), 6000 reaches 1080p (5196) and no further. Old code:
-    /// one rung per two windows, 10 s apart.
+    /// Up waits over the next rung's recover line (`min_step_s` for the first up after a
+    /// down, `RATE_CONFIRM` after that), then goes to the least-deep rung the lowest rate of
+    /// that run reaches, in one step: from 720p, 9000 reaches the launch rung (8000), 6000
+    /// reaches 1080p (5196) and no further. Old code (24ad172a): the first up came after
+    /// 1 s, at 6000 ms.
     #[test]
     fn the_rate_steps_up_to_the_highest_rung_it_holds() {
         let t = Instant::now();
@@ -2873,23 +2891,66 @@ mod tests {
                 rates(&mut p, t, 2000, 3, |_| 2800.0).is_empty(),
                 "under 900p's recover line"
             );
+            assert!(
+                rates(&mut p, t, 5000, 10, |_| rate).is_empty(),
+                "the first up after a down holds `min_step_s`"
+            );
             assert_eq!(
-                rates(&mut p, t, 5000, 2, |_| rate),
-                vec![(6000, to.to_string())],
+                rates(&mut p, t, 15_000, 1, |_| rate),
+                vec![(15_000, to.to_string())],
                 "rate {rate}"
             );
         }
-        // The lowest rate of the run decides: one dip to 6000 in a second at 9000 is 1080p.
+        // The lowest rate of the run decides: one dip to 6000 at 9000 is 1080p.
         let mut p = rate_planner(LadderOrder::ResFirst, false, 120, t);
         rates(&mut p, t, 0, 4, |_| 1000.0);
         let steps = rates(
             &mut p,
             t,
             4000,
-            2,
+            11,
             |ms| if ms == 4500 { 6000.0 } else { 9000.0 },
         );
-        assert_eq!(steps, vec![(5000, "res->1".to_string())]);
+        assert_eq!(steps, vec![(14_000, "res->1".to_string())]);
+        // An up after an up confirms in `RATE_CONFIRM`.
+        assert_eq!(
+            rates(&mut p, t, 17_000, 2, |_| 9000.0),
+            vec![(18_000, "res->0".to_string())]
+        );
+    }
+
+    /// #1376 review A1, the restart budget: a rate swinging 2900 ↔ 4200 every 6 s from 900p
+    /// crosses both lines (900p's engage 2965, 720p's recover 3953). Old code (24ad172a):
+    /// down and back up every cycle, about 10 restarts a minute. Now the first up after a
+    /// down needs `min_step_s` (10 s) over the line, so a 6 s good phase never brings it
+    /// back: one step in the minute. A held good phase still steps up, and a down after an
+    /// up stays prompt (`STEP_SETTLE` + `RATE_CONFIRM`).
+    #[test]
+    fn a_slow_oscillation_across_the_band_steps_down_once() {
+        let t = Instant::now();
+        let mut p = rate_planner(LadderOrder::ResFirst, false, 120, t);
+        assert_eq!(
+            rates(&mut p, t, 0, 2, |_| 3000.0),
+            vec![(1000, "res->2".to_string())]
+        );
+        let steps = rates(&mut p, t, 4000, 60, |ms| {
+            if ((ms - 4000) / 6000) % 2 == 0 {
+                2900.0
+            } else {
+                4200.0
+            }
+        });
+        assert_eq!(steps, vec![(5000, "res->3".to_string())]);
+        // The last good phase began at 58 s: held, it steps up 10 s later.
+        assert_eq!(
+            rates(&mut p, t, 64_000, 5, |_| 4200.0),
+            vec![(68_000, "res->2".to_string())]
+        );
+        assert_eq!(
+            rates(&mut p, t, 69_000, 4, |_| 2900.0),
+            vec![(72_000, "res->3".to_string())],
+            "down 4 s after the up"
+        );
     }
 
     /// No flap: a rate swinging 3000 ↔ 4500 every second sits inside 900p's band (engage
@@ -3010,8 +3071,9 @@ mod tests {
             "the window path's settle and dwell"
         );
         assert_eq!(
-            rates(&mut p, t, 34_000, 2, |_| 9000.0),
-            vec![(35_000, "res->0".to_string())]
+            rates(&mut p, t, 34_000, 11, |_| 9000.0),
+            vec![(44_000, "res->0".to_string())],
+            "the first up after a down: `min_step_s` over the line"
         );
     }
 
