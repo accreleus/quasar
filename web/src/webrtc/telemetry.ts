@@ -110,6 +110,11 @@ export interface TelemetrySnapshot {
   audioConcealedSamples: number | null;
   /** Separate runs of that, cumulative for the page view; null until audio is measured. */
   audioConcealmentEvents: number | null;
+  /** The WebTransport audio ring's least queued audio this window, ms; null when no audio is
+   *  playing there, and on WebRTC, which has no such ring. */
+  audioBufferMs: number | null;
+  /** The depth that ring is aiming for, ms; null with audioBufferMs. */
+  audioTargetMs: number | null;
 }
 
 /**
@@ -151,6 +156,8 @@ const EMPTY_SNAPSHOT: TelemetrySnapshot = {
   bytesReceivedTotal: 0,
   audioConcealedSamples: null,
   audioConcealmentEvents: null,
+  audioBufferMs: null,
+  audioTargetMs: null,
 };
 
 /**
@@ -166,6 +173,9 @@ export interface PostedCounters {
   /** Audio dropouts (audio_concealed_samples, audio_concealment_events); null until a transport measures audio. */
   audioConcealedSamples: number | null;
   audioConcealmentEvents: number | null;
+  /** Silence runs in the WebTransport audio ring (wt_audio_underruns); null until it has played
+   *  audio, and always on WebRTC, whose browser counts one event per dropout itself. */
+  audioUnderruns: number | null;
 }
 export const newPostedCounters = (): PostedCounters => ({
   packetsLost: 0,
@@ -173,12 +183,18 @@ export const newPostedCounters = (): PostedCounters => ({
   freezeCount: 0,
   audioConcealedSamples: null,
   audioConcealmentEvents: null,
+  audioUnderruns: null,
 });
 
 /** Adds one transport's audio dropout increments to the page view's totals; the first call starts them at 0. */
 export function addAudioDropouts(c: PostedCounters, samples: number, events: number): void {
   c.audioConcealedSamples = (c.audioConcealedSamples ?? 0) + Math.max(0, samples);
   c.audioConcealmentEvents = (c.audioConcealmentEvents ?? 0) + Math.max(0, events);
+}
+
+/** Adds a WebTransport player's silence runs to the page view's total, as addAudioDropouts does. */
+export function addAudioUnderruns(c: PostedCounters, runs: number): void {
+  c.audioUnderruns = (c.audioUnderruns ?? 0) + Math.max(0, runs);
 }
 
 /**
@@ -478,6 +494,9 @@ export class SessionTelemetry {
       bytesReceivedTotal: this.bytesReceivedTotal,
       audioConcealedSamples: this.posted.audioConcealedSamples,
       audioConcealmentEvents: this.posted.audioConcealmentEvents,
+      // No audio ring on this transport: a WebRTC session never posts the wt_audio_* keys.
+      audioBufferMs: null,
+      audioTargetMs: null,
     };
   }
 

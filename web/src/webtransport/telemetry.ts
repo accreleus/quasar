@@ -8,7 +8,7 @@ import { getOrCreateDeviceKey } from "../webrtc/capability";
 import { classifyClientHealth } from "../webrtc/clientHealth";
 import { estimateClockOffset, shouldPostClock, type ClockSample, type PostedClock } from "../webrtc/clockOffset";
 import { summarizePresentWindow } from "../webrtc/presentCadence";
-import { addAudioDropouts, EMPTY_SNAPSHOT, newPostedCounters, type PostedCounters, type TelemetrySnapshot } from "../webrtc/telemetry";
+import { addAudioDropouts, addAudioUnderruns, EMPTY_SNAPSHOT, newPostedCounters, type PostedCounters, type TelemetrySnapshot } from "../webrtc/telemetry";
 import { CLOCK_REPOST_DELTA_MS, CLOCK_REPOST_INTERVAL_S, PRESENT_MIN_SAMPLES } from "../webrtc/thresholds";
 
 /** capture→present samples kept for the median and p95 (webrtc/telemetry.ts keeps 600 too). */
@@ -82,6 +82,8 @@ export class WtTelemetry {
   private decodeFailed = false;
   private cushionMs = 0;
   private arrivalJitterMs: number | null = null;
+  private audioBufferMs: number | null = null;
+  private audioTargetMs: number | null = null;
 
   private pending: Record<string, unknown>[] = [];
   private posted: PostedClock = { offsetMs: null, atMs: 0 };
@@ -121,6 +123,18 @@ export class WtTelemetry {
   /** Audio the stream did not supply since the last call (concealed or silent frames, and runs of it). */
   addAudioDropouts(samples: number, events: number): void {
     addAudioDropouts(this.counters, samples, events);
+  }
+
+  /** The audio ring's silence runs since the last call: the dropouts that were an empty queue. */
+  addAudioUnderruns(runs: number): void {
+    addAudioUnderruns(this.counters, runs);
+  }
+
+  /** The audio ring's least queued audio since the last tick and the depth it aims for (null: no
+   *  audio playing, so nothing is posted and no empty ring is claimed). */
+  setAudioBuffer(bufferMs: number | null, targetMs: number | null): void {
+    this.audioBufferMs = bufferMs;
+    this.audioTargetMs = bufferMs === null ? null : targetMs;
   }
 
   /** Media bytes off the wire (access units, after reassembly). */
@@ -261,6 +275,8 @@ export class WtTelemetry {
       bytesReceivedTotal: this.bytesTotal,
       audioConcealedSamples: this.counters.audioConcealedSamples,
       audioConcealmentEvents: this.counters.audioConcealmentEvents,
+      audioBufferMs: this.audioBufferMs,
+      audioTargetMs: this.audioTargetMs,
     };
 
     // The keys are the metric manifest's (docs/session-trace/metrics.json): the shared
@@ -293,6 +309,9 @@ export class WtTelemetry {
     put("wt_arrival_jitter_ms", this.arrivalJitterMs);
     put("audio_concealed_samples", this.counters.audioConcealedSamples);
     put("audio_concealment_events", this.counters.audioConcealmentEvents);
+    put("wt_audio_buffer_ms", this.audioBufferMs);
+    put("wt_audio_target_ms", this.audioTargetMs);
+    put("wt_audio_underruns", this.counters.audioUnderruns);
     // A thin window has no σ: "smooth" there is unmeasured, and posting it would record a pass.
     const unmeasured = health.health === "smooth" && cadence.n < PRESENT_MIN_SAMPLES;
     this.pending.push({

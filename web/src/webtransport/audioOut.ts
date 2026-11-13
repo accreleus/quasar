@@ -5,6 +5,7 @@
 
 import type { AudioPacket } from "./framing";
 import { AudioSync } from "./audioSync";
+import type { RingStats } from "./audioRing";
 import { serialAfter } from "./framing";
 import type { AudioConfig } from "./transport";
 
@@ -38,6 +39,21 @@ export interface AudioOutStats {
   concealed: number;
   /** Chunks not posted because their time had passed. */
   late: number;
+  /** The playout ring's buffer, for the client.wt_audio_* series; null until the ring has
+   *  played audio, so a session with none posts nothing. */
+  buffer: AudioBufferStats | null;
+}
+
+/** What the playout ring's buffer was, and aimed to be, in the window since the last stats() (#1346). */
+export interface AudioBufferStats {
+  /** The least stream audio queued at a quantum since the previous stats() call, ms. 0 is a ring
+   *  that ran empty, which is the underrun this was added to tell apart from concealed packets. */
+  minMs: number;
+  /** The depth the ring is aiming for now: the largest of the video-matched base target, the
+   *  output device and posting floor, and that floor plus the measured jitter, ms (#1346). */
+  targetMs: number;
+  /** CUMULATIVE: times the ring ran empty and played silence, not a lost packet's fade. */
+  underruns: number;
 }
 
 /** The slice of AudioContext this uses; a test supplies a fake. */
@@ -123,7 +139,17 @@ export class AudioOut {
   /** The last chunk decoded, kept to fade out of when a packet is lost. */
   private lastPlanes: Float32Array[] | null = null;
   private lateRun = 0;
-  private worklet = { underrunFrames: 0, concealedFrames: 0, underrunEvents: 0, dropped: 0 };
+  private worklet: RingStats = {
+    underrunFrames: 0,
+    concealedFrames: 0,
+    underrunEvents: 0,
+    silenceRuns: 0,
+    dropped: 0,
+    minQueuedFrames: Infinity,
+  };
+  /** The least the worklet has had queued since the previous stats(): the telemetry posts once a
+   *  tick and the worklet reports about eight times a tick, so this spans its reports. */
+  private bufferMin = Infinity;
   private readonly sync: AudioSync;
   private readonly now: () => number;
 
@@ -156,9 +182,11 @@ export class AudioOut {
     }
     this.ctx = ctx;
     this.out = out;
-    out.port.onmessage = (e: MessageEvent<{ underrunFrames: number; concealedFrames: number; underrunEvents: number; dropped: number }>) => {
+    out.port.onmessage = (e: MessageEvent<RingStats>) => {
       this.hasMeasured = true; // the worklet reports only while the context runs
       this.worklet = e.data;
+      // Infinity (nothing played in that window) must not erase what an earlier one measured.
+      if (Number.isFinite(e.data.minQueuedFrames)) this.bufferMin = Math.min(this.bufferMin, e.data.minQueuedFrames);
     };
     out.setGain(this.held ? 0 : 1);
     // A context made without a user gesture starts suspended; the browser lets it resume on the
@@ -245,14 +273,22 @@ export class AudioOut {
   stats(): AudioOutStats {
     this.hasMeasured ||= this.out !== null && this.ctx?.state === "running";
     const rate = this.ctx?.sampleRate ?? 48_000;
+    // The buffer minimum is per window: reading it starts the next one, because telemetry posts
+    // one of these a tick. No report since the last read means no audio is playing to measure.
+    const queued = this.bufferMin;
+    this.bufferMin = Infinity;
+    const targetDelayMs = this.sync.targetDelayMs(this.minDelayMs());
     return {
-      targetDelayMs: this.sync.targetDelayMs(this.minDelayMs()),
+      targetDelayMs,
       videoLatencyMs: this.sync.videoLatencyMs(),
       avOffsetMs: this.sync.avOffsetMs(this.minDelayMs()),
       underrunMs: (this.worklet.underrunFrames / rate) * 1000,
       measured: this.hasMeasured,
       concealedSamples: this.worklet.underrunFrames + this.worklet.concealedFrames,
       concealmentEvents: this.worklet.underrunEvents,
+      buffer: Number.isFinite(queued)
+        ? { minMs: (queued / rate) * 1000, targetMs: targetDelayMs, underruns: this.worklet.silenceRuns }
+        : null,
       dropped: this.worklet.dropped,
       decoded: this.decoded,
       stale: this.stale,
