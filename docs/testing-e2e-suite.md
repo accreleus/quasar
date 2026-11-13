@@ -368,7 +368,7 @@ has no `session.json`; its id comes from the directory's path, so post it from t
 **A value taken from the bundle is used only in the shape its field has** (an identifier, a UUID, a
 commit, a finite number, a boolean); one that does not is left out and counted in `left_out=N`
 where it is only a tag or a fact, and refuses its scenario where it would stand in the bench
-scenario's name (above). So no tag, no condition and no argument holds free text. The bundle is
+scenario's name (above). So no tag, no condition and no argument holds free text; the run's summary and its artifacts are the bundle's own files and do. The bundle is
 validated before anything is posted, and every value reaches `bench_submit.py` as its own argument,
 never through a shell. A scenario is not posted (`failed=N`, and the reason says which) when:
 
@@ -394,8 +394,8 @@ validity:
 | `session.json` | checked: `id`, `codec`, `profile`, `host_id`, `encoder`, `profile_id`, and `launch`, `fps`, `bitrate_kbps`, `started_at_ms` as finite numbers |
 | `metrics.jsonl` | checked by the bundle validator, row by row: a numeric `ts_unix_ms`, a source quasar-bench accepts, keys the metric manifest defines |
 | `trace.json` | checked: an object whose `events` are objects, each `payload` an object |
-| `conditions.json` | checked: `effective` maps identifiers to strings, and `negotiated`'s members are in the shapes `session.json` was checked for — `width`, `height` and `fps` finite numbers, `codec`, `codec_profile` and `profile_id` identifiers, `encoder` and `encoder_negotiated` settings. A member this suite does not write is refused |
-| `summary.json` | checked: an object |
+| `conditions.json` | checked, member by member (the script posts the whole file as the run's conditions): only `effective`, `negotiated` and `unknown` may be there; `effective` maps identifiers to a setting or `[omitted]` (what the collector writes); `unknown` is the collector's one sentence; and `negotiated`'s members are in the shapes `session.json` was checked for — `width`, `height` and `fps` finite numbers, `codec`, `codec_profile` and `profile_id` identifiers, `encoder` and `encoder_negotiated` settings. A member this suite does not write is refused |
+| `summary.json` | checked: an object (the script posts it as the run's summary as it is, text included) |
 | `caps-negotiated.json`, `verdict.json`, `steps.jsonl`, `marks.jsonl`, any `.md` | **refused**: this suite writes none of them, so a bundle that carries one is not posted and the file is named |
 
 The run ends with:
@@ -441,9 +441,10 @@ two bundles give the same bytes out, in any directory.
   itself), it says that.
 - **Then, per scenario**: the criteria. Scenarios pair by the identity `e2e-post` would post them
   under — the scenario's name, then `transport`, `codec`, `profile`, the app and every other param —
-  so two scenarios pair exactly when quasar-bench would compare them, and a scenario either verb
-  refuses is not paired. Within one identity a scenario pairs with the one of its own directory
-  name first, so a plan reordered between the two runs is still the same scenario; the rest pair
+  so two scenarios pair exactly when quasar-bench would compare them, and a scenario whose name or
+  params either verb refuses is not paired (the poster's other refusals, such as a file it does not
+  write, do not stop a comparison). Within one identity the scenarios whose params are exactly
+  equal pair first (a 60 s hold with the 60 s hold, wherever each plan put it); the rest pair
   n-th with n-th in plan order, and the pairs are listed in A's plan order. A scenario in only one
   bundle is listed with its directory name beside its identity, not compared. Every criterion id in
   either side is one row: A's verdict and observed value,
@@ -456,9 +457,9 @@ two bundles give the same bytes out, in any directory.
   scenario's samples after (`classifier.warmup_exclude_s` in `docs/session-trace/thresholds.json`,
   after each side's own first browser sample), so the first seconds of a run do not decide the
   number; when either side has no browser sample to anchor it on, neither side is cut and the page
-  says so. A counter is not a median: the manifest marks one with `estimator: delta` (a count
-  already taken over a window) or `window: cumulative` (a running total such as `packets_lost`), and
-  it is compared as its last sample minus its first, which is what a running total means. The row's
+  says so. A running total is not a median: the manifest marks one with `window: cumulative` (such as
+  `packets_lost`), and it is compared as its last sample minus its first. A count already taken per
+  window (`estimator: delta` in the manifest) stays a median: its samples are already differences. The row's
   `estimator` column says which was used (`delta` or `median`). A percent is rounded before it is
   tested, so a rounding that overflows is no percent: the cell is a dash, never `+Infinity`, and
   `compare.json` has `null`. A key with fewer

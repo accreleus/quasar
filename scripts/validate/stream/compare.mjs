@@ -225,9 +225,9 @@ function criteriaOf(scenarioA, scenarioB) {
 /**
  * Every metric key both sides hold for the same source: its value on each side over the samples
  * after the review's warm-up, B minus A and the change. A key the manifest calls a counter — a
- * running total (`window: cumulative`, such as `packets_lost`) or a count already taken over a
- * window (`estimator: delta`) — is read as last minus first, never as the median of a running
- * total; every other key is a median. `estimator` on each row says which was used. No judgement
+ * running total (`window: cumulative`, such as `packets_lost`) — is read as last minus first, never
+ * as the median of a running total; every other key is a median, a count already taken per window
+ * (the manifest's `estimator: delta`) included, because its samples are already differences. `estimator` on each row says which was used. No judgement
  * and no threshold — the numbers are the report. A side with fewer than MIN_SAMPLES is listed as
  * too few, not compared, and a key the metric manifest does not define for its source is not
  * compared at all.
@@ -272,7 +272,7 @@ function metricsOf(rowsA, rowsB, warmup) {
       continue;
     }
     const m = estimators.get(id);
-    const counter = m?.estimator === "delta" || m?.window === "cumulative";
+    const counter = m?.window === "cumulative";
     const a = sideValue(values, counter);
     const b = sideValue(other, counter);
     // A percent is rounded first and then tested: a rounding that overflows is no percent, and a
@@ -359,9 +359,9 @@ export function compare(aDir, bDir, { thresholdsFile = THRESHOLDS_FILE } = {}) {
   const thresholds = loadThresholds(thresholdsFile);
   const scenariosA = scenariosOf(aDir, leftOut);
   const scenariosB = scenariosOf(bDir, leftOut);
-  // Within one identity the scenario with the same directory name on both sides pairs with
-  // itself first (a plan reordered between the two runs is still the same scenario); the rest
-  // pair n-th with n-th in plan order. A scenario with no partner is listed with its directory
+  // Within one identity the scenarios whose params are exactly equal pair with each other first
+  // (a 60 s hold with the 60 s hold, wherever a plan that gained or lost an entry put it: a
+  // directory name is a plan position, not an identity); the rest pair n-th with n-th in plan order. A scenario with no partner is listed with its directory
   // name, so a repeated identity's extra hold is not just its identity again.
   const ids = [];
   const onlyA = [];
@@ -373,7 +373,7 @@ export function compare(aDir, bDir, { thresholdsFile = THRESHOLDS_FILE } = {}) {
     const taken = new Set();
     const paired = new Set();
     for (const sa of la) {
-      const i = lb.findIndex((sb, j) => !taken.has(j) && sb.dir === sa.dir);
+      const i = lb.findIndex((sb, j) => !taken.has(j) && canon(sb.scenario.params ?? null) === canon(sa.scenario.params ?? null));
       if (i < 0) continue;
       taken.add(i);
       paired.add(sa);
@@ -604,7 +604,7 @@ export function renderCompare(cmp, leftOut) {
     L.push("### Metrics");
     if (pair.warmup.applied) {
       L.push(
-        "A median over the samples after the warm-up the review uses (`classifier.warmup_exclude_s` after each scenario's first browser sample, `docs/session-trace/thresholds.json`), except a counter, which is last minus first: the metric manifest marks one with `estimator: delta` (a count already taken over a window) or `window: cumulative` (a running total such as `packets_lost`), and the row's `estimator` says which was used.",
+        "A median over the samples after the warm-up the review uses (`classifier.warmup_exclude_s` after each scenario's first browser sample, `docs/session-trace/thresholds.json`), except a running total, which is last minus first: the metric manifest marks one with `window: cumulative` (such as `packets_lost`), and the row's `estimator` says which was used.",
       );
     } else {
       L.push(

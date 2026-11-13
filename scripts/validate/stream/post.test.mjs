@@ -456,6 +456,18 @@ test("a file in a scenario directory that this suite does not write refuses the 
   }
 });
 
+test("a folder named like a Markdown file is refused too: bench_submit.py would try to upload it", () => {
+  const dir = bundle();
+  fs.mkdirSync(path.join(dir, SC, "NOTES.md"));
+  fs.writeFileSync(path.join(dir, SC, "NOTES.md", "a.txt"), "x\n");
+  const rec = recorder();
+  const { out, said } = postCapturingStderr(dir, { host: HOST, spawn: rec.spawn });
+  // Whichever refuses it first (the bundle validator or the poster), nothing is posted.
+  assert.equal(out.posted, 0);
+  assert.equal(rec.submitted().length, 0);
+  assert.ok(out.reason === "invalid-bundle" || /NOTES\.md is not a file this suite writes/.test(said), said);
+});
+
 // The other files it opens are this suite's, and each field that reaches a tag or `conditions` is in
 // the shape that field has: conditions.json's `negotiated` agrees with what session.json was checked
 // for, and a member nobody writes is a refusal rather than an unchecked value.
@@ -464,8 +476,8 @@ test("the other files bench_submit.py reads are checked where they reach the run
   fs.writeFileSync(
     path.join(good, SC, "conditions.json"),
     JSON.stringify({
-      effective: { encoder_family: "vulkan", ladder_resolution: "off" },
-      unknown: { effective: "the host reports no settings" },
+      effective: { encoder_family: "vulkan", ladder_resolution: "off", host_path: "[omitted]" },
+      unknown: { effective: "the host has not reported its effective settings" },
       negotiated: { width: 1920, height: 1080, fps: 60, codec: "h264", encoder: "vulkanh264enc:0", profile_id: "observe" },
     }),
   );
@@ -485,6 +497,15 @@ test("the other files bench_submit.py reads are checked where they reach the run
     ["conditions.json", { negotiated: { encoder: "a b" } }],
     ["conditions.json", { negotiated: { profile_id: ["observe"] } }],
     ["conditions.json", { negotiated: { bitrate_kbps: 5000 } }],
+    ["conditions.json", { negotiated: { made_up: "x" } }],
+    // bench_submit.py posts every member of this file: only the collector's own may be there, in the collector's shapes.
+    ["conditions.json", { effective: { abr_mode: "free text with spaces / and a path" } }],
+    ["conditions.json", { effective: {}, verdict: "likely_network_congestion free text" }],
+    ["conditions.json", { effective: {}, git: { quasar: "hello world" } }],
+    ["conditions.json", { effective: {}, netem: { note: "anything at all" } }],
+    ["conditions.json", { effective: {}, foo: "bar baz" }],
+    ["conditions.json", { unknown: { effective: "some other sentence" } }],
+    ["conditions.json", { unknown: { effective: "the host has not reported its effective settings", more: "x" } }],
     ["trace.json", []],
     ["trace.json", { events: "caps" }],
     ["trace.json", { events: [{ ts_unix_ms: 1, type: "caps.negotiated", payload: "text" }] }],

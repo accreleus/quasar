@@ -21,7 +21,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { validateBundle } from "./bundle.mjs";
-import { SHAPES } from "./collect.mjs";
+import { EFFECTIVE_UNKNOWN, SHAPES } from "./collect.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 export const SUBMIT = path.join(ROOT, "scripts/dx/bench_submit.py");
@@ -193,7 +193,7 @@ function foreignFileProblem(sdir) {
   try {
     entries = fs.readdirSync(sdir, { withFileTypes: true });
   } catch {}
-  const md = entries.filter((e) => e.isFile() && e.name.endsWith(".md")).map((e) => e.name).sort()[0];
+  const md = entries.filter((e) => e.name.endsWith(".md")).map((e) => e.name).sort()[0]; // a file or a directory: the script globs the name
   if (md) return `${PLAIN_NAME.test(md) ? md : "a .md file"} is not a file this suite writes`;
   return null;
 }
@@ -230,11 +230,15 @@ function filesProblem(sdir) {
   if (present("conditions.json")) {
     const cond = readJson(path.join(sdir, "conditions.json"));
     if (!isObj(cond)) return "conditions.json is not an object";
+    // bench_submit.py posts every member of this file as the run's conditions: only the ones the collector writes may be there.
+    const extra = Object.keys(cond).find((k) => !["effective", "negotiated", "unknown"].includes(k));
+    if (extra !== undefined) return `conditions.json holds ${PLAIN_NAME.test(extra) ? extra : "a member"}, which this suite does not write`;
+    if (cond.unknown !== undefined && !(isObj(cond.unknown) && Object.keys(cond.unknown).length === 1 && cond.unknown.effective === EFFECTIVE_UNKNOWN)) return "conditions.json's unknown is not what the collector writes";
     const effective = cond.effective;
     if (effective !== undefined && !isObj(effective)) return "conditions.json's effective is not a map";
     for (const [k, v] of Object.entries(effective ?? {})) {
       if (!fits(SHAPES.identifier, k)) return "conditions.json's effective holds a key that is not an identifier";
-      if (typeof v !== "string") return "conditions.json's effective holds a value that is not a string";
+      if (v !== "[omitted]" && !fits(SHAPES.setting, v)) return "conditions.json's effective holds a value that is not a setting (the collector writes a setting or [omitted])";
     }
     const negotiated = cond.negotiated;
     if (negotiated !== undefined) {

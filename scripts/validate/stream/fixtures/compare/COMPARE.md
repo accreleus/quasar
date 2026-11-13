@@ -57,7 +57,7 @@
 | `audio_latency_ms` | `not judged` `null` | `not judged` `null` | `same` |
 | `freeze_count` | `pass` `0` | `pass` `0` | `same` |
 ### Metrics
-A median over the samples after the warm-up the review uses (`classifier.warmup_exclude_s` after each scenario's first browser sample, `docs/session-trace/thresholds.json`), except a counter, which is last minus first: the metric manifest marks one with `estimator: delta` (a count already taken over a window) or `window: cumulative` (a running total such as `packets_lost`), and the row's `estimator` says which was used.
+A median over the samples after the warm-up the review uses (`classifier.warmup_exclude_s` after each scenario's first browser sample, `docs/session-trace/thresholds.json`), except a running total, which is last minus first: the metric manifest marks one with `window: cumulative` (such as `packets_lost`), and the row's `estimator` says which was used.
 
 | source.key | estimator | A | B | B − A | change | samples A | samples B |
 | --- | --- | --- | --- | --- | --- | --- | --- |

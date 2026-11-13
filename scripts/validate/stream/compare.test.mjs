@@ -468,7 +468,7 @@ test("a counter is compared as its own change, not as the median of a running to
 
 // The manifest's other word for a counter: a count already taken over a window, which its
 // `estimator: delta` marks. It is differenced too, and the two counters' rows say `delta`.
-test("a per-window count the manifest calls `delta` is differenced as well", () => {
+test("a per-window count the manifest calls `delta` stays a median: its samples are already differences", () => {
   const { a, b } = pair();
   const write = (dir, last) => {
     const rows = Array.from({ length: 12 }, (_, i) => ({
@@ -482,8 +482,9 @@ test("a per-window count the manifest calls `delta` is differenced as well", () 
   write(a, 5);
   write(b, 9);
   const m = compare(a, b).pairs[0].metrics.compared.find((x) => x.key === "stage_frames_dropped");
-  // Eight samples a side after the warm-up, from 1 to 5 and from 1 to 9.
-  assert.deepEqual([m.estimator, m.value_a, m.value_b, m.samples_a], ["delta", 4, 8, 8]);
+  // Eight samples a side after the warm-up, seven of them 1: the median is 1 on both sides. Last minus first would read 4 and 8,
+  // and a steady 60 a window against a steady 30 would read 0 against 0.
+  assert.deepEqual([m.estimator, m.value_a, m.value_b, m.samples_a], ["median", 1, 1, 8]);
 });
 
 // A percent is rounded before it is tested, so a rounding that overflows is no percent at all.
@@ -508,7 +509,29 @@ test("a percent that the rounding overflows is absent, never +Infinity", () => {
 
 // Two sides that list one identity's holds in another order are still the same two holds: a
 // scenario pairs with the one of its own directory name first, and only the rest by position.
-test("a scenario pairs by its directory name first, then by position; a lone one carries its name", () => {
+test("a plan that gained an entry still pairs the 60 s hold with the 60 s hold: a directory name is a position, not an identity", () => {
+  const { a, b } = pair();
+  // A: [01 hold 60, 02 hold 240]. B: [01 input, 02 hold 60, 03 hold 240]: the same two holds, one position later.
+  const hold = (dir, name, hold_s) => {
+    if (name !== "01-stream-hold" || dir !== a) fs.cpSync(path.join(a, "01-stream-hold"), path.join(dir, name), { recursive: true });
+    edit(dir, `${name}/scenario.json`, (sc) => ({ ...sc, id: name, params: { ...sc.params, hold_s } }));
+  };
+  hold(a, "01-stream-hold", 60);
+  hold(a, "02-stream-hold", 240);
+  fs.rmSync(path.join(b, "01-stream-hold"), { recursive: true });
+  fs.cpSync(path.join(a, "02-input-kbm"), path.join(b, "01-input-kbm"), { recursive: true });
+  edit(b, "01-input-kbm/scenario.json", (sc) => ({ ...sc, id: "01-input-kbm" }));
+  hold(b, "02-stream-hold", 60);
+  hold(b, "03-stream-hold", 240);
+  edit(a, "manifest.json", (m) => ({ ...m, scenarios: ["01-stream-hold", "02-stream-hold"] }));
+  edit(b, "manifest.json", (m) => ({ ...m, scenarios: ["01-input-kbm", "02-stream-hold", "03-stream-hold"] }));
+  assert.deepEqual(validateBundle(a), []);
+  assert.deepEqual(validateBundle(b), []);
+  const holds = compare(a, b).pairs.map((p) => [p.dir_a, p.dir_b]);
+  assert.deepEqual(holds, [["01-stream-hold", "02-stream-hold"], ["02-stream-hold", "03-stream-hold"]]);
+});
+
+test("within one identity equal params pair first, then by position; a lone one carries its name", () => {
   const { a, b, out } = pair();
   const L = "03-stream-hold-long";
   const X = "04-stream-hold-extra";
