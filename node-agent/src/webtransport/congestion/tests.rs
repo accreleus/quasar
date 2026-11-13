@@ -1173,3 +1173,39 @@ fn each_line_names_every_cause_of_the_fall_it_covers() {
     }
     assert_eq!(cuts[2].2, est.estimate_kbps().round());
 }
+
+/// #1376: a report is evidence of the link (`measured`) only when its datagrams arrived
+/// slower than they were sent, and then it is the estimate, never under `BETA` × the
+/// receive rate. A clean link, an idle sender and a report with no receive rate give none.
+/// Old code: the higher of the estimate and the receive rate for any busy report, a clean
+/// link's included, and the estimate alone (a silence decay's included) with no receive rate.
+#[test]
+fn a_report_is_evidence_only_when_the_link_held_the_sender_back() {
+    let start = Instant::now();
+    let at = |ms| start + Duration::from_millis(ms);
+    let report = |rate_kbps, sent_kbps, loss| Measured {
+        usage: Usage::Normal,
+        rate_kbps,
+        sent_kbps,
+        fresh: true,
+        loss,
+    };
+    let mut est = Estimator::new(CEILING, start);
+    est.apply(report(Some(7900.0), Some(8000.0), None), at(100), NO_QUIC);
+    assert_eq!(est.measured(), None, "a clean link: arrived as sent");
+    est.apply(report(Some(1000.0), Some(3000.0), None), at(200), NO_QUIC);
+    assert_eq!(est.measured(), None, "an idle sender (application-limited)");
+    est.apply(report(None, Some(8000.0), None), at(300), NO_QUIC);
+    assert_eq!(est.measured(), None, "no receive rate");
+    est.apply(report(Some(6000.0), Some(8000.0), None), at(400), NO_QUIC);
+    assert_eq!(
+        est.measured(),
+        Some(CEILING),
+        "held back: the estimate, above 0.85 × 6000"
+    );
+    // A loss cut leaves the estimate under what arrived: the reading stops at BETA × that.
+    est.apply(report(None, None, Some(0.6)), at(500), NO_QUIC);
+    assert!(est.estimate_kbps() < BETA * 7000.0);
+    est.apply(report(Some(7000.0), Some(7500.0), None), at(600), NO_QUIC);
+    assert_eq!(est.measured(), Some(BETA * 7000.0));
+}

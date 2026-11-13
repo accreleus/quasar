@@ -117,10 +117,10 @@ pub(crate) struct Rate {
     /// A client's first estimate: its loop takes the encoder over (one writer per encoder).
     pub(crate) start: Box<dyn Fn() + Send + Sync>,
     pub(crate) observe: Box<dyn Fn(f64) + Send + Sync>,
-    /// After `observe`, for an estimate that came from a receiver report: what that report
-    /// showed the link carrying (`congestion::Estimator::measured`). Never for the silence
-    /// decay, nor for an application-limited report.
-    pub(crate) measured: Box<dyn Fn(f64) + Send + Sync>,
+    /// After `observe`, for every estimate that came from a receiver report, never for the
+    /// silence decay: what the report showed the link carrying when the link held the
+    /// sender back (`congestion::Estimator::measured`), `None` when it did not.
+    pub(crate) measured: Box<dyn Fn(Option<f64>) + Send + Sync>,
 }
 
 /// One client's congestion control: its feedback and the agent's silence clock into an
@@ -193,14 +193,7 @@ impl<'a> Control<'a> {
             }
         }
         if let Some(kbps) = estimate {
-            self.feed(kbps);
-            if let Some(link) = self
-                .estimator
-                .measured()
-                .filter(|_| self.gone.get().is_none())
-            {
-                (self.rate.measured)(link / (1.0 + self.charged));
-            }
+            self.feed(kbps, true);
             // QUIC's loss response is given up only while the estimate drives the encoder
             // from live feedback; the encoder never goes under the ABR's floor, so neither
             // does the window.
@@ -215,11 +208,14 @@ impl<'a> Control<'a> {
             // Feedback has gone silent: the decay holds the encoder at the floor at best, and
             // that may still overrun the path, so Cubic takes it back until feedback returns.
             self.governor.release();
-            self.feed(kbps);
+            self.feed(kbps, false);
         }
     }
 
-    fn feed(&mut self, kbps: f64) {
+    /// `report`: a receiver report's estimate, not the silence decay's; its reading
+    /// (`Rate::measured`) goes to the ABR first, so the governor judges the estimate with
+    /// this report stamped (#1376 review N1).
+    fn feed(&mut self, kbps: f64, report: bool) {
         // A client that no longer has the session must never start or re-take the ABR: the
         // encoder is its successor's, and after the session ended the hooks a start
         // registers would leak the encoder (`SessionMetrics::clear_hooks`).
@@ -238,6 +234,13 @@ impl<'a> Control<'a> {
             let room = (kbps / (self.rate.floor_kbps)() - 1.0).max(0.0);
             fec.overhead().min(room)
         });
+        if report {
+            (self.rate.measured)(
+                self.estimator
+                    .measured()
+                    .map(|link| link / (1.0 + self.charged)),
+            );
+        }
         (self.rate.observe)(kbps / (1.0 + self.charged));
     }
 
