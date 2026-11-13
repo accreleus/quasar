@@ -405,8 +405,6 @@ export const Hud = forwardRef<HudHandle, HudProps>(function Hud(props, ref) {
             touchLook={props.touchLook}
             scalingMode={props.scalingMode}
             onScalingChange={props.onScalingChange}
-            upscaleSharpen={props.upscaleSharpen}
-            onUpscaleSharpenChange={props.onUpscaleSharpenChange}
           />
         );
       case "stats":
@@ -437,6 +435,8 @@ export const Hud = forwardRef<HudHandle, HudProps>(function Hud(props, ref) {
             onUiScaleChange={props.onUiScaleChange}
             displayBusy={props.displayBusy}
             showInterfaceSize={props.showInterfaceSize}
+            upscaleSharpen={props.upscaleSharpen}
+            onUpscaleSharpenChange={props.onUpscaleSharpenChange}
           />
         );
     }

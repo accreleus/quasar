@@ -38,8 +38,6 @@ const base = {
   touchLook: false,
   scalingMode: "contain" as const,
   onScalingChange: vi.fn(),
-  upscaleSharpen: true,
-  onUpscaleSharpenChange: vi.fn(),
 };
 
 describe("InputPane capture", () => {
@@ -273,23 +271,6 @@ describe("InputPane scaling", () => {
     render(<InputPane {...base} onScalingChange={onScalingChange} />);
     fireEvent.click(screen.getByRole("tab", { name: "1:1" }));
     expect(onScalingChange).toHaveBeenCalledWith("integer");
-  });
-});
-
-describe("InputPane upscale sharpen (#1349)", () => {
-  it("shows the switch on, beside the scaling modes, and reports a turn-off", () => {
-    const onUpscaleSharpenChange = vi.fn();
-    render(<InputPane {...base} onUpscaleSharpenChange={onUpscaleSharpenChange} />);
-    const toggle = screen.getByRole("checkbox", { name: /sharpen an upscaled picture/i });
-    expect((toggle as HTMLInputElement).checked).toBe(true);
-    fireEvent.click(toggle);
-    expect(onUpscaleSharpenChange).toHaveBeenCalledWith(false);
-  });
-
-  it("reflects a stored off", () => {
-    render(<InputPane {...base} upscaleSharpen={false} />);
-    const toggle = screen.getByRole("checkbox", { name: /sharpen an upscaled picture/i });
-    expect((toggle as HTMLInputElement).checked).toBe(false);
   });
 });
 

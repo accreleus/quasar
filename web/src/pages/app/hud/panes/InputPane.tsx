@@ -11,7 +11,6 @@
 // via `register` (#139) — its re-renders never reach the rest of the pane.
 
 import { Fragment, memo, useEffect, useState } from "react";
-import { Switch } from "../../../../components/TextField";
 import { SCALING_MODES, type ScalingMode } from "../../../../settings/displayPreferences";
 import { EMPTY_SNAPSHOT, type TelemetrySnapshot } from "../../../../webrtc/telemetry";
 import { IconGamepadLarge } from "../icons";
@@ -47,9 +46,6 @@ export interface InputPaneProps {
   touchLook: boolean;
   scalingMode: ScalingMode;
   onScalingChange: (m: ScalingMode) => void;
-  /** #1349: the upscale + sharpen pass, on unless this device turned it off. */
-  upscaleSharpen: boolean;
-  onUpscaleSharpenChange: (on: boolean) => void;
 }
 
 /** Segment labels for the CSS-only presentation modes. Four, not the mock's
@@ -295,20 +291,6 @@ export function InputPane(props: InputPaneProps) {
                 </button>
               ))}
             </div>
-          </div>
-          {/* #1349: beside the mode it only matters for. Off is plain stretching;
-              the presenter skips the pass at 1:1 and in 1:1 whatever this says. */}
-          <div className="ctl-row">
-            <Switch
-              label="Sharpen an upscaled picture"
-              id="hud-upscale-sharpen"
-              checked={props.upscaleSharpen}
-              aria-describedby="hud-upscale-sharpen-hint"
-              onChange={props.onUpscaleSharpenChange}
-            />
-          </div>
-          <div className="col-note" id="hud-upscale-sharpen-hint">
-            Rebuilds detail when a WebTransport stream is smaller than the picture.
           </div>
         </div>
       </div>
