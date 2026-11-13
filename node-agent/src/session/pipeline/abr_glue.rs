@@ -2300,8 +2300,7 @@ mod tests {
         let back = wt
             .seen
             .iter()
-            .filter(|e| e.event == "abr.ladder.step")
-            .last()
+            .rfind(|e| e.event == "abr.ladder.step")
             .unwrap();
         assert_eq!(back.payload["to"], 0);
         assert!(rate_8000_at.is_some());
