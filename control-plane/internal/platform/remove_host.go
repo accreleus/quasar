@@ -78,6 +78,12 @@ func NewRemoveHandler(deps RemoveDeps, auditor audit.Recorder, log logger) *Remo
 	return &RemoveHandler{deps: deps, auditor: auditor, log: log, AckTimeout: DefaultAckTimeout, NewRequestID: newRequestID}
 }
 
+// SharesOwnMachineSet reports whether the own-machine guard was wired. Only the
+// composition-root wiring test reads it: RemoveDeps.SharesOwnMachine is a func
+// field, so a dropped injection makes the check skip silently (#1395), and no
+// route reaches that check without a connected owned host.
+func (h *RemoveHandler) SharesOwnMachineSet() bool { return h.deps.SharesOwnMachine != nil }
+
 // Register wires the route. admin must compose RequireAuth→RequireAdmin.
 func (h *RemoveHandler) Register(mux httpx.Router, admin func(http.Handler) http.Handler) {
 	mux.Handle("POST /v1/admin/platform/hosts/{id}/remove", admin(http.HandlerFunc(h.handleRemove)))
