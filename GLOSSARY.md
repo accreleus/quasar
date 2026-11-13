@@ -230,8 +230,10 @@ cannot connect, planned, is a different thing).
 
 **Active rectangle** — on a WebTransport session that moves resolution inside a fixed coded
 size, the part of each encoded frame that holds the game picture; the rest is padding the client
-never shows. It changes per frame without a configuration change (ADR 0014). _Avoid_: "viewport",
-"crop" (the crop is what the presenter does with it).
+never shows. Inside one coded size it changes per frame without a configuration change; a rung
+restart resets it to the full frame (ADR 0014). _Avoid_: "viewport", "crop" (the crop is what the
+presenter does with it), "`visibleRect`" (WebCodecs' name; on this design it is the whole coded
+frame).
 
 **Presenter** — the client-side component that draws decoded frames to the screen and owns
 the scaling modes and the present-cadence readout (**Present cadence**, under Stream health); on WebTransport it is a WebGPU
