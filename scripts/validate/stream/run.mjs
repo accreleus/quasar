@@ -439,9 +439,14 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
 
 /** The runner's own commit, and whether tracked files differ from it (a run from a tree with uncommitted changes is not the commit it names). */
 export function runnerState(cwd = ROOT) {
+  // An e2e-pack carries no git history: its VERSION file ("<sha>", then " dirty" if the tree was) names the commit it was made from.
+  try { const m = /^([0-9a-f]{40})( dirty)?\s*$/.exec(fs.readFileSync(path.join(cwd, "VERSION"), "utf8")); if (m) return { commit: m[1], dirty: !!m[2] }; } catch { /* a checkout has none */ }
   const git = (...args) => execFileSync("git", args, { cwd, encoding: "utf8", env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" } });
   try { return { commit: git("rev-parse", "HEAD").trim(), dirty: git("status", "--porcelain", "--untracked-files=no").trim() !== "" }; } catch { return { commit: "unknown", dirty: false }; /* not a checkout */ }
 }
+
+/** Headless only on a Linux box with no display: a Mac or Windows desktop has no DISPLAY and is not headless. */
+export const headless = (env = process.env, platform = process.platform) => platform === "linux" && !(env.DISPLAY || env.WAYLAND_DISPLAY);
 
 /** Certificate checks stay on unless the caller asks (INSECURE_TLS=1, for a stack with a self-signed certificate): the process-wide switch Node's fetch has. */
 export function configureTls(insecure, env = process.env) {
@@ -504,7 +509,7 @@ async function main() {
   const { chromium } = await import("playwright").catch(() => import("playwright-core"));
   const browser = args.cdp
     ? await chromium.connectOverCDP(args.cdp)
-    : await chromium.launch({ executablePath: process.env.CHROME || undefined, headless: !(process.env.DISPLAY || process.env.WAYLAND_DISPLAY) });
+    : await chromium.launch({ executablePath: process.env.CHROME || undefined, headless: headless() });
   const out = path.resolve(typeof args.out === "string" ? args.out : `e2e-bundle-${Date.now()}`);
   const { commit, dirty } = runnerState();
 
