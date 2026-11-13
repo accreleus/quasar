@@ -612,3 +612,41 @@ func TestAValveToolEnableDisableRowCarriesItsSteamName(t *testing.T) {
 		}
 	}
 }
+
+func TestRunReconcileRetriesUntilTheCatalogueFills(t *testing.T) {
+	pool := testDB(t)
+	s := NewStore(pool)
+	ctx := context.Background()
+	calls := 0
+	retryReconcile(ctx, func(c context.Context) error {
+		if calls++; calls <= 3 {
+			return fmt.Errorf("database not ready")
+		}
+		return s.Reconcile(c)
+	}, time.Millisecond, 4*time.Millisecond)
+	items, _, err := s.List(ctx)
+	if err != nil || calls != 4 || len(items) == 0 {
+		t.Fatalf("calls %d, %d catalogue rows (%v): want a fill on the 4th try", calls, len(items), err)
+	}
+}
+
+func TestRetryReconcileStopsWhenTheContextEnds(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := make(chan struct{}, 100)
+	done := make(chan struct{})
+	go func() {
+		retryReconcile(ctx, func(context.Context) error { calls <- struct{}{}; return fmt.Errorf("down") },
+			time.Hour, time.Hour)
+		close(done)
+	}()
+	<-calls
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the retry loop kept running after its context ended")
+	}
+	if len(calls) != 0 {
+		t.Errorf("%d attempts after the first; the hour-long wait should not have elapsed", len(calls))
+	}
+}

@@ -661,11 +661,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	compatStore.Superseder = coordinator.SupersedeParked
 	compatStore.Stopper = coordinator.StopByAdmin
 	go compatStore.RunStopLoop(janitorCtx, time.Minute)
-	compatCtx, compatCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	if err := compatStore.Reconcile(compatCtx); err != nil {
-		log.Error("compat tools: reconciling the catalogue failed", "err", err)
-	}
-	compatCancel()
+	go compatStore.RunReconcile(janitorCtx) // retried with backoff; boot does not wait on it (#1122)
 	// The compat_tools.converge job (amendment 56): desired state is every enabled GE tool on every
 	// compat_tools_v1 host; runs are filled with the host's first difference when it claims one.
 	compatConv := compat.NewConverger(pool, jobStore, auditStore, log)
