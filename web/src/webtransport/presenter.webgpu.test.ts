@@ -292,8 +292,9 @@ describe("the cross-fade over a size change (#1377)", () => {
   const BLUE = [0, 0, 200];
   const GREEN = [0, 200, 0];
 
-  /** Presents the frames in order; returns the pixel at the picture's centre after each. */
-  async function centres(frames: [number, number, number[]][], attrs: Record<string, string> = {}) {
+  /** Presents the frames in order, 25 ms apart; returns the pixel at the picture's centre after each.
+   *  A frame's 4th element is a wait (ms of the fake timers) after it, with a second reading. */
+  async function centres(frames: [number, number, number[], number?][], attrs: Record<string, string> = {}) {
     const fatal: string[] = [];
     let target!: GPUTexture;
     const canvas = {
@@ -319,19 +320,30 @@ describe("the cross-fade over a size change (#1377)", () => {
     expect(warn.mock.calls.filter((c) => String(c[0]).includes("cross-fade"))).toEqual([]);
     const device = presenter.device!;
     target = device.createTexture({ size: [CW, CH], format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
-    // A readback takes longer than the fade's time window; the fade is counted in frames here.
-    let now = 0;
-    const clock = vi.spyOn(performance, "now").mockImplementation(() => (now += 16));
+    // A readback takes longer than the fade's time window, so the clock and the deadline timer are fake.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let now = -25;
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
     const out: number[][] = [];
+    const read = async () => {
+      device.pushErrorScope("validation");
+      const px = await readBack(device, target, 1, 1, { x: CW / 2, y: CH / 2 });
+      expect((await device.popErrorScope())?.message ?? null).toBeNull();
+      out.push([...px.slice(0, 3)]);
+    };
     try {
-      for (const [w, h, color] of frames) {
-        device.pushErrorScope("validation");
+      for (const [w, h, color, wait] of frames) {
+        now += 25;
         expect(presenter.present(solid(w, h, color))).toBe(true);
-        const px = await readBack(device, target, 1, 1, { x: CW / 2, y: CH / 2 });
-        expect((await device.popErrorScope())?.message ?? null).toBeNull();
-        out.push([...px.slice(0, 3)]);
+        await read();
+        if (wait != null) {
+          now += wait;
+          vi.advanceTimersByTime(wait);
+          await read();
+        }
       }
     } finally {
+      vi.useRealTimers();
       clock.mockRestore();
       warn.mockRestore();
       presenter.destroy();
@@ -341,7 +353,7 @@ describe("the cross-fade over a size change (#1377)", () => {
   }
   const near = (got: number[], want: number[]) => got.forEach((v, i) => expect(Math.abs(v - want[i])).toBeLessThanOrEqual(2));
 
-  it("dissolves 1440p into 1080p over three frames, the first one already part new", async () => {
+  it("dissolves 1440p into 1080p by its deadline, the first frame already part new", async () => {
     const px = await centres([
       [CW, CH, RED],
       [W, H, BLUE],
@@ -361,16 +373,26 @@ describe("the cross-fade over a size change (#1377)", () => {
     near(px[1], [150, 0, 50]);
   }, 120_000);
 
-  it("restarts from the last frame shown when the size changes again mid-fade, with no flash", async () => {
+  it("cuts to the newest picture when the size changes again mid-fade", async () => {
     const px = await centres([
       [CW, CH, RED],
       [W, H, BLUE],
       [1280, 720, GREEN],
       [1280, 720, GREEN],
     ]);
-    // Frame 3 fades from the BLUE frame just shown: a quarter new, no red and no black.
-    near(px[2], [0, 50, 150]);
-    near(px[3], [0, 100, 100]);
+    near(px[2], [0, 200, 0]);
+    near(px[3], [0, 200, 0]);
+  }, 120_000);
+
+  it("shows the newest picture whole at the deadline when no frame arrives", async () => {
+    const px = await centres([[CW, CH, RED], [W, H, BLUE, 100]]);
+    near(px[1], [150, 0, 50]);
+    near(px[2], [0, 0, 200]);
+  }, 120_000);
+
+  it("cuts a size change after a stale picture", async () => {
+    const px = await centres([[CW, CH, RED, 1000], [W, H, BLUE]]);
+    near(px[2], [0, 0, 200]);
   }, 120_000);
 
   it("draws a steady size untouched, and the pixel-exact mode with no dissolve", async () => {

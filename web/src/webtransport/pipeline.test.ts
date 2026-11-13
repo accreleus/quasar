@@ -18,8 +18,8 @@ import {
 import {
   containRect,
   createWebGpuPresenter,
-  CROSSFADE_FRAMES,
-  CROSSFADE_MAX_MS,
+  CROSSFADE_MS,
+  CROSSFADE_STALE_MS,
   presentGeometry,
   shouldUpscaleSharpen,
   SizeFade,
@@ -1079,14 +1079,18 @@ describe("createWebGpuPresenter", () => {
       };
       return f;
     }
+    afterEach(() => void vi.useRealTimers());
     const open = async (opts: Parameters<typeof fakeGpu>[1] & { importFails?: boolean; mode?: string } = {}) => {
       clones.length = 0;
+      // A clock the test owns: the fade is timed, and its deadline is a timer.
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
       const g = fakeGpu(opts.importFails ?? false, opts);
       if (opts.mode) g.canvas.dataset.scalingMode = opts.mode;
       const fatal: string[] = [];
       const p = (await createWebGpuPresenter(g.canvas, (m) => fatal.push(m)))!;
-      /** Presents one frame and returns how many draws it took. */
-      const show = (size: number[]) => {
+      /** Lets `dt` ms pass, presents one frame and returns how many draws that present took. */
+      const show = (size: number[], dt = 25) => {
+        vi.advanceTimersByTime(dt);
         const before = g.drawn.length;
         const f = sized(size[0], size[1]);
         expect(p.present(f as unknown as VideoFrame)).toBe(true);
@@ -1096,7 +1100,7 @@ describe("createWebGpuPresenter", () => {
       return { ...g, p, fatal, show };
     };
 
-    it("blends the first frame at the new size in the same present, then fades out over three frames", async () => {
+    it("blends the first frame at the new size in the same present, then fades out by its deadline", async () => {
       const g = await open();
       expect(g.show(BIG)).toBe(1);
       expect([g.show(SMALL), g.show(SMALL), g.show(SMALL), g.show(SMALL), g.show(SMALL)]).toEqual([2, 2, 2, 1, 1]);
@@ -1126,19 +1130,70 @@ describe("createWebGpuPresenter", () => {
       expect(clones.filter((c) => !c.closed)).toHaveLength(1);
     });
 
-    it("restarts the fade from the last frame shown when the size changes during one", async () => {
+    it("cuts when the size changes again during a fade, and the deadline does not move", async () => {
       const g = await open();
       g.show(BIG);
       g.show(SMALL);
       g.show(SMALL);
-      expect(g.show(MID)).toBe(2);
-      expect(g.constants).toEqual([0.25, 0.5, 0.25]);
-      // The first fade's picture is released; the SMALL frame shown last is what fades out.
+      expect(g.show(MID)).toBe(1);
+      expect(g.constants).toEqual([0.25, 0.5]);
+      // The first fade's picture is released at the cut, and nothing is left to redraw.
       expect(clones[0].closed).toBe(true);
-      expect(clones[2].closed).toBe(false);
-      expect(g.show(MID) + g.show(MID) + g.show(MID)).toBe(2 + 2 + 1);
-      expect(g.constants).toEqual([0.25, 0.5, 0.25, 0.5, 0.75]);
+      const n = g.drawn.length;
+      vi.advanceTimersByTime(1000);
+      expect(g.drawn.length).toBe(n);
       expect(g.fatal).toEqual([]);
+    });
+
+    // #1377 round 2 (seat A, A1): a frame that never comes must not leave the newest picture part-blended.
+    it("draws the newest picture alone at the deadline when no frame arrives", async () => {
+      const g = await open();
+      g.show(BIG);
+      expect(g.show(SMALL)).toBe(2);
+      const [before, imports] = [g.drawn.length, g.calls.filter((c) => c === "import").length];
+      vi.advanceTimersByTime(CROSSFADE_MS - 1);
+      expect(g.drawn.length).toBe(before);
+      vi.advanceTimersByTime(1);
+      expect(g.drawn.length).toBe(before + 1);
+      expect(g.blends.at(-1)).toBe(false);
+      expect(g.calls.filter((c) => c === "import").length).toBe(imports + 1);
+      // The old picture is released, and a fade no longer running costs nothing.
+      expect(clones[0].closed).toBe(true);
+      vi.advanceTimersByTime(5000);
+      expect(g.drawn.length).toBe(before + 1);
+      expect(g.fatal).toEqual([]);
+    });
+
+    it("clears the deadline timer on the next present and on destroy", async () => {
+      const g = await open();
+      g.show(BIG);
+      g.show(SMALL);
+      expect(vi.getTimerCount()).toBe(1);
+      g.show(SMALL);
+      expect(vi.getTimerCount()).toBe(1);
+      g.p.destroy();
+      expect(vi.getTimerCount()).toBe(0);
+      expect(clones.filter((c) => !c.closed)).toHaveLength(0);
+    });
+
+    it("redraws the copy fallback's newest texture at the deadline and frees the old one", async () => {
+      const g = await open({ importFails: true });
+      g.show(BIG);
+      g.show(SMALL);
+      const before = g.drawn.length;
+      vi.advanceTimersByTime(CROSSFADE_MS);
+      expect(g.drawn.length).toBe(before + 1);
+      expect(g.textures.destroyed.map((t) => t.width)).toEqual([1920]);
+    });
+
+    // #1377 round 2 (seat B, B2): the previous picture must be recent.
+    it("cuts when the previous picture is older than the stale bound", async () => {
+      const g = await open();
+      g.show(BIG);
+      expect(g.show(SMALL, 1000)).toBe(1);
+      expect(g.constants).toEqual([]);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(g.show(BIG, CROSSFADE_STALE_MS)).toBe(2);
     });
 
     it("does not fade, or hold a frame, in the pixel-exact integer mode", async () => {
@@ -1220,36 +1275,74 @@ describe("upscaleSharpenStrength (#1377)", () => {
 });
 
 describe("SizeFade (#1377)", () => {
-  const run = (sizes: [number, number][], dt = 10) => {
+  /** Steps frames at the given times; each is [w, h, ms]. */
+  const run = (frames: [number, number, number][]) => {
     const f = new SizeFade();
-    return sizes.map(([w, h], i) => f.step(w, h, i * dt));
+    return frames.map(([w, h, t]) => f.step(w, h, t));
   };
+  const D = CROSSFADE_MS;
 
-  it("weighs the newest frame 1/4, 2/4, 3/4 and then 1; the previous frame takes the rest", () => {
-    const w = run([[1920, 1080], [1280, 720], [1280, 720], [1280, 720], [1280, 720], [1280, 720]]);
-    expect(w).toEqual([1, 0.25, 0.5, 0.75, 1, 1]);
-    expect(w.slice(1, 4).map((x) => x + (1 - x))).toEqual([1, 1, 1]);
-    expect(w.slice(1, 4).length).toBe(CROSSFADE_FRAMES);
-  });
-
-  it("runs no fade without a size change, and none for the first frame", () => {
-    expect(run(Array(8).fill([1920, 1080]))).toEqual(Array(8).fill(1));
-  });
-
-  it("restarts at 1/4 when the size changes again mid-fade", () => {
-    expect(run([[1920, 1080], [1280, 720], [1280, 720], [1600, 900], [1600, 900], [1600, 900], [1600, 900]])).toEqual([1, 0.25, 0.5, 0.25, 0.5, 0.75, 1]);
-  });
-
-  it("starts a new fade after a completed one", () => {
-    expect(run([[1, 1], [2, 2], [2, 2], [2, 2], [2, 2], [3, 3]])).toEqual([1, 0.25, 0.5, 0.75, 1, 0.25]);
-  });
-
-  it("ends within the time window when frames are slow", () => {
+  it("grows the newest frame's weight with elapsed time, from 1/4 to 1 at the deadline", () => {
     const f = new SizeFade();
     f.step(1920, 1080, 0);
     expect(f.step(1280, 720, 0)).toBe(0.25);
-    expect(f.step(1280, 720, CROSSFADE_MAX_MS - 1)).toBe(0.5);
-    expect(f.step(1280, 720, CROSSFADE_MAX_MS + 1)).toBe(1);
+    expect(f.deadline).toBe(D);
+    expect(f.step(1280, 720, D / 3)).toBeCloseTo(0.5);
+    expect(f.step(1280, 720, (2 * D) / 3)).toBeCloseTo(0.75);
+    expect(f.step(1280, 720, D)).toBe(1);
+    expect(f.step(1280, 720, D + 5)).toBe(1);
+  });
+
+  it("weighs the previous frame by exactly what the newest does not", () => {
+    const f = new SizeFade();
+    f.step(1920, 1080, 0);
+    f.step(1280, 720, 0);
+    for (const t of [5, 20, 40, 60]) {
+      const w = f.step(1280, 720, t);
+      expect(w).toBeGreaterThan(0.25);
+      expect(w).toBeLessThan(1);
+      expect(w).toBeCloseTo(0.25 + (0.75 * t) / D);
+    }
+  });
+
+  it("runs no fade without a size change, and none for the first frame", () => {
+    expect(run(Array.from({ length: 8 }, (_, i): [number, number, number] => [1920, 1080, i * 10]))).toEqual(Array(8).fill(1));
+  });
+
+  it("starts a new fade after a completed one", () => {
+    const w = run([[1, 1, 0], [2, 2, 10], [2, 2, 10 + D], [3, 3, 10 + D + 10]]);
+    expect(w).toEqual([1, 0.25, 1, 0.25]);
+  });
+
+  // A1/S1: one frame, then nothing for 400 ms. A late frame is already at full weight.
+  it("is at full weight for a frame that arrives after the deadline", () => {
+    expect(run([[1920, 1080, 0], [1280, 720, 0], [1280, 720, 400]])).toEqual([1, 0.25, 1]);
+  });
+
+  // A1/S2: a size change every 20 ms for 300 ms must not hold the newest frame at 1/4.
+  it("cuts a change inside a fade, so a burst of changes does not hold the newest frame low", () => {
+    const frames = Array.from({ length: 16 }, (_, i): [number, number, number] => [1000 + i, 600, i * 20]);
+    const w = run(frames);
+    // Fades start at 20, 100, 180 and 260 only (each deadline bars the next start); the rest cut.
+    expect(w.map((x, i) => (x < 1 ? i * 20 : null)).filter((x) => x !== null)).toEqual([20, 100, 180, 260]);
+    expect(w.filter((x) => x < 1)).toEqual([0.25, 0.25, 0.25, 0.25]);
+  });
+
+  it("does not move the deadline when the size changes inside the fade", () => {
+    const f = new SizeFade();
+    f.step(1920, 1080, 0);
+    f.step(1280, 720, 10);
+    const until = f.deadline;
+    expect(f.step(1600, 900, 30)).toBe(1);
+    expect(f.deadline).toBe(until);
+    expect(f.step(1600, 900, 40)).toBe(1);
+  });
+
+  // B2: the previous picture must be recent.
+  it("cuts when the previous frame is older than the stale bound, and fades at the bound", () => {
+    expect(run([[1920, 1080, 0], [1280, 720, 1000]])).toEqual([1, 1]);
+    expect(run([[1920, 1080, 0], [1280, 720, CROSSFADE_STALE_MS + 1]])).toEqual([1, 1]);
+    expect(run([[1920, 1080, 0], [1280, 720, CROSSFADE_STALE_MS]])).toEqual([1, 0.25]);
   });
 
   it("reports when a fade starts, and cancel() ends one", () => {

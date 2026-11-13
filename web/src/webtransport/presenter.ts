@@ -14,7 +14,7 @@
 // drifts past 1:1 never switches the look on.
 //
 // When the decoded size changes, the newest frame is blended over the previous one for
-// a few frames (`SizeFade`, #1377). The new frame is drawn the frame it arrives, so the
+// at most `CROSSFADE_MS` (`SizeFade`, #1377). The new frame is drawn the frame it arrives, so the
 // fade adds no latency. The previous picture is kept as one extra VideoFrame (a clone of
 // the last drawn; a decoder surface) or, in the copy fallback, the retired copy target
 // for the length of a fade.
@@ -167,41 +167,61 @@ export function upscaleSharpenStrength(scale: number): number {
   return t * t * (3 - 2 * t);
 }
 
-/** Frames a size-change fade lasts, and the longest it may take (a slow stream ends it early). */
-export const CROSSFADE_FRAMES = 3;
-export const CROSSFADE_MAX_MS = 70;
+/**
+ * A size-change fade lasts `CROSSFADE_MS` from the first change and never longer. The
+ * previous picture must have been drawn within `CROSSFADE_STALE_MS` of the new frame (about
+ * two frames at the lowest fps a session runs): after a stall, a reconnect or a hidden tab it is
+ * old news, so the size change cuts.
+ */
+export const CROSSFADE_MS = 75;
+export const CROSSFADE_STALE_MS = 100;
+const CROSSFADE_START = 0.25;
 
 /**
- * The cross-fade over a decoded size change (#1377). `step` is called once per frame and
- * returns the weight of the newest frame: 1 when nothing fades, else 1/4, 2/4, 3/4 and then
- * 1 again. The first frame at a new size is already part-new, so nothing waits. A size change
- * during a fade restarts it from the frame shown last. The previous frame's weight is 1 − w.
+ * The cross-fade over a decoded size change (#1377), bounded in time. `step` is called once
+ * per frame and returns the weight of the newest frame: 1 when nothing fades, else it grows
+ * linearly from 1/4 at the change to 1 at the deadline (`CROSSFADE_MS` later). The first frame
+ * at a new size is already part-new, so nothing waits. A second size change inside a fade cuts
+ * (weight 1) and no new fade starts before the deadline, so a burst of changes cannot hold the
+ * newest frame at a low weight. The previous frame's weight is 1 − w.
  */
 export class SizeFade {
   private w = 0;
   private h = 0;
-  private n = CROSSFADE_FRAMES;
-  private startedAt = 0;
-  /** True when the last `step` began (or restarted) a fade. */
+  private at = -Infinity;
+  private from = 0;
+  private until = 0;
+  /** False once a change inside the fade has cut it; `until` still bars a new fade before it. */
+  private live = false;
+  /** True when the last `step` began a fade. */
   started = false;
+
+  /** When the running fade must be at full weight (a time of `now`'s clock); 0 when none runs. */
+  get deadline(): number {
+    return this.until;
+  }
 
   step(w: number, h: number, now: number): number {
     this.started = false;
     if (this.w > 0 && (w !== this.w || h !== this.h)) {
-      this.n = 0;
-      this.startedAt = now;
-      this.started = true;
-    } else if (this.n < CROSSFADE_FRAMES && now - this.startedAt > CROSSFADE_MAX_MS) {
-      this.n = CROSSFADE_FRAMES;
+      if (now < this.until) this.live = false;
+      else if (now - this.at <= CROSSFADE_STALE_MS) {
+        this.from = now;
+        this.until = now + CROSSFADE_MS;
+        this.live = this.started = true;
+      }
     }
+    this.at = now;
     [this.w, this.h] = [w, h];
-    return this.n < CROSSFADE_FRAMES ? ++this.n / (CROSSFADE_FRAMES + 1) : 1;
+    return this.live && now < this.until ? CROSSFADE_START + ((1 - CROSSFADE_START) * (now - this.from)) / CROSSFADE_MS : 1;
   }
 
   /** Ends any fade and forgets the size; returns 1. */
   cancel(): number {
-    this.n = CROSSFADE_FRAMES;
+    this.until = 0;
+    this.live = false;
     this.w = this.h = 0;
+    this.at = -Infinity;
     this.started = false;
     return 1;
   }
@@ -452,14 +472,36 @@ export async function createWebGpuPresenter(
   let fadeBroken = false;
   let last: VideoFrame | null = null;
   let prev: Held | null = null;
+  // The copy fallback's newest picture (the external path keeps `last`), for the deadline redraw.
+  let newest: Layer | null = null;
+  let fadeTimer: ReturnType<typeof setTimeout> | null = null;
   const dropPrev = () => {
     prev?.frame?.close();
     prev?.texture?.destroy();
     prev = null;
   };
+  /** Ends the deadline timer and lets go of the picture a fade blends from. */
+  const endFade = () => {
+    if (fadeTimer != null) clearTimeout(fadeTimer);
+    fadeTimer = null;
+    dropPrev();
+  };
   const dropLast = () => {
     last?.close();
     last = null;
+  };
+
+  /** The fade's deadline passed with no new frame: the newest picture at full weight. */
+  const finishFade = () => {
+    fadeTimer = null;
+    if (failed || destroyed) return;
+    try {
+      const layer = last ? { kind: externalKind, texture: device.importExternalTexture({ source: last }), w: last.displayWidth, h: last.displayHeight } : newest;
+      if (layer) draw([layer]);
+      dropPrev();
+    } catch (err) {
+      fail(`the presenter could not draw: ${err instanceof Error ? err.message : String(err)}`);
+    }
   };
 
   return {
@@ -467,6 +509,7 @@ export async function createWebGpuPresenter(
     presentTexture(texture) {
       try {
         if (failed || destroyed) return false;
+        endFade();
         draw([{ kind: textureKind, texture: texture.createView(), w: texture.width, h: texture.height }]);
         return true;
       } catch (err) {
@@ -477,10 +520,13 @@ export async function createWebGpuPresenter(
     present(frame) {
       try {
         if (failed || destroyed) return false;
+        if (fadeTimer != null) clearTimeout(fadeTimer);
+        fadeTimer = null;
         const src = source(frame);
         // The fade needs the blending pipeline of this kind; `integer` is pixel-exact and never fades.
+        const now = performance.now();
         const canFade = !fadeBroken && src.kind.fadePlain != null && canvas.dataset?.scalingMode !== "integer";
-        const weight = canFade ? fade.step(src.w, src.h, performance.now()) : fade.cancel();
+        const weight = canFade ? fade.step(src.w, src.h, now) : fade.cancel();
         if (weight < 1 && fade.started) {
           dropPrev();
           if (src.retired) prev = { texture: src.retired, w: src.retired.width, h: src.retired.height };
@@ -513,6 +559,9 @@ export async function createWebGpuPresenter(
             last = null;
           }
         }
+        newest = copy ? src : null;
+        // No frame by the deadline: draw the newest picture alone then. One timer, none when nothing fades.
+        if (from) fadeTimer = setTimeout(finishFade, Math.max(0, fade.deadline - now));
         return true;
       } catch (err) {
         fail(`the presenter could not draw: ${err instanceof Error ? err.message : String(err)}`);
@@ -524,7 +573,7 @@ export async function createWebGpuPresenter(
     },
     destroy() {
       destroyed = true;
-      dropPrev();
+      endFade();
       dropLast();
       resize.disconnect();
       device.destroy();
