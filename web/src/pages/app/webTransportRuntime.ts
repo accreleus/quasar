@@ -3,7 +3,8 @@
 // through AudioOut and the microphone through MicOut, behind the same SessionRuntime surface the
 // page drives for WebRTC.
 
-import { mintTransportToken } from "../../api/library";
+import { getSession, mintTransportToken } from "../../api/library";
+import { ApiError } from "../../api/client";
 import type { WebTransportCoords } from "../../api/types";
 import { setupCapture } from "../../input/capture";
 import { NEUTRAL_MOUSE, type MouseSettings } from "../../input/mouseScale";
@@ -111,8 +112,21 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   const telemetrySubs = new Set<(snap: TelemetrySnapshot) => void>();
   let destroyed = false;
   let started = false;
-  /** The one reconnect a lost stream gets before the view falls back. */
+  /** One media reconnect before fallback; connectivity retries leave it unspent. */
   let reconnected = false;
+  let stableVideoSince: number | null = null;
+  // Thirty seconds of arriving video separates a recovered stream from repeated quick failures.
+  const MEDIA_RETRY_RESET_MS = 30_000;
+  function noteVideo(): void {
+    const now = performance.now();
+    if (stableVideoSince === null || lastVideoAt === null || now - lastVideoAt > MEDIA_SILENCE_MS) stableVideoSince = now;
+    lastVideoAt = now;
+    if (now - stableVideoSince >= MEDIA_RETRY_RESET_MS) reconnected = false;
+  }
+  let recovering = false;
+  let recoveryDeadline: ReturnType<typeof setTimeout> | null = null;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+  let wakeRetry: (() => void) | null = null;
   /** Set by the first terminal failure; nothing runs after it. */
   let failed = false;
   let transport: MediaTransport | null = null;
@@ -161,6 +175,9 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   let closing: Promise<void> | void = undefined;
 
   const stop = () => {
+    if (recoveryDeadline !== null) clearTimeout(recoveryDeadline);
+    recoveryDeadline = null;
+    wakeRetry?.();
     if (timer !== null) clearInterval(timer);
     timer = null;
     if (postTimer !== null) clearInterval(postTimer);
@@ -185,11 +202,11 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   };
 
   // A failure the contract falls back on hands the session to WebRTC; the rest end this view.
-  const fail = (code: string) => {
+  const fail = (code: string, terminal = false, message?: string) => {
     if (failed || destroyed) return;
     failed = true;
     const closed = stop();
-    const reason = fallbackReason(code);
+    const reason = terminal ? null : fallbackReason(code);
     if (reason) {
       // WebRTC's own input path takes over; nothing is left capturing for this connection.
       set({ status: "falling back to WebRTC…", channelOpen: false, inputCaptured: false, pointerLocked: false });
@@ -200,7 +217,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       });
       return;
     }
-    const detail = transportFailureDetail(code);
+    const detail = message ?? transportFailureDetail(code);
     // Before the reveal the loader shows the page's failure card; after it, `recovery`
     // `failed` puts the reason on the session's existing recovery banner.
     set({ status: detail, channelOpen: false, inputCaptured: false, pointerLocked: false, recovery: { phase: "failed", attempt: 0, maxAttempts: 0, message: detail } });
@@ -212,6 +229,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     if (document.visibilityState !== "visible") return;
     // A tab back from hidden gets the whole bound again.
     if (lastVideoAt !== null) lastVideoAt = performance.now();
+    stableVideoSince = null;
     telemetry.breakCadence();
     playout?.reset();
     transport?.requestKeyframe("loss");
@@ -240,6 +258,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     const now = performance.now();
     if (lastVideoAt !== null && lastTickAt !== null && now - lastTickAt > 2 * TELEMETRY_MS) {
       lastVideoAt = Math.min(now, lastVideoAt + now - lastTickAt - TELEMETRY_MS);
+      stableVideoSince = null;
     }
     lastTickAt = now;
     // A connection that is up and carries no media never ends by itself.
@@ -361,7 +380,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   }
 
   /** Opens a transport with `coords` and returns once it is up, or the view has failed.
-   *  A `reconnecting` one that fails reports `stream_lost`: the stream was up before. */
+   *  A `reconnecting` failure is rethrown so the recovery loop can check connectivity. */
   async function connectTransport(coords: WebTransportCoords, reconnecting: boolean): Promise<void> {
     // A mint that was in flight when the view ended must not open a connection.
     if (destroyed || failed) return;
@@ -408,14 +427,14 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
         },
         unit: (u) => {
           if (destroyed || failed || t !== transport) return;
-          lastVideoAt = performance.now();
+          noteVideo();
           telemetry.bytes(u.data.length);
           telemetry.decodeIn(u.captureUs);
           stage?.unit(u);
         },
         pyrowave: (f) => {
           if (destroyed || failed || t !== transport) return;
-          lastVideoAt = performance.now();
+          noteVideo();
           for (const b of f.packets) telemetry.bytes(b.byteLength);
           pyroStage?.frame(f);
         },
@@ -432,16 +451,17 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       });
     } catch (err) {
       if (destroyed || failed) return;
+      if (reconnecting) throw err;
       const code = err instanceof TransportError ? err.code : "internal";
       if (code === "taken_over") {
         takenOver();
       } else if (code !== "closed") {
         if (code === "session_ended") cfg.callbacks.onDisconnectSuspected();
-        fail(reconnecting && code !== "session_ended" ? "stream_lost" : code);
+        fail(code);
       }
       return;
     }
-    if (destroyed || failed) return;
+    if (destroyed || failed || t !== transport) return;
     // hello_ack: the control stream is up, and it is what carries input on this transport.
     set({ wsOpen: true, pcConnected: true, channelOpen: true, iceState: "connected" });
     // A reconnect's connection gets the whole bound to deliver its first frame.
@@ -523,16 +543,116 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       fail("session_ended");
       return;
     }
-    if (reconnected) {
-      fail("stream_lost");
-      return;
-    }
-    reconnected = true;
+    stableVideoSince = null;
     transport = null; // the closed one's own `end` is then not this view's
-    teardownInput(); // the new connection builds its own
+    teardownInput();
     closing = t.close();
-    set({ status: "reconnecting over WebTransport…", channelOpen: false, inputCaptured: false, pointerLocked: false });
-    mintCoords().then((c) => connectTransport(c, true), () => fail("stream_lost"));
+    // The active recovery loop notices that its replacement ended and tries again.
+    set({ channelOpen: false, inputCaptured: false, pointerLocked: false });
+    if (!recovering) void recoverTransport();
+  }
+
+  // Like signaling recovery, connectivity failures defer rather than spend the media retry.
+  async function recoverTransport(): Promise<void> {
+    recovering = true;
+    set({ status: "reconnecting over WebTransport…", channelOpen: false, inputCaptured: false, pointerLocked: false,
+      recovery: { phase: "reconnecting", attempt: 0, maxAttempts: 1, message: "Connection lost. Reconnecting…" } });
+    recoveryDeadline = setTimeout(() => fail("stream_lost", true), 60_000);
+    let attempt = 0;
+    let connectivityFailed = false;
+    let endedAtOnce = 0;
+    try {
+      while (!destroyed && !failed) {
+        const attemptedAt = performance.now();
+        try {
+          const { session } = await getSession(cfg.authToken, cfg.sessionId);
+          if (destroyed || failed) return;
+          if (session.state !== "running") {
+            fail("session_ended");
+            return;
+          }
+          if (reconnected && !connectivityFailed) {
+            fail("stream_lost");
+            return;
+          }
+          const coords = await mintCoords();
+          if (destroyed || failed) return;
+          await connectTransport(coords, true);
+          if (destroyed || failed) return;
+          if (transport === null) {
+            // The replacement connected and ended at once. With the network up that is a broken
+            // media path: one more try, then fall back, never a tight loop of token mints.
+            if (connectivityFailed) await retryWait(Math.min(1_000 * 2 ** attempt++, 4_000), attemptedAt);
+            else if (endedAtOnce++ >= 1) {
+              fail("stream_lost");
+              return;
+            }
+            continue;
+          }
+          // A network outage is independent of the bounded retry for a broken media path.
+          if (!connectivityFailed) reconnected = true;
+          set({ recovery: { phase: "recovered", attempt: 1, maxAttempts: 1, message: "Connection recovered" },
+            status: "streaming over WebTransport" });
+          return;
+        } catch (err) {
+          if (destroyed || failed) return;
+          if (err instanceof TransportError && err.code === "taken_over") {
+            takenOver();
+            return;
+          }
+          if ((err instanceof TransportError && err.code === "session_ended") ||
+              (err instanceof ApiError && err.status === 404)) {
+            fail("session_ended");
+            return;
+          }
+          if (!(err instanceof TypeError) && !(err instanceof ApiError && err.status >= 500)) {
+            // A failed QUIC path is a fallback only if the control plane is still reachable.
+            try {
+              const { session } = await getSession(cfg.authToken, cfg.sessionId);
+              if (destroyed || failed) return;
+              fail(session.state === "running" ? "stream_lost" : "session_ended");
+              return;
+            } catch (probeError) {
+              if (probeError instanceof ApiError && probeError.status < 500) {
+                fail(probeError.status === 404 ? "session_ended" : "stream_lost", true);
+                return;
+              }
+            }
+          }
+          if (destroyed || failed) return;
+          connectivityFailed = true;
+          const t = transport;
+          transport = null;
+          closing = t?.close() ?? closing;
+          await retryWait(Math.min(1_000 * 2 ** attempt++, 4_000), attemptedAt);
+        }
+      }
+    } finally {
+      recovering = false;
+      if (recoveryDeadline !== null) clearTimeout(recoveryDeadline);
+      recoveryDeadline = null;
+    }
+  }
+
+  function retryWait(ms: number, attemptedAt: number): Promise<void> {
+    return new Promise((resolve) => {
+      const wake = () => {
+        if (retryTimer !== null) clearTimeout(retryTimer);
+        retryTimer = null;
+        window.removeEventListener("online", online);
+        wakeRetry = null;
+        resolve();
+      };
+      const online = () => {
+        // navigator.onLine is a hint; only the next successful HTTPS read proves reachability.
+        if (!navigator.onLine) return;
+        if (retryTimer !== null) clearTimeout(retryTimer);
+        retryTimer = setTimeout(wake, Math.max(0, 1_000 - (performance.now() - attemptedAt)));
+      };
+      wakeRetry = wake;
+      window.addEventListener("online", online);
+      retryTimer = setTimeout(wake, ms);
+    });
   }
 
   return {
@@ -561,7 +681,9 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       capture?.setMouse(settings);
     },
     isCaptured: () => captured,
-    cancelRecovery() {},
+    cancelRecovery() {
+      if (recovering) fail("stream_lost", true, "Connection recovery cancelled.");
+    },
     hasMicSlot: () => micSlot && !failed && !destroyed,
     async attachMicTrack(track) {
       // Nothing may start after stop(): the transport is closed and nobody would tear it down.
