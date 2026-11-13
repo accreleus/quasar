@@ -561,7 +561,7 @@ describe("createWebTransportRuntime", () => {
     rt.destroy();
     await flush();
     expect(agent.sent("bye")).toEqual([{ type: "bye", reason: "client_closed" }]);
-  });
+  }, 15_000); // #1360: above the 8 s wait inside, which the default 5 s cut short on a busy machine
 
   it("re-configures the decoder on a new config_id, holding frames that beat their hello_ack", async () => {
     const { agent, decoders, presented, rt } = setup();
