@@ -9,6 +9,7 @@
 // guard and revert-to-last-acked all still live in useDisplayPatch.
 
 import { Chip } from "../../../../components/Chip";
+import { Switch } from "../../../../components/TextField";
 import { RenderResolutionControl, renderResolutionNote } from "../../RenderResolutionControl";
 import {
   StreamResolutionControl,
@@ -61,6 +62,9 @@ export interface DisplayPaneProps {
   /** True while a display PATCH is in flight — the rows go inert together,
    *  because they share one debounced request. */
   displayBusy: boolean;
+  /** #1349: the upscale + sharpen pass, on unless this device turned it off. */
+  upscaleSharpen: boolean;
+  onUpscaleSharpenChange: (on: boolean) => void;
 }
 
 export function DisplayPane(props: DisplayPaneProps) {
@@ -77,6 +81,19 @@ export function DisplayPane(props: DisplayPaneProps) {
   // Render's ceiling is the launch size; falls back to it until an ack lands.
   const renderValue = props.renderSize ?? props.streamSize;
 
+  // #1349: this device's own setting, so it shows whatever the session reported.
+  // The presenter skips the pass at 1:1 whatever this says.
+  const sharpen = (
+    <div className="ctl-row">
+      <Switch
+        label="Sharpen an upscaled picture"
+        id="hud-upscale-sharpen"
+        checked={props.upscaleSharpen}
+        onChange={props.onUpscaleSharpenChange}
+      />
+    </div>
+  );
+
   return (
     <>
       <div className="pane-head">
@@ -91,6 +108,7 @@ export function DisplayPane(props: DisplayPaneProps) {
           <div className="col-note">
             This session did not report a stream size, so its display controls are
             unavailable. Relaunch from the library to get them back.
+            {sharpen}
           </div>
         ) : (
           <>
@@ -133,6 +151,7 @@ export function DisplayPane(props: DisplayPaneProps) {
                   This session has one stream resolution, so there is nothing to choose.
                 </p>
               )}
+              {sharpen}
             </div>
 
             <div>

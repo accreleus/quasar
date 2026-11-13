@@ -13,6 +13,8 @@ const base = {
   uiScale: 1,
   onUiScaleChange: vi.fn(),
   displayBusy: false,
+  upscaleSharpen: true,
+  onUpscaleSharpenChange: vi.fn(),
 };
 
 const streamBase = {
@@ -230,5 +232,22 @@ describe("DisplayPane stream resolution", () => {
   it("does not report 'Adapting…' when the stream control itself is absent", () => {
     render(<DisplayPane {...streamBase} streamRungs={[[1920, 1080]]} streamAdapting />);
     expect(screen.queryByText("Adapting…")).toBeNull();
+  });
+});
+
+describe("DisplayPane upscale sharpen (#1349)", () => {
+  it("shows the switch on and reports a turn-off", () => {
+    const onUpscaleSharpenChange = vi.fn();
+    render(<DisplayPane {...base} onUpscaleSharpenChange={onUpscaleSharpenChange} />);
+    const toggle = screen.getByRole("checkbox", { name: /sharpen an upscaled picture/i });
+    expect((toggle as HTMLInputElement).checked).toBe(true);
+    fireEvent.click(toggle);
+    expect(onUpscaleSharpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("reflects a stored off, and shows without a reported stream size", () => {
+    render(<DisplayPane {...base} streamSize={null} upscaleSharpen={false} />);
+    const toggle = screen.getByRole("checkbox", { name: /sharpen an upscaled picture/i });
+    expect((toggle as HTMLInputElement).checked).toBe(false);
   });
 });
