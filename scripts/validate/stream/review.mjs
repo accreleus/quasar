@@ -29,7 +29,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../.
 // The golden threshold file. `scripts/dx/thresholds.py` is the harness-side reader of
 // the same file; this is the review-side one, and it takes only the keys that are a
 // limit on a sample key the bundle records.
-const THRESHOLDS_FILE = path.join(ROOT, "docs/session-trace/thresholds.json");
+export const THRESHOLDS_FILE = path.join(ROOT, "docs/session-trace/thresholds.json");
 const REVIEW_DIR = "review";
 const SUMMARY_FILE = "summary.json";
 const MARKDOWN_FILE = "REVIEW.md";
@@ -122,7 +122,8 @@ const MAX_TEXT = 200;
 const sampleHidden = (metrics) => metrics.is_hidden === 1 || metrics.is_hidden === true;
 
 const readJson = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
-const readJsonl = (file) =>
+/** Every non-empty line of a JSONL file, parsed; [] when there is no file. */
+export const readJsonl = (file) =>
   fs.existsSync(file)
     ? fs
         .readFileSync(file, "utf8")
@@ -172,7 +173,7 @@ function sortDeep(value) {
 }
 
 /** The threshold values and their version, or null when the file cannot be read. */
-function loadThresholds(file) {
+export function loadThresholds(file) {
   try {
     const doc = readJson(file);
     if (!doc || typeof doc.thresholds !== "object" || doc.thresholds === null) return null;
@@ -193,11 +194,29 @@ const thresholdValue = (thresholds, key) => {
 // pass nor a failure, so it sorts between the two.
 const criterionRank = (pass) => (pass === false ? 0 : pass === null ? 1 : 2);
 
-const median = (values) => {
+/** The median of a list of numbers, as this file's own windows and rules read them. */
+export const median = (values) => {
   const sorted = [...values].sort((a, b) => a - b);
   const mid = sorted.length >> 1;
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 };
+
+/**
+ * Where the review starts judging a scenario's samples: `classifier.warmup_exclude_s` seconds
+ * after its first browser sample, on the client's clock. Null when the thresholds file states no
+ * warm-up, or the scenario has no browser sample to anchor on: it is never defaulted, so a caller
+ * that cannot get a start time says "no warm-up" rather than inventing one. `e2e-compare` reads
+ * its metric medians after the same instant.
+ */
+export function warmupStartMs(samples, thresholds, warmupKey = "classifier.warmup_exclude_s") {
+  const warmup = thresholdValue(thresholds, warmupKey);
+  if (warmup === null) return null;
+  let first = Infinity;
+  for (const s of samples) {
+    if (s.source === "browser" && typeof s.ts_unix_ms === "number" && s.ts_unix_ms < first) first = s.ts_unix_ms;
+  }
+  return Number.isFinite(first) ? first + warmup * 1000 : null;
+}
 
 /**
  * The worst one-second windows, each named by the key that made it worst.
@@ -299,11 +318,10 @@ function anomalies(rows, thresholds) {
     if (rule.warmup) {
       // The anchor is the scenario's first browser sample, on the client's clock. The
       // control plane anchors on the session's running time, so the review can miss a
-      // hitch the control plane counts; it never adds one.
-      const warmup = thresholdValue(thresholds, rule.warmup);
-      let first = Infinity;
-      for (const s of samples) if (s.ts_unix_ms < first) first = s.ts_unix_ms;
-      pool = pool.filter((s) => s.ts_unix_ms >= first + warmup * 1000);
+      // hitch the control plane counts; it never adds one. The warm-up itself is
+      // `warmupStartMs`, which `e2e-compare` reads its metric medians after too.
+      const start = warmupStartMs(samples, thresholds, rule.warmup);
+      if (start !== null) pool = pool.filter((s) => s.ts_unix_ms >= start);
     }
     // Checked means compared: a rule whose filters leave no sample with its key compared nothing.
     if (!pool.some((s) => Number.isFinite(s.metrics[rule.key]))) {

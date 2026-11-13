@@ -1,0 +1,33 @@
+{
+  "kind": "web",
+  "label": "mac-test-client",
+  "browser": {
+    "name": "Chrome",
+    "version": "157.0.0.0"
+  },
+  "os": {
+    "name": "macOS",
+    "version": "26.1"
+  },
+  "cpu": {
+    "cores": 14
+  },
+  "gpu": {
+    "adapter": "apple m5 pro"
+  },
+  "displays": [
+    {
+      "width": 1920,
+      "height": 1080,
+      "refresh_hz": 60,
+      "pixel_ratio": 1
+    }
+  ],
+  "decode": {
+    "h264": {
+      "supported": true,
+      "hardware": true
+    }
+  },
+  "power": null
+}

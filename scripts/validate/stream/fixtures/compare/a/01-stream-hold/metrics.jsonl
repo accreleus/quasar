@@ -1,0 +1,17 @@
+{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940001000, "metrics": {"fps": 60, "present_interval_max_ms": 12}}
+{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940021000, "metrics": {"fps": 60, "present_interval_max_ms": 12, "missing_indices": 0}}
+{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940022000, "metrics": {"fps": 60, "present_interval_max_ms": 12, "missing_indices": 0}}
+{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940023000, "metrics": {"fps": 60, "present_interval_max_ms": 12, "missing_indices": 0}}
+{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940024000, "metrics": {"fps": 60, "present_interval_max_ms": 12}}
+{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940025000, "metrics": {"fps": 60, "present_interval_max_ms": 12}}
+{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940026000, "metrics": {"fps": 60, "present_interval_max_ms": 12}}
+{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940027000, "metrics": {"fps": 60, "present_interval_max_ms": 12}}
+{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940028000, "metrics": {"fps": 60, "present_interval_max_ms": 12}}
+{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940029000, "metrics": {"fps": 60, "present_interval_max_ms": 12}}
+{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940030000, "metrics": {"fps": 60, "present_interval_max_ms": 12}}
+{"kind": "metric", "source": "agent", "ts_unix_ms": 1786940021000, "metrics": {"encode_ms": 5.0}}
+{"kind": "metric", "source": "agent", "ts_unix_ms": 1786940022000, "metrics": {"encode_ms": 5.0}}
+{"kind": "metric", "source": "agent", "ts_unix_ms": 1786940023000, "metrics": {"encode_ms": 5.0}}
+{"kind": "metric", "source": "agent", "ts_unix_ms": 1786940024000, "metrics": {"encode_ms": 5.0}}
+{"kind": "metric", "source": "agent", "ts_unix_ms": 1786940025000, "metrics": {"encode_ms": 5.0}}
+{"kind": "metric", "source": "agent", "ts_unix_ms": 1786940026000, "metrics": {"encode_ms": 5.0}}

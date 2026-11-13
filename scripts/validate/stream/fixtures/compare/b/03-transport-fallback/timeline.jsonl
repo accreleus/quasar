@@ -1,0 +1,3 @@
+{"ts_unix_ms": 1786950101000, "clock": "client", "ev": "launch"}
+{"ts_unix_ms": 1786950104200, "clock": "client", "ev": "first_frame"}
+{"ts_unix_ms": 1786950400000, "clock": "client", "ev": "stop"}
