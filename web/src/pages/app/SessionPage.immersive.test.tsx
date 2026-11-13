@@ -678,6 +678,26 @@ describe("SessionPage — capture after a WebTransport reconnect or fallback", (
     expect(engageSpy).toHaveBeenCalledTimes(2);
   });
 
+  it.each(["reconnect", "fallback"])("a refused %s capture keeps the windowed user windowed on click", async (kind) => {
+    await revealOverWebTransport();
+    await act(async () => fireEvent.click(screen.getByText("Click to play")));
+    requestFullscreen.mockClear();
+    engageSpy.mockResolvedValue({ mode: "failed", error: new DOMException("gesture lost", "NotAllowedError") });
+    if (kind === "reconnect") {
+      await act(async () => wt.set!({ channelOpen: false, inputCaptured: false, pointerLocked: false }));
+      await act(async () => wt.set!({ channelOpen: true }));
+    } else {
+      await act(async () => wt.callbacks!.onFallback("stream_lost"));
+      await advance(100);
+      await act(async () => { openChannel(); });
+    }
+    await advance(100);
+    // The browser error does not distinguish a lost gesture from a persistent refusal.
+    expect(playLayer()).not.toBeNull();
+    await act(async () => fireEvent.click(screen.getByText("Click to play")));
+    expect(requestFullscreen).not.toHaveBeenCalled();
+  });
+
   it("re-engages in full screen once WebRTC's channel opens after a fallback", async () => {
     fsEl = document.documentElement;
     await revealOverWebTransport();

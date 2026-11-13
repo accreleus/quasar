@@ -460,6 +460,7 @@ function SessionPageBody() {
     setSwitching(true);
     // Capture went with the WebTransport connection: ask for it again once WebRTC is up.
     // `||`: a first reveal still owed keeps its "Click to play".
+    if (!autoArmedRef.current) resumeFullscreenRef.current = document.fullscreenElement !== null;
     autoArmedRef.current ||= "resume";
     rememberFallback(sessionId ?? "", reason);
     new TraceEventEmitter(sessionId ?? "", authToken ?? "").emitTransportFallback(reason);
@@ -999,10 +1000,15 @@ function SessionPageBody() {
   // It takes capture back without a click; a refused lock offers the existing gesture layer.
   const autoArmedRef = useRef<false | "reveal" | "resume">(immersive ? "reveal" : false);
   const [clickToPlay, setClickToPlay] = useState(false);
+  const resumeFullscreenRef = useRef(false);
+  const clickFullscreenRef = useRef(true);
   // A WebTransport connection lost and rebuilt takes capture with it: arm again for the new one.
   const wasOpenRef = useRef(false);
   useEffect(() => {
-    if (webtransport && wasOpenRef.current && !channelOpen) autoArmedRef.current ||= "resume";
+    if (webtransport && wasOpenRef.current && !channelOpen && !autoArmedRef.current) {
+      resumeFullscreenRef.current = document.fullscreenElement !== null;
+      autoArmedRef.current = "resume";
+    }
     wasOpenRef.current = channelOpen;
   }, [channelOpen, webtransport]);
   useEffect(() => {
@@ -1012,6 +1018,7 @@ function SessionPageBody() {
     if (!rt || !videoRef.current) return; // stays armed for the runtime to arrive
     const offerClick = autoArmedRef.current === "reveal";
     autoArmedRef.current = false;
+    clickFullscreenRef.current = offerClick || resumeFullscreenRef.current;
     if (rt.isCaptured()) return;
     // No Pointer Lock (touch, gesture mode): engaging needs no gesture at all.
     if (offerClick && pointerLockSupported() && !document.fullscreenElement) {
@@ -1028,6 +1035,8 @@ function SessionPageBody() {
     }
     void engaging.then((result) => {
       noteRawUnavailable(result);
+      // Pointer Lock refusals (including NotAllowedError) do not reliably distinguish
+      // a post-Esc cool-down/lost gesture from a persistent denial; offer a manual retry.
       if (result.mode === "failed") setClickToPlay(true);
     });
   }, [loaderInert, channelOpen, swapScreenUp, sessionOver, runtimeSnap, unmute, noteRawUnavailable]);
@@ -1039,7 +1048,7 @@ function SessionPageBody() {
   const handleClickToPlay = useCallback(() => {
     setClickToPlay(false);
     handleGrab();
-    enterLaunchFullscreen();
+    if (clickFullscreenRef.current) enterLaunchFullscreen();
   }, [handleGrab]);
   // Leaving the session leaves the full screen Play entered (a quick switch stays on this page).
   useEffect(() => () => leaveLaunchFullscreen(), []);

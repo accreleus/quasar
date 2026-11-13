@@ -980,6 +980,56 @@ describe("createWebTransportRuntime fallback", () => {
     expect(callbacks.onFallback).toHaveBeenCalledTimes(1);
   });
 
+  it("handles the replacement ending before its recovery connect finishes", async () => {
+    let sink!: MediaSink;
+    let finish!: () => void;
+    let connections = 0;
+    const onFallback = vi.fn();
+    const rt = createWebTransportRuntime({
+      sessionId: "s1", authToken: "auth", coords: COORDS, canvas: document.createElement("canvas"),
+      callbacks: { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn(), onFallback },
+      deps: {
+        createPresenter: async () => ({ present: () => true, destroy() {} }),
+        createTransport: () => ({
+          connect: async (s) => {
+            sink = s;
+            if (++connections === 2) await new Promise<void>((resolve) => { finish = resolve; });
+          },
+          close() {}, requestKeyframe() {}, sendMic: () => false, codecFallback() {},
+          input: { reliable() {}, datagram: () => false },
+        }),
+      },
+    });
+    rt.start();
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    sink.end({ code: null, reason: "lost" });
+    await vi.waitFor(() => expect(finish).toBeDefined());
+    sink.end({ code: null, reason: "replacement lost" });
+    finish();
+    await vi.waitFor(() => expect(connections).toBe(3));
+    expect(rt.getSnapshot().channelOpen).toBe(true);
+    expect(onFallback).not.toHaveBeenCalled();
+    rt.destroy();
+  });
+
+  it("restores a media reconnect budget after 30 seconds of continuous video", async () => {
+    vi.useFakeTimers();
+    const { agent, callbacks, rt } = setup();
+    rt.start();
+    await vi.advanceTimersByTimeAsync(10);
+    agent.last.closeWith(4400);
+    await vi.advanceTimersByTimeAsync(10);
+    for (let seq = 0; seq <= 31; seq++) {
+      agent.last.datagrams(packetize({ configId: 0, frameSeq: seq, keyframe: true, data: bytes(10, seq) }));
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+    agent.last.closeWith(4400);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(agent.conns).toHaveLength(3);
+    expect(rt.getSnapshot().channelOpen).toBe(true);
+    expect(callbacks.onFallback).not.toHaveBeenCalled();
+  });
+
   describe("network outage recovery (#1370)", () => {
     async function offline() {
       vi.useFakeTimers();
@@ -1017,6 +1067,40 @@ describe("createWebTransportRuntime fallback", () => {
       expect(captures).toHaveLength(2);
       expect(callbacks.onFallback).not.toHaveBeenCalled();
       expect(callbacks.onTransportFailed).not.toHaveBeenCalled();
+    });
+
+    it("connectivity recovery leaves the media reconnect available immediately", async () => {
+      const { agent, callbacks, rt } = await offline();
+      networkBack();
+      await vi.advanceTimersByTimeAsync(4_000);
+      agent.last.closeWith(4400);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(agent.conns).toHaveLength(3);
+      expect(rt.getSnapshot().channelOpen).toBe(true);
+      expect(callbacks.onFallback).not.toHaveBeenCalled();
+    });
+
+    it("recovers two Wi-Fi drops minutes apart on WebTransport", async () => {
+      const { agent, callbacks, rt } = await offline();
+      networkBack();
+      await vi.advanceTimersByTimeAsync(4_000);
+      for (let seq = 0; seq < 120; seq++) {
+        agent.last.datagrams(packetize({ configId: 0, frameSeq: seq, keyframe: true, data: bytes(10, seq) }));
+        await vi.advanceTimersByTimeAsync(1_000);
+      }
+      vi.mocked(getSession).mockRejectedValue(new TypeError("Failed to fetch"));
+      agent.last.closeWith(4400);
+      await vi.advanceTimersByTimeAsync(10_000);
+      networkBack();
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(agent.conns).toHaveLength(3);
+      expect(rt.getSnapshot().channelOpen).toBe(true);
+      expect(callbacks.onFallback).not.toHaveBeenCalled();
+    });
+
+    it("describes the lost connection without blaming the host", async () => {
+      const { rt } = await offline();
+      expect(rt.getSnapshot().recovery?.message).toBe("Connection lost. Reconnecting…");
     });
 
     it("ends with the existing failed banner after 60s, without an offline fallback", async () => {
@@ -1096,6 +1180,7 @@ describe("createWebTransportRuntime fallback", () => {
     it("cancels the wait and ignores later online events", async () => {
       const { agent, rt, callbacks } = await offline();
       rt.cancelRecovery();
+      expect(callbacks.onTransportFailed).toHaveBeenCalledWith("Connection recovery cancelled.");
       networkBack();
       await vi.advanceTimersByTimeAsync(60_000);
       expect(agent.conns).toHaveLength(1);
