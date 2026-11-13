@@ -201,6 +201,42 @@ func (s *Store) Reconcile(ctx context.Context) error {
 	return nil
 }
 
+// Reconcile retry bounds: 1s doubling to a 1m ceiling.
+const (
+	reconcileMinBackoff = time.Second
+	reconcileMaxBackoff = time.Minute
+	reconcileAttempt    = 10 * time.Second
+)
+
+// RunReconcile retries Reconcile with backoff until it succeeds or ctx ends; run it in a goroutine.
+func (s *Store) RunReconcile(ctx context.Context) {
+	retryReconcile(ctx, s.Reconcile, reconcileMinBackoff, reconcileMaxBackoff)
+}
+
+func retryReconcile(ctx context.Context, fn func(context.Context) error, backoff, ceiling time.Duration) {
+	for attempt := 1; ; attempt++ {
+		actx, cancel := context.WithTimeout(ctx, reconcileAttempt)
+		err := fn(actx)
+		cancel()
+		if err == nil {
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		slog.Error("compat tools: reconciling the catalogue failed; will retry",
+			"attempt", attempt, "retry_in", backoff, "err", err)
+		t := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return
+		case <-t.C:
+		}
+		backoff = min(backoff*2, ceiling)
+	}
+}
+
 // HasTag reports whether a catalogue row holds tag, so add-by-tag refuses before reading github.com.
 func (s *Store) HasTag(ctx context.Context, tag string) (bool, error) {
 	var ok bool
