@@ -45,7 +45,8 @@ ticket #1381; the build is CA5 (#1383).
     a restart at the same size, not yet reduced; nothing was measured below 0.90.
   - H.264 at a fixed 1440p coded size sat at its QP ceiling at about 2.6 (NVIDIA) and
     3.1 (AMD) Mbit/s: the 1000 and 1500 kbit/s targets produced the same bytes. A smaller
-    rectangle trims that by 7–18 % but cannot bring it down to such a target.
+    rectangle trims that by about a tenth (2.7 → 2.45 Mbit/s on NVIDIA, 3.35 → 2.9 on AMD at
+    s = 0.5) but cannot bring it down to such a target.
 
   A one-seat method review recomputed the tables and found every cell matches, with the notes
   that bear on this record: the AV1 zoom dips are about one standard deviation of frame-to-frame
