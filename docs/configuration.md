@@ -2813,6 +2813,37 @@ floor in one protective step, and the rung observation that runs after it in the
 window takes the step. It takes longer if the classifier does not name the congestion
 on that first window.
 
+**A collapse (WebTransport only).** The window path reads the governor's setpoint, which
+never goes under the floor, so on its own it learns how far under the floor the link is
+only one rung at a time. So the rung also reads what each WebTransport receiver report
+shows the link carrying: the higher of the estimate and the receive rate that report
+measured. That reading is taken at most once per 100 ms, and only when a feedback message
+arrived; it is skipped when the host sent less than 0.8 × the estimate (then the receive
+rate is the sender's, not the link's). The silence decay (the estimate × 0.8 per 500 ms
+with no feedback) still lowers the setpoint, but never counts here. When every reading for
+1 s is under 0.85 × the floor in force (the governor's default 15 % deadband: inside it the
+governor would not move either), the agent steps the resolution rung straight to the
+least-deep rung whose floor is at or under the highest of those readings (the floor rung
+when none is), and moves the floor, the setpoint and the encoder's bitrate down with it in
+the same action, without waiting for a window, `abr_ladder_res_min_step_s` or the dwell.
+That is 1 s after the first reading under the line, then the encoder restart and keyframe
+a step always costs. No reading counts while a resize has not finished negotiating, or for
+3 s after any step of either lever: the encoder restart pauses the stream and then sends a
+keyframe burst, so what the receiver measures then is the restart, not the link. The step
+is traced as `abr.ladder.step` with reason `collapse`. It never moves the frame rate, and
+it follows the order: under `fps_first` it leaves the frame-rate step to the window path,
+and under `hybrid` it stops at 1080p while 120 → 60 is still to come. Coming back up is
+the window path's, one rung per `abr_ladder_res_recover_dwell` windows and never sooner
+than `abr_ladder_res_min_step_s` after the collapse.
+
+An outage (no feedback at all: a hidden tab, a Wi-Fi roam) does not collapse the rung. The
+silence decay walks the setpoint to the floor, the WebTransport backlog and probe handle
+the stall, and once feedback returns the readings carry the receive rate of what the host
+is sending at the floor, which is above the line, so the rung stays unless the link really
+is smaller. How the WebTransport estimate itself behaves under a deep cut on a real link is
+not measured yet. `rtpgccbwe` never reports under its `min-bitrate`, which is held at the
+floor, so a WebRTC session never sees a collapse and keeps the window path alone.
+
 What the rung will NOT do: at `abr_ladder_res_min_height` (720p by default) it stops.
 An estimate under that rung's floor has no further remedy — the ladder has given up
 three quarters of a 1440p picture's pixels, since 720p keeps one quarter of them (half

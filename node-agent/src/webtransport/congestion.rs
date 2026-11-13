@@ -428,6 +428,8 @@ pub(crate) struct Estimator {
     newest_arrival: u64,
     /// (agent instant, receive rate) of recent windows that were not application-limited.
     throughput: VecDeque<(Instant, f64)>,
+    /// What the last message showed the link carrying, see [`Self::measured`].
+    measured: Option<f64>,
     overusing_since: Option<Instant>,
     last_overusing: Option<Instant>,
     /// Per message: (agent instant, received, lost); a late arrival after a loss is a
@@ -486,6 +488,7 @@ impl Estimator {
             bound: Bound::Ceiling,
             logged: (Bound::Ceiling, None),
             unlogged: None,
+            measured: None,
         }
     }
 
@@ -498,6 +501,14 @@ impl Estimator {
     /// Lost repair datagrams count: they crossed the same path.
     pub(crate) fn loss(&self) -> Option<f64> {
         self.loss
+    }
+
+    /// What the last message showed the link carrying: the higher of the estimate and the
+    /// receive rate it measured, or `None` when the sender was application-limited (then
+    /// the receive rate is the sender's, and an estimate left low by a silence decay is
+    /// not the link's). #1320's collapse reads only this, never the silence decay.
+    pub(crate) fn measured(&self) -> Option<f64> {
+        self.measured
     }
 
     /// Take one message; `Some(estimate)` when it is time to feed the ABR.
@@ -606,6 +617,10 @@ impl Estimator {
 
         let was = self.estimate_kbps;
         self.settle();
+        self.measured = (!app_limited).then(|| {
+            m.rate_kbps
+                .map_or(self.estimate_kbps, |r| r.max(self.estimate_kbps))
+        });
         let due = self.log_due(now) && (self.unlogged.is_some() || self.bound != self.logged.0);
         if !cut_by.is_empty() || due {
             // A silence fall not logged yet is part of this line's "from → to".
