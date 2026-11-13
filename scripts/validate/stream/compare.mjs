@@ -17,7 +17,7 @@
 // leave out is counted in `left_out`. There is no judgement here and no threshold: a single
 // pair of runs is not evidence of a regression (quasar-bench's rule is at least two a side).
 //
-// What is deliberately not in this unit: serving a web build (`WEB_DIST=`), UI journeys in a
+// What is deliberately not in this unit: UI journeys in a
 // plan, decoded-frame pairs at the same reference-app tick, and a pixel difference in pictures
 // (that needs a PNG decoder, and this verb takes no dependency). COMPARE.md's last section says so.
 import fs from "node:fs";
@@ -655,7 +655,7 @@ export function renderCompare(cmp, leftOut) {
 
   L.push("", "## Not in this unit");
   L.push(
-    "Serving a web build (`WEB_DIST=`), UI journeys in a plan, decoded-frame pairs at the same reference-app tick, and a pixel difference in pictures are not in this verb.",
+    "UI journeys in a plan, decoded-frame pairs at the same reference-app tick, and a pixel difference in pictures are not in this verb.",
   );
   return L.join("\n") + "\n";
 }

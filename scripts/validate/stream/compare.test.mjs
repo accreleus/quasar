@@ -444,7 +444,7 @@ test("compare() classifies every criterion id in either side, and the page reads
   // And the unit's own line, last.
   assert.match(
     md,
-    /^Serving a web build \(`WEB_DIST=`\), UI journeys in a plan, decoded-frame pairs at the same reference-app tick, and a pixel difference in pictures are not in this verb\.$/m,
+    /^UI journeys in a plan, decoded-frame pairs at the same reference-app tick, and a pixel difference in pictures are not in this verb\.$/m,
   );
 });
 

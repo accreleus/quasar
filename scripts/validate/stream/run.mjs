@@ -11,6 +11,7 @@
 //        CLIENT (a label for this test client, a role, never a host name),
 //        INSECURE_TLS=1 (a stack with a self-signed certificate: turns certificate checks off),
 //        HOOKS / QUASAR_E2E_HOOKS (--hooks: the caller's directory of hook scripts, see hooks.mjs)
+//        WEB_DIST / QUASAR_E2E_WEB_DIST (--web-dist: a local web build served in the runner's own browser context, see webdist.mjs)
 //
 // Exit 0 at least one scenario passed and none failed or errored, 1 otherwise, 2 usage, a bundle that
 // fails validateBundle (it is deleted, never left), or a browser that could not be left clean.
@@ -24,6 +25,7 @@ import { attachEvidenceListeners } from "../lib/listeners.mjs";
 import { FORMAT, validateBundle } from "./bundle.mjs";
 import { declaredHooks, Hooks, LEDGER } from "./hooks.mjs";
 import { Recorder, ScenarioRecorder } from "./record.mjs";
+import { loadWebDist, serveWebDist, webBuild } from "./webdist.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "../../..");
@@ -290,7 +292,7 @@ async function loadScenario(name) {
  * probeClient(page), browserNow(page), close(), and (optionally) `info` for builds.json. Never throws for a
  * scenario's failure; returns the counts.
  */
-export async function runSuite({ plan, dir, baseUrl, creds, host, api, thresholds, label = null, insecureTls = false, secrets = new Set(), app = DEFAULT_APP, commit = "unknown", dirty = false, abort = new Promise(() => {}), now = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), hooksDir = null, hookTimeoutMs, onNote = (line) => console.error(line), load = loadScenario }) {
+export async function runSuite({ plan, dir, baseUrl, creds, host, api, thresholds, label = null, insecureTls = false, secrets = new Set(), app = DEFAULT_APP, commit = "unknown", dirty = false, abort = new Promise(() => {}), now = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), hooksDir = null, webDist = null, hookTimeoutMs, onNote = (line) => console.error(line), load = loadScenario }) {
   if (fs.existsSync(dir)) throw new Error(`${dir} already exists: a bundle is never written over another`);
   const suiteRunId = `e2e-${new Date(now()).toISOString().replace(/[-:]|\.\d+/g, "")}-${crypto.randomBytes(2).toString("hex")}`;
   const staging = path.join(path.dirname(path.resolve(dir)), `.${path.basename(dir)}.staging-${crypto.randomBytes(4).toString("hex")}`);
@@ -411,9 +413,9 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
 
     const info = host.info ?? {};
     bundle.json("builds.json", {
-      components: { browser: client.browser, os: client.os, web: null, control_plane: null, node_agent: null, reference_app: null, gpu_driver: null },
-      // e2e-collect reads the control plane and the node agent only (collect.mjs).
-      unknown: Object.fromEntries(["web", "control_plane", "node_agent", "reference_app", "gpu_driver"].map((k) => [k, info[k] ?? (["control_plane", "node_agent"].includes(k) ? "the host half (e2e-collect) fills this; the client cannot see it" : "the client cannot see it, and e2e-collect does not read it yet")])),
+      components: { browser: client.browser, os: client.os, web: webDist ? webBuild(webDist) : null, control_plane: null, node_agent: null, reference_app: null, gpu_driver: null },
+      // e2e-collect reads the control plane and the node agent only (collect.mjs). A web build the runner served is known, so it has no reason.
+      unknown: Object.fromEntries(["web", "control_plane", "node_agent", "reference_app", "gpu_driver"].filter((k) => !(k === "web" && webDist)).map((k) => [k, info[k] ?? (["control_plane", "node_agent"].includes(k) ? "the host half (e2e-collect) fills this; the client cannot see it" : "the client cannot see it, and e2e-collect does not read it yet")])),
     });
     bundle.json("network.json", { path: { rtt_ms: null }, shaping: null, tls_verification: insecureTls ? "off (INSECURE_TLS=1)" : "on" });
     bundle.json("manifest.json", {
@@ -428,6 +430,7 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
       not_recorded: NOT_RECORDED,
       redacted: Object.keys(bundle.redacted),
       target: "stack",
+      ...(webDist ? { web_build: { served_by: "runner", source: "web-dist" } } : {}),
     });
     const errors = [...bundle.problems, ...validateBundle(staging)];
     if (!errors.length) { fs.renameSync(staging, dir); committed = true; }
@@ -460,8 +463,9 @@ export function configureTls(insecure, env = process.env) {
  * The runner works in a browser context of its own. Attached, that is a separate storage partition of the
  * person's browser, so their tabs, storage and sign-in are never read or written, and `close` closes only it.
  */
-export async function openHost(browser, { attached, insecureTls }) {
+export async function openHost(browser, { attached, insecureTls, baseUrl = null, webDist = null }) {
   const context = await browser.newContext({ ignoreHTTPSErrors: insecureTls, viewport: null });
+  if (webDist) await serveWebDist(context, baseUrl, webDist); // this context only: the person's own tabs never see it
   return {
     host: { newPage: () => context.newPage(), closePage: (p) => p.close(), probeClient, browserNow: (p) => p.evaluate(() => Date.now()) },
     close: () => (attached ? context.close() : browser.close()),
@@ -477,7 +481,7 @@ export function summarise({ counts: { pass, fail, error }, errors, closeFailed =
 }
 
 function usage(msg) {
-  console.error(`${msg}\nusage: e2e-run TARGET=<stack url> PLAN=<plan> [CDP=<endpoint>] [OUT=<dir>] [CLIENT=<label>] [HOOKS=<dir>] [INSECURE_TLS=1]; sign-in from QUASAR_E2E_EMAIL and QUASAR_E2E_PASSWORD (or QUASAR_E2E_CRED_FILE)`);
+  console.error(`${msg}\nusage: e2e-run TARGET=<stack url> PLAN=<plan> [CDP=<endpoint>] [OUT=<dir>] [CLIENT=<label>] [HOOKS=<dir>] [WEB_DIST=<dir>] [INSECURE_TLS=1]; sign-in from QUASAR_E2E_EMAIL and QUASAR_E2E_PASSWORD (or QUASAR_E2E_CRED_FILE)`);
   console.log("RESULT status=error target=e2e-run bundle= pass=0 fail=0 error=0 skipped=0");
   process.exit(2);
 }
@@ -505,6 +509,11 @@ async function main() {
 
   const hooksDir = args.hooks || process.env.QUASAR_E2E_HOOKS || null;
   if (hooksDir !== null && !(typeof hooksDir === "string" && fs.existsSync(hooksDir) && fs.statSync(hooksDir).isDirectory())) return usage("HOOKS must be a directory of hook scripts");
+  const webDistDir = args["web-dist"] || process.env.QUASAR_E2E_WEB_DIST || null;
+  let webDist = null;
+  if (webDistDir !== null) {
+    try { webDist = loadWebDist(webDistDir); } catch (e) { return usage(e.message); }
+  }
   const insecureTls = configureTls(process.env.INSECURE_TLS === "1");
   const { chromium } = await import("playwright").catch(() => import("playwright-core"));
   const browser = args.cdp
@@ -523,8 +532,8 @@ async function main() {
   let closeFailed = null;
   let opened = null;
   try {
-    opened = await openHost(browser, { attached: !!args.cdp, insecureTls });
-    result = await runSuite({ plan, dir: out, baseUrl, creds, host: opened.host, api, thresholds, label, insecureTls, secrets, app: process.env.QUASAR_E2E_APP || DEFAULT_APP, commit, dirty, abort, hooksDir });
+    opened = await openHost(browser, { attached: !!args.cdp, insecureTls, baseUrl, webDist });
+    result = await runSuite({ plan, dir: out, baseUrl, creds, host: opened.host, api, thresholds, label, insecureTls, secrets, app: process.env.QUASAR_E2E_APP || DEFAULT_APP, commit, dirty, abort, hooksDir, webDist });
   } finally {
     // Attached, only this run's own context is closed; the person's browser keeps running as it was.
     try { await (opened ? opened.close() : args.cdp ? null : browser.close()); } catch (e) { closeFailed = e; }

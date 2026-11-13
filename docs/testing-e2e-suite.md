@@ -17,6 +17,7 @@ loop, leaving one **run bundle** that an agent or a person reviews afterwards. S
 - A test user: an ordinary user's sign-in in `QUASAR_E2E_EMAIL` and `QUASAR_E2E_PASSWORD`, or in a file of `KEY=value` lines named by `QUASAR_E2E_CRED_FILE`. No admin token is needed or used. The password and the e-mail's local part must each be at least 8 characters: a shorter secret cannot be removed from the bundle without damaging unrelated values, so the runner refuses to start with one (exit 2). The account must not have the Classic layout on (the runner needs the game page).
 - The reference app in that user's library (`QUASAR_E2E_APP` names it, default `Quasar Benchapp`).
 - `CLIENT=<label>`: a name for this test client, by role (`mac-test-client`), never a host name. Letters, digits, `_`, `.`, `-`.
+- A web build served from your machine instead of the stack's own copy: `WEB_DIST=<dir>` (also `QUASAR_E2E_WEB_DIST`); see "Testing a web build against a running stack" below. Use an absolute path: `make` runs from the repo root.
 - A stack with a self-signed certificate: `INSECURE_TLS=1`. Certificate checks are on otherwise, for the runner's own requests and for a browser it launches, whatever `NODE_TLS_REJECT_UNAUTHORIZED` says in your environment (the runner removes it, and the verb keeps it out of `npm ci`); `network.json` records what was in force.
 - The host half (`e2e-collect`) also needs an admin bearer for the stack, and a certificate Node trusts (the fleet's certs are; set `NODE_EXTRA_CA_CERTS` otherwise).
 
@@ -25,7 +26,7 @@ loop, leaving one **run bundle** that an agent or a person reviews afterwards. S
 Run a plan from the machine you are testing from:
 
 ```
-make e2e-run TARGET=<stack url> PLAN=smoke [CDP=<DevTools http endpoint>] [OUT=<dir>] [CLIENT=<label>] [INSECURE_TLS=1]
+make e2e-run TARGET=<stack url> PLAN=smoke [CDP=<DevTools http endpoint>] [OUT=<dir>] [CLIENT=<label>] [WEB_DIST=<dir>] [INSECURE_TLS=1]
 ```
 
 `PLAN` is a name under `scripts/validate/stream/plans/` or a path to a plan file. The runner works
@@ -464,7 +465,7 @@ two bundles give the same bytes out, in any directory.
   than five samples on a side is listed as too few, not compared.
 - **Then the pictures**: `shots/<label>.png` paired by label, whether the bytes are identical, and
   the two sizes; a picture only one side took is listed.
-- **Last**, the one line this unit does not do: serving a web build (`WEB_DIST=`), UI journeys in a
+- **Last**, what this verb does not do: UI journeys in a
   plan, decoded-frame pairs at the same reference-app tick, and a pixel difference in pictures.
 
 **How to read the result.** Read `COMPARE.md` first: what the runs differed in, then what moved. It
@@ -488,6 +489,57 @@ is the pairs compared. Exit 0 both
 bundles are valid and the comparison was written (whether or not anything changed), 1 a bundle is not
 valid (`reason=invalid-a` or `invalid-b`), 2 usage, or a comparison that cannot be written
 (`reason=out-exists`, `out-inside-bundle`, `cannot-write`). A bundle zip is not read: unzip it first.
+
+### Testing a web build against a running stack
+
+```
+make e2e-run TARGET=<stack url> PLAN=<plan> WEB_DIST=<dir> OUT=<dir>
+```
+
+**What you need.** A build of the web client (`cd web && npm ci && npm run build` writes `web/dist/`; build
+each variant into its own directory), and a running stack with its test user, as for any run. Nothing is
+deployed and nothing on the stack changes.
+
+**What it does.** In the runner's own browser context (with `CDP=` that is still a separate context, never
+your tabs), every same-origin `GET` or `HEAD` for a document or a static file is answered from `<dir>`
+with `cache-control: no-store`. Everything else goes to the stack as before. Never answered from the
+directory, because the control plane routes them: `/v1/*` (the API and the signaling socket),
+`/health`, `/agent/*`, `/wt`, `/debug/*` and `/enroll-host.sh`. It follows the control plane's own static
+handler (`control-plane/internal/httpx/spa.go`): a file in the directory is served; an `/assets/*` path with no file is a 404
+(never `index.html`); any other path with no file, such as `/app/...`, `/admin/...` and `/login`, gets `index.html`.
+A document carries the stack's own security headers, copied from the stack's answer for that address, so a build that the stack's
+content security policy would block is blocked in the run too (that policy pins the two inline scripts in `web/index.html` by hash; changing one
+needs the control plane's hash changed with it, and the run will show the block). The page registers no service worker of its own (it
+registers one empty probe worker and unregisters it at once), and the run's browser context is fresh, so the stack's copy cannot be cached
+behind the directory's. A write (`POST`, `PUT`, ...) to a static path is not answered here: it goes to the stack and the page-write watch counts it as before.
+
+**Trust.** The directory is as trusted as the stack's own web client: its scripts run in the browser
+as the stack's origin, with the test user's session. The runner serves it only to the stack's origin and
+only in its own context. A request path is decoded as the server does and must be a plain name: `..`, an
+encoded `/` or `\`, a NUL or an empty segment is refused with a 400 and never reaches the file system. The
+directory is read once at the start, so the bytes served are the bytes digested. It is refused (exit 2, nothing run)
+when `index.html` is missing, when anything in it is a link or other non-regular file, when it holds more
+than 200 MB, or when a file has an extension outside the table the runner knows (what Vite emits: html, js, css, json, webmanifest, svg, images, fonts, wasm, map, txt, sh).
+
+**How to read the result.** `builds.json` says `web: {"source": "web-dist", "sha256": ..., "files": N}`
+and `manifest.json` has `web_build: {"served_by": "runner", "source": "web-dist"}`. The digest is of the sorted file paths and file
+hashes: the same build in another directory has the same digest, one changed byte has a different one.
+No path or file name from your machine is written. `make e2e-review` and `e2e-compare` show it as the web build.
+
+**A/B of a web change**, two runs on the same stack, then the comparison:
+
+```
+make e2e-run TARGET=<stack url> PLAN=smoke WEB_DIST=/abs/path/build-a OUT=/abs/path/run-a
+make e2e-run TARGET=<stack url> PLAN=smoke WEB_DIST=/abs/path/build-b OUT=/abs/path/run-b
+make e2e-compare A=/abs/path/run-a B=/abs/path/run-b
+```
+
+`COMPARE.md` opens with `builds.web.build` differing between the two (the two digests), and then what moved. One pair of runs is not a regression: repeat each side.
+Both sides of an A/B must be `WEB_DIST` runs: compare a build against the stack's own copy by building that copy too. A run with `WEB_DIST` loads
+the web client's files from the runner's memory with the browser's HTTP cache off, so the page's own download-speed probe (it times the main script
+bundle) says nothing about the path to the stack; requests the stack answers, such as its health probe, are not touched.
+A stray file with no known extension in the directory (a `.DS_Store` from a Mac) refuses the run: remove it.
+The pack for a remote tester takes the same variable in its environment (`QUASAR_E2E_WEB_DIST`); it has no flag for it.
 
 ### The fallback and keyboard-and-mouse scenarios
 
@@ -606,7 +658,7 @@ A directory, zipped when it is handed between machines.
 - **Not measured is `null`, never `0`.** A criterion that was not judged has `observed: null`. A fact listed in `not_recorded` has no value as a criterion or as a sample.
 - **Keys are the metric manifest's.** An `agent` or `browser` sample key must be in `docs/session-trace/metrics.json` (bench-mode keys ride in `browser` samples, with the six keys `scripts/dx/bench_app_samples.py` derives: `bench_n`, `bench_decoded`, `i2p_p50_ms`, `i2p_max_ms`, `i2p_n`, `ts_nudged`). Sample sources are the five quasar-bench accepts: `agent`, `browser`, `app`, `netem`, `harness`.
 - **Every timestamp names its clock.** A timeline row says `client` or `host`; a sample's clock is its key's clock in the metric manifest. `clock_offset_ms` is the measured client-to-host offset, or `null`.
-- **A missing build has a reason.**
+- **A missing build has a reason.** A web build the runner served is `web: {source: "web-dist", sha256, files}` and nothing else, with `manifest.web_build: {served_by: "runner", source: "web-dist"}`; each without the other is refused.
 - **No address, token or password** in any text file, whatever its name. A JSON field whose name says it holds a credential (`authorization`, `cookie`, any `*token`, `password`, `secret`, `api key`, `private key`; any case, hyphen or camelCase) and whose value is not a "there is none" word is a credential too. A bundle's text is UTF-8: a file whose first two or four bytes are a UTF-16 or UTF-32 byte-order mark is not valid, and any other file with a NUL byte in its first 4 KB is taken as binary (a picture, a video, an archive) and not read. Documentation addresses (RFC 5737) pass. Known limits: the address check knows IPv4 only, reads a four-part version such as `1.2.3.4` as an address, and lets `x.0.0.0` and `127.0.0.1` through (a browser's version looks like the first); a bearer token made of letters only is not seen, nor is UTF-16 text with no byte-order mark (it reads as binary); host names and home paths are not looked for (a session container's own home is a real path in app logs). `scripts/dev/leak-scan.sh` with the operator's patterns still runs before a bundle goes anywhere public.
 
 The test (`node --test scripts/validate/stream/bundle.test.mjs`, part of `make verify`) breaks the
