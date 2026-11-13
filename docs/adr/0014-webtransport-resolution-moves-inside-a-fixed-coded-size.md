@@ -41,10 +41,11 @@ ticket #1381; the build is CA5 (#1383).
   on the wire. 5 % steps cost 1/3 to 1/4 of a restart and pile up at low rates. Two costs of the
   fixed size itself:
   - At the same rate, the fixed-size picture settles 0.5–1 dB below a restart at its own size
-    (NVIDIA, s ≈ 0.94–0.97, padding counted). Not measured lower in the band.
+    (NVIDIA, s ≈ 0.94–0.97, padding counted). The spike also held s = 0.90 on both hosts against
+    a restart at the same size, not yet reduced; nothing was measured below 0.90.
   - H.264 at a fixed 1440p coded size sat at its QP ceiling at about 2.6 (NVIDIA) and
-    3.1 (AMD) Mbit/s: the 1000 and 1500 kbit/s targets produced the same bytes. Below that a
-    smaller rectangle saves nothing.
+    3.1 (AMD) Mbit/s: the 1000 and 1500 kbit/s targets produced the same bytes. A smaller
+    rectangle trims that by 7–18 % but cannot bring it down to such a target.
 
   A one-seat method review recomputed the tables and found every cell matches, with the notes
   that bear on this record: the AV1 zoom dips are about one standard deviation of frame-to-frame
@@ -82,8 +83,8 @@ smaller rectangle.
 The evidence does not fix the band's bottom. CA5 sets it by measurement (CA5f): steady-state rate
 and PSNR at a fixed coded size against a restart at the rectangle's own size, per codec, for s from
 1 down to 0.5, on real game content. The bottom is where the fixed size stops being
-rate-controlled or its quality gap to a restart outgrows a step's cost. Nothing below the range where that
-gap was measured (s ≈ 0.94) ships before it.
+rate-controlled or its quality gap to a restart outgrows a step's cost. Nothing below the lowest
+size where that gap was measured (s = 0.90) ships before it.
 
 ## Step size and slew
 
