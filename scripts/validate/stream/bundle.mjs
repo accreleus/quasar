@@ -118,6 +118,21 @@ export function manifestKeys(file = path.join(ROOT, "docs/session-trace/metrics.
   return keys;
 }
 
+/**
+ * How the manifest says each key is read, per the source a bundle's row carries it on: its
+ * `estimator` (`delta` for a count already taken over a window) and its `window` (`cumulative`
+ * for a running total such as `packets_lost`). `e2e-compare` differences a counter and takes
+ * the median of a gauge, so it needs both words.
+ */
+export function manifestEstimators(file = path.join(ROOT, "docs/session-trace/metrics.json")) {
+  const out = new Map();
+  for (const m of JSON.parse(fs.readFileSync(file, "utf8")).metrics) {
+    const source = m.source === "agent" ? "agent" : "browser"; // browser and bench
+    out.set(`${source}\u0000${m.key}`, { estimator: m.estimator ?? null, window: m.window ?? null });
+  }
+  return out;
+}
+
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 
 /** Every way `dir` is not a valid bundle. An empty list means valid. It never throws. */

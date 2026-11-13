@@ -62,6 +62,18 @@ function cli(args, opts) {
   }
 }
 
+/** postBundle() with what it said on stderr: a refusal's reason is read from there. */
+function postCapturingStderr(dir, opts) {
+  const lines = [];
+  const { error } = console;
+  console.error = (...a) => lines.push(a.join(" "));
+  try {
+    return { out: postBundle(dir, opts), said: lines.join("\n") };
+  } finally {
+    console.error = error;
+  }
+}
+
 test("a pass scenario is one run with the bundle's build, tags and artifacts", () => {
   const dir = bundle();
   const rec = recorder();
@@ -124,7 +136,7 @@ test("the same scenario with other params is another bench scenario (the server 
   ]);
 });
 
-test("every param that changes what is measured is in the name, in a fixed order, and `hold_s` is only a tag", () => {
+test("every param that changes what is measured is in the name, in a fixed order; `hold_s` is only a tag", () => {
   const dir = bundle();
   // The fallback plan's two cases differ only in `when`: the bench must not compare them.
   edit(dir, `${SC}/scenario.json`, (s) => ({
@@ -135,10 +147,36 @@ test("every param that changes what is measured is in the name, in a fixed order
   const rec = recorder();
   assert.equal(postBundle(dir, { host: HOST, spawn: rec.spawn }).posted, 1);
   const a = rec.submitted()[0].args;
-  assert.equal(after(a, "--scenario"), "transport-fallback/transport=webtransport/codec=h264/profile=1080p60/when=connect");
+  assert.equal(after(a, "--scenario"), "transport-fallback/transport=webtransport/codec=h264/profile=1080p60/app=steam/when=connect");
   const tags = valuesOf(a, "--tag");
-  for (const t of ["hold_s=60", "transport=webtransport", "codec=h264", "profile=1080p60"]) assert.ok(tags.includes(t), t);
-  for (const t of ["app=", "bench=", "cover_qr=", "when="]) assert.ok(!tags.some((x) => x.startsWith(t)), t);
+  for (const t of ["hold_s=60", "transport=webtransport", "codec=h264", "profile=1080p60", "app=steam"]) assert.ok(tags.includes(t), t);
+  for (const t of ["bench=", "cover_qr=", "when="]) assert.ok(!tags.some((x) => x.startsWith(t)), t);
+});
+
+test("the app in the name is a slug: lower case, runs of other characters one `-`, trimmed, 40 at most", () => {
+  const dir = bundle();
+  for (const [app, slug] of [
+    ["Quasar Benchapp", "quasar-benchapp"],
+    ["  KDE   Desktop!!", "kde-desktop"],
+    ["--Steam--", "steam"],
+    ["x".repeat(60), "x".repeat(40)],
+    ["y".repeat(39) + "  z", "y".repeat(39)],
+  ]) {
+    edit(dir, `${SC}/scenario.json`, (s) => ({ ...s, params: { ...s.params, app } }));
+    const rec = recorder();
+    assert.equal(postBundle(dir, { host: HOST, spawn: rec.spawn }).posted, 1, app);
+    const a = rec.submitted()[0].args;
+    assert.equal(after(a, "--scenario"), `stream-hold/transport=webrtc/codec=h264/profile=1080p60/app=${slug}`, app);
+    assert.ok(valuesOf(a, "--tag").includes(`app=${slug}`), app);
+  }
+  // A name with nothing to slug is not in the name and is counted; nothing of it is posted.
+  edit(dir, `${SC}/scenario.json`, (s) => ({ ...s, params: { ...s.params, app: "  ??  " } }));
+  const rec = recorder();
+  const out = postBundle(dir, { host: HOST, spawn: rec.spawn });
+  assert.equal(out.posted, 1);
+  assert.equal(out.leftOut, 1);
+  assert.equal(after(rec.submitted()[0].args, "--scenario"), "stream-hold/transport=webrtc/codec=h264/profile=1080p60");
+  assert.ok(!valuesOf(rec.submitted()[0].args, "--tag").some((t) => t.startsWith("app=")));
 });
 
 test("a scenario name holding a dot cannot collide with another scenario's params", () => {
@@ -157,10 +195,10 @@ test("a scenario name holding a dot cannot collide with another scenario's param
 
 test("a numeric or boolean param is used; an over-long name is refused, never truncated", () => {
   const dir = bundle();
-  edit(dir, `${SC}/scenario.json`, (s) => ({ ...s, params: { ...s.params, retries: 3, strict: true, skipped: null } }));
+  edit(dir, `${SC}/scenario.json`, (s) => ({ ...s, params: { ...s.params, retries: 3, strict: true } }));
   const rec = recorder();
   const out = postBundle(dir, { host: HOST, spawn: rec.spawn });
-  assert.equal(out.leftOut, 1); // `null` is not a shape a value has
+  assert.equal(out.leftOut, 0);
   assert.equal(after(rec.submitted()[0].args, "--scenario"), "stream-hold/transport=webrtc/codec=h264/profile=1080p60/retries=3/strict=true");
 
   const long = bundle();
@@ -171,6 +209,45 @@ test("a numeric or boolean param is used; an over-long name is refused, never tr
   const out2 = postBundle(long, { host: HOST, spawn: rec2.spawn });
   assert.deepEqual([out2.status, out2.exit, out2.posted, out2.failed], ["failed", 1, 0, 1]);
   assert.equal(rec2.calls.length, 0); // the archive is not made for a scenario that is refused
+});
+
+// Two cases that differ in a param the name cannot hold would share one name, and the bench
+// compares the newest run per name: the scenario is refused instead, and the key is named.
+test("a param that cannot be in the name refuses the scenario, nothing is posted for it", () => {
+  const cases = [
+    ["skipped", null, /param skipped is not an identifier/],
+    ["transport", "webrtc ; rm -rf /", /param transport is not an identifier/],
+    ["codec", "x".repeat(300), /param codec is not an identifier/],
+    ["when", { mid: true }, /param when is not an identifier/],
+    ["when", ["mid"], /param when is not an identifier/],
+    ["app", 7, /param app is not an app name/],
+  ];
+  for (const [k, v, why] of cases) {
+    const dir = bundle();
+    edit(dir, `${SC}/scenario.json`, (s) => ({ ...s, params: { ...s.params, [k]: v } }));
+    const rec = recorder();
+    const lines = [];
+    const { error } = console;
+    console.error = (...a) => lines.push(a.join(" "));
+    let out;
+    try {
+      out = postBundle(dir, { host: HOST, spawn: rec.spawn });
+    } finally {
+      console.error = error;
+    }
+    assert.deepEqual([out.status, out.exit, out.posted, out.failed], ["failed", 1, 0, 1], `${k}=${JSON.stringify(v)}`);
+    assert.equal(rec.calls.length, 0, `${k}: nothing is run`);
+    assert.match(lines.join("\n"), why, `${k}: the reason names the key`);
+  }
+  // A `params` that is not an object is the same refusal: nothing says which case it was.
+  for (const params of [null, [], "transport=webrtc", 7]) {
+    const dir = bundle();
+    edit(dir, `${SC}/scenario.json`, (s) => ({ ...s, params }));
+    const rec = recorder();
+    const out = postBundle(dir, { host: HOST, spawn: rec.spawn });
+    assert.deepEqual([out.status, out.posted, out.failed], ["failed", 0, 1], JSON.stringify(params));
+    assert.equal(rec.calls.length, 0);
+  }
 });
 
 test("A1: a scenario whose name is not a name posts nothing; the directory name is never a stand-in", () => {
@@ -312,21 +389,22 @@ test("an invalid bundle is refused before anything is posted", () => {
   assert.equal(rec.calls.length, 0);
 });
 
-test("a hostile tag value is left out and counted", () => {
+// A tag this file derives from a param that is not in the name (`hold_s`) is a value in a shape or
+// nothing, and a shape is not an argv injection: a hostile value reaches no call at all.
+test("a tag value in no shape is left out and counted, and reaches no call", () => {
   const dir = bundle();
   edit(dir, `${SC}/scenario.json`, (s) => ({
     ...s,
-    params: { ...s.params, transport: "webrtc ; rm -rf /", codec: "x".repeat(300) },
+    params: { ...s.params, hold_s: "240 ; rm -rf /" },
   }));
   const rec = recorder();
   const out = postBundle(dir, { host: HOST, spawn: rec.spawn });
   assert.equal(out.exit, 0);
-  assert.equal(out.leftOut, 2);
+  assert.equal(out.leftOut, 1);
   const tags = valuesOf(rec.submitted()[0].args, "--tag");
-  assert.ok(!tags.some((t) => t.startsWith("transport=")));
-  assert.ok(!tags.some((t) => t.startsWith("codec=")));
-  assert.ok(tags.includes("profile=1080p60"));
+  assert.ok(!tags.some((t) => t.startsWith("hold_s=")));
   assert.ok(!rec.submitted()[0].args.join(" ").includes("rm -rf"));
+  assert.ok(tags.includes("profile=1080p60"));
 });
 
 test("the notes carry criterion ids and numbers only", () => {
@@ -355,6 +433,128 @@ test("a missing client label leaves the host as the role and is counted", () => 
   const a = rec.submitted()[0].args;
   assert.equal(after(a, "--host"), HOST);
   assert.ok(!valuesOf(a, "--tag").some((t) => t.startsWith("client=")));
+});
+
+// bench_submit.py opens more than session.json in a scenario directory. The ones this suite never
+// writes would reach the run unchecked (a verdict's validity and its free-text reason, a caps trace
+// as tags, soak marks and steps as events, a report as an artifact), so their presence is a refusal.
+test("a file in a scenario directory that this suite does not write refuses the scenario, named", () => {
+  for (const [file, body] of [
+    ["caps-negotiated.json", JSON.stringify({ events: [{ payload: { codec: "h264", profile: "main" } }] })],
+    ["verdict.json", JSON.stringify({ verdict: "likely_network_congestion", evidence: ["free text"] })],
+    ["steps.jsonl", '{"t_start_ms": 1, "level": "moderate"}\n'],
+    ["marks.jsonl", '{"ts_unix_ms": 1, "mark": "impair"}\n'],
+    ["REPORT.md", "# a hand-written report\n"],
+  ]) {
+    const dir = bundle();
+    fs.writeFileSync(path.join(dir, SC, file), body);
+    const rec = recorder();
+    const { out, said } = postCapturingStderr(dir, { host: HOST, spawn: rec.spawn });
+    assert.deepEqual([out.status, out.exit, out.posted, out.failed], ["failed", 1, 0, 1], file);
+    assert.equal(rec.calls.length, 0, `${file}: nothing is run`);
+    assert.match(said, new RegExp(`${file.replace(/\./g, "\\.")} is not a file this suite writes`), file);
+  }
+});
+
+test("a folder named like a Markdown file is refused too: bench_submit.py would try to upload it", () => {
+  const dir = bundle();
+  fs.mkdirSync(path.join(dir, SC, "NOTES.md"));
+  fs.writeFileSync(path.join(dir, SC, "NOTES.md", "a.txt"), "x\n");
+  const rec = recorder();
+  const { out, said } = postCapturingStderr(dir, { host: HOST, spawn: rec.spawn });
+  // Whichever refuses it first (the bundle validator or the poster), nothing is posted.
+  assert.equal(out.posted, 0);
+  assert.equal(rec.submitted().length, 0);
+  assert.ok(out.reason === "invalid-bundle" || /NOTES\.md is not a file this suite writes/.test(said), said);
+});
+
+// The other files it opens are this suite's, and each field that reaches a tag or `conditions` is in
+// the shape that field has: conditions.json's `negotiated` agrees with what session.json was checked
+// for, and a member nobody writes is a refusal rather than an unchecked value.
+test("the other files bench_submit.py reads are checked where they reach the run", () => {
+  const good = bundle();
+  fs.writeFileSync(
+    path.join(good, SC, "conditions.json"),
+    JSON.stringify({
+      effective: { encoder_family: "vulkan", ladder_resolution: "off", host_path: "[omitted]" },
+      unknown: { effective: "the host has not reported its effective settings" },
+      negotiated: { width: 1920, height: 1080, fps: 60, codec: "h264", encoder: "vulkanh264enc:0", profile_id: "observe" },
+    }),
+  );
+  fs.writeFileSync(path.join(good, SC, "trace.json"), JSON.stringify({ events: [{ ts_unix_ms: 1786940001000, type: "caps.negotiated", payload: { codec: "h264" } }] }));
+  fs.writeFileSync(path.join(good, SC, "summary.json"), JSON.stringify({ overall: "PASS" }));
+  assert.equal(postBundle(good, { host: HOST, spawn: recorder().spawn }).posted, 1);
+
+  const cases = [
+    ["conditions.json", []],
+    ["conditions.json", { effective: { "encoder family": "vulkan" } }],
+    ["conditions.json", { effective: { encoder_family: 7 } }],
+    ["conditions.json", { effective: [] }],
+    ["conditions.json", { negotiated: 7 }],
+    ["conditions.json", { negotiated: { width: "1920" } }],
+    ["conditions.json", { negotiated: { fps: null } }],
+    ["conditions.json", { negotiated: { codec: "h264 ; rm -rf /" } }],
+    ["conditions.json", { negotiated: { encoder: "a b" } }],
+    ["conditions.json", { negotiated: { profile_id: ["observe"] } }],
+    ["conditions.json", { negotiated: { bitrate_kbps: 5000 } }],
+    ["conditions.json", { negotiated: { made_up: "x" } }],
+    // bench_submit.py posts every member of this file: only the collector's own may be there, in the collector's shapes.
+    ["conditions.json", { effective: { abr_mode: "free text with spaces / and a path" } }],
+    ["conditions.json", { effective: {}, verdict: "likely_network_congestion free text" }],
+    ["conditions.json", { effective: {}, git: { quasar: "hello world" } }],
+    ["conditions.json", { effective: {}, netem: { note: "anything at all" } }],
+    ["conditions.json", { effective: {}, foo: "bar baz" }],
+    ["conditions.json", { unknown: { effective: "some other sentence" } }],
+    ["conditions.json", { unknown: { effective: "the host has not reported its effective settings", more: "x" } }],
+    ["trace.json", []],
+    ["trace.json", { events: "caps" }],
+    ["trace.json", { events: [{ ts_unix_ms: 1, type: "caps.negotiated", payload: "text" }] }],
+    ["trace.json", { events: [{ ts_unix_ms: 1, type: "caps.negotiated", payload: ["text"] }] }],
+    ["summary.json", []],
+    ["summary.json", "PASS"],
+  ];
+  for (const [file, doc] of cases) {
+    const dir = bundle();
+    fs.writeFileSync(path.join(dir, SC, file), JSON.stringify(doc));
+    const rec = recorder();
+    const out = postBundle(dir, { host: HOST, spawn: rec.spawn });
+    assert.deepEqual([out.status, out.posted, out.failed], ["failed", 0, 1], `${file} ${JSON.stringify(doc)}`);
+    assert.equal(rec.calls.length, 0, `${file} ${JSON.stringify(doc)}`);
+  }
+});
+
+// The rest of session.json that reaches a tag or conditions.negotiated is a number, and
+// bench_submit.py casts it: a string is a crash and a size that is not two numbers is no size.
+test("session.json's launch and rates are finite numbers, or the scenario is refused", () => {
+  for (const [key, value] of [
+    ["launch", "1920x1080"],
+    ["launch", [1920]],
+    ["launch", [1920, 1080, 1]],
+    ["launch", [1920, "1080"]],
+    ["launch", { width: 1920, height: 1080 }],
+    ["fps", "120"],
+    ["bitrate_kbps", "11500"],
+    ["started_at_ms", "1786940000000"],
+  ]) {
+    const dir = bundle();
+    edit(dir, `${SC}/session.json`, (s) => ({ ...s, [key]: value }));
+    const rec = recorder();
+    const out = postBundle(dir, { host: HOST, spawn: rec.spawn });
+    assert.deepEqual([out.status, out.posted, out.failed], ["failed", 0, 1], `${key}=${JSON.stringify(value)}`);
+    assert.equal(rec.calls.length, 0);
+  }
+});
+
+// bench_submit.py's parser would read a name that begins with `-` as an option of its own, and a
+// scenario is not posted on a guess: it is refused here, in plain words, before the script runs.
+test("a scenario name beginning with '-' is refused before bench_submit.py is run", () => {
+  const dir = bundle();
+  edit(dir, `${SC}/scenario.json`, (s) => ({ ...s, scenario: "-transport" }));
+  const rec = recorder();
+  const { out, said } = postCapturingStderr(dir, { host: HOST, spawn: rec.spawn });
+  assert.deepEqual([out.status, out.exit, out.posted, out.failed], ["failed", 1, 0, 1]);
+  assert.equal(rec.calls.length, 0);
+  assert.match(said, /its scenario name begins with '-'/);
 });
 
 test("a post that fails is counted and the verb exits 1", () => {

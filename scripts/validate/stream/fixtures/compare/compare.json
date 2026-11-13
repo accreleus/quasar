@@ -183,14 +183,22 @@
     "scenarios": 1,
     "only_a": 1,
     "only_b": 1,
-    "criteria_changed": 6
+    "criteria_changed": 6,
+    "status_changed": 1,
+    "changed": 7
   },
   "truncated": false,
   "only_a": [
-    "input-kbm/transport=webrtc/codec=h264/profile=1080p60"
+    {
+      "id": "input-kbm/transport=webrtc/codec=h264/profile=1080p60",
+      "dir": "02-input-kbm"
+    }
   ],
   "only_b": [
-    "transport-fallback/transport=webtransport/codec=h264/profile=1080p60/when=mid"
+    {
+      "id": "transport-fallback/transport=webtransport/codec=h264/profile=1080p60/when=mid",
+      "dir": "03-transport-fallback"
+    }
   ],
   "pairs": [
     {
@@ -199,6 +207,7 @@
       "dir_b": "01-stream-hold",
       "status_a": "pass",
       "status_b": "fail",
+      "status_changed": true,
       "warmup": {
         "applied": true
       },
@@ -305,10 +314,22 @@
       "metrics": {
         "compared": [
           {
+            "source": "browser",
+            "key": "packets_lost",
+            "estimator": "delta",
+            "value_a": 9,
+            "value_b": 18,
+            "delta": 9,
+            "change_pct": 100,
+            "samples_a": 10,
+            "samples_b": 10
+          },
+          {
             "source": "agent",
             "key": "encode_ms",
-            "median_a": 5,
-            "median_b": 7,
+            "estimator": "median",
+            "value_a": 5,
+            "value_b": 7,
             "delta": 2,
             "change_pct": 40,
             "samples_a": 6,
@@ -317,8 +338,9 @@
           {
             "source": "browser",
             "key": "present_interval_max_ms",
-            "median_a": 12,
-            "median_b": 15,
+            "estimator": "median",
+            "value_a": 12,
+            "value_b": 15,
             "delta": 3,
             "change_pct": 25,
             "samples_a": 10,
@@ -327,8 +349,9 @@
           {
             "source": "browser",
             "key": "fps",
-            "median_a": 60,
-            "median_b": 54,
+            "estimator": "median",
+            "value_a": 60,
+            "value_b": 54,
             "delta": -6,
             "change_pct": -10,
             "samples_a": 10,
