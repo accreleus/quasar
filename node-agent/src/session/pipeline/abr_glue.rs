@@ -1769,6 +1769,153 @@ mod tests {
         );
     }
 
+    // ---- the ladder on a WebTransport session (#1320) ----
+
+    /// #1320: the WebTransport loop's own resolution rung, end to end.
+    ///
+    /// The estimate a client's receiver feedback produces goes through the same governor
+    /// and the same [`EncodeResolutionLever`] the manual display PATCH uses, so an
+    /// estimate that collapses far under the governor's floor steps the ENCODE size down
+    /// while the frame rate stays where it is — and the ABR floor follows the rung, so the
+    /// encoder may then go below the launch picture's floor. `res_first` on a 60 fps
+    /// session can only step pixels, which is the order the owner asked for.
+    ///
+    /// Nothing else covers this: every `feedback_abr` test beside it passes `None` for the
+    /// lever, and the ladder the WebRTC arm seeds is `enable_abr`'s. A WebTransport
+    /// session could therefore have had no resolution rung at all and the suite stayed
+    /// green.
+    ///
+    /// What this DOES prove: the WebTransport feedback path carries a lever through to the
+    /// governor's ladder end to end — an estimate under the floor moves the encode size
+    /// through that lever, keeps the frame rate, and drags the ABR floor with it.
+    ///
+    /// What it does NOT prove: that a session's start hands the session's own lever in.
+    /// This test supplies the lever itself, so deleting the `Some(session.lever.clone())`
+    /// argument at the WebTransport attach site (`runner.rs`, `SessionTransports::attach`)
+    /// leaves it green. Pinning that needs a runner-level attach, which builds the encode
+    /// pipeline and the WebRTC slot beside it (a registry, a real encoder, an audio plan) —
+    /// a harness of its own, not a unit test.
+    #[test]
+    fn a_webtransport_client_under_the_floor_steps_the_resolution_rung() {
+        init();
+        let metrics = Arc::new(SessionMetrics::new("smooth", 60));
+        let (tx, mut traces) = tokio::sync::mpsc::channel(64);
+        let trace =
+            crate::session::runner::DiagnosticEventTx::new(tx, Arc::default(), Arc::default());
+        // The owner's shape at a size the software arm can encode: the 16:9 family down to
+        // 720p, the ladder armed resolution-first, the fps rung off.
+        let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
+        settings.encoder = EncoderChoice::Openh264;
+        settings.abr_mode = AbrMode::Smooth;
+        settings.ladder.resolution_enabled = true;
+        settings.ladder.order = ladder::LadderOrder::ResFirst;
+        let stream = crate::session::StreamParams {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_kbps: 8000,
+            h264_profile: "constrained-baseline".to_string(),
+            codec: Codec::H264,
+            abr_floor_kbps: 0,
+            mic: false,
+        };
+        let mut cfg = SessionConfig::for_assignment_with(&settings, stream, None);
+        // Both gates are wall-clock paced in a session; a window here is one synthetic
+        // second, so only the governor's interval would hide a step.
+        cfg.abr_governor.min_interval_ms = 1;
+        cfg.abr_governor.down_dwell_ms = 1;
+        let launch_floor = cfg.abr_config().expect("smooth arms the ABR").floor_kbps;
+        assert_eq!(launch_floor, 2400, "8000 kbit/s at abr_floor_ratio 0.3");
+        let encoder = gst::ElementFactory::make("openh264enc").build().unwrap();
+        let stage = super::super::scale_stage::build_scale_stage(&cfg, None).unwrap();
+        assert!(stage.supported, "the software arm always carries the lever");
+        let lever = Arc::new(EncodeResolutionLever::new(stage, encoder.clone(), |_| {}));
+
+        let client = feedback_abr(
+            &encoder,
+            &cfg,
+            metrics.clone(),
+            trace,
+            "s".into(),
+            Some(lever.clone()),
+        )
+        .expect("openh264enc takes live writes");
+        (client.start)();
+
+        // One ~5 s session window, one synthetic second wide: the encoder is still sending
+        // its launch setpoint at 60 fps (so the classifier reads a flooding pipe, not an
+        // idle encoder) and the client's feedback says the link carries far less than the
+        // floor.
+        let base = std::time::Instant::now();
+        let drained = std::cell::Cell::new(0u32);
+        let window = |estimate_kbps: f64| {
+            let at = std::time::Instant::now();
+            for _ in 0..60 {
+                metrics.record_encode_in(at);
+                // 16 666 bytes × 60 fps ≈ 8000 kbit/s.
+                metrics.record_encode_out(at + std::time::Duration::from_millis(2), 16_666);
+            }
+            // The governor's anti-thrash interval is wall-clock; a session's windows are
+            // seconds apart, an assertion is not.
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            (client.observe)(estimate_kbps);
+            let n = drained.get() + 1;
+            drained.set(n);
+            metrics.drain_window(base + std::time::Duration::from_secs(u64::from(n)))
+        };
+        // 1: the governor has not been told the path is congested yet, so it takes its
+        //    capped first down-step and the window classifies the congestion.
+        let first = window(1000.0);
+        assert_eq!(first.ladder_res_rung, None, "no step on the first window");
+        // 2: with congestion confirmed the governor goes straight to the floor, the rung
+        //    sees the setpoint pinned there and takes a step — immediately, not after a
+        //    dwell (`StepReason::Emergency`).
+        let stepped = window(1000.0);
+        assert_eq!(stepped.ladder_res_rung, Some(1), "one resolution rung down");
+        assert_eq!(
+            lever.stage().requested(),
+            (1600, 900),
+            "the encode size moved, through the session's own lever"
+        );
+        assert_eq!(
+            lever.stage().current_fps(),
+            60,
+            "and the frame rate did not: resolution first on a 60 fps session"
+        );
+        // 3: the floor is a function of the picture being sent, not of the launch size. It
+        //    echoes one window late — `drain_window` reads it before the window's hooks run,
+        //    which is why the step's own window still reports the launch floor.
+        let followed = window(1000.0);
+        assert_eq!(
+            followed.abr_floor_kbps,
+            Some(1826.0),
+            "8000 × (1600×900 / 1920×1080)^0.75 scaled onto the 2400 launch floor"
+        );
+        assert_eq!(
+            followed.abr_setpoint_kbps,
+            Some(1826.0),
+            "the encoder may now go under the launch picture's floor — the owner's \
+             setpoint stuck at 2600 kbit/s was this bound, not a governor choice"
+        );
+        assert_eq!(followed.ladder_res_rung, Some(1), "no flap, no second step");
+
+        let mut step = None;
+        while let Ok((_, event)) = traces.try_recv() {
+            if event.event == "abr.ladder.step" {
+                step = Some(event);
+            }
+        }
+        let step = step.expect("the rung step is traced");
+        assert_eq!(step.payload["rung"], "resolution");
+        assert_eq!(step.payload["from"], 0);
+        assert_eq!(step.payload["to"], 1);
+        assert_eq!(step.payload["reason"], "emergency");
+        assert_eq!(
+            step.payload["floor_kbps"], 1826,
+            "the floor in effect AFTER the step"
+        );
+    }
+
     // ---- ResolutionLever ----
 
     fn software_lever(launch: (i32, i32)) -> EncodeResolutionLever {

@@ -2732,12 +2732,103 @@ always reports the computed `external_resize_supported: bool` for the
 session's actual encoder/host, so a client never has to guess from the
 encoder name alone.
 
-**Not wired into ABR.** The stream-resolution lever is manual/API only in
-this feature. The ABR governor is given a `ResolutionLever` interface
-(`available_rungs()` / `set_rung()` / `current()`) so it *could* call the
-same mechanism later, but nothing drives it automatically yet; independent
-validation of the lever comes first. See `node-agent/src/session/ladder.rs`
-for the smoothness-ladder rung this replaces the old deferral note on.
+**Driven by ABR, not only by the API.** This lever is also what the resolution rung
+of the ABR ladder actuates: `abr_ladder_resolution` steps the same `EncodeResolutionLever`
+(`node-agent/src/session/pipeline/abr_glue.rs`, `observe_resolution_rung`) from the
+`LadderPlanner`'s decision (`node-agent/src/session/ladder.rs`). The two callers share
+that actuator and nothing else. A manual `PATCH` of the stream size goes straight to the
+lever (`apply_stream_update` in `node-agent/src/session/runner.rs`) — no window, no
+dwell, no rung ordering — so it may move several rungs at once, and a non-launch size
+**pins** the session where the operator put it: the ladder keeps observing but stops
+moving the size until a `PATCH` back to the launch size releases it to `auto`. While
+pinned, the resolution and frame-rate rungs take no step (their `observe` in
+`node-agent/src/session/ladder.rs` returns before one can be emitted). The floor still
+moves. Every window
+re-derives it from the size the session is actually sending — after the resync, the
+pinned one — and calls `set_floor` unconditionally, even in a window where the rung
+decides nothing (`observe_resolution_rung`'s caller in `abr_glue.rs`), so the floor
+still follows the pinned size. See "The ladder on each transport" below for what a
+step does on the wire.
+
+### The ladder on each transport (#1320)
+
+The rungs are shared, not duplicated: `AbrLoop` and `LadderPlanner` are one
+implementation and each transport only supplies the rate estimate and the
+renegotiation. On **WebRTC** the estimate is `rtpgccbwe`'s `estimated-bitrate`
+notification, armed on `webrtcbin`'s send path. On **WebTransport** it is the
+client's own receiver `feedback` (`protocol/transport-webtransport.md` §Feedback),
+which `feedback_abr` turns into the same governor input — there is no second
+bitrate controller, and the ladder's "the governor is pinned at its floor" test
+reads the one live floor either way. Only the transport that started last writes
+the encoder, and a client's first estimate takes it over from a WebRTC peer's loop.
+
+Everything below is about the **standard codecs** (h264, h265, av1). A **PyroWave**
+session is outside it: while PyroWave is active the WebTransport loop drops the
+client's receiver `feedback` before it reaches the ABR (`node-agent/src/webtransport/mod.rs`),
+and a PyroWave client is not sent the standard-codec configuration when it changes
+(`webtransport/media.rs`), so the governor never sees an estimate and the rung has
+nothing to act on. PyroWave runs its own rate controller instead; the ladder does not
+drive it.
+
+A step changes the `convert/scale → encoder` link only. That means:
+
+- **WebRTC:** nothing visible on the signalling side. `webrtcbin` is never
+  renegotiated (the one-offer invariant), so the browser follows the new size from
+  the in-band parameter sets the forced IDR carries.
+- **WebTransport:** the agent sends `hello_ack` again with a new `config_id` and the
+  new `video` (`width`, `height`, `fps` and the new description) on the control
+  stream before the first frame encoded under it, which is a keyframe
+  (`transport-webtransport.md` §Hello ack). The browser holds frames whose
+  `config_id` it has no `hello_ack` for — at most 1 s — reconfigures the decoder
+  under the new one (`web/src/webtransport/decodeStage.ts`), and the presenter
+  rebuilds its texture at the new size (`web/src/webtransport/presenter.ts`).
+
+  What that costs in media is only partly known. On the Vulkan encoder path a rung
+  step restarts the encoder session, as any size change there does; on every path the
+  step is an IDR plus a decoder reconfigure. The browser ends a WebTransport stream
+  that has delivered no video for five seconds (`MEDIA_SILENCE_MS` in
+  `web/src/pages/app/webTransportRuntime.ts`), and that end is not a no-op: the first
+  end mints a fresh transport token and opens one new WebTransport connection, which
+  is given the whole five seconds again to deliver a frame. The page reports
+  `transport.fallback` with reason `stream_lost` only if that attempt fails, or a
+  later end finds the one reconnect already used; until then it stays on WebTransport.
+  A step is *expected*
+  to sit well inside that five seconds, but **no bound on the restart's duration has
+  been measured**: nobody has timed a step's silence on a real session, and a restart
+  that overran it would cost a reconnect and a fallback rather than nothing.
+
+**When it steps.** The rung is observed once per ~5 s metrics window, off the
+governor's setpoint. A normal down-step needs `abr_ladder_res_engage_dwell` (two)
+*qualifying* windows on top of the governor having already descended below
+`abr_ladder_res_engage_frac × B(r)` — it is not a fixed delay from the collapse, and a
+governor still above that band delays it further. The emergency path (congested **and**
+the setpoint at the floor) skips the dwell, but not the settle window that swallows the
+first window after a step, and not `abr_ladder_res_min_step_s` (10 s) since the last
+step. In the common shape the first step lands about 5 to 10 s after the collapse
+begins (a window is ~5 s, and the collapse can begin anywhere inside one), and it
+takes two windows rather than one: the first is the governor's capped down-step, and
+the window that closes it is the one that writes the congested hint, so no rung moves
+yet; the next window's feedback `observe` reads that hint and drops the setpoint to the
+floor in one protective step, and the rung observation that runs after it in the same
+window takes the step. It takes longer if the classifier does not name the congestion
+on that first window.
+
+What the rung will NOT do: at `abr_ladder_res_min_height` (720p by default) it stops.
+An estimate under that rung's floor has no further remedy — the ladder has given up
+three quarters of a 1440p picture's pixels, since 720p keeps one quarter of them (half
+the linear size in each direction), and it cannot give up more without an operator
+lowering the floor rung. `abr_ladder_floor_follows_rung` is what lets the encoder
+actually go there; without it a step changes bits per pixel and not the bitrate the link
+is judged to carry. With it on, the floor scales by the same power law as the comfort
+bitrate, `launch_floor × (px_rung / px_launch)^k` with `k = abr_ladder_res_exponent`
+(0.75): the height ratio squared is the pixel ratio, so `2 × 0.75 = 1.5` on the height
+ratio is the same exponent, and a 1440p session launched with a 2600 kbit/s floor lands
+on 2600 × (720/1440)^1.5 ≈ 919 kbit/s at 720p. With the frame-rate rung enabled and
+down, the same scale is multiplied by 0.6 once more — ≈ 552 kbit/s here. Two floors
+still bound it: the 300 kbit/s hard minimum, and an operator floor
+(`QUASAR_ABR_FLOOR_KBPS` or a host `abr_floor_kbps`), which raises the result up to the
+launch floor and no further — `floor_for` takes `min(launch_floor)` last, so an operator
+floor above the launch floor does not win.
 
 ### Flow (both internal and external)
 
