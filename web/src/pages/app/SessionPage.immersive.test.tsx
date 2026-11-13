@@ -664,6 +664,20 @@ describe("SessionPage — capture after a WebTransport reconnect or fallback", (
     expect(playLayer()).toBeNull();
   });
 
+  it("offers a gesture only when the browser refuses capture after a reconnect", async () => {
+    fsEl = document.documentElement;
+    await revealOverWebTransport();
+    expect(playLayer()).toBeNull();
+    await act(async () => wt.set!({ channelOpen: false, inputCaptured: false, pointerLocked: false }));
+    engageSpy.mockResolvedValue({ mode: "failed" });
+    await act(async () => wt.set!({ channelOpen: true }));
+    await advance(100);
+    expect(engageSpy).toHaveBeenCalledTimes(2);
+    expect(playLayer()).not.toBeNull();
+    await advance(5_000);
+    expect(engageSpy).toHaveBeenCalledTimes(2);
+  });
+
   it("re-engages in full screen once WebRTC's channel opens after a fallback", async () => {
     fsEl = document.documentElement;
     await revealOverWebTransport();
@@ -686,7 +700,7 @@ describe("SessionPage — capture after a WebTransport reconnect or fallback", (
     return document.body.querySelector("audio") as HTMLAudioElement;
   };
 
-  it("a fallback outside full screen stays revealed and audible, with no Click to play, and a refused capture raises none (#1300)", async () => {
+  it("a fallback stays revealed and audible; only a refused capture asks for a gesture", async () => {
     await revealOverWebTransport();
     await act(async () => {
       fireEvent.click(screen.getByText("Click to play"));
@@ -702,11 +716,11 @@ describe("SessionPage — capture after a WebTransport reconnect or fallback", (
     });
     await advance(100);
     expect(engageSpy).toHaveBeenCalledTimes(2);
-    expect(playLayer()).toBeNull();
+    expect(playLayer()).not.toBeNull();
     expect(webRtcAudio().muted).toBe(false);
     await advance(5_000);
     expect(engageSpy).toHaveBeenCalledTimes(2);
-    expect(playLayer()).toBeNull();
+    expect(playLayer()).not.toBeNull();
   });
 
   it("a fallback before the first reveal still owes Click to play outside full screen", async () => {

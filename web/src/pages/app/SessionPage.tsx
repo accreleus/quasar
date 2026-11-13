@@ -996,7 +996,7 @@ function SessionPageBody() {
   // Armed again by a quick switch, which spends its own click the same way.
   const [immersive] = useState(launchImmersive);
   // `resume`: armed mid-session by a transport that changed under a picture already showing.
-  // It takes capture back when the browser allows it with no click, and never raises the layer.
+  // It takes capture back without a click; a refused lock offers the existing gesture layer.
   const autoArmedRef = useRef<false | "reveal" | "resume">(immersive ? "reveal" : false);
   const [clickToPlay, setClickToPlay] = useState(false);
   // A WebTransport connection lost and rebuilt takes capture with it: arm again for the new one.
@@ -1028,7 +1028,7 @@ function SessionPageBody() {
     }
     void engaging.then((result) => {
       noteRawUnavailable(result);
-      if (result.mode === "failed" && offerClick) setClickToPlay(true);
+      if (result.mode === "failed") setClickToPlay(true);
     });
   }, [loaderInert, channelOpen, swapScreenUp, sessionOver, runtimeSnap, unmute, noteRawUnavailable]);
   useEffect(() => {
