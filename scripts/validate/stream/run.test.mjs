@@ -1674,6 +1674,10 @@ test("input-kbm: no pointer lock fails pointer_lock_taken; an unreadable record 
   const get = (seen) => Object.fromEntries(judgeInput({ firstFrameS: 1, seen: { locked: true, lockClicks: 1, sequenceRan: true, held: { keys: [], buttons: [] }, i2p: [], i2pMissed: 0, ...seen } }).map((c) => [c.id, c]));
   assert.equal(get({ held: null }).nothing_held_at_end.pass, null);
   assert.equal(get({ held: { keys: [], buttons: [0] } }).nothing_held_at_end.pass, false);
+  // A move log that could not be read is said so; it is not "0 events".
+  assert.match(get({ motion: { sent: { x: 50, y: 25 }, received: null, events: null } }).motion_sum_matches.expected, /move log could not be read/);
+  assert.match(get({ motion: { sent: { x: 50, y: 25 }, received: { x: 50, y: 25 }, events: 3 } }).motion_sum_matches.expected, /received 3 mousemove events summing to \(50, 25\)/);
+  assert.match(get({ locked: false, lockClicks: 0, lockHud: "no-surface" }).pointer_lock_taken.observed, /no visible stream surface to click/);
   assert.equal(checkInput({ transport: "webrtc", codec: "h264", profile: "1080p60", hold_s: 5, app: "x" }), null);
 });
 
@@ -1969,7 +1973,7 @@ test("#1343 item 4: the key is held only when the lock is held, not when a click
   const rec = JSON.parse(read(r.dir, `${r.id()}/fallback.json`));
   assert.equal(rec.key_held, false);
   assert.equal(rec.key_released_by_runner, null);
-  assert.match(r.by().held_key_released.expected, /the lock was not held after the click/);
+  assert.match(r.by().held_key_released.expected, /the pointer lock was not taken, through the "Click to play" layer or the HUD's Capture input button/);
   assert.ok(!r.timeline().some((x) => x.ev === "key-held"));
 });
 
@@ -2021,6 +2025,19 @@ test("#1343 items 6 and 7: why the wait ended, how long, and how long no frame a
   const rc = await runReal(con.w, FALLBACK("connect"), { hooksDir: con.hooksDir });
   assert.equal(JSON.parse(read(rc.dir, `${rc.id()}/fallback.json`)).no_frame_advance_before_video_s, null);
   assert.doesNotMatch(rc.by().frame_after_fallback.observed, /no frame advanced/);
+  // The session ends before the first sample: nothing was compared, so no freeze is stated (not 0).
+  const gone = fallbackWorld();
+  const session = gone.w.api.session;
+  gone.w.api.session = async (id) => { const row = await session(id); return row && logOf(gone.hooksDir).some((l) => l.startsWith("apply")) ? { ...row, state: "stopped" } : row; };
+  const rg = await runReal(gone.w, FALLBACK("mid"), { hooksDir: gone.hooksDir });
+  const recG = JSON.parse(read(rg.dir, `${rg.id()}/fallback.json`));
+  assert.deepEqual([recG.wait_ended_by, recG.no_frame_advance_before_video_s], ["session_ended", null]);
+  assert.equal(rg.timeline().find((x) => x.ev === "wait-ended").no_frame_advance_s, null);
+  // The bench ring is full: its count no longer grows, so "no advance" is not known.
+  const full = fallbackWorld({ stats: { frames: 6000, decoded: 100 } });
+  const rf = await runReal(full.w, FALLBACK("mid"), { hooksDir: full.hooksDir });
+  assert.equal(JSON.parse(read(rf.dir, `${rf.id()}/fallback.json`)).no_frame_advance_before_video_s, null);
+  assert.doesNotMatch(rf.by().frame_after_fallback.observed, /no frame advanced/);
   // A value that is not a finite number is not stated.
   const get = (freezeS) => Object.fromEntries(judgeFallback({ params: { hold_s: 30 }, firstFrameS: 1, seen: { row: { state: "running" }, fallbackReason: "x", posted: [], videoAfterS: 4, tail: { before: 1, after: 9 }, keyHeld: false, faultApplied: true, watched: true, freezeS } }).map((c) => [c.id, c]));
   assert.doesNotMatch(get(NaN).frame_after_fallback.observed, /no frame advanced/);

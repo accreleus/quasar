@@ -210,7 +210,7 @@ const HUD_WAIT_S = 2; // how long the HUD's "Capture input" button is waited for
  * for it, clicks it ONCE with a trusted click, then waits for the lock. With no layer within LOCK_WAIT_S and no lock (auto-capture can
  * take it with no click) the launch was not immersive: the HUD's own route is tried, a click on the stage (which opens the shelf) and a
  * click on its "Capture input" button (an aria-label the product sets, HudBar.tsx).
- * Returns { held, clicks, hud, at }: `clicks` is the clicks on the layer (0 or 1); `hud` is null (not tried), "no-button" (the shelf showed
+ * Returns { held, clicks, hud, at }: `clicks` is the clicks on the layer (0 or 1); `hud` is null (not tried), "no-surface" (no visible stream surface, so nothing was clicked), "no-button" (the shelf showed
  * no enabled button) or "clicked"; `at` is where the last click was.
  */
 export async function takeLock(page, cdp, { now, sleep }) {
@@ -244,10 +244,10 @@ export async function takeLock(page, cdp, { now, sleep }) {
   }
   // No layer: the launch was not immersive. A click on the stage opens the HUD shelf; its button takes the lock.
   const centre = await streamCentre(page);
-  if (!centre) return { held: false, clicks: 0, hud: "no-button", at: null };
+  if (!centre) return { held: false, clicks: 0, hud: "no-surface", at: null };
   await click(centre);
   const button = await wait(HUD_WAIT_S, () => spotOf('button[aria-label="Capture input"]'));
-  if (!button) return { held: false, clicks: 0, hud: "no-button", at: centre };
+  if (!button) return { held: await held(), clicks: 0, hud: "no-button", at: centre };
   await click(button);
   return { held: !!(await wait(LOCK_WAIT_S, held)), clicks: 0, hud: "clicked", at: button };
 }

@@ -72,7 +72,7 @@ const median = (xs) => { const s = [...xs].sort((a, b) => a - b); return s[Math.
 /**
  * `seen`: `locked` (the stream surface holds the pointer lock), `lockClicks` (clicks made on the layer that takes it), `sequenceRan` (the
  * sequence was sent), `held` ({ keys, buttons } the page was left holding, or null when the recorder could not be read), `i2p` (finite
- * samples, ms), `i2pMissed`, `lockHud` (null, "no-button" or "clicked": the HUD's route to the lock), `motion` ({ sent: {x, y}, received:
+ * samples, ms), `i2pMissed`, `lockHud` (null, "no-surface", "no-button" or "clicked": the HUD's route to the lock), `motion` ({ sent: {x, y}, received:
  * {x, y} | null, events } what was sent against what the page received).
  */
 export function judge({ firstFrameS, seen }) {
@@ -85,11 +85,11 @@ export function judge({ firstFrameS, seen }) {
   return [
     firstFrameCriterion(firstFrameS),
     s.sequenceRan
-      ? crit("pointer_lock_taken", s.locked, s.locked ? `the stream surface holds the pointer lock${s.lockHud === "clicked" ? ' (taken through the HUD\'s "Capture input": the launch was not immersive, so there was no "Click to play" layer)' : ""}` : s.lockClicks ? 'no pointer lock after the click on the "Click to play" layer' : `no pointer lock: the launch was not immersive, so there is no layer to click${s.lockHud === "clicked" ? '; the HUD\'s "Capture input" was clicked and did not lock' : s.lockHud === "no-button" ? '; a click on the stream showed no "Capture input" button in the HUD' : ""}`, `document.pointerLockElement is the stream surface (the product takes it from a trusted click on its "Click to play" layer)`)
+      ? crit("pointer_lock_taken", s.locked, s.locked ? `the stream surface holds the pointer lock${s.lockHud === "clicked" ? ' (taken through the HUD\'s "Capture input": the launch was not immersive, so there was no "Click to play" layer)' : ""}` : s.lockClicks ? 'no pointer lock after the click on the "Click to play" layer' : `no pointer lock: the launch was not immersive, so there is no layer to click${s.lockHud === "clicked" ? '; the HUD\'s "Capture input" was clicked and did not lock' : s.lockHud === "no-button" ? '; a click on the stream showed no "Capture input" button in the HUD' : s.lockHud === "no-surface" ? "; there was no visible stream surface to click either" : ""}`, `document.pointerLockElement is the stream surface (the product takes it from a trusted click on its "Click to play" layer)`)
       : crit("pointer_lock_taken", null, null, unsent),
     crit("keys_match", null, null, noLog),
     crit("buttons_match", null, null, noLog),
-    crit("motion_sum_matches", null, null, s.motion ? `${noLog}. The page received ${s.motion.events} mousemove events${s.motion.received ? ` summing to (${s.motion.received.x}, ${s.motion.received.y})` : " (their sum could not be read)"} against (${s.motion.sent.x}, ${s.motion.sent.y}) sent` : noLog),
+    crit("motion_sum_matches", null, null, s.motion ? s.motion.events === null ? `${noLog}. The page's move log could not be read` : `${noLog}. The page received ${s.motion.events} mousemove events${s.motion.received ? ` summing to (${s.motion.received.x}, ${s.motion.received.y})` : " (their sum could not be read)"} against (${s.motion.sent.x}, ${s.motion.sent.y}) sent` : noLog),
     !s.sequenceRan
       ? crit("nothing_held_at_end", null, null, unsent)
       : s.held === null
@@ -206,7 +206,7 @@ export default {
         const received = await page.evaluate(() => window.__e2eInput ?? null);
         const sentMotion = sum(sent.filter((x) => x.kind === "move"));
         const receivedMotion = received && finite(received.move?.x) && finite(received.move?.y) ? { x: received.move.x, y: received.move.y } : null;
-        seen.motion = { sent: sentMotion, received: receivedMotion, events: finite(received?.moveCount) ? received.moveCount : 0 };
+        seen.motion = { sent: sentMotion, received: receivedMotion, events: finite(received?.moveCount) ? received.moveCount : null };
         seen.held = received && Array.isArray(received.keys) && Array.isArray(received.buttons) ? { keys: received.keys.map(String), buttons: received.buttons.filter(finite) } : null;
         rec.json("input-sent.json", {
           sequence: sent,

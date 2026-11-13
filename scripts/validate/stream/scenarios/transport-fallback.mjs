@@ -12,6 +12,7 @@ export const HOOK = "fault:webtransport-block";
 const TERMINAL = ["stopped", "failed"];
 const REASON = /^[a-z0-9_]{1,64}$/;
 const TRACE_POST = /^\/v1\/sessions\/([0-9a-f-]{36})\/trace\/events$/i; // the session is the capture: only this run's own counts
+const BENCH_RING = 5000; // the bench controller's ring capacity (web/src/bench/benchController.ts RING_CAPACITY)
 const TAIL_S = 5; // how long the stream is watched once on WebRTC, to see it keeps going
 const KEY = { code: "KeyW", key: "w", vk: 87 };
 
@@ -68,7 +69,7 @@ export function judge({ params, firstFrameS, seen }) {
       ? crit("held_key_released", null, null, unwatched)
       : s.keyHeld
       ? crit("held_key_released", null, null, "not judged: the client cannot see the host's key state. A key was held across the fallback (timeline key-held / key-released); whether the host released it needs the host half (an agent input log) or the reference app logging individual keys")
-      : crit("held_key_released", null, null, "not judged: no key could be held (the pointer lock was not taken: the \"Click to play\" layer that takes it did not appear, or the lock was not held after the click)"),
+      : crit("held_key_released", null, null, "not judged: no key could be held (the pointer lock was not taken, through the \"Click to play\" layer or the HUD's Capture input button)"),
   ];
 }
 
@@ -150,7 +151,6 @@ export default {
         const early = (typeof row0.transport_fallback_reason === "string" && REASON.test(row0.transport_fallback_reason) ? row0.transport_fallback_reason : null) ?? mine()[0]?.reason ?? null;
         const p0 = await probe(page);
         if (early !== null || (finite(p0.videoFrames) && p0.videoFrames > 0)) throw new Error(`fell back at connect (${early ?? "no reason reported"}) before the fault; the mid-stream fallback was not exercised`);
-        frames0 = p0;
         // The pointer lock through the product's own layer, then a key held across the fault (only when the lock is held).
         cdp = await openCdp(page);
         const lock = await takeLock(page, cdp, ctx);
@@ -162,6 +162,7 @@ export default {
           rec.step("key-held", { code: KEY.code });
         }
         postedBefore = mine().length;
+        frames0 = await probe(page); // right before the fault, after the lock was taken: the first sample after it is then a real comparison
         await ctx.hook(HOOK, "apply");
         faultApplied = true;
         tFault = now();
@@ -180,6 +181,7 @@ export default {
         let last = frames0;
         let lastMoveAt = tFault;
         let freeze = frames0 ? 0 : null;
+        let sampled = false; // a freeze of 0 s is a fact only once a sample was compared
         let ended = false;
         while (now() < until && !(fallbackAt !== null && videoAt !== null)) {
           await sleep(1000);
@@ -192,7 +194,9 @@ export default {
           }
           const p = await probe(page);
           if (videoAt === null && freeze !== null) {
-            if (![p.frames, p.videoFrames, last.frames, last.videoFrames].every(finite)) freeze = null;
+            sampled = true;
+            // The bench frame count is a ring's length and stops growing when the ring is full: from there "no advance" is not known.
+            if (![p.frames, p.videoFrames, last.frames, last.videoFrames].every(finite) || p.frames >= BENCH_RING) freeze = null;
             else if (p.frames > last.frames || p.videoFrames > last.videoFrames) lastMoveAt = now();
             else freeze = Math.max(freeze, (now() - lastMoveAt) / 1000);
             last = p;
@@ -203,6 +207,7 @@ export default {
             rec.step("video-frame", { since_fault_s: seen.videoAfterS });
           }
         }
+        if (!sampled) freeze = null;
         seen.freezeS = freeze;
         waitedS = (now() - waitStart) / 1000;
         waitEndedBy = ended ? "session_ended" : fallbackAt !== null && videoAt !== null ? "fallback_and_frame_seen" : "hold_elapsed";
