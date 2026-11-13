@@ -1048,12 +1048,12 @@
       "taxonomy": "client.wt_audio_buffer_ms",
       "unit": "ms",
       "clock": "none",
-      "window": "snapshot",
+      "window": "1s",
       "estimator": "min",
       "n_key": null,
       "deprecated_for": null,
       "since": "0.6 (#1346)",
-      "why": "A WebTransport session's audio playout buffer: the LEAST audio queued in the ring at a quantum since the previous sample, in ms of audio. 0 means the ring ran empty and played silence, which is what wt_audio_underruns then counts; a min at or near wt_audio_target_ms is a buffer that was never in danger. Measured in the worklet where the fill is known, so it needs no clock and costs nothing per sample. Absent before any audio has played, and on WebRTC, which reports the browser's jitter buffer instead."
+      "why": "A WebTransport session's audio playout buffer: the LEAST audio queued in the ring at a quantum since the previous sample, in ms of audio. 0 exactly when silence was played in the window (the queue was empty, or its next chunk was not yet due), which is what wt_audio_underruns then counts; a lost packet's fade counts as queued, so loss alone never reads 0; a min at or near wt_audio_target_ms is a buffer that was never in danger. Measured in the worklet where the fill is known, so it needs no clock and costs nothing per sample. Absent before any audio has played, and on WebRTC, which reports the browser's jitter buffer instead."
     },
     {
       "key": "wt_audio_target_ms",

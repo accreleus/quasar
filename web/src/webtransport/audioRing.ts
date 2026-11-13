@@ -33,8 +33,8 @@ export interface RingStats {
   silenceRuns: number;
   /** Chunks dropped because they were due before they arrived, or the queue was full. */
   dropped: number;
-  /** The least stream audio queued at a quantum since the last {@link AudioRing.takeStats},
-   *  frames; `Infinity` before any audio has played. 0 is a queue that ran empty. */
+  /** The least audio queued at a quantum since the last {@link AudioRing.takeStats}, frames;
+   *  `Infinity` before any audio has played. 0 exactly when silence was played in the window. */
   minQueuedFrames: number;
 }
 
@@ -260,6 +260,8 @@ export class AudioRing {
   private underrun(frames: number): void {
     if (this.lastEnd === null) return;
     this.stats.underrunFrames += frames;
+    // Silence played: the window reads 0 even when a later chunk is queued but not yet due.
+    this.stats.minQueuedFrames = 0;
     if (!this.starving) {
       this.stats.underrunEvents += 1;
       this.stats.silenceRuns += 1;
@@ -269,11 +271,11 @@ export class AudioRing {
 
   /** The least audio waiting in the queue at this quantum: what a buffer reading is the minimum
    *  of, measured once a quantum rather than per sample and with nothing allocated. A
-   *  concealment fade is not the stream's audio, so it is not counted. */
+   *  concealment fade counts: it plays in place of the lost packet, so 0 is kept for silence. */
   private noteQueued(): void {
     if (this.lastEnd === null) return; // nothing has played yet: there is no buffer to measure
     let frames = 0;
-    for (const chunk of this.queue) if (!chunk.concealed) frames += Math.max(0, chunk.frames - chunk.off);
+    for (const chunk of this.queue) frames += Math.max(0, chunk.frames - chunk.off);
     this.stats.minQueuedFrames = Math.min(this.stats.minQueuedFrames, frames);
   }
 

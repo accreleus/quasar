@@ -331,12 +331,23 @@ describe("AudioRing", () => {
     expect(dry.takeStats().minQueuedFrames).toBe(0);
   });
 
-  it("does not count a concealment fade as audio queued: it is the hole, not the stream", () => {
+  it("counts a concealment fade as queued, so 0 is kept for silence actually played", () => {
     const ring = new AudioRing();
     ring.push(0, chunk(128, 1), 0);
     quantum(ring, 0);
     ring.push(128, chunk(480, 0.5), 0, true);
     quantum(ring, 128);
+    expect(ring.stats.minQueuedFrames).toBe(480);
+    expect(ring.stats.silenceRuns).toBe(0);
+  });
+
+  it("reads 0 when silence played while a later chunk was queued but not yet due", () => {
+    const ring = new AudioRing();
+    ring.push(0, chunk(128, 1), 0);
+    quantum(ring, 0);
+    ring.push(4_800, chunk(128, 1), 0); // far ahead: the gap before it is silence
+    quantum(ring, 128);
+    expect(ring.stats.silenceRuns).toBe(1);
     expect(ring.stats.minQueuedFrames).toBe(0);
   });
 
@@ -1218,19 +1229,22 @@ describe("createWebTransportRuntime audio and microphone", () => {
     vi.mocked(mintTransportToken).mockResolvedValueOnce({
       transport_options: { webtransport: { ...COORDS, token: "tok-2" } },
     } as never);
-    const { agent, rt, audio } = setup({ ...helloAck(0, avcC()), audio: OPUS, mic: null });
+    const counters = newPostedCounters();
+    const { agent, rt, audio } = setup({ ...helloAck(0, avcC()), audio: OPUS, mic: null }, {}, counters);
     const snaps: { audioConcealedSamples: number | null; audioConcealmentEvents: number | null }[] = [];
     rt.registerTelemetry((sn) => snaps.push(sn));
     rt.start();
     await vi.advanceTimersByTimeAsync(1_100);
     expect(snaps.at(-1)).toMatchObject({ audioConcealedSamples: 0, audioConcealmentEvents: 0 });
-    audio.port.onmessage?.({ data: { underrunFrames: 960, concealedFrames: 0, underrunEvents: 2, silenceRuns: 0, dropped: 0, minQueuedFrames: Infinity } });
+    audio.port.onmessage?.({ data: { underrunFrames: 960, concealedFrames: 0, underrunEvents: 2, silenceRuns: 2, dropped: 0, minQueuedFrames: 0 } });
     agent.last.closeWith(4400); // a reconnect before the next tick: the player is replaced
     await vi.advanceTimersByTimeAsync(50);
     expect(audio.createContext).toHaveBeenCalledTimes(2);
-    audio.port.onmessage?.({ data: { underrunFrames: 480, concealedFrames: 0, underrunEvents: 1, silenceRuns: 0, dropped: 0, minQueuedFrames: Infinity } });
+    audio.port.onmessage?.({ data: { underrunFrames: 480, concealedFrames: 0, underrunEvents: 1, silenceRuns: 1, dropped: 0, minQueuedFrames: 0 } });
     await vi.advanceTimersByTimeAsync(1_000);
     expect(snaps.at(-1)).toMatchObject({ audioConcealedSamples: 1_440, audioConcealmentEvents: 3 });
+    // #1346: the new player counts its silence runs from 0, so 2 + 1, not max(0, 1 - 2).
+    expect(counters.audioUnderruns).toBe(3);
     rt.destroy();
   });
 
