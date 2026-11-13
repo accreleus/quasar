@@ -313,24 +313,37 @@ those; this verb never sees them.
 
 **What it does.** One quasar-bench run per scenario whose status is not `skipped`, through
 `scripts/dx/bench_submit.py`, so the server and the API are the ones that script already posts to.
-The bench scenario is the scenario's name followed by its transport, codec and profile
-(`stream-hold.webrtc.h264.1080p60`): the server compares the newest run per suite, scenario and
-host, so the same scenario on another transport must not share a name.
+The bench scenario is the scenario's name, then `transport`, `codec` and `profile`, then every
+other param of the scenario in sorted key order, as `<k>=<v>` joined with `/`
+(`transport-fallback/transport=webtransport/codec=h264/profile=1080p60/when=mid`): the server
+compares the newest run per suite, scenario and host, so two runs that measured different things
+must not share a name. `/` and `=` are the separators because an identifier and a UUID hold
+neither, so a scenario's own name can never spell another scenario's params. `app`, `bench`,
+`cover_qr` and `hold_s` are not in the name — they do not change what the bench compares, and
+`hold_s` is a tag — and a param takes part only when its value is an identifier, a finite number
+or a boolean; anything else is left out and counted in `left_out=N`. The whole name may not pass
+200 characters: a longer one is refused (`failed=N`), never truncated.
 Each run is created with `repo=accreleus/quasar` and `commit` the node agent's commit from
 `builds.json` — never this checkout's HEAD, which is why a bundle without one is refused rather
 than posted under the wrong build. The tags are `suite_run` (the suite run id), `client` (the label
-from `client.json`), `transport`, `codec` and `profile` (the scenario's params), and `clock=raw`:
-the collected `trace.json` keeps client-clock browser events, so these runs are not comparable with
-host-aligned ones event for event. `git_quasar` is the bundle's commit and `git_protocol` is
-`unknown` (the bundle does not hold the build's protocol pin, and the posting checkout's would be a
-false fact); `bench_submit.py` adds its own tags from `session.json`. The run's notes carry the criteria, one line each,
-`<id> pass|fail|not-judged <observed>`; `expected`, a scenario's `reason` and any other free text
-are not copied into the notes or the tags. They do reach the server inside the artifacts, which
-are `review/summary.json`, the scenario's `scenario.json` and
-`timeline.jsonl`, its `shots/*.png`, and on the first run only a `tar.gz` of the whole bundle. The
-verdict is PASS for a `pass` and FAIL for a `fail` or an `error`; an error also carries the tag
-`status=error`. A failed scenario is posted, never withheld, and is not marked invalid. A skipped
-scenario posts nothing.
+from `client.json`), `transport`, `codec` and `profile` (the scenario's params), `hold_s` (how long
+it ran) and `clock=raw`: the collected `trace.json` keeps client-clock browser events, so these runs
+are not comparable with host-aligned ones event for event. `git_quasar` is the bundle's commit and
+`git_protocol` is `unknown` (the bundle does not hold the build's protocol pin, and the posting
+checkout's would be a false fact). **`bench_submit.py` adds its own**, and posts them too: from
+`session.json` the tags `launch`, `height`, `fps`, `codec`, `profile`, `session_id`,
+`quasar_host_id`, `launch_bitrate_kbps` and `soak_profile`, and `source_dir` (the two `git_` tags
+above win over its own); the files it uploads from the scenario directory — `summary.json`,
+`steps.jsonl`, `marks.jsonl`, `session.json`, `conditions.json`, `verdict.json`,
+`caps-negotiated.json`, and any `REPORT.md`, `LADDER.md` or other `.md` there; and the run's own
+samples and events, read from `metrics.jsonl`, `trace.json`, `marks.jsonl` and `steps.jsonl`. The
+run's notes carry the criteria, one line each, `<id> pass|fail|not-judged <observed>`;
+`expected`, a scenario's `reason` and any other free text are not copied into the notes or the
+tags. They do reach the server inside the artifacts: this verb adds `review/summary.json`, the
+scenario's `scenario.json` and `timeline.jsonl`, its `shots/*.png`, and on the first run only a
+`tar.gz` of the whole bundle. The verdict is PASS for a `pass` and FAIL for a `fail` or an `error`;
+an error also carries the tag `status=error`. A failed scenario is posted, never withheld, and is
+not marked invalid. A skipped scenario posts nothing.
 
 **The host pairs the runs.** A run's host is `<HOST>@<client label>`: the server takes the host
 string as a whole, so two test clients on one host
@@ -343,22 +356,31 @@ has no `session.json`; its id comes from the directory's path, so post it from t
 commit); one that does not match is left out and counted in `left_out=N`, so a tag is never free
 text. The bundle is validated before anything is posted, and every value reaches
 `bench_submit.py` as its own argument, never through a shell. A scenario is not posted
-(`failed=N`) when its name is not a name, or when its `session.json` does not carry one of the
-scenario's own session ids or holds a codec, profile or host id that is not a plain name: the
-script builds the run's identity and tags from that file. If the bundle cannot be archived, nothing
-is posted (`reason=no-archive`).
+(`failed=N`) when its name is not a name, when its bench scenario name would pass 200 characters,
+or when its `session.json` does not carry one of the scenario's own session ids in the lower-case
+form the collector writes (an id in another case is another external id, so a re-post would fork a
+second run), or holds a codec, profile, host id, `encoder` or `profile_id` that is not a plain
+name: the script builds the run's identity, its tags and its `conditions.negotiated` from that
+file. If the bundle cannot be archived, nothing is posted (`reason=no-archive`).
 
 The run ends with:
 
 ```
-RESULT status=ok|failed|error target=e2e-post posted=N skipped=N [failed=N] [left_out=N] [dry_run=1] [reason=...]
+RESULT status=ok|failed|error target=e2e-post posted=N skipped=N [failed=N] [left_out=N] [warn=N] [dry_run=1] [reason=...]
 ```
 
-Exit 0 every scenario posted (or planned, with `DRY_RUN=1`), 1 the bundle is not valid, the build
-has no commit, or a post failed, 2 usage. `DRY_RUN=1` runs `bench_submit.py --dry-run` for each
-scenario: it posts nothing (with a bench server configured the script still asks it for its
-version) and prints each run's plan, tags and external id — the way to see
-what a bundle would post.
+Exit 0 every scenario posted (or planned, with `DRY_RUN=1`), 1 the bundle is not valid
+(`reason=invalid-bundle`), the build has no commit (`reason=no-commit`), the archive could not be
+made (`reason=no-archive`), a scenario was refused (`failed=N`, nothing posted for it) or a post
+failed, 2 usage. A run `bench_submit.py` posted but whose tags disagree with what the host actually
+did (its exit 3) is counted as posted and as `warn=N`, and the verb still exits 0: the evidence is
+there, and it is not re-posted.
+
+`DRY_RUN=1` runs `bench_submit.py --dry-run` for each scenario: it posts nothing (with a bench
+server configured the script still asks it for its version) and prints each run's plan, tags and
+external id — the way to see what a bundle would post. With a bench address set but no key it
+fails instead: the plan is refused before anything is posted, because the script needs the key even
+to plan, so the verb exits 1 with `failed=N`.
 
 ### The fallback and keyboard-and-mouse scenarios
 
