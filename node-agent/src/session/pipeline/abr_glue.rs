@@ -1784,6 +1784,17 @@ mod tests {
     /// lever, and the ladder the WebRTC arm seeds is `enable_abr`'s. A WebTransport
     /// session could therefore have had no resolution rung at all and the suite stayed
     /// green.
+    ///
+    /// What this DOES prove: the WebTransport feedback path carries a lever through to the
+    /// governor's ladder end to end — an estimate under the floor moves the encode size
+    /// through that lever, keeps the frame rate, and drags the ABR floor with it.
+    ///
+    /// What it does NOT prove: that a session's start hands the session's own lever in.
+    /// This test supplies the lever itself, so deleting the `Some(session.lever.clone())`
+    /// argument at the WebTransport attach site (`runner.rs`, `SessionTransports::attach`)
+    /// leaves it green. Pinning that needs a runner-level attach, which builds the encode
+    /// pipeline and the WebRTC slot beside it (a registry, a real encoder, an audio plan) —
+    /// a harness of its own, not a unit test.
     #[test]
     fn a_webtransport_client_under_the_floor_steps_the_resolution_rung() {
         init();

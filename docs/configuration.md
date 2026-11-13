@@ -2735,10 +2735,15 @@ encoder name alone.
 **Driven by ABR, not only by the API.** This lever is also what the resolution rung
 of the ABR ladder actuates: `abr_ladder_resolution` steps the same `EncodeResolutionLever`
 (`node-agent/src/session/pipeline/abr_glue.rs`, `observe_resolution_rung`) from the
-`LadderPlanner`'s decision (`node-agent/src/session/ladder.rs`), so the decision half —
-comfort bitrates, dwell, hysteresis, ordering, the floor follow — is the same for a
-manual `PATCH` and for a step the ladder takes. See "The ladder on each transport"
-below for what a step does on the wire.
+`LadderPlanner`'s decision (`node-agent/src/session/ladder.rs`). The two callers share
+that actuator and nothing else. A manual `PATCH` of the stream size goes straight to the
+lever (`apply_stream_update` in `node-agent/src/session/runner.rs`) — no window, no
+dwell, no rung ordering — so it may move several rungs at once, and a non-launch size
+**pins** the session where the operator put it: the ladder keeps observing but stops
+moving the size until a `PATCH` back to the launch size releases it to `auto`. Every
+decision the ladder makes — comfort bitrates, dwell, hysteresis, ordering, the floor
+follow — is skipped on that path. See "The ladder on each transport" below for what a
+step does on the wire.
 
 ### The ladder on each transport (#1320)
 
@@ -2752,6 +2757,14 @@ bitrate controller, and the ladder's "the governor is pinned at its floor" test
 reads the one live floor either way. Only the transport that started last writes
 the encoder, and a client's first estimate takes it over from a WebRTC peer's loop.
 
+Everything below is about the **standard codecs** (h264, h265, av1). A **PyroWave**
+session is outside it: while PyroWave is active the WebTransport loop drops the
+client's receiver `feedback` before it reaches the ABR (`node-agent/src/webtransport/mod.rs`),
+and a PyroWave client is not sent the standard-codec configuration when it changes
+(`webtransport/media.rs`), so the governor never sees an estimate and the rung has
+nothing to act on. PyroWave runs its own rate controller instead; the ladder does not
+drive it.
+
 A step changes the `convert/scale → encoder` link only. That means:
 
 - **WebRTC:** nothing visible on the signalling side. `webrtcbin` is never
@@ -2763,17 +2776,46 @@ A step changes the `convert/scale → encoder` link only. That means:
   (`transport-webtransport.md` §Hello ack). The browser holds frames whose
   `config_id` it has no `hello_ack` for — at most 1 s — reconfigures the decoder
   under the new one (`web/src/webtransport/decodeStage.ts`), and the presenter
-  rebuilds its texture at the new size (`web/src/webtransport/presenter.ts`). No
-  reconnect, no `transport.fallback` and no "Click to play": the client's media
-  silence watchdog is 5 s (`MEDIA_SILENCE_MS` in
-  `web/src/pages/app/webTransportRuntime.ts`), far longer than a step's
-  renegotiation and keyframe.
+  rebuilds its texture at the new size (`web/src/webtransport/presenter.ts`).
+
+  What that costs in media is only partly known. On the Vulkan encoder path a rung
+  step restarts the encoder session, as any size change there does; on every path the
+  step is an IDR plus a decoder reconfigure. The browser ends a WebTransport stream
+  that has delivered no video for five seconds (`MEDIA_SILENCE_MS` in
+  `web/src/pages/app/webTransportRuntime.ts`), and that end is not a no-op: the client
+  makes one fresh WebTransport attempt and then reports `transport.fallback` with
+  reason `stream_lost`, so the page plays over WebRTC from there. A step is *expected*
+  to sit well inside that five seconds, but **no bound on the restart's duration has
+  been measured**: nobody has timed a step's silence on a real session, and a restart
+  that overran it would cost a reconnect and a fallback rather than nothing.
+
+**When it steps.** The rung is observed once per ~5 s metrics window, off the
+governor's setpoint. A normal down-step needs `abr_ladder_res_engage_dwell` (two)
+*qualifying* windows on top of the governor having already descended below
+`abr_ladder_res_engage_frac × B(r)` — it is not a fixed delay from the collapse, and a
+governor still above that band delays it further. The emergency path (congested **and**
+the setpoint at the floor) skips the dwell, but not the settle window that swallows the
+first window after a step, and not `abr_ladder_res_min_step_s` (10 s) since the last
+step. In the common shape — one window for the classifier to name the congestion and
+the governor to reach its floor, the next for the rung to act — the first step lands
+about 5 to 10 s after the collapse begins (a window is ~5 s, and the collapse can begin
+anywhere inside one). It takes longer if the governor needs more than one capped
+down-step to reach its floor.
 
 What the rung will NOT do: at `abr_ladder_res_min_height` (720p by default) it stops.
 An estimate under that rung's floor has no further remedy — the ladder has given up
-half the pixels and cannot give up more without an operator lowering the floor rung.
-`abr_ladder_floor_follows_rung` is what lets the encoder actually go there; without
-it a step changes bits per pixel and not the bitrate the link is judged to carry.
+three quarters of a 1440p picture's pixels, since 720p keeps one quarter of them (half
+the linear size in each direction), and it cannot give up more without an operator
+lowering the floor rung. `abr_ladder_floor_follows_rung` is what lets the encoder
+actually go there; without it a step changes bits per pixel and not the bitrate the link
+is judged to carry. With it on, the floor scales by the same power law as the comfort
+bitrate, `launch_floor × (px_rung / px_launch)^k` with `k = abr_ladder_res_exponent`
+(0.75): the height ratio squared is the pixel ratio, so `2 × 0.75 = 1.5` on the height
+ratio is the same exponent, and a 1440p session launched with a 2600 kbit/s floor lands
+on 2600 × (720/1440)^1.5 ≈ 919 kbit/s at 720p. With the frame-rate rung enabled and
+down, the same scale is multiplied by 0.6 once more — ≈ 552 kbit/s here. Two floors
+still bound it: the 300 kbit/s hard minimum, and an operator floor
+(`QUASAR_ABR_FLOOR_KBPS` or a host `abr_floor_kbps`), which always wins.
 
 ### Flow (both internal and external)
 
