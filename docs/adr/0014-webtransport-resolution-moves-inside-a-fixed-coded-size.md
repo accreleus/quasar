@@ -37,9 +37,20 @@ browser's decoder. Spec #1375, ticket #1381; the build is CA5 (#1383).
   dips 0.5–0.8 dB of PSNR and is back within 4–7 frames. A restart with a keyframe dips 3–5 dB
   and takes 11–26 frames. At fixed QP the step costs +0.3 to +0.8 frame-equivalents of bytes, and
   the restart +1.7 to +5.9, on AV1 and on H.264 on both hosts. H.264 keyframes are not held to
-  the one-frame budget: a restart puts 5–14 times a normal frame on the wire (483 ms of link time
-  at 1 Mbit/s on AMD). That latency is what Design 4 removes. The 5 % steps cost 1/3 to 1/4 of a
-  restart and pile up at low rates.
+  the one-frame budget: a restart puts 5–14 times a normal frame on the wire. That latency is what
+  Design 4 removes. The 5 % steps cost 1/3 to 1/4 of a restart and pile up at low rates.
+  A one-seat method review recomputed the tables from the raw data and found that every cell
+  matches. It accepted the result with five corrections that this record applies:
+  - The AV1 zoom dips are about one standard deviation of the frame-to-frame noise (0.3–0.7 dB).
+    The restart's 3–5 dB is not.
+  - The H.264 keyframe's 216 ms (NVIDIA) and 483 ms (AMD) of link time at 1 Mbit/s are an upper
+    bound. They come from content that the encoder could not rate-control that low.
+  - The Vulkan encoders have no one-frame VBV, in the spike or in production. AV1 keyframes ran at
+    2.5–3.8 times the one-frame budget.
+  - The spike ran with no periodic keyframe, where production has one per second. The ratio
+    survives that, and the restart's cost is slightly overstated if anything.
+  - The ramp figures are approximate.
+  All of these ratios hold for this content only.
 
 ## What each option covers
 
@@ -60,7 +71,7 @@ remove.
 - **At most 3 % of each side per step, and the rectangle 8-pixel aligned**, as measured. At 5 %
   the steps start to pile up at low rates.
 - **One step every 6 frames at most at 60 fps (100 ms).** At that cadence a full 1 → 0.5 → 1
-  ramp cost at most 0.3 dB of mean PSNR. A full-size to half-size softening takes about 1.7 s. An
+  ramp cost roughly 0.3 dB of mean PSNR at most (approximate, per the review). A full-size to half-size softening takes about 1.7 s. An
   isolated step on AV1 at 1–2.6 Mbit/s needs up to 8 frames to recover fully, so a controller that
   is not chasing a collapse spaces its steps 8 frames apart. A 120 fps session keeps the same
   spacing in time (12 to 16 frames) until it is measured.
