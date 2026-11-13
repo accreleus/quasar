@@ -57,12 +57,14 @@ describe("fallbackStreamRungs", () => {
       [1920, 1080],
       [1600, 900],
       [1280, 720],
+      [960, 540],
+      [640, 360],
     ]);
   });
 
   it("offers the higher rungs for a 4K launch", () => {
     expect(fallbackStreamRungs({ w: 3840, h: 2160 })[0]).toEqual([3840, 2160]);
-    expect(fallbackStreamRungs({ w: 3840, h: 2160 })).toHaveLength(5);
+    expect(fallbackStreamRungs({ w: 3840, h: 2160 })).toHaveLength(7);
   });
 
   it("offers launch only for a non-16:9 session (the server owns those families)", () => {

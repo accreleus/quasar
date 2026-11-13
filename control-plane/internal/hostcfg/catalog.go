@@ -75,7 +75,7 @@ func Catalog() []Knob {
 		// (docs/reports/2026-08-18-overnight-optimisation/t3-ladder-step-recovery.md).
 		{Key: "abr_ladder_res_recover_dwell", Type: TypeInt, Default: float64(2), Min: f(1), Max: f(60), Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_RES_RECOVER_DWELL"},
 		{Key: "abr_ladder_res_min_step_s", Type: TypeInt, Default: float64(10), Min: f(5), Max: f(120), Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_RES_MIN_STEP_S"},
-		{Key: "abr_ladder_res_min_height", Type: TypeInt, Default: float64(720), Min: f(360), Max: f(2160), Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_RES_MIN_HEIGHT"},
+		{Key: "abr_ladder_res_min_height", Type: TypeInt, Default: float64(360), Min: f(360), Max: f(2160), Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_RES_MIN_HEIGHT"},
 		{Key: "abr_ladder_fps", Type: TypeBool, Default: false, Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_FPS"},
 		{Key: "abr_ladder_floor_follows_rung", Type: TypeBool, Default: true, Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_FLOOR_FOLLOWS_RUNG"},
 		{Key: "abr_ladder_order", Type: TypeEnum, Default: "hybrid", Enum: []string{"res_first", "fps_first", "hybrid"}, Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_ORDER"},

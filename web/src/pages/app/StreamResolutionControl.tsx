@@ -33,6 +33,8 @@ const FALLBACK_RUNGS_16_9: ReadonlyArray<readonly [number, number]> = [
   [1920, 1080],
   [1600, 900],
   [1280, 720],
+  [960, 540],
+  [640, 360],
 ];
 
 /** Client-side stand-in for `session.stream.rungs`: 16:9 family filtered to

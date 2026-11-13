@@ -709,7 +709,7 @@ impl ResolutionPolicy {
     /// for the measured gain (this is the resolution-rung half of the same arm).
     pub const DEFAULT_RECOVER_DWELL: u8 = 2;
     pub const DEFAULT_MIN_STEP_S: u64 = 10;
-    pub const DEFAULT_MIN_HEIGHT: i32 = 720;
+    pub const DEFAULT_MIN_HEIGHT: i32 = 360;
     pub const DEFAULT_SETTLE_WINDOWS: u8 = 1;
 
     pub fn new() -> Self {
@@ -2296,11 +2296,15 @@ mod tests {
         assert_eq!(r.rung(), 2);
     }
 
-    // Floor rung: never below min_height (720 by default).
+    // Floor rung: never below min_height.
     #[test]
     fn never_steps_below_the_min_height() {
         let t = Instant::now();
-        let mut r = rung_at(t);
+        let policy = ResolutionPolicy {
+            min_height: 720,
+            ..ResolutionPolicy::new()
+        };
+        let mut r = ResolutionRung::new(policy, rungs_1440(), CEILING, t);
         let mut steps = Vec::new();
         for i in 0..40u64 {
             if let Some(d) = r.observe(
@@ -2852,6 +2856,27 @@ mod tests {
                 reason: StepReason::Rate
             })
         );
+    }
+
+    /// A 1440p120 session on the real 16:9 table at the default floor: 1000 kbit/s is under
+    /// every line down to 540p (engage 1378), so it lands on 640x360 (engage 750); 1400
+    /// fits 540p. With the table and floor of 720p, both land on 720p (`res->3`).
+    #[test]
+    fn a_link_under_the_720p_floor_steps_under_720p() {
+        let t = Instant::now();
+        let cfg = LadderConfig {
+            resolution_enabled: true,
+            order: LadderOrder::ResFirst,
+            ..LadderConfig::new()
+        };
+        for (rate, to, size) in [(1000.0, 5, (640, 360)), (1400.0, 4, (960, 540))] {
+            let rungs = crate::session::rungs::available_rungs(2560, 1440);
+            let mut p = LadderPlanner::new(&cfg, rungs, 120, CEILING, t);
+            p.set_per_report();
+            let steps = rates(&mut p, t, 0, 3, |_| rate);
+            assert_eq!(steps, vec![(1000, format!("res->{to}"))], "rate {rate}");
+            assert_eq!(p.res_size(), size, "rate {rate}");
+        }
     }
 
     /// One report, or a run shorter than `RATE_CONFIRM`, moves nothing; nor does a rate in
