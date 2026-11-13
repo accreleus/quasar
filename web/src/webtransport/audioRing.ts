@@ -46,17 +46,17 @@ export const SLACK_FRAMES = 240;
 /** The most audio queued (one second at 48 kHz). */
 export const MAX_QUEUED_FRAMES = 48_000;
 /** A step in the playout delay up to this size is closed by playing slightly off real time
- *  (60 ms at 48 kHz). A larger one is a stall or a reset, not a delay to follow: it keeps the
- *  old behaviour, the whole gap as silence or the whole overlap cut. */
+ *  (60 ms at 48 kHz). Larger unmarked steps are stalls or resets:
+ *  the whole gap stays silence or the whole overlap is cut. */
 export const MAX_STRETCH_FRAMES = 2_880;
-/** How far off real time the queue plays while it closes such a step: 2 %. Over the second or
- *  two it takes, that shifts pitch by a third of a semitone, not a click — the accepted trade
- *  here, where a resampler is all this needs and a phase vocoder or WSOLA is not. */
-export const STRETCH_RATE = 0.02;
+/** At 0.5 %, a 10 ms step takes 2 s and 60 ms takes 12 s; pitch stays within 9 cents. */
+export const STRETCH_RATE = 0.005;
 /** A correction under way runs until the step is this small (1 ms at 48 kHz), not until it is
  *  inside the slack: stopping there would leave the queue 5 ms ahead of the delay it was given,
  *  which is 5 ms of the jitter cover gone. */
 export const STRETCH_DONE_FRAMES = 48;
+/** The full 40–150 ms target range plus the previous correction's allowed remainder. */
+const MAX_TARGET_CHANGE_FRAMES = 5_280 + STRETCH_DONE_FRAMES;
 
 export class AudioRing {
   private queue: Chunk[] = [];
@@ -73,8 +73,9 @@ export class AudioRing {
   };
   /** The last frame rendered was silence for want of audio. */
   private starving = false;
-  /** Source frames played per output frame: 1, or 2 % off while a delay change is closed. */
+  /** Source frames played per output frame: 1, or 0.5 % off while a delay change is closed. */
   private rate = 1;
+  private sourceCarry = 0;
   /** The stream's own start of the last chunk finished, and its length: what a step in the
    *  stream's timeline, rather than in ours, is measured against. */
   private prevStart: number | null = null;
@@ -171,9 +172,8 @@ export class AudioRing {
    *  shows as a step in the stream's own start times between two chunks that are otherwise
    *  back to back; it is closed by playing slightly slower (a rise: the audio we have is now
    *  early) or faster (a fall) from where the last chunk ended, instead of by a gap of silence
-   *  or a cut head. Everything else keeps the old behaviour: the queue ran dry, audio is lost
-   *  behind a concealment fade, the stream skipped a whole number of chunks (packets that
-   *  never arrived), or the step is over the bound (a stall or a reset). */
+   *  or a cut head. Interruptions preserve an ongoing correction; outside a correction,
+   *  dry queues, concealment, lost packets and steps over the bound keep their old behaviour. */
   private align(chunk: Chunk, f: number): void {
     const end = this.lastEnd;
     const correcting = this.rate !== 1;
@@ -190,23 +190,34 @@ export class AudioRing {
       chunk.targetDelayFrames !== undefined && this.prevTargetDelayFrames !== undefined
         ? chunk.targetDelayFrames - this.prevTargetDelayFrames
         : 0;
+    // Only a real target change (or its unfinished remainder) extends the unmarked bound.
+    const remainder = correcting && this.prevStart !== null ? this.prevStart + this.prevFrames - end : 0;
+    const stretchLimit = Math.min(
+      MAX_TARGET_CHANGE_FRAMES,
+      MAX_STRETCH_FRAMES + Math.abs(delayChange) + Math.abs(remainder),
+    );
     const sourceJump = jump - delayChange;
     const intentional = delayChange !== 0 && Math.abs(sourceJump) <= this.slack;
     const step =
-      (end === f || intentional) &&
-      !this.lostChunks(sourceJump) &&
-      !(this.prevConcealed && sourceJump > this.slack) &&
+      (end === f || intentional || correcting) &&
+      (correcting || !this.lostChunks(sourceJump)) &&
+      (correcting || !(this.prevConcealed && sourceJump > this.slack)) &&
       Math.abs(obs) > (correcting ? STRETCH_DONE_FRAMES : this.slack) &&
-      Math.abs(obs) <= MAX_STRETCH_FRAMES &&
+      Math.abs(obs) <= stretchLimit &&
       (correcting || Math.abs(obs - jump) <= this.slack);
     if (step) {
       // If the queue already ran dry, start now: waiting for the new target would count
       // the intentional step as a second underrun and deepen the buffer again.
-      chunk.start = Math.max(end, f);
+      // Preserve only the missing source audio as a gap; paying the outstanding delay
+      // correction here would turn one lost packet into a much longer underrun.
+      chunk.start = Math.max(end + (correcting && sourceJump > this.slack ? sourceJump : 0), f);
+      chunk.off += this.sourceCarry;
+      this.sourceCarry = 0;
       this.rate = obs > 0 ? 1 - STRETCH_RATE : 1 + STRETCH_RATE;
       return;
     }
     this.rate = 1;
+    this.sourceCarry = 0;
     // Back to back with the last chunk when its timestamp is within the slack; an overlap
     // (a duplicate, or a late reorder) loses its head instead of playing twice.
     if (chunk.start + chunk.out <= end + this.slack) {
@@ -241,8 +252,7 @@ export class AudioRing {
     return take;
   }
 
-  /** Play `chunk` on from `pos`, `rate` source frames per output frame: linear interpolation,
-   *  which for the 2 % above is a pitch shift of a third of a semitone, not a click. */
+  /** Linear interpolation at `rate` source frames per output frame. */
   private resample(chunk: Chunk, out: Float32Array[], pos: number, room: number): number {
     let written = 0;
     while (written < room && chunk.off < chunk.frames) {
@@ -260,6 +270,9 @@ export class AudioRing {
   }
 
   private finish(chunk: Chunk, dropped: boolean): void {
+    // Carry the fractional source position across chunks, so rounding each 10 ms chunk does
+    // not turn a 0.5 % correction into a larger effective rate change.
+    this.sourceCarry = !dropped && this.rate !== 1 ? Math.max(0, chunk.off - chunk.frames) : 0;
     this.queue.shift();
     this.queued -= chunk.frames;
     if (dropped) this.stats.dropped += 1;
