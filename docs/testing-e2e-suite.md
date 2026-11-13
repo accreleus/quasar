@@ -6,9 +6,9 @@ loop, leaving one **run bundle** that an agent or a person reviews afterwards. S
 > **Status.** The bundle format and its validator (#1272), the runner (#1273, `make e2e-run`), the
 > host half of a bundle (#1274, `make e2e-collect`), the review that summarises a bundle (#1275,
 > `make e2e-review`) posting a run to quasar-bench (#1276, `make e2e-post`), the client half as one archive for a
-> remote tester (#1280, `make e2e-pack`) and two bundles compared (#1284, `make e2e-compare`) exist.
-> Serving a web build to the browser on the stack's own origin and the UI journeys in a plan are the
-> spec's later tickets (#1284); this page grows with them.
+> remote tester (#1280, `make e2e-pack`), two bundles compared (#1284, `make e2e-compare`) and a
+> local web build served to the browser on the stack's own origin (#1284, `WEB_DIST=`) exist.
+> The UI journeys in a plan are a later ticket (#1284); this page grows with it.
 
 ## What you need
 
