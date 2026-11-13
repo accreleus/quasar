@@ -1568,6 +1568,16 @@ mod tests {
                     held_off = true;
                     std::thread::sleep(Duration::from_millis(5));
                 }
+                // A flood can outlast `IDLE` on the reading side, which then closes the
+                // connection; what this test is about is the cap, not surviving the close.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    break
+                }
                 Err(e) => panic!("{e}"),
             }
         }
