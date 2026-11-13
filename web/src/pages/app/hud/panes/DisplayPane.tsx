@@ -105,11 +105,13 @@ export function DisplayPane(props: DisplayPaneProps) {
       </div>
       <div className="cols">
         {props.streamSize == null || currentStream == null ? (
-          <div className="col-note">
-            This session did not report a stream size, so its display controls are
-            unavailable. Relaunch from the library to get them back.
-            {sharpen}
-          </div>
+          <>
+            <div className="col-note">
+              This session did not report a stream size, so its display controls are
+              unavailable. Relaunch from the library to get them back.
+            </div>
+            <div>{sharpen}</div>
+          </>
         ) : (
           <>
             <div>
@@ -136,6 +138,7 @@ export function DisplayPane(props: DisplayPaneProps) {
                       }
                     />
                   </div>
+                  {sharpen}
                   {props.streamAdapting && (
                     <p className="col-note" role="status">
                       Adapting…
@@ -147,11 +150,13 @@ export function DisplayPane(props: DisplayPaneProps) {
                   )}
                 </>
               ) : (
-                <p className="col-note">
-                  This session has one stream resolution, so there is nothing to choose.
-                </p>
+                <>
+                  <p className="col-note">
+                    This session has one stream resolution, so there is nothing to choose.
+                  </p>
+                  {sharpen}
+                </>
               )}
-              {sharpen}
             </div>
 
             <div>

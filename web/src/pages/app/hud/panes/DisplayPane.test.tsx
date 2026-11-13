@@ -250,4 +250,14 @@ describe("DisplayPane upscale sharpen (#1349)", () => {
     const toggle = screen.getByRole("checkbox", { name: /sharpen an upscaled picture/i });
     expect((toggle as HTMLInputElement).checked).toBe(false);
   });
+
+  it.each([
+    ["several rungs", streamBase],
+    ["resize unsupported", { ...streamBase, externalResizeSupported: false }],
+    ["one rung", base],
+    ["no stream size", { ...base, streamSize: null }],
+  ])("renders exactly once: %s", (_name, props) => {
+    render(<DisplayPane {...props} />);
+    expect(screen.getAllByRole("checkbox", { name: /sharpen an upscaled picture/i })).toHaveLength(1);
+  });
 });
