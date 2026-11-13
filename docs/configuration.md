@@ -2740,10 +2740,10 @@ that actuator and nothing else. A manual `PATCH` of the stream size goes straigh
 lever (`apply_stream_update` in `node-agent/src/session/runner.rs`) — no window, no
 dwell, no rung ordering — so it may move several rungs at once, and a non-launch size
 **pins** the session where the operator put it: the ladder keeps observing but stops
-moving the size until a `PATCH` back to the launch size releases it to `auto`. The pin
-is checked at the rung's commit points only (`Ladder::observe` in
-`node-agent/src/session/ladder.rs`), so a step cannot emit: comfort bitrates, dwell,
-hysteresis and ordering are skipped on that path. The floor is not. Every window
+moving the size until a `PATCH` back to the launch size releases it to `auto`. While
+pinned, the resolution and frame-rate rungs take no step (their `observe` in
+`node-agent/src/session/ladder.rs` returns before one can be emitted). The floor still
+moves. Every window
 re-derives it from the size the session is actually sending — after the resync, the
 pinned one — and calls `set_floor` unconditionally, even in a window where the rung
 decides nothing (`observe_resolution_rung`'s caller in `abr_glue.rs`), so the floor
@@ -2811,7 +2811,7 @@ the window that closes it is the one that writes the congested hint, so no rung 
 yet; the next window's feedback `observe` reads that hint and drops the setpoint to the
 floor in one protective step, and the rung observation that runs after it in the same
 window takes the step. It takes longer if the classifier does not name the congestion
-on that first window, so more capped steps pass before the protective one.
+on that first window.
 
 What the rung will NOT do: at `abr_ladder_res_min_height` (720p by default) it stops.
 An estimate under that rung's floor has no further remedy — the ladder has given up
