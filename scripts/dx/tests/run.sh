@@ -3723,10 +3723,13 @@ if command -v node >/dev/null 2>&1; then
   # Posting a run to quasar-bench (#1276): the spawn is recorded, and one dry run drives the real
   # bench_submit.py with no server configured.
   rc_of 0 "e2e:post" -- node --test "$ROOT/scripts/validate/stream/post.test.mjs"
+  # The client pack (#1280): its archive unpacked alone into an empty directory, its entry run against an in-process stack.
+  rc_of 0 "e2e:pack" -- node --test "$ROOT/scripts/validate/stream/pack.test.mjs"
 else
   warn "e2e:bundle-format" "node not installed — SKIPPED"
   warn "e2e:collect" "node not installed — SKIPPED"
   warn "e2e:post" "node not installed — SKIPPED"
+  warn "e2e:pack" "node not installed — SKIPPED"
 fi
 
 # The review an agent reads first (#1275): golden bytes, the same bytes twice, a

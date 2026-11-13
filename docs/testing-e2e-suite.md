@@ -5,8 +5,9 @@ loop, leaving one **run bundle** that an agent or a person reviews afterwards. S
 
 > **Status.** The bundle format and its validator (#1272), the runner (#1273, `make e2e-run`), the
 > host half of a bundle (#1274, `make e2e-collect`), the review that summarises a bundle (#1275,
-> `make e2e-review`) and posting a run to quasar-bench (#1276, `make e2e-post`) exist. `e2e-compare`
-> and `e2e-pack` are the spec's later tickets; this page grows with them.
+> `make e2e-review`) posting a run to quasar-bench (#1276, `make e2e-post`) and the client half as one archive for a
+> remote tester (#1280, `make e2e-pack`) exist. `e2e-compare` is the spec's later ticket; this page
+> grows with it.
 
 ## What you need
 
@@ -399,7 +400,7 @@ key held, then the hook is applied while streaming) or `connect` (applied before
 long it waits for the fallback and a frame: counted from the fault in `mid`, from the first frame in `connect`
 (the fault was already on). A `mid` run whose session had already fallen back before the fault (the session row
 has a reason, the page already posted the event, or the `<video>` is already decoding) is an `error` that says so
-and the hook is not applied; only evidence from after the fault counts. With no first frame the fault is never
+and the hook is not applied; only evidence from after the fault counts. That check runs before the pointer lock is taken and the key held, so such a run touches nothing, and a session row it cannot read just before the fault is an `error` that says so. The key is held only when the lock is held. With no first frame the fault is never
 applied (`mid`) or nothing is watched after it (`connect`), so the criteria after the fault are `pass: null`.
 
 | criterion | judged as |
@@ -407,23 +408,70 @@ applied (`mid`) or nothing is watched after it (`connect`), so the criteria afte
 | `webtransport_closed_first` | `pass: null`. The page does not expose when its WebTransport session closed, the trace has no event for it, and the agent logs nothing of its own for a lost WebTransport client. Needs a client trace event or bench field for the close time, or an agent log line, in the host half |
 | `continues_on_webrtc` | after the fallback the session is not `stopped`/`failed`, and the `<video>` (the WebRTC path; WebTransport draws on a canvas) decodes frames across a 5 s tail |
 | `fallback_event` | the session row's `transport_fallback_reason` (the control plane writes it from the `transport.fallback` event), or that event as the page itself posts it to the stack, has a reason matching `^[a-z0-9_]{1,64}$`; `observed` says which source |
-| `frame_after_fallback` | the `<video>` decoded a frame after the fault went on (it had none before it); `observed` is the seconds from the fault |
+| `frame_after_fallback` | the `<video>` decoded a frame after the fault went on (it had none before it); `observed` is the seconds from the fault and, in `mid`, how long no frame advanced (see below) |
 | `held_key_released` | `pass: null`. A key held across the fallback (`key-held`, then `key-released` by the runner at the end) is the test; the client cannot see the host's key state. Needs the host half (an agent input log) or the reference app logging individual keys. In `connect` nothing is held: no input is captured before the first picture |
+
+`fallback.json` also records why the wait ended (`wait_ended_by`: `fallback_and_frame_seen`, `hold_elapsed` or `session_ended`; the same in the timeline step `wait-ended`) with the seconds waited (`waited_s`), and, in `mid`, `no_frame_advance_before_video_s`: the longest run of one-second samples between the fault and the first `<video>` frame in which neither the bench frames nor the `<video>` advanced (about the seconds the picture froze; one-second resolution; when no `<video>` frame came it runs to the end of the wait). It is `null` in `connect`, when no sample was taken (the session ended at once), when a count could not be read, and once the bench's frame ring is full (5000 frames), because its count then stops growing. It is a fact, not a criterion, and has no threshold. `fallback_event` and `frame_after_fallback` say where their wait starts: the fault in `mid`, the first frame in `connect`.
 
 `input-kbm` sends one fixed sequence (`SEQUENCE` in the scenario file: six keys, the three mouse buttons, wheel up
 and down, relative motion) as trusted events through the DevTools protocol (`Input.dispatchKeyEvent`,
 `Input.dispatchMouseEvent`). The pointer lock first: the product takes it from its "Click to play" layer (a click on
-the stage only opens the HUD shelf), so the scenario waits for that layer and clicks it with a trusted click, up to
-three times. A key or button held when the run is cut is released on the way out; a release that fails is named
-in "left behind". `hold_s` is the pause after the sequence. `input-sent.json` holds what was sent (in order) and what the page
-received, for the host half to compare.
+the stage only opens the HUD shelf), so the scenario waits for that layer and clicks it once with a trusted click (the
+product removes the layer on the first click), then waits for the lock. With no layer within the wait the launch was not
+immersive, and it tries the HUD's own route: a trusted click on the stream, which opens the shelf, then a click on the
+shelf's "Capture input" button (the product's `aria-label`); `pointer_lock_taken`'s `observed` says which route held the lock
+or why none did. A key or button held when the run is cut is released on the way out; a release that fails is named
+in "left behind". `hold_s` is the pause after the sequence. `input-sent.json` holds what was sent (in order, with `sent_motion_sum`) and what the page
+received (each `mousemove` as `[movementX, movementY, isTrusted]`, at most 200, with the total count and `motion_sum`; the motion
+before the sequence starts is not counted), for the host half to compare. The moves sum to (50, 25), not zero, so no motion and
+motion that cancels are different bundles.
 
 | criterion | judged as |
 |---|---|
-| `pointer_lock_taken` | `document.pointerLockElement` is the stream surface after the click on the "Click to play" layer; `pass: null` when no first frame was seen (the sequence was not sent) |
-| `keys_match`, `buttons_match`, `motion_sum_matches` | `pass: null`. The reference app does not log individual keys, buttons or motion (its echo is one bit) and the runner cannot see the page's input channel. Needs the app's own input log on the host |
+| `pointer_lock_taken` | `document.pointerLockElement` is the stream surface after the click on the "Click to play" layer, or on the HUD's "Capture input" button when the launch was not immersive; `pass: null` when no first frame was seen (the sequence was not sent) |
+| `keys_match`, `buttons_match`, `motion_sum_matches` | `pass: null`. The reference app does not log individual keys, buttons or motion (its echo is one bit) and the runner cannot see the page's input channel. Needs the app's own input log on the host. `motion_sum_matches`'s `expected` also says how many `mousemove` events the page received, their sum, and the sum sent |
 | `nothing_held_at_end` | every key and button the page was sent down was also sent up, as the page received them. The product's own held-key set is not exposed, so a key the page failed to release on the host is not seen here |
 | `input_to_photon_ms` | `pass: null` (no limit is calibrated); `expected` carries the count, median and max of the samples from eight `__qBench.pressKey` rounds. A sample that is not a finite number is not counted; none at all says the marker echoed no key |
+
+### The pack for a remote tester
+
+`make e2e-pack [OUT=<path without extension>]` writes the client half as one archive, `OUT.tar.gz`
+and `OUT.zip` (the same files; Windows opens the zip, macOS and Linux either), 70 to 85 KB. It holds
+the runner and every file it imports (worked out from the code, not listed by hand), the plans,
+`thresholds.json` and `metrics.json`, `package.json` and a lockfile for `playwright-core` alone,
+`run.sh` and `run.cmd`, a plain `README.txt` and `VERSION` (the commit it was made from, `dirty`
+after it if tracked files differed; a scenario or plan git does not track stops the pack). No
+tests, no hook scripts, no host or `.env` file, nothing from `.claude/`. The tester needs Node 22 and Chrome, nothing from this repository.
+
+What the tester does (they are also told in `README.txt`): unpack, make `signin.txt` in the folder
+with `QUASAR_E2E_EMAIL=` and `QUASAR_E2E_PASSWORD=` lines (the sign-in is never a command-line
+argument and never goes into what comes back), then one command with the stack's address:
+
+```
+bash run.sh https://<stack> [<plan>] [--insecure]     # macOS, Linux
+.\run.cmd https://<stack> [<plan>] [--insecure]       # Windows (cmd or PowerShell)
+```
+
+`--insecure` is `INSECURE_TLS=1`. The first run fetches `playwright-core` with `npm ci` (online,
+without the sign-in in that process' environment). Then `doctor` checks, in order, Node, Chrome, the
+plan, that the stack answers, that the sign-in is accepted, that the reference app is in the user's
+library, that Chrome can open the stack's page (on a Mac a failure here is most often the Local
+Network permission, and the message says so) and that this Chrome can decode what the plan asks
+(a scenario it cannot run is a note; none that it can is a failure). Each line is `ok` or
+`FAIL` with a sentence in plain words. `run.sh doctor https://<stack>` stops there. A failed check
+ends the command (exit 1, `zip=` empty); otherwise it runs the plan (default `smoke`, in a headed
+Chrome on Mac and Windows, since a desktop there has no `DISPLAY`), validates the bundle with
+`validateBundle`, and writes `results/quasar-e2e-<time>.zip`: the bundle and nothing else. Hooks
+are not part of the pack, so a scenario that needs one is `skipped`.
+
+```
+RESULT status=ok|failed|error target=e2e-pack zip=<file> run=ok|failed pass=N fail=N error=N skipped=N
+```
+
+A full run exits 0 only when that zip was written (`reason=no-zip` otherwise), whether or not the
+streams passed; `doctor` alone exits 0 when every check passed, with `zip=` empty: the result is in the
+bundle, and the tester sends the file back either way. `make e2e-review BUNDLE=<unzipped dir>`
+reads it.
 
 ## The run bundle, format 1
 

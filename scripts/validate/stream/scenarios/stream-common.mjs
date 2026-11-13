@@ -201,36 +201,53 @@ export const streamCentre = (page) =>
   });
 
 export const LOCK_WAIT_S = 5; // how long the pointer lock, or the layer that takes it, is waited for
-const LOCK_TRIES = 3; // clicks on that layer before giving up
+const HUD_WAIT_S = 2; // how long the HUD's "Capture input" button is waited for after a click on the stage
 
 /**
  * Takes the pointer lock the way the product does (SessionPage.tsx): a stage click while input is not captured only opens the HUD
  * shelf; the lock is requested from the "Click to play" layer (`.session-play`), which the page raises once the loader is inert and the
- * channel is open (and only when Play went immersive, the default). So this waits for the layer, clicks IT with a trusted click, and
- * clicks again while the lock is not held, up to LOCK_TRIES times within LOCK_WAIT_S. Returns { held, clicks, at } (`at` is where the last click was): no layer within the wait
- * and no lock (auto-capture can take it with no click) is { held: false, clicks: 0 }.
+ * channel is open (and only when Play went immersive, the default). The product removes that layer on the first click, so this waits
+ * for it, clicks it ONCE with a trusted click, then waits for the lock. With no layer within LOCK_WAIT_S and no lock (auto-capture can
+ * take it with no click) the launch was not immersive: the HUD's own route is tried, a click on the stage (which opens the shelf) and a
+ * click on its "Capture input" button (an aria-label the product sets, HudBar.tsx).
+ * Returns { held, clicks, hud, at }: `clicks` is the clicks on the layer (0 or 1); `hud` is null (not tried), "no-surface" (no visible stream surface, so nothing was clicked), "no-button" (the shelf showed
+ * no enabled button) or "clicked"; `at` is where the last click was.
  */
 export async function takeLock(page, cdp, { now, sleep }) {
   const held = () => page.evaluate(() => document.pointerLockElement?.classList?.contains("session-video") === true);
-  const layer = () =>
-    page.evaluate(() => {
-      const r = document.querySelector(".session-play")?.getBoundingClientRect?.();
+  const spotOf = (sel) =>
+    page.evaluate((s) => {
+      const el = document.querySelector(s);
+      const r = el && !el.disabled ? el.getBoundingClientRect?.() : null;
       return r && r.width > 0 && r.height > 0 ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
-    });
-  const until = now() + LOCK_WAIT_S * 1000;
-  let clicks = 0;
-  let at = null;
-  for (;;) {
-    if (await held()) return { held: true, clicks, at };
-    if (now() >= until) return { held: false, clicks, at };
-    const spot = clicks < LOCK_TRIES ? await layer() : null;
-    if (spot) {
-      at = spot;
-      await mouseEvent(cdp, { type: "mouseMoved", x: at.x, y: at.y });
-      await mouseEvent(cdp, { type: "mousePressed", x: at.x, y: at.y, button: "left", buttons: 1, clickCount: 1 });
-      await mouseEvent(cdp, { type: "mouseReleased", x: at.x, y: at.y, button: "left", buttons: 0, clickCount: 1 });
-      clicks += 1;
+    }, sel);
+  const click = async (at) => {
+    await mouseEvent(cdp, { type: "mouseMoved", x: at.x, y: at.y });
+    await mouseEvent(cdp, { type: "mousePressed", x: at.x, y: at.y, button: "left", buttons: 1, clickCount: 1 });
+    await mouseEvent(cdp, { type: "mouseReleased", x: at.x, y: at.y, button: "left", buttons: 0, clickCount: 1 });
+  };
+  // Polls `ready` until it returns something truthy or the deadline passes.
+  const wait = async (s, ready) => {
+    const until = now() + s * 1000;
+    for (;;) {
+      const v = await ready();
+      if (v) return v;
+      if (now() >= until) return v;
+      await sleep(250);
     }
-    await sleep(250);
+  };
+  const layer = await wait(LOCK_WAIT_S, async () => ((await held()) ? "held" : spotOf(".session-play")));
+  if (layer === "held") return { held: true, clicks: 0, hud: null, at: null };
+  if (layer) {
+    await click(layer);
+    return { held: !!(await wait(LOCK_WAIT_S, held)), clicks: 1, hud: null, at: layer };
   }
+  // No layer: the launch was not immersive. A click on the stage opens the HUD shelf; its button takes the lock.
+  const centre = await streamCentre(page);
+  if (!centre) return { held: false, clicks: 0, hud: "no-surface", at: null };
+  await click(centre);
+  const button = await wait(HUD_WAIT_S, () => spotOf('button[aria-label="Capture input"]'));
+  if (!button) return { held: await held(), clicks: 0, hud: "no-button", at: centre };
+  await click(button);
+  return { held: !!(await wait(LOCK_WAIT_S, held)), clicks: 0, hud: "clicked", at: button };
 }
