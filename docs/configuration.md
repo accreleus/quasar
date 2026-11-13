@@ -757,8 +757,9 @@ WebTransport in `protective`, keep the window loop the rest of this section desc
   and the setpoint to the higher of the two in one move, about 100 ms after the first
   report that shows the link short: no `abr_max_down_step` cap, no `abr_down_dwell_ms`,
   no `abr_min_interval_ms`.
-- **Up.** Each estimate may raise the rate by at most `abr_max_up_step` per
-  `abr_min_interval_ms` (25 %/s by default), never above the estimate. The setpoint follows
+- **Up.** Each estimate may raise the rate by at most `abr_max_up_step` × the time since
+  the last estimate (counted up to 1 s) / `abr_min_interval_ms`, never above the estimate:
+  2.5 % per 100 ms report by default, which compounds to 28 % a second. The setpoint follows
   in moves of more than `abr_deadband`, and to the ceiling once the estimate is there. No
   timer and no EWMA.
 - **Silence.** With no report for 500 ms (a hidden tab, a Wi-Fi roam) the silence decay
@@ -767,9 +768,11 @@ WebTransport in `protective`, keep the window loop the rest of this section desc
 - **Encoders whose bitrate write costs a keyframe.** A live bitrate write re-initialises
   NVENC (its VBV write is a rate-control parameter change) and VA (any rate-control write),
   each with a keyframe, so on those the loop writes the encoder at most once per
-  `abr_min_interval_ms`. The Vulkan encoders' write changes rate control only, with no
-  keyframe (`deploy/patches/vulkan/README.md`); they and openh264 are written as soon as the
-  rate moves.
+  `abr_min_interval_ms`, and never more than once a second whatever that is set to. The
+  Vulkan encoders' write changes rate control only, with no keyframe
+  (`deploy/patches/vulkan/README.md`), and openh264's applies the new target without the
+  encoder reset that forces an IDR (`gstopenh264enc.cpp` `handle_frame`, openh264's
+  `WelsEncoderParamAdjust`); those are written as soon as the rate moves.
 - **Trace.** Each move is one `abr.retarget`, and each follows a move of the rate past the
   deadband: a minute of a link at its limit is tens of events, not one per report.
 
@@ -792,7 +795,7 @@ matched the spec's worked example **except `abr_ladder_res_recover_dwell`, flipp
 | `QUASAR_ABR_LADDER_RES_RECOVER_FRAC` | `0.8` | `0.3..1.0` | Step **up** one rung when the setpoint reaches `recover_frac × B(r-1)` for `res_recover_dwell` consecutive windows. WebTransport: the rate at or over it for 1 s steps up to the highest rung it reaches. |
 | `QUASAR_ABR_LADDER_RES_ENGAGE_DWELL` | `2` | `1..60` | Consecutive pressure windows (~5 s each) required before a down-step. WebRTC only. |
 | `QUASAR_ABR_LADDER_RES_RECOVER_DWELL` | `2` | `1..60` | Consecutive recovered windows required before an up-step. WebRTC only. **2026-08-18 flip** (was `4`; T3 `ladder_recover_fast` — time-to-launch-rung 55.2s → 37.6s (−32%), 0 oscillations; the T3 report, `docs/reports/2026-08-18-overnight-optimisation/t3-ladder-step-recovery.md`, was deliberately not carried over to the public repository). |
-| `QUASAR_ABR_LADDER_RES_MIN_STEP_S` | `10` | `5..120` | Minimum wall-time between two resolution steps (anti-thrash), on top of the settle-window IDR-spike guard. WebRTC only (WebTransport holds 3 s after a step). |
+| `QUASAR_ABR_LADDER_RES_MIN_STEP_S` | `10` | `5..120` | Minimum wall-time between two resolution steps (anti-thrash), on top of the settle-window IDR-spike guard. WebTransport: how long the rate must hold over the recover line for the first step up after a step down (other steps hold 3 s after a step, then 1 s). |
 | `QUASAR_ABR_LADDER_RES_MIN_HEIGHT` | `720` | `360..2160` | Floor rung — the ladder never steps the encoded size below this height. |
 
 `abr_ladder_res_recover_frac` must exceed `abr_ladder_res_engage_frac` by at least `0.05` (the D2
@@ -2856,10 +2859,14 @@ rung the rate fits (`engage_frac × B` at or under it; the floor rung when none 
 step and one encoder restart, several rungs at once if need be. At or over
 `abr_ladder_res_recover_frac × B(r−1)` for 1 s, it steps up to the least-deep rung the lowest
 rate of that second reaches by `recover_frac × B`, again in one step. Between the two lines
-it holds, which is what keeps a link oscillating around a boundary from flapping;
-`abr_ladder_res_engage_dwell`, `abr_ladder_res_recover_dwell` and `abr_ladder_res_min_step_s`
-are not used. The floor follows the new size, and the setpoint and the encoder's bitrate move
-with it in the same action. On a 1440p120 session at 10 Mbit/s a cut to 6 Mbit/s lands on
+it holds, so a rate noisy at a line never steps. The first step up after a step down needs
+the rate over the line for `abr_ladder_res_min_step_s` (10 s) instead of 1 s: a link swinging
+across the whole band completes at most one down-and-up cycle per 17 s at the defaults (3 s
+settle, 10 s, 3 s settle, 1 s; about 7 restarts a minute at worst), and one whose good phase
+lasts under 10 s steps down once and stays there. A step down never waits longer than the
+1 s: a queue costs more than a size. `abr_ladder_res_engage_dwell` and
+`abr_ladder_res_recover_dwell` are not used. The floor follows the new size, and the setpoint
+and the encoder's bitrate move with it in the same action. On a 1440p120 session at 10 Mbit/s a cut to 6 Mbit/s lands on
 1080p and a cut to 1.5 Mbit/s on 720p, each about 1.1 s after the first report that shows the
 link short. Nothing counts while a step has not finished negotiating, or for 3 s after any
 step of either lever or a manual resize: the encoder restart pauses the stream and then sends
