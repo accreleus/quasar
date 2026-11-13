@@ -379,7 +379,9 @@ export class AudioOut {
     const ctx = this.ctx;
     const out = this.out;
     if (!ctx || !out) return;
-    const playAt = this.sync.playAtMs(captureUs, this.minDelayMs());
+    const minDelayMs = this.minDelayMs();
+    const targetDelayFrames = (this.sync.targetDelayMs(minDelayMs) / 1000) * ctx.sampleRate;
+    const playAt = this.sync.playAtMs(captureUs, minDelayMs);
     if (playAt === null) return;
     const now = this.now();
     const outputLatencyMs = (ctx.outputLatency || ctx.baseLatency || 0) * 1000;
@@ -397,6 +399,6 @@ export class AudioOut {
     const contextTime = ts.contextTime || ctx.currentTime;
     const performanceTime = ts.performanceTime || now;
     const start = Math.round((contextTime + (playAt - performanceTime) / 1000) * ctx.sampleRate);
-    out.port.postMessage({ start, planes, concealed }, planes.map((p) => p.buffer));
+    out.port.postMessage({ start, planes, concealed, targetDelayFrames }, planes.map((p) => p.buffer));
   }
 }

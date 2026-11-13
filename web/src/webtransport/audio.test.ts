@@ -517,6 +517,49 @@ describe("AudioRing across a playout delay change", () => {
     expect(ring.stats).toMatchObject({ underrunFrames: 2 * PTIME, underrunEvents: 1, dropped: 0 });
   });
 
+  it.each([480, 960, 1920, 479.4])("closes a known target rise of %s frames without silence", (step) => {
+    const ring = new AudioRing();
+    for (let k = 0; k < 90; k++) {
+      const delay = k >= 20 ? step : 0;
+      ring.push(Math.round(k * PTIME + delay), [new Float32Array(PTIME).fill(1)], 0, false, delay);
+    }
+    const buf = [new Float32Array(128)];
+    for (let f = 0; f < 40_000; f += 128) {
+      ring.render(buf, f);
+      expect(buf[0].includes(0)).toBe(false);
+    }
+    expect(ring.stats).toMatchObject({ silenceRuns: 0, underrunFrames: 0, dropped: 0 });
+  });
+
+  it("keeps real loss counted when a packet disappears alongside a known delay change", () => {
+    const ring = new AudioRing();
+    ring.push(0, [new Float32Array(480).fill(1)], 0, false, 0);
+    // One missing packet, plus a 10 ms rise: subtracting the target still leaves real loss.
+    ring.push(1440, [new Float32Array(480).fill(1)], 0, false, 480);
+    ring.render([new Float32Array(1920)], 0);
+    expect(ring.stats).toMatchObject({ silenceRuns: 1, underrunFrames: 960 });
+  });
+
+  it("closes a known delay change after the queue ran dry without adding another run", () => {
+    const ring = new AudioRing();
+    ring.push(0, [new Float32Array(480).fill(1)], 0, false, 0);
+    ring.render([new Float32Array(608)], 0); // one genuine underrun
+    ring.push(960, [new Float32Array(480).fill(1)], 608, false, 480);
+    const buf = [new Float32Array(128)];
+    ring.render(buf, 608);
+    expect(buf[0].includes(0)).toBe(false);
+    expect(ring.stats).toMatchObject({ silenceRuns: 1, underrunFrames: 128 });
+  });
+
+  it("keeps the stretch bound for a known target change", () => {
+    const ring = new AudioRing();
+    ring.push(0, [new Float32Array(480).fill(1)], 0, false, 0);
+    const delay = MAX_STRETCH_FRAMES + 1;
+    ring.push(480 + delay, [new Float32Array(480).fill(1)], 0, false, delay);
+    ring.render([new Float32Array(960 + delay)], 0);
+    expect(ring.stats).toMatchObject({ silenceRuns: 1, underrunFrames: delay });
+  });
+
   it("plays steady state back to back sample for sample, with no resampling at all", () => {
     const ring = new AudioRing();
     const source: number[] = [];
@@ -578,16 +621,16 @@ function fakeAudioData(timestamp: number) {
   };
 }
 
-function setupAudioOut(opts: { running?: boolean; supported?: boolean } = {}) {
+function setupAudioOut(opts: { running?: boolean; supported?: boolean; outputLatency?: number } = {}) {
   let t = 5_100;
-  const posted: { start: number; planes: Float32Array[] }[] = [];
+  const posted: { start: number; planes: Float32Array[]; concealed?: boolean; targetDelayFrames?: number }[] = [];
   const gains: number[] = [];
-  const port = { postMessage: (m: { start: number; planes: Float32Array[] }) => posted.push(m), onmessage: null as ((e: unknown) => void) | null };
+  const port = { postMessage: (m: { start: number; planes: Float32Array[]; concealed?: boolean; targetDelayFrames?: number }) => posted.push(m), onmessage: null as ((e: unknown) => void) | null };
   const ctx: ContextLike & { resume: ReturnType<typeof vi.fn>; state: string } = {
     state: opts.running === false ? "suspended" : "running",
     sampleRate: 48_000,
     currentTime: 3,
-    outputLatency: 0.01,
+    outputLatency: opts.outputLatency ?? 0.01,
     baseLatency: 0.005,
     getOutputTimestamp: () => ({ contextTime: 10, performanceTime: 1_000 }),
     onstatechange: null,
@@ -621,6 +664,48 @@ let nextSeq = 0;
 const packet = (captureUs: number, packetSeq = nextSeq++) => ({ packetSeq, ts48k: 0, captureUs, opus: Uint8Array.from([0xf4, 1, 2]) });
 
 describe("AudioOut", () => {
+  it("does not feed an intentional delay step back as another underrun on a perfect link", async () => {
+    const { out, ctx, decoders, posted, port, at } = setupAudioOut({ outputLatency: 0.04 });
+    // The 55 ms device + posting floor determines the target.
+    ctx.getOutputTimestamp = () => ({ contextTime: 0.001, performanceTime: 1 });
+    await out.start(STEREO);
+    const ring = new AudioRing();
+    const buf = [new Float32Array(128), new Float32Array(128)];
+    // Seed one actual underrun, then supply continuous 10 ms packets without jitter or loss.
+    ring.push(0, [new Float32Array(128).fill(1)], 0);
+    ring.render(buf, 0);
+    ring.render(buf, 128);
+    let next = 10;
+    let seen = 0;
+    let firstReportMs = 0;
+    for (let q = 2; q < 1_000; q++) {
+      const frame = q * 128;
+      const now = frame / 48;
+      at(now);
+      while (next <= now) {
+        at(next);
+        out.packet(packet(next * 1_000));
+        decoders[0].emit(next * 1_000);
+        next += 10;
+      }
+      at(now);
+      while (seen < posted.length) {
+        const m = posted[seen++];
+        ring.push(m.start, m.planes, frame, m.concealed, m.targetDelayFrames);
+      }
+      ring.render(buf, frame);
+      if (q % 50 === 0) {
+        if (!firstReportMs) firstReportMs = now;
+        port.onmessage?.({ data: ring.takeStats() });
+      }
+    }
+    // One step, minus only the specified decay since the first report; never the 60 ms cap.
+    expect(out.stats().targetDelayMs).toBeCloseTo(55 + UNDERRUN_STEP_MS - (999 * 128 / 48 - firstReportMs) * 0.0001, 8);
+    expect(ring.stats.silenceRuns).toBe(1);
+    expect(ring.stats.dropped).toBe(0);
+    out.close();
+  });
+
   it("configures WebCodecs Opus from the hello_ack and decodes each packet under its capture time", async () => {
     const { out, decoders } = setupAudioOut();
     await out.start(STEREO);

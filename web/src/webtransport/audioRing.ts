@@ -8,6 +8,8 @@ interface Chunk {
   start: number;
   /** The frame the stream scheduled it at: what its own timeline's steps are measured against. */
   nominal: number;
+  /** The scheduler's target, so a delay step can be separated from missing packets. */
+  targetDelayFrames?: number;
   planes: Float32Array[];
   frames: number;
   /** Source frames already played or skipped from its head; fractional while the rate is off. */
@@ -77,6 +79,7 @@ export class AudioRing {
    *  stream's timeline, rather than in ours, is measured against. */
   private prevStart: number | null = null;
   private prevFrames = 0;
+  private prevTargetDelayFrames: number | undefined;
   /** The last chunk finished was a concealment fade: audio is missing, so the next gap is not
    *  a delay change. */
   private prevConcealed = false;
@@ -87,7 +90,7 @@ export class AudioRing {
   ) {}
 
   /** Queue a chunk to start at render frame `start`; `now` is the render frame at this moment. */
-  push(start: number, planes: Float32Array[], now: number, concealed = false): void {
+  push(start: number, planes: Float32Array[], now: number, concealed = false, targetDelayFrames?: number): void {
     const frames = planes[0]?.length ?? 0;
     if (frames === 0) return;
     if (start + frames <= now || this.queued + frames > this.maxQueued) {
@@ -100,7 +103,7 @@ export class AudioRing {
     // would play them out of order.
     let at = this.queue.length;
     while (at > 0 && this.queue[at - 1].start > start && (concealed || this.queue[at - 1].concealed)) at--;
-    this.queue.splice(at, 0, { start, nominal: start, planes, frames, off: 0, out: 0, concealed, settled: false });
+    this.queue.splice(at, 0, { start, nominal: start, targetDelayFrames, planes, frames, off: 0, out: 0, concealed, settled: false });
     this.queued += frames;
   }
 
@@ -183,15 +186,23 @@ export class AudioRing {
     // A step that is not also there (audio dropped behind the playhead) is lost audio, not a
     // delay change, and stays counted.
     const jump = this.prevStart === null ? obs : chunk.start - (this.prevStart + this.prevFrames);
+    const delayChange =
+      chunk.targetDelayFrames !== undefined && this.prevTargetDelayFrames !== undefined
+        ? chunk.targetDelayFrames - this.prevTargetDelayFrames
+        : 0;
+    const sourceJump = jump - delayChange;
+    const intentional = delayChange !== 0 && Math.abs(sourceJump) <= this.slack;
     const step =
-      end === f &&
-      !this.lostChunks(jump) &&
-      !(this.prevConcealed && jump > this.slack) &&
+      (end === f || intentional) &&
+      !this.lostChunks(sourceJump) &&
+      !(this.prevConcealed && sourceJump > this.slack) &&
       Math.abs(obs) > (correcting ? STRETCH_DONE_FRAMES : this.slack) &&
       Math.abs(obs) <= MAX_STRETCH_FRAMES &&
       (correcting || Math.abs(obs - jump) <= this.slack);
     if (step) {
-      chunk.start = end;
+      // If the queue already ran dry, start now: waiting for the new target would count
+      // the intentional step as a second underrun and deepen the buffer again.
+      chunk.start = Math.max(end, f);
       this.rate = obs > 0 ? 1 - STRETCH_RATE : 1 + STRETCH_RATE;
       return;
     }
@@ -211,8 +222,8 @@ export class AudioRing {
 
   /** A whole number of chunks of the stream's starts skipped (within a twentieth of a chunk,
    *  0.5 ms): packets that never arrived or came too late to post, not a delay change, which
-   *  lands on any offset. A rise in the delay that happens to be a whole number of chunks plays
-   *  as it did before this, as silence. A fall is never lost audio. */
+   *  lands on any offset. An unmarked rise in the delay that happens to be a whole number of chunks
+   *  still plays as silence. The scheduler's known delay change is subtracted first. A fall is never lost audio. */
   private lostChunks(jump: number): boolean {
     const frames = this.prevFrames;
     if (frames <= 0 || jump <= 0) return false;
@@ -254,6 +265,7 @@ export class AudioRing {
     if (dropped) this.stats.dropped += 1;
     this.prevStart = chunk.nominal;
     this.prevFrames = chunk.frames;
+    this.prevTargetDelayFrames = chunk.targetDelayFrames;
     this.prevConcealed = chunk.concealed;
   }
 

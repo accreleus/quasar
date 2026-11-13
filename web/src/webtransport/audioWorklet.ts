@@ -18,8 +18,8 @@ class QuasarAudioOut extends AudioWorkletProcessor {
 
   constructor() {
     super();
-    this.port.onmessage = (e: MessageEvent<{ start: number; planes: Float32Array[]; concealed?: boolean }>) =>
-      this.ring.push(e.data.start, e.data.planes, currentFrame, e.data.concealed);
+    this.port.onmessage = (e: MessageEvent<{ start: number; planes: Float32Array[]; concealed?: boolean; targetDelayFrames?: number }>) =>
+      this.ring.push(e.data.start, e.data.planes, currentFrame, e.data.concealed, e.data.targetDelayFrames);
   }
 
   process(_inputs: Float32Array[][], outputs: Float32Array[][]): boolean {
