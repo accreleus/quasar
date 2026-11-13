@@ -1,0 +1,59 @@
+{
+  "id": "01-stream-hold",
+  "scenario": "stream-hold",
+  "params": {
+    "transport": "webrtc",
+    "codec": "h264",
+    "profile": "1080p60",
+    "hold_s": 240
+  },
+  "status": "fail",
+  "sessions": [
+    "11111111-2222-3333-4444-555555555555"
+  ],
+  "clock_offset_ms": 3,
+  "criteria": [
+    {
+      "id": "first_frame_s",
+      "pass": true,
+      "observed": 6.8,
+      "expected": "<= 30"
+    },
+    {
+      "id": "freeze_count",
+      "pass": true,
+      "observed": 0,
+      "expected": "0"
+    },
+    {
+      "id": "marker_decoded",
+      "pass": true,
+      "observed": true,
+      "expected": ">= 1"
+    },
+    {
+      "id": "transport_as_asked",
+      "pass": false,
+      "observed": "webrtc",
+      "expected": "webrtc"
+    },
+    {
+      "id": "codec_as_asked",
+      "pass": null,
+      "observed": null,
+      "expected": "h264"
+    },
+    {
+      "id": "missing_indices_rate",
+      "pass": true,
+      "observed": 0.0695,
+      "expected": "<= 0.05"
+    },
+    {
+      "id": "audio_latency_ms",
+      "pass": null,
+      "observed": null,
+      "expected": "<= 80"
+    }
+  ]
+}

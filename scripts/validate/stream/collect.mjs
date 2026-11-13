@@ -45,8 +45,9 @@ const SETTING = /^[A-Za-z0-9_.:+-]{1,64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isId = (v) => typeof v === "string" && UUID.test(v);
 /** The same field shapes, for a later verb that uses a bundle value: post.mjs puts one in a tag
- *  and checks the session fields bench_submit.py copies into the run's conditions. */
-export const SHAPES = { identifier: IDENT, uuid: UUID, commit: COMMIT, setting: SETTING };
+ *  and checks the session fields bench_submit.py copies into the run's conditions; compare.mjs
+ *  keeps only the values that fit one of these (there and in `version`'s shape) in its JSON. */
+export const SHAPES = { identifier: IDENT, uuid: UUID, commit: COMMIT, setting: SETTING, version: VERSION };
 const fits = (re, v) => typeof v === "string" && re.test(v);
 /** A time as ISO, or null when the text is not one: what is written back is never the answer's own text. */
 const isoTime = (v) => {

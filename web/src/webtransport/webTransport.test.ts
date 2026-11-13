@@ -13,7 +13,8 @@ import type { Presenter } from "./presenter";
 import { TransportError, type MediaSink, type MediaTransport, type TransportEnd } from "./transport";
 import { createWebTransportRuntime as createRuntime, MEDIA_SILENCE_MS, type WebTransportRuntimeDeps } from "../pages/app/webTransportRuntime";
 import type { BenchDeps } from "../bench/benchController";
-import { mintTransportToken } from "../api/library";
+import { ApiError } from "../api/client";
+import { getSession, mintTransportToken } from "../api/library";
 import {
   avcC,
   b64,
@@ -52,6 +53,7 @@ afterEach(() => {
 vi.mock("../api/library", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../api/library")>()),
   mintTransportToken: vi.fn(),
+  getSession: vi.fn(),
 }));
 
 const NO_SINK: MediaSink = { config: () => {}, unit: () => {}, pyrowave: () => {}, end: () => {} };
@@ -908,6 +910,8 @@ describe("createWebTransportRuntime fallback", () => {
   }
 
   beforeEach(() => {
+    vi.mocked(getSession).mockReset();
+    vi.mocked(getSession).mockResolvedValue({ session: { state: "running" } } as never);
     vi.mocked(mintTransportToken).mockReset();
     vi.mocked(mintTransportToken).mockResolvedValue({
       transport_options: { webtransport: { ...COORDS, token: "tok-2" } },
@@ -974,6 +978,263 @@ describe("createWebTransportRuntime fallback", () => {
     agent.last.closeWith(4400);
     await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost"));
     expect(callbacks.onFallback).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back after two replacements end at once with the network up, without a mint loop", async () => {
+    let connections = 0;
+    const onFallback = vi.fn();
+    const rt = createWebTransportRuntime({
+      sessionId: "s1", authToken: "auth", coords: COORDS, canvas: document.createElement("canvas"),
+      callbacks: { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn(), onFallback },
+      deps: {
+        createPresenter: async () => ({ present: () => true, destroy() {} }),
+        createTransport: () => ({
+          // Every connection after the first is accepted and ended by the agent at once.
+          connect: async (s) => { if (++connections > 1) s.end({ code: null, reason: "closed at once" }); else first = s; },
+          close() {}, requestKeyframe() {}, sendMic: () => false, codecFallback() {},
+          input: { reliable() {}, datagram: () => false },
+        }),
+      },
+    });
+    let first!: MediaSink;
+    rt.start();
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    first.end({ code: null, reason: "lost" });
+    await vi.waitFor(() => expect(onFallback).toHaveBeenCalledWith("stream_lost"));
+    expect(connections).toBe(3); // the lost one and two replacements, not hundreds
+    rt.destroy();
+  });
+
+  it("handles the replacement ending before its recovery connect finishes", async () => {
+    let sink!: MediaSink;
+    let finish!: () => void;
+    let connections = 0;
+    const onFallback = vi.fn();
+    const rt = createWebTransportRuntime({
+      sessionId: "s1", authToken: "auth", coords: COORDS, canvas: document.createElement("canvas"),
+      callbacks: { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn(), onFallback },
+      deps: {
+        createPresenter: async () => ({ present: () => true, destroy() {} }),
+        createTransport: () => ({
+          connect: async (s) => {
+            sink = s;
+            if (++connections === 2) await new Promise<void>((resolve) => { finish = resolve; });
+          },
+          close() {}, requestKeyframe() {}, sendMic: () => false, codecFallback() {},
+          input: { reliable() {}, datagram: () => false },
+        }),
+      },
+    });
+    rt.start();
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    sink.end({ code: null, reason: "lost" });
+    await vi.waitFor(() => expect(finish).toBeDefined());
+    sink.end({ code: null, reason: "replacement lost" });
+    finish();
+    await vi.waitFor(() => expect(connections).toBe(3));
+    expect(rt.getSnapshot().channelOpen).toBe(true);
+    expect(onFallback).not.toHaveBeenCalled();
+    rt.destroy();
+  });
+
+  it("restores a media reconnect budget after 30 seconds of continuous video", async () => {
+    vi.useFakeTimers();
+    const { agent, callbacks, rt } = setup();
+    rt.start();
+    await vi.advanceTimersByTimeAsync(10);
+    agent.last.closeWith(4400);
+    await vi.advanceTimersByTimeAsync(10);
+    for (let seq = 0; seq <= 31; seq++) {
+      agent.last.datagrams(packetize({ configId: 0, frameSeq: seq, keyframe: true, data: bytes(10, seq) }));
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+    agent.last.closeWith(4400);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(agent.conns).toHaveLength(3);
+    expect(rt.getSnapshot().channelOpen).toBe(true);
+    expect(callbacks.onFallback).not.toHaveBeenCalled();
+  });
+
+  describe("network outage recovery (#1370)", () => {
+    async function offline() {
+      vi.useFakeTimers();
+      const s = setup();
+      s.rt.start();
+      await vi.advanceTimersByTimeAsync(10);
+      expect(s.rt.getSnapshot().channelOpen).toBe(true);
+      vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+      vi.mocked(getSession).mockRejectedValue(new TypeError("Failed to fetch"));
+      vi.mocked(mintTransportToken).mockRejectedValue(new TypeError("Failed to fetch"));
+      s.agent.last.closeWith(4400);
+      await vi.advanceTimersByTimeAsync(10_000);
+      return s;
+    }
+
+    function networkBack(onlineEvent = true) {
+      vi.spyOn(navigator, "onLine", "get").mockReturnValue(true);
+      vi.mocked(getSession).mockResolvedValue({ session: { state: "running" } } as never);
+      vi.mocked(mintTransportToken).mockResolvedValue({
+        transport_options: { webtransport: { ...COORDS, token: "tok-returned" } },
+      } as never);
+      if (onlineEvent) window.dispatchEvent(new Event("online"));
+    }
+
+    it.each([true, false])("recovers after 10s offline, online event=%s, with fresh token and capture", async (event) => {
+      const { agent, callbacks, rt, captures } = await offline();
+      expect(callbacks.onFallback).not.toHaveBeenCalled();
+      expect(mintTransportToken).not.toHaveBeenCalled();
+      expect(agent.conns).toHaveLength(1);
+      expect(rt.getSnapshot().recovery?.phase).toBe("reconnecting");
+      networkBack(event);
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(agent.sent("hello").map((h) => h.token)).toEqual(["tok-1", "tok-returned"]);
+      expect(rt.getSnapshot().channelOpen).toBe(true);
+      expect(captures).toHaveLength(2);
+      expect(callbacks.onFallback).not.toHaveBeenCalled();
+      expect(callbacks.onTransportFailed).not.toHaveBeenCalled();
+    });
+
+    it("connectivity recovery leaves the media reconnect available immediately", async () => {
+      const { agent, callbacks, rt } = await offline();
+      networkBack();
+      await vi.advanceTimersByTimeAsync(4_000);
+      agent.last.closeWith(4400);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(agent.conns).toHaveLength(3);
+      expect(rt.getSnapshot().channelOpen).toBe(true);
+      expect(callbacks.onFallback).not.toHaveBeenCalled();
+    });
+
+    it("recovers two Wi-Fi drops minutes apart on WebTransport", async () => {
+      const { agent, callbacks, rt } = await offline();
+      networkBack();
+      await vi.advanceTimersByTimeAsync(4_000);
+      for (let seq = 0; seq < 120; seq++) {
+        agent.last.datagrams(packetize({ configId: 0, frameSeq: seq, keyframe: true, data: bytes(10, seq) }));
+        await vi.advanceTimersByTimeAsync(1_000);
+      }
+      vi.mocked(getSession).mockRejectedValue(new TypeError("Failed to fetch"));
+      agent.last.closeWith(4400);
+      await vi.advanceTimersByTimeAsync(10_000);
+      networkBack();
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(agent.conns).toHaveLength(3);
+      expect(rt.getSnapshot().channelOpen).toBe(true);
+      expect(callbacks.onFallback).not.toHaveBeenCalled();
+    });
+
+    it("describes the lost connection without blaming the host", async () => {
+      const { rt } = await offline();
+      expect(rt.getSnapshot().recovery?.message).toBe("Connection lost. Reconnecting…");
+    });
+
+    it("ends with the existing failed banner after 60s, without an offline fallback", async () => {
+      const { agent, callbacks, rt } = await offline();
+      await vi.advanceTimersByTimeAsync(50_100);
+      expect(rt.getSnapshot().recovery?.phase).toBe("failed");
+      expect(callbacks.onTransportFailed).toHaveBeenCalledWith("The WebTransport connection failed.");
+      expect(callbacks.onFallback).not.toHaveBeenCalled();
+      expect(vi.mocked(getSession).mock.calls.length).toBeLessThanOrEqual(18);
+      networkBack();
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(agent.conns).toHaveLength(1);
+    });
+
+    it("falls back when connectivity returns but WebTransport is refused", async () => {
+      const { agent, callbacks } = await offline();
+      expect(callbacks.onFallback).not.toHaveBeenCalled();
+      agent.refuseHandshake = true;
+      networkBack();
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost");
+      expect(callbacks.onFallback).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(["mint", "QUIC"])("defers a failed %s when the network drops after the session read", async (step) => {
+      vi.useFakeTimers();
+      const { agent, callbacks, rt } = setup();
+      rt.start();
+      await vi.advanceTimersByTimeAsync(10);
+      if (step === "mint") {
+        vi.mocked(mintTransportToken).mockRejectedValueOnce(new TypeError("Failed to fetch"));
+      } else {
+        agent.refuseHandshake = true;
+        vi.mocked(getSession).mockResolvedValueOnce({ session: { state: "running" } } as never)
+          .mockRejectedValue(new TypeError("Failed to fetch"));
+      }
+      agent.last.closeWith(4400);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(callbacks.onFallback).not.toHaveBeenCalled();
+      agent.refuseHandshake = false;
+      networkBack();
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(rt.getSnapshot().channelOpen).toBe(true);
+      expect(agent.sent("hello").at(-1)?.token).toBe("tok-returned");
+      expect(callbacks.onFallback).not.toHaveBeenCalled();
+    });
+
+    it("treats onLine as a hint and succeeds with a stale offline flag", async () => {
+      const { rt, callbacks } = await offline();
+      networkBack(false);
+      vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(rt.getSnapshot().channelOpen).toBe(true);
+      expect(callbacks.onFallback).not.toHaveBeenCalled();
+    });
+
+    it.each(["destroy", "deadline"])("ignores a late session read after %s", async (end) => {
+      vi.useFakeTimers();
+      const { agent, rt, callbacks } = setup();
+      rt.start();
+      await vi.advanceTimersByTimeAsync(10);
+      let reply!: (v: Awaited<ReturnType<typeof getSession>>) => void;
+      vi.mocked(getSession).mockReturnValue(new Promise((resolve) => { reply = resolve; }));
+      agent.last.closeWith(4400);
+      await vi.advanceTimersByTimeAsync(100);
+      if (end === "destroy") rt.destroy();
+      else await vi.advanceTimersByTimeAsync(60_000);
+      reply({ session: { state: "running" } } as never);
+      window.dispatchEvent(new Event("online"));
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(mintTransportToken).not.toHaveBeenCalled();
+      expect(agent.conns).toHaveLength(1);
+      expect(callbacks.onFallback).not.toHaveBeenCalled();
+      expect(callbacks.onTransportFailed).toHaveBeenCalledTimes(end === "deadline" ? 1 : 0);
+    });
+
+    it("cancels the wait and ignores later online events", async () => {
+      const { agent, rt, callbacks } = await offline();
+      rt.cancelRecovery();
+      expect(callbacks.onTransportFailed).toHaveBeenCalledWith("Connection recovery cancelled.");
+      networkBack();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(agent.conns).toHaveLength(1);
+      expect(callbacks.onFallback).not.toHaveBeenCalled();
+      expect(callbacks.onTransportFailed).toHaveBeenCalledTimes(1);
+      expect(rt.getSnapshot().recovery?.phase).toBe("failed");
+    });
+
+    it.each([401, 404])("stops on a terminal HTTP %s", async (status) => {
+      const { agent, callbacks } = await offline();
+      networkBack();
+      vi.mocked(getSession).mockRejectedValue(new ApiError(status, "refused", "refused"));
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(agent.conns).toHaveLength(1);
+      expect(callbacks.onFallback).not.toHaveBeenCalled();
+      expect(callbacks.onTransportFailed).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not reconnect a session that ended during the outage", async () => {
+      const { agent, callbacks, rt } = await offline();
+      networkBack();
+      vi.mocked(getSession).mockResolvedValue({ session: { state: "stopped" } } as never);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(callbacks.onTransportFailed).toHaveBeenCalledWith("The session ended.");
+      expect(rt.getSnapshot().recovery?.phase).toBe("failed");
+      expect(mintTransportToken).not.toHaveBeenCalled();
+      expect(agent.conns).toHaveLength(1);
+      expect(callbacks.onFallback).not.toHaveBeenCalled();
+    });
   });
 
   describe("media watchdog (#1297)", () => {
