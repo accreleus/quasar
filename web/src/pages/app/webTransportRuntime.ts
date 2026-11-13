@@ -137,7 +137,6 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   let benchFaulted = false;
   let audioOut: AudioOut | null = null;
   /** The current AudioOut's dropout totals already given to telemetry; a new AudioOut counts from 0. */
-  /** The current AudioOut's dropout totals already given to telemetry; a new AudioOut counts from 0. */
   let audioSeen = { samples: 0, events: 0, underruns: 0 };
   /** The sound starts muted (webrtc/sessionRuntime holdAudio): nothing the app plays before the reveal is heard. */
   let audioHeld = true;
