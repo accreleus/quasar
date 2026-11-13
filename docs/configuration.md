@@ -2813,6 +2813,25 @@ floor in one protective step, and the rung observation that runs after it in the
 window takes the step. It takes longer if the classifier does not name the congestion
 on that first window.
 
+**A collapse (WebTransport only).** The window path reads the governor's setpoint, which
+never goes under the floor, so on its own it learns how far under the floor the link is
+only one rung at a time. The WebTransport estimate (one report every 100 ms) also goes to
+the rung: when every estimate for 1 s is under half the floor in force, the agent steps
+the resolution rung straight to the least-deep rung whose floor is at or under the
+highest of those estimates (the floor rung when none is), and moves the floor and the
+setpoint down with it in the same action, without waiting for a window,
+`abr_ladder_res_min_step_s` or the dwell. From the moment the estimate crosses half the
+floor, that is 1 s plus at most one report, then the encoder restart and keyframe a step
+always costs. How long the estimate itself takes to fall depends on the link; the
+estimator falls to the receive rate in about 1.5 s in the agent's simulation of a 10 →
+1.5 Mbit/s collapse. The step is traced as `abr.ladder.step` with reason `collapse`. It
+never moves the frame rate, and it follows the order: under `fps_first` it leaves the
+frame-rate step to the window path, and under `hybrid` it stops at 1080p while 120 → 60
+is still to come. Coming back up is the window path's, one rung per
+`abr_ladder_res_recover_dwell` windows and never sooner than `abr_ladder_res_min_step_s`
+after the collapse. `rtpgccbwe` never reports under its `min-bitrate`, which is held at
+the floor, so a WebRTC session never sees a collapse and keeps the window path alone.
+
 What the rung will NOT do: at `abr_ladder_res_min_height` (720p by default) it stops.
 An estimate under that rung's floor has no further remedy — the ladder has given up
 three quarters of a 1440p picture's pixels, since 720p keeps one quarter of them (half

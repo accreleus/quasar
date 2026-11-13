@@ -811,6 +811,9 @@ pub enum StepReason {
     Recover,
     /// The governor is already at the floor and the path is still congested.
     Emergency,
+    /// The estimate stayed far under the floor: several rungs in one step
+    /// ([`LadderPlanner::observe_estimate`]).
+    Collapse,
 }
 
 impl StepReason {
@@ -819,6 +822,7 @@ impl StepReason {
             StepReason::Engage => "engage",
             StepReason::Recover => "recover",
             StepReason::Emergency => "emergency",
+            StepReason::Collapse => "collapse",
         }
     }
 }
@@ -1049,6 +1053,30 @@ impl ResolutionRung {
                 None
             }
         }
+    }
+
+    /// Step straight to the least-deep rung in `current + 1 ..= deepest` whose floor
+    /// (`floor_at(pixels)`) is at or under `estimate_kbps`, or to `deepest` when none is.
+    /// Skips dwell, settle and `min_step_s`; arms them for the windows after.
+    fn collapse_to(
+        &mut self,
+        estimate_kbps: f64,
+        floor_at: &dyn Fn(i64) -> f64,
+        deepest: usize,
+        now: Instant,
+    ) -> Option<StepDecision> {
+        if self.pinned || self.current >= deepest {
+            return None;
+        }
+        let to = (self.current + 1..=deepest)
+            .find(|&i| {
+                let (w, h) = self.rungs[i];
+                floor_at(w as i64 * h as i64) <= estimate_kbps
+            })
+            .unwrap_or(deepest);
+        self.engage_run = 0;
+        self.recover_run = 0;
+        Some(self.step_to(to, StepReason::Collapse, now))
     }
 
     /// Commit a step, arming the settle window and the min-interval clock. Returns
@@ -1342,9 +1370,19 @@ pub struct LadderPlanner {
     /// Set once a lever has refused a step — see [`LadderPlanner::set_res_retired`].
     res_retired: bool,
     fps_retired: bool,
+    /// [`Self::observe_estimate`]: since when every estimate has been under the collapse
+    /// line, and the highest of them.
+    collapse: Option<(Instant, f64)>,
 }
 
 impl LadderPlanner {
+    /// An estimate under this fraction of the floor in force is a collapse, not a dip the
+    /// governor can ride at its floor.
+    pub const COLLAPSE_FRAC: f64 = 0.5;
+    /// How long every estimate must stay under the line: about ten WebTransport reports
+    /// (`webtransport::congestion::REPORT_EVERY`), so one bad report cannot step.
+    pub const COLLAPSE_CONFIRM: std::time::Duration = std::time::Duration::from_secs(1);
+
     /// The hybrid pivot: the height at and below which the fps rung is taken before any
     /// further resolution step. Michael's rule — "120→60 as the step before dropping
     /// below 1080p".
@@ -1364,6 +1402,7 @@ impl LadderPlanner {
             fps_enabled: cfg.fps_enabled,
             res_retired: false,
             fps_retired: false,
+            collapse: None,
         }
     }
 
@@ -1485,6 +1524,74 @@ impl LadderPlanner {
 
     /// One window. Returns at most ONE step, on exactly one lever.
     pub fn observe(
+        &mut self,
+        state: AdaptationState,
+        setpoint_kbps: f64,
+        floor_kbps: f64,
+        now: Instant,
+    ) -> Option<PlannedStep> {
+        let step = self.observe_window(state, setpoint_kbps, floor_kbps, now);
+        if step.is_some() {
+            // A collapse is judged against the floor of the picture now being sent.
+            self.collapse = None;
+        }
+        step
+    }
+
+    /// One rate estimate, between windows (#1320). The window path reads the governor's
+    /// setpoint, which never goes under the floor, so it can only learn one rung at a time
+    /// how far under the floor the link is. An estimate that stays under
+    /// [`Self::COLLAPSE_FRAC`] × `floor_kbps` for [`Self::COLLAPSE_CONFIRM`] steps the
+    /// resolution rung straight to the rung whose floor (`floors`) fits the highest
+    /// estimate of that run. Only when resolution is the lever the order takes next, and
+    /// under `hybrid` never past the pivot while 120 → 60 is still to come. Never moves the
+    /// frame rate.
+    pub fn observe_estimate(
+        &mut self,
+        estimate_kbps: f64,
+        floor_kbps: f64,
+        floors: &FloorFollow,
+        now: Instant,
+    ) -> Option<PlannedStep> {
+        if estimate_kbps >= Self::COLLAPSE_FRAC * floor_kbps {
+            self.collapse = None;
+            return None;
+        }
+        let (since, best) = self.collapse.get_or_insert((now, estimate_kbps));
+        *best = best.max(estimate_kbps);
+        if now.saturating_duration_since(*since) < Self::COLLAPSE_CONFIRM {
+            return None;
+        }
+        let best = *best;
+        let next = self
+            .down_priority()
+            .into_iter()
+            .find(|l| self.can_step(*l, StepDir::Down));
+        if next != Some(Lever::Res) {
+            return None;
+        }
+        let mut deepest = self.res.floor_rung;
+        if self.order == LadderOrder::Hybrid && self.can_step(Lever::Fps, StepDir::Down) {
+            let pivot = self
+                .res
+                .rungs
+                .iter()
+                .rposition(|r| r.1 >= Self::HYBRID_PIVOT_HEIGHT)
+                .unwrap_or(0);
+            deepest = deepest.min(pivot);
+        }
+        let fps_engaged = self.fps.rung() > 0;
+        let step = self.res.collapse_to(
+            best,
+            &|px| floors.floor_for(px, fps_engaged) as f64,
+            deepest,
+            now,
+        )?;
+        self.collapse = None;
+        Some(PlannedStep::Resolution(step))
+    }
+
+    fn observe_window(
         &mut self,
         state: AdaptationState,
         setpoint_kbps: f64,
@@ -2612,6 +2719,199 @@ mod tests {
                 later(t, 30)
             ),
             None
+        );
+    }
+
+    // ── #1320: a collapse far under the floor ─────────────────────────────────
+
+    /// The owner's throttled session: 1440p120 at 10 Mbit/s with a 4000 kbit/s launch floor,
+    /// so 1080p 2598, 900p 1976 and 720p 1414 (the floors the issue measured).
+    fn owner_floors() -> FloorFollow {
+        FloorFollow {
+            enabled: true,
+            launch_floor_kbps: 4000,
+            operator_floor_kbps: None,
+            ceiling_kbps: CEILING,
+            launch_px: 2560 * 1440,
+            exponent: ResolutionPolicy::DEFAULT_EXPONENT,
+        }
+    }
+
+    /// The floor the governor holds for the planner's current rungs, as the glue derives it.
+    fn floor_now(p: &LadderPlanner, f: &FloorFollow) -> f64 {
+        let (w, h) = p.res_size();
+        f.floor_for(w as i64 * h as i64, p.fps_rung() > 0) as f64
+    }
+
+    /// Feed one estimate report every 100 ms (WebTransport's `REPORT_EVERY`) from `from` for
+    /// `secs`; returns each step with the report time it landed at.
+    fn reports(
+        p: &mut LadderPlanner,
+        f: &FloorFollow,
+        t: Instant,
+        from_ms: u64,
+        secs: u64,
+        est: impl Fn(u64) -> f64,
+    ) -> Vec<(u64, PlannedStep)> {
+        let mut steps = Vec::new();
+        for ms in (from_ms..from_ms + secs * 1000).step_by(100) {
+            let floor = floor_now(p, f);
+            if let Some(s) = p.observe_estimate(est(ms), floor, f, t + Duration::from_millis(ms)) {
+                steps.push((ms, s));
+            }
+        }
+        steps
+    }
+
+    /// The measured series: the estimate falls from 10 000 to 1500 kbit/s in one report.
+    /// Old code had no per-estimate path at all: the rung moved only on 5 s windows, one rung
+    /// per 10 s (`settle_and_min_interval_suppress_a_second_step`), so this could not land a
+    /// step 1 s after the collapse, nor three rungs in one.
+    #[test]
+    fn a_collapse_steps_straight_to_the_rung_whose_floor_fits_within_a_second() {
+        let t = Instant::now();
+        let f = owner_floors();
+        // The owner's round: `res_first`, the frame-rate rung off.
+        let mut p = planner(LadderOrder::ResFirst, false, 120, t);
+        let est = |ms: u64| if ms < 5000 { 10_000.0 } else { 1500.0 };
+        let steps = reports(&mut p, &f, t, 0, 5, est);
+        assert!(steps.is_empty(), "a healthy link never steps");
+        let steps = reports(&mut p, &f, t, 5000, 3, est);
+        assert_eq!(steps.len(), 1, "one step, not one per report: {steps:?}");
+        let (at, step) = steps[0];
+        assert_eq!(at, 6000, "after COLLAPSE_CONFIRM of reports under the line");
+        assert_eq!(
+            step,
+            PlannedStep::Resolution(StepDecision {
+                from: 0,
+                to: 3,
+                reason: StepReason::Collapse
+            }),
+            "past 1080p (2598) and 900p (1976) to 720p, the one rung whose floor fits 1500"
+        );
+        assert_eq!(
+            floor_now(&p, &f),
+            1414.0,
+            "the floor this step hands the governor"
+        );
+        assert_eq!(p.fps(), 120, "resolution only: the frame rate is kept");
+
+        // Under the floor rung there is nothing left to collapse to, and an estimate that
+        // overshoots after the step (the estimator compounds loss cuts) moves nothing.
+        assert!(reports(&mut p, &f, t, 8000, 5, |_| 150.0).is_empty());
+        // Nor do the windows: the settle window, then `min_step_s` since the collapse.
+        let w = |s: u64| t + Duration::from_secs(s);
+        for s in [10, 15] {
+            assert_eq!(
+                p.observe(AdaptationState::Healthy, 1414.0, 1414.0, w(s)),
+                None
+            );
+        }
+        // The link comes back: one rung up per recover dwell, never two at once.
+        let mut ups = Vec::new();
+        for s in (20..60).step_by(5) {
+            if let Some(step) = p.observe(AdaptationState::Healthy, 9000.0, floor_now(&p, &f), w(s))
+            {
+                ups.push((s, label(step)));
+            }
+        }
+        assert_eq!(
+            ups,
+            vec![
+                (25, "res->2".into()),
+                (40, "res->1".into()),
+                (55, "res->0".into())
+            ]
+        );
+    }
+
+    /// One report, or a run shorter than `COLLAPSE_CONFIRM`, is not a collapse. New logic;
+    /// the old code had no estimate path to fire.
+    #[test]
+    fn a_short_run_of_low_reports_does_not_step() {
+        let t = Instant::now();
+        let f = owner_floors();
+        let mut p = planner(LadderOrder::ResFirst, true, 120, t);
+        // Every 10th report healthy: runs of 0.9 s under the line, forever.
+        let steps = reports(&mut p, &f, t, 0, 30, |ms| {
+            if ms % 1000 == 900 {
+                10_000.0
+            } else {
+                500.0
+            }
+        });
+        assert!(steps.is_empty(), "{steps:?}");
+        assert_eq!(p.res_rung(), 0);
+        // Under the floor but above half of it: the governor's to ride, not a collapse.
+        assert!(reports(&mut p, &f, t, 30_000, 5, |_| 2100.0).is_empty());
+    }
+
+    /// `res_first` at 120 fps: a collapse under every floor reaches the floor rung and keeps
+    /// 120; only the window path takes 120 → 60, and only from the floor rung.
+    #[test]
+    fn res_first_keeps_120_fps_through_a_collapse() {
+        let t = Instant::now();
+        let f = owner_floors();
+        let mut p = planner(LadderOrder::ResFirst, true, 120, t);
+        let steps = reports(&mut p, &f, t, 0, 2, |_| 500.0);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(p.res_rung(), 3, "no rung fits 500: the floor rung");
+        assert_eq!(p.fps(), 120);
+        let w = |s: u64| t + Duration::from_secs(s);
+        let floor = floor_now(&p, &f);
+        let mut later_steps = Vec::new();
+        for s in (5..40).step_by(5) {
+            if let Some(s) = p.observe(AdaptationState::NetworkCongested, floor, floor, w(s)) {
+                later_steps.push(label(s));
+            }
+        }
+        assert_eq!(later_steps, vec!["fps->60"], "then 60, once, never below");
+    }
+
+    /// The other orders keep their meaning: `hybrid` takes 120 → 60 at 1080p before any rung
+    /// under it, so a collapse stops at the pivot; `fps_first` takes the frame-rate step
+    /// first, so the collapse leaves it to the window path. A pin holds everything.
+    #[test]
+    fn a_collapse_follows_the_ladder_order() {
+        let t = Instant::now();
+        let f = owner_floors();
+        let collapse = |order, fps_on, fps| {
+            let mut p = planner(order, fps_on, fps, t);
+            reports(&mut p, &f, t, 0, 2, |_| 500.0);
+            p.res_rung()
+        };
+        assert_eq!(
+            collapse(LadderOrder::Hybrid, true, 120),
+            1,
+            "stops at the pivot"
+        );
+        assert_eq!(
+            collapse(LadderOrder::Hybrid, true, 60),
+            3,
+            "no frame-rate step to wait for"
+        );
+        assert_eq!(
+            collapse(LadderOrder::FpsFirst, true, 120),
+            0,
+            "the frame rate goes first"
+        );
+        assert_eq!(
+            collapse(LadderOrder::FpsFirst, false, 120),
+            3,
+            "no fps rung: pixels"
+        );
+
+        let mut p = planner(LadderOrder::ResFirst, true, 120, t);
+        p.set_pinned(true);
+        assert!(
+            reports(&mut p, &f, t, 0, 3, |_| 500.0).is_empty(),
+            "a human pin holds"
+        );
+        p.set_pinned(false);
+        assert_eq!(
+            reports(&mut p, &f, t, 3000, 1, |_| 500.0).len(),
+            1,
+            "released: steps"
         );
     }
 }

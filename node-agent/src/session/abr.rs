@@ -470,6 +470,23 @@ impl Governor {
         None
     }
 
+    /// The ladder's collapse step (#1320) moves the setpoint with the rung: down to
+    /// `kbps` (clamped to the floor) at once, past the interval and the dwell. Never up.
+    /// Restarts the interval and the up path's average from `kbps`, so the estimate the
+    /// link carried before the collapse cannot ramp it straight back.
+    pub fn cut_to(&mut self, kbps: f64, now: Instant) -> Option<u32> {
+        let target = (kbps.round() as i64)
+            .clamp(self.cfg.floor_kbps as i64, self.cfg.ceiling_kbps as i64)
+            as u32;
+        if target >= self.setpoint {
+            return None;
+        }
+        self.setpoint = target;
+        self.last_retarget = now;
+        self.ewma = Some(kbps);
+        Some(target)
+    }
+
     /// Push the latest per-window adaptation hint. No-op on `Protective`/`Off` — only
     /// `Smooth` reads it. Called once per ~5 s drain.
     pub fn set_adaptation_hint(&mut self, hint: AdaptationHint) {
@@ -642,6 +659,21 @@ mod tests {
             last.is_some(),
             "a collapse must produce at least one retarget"
         );
+    }
+
+    /// #1320: the collapse step moves the setpoint inside the first interval, down only,
+    /// clamped to the (just lowered) floor, and the up path starts from the cut.
+    #[test]
+    fn cut_to_drops_at_once_and_never_raises() {
+        let base = Instant::now();
+        let mut g = Governor::new(AbrConfig::new_smooth(2500, 8000, 60), base);
+        g.set_floor_kbps(900);
+        let now = base + Duration::from_millis(100);
+        assert_eq!(g.cut_to(1200.0, now), Some(1200), "inside min_interval");
+        assert_eq!(g.cut_to(5000.0, now), None, "never up");
+        assert_eq!(g.cut_to(100.0, now), Some(900), "never under the floor");
+        // The pre-collapse average does not ramp it back: an estimate at the cut holds.
+        assert_eq!(g.observe(900.0, at(base, 2)), None);
     }
 
     #[test]
