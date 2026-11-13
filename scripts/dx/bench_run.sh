@@ -234,7 +234,6 @@ done
 
 [ -n "$PROFILE" ] || dx_guard "$TARGET" \
   "--profile is required: an unpinned launch is not a benchmark cell (list LAUNCH profile ids with GET /v1/admin/launch-profiles — a stream-profile rung id like 1080p120-h264 is rejected; use --profile forced for an app whose row sets profile_policy=force, which rejects profile_id outright)"
-[ -f "$QSES" ] || { dx_fail qses "$QSES missing"; dx_result "$TARGET"; }
 # A pulse with no in-page instrument to answer it produces nothing; fail loudly
 # rather than submit a cell whose i2p column is silently empty.
 if [ -n "$PULSE_EVERY" ] && [ "$BENCH_MODE" != 1 ]; then
@@ -717,6 +716,10 @@ for a in (d.get("items") or d.get("apps") or []):
     fi
   fi
 fi
+
+# qses is the quasar-session skill's CLI, absent from a bare checkout; the plan,
+# the guards and the preflight above run without it, the launch does not (#1267).
+[ -f "$QSES" ] || { dx_fail qses "$QSES missing"; dx_result "$TARGET"; }
 
 # Stamped BEFORE the launch: --app-log-glob uses it to keep the app-side pull to
 # the files THIS session produced (see the pull block below). A few seconds of
