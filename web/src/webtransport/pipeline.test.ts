@@ -15,7 +15,17 @@ import {
   codecString,
   hevcCodecString,
 } from "./decodeStage";
-import { containRect, createWebGpuPresenter, presentGeometry, shouldUpscaleSharpen } from "./presenter";
+import {
+  containRect,
+  createWebGpuPresenter,
+  CROSSFADE_FRAMES,
+  CROSSFADE_MAX_MS,
+  presentGeometry,
+  shouldUpscaleSharpen,
+  SizeFade,
+  upscaleSharpenStrength,
+  UPSCALE_SHARPEN_FULL_SCALE,
+} from "./presenter";
 import { avcC, bytes, FakeChunk, FakeDecoder, fakeFrame, flush, packetize, repairOf, type FakeFrame, type UnitSpec } from "./testSupport";
 
 beforeEach(() => {
@@ -780,7 +790,7 @@ describe("DecodeStage", () => {
 // ── Presenter ───────────────────────────────────────────────────────────────
 
 describe("createWebGpuPresenter", () => {
-  function fakeGpu(importFails: boolean, opts: { compileFails?: boolean } = {}) {
+  function fakeGpu(importFails: boolean, opts: { compileFails?: boolean; blendFails?: "reject" | "validation" | "oom" } = {}) {
     const calls: string[] = [];
     let lose!: (info: { reason: string; message: string }) => void;
     const listeners: Record<string, (e: unknown) => void> = {};
@@ -789,12 +799,20 @@ describe("createWebGpuPresenter", () => {
     const samplers: string[] = [];
     /** Every pipeline the presenter drew with, by its fragment shader's source. */
     const drawn: string[] = [];
+    /** Whether each drawn pipeline blends (the cross-fade's), and the blend constants set. */
+    const blends: boolean[] = [];
+    const constants: number[] = [];
+    let blendBuilt = false;
+    const scopes: string[] = [];
+    const textures = { destroyed: [] as { width: number }[] };
     /** Bind group sizes, so a test can see whether the texel uniform was bound. */
     const bindings: number[] = [];
     const pass = {
-      setPipeline(p: { code: string }) {
+      setPipeline(p: { code: string; blend: boolean }) {
         drawn.push(p.code);
+        blends.push(p.blend);
       },
+      setBlendConstant: (c: { r: number }) => void constants.push(c.r),
       setBindGroup() {},
       setViewport: (...v: number[]) => void viewports.push(v.slice(0, 4)),
       draw() {},
@@ -817,17 +835,30 @@ describe("createWebGpuPresenter", () => {
           messages: opts.compileFails && d.code.includes("upscaleSharpen") ? [{ type: "error", message: "expected ;" }] : [],
         }),
       }),
-      createRenderPipeline: (d: { vertex: { module: { code: string } } }) => ({ code: d.vertex.module.code, getBindGroupLayout: () => ({}) }),
-      createRenderPipelineAsync: async (d: { vertex: { module: { code: string } } }) => ({ code: d.vertex.module.code, getBindGroupLayout: () => ({}) }),
-      pushErrorScope: () => {},
-      popErrorScope: async () => null,
+      createRenderPipeline: (d: { vertex: { module: { code: string } } }) => ({ code: d.vertex.module.code, blend: false, getBindGroupLayout: () => ({}) }),
+      createRenderPipelineAsync: async (d: { vertex: { module: { code: string } }; fragment: { targets: { blend?: unknown }[] } }) => {
+        const blend = d.fragment.targets[0].blend != null;
+        if (blend) blendBuilt = true;
+        if (blend && opts.blendFails === "reject") throw new Error("pipeline refused");
+        return { code: d.vertex.module.code, blend, getBindGroupLayout: () => ({}) };
+      },
+      pushErrorScope: (type: string) => void scopes.push(type),
+      popErrorScope: async () => {
+        const type = scopes.pop();
+        const raised = blendBuilt && ((opts.blendFails === "validation" && type === "validation") || (opts.blendFails === "oom" && type === "out-of-memory"));
+        if (scopes.length === 0) blendBuilt = false;
+        return raised ? { message: `${type} error` } : null;
+      },
       createSampler: (d: { magFilter: string }) => d.magFilter,
-      importExternalTexture: () => {
+      importExternalTexture: (d: { source: { expired?: boolean } }) => {
         calls.push("import");
-        if (importFails) throw new Error("Failed to import texture from video");
+        if (importFails || d.source.expired) throw new Error("Failed to import texture from video");
         return {};
       },
-      createTexture: (d: { size: number[] }) => ({ width: d.size[0], height: d.size[1], createView: () => ({}), destroy() {} }),
+      createTexture: (d: { size: number[] }) => {
+        const t = { width: d.size[0], height: d.size[1], createView: () => ({}), destroy: () => void textures.destroyed.push(t) };
+        return t;
+      },
       createBindGroup: (d: { entries: { resource: unknown }[] }) => {
         samplers.push(d.entries[0].resource as string);
         bindings.push(d.entries.length);
@@ -848,7 +879,7 @@ describe("createWebGpuPresenter", () => {
       dataset: {} as Record<string, string>,
       getContext: () => ({ configure() {}, getCurrentTexture: () => ({ createView: () => ({}) }) }),
     } as unknown as HTMLCanvasElement;
-    return { calls, canvas, lose, viewports, crops, samplers, drawn, bindings, uncaptured: (message: string) => listeners.uncapturederror({ error: { message } }) };
+    return { calls, canvas, lose, viewports, crops, samplers, drawn, blends, constants, textures, bindings, uncaptured: (message: string) => listeners.uncapturederror({ error: { message } }) };
   }
 
   it("falls back to copying each frame once an import fails, and closes every frame", async () => {
@@ -1006,6 +1037,231 @@ describe("createWebGpuPresenter", () => {
       expect(console.warn).toHaveBeenCalledTimes(1);
       expect(String((console.warn as unknown as { mock: { calls: unknown[][] } }).mock.calls[0][0])).toContain("upscale+sharpen");
     });
+
+    it("scales the strength with the upscale factor instead of fixing it", async () => {
+      // The texel uniform's z is the weight of (bicubic - bilinear): 2 is the full pass (#1377).
+      const z = async (cw: number, ch: number) => {
+        const g = fakeGpu(false);
+        g.canvas.width = cw;
+        g.canvas.height = ch;
+        const p = (await createWebGpuPresenter(g.canvas, () => {}))!;
+        p.present(frame(1280, 720) as unknown as VideoFrame);
+        return g.crops[1][2];
+      };
+      expect(await z(1344, 756)).toBeCloseTo(2 * upscaleSharpenStrength(1.05), 5);
+      expect(await z(1600, 900)).toBeCloseTo(1, 5);
+      expect(await z(1920, 1080)).toBeCloseTo(2, 5);
+      expect(await z(2560, 1440)).toBeCloseTo(2, 5);
+    });
+  });
+
+  // ── The size-change cross-fade (#1377) ────────────────────────────────────
+  describe("the size-change cross-fade", () => {
+    const BIG = [1920, 1080];
+    const SMALL = [1280, 720];
+    const MID = [1600, 900];
+    /** A frame that can be cloned, as a VideoFrame is; every clone is kept so a test can see it closed. */
+    const clones: ReturnType<typeof sized>[] = [];
+    function sized(w: number, h: number) {
+      const f = {
+        displayWidth: w,
+        displayHeight: h,
+        closed: false,
+        expired: false,
+        close() {
+          f.closed = true;
+        },
+        clone() {
+          const c = sized(w, h);
+          clones.push(c);
+          return c;
+        },
+      };
+      return f;
+    }
+    const open = async (opts: Parameters<typeof fakeGpu>[1] & { importFails?: boolean; mode?: string } = {}) => {
+      clones.length = 0;
+      const g = fakeGpu(opts.importFails ?? false, opts);
+      if (opts.mode) g.canvas.dataset.scalingMode = opts.mode;
+      const fatal: string[] = [];
+      const p = (await createWebGpuPresenter(g.canvas, (m) => fatal.push(m)))!;
+      /** Presents one frame and returns how many draws it took. */
+      const show = (size: number[]) => {
+        const before = g.drawn.length;
+        const f = sized(size[0], size[1]);
+        expect(p.present(f as unknown as VideoFrame)).toBe(true);
+        expect(f.closed).toBe(true);
+        return g.drawn.length - before;
+      };
+      return { ...g, p, fatal, show };
+    };
+
+    it("blends the first frame at the new size in the same present, then fades out over three frames", async () => {
+      const g = await open();
+      expect(g.show(BIG)).toBe(1);
+      expect([g.show(SMALL), g.show(SMALL), g.show(SMALL), g.show(SMALL), g.show(SMALL)]).toEqual([2, 2, 2, 1, 1]);
+      expect(g.constants).toEqual([0.25, 0.5, 0.75]);
+      // The previous layer is the plain pipeline of the old frame; the newest blends.
+      expect(g.blends.slice(1, 5)).toEqual([false, true, false, true]);
+    });
+
+    it("never fades when the size does not change", async () => {
+      const g = await open();
+      for (let i = 0; i < 5; i++) expect(g.show(BIG)).toBe(1);
+      expect(g.constants).toEqual([]);
+    });
+
+    it("holds the previous picture for the fade only", async () => {
+      const g = await open();
+      g.show(BIG);
+      g.show(SMALL);
+      const old = clones[0];
+      expect(old.closed).toBe(false);
+      g.show(SMALL);
+      g.show(SMALL);
+      expect(old.closed).toBe(false);
+      g.show(SMALL);
+      expect(old.closed).toBe(true);
+      // One clone is held while nothing fades.
+      expect(clones.filter((c) => !c.closed)).toHaveLength(1);
+    });
+
+    it("restarts the fade from the last frame shown when the size changes during one", async () => {
+      const g = await open();
+      g.show(BIG);
+      g.show(SMALL);
+      g.show(SMALL);
+      expect(g.show(MID)).toBe(2);
+      expect(g.constants).toEqual([0.25, 0.5, 0.25]);
+      // The first fade's picture is released; the SMALL frame shown last is what fades out.
+      expect(clones[0].closed).toBe(true);
+      expect(clones[2].closed).toBe(false);
+      expect(g.show(MID) + g.show(MID) + g.show(MID)).toBe(2 + 2 + 1);
+      expect(g.constants).toEqual([0.25, 0.5, 0.25, 0.5, 0.75]);
+      expect(g.fatal).toEqual([]);
+    });
+
+    it("does not fade, or hold a frame, in the pixel-exact integer mode", async () => {
+      const g = await open({ mode: "integer" });
+      expect(g.show(BIG)).toBe(1);
+      expect(g.show(SMALL)).toBe(1);
+      expect(g.constants).toEqual([]);
+      expect(clones).toHaveLength(0);
+    });
+
+    it("fades without the sharpen pass when the user's switch is off", async () => {
+      const g = await open();
+      g.canvas.dataset.upscaleSharpen = "off";
+      g.show(BIG);
+      expect(g.show(SMALL)).toBe(2);
+      expect(g.drawn.slice(1).some((d) => d.includes("upscaleSharpen"))).toBe(false);
+      expect(g.constants).toEqual([0.25]);
+    });
+
+    it("keeps the copy fallback's previous texture for the fade, then frees it", async () => {
+      const g = await open({ importFails: true });
+      g.show(BIG);
+      expect(g.show(SMALL)).toBe(2);
+      expect(g.textures.destroyed).toHaveLength(0);
+      g.show(SMALL);
+      g.show(SMALL);
+      expect(g.textures.destroyed).toHaveLength(0);
+      g.show(SMALL);
+      expect(g.textures.destroyed.map((t) => t.width)).toEqual([1920]);
+      expect(g.constants).toEqual([0.25, 0.5, 0.75]);
+    });
+
+    for (const failure of ["reject", "validation", "oom"] as const) {
+      it(`cuts instead, without ending the session, when the blending pipeline fails (${failure})`, async () => {
+        const g = await open({ blendFails: failure });
+        expect(g.show(BIG)).toBe(1);
+        expect(g.show(SMALL)).toBe(1);
+        expect(g.fatal).toEqual([]);
+        expect(g.constants).toEqual([]);
+        expect(clones).toHaveLength(0);
+        const msgs = (console.warn as unknown as { mock: { calls: unknown[][] } }).mock.calls.map((c) => String(c[0]));
+        expect(msgs.some((m) => m.includes("cross-fade"))).toBe(true);
+        // The sharpen pass is a separate feature and still runs.
+        expect(g.drawn.at(-1)).toContain("upscaleSharpen");
+      });
+    }
+
+    it("cuts, and stays cut, when the previous frame can no longer be drawn", async () => {
+      const g = await open();
+      g.show(BIG);
+      clones[0].expired = true;
+      expect(g.show(SMALL)).toBe(1);
+      expect(g.show(BIG)).toBe(1);
+      expect(g.constants).toEqual([]);
+      expect(g.fatal).toEqual([]);
+    });
+  });
+});
+
+describe("upscaleSharpenStrength (#1377)", () => {
+  it("is 0 at 1:1 and below, full from the top of the ramp, and monotonic in between", () => {
+    expect(upscaleSharpenStrength(0.5)).toBe(0);
+    expect(upscaleSharpenStrength(1)).toBe(0);
+    expect(upscaleSharpenStrength(UPSCALE_SHARPEN_FULL_SCALE)).toBe(1);
+    expect(upscaleSharpenStrength(3)).toBe(1);
+    let before = 0;
+    for (let s = 1; s <= 1.6; s += 0.01) {
+      const v = upscaleSharpenStrength(s);
+      expect(v).toBeGreaterThanOrEqual(before);
+      before = v;
+    }
+    expect(upscaleSharpenStrength(1.25)).toBeCloseTo(0.5, 6);
+  });
+
+  it("has no jump where the pass switches on (1.01x) or at the top", () => {
+    expect(upscaleSharpenStrength(1.01)).toBeLessThan(0.005);
+    expect(upscaleSharpenStrength(UPSCALE_SHARPEN_FULL_SCALE - 0.01)).toBeGreaterThan(0.99);
+  });
+});
+
+describe("SizeFade (#1377)", () => {
+  const run = (sizes: [number, number][], dt = 10) => {
+    const f = new SizeFade();
+    return sizes.map(([w, h], i) => f.step(w, h, i * dt));
+  };
+
+  it("weighs the newest frame 1/4, 2/4, 3/4 and then 1; the previous frame takes the rest", () => {
+    const w = run([[1920, 1080], [1280, 720], [1280, 720], [1280, 720], [1280, 720], [1280, 720]]);
+    expect(w).toEqual([1, 0.25, 0.5, 0.75, 1, 1]);
+    expect(w.slice(1, 4).map((x) => x + (1 - x))).toEqual([1, 1, 1]);
+    expect(w.slice(1, 4).length).toBe(CROSSFADE_FRAMES);
+  });
+
+  it("runs no fade without a size change, and none for the first frame", () => {
+    expect(run(Array(8).fill([1920, 1080]))).toEqual(Array(8).fill(1));
+  });
+
+  it("restarts at 1/4 when the size changes again mid-fade", () => {
+    expect(run([[1920, 1080], [1280, 720], [1280, 720], [1600, 900], [1600, 900], [1600, 900], [1600, 900]])).toEqual([1, 0.25, 0.5, 0.25, 0.5, 0.75, 1]);
+  });
+
+  it("starts a new fade after a completed one", () => {
+    expect(run([[1, 1], [2, 2], [2, 2], [2, 2], [2, 2], [3, 3]])).toEqual([1, 0.25, 0.5, 0.75, 1, 0.25]);
+  });
+
+  it("ends within the time window when frames are slow", () => {
+    const f = new SizeFade();
+    f.step(1920, 1080, 0);
+    expect(f.step(1280, 720, 0)).toBe(0.25);
+    expect(f.step(1280, 720, CROSSFADE_MAX_MS - 1)).toBe(0.5);
+    expect(f.step(1280, 720, CROSSFADE_MAX_MS + 1)).toBe(1);
+  });
+
+  it("reports when a fade starts, and cancel() ends one", () => {
+    const f = new SizeFade();
+    f.step(1920, 1080, 0);
+    expect(f.started).toBe(false);
+    f.step(1280, 720, 1);
+    expect(f.started).toBe(true);
+    f.step(1280, 720, 2);
+    expect(f.started).toBe(false);
+    expect(f.cancel()).toBe(1);
+    expect(f.step(1280, 720, 3)).toBe(1);
   });
 });
 

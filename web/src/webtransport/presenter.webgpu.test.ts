@@ -15,6 +15,13 @@
 // Everything else is real: the shader, the pipelines, the geometry, the uniforms, a
 // validation error scope, and the pixels.
 //
+// The cross-fade over a size change (#1377) is drawn through `present()` with real VideoFrames
+// solid colours, so the blend weights can be read off a pixel. Importing or copying a VideoFrame
+// kills the device here (see above), so the frames are stand-ins, the import refuses and the copy
+// is a texture write of the stand-in's colour: the presenter takes its copy fallback, and the
+// fade's real blend, pipelines and previous texture are exercised. The external-texture variant
+// of the previous frame is covered by the jsdom tests.
+//
 // VITE_PRESENTER_CAPTURE=1 prints labelled PNG data URLs to the log for the issue's
 // side-by-side evidence. Timings are SwiftShader's software rasteriser, not a GPU's.
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -104,7 +111,7 @@ interface Shot {
 
 /** Presents the still through a real presenter at `w`x`h`, pass on or off, and reads the
  *  target back. A fresh presenter for each shot: an adapter is consumed by requestDevice. */
-async function shoot(opts: { sharpen: boolean; w?: number; h?: number }): Promise<Shot> {
+async function shoot(opts: { sharpen: boolean; w?: number; h?: number; timed?: boolean }): Promise<Shot> {
   const [w, h] = [opts.w ?? CW, opts.h ?? CH];
   // The target and the read-back must belong to the presenter's own device, so they are
   // made after it exists. The canvas stub is what hands it a real texture to draw into.
@@ -142,20 +149,21 @@ async function shoot(opts: { sharpen: boolean; w?: number; h?: number }): Promis
   expect((await device.popErrorScope())?.message ?? null).toBeNull();
   // Frame time, submitted and drained frame by frame.
   const t0 = performance.now();
-  for (let i = 0; i < 30; i++) {
+  const n = opts.timed === false ? 0 : 30;
+  for (let i = 0; i < n; i++) {
     presenter.presentTexture!(frame);
     await device.queue.onSubmittedWorkDone();
   }
-  const msPerFrame = (performance.now() - t0) / 30;
+  const msPerFrame = n ? (performance.now() - t0) / n : 0;
   presenter.destroy();
   return { pixels, fatal, msPerFrame };
 }
 
-async function readBack(device: GPUDevice, texture: GPUTexture, w: number, h: number): Promise<Px> {
+async function readBack(device: GPUDevice, texture: GPUTexture, w: number, h: number, origin = { x: 0, y: 0 }): Promise<Px> {
   const bytesPerRow = Math.ceil((w * 4) / 256) * 256;
   const buffer = device.createBuffer({ size: bytesPerRow * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
   const encoder = device.createCommandEncoder();
-  encoder.copyTextureToBuffer({ texture }, { buffer, bytesPerRow }, [w, h]);
+  encoder.copyTextureToBuffer({ texture, origin }, { buffer, bytesPerRow }, [w, h]);
   device.queue.submit([encoder.finish()]);
   await buffer.mapAsync(GPUMapMode.READ);
   const src = new Uint8Array(buffer.getMappedRange());
@@ -238,6 +246,139 @@ describe("the upscale + sharpen pass, 1080p drawn at 1440p", () => {
   }, 120_000);
 });
 
+
+const meanAbsDiff = (a: Px, b: Px) => {
+  let sum = 0;
+  for (let i = 0; i < a.length; i += 4) sum += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
+  return sum / ((a.length / 4) * 3);
+};
+
+describe("the sharpen strength follows the upscale factor (#1377)", () => {
+  // The same 1080p picture drawn at 1.02x, 1.5x and 2x. Just above the pass's 1.01x switch
+  // it must be close to the plain picture, where a fixed strength jumped to the full pass.
+  const scales = [1.02, 1.5, 2];
+  const results = new Map<number, { plain: Shot; sharp: Shot }>();
+
+  it.each(scales)("renders %sx", async (scale) => {
+    const [w, h] = [Math.round(W * scale), Math.round(H * scale)];
+    const plain = await shoot({ sharpen: false, w, h, timed: false });
+    const sharp = await shoot({ sharpen: true, w, h, timed: false });
+    results.set(scale, { plain, sharp });
+    expect(sharp.fatal).toEqual([]);
+    const diff = meanAbsDiff(plain.pixels, sharp.pixels);
+    const gain = edgeEnergy(sharp.pixels, w, h) / edgeEnergy(plain.pixels, w, h);
+    console.log(`presenter-ramp ${scale}x mean|sharp-plain|=${diff.toFixed(3)} edge-energy gain=${gain.toFixed(3)}`);
+    if (CAPTURE) captureAt(`ramp-${scale}x`, plain.pixels, sharp.pixels, w, h, "plain scaling", "upscaled + sharpened");
+    if (scale < 1.1) expect(diff).toBeLessThan(0.05);
+    else {
+      expect(diff).toBeGreaterThan(0.5);
+      expect(gain).toBeGreaterThan(1.02);
+    }
+  }, 180_000);
+
+  it("is stronger the further the picture is upscaled", () => {
+    const d = (s: number) => meanAbsDiff(results.get(s)!.plain.pixels, results.get(s)!.sharp.pixels);
+    expect(d(1.02)).toBeLessThan(d(1.5));
+  });
+});
+
+describe("the cross-fade over a size change (#1377)", () => {
+  /** A stand-in for a decoded frame: its size and colour, closable and cloneable like a VideoFrame. */
+  const solid = (w: number, h: number, color: number[]) => {
+    const f = { displayWidth: w, displayHeight: h, color, close() {}, clone: () => solid(w, h, color) };
+    return f as unknown as VideoFrame;
+  };
+  const RED = [200, 0, 0];
+  const BLUE = [0, 0, 200];
+  const GREEN = [0, 200, 0];
+
+  /** Presents the frames in order; returns the pixel at the picture's centre after each. */
+  async function centres(frames: [number, number, number[]][], attrs: Record<string, string> = {}) {
+    const fatal: string[] = [];
+    let target!: GPUTexture;
+    const canvas = {
+      width: CW,
+      height: CH,
+      dataset: { ...attrs } as Record<string, string>,
+      getContext: () => ({ configure() {}, getCurrentTexture: () => target }),
+    } as unknown as HTMLCanvasElement;
+    const warn = vi.spyOn(console, "warn");
+    const presenter = (await createWebGpuPresenter(canvas, (m) => fatal.push(m)))!;
+    const queue = presenter.device!.queue;
+    vi.spyOn(presenter.device!, "importExternalTexture").mockImplementation(() => {
+      throw new Error("stubbed: importing a VideoFrame kills the device in this environment");
+    });
+    vi.spyOn(queue, "copyExternalImageToTexture").mockImplementation((src, dst, size) => {
+      const { displayWidth: w, displayHeight: h, color } = src.source as unknown as { displayWidth: number; displayHeight: number; color: number[] };
+      expect([...(size as number[])]).toEqual([w, h]);
+      const data = new Uint8Array(w * h * 4);
+      for (let i = 0; i < data.length; i += 4) data.set([...color, 255], i);
+      queue.writeTexture({ texture: dst.texture }, data, { bytesPerRow: w * 4 }, [w, h]);
+    });
+    // The blending pipelines compiled on a real device: a rejected one only logs.
+    expect(warn.mock.calls.filter((c) => String(c[0]).includes("cross-fade"))).toEqual([]);
+    const device = presenter.device!;
+    target = device.createTexture({ size: [CW, CH], format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    // A readback takes longer than the fade's time window; the fade is counted in frames here.
+    let now = 0;
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => (now += 16));
+    const out: number[][] = [];
+    try {
+      for (const [w, h, color] of frames) {
+        device.pushErrorScope("validation");
+        expect(presenter.present(solid(w, h, color))).toBe(true);
+        const px = await readBack(device, target, 1, 1, { x: CW / 2, y: CH / 2 });
+        expect((await device.popErrorScope())?.message ?? null).toBeNull();
+        out.push([...px.slice(0, 3)]);
+      }
+    } finally {
+      clock.mockRestore();
+      warn.mockRestore();
+      presenter.destroy();
+    }
+    expect(fatal).toEqual([]);
+    return out;
+  }
+  const near = (got: number[], want: number[]) => got.forEach((v, i) => expect(Math.abs(v - want[i])).toBeLessThanOrEqual(2));
+
+  it("dissolves 1440p into 1080p over three frames, the first one already part new", async () => {
+    const px = await centres([
+      [CW, CH, RED],
+      [W, H, BLUE],
+      [W, H, BLUE],
+      [W, H, BLUE],
+      [W, H, BLUE],
+    ]);
+    near(px[0], [200, 0, 0]);
+    near(px[1], [150, 0, 50]);
+    near(px[2], [100, 0, 100]);
+    near(px[3], [50, 0, 150]);
+    near(px[4], [0, 0, 200]);
+  }, 120_000);
+
+  it("dissolves with the sharpen switch off too", async () => {
+    const px = await centres([[CW, CH, RED], [W, H, BLUE]], { upscaleSharpen: "off" });
+    near(px[1], [150, 0, 50]);
+  }, 120_000);
+
+  it("restarts from the last frame shown when the size changes again mid-fade, with no flash", async () => {
+    const px = await centres([
+      [CW, CH, RED],
+      [W, H, BLUE],
+      [1280, 720, GREEN],
+      [1280, 720, GREEN],
+    ]);
+    // Frame 3 fades from the BLUE frame just shown: a quarter new, no red and no black.
+    near(px[2], [0, 50, 150]);
+    near(px[3], [0, 100, 100]);
+  }, 120_000);
+
+  it("draws a steady size untouched, and the pixel-exact mode with no dissolve", async () => {
+    near((await centres([[W, H, RED], [W, H, RED]]))[1], [200, 0, 0]);
+    near((await centres([[CW, CH, RED], [W, H, BLUE]], { scalingMode: "integer" }))[1], [0, 0, 200]);
+  }, 120_000);
+});
+
 /** Prints labelled side-by-side pairs for the issue's evidence: the whole frame at half
  *  scale, a 1:1 detail crop, and a 3x zoom on the small text. */
 function capture(name: string, plain: Px, sharp: Px, l: string, r: string) {
@@ -269,5 +410,38 @@ function capture(name: string, plain: Px, sharp: Px, l: string, r: string) {
     g.fillText(l, 8, 24);
     g.fillText(r, dw + 20, 24);
     console.log(`PRESENTER_CAPTURE ${name}-${tag} ${c.toDataURL("image/png")}`);
+  }
+}
+
+/** The whole frame at a size, side by side at half scale, plus a 1:1 detail crop and a 3x text zoom. */
+function captureAt(name: string, plain: Px, sharp: Px, w: number, h: number, l: string, r: string) {
+  const whole = (p: Px) => {
+    const c = document.createElement("canvas");
+    [c.width, c.height] = [w, h];
+    c.getContext("2d")!.putImageData(new ImageData(p, w, h), 0, 0);
+    return c;
+  };
+  const [a, b] = [whole(plain), whole(sharp)];
+  // The text sits at (1300, 920) of the 1080p picture; scale it to this size.
+  const k = w / W;
+  const crops = [
+    { tag: "detail", sx: Math.round(1250 * k), sy: Math.round(660 * k), w: 620, h: 348, zoom: 1 },
+    { tag: "textzoom", sx: Math.round(1290 * k), sy: Math.round(895 * k), w: 300, h: 60, zoom: 3 },
+  ];
+  for (const c of crops) {
+    const [dw, dh] = [c.w * c.zoom, c.h * c.zoom];
+    const out = document.createElement("canvas");
+    [out.width, out.height] = [dw * 2 + 12, dh + 36];
+    const g = out.getContext("2d")!;
+    g.fillStyle = "#111";
+    g.fillRect(0, 0, out.width, out.height);
+    g.imageSmoothingEnabled = c.zoom === 1;
+    g.drawImage(a, c.sx, c.sy, c.w, c.h, 0, 36, dw, dh);
+    g.drawImage(b, c.sx, c.sy, c.w, c.h, dw + 12, 36, dw, dh);
+    g.fillStyle = "#fff";
+    g.font = "16px sans-serif";
+    g.fillText(l, 8, 24);
+    g.fillText(r, dw + 20, 24);
+    console.log(`PRESENTER_CAPTURE ${name}-${c.tag} ${out.toDataURL("image/png")}`);
   }
 }
