@@ -53,22 +53,66 @@ export function criteriaNotes(criteria) {
   return lines.join("\n");
 }
 
-/** The tags from the scenario's params; a value in any other shape is left out. */
-function paramsTags(sc) {
-  const tags = [];
-  const leftOut = [];
+// ── the bench scenario's name ───────────────────────────────────────────────
+// `<scenario>/<k>=<v>/<k>=<v>...`: a separator (`/`) and a joiner (`=`) that a name
+// (`[A-Za-z0-9_.-]{1,64}`) and a UUID cannot hold, so a scenario whose name reads like
+// another's params is still another name. What decides comparison comes first, in this
+// order; every other param follows, sorted.
+const NAME_KEYS = ["transport", "codec", "profile"];
+// The four that do not change what is measured in a way the bench splits on: `hold_s` is
+// kept as a tag (how long it ran), the other three pick the app and its presentation.
+const NOT_IN_NAME = new Set(["app", "bench", "cover_qr", "hold_s"]);
+/** A bench scenario's whole name; the service takes it as text, and this is our own cap. */
+const NAME_MAX = 200;
+
+/** A param's value as name or tag text, or null when its type is not one a value may have. */
+function paramValue(v) {
+  if (typeof v === "string") return fits(SHAPES.identifier, v) ? v : null;
+  if (typeof v === "number") return Number.isFinite(v) ? String(v) : null;
+  if (typeof v === "boolean") return String(v);
+  return null;
+}
+
+/**
+ * The name to post under, the tags, and the params left out. A value (or a key) in any other
+ * shape is left out and counted, never passed on: the bundle is untrusted.
+ */
+function benchIdentity(sc) {
   const params = isObj(sc.params) ? sc.params : {};
-  for (const k of ["transport", "codec", "profile"]) {
-    if (fits(SHAPES.identifier, params[k])) tags.push([k, params[k]]);
-    else if (params[k] !== undefined) leftOut.push(k);
+  const pairs = [];
+  const leftOut = [];
+  const take = (k) => {
+    const v = paramValue(params[k]);
+    if (v !== null) return v;
+    if (params[k] !== undefined) leftOut.push(k);
+    return null;
+  };
+  for (const k of NAME_KEYS) {
+    const v = take(k);
+    if (v !== null) pairs.push([k, v]);
   }
-  return { tags, leftOut };
+  for (const k of Object.keys(params).sort()) {
+    if (NAME_KEYS.includes(k) || NOT_IN_NAME.has(k)) continue;
+    if (!fits(SHAPES.identifier, k)) {
+      leftOut.push(k);
+      continue;
+    }
+    const v = take(k);
+    if (v !== null) pairs.push([k, v]);
+  }
+  const tags = pairs.filter(([k]) => NAME_KEYS.includes(k));
+  const hold = take("hold_s");
+  if (hold !== null) tags.push(["hold_s", hold]);
+  const name = [sc.scenario, ...pairs.map(([k, v]) => `${k}=${v}`)].join("/");
+  return { name, tags, leftOut };
 }
 
 /**
  * bench_submit.py builds the run's identity and several tags from session.json (`ext_id`,
- * `derive_tags`): the id must be one of the scenario's own sessions, and every field that becomes a
- * tag as text must be a plain name. Null when the file may be posted (or is absent).
+ * `derive_tags`) and copies `encoder` and `profile_id` into the run's conditions.negotiated:
+ * the id must be one of the scenario's own sessions, in the collector's lower-case form (an
+ * id spelled in another case hashes to another external id and forks a second run), and every
+ * field is used only in the shape its field has. Null when the file may be posted (or is absent).
  */
 function sessionProblem(file, sc) {
   if (!fs.existsSync(file)) return null;
@@ -76,9 +120,13 @@ function sessionProblem(file, sc) {
   if (!isObj(s)) return "session.json is not an object";
   const mine = (Array.isArray(sc.sessions) ? sc.sessions : []).map((id) => String(id).toLowerCase());
   if (!fits(SHAPES.uuid, s.id) || !mine.includes(s.id.toLowerCase())) return "session.json's id is not one of the scenario's sessions (run e2e-collect first)";
+  if (s.id !== s.id.toLowerCase()) return "session.json's id is not lower case (the collector writes it lower case; another case is another run)";
   for (const k of ["codec", "profile", "host_id"]) {
     if (s[k] !== undefined && s[k] !== null && !fits(SHAPES.identifier, s[k])) return `session.json's ${k} is not a plain name`;
   }
+  if (s.encoder !== undefined && s.encoder !== null && !fits(SHAPES.setting, s.encoder)) return "session.json's encoder is not a plain name";
+  // A launch profile's id: an identifier or a UUID, both of which an identifier covers.
+  if (s.profile_id !== undefined && s.profile_id !== null && !fits(SHAPES.identifier, s.profile_id)) return "session.json's profile_id is not an identifier or a UUID";
   return null;
 }
 
@@ -108,7 +156,7 @@ function archive(dir, spawn, tar) {
   const r = spawn(tar, ["-czf", dest, "-C", path.dirname(src), "--", path.basename(src)], { encoding: "utf8" });
   if (r?.error || r?.status !== 0) {
     fs.rmSync(tmp, { recursive: true, force: true });
-    console.error(`the bundle could not be archived (${tar} -czf): ${r?.error?.message ?? `exit ${r?.status}`}); nothing is posted`);
+    console.error(`the bundle could not be archived (${tar} -czf): ${r?.error?.message ?? `exit ${r?.status}`}; nothing is posted`);
     return null;
   }
   return { dest, tmp };
@@ -122,7 +170,7 @@ export function postBundle(
   given,
   { host, dryRun = false, spawn = spawnSync, python = "python3", submit = SUBMIT, tar = "tar", env = process.env } = {},
 ) {
-  const out = { status: "ok", exit: EXIT.ok, posted: 0, skipped: 0, failed: 0, leftOut: 0, dryRun, reason: null, problems: [] };
+  const out = { status: "ok", exit: EXIT.ok, posted: 0, skipped: 0, failed: 0, warn: 0, leftOut: 0, dryRun, reason: null, problems: [] };
   const dir = fs.realpathSync(given);
   const problems = validateBundle(dir);
   if (problems.length) return { ...out, status: "failed", exit: EXIT.failed, reason: "invalid-bundle", problems };
@@ -164,16 +212,21 @@ export function postBundle(
         out.failed += 1;
         continue;
       }
-      const scenario = sc.scenario;
+      // The name and its tags are the bundle's own words or nothing: a param in another shape
+      // is left out and counted, and a name over the cap is refused, never truncated.
+      const { name: benchScenario, tags, leftOut } = benchIdentity(sc);
+      out.leftOut += leftOut.length;
+      if (benchScenario.length > NAME_MAX) {
+        console.error(`${name}: its bench scenario name is ${benchScenario.length} characters (at most ${NAME_MAX}); nothing posted for it`);
+        out.failed += 1;
+        continue;
+      }
       // The archive is part of the post: without it nothing is posted, the first run included.
       bundleArchive ??= archive(dir, spawn, tar);
       if (!bundleArchive) return { ...out, status: "failed", exit: EXIT.failed, reason: "no-archive" };
 
-      const { tags, leftOut } = paramsTags(sc);
-      out.leftOut += leftOut.length;
       // The server pairs runs by suite, scenario and host, newest per commit: the same scenario
       // with other params is another bench scenario, or webrtc would be compared with webtransport.
-      const benchScenario = [scenario, ...tags.map(([, v]) => v)].join(".");
       // `clock=raw`: the bundle's trace.json keeps client-clock browser events, so these runs
       // are not comparable with host-aligned ones event for event (issue #1276).
       const all = [["clock", "raw"], ...tags];
@@ -210,9 +263,15 @@ export function postBundle(
       const r = spawn(python, argv, { encoding: "utf8", env });
       if (r?.stdout) process.stdout.write(r.stdout);
       if (r?.stderr) process.stderr.write(r.stderr);
-      if (r?.error || r?.status !== 0) {
+      if (r?.error || (r?.status !== 0 && r?.status !== 3)) {
         console.error(`${name}: bench_submit.py did not finish (${r?.error?.message ?? `exit ${r?.status}`})`);
         out.failed += 1;
+      } else if (r?.status === 3) {
+        // bench_submit.py's exit 3 is a POSTED run whose tags disagree with what the host did,
+        // not a lost one: do not re-post it, and do not let the archive ride on a later run.
+        console.error(`${name}: bench_submit.py exit 3 — posted, but its tags disagree with the host (see the mismatch line above); counted as posted`);
+        out.warn += 1;
+        out.posted += 1;
       } else {
         out.posted += 1;
       }
@@ -269,6 +328,7 @@ export function main(argv, opts = {}) {
   const more = [
     r.failed ? `failed=${r.failed}` : "",
     r.leftOut ? `left_out=${r.leftOut}` : "",
+    r.warn ? `warn=${r.warn}` : "",
     r.dryRun ? "dry_run=1" : "",
     r.reason ? `reason=${r.reason}` : "",
   ]
