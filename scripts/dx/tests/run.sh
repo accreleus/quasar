@@ -31,9 +31,30 @@ fail() { FAIL_N=$((FAIL_N + 1)); printf 'FAIL %s — %s\n' "$1" "${2:-}" >&2; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/dx-tests.XXXXXX")"
 export WORK   # visible to PATH-shim subprocesses (e.g. the crontab stub's default state file)
-# shellcheck disable=SC2329  # invoked by the trap below, not by name
-cleanup() { rm -rf "$WORK"; }
-trap cleanup EXIT INT TERM
+# Every background child the suite starts (the fake control-plane and bench
+# servers) is recorded as it is launched, so the exit path stops it too. Only
+# removing $WORK was not enough: a run that never reached a test's own `kill` —
+# Ctrl-C, a `timeout`, a shell aborting mid-file — left a server listening with
+# its state file deleted from under it, and under `flock … make verify` that
+# orphan also keeps the lock's inherited descriptor open, which is how one held
+# the machine-wide gate for ten minutes.
+BG_PIDS=()
+start_bg() { BG_PIDS+=("$1"); }   # start_bg <pid> — remember a background child
+# shellcheck disable=SC2329  # invoked by the traps below, not by name
+cleanup() {
+  local pid
+  for pid in "${BG_PIDS[@]}"; do
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+# A signal runs the EXIT trap (so the servers stop) and then ENDS the run,
+# rather than letting it carry on with $WORK already gone.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # The operator's real bench server and key (BENCH_URL / BENCH_KEY, or qbench's
 # ~/.config/qbench/{url,key}) must never reach this suite: every bench script now
@@ -1639,6 +1660,7 @@ PY
   python3 "$TESTS_DIR/fake_bench_server.py" --port "$KEY_BENCH_PORT" --log "$WORK/key-bench-server.log" \
     > "$WORK/key-bench-server.out" 2>&1 &
   KEY_BENCH_PID=$!
+  start_bg "$KEY_BENCH_PID"
   for _ in $(seq 1 40); do
     curl -fsS "http://127.0.0.1:$KEY_BENCH_PORT/v1/health" >/dev/null 2>&1 && break
     sleep 0.25
@@ -1715,6 +1737,7 @@ CP_STATE="$WORK/cp-overrides.json"
 python3 "$TESTS_DIR/fake_cp_server.py" --port "$CP_PORT" --state "$CP_STATE" \
   --seed '{"abr_mode":"smooth"}' > "$WORK/cp-server.out" 2>&1 &
 CP_PID=$!
+start_bg "$CP_PID"
 for _ in $(seq 1 40); do
   curl -fsS "http://127.0.0.1:$CP_PORT/v1/hosts" >/dev/null 2>&1 && break
   sleep 0.25
@@ -1792,6 +1815,7 @@ python3 "$TESTS_DIR/fake_cp_server.py" --port "$FP_PORT" --state "$FP_STATE" \
   --apps-seed '[{"id":"app-1","name":"Quasar Benchapp","profile_policy":"force","default_profile_id":"1080p60"}]' \
   > "$WORK/fp-server.out" 2>&1 &
 FP_PID=$!
+start_bg "$FP_PID"
 for _ in $(seq 1 40); do
   curl -fsS "http://127.0.0.1:$FP_PORT/v1/hosts" >/dev/null 2>&1 && break
   sleep 0.25
@@ -1887,6 +1911,7 @@ PY
   python3 "$TESTS_DIR/fake_bench_server.py" --port "$BENCH_PORT" --log "$BENCH_LOG" \
     > "$WORK/bench-server.out" 2>&1 &
   BENCH_PID=$!
+  start_bg "$BENCH_PID"
   for _ in $(seq 1 40); do
     curl -fsS "http://127.0.0.1:$BENCH_PORT/v1/health" >/dev/null 2>&1 && break
     sleep 0.25
@@ -2307,6 +2332,7 @@ PY
   python3 "$TESTS_DIR/fake_bench_server.py" --port "$BUD_BENCH_PORT" \
     --log "$WORK/bench-budget-server.log" > "$WORK/bench-budget-server.out" 2>&1 &
   BUD_BENCH_PID=$!
+  start_bg "$BUD_BENCH_PID"
   for _ in $(seq 1 40); do
     curl -fsS "http://127.0.0.1:$BUD_BENCH_PORT/v1/health" >/dev/null 2>&1 && break
     sleep 0.25
@@ -2360,6 +2386,7 @@ PY
     --log "$WORK/bench-budget-server2.log" --regressions-file "$BUD_FIXTURE" \
     > "$WORK/bench-budget-server2.out" 2>&1 &
   BUD_BENCH_PID=$!
+  start_bg "$BUD_BENCH_PID"
   for _ in $(seq 1 40); do
     curl -fsS "http://127.0.0.1:$BUD_BENCH_PORT/v1/health" >/dev/null 2>&1 && break
     sleep 0.25
@@ -2741,6 +2768,7 @@ PY
     python3 "$TESTS_DIR/fake_cp_server.py" --port "$port" --state "$state" \
       --session-mode "$mode" > "$WORK/qses-$label.out" 2>&1 &
     local pid=$!
+    start_bg "$pid"
     for _ in $(seq 1 40); do
       curl -fsS "http://127.0.0.1:$port/v1/hosts" >/dev/null 2>&1 && break
       sleep 0.25
@@ -3214,6 +3242,7 @@ sess_server_up() { # sess_server_up [--verdict V] [--expect-token T] [--sessions
   python3 "$TESTS_DIR/fake_cp_server.py" --port "$SESS_PORT" --state "$SESS_DIR/state.json" \
     --sessions-seed "$SESS_SEED" "$@" > "$SESS_DIR/server.out" 2>&1 &
   SESS_PID=$!
+  start_bg "$SESS_PID"
   local _
   for _ in $(seq 1 40); do
     curl -fsS "http://127.0.0.1:$SESS_PORT/v1/hosts" >/dev/null 2>&1 && break
