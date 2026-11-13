@@ -12010,6 +12010,12 @@ export interface components {
             audio_concealed_samples?: number;
             /** @description Amendment 66 (accreleus/quasar#1318), additive. CUMULATIVE for the page view: separate audible dropouts. WebRTC: the browser's inbound-rtp concealmentEvents. WebTransport: runs of silence from an empty audio queue (one per run) plus lost packets concealed (a gap of several lost packets, with the silence after its fade, counts once). Absent until the transport has measured audio. */
             audio_concealment_events?: number;
+            /** @description Amendment 68 (accreleus/quasar#1346), additive. A WebTransport session's audio playout buffer: the LEAST audio queued in the ring at a quantum since the previous sample, ms. 0 means the ring ran empty and played silence; a value at wt_audio_target_ms means it was never in danger. Absent before any audio has played and on WebRTC, which reports the browser's jitter buffer instead. */
+            wt_audio_buffer_ms?: number;
+            /** @description Amendment 68 (accreleus/quasar#1346), additive. The depth a WebTransport session's audio ring is aiming for, ms: the largest of its base target (the median video capture-to-present latency), 40 ms, and what the output device and posting need plus the jitter allowance it measures from audio packet arrival; capped at 150 ms. A setting, not a measurement; read beside wt_audio_buffer_ms. Absent before any audio has played and on WebRTC. */
+            wt_audio_target_ms?: number;
+            /** @description Amendment 68 (accreleus/quasar#1346), additive. CUMULATIVE for the page view: times a WebTransport session's audio ring ran empty and played silence, however long each run lasted. The silence-run half of audio_concealment_events, so that count minus this one is the dropouts a lost packet's fade caused. Absent until audio has played, and never posted by a WebRTC session. */
+            wt_audio_underruns?: number;
             /** @description Accepted by the browser ingest allow-list and declared here, but no client has ever posted it — the browser cannot observe host encode time. Kept declared so the ingest contract does not change. */
             encode_ms?: number;
             network_pacing_ms?: number;

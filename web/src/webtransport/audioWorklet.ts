@@ -24,7 +24,7 @@ class QuasarAudioOut extends AudioWorkletProcessor {
 
   process(_inputs: Float32Array[][], outputs: Float32Array[][]): boolean {
     this.ring.render(outputs[0], currentFrame);
-    if (++this.quanta % STATS_EVERY === 0) this.port.postMessage(this.ring.stats);
+    if (++this.quanta % STATS_EVERY === 0) this.port.postMessage(this.ring.takeStats());
     return true;
   }
 }

@@ -137,7 +137,8 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   let benchFaulted = false;
   let audioOut: AudioOut | null = null;
   /** The current AudioOut's dropout totals already given to telemetry; a new AudioOut counts from 0. */
-  let audioSeen = { samples: 0, events: 0 };
+  /** The current AudioOut's dropout totals already given to telemetry; a new AudioOut counts from 0. */
+  let audioSeen = { samples: 0, events: 0, underruns: 0 };
   /** The sound starts muted (webrtc/sessionRuntime holdAudio): nothing the app plays before the reveal is heard. */
   let audioHeld = true;
   let micSlot = false;
@@ -222,8 +223,15 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     const audio = audioOut?.stats();
     if (audio?.measured) {
       telemetry.addAudioDropouts(audio.concealedSamples - audioSeen.samples, audio.concealmentEvents - audioSeen.events);
-      audioSeen = { samples: audio.concealedSamples, events: audio.concealmentEvents };
+      // Silence runs are cumulative per player, and a player that has not played audio has none.
+      if (audio.buffer) telemetry.addAudioUnderruns(audio.buffer.underruns - audioSeen.underruns);
+      audioSeen = {
+        samples: audio.concealedSamples,
+        events: audio.concealmentEvents,
+        underruns: audio.buffer?.underruns ?? audioSeen.underruns,
+      };
     }
+    telemetry.setAudioBuffer(audio?.buffer?.minMs ?? null, audio?.buffer?.targetMs ?? null);
     return audio;
   };
 
@@ -373,7 +381,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
           harvestAudio();
           audioOut?.close();
           audioOut = null;
-          audioSeen = { samples: 0, events: 0 };
+          audioSeen = { samples: 0, events: 0, underruns: 0 };
           if (!streams.audio || failed || destroyed) return;
           const out = (audioOut = new AudioOut(deps.audio));
           if (!audioHeld) out.release();

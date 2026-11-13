@@ -466,6 +466,16 @@ export function StatsPane(props: StatsPaneProps) {
                   </td>
                 </tr>
                 <tr>
+                  {/* WebTransport only: the least the audio ring held this second, against the
+                      depth it aims for. A left number at 0 is the ring running empty (#1346). */}
+                  <MetricLabel text="audio buffer" metric="wt_audio_buffer_ms" />
+                  <td className={telemetry.audioBufferMs === 0 ? "diag-warn" : undefined}>
+                    {telemetry.audioBufferMs == null
+                      ? "–"
+                      : `${Math.round(telemetry.audioBufferMs)} / ${Math.round(telemetry.audioTargetMs ?? 0)} ms`}
+                  </td>
+                </tr>
+                <tr>
                   {/* Not this-second: g2g is a median over up to 600 RVFC samples. */}
                   <MetricLabel text="capture→display" metric="rvfc_capture_to_display_ms" />
                   <td>{fmt(telemetry.g2gMs)}</td>

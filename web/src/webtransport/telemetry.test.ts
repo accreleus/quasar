@@ -176,6 +176,35 @@ describe("WtTelemetry", () => {
     expect(metrics.map((m) => m.audio_concealment_events)).toEqual([undefined, 0, 2, 3]);
   });
 
+  it("posts the audio ring's least buffer and target, and the silence runs cumulative, once audio plays", async () => {
+    const h = harness();
+    h.frames(10, 8);
+    h.t.tick();
+    h.t.setAudioBuffer(12.5, 50);
+    h.frames(10, 8);
+    h.t.tick();
+    h.t.addAudioUnderruns(0); // audio has played and never underrun
+    h.t.setAudioBuffer(0, 50); // and this window the ring ran empty
+    h.frames(10, 8);
+    h.t.addAudioUnderruns(3); // a reconnect's new player adds to the total, it does not replace it
+    const snap = h.t.tick();
+    h.t.setAudioBuffer(null, null); // the player closed: no buffer is claimed again
+    h.frames(10, 8);
+    expect(h.t.tick()).toMatchObject({ audioBufferMs: null, audioTargetMs: null });
+    expect(snap).toMatchObject({ audioBufferMs: 0, audioTargetMs: 50 });
+    await h.t.flush();
+    const metrics = (h.posts[0].body.samples as { metrics: Record<string, number> }[]).map((s) => s.metrics);
+    expect(metrics[0]).not.toHaveProperty("wt_audio_buffer_ms");
+    expect(metrics[0]).not.toHaveProperty("wt_audio_target_ms");
+    expect(metrics[0]).not.toHaveProperty("wt_audio_underruns");
+    expect(metrics[1]).toMatchObject({ wt_audio_buffer_ms: 12.5, wt_audio_target_ms: 50 });
+    expect(metrics[1]).not.toHaveProperty("wt_audio_underruns");
+    expect(metrics[2]).toMatchObject({ wt_audio_buffer_ms: 0, wt_audio_underruns: 3 });
+    expect(metrics[3]).not.toHaveProperty("wt_audio_buffer_ms");
+    expect(metrics[3]).not.toHaveProperty("wt_audio_target_ms");
+    expect(metrics[3]).toMatchObject({ wt_audio_underruns: 3 });
+  });
+
   it("counts long frames and present rate by the one definition WebRTC uses", () => {
     const h = harness();
     h.t.presented(0);

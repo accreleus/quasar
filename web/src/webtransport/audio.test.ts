@@ -303,6 +303,57 @@ describe("AudioRing", () => {
     ring.push(600, chunk(600, 1), 0);
     expect(ring.stats.dropped).toBe(1);
   });
+
+  it("reports the least audio queued at a quantum, and a new window at each takeStats", () => {
+    const ring = new AudioRing();
+    ring.push(0, chunk(480, 1), 0);
+    ring.push(480, chunk(480, 1), 0);
+    quantum(ring, 0); // the first chunk plays: there was no buffer to measure before it
+    expect(ring.stats.minQueuedFrames).toBe(Infinity);
+    quantum(ring, 128); // 960 queued, 128 played
+    expect(ring.stats.minQueuedFrames).toBe(832);
+    quantum(ring, 256);
+    expect(ring.stats.minQueuedFrames).toBe(704);
+    expect(ring.takeStats().minQueuedFrames).toBe(704);
+    // The window just reported started again: nothing has been measured in the next one yet.
+    expect(ring.stats.minQueuedFrames).toBe(Infinity);
+  });
+
+  it("reports 0 for a buffer that ran empty, and never a buffer before audio has played", () => {
+    const dry = new AudioRing();
+    quantum(dry, 0);
+    expect(dry.stats.minQueuedFrames).toBe(Infinity); // no audio has played: nothing to report
+    expect(dry.takeStats().minQueuedFrames).toBe(Infinity);
+    dry.push(0, chunk(128, 1), 0);
+    quantum(dry, 0); // it plays
+    quantum(dry, 128); // and the queue is dry: the buffer reads 0, which is what an underrun is
+    expect(dry.stats.minQueuedFrames).toBe(0);
+    expect(dry.takeStats().minQueuedFrames).toBe(0);
+  });
+
+  it("does not count a concealment fade as audio queued: it is the hole, not the stream", () => {
+    const ring = new AudioRing();
+    ring.push(0, chunk(128, 1), 0);
+    quantum(ring, 0);
+    ring.push(128, chunk(480, 0.5), 0, true);
+    quantum(ring, 128);
+    expect(ring.stats.minQueuedFrames).toBe(0);
+  });
+
+  it("counts the queue running dry apart from a fade, so events minus runs is the concealed packets", () => {
+    const ring = new AudioRing();
+    ring.push(0, chunk(128, 1), 0);
+    quantum(ring, 0);
+    ring.push(128, chunk(128, 0.5), 0, true); // a lost packet's fade opens the gap's event
+    quantum(ring, 128);
+    expect(ring.stats).toMatchObject({ underrunEvents: 1, silenceRuns: 0 });
+    ring.push(256, chunk(128, 1), 0);
+    quantum(ring, 256); // real audio: the gap is over
+    quantum(ring, 384); // dry: the event that was an empty ring
+    expect(ring.stats).toMatchObject({ underrunEvents: 2, silenceRuns: 1 });
+    quantum(ring, 512); // the same run of silence is still one
+    expect(ring.stats).toMatchObject({ underrunEvents: 2, silenceRuns: 1 });
+  });
 });
 
 // ── AudioRing across a playout delay change (#1346, step 3) ─────────────────
@@ -652,8 +703,20 @@ describe("AudioOut", () => {
     const { out, port } = setupAudioOut();
     await out.start(STEREO);
     expect(out.stats()).toMatchObject({ concealedSamples: 0, concealmentEvents: 0 });
-    port.onmessage?.({ data: { underrunFrames: 960, concealedFrames: 480, underrunEvents: 3, dropped: 0 } });
+    port.onmessage?.({ data: { underrunFrames: 960, concealedFrames: 480, underrunEvents: 3, silenceRuns: 1, dropped: 0, minQueuedFrames: Infinity } });
     expect(out.stats()).toMatchObject({ concealedSamples: 1_440, concealmentEvents: 3 });
+  });
+
+  it("reports the ring's least queued audio per window with the depth it aims for, and no buffer before audio plays", async () => {
+    const { out, port } = setupAudioOut();
+    await out.start(STEREO);
+    expect(out.stats().buffer).toBeNull(); // nothing has played yet
+    port.onmessage?.({ data: { underrunFrames: 0, concealedFrames: 0, underrunEvents: 0, silenceRuns: 1, dropped: 0, minQueuedFrames: 2_400 } });
+    port.onmessage?.({ data: { underrunFrames: 0, concealedFrames: 0, underrunEvents: 0, silenceRuns: 1, dropped: 0, minQueuedFrames: 1_200 } });
+    // The least of the worklet's reports since the previous read, at the device's 48 kHz.
+    expect(out.stats().buffer).toEqual({ minMs: 25, targetMs: 50, underruns: 1 });
+    // Reading it started the next window, and no report has arrived in it.
+    expect(out.stats().buffer).toBeNull();
   });
 
   it("is measured only once a running context has the worklet: not before start, after a failed start, or while suspended", async () => {
@@ -668,7 +731,7 @@ describe("AudioOut", () => {
     suspended.ctx.state = "running";
     expect(suspended.out.stats().measured).toBe(true);
     // Latched: suspended again before a reconnect or a stop, what it counted is still harvested.
-    suspended.port.onmessage?.({ data: { underrunFrames: 960, concealedFrames: 480, underrunEvents: 3, dropped: 0 } });
+    suspended.port.onmessage?.({ data: { underrunFrames: 960, concealedFrames: 480, underrunEvents: 3, silenceRuns: 0, dropped: 0, minQueuedFrames: Infinity } });
     suspended.ctx.state = "suspended";
     expect(suspended.out.stats()).toMatchObject({ measured: true, concealedSamples: 1_440, concealmentEvents: 3 });
   });
@@ -1161,11 +1224,11 @@ describe("createWebTransportRuntime audio and microphone", () => {
     rt.start();
     await vi.advanceTimersByTimeAsync(1_100);
     expect(snaps.at(-1)).toMatchObject({ audioConcealedSamples: 0, audioConcealmentEvents: 0 });
-    audio.port.onmessage?.({ data: { underrunFrames: 960, concealedFrames: 0, underrunEvents: 2, dropped: 0 } });
+    audio.port.onmessage?.({ data: { underrunFrames: 960, concealedFrames: 0, underrunEvents: 2, silenceRuns: 0, dropped: 0, minQueuedFrames: Infinity } });
     agent.last.closeWith(4400); // a reconnect before the next tick: the player is replaced
     await vi.advanceTimersByTimeAsync(50);
     expect(audio.createContext).toHaveBeenCalledTimes(2);
-    audio.port.onmessage?.({ data: { underrunFrames: 480, concealedFrames: 0, underrunEvents: 1, dropped: 0 } });
+    audio.port.onmessage?.({ data: { underrunFrames: 480, concealedFrames: 0, underrunEvents: 1, silenceRuns: 0, dropped: 0, minQueuedFrames: Infinity } });
     await vi.advanceTimersByTimeAsync(1_000);
     expect(snaps.at(-1)).toMatchObject({ audioConcealedSamples: 1_440, audioConcealmentEvents: 3 });
     rt.destroy();
@@ -1177,7 +1240,7 @@ describe("createWebTransportRuntime audio and microphone", () => {
     const { rt, audio } = setup({ ...helloAck(0, avcC()), audio: OPUS, mic: null }, {}, counters);
     rt.start();
     await vi.advanceTimersByTimeAsync(1_100);
-    audio.port.onmessage?.({ data: { underrunFrames: 960, concealedFrames: 0, underrunEvents: 2, dropped: 0 } });
+    audio.port.onmessage?.({ data: { underrunFrames: 960, concealedFrames: 0, underrunEvents: 2, silenceRuns: 0, dropped: 0, minQueuedFrames: Infinity } });
     rt.destroy(); // before the next tick
     expect(counters).toMatchObject({ audioConcealedSamples: 960, audioConcealmentEvents: 2 });
   });
@@ -1201,6 +1264,27 @@ describe("createWebTransportRuntime audio and microphone", () => {
     const posted = suspended.metrics().map((m) => m.audio_concealed_samples);
     expect(posted.slice(0, 2)).toEqual([undefined, undefined]);
     expect(posted.at(-1)).toBe(0);
+  });
+
+  it("posts the audio ring's buffer, its target and the silence-run count, and none of them before audio plays", async () => {
+    vi.useFakeTimers();
+    const { audio, rt, metrics } = setup({ ...helloAck(0, avcC()), audio: OPUS, mic: null });
+    rt.start();
+    await vi.advanceTimersByTimeAsync(2_100);
+    // The worklet is reporting and nothing has played: an empty ring is not a measurement.
+    audio.port.onmessage?.({ data: { underrunFrames: 0, concealedFrames: 0, underrunEvents: 0, silenceRuns: 0, dropped: 0, minQueuedFrames: Infinity } });
+    await vi.advanceTimersByTimeAsync(1_000);
+    audio.port.onmessage?.({ data: { underrunFrames: 0, concealedFrames: 0, underrunEvents: 3, silenceRuns: 3, dropped: 0, minQueuedFrames: 2_400 } });
+    await vi.advanceTimersByTimeAsync(1_000);
+    rt.destroy(); // flushes the samples queued since the last 5 s post
+    const posted = metrics();
+    const withBuffer = posted.filter((m) => "wt_audio_buffer_ms" in m || "wt_audio_target_ms" in m || "wt_audio_underruns" in m);
+    expect(withBuffer).toHaveLength(1);
+    expect(withBuffer[0].wt_audio_buffer_ms).toBeCloseTo(50, 6);
+    expect(withBuffer[0].wt_audio_target_ms).toBeGreaterThanOrEqual(40);
+    expect(withBuffer[0].wt_audio_underruns).toBe(3);
+    // Measured samples went out before it; none of them claimed a buffer.
+    expect(posted.indexOf(withBuffer[0])).toBeGreaterThan(0);
   });
 
   it("posts the arrival jitter only once two frames have been measured", async () => {
