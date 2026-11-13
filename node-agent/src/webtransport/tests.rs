@@ -1539,6 +1539,7 @@ async fn governed_agent(stream: Stream) -> Agent {
         "snow",
         |_| {
             Some(Rate {
+                measured: Box::new(|_| {}),
                 ceiling_kbps: 8000.0,
                 floor_kbps: Box::new(|| 4000.0),
                 retargets: true,
@@ -1977,6 +1978,7 @@ async fn feedback_while_pyrowave_is_active_feeds_no_estimate() {
         "ball",
         move |_| {
             Some(Rate {
+                measured: Box::new(|_| {}),
                 ceiling_kbps: 4000.0,
                 floor_kbps: Box::new(|| 500.0),
                 retargets: true,
@@ -2070,6 +2072,7 @@ async fn audio_alone_never_moves_the_video_estimate() {
     };
     let mut agent = agent_built(Stream::H264, Limits::default(), plan, "ball", move |_| {
         Some(Rate {
+            measured: Box::new(|_| {}),
             ceiling_kbps: 4000.0,
             floor_kbps: Box::new(|| 500.0),
             retargets: true,
@@ -2111,6 +2114,7 @@ async fn audio_alone_never_moves_the_video_estimate() {
 
 fn rate(retargets: bool) -> Rate {
     Rate {
+        measured: Box::new(|_| {}),
         ceiling_kbps: 8000.0,
         floor_kbps: Box::new(|| 4000.0),
         retargets,
@@ -2181,6 +2185,53 @@ fn silent_feedback_hands_the_window_back_to_cubic_until_feedback_returns() {
     assert!(governor.kbps() >= 4000, "feedback is back: governed again");
 }
 
+/// #1320 review: the silence decay (×0.8 per 500 ms without feedback) still pulls the
+/// setpoint down, but it is not evidence of the link, so it never reaches the ladder's
+/// collapse (`Rate::measured`): a hidden tab or a Wi-Fi roam must not cost the picture. On
+/// the old code every estimate the ABR was fed, the decay's included, went to the collapse.
+#[test]
+fn the_silence_decay_is_never_fed_to_the_collapse_as_a_measured_link() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let (fed, measured) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (f, m) = (fed.clone(), measured.clone());
+    let rate = Rate {
+        measured: Box::new(move |_| {
+            m.fetch_add(1, SeqCst);
+        }),
+        ceiling_kbps: 8000.0,
+        floor_kbps: Box::new(|| 4000.0),
+        retargets: true,
+        start: Box::new(|| {}),
+        observe: Box::new(move |_| {
+            f.fetch_add(1, SeqCst);
+        }),
+    };
+    let mut control = Control::new(&rate, Arc::default(), false, Default::default());
+    let t0 = std::time::Instant::now();
+    let rtt = Duration::from_millis(20);
+    answered(&mut control, 0, t0);
+    let (fed0, measured0) = (fed.load(SeqCst), measured.load(SeqCst));
+    assert_eq!(
+        (fed0, measured0),
+        (1, 1),
+        "a report is fed, and is a measurement"
+    );
+    let mut d = vec![0u8; media::MAX_DATAGRAM];
+    d[1..5].copy_from_slice(&200u32.to_le_bytes());
+    control
+        .log
+        .record(&d, t0 + Duration::from_millis(300), false);
+    for ms in (900..6000).step_by(100) {
+        control.tick(rtt, t0 + Duration::from_millis(ms));
+    }
+    assert!(fed.load(SeqCst) > fed0, "the decay is fed to the setpoint");
+    assert_eq!(
+        measured.load(SeqCst),
+        measured0,
+        "and never to the collapse"
+    );
+}
+
 /// A client displaced, or told the session ended, neither starts nor feeds the ABR: the
 /// encoder is its successor's, and a start after the session ended would register hooks
 /// that keep the encoder alive.
@@ -2190,6 +2241,7 @@ fn a_client_that_is_gone_neither_starts_nor_feeds_the_abr() {
     let calls = Arc::new(AtomicUsize::new(0));
     let (started, fed) = (calls.clone(), calls.clone());
     let rate = Rate {
+        measured: Box::new(|_| {}),
         ceiling_kbps: 4000.0,
         floor_kbps: Box::new(|| 500.0),
         retargets: true,
@@ -2249,6 +2301,7 @@ fn the_abr_is_fed_the_estimate_less_the_fec_share() {
     let fed = Arc::new(Mutex::new(Vec::new()));
     let seen = fed.clone();
     let rate = Rate {
+        measured: Box::new(|_| {}),
         ceiling_kbps: 6000.0,
         floor_kbps: Box::new(|| 500.0),
         retargets: true,
@@ -2274,6 +2327,7 @@ async fn lossy_session(retargets: bool) -> Agent {
         "snow",
         move |_| {
             Some(Rate {
+                measured: Box::new(|_| {}),
                 ceiling_kbps: 4000.0,
                 floor_kbps: Box::new(|| 500.0),
                 retargets,
@@ -2435,6 +2489,7 @@ fn repairs_spend_only_what_the_estimate_leaves_above_the_abr_floor() {
     let fed = Arc::new(Mutex::new(Vec::new()));
     let seen = fed.clone();
     let rate = Rate {
+        measured: Box::new(|_| {}),
         ceiling_kbps: 6000.0,
         floor_kbps: Box::new(|| 2500.0),
         retargets: true,
@@ -2470,6 +2525,7 @@ fn governed(level: u8, estimate_kbps: f64, seconds: u64) -> Vec<(u32, f64)> {
     )));
     let (floor, observed) = (governor.clone(), governor.clone());
     let rate = Rate {
+        measured: Box::new(|_| {}),
         ceiling_kbps: 8000.0,
         floor_kbps: Box::new(move || f64::from(floor.lock().unwrap().0.floor_kbps())),
         retargets: true,
@@ -2566,6 +2622,7 @@ fn on_a_constrained_link_video_plus_fec_settles_inside_the_governors_bound() {
 #[test]
 fn a_pyrowave_frame_gets_no_repair_at_any_overhead() {
     let rate = Rate {
+        measured: Box::new(|_| {}),
         ceiling_kbps: 6000.0,
         floor_kbps: Box::new(|| 500.0),
         retargets: true,

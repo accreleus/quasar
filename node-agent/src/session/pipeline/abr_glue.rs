@@ -242,28 +242,29 @@ impl AbrLoop {
                 );
             }
         }
-        // `rtpgccbwe` never reports under its `min-bitrate`, which `set_floor` holds at the
-        // floor, so only the WebTransport estimate can show a collapse; a tick re-feeds an
-        // old estimate and is no new evidence.
-        if from_notify && self.source != RTPGCCBWE {
-            self.collapse(est_kbps);
-        }
     }
 
-    /// #1320: a link that collapsed far under the floor. Steps the resolution rung, the
-    /// floor and the setpoint in one action, between windows
-    /// ([`ladder::LadderPlanner::observe_estimate`]).
-    fn collapse(&self, est_kbps: f64) {
-        if self.mode == AbrMode::Off {
+    /// #1320: what a WebTransport receiver report showed the link carrying
+    /// (`webtransport::Rate::measured`), never the silence decay. A link the current rung
+    /// cannot carry steps the resolution rung, the floor and the setpoint in one action,
+    /// between windows ([`ladder::LadderPlanner::observe_estimate`]). WebRTC never calls
+    /// this: `rtpgccbwe` never reports under its `min-bitrate`, which `set_floor` holds at
+    /// the floor.
+    fn collapse(&self, est_kbps: f64, now: std::time::Instant) {
+        if self.mode == AbrMode::Off || !self.owns_encoder() {
             return;
         }
         let Some(rungs) = self.rungs.lock().unwrap().clone() else {
             return;
         };
-        let now = std::time::Instant::now();
         // Lock order as the window hook's: rungs, then the governor.
         let mut guard = rungs.state.lock().unwrap();
         let st = &mut *guard;
+        // A resize not negotiated yet: the encoder is restarting, and what the receiver
+        // measures is the restart. The planner's `COLLAPSE_SETTLE` covers the time after.
+        if rungs.lever.current() != st.planner.res_size() {
+            return;
+        }
         let floor = self.governor.lock().unwrap().floor_kbps() as f64;
         st.planner.set_res_retired(st.res_disabled);
         st.planner.set_fps_retired(st.fps_disabled);
@@ -299,8 +300,8 @@ impl AbrLoop {
             m.set_ladder_res_rung(d.to);
         }
         tracing::info!(
-            "SPT-08 ladder step: resolution rung {} → {} ({}), {w}x{h}, estimate \
-             {est_kbps:.0} kbps under half the floor {floor:.0} kbps; floor {floor_now} kbps, \
+            "SPT-08 ladder step: resolution rung {} → {} ({}), {w}x{h}, the link measured at \
+             {est_kbps:.0} kbps under the floor {floor:.0} kbps; floor {floor_now} kbps, \
              setpoint {setpoint} kbps",
             d.from,
             d.to,
@@ -1260,6 +1261,7 @@ pub(crate) fn feedback_abr(
     let mode = cfg.abr_mode;
     let observe_loop = abr_loop.clone();
     let floor_loop = abr_loop.clone();
+    let collapse_loop = abr_loop.clone();
     let observed = latest.clone();
     let begin: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         let latest = latest.clone();
@@ -1296,6 +1298,7 @@ pub(crate) fn feedback_abr(
             }
             observe_loop.observe(kbps, true);
         }),
+        measured: Box::new(move |kbps| collapse_loop.collapse(kbps, std::time::Instant::now())),
     })
 }
 
@@ -2019,10 +2022,11 @@ mod tests {
         );
     }
 
-    /// #1320: a WebTransport link that collapses far under the floor reaches a rung it can
-    /// carry from the estimate reports alone, inside ~1 s and before any window closes: the
-    /// rung, the floor and the setpoint in one action. On the old code nothing moved until
-    /// a window drained (none does here), and then one rung per 10 s.
+    /// #1320: what WebTransport reports measured of a collapsed link reaches a rung it can
+    /// carry from the reports alone, `COLLAPSE_CONFIRM` after the first and before any
+    /// window closes: the rung, the floor, the setpoint and the encoder's bitrate in one
+    /// action. On the old code nothing moved until a window drained (none does here), and
+    /// then one rung per 10 s.
     #[test]
     fn a_webtransport_collapse_steps_rung_floor_and_setpoint_together_between_windows() {
         init();
@@ -2049,41 +2053,53 @@ mod tests {
         let encoder = gst::ElementFactory::make("openh264enc").build().unwrap();
         let stage = super::super::scale_stage::build_scale_stage(&cfg, None).unwrap();
         let lever = Arc::new(EncodeResolutionLever::new(stage, encoder.clone(), |_| {}));
-        let client = feedback_abr(
+        // `feedback_abr`'s own two calls, so the reports can carry their own clock.
+        let (abr_loop, plan) = arm(
             &encoder,
             &cfg,
             metrics.clone(),
             trace,
             "s".into(),
             Some(lever.clone()),
+            "webtransport feedback",
         )
         .expect("openh264enc takes live writes");
-        (client.start)();
+        start(&abr_loop, &plan, Box::new(|| 8000.0));
+        let bitrate = || encoder.property::<u32>("bitrate");
+        let before = bitrate();
 
         // One report every 100 ms, as `webtransport::congestion::REPORT_EVERY`.
-        let start = std::time::Instant::now();
-        let mut stepped_at = None;
-        for _ in 0..14 {
-            (client.observe)(1000.0);
-            if stepped_at.is_none() && lever.stage().requested() != (1920, 1080) {
-                stepped_at = Some(start.elapsed());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        let t0 = std::time::Instant::now();
+        let report = |ms: u64| {
+            abr_loop.collapse(1000.0, t0 + std::time::Duration::from_millis(ms));
+        };
+        for ms in (0..1000).step_by(100) {
+            report(ms);
         }
-        let stepped_at = stepped_at.expect("the collapse stepped without a window");
-        assert!(
-            stepped_at >= ladder::LadderPlanner::COLLAPSE_CONFIRM
-                && stepped_at < std::time::Duration::from_millis(1300),
-            "{stepped_at:?}"
+        assert_eq!(
+            lever.stage().requested(),
+            (1920, 1080),
+            "not before COLLAPSE_CONFIRM"
         );
+        assert_eq!(bitrate(), before);
+        report(1000);
         assert_eq!(
             lever.stage().requested(),
             (1280, 720),
             "1000 kbit/s fits no floor (900p 1826, 720p 1306): the floor rung, in one step"
         );
         assert_eq!(lever.stage().current_fps(), 60, "the frame rate is kept");
+        assert_eq!(
+            bitrate(),
+            1_306_000,
+            "the encoder is written at the new floor"
+        );
+        for ms in (1100..3000).step_by(100) {
+            report(ms);
+        }
+        assert_eq!(bitrate(), 1_306_000, "nothing more at the floor rung");
 
-        let w = metrics.drain_window(start + std::time::Duration::from_secs(5));
+        let w = metrics.drain_window(t0 + std::time::Duration::from_secs(5));
         assert_eq!(w.ladder_res_rung, Some(2));
         assert_eq!(
             w.abr_floor_kbps,

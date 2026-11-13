@@ -811,8 +811,8 @@ pub enum StepReason {
     Recover,
     /// The governor is already at the floor and the path is still congested.
     Emergency,
-    /// The estimate stayed far under the floor: several rungs in one step
-    /// ([`LadderPlanner::observe_estimate`]).
+    /// The link stayed under the floor by more than the governor's deadband: to the rung
+    /// that fits, several at once if need be ([`LadderPlanner::observe_estimate`]).
     Collapse,
 }
 
@@ -1376,12 +1376,18 @@ pub struct LadderPlanner {
 }
 
 impl LadderPlanner {
-    /// An estimate under this fraction of the floor in force is a collapse, not a dip the
-    /// governor can ride at its floor.
-    pub const COLLAPSE_FRAC: f64 = 0.5;
+    /// An estimate under this fraction of the floor in force is one the current rung cannot
+    /// carry. It is the governor's default deadband (`AbrConfig::DEFAULT_DEADBAND`, 15 %):
+    /// an estimate inside it would not move the setpoint even with no floor, so the rung
+    /// leaves it alone too; anything further under the floor steps to the rung that fits.
+    pub const COLLAPSE_FRAC: f64 = 0.85;
     /// How long every estimate must stay under the line: about ten WebTransport reports
     /// (`webtransport::congestion::REPORT_EVERY`), so one bad report cannot step.
     pub const COLLAPSE_CONFIRM: std::time::Duration = std::time::Duration::from_secs(1);
+    /// No estimate counts this long after any step of either lever: a resolution step
+    /// restarts the encoder, which pauses the stream and then sends a keyframe burst, so
+    /// what the receiver measures then is the restart, not the link.
+    pub const COLLAPSE_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
 
     /// The hybrid pivot: the height at and below which the fps rung is taken before any
     /// further resolution step. Michael's rule — "120→60 as the step before dropping
@@ -1538,14 +1544,15 @@ impl LadderPlanner {
         step
     }
 
-    /// One rate estimate, between windows (#1320). The window path reads the governor's
-    /// setpoint, which never goes under the floor, so it can only learn one rung at a time
-    /// how far under the floor the link is. An estimate that stays under
-    /// [`Self::COLLAPSE_FRAC`] × `floor_kbps` for [`Self::COLLAPSE_CONFIRM`] steps the
-    /// resolution rung straight to the rung whose floor (`floors`) fits the highest
-    /// estimate of that run. Only when resolution is the lever the order takes next, and
-    /// under `hybrid` never past the pivot while 120 → 60 is still to come. Never moves the
-    /// frame rate.
+    /// One rate estimate measured from a receiver report, between windows (#1320). The
+    /// window path reads the governor's setpoint, which never goes under the floor, so it
+    /// can only learn one rung at a time how far under the floor the link is. An estimate
+    /// that stays under [`Self::COLLAPSE_FRAC`] × `floor_kbps` for
+    /// [`Self::COLLAPSE_CONFIRM`] steps the resolution rung straight to the rung whose
+    /// floor (`floors`) fits the highest estimate of that run. Not within
+    /// [`Self::COLLAPSE_SETTLE`] of any step. Only when resolution is the lever the order
+    /// takes next, and under `hybrid` never past the pivot while 120 → 60 is still to come.
+    /// Never moves the frame rate.
     pub fn observe_estimate(
         &mut self,
         estimate_kbps: f64,
@@ -1553,7 +1560,10 @@ impl LadderPlanner {
         floors: &FloorFollow,
         now: Instant,
     ) -> Option<PlannedStep> {
-        if estimate_kbps >= Self::COLLAPSE_FRAC * floor_kbps {
+        let last_step = self.res.last_step.max(self.fps.last_step);
+        if estimate_kbps >= Self::COLLAPSE_FRAC * floor_kbps
+            || now.saturating_duration_since(last_step) < Self::COLLAPSE_SETTLE
+        {
             self.collapse = None;
             return None;
         }
@@ -2842,8 +2852,128 @@ mod tests {
         });
         assert!(steps.is_empty(), "{steps:?}");
         assert_eq!(p.res_rung(), 0);
-        // Under the floor but above half of it: the governor's to ride, not a collapse.
-        assert!(reports(&mut p, &f, t, 30_000, 5, |_| 2100.0).is_empty());
+        // Under the floor but inside the governor's deadband (3500 ≥ 0.85 × 4000): the
+        // governor would not move for it either.
+        assert!(reports(&mut p, &f, t, 30_000, 5, |_| 3500.0).is_empty());
+    }
+
+    /// #1320 review: a link under the floor but above half of it was a dead zone (the line
+    /// was 0.5 × floor): 2400 kbit/s against the 4000 launch floor never stepped here and
+    /// the window path took about 20 s. Now any link the rung cannot carry steps in
+    /// `COLLAPSE_CONFIRM` to the rung that fits it: 900p, whose floor (1976) is under 2400.
+    #[test]
+    fn a_link_the_rung_cannot_carry_steps_promptly_however_shallow() {
+        let t = Instant::now();
+        let f = owner_floors();
+        let mut p = planner(LadderOrder::ResFirst, false, 120, t);
+        let steps = reports(&mut p, &f, t, 0, 3, |_| 2400.0);
+        assert_eq!(
+            steps,
+            vec![(
+                1000,
+                PlannedStep::Resolution(StepDecision {
+                    from: 0,
+                    to: 2,
+                    reason: StepReason::Collapse
+                })
+            )]
+        );
+    }
+
+    /// #1320 review: right after a step the receiver measures the encoder restart (pause,
+    /// then a keyframe burst), not the link; the estimator can read 150 kbit/s. Old code took
+    /// such a reading 1 s after a window step for a second step, mid-restart. Now nothing
+    /// counts for `COLLAPSE_SETTLE` after any step, window or collapse; a link still under
+    /// the floor after that steps once more.
+    #[test]
+    fn no_collapse_inside_the_settle_after_any_step() {
+        let t = Instant::now();
+        let f = owner_floors();
+        let ms = |ms: u64| t + Duration::from_millis(ms);
+        let mut p = planner(LadderOrder::ResFirst, false, 120, t);
+        // A window step: congested with the governor at its floor.
+        let w = p.observe(AdaptationState::NetworkCongested, 4000.0, 4000.0, ms(0));
+        assert_eq!(w.map(label), Some("res->1".into()));
+        assert!(
+            reports(&mut p, &f, t, 100, 3, |_| 150.0).is_empty(),
+            "settle"
+        );
+        let steps = reports(&mut p, &f, t, 3100, 2, |_| 150.0);
+        assert_eq!(steps.iter().map(|s| s.0).collect::<Vec<_>>(), vec![4000]);
+        assert_eq!(p.res_rung(), 3);
+
+        // A collapse settles the next one the same way. 2500 is under 1080p's floor (2598),
+        // so the first one lands on 900p.
+        let mut p = planner(LadderOrder::ResFirst, false, 120, t);
+        let first = reports(&mut p, &f, t, 0, 2, |_| 2500.0);
+        assert_eq!(first.iter().map(|s| s.0).collect::<Vec<_>>(), vec![1000]);
+        assert_eq!(p.res_rung(), 2);
+        assert!(
+            reports(&mut p, &f, t, 2000, 2, |_| 150.0).is_empty(),
+            "settle"
+        );
+        assert_eq!(reports(&mut p, &f, t, 4000, 2, |_| 150.0).len(), 1);
+        assert_eq!(p.res_rung(), 3);
+    }
+
+    /// Reports every 100 ms and a window every 5 s from `from_ms` for `secs`, the link at
+    /// `kbps` and the setpoint following it as the governor would (never under the floor).
+    fn link(
+        p: &mut LadderPlanner,
+        f: &FloorFollow,
+        t: Instant,
+        from_ms: u64,
+        secs: u64,
+        kbps: f64,
+    ) -> Vec<(u64, String)> {
+        let mut steps = Vec::new();
+        for ms in (from_ms..from_ms + secs * 1000).step_by(100) {
+            let at = t + Duration::from_millis(ms);
+            if let Some(s) = p.observe_estimate(kbps, floor_now(p, f), f, at) {
+                steps.push((ms, label(s)));
+            }
+            if ms % 5000 == 0 {
+                let floor = floor_now(p, f);
+                if let Some(s) = p.observe(AdaptationState::Healthy, kbps.max(floor), floor, at) {
+                    steps.push((ms, label(s)));
+                }
+            }
+        }
+        steps
+    }
+
+    /// #1320 review: no flapping. A link that stays at 1.5 Mbit/s after the collapse to
+    /// 720p (floor 1414) keeps 720p: the up gate never climbs back into the collapse.
+    #[test]
+    fn a_link_that_stays_low_holds_the_rung_it_collapsed_to() {
+        let t = Instant::now();
+        let f = owner_floors();
+        let mut p = planner(LadderOrder::ResFirst, false, 120, t);
+        assert_eq!(
+            link(&mut p, &f, t, 0, 120, 1500.0),
+            vec![(1000, "res->3".into())]
+        );
+    }
+
+    /// #1320 review: a link that comes back to 10 Mbit/s climbs one rung at a time, at the
+    /// window path's pace, and nothing steps back down.
+    #[test]
+    fn a_link_that_recovers_climbs_one_rung_at_a_time_and_stays() {
+        let t = Instant::now();
+        let f = owner_floors();
+        let mut p = planner(LadderOrder::ResFirst, false, 120, t);
+        assert_eq!(
+            link(&mut p, &f, t, 0, 2, 1500.0),
+            vec![(1000, "res->3".into())]
+        );
+        assert_eq!(
+            link(&mut p, &f, t, 2000, 120, 10_000.0),
+            vec![
+                (15_000, "res->2".into()),
+                (30_000, "res->1".into()),
+                (45_000, "res->0".into())
+            ]
+        );
     }
 
     /// `res_first` at 120 fps: a collapse under every floor reaches the floor rung and keeps

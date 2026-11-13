@@ -472,8 +472,9 @@ impl Governor {
 
     /// The ladder's collapse step (#1320) moves the setpoint with the rung: down to
     /// `kbps` (clamped to the floor) at once, past the interval and the dwell. Never up.
-    /// Restarts the interval and the up path's average from `kbps`, so the estimate the
-    /// link carried before the collapse cannot ramp it straight back.
+    /// Restarts the interval and the up path's average from the new setpoint, so the
+    /// estimate the link carried before the collapse cannot ramp it straight back, and an
+    /// estimate under the floor cannot hold the climb back once the link returns.
     pub fn cut_to(&mut self, kbps: f64, now: Instant) -> Option<u32> {
         let target = (kbps.round() as i64)
             .clamp(self.cfg.floor_kbps as i64, self.cfg.ceiling_kbps as i64)
@@ -483,7 +484,7 @@ impl Governor {
         }
         self.setpoint = target;
         self.last_retarget = now;
-        self.ewma = Some(kbps);
+        self.ewma = Some(target as f64);
         Some(target)
     }
 
@@ -674,6 +675,13 @@ mod tests {
         assert_eq!(g.cut_to(100.0, now), Some(900), "never under the floor");
         // The pre-collapse average does not ramp it back: an estimate at the cut holds.
         assert_eq!(g.observe(900.0, at(base, 2)), None);
+        // The average restarts at the clamped setpoint, not the raw estimate: seeded with 100
+        // it would read 0.3 × 2000 + 0.7 × 100 = 670 and hold; from 900 it reads 1230 and
+        // climbs one step.
+        let mut g = Governor::new(AbrConfig::new_smooth(2500, 8000, 60), base);
+        g.set_floor_kbps(900);
+        assert_eq!(g.cut_to(100.0, now), Some(900));
+        assert_eq!(g.observe(2000.0, at(base, 2)), Some(1125));
     }
 
     #[test]
