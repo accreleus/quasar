@@ -3058,7 +3058,7 @@ if command -v make >/dev/null 2>&1; then
   mk_missing=""
   for t in help init doctor config-check verify test test-go test-rust test-uinput test-web test-webgpu \
            test-db preflight up down restart rebuild redeploy-cp status health logs \
-           logs-follow dev-web dev-cp diagnose diagnose-bundle clean reset e2e-review; do
+           logs-follow dev-web dev-cp diagnose diagnose-bundle clean reset e2e-review e2e-compare; do
     if ! make -C "$ROOT" -n "$t" >/dev/null 2>&1; then
       mk_missing="$mk_missing $t"
     fi
@@ -3738,6 +3738,14 @@ if command -v node >/dev/null 2>&1; then
   rc_of 0 "e2e:review" -- node --test "$ROOT/scripts/validate/stream/review.test.mjs"
 else
   warn "e2e:review" "node not installed — SKIPPED"
+fi
+
+# Two bundles compared (#1284): golden bytes, the same bytes twice, bundle text that cannot become
+# page structure, the review's warm-up, and a comparison that cannot be written.
+if command -v node >/dev/null 2>&1; then
+  rc_of 0 "e2e:compare" -- node --test "$ROOT/scripts/validate/stream/compare.test.mjs"
+else
+  warn "e2e:compare" "node not installed — SKIPPED"
 fi
 
 # Release publication must wait for every image its manifest names.

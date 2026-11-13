@@ -107,7 +107,7 @@ export VERSION DRY_RUN
 	test test-go test-rust test-uinput test-web test-webgpu test-engines test-engines-build \
         test-db preflight release up down restart rebuild redeploy-cp status health logs logs-follow \
         dev-web dev-cp diagnose diagnose-bundle clean reset agent-creds validate \
-        e2e-run e2e-collect e2e-review e2e-post e2e-pack \
+        e2e-run e2e-collect e2e-review e2e-post e2e-pack e2e-compare \
         ui-audit ui-audit-routes ui-audit-ab session-display session-soak abr-ladder \
         bench-submit bench-retro bench-run bench-suite bench-budget bench-baseline \
         homes-gc \
@@ -326,6 +326,9 @@ e2e-review: ## The deterministic summary an agent reads first — BUNDLE=<bundle
 
 e2e-post: ## Put a suite run on quasar-bench: one run per scenario — BUNDLE=<dir> HOST=<role> [DRY_RUN=1]
 	@bash $(DX)/e2e_post.sh
+
+e2e-compare: ## What changed between two run bundles: criteria, metric medians, pictures — A=<bundle-dir> B=<bundle-dir> [OUT=<dir>]
+	@bash $(DX)/e2e_compare.sh
 
 e2e-pack: ## The client half of the suite as one archive for a remote tester (Node 22 + Chrome only) — [OUT=<path without extension>]
 	@bash $(DX)/e2e_pack.sh

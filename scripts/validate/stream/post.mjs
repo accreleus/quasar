@@ -64,6 +64,11 @@ const NAME_KEYS = ["transport", "codec", "profile"];
 const NOT_IN_NAME = new Set(["app", "bench", "cover_qr", "hold_s"]);
 /** A bench scenario's whole name; the service takes it as text, and this is our own cap. */
 const NAME_MAX = 200;
+/** The shape such a name has: what `[scenario, k=v, ...].join("/")` can make out of identifiers,
+ *  finite numbers and booleans — letters, digits, `_ . - + / =` — at most NAME_MAX characters.
+ *  `e2e-compare` keeps a scenario's identity in its JSON only in this shape, so two bundles pair
+ *  by exactly what this file posts. */
+export const NAME_SHAPE = /^[A-Za-z0-9_.\-+/=]{1,200}$/;
 
 /** A param's value as name or tag text, or null when its type is not one a value may have. */
 function paramValue(v) {
@@ -75,9 +80,10 @@ function paramValue(v) {
 
 /**
  * The name to post under, the tags, and the params left out. A value (or a key) in any other
- * shape is left out and counted, never passed on: the bundle is untrusted.
+ * shape is left out and counted, never passed on: the bundle is untrusted. `e2e-compare` pairs
+ * two bundles' scenarios by `name`, so the two verbs agree on when two runs measured one thing.
  */
-function benchIdentity(sc) {
+export function benchIdentity(sc) {
   const params = isObj(sc.params) ? sc.params : {};
   const pairs = [];
   const leftOut = [];

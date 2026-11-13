@@ -5,9 +5,10 @@ loop, leaving one **run bundle** that an agent or a person reviews afterwards. S
 
 > **Status.** The bundle format and its validator (#1272), the runner (#1273, `make e2e-run`), the
 > host half of a bundle (#1274, `make e2e-collect`), the review that summarises a bundle (#1275,
-> `make e2e-review`) posting a run to quasar-bench (#1276, `make e2e-post`) and the client half as one archive for a
-> remote tester (#1280, `make e2e-pack`) exist. `e2e-compare` is the spec's later ticket; this page
-> grows with it.
+> `make e2e-review`) posting a run to quasar-bench (#1276, `make e2e-post`), the client half as one archive for a
+> remote tester (#1280, `make e2e-pack`) and two bundles compared (#1284, `make e2e-compare`) exist.
+> Serving a web build to the browser on the stack's own origin and the UI journeys in a plan are the
+> spec's later tickets (#1284); this page grows with them.
 
 ## What you need
 
@@ -382,6 +383,65 @@ server configured the script still asks it for its version) and prints each run'
 external id — the way to see what a bundle would post. With a bench address set but no key it
 fails instead: the plan is refused before anything is posted, because the script needs the key even
 to plan, so the verb exits 1 with `failed=N`.
+
+### Comparing two run bundles
+
+```
+make e2e-compare A=<bundle-dir> B=<bundle-dir> [OUT=<dir>]
+```
+
+**What you need.** Two run bundles of the same plan — two web builds on one stack, two commits, two
+test clients, or two runs of one build — and Node 22. No stack, no token, no bench server: this verb
+reads two directories and nothing else. Both bundles are validated first, and an invalid one is
+refused (its problems are printed and nothing is written).
+
+**What it does.** It writes `COMPARE.md` and `compare.json` into `OUT`, a new directory beside `B` by
+default (`<B>-compare`). Nothing is written into `A` or `B`, and an `OUT` that exists is refused, so a
+comparison is never overwritten. Neither file holds a clock reading or an absolute path, so the same
+two bundles give the same bytes out, in any directory.
+
+- **First, what differed about the runs**: one table of the field, each side's value and whether they
+  are the same — every build component's version, commit and whether it could say; the client's label,
+  kind, browser, OS, GPU and decode support per codec; the plan, the runner's commit and dirty flag,
+  the suite run and its times; the network path and shaping. When only the facts of one run differ
+  (a second run of one build), it says so in one line; when nothing does (a bundle compared with
+  itself), it says that.
+- **Then, per scenario**: the criteria. Scenarios pair by the identity `e2e-post` would post them
+  under — the scenario's name, then `transport`, `codec`, `profile` and every other param — so two
+  scenarios pair exactly when quasar-bench would compare them, and a scenario in only one bundle is
+  listed, not compared. Every criterion id in either side is one row: A's verdict and observed value,
+  B's, and a class — `same`, `regressed` (true to false), `fixed` (false to true), `now_judged` or
+  `no_longer_judged` (to or from not judged), `observed_changed` (same verdict, a different value), or
+  `only_a` / `only_b`.
+- **Then the metric deltas**: for every key `docs/session-trace/metrics.json` defines for a source
+  both sides carry, the median on each side, B minus A and the percent change, sorted by the size of
+  the change. The medians are read after the same warm-up the review judges a scenario's samples
+  after (`classifier.warmup_exclude_s` in `docs/session-trace/thresholds.json`, after each side's own
+  first browser sample), so the first seconds of a run do not decide the number. A key with fewer
+  than five samples on a side is listed as too few, not compared.
+- **Then the pictures**: `shots/<label>.png` paired by label, whether the bytes are identical, and
+  the two sizes; a picture only one side took is listed.
+- **Last**, the one line this unit does not do: serving a web build (`WEB_DIST=`), UI journeys in a
+  plan, decoded-frame pairs at the same reference-app tick, and a pixel difference in pictures.
+
+**How to read the result.** Read `COMPARE.md` first: what the runs differed in, then what moved. It
+carries **no judgement and no threshold** — the numbers are the report — because one pair of runs is
+not evidence of a regression: quasar-bench's rule is at least two runs a side. `compare.json` is the
+same comparison as data, for a script: it holds only values in a known shape (an identifier, a UUID,
+a commit, a version, a finite number, a boolean, null, and the class words), and a value that fits no
+shape — free text, an object — is left out and counted in `left_out`. `COMPARE.md` still shows those
+values, as data in one-line code spans, so bundle text can never become a heading, a table row or a
+link. At most 100 scenarios, 200 criteria and 500 metric keys per scenario are compared; over that the
+page says it was truncated.
+
+```
+RESULT status=ok target=e2e-compare changed=N scenarios=N only_a=N only_b=N [left_out=N] [truncated=1]
+```
+
+`changed` counts the criteria whose class is not `same`, `scenarios` the pairs compared. Exit 0 both
+bundles are valid and the comparison was written (whether or not anything changed), 1 a bundle is not
+valid (`reason=invalid-a` or `invalid-b`), 2 usage, or a comparison that cannot be written
+(`reason=out-exists`, `out-inside-bundle`, `cannot-write`). A bundle zip is not read: unzip it first.
 
 ### The fallback and keyboard-and-mouse scenarios
 

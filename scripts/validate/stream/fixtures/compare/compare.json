@@ -1,0 +1,373 @@
+{
+  "format": 1,
+  "a": {
+    "bundle": "a",
+    "suite_run_id": "compare-a-0001"
+  },
+  "b": {
+    "bundle": "b",
+    "suite_run_id": "compare-b-0001"
+  },
+  "runs": {
+    "changed": true,
+    "fields": [
+      {
+        "field": "builds.control_plane.commit",
+        "same": true,
+        "a": "9e3c207f",
+        "b": "9e3c207f"
+      },
+      {
+        "field": "builds.control_plane.unknown",
+        "same": true,
+        "a": false,
+        "b": false
+      },
+      {
+        "field": "builds.control_plane.version",
+        "same": true,
+        "a": "0.6.0-dev",
+        "b": "0.6.0-dev"
+      },
+      {
+        "field": "builds.gpu_driver.unknown",
+        "same": true,
+        "a": true,
+        "b": true
+      },
+      {
+        "field": "builds.node_agent.commit",
+        "same": false,
+        "a": "9e3c207f",
+        "b": "a1b2c3d4"
+      },
+      {
+        "field": "builds.node_agent.unknown",
+        "same": true,
+        "a": false,
+        "b": false
+      },
+      {
+        "field": "builds.node_agent.version",
+        "same": true,
+        "a": "0.6.0-dev",
+        "b": "0.6.0-dev"
+      },
+      {
+        "field": "builds.reference_app.unknown",
+        "same": true,
+        "a": false,
+        "b": false
+      },
+      {
+        "field": "builds.reference_app.version",
+        "same": true,
+        "a": "767e2ad",
+        "b": "767e2ad"
+      },
+      {
+        "field": "builds.web.unknown",
+        "same": true,
+        "a": true,
+        "b": true
+      },
+      {
+        "field": "client.label",
+        "same": true,
+        "a": "mac-test-client",
+        "b": "mac-test-client"
+      },
+      {
+        "field": "client.kind",
+        "same": true,
+        "a": "web",
+        "b": "web"
+      },
+      {
+        "field": "client.browser.name",
+        "same": true,
+        "a": "Chrome",
+        "b": "Chrome"
+      },
+      {
+        "field": "client.browser.version",
+        "same": false,
+        "a": "157.0.0.0",
+        "b": "158.0.0.0"
+      },
+      {
+        "field": "client.os.name",
+        "same": true,
+        "a": "macOS",
+        "b": "macOS"
+      },
+      {
+        "field": "client.os.version",
+        "same": true,
+        "a": "26.1",
+        "b": "26.1"
+      },
+      {
+        "field": "client.gpu.adapter",
+        "same": true
+      },
+      {
+        "field": "client.decode.h264.supported",
+        "same": true,
+        "a": true,
+        "b": true
+      },
+      {
+        "field": "client.decode.h264.hardware",
+        "same": true,
+        "a": true,
+        "b": true
+      },
+      {
+        "field": "manifest.plan",
+        "same": true,
+        "a": "smoke",
+        "b": "smoke"
+      },
+      {
+        "field": "manifest.runner.commit",
+        "same": true,
+        "a": "1111111111111111111111111111111111111111",
+        "b": "1111111111111111111111111111111111111111"
+      },
+      {
+        "field": "manifest.runner.dirty",
+        "same": true,
+        "a": false,
+        "b": false
+      },
+      {
+        "field": "manifest.suite_run_id",
+        "same": false,
+        "a": "compare-a-0001",
+        "b": "compare-b-0001"
+      },
+      {
+        "field": "manifest.started_at_ms",
+        "same": false,
+        "a": 1786940000000,
+        "b": 1786950000000
+      },
+      {
+        "field": "manifest.ended_at_ms",
+        "same": false,
+        "a": 1786940600000,
+        "b": 1786950600000
+      },
+      {
+        "field": "network.shaping",
+        "same": true,
+        "a": null,
+        "b": null
+      },
+      {
+        "field": "network.path.kind",
+        "same": true,
+        "a": "lan",
+        "b": "lan"
+      },
+      {
+        "field": "network.path.rtt_ms",
+        "same": true,
+        "a": 3,
+        "b": 3
+      }
+    ]
+  },
+  "counts": {
+    "scenarios": 1,
+    "only_a": 1,
+    "only_b": 1,
+    "criteria_changed": 6
+  },
+  "truncated": false,
+  "only_a": [
+    "input-kbm/transport=webrtc/codec=h264/profile=1080p60"
+  ],
+  "only_b": [
+    "transport-fallback/transport=webtransport/codec=h264/profile=1080p60/when=mid"
+  ],
+  "pairs": [
+    {
+      "id": "stream-hold/transport=webrtc/codec=h264/profile=1080p60",
+      "dir_a": "01-stream-hold",
+      "dir_b": "01-stream-hold",
+      "status_a": "pass",
+      "status_b": "fail",
+      "warmup": {
+        "applied": true
+      },
+      "criteria_changed": 6,
+      "criteria": [
+        {
+          "id": "profile_as_asked",
+          "class": "only_a",
+          "a": {
+            "pass": true,
+            "observed": true
+          },
+          "b": {
+            "pass": null,
+            "observed": null
+          }
+        },
+        {
+          "id": "marker_decoded",
+          "class": "only_b",
+          "a": {
+            "pass": null,
+            "observed": null
+          },
+          "b": {
+            "pass": true,
+            "observed": true
+          }
+        },
+        {
+          "id": "transport_as_asked",
+          "class": "regressed",
+          "a": {
+            "pass": true,
+            "observed": "webrtc"
+          },
+          "b": {
+            "pass": false,
+            "observed": "webrtc"
+          }
+        },
+        {
+          "id": "missing_indices_rate",
+          "class": "now_judged",
+          "a": {
+            "pass": null,
+            "observed": null
+          },
+          "b": {
+            "pass": true,
+            "observed": 0.0695
+          }
+        },
+        {
+          "id": "codec_as_asked",
+          "class": "no_longer_judged",
+          "a": {
+            "pass": true,
+            "observed": "h264"
+          },
+          "b": {
+            "pass": null,
+            "observed": null
+          }
+        },
+        {
+          "id": "first_frame_s",
+          "class": "observed_changed",
+          "a": {
+            "pass": true,
+            "observed": 4.2
+          },
+          "b": {
+            "pass": true,
+            "observed": 6.8
+          },
+          "delta": 2.6
+        },
+        {
+          "id": "audio_latency_ms",
+          "class": "same",
+          "a": {
+            "pass": null,
+            "observed": null
+          },
+          "b": {
+            "pass": null,
+            "observed": null
+          }
+        },
+        {
+          "id": "freeze_count",
+          "class": "same",
+          "a": {
+            "pass": true,
+            "observed": 0
+          },
+          "b": {
+            "pass": true,
+            "observed": 0
+          }
+        }
+      ],
+      "metrics": {
+        "compared": [
+          {
+            "source": "agent",
+            "key": "encode_ms",
+            "median_a": 5,
+            "median_b": 7,
+            "delta": 2,
+            "change_pct": 40,
+            "samples_a": 6,
+            "samples_b": 6
+          },
+          {
+            "source": "browser",
+            "key": "present_interval_max_ms",
+            "median_a": 12,
+            "median_b": 15,
+            "delta": 3,
+            "change_pct": 25,
+            "samples_a": 10,
+            "samples_b": 10
+          },
+          {
+            "source": "browser",
+            "key": "fps",
+            "median_a": 60,
+            "median_b": 54,
+            "delta": -6,
+            "change_pct": -10,
+            "samples_a": 10,
+            "samples_b": 10
+          }
+        ],
+        "too_few": [
+          {
+            "source": "browser",
+            "key": "missing_indices",
+            "samples_a": 3,
+            "samples_b": 3
+          }
+        ],
+        "truncated": false
+      },
+      "pictures": {
+        "pairs": [
+          {
+            "label": "end.png",
+            "identical": false,
+            "bytes_a": 70,
+            "bytes_b": 70
+          },
+          {
+            "label": "frame-1s.png",
+            "identical": true,
+            "bytes_a": 70,
+            "bytes_b": 70
+          }
+        ],
+        "only_a": [
+          "only-a.png"
+        ],
+        "only_b": [
+          "only-b.png"
+        ]
+      }
+    }
+  ],
+  "left_out": 2
+}
