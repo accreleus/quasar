@@ -45,7 +45,8 @@ export function loadWebDist(dir, max = MAX_BYTES) {
       files.set(r, { type, body: fs.readFileSync(path.join(root, r)) });
     }
   };
-  walk("");
+  // A file or folder that cannot be read: said with its place inside the directory, never the system's own message (it holds the full path).
+  try { walk(""); } catch (e) { throw e.code ? new Error(`WEB_DIST: something in it cannot be read (${e.code})`) : e; }
   if (!files.has("index.html")) throw new Error("WEB_DIST has no index.html at its top");
   const h = crypto.createHash("sha256");
   for (const r of [...files.keys()].sort()) h.update(`${r}\0${crypto.createHash("sha256").update(files.get(r).body).digest("hex")}\n`);
@@ -80,7 +81,9 @@ export function decide(dist, method, url, origin) {
 /** Answers the stack's static files from `dist` in `context` and nowhere else. Call before a page is opened. */
 export async function serveWebDist(context, baseUrl, dist) {
   const origin = new URL(baseUrl).origin;
-  await context.route((u) => u.origin === origin, async (route) => {
+  // Only what this would answer is routed: a request the stack answers (the API, /health) never waits on the runner, so the
+  // page's own timing probes of the stack read what they would without WEB_DIST.
+  await context.route((u) => u.origin === origin && !decide(dist, "GET", u.href, origin).pass, async (route) => {
     const q = route.request();
     const d = decide(dist, q.method(), q.url(), origin);
     if (d.pass) return route.continue();

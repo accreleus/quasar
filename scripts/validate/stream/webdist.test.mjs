@@ -84,6 +84,16 @@ test("the directory check: what is refused at start", () => {
   assert.doesNotThrow(() => loadWebDist(build(), 1024));
 });
 
+test("an unreadable folder in the directory is refused without printing where the directory is", (t) => {
+  if (process.getuid?.() === 0) return t.skip("root reads everything");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-wd-"));
+  try {
+    fs.writeFileSync(path.join(dir, "index.html"), "<!doctype html>");
+    fs.mkdirSync(path.join(dir, "secret"), { mode: 0o000 });
+    assert.throws(() => loadWebDist(dir), (e) => /cannot be read \(EACCES\)/.test(e.message) && !e.message.includes(dir));
+  } finally { fs.chmodSync(path.join(dir, "secret"), 0o700); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("the digest names the content, not the place: same files same digest, one byte or one name changes it", () => {
   const a = loadWebDist(build());
   assert.match(a.sha256, /^[0-9a-f]{64}$/);
@@ -124,6 +134,9 @@ test("the handler: only the stack's origin is matched; the API goes on, a file i
   const { match, send } = await handler();
   assert.equal(match(new URL(`${ORIGIN}/x`)), true);
   assert.equal(match(new URL("https://other.test/x")), false);
+  // What the stack answers is not routed at all, so the page's timing probes of it never wait on the runner.
+  for (const p of ["/health", "/v1/apps", "/v1/signal", "/agent/ws", "/wt", "/enroll-host.sh"]) assert.equal(match(new URL(`${ORIGIN}${p}`)), false, p);
+  for (const p of ["/", "/app/library", "/assets/missing.js", "/index.html"]) assert.equal(match(new URL(`${ORIGIN}${p}`)), true, p);
   assert.equal((await send("GET", `${ORIGIN}/v1/me`)).continued, true);
   assert.equal((await send("POST", `${ORIGIN}/icon.svg`)).continued, true, "a write to a static path is the stack's");
   const js = (await send("GET", `${ORIGIN}/assets/index-abc.js`)).fulfilled;

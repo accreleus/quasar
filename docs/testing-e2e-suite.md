@@ -489,6 +489,10 @@ make e2e-compare A=/abs/path/run-a B=/abs/path/run-b
 ```
 
 `COMPARE.md` opens with `builds.web.build` differing between the two (the two digests), and then what moved. One pair of runs is not a regression: repeat each side.
+Both sides of an A/B must be `WEB_DIST` runs: compare a build against the stack's own copy by building that copy too. A run with `WEB_DIST` loads
+the web client's files from the runner's memory with the browser's HTTP cache off, so the page's own download-speed probe (it times the main script
+bundle) says nothing about the path to the stack; requests the stack answers, such as its health probe, are not touched.
+A stray file with no known extension in the directory (a `.DS_Store` from a Mac) refuses the run: remove it.
 The pack for a remote tester takes the same variable in its environment (`QUASAR_E2E_WEB_DIST`); it has no flag for it.
 
 ### The fallback and keyboard-and-mouse scenarios
