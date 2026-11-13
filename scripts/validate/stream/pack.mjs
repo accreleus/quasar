@@ -66,6 +66,10 @@ export function packMembers(root = ROOT, version = versionOf(root)) {
   const scenarios = fs.readdirSync(path.join(root, STREAM, "scenarios")).filter((f) => f.endsWith(".mjs")).map((f) => `${STREAM}/scenarios/${f}`);
   const plans = fs.readdirSync(path.join(root, STREAM, "plans")).filter((f) => f.endsWith(".json")).map((f) => `${STREAM}/plans/${f}`);
   const files = [...closure([ENTRY, ...scenarios], root), ...plans.sort(), ...DATA];
+  // VERSION says "dirty" for changed tracked files only: a file git does not know would ride along under a clean commit.
+  let untracked = [];
+  try { untracked = execFileSync("git", ["ls-files", "--others", "--exclude-standard", "--", ...ALLOWED], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).split("\n").filter((f) => files.includes(f)); } catch { /* not a git checkout: nothing to compare with */ }
+  if (untracked.length) throw new Error(`${untracked[0]} is not tracked by git: commit it or remove it before packing`);
   for (const f of files) if (!fs.lstatSync(path.join(root, f)).isFile()) throw new Error(`${f} is not a plain file`);
   const members = files.map((f) => ({ name: `${TOP}/${f}`, data: fs.readFileSync(path.join(root, f)), mode: 0o644 }));
   for (const [f, mode] of Object.entries(LAUNCHERS)) members.push({ name: `${TOP}/${f}`, data: fs.readFileSync(path.join(root, STREAM, "pack", f)), mode });
@@ -77,7 +81,7 @@ export function packMembers(root = ROOT, version = versionOf(root)) {
 function main() {
   const i = process.argv.indexOf("--out");
   const version = versionOf();
-  const base = path.resolve(i > 0 ? process.argv[i + 1] : `quasar-e2e-pack-${version.slice(0, 8)}`);
+  const base = path.resolve(i > 0 ? process.argv[i + 1] : `quasar-e2e-pack-${version.trim().slice(0, 8)}`);
   const members = packMembers(ROOT, version);
   fs.writeFileSync(`${base}.tar.gz`, tarGz(members));
   fs.writeFileSync(`${base}.zip`, zip(members));

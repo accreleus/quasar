@@ -37,13 +37,18 @@ export function findChrome(env = process.env, platform = process.platform, exist
   return ({ win32: win, darwin: mac }[platform] ?? linux).find((p) => exists(p)) ?? null;
 }
 
+/** `env` as a child that must not see the sign-in gets it (npm on the first run). */
+export function withoutSignIn(env) {
+  const out = { ...env };
+  for (const k of STRIP) delete out[k];
+  return out;
+}
+
 /** The pack carries no node_modules: the first run installs playwright-core from the lockfile. The sign-in is not in this process' environment. */
 function ensureDeps() {
   if (!fs.existsSync(path.join(ROOT, "package.json")) || fs.existsSync(path.join(ROOT, "node_modules", "playwright-core"))) return null;
   console.error("first run: fetching the one library this needs (npm ci)");
-  const env = { ...process.env };
-  for (const k of STRIP) delete env[k];
-  const r = spawnSync("npm", ["ci", "--omit=dev", "--no-audit", "--no-fund"], { cwd: ROOT, env, stdio: ["ignore", "inherit", "inherit"], shell: process.platform === "win32" });
+  const r = spawnSync("npm", ["ci", "--omit=dev", "--no-audit", "--no-fund"], { cwd: ROOT, env: withoutSignIn(process.env), stdio: ["ignore", "inherit", "inherit"], shell: process.platform === "win32" });
   return r.status === 0 ? null : "npm ci failed: is this machine online, and is npm installed with Node?";
 }
 
@@ -101,7 +106,7 @@ export async function doctor({ target, plan, creds, chrome, insecure, deps = {},
         ? `Chrome could not reach the stack although this program can (${why}). On a Mac this is almost always the Local Network permission: System Settings > Privacy & Security > Local Network > allow Google Chrome, then run again.`
         : `Chrome could not open the stack's page (${why})`);
     }
-    if (page) {
+    if (page && planDoc) {
       try {
         const client = await probeClient(page);
         const skips = (planDoc?.scenarios ?? []).map((s, i) => [i + 1, cannotRun(s.params ?? {}, client)]).filter(([, why]) => why);
@@ -128,6 +133,12 @@ export function zipBundle(dir, outFile, date = new Date()) {
   walk(dir);
   fs.writeFileSync(outFile, zip(members.sort((a, b) => (a.name < b.name ? -1 : 1)), { date }));
   return members.length;
+}
+
+/** Zips a valid bundle. Null when the zip is on disk; otherwise why not. */
+export function sendBack(bundle, file, zipFn = zipBundle) {
+  try { zipFn(bundle, file); } catch (e) { return `the bundle could not be zipped (${e.message})`; }
+  return fs.existsSync(file) ? null : "no zip was written";
 }
 
 const result = (status, extra) => console.log(`RESULT status=${status} target=e2e-pack ${extra}`);
@@ -169,7 +180,8 @@ async function main() {
   const problems = validateBundle(bundle);
   if (problems.length) { for (const p of problems) console.error(p); result("failed", `zip= reason=bundle-invalid ${line}`); return 1; }
   const file = path.join(results, `quasar-e2e-${stamp}.zip`);
-  zipBundle(bundle, file);
+  const bad = sendBack(bundle, file);
+  if (bad) { console.error(bad); result("failed", `zip= reason=no-zip ${line}`); return 1; }
   console.log(`\nSend back this one file:\n  ${file}`);
   result("ok", `zip=${file} ${line}`);
   return 0;

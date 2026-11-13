@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { checkName, crc32, tarGz, zip } from "./archive.mjs";
 import { validateBundle } from "./bundle.mjs";
 import { closure, packMembers, playwrightFiles } from "./pack.mjs";
-import { doctor, findChrome, parseCli, zipBundle } from "./pack-run.mjs";
+import { doctor, findChrome, parseCli, sendBack, withoutSignIn, zipBundle } from "./pack-run.mjs";
 import { headless, runnerState } from "./run.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -264,6 +264,26 @@ test("the zip a run sends back passes the bundle validator and holds the bundle 
     fs.writeFileSync(path.join(bundle, "client.json.bak"), "Authorization: Bearer abcdef1234567890abcdef\n");
     assert.notDeepEqual(validateBundle(bundle), []);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("npm on the first run does not get the sign-in; the run is ok only when the zip is on disk", () => {
+  const env = withoutSignIn({ PATH: "/bin", QUASAR_E2E_EMAIL: "a", QUASAR_E2E_PASSWORD: "b", QUASAR_E2E_CRED_FILE: "c", NODE_TLS_REJECT_UNAUTHORIZED: "0" });
+  assert.deepEqual(env, { PATH: "/bin" });
+  const dir = tmp();
+  try {
+    const bundle = path.join(dir, "bundle-x");
+    fs.cpSync(path.join(HERE, "fixtures/bundle"), bundle, { recursive: true });
+    assert.equal(sendBack(bundle, path.join(dir, "a.zip")), null);
+    assert.equal(sendBack(bundle, path.join(dir, "b.zip"), () => {}), "no zip was written");
+    assert.match(sendBack(bundle, path.join(dir, "c.zip"), () => { throw new Error("disk full"); }), /could not be zipped \(disk full\)/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a scenario or plan git does not track stops the pack", () => {
+  const stray = path.join(HERE, "plans", "zz-untracked-test.json");
+  fs.writeFileSync(stray, '{"name":"zz","scenarios":[]}\n');
+  try { assert.throws(() => packMembers(), /zz-untracked-test\.json is not tracked by git/); } finally { fs.rmSync(stray, { force: true }); }
+  assert.ok(packMembers().length > 10);
 });
 
 test("a symlink in a bundle is not zipped", () => {

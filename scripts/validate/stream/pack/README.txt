@@ -12,12 +12,13 @@ What to do
          QUASAR_E2E_PASSWORD=the password you were given
   2. Open a terminal in this folder and run ONE command:
          macOS / Linux:   bash run.sh https://the-stack-address
-         Windows:         run.cmd https://the-stack-address
+         Windows:         .\run.cmd https://the-stack-address
      It checks this machine first and says plainly what is wrong, if anything. If the
      stack uses a self-made certificate, add   --insecure   after the address. The test
      streams for several minutes and opens a Chrome window: leave it alone until the
      command ends.
-     Just to check this machine without streaming:  bash run.sh doctor https://the-stack-address
+     Just to check this machine without streaming, put the word doctor before the address:
+         bash run.sh doctor https://the-stack-address      (Windows: .\run.cmd doctor https://...)
   3. When it ends it prints the path of one .zip file (in the "results" folder).
 
 What to send back

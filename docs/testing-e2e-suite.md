@@ -407,12 +407,12 @@ received, for the host half to compare.
 ### The pack for a remote tester
 
 `make e2e-pack [OUT=<path without extension>]` writes the client half as one archive, `OUT.tar.gz`
-and `OUT.zip` (the same files; Windows opens the zip, macOS and Linux either), about 70 KB. It holds
+and `OUT.zip` (the same files; Windows opens the zip, macOS and Linux either), 70 to 85 KB. It holds
 the runner and every file it imports (worked out from the code, not listed by hand), the plans,
 `thresholds.json` and `metrics.json`, `package.json` and a lockfile for `playwright-core` alone,
 `run.sh` and `run.cmd`, a plain `README.txt` and `VERSION` (the commit it was made from, `dirty`
-after it if tracked files differed). No tests, no hooks, no host or `.env` file, nothing from
-`.claude/`. The tester needs Node 22 and Chrome, nothing from this repository.
+after it if tracked files differed; a scenario or plan git does not track stops the pack). No
+tests, no hook scripts, no host or `.env` file, nothing from `.claude/`. The tester needs Node 22 and Chrome, nothing from this repository.
 
 What the tester does (they are also told in `README.txt`): unpack, make `signin.txt` in the folder
 with `QUASAR_E2E_EMAIL=` and `QUASAR_E2E_PASSWORD=` lines (the sign-in is never a command-line
@@ -420,7 +420,7 @@ argument and never goes into what comes back), then one command with the stack's
 
 ```
 bash run.sh https://<stack> [<plan>] [--insecure]     # macOS, Linux
-run.cmd https://<stack> [<plan>] [--insecure]         # Windows
+.\run.cmd https://<stack> [<plan>] [--insecure]       # Windows (cmd or PowerShell)
 ```
 
 `--insecure` is `INSECURE_TLS=1`. The first run fetches `playwright-core` with `npm ci` (online,
@@ -439,7 +439,8 @@ are not part of the pack, so a scenario that needs one is `skipped`.
 RESULT status=ok|failed|error target=e2e-pack zip=<file> run=ok|failed pass=N fail=N error=N skipped=N
 ```
 
-Exit 0 only when that zip was written, whether or not the streams passed: the result is in the
+A full run exits 0 only when that zip was written (`reason=no-zip` otherwise), whether or not the
+streams passed; `doctor` alone exits 0 when every check passed, with `zip=` empty: the result is in the
 bundle, and the tester sends the file back either way. `make e2e-review BUNDLE=<unzipped dir>`
 reads it.
 
