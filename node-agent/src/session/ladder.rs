@@ -2362,6 +2362,26 @@ mod tests {
         assert_eq!(p.fps(), 60);
     }
 
+    /// The owner's rule for #1320: resolution first, then 120 → 60, never below 60.
+    ///
+    /// Distinct from `res_first_never_touches_fps_until_the_floor_rung` above, which stops
+    /// as soon as the frame-rate step lands: this one keeps the collapse going past every
+    /// rung and pins the END state — 60 fps at the floor resolution, with nothing left to
+    /// take. An fps ladder is `[launch, launch/2]`, so a 120 fps session halving once is
+    /// the only step it has and no series of windows can reach 30.
+    #[test]
+    fn res_first_ends_at_60fps_on_the_floor_rung_and_never_goes_lower() {
+        let t = Instant::now();
+        let mut p = planner(LadderOrder::ResFirst, true, 120, t);
+        assert_eq!(
+            congested_run(&mut p, t, 20),
+            vec!["res->1", "res->2", "res->3", "fps->60"],
+            "every resolution rung first, then the halving, then nothing"
+        );
+        assert_eq!(p.res_rung(), 3, "the floor rung is the last pixel step");
+        assert_eq!(p.fps(), 60, "120 halves once and never below 60");
+    }
+
     #[test]
     fn fps_first_takes_the_frame_rate_step_before_any_resolution_step() {
         let t = Instant::now();
