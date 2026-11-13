@@ -3718,6 +3718,8 @@ fi
 if command -v node >/dev/null 2>&1; then
   rc_of 0 "e2e:bundle-format" -- node --test "$ROOT/scripts/validate/stream/bundle.test.mjs"
   rc_of 0 "e2e:runner" -- node --test "$ROOT/scripts/validate/stream/run.test.mjs"
+  # WEB_DIST (#1284): the route decision, the directory check and the digest, against a fake route.
+  rc_of 0 "e2e:web-dist" -- node --test "$ROOT/scripts/validate/stream/webdist.test.mjs"
   # Its host half (#1274), driven against a fake API as an in-process fetch — no stack, no sockets.
   rc_of 0 "e2e:collect" -- node --test "$ROOT/scripts/validate/stream/collect.test.mjs"
   # Posting a run to quasar-bench (#1276): the spawn is recorded, and one dry run drives the real
@@ -3727,6 +3729,7 @@ if command -v node >/dev/null 2>&1; then
   rc_of 0 "e2e:pack" -- node --test "$ROOT/scripts/validate/stream/pack.test.mjs"
 else
   warn "e2e:bundle-format" "node not installed — SKIPPED"
+  warn "e2e:web-dist" "node not installed — SKIPPED"
   warn "e2e:collect" "node not installed — SKIPPED"
   warn "e2e:post" "node not installed — SKIPPED"
   warn "e2e:pack" "node not installed — SKIPPED"
