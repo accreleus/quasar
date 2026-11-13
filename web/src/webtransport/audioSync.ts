@@ -21,6 +21,13 @@ const JITTER_SAMPLES = 1_000;
 export const MAX_JITTER_MS = 40;
 /** Packets behind the recurring-lateness percentile: two seconds at 10 ms. */
 const RECURRING_SAMPLES = 200;
+/** The buffer is deepened by this after the ring ran dry (#1346): the jitter estimate covers
+ *  lateness it has seen, and an underrun is lateness it did not cover. */
+export const UNDERRUN_STEP_MS = 10;
+/** The most underruns can add: past this the link is stalling, not jittering. */
+export const MAX_UNDERRUN_MARGIN_MS = 60;
+/** Margin given back per second without an underrun: one step lasts 100 s, so a clean link pays nothing. */
+const UNDERRUN_DECAY_MS_PER_S = 0.1;
 /** Used until a video frame has been presented. */
 const DEFAULT_TARGET_MS = 50;
 
@@ -34,6 +41,21 @@ export class AudioSync {
   private readonly video: number[] = [];
   /** How far past the floor recent packets arrived. */
   private readonly excess: number[] = [];
+  /** The underrun margin as it stood at `marginAt`; it decays from there. */
+  private margin = 0;
+  private marginAt = 0;
+
+  /** The ring ran dry and played silence: deepen the buffer by one step. */
+  noteUnderrun(nowMs: number): void {
+    this.margin = Math.min(MAX_UNDERRUN_MARGIN_MS, this.underrunMarginMs(nowMs) + UNDERRUN_STEP_MS);
+    this.marginAt = nowMs;
+  }
+
+  /** What underruns add to the playout delay now: a step each, given back slowly. Kept across
+   *  {@link reset}: a new delay floor does not make the link any steadier. */
+  underrunMarginMs(nowMs: number): number {
+    return Math.max(0, this.margin - (Math.max(0, nowMs - this.marginAt) / 1_000) * UNDERRUN_DECAY_MS_PER_S);
+  }
 
   /** An audio packet arrived at `arrivalMs`: updates the delay floor (arrival − capture). */
   noteAudio(captureUs: number, arrivalMs: number): void {

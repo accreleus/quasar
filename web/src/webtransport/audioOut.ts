@@ -184,6 +184,9 @@ export class AudioOut {
     this.out = out;
     out.port.onmessage = (e: MessageEvent<RingStats>) => {
       this.hasMeasured = true; // the worklet reports only while the context runs
+      // One step a report however many runs it holds: reports are 133 ms apart, and a burst of
+      // short runs is one bad moment, not several.
+      if (e.data.silenceRuns > this.worklet.silenceRuns) this.sync.noteUnderrun(this.now());
       this.worklet = e.data;
       // Infinity (nothing played in that window) must not erase what an earlier one measured.
       if (Number.isFinite(e.data.minQueuedFrames)) this.bufferMin = Math.min(this.bufferMin, e.data.minQueuedFrames);
@@ -313,7 +316,7 @@ export class AudioOut {
   /** What the output device itself takes, then what it needs to be posted in time. */
   private minDelayMs(): number {
     const latency = this.ctx?.outputLatency || this.ctx?.baseLatency || 0;
-    return latency * 1000 + POST_MARGIN_MS;
+    return latency * 1000 + POST_MARGIN_MS + this.sync.underrunMarginMs(this.now());
   }
 
   private makeDecoder(): void {
@@ -376,7 +379,9 @@ export class AudioOut {
     const ctx = this.ctx;
     const out = this.out;
     if (!ctx || !out) return;
-    const playAt = this.sync.playAtMs(captureUs, this.minDelayMs());
+    const minDelayMs = this.minDelayMs();
+    const targetDelayFrames = (this.sync.targetDelayMs(minDelayMs) / 1000) * ctx.sampleRate;
+    const playAt = this.sync.playAtMs(captureUs, minDelayMs);
     if (playAt === null) return;
     const now = this.now();
     const outputLatencyMs = (ctx.outputLatency || ctx.baseLatency || 0) * 1000;
@@ -394,6 +399,6 @@ export class AudioOut {
     const contextTime = ts.contextTime || ctx.currentTime;
     const performanceTime = ts.performanceTime || now;
     const start = Math.round((contextTime + (playAt - performanceTime) / 1000) * ctx.sampleRate);
-    out.port.postMessage({ start, planes, concealed }, planes.map((p) => p.buffer));
+    out.port.postMessage({ start, planes, concealed, targetDelayFrames }, planes.map((p) => p.buffer));
   }
 }
