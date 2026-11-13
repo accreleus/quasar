@@ -18,6 +18,7 @@ const (
 	CodeForbidden              = "forbidden"                // 403
 	CodeNotFound               = "not_found"                // 404
 	CodeConflict               = "conflict"                 // 409
+	CodeHostNotRemovable       = "host_not_removable"       // 409, amendment 14
 	CodeRateLimited            = "rate_limited"             // 429
 	CodeNoHostAvailable        = "no_host_available"        // 503, retryable
 	CodeCapacityExhausted      = "capacity_exhausted"       // 503, retryable
