@@ -3507,14 +3507,16 @@ fn a_hello_racing_a_webrtc_first_answer_leaves_one_holder_and_one_displaced() {
 }
 
 #[tokio::test]
-async fn past_64_unauthenticated_connections_new_sessions_are_refused() {
+async fn past_the_unauthenticated_cap_new_sessions_are_refused() {
+    // A cap of 4, not 64: 64 handshakes can outlast HELLO_DEADLINE and free a slot for the 65th.
+    const CAP: usize = 4;
     let agent = agent_with(Limits {
+        unauthenticated: CAP,
         per_source: 0,
-        ..Limits::default()
     })
     .await;
     let mut held = Vec::new();
-    for _ in 0..MAX_UNAUTHENTICATED {
+    for _ in 0..CAP {
         held.push(agent.connect().await);
     }
     let refused = ClientBuilder::new()
@@ -3522,12 +3524,20 @@ async fn past_64_unauthenticated_connections_new_sessions_are_refused() {
         .unwrap()
         .connect(agent.url.clone())
         .await;
-    assert!(refused.is_err(), "the 65th session is refused");
+    assert!(refused.is_err(), "the next session is refused");
 
     held.pop().unwrap().close(0, b"");
     tokio::time::sleep(Duration::from_millis(200)).await;
     let (_session, _send, _recv, ack) = agent.hello(TOKEN).await;
     assert_eq!(ack["type"], "hello_ack", "a freed slot takes a new client");
+}
+
+/// The production cap the test above no longer exercises: it opens 4 connections to stay
+/// inside `HELLO_DEADLINE`, so the documented 64 is pinned here.
+#[test]
+fn the_unauthenticated_cap_is_the_documented_64() {
+    assert_eq!(Limits::default().unauthenticated, MAX_UNAUTHENTICATED);
+    assert_eq!(MAX_UNAUTHENTICATED, 64);
 }
 
 #[test]
