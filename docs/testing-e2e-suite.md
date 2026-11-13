@@ -397,7 +397,7 @@ refused (its problems are printed and nothing is written).
 
 **What it does.** It writes `COMPARE.md` and `compare.json` into `OUT`, a new directory beside `B` by
 default (`<B>-compare`). Nothing is written into `A` or `B`, and an `OUT` that exists is refused, so a
-comparison is never overwritten. Neither file holds a clock reading or an absolute path, so the same
+comparison is never overwritten. Neither file holds the time it was written or an absolute path (the runs table does show each run's own start and end), so the same
 two bundles give the same bytes out, in any directory.
 
 - **First, what differed about the runs**: one table of the field, each side's value and whether they
@@ -417,7 +417,7 @@ two bundles give the same bytes out, in any directory.
   both sides carry, the median on each side, B minus A and the percent change, sorted by the size of
   the change. The medians are read after the same warm-up the review judges a scenario's samples
   after (`classifier.warmup_exclude_s` in `docs/session-trace/thresholds.json`, after each side's own
-  first browser sample), so the first seconds of a run do not decide the number. A key with fewer
+  first browser sample), so the first seconds of a run do not decide the number; when either side has no browser sample to anchor it on, neither side is cut and the page says so. A key with fewer
   than five samples on a side is listed as too few, not compared.
 - **Then the pictures**: `shots/<label>.png` paired by label, whether the bytes are identical, and
   the two sizes; a picture only one side took is listed.

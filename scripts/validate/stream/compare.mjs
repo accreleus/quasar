@@ -60,6 +60,10 @@ const num = (v) => typeof v === "number" && Number.isFinite(v);
 const fits = (re, v) => typeof v === "string" && re.test(v);
 const readJson = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
 const round = (v, places) => Math.round(v * 10 ** places) / 10 ** places;
+// A sample is a finite number small enough that a median, a difference and a scaling of it stay finite; anything else is no sample (as NaN is).
+const SAMPLE_MAX = 1e150;
+/** `obj[key]` only when the bundle's own object holds it: never something every object inherits (constructor, toString). */
+const own = (obj, key) => (isObj(obj) && Object.hasOwn(obj, key) ? obj[key] : undefined);
 
 /** A canonical text for any JSON value, members sorted, so two values compare as text. */
 function canon(value) {
@@ -97,8 +101,8 @@ function runDiff(a, b) {
     // What a build record says: its version, its commit, both, or neither (then it prints from
     // its sorted form, as the review's own builds line does). A part that could not say is null.
     const pick = (d) => {
-      const value = d.builds.components?.[name];
-      if (value === null || value === undefined) return { unknown: typeof d.builds.unknown?.[name] === "string" };
+      const value = own(d.builds.components, name);
+      if (value === null || value === undefined) return { unknown: typeof own(d.builds.unknown, name) === "string" };
       if (!isObj(value)) return { build: value, unknown: false };
       const out = { unknown: false };
       if ("version" in value) out.version = value.version;
@@ -130,8 +134,8 @@ function runDiff(a, b) {
   for (const codec of codecs) {
     if (!fits(SHAPES.identifier, codec)) continue;
     add([
-      [`client.decode.${codec}.supported`, (d) => d.client.decode?.[codec]?.supported ?? null],
-      [`client.decode.${codec}.hardware`, (d) => d.client.decode?.[codec]?.hardware ?? null],
+      [`client.decode.${codec}.supported`, (d) => own(d.client.decode, codec)?.supported ?? null],
+      [`client.decode.${codec}.hardware`, (d) => own(d.client.decode, codec)?.hardware ?? null],
     ]);
   }
   add([
@@ -153,8 +157,9 @@ function runDiff(a, b) {
 /**
  * The scenarios of one bundle, each under the identity `e2e-post` would post it under: two
  * bundles' scenarios pair exactly when the bench would compare them. A scenario whose name is
- * not a plain name has no trustworthy identity, so it takes part in no comparison and is counted;
- * so is a second scenario in one bundle whose identity is already taken.
+ * not a plain name has no trustworthy identity, so it takes part in no comparison and is counted.
+ * Two scenarios of one bundle may share an identity (a param the identity leaves out, such as
+ * `hold_s`): they are kept in plan order, and the n-th of A pairs with the n-th of B.
  */
 function scenariosOf(dir, leftOut) {
   const manifest = readJson(path.join(dir, "manifest.json"));
@@ -172,11 +177,7 @@ function scenariosOf(dir, leftOut) {
     }
     const identity = benchIdentity(scenario);
     leftOut.n += identity.leftOut.length;
-    if (byId.has(identity.name)) {
-      leftOut.n += 1;
-      continue;
-    }
-    byId.set(identity.name, { dir: name, scenario });
+    byId.set(identity.name, [...(byId.get(identity.name) ?? []), { dir: name, scenario }]);
   }
   return byId;
 }
@@ -230,7 +231,7 @@ function metricsOf(rowsA, rowsB, warmup) {
       const allowed = keys[r.source];
       if (!allowed) continue;
       for (const [key, value] of Object.entries(r.metrics)) {
-        if (!allowed.has(key) || !num(value)) continue;
+        if (!allowed.has(key) || !num(value) || Math.abs(value) >= SAMPLE_MAX) continue;
         const id = `${r.source}\u0000${key}`;
         if (!values.has(id)) values.set(id, []);
         values.get(id).push(value);
@@ -238,8 +239,10 @@ function metricsOf(rowsA, rowsB, warmup) {
     }
     return values;
   };
-  const va = collect(rowsA, warmup.startA);
-  const vb = collect(rowsB, warmup.startB);
+  // Both sides or neither: a warm-up cut on one side only would compare unlike spans.
+  const both = warmup.startA !== null && warmup.startB !== null;
+  const va = collect(rowsA, both ? warmup.startA : null);
+  const vb = collect(rowsB, both ? warmup.startB : null);
   const compared = [];
   const tooFew = [];
   for (const [id, values] of va) {
@@ -259,7 +262,7 @@ function metricsOf(rowsA, rowsB, warmup) {
       median_b: round(mb, 3),
       delta: round(mb - ma, 3),
       // A median of 0 has no percent change: it is absent, never a made-up 100 %.
-      change_pct: ma === 0 ? null : round(((mb - ma) / ma) * 100, 1),
+      change_pct: ma === 0 || !Number.isFinite(((mb - ma) / ma) * 100) ? null : round(((mb - ma) / ma) * 100, 1),
       samples_a: values.length,
       samples_b: other.length,
     });
@@ -334,16 +337,21 @@ export function compare(aDir, bDir, { thresholdsFile = THRESHOLDS_FILE } = {}) {
   const scenariosA = scenariosOf(aDir, leftOut);
   const scenariosB = scenariosOf(bDir, leftOut);
   // In A's own order: the pairs read in the order the plan ran them.
-  const ids = [...scenariosA.keys()].filter((id) => scenariosB.has(id));
-  const onlyA = [...scenariosA.keys()].filter((id) => !scenariosB.has(id)).sort();
-  const onlyB = [...scenariosB.keys()].filter((id) => !scenariosA.has(id)).sort();
+  const ids = [];
+  const onlyA = [];
+  const onlyB = [];
+  for (const [id, la] of scenariosA) {
+    const lb = scenariosB.get(id) ?? [];
+    la.forEach((sa, i) => (lb[i] ? ids.push([id, sa, lb[i]]) : onlyA.push(id)));
+  }
+  for (const [id, lb] of scenariosB) lb.slice((scenariosA.get(id) ?? []).length).forEach(() => onlyB.push(id));
+  onlyA.sort();
+  onlyB.sort();
 
   let criteriaChanged = 0;
   let truncated = ids.length > MAX_PAIRS || onlyA.length > MAX_PAIRS || onlyB.length > MAX_PAIRS;
   const pairs = [];
-  for (const id of ids.slice(0, MAX_PAIRS)) {
-    const sa = scenariosA.get(id);
-    const sb = scenariosB.get(id);
+  for (const [id, sa, sb] of ids.slice(0, MAX_PAIRS)) {
     const rowsA = readJsonl(path.join(aDir, sa.dir, "metrics.jsonl"));
     const rowsB = readJsonl(path.join(bDir, sb.dir, "metrics.jsonl"));
     // The warm-up the review judges a scenario's samples after, each side on its own anchor.

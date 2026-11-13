@@ -301,6 +301,69 @@ test("the metric medians are read after the review's warm-up, each side on its o
   assert.equal(compare(a, b).pairs[0].metrics.compared.some((m) => m.source === "app"), false);
 });
 
+test("the warm-up is cut on both sides or on neither: a side with no browser sample does not leave the other one cut alone", () => {
+  const { a, b } = pair();
+  const agent = [];
+  for (let i = 1; i <= 7; i += 1) agent.push({ kind: "metric", source: "agent", ts_unix_ms: 1786940001000 + i * 1000, metrics: { encode_ms: 50 } });
+  for (let i = 1; i <= 6; i += 1) agent.push({ kind: "metric", source: "agent", ts_unix_ms: 1786940030000 + i * 1000, metrics: { encode_ms: 5 } });
+  const lines = (rows) => rows.map((r) => JSON.stringify(r) + "\n").join("");
+  // A has a browser sample to anchor a warm-up on, B has none; the agent rows are the same on both.
+  fs.writeFileSync(path.join(a, "01-stream-hold", "metrics.jsonl"), lines([{ kind: "metric", source: "browser", ts_unix_ms: 1786940001000, metrics: { fps: 60 } }, ...agent]));
+  fs.writeFileSync(path.join(b, "01-stream-hold", "metrics.jsonl"), lines(agent));
+  const cmp = compare(a, b);
+  const enc = cmp.pairs[0].metrics.compared.find((m) => m.source === "agent" && m.key === "encode_ms");
+  assert.deepEqual([enc.median_a, enc.median_b, enc.delta, enc.samples_a, enc.samples_b], [50, 50, 0, 13, 13]);
+  assert.equal(cmp.pairs[0].warmup.applied, false);
+});
+
+test("two scenarios of one bundle with the same identity pair in plan order; none is dropped", () => {
+  const { a, b } = pair();
+  const LONG = "03-stream-hold-long";
+  for (const dir of [a, b]) {
+    // Both sides' second hold is A's first one with a longer hold: `hold_s` is not in the identity.
+    fs.cpSync(path.join(a, "01-stream-hold"), path.join(dir, LONG), { recursive: true });
+    edit(dir, `${LONG}/scenario.json`, (sc) => ({ ...sc, id: LONG, params: { ...sc.params, hold_s: 600 } }));
+    edit(dir, "manifest.json", (m) => ({ ...m, scenarios: [...m.scenarios, LONG] }));
+  }
+  const before = compare(a, b);
+  assert.deepEqual(validateBundle(a), []);
+  assert.deepEqual(validateBundle(b), []);
+  const long = before.pairs.find((p) => p.dir_a === LONG);
+  assert.ok(long, "the second hold is compared");
+  assert.deepEqual([long.dir_b, long.criteria_changed, before.counts.scenarios], [LONG, 0, 2]);
+  // One criterion flips in B's second hold: it is counted, not lost behind the first.
+  edit(b, `${LONG}/scenario.json`, (sc) => ({ ...sc, status: "fail", criteria: sc.criteria.map((c) => (c.pass === true && c.id === sc.criteria.find((x) => x.pass === true).id ? { ...c, pass: false } : c)) }));
+  const after = compare(a, b);
+  assert.equal(after.pairs.find((p) => p.dir_a === LONG).criteria_changed, 1);
+  assert.equal(after.counts.criteria_changed, before.counts.criteria_changed + 1);
+  // A second hold on one side only is "only in A", by its identity.
+  fs.rmSync(path.join(b, LONG), { recursive: true });
+  edit(b, "manifest.json", (m) => ({ ...m, scenarios: m.scenarios.filter((x) => x !== LONG) }));
+  const lone = compare(a, b);
+  assert.equal(lone.counts.scenarios, 1);
+  assert.equal(lone.only_a.filter((id) => id.startsWith("stream-hold/")).length, 1);
+});
+
+test("a member named like something every object has is not read as a bundle value; no number written is infinite", () => {
+  const { a, b } = pair();
+  // B has a build component called `constructor`; A has none. It must read as absent on A, never as Object's own constructor.
+  edit(b, "builds.json", (x) => ({ ...x, components: { ...x.components, constructor: { version: "1.0.0" } } }));
+  const cmp = compare(a, b);
+  const row = cmp.runs.fields.find((f) => f.field === "builds.constructor.version");
+  assert.deepEqual([row.a, row.b, row.same], [null, "1.0.0", false]);
+  assert.doesNotMatch(renderCompare(cmp, 0), /native code/);
+  // A number too large to average or scale is no sample; a percent that overflows is absent. Every number written is finite.
+  const rows = (fps, max) => Array.from({ length: 30 }, (_, i) => ({ kind: "metric", source: "browser", ts_unix_ms: 1786940000000 + i * 1000, metrics: { fps, present_interval_max_ms: max } }));
+  const write = (dir, r) => fs.writeFileSync(path.join(dir, "01-stream-hold", "metrics.jsonl"), r.map((x) => JSON.stringify(x) + "\n").join(""));
+  write(a, rows(1e308, 1e-300));
+  write(b, rows(1e308, 1e100));
+  const m = compare(a, b).pairs[0].metrics;
+  assert.equal(m.compared.some((x) => x.key === "fps"), false);
+  const tiny = m.compared.find((x) => x.key === "present_interval_max_ms");
+  assert.equal(tiny.change_pct, null);
+  for (const x of m.compared) for (const v of [x.median_a, x.median_b, x.delta]) assert.ok(Number.isFinite(v), `${x.key} ${v}`);
+});
+
 test("a key with too few samples is listed, not compared, and nothing is judged", () => {
   const { a, b, out } = pair();
   assert.equal(run(a, b, out).status, 0);
