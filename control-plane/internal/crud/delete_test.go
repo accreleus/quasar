@@ -7,7 +7,10 @@ package crud
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -262,6 +265,40 @@ func TestDeleteHostWaitsForRunningTransitionBeforeTombstone(t *testing.T) {
 	mustExec(t, pool.QueryRow(ctx, `SELECT gc_after IS NOT NULL FROM user_homes WHERE user_id=$1::uuid`, ids.userID).Scan(&gc))
 	if gc {
 		t.Fatal("host deletion tombstoned a running session's home")
+	}
+}
+
+// TestDeleteHostHTTP_RefusesOwnMachine: a direct DELETE /v1/hosts/{id} for the host
+// that shares the control plane's machine is 409 host_not_removable and the row
+// survives; any other offline host is still forgotten (204).
+func TestDeleteHostHTTP_RefusesOwnMachine(t *testing.T) {
+	pool := testPool(t)
+	ids := seedBasic(t, pool)
+	h := NewHandler(pool)
+	h.SetOwnMachine(func(node string) bool { return node == "host-1" })
+
+	del := func(id string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodDelete, "/v1/hosts/"+id, nil)
+		req.SetPathValue("id", id)
+		rec := httptest.NewRecorder()
+		h.handleDeleteHost(rec, req)
+		return rec
+	}
+	rec := del(ids.hostID)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), `"host_not_removable"`) {
+		t.Fatalf("own machine: got %d %s, want 409 host_not_removable", rec.Code, rec.Body)
+	}
+	var n int
+	_ = pool.QueryRow(context.Background(), `SELECT count(*) FROM hosts WHERE id::text=$1`, ids.hostID).Scan(&n)
+	if n != 1 {
+		t.Fatal("the control plane's own host row was dropped")
+	}
+
+	var other string
+	mustExec(t, pool.QueryRow(context.Background(), `INSERT INTO hosts (node_name, status)
+		VALUES ('host-2','offline') RETURNING id::text`).Scan(&other))
+	if rec := del(other); rec.Code != http.StatusNoContent {
+		t.Fatalf("normal forget: got %d %s, want 204", rec.Code, rec.Body)
 	}
 }
 

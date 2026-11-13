@@ -1872,9 +1872,11 @@ async fn outage_recovers(stream: Stream) {
 }
 
 /// #1040: receiver feedback from a rate-capped client drives the session's real ABR
-/// (governor, classifier, smooth mode) until the encoder sends below the cap. Below it
-/// within 10 s needs the #68 emergency drop: smooth's capped steps (−12.5 % per 7 s
-/// dwell) take over 30 s.
+/// (governor, smooth mode) until the encoder sends below the cap. #1376: the per-report
+/// loop takes it there with no window naming the congestion (measured alone: by the 1 s
+/// check; with the per-report loop off, 3 s through the classifier's #68 emergency drop).
+/// The timing is wall-clock and a loaded machine stretches it, so the deterministic replays
+/// in `abr_glue` carry the bound. Smooth's capped steps alone (−12.5 % per 7 s) take 30 s.
 #[tokio::test]
 async fn a_rate_capped_client_steps_the_encoder_below_the_cap() {
     const CAP_KBPS: f64 = 1500.0;
@@ -1934,7 +1936,6 @@ async fn a_rate_capped_client_steps_the_encoder_below_the_cap() {
     let mut path = Bottleneck::new(CAP_KBPS);
     let mut report = tokio::time::interval(Duration::from_millis(50));
     let mut drain = tokio::time::interval(Duration::from_secs(1));
-    let mut congested = false;
     let deadline = tokio::time::sleep(Duration::from_secs(10));
     tokio::pin!(deadline);
     let kbps = loop {
@@ -1947,8 +1948,7 @@ async fn a_rate_capped_client_steps_the_encoder_below_the_cap() {
             }
             _ = drain.tick() => {
                 // The runner's heartbeat drains a window every ~5 s; faster here.
-                let window = metrics.drain_window(std::time::Instant::now());
-                congested |= window.adaptation_state == "network_congested";
+                metrics.drain_window(std::time::Instant::now());
                 let kbps = encoder.property::<u32>("bitrate") / 1000;
                 if (kbps as f64) < CAP_KBPS {
                     break kbps;
@@ -1960,7 +1960,6 @@ async fn a_rate_capped_client_steps_the_encoder_below_the_cap() {
             ),
         }
     };
-    assert!(congested, "the drop came through the congestion classifier");
     assert!(kbps >= 500, "never below the ABR floor ({kbps} kbps)");
 }
 
@@ -2232,6 +2231,26 @@ fn the_silence_decay_is_never_fed_to_the_collapse_as_a_measured_link() {
     );
 }
 
+/// #1376 review N1: a report's reading reaches the ABR before its estimate, so the governor
+/// sees the report stamped when it judges the estimate (otherwise the first report after a
+/// 500 ms gap is taken for the silence decay). Old code: the estimate first.
+#[test]
+fn a_report_gives_the_abr_its_reading_before_its_estimate() {
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (o, m) = (order.clone(), order.clone());
+    let rate = Rate {
+        measured: Box::new(move |_| m.lock().unwrap().push("measured")),
+        ceiling_kbps: 8000.0,
+        floor_kbps: Box::new(|| 4000.0),
+        retargets: true,
+        start: Box::new(|| {}),
+        observe: Box::new(move |_| o.lock().unwrap().push("observe")),
+    };
+    let mut control = Control::new(&rate, Arc::default(), false, Default::default());
+    answered(&mut control, 0, std::time::Instant::now());
+    assert_eq!(*order.lock().unwrap(), ["measured", "observe"]);
+}
+
 /// A client displaced, or told the session ended, neither starts nor feeds the ABR: the
 /// encoder is its successor's, and a start after the session ended would register hooks
 /// that keep the encoder alive.
@@ -2254,11 +2273,11 @@ fn a_client_that_is_gone_neither_starts_nor_feeds_the_abr() {
     };
     let gone = Arc::new(OnceLock::new());
     let mut control = Control::new(&rate, gone.clone(), false, Default::default());
-    control.feed(3000.0);
+    control.feed(3000.0, false);
     assert_eq!(calls.load(SeqCst), 2, "a live client starts and feeds");
     gone.set(Gone::TakenOver).unwrap();
-    control.feed(3000.0);
-    Control::new(&rate, gone, false, Default::default()).feed(3000.0);
+    control.feed(3000.0, false);
+    Control::new(&rate, gone, false, Default::default()).feed(3000.0, false);
     assert_eq!(calls.load(SeqCst), 2);
 }
 
@@ -2309,11 +2328,11 @@ fn the_abr_is_fed_the_estimate_less_the_fec_share() {
         observe: Box::new(move |kbps: f64| seen.lock().unwrap().push(kbps.round())),
     };
     let mut control = Control::new(&rate, Arc::default(), true, Default::default());
-    control.feed(4200.0);
+    control.feed(4200.0, false);
     let fec = control.fec.as_mut().unwrap();
     fec.observe(0.04, std::time::Instant::now());
-    control.feed(4200.0);
-    Control::new(&rate, Arc::default(), false, Default::default()).feed(4200.0);
+    control.feed(4200.0, false);
+    Control::new(&rate, Arc::default(), false, Default::default()).feed(4200.0, false);
     assert_eq!(*fed.lock().unwrap(), [4200.0, 3500.0, 4200.0]);
 }
 
@@ -2502,7 +2521,7 @@ fn repairs_spend_only_what_the_estimate_leaves_above_the_abr_floor() {
     assert_eq!(fec.overhead(), 0.25);
     let frame = forty_fragments();
     let mut repairs = |estimate_kbps| {
-        control.feed(estimate_kbps);
+        control.feed(estimate_kbps, false);
         control.protect(false, &frame, &mut 0).len()
     };
     assert_eq!(repairs(2000.0), 0, "under the floor");
@@ -2543,7 +2562,7 @@ fn governed(level: u8, estimate_kbps: f64, seconds: u64) -> Vec<(u32, f64)> {
     (1..=seconds)
         .map(|second| {
             governor.lock().unwrap().1 = base + Duration::from_secs(second);
-            control.feed(estimate_kbps);
+            control.feed(estimate_kbps, false);
             let setpoint = governor.lock().unwrap().0.setpoint_kbps();
             let fragments = (setpoint as usize * 125 / 60).div_ceil(media::MAX_DATAGRAM);
             let frame = vec![Bytes::from(vec![1; media::MAX_DATAGRAM]); fragments];
@@ -2632,7 +2651,7 @@ fn a_pyrowave_frame_gets_no_repair_at_any_overhead() {
     let mut control = Control::new(&rate, Arc::default(), true, Default::default());
     let fec = control.fec.as_mut().unwrap();
     fec.observe(0.05, std::time::Instant::now());
-    control.feed(6000.0);
+    control.feed(6000.0, false);
     let frame = forty_fragments();
     assert_eq!(control.protect(false, &frame, &mut 0).len(), 10);
     assert!(control.protect(true, &frame, &mut 0).is_empty());

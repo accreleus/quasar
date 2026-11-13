@@ -96,6 +96,9 @@ const OVERUSE_GAP: Duration = Duration::from_millis(250);
 /// A window whose datagrams were sent under this share of the estimate is
 /// application-limited, and is no throughput sample.
 const APP_LIMITED: f64 = 0.8;
+/// Datagrams that arrived at under this share of the rate they were sent at: the link held
+/// them back (a queue or loss), so the report is evidence of the link ([`Estimator::measured`]).
+const LINK_LIMITED: f64 = 0.95;
 const MAX_ARRIVALS: usize = 1 << 14;
 
 /// Feedback silence while media is sent: past max(this, 2 intervals + RTT), the estimate
@@ -503,10 +506,12 @@ impl Estimator {
         self.loss
     }
 
-    /// What the last message showed the link carrying: the higher of the estimate and the
-    /// receive rate it measured, or `None` when the sender was application-limited (then
-    /// the receive rate is the sender's, and an estimate left low by a silence decay is
-    /// not the link's). #1320's collapse reads only this, never the silence decay.
+    /// What the last message showed the link carrying, when the link held the sender back:
+    /// the higher of the estimate and `BETA` × the receive rate (the delay cut's own drain
+    /// margin, so neither a loss cut's overshoot nor a silence decay goes under it). `None`
+    /// when the datagrams arrived at the rate they were sent (a clean link, whatever the
+    /// delay detector says: #68), when the sender was application-limited, or when no
+    /// receive rate was measured. The ABR's down path reads only this (#1376).
     pub(crate) fn measured(&self) -> Option<f64> {
         self.measured
     }
@@ -617,10 +622,11 @@ impl Estimator {
 
         let was = self.estimate_kbps;
         self.settle();
-        self.measured = (!app_limited).then(|| {
-            m.rate_kbps
-                .map_or(self.estimate_kbps, |r| r.max(self.estimate_kbps))
-        });
+        self.measured = m
+            .rate_kbps
+            .zip(m.sent_kbps)
+            .filter(|&(r, s)| !app_limited && r < LINK_LIMITED * s)
+            .map(|(r, _)| self.estimate_kbps.max(BETA * r));
         let due = self.log_due(now) && (self.unlogged.is_some() || self.bound != self.logged.0);
         if !cut_by.is_empty() || due {
             // A silence fall not logged yet is part of this line's "from → to".

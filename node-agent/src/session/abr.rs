@@ -93,6 +93,10 @@ pub struct AbrConfig {
     /// the setpoint below `cliff_guard_frac × setpoint` in one move (bitrate-down
     /// won't fix encoder saturation). 0.50 ⇒ no >50% cliff. Ignored by `Protective`.
     pub cliff_guard_frac: f64,
+    /// `Some` on a WebTransport session in `Smooth` (#1376): the per-report loop
+    /// ([`Governor::observe_report`]) instead of windows, the value being the least time
+    /// between two encoder writes (zero where a write costs no keyframe).
+    pub per_report: Option<Duration>,
 }
 
 impl AbrConfig {
@@ -126,6 +130,7 @@ impl AbrConfig {
             max_down_step: Self::DEFAULT_MAX_DOWN_STEP,
             down_dwell: Self::DEFAULT_DOWN_DWELL,
             cliff_guard_frac: Self::DEFAULT_CLIFF_GUARD_FRAC,
+            per_report: None,
         }
     }
 
@@ -390,6 +395,10 @@ fn parse_validated_ms(
     }
 }
 
+/// Per-report loop: no report for this long is feedback silence, so the estimate fed is
+/// the silence decay's.
+const REPORT_GAP: Duration = Duration::from_millis(500);
+
 /// The ABR governor state machine. Fed the rtpgccbwe estimate; emits a new CBR
 /// setpoint when (and only when) a retarget is warranted.
 #[derive(Debug)]
@@ -408,6 +417,15 @@ pub struct Governor {
     /// `Smooth` only: the latest per-window adaptation hint, pushed by the glue each
     /// drain. `Protective`/`Off` never read it.
     hint: AdaptationHint,
+    /// Per-report loop: what the link allows, not clamped to the floor (the resolution
+    /// rung reads it, so a floor cannot hide how far under it the link is).
+    rate: f64,
+    /// Per-report loop: the last estimate fed to `observe`, and when (the slew's clock).
+    fed: Option<Instant>,
+    /// Per-report loop: when the last receiver report came.
+    last_report: Option<Instant>,
+    /// Per-report loop: the first reading of a run under the line.
+    under: Option<f64>,
 }
 
 impl Governor {
@@ -421,7 +439,17 @@ impl Governor {
             last_retarget: start,
             last_down: None,
             hint: AdaptationHint::default(),
+            rate: cfg.ceiling_kbps as f64,
+            fed: None,
+            last_report: None,
+            under: None,
         }
+    }
+
+    /// Per-report loop: what the link allows, unclamped by the floor. The ceiling
+    /// otherwise.
+    pub fn rate_kbps(&self) -> f64 {
+        self.rate
     }
 
     /// The current CBR setpoint (kbps) — what the encoder bitrate is held at.
@@ -497,6 +525,92 @@ impl Governor {
     /// Feed one bandwidth estimate (kbps) observed at `now`. Returns
     /// `Some(new_setpoint_kbps)` (already clamped to `[floor, ceiling]`) when the
     /// encoder should retarget now, else `None`.
+    pub fn observe(&mut self, estimate_kbps: f64, now: Instant) -> Option<u32> {
+        if self.cfg.per_report.is_some() {
+            return self.observe_per_report(estimate_kbps, now);
+        }
+        self.observe_window(estimate_kbps, now)
+    }
+
+    /// Per-report loop, one estimate (each report's, and the silence decay's): up only,
+    /// never above the estimate, at most `max_up_step` per `min_interval` (the slew, no
+    /// timer), in moves of more than the deadband. Down is [`Self::observe_report`]'s;
+    /// only after `REPORT_GAP` with no report (the silence decay) does the window down
+    /// path still lower the setpoint, and never the rate: silence is not evidence. That
+    /// path is paced by `per_report` too, not only by `min_interval` (#1376 review R3).
+    fn observe_per_report(&mut self, estimate: f64, now: Instant) -> Option<u32> {
+        let dt = self.fed.map_or(0.0, |at| {
+            now.saturating_duration_since(at).as_secs_f64().min(1.0)
+        });
+        self.fed = Some(now);
+        let sp = self.setpoint as f64;
+        let silent = self
+            .last_report
+            .is_none_or(|at| now.saturating_duration_since(at) >= REPORT_GAP);
+        if silent && estimate < sp * (1.0 - self.cfg.deadband) {
+            return self
+                .write_due(now)
+                .then(|| self.observe_window(estimate, now))
+                .flatten();
+        }
+        let slew = self.cfg.max_up_step / self.cfg.min_interval.as_secs_f64();
+        if estimate > self.rate {
+            self.rate = estimate
+                .min(self.rate * (1.0 + slew * dt))
+                .min(self.cfg.ceiling_kbps as f64);
+        }
+        let target = self.clamp(self.rate.min(estimate).floor());
+        let up = target > self.setpoint
+            && (target as f64 >= sp * (1.0 + self.cfg.deadband) || target == self.cfg.ceiling_kbps);
+        if !up || !self.write_due(now) {
+            return None;
+        }
+        self.setpoint = target;
+        self.last_retarget = now;
+        Some(target)
+    }
+
+    /// Per-report loop, once per receiver report: `reading` is what the report showed the
+    /// link carrying when the link held the sender back (`webtransport::Rate::measured`),
+    /// `None` when it did not. A link that delivers what it is sent gives no reading,
+    /// whatever its delay detector says: that is the #68 guard. Two readings in a row under
+    /// the rate by more than the deadband take the rate and the setpoint to the higher of
+    /// them in one move, with no step cap and no dwell.
+    pub fn observe_report(&mut self, reading: Option<f64>, now: Instant) -> Option<u32> {
+        self.cfg.per_report?;
+        self.last_report = Some(now);
+        let Some(reading) = reading.filter(|&r| r < self.rate * (1.0 - self.cfg.deadband)) else {
+            self.under = None;
+            return None;
+        };
+        let first = self.under.replace(reading)?;
+        let target = first.max(reading);
+        if !self.write_due(now) {
+            self.under = Some(target);
+            return None;
+        }
+        self.under = None;
+        self.rate = target;
+        let sp = self.clamp(target);
+        if sp >= self.setpoint {
+            return None;
+        }
+        self.setpoint = sp;
+        self.last_retarget = now;
+        Some(sp)
+    }
+
+    fn clamp(&self, kbps: f64) -> u32 {
+        (kbps.round() as i64).clamp(self.cfg.floor_kbps as i64, self.cfg.ceiling_kbps as i64) as u32
+    }
+
+    /// Per-report loop: an encoder whose bitrate write costs a keyframe is written at most
+    /// once per `per_report`.
+    fn write_due(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_retarget) >= self.cfg.per_report.unwrap_or_default()
+    }
+
+    /// The window loop (WebRTC, and WebTransport outside `Smooth`).
     ///
     /// The #68 guard: the governor is notification-driven and `rtpgccbwe` only
     /// notifies on estimate CHANGE — under sustained loss GCC pins the estimate and
@@ -507,7 +621,7 @@ impl Governor {
     /// to oscillation/overdrive), while up stays EWMA-gated and capped at
     /// `+max_up_step` per interval — worst case strands the setpoint low, never
     /// overdrives the path.
-    pub fn observe(&mut self, estimate_kbps: f64, now: Instant) -> Option<u32> {
+    fn observe_window(&mut self, estimate_kbps: f64, now: Instant) -> Option<u32> {
         // EWMA updates on every observation — it gates the UP path.
         let smoothed = match self.ewma {
             Some(prev) => self.cfg.ewma_alpha * estimate_kbps + (1.0 - self.cfg.ewma_alpha) * prev,
@@ -1102,5 +1216,209 @@ mod tests {
             after_one > before && after_one <= 3200,
             "smooth up-step must be ≤ +25% ({before} → {after_one})"
         );
+    }
+
+    // ── #1376: the per-report loop (WebTransport) ─────────────────────────────
+
+    fn per_report(gap_ms: u64) -> AbrConfig {
+        AbrConfig {
+            per_report: Some(Duration::from_millis(gap_ms)),
+            ..AbrConfig::new_smooth(1000, 10_000, 60)
+        }
+    }
+
+    fn ms(base: Instant, ms: u64) -> Instant {
+        base + Duration::from_millis(ms)
+    }
+
+    /// Down: two readings in a row under the rate by more than the deadband take the
+    /// setpoint to the higher of them at once, with no −12.5 % cap, and a deeper drop right
+    /// after is not held by a dwell. The window loop caps a step at −12.5 % and dwells 7 s.
+    #[test]
+    fn per_report_down_takes_the_reading_in_one_move() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        assert_eq!(g.observe(10_000.0, ms(base, 0)), None);
+        assert_eq!(
+            g.observe_report(Some(5000.0), ms(base, 0)),
+            None,
+            "one reading is no evidence"
+        );
+        assert_eq!(
+            g.observe(5000.0, ms(base, 100)),
+            None,
+            "the estimate alone never goes down"
+        );
+        assert_eq!(
+            g.observe_report(Some(5100.0), ms(base, 100)),
+            Some(5100),
+            "the higher of the two"
+        );
+        assert_eq!(g.rate_kbps(), 5100.0);
+        g.observe_report(Some(800.0), ms(base, 300));
+        assert_eq!(
+            g.observe_report(Some(700.0), ms(base, 400)),
+            Some(1000),
+            "the setpoint stops at the floor"
+        );
+        assert_eq!(g.rate_kbps(), 800.0, "the rate does not");
+    }
+
+    /// A report with no reading between two low ones breaks the run, and a reading inside
+    /// the deadband is none.
+    #[test]
+    fn per_report_a_broken_run_or_a_reading_in_the_deadband_holds() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        for i in 0..20 {
+            let r = (i % 2 == 0).then_some(5000.0);
+            assert_eq!(g.observe_report(r, ms(base, i * 100)), None);
+        }
+        for i in 20..40 {
+            assert_eq!(
+                g.observe_report(Some(8600.0), ms(base, i * 100)),
+                None,
+                "inside 15 %"
+            );
+        }
+        assert_eq!(g.setpoint_kbps(), 10_000);
+    }
+
+    /// #68: with reports flowing, an estimate under the setpoint (a delay detector misreading
+    /// a clean link) moves nothing; only a report's reading can. The window loop steps down
+    /// 12.5 % on the first such estimate.
+    #[test]
+    fn per_report_a_low_estimate_without_a_reading_moves_nothing() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        for i in 0..100 {
+            let at = ms(base, i * 100);
+            assert_eq!(
+                g.observe(if i % 3 == 0 { 6000.0 } else { 9800.0 }, at),
+                None
+            );
+            assert_eq!(g.observe_report(None, at), None);
+        }
+        assert_eq!(g.setpoint_kbps(), 10_000);
+        let mut w = Governor::new(AbrConfig::new_smooth(1000, 10_000, 60), base);
+        assert_eq!(
+            w.observe(6000.0, ms(base, 1500)),
+            Some(8750),
+            "the window loop moves"
+        );
+    }
+
+    /// Up: never above the estimate, never faster than `max_up_step` per `min_interval`
+    /// (25 %/s, compounded per report here), each move past the deadband, and the ceiling
+    /// once the estimate is there. The window loop climbs off an EWMA, one step per
+    /// `min_interval`.
+    #[test]
+    fn per_report_up_is_slew_limited_under_the_estimate_and_past_the_deadband() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        g.observe(10_000.0, ms(base, 0));
+        g.observe_report(Some(2000.0), ms(base, 0));
+        assert_eq!(g.observe_report(Some(2000.0), ms(base, 100)), Some(2000));
+        let (mut est, mut moves) = (2000.0f64, vec![2000u32]);
+        for i in 2..300u64 {
+            // The estimate climbs 34 %/s here, faster than the slew lets the setpoint.
+            est = (est * 1.03).min(10_000.0);
+            let at = ms(base, i * 100);
+            if let Some(sp) = g.observe(est, at) {
+                moves.push(sp);
+            }
+            g.observe_report(None, at);
+            let sp = g.setpoint_kbps() as f64;
+            assert!(sp <= est, "never above the estimate: {sp} > {est}");
+            assert!(
+                sp <= 2000.0 * 1.025f64.powi(i as i32) + 1.0,
+                "slew at {i}: {sp}"
+            );
+        }
+        for pair in moves.windows(2) {
+            assert!(
+                pair[1] as f64 >= pair[0] as f64 * 1.15 || pair[1] == 10_000,
+                "a move inside the deadband: {moves:?}"
+            );
+        }
+        assert_eq!(g.setpoint_kbps(), 10_000);
+        assert!(moves.len() <= 13, "bounded: {moves:?}");
+    }
+
+    /// The silence decay (no report for 500 ms) still lowers the setpoint the window loop's
+    /// way, and never the rate the resolution rung reads.
+    #[test]
+    fn per_report_the_silence_decay_lowers_the_setpoint_never_the_rate() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        g.observe(10_000.0, ms(base, 0));
+        g.observe_report(None, ms(base, 0));
+        assert_eq!(
+            g.observe(4000.0, ms(base, 300)),
+            None,
+            "a report 300 ms ago: not silence"
+        );
+        assert_eq!(
+            g.observe(4000.0, ms(base, 1500)),
+            Some(8750),
+            "silence: the capped step"
+        );
+        assert_eq!(g.rate_kbps(), 10_000.0);
+    }
+
+    /// An encoder whose bitrate write costs a keyframe (NVENC, VA) is written at most once per
+    /// `per_report`; the run waits for it rather than being lost.
+    #[test]
+    fn per_report_writes_wait_out_the_gap() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(1000), base);
+        g.observe_report(Some(5000.0), ms(base, 500));
+        assert_eq!(
+            g.observe_report(Some(5000.0), ms(base, 600)),
+            None,
+            "1 s since the start"
+        );
+        assert_eq!(g.observe_report(Some(5000.0), ms(base, 1000)), Some(5000));
+        g.observe_report(Some(2000.0), ms(base, 1100));
+        assert_eq!(g.observe_report(Some(2000.0), ms(base, 1200)), None);
+        assert_eq!(g.observe_report(Some(2000.0), ms(base, 2000)), Some(2000));
+    }
+
+    /// #1376 review R3: the silence decay is paced by `per_report` as well. With a 100 ms
+    /// `min_interval` and confirmed congestion (no dwell), a falling estimate on silence
+    /// ticks 100 ms apart is written at most once a second. Old code: every tick.
+    #[test]
+    fn per_report_the_silence_decay_waits_out_the_gap() {
+        let base = Instant::now();
+        let mut g = Governor::new(
+            AbrConfig {
+                min_interval: Duration::from_millis(100),
+                ..per_report(1000)
+            },
+            base,
+        );
+        g.set_adaptation_hint(AdaptationHint {
+            network_congested: true,
+            encoder_saturation_fresh: false,
+        });
+        let writes: Vec<u64> = (10..40u64)
+            .filter(|i| {
+                g.observe(9000.0 - *i as f64 * 200.0, ms(base, i * 100))
+                    .is_some()
+            })
+            .map(|i| i * 100)
+            .collect();
+        assert_eq!(writes, vec![1000, 2000, 3000], "{writes:?}");
+    }
+
+    /// The window loop (WebRTC, `protective`) never reads a report.
+    #[test]
+    fn a_window_governor_ignores_reports() {
+        let base = Instant::now();
+        let mut g = Governor::new(AbrConfig::new_smooth(1000, 10_000, 60), base);
+        for i in 0..10 {
+            assert_eq!(g.observe_report(Some(2000.0), ms(base, i * 100)), None);
+        }
+        assert_eq!(g.setpoint_kbps(), 10_000);
     }
 }

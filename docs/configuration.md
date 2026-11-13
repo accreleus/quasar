@@ -741,6 +741,43 @@ flag are set, `QUASAR_ABR_MODE` wins (it is checked first and short-circuits).
 | `QUASAR_ABR_LADDER_FLOOR_FOLLOWS_RUNG` | `on` | **Amendment 5, 2026-08-17.** While a ladder rung is engaged, the ABR **floor** is scaled by the same factor the rung scales the comfort bitrate by: `floor_eff = launch_floor × (B_eff / ceiling)`, with `B_eff = B(r) × 0.6` when the fps rung is down — and it rises again as the ladder climbs back. Without this a rung is only half a lever: it changes bits per pixel, not bandwidth. Measured (run C): a 1080p120 h264 session with bounds `[4000, 11500]` behind a 3.5 Mbps link bottomed the setpoint at ~4.4 Mbps and flooded the pipe for a full 90 s window — 83 packets lost, 107 ms jitter buffer, ~6 fps at the browser — having taken every rung it had. With this on, that session's floor is 2400 kbps after the fps step alone and ≈1307 kbps at 720p60. **Inert with the ladder off or at the launch rung** (at rung 0 `B_eff == ceiling`, so the floor is today's exactly). Never below 300 kbps, never above the launch floor. A **host-level** `abr_floor_kbps` / `QUASAR_ABR_FLOOR_KBPS` is an absolute bound that always wins; a per-profile wire floor is NOT — it describes that profile's picture, so it travels with the rung (when the floor is instead `ratio × ceiling`, the formula reduces exactly to `abr_floor_ratio × B_eff`). The move applies to **both** bounds — the governor's floor and `rtpgccbwe`'s own `min-bitrate`; moving only the governor's is a measured no-op (run D: GCC pinned at exactly the launch floor and nothing downstream changed). `0`/`false` restores the pre-amendment fixed floor. Published per window as `abr_floor_kbps` in `session_metrics` (omitted while at the launch floor) and as `floor_kbps` in the `abr.ladder.step` trace event. Live-proven on the devbox NVENC path 2026-08-17 (run E: under a 3.5 Mbps cap the browser holds 60 fps at 720p60 where it previously sat at ~0); **not yet run on VA** — #499 gates the fps rung there. |
 | `QUASAR_ABR_LADDER_ORDER` | `hybrid` | **Shipped 2026-08-17**, actuated whenever both rungs can move. Enum `res_first`\|`fps_first`\|`hybrid`. `hybrid` = resolution rungs down to 1080p, **then** fps 120→60, **then** the deeper resolution rungs (a frame-rate halving is the smaller perceptual cost at 1080p). `res_first`/`fps_first` are the two pure orders, for A/B. **Recovery always unwinds in the exact reverse of the engage order**, derived per window from the two rungs' positions — never a replayed stack, so a manual resize cannot desync it. With only one rung enabled the order is moot (the other rung is retired and every window falls through). |
 
+#### WebTransport in `smooth`: the per-report loop (#1376)
+
+On a WebTransport session in `smooth` the governor and the resolution rung act on each
+receiver report (about every 100 ms), not on the ~5 s windows. WebRTC sessions, and
+WebTransport in `protective`, keep the window loop the rest of this section describes.
+
+- **What a report says.** A report is a *reading* only when its datagrams arrived slower
+  than they were sent (under 0.95 ×: a queue or loss on the link), the host was busy (it
+  sent at least 0.8 × the estimate) and a receive rate was measured. The reading is the
+  estimate, never under 0.85 × the receive rate. A clean link that delivers what it is
+  sent gives no reading whatever its delay detector says (the #68 lesson), and neither
+  does an idle sender or the silence decay.
+- **Down.** Two readings in a row under the rate by more than `abr_deadband` take the rate
+  and the setpoint to the higher of the two in one move, about 100 ms after the first
+  report that shows the link short: no `abr_max_down_step` cap, no `abr_down_dwell_ms`,
+  no `abr_min_interval_ms`.
+- **Up.** Each estimate may raise the rate by at most `abr_max_up_step` × the time since
+  the last estimate (counted up to 1 s) / `abr_min_interval_ms`, never above the estimate:
+  2.5 % per 100 ms report by default, which compounds to 28 % a second. The setpoint follows
+  in moves of more than `abr_deadband`, and to the ceiling once the estimate is there. No
+  timer and no EWMA.
+- **Silence.** With no report for 500 ms (a hidden tab, a Wi-Fi roam) the silence decay
+  still lowers the setpoint the window loop's way (capped and dwelled), but never the rate
+  the resolution rung reads, so an outage never steps the rung.
+- **Encoders whose bitrate write costs a keyframe.** A live bitrate write re-initialises
+  NVENC (its VBV write is a rate-control parameter change) and VA (any rate-control write),
+  each with a keyframe, so on those the loop writes the encoder at most once per
+  `abr_min_interval_ms`, and never more than once a second whatever that is set to. The
+  Vulkan encoders' write changes rate control only, with no keyframe
+  (`deploy/patches/vulkan/README.md`), and openh264's applies the new target without the
+  encoder reset that forces an IDR (`gstopenh264enc.cpp` `handle_frame`, openh264's
+  `WelsEncoderParamAdjust`); those are written as soon as the rate moves.
+- **Trace.** Each move is one `abr.retarget`, and each follows a move of the rate past the
+  deadband: a minute of a link at its limit is tens of events, not one per report.
+
+The resolution rung on this loop: "The ladder on each transport", below.
+
 #### Resolution ladder tuning (abr-resolution-fps-ladder)
 
 Operator tuning knobs for the resolution rung's comfort-bitrate table and decision hysteresis
@@ -754,11 +791,11 @@ matched the spec's worked example **except `abr_ladder_res_recover_dwell`, flipp
 | Variable | Default | Range | Notes |
 |---|---|---|---|
 | `QUASAR_ABR_LADDER_RES_EXPONENT` | `0.75` | `0.5..1.0` | The comfort-bitrate power-law exponent `k` in `B(r) = ceiling × (px(r)/px(0))^k` — the empirical bits-per-pixel law for H.264/HEVC/AV1 at fixed fps. Worked example: on a 1440p120 @ 10 Mbps session, `k=0.75` gives comfort bitrates 1080p 6.5 / 900p 4.9 / 720p 3.5 Mbps. |
-| `QUASAR_ABR_LADDER_RES_ENGAGE_FRAC` | `0.6` | `0.2..0.95` | Step **down** one rung when the ABR setpoint stays below `engage_frac × B(r)` for `res_engage_dwell` consecutive windows. |
-| `QUASAR_ABR_LADDER_RES_RECOVER_FRAC` | `0.8` | `0.3..1.0` | Step **up** one rung when the setpoint reaches `recover_frac × B(r-1)` for `res_recover_dwell` consecutive windows. |
-| `QUASAR_ABR_LADDER_RES_ENGAGE_DWELL` | `2` | `1..60` | Consecutive pressure windows (~5 s each) required before a down-step. |
-| `QUASAR_ABR_LADDER_RES_RECOVER_DWELL` | `2` | `1..60` | Consecutive recovered windows required before an up-step. **2026-08-18 flip** (was `4`; T3 `ladder_recover_fast` — time-to-launch-rung 55.2s → 37.6s (−32%), 0 oscillations; the T3 report, `docs/reports/2026-08-18-overnight-optimisation/t3-ladder-step-recovery.md`, was deliberately not carried over to the public repository). |
-| `QUASAR_ABR_LADDER_RES_MIN_STEP_S` | `10` | `5..120` | Minimum wall-time between two resolution steps (anti-thrash), on top of the settle-window IDR-spike guard. |
+| `QUASAR_ABR_LADDER_RES_ENGAGE_FRAC` | `0.6` | `0.2..0.95` | Step **down** one rung when the ABR setpoint stays below `engage_frac × B(r)` for `res_engage_dwell` consecutive windows. WebTransport: the rate under it for 1 s steps down to the rung the rate fits. |
+| `QUASAR_ABR_LADDER_RES_RECOVER_FRAC` | `0.8` | `0.3..1.0` | Step **up** one rung when the setpoint reaches `recover_frac × B(r-1)` for `res_recover_dwell` consecutive windows. WebTransport: the rate at or over it for 1 s steps up to the highest rung it reaches. |
+| `QUASAR_ABR_LADDER_RES_ENGAGE_DWELL` | `2` | `1..60` | Consecutive pressure windows (~5 s each) required before a down-step. WebRTC only. |
+| `QUASAR_ABR_LADDER_RES_RECOVER_DWELL` | `2` | `1..60` | Consecutive recovered windows required before an up-step. WebRTC only. **2026-08-18 flip** (was `4`; T3 `ladder_recover_fast` — time-to-launch-rung 55.2s → 37.6s (−32%), 0 oscillations; the T3 report, `docs/reports/2026-08-18-overnight-optimisation/t3-ladder-step-recovery.md`, was deliberately not carried over to the public repository). |
+| `QUASAR_ABR_LADDER_RES_MIN_STEP_S` | `10` | `5..120` | Minimum wall-time between two resolution steps (anti-thrash), on top of the settle-window IDR-spike guard. WebTransport: how long the rate must hold over the recover line for the first step up after a step down (other steps hold 3 s after a step, then 1 s). |
 | `QUASAR_ABR_LADDER_RES_MIN_HEIGHT` | `720` | `360..2160` | Floor rung — the ladder never steps the encoded size below this height. |
 
 `abr_ladder_res_recover_frac` must exceed `abr_ladder_res_engage_frac` by at least `0.05` (the D2
@@ -799,13 +836,13 @@ which was deliberately not carried over to the public repository).
 
 | Variable | Default | Values / notes |
 |---|---|---|
-| `QUASAR_ABR_EWMA_ALPHA` | `0.3` | Up-path EWMA smoothing factor, `(0, 1]`. Higher tracks the estimate up faster. Operator tuning knob; default matches the previous hardcoded value. Settable via Host Settings since 2026-08-18. |
-| `QUASAR_ABR_DEADBAND` | `0.15` | Relative departure from the setpoint that must be exceeded before any retarget, `(0, 1)`. Operator tuning knob; default matches the previous hardcoded value. Settable via Host Settings since 2026-08-18. |
+| `QUASAR_ABR_EWMA_ALPHA` | `0.3` | Up-path EWMA smoothing factor, `(0, 1]`. Higher tracks the estimate up faster. Not used by WebTransport's per-report loop. Operator tuning knob; default matches the previous hardcoded value. Settable via Host Settings since 2026-08-18. |
+| `QUASAR_ABR_DEADBAND` | `0.15` | Relative departure from the setpoint that must be exceeded before any retarget, `(0, 1)`. WebTransport's per-report loop: how far under the rate a reading must be, and the least up move. Operator tuning knob; default matches the previous hardcoded value. Settable via Host Settings since 2026-08-18. |
 | `QUASAR_ABR_MAX_UP_STEP` | `0.25` | Max fractional increase per up-step, `>0`. **2026-08-18 flip** (was `0.10`; T3 `abr_up_fast` — post-impairment setpoint ramp 37.8s → 14.0s, client-present drops 12.2% → 1.7%, 0 oscillations; the T3 report, `docs/reports/2026-08-18-overnight-optimisation/t3-ladder-step-recovery.md`, was deliberately not carried over to the public repository). Settable via Host Settings since 2026-08-18. |
-| `QUASAR_ABR_MIN_INTERVAL_MS` | `1000` | Minimum wall-time (ms) between retargets, both directions (anti-thrash), `>= 1`. **2026-08-18 flip** (was `2000`; moved together with `QUASAR_ABR_MAX_UP_STEP` above as the `abr_up_fast` arm). Settable via Host Settings since 2026-08-18. |
-| `QUASAR_ABR_MAX_DOWN_STEP` | `0.125` | **`smooth` only.** Max fractional down-step per non-emergency retarget, `(0, 1)`. Operator tuning knob; default matches the previous hardcoded −12.5%. Settable via Host Settings since 2026-08-18. |
-| `QUASAR_ABR_DOWN_DWELL_MS` | `7000` | **`smooth` only.** Minimum wall-time (ms) between non-emergency downshifts, `>= 0` (`0` disables the dwell). Emergency drops on confirmed congestion bypass it. Operator tuning knob; default matches the previous hardcoded 7 s. Settable via Host Settings since 2026-08-18. |
-| `QUASAR_ABR_CLIFF_GUARD_FRAC` | `0.50` | **`smooth` only.** Under fresh encoder saturation, GCC alone never drives the setpoint below this fraction of the current setpoint in one move, `(0, 1)`. Operator tuning knob; default matches the previous hardcoded 50%. Settable via Host Settings since 2026-08-18. |
+| `QUASAR_ABR_MIN_INTERVAL_MS` | `1000` | Minimum wall-time (ms) between retargets, both directions (anti-thrash), `>= 1`. WebTransport's per-report loop: with `QUASAR_ABR_MAX_UP_STEP` the up slew (max rise per this interval), and the least time between two writes on NVENC and VA only, floored at 1 s there (each write costs a keyframe), on the per-report paths and the silence decay alike. **2026-08-18 flip** (was `2000`; moved together with `QUASAR_ABR_MAX_UP_STEP` above as the `abr_up_fast` arm). Settable via Host Settings since 2026-08-18. |
+| `QUASAR_ABR_MAX_DOWN_STEP` | `0.125` | **`smooth` only.** Max fractional down-step per non-emergency retarget, `(0, 1)`. On WebTransport only for the silence decay's steps. Operator tuning knob; default matches the previous hardcoded −12.5%. Settable via Host Settings since 2026-08-18. |
+| `QUASAR_ABR_DOWN_DWELL_MS` | `7000` | **`smooth` only.** Minimum wall-time (ms) between non-emergency downshifts, `>= 0` (`0` disables the dwell). Emergency drops on confirmed congestion bypass it. On WebTransport only for the silence decay's steps. Operator tuning knob; default matches the previous hardcoded 7 s. Settable via Host Settings since 2026-08-18. |
+| `QUASAR_ABR_CLIFF_GUARD_FRAC` | `0.50` | **`smooth` only.** Under fresh encoder saturation, GCC alone never drives the setpoint below this fraction of the current setpoint in one move, `(0, 1)`. On WebTransport only for the silence decay's steps. Operator tuning knob; default matches the previous hardcoded 50%. Settable via Host Settings since 2026-08-18. |
 
 #### Ladder hysteresis tuning (advanced)
 
@@ -2797,7 +2834,7 @@ A step changes the `convert/scale → encoder` link only. That means:
   been measured**: nobody has timed a step's silence on a real session, and a restart
   that overran it would cost a reconnect and a fallback rather than nothing.
 
-**When it steps.** The rung is observed once per ~5 s metrics window, off the
+**When it steps on WebRTC.** The rung is observed once per ~5 s metrics window, off the
 governor's setpoint. A normal down-step needs `abr_ladder_res_engage_dwell` (two)
 *qualifying* windows on top of the governor having already descended below
 `abr_ladder_res_engage_frac × B(r)` — it is not a fixed delay from the collapse, and a
@@ -2813,36 +2850,37 @@ floor in one protective step, and the rung observation that runs after it in the
 window takes the step. It takes longer if the classifier does not name the congestion
 on that first window.
 
-**A collapse (WebTransport only).** The window path reads the governor's setpoint, which
-never goes under the floor, so on its own it learns how far under the floor the link is
-only one rung at a time. So the rung also reads what each WebTransport receiver report
-shows the link carrying: the higher of the estimate and the receive rate that report
-measured. That reading is taken at most once per 100 ms, and only when a feedback message
-arrived; it is skipped when the host sent less than 0.8 × the estimate (then the receive
-rate is the sender's, not the link's). The silence decay (the estimate × 0.8 per 500 ms
-with no feedback) still lowers the setpoint, but never counts here. When every reading for
-1 s is under 0.85 × the floor in force (the governor's default 15 % deadband: inside it the
-governor would not move either), the agent steps the resolution rung straight to the
-least-deep rung whose floor is at or under the highest of those readings (the floor rung
-when none is), and moves the floor, the setpoint and the encoder's bitrate down with it in
-the same action, without waiting for a window, `abr_ladder_res_min_step_s` or the dwell.
-That is 1 s after the first reading under the line, then the encoder restart and keyframe
-a step always costs. No reading counts while a resize has not finished negotiating, or for
-3 s after any step of either lever: the encoder restart pauses the stream and then sends a
-keyframe burst, so what the receiver measures then is the restart, not the link. The step
-is traced as `abr.ladder.step` with reason `collapse`. It never moves the frame rate, and
-it follows the order: under `fps_first` it leaves the frame-rate step to the window path,
-and under `hybrid` it stops at 1080p while 120 → 60 is still to come. Coming back up is
-the window path's, one rung per `abr_ladder_res_recover_dwell` windows and never sooner
-than `abr_ladder_res_min_step_s` after the collapse.
-
-An outage (no feedback at all: a hidden tab, a Wi-Fi roam) does not collapse the rung. The
-silence decay walks the setpoint to the floor, the WebTransport backlog and probe handle
-the stall, and once feedback returns the readings carry the receive rate of what the host
-is sending at the floor, which is above the line, so the rung stays unless the link really
-is smaller. How the WebTransport estimate itself behaves under a deep cut on a real link is
-not measured yet. `rtpgccbwe` never reports under its `min-bitrate`, which is held at the
-floor, so a WebRTC session never sees a collapse and keeps the window path alone.
+**When it steps on WebTransport (#1376).** In `smooth` the resolution rung follows the
+governor's rate on each receiver report instead (the per-report loop, under "Node agent —
+adaptive bitrate"), and the windows move only the frame-rate rung. The rate is not clamped
+to the floor, so the rung sees how far under it the link is. Under
+`abr_ladder_res_engage_frac × B(r)` for 1 s, the rung steps straight down to the least-deep
+rung the rate fits (`engage_frac × B` at or under it; the floor rung when none does): one
+step and one encoder restart, several rungs at once if need be. At or over
+`abr_ladder_res_recover_frac × B(r−1)` for 1 s, it steps up to the least-deep rung the lowest
+rate of that second reaches by `recover_frac × B`, again in one step. Between the two lines
+it holds, so a rate noisy at a line never steps. The first step up after a step down also
+waits until that step down is `abr_ladder_res_min_step_s` (10 s) old; a dip under the line
+inside those 10 s only restarts the 1 s, not the 10 s. A link swinging across the whole band
+therefore completes at most one down-and-up cycle per 14 s at the defaults (10 s, 3 s settle,
+1 s; about 8.6 restarts a minute at worst). A step down never waits longer than the
+1 s: a queue costs more than a size. `abr_ladder_res_engage_dwell` and
+`abr_ladder_res_recover_dwell` are not used. The floor follows the new size, and the setpoint
+and the encoder's bitrate move with it in the same action. On a 1440p120 session at 10 Mbit/s a cut to 6 Mbit/s lands on
+1080p and a cut to 1.5 Mbit/s on 720p, each about 1.1 s after the first report that shows the
+link short. Nothing counts while a step has not finished negotiating (a step that never
+negotiates is given up at the next agent heartbeat window, so up to 5 s, then the 3 s settle:
+the rate path is deaf for up to about 8 s), or for 3 s after any step of either lever or a
+manual resize: the encoder restart pauses the stream and then sends
+a keyframe burst, so what the receiver measures then is the restart, not the link (a chosen
+bound, not a measured one). The step is traced as `abr.ladder.step` with reason `rate`. It
+never moves the frame rate, and it follows the order: under `fps_first` the frame rate goes
+first, under `hybrid` it stops at 1080p while 120 → 60 is still to come, and on the way up
+the frame rate comes back first where the order says so. A human pin holds it. An outage
+(no feedback at all) never steps it: the silence decay does not move the rate. How the
+WebTransport estimate behaves under a deep cut on a real link, and how long a step's silence
+lasts, are not measured yet. `rtpgccbwe` never reports under its `min-bitrate`, which is held
+at the floor, so a WebRTC session keeps the window path alone.
 
 What the rung will NOT do: at `abr_ladder_res_min_height` (720p by default) it stops.
 An estimate under that rung's floor has no further remedy — the ladder has given up

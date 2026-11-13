@@ -611,6 +611,8 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	}
 	crudHandler := crud.NewHandler(pool, auditStore)
 	crudHandler.SetRegistry(agentRegistry) // lets DELETE /v1/hosts/{id} check live connectivity
+	// The same own-machine decision Remove host makes: Forget host must not drop this machine's row.
+	crudHandler.SetOwnMachine(applyMachineShape(cfg).SharesMachineWith)
 	crudHandler.SetReadinessStaleSecs(int(cfg.ReadinessStaleSecs))
 	crudHandler.SetSessionRevoker(coordinator.StopUnentitledSessions)
 	sessionHandler := session.NewHandler(coordinator, sessionStore, auditStore).
@@ -1256,9 +1258,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		Connected: agentRegistry.IsConnected,
 		// The shape the recovery actor wrote into this control plane's configuration,
 		// known whether or not the actor answers (control-api.md, machine_node_name).
-		OwnNodeName: func(context.Context) (string, bool) {
-			return applyMachineShape(cfg).CombinedNodeName()
-		},
+		SharesOwnMachine: applyMachineShape(cfg).SharesMachineWith,
 		Cordon: func(ctx context.Context, hostID string) (func(context.Context), error) {
 			held, err := admissionStore.List(ctx, hostID)
 			if err != nil {
