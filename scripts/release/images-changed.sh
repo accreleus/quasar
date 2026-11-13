@@ -13,6 +13,7 @@
 #
 #   quasar-control-plane  control-plane/**  web/**  deploy/enroll-host.sh
 #                         deploy/control-entrypoint.sh  deploy/Dockerfile.control.prod
+#                         testdata/pyrowave/manifest.json (typechecked test imports it, #1267)
 #   quasar-node-agent     node-agent/**  deploy/Dockerfile.vulkan  deploy/patches/**
 #                         deploy/audio/**
 #   quasar-recovery       node-agent/**  deploy/Dockerfile.recovery
@@ -37,7 +38,7 @@ set -euo pipefail
 control=false agent=false recovery=false
 while IFS= read -r p; do
   case "$p" in
-    control-plane/*|web/*|deploy/enroll-host.sh|deploy/control-entrypoint.sh|deploy/Dockerfile.control.prod) control=true ;;
+    control-plane/*|web/*|deploy/enroll-host.sh|deploy/control-entrypoint.sh|deploy/Dockerfile.control.prod|testdata/pyrowave/manifest.json) control=true ;;
   esac
   case "$p" in
     node-agent/*|deploy/Dockerfile.vulkan|deploy/patches/*|deploy/audio/*) agent=true ;;
