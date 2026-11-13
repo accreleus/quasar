@@ -2740,9 +2740,14 @@ that actuator and nothing else. A manual `PATCH` of the stream size goes straigh
 lever (`apply_stream_update` in `node-agent/src/session/runner.rs`) — no window, no
 dwell, no rung ordering — so it may move several rungs at once, and a non-launch size
 **pins** the session where the operator put it: the ladder keeps observing but stops
-moving the size until a `PATCH` back to the launch size releases it to `auto`. Every
-decision the ladder makes — comfort bitrates, dwell, hysteresis, ordering, the floor
-follow — is skipped on that path. See "The ladder on each transport" below for what a
+moving the size until a `PATCH` back to the launch size releases it to `auto`. The pin
+is checked at the rung's commit points only (`Ladder::observe` in
+`node-agent/src/session/ladder.rs`), so a step cannot emit: comfort bitrates, dwell,
+hysteresis and ordering are skipped on that path. The floor is not. Every window
+re-derives it from the size the session is actually sending — after the resync, the
+pinned one — and calls `set_floor` unconditionally, even in a window where the rung
+decides nothing (`observe_resolution_rung`'s caller in `abr_glue.rs`), so the floor
+still follows the pinned size. See "The ladder on each transport" below for what a
 step does on the wire.
 
 ### The ladder on each transport (#1320)
@@ -2782,9 +2787,12 @@ A step changes the `convert/scale → encoder` link only. That means:
   step restarts the encoder session, as any size change there does; on every path the
   step is an IDR plus a decoder reconfigure. The browser ends a WebTransport stream
   that has delivered no video for five seconds (`MEDIA_SILENCE_MS` in
-  `web/src/pages/app/webTransportRuntime.ts`), and that end is not a no-op: the client
-  makes one fresh WebTransport attempt and then reports `transport.fallback` with
-  reason `stream_lost`, so the page plays over WebRTC from there. A step is *expected*
+  `web/src/pages/app/webTransportRuntime.ts`), and that end is not a no-op: the first
+  end mints a fresh transport token and opens one new WebTransport connection, which
+  is given the whole five seconds again to deliver a frame. The page reports
+  `transport.fallback` with reason `stream_lost` only if that attempt fails, or a
+  later end finds the one reconnect already used; until then it stays on WebTransport.
+  A step is *expected*
   to sit well inside that five seconds, but **no bound on the restart's duration has
   been measured**: nobody has timed a step's silence on a real session, and a restart
   that overran it would cost a reconnect and a fallback rather than nothing.
@@ -2796,11 +2804,14 @@ governor's setpoint. A normal down-step needs `abr_ladder_res_engage_dwell` (two
 governor still above that band delays it further. The emergency path (congested **and**
 the setpoint at the floor) skips the dwell, but not the settle window that swallows the
 first window after a step, and not `abr_ladder_res_min_step_s` (10 s) since the last
-step. In the common shape — one window for the classifier to name the congestion and
-the governor to reach its floor, the next for the rung to act — the first step lands
-about 5 to 10 s after the collapse begins (a window is ~5 s, and the collapse can begin
-anywhere inside one). It takes longer if the governor needs more than one capped
-down-step to reach its floor.
+step. In the common shape the first step lands about 5 to 10 s after the collapse
+begins (a window is ~5 s, and the collapse can begin anywhere inside one), and it
+takes two windows rather than one: the first is the governor's capped down-step, and
+the window that closes it is the one that writes the congested hint, so no rung moves
+yet; the next window's feedback `observe` reads that hint and drops the setpoint to the
+floor in one protective step, and the rung observation that runs after it in the same
+window takes the step. It takes longer if the classifier does not name the congestion
+on that first window, so more capped steps pass before the protective one.
 
 What the rung will NOT do: at `abr_ladder_res_min_height` (720p by default) it stops.
 An estimate under that rung's floor has no further remedy — the ladder has given up
@@ -2815,7 +2826,9 @@ ratio is the same exponent, and a 1440p session launched with a 2600 kbit/s floo
 on 2600 × (720/1440)^1.5 ≈ 919 kbit/s at 720p. With the frame-rate rung enabled and
 down, the same scale is multiplied by 0.6 once more — ≈ 552 kbit/s here. Two floors
 still bound it: the 300 kbit/s hard minimum, and an operator floor
-(`QUASAR_ABR_FLOOR_KBPS` or a host `abr_floor_kbps`), which always wins.
+(`QUASAR_ABR_FLOOR_KBPS` or a host `abr_floor_kbps`), which raises the result up to the
+launch floor and no further — `floor_for` takes `min(launch_floor)` last, so an operator
+floor above the launch floor does not win.
 
 ### Flow (both internal and external)
 
