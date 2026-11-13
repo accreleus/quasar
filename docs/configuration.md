@@ -796,7 +796,7 @@ matched the spec's worked example **except `abr_ladder_res_recover_dwell`, flipp
 | `QUASAR_ABR_LADDER_RES_ENGAGE_DWELL` | `2` | `1..60` | Consecutive pressure windows (~5 s each) required before a down-step. WebRTC only. |
 | `QUASAR_ABR_LADDER_RES_RECOVER_DWELL` | `2` | `1..60` | Consecutive recovered windows required before an up-step. WebRTC only. **2026-08-18 flip** (was `4`; T3 `ladder_recover_fast` — time-to-launch-rung 55.2s → 37.6s (−32%), 0 oscillations; the T3 report, `docs/reports/2026-08-18-overnight-optimisation/t3-ladder-step-recovery.md`, was deliberately not carried over to the public repository). |
 | `QUASAR_ABR_LADDER_RES_MIN_STEP_S` | `10` | `5..120` | Minimum wall-time between two resolution steps (anti-thrash), on top of the settle-window IDR-spike guard. WebTransport: how long the rate must hold over the recover line for the first step up after a step down (other steps hold 3 s after a step, then 1 s). |
-| `QUASAR_ABR_LADDER_RES_MIN_HEIGHT` | `720` | `360..2160` | Floor rung — the ladder never steps the encoded size below this height. |
+| `QUASAR_ABR_LADDER_RES_MIN_HEIGHT` | `360` | `360..2160` | Floor rung — the ladder never steps the encoded size below this height. Raise it to 720 for the old floor. |
 
 `abr_ladder_res_recover_frac` must exceed `abr_ladder_res_engage_frac` by at least `0.05` (the D2
 hysteresis rule) — because the comfort-bitrate table is monotonic, this guarantees the per-pair band
@@ -2710,9 +2710,9 @@ The external size steps through a **rung ladder**, keyed by the launch
 profile's aspect family, filtered to values ≤ the launch (launch = the
 session's stream size at connect time, unchanged):
 
-- `16:9`: 3840x2160, 2560x1440, 1920x1080, 1600x900, 1280x720
+- `16:9`: 3840x2160, 2560x1440, 1920x1080, 1600x900, 1280x720, 960x540, 640x360
 - `16:10`, `21:9`, `4:3`: equivalent per-family rungs (same construction,
-  scaled to each family's aspect)
+  scaled to each family's aspect), unchanged by the 16:9 rungs under 720p
 
 A session's available rungs are the family's list filtered `≤` the launch
 WxH. Custom rungs and a client-aspect-driven family pick are architected for
@@ -2867,7 +2867,7 @@ therefore completes at most one down-and-up cycle per 14 s at the defaults (10 s
 1 s: a queue costs more than a size. `abr_ladder_res_engage_dwell` and
 `abr_ladder_res_recover_dwell` are not used. The floor follows the new size, and the setpoint
 and the encoder's bitrate move with it in the same action. On a 1440p120 session at 10 Mbit/s a cut to 6 Mbit/s lands on
-1080p and a cut to 1.5 Mbit/s on 720p, each about 1.1 s after the first report that shows the
+1080p, a cut to 1.5 Mbit/s on 540p and a cut to 1.0 Mbit/s on 360p, each about 1.1 s after the first report that shows the
 link short. Nothing counts while a step has not finished negotiating (a step that never
 negotiates is given up at the next agent heartbeat window, so up to 5 s, then the 3 s settle:
 the rate path is deaf for up to about 8 s), or for 3 s after any step of either lever or a
@@ -2882,11 +2882,11 @@ WebTransport estimate behaves under a deep cut on a real link, and how long a st
 lasts, are not measured yet. `rtpgccbwe` never reports under its `min-bitrate`, which is held
 at the floor, so a WebRTC session keeps the window path alone.
 
-What the rung will NOT do: at `abr_ladder_res_min_height` (720p by default) it stops.
-An estimate under that rung's floor has no further remedy — the ladder has given up
-three quarters of a 1440p picture's pixels, since 720p keeps one quarter of them (half
-the linear size in each direction), and it cannot give up more without an operator
-lowering the floor rung. `abr_ladder_floor_follows_rung` is what lets the encoder
+What the rung will NOT do: at `abr_ladder_res_min_height` (360, the 16:9 family's deepest
+rung, by default) it stops. An estimate under that rung's floor has no further remedy: 360p
+keeps one sixteenth of a 1440p picture's pixels, and the ladder cannot give up more without
+a rung below it. An operator who wants the old 720p floor sets the knob to 720.
+`abr_ladder_floor_follows_rung` is what lets the encoder
 actually go there; without it a step changes bits per pixel and not the bitrate the link
 is judged to carry. With it on, the floor scales by the same power law as the comfort
 bitrate, `launch_floor × (px_rung / px_launch)^k` with `k = abr_ladder_res_exponent`
@@ -2897,7 +2897,8 @@ down, the same scale is multiplied by 0.6 once more — ≈ 552 kbit/s here. Two
 still bound it: the 300 kbit/s hard minimum, and an operator floor
 (`QUASAR_ABR_FLOOR_KBPS` or a host `abr_floor_kbps`), which raises the result up to the
 launch floor and no further — `floor_for` takes `min(launch_floor)` last, so an operator
-floor above the launch floor does not win.
+floor above the launch floor does not win. At 360p the same 2600 kbit/s floor scales to ≈ 325 kbit/s, so with the frame-rate rung
+down the 300 kbit/s minimum is what holds it.
 
 ### Flow (both internal and external)
 
@@ -2958,7 +2959,9 @@ an undersized image.
 The compositor also advertises a **mode ladder** on the `wl_output` (one
 mode per rung ≤ the session's current external size, in the profile's
 aspect family), so in-app resolution menus and desktop display settings can
-list real choices instead of one fixed mode.
+list real choices instead of one fixed mode. On a 16:9 session that now
+includes 960x540 and 640x360, so a game's resolution menu gains those two
+entries.
 
 **KDE Display Settings** lists the ladder and applies a chosen mode only
 with the **patched KWin shipped in the KDE image** (`quasar-images`); a

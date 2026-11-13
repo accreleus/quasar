@@ -43,6 +43,8 @@ pub const RUNGS_16X9: &[Rung] = &[
     (1920, 1080),
     (1600, 900),
     (1280, 720),
+    (960, 540),
+    (640, 360),
 ];
 pub const RUNGS_16X10: &[Rung] = &[
     (2560, 1600),
@@ -114,7 +116,7 @@ pub fn is_rung(w: i32, h: i32, launch_w: i32, launch_h: i32) -> bool {
     available_rungs(launch_w, launch_h).contains(&(w, h))
 }
 
-/// The compositor's `mode-ladder` wire form: `"1920x1080,1600x900,1280x720"`.
+/// The compositor's `mode-ladder` wire form: `"1920x1080,1600x900,1280x720,960x540,640x360"`.
 pub fn format_ladder(rungs: &[Rung]) -> String {
     rungs
         .iter()
@@ -170,11 +172,28 @@ mod tests {
 
         // TestAvailableRungs
         for (w, h, want) in [
-            (1920, 1080, vec![(1920, 1080), (1600, 900), (1280, 720)]),
+            (
+                1920,
+                1080,
+                vec![
+                    (1920, 1080),
+                    (1600, 900),
+                    (1280, 720),
+                    (960, 540),
+                    (640, 360),
+                ],
+            ),
             (
                 2560,
                 1440,
-                vec![(2560, 1440), (1920, 1080), (1600, 900), (1280, 720)],
+                vec![
+                    (2560, 1440),
+                    (1920, 1080),
+                    (1600, 900),
+                    (1280, 720),
+                    (960, 540),
+                    (640, 360),
+                ],
             ),
             (
                 3840,
@@ -185,10 +204,12 @@ mod tests {
                     (1920, 1080),
                     (1600, 900),
                     (1280, 720),
+                    (960, 540),
+                    (640, 360),
                 ],
             ),
-            // 720p is its own floor.
-            (1280, 720, vec![(1280, 720)]),
+            // A 720p launch keeps the rungs under it.
+            (1280, 720, vec![(1280, 720), (960, 540), (640, 360)]),
             (
                 1920,
                 1200,
@@ -200,9 +221,16 @@ mod tests {
             (
                 2000,
                 1125,
-                vec![(2000, 1125), (1920, 1080), (1600, 900), (1280, 720)],
+                vec![
+                    (2000, 1125),
+                    (1920, 1080),
+                    (1600, 900),
+                    (1280, 720),
+                    (960, 540),
+                    (640, 360),
+                ],
             ),
-            // Below every canonical rung of its family ⇒ only itself.
+            // The deepest canonical 16:9 rung ⇒ only itself.
             (640, 360, vec![(640, 360)]),
             (1280, 1024, vec![(1280, 1024)]),
         ] {
@@ -216,6 +244,10 @@ mod tests {
             (1920, 1080, 1920, 1080, true),
             (1600, 900, 1920, 1080, true),
             (1280, 720, 1920, 1080, true),
+            // Under 720p, down to the deepest rung, and not below it.
+            (960, 540, 1920, 1080, true),
+            (640, 360, 2560, 1440, true),
+            (320, 180, 1920, 1080, false),
             // Above the launch size.
             (2560, 1440, 1920, 1080, false),
             // Not on the ladder.
@@ -270,9 +302,8 @@ mod tests {
     fn ladder_formats_for_the_compositor() {
         assert_eq!(
             format_ladder(&available_rungs(1920, 1080)),
-            "1920x1080,1600x900,1280x720"
+            "1920x1080,1600x900,1280x720,960x540,640x360"
         );
-        assert_eq!(format_ladder(&available_rungs(1280, 720)), "1280x720");
         assert_eq!(format_ladder(&[]), "");
     }
 }

@@ -1972,6 +1972,7 @@ mod tests {
         settings.encoder = EncoderChoice::Openh264;
         settings.abr_mode = AbrMode::Smooth;
         settings.ladder.resolution_enabled = true;
+        settings.ladder.res.min_height = 720; // these tests pin the 720p floor, whatever the default
         settings.ladder.order = ladder::LadderOrder::ResFirst;
         let stream = crate::session::StreamParams {
             width: 1920,
@@ -2078,6 +2079,7 @@ mod tests {
             settings.encoder = EncoderChoice::Openh264;
             settings.abr_mode = AbrMode::Smooth;
             settings.ladder.resolution_enabled = true;
+            settings.ladder.res.min_height = 720; // pins the 720p floor, whatever the default
             settings.ladder.order = ladder::LadderOrder::ResFirst;
             settings.ladder.floor_follows_rung = floor_follows_rung;
             let stream = crate::session::StreamParams {
@@ -2503,7 +2505,13 @@ mod tests {
         let lever = software_lever((1920, 1080));
         assert_eq!(
             lever.available_rungs(),
-            vec![(1920, 1080), (1600, 900), (1280, 720)]
+            vec![
+                (1920, 1080),
+                (1600, 900),
+                (1280, 720),
+                (960, 540),
+                (640, 360)
+            ]
         );
         assert_eq!(lever.current(), (1920, 1080));
     }
