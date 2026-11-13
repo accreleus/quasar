@@ -37,6 +37,18 @@ test("the fixture bundle is valid", () => {
   assert.deepEqual(validateBundle(bundle()), []);
 });
 
+const WEB = { source: "web-dist", sha256: "a".repeat(64), files: 12 };
+const withWeb = (d, web = WEB, served = { served_by: "runner", source: "web-dist" }) => {
+  edit(d, "builds.json", (b) => ({ ...b, components: { ...b.components, web }, unknown: Object.fromEntries(Object.entries(b.unknown).filter(([k]) => k !== "web")) }));
+  if (served !== null) edit(d, "manifest.json", (m) => ({ ...m, web_build: served }));
+};
+
+test("a web build the runner served from WEB_DIST is a valid bundle", () => {
+  const d = bundle();
+  withWeb(d);
+  assert.deepEqual(validateBundle(d), []);
+});
+
 test("a scenario directory is a bench_submit.py run directory", () => {
   const out = execFileSync("python3", [path.join(DX, "bench_submit.py"), "--dir", path.join(bundle(), SC), "--suite", "e2e-smoke", "--scenario", "stream-hold", "--dry-run"], { env: ENV, encoding: "utf8" });
   assert.match(out, /dry run, no service contacted/);
@@ -111,6 +123,12 @@ const RULES = [
   ["no clock offset", (d) => edit(d, `${SC}/scenario.json`, ({ clock_offset_ms, ...s }) => s), /no clock_offset_ms/],
   ["a criterion with no expected value", (d) => edit(d, `${SC}/scenario.json`, (s) => ({ ...s, criteria: [{ id: "x", pass: true, observed: 1 }] })), /criterion x needs id, pass/],
   ["a skip with no reason", (d) => edit(d, `${SC}/scenario.json`, (s) => ({ ...s, status: "skipped" })), /skipped needs a reason/],
+  ["a web-dist build that carries a path", (d) => withWeb(d, { ...WEB, dir: "build-a" }), /web \(web-dist\) must be exactly source, sha256/],
+  ["a web-dist build with a short digest", (d) => withWeb(d, { ...WEB, sha256: "abc" }), /web \(web-dist\) must be exactly source, sha256/],
+  ["a web-dist build with no files", (d) => withWeb(d, { ...WEB, files: 0 }), /web \(web-dist\) must be exactly source, sha256/],
+  ["a web-dist build the manifest does not say the runner served", (d) => withWeb(d, WEB, null), /manifest has no web_build/],
+  ["a web_build in the manifest with no web-dist build", (d) => edit(d, "manifest.json", (m) => ({ ...m, web_build: { served_by: "runner", source: "web-dist" } })), /web_build is set and builds.json has no web-dist/],
+  ["a web_build that names a path", (d) => withWeb(d, WEB, { served_by: "runner", source: "web-dist", dir: "/x" }), /web_build must be/],
   ["a build that is null with no reason", (d) => edit(d, "builds.json", (b) => ({ ...b, unknown: { gpu_driver: b.unknown.gpu_driver } })), /web is null with no reason/],
   ["a key that is not in the metric manifest", (d) => append(d, `${SC}/metrics.jsonl`, { kind: "metric", source: "browser", ts_unix_ms: 1, metrics: { smoothness: 1 } }), /browser key smoothness is not in the metric manifest/],
   ["an agent key that is not in the metric manifest", (d) => append(d, `${SC}/metrics.jsonl`, { kind: "metric", source: "agent", ts_unix_ms: 1, metrics: { g2g_p50_ms: 1 } }), /agent key g2g_p50_ms is not in the metric manifest/],

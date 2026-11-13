@@ -82,4 +82,4 @@ Only in B: `only-b.png`
 - B only: `transport-fallback/transport=webtransport/codec=h264/profile=1080p60/when=mid`
 
 ## Not in this unit
-Serving a web build (`WEB_DIST=`), UI journeys in a plan, decoded-frame pairs at the same reference-app tick, and a pixel difference in pictures are not in this verb.
+UI journeys in a plan, decoded-frame pairs at the same reference-app tick, and a pixel difference in pictures are not in this verb.
