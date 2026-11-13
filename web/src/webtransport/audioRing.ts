@@ -172,9 +172,8 @@ export class AudioRing {
    *  shows as a step in the stream's own start times between two chunks that are otherwise
    *  back to back; it is closed by playing slightly slower (a rise: the audio we have is now
    *  early) or faster (a fall) from where the last chunk ended, instead of by a gap of silence
-   *  or a cut head. Everything else keeps the old behaviour: the queue ran dry, audio is lost
-   *  behind a concealment fade, the stream skipped a whole number of chunks (packets that
-   *  never arrived), or the step is over the bound (a stall or a reset). */
+   *  or a cut head. Interruptions preserve an ongoing correction; outside a correction,
+   *  dry queues, concealment, lost packets and steps over the bound keep their old behaviour. */
   private align(chunk: Chunk, f: number): void {
     const end = this.lastEnd;
     const correcting = this.rate !== 1;
@@ -191,21 +190,27 @@ export class AudioRing {
       chunk.targetDelayFrames !== undefined && this.prevTargetDelayFrames !== undefined
         ? chunk.targetDelayFrames - this.prevTargetDelayFrames
         : 0;
-    const stretchLimit = chunk.targetDelayFrames !== undefined && this.prevTargetDelayFrames !== undefined
-      ? MAX_TARGET_CHANGE_FRAMES : MAX_STRETCH_FRAMES;
+    // Only a real target change (or its unfinished remainder) extends the unmarked bound.
+    const remainder = correcting && this.prevStart !== null ? this.prevStart + this.prevFrames - end : 0;
+    const stretchLimit = Math.min(
+      MAX_TARGET_CHANGE_FRAMES,
+      MAX_STRETCH_FRAMES + Math.abs(delayChange) + Math.abs(remainder),
+    );
     const sourceJump = jump - delayChange;
     const intentional = delayChange !== 0 && Math.abs(sourceJump) <= this.slack;
     const step =
-      (end === f || intentional) &&
-      !this.lostChunks(sourceJump) &&
-      !(this.prevConcealed && sourceJump > this.slack) &&
+      (end === f || intentional || correcting) &&
+      (correcting || !this.lostChunks(sourceJump)) &&
+      (correcting || !(this.prevConcealed && sourceJump > this.slack)) &&
       Math.abs(obs) > (correcting ? STRETCH_DONE_FRAMES : this.slack) &&
       Math.abs(obs) <= stretchLimit &&
       (correcting || Math.abs(obs - jump) <= this.slack);
     if (step) {
       // If the queue already ran dry, start now: waiting for the new target would count
       // the intentional step as a second underrun and deepen the buffer again.
-      chunk.start = Math.max(end, f);
+      // Preserve only the missing source audio as a gap; paying the outstanding delay
+      // correction here would turn one lost packet into a much longer underrun.
+      chunk.start = Math.max(end + (correcting && sourceJump > this.slack ? sourceJump : 0), f);
       chunk.off += this.sourceCarry;
       this.sourceCarry = 0;
       this.rate = obs > 0 ? 1 - STRETCH_RATE : 1 + STRETCH_RATE;

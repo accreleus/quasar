@@ -33,6 +33,8 @@ const DEFAULT_TARGET_MS = 50;
 /** Keep the margin's continuous decay from continuously changing the playback rate. */
 const TARGET_DEADBAND_MS = 5;
 const TARGET_FALL_HOLD_MS = 5_000;
+/** Restart the hold after ten packet intervals without an arrival. */
+const AUDIO_ARRIVAL_GAP_MS = 100;
 
 const median = (xs: number[]): number => {
   const s = [...xs].sort((a, b) => a - b);
@@ -65,6 +67,7 @@ export class AudioSync {
 
   /** An audio packet arrived at `arrivalMs`: updates the delay floor (arrival − capture). */
   noteAudio(captureUs: number, arrivalMs: number): void {
+    if (arrivalMs - this.audioAt > AUDIO_ARRIVAL_GAP_MS) this.lowerSince = null;
     this.audioAt = arrivalMs;
     const owd = arrivalMs - captureUs / 1000;
     const bucket = Math.floor(arrivalMs / BUCKET_MS);
@@ -143,6 +146,9 @@ export class AudioSync {
       this.scheduledTarget = computed;
       this.lowerSince = null;
     } else if (computed < scheduled - TARGET_DEADBAND_MS) {
+      // Swings faster than the hold intentionally retain their peak: the link needed that
+      // depth in the last 5 s and will again. Following them causes audible pitch wobble.
+      // The 150 ms cap bounds audio lag (up to 110 ms); it falls 5 s after swings stop.
       this.lowerSince ??= this.audioAt;
       if (this.audioAt - this.lowerSince >= TARGET_FALL_HOLD_MS) {
         this.scheduledTarget = computed;
