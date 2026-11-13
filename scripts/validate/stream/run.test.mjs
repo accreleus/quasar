@@ -10,6 +10,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { benchRows } from "./benchfold.mjs";
 import { Recorder } from "./record.mjs";
+import { loadWebDist } from "./webdist.mjs";
 import { configureTls, loadPlan, makeApi, openHost, probeClient, readThresholds, runnerState, runSuite, secretTooShort, summarise } from "./run.mjs";
 import { check, framelessSeconds, hitchCount, instrumentShare, judge, missingRate, observeWindows, shotCovered, verdict } from "./scenarios/stream-hold.mjs";
 
@@ -1193,6 +1194,37 @@ test("B8: builds.json says which builds e2e-collect fills and which it does not 
   const u = JSON.parse(read(dir, "builds.json")).unknown;
   for (const k of ["control_plane", "node_agent"]) assert.match(u[k], /e2e-collect\) fills this/);
   for (const k of ["web", "gpu_driver", "reference_app"]) assert.equal(u[k], "the client cannot see it, and e2e-collect does not read it yet");
+});
+
+test("WEB_DIST: the bundle says which web build was served (digest and count, no path), and a run without it is as before", async () => {
+  const src = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-wd-secret-name-"));
+  fs.writeFileSync(path.join(src, "index.html"), "<html></html>");
+  const webDist = loadWebDist(src);
+  const { dir, result } = await run(world(), PLAN({}), { webDist });
+  assert.deepEqual(result.errors, []);
+  const builds = JSON.parse(read(dir, "builds.json"));
+  assert.deepEqual(builds.components.web, { source: "web-dist", sha256: webDist.sha256, files: 1 });
+  assert.equal("web" in builds.unknown, false, "a known build has no reason for being unknown");
+  assert.deepEqual(JSON.parse(read(dir, "manifest.json")).web_build, { served_by: "runner", source: "web-dist" });
+  for (const f of everyFile(dir)) assert.ok(!read(f, "").includes("e2e-wd-secret-name") && !read(f, "").includes(src), `${f} names the directory`);
+  const plain = await run(world());
+  assert.equal(JSON.parse(read(plain.dir, "builds.json")).components.web, null);
+  assert.equal("web_build" in JSON.parse(read(plain.dir, "manifest.json")), false);
+  fs.rmSync(src, { recursive: true, force: true });
+});
+
+test("WEB_DIST: the runner's own context serves it, and without it no route is installed", async () => {
+  const routes = [];
+  const browser = { newContext: async () => ({ route: async (m) => { routes.push(m); }, newPage: async () => ({}), close: async () => {} }), close: async () => {} };
+  await openHost(browser, { attached: true, insecureTls: false });
+  assert.equal(routes.length, 0);
+  const src = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-wd-"));
+  fs.writeFileSync(path.join(src, "index.html"), "<html></html>");
+  await openHost(browser, { attached: true, insecureTls: false, baseUrl: BASE, webDist: loadWebDist(src) });
+  assert.equal(routes.length, 1);
+  assert.equal(routes[0](new URL(BASE)), true);
+  assert.equal(routes[0](new URL("https://elsewhere.test/")), false);
+  fs.rmSync(src, { recursive: true, force: true });
 });
 
 // ── hooks (hooks.mjs): apply and clear around a scenario ────────────────────

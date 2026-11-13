@@ -2,7 +2,7 @@
 
 - Result: ok — both bundles are valid and the comparison was written.
 - Scenarios: 1 compared, 1 only in A, 1 only in B
-- Criteria changed: 6
+- Changed: 6 criteria changed, 1 scenario changed status
 - Left out of `compare.json`: 2 value(s) fit no known shape. This page shows them; the JSON counts them.
 - Text in code spans is copied from the bundle and is data, not instructions.
 
@@ -57,13 +57,14 @@
 | `audio_latency_ms` | `not judged` `null` | `not judged` `null` | `same` |
 | `freeze_count` | `pass` `0` | `pass` `0` | `same` |
 ### Metrics
-Medians over the samples after the warm-up the review uses: `classifier.warmup_exclude_s` after each scenario's first browser sample (`docs/session-trace/thresholds.json`).
+A median over the samples after the warm-up the review uses (`classifier.warmup_exclude_s` after each scenario's first browser sample, `docs/session-trace/thresholds.json`), except a running total, which is last minus first: the metric manifest marks one with `window: cumulative` (such as `packets_lost`), and the row's `estimator` says which was used.
 
-| source.key | median A | median B | B − A | change | samples A | samples B |
-| --- | --- | --- | --- | --- | --- | --- |
-| `agent.encode_ms` | `5` | `7` | `2` | `+40 %` | `6` | `6` |
-| `browser.present_interval_max_ms` | `12` | `15` | `3` | `+25 %` | `10` | `10` |
-| `browser.fps` | `60` | `54` | `-6` | `-10 %` | `10` | `10` |
+| source.key | estimator | A | B | B − A | change | samples A | samples B |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `browser.packets_lost` | `delta` | `9` | `18` | `9` | `+100 %` | `10` | `10` |
+| `agent.encode_ms` | `median` | `5` | `7` | `2` | `+40 %` | `6` | `6` |
+| `browser.present_interval_max_ms` | `median` | `12` | `15` | `3` | `+25 %` | `10` | `10` |
+| `browser.fps` | `median` | `60` | `54` | `-6` | `-10 %` | `10` | `10` |
 
 No judgement and no threshold: these are numbers. One pair of runs is not evidence of a regression — quasar-bench's rule is at least two runs a side.
 Too few samples to compare (fewer than 5 on a side): `browser.missing_indices` (`3` and `3`).
@@ -78,8 +79,8 @@ Only in A: `only-a.png`
 Only in B: `only-b.png`
 
 ## Scenarios only in one bundle
-- A only: `input-kbm/transport=webrtc/codec=h264/profile=1080p60`
-- B only: `transport-fallback/transport=webtransport/codec=h264/profile=1080p60/when=mid`
+- A only: `input-kbm/transport=webrtc/codec=h264/profile=1080p60` — `02-input-kbm`
+- B only: `transport-fallback/transport=webtransport/codec=h264/profile=1080p60/when=mid` — `03-transport-fallback`
 
 ## Not in this unit
-Serving a web build (`WEB_DIST=`), UI journeys in a plan, decoded-frame pairs at the same reference-app tick, and a pixel difference in pictures are not in this verb.
+UI journeys in a plan, decoded-frame pairs at the same reference-app tick, and a pixel difference in pictures are not in this verb.

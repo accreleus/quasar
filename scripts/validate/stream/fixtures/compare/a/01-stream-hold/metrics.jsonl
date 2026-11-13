@@ -1,14 +1,14 @@
-{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940001000, "metrics": {"fps": 60, "present_interval_max_ms": 12}}
-{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940021000, "metrics": {"fps": 60, "present_interval_max_ms": 12, "missing_indices": 0}}
-{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940022000, "metrics": {"fps": 60, "present_interval_max_ms": 12, "missing_indices": 0}}
-{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940023000, "metrics": {"fps": 60, "present_interval_max_ms": 12, "missing_indices": 0}}
-{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940024000, "metrics": {"fps": 60, "present_interval_max_ms": 12}}
-{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940025000, "metrics": {"fps": 60, "present_interval_max_ms": 12}}
-{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940026000, "metrics": {"fps": 60, "present_interval_max_ms": 12}}
-{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940027000, "metrics": {"fps": 60, "present_interval_max_ms": 12}}
-{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940028000, "metrics": {"fps": 60, "present_interval_max_ms": 12}}
-{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940029000, "metrics": {"fps": 60, "present_interval_max_ms": 12}}
-{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940030000, "metrics": {"fps": 60, "present_interval_max_ms": 12}}
+{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940001000, "metrics": {"fps": 60, "present_interval_max_ms": 12, "packets_lost": 0}}
+{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940021000, "metrics": {"fps": 60, "present_interval_max_ms": 12, "missing_indices": 0, "packets_lost": 1}}
+{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940022000, "metrics": {"fps": 60, "present_interval_max_ms": 12, "missing_indices": 0, "packets_lost": 2}}
+{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940023000, "metrics": {"fps": 60, "present_interval_max_ms": 12, "missing_indices": 0, "packets_lost": 3}}
+{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940024000, "metrics": {"fps": 60, "present_interval_max_ms": 12, "packets_lost": 4}}
+{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940025000, "metrics": {"fps": 60, "present_interval_max_ms": 12, "packets_lost": 5}}
+{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940026000, "metrics": {"fps": 60, "present_interval_max_ms": 12, "packets_lost": 6}}
+{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940027000, "metrics": {"fps": 60, "present_interval_max_ms": 12, "packets_lost": 7}}
+{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940028000, "metrics": {"fps": 60, "present_interval_max_ms": 12, "packets_lost": 8}}
+{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940029000, "metrics": {"fps": 60, "present_interval_max_ms": 12, "packets_lost": 9}}
+{"kind": "metric", "source": "browser", "ts_unix_ms": 1786940030000, "metrics": {"fps": 60, "present_interval_max_ms": 12, "packets_lost": 10}}
 {"kind": "metric", "source": "agent", "ts_unix_ms": 1786940021000, "metrics": {"encode_ms": 5.0}}
 {"kind": "metric", "source": "agent", "ts_unix_ms": 1786940022000, "metrics": {"encode_ms": 5.0}}
 {"kind": "metric", "source": "agent", "ts_unix_ms": 1786940023000, "metrics": {"encode_ms": 5.0}}

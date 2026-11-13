@@ -16,10 +16,11 @@ import { avcC, bytes, COORDS, FakeAgent, FakeChunk, FakeDecoder, flush, helloAck
 import { WebTransportMedia } from "./webTransportMedia";
 import type { AudioStreams } from "./transport";
 
-// Unset, a reconnect's mint fails and the runtime falls back, as with no server.
+// A refused mint falls back unless a test supplies fresh coordinates.
 vi.mock("../api/library", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../api/library")>()),
-  mintTransportToken: vi.fn(),
+  mintTransportToken: vi.fn(async () => { throw new Error("mint refused"); }),
+  getSession: vi.fn(async () => ({ session: { state: "running" } })),
 }));
 
 const OPUS = { codec: "opus", channels: 2, sample_rate: 48000, ptime_ms: 10 };
@@ -1370,8 +1371,12 @@ describe("createWebTransportRuntime audio and microphone", () => {
     const { agent, rt, audio } = setup({ ...helloAck(0, avcC()), audio: OPUS, mic: null });
     rt.start();
     await vi.waitFor(() => expect(audio.createContext).toHaveBeenCalledTimes(1));
+    rt.releaseAudio();
+    const resumes = audio.ctx.resume.mock.calls.length;
     agent.last.closeWith(4400);
     await vi.waitFor(() => expect(audio.createContext).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(audio.ctx.resume.mock.calls.length).toBeGreaterThan(resumes));
+    expect(audio.gains.at(-1)).toBe(1);
     expect(rt.getSnapshot().channelOpen).toBe(true);
     expect(audio.ctx.close).toHaveBeenCalledTimes(1);
     rt.destroy();

@@ -6,7 +6,8 @@
 // The caller runs the same plan twice — two web builds, two commits, two clients, or two runs
 // of one build — and gets one command that says, with no model, what differed: FIRST what was
 // different about the runs (builds, client, plan, network), then what the results show
-// (criteria, metric medians, pictures). A person or an agent reads the output afterwards.
+// (criteria, metric values — a median, or a counter differenced — and pictures). A person or an
+// agent reads the output afterwards.
 //
 // Both bundles are untrusted, every file of them: they are validated first, and text from one
 // reaches COMPARE.md only the way review.mjs puts bundle text into REVIEW.md — one-line code
@@ -16,13 +17,13 @@
 // leave out is counted in `left_out`. There is no judgement here and no threshold: a single
 // pair of runs is not evidence of a regression (quasar-bench's rule is at least two a side).
 //
-// What is deliberately not in this unit: serving a web build (`WEB_DIST=`), UI journeys in a
+// What is deliberately not in this unit: UI journeys in a
 // plan, decoded-frame pairs at the same reference-app tick, and a pixel difference in pictures
 // (that needs a PNG decoder, and this verb takes no dependency). COMPARE.md's last section says so.
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { manifestKeys, validateBundle } from "./bundle.mjs";
+import { manifestEstimators, manifestKeys, validateBundle } from "./bundle.mjs";
 import { SHAPES } from "./collect.mjs";
 import { NAME_SHAPE, benchIdentity } from "./post.mjs";
 import { THRESHOLDS_FILE, bundleText, loadThresholds, median, readJsonl, warmupStartMs } from "./review.mjs";
@@ -157,14 +158,16 @@ function runDiff(a, b) {
 /**
  * The scenarios of one bundle, each under the identity `e2e-post` would post it under: two
  * bundles' scenarios pair exactly when the bench would compare them. A scenario whose name is
- * not a plain name has no trustworthy identity, so it takes part in no comparison and is counted.
- * Two scenarios of one bundle may share an identity (a param the identity leaves out, such as
- * `hold_s`): they are kept in plan order, and the n-th of A pairs with the n-th of B.
+ * not a plain name, or whose params `e2e-post` would refuse, has no trustworthy identity, so it
+ * takes part in no comparison and is counted. Two scenarios of one bundle may share an identity
+ * (a param the identity leaves out, such as `hold_s`): they are kept in plan order, with the
+ * place each holds in it.
  */
 function scenariosOf(dir, leftOut) {
   const manifest = readJson(path.join(dir, "manifest.json"));
   const byId = new Map();
-  for (const name of Array.isArray(manifest.scenarios) ? manifest.scenarios : []) {
+  const names = Array.isArray(manifest.scenarios) ? manifest.scenarios : [];
+  for (const [at, name] of names.entries()) {
     let scenario;
     try {
       scenario = readJson(path.join(dir, name, "scenario.json"));
@@ -176,8 +179,12 @@ function scenariosOf(dir, leftOut) {
       continue;
     }
     const identity = benchIdentity(scenario);
+    if (identity.refused) {
+      leftOut.n += 1;
+      continue;
+    }
     leftOut.n += identity.leftOut.length;
-    byId.set(identity.name, [...(byId.get(identity.name) ?? []), { dir: name, scenario }]);
+    byId.set(identity.name, [...(byId.get(identity.name) ?? []), { dir: name, scenario, at }]);
   }
   return byId;
 }
@@ -216,13 +223,18 @@ function criteriaOf(scenarioA, scenarioB) {
 }
 
 /**
- * Every metric key both sides hold for the same source: its median on each side over the samples
- * after the review's warm-up, B minus A and the change. No judgement and no threshold — the
- * numbers are the report. A side with fewer than MIN_SAMPLES is listed as too few, not compared,
- * and a key the metric manifest does not define for its source is not compared at all.
+ * Every metric key both sides hold for the same source: its value on each side over the samples
+ * after the review's warm-up, B minus A and the change. A key the manifest calls a counter — a
+ * running total (`window: cumulative`, such as `packets_lost`) — is read as last minus first, never
+ * as the median of a running total; every other key is a median, a count already taken per window
+ * (the manifest's `estimator: delta`) included, because its samples are already differences. `estimator` on each row says which was used. No judgement
+ * and no threshold — the numbers are the report. A side with fewer than MIN_SAMPLES is listed as
+ * too few, not compared, and a key the metric manifest does not define for its source is not
+ * compared at all.
  */
 function metricsOf(rowsA, rowsB, warmup) {
   const keys = manifestKeys();
+  const estimators = manifestEstimators();
   const collect = (rows, start) => {
     const values = new Map();
     for (const r of rows) {
@@ -234,10 +246,16 @@ function metricsOf(rowsA, rowsB, warmup) {
         if (!allowed.has(key) || !num(value) || Math.abs(value) >= SAMPLE_MAX) continue;
         const id = `${r.source}\u0000${key}`;
         if (!values.has(id)) values.set(id, []);
-        values.get(id).push(value);
+        values.get(id).push({ ts: r.ts_unix_ms, value });
       }
     }
     return values;
+  };
+  // A counter is differenced over its own samples in time order: the file order is not trusted.
+  const sideValue = (samples, counter) => {
+    if (!counter) return median(samples.map((s) => s.value));
+    const byTime = [...samples].sort((x, y) => x.ts - y.ts);
+    return byTime[byTime.length - 1].value - byTime[0].value;
   };
   // Both sides or neither: a warm-up cut on one side only would compare unlike spans.
   const both = warmup.startA !== null && warmup.startB !== null;
@@ -253,16 +271,21 @@ function metricsOf(rowsA, rowsB, warmup) {
       tooFew.push({ source, key, samples_a: values.length, samples_b: other.length });
       continue;
     }
-    const ma = median(values);
-    const mb = median(other);
+    const m = estimators.get(id);
+    const counter = m?.window === "cumulative";
+    const a = sideValue(values, counter);
+    const b = sideValue(other, counter);
+    // A percent is rounded first and then tested: a rounding that overflows is no percent, and a
+    // base of 0 has none either.
+    const pct = a === 0 ? null : round(((b - a) / a) * 100, 1);
     compared.push({
       source,
       key,
-      median_a: round(ma, 3),
-      median_b: round(mb, 3),
-      delta: round(mb - ma, 3),
-      // A median of 0 has no percent change: it is absent, never a made-up 100 %.
-      change_pct: ma === 0 || !Number.isFinite(((mb - ma) / ma) * 100) ? null : round(((mb - ma) / ma) * 100, 1),
+      estimator: counter ? "delta" : "median",
+      value_a: round(a, 3),
+      value_b: round(b, 3),
+      delta: round(b - a, 3),
+      change_pct: Number.isFinite(pct) ? pct : null,
       samples_a: values.length,
       samples_b: other.length,
     });
@@ -336,19 +359,41 @@ export function compare(aDir, bDir, { thresholdsFile = THRESHOLDS_FILE } = {}) {
   const thresholds = loadThresholds(thresholdsFile);
   const scenariosA = scenariosOf(aDir, leftOut);
   const scenariosB = scenariosOf(bDir, leftOut);
-  // In A's own order: the pairs read in the order the plan ran them.
+  // Within one identity the scenarios whose params are exactly equal pair with each other first
+  // (a 60 s hold with the 60 s hold, wherever a plan that gained or lost an entry put it: a
+  // directory name is a plan position, not an identity); the rest pair n-th with n-th in plan order. A scenario with no partner is listed with its directory
+  // name, so a repeated identity's extra hold is not just its identity again.
   const ids = [];
   const onlyA = [];
   const onlyB = [];
-  for (const [id, la] of scenariosA) {
+  const identities = [...scenariosA.keys(), ...[...scenariosB.keys()].filter((id) => !scenariosA.has(id))];
+  for (const id of identities) {
+    const la = scenariosA.get(id) ?? [];
     const lb = scenariosB.get(id) ?? [];
-    la.forEach((sa, i) => (lb[i] ? ids.push([id, sa, lb[i]]) : onlyA.push(id)));
+    const taken = new Set();
+    const paired = new Set();
+    for (const sa of la) {
+      const i = lb.findIndex((sb, j) => !taken.has(j) && canon(sb.scenario.params ?? null) === canon(sa.scenario.params ?? null));
+      if (i < 0) continue;
+      taken.add(i);
+      paired.add(sa);
+      ids.push([id, sa, lb[i]]);
+    }
+    const restA = la.filter((sa) => !paired.has(sa));
+    const restB = lb.filter((_, j) => !taken.has(j));
+    const both = Math.min(restA.length, restB.length);
+    for (let i = 0; i < both; i += 1) ids.push([id, restA[i], restB[i]]);
+    for (const sa of restA.slice(both)) onlyA.push({ id, dir: sa.dir });
+    for (const sb of restB.slice(both)) onlyB.push({ id, dir: sb.dir });
   }
-  for (const [id, lb] of scenariosB) lb.slice((scenariosA.get(id) ?? []).length).forEach(() => onlyB.push(id));
-  onlyA.sort();
-  onlyB.sort();
+  // In A's plan order: the pairs read in the order the plan ran them.
+  ids.sort((x, y) => x[1].at - y[1].at);
+  const byPosition = (x, y) => (x.id < y.id ? -1 : x.id > y.id ? 1 : x.dir < y.dir ? -1 : x.dir > y.dir ? 1 : 0);
+  onlyA.sort(byPosition);
+  onlyB.sort(byPosition);
 
   let criteriaChanged = 0;
+  let statusChanged = 0;
   let truncated = ids.length > MAX_PAIRS || onlyA.length > MAX_PAIRS || onlyB.length > MAX_PAIRS;
   const pairs = [];
   for (const [id, sa, sb] of ids.slice(0, MAX_PAIRS)) {
@@ -361,6 +406,10 @@ export function compare(aDir, bDir, { thresholdsFile = THRESHOLDS_FILE } = {}) {
     };
     const criteria = criteriaOf(sa.scenario, sb.scenario);
     criteriaChanged += criteria.changed;
+    // A scenario that went from pass to fail is a change even when every criterion reads the
+    // same, and so is the reverse of it.
+    const flipped = sa.scenario.status !== sb.scenario.status;
+    if (flipped) statusChanged += 1;
     const metrics = metricsOf(rowsA, rowsB, warmup);
     truncated = truncated || criteria.truncated || metrics.truncated;
     pairs.push({
@@ -369,6 +418,7 @@ export function compare(aDir, bDir, { thresholdsFile = THRESHOLDS_FILE } = {}) {
       dir_b: sb.dir,
       status_a: sa.scenario.status,
       status_b: sb.scenario.status,
+      status_changed: flipped,
       warmup: { applied: warmup.startA !== null && warmup.startB !== null },
       criteria: criteria.criteria,
       criteria_changed: criteria.changed,
@@ -387,6 +437,9 @@ export function compare(aDir, bDir, { thresholdsFile = THRESHOLDS_FILE } = {}) {
       only_a: onlyA.length,
       only_b: onlyB.length,
       criteria_changed: criteriaChanged,
+      status_changed: statusChanged,
+      // The one number a reader starts from: a criterion that moved, or a scenario that did.
+      changed: criteriaChanged + statusChanged,
     },
     truncated,
     left_out: leftOut.n,
@@ -449,14 +502,15 @@ export function jsonOf(cmp) {
     },
     counts: cmp.counts,
     truncated: cmp.truncated,
-    only_a: cmp.only_a.map(take).filter((v) => v !== undefined),
-    only_b: cmp.only_b.map(take).filter((v) => v !== undefined),
+    only_a: cmp.only_a.map((x) => ({ id: take(x.id), dir: take(x.dir) })),
+    only_b: cmp.only_b.map((x) => ({ id: take(x.id), dir: take(x.dir) })),
     pairs: cmp.pairs.map((pair) => ({
       id: take(pair.id),
       dir_a: take(pair.dir_a),
       dir_b: take(pair.dir_b),
       status_a: pair.status_a,
       status_b: pair.status_b,
+      status_changed: pair.status_changed,
       warmup: pair.warmup,
       criteria_changed: pair.criteria_changed,
       criteria: pair.criteria.map((c) => {
@@ -510,7 +564,7 @@ export function renderCompare(cmp, leftOut) {
   L.push("# COMPARE", "");
   L.push("- Result: ok — both bundles are valid and the comparison was written.");
   L.push(`- Scenarios: ${counts.scenarios} compared, ${counts.only_a} only in A, ${counts.only_b} only in B`);
-  L.push(`- Criteria changed: ${counts.criteria_changed}`);
+  L.push(`- Changed: ${counts.criteria_changed} criteria changed, ${counts.status_changed} scenario${counts.status_changed === 1 ? "" : "s"} changed status`);
   if (cmp.truncated) {
     L.push(`- Truncated: at most ${MAX_PAIRS} scenarios, ${MAX_CRITERIA} criteria and ${MAX_METRIC_KEYS} metric keys per scenario are compared.`);
   }
@@ -550,19 +604,19 @@ export function renderCompare(cmp, leftOut) {
     L.push("### Metrics");
     if (pair.warmup.applied) {
       L.push(
-        "Medians over the samples after the warm-up the review uses: `classifier.warmup_exclude_s` after each scenario's first browser sample (`docs/session-trace/thresholds.json`).",
+        "A median over the samples after the warm-up the review uses (`classifier.warmup_exclude_s` after each scenario's first browser sample, `docs/session-trace/thresholds.json`), except a running total, which is last minus first: the metric manifest marks one with `window: cumulative` (such as `packets_lost`), and the row's `estimator` says which was used.",
       );
     } else {
       L.push(
-        "No warm-up: the thresholds file states no `classifier.warmup_exclude_s`, or a side has no browser sample to anchor it on, so every sample counts.",
+        "No warm-up: the thresholds file states no `classifier.warmup_exclude_s`, or a side has no browser sample to anchor it on, so every sample counts. A median, except a counter, which is last minus first (`estimator` on the row says which).",
       );
     }
     if (pair.metrics.compared.length) {
-      L.push("", "| source.key | median A | median B | B − A | change | samples A | samples B |", "| --- | --- | --- | --- | --- | --- | --- |");
+      L.push("", "| source.key | estimator | A | B | B − A | change | samples A | samples B |", "| --- | --- | --- | --- | --- | --- | --- | --- |");
       for (const m of pair.metrics.compared) {
         const change = m.change_pct === null ? dash : `${m.change_pct > 0 ? "+" : ""}${m.change_pct} %`;
         L.push(
-          `| ${code(`${m.source}.${m.key}`)} | ${code(m.median_a)} | ${code(m.median_b)} | ${code(m.delta)} | ${span(change)} | ${code(m.samples_a)} | ${code(m.samples_b)} |`,
+          `| ${code(`${m.source}.${m.key}`)} | ${code(m.estimator)} | ${code(m.value_a)} | ${code(m.value_b)} | ${code(m.delta)} | ${span(change)} | ${code(m.samples_a)} | ${code(m.samples_b)} |`,
         );
       }
       L.push(
@@ -570,7 +624,7 @@ export function renderCompare(cmp, leftOut) {
         "No judgement and no threshold: these are numbers. One pair of runs is not evidence of a regression — quasar-bench's rule is at least two runs a side.",
       );
     } else {
-      L.push("", "No metric key both sides hold for the same source, so no median is compared.");
+      L.push("", "No metric key both sides hold for the same source, so no value is compared.");
     }
     if (pair.metrics.too_few.length) {
       const few = pair.metrics.too_few.map((m) => `${code(`${m.source}.${m.key}`)} (${code(m.samples_a)} and ${code(m.samples_b)})`);
@@ -596,12 +650,12 @@ export function renderCompare(cmp, leftOut) {
 
   L.push("", "## Scenarios only in one bundle");
   if (!cmp.only_a.length && !cmp.only_b.length) L.push("Every scenario is in both bundles.");
-  for (const id of cmp.only_a) L.push(`- A only: ${code(id)}`);
-  for (const id of cmp.only_b) L.push(`- B only: ${code(id)}`);
+  for (const s of cmp.only_a) L.push(`- A only: ${code(s.id)} — ${code(s.dir)}`);
+  for (const s of cmp.only_b) L.push(`- B only: ${code(s.id)} — ${code(s.dir)}`);
 
   L.push("", "## Not in this unit");
   L.push(
-    "Serving a web build (`WEB_DIST=`), UI journeys in a plan, decoded-frame pairs at the same reference-app tick, and a pixel difference in pictures are not in this verb.",
+    "UI journeys in a plan, decoded-frame pairs at the same reference-app tick, and a pixel difference in pictures are not in this verb.",
   );
   return L.join("\n") + "\n";
 }
@@ -734,7 +788,7 @@ export function main(argv, { compareFn = compare, writeFn = writeCompare } = {})
   console.log(`wrote ${path.join(out, "COMPARE.md")} and ${path.join(out, "compare.json")}`);
   const more = [json.left_out ? `left_out=${json.left_out}` : "", json.truncated ? "truncated=1" : ""].filter(Boolean).join(" ");
   console.log(
-    `RESULT status=ok target=e2e-compare changed=${counts.criteria_changed} scenarios=${counts.scenarios} only_a=${counts.only_a} only_b=${counts.only_b}${more ? ` ${more}` : ""}`,
+    `RESULT status=ok target=e2e-compare changed=${counts.changed} scenarios=${counts.scenarios} only_a=${counts.only_a} only_b=${counts.only_b}${more ? ` ${more}` : ""}`,
   );
   return EXIT.ok;
 }
