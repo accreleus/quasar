@@ -8,11 +8,12 @@ import { RuntimeTab } from "./RuntimeTab";
 import { draftFromApp } from "./appDraft";
 import type { RuntimePreset } from "../../../../api/types";
 
-function renderTab(presetHome: boolean) {
+function renderTab(presetHome: boolean, draftOver: Partial<ReturnType<typeof draftFromApp>> = {}) {
   const preset = {
     id: "preset-1",
     name: "KDE Desktop",
     managed_home: presetHome,
+    home_container_path: "/home/kde",
     env: {},
   } as unknown as RuntimePreset;
   const draft = {
@@ -20,6 +21,7 @@ function renderTab(presetHome: boolean) {
     kind: "desktop" as const,
     runtimePresetId: "preset-1",
     managedHome: false,
+    ...draftOver,
   };
   render(
     <MemoryRouter>
@@ -50,6 +52,21 @@ describe("RuntimeTab managed home", () => {
     const home = screen.getByLabelText("Managed home") as HTMLInputElement;
     expect(home.checked).toBe(false);
     expect(home.disabled).toBe(false);
+    expect(screen.queryByLabelText("Share the user's Steam library")).toBeNull();
+  });
+
+  it("shows the preset's home path when the app is still on the default path", () => {
+    renderTab(true);
+    expect((screen.getByLabelText("Mount path inside container") as HTMLInputElement).value).toBe("/home/kde");
+  });
+
+  it("keeps the app's own home path over the preset's", () => {
+    renderTab(true, { containerPath: "/srv/own" });
+    expect((screen.getByLabelText("Mount path inside container") as HTMLInputElement).value).toBe("/srv/own");
+  });
+
+  it("hides the Steam library switch for a library-provider desktop app", () => {
+    renderTab(true, { libraryProvider: "steam" });
     expect(screen.queryByLabelText("Share the user's Steam library")).toBeNull();
   });
 });
