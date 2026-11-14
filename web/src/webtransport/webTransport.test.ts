@@ -441,6 +441,55 @@ describe("WebTransportMedia receiver feedback", () => {
     t.close();
   });
 
+  /** How long after a later datagram passes a lost one the feedback reports it, on a link where ten
+   *  datagrams in the last second came 100 ms late. One datagram a millisecond, a message every 5 ms. */
+  async function heldFor(ack: Record<string, unknown>, rttMs: number): Promise<number> {
+    let clock = 0;
+    let report = () => {};
+    const agent = new FakeAgent();
+    agent.replies = [[ack]];
+    const t = transport(agent, {
+      now: () => clock,
+      ticker: (ms, fn) => {
+        if (ms === 50) report = fn;
+        return () => {};
+      },
+    });
+    await t.connect(NO_SINK);
+    clock = rttMs;
+    agent.last.control({ type: "pong", id: 1, tc: agent.sent("ping")[0].tc, ts: 0, tw: 0 });
+    await flush();
+    const late = (s: number) => s >= 100 && s <= 550 && s % 50 === 0;
+    const at = new Map<number, number[]>();
+    for (let s = 0; s < 1000; s++) if (s !== 800) at.set(late(s) ? s + 100 : s, [...(at.get(late(s) ? s + 100 : s) ?? []), s]);
+    for (let ms = 0; ms < 1000; ms++) {
+      clock = rttMs + ms;
+      const due = at.get(ms) ?? [];
+      if (due.length) {
+        agent.last.datagrams(due.map((s) => Uint8Array.of(0x01, s & 0xff, (s >> 8) & 0xff, 0, 0)));
+        await flush();
+      }
+      if (ms % 5 === 0) report();
+      const fb = agent.sent("feedback").find((m) => (m.first_pkt_seq as number) <= 800 && (m.first_pkt_seq as number) + (m.count as number) > 800);
+      if (fb) {
+        t.close();
+        return ms - 801;
+      }
+    }
+    throw new Error("the gap was never reported");
+  }
+
+  it("holds a gap no longer than the agent can still repair: retransmit window less a frame and a round trip (#1330)", async () => {
+    // No retransmit_window_ms: nothing is held, as on a link that does not reorder.
+    expect(await heldFor(helloAck(0, avcC()), 20)).toBeLessThan(15);
+    // 250 ms window, 60 fps, 50 ms round trip: room for the whole 100 ms the link reorders by.
+    expect(await heldFor({ ...helloAck(0, avcC()), retransmit_window_ms: 250 }, 50)).toBeGreaterThan(100);
+    // A 200 ms round trip leaves 250 − 16.7 − 200 = 33 ms.
+    const capped = await heldFor({ ...helloAck(0, avcC()), retransmit_window_ms: 250 }, 200);
+    expect(capped).toBeGreaterThan(30);
+    expect(capped).toBeLessThan(50);
+  });
+
   it("reports on the transport's ticker, the Worker clock a hidden tab keeps running", async () => {
     const periods: number[] = [];
     const agent = new FakeAgent();
@@ -1527,7 +1576,7 @@ describe("createWebTransportRuntime fallback", () => {
         expect(s.callbacks.onFallback).toHaveBeenCalledTimes(1);
       });
 
-      it("does not fire on a normal start, nor on units that arrive before the first keyframe", async () => {
+      it("does not fire on a normal start", async () => {
         vi.useFakeTimers();
         const ok = setup();
         ok.rt.start();
@@ -1535,10 +1584,20 @@ describe("createWebTransportRuntime fallback", () => {
         await feed(ok, 12);
         expect(ok.callbacks.onFallback).not.toHaveBeenCalled();
         ok.rt.destroy();
+      });
 
-        const s = await stuckDecoder();
-        await feed(s, 12, 0, delta);
+      it("takes a first connection whose keyframe never comes for a lost stream: reconnects at about 5 s, then falls back with stream_lost", async () => {
+        vi.useFakeTimers();
+        const s = setup();
+        s.rt.start();
+        await vi.advanceTimersByTimeAsync(10);
+        await feed(s, 5, 0, delta);
+        expect(s.agent.sent("hello")).toHaveLength(1);
+        await feed(s, 2, 5, delta);
+        expect(s.agent.sent("hello")).toHaveLength(2);
         expect(s.callbacks.onFallback).not.toHaveBeenCalled();
+        await feed(s, 8, 7, delta);
+        expect(vi.mocked(s.callbacks.onFallback).mock.calls.map((c) => c[0])).toEqual(["stream_lost"]);
         s.rt.destroy();
       });
 
@@ -1559,7 +1618,10 @@ describe("createWebTransportRuntime fallback", () => {
         s.rt.destroy();
       });
 
-      it("does not count the wait for a keyframe: units of a new configuration arrive for over 5 s before its keyframe", async () => {
+      const delta1 = (agent: FakeAgent, seq: number) =>
+        agent.last.datagrams(packetize({ configId: 1, frameSeq: seq, keyframe: false, data: bytes(10, seq) }));
+
+      it("does not count the wait for a keyframe: units of a new configuration arrive for 3 s before its keyframe", async () => {
         vi.useFakeTimers();
         const s = setup();
         s.rt.start();
@@ -1567,17 +1629,32 @@ describe("createWebTransportRuntime fallback", () => {
         await feed(s, 2);
         // A rung change: the live connection announces configuration 1, whose deltas reach the decode stage first.
         s.agent.last.control(helloAck(1, avcC(0x28), 1280, 720));
-        const delta1 = (agent: FakeAgent, seq: number) =>
-          agent.last.datagrams(packetize({ configId: 1, frameSeq: seq, keyframe: false, data: bytes(10, seq) }));
-        await feed(s, 9, 2, delta1);
-        expect(s.agent.sent("hello")).toHaveLength(1);
-        expect(s.callbacks.onFallback).not.toHaveBeenCalled();
+        await feed(s, 3, 2, delta1);
         // The keyframe lands and is shown; the clock then starts from it.
-        s.agent.last.datagrams(packetize({ configId: 1, frameSeq: 11, keyframe: true, data: bytes(10, 11) }));
-        await feed(s, 8, 12, delta1);
+        s.agent.last.datagrams(packetize({ configId: 1, frameSeq: 5, keyframe: true, data: bytes(10, 5) }));
+        await feed(s, 8, 6, delta1);
         expect(s.agent.sent("hello")).toHaveLength(1);
         expect(s.callbacks.onFallback).not.toHaveBeenCalled();
         s.rt.destroy();
+      });
+
+      it("takes a keyframe wait longer than the bound for a lost stream: reconnects at about 5 s, falls back with stream_lost on the second (#1426)", async () => {
+        vi.useFakeTimers();
+        const s = setup();
+        s.rt.start();
+        await vi.advanceTimersByTimeAsync(10);
+        await feed(s, 2);
+        // Deltas keep arriving and the keyframe they need never does (a path that loses it).
+        s.agent.last.control(helloAck(1, avcC(0x28), 1280, 720));
+        await feed(s, 5, 2, delta1);
+        expect(s.agent.sent("hello")).toHaveLength(1);
+        await feed(s, 2, 7, delta1);
+        expect(s.agent.sent("hello")).toHaveLength(2);
+        expect(s.callbacks.onFallback).not.toHaveBeenCalled();
+        // The reconnect's first keyframe is lost too, while its deltas keep arriving: nothing shows on it.
+        await feed(s, 8, 9, delta);
+        expect(vi.mocked(s.callbacks.onFallback).mock.calls.map((c) => c[0])).toEqual(["stream_lost"]);
+        expect(s.agent.sent("hello")).toHaveLength(2);
       });
     });
 

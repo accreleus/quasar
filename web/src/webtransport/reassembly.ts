@@ -122,7 +122,12 @@ export class FrameAssembler {
   /** Set by {@link recover}: when the earliest held NACK falls due. */
   private wakeAt: number | null = null;
 
-  constructor(private readonly now: () => number = () => performance.now()) {}
+  /** `reorderMs`: how late reordered datagrams come on this path (`FeedbackRecorder.reorderMs`).
+   *  A gap's first NACK waits that long and each repeat waits that much longer (#1330). */
+  constructor(
+    private readonly now: () => number = () => performance.now(),
+    private readonly reorderMs: (now: number) => number = () => 0,
+  ) {}
 
   /** Fragments found missing so far, each counted once at its first NACK: the loss telemetry reads. */
   lost = 0;
@@ -308,11 +313,14 @@ export class FrameAssembler {
     return this.wakeAt === null ? { units, nacks, needKeyframe } : { units, nacks, needKeyframe, wakeMs: this.wakeAt - at };
   }
 
-  /** Is fragment `i`'s first NACK still waiting for the frame's repairs? Not once a later
-   *  frame has shown: the agent sent this frame's repairs before it. */
+  /** Is fragment `i`'s first NACK still waiting, for the frame's repairs or for the fragment
+   *  itself on a path that reorders? A later frame shows the repairs are not coming (the agent
+   *  sent them before it), not that a reordered fragment is not. */
   private held(p: Pending, i: number, at: number, later: boolean): boolean {
-    if (later || this.repairAt === null || at - this.repairAt > FEC_ACTIVE_MS) return false;
-    const due = ((p.heldAt ??= [])[i] ??= at) + FEC_HOLD_MS;
+    const fec = !later && this.repairAt !== null && at - this.repairAt <= FEC_ACTIVE_MS;
+    const hold = Math.max(fec ? FEC_HOLD_MS : 0, this.reorderMs(at));
+    if (hold <= 0) return false;
+    const due = ((p.heldAt ??= [])[i] ??= at) + hold;
     if (at >= due) return false;
     this.wakeAt = Math.min(this.wakeAt ?? due, due);
     return true;
@@ -332,7 +340,7 @@ export class FrameAssembler {
 
   /** The NACKs now due, and late marks for repeats that went unanswered. */
   private recover(at: number): Nack[] {
-    const wait = this.rttMs + RTT_SLACK_MS;
+    const wait = this.rttMs + RTT_SLACK_MS + this.reorderMs(at);
     for (const [k, t] of this.asked) {
       if (at - t <= ASK_MEMORY_MS && this.asked.size <= MAX_ASKS_REMEMBERED) break;
       this.asked.delete(k);
