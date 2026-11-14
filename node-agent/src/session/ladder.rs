@@ -90,8 +90,9 @@ pub struct LadderSettings {
     pub res: ResolutionPolicy,
     /// Whether an operator set `abr_ladder_resolution` / `abr_ladder_order` (env or
     /// override). Unset ones take the WebTransport defaults in [`Self::for_session`].
-    /// A typed-policy `deployment` choice arrives as a value and counts as set; an empty
-    /// env var is unset, since compose passes an unset variable through as "".
+    /// A typed-policy `deployment` choice does not count: `PolicyAgent::mark_ladder_choices`
+    /// corrects what `apply_json` marks. An empty env var is unset, since compose passes
+    /// an unset variable through as "".
     pub resolution_set: bool,
     pub order_set: bool,
 }

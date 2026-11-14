@@ -529,7 +529,48 @@ impl PolicyAgent {
                 .ok_or("typed_snapshot_missing")?;
             snapshots.push((group.as_str(), &active.resolved_settings));
         }
-        policy_catalog::compose_groups(settings, snapshots).map_err(str::to_string)
+        policy_catalog::compose_groups(settings, snapshots).map_err(str::to_string)?;
+        self.mark_ladder_choices(settings);
+        Ok(())
+    }
+
+    /// `apply_json` marks every ladder value it is given as set, but a typed group's
+    /// value is only an operator's when its active snapshot came from an explicit
+    /// choice (#1375). A `deployment` choice keeps the baseline's flag (env).
+    /// shortcut: a seed has no choice, so it counts as set only where it differs from
+    /// the baseline; a pre-ownership legacy override equal to the baseline reads unset.
+    fn mark_ladder_choices(&self, settings: &mut RuntimeSettings) {
+        let baseline = self.deployment_baseline.deployment_map();
+        for key in ["abr_ladder_resolution", "abr_ladder_order"] {
+            let Some(active) = self
+                .journal
+                .active_groups
+                .get(key)
+                .filter(|_| self.journal.ever_accepted_typed.contains(key))
+            else {
+                continue;
+            };
+            let chosen = if active.kind == "seeded" {
+                !baseline.get(key).is_some_and(|base| {
+                    active
+                        .resolved_settings
+                        .get(key)
+                        .is_some_and(|got| policy_catalog::json_equal(base, got))
+                })
+            } else {
+                self.journal.records.values().any(|record| {
+                    record.group == key
+                        && record.digest == active.digest
+                        && record.settings[key]["source"] == "explicit"
+                })
+            };
+            let env = &self.deployment_baseline.ladder;
+            if key == "abr_ladder_resolution" {
+                settings.ladder.resolution_set = chosen || env.resolution_set;
+            } else {
+                settings.ladder.order_set = chosen || env.order_set;
+            }
+        }
     }
 
     pub fn inventory_page(
@@ -1221,6 +1262,7 @@ impl PolicyAgent {
                     return Err("journal_write_failed".into());
                 }
             }
+            self.mark_ladder_choices(&mut next);
             *settings = next;
             return Ok((
                 "applied",
@@ -1340,6 +1382,7 @@ impl PolicyAgent {
             self.journal = accepted;
             return Err("journal_write_failed".into());
         }
+        self.mark_ladder_choices(&mut next);
         *settings = next;
         Ok((
             "applied",
@@ -2788,6 +2831,131 @@ mod tests {
             assert_eq!(revision_high_water[*group], "1", "{group}");
             assert_eq!(active_snapshots[*group]["kind"], "verified", "{group}");
         }
+    }
+
+    const LADDER_KEYS: [&str; 3] = [
+        "abr_ladder_resolution",
+        "abr_ladder_order",
+        "abr_ladder_floor_follows_rung",
+    ];
+
+    fn ladder_set(runtime: &RuntimeSettings) -> (bool, bool) {
+        (runtime.ladder.resolution_set, runtime.ladder.order_set)
+    }
+
+    /// An owned host whose ladder groups are seeded, then pushed as `deployment`
+    /// choices, has set neither knob (#1375): a WebTransport session takes the
+    /// default, a WebRTC one keeps the host values, and a reopen keeps it so.
+    #[test]
+    fn deployment_ladder_choices_leave_the_knobs_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let baseline = RuntimeSettings::baseline_with(&|_| None);
+        let mut runtime = baseline.clone();
+        let mut agent = owned_agent(dir.path(), &LADDER_KEYS, &mut runtime);
+        assert_eq!(ladder_set(&runtime), (false, false), "seeded");
+        let deployed = runtime.deployment_map();
+        for key in LADDER_KEYS {
+            let o = offer(
+                &agent,
+                key,
+                "0",
+                key,
+                json!({"source":"deployment"}),
+                deployed[key].clone(),
+            );
+            assert_eq!(phase_of(&agent.accept(o, &mut runtime)), ("applied", None));
+        }
+        assert_eq!(ladder_set(&runtime), (false, false), "deployment push");
+        assert!(runtime.ladder.floor_follows_rung);
+        let wt = runtime.ladder.for_session(true);
+        assert!(wt.resolution_enabled);
+        assert_eq!(wt.order, crate::session::ladder::LadderOrder::ResFirst);
+        let rtc = runtime.ladder.for_session(false);
+        assert!(!rtc.resolution_enabled);
+        assert_eq!(rtc.order, crate::session::ladder::LadderOrder::Hybrid);
+        drop(agent);
+
+        let mut restarted = baseline.clone();
+        let mut reopened = open_at(&dir.path().join("policy.json"), &mut restarted);
+        assert_eq!(ladder_set(&restarted), (false, false), "reopen");
+        reopened
+            .apply_legacy_overlay(&baseline, &mut restarted, &json!({}), Some("d2"))
+            .unwrap();
+        assert_eq!(ladder_set(&restarted), (false, false), "legacy map");
+    }
+
+    /// An explicit choice marks its knob set, also when it equals the baseline: an
+    /// explicit "off" on an "off" host turns the WebTransport default off.
+    #[test]
+    fn explicit_ladder_choices_mark_the_knob_set_even_at_the_baseline_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.json");
+        let baseline = RuntimeSettings::baseline_with(&|_| None);
+        let mut runtime = baseline.clone();
+        let mut agent = owned_agent(dir.path(), &LADDER_KEYS, &mut runtime);
+        let o = explicit(&agent, "r", "1", "abr_ladder_resolution", json!(false));
+        assert_eq!(phase_of(&agent.accept(o, &mut runtime)), ("applied", None));
+        assert_eq!(ladder_set(&runtime), (true, false));
+        assert!(!runtime.ladder.for_session(true).resolution_enabled);
+        let o = explicit(&agent, "o", "1", "abr_ladder_order", json!("hybrid"));
+        assert_eq!(phase_of(&agent.accept(o, &mut runtime)), ("applied", None));
+        assert_eq!(ladder_set(&runtime), (true, true));
+        drop(agent);
+        let mut restarted = baseline.clone();
+        let mut reopened = open_at(&path, &mut restarted);
+        assert_eq!(ladder_set(&restarted), (true, true), "reopen");
+
+        // Back to deployment: unset again.
+        let o = offer(
+            &reopened,
+            "r2",
+            "2",
+            "abr_ladder_resolution",
+            json!({"source":"deployment"}),
+            json!(false),
+        );
+        assert_eq!(
+            phase_of(&reopened.accept(o, &mut restarted)),
+            ("applied", None)
+        );
+        assert_eq!(ladder_set(&restarted), (false, true));
+    }
+
+    /// The env var decides for a `deployment` choice: set when non-empty, unset when
+    /// empty (compose passes an unset variable as ""). A legacy override sets it.
+    #[test]
+    fn env_and_legacy_overrides_still_mark_the_ladder_knobs_set() {
+        for (value, want) in [("", false), ("true", true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let lookup = |k: &str| (k == "QUASAR_ABR_LADDER_RESOLUTION").then(|| value.to_string());
+            let mut runtime = RuntimeSettings::baseline_with(&lookup);
+            let mut agent = owned_agent(dir.path(), &["abr_ladder_resolution"], &mut runtime);
+            let deployed = runtime.deployment_map()["abr_ladder_resolution"].clone();
+            let o = offer(
+                &agent,
+                "r",
+                "0",
+                "abr_ladder_resolution",
+                json!({"source":"deployment"}),
+                deployed,
+            );
+            assert_eq!(phase_of(&agent.accept(o, &mut runtime)), ("applied", None));
+            assert_eq!(runtime.ladder.resolution_set, want, "env {value:?}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let baseline = RuntimeSettings::baseline_with(&|_| None);
+        let mut runtime = baseline.clone();
+        let mut agent = owned_agent(dir.path(), &[], &mut runtime);
+        agent
+            .apply_legacy_overlay(
+                &baseline,
+                &mut runtime,
+                &json!({"abr_ladder_order":"hybrid"}),
+                Some("d2"),
+            )
+            .unwrap();
+        assert_eq!(ladder_set(&runtime), (false, true), "legacy override");
     }
 
     /// A typed snapshot of any group reaches the next session's settings, is
