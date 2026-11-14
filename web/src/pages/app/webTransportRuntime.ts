@@ -15,7 +15,7 @@ import { TraceEventEmitter } from "../../webrtc/traceEvents";
 import { AudioOut, type AudioOutDeps } from "../../webtransport/audioOut";
 import { MicOut, type MicOutDeps } from "../../webtransport/micOut";
 import { DecodeStage, type DecodeFailure, type DecodeStageOptions } from "../../webtransport/decodeStage";
-import { fallbackReason } from "../../webtransport/fallback";
+import { fallbackCause, fallbackReason } from "../../webtransport/fallback";
 import { Playout } from "../../webtransport/playout";
 import { createWebGpuPresenter, type Presenter } from "../../webtransport/presenter";
 import { WtTelemetry, type WtTelemetryOptions } from "../../webtransport/telemetry";
@@ -86,8 +86,9 @@ export interface WebTransportRuntimeConfig {
      *  human copy for the failure card. */
     onTransportFailed(detail: string): void;
     /** WebTransport has been closed and the page should carry on over WebRTC.
-     *  `reason` is the `transport.fallback` reason (control-api.md §Transport fallback). */
-    onFallback(reason: string): void;
+     *  `reason` is the `transport.fallback` reason (control-api.md §Transport fallback); `cause`
+     *  is the error's own text, for the HUD only (never sent anywhere). */
+    onFallback(reason: string, cause: string): void;
   };
   deps?: Partial<WebTransportRuntimeDeps>;
 }
@@ -202,18 +203,20 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   };
 
   // A failure the contract falls back on hands the session to WebRTC; the rest end this view.
-  const fail = (code: string, terminal = false, message?: string) => {
+  const fail = (code: string, terminal = false, message?: string, err?: unknown) => {
     if (failed || destroyed) return;
     failed = true;
     const closed = stop();
     const reason = terminal ? null : fallbackReason(code);
     if (reason) {
+      const cause = fallbackCause(code, err);
+      console.warn("webtransport: falling back to WebRTC:", cause);
       // WebRTC's own input path takes over; nothing is left capturing for this connection.
       set({ status: "falling back to WebRTC…", channelOpen: false, inputCaptured: false, pointerLocked: false });
       // Close first (control-api.md §Transport fallback): the page opens WebRTC only once the
       // WebTransport session has been told to close, which close() bounds to a short wait.
       void Promise.resolve(closed).then(() => {
-        if (!destroyed) cfg.callbacks.onFallback(reason);
+        if (!destroyed) cfg.callbacks.onFallback(reason, cause);
       });
       return;
     }
@@ -301,14 +304,14 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
         cfg.canvas,
         (message) => {
           console.warn("presenter:", message);
-          fail("gpu_failed");
+          fail("gpu_failed", false, undefined, message);
         },
         { pyrowave: cfg.pyrowave === true },
       );
     } catch (err) {
       // requestAdapter, requestDevice or configure refused.
       console.warn("presenter:", err);
-      fail("gpu_failed");
+      fail("gpu_failed", false, undefined, err);
       return;
     }
     // Destroyed, or the device failed while the presenter was being made: no transport then.
@@ -457,7 +460,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
         takenOver();
       } else if (code !== "closed") {
         if (code === "session_ended") cfg.callbacks.onDisconnectSuspected();
-        fail(code);
+        fail(code, false, undefined, err);
       }
       return;
     }

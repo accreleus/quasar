@@ -112,11 +112,11 @@ vi.mock("../../webrtc/traceEvents", () => ({
 const emitTransportFallback = vi.fn();
 
 /** The WebTransport runtime's callbacks, so a test plays its verdict without a QUIC connection. */
-let lastWtCallbacks: { onFallback(reason: string): void } | null = null;
+let lastWtCallbacks: { onFallback(reason: string, cause: string): void } | null = null;
 vi.mock("./webTransportRuntime", async () => {
   const { IDLE_SNAPSHOT } = await import("./sessionRuntime");
   return {
-    createWebTransportRuntime: (cfg: { callbacks: { onFallback(reason: string): void } }) => {
+    createWebTransportRuntime: (cfg: { callbacks: { onFallback(reason: string, cause: string): void } }) => {
       lastWtCallbacks = cfg.callbacks;
       return {
         getSnapshot: () => IDLE_SNAPSHOT,
@@ -1377,7 +1377,7 @@ describe("SessionPage — WebTransport falls back to WebRTC (A11)", () => {
     expect((lastDrawerProps as Record<string, unknown>).transport).toBe("webtransport");
 
     await act(async () => {
-      lastWtCallbacks!.onFallback("connect_timeout");
+      lastWtCallbacks!.onFallback("connect_timeout", "connect_timeout: boom");
     });
     await act(async () => {
       await vi.advanceTimersByTimeAsync(100);
@@ -1388,13 +1388,14 @@ describe("SessionPage — WebTransport falls back to WebRTC (A11)", () => {
     const hud = lastDrawerProps as Record<string, unknown>;
     expect(hud.transport).toBe("webrtc");
     expect(hud.transportFallbackReason).toBe("connect_timeout");
+    expect(hud.transportFallbackCause).toBe("connect_timeout: boom");
   });
 
   it("says the stream is unreachable when no signaling token can be minted", async () => {
     mintSignalingToken.mockRejectedValue(new Error("offline"));
     renderPage({ webtransport: wt });
     await act(async () => {
-      lastWtCallbacks!.onFallback("connect_failed");
+      lastWtCallbacks!.onFallback("connect_failed", "connect_failed");
     });
     await act(async () => {
       await vi.advanceTimersByTimeAsync(100);
@@ -1408,7 +1409,7 @@ describe("SessionPage — WebTransport falls back to WebRTC (A11)", () => {
     mintSignalingToken.mockReturnValue(new Promise((r) => (release = r)));
     renderPage({ webtransport: wt });
     await act(async () => {
-      lastWtCallbacks!.onFallback("connect_timeout");
+      lastWtCallbacks!.onFallback("connect_timeout", "connect_timeout: boom");
     });
     expect(screen.getAllByText("Switching to WebRTC…").length).toBeGreaterThan(0);
     expect(sessionStorage.getItem("quasar.wt-fallback.s1")).toBe("connect_timeout");

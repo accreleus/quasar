@@ -155,6 +155,8 @@ function SessionPageBody() {
   // A reload of a session that already fell back goes straight to WebRTC.
   const [remembered] = useState(() => rememberedFallback(sessionId));
   const [fallbackReason, setFallbackReason] = useState<string | null>(remembered);
+  // Only this page load's fallback has a cause; a remembered one (reload) has none.
+  const [fallbackCause, setFallbackCause] = useState<string | null>(null);
   // The status line from the moment WebTransport gives up until WebRTC's signaling is open.
   const [switching, setSwitching] = useState(false);
   const webtransport = fallbackReason ? undefined : state?.webtransport;
@@ -456,7 +458,7 @@ function SessionPageBody() {
 
   // The runtime has already closed WebTransport (control-api.md §Transport fallback, "Close first").
   // The launch's signaling token may have expired, so a fresh one is minted.
-  const fallBackToWebRtc = async (reason: string) => {
+  const fallBackToWebRtc = async (reason: string, cause: string) => {
     setSwitching(true);
     // Capture went with the WebTransport connection: ask for it again once WebRTC is up.
     // `||`: a first reveal still owed keeps its "Click to play".
@@ -468,6 +470,7 @@ function SessionPageBody() {
       const { signaling } = await mintSignalingToken(authToken ?? "", sessionId ?? "");
       if (!signaling?.url || !signaling?.token) throw new Error("no signaling coordinates");
       setFallbackReason(reason);
+      setFallbackCause(cause);
       setSignalCoords({ url: signaling.url, token: signaling.token, replacement: true, iceServers: signaling.ice_servers ?? [] });
     } catch (err) {
       setSwitching(false);
@@ -535,7 +538,7 @@ function SessionPageBody() {
             onSessionTakenOver: () => noteFailure(takenOverFailure()),
             // A poll verdict about the session's end outranks this one (settleFailure).
             onTransportFailed: (detail) => noteFailure(unreachableFailure(detail)),
-            onFallback: (reason) => void fallBackToWebRtc(reason),
+            onFallback: (reason, cause) => void fallBackToWebRtc(reason, cause),
           },
         })
       : createSessionRuntime({
@@ -1350,6 +1353,7 @@ function SessionPageBody() {
             resolvedCodec={state?.resolvedCodec}
             transport={webtransport ? "webtransport" : "webrtc"}
             transportFallbackReason={fallbackReason}
+            transportFallbackCause={fallbackCause}
             sessionId={sessionId}
             inputCaptured={inputCaptured}
             onGrab={handleGrab}

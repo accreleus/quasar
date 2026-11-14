@@ -174,7 +174,8 @@ describe("WebTransportMedia connect", () => {
   it("closes with 4400 on a malformed hello_ack", async () => {
     const agent = new FakeAgent();
     agent.replies = [[{ type: "hello_ack", wt_proto: 1, config_id: 0, video: null }]];
-    await expect(transport(agent).connect(NO_SINK)).rejects.toMatchObject({ code: "internal" });
+    // The refusal keeps our own close code and reason, which is all a phone user can read (#1403).
+    await expect(transport(agent).connect(NO_SINK)).rejects.toMatchObject({ code: "internal", message: "close 4400 malformed hello_ack" });
     expect(agent.last.closes[0]).toMatchObject({ closeCode: 4400 });
   });
 
@@ -634,7 +635,7 @@ describe("createWebTransportRuntime", () => {
   it("reports a browser with no WebGPU adapter", async () => {
     const { callbacks, rt } = setup({ noWebGpu: true });
     rt.start();
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("decoder_unsupported"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("decoder_unsupported", expect.any(String)));
     expect(callbacks.onTransportFailed).not.toHaveBeenCalled();
   });
 
@@ -648,7 +649,7 @@ describe("createWebTransportRuntime", () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     presenterFatal()("the GPU device was lost");
     // The fallback follows the close (control-api.md §Transport fallback, "Close first").
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("internal"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("internal", expect.any(String)));
   });
 
   it("reports a presenter that cannot be made, and builds no transport", async () => {
@@ -665,7 +666,7 @@ describe("createWebTransportRuntime", () => {
       deps: { createTransport, createPresenter: () => Promise.reject(new Error("requestDevice failed")) },
     });
     rt.start();
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("internal"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("internal", expect.any(String)));
     expect(createTransport).not.toHaveBeenCalled();
     expect(agent.conns).toHaveLength(0);
   });
@@ -756,7 +757,7 @@ describe("createWebTransportRuntime", () => {
       },
     });
     rt.start();
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("decoder_unsupported"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("decoder_unsupported", expect.any(String)));
     expect(callbacks.onTransportFailed).not.toHaveBeenCalled();
   });
 
@@ -879,7 +880,7 @@ describe("WebTransportMedia unreachable agent", () => {
 });
 
 describe("createWebTransportRuntime fallback", () => {
-  function setup() {
+  function setup(deps: Partial<WebTransportRuntimeDeps> = {}) {
     /** One per connection the runtime brought up; `sendInput` is what that capture sends with. */
     const captures: { sendInput: (m: InputMsg) => void; cleanup: ReturnType<typeof vi.fn>; engage: ReturnType<typeof vi.fn> }[] = [];
     const agent = new FakeAgent();
@@ -904,6 +905,7 @@ describe("createWebTransportRuntime fallback", () => {
           captures.push(c);
           return c;
         }) as never,
+        ...deps,
       },
     });
     return { agent, callbacks, rt, captures };
@@ -922,7 +924,7 @@ describe("createWebTransportRuntime fallback", () => {
     const { agent, callbacks, rt } = setup();
     agent.refuseHandshake = true;
     rt.start();
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("connect_failed"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("connect_failed", expect.any(String)));
     expect(agent.conns).toHaveLength(1);
     expect(agent.sent("hello")).toHaveLength(0);
     expect(callbacks.onTransportFailed).not.toHaveBeenCalled();
@@ -935,7 +937,7 @@ describe("createWebTransportRuntime fallback", () => {
     agent.hold = "ready";
     rt.start();
     await vi.advanceTimersByTimeAsync(HANDSHAKE_DEADLINE_MS + 1);
-    expect(callbacks.onFallback).toHaveBeenCalledWith("connect_timeout");
+    expect(callbacks.onFallback).toHaveBeenCalledWith("connect_timeout", expect.any(String));
     expect(callbacks.onFallback).toHaveBeenCalledTimes(1);
   });
 
@@ -943,7 +945,7 @@ describe("createWebTransportRuntime fallback", () => {
     const { agent, callbacks, rt } = setup();
     agent.replies = [[{ ...helloAck(0, avcC()), wt_proto: 2 }]];
     rt.start();
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("unsupported_version"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("unsupported_version", expect.any(String)));
     expect(agent.conns[0].closes).toHaveLength(1);
   });
 
@@ -951,20 +953,39 @@ describe("createWebTransportRuntime fallback", () => {
     const { agent, callbacks, rt } = setup();
     agent.replies = [[{ type: "error", code: "auth_failed" }]];
     rt.start();
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("auth_failed"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("auth_failed", expect.any(String)));
     expect(agent.sent("hello").map((h) => h.token)).toEqual(["tok-1", "tok-2"]);
 
     const other = setup();
     other.agent.replies = [[{ type: "error", code: "takeover_rate_limited" }]];
     other.rt.start();
-    await vi.waitFor(() => expect(other.callbacks.onFallback).toHaveBeenCalledWith("takeover_rate_limited"));
+    await vi.waitFor(() => expect(other.callbacks.onFallback).toHaveBeenCalledWith("takeover_rate_limited", expect.any(String)));
+  });
+
+  it("a non-TransportError thrown during connect falls back as internal and keeps its name and message (#1403)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { callbacks, rt } = setup({
+      createTransport: () => ({ connect: () => Promise.reject(new TypeError("datagrams are not readable")), close: async () => {} }) as never,
+    });
+    rt.start();
+    await vi.waitFor(() =>
+      expect(callbacks.onFallback).toHaveBeenCalledWith("internal", "internal: TypeError: datagrams are not readable"),
+    );
+    expect(warn).toHaveBeenCalledWith("webtransport: falling back to WebRTC:", "internal: TypeError: datagrams are not readable");
+  });
+
+  it("a refusal falls back with its code in the cause (#1403)", async () => {
+    const { agent, callbacks, rt } = setup();
+    agent.replies = [[{ type: "error", code: "unsupported_version" }]];
+    rt.start();
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("unsupported_version", "unsupported_version"));
   });
 
   it("a code outside the contract's vocabulary is reported as internal", async () => {
     const { agent, callbacks, rt } = setup();
     agent.replies = [[{ type: "error", code: "bad_request" }]];
     rt.start();
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("internal"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("internal", expect.any(String)));
   });
 
   it("mid-session loss: one reconnect on a fresh token, then falls back with stream_lost", async () => {
@@ -976,7 +997,7 @@ describe("createWebTransportRuntime fallback", () => {
     await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
     expect(callbacks.onFallback).not.toHaveBeenCalled();
     agent.last.closeWith(4400);
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost", expect.any(String)));
     expect(callbacks.onFallback).toHaveBeenCalledTimes(1);
   });
 
@@ -1000,7 +1021,7 @@ describe("createWebTransportRuntime fallback", () => {
     rt.start();
     await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
     first.end({ code: null, reason: "lost" });
-    await vi.waitFor(() => expect(onFallback).toHaveBeenCalledWith("stream_lost"));
+    await vi.waitFor(() => expect(onFallback).toHaveBeenCalledWith("stream_lost", expect.any(String)));
     expect(connections).toBe(3); // the lost one and two replacements, not hundreds
     rt.destroy();
   });
@@ -1146,7 +1167,7 @@ describe("createWebTransportRuntime fallback", () => {
       agent.refuseHandshake = true;
       networkBack();
       await vi.advanceTimersByTimeAsync(4_000);
-      expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost");
+      expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost", expect.any(String));
       expect(callbacks.onFallback).toHaveBeenCalledTimes(1);
     });
 
@@ -1258,7 +1279,7 @@ describe("createWebTransportRuntime fallback", () => {
       expect(agent.sent("hello").map((h) => h.token)).toEqual(["tok-1", "tok-2"]);
       expect(callbacks.onFallback).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(SILENT + BYE_FLUSH_MS);
-      expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost");
+      expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost", expect.any(String));
       expect(agent.conns).toHaveLength(2);
     });
 
@@ -1355,14 +1376,14 @@ describe("createWebTransportRuntime fallback", () => {
     rt.start();
     await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
     agent.last.closeWith(4400);
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost", expect.any(String)));
 
     const refused = setup();
     refused.rt.start();
     await vi.waitFor(() => expect(refused.rt.getSnapshot().channelOpen).toBe(true));
     refused.agent.replies = [[{ type: "error", code: "takeover_rate_limited" }]];
     refused.agent.last.closeWith(4400);
-    await vi.waitFor(() => expect(refused.callbacks.onFallback).toHaveBeenCalledWith("stream_lost"));
+    await vi.waitFor(() => expect(refused.callbacks.onFallback).toHaveBeenCalledWith("stream_lost", expect.any(String)));
     expect(refused.callbacks.onFallback).toHaveBeenCalledTimes(1);
   });
 
@@ -1413,7 +1434,7 @@ describe("createWebTransportRuntime fallback", () => {
     agent.last.closeWith(4400);
     await vi.waitFor(() => expect(release).toBeDefined());
     fatal("the GPU device was lost");
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("internal"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("internal", expect.any(String)));
     release();
     await flush();
     expect(agent.conns).toHaveLength(1);
@@ -1532,7 +1553,7 @@ describe("createWebTransportRuntime fallback", () => {
     await vi.waitFor(() => expect(captures).toHaveLength(2));
     await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
     agent.last.closeWith(4400); // second loss: fallback, from a connection with a live capture
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost", expect.any(String)));
     expect(captures[1].cleanup).toHaveBeenCalledTimes(1);
     const before = inputs(agent).length;
     captures[1].sendInput(key);
@@ -1547,7 +1568,7 @@ describe("createWebTransportRuntime fallback", () => {
     const { agent, callbacks, rt, captures } = setup();
     agent.refuseHandshake = true;
     rt.start();
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("connect_failed"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("connect_failed", expect.any(String)));
     expect(captures).toHaveLength(0);
   });
 });
