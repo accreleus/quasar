@@ -724,6 +724,37 @@ pub(super) fn enable_abr(
     if let Some(why) = cfg.ladder_gate_warning() {
         tracing::warn!(token = "abr-disarmed", "{why}");
     }
+    let host = cfg.ladder;
+    let session = host.for_session(cfg.webtransport);
+    let origin = |set: bool, changed: bool| match (set, changed) {
+        (true, _) => "set on the host",
+        (false, true) => "WebTransport default",
+        (false, false) => "default",
+    };
+    tracing::info!(
+        token = "abr-ladder-effective",
+        "SPT-08 ladder for this session: resolution rung {} ({}), order {} ({}), \
+         fps rung {}, floor follows rung {}, abr_mode {}, transport {}",
+        if session.resolution_enabled {
+            "on"
+        } else {
+            "off"
+        },
+        origin(
+            host.resolution_set,
+            session.resolution_enabled != host.resolution_enabled
+        ),
+        session.order.as_str(),
+        origin(host.order_set, session.order != host.order),
+        if session.fps_enabled { "on" } else { "off" },
+        session.floor_follows_rung,
+        mode.as_str(),
+        if cfg.webtransport {
+            "webtransport"
+        } else {
+            "webrtc"
+        },
+    );
     if gst::ElementFactory::find("rtpgccbwe").is_none() {
         tracing::warn!(
             token = "abr-rtpgccbwe-missing",
@@ -1485,7 +1516,8 @@ fn write_launch_point(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The second knob a congestion controller can turn: frame size, not bitrate.
-/// `LadderConfig::resolution_enabled` is `false` by default; the other caller is the
+/// `LadderConfig::resolution_enabled` is off by default for WebRTC and on for a session
+/// assigned WebTransport (`LadderSettings::for_session`); the other caller is the
 /// runner's `session_display_update.stream_*` path (an explicit operator/user request).
 pub trait ResolutionLever: Send + Sync {
     /// The external sizes this session may be stepped to, descending, launch size first.

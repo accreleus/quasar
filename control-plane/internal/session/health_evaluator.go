@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"sync"
 	"time"
 )
@@ -17,13 +18,20 @@ type healthEvaluator struct {
 	failSession func(sessionID, reason string, detail *string) // = Coordinator.failSessionWithDetail
 
 	mu         sync.Mutex
-	healthRuns map[string]time.Time
+	healthRuns map[string]belowFloorRun
 	clientRuns map[string]*clientHealthRun
+}
+
+// belowFloorRun is a session's open below-floor run and the floor it is counted
+// against: a different floor (a ladder step) starts the clock again.
+type belowFloorRun struct {
+	since     time.Time
+	floorKbps int32
 }
 
 func newHealthEvaluator(store *Store, log *slog.Logger, failSession func(string, string, *string)) *healthEvaluator {
 	return &healthEvaluator{store: store, log: log, failSession: failSession,
-		healthRuns: make(map[string]time.Time), clientRuns: make(map[string]*clientHealthRun)}
+		healthRuns: make(map[string]belowFloorRun), clientRuns: make(map[string]*clientHealthRun)}
 }
 
 // forget deletes a session's health-run tracking from both maps. Call it at
@@ -52,23 +60,28 @@ type ClientHealthSample struct {
 }
 
 // evaluateHealth computes stream health from the latest ABR setpoint against the
-// rung's floor, persists a change, and fails a session unsustainable too long.
-// The state machine is Evaluate; this does the I/O, in its own goroutine off the
-// metrics hot path, logging errors rather than propagating them.
-func (h *healthEvaluator) evaluateHealth(ctx context.Context, sessionID string, setpointKbps float64) {
+// floor of the rung the session is on now, persists a change, and fails a session
+// unsustainable too long. reportedFloorKbps is the sample's abr_floor_kbps (nil ⇒
+// the launch floor, agent-api.md §session_metrics). The state machine is Evaluate;
+// this does the I/O, in its own goroutine off the metrics hot path, logging errors
+// rather than propagating them.
+func (h *healthEvaluator) evaluateHealth(ctx context.Context, sessionID string, setpointKbps float64, reportedFloorKbps *float64) {
 	sess, err := h.store.Get(ctx, sessionID)
 	if err != nil {
 		return
 	}
-	// The floor comes from the RESOLVED RUNG, read from the database: an in-code
-	// catalog was a second source of truth that cannot follow an admin tuning a
-	// per-rung floor, and a stale floor fails healthy sessions or spares unhealthy
-	// ones. No resolved rung, a read error or a zero floor all skip.
+	// No resolved rung, a read error or a zero floor all skip.
 	if sess.StreamProfileID == nil {
 		return
 	}
-	floorKbps, err := h.store.RungABRFloor(ctx, *sess.StreamProfileID)
-	if err != nil {
+	// The floor of the rung the session is on (amendment 75): judging the launch
+	// floor failed sessions streaming fine on a lower rung (#1375). A sample with no
+	// reported floor, or one out of range, falls back to the resolved rung's, read
+	// from the database so an admin-tuned per-rung floor is followed.
+	var floorKbps int32
+	if f := reportedFloorKbps; f != nil && *f > 0 && *f <= math.MaxInt32 {
+		floorKbps = int32(*f)
+	} else if floorKbps, err = h.store.RungABRFloor(ctx, *sess.StreamProfileID); err != nil {
 		h.log.Warn("read rung abr floor failed, skipping health evaluation",
 			"session_id", sessionID, "stream_profile_id", *sess.StreamProfileID, "err", err)
 		return
@@ -78,10 +91,13 @@ func (h *healthEvaluator) evaluateHealth(ctx context.Context, sessionID string, 
 	}
 
 	h.mu.Lock()
-	since := h.healthRuns[sessionID]
+	run := h.healthRuns[sessionID]
+	if run.floorKbps != floorKbps {
+		run = belowFloorRun{}
+	}
 	res := Evaluate(HealthSample{
 		Current:         sess.HealthState,
-		BelowFloorSince: since,
+		BelowFloorSince: run.since,
 		SetpointKbps:    setpointKbps,
 		HasSetpoint:     true,
 		FloorKbps:       floorKbps,
@@ -90,7 +106,7 @@ func (h *healthEvaluator) evaluateHealth(ctx context.Context, sessionID string, 
 	if res.BelowFloorSince.IsZero() {
 		delete(h.healthRuns, sessionID)
 	} else {
-		h.healthRuns[sessionID] = res.BelowFloorSince
+		h.healthRuns[sessionID] = belowFloorRun{since: res.BelowFloorSince, floorKbps: floorKbps}
 	}
 	h.mu.Unlock()
 
@@ -115,7 +131,8 @@ func (h *healthEvaluator) evaluateHealth(ctx context.Context, sessionID string, 
 			h.log.Warn("update session health failed", "session_id", sessionID, "err", err)
 		} else {
 			h.log.Info("session health changed",
-				"session_id", sessionID, "health_state", res.State, "reason", res.Reason)
+				"session_id", sessionID, "health_state", res.State, "reason", res.Reason,
+				"setpoint_kbps", setpointKbps, "floor_kbps", floorKbps)
 		}
 	}
 
@@ -128,7 +145,7 @@ func (h *healthEvaluator) evaluateHealth(ctx context.Context, sessionID string, 
 		h.mu.Unlock()
 		// state_detail carries the reason too (mirroring host_lost) so the client
 		// banner can read it, not just error_message.
-		reason := "unsustainable: " + res.Reason
+		reason := fmt.Sprintf("unsustainable: %s (setpoint %.0f kbps, floor %d kbps)", res.Reason, setpointKbps, floorKbps)
 		h.failSession(sessionID, reason, &reason)
 	}
 }

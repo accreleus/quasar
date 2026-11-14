@@ -20,9 +20,10 @@
 //!     doesn't touch compositor/interpipe caps or trigger renegotiation), implemented
 //!     here as [`ResolutionRung`] with its own hysteresis/dwell/settle/emergency policy
 //!     ([`ResolutionPolicy`]), actuated through `ResolutionLever` in
-//!     [`crate::session::pipeline::abr_glue`]. Ships DARK behind
-//!     [`LadderConfig::resolution_enabled`] (`abr_ladder_resolution`, default false)
-//!     until the per-host netem soak signs it off.
+//!     [`crate::session::pipeline::abr_glue`]. Behind
+//!     [`LadderConfig::resolution_enabled`] (`abr_ladder_resolution`): off by default for
+//!     WebRTC, on for a session assigned WebTransport unless the host set it
+//!     ([`LadderSettings::for_session`]).
 //!  5. **Playout increase** — `client_presentation_limited` is a control-plane/browser-trace
 //!     signal the agent never sees (invariant #1); stays with the AS-05 client-side
 //!     playout controller.
@@ -87,6 +88,12 @@ pub struct LadderSettings {
     pub floor_follows_rung: bool,
     pub order: LadderOrder,
     pub res: ResolutionPolicy,
+    /// Whether an operator set `abr_ladder_resolution` / `abr_ladder_order` (env or
+    /// override). Unset ones take the WebTransport defaults in [`Self::for_session`].
+    /// A typed-policy `deployment` choice arrives as a value and counts as set; an empty
+    /// env var is unset, since compose passes an unset variable through as "".
+    pub resolution_set: bool,
+    pub order_set: bool,
 }
 
 impl LadderSettings {
@@ -116,6 +123,8 @@ impl LadderSettings {
             order: lookup("QUASAR_ABR_LADDER_ORDER")
                 .and_then(|s| LadderOrder::parse(&s))
                 .unwrap_or(LadderOrder::Hybrid),
+            resolution_set: env_set("QUASAR_ABR_LADDER_RESOLUTION", lookup),
+            order_set: env_set("QUASAR_ABR_LADDER_ORDER", lookup),
             res: ResolutionPolicy {
                 exponent: env_f64(
                     "QUASAR_ABR_LADDER_RES_EXPONENT",
@@ -187,6 +196,7 @@ impl LadderSettings {
         }
         if let Some(x) = v.get("abr_ladder_resolution").and_then(|x| x.as_bool()) {
             self.resolution_enabled = x;
+            self.resolution_set = true;
         }
         if let Some(x) = v.get("abr_ladder_fps").and_then(|x| x.as_bool()) {
             self.fps_enabled = x;
@@ -200,6 +210,7 @@ impl LadderSettings {
         if let Some(x) = v.get("abr_ladder_order").and_then(|x| x.as_str()) {
             if let Some(o) = LadderOrder::parse(x) {
                 self.order = o;
+                self.order_set = true;
             }
         }
         if let Some(x) = v.get("abr_ladder_res_exponent").and_then(|x| x.as_f64()) {
@@ -307,10 +318,31 @@ impl LadderSettings {
     }
 }
 
+impl LadderSettings {
+    /// The knobs one session runs with (#1375): on WebTransport an unset resolution
+    /// rung is on, with `res_first` unless the host set the order, so a link under the
+    /// launch floor steps down a size instead of losing the transport. WebRTC keeps the
+    /// host values. A host that set the rung keeps its own order, and a floor that cannot
+    /// follow the rung would leave the step useless, so neither gets the default.
+    pub fn for_session(mut self, webtransport: bool) -> Self {
+        if webtransport && !self.resolution_set && self.floor_follows_rung {
+            self.resolution_enabled = true;
+            if !self.order_set {
+                self.order = LadderOrder::ResFirst;
+            }
+        }
+        self
+    }
+}
+
 impl Default for LadderSettings {
     fn default() -> Self {
         Self::from_env()
     }
+}
+
+fn env_set(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
+    lookup(var).is_some_and(|v| !v.trim().is_empty())
 }
 
 fn env_flag(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> bool {

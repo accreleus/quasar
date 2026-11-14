@@ -66,6 +66,8 @@ func Catalog() []Knob {
 		{Key: "abr_ladder_max_bias", Type: TypeInt, Default: float64(2), Min: f(0), Max: f(255), Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_MAX_BIAS"},
 		{Key: "abr_ladder_engage_dwell", Type: TypeInt, Default: float64(2), Min: f(1), Max: f(255), Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_ENGAGE_DWELL"},
 		{Key: "abr_ladder_recover_dwell", Type: TypeInt, Default: float64(2), Min: f(1), Max: f(255), Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_RECOVER_DWELL"},
+		// Default false is WebRTC's: the agent turns an unset rung on, res_first, for a
+		// session assigned WebTransport (#1375, ladder.rs LadderSettings::for_session).
 		{Key: "abr_ladder_resolution", Type: TypeBool, Default: false, Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_RESOLUTION"},
 		{Key: "abr_ladder_res_exponent", Type: TypeFloat, Default: 0.75, Min: f(0.5), Max: f(1.0), Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_RES_EXPONENT"},
 		{Key: "abr_ladder_res_engage_frac", Type: TypeFloat, Default: 0.6, Min: f(0.2), Max: f(0.95), Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_RES_ENGAGE_FRAC"},

@@ -11896,7 +11896,7 @@ export interface components {
             encode_ms_p95?: number;
             encode_ms_max?: number;
             overlay_frames?: number;
-            /** @description The governor's live floor, sent ONLY when the ladder has moved it off the launch floor. Absent means 'the floor the session launched with', never 'unknown'. Uncurated: readable via GET .../metrics, not in the diagnostic lens. */
+            /** @description The governor's live floor, sent ONLY when the ladder has moved it off the launch floor. Absent means 'the floor the session launched with', never 'unknown'. Stream health judges the setpoint against it when present (amendment 75). Uncurated: readable via GET .../metrics, not in the diagnostic lens. */
             abr_floor_kbps?: number;
             /** @description The ABR mode this session is actually running ('smooth' | 'protective' | 'off'). Reported rather than inferred: deriving it from setpoint presence was wrong for 'off', where rtpgccbwe stays attached. Uncurated (a label, not a series). */
             abr_mode?: string;
