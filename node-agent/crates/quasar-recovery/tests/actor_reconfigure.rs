@@ -641,6 +641,12 @@ fn the_rtp_mtu_is_an_agent_variable_a_reconfigure_sets() {
 #[test]
 fn the_webtransport_port_and_per_source_cap_are_agent_variables_a_reconfigure_sets() {
     let m = Machine::install(combined_env());
+    for name in ["QUASAR_WT_PORT", "QUASAR_WT_UNAUTH_PER_SOURCE"] {
+        assert!(
+            env(&m.agent(), name).is_empty(),
+            "{name} unset by default: the agent uses its own"
+        );
+    }
     let actor = m.actor();
     let (_, result) = run(
         &actor,

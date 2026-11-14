@@ -201,16 +201,19 @@ export function WebTransportCard({ hostId, now }: { hostId: string; now: number 
               {error}
             </div>
           )}
-          <SelectField
-            label="Certificate"
-            value={certificate}
-            disabled={saving}
-            onChange={(e) => setCertDraft(e.target.value as Certificate)}
-            hint="Forward the UDP port to this host, then enter https://<name>:<port>/wt. A browser on the same network needs neither: leave the URL empty to use the detected address."
-          >
-            <option value="agent">Port forward (the host’s own certificate)</option>
-            <option value="public">Reverse proxy with a public certificate (not supported for WebTransport yet)</option>
-          </SelectField>
+          <div className="mt4">
+            <SelectField
+              id={`wt-cert-${hostId}`}
+              label="Reached through"
+              value={certificate}
+              disabled={saving}
+              onChange={(e) => setCertDraft(e.target.value as Certificate)}
+              hint="Forward the UDP port to this host, then enter https://<name>:<port>/wt. A browser on the same network needs neither: leave the URL empty to use the detected address."
+            >
+              <option value="agent">Port forward (the host’s own certificate)</option>
+              <option value="public">Reverse proxy with a public certificate (not supported for WebTransport yet)</option>
+            </SelectField>
+          </div>
         </div>
       )}
     </div>

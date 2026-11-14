@@ -101,7 +101,7 @@ describe("WebTransportCard", () => {
   it("a new URL defaults to the host's own certificate (a port forward)", async () => {
     mocked.setHostWebTransport.mockResolvedValue(body());
     await show(body());
-    expect(screen.getByLabelText("Certificate")).toHaveValue("agent");
+    expect(screen.getByLabelText("Reached through")).toHaveValue("agent");
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "https://stream.example.com:4433/wt" } });
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Save" }));
@@ -116,7 +116,7 @@ describe("WebTransportCard", () => {
     mocked.setHostWebTransport.mockResolvedValue(body());
     await show(body({ override: { public_url: "https://stream.example.com/wt", certificate: "agent" } }));
     expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
-    fireEvent.change(screen.getByLabelText("Certificate"), { target: { value: "public" } });
+    fireEvent.change(screen.getByLabelText("Reached through"), { target: { value: "public" } });
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Save" }));
     });
@@ -129,7 +129,7 @@ describe("WebTransportCard", () => {
   it("an existing public certificate is shown and kept when only the URL changes", async () => {
     mocked.setHostWebTransport.mockResolvedValue(body());
     await show(body({ override: { public_url: "https://old.example.com/wt", certificate: "public" } }));
-    expect(screen.getByLabelText("Certificate")).toHaveValue("public");
+    expect(screen.getByLabelText("Reached through")).toHaveValue("public");
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "https://new.example.com/wt" } });
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Save" }));
@@ -138,6 +138,11 @@ describe("WebTransportCard", () => {
       public_url: "https://new.example.com/wt",
       certificate: "public",
     });
+  });
+
+  it("showing a host with a saved public override sends nothing", async () => {
+    await show(body({ override: { public_url: "https://stream.example.com/wt", certificate: "public" } }));
+    expect(mocked.setHostWebTransport).not.toHaveBeenCalled();
   });
 
   it("clears with null", async () => {
