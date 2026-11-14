@@ -648,7 +648,10 @@ fn a_link_that_reorders_keeps_the_estimate_at_the_link_rate() {
     let mut s = reordering(1000);
     s.run(30.0);
     let (low, mean) = (s.min_after(3.0), s.mean_after(3.0));
-    assert!(low > 0.85 * CEILING && mean > 0.95 * CEILING, "lowest {low:.0}, mean {mean:.0}");
+    assert!(
+        low > 0.85 * CEILING && mean > 0.95 * CEILING,
+        "lowest {low:.0}, mean {mean:.0}"
+    );
 }
 
 #[test]
