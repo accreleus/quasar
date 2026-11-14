@@ -847,6 +847,51 @@ func TestSwapIntoASharingDesktopOwnsTheSteamClaimOnEveryEpoch(t *testing.T) {
 	}
 }
 
+// #1246: after game -> desktop -> game swaps the session holds the Steam and
+// desktop claims. Once it ends, by a stop or by a park on exit that a desktop
+// launch then supersedes, a desktop launch minutes later shares the library.
+func TestDesktopStartAfterGameDesktopGameSwapsSharesTheLibrary(t *testing.T) {
+	for _, end := range []string{"stop", "park on exit"} {
+		t.Run(end, func(t *testing.T) {
+			f := newWarmFixture(t, 8)
+			desktop := seedDesktop(t, f, true)
+			must(t, exec(t, f.pool, `UPDATE apps SET default_encode_slots=2 WHERE id=$1::uuid`, desktop))
+			ctx := context.Background()
+			s := f.runningTile(t)
+			var tile string
+			must(t, f.pool.QueryRow(ctx, `SELECT app_id::text FROM sessions WHERE id=$1::uuid`, s).Scan(&tile))
+			for _, target := range []string{desktop, tile} {
+				if _, err := f.coord.Swap(ctx, s, target); err != nil {
+					t.Fatalf("swap into %s: %v", target, err)
+				}
+				f.disp.waitFor(t, "swap")
+				f.commitSwap(t, s)
+			}
+			ender := s
+			if end == "stop" {
+				if _, err := f.coord.Stop(ctx, s, "user_requested"); err != nil {
+					t.Fatalf("stop: %v", err)
+				}
+			} else {
+				f.coord.AgentState(ctx, f.hostID, heldStop(s))
+				ender = f.parkedID(t)
+				f.disp.waitFor(t, "start")
+				f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: ender, State: "running"})
+				if _, err := f.launch(t, desktop); err == nil {
+					t.Fatalf("desktop launch beside the parked Steam = %v, want it superseded and refused", err)
+				}
+			}
+			f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: ender, State: "stopped", HomeCleanupQualified: true})
+			must(t, exec(t, f.pool, `UPDATE sessions SET ended_at=now()-interval '5 minutes' WHERE ended_at IS NOT NULL`))
+
+			res := f.mustLaunch(t, desktop)
+			if res.Notice != "" || f.sharingOf(t, res.Session.ID) != f.steam {
+				t.Fatalf("desktop launch notice=%q shared=%q, want the library shared", res.Notice, f.sharingOf(t, res.Session.ID))
+			}
+		})
+	}
+}
+
 // A console auto-start that fails before the agent releases the unused Steam
 // claim it created, as the same failure does on a launch.
 func TestFailedConsoleAutoStartReleasesAnUnusedSteamClaim(t *testing.T) {
