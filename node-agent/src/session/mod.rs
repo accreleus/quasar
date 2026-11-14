@@ -679,7 +679,7 @@ impl SessionConfig {
         if self.abr_mode != AbrMode::Smooth {
             return None;
         }
-        let s = &self.ladder;
+        let s = &self.ladder.for_session(self.webtransport);
         if !s.enabled && !s.resolution_enabled && !s.fps_enabled {
             return None;
         }
@@ -701,7 +701,7 @@ impl SessionConfig {
     /// `GET /v1/admin/hosts/{id}/settings`, so the agent says it out loud once per
     /// session. Pure (the caller logs it) so it is testable with no tracing subscriber.
     pub fn ladder_gate_warning(&self) -> Option<String> {
-        let s = &self.ladder;
+        let s = &self.ladder.for_session(self.webtransport);
         if self.abr_mode == AbrMode::Smooth || !(s.resolution_enabled || s.fps_enabled) {
             return None;
         }
@@ -1810,6 +1810,53 @@ mod tests {
             .ladder_config()
             .is_none(),
             "mode gate precedes the fps/resolution flags"
+        );
+    }
+
+    // #1375: an unset resolution rung/order is on/res_first for a WebTransport session,
+    // WebRTC keeps the host values, and an operator's explicit setting wins on both.
+    #[test]
+    fn webtransport_defaults_the_resolution_rung_on_unless_an_operator_set_it() {
+        let ladder = |webtransport: bool, env: &[(&str, &str)], push: serde_json::Value| {
+            let mut s = settings::RuntimeSettings::baseline_with(&crate::test_env::lookup(env));
+            s.abr_mode = AbrMode::Smooth;
+            s.apply_json(&push);
+            let mut cfg = SessionConfig::for_assignment_with(&s, stream_with_floor(0), None);
+            cfg.webtransport = webtransport;
+            let lc = cfg.ladder_config().expect("smooth + speed-bias rung ⇒ Some");
+            (lc.resolution_enabled, lc.order)
+        };
+        let none = serde_json::json!({});
+        assert_eq!(
+            ladder(true, &[], none.clone()),
+            (true, ladder::LadderOrder::ResFirst),
+            "unset + WebTransport"
+        );
+        assert_eq!(
+            ladder(false, &[], none.clone()),
+            (false, ladder::LadderOrder::Hybrid),
+            "unset + WebRTC"
+        );
+        assert_eq!(
+            ladder(
+                true,
+                &[],
+                serde_json::json!({"abr_ladder_resolution": false, "abr_ladder_order": "hybrid"})
+            ),
+            (false, ladder::LadderOrder::Hybrid),
+            "override off + WebTransport"
+        );
+        assert_eq!(
+            ladder(
+                true,
+                &[
+                    ("QUASAR_ABR_LADDER_RESOLUTION", "0"),
+                    ("QUASAR_ABR_LADDER_ORDER", "fps_first")
+                ],
+                none
+            ),
+            (false, ladder::LadderOrder::FpsFirst),
+            "env off + WebTransport"
         );
     }
 
