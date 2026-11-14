@@ -27,6 +27,65 @@ Quasar behaves as on a LAN.
 - **The VPN must carry UDP with low latency.** A relayed Tailscale connection adds
   the relay's latency.
 
+## WebTransport from the internet
+
+<Aside type="caution" title="Experimental, and not a reason to publish Quasar">
+A VPN is still the supported way to reach Quasar from outside, as above. WebTransport
+is an opt-in, experimental transport in 0.6. If your instance is already published,
+this is the only way WebTransport works from outside in 0.6. It exposes one UDP
+port on the GPU host, guarded by a per-source limit on connections that have not
+authenticated yet (`QUASAR_WT_UNAUTH_PER_SOURCE`).
+</Aside>
+
+**On the same network there is nothing to set up here.** The browser connects to the
+address the host reports. The host firewall must allow the UDP port (see
+[Ports](/quasar/reference/ports/#firewall)), and the launch profile must have
+WebTransport on, since it is opt-in. Everything below is for a browser outside the
+network.
+
+**What you need:** a name that reaches the GPU host's router (here
+`stream.example.com`), and the agent's WebTransport port: UDP `4433`, or the value of
+`QUASAR_WT_PORT`. To change it, set `QUASAR_WT_PORT` in `deploy/.env` on a Compose
+install, or on an owned install, on the GPU host's machine:
+
+```bash
+docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_WT_PORT=4434
+```
+
+**What to do:**
+
+1. **Forward UDP `4433` to the GPU host.** The router sends it to the machine that
+   runs the node agent, on the same port. Allow it in the host's firewall too,
+   [from any source](/quasar/reference/ports/#firewall) for this port.
+2. **Tell Quasar the public address.** Open **Admin ▸ Fleet ▸ Hosts**, the host's
+   **WebTransport** card, then:
+   - **Public URL:** `https://stream.example.com:4433/wt`
+   - **Reached through:** *Port forward (the host's own certificate)*
+
+   Or by the API (`certificate` must be `agent`):
+
+   ```bash
+   curl -X PATCH https://<control-plane>/v1/admin/hosts/<host-id>/webtransport \
+     -H "Authorization: Bearer <admin-token>" -H "Content-Type: application/json" \
+     -d '{"public_url": "https://stream.example.com:4433/wt", "certificate": "agent"}'
+   ```
+
+   The agent's own certificate is self-signed, and Quasar gives its hash to the
+   browser, so the browser trusts it without a public certificate. The host renews
+   it by itself before it expires: there is nothing to renew or re-enter.
+
+**A reverse proxy in front of WebTransport is not supported in 0.6.** Passing
+WebTransport through a proxy such as Caddy needs a proxy feature that has not been
+released, and it failed in testing. The card still offers *Reverse proxy with a
+public certificate* because the API accepts it; it will not stream today.
+
+**How to check:** launch a session from a browser outside your network. The stats
+overlay shows `transport  WebTransport`. If it shows WebRTC, the **WebTransport
+fallback** row names the cause. Without this setup the player still works: it waits
+about 10 seconds for WebTransport, then falls back to WebRTC. The usual causes are a
+UDP port that is not forwarded, a host with no public URL, or a certificate set to
+*public*.
+
 ## On a LAN
 
 Use an address covered by the certificate, and allow the

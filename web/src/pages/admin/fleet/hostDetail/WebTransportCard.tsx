@@ -1,7 +1,7 @@
 /**
  * The host's "WebTransport" card (mock #1037, host detail): how browsers reach the
- * agent's WebTransport listener, the certificate, and the admin's public URL for an
- * edge proxy. Authorization is server-enforced (`admin(...)` on both routes); this
+ * agent's WebTransport listener, the certificate, and the admin's public URL (a port
+ * forward with the host's own certificate is the supported internet path in 0.6). Authorization is server-enforced (`admin(...)` on both routes); this
  * card is UX only (invariant #6).
  */
 
@@ -11,11 +11,14 @@ import { ApiError } from "../../../../api/client";
 import type { HostWebTransport } from "../../../../api/types";
 import { Button } from "../../../../components/Button";
 import { Chip, type ChipVariant } from "../../../../components/Chip";
+import { SelectField } from "../../../../components/TextField";
 import { useToast } from "../../../../components/Toast";
 import { useResource } from "../../../../lib/resource/react";
 import { certificateFact, unusableReason, webTransportMode } from "../webTransport";
 
 const POLL_MS = 10_000;
+
+type Certificate = "agent" | "public";
 
 export function WebTransportCard({ hostId, now }: { hostId: string; now: number }) {
   const { addToast } = useToast();
@@ -25,6 +28,7 @@ export function WebTransportCard({ hostId, now }: { hostId: string; now: number 
   );
   const wt = res.data;
   const [draft, setDraft] = useState<string | null>(null);
+  const [certDraft, setCertDraft] = useState<Certificate | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -43,6 +47,9 @@ export function WebTransportCard({ hostId, now }: { hostId: string; now: number 
 
   const saved = wt.override?.public_url ?? "";
   const value = draft ?? saved;
+  // A new URL defaults to the supported path (a port forward); a saved value is shown as it is.
+  const savedCert = wt.override?.certificate;
+  const certificate: Certificate = certDraft ?? savedCert ?? "agent";
 
   // Inline error rather than a toast (the server's message names what is wrong with the URL),
   // so this calls `mutate` directly instead of `useAdminAction`.
@@ -54,11 +61,12 @@ export function WebTransportCard({ hostId, now }: { hostId: string; now: number 
         (ctx) =>
           adminApi.setHostWebTransport(ctx.token, hostId, {
             public_url: publicUrl,
-            certificate: wt.override?.certificate ?? "public",
+            certificate: publicUrl === null ? (savedCert ?? "public") : certificate,
           }),
         (_data, next) => next,
       );
       setDraft(null);
+      setCertDraft(null);
       addToast({ variant: "success", title: publicUrl ? "Public URL saved" : "Public URL cleared" });
     } catch (e: unknown) {
       setError(e instanceof ApiError ? e.message : "Could not save the public URL.");
@@ -172,7 +180,7 @@ export function WebTransportCard({ hostId, now }: { hostId: string; now: number 
               id={`wt-url-${hostId}`}
               className="input mono"
               value={value}
-              placeholder="https://play.example.com/webtransport/host"
+              placeholder="https://stream.example.com:4433/wt"
               maxLength={2048}
               disabled={saving}
               aria-invalid={error ? true : undefined}
@@ -181,7 +189,7 @@ export function WebTransportCard({ hostId, now }: { hostId: string; now: number 
                 setError(null);
               }}
             />
-            <Button disabled={saving || !value.trim() || value === saved} onClick={() => void write(value.trim())}>
+            <Button disabled={saving || !value.trim() || (value === saved && certificate === savedCert)} onClick={() => void write(value.trim())}>
               Save
             </Button>
             <Button disabled={saving || !wt.override} onClick={() => void write(null)}>
@@ -193,10 +201,19 @@ export function WebTransportCard({ hostId, now }: { hostId: string; now: number 
               {error}
             </div>
           )}
-          <p className="hint">
-            Set this when browsers reach this host through your reverse proxy. Leave it empty to use the detected
-            address.
-          </p>
+          <div className="mt4">
+            <SelectField
+              id={`wt-cert-${hostId}`}
+              label="Reached through"
+              value={certificate}
+              disabled={saving}
+              onChange={(e) => setCertDraft(e.target.value as Certificate)}
+              hint="Forward the UDP port to this host, then enter https://<name>:<port>/wt. A browser on the same network needs neither: leave the URL empty to use the detected address."
+            >
+              <option value="agent">Port forward (the host’s own certificate)</option>
+              <option value="public">Reverse proxy with a public certificate (not supported for WebTransport yet)</option>
+            </SelectField>
+          </div>
         </div>
       )}
     </div>
