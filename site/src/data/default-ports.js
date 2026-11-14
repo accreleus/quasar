@@ -5,6 +5,6 @@ export const DEFAULT_PORTS = [
   ['8080', 'TCP / HTTP', 'Enrollment and health', 'GPU host → control plane; local health checks'],
   ['9091', 'TCP / HTTP', 'Agent health', 'Localhost on GPU host only'],
   ['Host ephemeral range', 'UDP', 'Game stream and input', 'Browser ↔ GPU host, directly'],
-  ['4433', 'UDP / WebTransport', 'Optional WebTransport stream (`QUASAR_WT_PORT`; only sessions on WebTransport use it)', 'Browser ↔ GPU host, directly'],
+  ['4433', 'UDP / WebTransport', 'Optional WebTransport stream (QUASAR_WT_PORT; only sessions on WebTransport use it)', 'Browser ↔ GPU host, directly'],
   ['5353', 'UDP / mDNS', 'Chromium local ICE candidates', 'LAN peers ↔ GPU host'],
 ];
