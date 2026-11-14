@@ -873,7 +873,9 @@ func TestSwapIntoAnUnmanagedAppBesideALegacyMarkedSteamClaimRefusesNothing(t *te
 		RETURNING id::text`).Scan(&unmanaged))
 	entitleAll(t, f.pool, unmanaged)
 	must(t, exec(t, f.pool, `UPDATE managed_home_claims SET legacy_unprotected_dispatch=true`))
-	must(t, f.store.GuardPlacementForSwap(ctx, a, unmanaged, f.hostID))
+	unmanagedApp, err := f.store.GetLaunchApp(ctx, unmanaged)
+	must(t, err)
+	must(t, f.store.GuardPlacementForSwap(ctx, a, unmanagedApp, f.hostID))
 
 	p := launchParams(f.seedIDs)
 	p.AppID, p.HomeAppID, p.ManagedHome = f.steam, f.steam, true
