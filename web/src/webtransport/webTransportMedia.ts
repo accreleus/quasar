@@ -453,7 +453,9 @@ export class WebTransportMedia implements MediaTransport {
     this.connected = true;
     this.live = live;
     this.router = router;
-    this.datagramWriter = wt.datagrams.writable.getWriter();
+    // Safari ships the newer spec shape: `datagrams.createWritable()` and no `writable` (#1403).
+    const dg = wt.datagrams as WebTransportDatagramDuplexStream & { createWritable?: () => WritableStream<Uint8Array> };
+    this.datagramWriter = (dg.createWritable ? dg.createWritable() : dg.writable).getWriter();
     sink.streams?.(audioStreamsFrom(first));
     router.config(config);
     const ping = () => this.send({ type: "ping", id: ++this.pingId, tc: this.now() });
