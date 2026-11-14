@@ -293,7 +293,10 @@ export async function createWebGpuPresenter(
   const device = await withTimeout(adapter.requestDevice({ requiredFeatures }), WEBGPU_ADAPTER_TIMEOUT_MS, null);
   if (!device) return null;
   const context = canvas.getContext("webgpu");
-  if (!context) return null;
+  if (!context) {
+    device.destroy();
+    return null;
+  }
 
   let failed = false;
   let destroyed = false;

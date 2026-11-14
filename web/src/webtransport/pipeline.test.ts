@@ -893,6 +893,13 @@ describe("createWebGpuPresenter", () => {
     expect(a.closed && b.closed).toBe(true);
   });
 
+  it("destroys the device when the canvas refuses a WebGPU context", async () => {
+    const g = fakeGpu(false);
+    (g.canvas as unknown as { getContext: () => null }).getContext = () => null;
+    expect(await createWebGpuPresenter(g.canvas, () => {})).toBeNull();
+    expect(g.deviceDestroyed.n).toBe(1);
+  });
+
   it("gives up on an adapter or a device request that never answers, so the session falls back", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
