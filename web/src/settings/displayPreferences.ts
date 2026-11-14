@@ -25,7 +25,8 @@ export interface DisplayPreferences {
    *  into, instead of stretching it. Per device like the scaling mode beside it;
    *  absent means on. */
   upscaleSharpen?: boolean;
-  /** #1401: the touch pad drawn over the picture. Per device; absent means on. */
+  /** #1401: the touch pad drawn over the picture. Per device; opt-in, absent means off
+   *  (the layout is a first pass, #1405). */
   onScreenControls?: boolean;
 }
 
@@ -53,7 +54,7 @@ export function loadDisplayPreferences(): DisplayPreferences {
       ...(preferredMicDeviceId ? { preferredMicDeviceId } : {}),
       ...(parsed.launchImmersive === false ? { launchImmersive: false } : {}),
       ...(parsed.upscaleSharpen === false ? { upscaleSharpen: false } : {}),
-      ...(parsed.onScreenControls === false ? { onScreenControls: false } : {}),
+      ...(parsed.onScreenControls === true ? { onScreenControls: true } : {}),
     };
   } catch {
     return { ...DEFAULT_PREFS };
@@ -85,5 +86,5 @@ export function upscaleSharpen(): boolean {
 
 /** #1401: whether the on-screen controls are on for this device. */
 export function onScreenControls(): boolean {
-  return loadDisplayPreferences().onScreenControls !== false;
+  return loadDisplayPreferences().onScreenControls === true;
 }

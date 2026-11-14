@@ -127,6 +127,8 @@
   --osc-u: clamp(44px, 13vmin, 80px);
   --osc-edge: clamp(var(--s4), 3vmin, 28px);
   --osc-key: max(44px, calc(var(--osc-u) * 0.8));
+  /* The collapsed HUD pill is 38px tall and docked to the bottom edge: the clusters sit above it. */
+  --osc-lift: var(--s9);
   --osc-cluster-h: calc(var(--osc-key) + var(--osc-u) * 4.8 + var(--s2) * 2);
 }
 .osc-btn,
@@ -167,7 +169,7 @@
 /* Stacked top to bottom: shoulders, d-pad or face diamond, stick. */
 .osc-cluster {
   position: absolute;
-  bottom: calc(var(--osc-edge) + env(safe-area-inset-bottom, 0px));
+  bottom: calc(var(--osc-lift) + env(safe-area-inset-bottom, 0px));
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -253,5 +255,5 @@
 
 /* Portrait: the clusters fill the width, so Start/Select ride above them. */
 @media (orientation: portrait) {
-  .osc-meta { bottom: calc(var(--osc-edge) + var(--osc-cluster-h) + var(--s2) + env(safe-area-inset-bottom, 0px)); }
+  .osc-meta { bottom: calc(var(--osc-lift) + var(--osc-cluster-h) + var(--s2) + env(safe-area-inset-bottom, 0px)); }
 }
