@@ -123,6 +123,18 @@ beforeEach(() => {
 });
 afterEach(() => localStorage.clear());
 
+describe("StatsPane — WebTransport fallback cause (#1403)", () => {
+  it("shows the cause under the transport row only when there is one", () => {
+    const cause = "internal: TypeError: datagrams are not readable";
+    const { unmount } = renderDetail({ transport: "webrtc", transportFallbackReason: "internal", transportFallbackCause: cause });
+    expect(screen.getByText("WebTransport fallback")).toBeTruthy();
+    expect(screen.getByText(cause)).toBeTruthy();
+    unmount();
+    renderDetail({ transport: "webrtc", transportFallbackReason: "internal" });
+    expect(screen.queryByText("WebTransport fallback")).toBeNull();
+  });
+});
+
 describe("StatsPane simple view", () => {
   it("shows the four cards anyone acts on", () => {
     const { push } = renderPane();

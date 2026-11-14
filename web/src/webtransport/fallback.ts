@@ -25,6 +25,19 @@ export function fallbackReason(code: string): string | null {
   return FALLBACK_REASONS.has(code) ? code : "internal";
 }
 
+/** The cause a phone user can read when the HUD is all there is: the code, then the error's own
+ *  name and message (the code alone, `internal`, hid why Safari fell back), capped for the pane. */
+export function fallbackCause(code: string, err?: unknown): string {
+  const parts = [code];
+  if (err instanceof Error) {
+    if (err.name !== "TransportError") parts.push(err.name);
+    if (err.message && err.message !== code) parts.push(err.message);
+  } else if (err !== undefined) {
+    parts.push(String(err));
+  }
+  return parts.join(": ").slice(0, 200);
+}
+
 const REMEMBER_PREFIX = "quasar.wt-fallback.";
 
 /** Keeps a session on WebRTC across a reload of this tab, so each reload does not retry WebTransport. */

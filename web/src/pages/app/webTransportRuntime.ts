@@ -15,7 +15,7 @@ import { TraceEventEmitter } from "../../webrtc/traceEvents";
 import { AudioOut, type AudioOutDeps } from "../../webtransport/audioOut";
 import { MicOut, type MicOutDeps } from "../../webtransport/micOut";
 import { DecodeStage, type DecodeFailure, type DecodeStageOptions } from "../../webtransport/decodeStage";
-import { fallbackReason } from "../../webtransport/fallback";
+import { fallbackCause, fallbackReason } from "../../webtransport/fallback";
 import { Playout } from "../../webtransport/playout";
 import { createWebGpuPresenter, type Presenter } from "../../webtransport/presenter";
 import { WtTelemetry, type WtTelemetryOptions } from "../../webtransport/telemetry";
@@ -86,8 +86,9 @@ export interface WebTransportRuntimeConfig {
      *  human copy for the failure card. */
     onTransportFailed(detail: string): void;
     /** WebTransport has been closed and the page should carry on over WebRTC.
-     *  `reason` is the `transport.fallback` reason (control-api.md §Transport fallback). */
-    onFallback(reason: string): void;
+     *  `reason` is the `transport.fallback` reason (control-api.md §Transport fallback); `cause`
+     *  is the error's own text, for the HUD only (never sent anywhere). */
+    onFallback(reason: string, cause: string): void;
   };
   deps?: Partial<WebTransportRuntimeDeps>;
 }
@@ -124,6 +125,8 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     if (now - stableVideoSince >= MEDIA_RETRY_RESET_MS) reconnected = false;
   }
   let recovering = false;
+  /** Our own 4400 for a dead datagram reader (#1403): its reason is the cause of a later stream_lost. */
+  let lostCause: string | undefined;
   let recoveryDeadline: ReturnType<typeof setTimeout> | null = null;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   let wakeRetry: (() => void) | null = null;
@@ -202,18 +205,20 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   };
 
   // A failure the contract falls back on hands the session to WebRTC; the rest end this view.
-  const fail = (code: string, terminal = false, message?: string) => {
+  const fail = (code: string, terminal = false, message?: string, err?: unknown) => {
     if (failed || destroyed) return;
     failed = true;
     const closed = stop();
     const reason = terminal ? null : fallbackReason(code);
     if (reason) {
+      const cause = fallbackCause(code, err);
+      console.warn("webtransport: falling back to WebRTC:", cause);
       // WebRTC's own input path takes over; nothing is left capturing for this connection.
       set({ status: "falling back to WebRTC…", channelOpen: false, inputCaptured: false, pointerLocked: false });
       // Close first (control-api.md §Transport fallback): the page opens WebRTC only once the
       // WebTransport session has been told to close, which close() bounds to a short wait.
       void Promise.resolve(closed).then(() => {
-        if (!destroyed) cfg.callbacks.onFallback(reason);
+        if (!destroyed) cfg.callbacks.onFallback(reason, cause);
       });
       return;
     }
@@ -301,14 +306,14 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
         cfg.canvas,
         (message) => {
           console.warn("presenter:", message);
-          fail("gpu_failed");
+          fail("gpu_failed", false, undefined, message);
         },
         { pyrowave: cfg.pyrowave === true },
       );
     } catch (err) {
       // requestAdapter, requestDevice or configure refused.
       console.warn("presenter:", err);
-      fail("gpu_failed");
+      fail("gpu_failed", false, undefined, err);
       return;
     }
     // Destroyed, or the device failed while the presenter was being made: no transport then.
@@ -457,7 +462,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
         takenOver();
       } else if (code !== "closed") {
         if (code === "session_ended") cfg.callbacks.onDisconnectSuspected();
-        fail(code);
+        fail(code, false, undefined, err);
       }
       return;
     }
@@ -543,6 +548,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       fail("session_ended");
       return;
     }
+    lostCause = e.code === 4400 && e.reason.startsWith("datagrams:") ? e.reason : undefined;
     stableVideoSince = null;
     transport = null; // the closed one's own `end` is then not this view's
     teardownInput();
@@ -572,7 +578,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
             return;
           }
           if (reconnected && !connectivityFailed) {
-            fail("stream_lost");
+            fail("stream_lost", false, undefined, lostCause);
             return;
           }
           const coords = await mintCoords();
@@ -584,7 +590,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
             // media path: one more try, then fall back, never a tight loop of token mints.
             if (connectivityFailed) await retryWait(Math.min(1_000 * 2 ** attempt++, 4_000), attemptedAt);
             else if (endedAtOnce++ >= 1) {
-              fail("stream_lost");
+              fail("stream_lost", false, undefined, lostCause);
               return;
             }
             continue;
@@ -610,7 +616,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
             try {
               const { session } = await getSession(cfg.authToken, cfg.sessionId);
               if (destroyed || failed) return;
-              fail(session.state === "running" ? "stream_lost" : "session_ended");
+              fail(session.state === "running" ? "stream_lost" : "session_ended", false, undefined, err);
               return;
             } catch (probeError) {
               if (probeError instanceof ApiError && probeError.status < 500) {

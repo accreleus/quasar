@@ -178,6 +178,8 @@ export interface FakeConnection {
   /** Every close() the client made on it. */
   closes: (WebTransportCloseInfo | undefined)[];
   datagrams(ds: Uint8Array[]): void;
+  /** The browser errors the incoming datagram stream, as Safari does with a NetworkError. */
+  failDatagrams(err: unknown): void;
   control(m: object): void;
   closeWith(code: number): void;
 }
@@ -200,6 +202,8 @@ export class FakeAgent {
   hold: "ready" | "stream" | "write" | "answer" | null = null;
   /** Off: datagrams already in flight still arrive after close(), the case a stale attempt must ignore. */
   closeEndsDatagrams = true;
+  /** Safari's datagram shape (the current spec): `createWritable()` and no `writable`. */
+  safariDatagrams = false;
   /** The await the client is parked at, once it gets there. */
   reached: string | null = null;
   private gate: { promise: Promise<void>; open: () => void } | null = null;
@@ -234,6 +238,7 @@ export class FakeAgent {
       options,
       closes: [],
       datagrams: (ds) => ds.forEach((d) => dgram?.enqueue(d)),
+      failDatagrams: (err) => dgram?.error(err),
       control: (m) => {
         try {
           ctl?.enqueue(encodeControl(m));
@@ -276,10 +281,11 @@ export class FakeAgent {
     const wt = {
       ready,
       closed,
-      datagrams: {
-        readable: new ReadableStream<Uint8Array>({ start: (c) => void (dgram = c) }),
-        writable: new WritableStream<Uint8Array>({ write: (chunk) => void agent.datagramsSent.push(chunk) }),
-      },
+      datagrams: (() => {
+        const readable = new ReadableStream<Uint8Array>({ start: (c) => void (dgram = c) });
+        const writable = () => new WritableStream<Uint8Array>({ write: (chunk) => void agent.datagramsSent.push(chunk) });
+        return this.safariDatagrams ? { readable, createWritable: writable } : { readable, writable: writable() };
+      })(),
       async createBidirectionalStream() {
         await agent.parked("stream");
         return {
