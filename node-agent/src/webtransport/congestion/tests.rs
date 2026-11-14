@@ -10,6 +10,7 @@ const NO_QUIC: QuicPath = QuicPath {
     rtt: RTT,
     cwnd_bytes: 0,
     congestion_events: 0,
+    queued_bytes: 0,
 };
 
 /// A one-hop path for the estimator, simulated: 60 fps frames sent as bursts into a
@@ -1213,17 +1214,26 @@ fn a_report_is_evidence_only_when_the_link_held_the_sender_back() {
 const PYRO_TARGET: u32 = 200_000;
 const PYRO_FLOOR: u32 = 100_000;
 
-/// A LAN path whose QUIC window allows `kbps` at a 1 ms RTT.
+/// A LAN path whose QUIC window allows `kbps` at a 1 ms RTT, the sender under it.
 fn quic_at(kbps: f64) -> QuicPath {
     QuicPath {
         rtt: Duration::from_millis(1),
         cwnd_bytes: (kbps * 1000.0 / 8.0 * 0.001) as u64,
         congestion_events: 0,
+        queued_bytes: 0,
+    }
+}
+
+/// As [`quic_at`], with datagrams waiting on the window: QUIC limits the sender.
+fn backed_up(kbps: f64) -> QuicPath {
+    QuicPath {
+        queued_bytes: 64 * 1024,
+        ..quic_at(kbps)
     }
 }
 
 fn budget_of(kbps: f64) -> u32 {
-    (kbps * PYRO_PAYLOAD_SHARE) as u32
+    pyro_budget(kbps)
 }
 
 /// 40 PyroWave datagrams sent at `at`, the next `pkt_seq` after `seq`.
@@ -1290,14 +1300,42 @@ fn pyrowave_quic_cap_applies_from_the_first_feedback_and_never_lifts_the_target(
     };
     let at = on + Duration::from_millis(600);
     assert_eq!(
-        rate.on_feedback(&fb, at, quic_at(150_000.0)),
+        rate.on_feedback(&fb, at, backed_up(150_000.0)),
         PyroVerdict::Budget(budget_of(150_000.0)),
         "min(target, estimate) with the estimate capped by QUIC"
     );
     assert_eq!(
-        rate.on_tick(at + Duration::from_millis(100), quic_at(8_000_000.0)),
+        rate.on_tick(at + Duration::from_millis(100), backed_up(8_000_000.0)),
         PyroVerdict::Budget(target),
         "a wider window never lifts the budget past the target"
+    );
+    assert_eq!(
+        rate.on_tick(at + Duration::from_millis(200), quic_at(150_000.0)),
+        PyroVerdict::Hold,
+        "a small window with nothing queued is the sender's own rate, not a cap"
+    );
+    let lossy = QuicPath {
+        congestion_events: 1,
+        ..quic_at(150_000.0)
+    };
+    assert_eq!(
+        rate.on_tick(at + Duration::from_millis(300), lossy),
+        PyroVerdict::Budget(budget_of(150_000.0)),
+        "congestion since the last judgement: QUIC limits the sender"
+    );
+    assert_eq!(
+        rate.on_tick(at + Duration::from_millis(400), lossy),
+        PyroVerdict::Budget(target),
+        "no new congestion and an empty queue: the cap lets go"
+    );
+    let unknown = QuicPath {
+        cwnd_bytes: 0,
+        ..backed_up(150_000.0)
+    };
+    assert_eq!(
+        rate.on_tick(at + Duration::from_millis(500), unknown),
+        PyroVerdict::Hold,
+        "no window known: no cap"
     );
 }
 
@@ -1305,7 +1343,7 @@ fn pyrowave_quic_cap_applies_from_the_first_feedback_and_never_lifts_the_target(
 fn pyrowave_under_the_floor_for_1_s_steps_down_and_not_before() {
     let on = Instant::now();
     let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
-    let narrow = quic_at(80_000.0);
+    let narrow = backed_up(80_000.0);
     let mut seq = 0;
     let first = pyro_send(&mut rate, &mut seq, on);
     let fb = Feedback {
@@ -1316,8 +1354,8 @@ fn pyrowave_under_the_floor_for_1_s_steps_down_and_not_before() {
     let start = on + Duration::from_millis(50);
     assert_eq!(
         rate.on_feedback(&fb, start, narrow),
-        PyroVerdict::Budget(budget_of(f64::from(PYRO_FLOOR))),
-        "under the floor the budget holds at the floor"
+        PyroVerdict::Budget(budget_of(80_000.0)),
+        "under the floor the budget is still min(target, estimate)"
     );
     // Back over the floor for a moment: the 1 s starts again.
     rate.on_tick(start + Duration::from_millis(500), quic_at(8_000_000.0));
@@ -1369,7 +1407,7 @@ fn pyrowave_feedback_silence_does_not_step_down() {
 fn pyrowave_withheld_feedback_is_judged_on_quic_from_1_s_after_the_switch_on() {
     let on = Instant::now();
     let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
-    let narrow = quic_at(80_000.0);
+    let narrow = backed_up(80_000.0);
     let mut stepped = None;
     for ms in (0..=3000u64).step_by(100) {
         if let PyroVerdict::StepDown { .. } = rate.on_tick(on + Duration::from_millis(ms), narrow) {
@@ -1382,4 +1420,110 @@ fn pyrowave_withheld_feedback_is_judged_on_quic_from_1_s_after_the_switch_on() {
         Some(2000),
         "the cap from 1 s, then 1 s under the floor"
     );
+}
+
+/// Clean feedback for `secs` on a path that carries everything at once, 60 fps frames of
+/// `frame_datagrams` each; the verdicts, in order.
+fn pyro_clean_run(
+    rate: &mut PyroRate,
+    on: Instant,
+    path: QuicPath,
+    frame_datagrams: u32,
+    secs: u64,
+) -> Vec<PyroVerdict> {
+    let mut verdicts = Vec::new();
+    let (mut seq, mut unreported) = (0u32, Vec::new());
+    let (mut next_frame, mut next_fb, mut next_tick) = (0u64, 50_000u64, 100_000u64);
+    let end = secs * 1_000_000;
+    while next_frame.min(next_fb).min(next_tick) < end {
+        let t = next_frame.min(next_fb).min(next_tick);
+        let at = on + Duration::from_micros(t);
+        if t == next_frame {
+            for i in 0..frame_datagrams {
+                let mut d = vec![0u8; SIZE];
+                d[1..5].copy_from_slice(&seq.to_le_bytes());
+                rate.log.record(&d, at, false);
+                // 1 ms one way, then 1 Gbit/s.
+                unreported.push((seq, t + 1_000 + u64::from(i) * 9));
+                seq += 1;
+            }
+            next_frame += 16_667;
+        } else if t == next_fb {
+            next_fb += 50_000;
+            let arrived: Vec<_> = unreported
+                .iter()
+                .filter(|&&(_, a)| a <= t)
+                .copied()
+                .collect();
+            unreported.retain(|&(_, a)| a > t);
+            let Some(&(first, ref_us)) = arrived.first() else {
+                continue;
+            };
+            let fb = Feedback {
+                first_pkt_seq: first,
+                ref_us,
+                arrivals: arrived
+                    .iter()
+                    .map(|&(_, a)| ((a - ref_us) / UNIT_US) as u16)
+                    .collect(),
+            };
+            verdicts.push(rate.on_feedback(&fb, at, path));
+        } else {
+            next_tick += 100_000;
+            verdicts.push(rate.on_tick(at, path));
+        }
+    }
+    verdicts
+}
+
+#[test]
+fn pyrowave_an_application_limited_sender_with_a_small_window_never_steps_down() {
+    let on = Instant::now();
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
+    // Quinn's first window (12 000 B) at a 1 ms RTT: 96 Mbit/s, under the floor. A dark
+    // screen's frames fit it, so nothing queues and Cubic never grows it.
+    let window = QuicPath {
+        cwnd_bytes: 12_000,
+        ..quic_at(0.0)
+    };
+    let verdicts = pyro_clean_run(&mut rate, on, window, 8, 10);
+    assert!(
+        !verdicts
+            .iter()
+            .any(|v| matches!(v, PyroVerdict::StepDown { .. })),
+        "stepped down: {:?}",
+        verdicts
+            .iter()
+            .find(|v| matches!(v, PyroVerdict::StepDown { .. }))
+    );
+    assert_eq!(rate.budget, budget_of(f64::from(PYRO_TARGET)));
+}
+
+#[test]
+fn pyrowave_clean_feedback_at_the_target_for_10_s_never_steps_down() {
+    let on = Instant::now();
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
+    // 200 Mbit/s at 60 fps: 363 full datagrams a frame.
+    let verdicts = pyro_clean_run(&mut rate, on, quic_at(8_000_000.0), 363, 10);
+    assert!(
+        !verdicts
+            .iter()
+            .any(|v| matches!(v, PyroVerdict::StepDown { .. })),
+        "stepped down on a clean link"
+    );
+    assert!(
+        rate.estimator.estimate_kbps >= f64::from(PYRO_FLOOR),
+        "estimate {:.0}",
+        rate.estimator.estimate_kbps
+    );
+}
+
+#[test]
+fn the_abr_resumes_from_the_estimate_it_is_handed_never_above_its_ceiling() {
+    let now = Instant::now();
+    let mut est = Estimator::new(CEILING, now);
+    est.resume_at(3000.0);
+    assert_eq!(est.estimate_kbps(), 3000.0);
+    est.resume_at(2.0 * CEILING);
+    assert_eq!(est.estimate_kbps(), CEILING);
 }

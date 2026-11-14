@@ -2145,6 +2145,7 @@ fn answered(control: &mut Control, first: u32, at: std::time::Instant) {
         rtt: Duration::from_millis(20),
         cwnd_bytes: 0,
         congestion_events: 0,
+        queued_bytes: 0,
     };
     control.feedback(&fb, path, at + Duration::from_millis(250));
 }
@@ -4774,15 +4775,37 @@ async fn a_pyrowave_client_gets_frames_that_rejoin_byte_for_byte_and_can_fall_ba
     assert_eq!(nal_types(&first.data).last(), Some(&5));
 }
 
-/// codec-pyrowave.md §Rate: feedback that keeps the estimate under `floor_kbps` for 1 s steps
-/// the session down to the standard codec, reason `congestion`.
+/// codec-pyrowave.md §Rate: feedback lowers the encoder's live `bitrate`; under `floor_kbps`
+/// for 1 s it steps the session down to the standard codec, reason `congestion`, and the ABR
+/// resumes from the PyroWave estimate, not from its ceiling.
 #[tokio::test]
 async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
-    let agent = agent().await;
+    let fed = Arc::new(Mutex::new(Vec::<f64>::new()));
+    let observed = fed.clone();
+    let agent = agent_built(
+        Stream::H264,
+        Limits::default(),
+        audio::Plan::default(),
+        "ball",
+        move |_| {
+            Some(Rate {
+                measured: Box::new(|_| {}),
+                ceiling_kbps: 1_000_000.0,
+                floor_kbps: Box::new(|| 500.0),
+                retargets: true,
+                start: Box::new(|| {}),
+                observe: Box::new(move |kbps| observed.lock().unwrap().push(kbps)),
+            })
+        },
+    )
+    .await;
     let media = agent.listener.registry().lock()[SESSION]
         .media
         .clone()
         .unwrap();
+    // The element only: its `bitrate` is what the stream loop writes. No device is opened.
+    let _ = gstpyrowave::plugin_register_static();
+    let encoder = gst::ElementFactory::make("pyrowaveenc").build().unwrap();
     media.grant_pyrowave(
         PyroWaveGrant {
             wanted: true,
@@ -4793,6 +4816,7 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
         (320, 192, 60),
         true,
     );
+    media.pyrowave_encoder(encoder.downgrade());
     let raw = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../testdata/pyrowave/detail_320x192_xhi.pwv1"
@@ -4805,7 +4829,6 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
     write_message(&mut send, &hello).await.unwrap();
     let ack = read_message(&mut recv).await.unwrap();
     assert_eq!(ack["video"]["codec"], "pyrowave");
-    let switched_on = Instant::now();
 
     // A path that loses all but the first datagram of each report.
     let (mut seqs, mut fb_seq) = (Vec::new(), 0u64);
@@ -4842,17 +4865,40 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
     assert_eq!(back["type"], "hello_ack");
     assert_eq!(back["video"]["codec"], "h264");
     assert_eq!(back["codec_switch_reason"], "congestion");
-    assert!(
-        switched_on.elapsed() >= Duration::from_secs(1),
-        "stepped down {:?} after the switch on",
-        switched_on.elapsed()
-    );
     let reasons: Vec<_> = media
         .take_switched(true)
         .into_iter()
         .map(|s| s["reason"].clone())
         .collect();
     assert_eq!(reasons, [json!("launch"), json!("congestion")]);
+    let floor_budget = congestion::pyro_budget(100_000.0);
+    let written = encoder.property::<u32>("bitrate");
+    assert!(
+        written < floor_budget,
+        "the encoder's live bitrate followed the estimate under the floor: {written} kbit/s"
+    );
+    assert!(fed.lock().unwrap().is_empty(), "PyroWave fed the ABR");
+
+    // H.264 on a clean path: the ABR's first estimate starts from PyroWave's, under the floor,
+    // not from its 1 000 000 kbit/s ceiling.
+    let mut path = Bottleneck::new(1e6);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fed.lock().unwrap().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "H.264 feedback never fed the ABR"
+        );
+        if let Ok(d) =
+            tokio::time::timeout(Duration::from_millis(50), session.read_datagram()).await
+        {
+            path.receive(&d.unwrap());
+        }
+        if let Some(feedback) = path.feedback() {
+            write_message(&mut send, &feedback).await.unwrap();
+        }
+    }
+    let first = fed.lock().unwrap()[0];
+    assert!(first < 110_000.0, "the ABR resumed at {first:.0} kbit/s");
 }
 
 /// A session id assigned again while its tap runs gets a fresh registry entry, which no longer

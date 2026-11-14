@@ -224,6 +224,8 @@ pub(crate) struct QuicPath {
     pub(crate) rtt: Duration,
     pub(crate) cwnd_bytes: u64,
     pub(crate) congestion_events: u64,
+    /// Bytes waiting in quinn's datagram queue: QUIC is holding the sender back.
+    pub(crate) queued_bytes: u64,
 }
 
 /// Which bound the estimate sits at; silence decays the delay and loss bounds.
@@ -498,6 +500,14 @@ impl Estimator {
     #[cfg(test)]
     pub(crate) fn estimate_kbps(&self) -> f64 {
         self.estimate_kbps
+    }
+
+    /// Start again from `kbps` (never above the ceiling): codec-pyrowave.md §Rate, the ABR
+    /// resumes from the estimate after a switch back.
+    pub(crate) fn resume_at(&mut self, kbps: f64) {
+        self.delay_kbps = kbps;
+        self.loss_kbps = kbps;
+        self.settle();
     }
 
     /// The loss fraction the last message's window measured; `None` on too few datagrams.
@@ -856,6 +866,12 @@ const PYRO_PAYLOAD_SHARE: f64 =
     (super::media::MAX_DATAGRAM - super::media::HEADER - super::pyrowave::HEADER) as f64
         / super::media::MAX_DATAGRAM as f64;
 
+/// codec-pyrowave.md §Rate: the encoder's `bitrate` for an estimate, kbit/s, less the
+/// agent's datagram overhead. The one place the budget is computed, the launch value too.
+pub(crate) fn pyro_budget(kbps: f64) -> u32 {
+    (kbps * PYRO_PAYLOAD_SHARE) as u32
+}
+
 /// What [`PyroRate`] asks of the session.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum PyroVerdict {
@@ -873,6 +889,11 @@ pub(crate) enum PyroVerdict {
 /// what the QUIC connection carries from `min(first feedback, switch on + 1 s)`. Feedback
 /// silence does not decay it, as on the standard codec it never takes the encoder under
 /// the floor; QUIC's cap still applies, so withholding feedback cannot postpone a step-down.
+///
+/// The cap counts only while QUIC limits the sender: its datagram queue holds bytes, or it
+/// saw congestion since the last judgement. Quinn's Cubic does not grow its window while the
+/// sender is application-limited (small frames: a dark or still screen), so window over RTT
+/// is then what was sent, not what the link carries, and must never step a session down.
 pub(crate) struct PyroRate {
     estimator: Estimator,
     pub(crate) log: SendLog,
@@ -884,6 +905,8 @@ pub(crate) struct PyroRate {
     below_since: Option<Instant>,
     /// The `bitrate` last asked for.
     budget: u32,
+    /// QUIC's congestion events at the last judgement.
+    events: Option<u64>,
 }
 
 impl PyroRate {
@@ -896,7 +919,9 @@ impl PyroRate {
             on: now,
             judged_from: None,
             below_since: None,
-            budget: target_kbps,
+            // The first judgement always writes: a previous client may have left a lower one.
+            budget: 0,
+            events: None,
         }
     }
 
@@ -921,8 +946,13 @@ impl PyroRate {
 
     fn judge(&mut self, now: Instant, path: QuicPath) -> PyroVerdict {
         let mut kbps = self.estimator.estimate_kbps.min(self.target_kbps);
+        let events = self.events.replace(path.congestion_events);
+        let quic_limits =
+            path.queued_bytes > 0 || events.is_some_and(|was| path.congestion_events > was);
         if self.judged_from.is_some() {
-            kbps = kbps.min(quic_kbps(path));
+            if quic_limits {
+                kbps = kbps.min(quic_kbps(path));
+            }
             if kbps < self.floor_kbps {
                 let since = *self.below_since.get_or_insert(now);
                 if now.saturating_duration_since(since) >= PYRO_STEP_DOWN_AFTER {
@@ -934,7 +964,7 @@ impl PyroRate {
                 self.below_since = None;
             }
         }
-        let budget = (kbps.max(self.floor_kbps) * PYRO_PAYLOAD_SHARE) as u32;
+        let budget = pyro_budget(kbps);
         if budget == self.budget {
             return PyroVerdict::Hold;
         }
@@ -943,9 +973,10 @@ impl PyroRate {
     }
 }
 
-/// What the connection's congestion controller permits: its window over the smoothed RTT.
+/// What the connection's congestion controller permits: its window over the smoothed RTT;
+/// unbounded when either is unknown (0).
 fn quic_kbps(path: QuicPath) -> f64 {
-    if path.rtt.is_zero() {
+    if path.rtt.is_zero() || path.cwnd_bytes == 0 {
         return f64::INFINITY;
     }
     path.cwnd_bytes as f64 * 8.0 / path.rtt.as_secs_f64() / 1000.0

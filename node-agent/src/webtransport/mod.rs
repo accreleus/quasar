@@ -590,7 +590,7 @@ fn pyrowave_branch(
     let started = crate::session::pipeline::pyrowave_branch::start_encoder(
         cfg,
         feed,
-        grant.target_kbps,
+        congestion::pyro_budget(f64::from(grant.target_kbps)),
         move || gate.upgrade().is_some_and(|m| m.pyrowave_active()),
         move |buffer| {
             if let Some(media) = frames.upgrade() {
@@ -1442,6 +1442,7 @@ fn quic_path(session: &Session) -> congestion::QuicPath {
         rtt: path.rtt,
         cwnd_bytes: path.cwnd,
         congestion_events: path.congestion_events,
+        queued_bytes: DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space()) as u64,
     }
 }
 
@@ -1469,6 +1470,7 @@ fn pyro_act(
     media: &Media,
     client: &Attached,
     pyro: &mut Option<congestion::PyroRate>,
+    control: Option<&mut Control>,
     verdict: congestion::PyroVerdict,
 ) {
     // A displaced client's loop must not write its successor's encoder.
@@ -1486,6 +1488,9 @@ fn pyro_act(
                 "PyroWave estimate under the floor for 1 s; stepping down to the standard codec"
             );
             *pyro = None;
+            if let Some(control) = control {
+                control.estimator.resume_at(estimate_kbps);
+            }
             media.switch_off(Some(client.id), "congestion");
         }
     }
@@ -1538,6 +1543,7 @@ async fn stream(
     // The configuration the client was last sent: a PyroWave unit packs for its size.
     let mut current = client.config.clone();
     let mut pyro = pyro_rate(media, &current, None);
+    let mut pyro_refused = 0u64;
     // What ends the stream: an optional last message, the close code and its reason.
     const QUIET: (Option<Value>, u32, &str) = (None, CLOSE_NORMAL, "");
     let mut idle = pin!(tokio::time::sleep(CONTROL_IDLE));
@@ -1572,7 +1578,7 @@ async fn stream(
             _ = control_tick.tick(), if pyro.is_some() || (control.is_some() && current.codec != "pyrowave") => {
                 if let Some(rate) = pyro.as_mut() {
                     let verdict = rate.on_tick(std::time::Instant::now(), quic_path(session));
-                    pyro_act(media, &client, &mut pyro, verdict);
+                    pyro_act(media, &client, &mut pyro, control.as_mut(), verdict);
                 } else if let Some(control) = control.as_mut() {
                     control.tick(quinn::Connection::rtt(session), std::time::Instant::now());
                 }
@@ -1731,9 +1737,20 @@ async fn stream(
                         },
                         Some("feedback") if current.codec == "pyrowave" => {
                             let fb = congestion::feedback_of(&message);
+                            if let Err(field) = fb {
+                                if pyro_refused == 0 {
+                                    tracing::warn!(
+                                        token = "pyrowave-feedback-invalid",
+                                        field,
+                                        "PyroWave feedback out of contract, ignored (§Feedback); later \
+                                         ones are counted, not logged"
+                                    );
+                                }
+                                pyro_refused += 1;
+                            }
                             if let (Some(rate), Ok(fb)) = (pyro.as_mut(), fb) {
                                 let verdict = rate.on_feedback(&fb, std::time::Instant::now(), quic_path(session));
-                                pyro_act(media, &client, &mut pyro, verdict);
+                                pyro_act(media, &client, &mut pyro, control.as_mut(), verdict);
                             }
                         }
                         Some("feedback") => {
@@ -1785,6 +1802,13 @@ async fn stream(
             nacks_capped,
             resends_too_large,
             "WebTransport left nacks unanswered or resends unsent"
+        );
+    }
+    if pyro_refused > 0 {
+        tracing::debug!(
+            token = "pyrowave-feedback-refused",
+            refused = pyro_refused,
+            "PyroWave feedback messages ignored as out of contract"
         );
     }
     if let Some(refused) = control.as_ref().map(|c| c.refused).filter(|&n| n > 0) {
