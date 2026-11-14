@@ -285,7 +285,7 @@ export async function probeWebCodecs(): Promise<WebCodecsProbe> {
 let webGpuProbe: Promise<{ available: boolean; features: string[] }> | undefined;
 
 // requestAdapter normally answers in milliseconds; this only bounds a browser that never does.
-const WEBGPU_ADAPTER_TIMEOUT_MS = 1500;
+export const WEBGPU_ADAPTER_TIMEOUT_MS = 1500;
 
 /** The features the PyroWave decoder uses when present (`pyroWaveDeviceFeatures`); it needs neither. */
 const WEBGPU_REPORTED_FEATURES = ["subgroups", "shader-f16"];

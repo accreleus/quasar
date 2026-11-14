@@ -805,6 +805,7 @@ describe("createWebGpuPresenter", () => {
     let blendBuilt = false;
     const scopes: string[] = [];
     const textures = { destroyed: [] as { width: number }[] };
+    const deviceDestroyed = { n: 0 };
     /** Bind group sizes, so a test can see whether the texel uniform was bound. */
     const bindings: number[] = [];
     const pass = {
@@ -864,7 +865,7 @@ describe("createWebGpuPresenter", () => {
         bindings.push(d.entries.length);
       },
       createCommandEncoder: () => ({ beginRenderPass: () => pass, finish: () => ({}) }),
-      destroy() {},
+      destroy: () => void (deviceDestroyed.n += 1),
     };
     vi.stubGlobal("navigator", {
       gpu: { requestAdapter: async () => ({ requestDevice: async () => device }), getPreferredCanvasFormat: () => "bgra8unorm" },
@@ -879,7 +880,7 @@ describe("createWebGpuPresenter", () => {
       dataset: {} as Record<string, string>,
       getContext: () => ({ configure() {}, getCurrentTexture: () => ({ createView: () => ({}) }) }),
     } as unknown as HTMLCanvasElement;
-    return { calls, canvas, lose, viewports, crops, samplers, drawn, blends, constants, textures, bindings, uncaptured: (message: string) => listeners.uncapturederror({ error: { message } }) };
+    return { calls, canvas, deviceDestroyed, lose, viewports, crops, samplers, drawn, blends, constants, textures, bindings, uncaptured: (message: string) => listeners.uncapturederror({ error: { message } }) };
   }
 
   it("falls back to copying each frame once an import fails, and closes every frame", async () => {
@@ -890,6 +891,23 @@ describe("createWebGpuPresenter", () => {
     expect(p.present(b as unknown as VideoFrame)).toBe(true);
     expect(g.calls).toEqual(["import", "copy", "submit", "copy", "submit"]);
     expect(a.closed && b.closed).toBe(true);
+  });
+
+  it("gives up on an adapter or a device request that never answers, so the session falls back", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const g = fakeGpu(false);
+      vi.stubGlobal("navigator", { gpu: { requestAdapter: () => new Promise(() => {}) } });
+      const noAdapter = createWebGpuPresenter(g.canvas, () => {});
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(await noAdapter).toBeNull();
+      vi.stubGlobal("navigator", { gpu: { requestAdapter: async () => ({ features: new Set(), requestDevice: () => new Promise(() => {}) }) } });
+      const noDevice = createWebGpuPresenter(g.canvas, () => {});
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(await noDevice).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("stops drawing and reports once when the device is lost", async () => {

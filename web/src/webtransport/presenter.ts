@@ -19,6 +19,8 @@
 // the last drawn; a decoder surface) or, in the copy fallback, the retired copy target
 // for the length of a fade.
 
+import { WEBGPU_ADAPTER_TIMEOUT_MS, withTimeout } from "../webrtc/capability";
+
 /** What the runtime needs of a presenter; a test supplies a fake. */
 export interface Presenter {
   /** Draws `frame` and closes it; false when nothing was drawn. */
@@ -282,12 +284,14 @@ export async function createWebGpuPresenter(
   opts: { pyrowave?: boolean } = {},
 ): Promise<Presenter | null> {
   const gpu = navigator.gpu as GPU | undefined;
-  const adapter = await gpu?.requestAdapter();
+  // Bounded as the capability probe bounds it: a browser that never answers falls back to WebRTC.
+  const adapter = gpu && (await withTimeout(gpu.requestAdapter(), WEBGPU_ADAPTER_TIMEOUT_MS, null));
   if (!gpu || !adapter) return null;
   // The PyroWave decoder's fast path wants these (pyroWaveDeviceFeatures in pyrowave/decoder.ts,
   // not imported: the decoder loads only for a PyroWave session).
   const requiredFeatures = opts.pyrowave ? (["subgroups", "shader-f16"] as const).filter((f) => adapter.features.has(f)) : [];
-  const device = await adapter.requestDevice({ requiredFeatures });
+  const device = await withTimeout(adapter.requestDevice({ requiredFeatures }), WEBGPU_ADAPTER_TIMEOUT_MS, null);
+  if (!device) return null;
   const context = canvas.getContext("webgpu");
   if (!context) return null;
 
