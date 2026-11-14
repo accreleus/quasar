@@ -983,6 +983,41 @@ func TestDesktopStartAfterGameDesktopGameSwapsSharesTheLibrary(t *testing.T) {
 	}
 }
 
+// #1246, the order where the first desktop start replaces the parked row before
+// that row's first report: the Steam hold stays on the ended game's id, and
+// only the pending-home reconcile's stop for that id, answered by the agent with
+// its qualified terminal (a retired id, agent.rs SessionStop), releases it.
+func TestDesktopStartAfterAParkReplacedBeforeItsFirstReportSharesTheLibrary(t *testing.T) {
+	f := newWarmFixture(t, 8)
+	desktop := seedDesktop(t, f, true)
+	ctx := context.Background()
+	game := f.runningTile(t)
+	f.coord.AgentState(ctx, f.hostID, heldStop(game))
+	parked := f.parkedID(t)
+	f.disp.waitFor(t, "start")
+	if _, err := f.launch(t, desktop); err == nil {
+		t.Fatal("desktop launch beside the parked Steam was admitted, want it superseded and refused")
+	}
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: parked, State: "stopped", HomeCleanupQualified: true})
+	if h, _ := f.claimHolder(t, f.steam); h != game {
+		t.Fatalf("Steam hold = %q after the parked row ended unreported, want still the game's %s", h, game)
+	}
+
+	epoch, _ := f.disp.CurrentHomeCommandEpoch(f.hostID)
+	before := f.disp.stopsFor(game)
+	f.coord.ReconcilePendingHomes(ctx, f.hostID, epoch)
+	if f.disp.stopsFor(game) == before {
+		t.Fatalf("no reconcile stop for the stranded holder %s", game)
+	}
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: game, State: "stopped", HomeCleanupQualified: true})
+	must(t, exec(t, f.pool, `UPDATE sessions SET ended_at=now()-interval '5 minutes' WHERE ended_at IS NOT NULL`))
+
+	res := f.mustLaunch(t, desktop)
+	if res.Notice != "" || f.sharingOf(t, res.Session.ID) != f.steam {
+		t.Fatalf("desktop launch notice=%q shared=%q, want the library shared", res.Notice, f.sharingOf(t, res.Session.ID))
+	}
+}
+
 // A console auto-start that fails before the agent releases the unused Steam
 // claim it created, as the same failure does on a launch.
 func TestFailedConsoleAutoStartReleasesAnUnusedSteamClaim(t *testing.T) {
