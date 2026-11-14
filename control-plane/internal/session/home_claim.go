@@ -603,6 +603,14 @@ func (s *Store) GuardHomeForSwapWithHold(ctx context.Context, sessionID, userID 
 	if !selected {
 		return swapHomeGuard{}, ErrHomeConflict
 	}
+	// The swapper's HasLiveUserAppSession ran in its own transaction; repeated
+	// here under the user lock, a launch admitted since cannot slip past it.
+	if conflict, err := homeInUse(ctx, tx, userID, p.homeAppID(), sessionID); err != nil || conflict != nil {
+		if err != nil {
+			return swapHomeGuard{}, fmt.Errorf("count own home sessions: %w", err)
+		}
+		return swapHomeGuard{}, conflict
+	}
 	owner, err := homeClaimOwner(ctx, tx, p, sessionID)
 	if err != nil {
 		return swapHomeGuard{}, s.finishRefusedSwapHome(ctx, tx, p, err)
@@ -622,6 +630,11 @@ func (s *Store) GuardHomeForSwapWithHold(ctx context.Context, sessionID, userID 
 	// by itself — so nothing below refuses or supersedes anything for a library
 	// this swap is not going to mount. A live holder is a refusal, naming it.
 	notice := ""
+	if !capable && p.SharedHomeAppID != "" {
+		// No hold is possible and the row records the share only at commit, so
+		// nothing would own the Steam claim until then (#1253): run without it.
+		p.SharedHomeAppID, notice = "", noticeSharedUnavailable
+	}
 	if p.SharedHomeAppID != "" {
 		if notice, err = claimSharedHome(ctx, tx, &p, hostID, sessionID); err != nil {
 			var settling *homeHoldSettlingError
