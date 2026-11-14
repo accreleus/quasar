@@ -680,6 +680,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       mouse = settings;
       capture?.setMouse(settings);
     },
+    setVirtualPad: (pad) => capture?.setVirtualPad(pad),
     isCaptured: () => captured,
     cancelRecovery() {
       if (recovering) fail("stream_lost", true, "Connection recovery cancelled.");
