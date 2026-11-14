@@ -22,6 +22,9 @@ export function CompatToolSection({
   error: string | null;
 }) {
   const { installed, valve } = toolGroups(tools ?? [], savedToolId);
+  // hosts.installed counts enrolled hosts, offline ones too, so this is the floor of "unplaceable".
+  const picked = tools?.find((t) => t.id === choice.toolId);
+  const nowhere = picked?.family === "ge" && picked.hosts?.installed === 0;
   return (
     <Section
       title="Compatibility tool"
@@ -77,6 +80,14 @@ export function CompatToolSection({
         builds. Force overrides the player&rsquo;s own pick in Steam. Without
         it, the tool is set only when the player hasn&rsquo;t picked one.
       </span>
+      {nowhere && (
+        <div className="note warn" data-testid="compat-tool-nowhere">
+          <div>
+            <b>No host has {picked.display_name} installed.</b> A launch of this game is refused
+            until one does.
+          </div>
+        </div>
+      )}
     </Section>
   );
 }
