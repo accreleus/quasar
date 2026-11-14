@@ -20,9 +20,10 @@
 //!     doesn't touch compositor/interpipe caps or trigger renegotiation), implemented
 //!     here as [`ResolutionRung`] with its own hysteresis/dwell/settle/emergency policy
 //!     ([`ResolutionPolicy`]), actuated through `ResolutionLever` in
-//!     [`crate::session::pipeline::abr_glue`]. Ships DARK behind
-//!     [`LadderConfig::resolution_enabled`] (`abr_ladder_resolution`, default false)
-//!     until the per-host netem soak signs it off.
+//!     [`crate::session::pipeline::abr_glue`]. Behind
+//!     [`LadderConfig::resolution_enabled`] (`abr_ladder_resolution`): off by default for
+//!     WebRTC, on for a session assigned WebTransport unless the host set it
+//!     ([`LadderSettings::for_session`]).
 //!  5. **Playout increase** — `client_presentation_limited` is a control-plane/browser-trace
 //!     signal the agent never sees (invariant #1); stays with the AS-05 client-side
 //!     playout controller.
@@ -89,7 +90,8 @@ pub struct LadderSettings {
     pub res: ResolutionPolicy,
     /// Whether an operator set `abr_ladder_resolution` / `abr_ladder_order` (env or
     /// override). Unset ones take the WebTransport defaults in [`Self::for_session`].
-    /// A typed-policy `deployment` choice arrives as a value and counts as set.
+    /// A typed-policy `deployment` choice arrives as a value and counts as set; an empty
+    /// env var is unset, since compose passes an unset variable through as "".
     pub resolution_set: bool,
     pub order_set: bool,
 }
@@ -318,13 +320,13 @@ impl LadderSettings {
 
 impl LadderSettings {
     /// The knobs one session runs with (#1375): on WebTransport an unset resolution
-    /// rung is on and an unset order is `res_first`, so a link under the launch floor
-    /// steps down a size instead of losing the transport. WebRTC keeps the host values.
+    /// rung is on, with `res_first` unless the host set the order, so a link under the
+    /// launch floor steps down a size instead of losing the transport. WebRTC keeps the
+    /// host values. A host that set the rung keeps its own order, and a floor that cannot
+    /// follow the rung would leave the step useless, so neither gets the default.
     pub fn for_session(mut self, webtransport: bool) -> Self {
-        if webtransport {
-            if !self.resolution_set {
-                self.resolution_enabled = true;
-            }
+        if webtransport && !self.resolution_set && self.floor_follows_rung {
+            self.resolution_enabled = true;
             if !self.order_set {
                 self.order = LadderOrder::ResFirst;
             }

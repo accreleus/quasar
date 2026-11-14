@@ -701,7 +701,8 @@ impl SessionConfig {
     /// `GET /v1/admin/hosts/{id}/settings`, so the agent says it out loud once per
     /// session. Pure (the caller logs it) so it is testable with no tracing subscriber.
     pub fn ladder_gate_warning(&self) -> Option<String> {
-        let s = &self.ladder.for_session(self.webtransport);
+        // The host's own settings: a default nobody set is not worth a warning.
+        let s = &self.ladder;
         if self.abr_mode == AbrMode::Smooth || !(s.resolution_enabled || s.fps_enabled) {
             return None;
         }
@@ -1855,11 +1856,50 @@ mod tests {
                     ("QUASAR_ABR_LADDER_RESOLUTION", "0"),
                     ("QUASAR_ABR_LADDER_ORDER", "fps_first")
                 ],
-                none
+                none.clone()
             ),
             (false, ladder::LadderOrder::FpsFirst),
             "env off + WebTransport"
         );
+        assert_eq!(
+            ladder(
+                true,
+                &[],
+                serde_json::json!({"abr_ladder_order": "fps_first"})
+            ),
+            (true, ladder::LadderOrder::FpsFirst),
+            "only order set + WebTransport: rung default on, the host's order"
+        );
+        assert_eq!(
+            ladder(
+                true,
+                &[],
+                serde_json::json!({"abr_ladder_resolution": true})
+            ),
+            (true, ladder::LadderOrder::Hybrid),
+            "rung set, order unset + WebTransport: the host's order, not res_first"
+        );
+        assert_eq!(
+            ladder(
+                true,
+                &[],
+                serde_json::json!({"abr_ladder_floor_follows_rung": false})
+            ),
+            (false, ladder::LadderOrder::Hybrid),
+            "floor cannot follow the rung + WebTransport: no default"
+        );
+        assert_eq!(
+            ladder(true, &[("QUASAR_ABR_LADDER_RESOLUTION", "")], none),
+            (true, ladder::LadderOrder::ResFirst),
+            "an empty env var is unset"
+        );
+
+        // A protective host warns only about a rung it set, not about the WT default.
+        let mut s = settings::RuntimeSettings::baseline_with(&|_| None);
+        s.abr_mode = AbrMode::Protective;
+        let mut cfg = SessionConfig::for_assignment_with(&s, stream_with_floor(0), None);
+        cfg.webtransport = true;
+        assert_eq!(cfg.ladder_gate_warning(), None);
     }
 
     // Ladder settings are snapshotted at assign time: a later config_update cannot
