@@ -20,6 +20,7 @@ import {
   createWebGpuPresenter,
   CROSSFADE_MS,
   CROSSFADE_STALE_MS,
+  GPU_REQUEST_TIMEOUT_MS,
   presentGeometry,
   shouldUpscaleSharpen,
   SizeFade,
@@ -900,21 +901,44 @@ describe("createWebGpuPresenter", () => {
     expect(g.deviceDestroyed.n).toBe(1);
   });
 
-  it("gives up on an adapter or a device request that never answers, so the session falls back", async () => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    try {
+  describe("the adapter and device requests", () => {
+    const withGpu = (requestAdapter: () => Promise<unknown>) => vi.stubGlobal("navigator", { gpu: { requestAdapter, getPreferredCanvasFormat: () => "bgra8unorm" } });
+    beforeEach(() => vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] }));
+    afterEach(() => vi.useRealTimers());
+
+    it("gives up on an adapter that never answers, so the session falls back", async () => {
       const g = fakeGpu(false);
-      vi.stubGlobal("navigator", { gpu: { requestAdapter: () => new Promise(() => {}) } });
-      const noAdapter = createWebGpuPresenter(g.canvas, () => {});
-      await vi.advanceTimersByTimeAsync(2000);
-      expect(await noAdapter).toBeNull();
-      vi.stubGlobal("navigator", { gpu: { requestAdapter: async () => ({ features: new Set(), requestDevice: () => new Promise(() => {}) }) } });
-      const noDevice = createWebGpuPresenter(g.canvas, () => {});
-      await vi.advanceTimersByTimeAsync(2000);
-      expect(await noDevice).toBeNull();
-    } finally {
-      vi.useRealTimers();
-    }
+      withGpu(() => new Promise(() => {}));
+      const p = createWebGpuPresenter(g.canvas, () => {});
+      await vi.advanceTimersByTimeAsync(GPU_REQUEST_TIMEOUT_MS - 1);
+      let settled = false;
+      void p.then(() => (settled = true));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).toBe(false); // a slow GPU gets its full bound
+      await vi.advanceTimersByTimeAsync(2);
+      expect(await p).toBeNull();
+    });
+
+    it("gives up on a device that never answers, and destroys one that arrives after the bound", async () => {
+      const g = fakeGpu(false);
+      let late!: (d: unknown) => void;
+      const device = { destroy: vi.fn() };
+      withGpu(async () => ({ features: new Set(), requestDevice: () => new Promise((r) => (late = r)) }));
+      const p = createWebGpuPresenter(g.canvas, () => {});
+      await vi.advanceTimersByTimeAsync(GPU_REQUEST_TIMEOUT_MS + 1);
+      expect(await p).toBeNull();
+      late(device);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(device.destroy).toHaveBeenCalledTimes(1);
+    });
+
+    it("lets a refused request reject, so it is reported with its own cause and not as no WebGPU", async () => {
+      const g = fakeGpu(false);
+      withGpu(async () => ({ features: new Set(), requestDevice: () => Promise.reject(new Error("device refused")) }));
+      await expect(createWebGpuPresenter(g.canvas, () => {})).rejects.toThrow("device refused");
+      withGpu(() => Promise.reject(new Error("adapter refused")));
+      await expect(createWebGpuPresenter(g.canvas, () => {})).rejects.toThrow("adapter refused");
+    });
   });
 
   it("stops drawing and reports once when the device is lost", async () => {
