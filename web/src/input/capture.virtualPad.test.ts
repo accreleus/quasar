@@ -128,9 +128,25 @@ describe("setVirtualPad", () => {
     poll!();
     expect(gp()).toEqual([]);
   });
+
+  it("the same real pad returning after the virtual one is sent in full again (gpPrev cleared)", () => {
+    const real = { index: 0, id: "pad", mapping: "standard", buttons: [{ value: 1 }], axes: [0.5] };
+    pads = [real];
+    poll!();
+    pads = [];
+    harness.setVirtualPad(pressA());
+    poll!();
+    sent.length = 0;
+    pads = [real]; // unchanged since it was last sent: only a cleared gpPrev resends it
+    poll!();
+    expect(gp()).toEqual([
+      { t: "gp", i: 0, buttons: neutralPad().buttons, axes: [0, 0, 0, 0] },
+      { t: "gp", i: 0, buttons: [1], axes: [0.5] },
+    ]);
+  });
 });
 
-describe("touches on the overlay", () => {
+describe("touches on the overlay (regression guards)", () => {
   it("never reach the touch layer: no mouse input, with or without moving", () => {
     overlay.dispatchEvent(new FakePointerEvent("pointerdown", { clientX: 10, clientY: 10 }));
     document.dispatchEvent(new FakePointerEvent("pointermove", { clientX: 200, clientY: 10 }));

@@ -285,7 +285,7 @@ export function InputPane(props: InputPaneProps) {
               <Switch
                 label="On-screen controls"
                 id="hud-on-screen-controls"
-                checked={props.onScreenControls !== false}
+                checked={props.onScreenControls === true}
                 onChange={props.onOnScreenControlsChange}
               />
             </div>

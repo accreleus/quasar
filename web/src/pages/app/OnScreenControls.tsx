@@ -67,7 +67,6 @@ function PadButton({ index, label, cls, update, children }: {
       type="button"
       className={`osc-btn ${cls}`}
       aria-label={label}
-      aria-pressed={down}
       data-down={down || undefined}
       {...h}
       onPointerCancel={h.onPointerUp}
@@ -111,7 +110,10 @@ const DIRS = [
 
 function Dpad({ update }: { update: Update }) {
   const [held, setHeld] = useState({ up: false, down: false, left: false, right: false });
+  const last = useRef(held); // not `held`: two moves can land before a re-render
   const apply = (d: typeof held) => {
+    if (DIRS.every(([k]) => d[k] === last.current[k])) return;
+    last.current = d;
     setHeld(d);
     update((p) => DIRS.reduce((acc, [k, idx]) => setButton(acc, idx, d[k]), p));
   };

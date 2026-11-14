@@ -280,13 +280,13 @@ describe("InputPane on-screen controls switch (#1401)", () => {
     expect(screen.queryByRole("checkbox", { name: /on-screen controls/i })).toBeNull();
   });
 
-  it("is on by default on a touch device and reports the change", () => {
+  it("is off unless turned on, on a touch device, and reports the change", () => {
     const onChange = vi.fn();
     render(<InputPane {...base} touchLook pointerLockAvailable={false} onOnScreenControlsChange={onChange} />);
     const sw = screen.getByRole("checkbox", { name: /on-screen controls/i }) as HTMLInputElement;
-    expect(sw.checked).toBe(true);
+    expect(sw.checked).toBe(false);
     fireEvent.click(sw);
-    expect(onChange).toHaveBeenCalledWith(false);
+    expect(onChange).toHaveBeenCalledWith(true);
   });
 });
 

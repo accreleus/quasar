@@ -140,12 +140,12 @@ describe("launchImmersive (#647)", () => {
 });
 
 describe("onScreenControls (#1401)", () => {
-  it("defaults on, and reads back a stored off", () => {
+  it("defaults off (opt-in), and reads back a stored on", () => {
     localStorage.removeItem("quasar.display.preferences");
-    expect(onScreenControls()).toBe(true);
-    saveDisplayPreferences({ onScreenControls: false });
     expect(onScreenControls()).toBe(false);
     saveDisplayPreferences({ onScreenControls: true });
     expect(onScreenControls()).toBe(true);
+    saveDisplayPreferences({ onScreenControls: false });
+    expect(onScreenControls()).toBe(false);
   });
 });
