@@ -860,7 +860,8 @@ impl Estimator {
 /// codec-pyrowave.md §Rate: the 1 s the estimate may sit under `floor_kbps`, and the latest
 /// the QUIC cap and that timer start after a switch on.
 const PYRO_STEP_DOWN_AFTER: Duration = Duration::from_secs(1);
-/// The shortest span the encoder's fill of its budget is read over: 6 frames at 60 fps.
+/// The shortest span the encoder's fill of its budget is read over (6 frames at 60 fps), and
+/// that a waiting queue must last to count by itself.
 const PYRO_FILL_WINDOW: Duration = Duration::from_millis(100);
 /// What of a full PyroWave datagram is the encoder's bytes: §Rate's estimate is "less the
 /// agent's datagram overhead".
@@ -892,16 +893,16 @@ pub(crate) enum PyroVerdict {
 /// silence does not decay it, as on the standard codec it never takes the encoder under
 /// the floor; QUIC's cap still applies, so withholding feedback cannot postpone a step-down.
 ///
-/// The cap counts only while QUIC limits the sender: more than a window of datagrams waits in
-/// its queue, or it saw congestion since the last judgement. Quinn's Cubic does not grow its
-/// window while the sender is application-limited (small frames: a dark or still screen), so
-/// window over RTT is then what was sent, not what the link carries, and must never step a
-/// session down. It also counts only while the encoder fills the budget asked of it: a
-/// picture that gives less (dark, still) is what sets the rate, not QUIC. Once a waiting
-/// queue has put the reading under the floor it stays latched until the reading is back over
-/// it or the encoder stops filling its budget: cutting the budget drains the queue, and our
-/// own reaction is not the link recovering. The window growing (Cubic grows it only on data
-/// acknowledged while window-limited) releases it; feedback never raises the estimate.
+/// The cap counts only while QUIC limits the sender. More than a window of datagrams waiting
+/// at consecutive judgements over at least 100 ms is the link limiting us, whatever the
+/// picture's rate; one judgement of it is a burst in flight. The weaker signals, congestion
+/// since the last judgement and holding the latch, count only while the encoder fills the
+/// budget asked of it: a picture that gives less (dark, still) sets the rate, not QUIC, and
+/// quinn's Cubic does not grow its window for an application-limited sender, so window over
+/// RTT is then what was sent, not what the link carries. Once a waiting queue has put the
+/// capped estimate under the floor the cap stays latched until the capped estimate is back at
+/// or over the floor, or the encoder stops filling its budget: cutting the budget drains the
+/// queue, and our own reaction is not the link recovering. Feedback never raises the estimate.
 pub(crate) struct PyroRate {
     estimator: Estimator,
     pub(crate) log: SendLog,
@@ -917,6 +918,8 @@ pub(crate) struct PyroRate {
     events: Option<u64>,
     /// A waiting queue put the reading under the floor: the cap holds until it is back over.
     latched: bool,
+    /// Since when more than a window has waited, at every judgement.
+    waiting_since: Option<Instant>,
     /// Encoder bytes handed to the stream loop, before the stall guard.
     offered: u64,
     /// (when, `offered` then): the older is 100-200 ms back, the window the fill is read over.
@@ -937,6 +940,7 @@ impl PyroRate {
             budget: 0,
             events: None,
             latched: false,
+            waiting_since: None,
             offered: 0,
             marks: [(now, 0); 2],
         }
@@ -984,15 +988,21 @@ impl PyroRate {
         let events = self.events.replace(path.congestion_events);
         // A frame smaller than the window waits only while quinn flushes it.
         let waiting = path.queued_bytes > path.cwnd_bytes;
+        if !waiting {
+            self.waiting_since = None;
+        }
+        let sustained = waiting
+            && now.saturating_duration_since(*self.waiting_since.get_or_insert(now))
+                >= PYRO_FILL_WINDOW;
         let rose = events.is_some_and(|was| path.congestion_events > was);
         let fills = self.offered_kbps(now) >= APP_LIMITED * f64::from(self.budget);
         if self.judged_from.is_some() {
-            if (waiting || rose || self.latched) && fills {
+            if sustained || ((rose || self.latched) && fills) {
                 kbps = kbps.min(quic_kbps(path));
             }
             if kbps < self.floor_kbps {
                 // A single loss (`rose`) never latches: it buys this judgement only.
-                self.latched = (self.latched || waiting) && fills;
+                self.latched = sustained || (self.latched && fills);
                 let since = *self.below_since.get_or_insert(now);
                 if now.saturating_duration_since(since) >= PYRO_STEP_DOWN_AFTER {
                     return PyroVerdict::StepDown {
