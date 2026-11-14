@@ -560,6 +560,26 @@ export function setupCapture({
     setCaptured(false);
   };
 
+  // A hidden page gets no rAF and may get no pointer events, so nothing would release what the
+  // host holds. Releases at once through the same path as any other release; the lock's own
+  // pointerlockchange arrives later and finds nothing left to do.
+  const onPageHidden = () => {
+    try {
+      release();
+      if (captured) {
+        captureMode = "none";
+        setCaptured(false);
+      }
+    } catch {
+      // channel closing: nothing more can be sent
+    }
+  };
+  const onVisibilityChange = () => {
+    if (document.hidden) onPageHidden();
+  };
+  document.addEventListener("visibilitychange", onVisibilityChange);
+  window.addEventListener("pagehide", onPageHidden);
+
   // ── Mouse ─────────────────────────────────────────────────────────────────
 
   // seq/tc stamp when tracing; zero wire impact when ?itrace=1 is absent
@@ -1039,6 +1059,8 @@ export function setupCapture({
     cleanedUp = true;
     if (liveCapture.get(videoEl) === self) liveCapture.delete(videoEl);
     document.removeEventListener("pointerlockchange", onLockChange);
+    document.removeEventListener("visibilitychange", onVisibilityChange);
+    window.removeEventListener("pagehide", onPageHidden);
     document.removeEventListener("pointerdown", onPointerDown, true);
     document.removeEventListener("pointermove", onPointerMove);
     document.removeEventListener("mousedown", onMouseDown);

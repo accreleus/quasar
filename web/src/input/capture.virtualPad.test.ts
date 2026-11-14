@@ -146,6 +146,63 @@ describe("setVirtualPad", () => {
   });
 });
 
+describe("page hidden", () => {
+  const hide = (how: "visibility" | "pagehide") => {
+    if (how === "pagehide") return window.dispatchEvent(new Event("pagehide"));
+    Object.defineProperty(document, "hidden", { value: true, configurable: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+  };
+  afterEach(() => delete (document as unknown as { hidden?: boolean }).hidden);
+
+  it.each(["visibility", "pagehide"] as const)("%s: a held virtual pad is released at once, rAF or not", (how) => {
+    harness.setVirtualPad(pressA());
+    poll!();
+    sent.length = 0;
+    const frame = poll;
+    hide(how);
+    expect(gp()).toEqual([{ t: "gp", i: 0, buttons: neutralPad().buttons, axes: [0, 0, 0, 0] }]);
+    expect(harness.getMetrics().captured).toBe(false);
+    frame!();
+    expect(gp()).toHaveLength(1);
+  });
+
+  it("a held key gets one key-up", () => {
+    document.dispatchEvent(new KeyboardEvent("keydown", { code: "KeyA" }));
+    sent.length = 0;
+    hide("visibility");
+    hide("pagehide");
+    expect(sent.filter((m) => m.t === "k")).toEqual([{ t: "k", code: 30, pressed: false }]);
+  });
+
+  it("a real pad gets one neutral state", () => {
+    pads = [{ index: 0, id: "pad", mapping: "standard", buttons: [{ value: 1 }], axes: [0.5] }];
+    poll!();
+    sent.length = 0;
+    hide("visibility");
+    hide("pagehide");
+    expect(gp()).toEqual([{ t: "gp", i: 0, buttons: [0], axes: [0] }]);
+  });
+
+  it("hidden while not captured sends nothing", () => {
+    harness.release();
+    sent.length = 0;
+    hide("visibility");
+    hide("pagehide");
+    expect(sent).toEqual([]);
+  });
+
+  it("a closing channel does not throw", async () => {
+    harness.cleanup();
+    let closed = false;
+    harness = setupCapture({ videoEl: video, sendInput: () => { if (closed) throw new Error("closed"); }, onCaptureChange: () => {} });
+    await harness.engage();
+    harness.setVirtualPad(pressA());
+    poll!();
+    closed = true;
+    expect(() => hide("pagehide")).not.toThrow();
+  });
+});
+
 describe("touches on the overlay (regression guards)", () => {
   it("never reach the touch layer: no mouse input, with or without moving", () => {
     overlay.dispatchEvent(new FakePointerEvent("pointerdown", { clientX: 10, clientY: 10 }));
