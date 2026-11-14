@@ -64,6 +64,9 @@ const DATAGRAM_BUFFER: usize = 1 << 20;
 /// One transmit (up to ten packets where the socket batches them) per 100 ms, only behind a
 /// stalled queue on a path that acknowledges nothing: at most about 145 kB/s.
 const STARVED_PROBE_INTERVAL: Duration = Duration::from_millis(100);
+/// The probe's datagram: channel `0x00`, which no receiver knows and so drops (§Channels). Never
+/// empty: Chrome (156, 157) delivers no datagram to the page after an empty one (#1333).
+const STARVED_PROBE: &[u8] = &[0x00];
 
 const CLOSE_NORMAL: u32 = 0;
 const CLOSE_PROTOCOL: u32 = 4400;
@@ -1497,13 +1500,13 @@ async fn stream(
                     && backlog.probe(queued, acks);
                 governor.probe(probe);
                 if probe {
-                    // An empty WT datagram wakes quinn; the client drops it. The allowance lets
+                    // A datagram wakes quinn; the client drops it. The allowance lets
                     // one transmit of what is queued past a closed window: up to ten packets
                     // where the socket batches them, so at most about 145 kB/s, and only while
                     // nothing at all is being acknowledged.
                     starved_probes += 1;
                     handed += 1;
-                    if session.send_datagram(bytes::Bytes::new()).is_err() {
+                    if session.send_datagram(bytes::Bytes::from_static(STARVED_PROBE)).is_err() {
                         break QUIET;
                     }
                 }
