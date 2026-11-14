@@ -513,7 +513,19 @@ export class WebTransportMedia implements MediaTransport {
   ): Promise<void> {
     const reader = wt.datagrams.readable.getReader();
     for (;;) {
-      const { value, done } = await reader.read();
+      let read: ReadableStreamReadResult<Uint8Array>;
+      try {
+        read = await reader.read();
+      } catch (err) {
+        // Safari fails this reader with a bare NetworkError ahead of the session's own close (#1403):
+        // a close of ours now would hide that close's code and reason.
+        if (await Promise.race([wt.closed.then(() => true, () => true), after(CLOSE_CODE_WAIT_MS, false)])) {
+          router.stop();
+          return;
+        }
+        throw new Error(`datagrams: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`);
+      }
+      const { value, done } = read;
       if (done || !live.on) {
         router.stop();
         return;
