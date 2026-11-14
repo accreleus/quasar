@@ -43,6 +43,23 @@ struct Sim {
     pending: VecDeque<(u32, Option<u64>)>,
     /// (seconds, estimate) after each message.
     trace: Vec<(f64, f64)>,
+    /// Video goes through the agent's queue and QUIC's governed window, not straight out.
+    quic: Option<Quic>,
+    /// The most video the queue held, bytes.
+    held_max: usize,
+}
+
+/// The agent's [`VideoQueue`] and QUIC behind it: a datagram leaves QUIC's queue once the
+/// governed window (`Window`: 2 × estimate × max(sRTT, 100 ms)) has room for it.
+#[derive(Default)]
+struct Quic {
+    video: VideoQueue,
+    queue: VecDeque<bytes::Bytes>,
+    queued: usize,
+    /// (sent µs, acknowledged or declared lost µs, bytes, arrived).
+    flight: VecDeque<(u64, u64, usize, bool)>,
+    in_flight: usize,
+    srtt_us: f64,
 }
 
 impl Sim {
@@ -71,6 +88,8 @@ impl Sim {
             queue_drops: 0,
             pending: VecDeque::new(),
             trace: Vec::new(),
+            quic: None,
+            held_max: 0,
         }
     }
 
@@ -78,8 +97,13 @@ impl Sim {
         let end = self.t + (secs * 1e6) as u64;
         let mut next_frame = self.t;
         let mut next_feedback = self.t + 50_000;
+        let mut next_tick = self.t + 1000;
         while self.t < end {
-            if next_frame <= next_feedback {
+            if self.quic.is_some() && next_tick < next_frame.min(next_feedback) {
+                self.t = next_tick;
+                self.drain();
+                next_tick += 1000;
+            } else if next_frame <= next_feedback {
                 self.t = next_frame;
                 self.frame();
                 next_frame += 16_667;
@@ -98,26 +122,103 @@ impl Sim {
             .min((self.content_kbps)(self.t));
         let bytes = kbps * 1000.0 / 8.0 / 60.0;
         let n = (bytes / SIZE as f64).ceil().max(1.0) as u32;
-        let service = (SIZE as f64 * 8.0 * 1000.0 / self.cap_kbps) as u64;
+        if let Some(quic) = self.quic.as_mut() {
+            let queued_at = self.start + Duration::from_micros(self.t);
+            for _ in 0..n {
+                let datagram = video_datagram(quic.video.next_seq());
+                let held = Held {
+                    datagram,
+                    logged: true,
+                    resend: false,
+                    queued_at,
+                };
+                quic.video.push(held, BUFFER);
+            }
+            self.drain();
+            return;
+        }
         for _ in 0..n {
             let mut d = vec![0u8; SIZE];
             d[1..5].copy_from_slice(&self.seq.to_le_bytes());
             self.log
                 .record(&d, self.start + Duration::from_micros(self.t), false);
-            let backlog = self.free_at.saturating_sub(self.t) as f64 / service as f64 * SIZE as f64;
-            let dropped = self.drop_every > 0 && self.seq.is_multiple_of(self.drop_every);
-            let full = backlog + SIZE as f64 > self.queue_bytes;
-            self.queue_drops += u32::from(full);
-            let arrival = (!dropped && !full).then(|| {
-                self.free_at = self.free_at.max(self.t) + service;
-                // One path, first in first out: a delay spike holds back what follows it.
-                self.last_arrival = self
-                    .last_arrival
-                    .max(self.free_at + 10_000 + (self.extra_us)(self.t));
-                self.last_arrival
-            });
-            self.pending.push_back((self.seq, arrival));
+            self.transmit(self.seq);
             self.seq = self.seq.wrapping_add(1);
+        }
+    }
+
+    /// One datagram onto the path now; its arrival on the agent's clock, or `None` dropped.
+    fn transmit(&mut self, seq: u32) -> Option<u64> {
+        let service = (SIZE as f64 * 8.0 * 1000.0 / self.cap_kbps) as u64;
+        let backlog = self.free_at.saturating_sub(self.t) as f64 / service as f64 * SIZE as f64;
+        let dropped = self.drop_every > 0 && seq.is_multiple_of(self.drop_every);
+        let full = backlog + SIZE as f64 > self.queue_bytes;
+        self.queue_drops += u32::from(full);
+        let arrival = (!dropped && !full).then(|| {
+            self.free_at = self.free_at.max(self.t) + service;
+            // One path, first in first out: a delay spike holds back what follows it.
+            self.last_arrival = self
+                .last_arrival
+                .max(self.free_at + 10_000 + (self.extra_us)(self.t));
+            self.last_arrival
+        });
+        self.pending.push_back((seq, arrival));
+        arrival
+    }
+
+    /// QUIC sends what its window allows, the queue hands it what fits in the room the
+    /// production `feed` gives it, and QUIC sends again.
+    fn drain(&mut self) {
+        let mut quic = self.quic.take().expect("queued mode");
+        let est = self.est.estimate_kbps();
+        self.send_window(&mut quic, est);
+        let room = quic
+            .video
+            .room(Some(est as u64), BUFFER)
+            .saturating_sub(quic.queued);
+        let (queue, queued) = (&mut quic.queue, &mut quic.queued);
+        quic.video.feed(room, Some(&mut self.log), |held| {
+            *queued += held.datagram.len();
+            queue.push_back(held.datagram);
+            Handed::Sent
+        });
+        self.held_max = self.held_max.max(quic.video.bytes());
+        self.send_window(&mut quic, est);
+        self.quic = Some(quic);
+    }
+
+    fn send_window(&mut self, quic: &mut Quic, est_kbps: f64) {
+        let now = self.t;
+        while let Some(&(sent, done, _, arrived)) = quic.flight.front() {
+            if done > now {
+                break;
+            }
+            if arrived {
+                let rtt = (done - sent) as f64;
+                quic.srtt_us = if quic.srtt_us == 0.0 {
+                    rtt
+                } else {
+                    0.875 * quic.srtt_us + 0.125 * rtt
+                };
+            }
+            quic.in_flight -= quic.flight.pop_front().unwrap().2;
+        }
+        let srtt = quic.srtt_us.max(100_000.0) / 1e6;
+        let window = (2.0 * est_kbps * 1000.0 / 8.0 * srtt) as usize;
+        while let Some(d) = quic.queue.front() {
+            if quic.in_flight + d.len() > window {
+                break;
+            }
+            let d = quic.queue.pop_front().unwrap();
+            quic.queued -= d.len();
+            quic.in_flight += d.len();
+            let arrival = self.transmit(wire_seq(&d));
+            // The ACK returns over the same 10 ms; a loss is declared about 200 ms on.
+            // Kept in completion order: arrivals are first in first out already.
+            let last = quic.flight.back().map_or(0, |f| f.1);
+            let done = arrival.map_or(now + 200_000, |a| a + 10_000).max(last);
+            quic.flight
+                .push_back((now, done, d.len(), arrival.is_some()));
         }
     }
 
@@ -1223,33 +1324,40 @@ fn held(pkt_seq: u32) -> Held {
         datagram: video_datagram(pkt_seq),
         logged: true,
         resend: false,
+        queued_at: Instant::now(),
     }
+}
+
+fn wire_seq(d: &[u8]) -> u32 {
+    u32::from_le_bytes(d[1..5].try_into().unwrap())
 }
 
 /// QUIC taking a datagram: its wire `pkt_seq` is noted.
 fn quic(wire: &mut Vec<u32>, held: Held) -> Handed {
-    wire.push(u32::from_le_bytes(held.datagram[1..5].try_into().unwrap()));
+    wire.push(wire_seq(&held.datagram));
     Handed::Sent
 }
 
+const BUFFER: usize = 1 << 20;
+
 #[test]
 fn audio_leaves_ahead_of_video_over_the_send_budget_and_video_waits() {
-    // 2 Mbit/s governed: 20 ms of it is 5000 bytes, four video datagrams.
-    let room = VideoQueue::room(Some(2000), 1 << 20);
-    assert_eq!(room, 5000);
     let mut video = VideoQueue::default();
+    // 2 Mbit/s: 20 ms of it is 5000 bytes, four video datagrams.
+    let room = video.room(Some(2000), BUFFER);
+    assert_eq!(room, 5000);
     let mut wire = Vec::new();
     // A keyframe of 40 datagrams lands on a path that has not drained.
     let first = video.next_seq();
     for i in 0..40 {
-        video.push(held(first + i), 1 << 20);
+        video.push(held(first + i), BUFFER);
     }
-    assert!(video.feed(room, |h| quic(&mut wire, h)));
+    assert!(video.feed(room, None, |h| quic(&mut wire, h)));
     // QUIC drains nothing while three audio datagrams arrive.
     let mut audio = Vec::new();
     for _ in 0..3 {
         audio.push(video.take_seq());
-        assert!(video.feed(0, |h| quic(&mut wire, h)));
+        assert!(video.feed(0, None, |h| quic(&mut wire, h)));
     }
     assert_eq!(
         wire,
@@ -1260,7 +1368,7 @@ fn audio_leaves_ahead_of_video_over_the_send_budget_and_video_waits() {
     assert_eq!(video.bytes(), 36 * SIZE);
 
     // The path drains: the rest follows, numbered after the audio, with no gap.
-    assert!(video.feed(usize::MAX, |h| quic(&mut wire, h)));
+    assert!(video.feed(usize::MAX, None, |h| quic(&mut wire, h)));
     assert_eq!(wire[4..], (7..43).collect::<Vec<_>>());
     assert!(video.is_empty());
 }
@@ -1271,9 +1379,9 @@ fn held_video_over_the_cap_drops_oldest_first_and_leaves_no_gap() {
     for i in 0..5 {
         video.push(held(i), 3 * SIZE);
     }
-    assert_eq!(video.bytes(), 3 * SIZE);
+    assert_eq!((video.bytes(), video.dropped), (3 * SIZE, 2));
     let mut wire = Vec::new();
-    assert!(video.feed(usize::MAX, |h| quic(&mut wire, h)));
+    assert!(video.feed(usize::MAX, None, |h| quic(&mut wire, h)));
     assert_eq!(
         wire,
         [0, 1, 2],
@@ -1282,9 +1390,109 @@ fn held_video_over_the_cap_drops_oldest_first_and_leaves_no_gap() {
 }
 
 #[test]
-fn ungoverned_video_has_quics_whole_queue() {
-    assert_eq!(VideoQueue::room(None, 1 << 20), 1 << 20);
+fn the_room_is_two_datagrams_at_least_and_half_the_buffer_at_most() {
+    let mut video = VideoQueue::default();
+    assert_eq!(
+        video.room(None, BUFFER),
+        BUFFER,
+        "never governed: QUIC's whole queue"
+    );
     let two = 2 * super::super::media::MAX_DATAGRAM;
-    assert_eq!(VideoQueue::room(Some(100), 1 << 20), two);
-    assert_eq!(VideoQueue::room(Some(10_000_000), 1 << 20), 1 << 19);
+    assert_eq!(video.room(Some(100), BUFFER), two);
+    assert_eq!(video.room(Some(10_000_000), BUFFER), BUFFER / 2);
+    assert_eq!(
+        video.room(Some(100), 1000),
+        500,
+        "a tiny buffer: half, no panic"
+    );
+}
+
+/// A2/S4: feedback silence releases the governor; what is held then drains at the last
+/// governed rate, not into QUIC in one go ahead of audio.
+#[test]
+fn video_held_when_the_governor_lets_go_drains_at_the_last_governed_rate() {
+    let mut video = VideoQueue::default();
+    assert_eq!(video.room(Some(2000), BUFFER), 5000);
+    for i in 0..40 {
+        video.push(held(i), BUFFER);
+    }
+    assert_eq!(video.room(None, BUFFER), 5000, "released with video held");
+    let mut wire = Vec::new();
+    assert!(video.feed(usize::MAX, None, |h| quic(&mut wire, h)));
+    assert!(video.is_empty());
+    assert_eq!(
+        video.room(None, BUFFER),
+        BUFFER,
+        "drained: QUIC's whole queue again"
+    );
+}
+
+/// A10/S1: a configuration change drops what is held, and the rate it was paced at.
+#[test]
+fn a_cleared_queue_holds_nothing_and_keeps_its_numbering() {
+    let mut video = VideoQueue::default();
+    video.room(Some(2000), BUFFER);
+    for i in 0..4 {
+        video.push(held(i), BUFFER);
+    }
+    let mut wire = Vec::new();
+    assert!(video.feed(SIZE, None, |h| quic(&mut wire, h)));
+    video.clear();
+    assert!(video.is_empty() && video.bytes() == 0);
+    assert_eq!(video.room(None, BUFFER), BUFFER);
+    video.push(held(9), BUFFER);
+    assert!(video.feed(usize::MAX, None, |h| quic(&mut wire, h)));
+    assert_eq!(wire, [0, 1], "no gap across the clear");
+}
+
+/// A4: a datagram over the path's size is counted and takes no `pkt_seq`; nor does a resend
+/// whose budget is spent.
+#[test]
+fn a_skipped_datagram_takes_no_pkt_seq_and_too_large_is_counted() {
+    let mut video = VideoQueue::default();
+    let mut resend = held(1);
+    resend.resend = true;
+    for h in [held(0), resend, held(2), held(3)] {
+        video.push(h, BUFFER);
+    }
+    let mut verdicts = [
+        Handed::TooLarge,
+        Handed::TooLarge,
+        Handed::Skipped,
+        Handed::Sent,
+    ]
+    .into_iter();
+    let mut wire = Vec::new();
+    assert!(
+        video.feed(usize::MAX, None, |h| match verdicts.next().unwrap() {
+            Handed::Sent => quic(&mut wire, h),
+            other => other,
+        })
+    );
+    assert_eq!((video.too_large, video.resends_too_large), (1, 1));
+    assert_eq!(wire, [0], "the one sent takes the first number");
+}
+
+/// M1: a step cut under a deep bottleneck buffer, with video handed to QUIC through the
+/// queue and QUIC's governed window (`Window`) in between. The send log stamps the time a
+/// datagram was queued, so the estimate comes down as it does with no queue.
+#[test]
+fn a_step_cut_under_a_deep_buffer_brings_the_estimate_down_through_the_queue() {
+    let cut = |queued: bool| {
+        let mut s = Sim::new(20_000.0);
+        s.queue_bytes = 8.0 * 1024.0 * 1024.0;
+        if queued {
+            s.quic = Some(Quic::default());
+        }
+        s.run(10.0);
+        assert_eq!(s.est.estimate_kbps(), CEILING, "the ceiling before the cut");
+        s.cap_kbps = 2000.0;
+        s.run(20.0);
+        (s.mean_after(20.0), s.held_max)
+    };
+    let (direct, _) = cut(false);
+    let (queued, held_max) = cut(true);
+    eprintln!("estimate 10-20 s after the cut: direct {direct:.0}, through the queue {queued:.0}; most held {held_max} B");
+    assert!(direct < 2400.0, "no queue: {direct:.0}");
+    assert!(queued < 2400.0, "through the queue: {queued:.0}");
 }

@@ -1224,31 +1224,49 @@ pub(crate) struct VideoQueue {
     bytes: usize,
     /// The `pkt_seq` of the next datagram handed to QUIC.
     wire: u32,
+    /// The rate the room was last sized at: held video drains at it after a release.
+    pace: Option<u64>,
+    /// Video datagrams dropped at the cap; they never take a `pkt_seq`, so no feedback
+    /// reports them lost.
+    pub(crate) dropped: u64,
+    /// Video and resent datagrams over the path's datagram size, skipped.
+    pub(crate) too_large: u64,
+    pub(crate) resends_too_large: u64,
 }
 
 pub(crate) struct Held {
     pub(crate) datagram: bytes::Bytes,
-    /// Goes in the send log.
+    /// Goes in the send log, stamped `queued_at`: time held here is delay the estimate
+    /// must see, as it saw time in QUIC's queue.
     pub(crate) logged: bool,
     pub(crate) resend: bool,
+    pub(crate) queued_at: Instant,
 }
 
 /// What became of a datagram handed to QUIC.
 pub(crate) enum Handed {
     Sent,
-    /// Over the path's datagram size: skipped, its `pkt_seq` not used.
+    /// Not sent and its `pkt_seq` not used: a resend the fragment's budget no longer allows.
+    Skipped,
+    /// Over the path's datagram size: skipped like [`Handed::Skipped`], and counted.
     TooLarge,
     Gone,
 }
 
 impl VideoQueue {
-    /// Bytes of QUIC's datagram queue video may fill: [`AUDIO_AHEAD_MS`] at the governed rate,
-    /// at least two datagrams, at most half the queue so audio always fits beside it.
-    /// shortcut: ungoverned (no feedback, ABR off, PyroWave) video goes straight to QUIC as
-    /// before; give those sessions a rate here if their audio pops under congestion.
-    pub(crate) fn room(governed_kbps: Option<u64>, buffer: usize) -> usize {
-        governed_kbps.map_or(buffer, |kbps| {
-            ((kbps * AUDIO_AHEAD_MS / 8) as usize).clamp(2 * super::media::MAX_DATAGRAM, buffer / 2)
+    /// Bytes of QUIC's datagram queue video may fill: [`AUDIO_AHEAD_MS`] at `kbps`, at
+    /// least two datagrams, at most half the queue so audio always fits beside it. With no
+    /// rate (`None`), video held from a governed spell still drains at that spell's last
+    /// rate; only an empty queue goes back to QUIC's whole buffer.
+    /// shortcut: a session never governed (no feedback, ABR off, PyroWave) gets the whole
+    /// buffer, so under congestion audio waits behind QUIC's queue as before #1321.
+    pub(crate) fn room(&mut self, kbps: Option<u64>, buffer: usize) -> usize {
+        let kbps = kbps.or(self.pace.filter(|_| !self.held.is_empty()));
+        self.pace = kbps;
+        kbps.map_or(buffer, |kbps| {
+            ((kbps * AUDIO_AHEAD_MS / 8) as usize)
+                .max(2 * super::media::MAX_DATAGRAM)
+                .min(buffer / 2)
         })
     }
 
@@ -1260,7 +1278,15 @@ impl VideoQueue {
         self.bytes
     }
 
-    /// The `pkt_seq` new video is numbered from: after everything held.
+    /// Drops everything held: datagrams of a configuration the client has left.
+    pub(crate) fn clear(&mut self) {
+        self.held.clear();
+        self.bytes = 0;
+        self.pace = None;
+    }
+
+    /// The `pkt_seq` new video is numbered from, a guess `feed` corrects: after everything
+    /// held.
     pub(crate) fn next_seq(&self) -> u32 {
         self.wire.wrapping_add(self.held.len() as u32)
     }
@@ -1279,14 +1305,21 @@ impl VideoQueue {
                 break;
             };
             self.bytes -= old.datagram.len();
+            self.dropped += 1;
         }
         self.bytes += held.datagram.len();
         self.held.push_back(held);
     }
 
     /// Hands `send` the oldest datagrams that fit in `room` bytes, each carrying the next
-    /// wire `pkt_seq`. False when the connection is gone.
-    pub(crate) fn feed(&mut self, mut room: usize, mut send: impl FnMut(Held) -> Handed) -> bool {
+    /// wire `pkt_seq`, and logs each sent one at the time it was queued. False when the
+    /// connection is gone.
+    pub(crate) fn feed(
+        &mut self,
+        mut room: usize,
+        mut log: Option<&mut SendLog>,
+        mut send: impl FnMut(Held) -> Handed,
+    ) -> bool {
         while let Some(next) = self.held.front() {
             let len = next.datagram.len();
             if len > room {
@@ -1305,12 +1338,20 @@ impl VideoQueue {
                 d[1..5].copy_from_slice(&seq);
                 held.datagram = d.freeze();
             }
+            let (resend, queued_at) = (held.resend, held.queued_at);
+            let logged = log.as_deref_mut().filter(|_| held.logged);
+            let record = logged.map(|log| (log, held.datagram.clone()));
             match send(held) {
                 Handed::Sent => {
+                    if let Some((log, d)) = record {
+                        log.record(&d, queued_at, resend);
+                    }
                     room -= len;
                     self.wire = self.wire.wrapping_add(1);
                 }
-                Handed::TooLarge => {}
+                Handed::Skipped => {}
+                Handed::TooLarge if resend => self.resends_too_large += 1,
+                Handed::TooLarge => self.too_large += 1,
                 Handed::Gone => return false,
             }
         }
