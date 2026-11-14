@@ -212,6 +212,90 @@ describe("WebTransportMedia connect", () => {
     await expect(up).rejects.toMatchObject({ code: "internal", message: "close 4400 datagrams: NetworkError: A network error occurred." });
   });
 
+  const NETWORK_ERROR = () => new DOMException("A network error occurred.", "NetworkError");
+  const READER_DETAIL = "datagrams: NetworkError: A network error occurred.";
+
+  it("retries a not-ready refusal whose datagram reader Safari failed first, and sends no 4400 (#1403)", async () => {
+    // The agent's real order (webtransport/mod.rs): the error message, the stream finished, close code 0.
+    const agent = new FakeAgent();
+    agent.hold = "answer";
+    const t = transport(agent);
+    const up = t.connect(NO_SINK);
+    await vi.waitFor(() => expect(agent.reached).toBe("answer"));
+    agent.hold = null;
+    agent.replies = [[helloAck(0, avcC())]];
+    agent.last.failDatagrams(NETWORK_ERROR());
+    await flush();
+    agent.last.control({ type: "error", code: "session_not_ready" });
+    agent.last.closeWith(0);
+    await up;
+    expect(agent.conns).toHaveLength(2);
+    expect(agent.conns.flatMap((c) => c.closes).some((c) => c?.closeCode === 4400)).toBe(false);
+    t.close();
+  });
+
+  it("does not take a hello_ack on an attempt whose datagram reader already died (#1403)", async () => {
+    const agent = new FakeAgent();
+    agent.hold = "answer";
+    const t = transport(agent);
+    const up = t.connect(NO_SINK);
+    await vi.waitFor(() => expect(agent.reached).toBe("answer"));
+    agent.last.failDatagrams(NETWORK_ERROR());
+    await flush();
+    agent.last.control(helloAck(0, avcC()));
+    await expect(up).rejects.toMatchObject({ code: "internal", message: READER_DETAIL });
+    expect(agent.last.closes).toEqual([{ closeCode: 4400, reason: READER_DETAIL }]);
+    expect(agent.sent("ping")).toHaveLength(0);
+  });
+
+  it("ends a connected session whose datagram reader died with one 4400 that names it (#1403)", async () => {
+    vi.useFakeTimers();
+    const agent = new FakeAgent();
+    agent.replies = [[helloAck(0, avcC())]];
+    const ends: TransportEnd[] = [];
+    await transport(agent).connect({ ...NO_SINK, end: (e) => ends.push(e) });
+    agent.last.failDatagrams(NETWORK_ERROR());
+    await vi.advanceTimersByTimeAsync(999);
+    expect(agent.last.closes).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(agent.last.closes).toEqual([{ closeCode: 4400, reason: READER_DETAIL }]);
+    expect(ends).toEqual([{ code: 4400, reason: READER_DETAIL }]);
+  });
+
+  it("lets a connected session's own close inside the wait outrank its dead datagram reader (#1403)", async () => {
+    vi.useFakeTimers();
+    const agent = new FakeAgent();
+    agent.replies = [[helloAck(0, avcC())]];
+    const ends: TransportEnd[] = [];
+    await transport(agent).connect({ ...NO_SINK, end: (e) => ends.push(e) });
+    agent.last.failDatagrams(NETWORK_ERROR());
+    await vi.advanceTimersByTimeAsync(500);
+    agent.last.closeWith(4404);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(agent.last.closes).toHaveLength(0);
+    expect(ends).toEqual([{ code: 4404, reason: "" }]);
+  });
+
+  it("sends datagrams through datagrams.writable when the browser has both shapes (#1403)", async () => {
+    const writes: string[] = [];
+    const agent = new FakeAgent();
+    agent.replies = [[helloAck(0, avcC())]];
+    const t = transport(agent, {
+      createWebTransport: (url, o) => {
+        const wt = agent.create(url, o);
+        const dg = wt.datagrams as unknown as { createWritable?: () => WritableStream<Uint8Array> };
+        dg.createWritable = () => new WritableStream({ write: () => void writes.push("createWritable") });
+        return wt;
+      },
+    });
+    await t.connect(NO_SINK);
+    expect(t.input.datagram(Uint8Array.from([3, 1]))).toBe(true);
+    await flush();
+    expect(writes).toEqual([]);
+    expect(agent.datagramsSent).toHaveLength(1);
+    t.close();
+  });
+
   it("refuses a PyroWave hello_ack whose picture size no PWV1 header can state", async () => {
     const agent = new FakeAgent();
     const ack = helloAck(0, avcC(), 1_000_000, 1_000_000);
@@ -1031,6 +1115,22 @@ describe("createWebTransportRuntime fallback", () => {
     expect(callbacks.onFallback).not.toHaveBeenCalled();
     agent.last.closeWith(4400);
     await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost", expect.any(String)));
+    expect(callbacks.onFallback).toHaveBeenCalledTimes(1);
+  });
+
+  it("a datagram reader that dies after connect ends the session, reconnects once, then falls back naming it (#1403)", async () => {
+    const { agent, callbacks, rt } = setup();
+    rt.start();
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    agent.last.failDatagrams(new DOMException("A network error occurred.", "NetworkError"));
+    await vi.waitFor(() => expect(agent.conns).toHaveLength(2), { timeout: 3_000 });
+    expect(agent.conns[0].closes[0]).toEqual({ closeCode: 4400, reason: "datagrams: NetworkError: A network error occurred." });
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    agent.last.failDatagrams(new DOMException("A network error occurred.", "NetworkError"));
+    await vi.waitFor(
+      () => expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost", "stream_lost: datagrams: NetworkError: A network error occurred."),
+      { timeout: 3_000 },
+    );
     expect(callbacks.onFallback).toHaveBeenCalledTimes(1);
   });
 

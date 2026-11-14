@@ -125,6 +125,8 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     if (now - stableVideoSince >= MEDIA_RETRY_RESET_MS) reconnected = false;
   }
   let recovering = false;
+  /** Our own 4400 for a dead datagram reader (#1403): its reason is the cause of a later stream_lost. */
+  let lostCause: string | undefined;
   let recoveryDeadline: ReturnType<typeof setTimeout> | null = null;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   let wakeRetry: (() => void) | null = null;
@@ -546,6 +548,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       fail("session_ended");
       return;
     }
+    lostCause = e.code === 4400 && e.reason.startsWith("datagrams:") ? e.reason : undefined;
     stableVideoSince = null;
     transport = null; // the closed one's own `end` is then not this view's
     teardownInput();
@@ -575,7 +578,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
             return;
           }
           if (reconnected && !connectivityFailed) {
-            fail("stream_lost");
+            fail("stream_lost", false, undefined, lostCause);
             return;
           }
           const coords = await mintCoords();
@@ -587,7 +590,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
             // media path: one more try, then fall back, never a tight loop of token mints.
             if (connectivityFailed) await retryWait(Math.min(1_000 * 2 ** attempt++, 4_000), attemptedAt);
             else if (endedAtOnce++ >= 1) {
-              fail("stream_lost");
+              fail("stream_lost", false, undefined, lostCause);
               return;
             }
             continue;
@@ -613,7 +616,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
             try {
               const { session } = await getSession(cfg.authToken, cfg.sessionId);
               if (destroyed || failed) return;
-              fail(session.state === "running" ? "stream_lost" : "session_ended");
+              fail(session.state === "running" ? "stream_lost" : "session_ended", false, undefined, err);
               return;
             } catch (probeError) {
               if (probeError instanceof ApiError && probeError.status < 500) {

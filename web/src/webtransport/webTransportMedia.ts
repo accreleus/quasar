@@ -417,7 +417,9 @@ export class WebTransportMedia implements MediaTransport {
     // router PyroWave fragments.
     const router = this.makeRouter(sink, live);
     const feedback = new FeedbackRecorder(this.now());
-    void this.readDatagrams(wt, sink, router, live, feedback).catch((err: unknown) => {
+    /** Set once this attempt's datagram reader has failed: `datagrams: <name>: <message>`. */
+    const datagramReader = { death: null as string | null };
+    void this.readDatagrams(wt, sink, router, live, feedback, datagramReader).catch((err: unknown) => {
       // No more video would arrive on this connection: end it, as a malformed control stream does.
       if (live.on) wt.close({ closeCode: 4400, reason: err instanceof Error ? err.message.slice(0, 100) : "" });
     });
@@ -447,6 +449,8 @@ export class WebTransportMedia implements MediaTransport {
     }
 
     if (this.closed) return abandon(refused("closed"));
+    // Accepted, but no video can arrive on this connection: never call it connected (#1403).
+    if (datagramReader.death) return abandon(refused("internal", datagramReader.death), { closeCode: 4400, reason: datagramReader.death.slice(0, 100) });
     this.abortAttempt = null;
     this.wt = wt;
     this.writer = writer;
@@ -454,8 +458,9 @@ export class WebTransportMedia implements MediaTransport {
     this.live = live;
     this.router = router;
     // Safari ships the newer spec shape: `datagrams.createWritable()` and no `writable` (#1403).
-    const dg = wt.datagrams as WebTransportDatagramDuplexStream & { createWritable?: () => WritableStream<Uint8Array> };
-    this.datagramWriter = (dg.createWritable ? dg.createWritable() : dg.writable).getWriter();
+    // `writable` first, so Chrome's path is the one it always took.
+    const dg = wt.datagrams as { writable?: WritableStream<Uint8Array>; createWritable?: () => WritableStream<Uint8Array> };
+    this.datagramWriter = (dg.writable ?? dg.createWritable!()).getWriter();
     sink.streams?.(audioStreamsFrom(first));
     router.config(config);
     const ping = () => this.send({ type: "ping", id: ++this.pingId, tc: this.now() });
@@ -510,6 +515,7 @@ export class WebTransportMedia implements MediaTransport {
     router: Router,
     live: { on: boolean },
     feedback: FeedbackRecorder,
+    died: { death: string | null },
   ): Promise<void> {
     const reader = wt.datagrams.readable.getReader();
     for (;;) {
@@ -517,13 +523,14 @@ export class WebTransportMedia implements MediaTransport {
       try {
         read = await reader.read();
       } catch (err) {
-        // Safari fails this reader with a bare NetworkError ahead of the session's own close (#1403):
-        // a close of ours now would hide that close's code and reason.
+        died.death = `datagrams: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`;
+        // E.g. Safari fails this reader when the agent closes a not-ready session, ahead of that
+        // close and its error message (#1403): the session's own answer or close decides, not this.
         if (await Promise.race([wt.closed.then(() => true, () => true), after(CLOSE_CODE_WAIT_MS, false)])) {
           router.stop();
           return;
         }
-        throw new Error(`datagrams: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`);
+        throw new Error(died.death);
       }
       const { value, done } = read;
       if (done || !live.on) {
