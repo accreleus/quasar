@@ -98,6 +98,48 @@ describe("WebTransportCard", () => {
     });
   });
 
+  it("a new URL defaults to the host's own certificate (a port forward)", async () => {
+    mocked.setHostWebTransport.mockResolvedValue(body());
+    await show(body());
+    expect(screen.getByLabelText("Certificate")).toHaveValue("agent");
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "https://stream.example.com:4433/wt" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    });
+    expect(mocked.setHostWebTransport).toHaveBeenCalledWith("tok", "h1", {
+      public_url: "https://stream.example.com:4433/wt",
+      certificate: "agent",
+    });
+  });
+
+  it("saves the certificate the admin chose", async () => {
+    mocked.setHostWebTransport.mockResolvedValue(body());
+    await show(body({ override: { public_url: "https://stream.example.com/wt", certificate: "agent" } }));
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Certificate"), { target: { value: "public" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    });
+    expect(mocked.setHostWebTransport).toHaveBeenCalledWith("tok", "h1", {
+      public_url: "https://stream.example.com/wt",
+      certificate: "public",
+    });
+  });
+
+  it("an existing public certificate is shown and kept when only the URL changes", async () => {
+    mocked.setHostWebTransport.mockResolvedValue(body());
+    await show(body({ override: { public_url: "https://old.example.com/wt", certificate: "public" } }));
+    expect(screen.getByLabelText("Certificate")).toHaveValue("public");
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "https://new.example.com/wt" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    });
+    expect(mocked.setHostWebTransport).toHaveBeenCalledWith("tok", "h1", {
+      public_url: "https://new.example.com/wt",
+      certificate: "public",
+    });
+  });
+
   it("clears with null", async () => {
     mocked.setHostWebTransport.mockResolvedValue(body());
     await show(body({ override: { public_url: "https://old.example.com/", certificate: "public" } }));
