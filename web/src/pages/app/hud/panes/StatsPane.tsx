@@ -371,7 +371,7 @@ export function StatsPane(props: StatsPaneProps) {
                 {props.transportFallbackCause && (
                   <tr>
                     <td>WebTransport fallback</td>
-                    <td>{props.transportFallbackCause}</td>
+                    <td className="diag-cause">{props.transportFallbackCause}</td>
                   </tr>
                 )}
                 {props.transportFallbackReason && (

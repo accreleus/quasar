@@ -1414,6 +1414,8 @@ describe("SessionPage — WebTransport falls back to WebRTC (A11)", () => {
     });
     expect(screen.getAllByText("Switching to WebRTC…").length).toBeGreaterThan(0);
     expect(sessionStorage.getItem("quasar.wt-fallback.s1")).toBe("connect_timeout");
+    // The cause is shown while the mint is still out (#1403).
+    expect((lastDrawerProps as Record<string, unknown>).transportFallbackCause).toBe("connect_timeout: boom");
     await act(async () => {
       release({ signaling: { url: "wss://fresh", token: "fresh" } });
     });

@@ -470,11 +470,12 @@ function SessionPageBody() {
     autoArmedRef.current ||= "resume";
     rememberFallback(sessionId ?? "", reason);
     new TraceEventEmitter(sessionId ?? "", authToken ?? "").emitTransportFallback(reason);
+    // Before the mint: a mint that hangs or fails must not hide why WebTransport gave up.
+    setFallbackCause(cause);
     try {
       const { signaling } = await mintSignalingToken(authToken ?? "", sessionId ?? "");
       if (!signaling?.url || !signaling?.token) throw new Error("no signaling coordinates");
       setFallbackReason(reason);
-      setFallbackCause(cause);
       setSignalCoords({ url: signaling.url, token: signaling.token, replacement: true, iceServers: signaling.ice_servers ?? [] });
     } catch (err) {
       setSwitching(false);
