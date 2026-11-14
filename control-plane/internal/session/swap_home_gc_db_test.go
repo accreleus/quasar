@@ -133,99 +133,72 @@ func TestUnqueuedSwapEpochRefreshUsesNewCapability(t *testing.T) {
 	must(t, store.ClearNewHomeHold(ctx, decision))
 }
 
-// A capability downgrade before handoff releases the Steam hold this swap took
-// as well as its own, and records the unprotected dispatch on both claims: the
-// frame has not left the control plane, so nothing may stay held for it.
-func TestUnqueuedSwapEpochRefreshReleasesTheSharedHold(t *testing.T) {
+// #1253: a sharing swap guarded on a capable epoch whose epoch then loses
+// cleanup before handoff is refused, not dispatched with the Steam mount and no
+// hold; the swapper's unstarted-swap release frees what the guard took, and the
+// retry re-enters the guard, which runs it without the library.
+func TestSwapEpochDowngradeOfASharingSwapIsRefused(t *testing.T) {
 	f := newWarmFixture(t, 8)
 	desktop := seedDesktop(t, f, true)
-	mine := seedDesktop(t, f, false)
-	sess := f.startedLaunch(t, mine)
+	sess := f.startedLaunch(t, seedDesktop(t, f, false))
 	ctx := context.Background()
-
 	app, err := f.store.GetLaunchApp(ctx, desktop)
 	must(t, err)
 	guard, err := f.store.GuardHomeForSwapWithHold(ctx, sess, f.userID, app, f.hostID, true, f.steam)
 	must(t, err)
-	if guard.hold == nil || !guard.hold.Created || guard.sharedHold == nil || !guard.sharedHold.Created {
-		t.Fatalf("guard = %+v, want a new own hold and a new shared hold", guard)
-	}
-	if h, _ := f.claimHolder(t, f.steam); h != sess {
-		t.Fatalf("Steam hold = %q, want the swap's own %s", h, sess)
-	}
 
-	decision, err := f.store.RefreshSwapHomeHold(ctx, sess, f.userID, desktop, f.hostID,
-		guard.hold, false, guard.sharedHold)
-	must(t, err)
-	if decision != nil {
-		t.Fatalf("unsupported replacement epoch kept new hold: %+v", decision)
+	if _, err := f.store.RefreshSwapHomeHold(ctx, sess, f.userID, desktop, f.hostID,
+		guard.hold, false, guard.sharedHold); !errors.Is(err, errSwapSharedHoldLost) {
+		t.Fatalf("downgrade of a sharing swap = %v, want it refused", err)
 	}
-	for _, appID := range []string{desktop, f.steam} {
-		var pending, warning bool
-		must(t, f.pool.QueryRow(ctx, `SELECT pending_home_token IS NOT NULL,legacy_unprotected_dispatch
-			FROM managed_home_claims WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, f.userID, appID).
-			Scan(&pending, &warning))
-		if pending || !warning {
-			t.Errorf("app %s after the epoch refresh: pending=%t warning=%t, want released and recorded", appID, pending, warning)
-		}
+	var warning bool
+	must(t, f.pool.QueryRow(ctx, `SELECT legacy_unprotected_dispatch FROM managed_home_claims
+		WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, f.userID, f.steam).Scan(&warning))
+	if warning {
+		t.Error("the refused downgrade recorded an unprotected Steam dispatch")
 	}
 }
 
-// A capability change that would dispatch a sharing swap WITHOUT its Steam hold
-// is refused: an earlier downgrade released that hold, and this refresh re-takes
-// only the target's own, so the retry must re-enter the swap guard afresh. An
-// unsupported epoch from the start is the same case — the guard took no holder
-// at all, and the Steam identity is what the refresh still has to reason about.
+// A capable refresh that would carry the Steam mount without this swap's hold
+// is refused, so the retry re-enters the swap guard afresh. A swap guarded on
+// an unsupported epoch shares nothing, so its upgrade takes only its own hold.
 func TestSwapEpochUpgradeWithoutTheSharedHoldIsRejected(t *testing.T) {
-	for _, tc := range []struct {
-		name         string
-		guardCapable bool
-		downgrade    bool
-	}{
-		{"downgraded then upgraded", true, true},
-		{"unsupported epoch then capable", false, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newWarmFixture(t, 8)
-			desktop := seedDesktop(t, f, true)
-			mine := seedDesktop(t, f, false)
-			sess := f.startedLaunch(t, mine)
-			ctx := context.Background()
-
-			app, err := f.store.GetLaunchApp(ctx, desktop)
-			must(t, err)
-			guard, err := f.store.GuardHomeForSwapWithHold(ctx, sess, f.userID, app, f.hostID,
-				tc.guardCapable, f.steam)
-			must(t, err)
-			if guard.sharedHold == nil || guard.sharedHold.AppID != f.steam {
-				t.Fatalf("guard = %+v, want the swap's Steam identity recorded", guard)
-			}
-
-			prior := guard.hold
-			if tc.downgrade {
-				prior, err = f.store.RefreshSwapHomeHold(ctx, sess, f.userID, desktop, f.hostID,
-					guard.hold, false, guard.sharedHold)
-				must(t, err)
-				if prior != nil {
-					t.Fatalf("downgrade kept a new hold: %+v", prior)
-				}
-			}
-
-			if _, err := f.store.RefreshSwapHomeHold(ctx, sess, f.userID, desktop, f.hostID,
-				prior, true, guard.sharedHold); !errors.Is(err, errSwapSharedHoldLost) {
-				t.Fatalf("upgrade to a capable epoch = %v, want the swap rejected", err)
-			}
-			// Nothing from that swap is left held by the session.
-			for _, appID := range []string{desktop, f.steam} {
-				var pending *string
-				must(t, f.pool.QueryRow(ctx, `SELECT pending_home_session_id::text FROM managed_home_claims
-					WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, f.userID, appID).Scan(&pending))
-				if pending != nil {
-					t.Errorf("app %s still held by %s after the refused upgrade", appID, *pending)
-				}
-			}
-		})
-	}
+	t.Run("hold gone", func(t *testing.T) {
+		f := newWarmFixture(t, 8)
+		desktop := seedDesktop(t, f, true)
+		sess := f.startedLaunch(t, seedDesktop(t, f, false))
+		ctx := context.Background()
+		app, err := f.store.GetLaunchApp(ctx, desktop)
+		must(t, err)
+		guard, err := f.store.GuardHomeForSwapWithHold(ctx, sess, f.userID, app, f.hostID, true, f.steam)
+		must(t, err)
+		must(t, exec(t, f.pool, `UPDATE managed_home_claims SET pending_home_session_id=NULL,
+			pending_home_token=NULL, pending_home_started_at=NULL WHERE canonical_app_id=$1::uuid`, f.steam))
+		if _, err := f.store.RefreshSwapHomeHold(ctx, sess, f.userID, desktop, f.hostID,
+			guard.hold, true, guard.sharedHold); !errors.Is(err, errSwapSharedHoldLost) {
+			t.Fatalf("capable refresh without the Steam hold = %v, want the swap rejected", err)
+		}
+	})
+	t.Run("unsupported epoch then capable", func(t *testing.T) {
+		f := newWarmFixture(t, 8)
+		desktop := seedDesktop(t, f, true)
+		sess := f.startedLaunch(t, seedDesktop(t, f, false))
+		ctx := context.Background()
+		must(t, exec(t, f.pool, `UPDATE managed_home_claims SET pending_home_session_id=NULL,
+			pending_home_token=NULL, pending_home_started_at=NULL`))
+		app, err := f.store.GetLaunchApp(ctx, desktop)
+		must(t, err)
+		guard, err := f.store.GuardHomeForSwapWithHold(ctx, sess, f.userID, app, f.hostID, false, f.steam)
+		must(t, err)
+		decision, err := f.store.RefreshSwapHomeHold(ctx, sess, f.userID, desktop, f.hostID,
+			guard.hold, true, guard.sharedHold)
+		if err != nil || decision == nil {
+			t.Fatalf("upgrade of a swap that shares nothing = %+v, %v; want its own hold", decision, err)
+		}
+		if h, _ := f.claimHolder(t, f.steam); h != "" {
+			t.Errorf("Steam hold = %q, want none for a swap that does not share", h)
+		}
+	})
 }
 
 // A stop request can race the pending swap's agent callback. The target may
