@@ -1738,7 +1738,7 @@ async fn a_healthy_video_path_sends_no_starved_probes() {
         tokio::select! {
             d = session.read_datagram() => {
                 let d = d.unwrap();
-                assert!(!d.is_empty(), "an unnecessary probe on a healthy path");
+                assert_ne!(d[..], *STARVED_PROBE, "an unnecessary probe on a healthy path");
                 path.receive(&d);
             }
             _ = report.tick() => {
@@ -1815,7 +1815,7 @@ async fn outage_recovers(stream: Stream) {
         tokio::select! {
             d = session.read_datagram() => {
                 let d = d.unwrap();
-                if d.is_empty() { continue; }
+                if d[..] == *STARVED_PROBE { continue; }
                 path.receive(&d);
                 let frame_seq = u16::from_le_bytes([d[7], d[8]]);
                 let pkt_seq = u32::from_le_bytes(d[1..5].try_into().unwrap());
@@ -1869,6 +1869,100 @@ async fn outage_recovers(stream: Stream) {
         !missed.load(Relaxed),
         "a NACK behind the stalled queue was answered with a nack_miss"
     );
+}
+
+/// #1333: what a browser has after everything the host sent was dropped for `outage`: when
+/// the first whole keyframe arrived after the path came back, and the longest it then went
+/// without a whole frame. The client sends what the web client does (feedback every 50 ms, a
+/// ping each second, a keyframe request for a frame that never completes) and receives as
+/// Chrome does: after an empty datagram it is handed no datagram again (Chrome 156 and 157,
+/// measured against this agent through the same relay).
+async fn decodable_after_outage(outage: Duration) -> (Option<Duration>, Duration) {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let mut agent = governed_agent(Stream::H264).await;
+    let down = Arc::new(AtomicBool::new(false));
+    let cut = down.clone();
+    let (session, mut send, mut recv) = through(&mut agent, move || {
+        (!cut.load(Relaxed)).then_some(Duration::ZERO)
+    })
+    .await;
+    tokio::spawn(async move { while read_message(&mut recv).await.is_ok() {} });
+    let mut path = Arrivals::default();
+    let mut report = tokio::time::interval(Duration::from_millis(50));
+    let mut ping = tokio::time::interval(Duration::from_secs(1));
+    let cut_at = Instant::now() + Duration::from_secs(2);
+    let (up_at, end) = (cut_at + outage, cut_at + outage + Duration::from_secs(6));
+    let mut parts: HashMap<u16, (u16, usize)> = HashMap::new();
+    let (mut first_key, mut last_whole, mut longest) = (None, None::<Instant>, Duration::ZERO);
+    let (mut wedged, mut ping_id) = (false, 0);
+    loop {
+        let now = Instant::now();
+        if now >= end {
+            break;
+        }
+        down.store((cut_at..up_at).contains(&now), Relaxed);
+        tokio::select! {
+            d = session.read_datagram(), if !wedged => {
+                let d = d.unwrap();
+                wedged = d.is_empty();
+                if d.first() != Some(&0x01) {
+                    continue;
+                }
+                path.receive(&d);
+                let frame_seq = u16::from_le_bytes([d[7], d[8]]);
+                let count = u16::from_le_bytes([d[11], d[12]]);
+                let frame = parts.entry(frame_seq).or_insert((count, 0));
+                frame.1 += 1;
+                if frame.1 < frame.0 as usize {
+                    continue;
+                }
+                parts.remove(&frame_seq);
+                if now >= up_at && (first_key.is_some() || d[5] & 1 == 1) {
+                    first_key.get_or_insert(now - up_at);
+                    longest = longest.max(now - last_whole.unwrap_or(up_at));
+                    last_whole = Some(now);
+                }
+            }
+            _ = report.tick() => {
+                if let Some(fb) = path.feedback() {
+                    write_message(&mut send, &fb).await.unwrap();
+                }
+                if now >= up_at && first_key.is_none() && !parts.is_empty() {
+                    parts.clear();
+                    write_message(&mut send, &json!({"type": "keyframe_request"})).await.unwrap();
+                }
+            }
+            _ = ping.tick() => {
+                ping_id += 1;
+                write_message(&mut send, &json!({"type": "ping", "id": ping_id, "tc": 0})).await.unwrap();
+            }
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+    (first_key, longest.max(end - last_whole.unwrap_or(up_at)))
+}
+
+/// #1333: after a 1 s and a 2 s outage the browser decodes again soon after the path is back,
+/// and never goes without video long enough for its 5 s check (`MEDIA_SILENCE_MS`) to end the
+/// connection. The outage probe's empty datagram stopped Chrome's datagram reader for good.
+#[tokio::test]
+async fn video_the_client_can_decode_follows_a_one_and_a_two_second_outage() {
+    for outage in [Duration::from_secs(1), Duration::from_secs(2)] {
+        let (first_key, longest) = decodable_after_outage(outage).await;
+        eprintln!(
+            "{outage:?} outage: first whole keyframe {first_key:?} after, longest gap {longest:?}"
+        );
+        let first_key =
+            first_key.unwrap_or_else(|| panic!("no whole keyframe after a {outage:?} outage"));
+        assert!(
+            first_key < Duration::from_millis(500),
+            "{outage:?} outage: the first whole keyframe came {first_key:?} after the path was back"
+        );
+        assert!(
+            longest < Duration::from_secs(1),
+            "{outage:?} outage: {longest:?} without a whole frame after the path was back"
+        );
+    }
 }
 
 /// #1040: receiver feedback from a rate-capped client drives the session's real ABR
