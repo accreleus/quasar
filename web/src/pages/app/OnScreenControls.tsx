@@ -144,23 +144,27 @@ function Controls({ setPad }: { setPad: (pad: VirtualPadState | null) => void })
 
   return (
     <div className="osc" data-testid="on-screen-controls">
-      <div className="osc-shoulder osc-shoulder-l">
-        <PadButton index={BTN.LT} label="LT" cls="osc-trigger" update={update} />
-        <PadButton index={BTN.LB} label="LB" cls="osc-trigger" update={update} />
+      <div className="osc-cluster osc-cluster-l">
+        <div className="osc-shoulder">
+          <PadButton index={BTN.LT} label="LT" cls="osc-trigger" update={update} />
+          <PadButton index={BTN.LB} label="LB" cls="osc-trigger" update={update} />
+        </div>
+        <Dpad update={update} />
+        <Stick first={STICK_LEFT} label="Left stick" update={update} />
       </div>
-      <div className="osc-shoulder osc-shoulder-r">
-        <PadButton index={BTN.RB} label="RB" cls="osc-trigger" update={update} />
-        <PadButton index={BTN.RT} label="RT" cls="osc-trigger" update={update} />
+      <div className="osc-cluster osc-cluster-r">
+        <div className="osc-shoulder">
+          <PadButton index={BTN.RB} label="RB" cls="osc-trigger" update={update} />
+          <PadButton index={BTN.RT} label="RT" cls="osc-trigger" update={update} />
+        </div>
+        <div className="osc-face">
+          <PadButton index={BTN.Y} label="Y" cls="osc-face-btn osc-y" update={update} />
+          <PadButton index={BTN.X} label="X" cls="osc-face-btn osc-x" update={update} />
+          <PadButton index={BTN.B} label="B" cls="osc-face-btn osc-b" update={update} />
+          <PadButton index={BTN.A} label="A" cls="osc-face-btn osc-a" update={update} />
+        </div>
+        <Stick first={STICK_RIGHT} label="Right stick" update={update} />
       </div>
-      <div className="osc-zone osc-dpad-zone"><Dpad update={update} /></div>
-      <div className="osc-zone osc-lstick-zone"><Stick first={STICK_LEFT} label="Left stick" update={update} /></div>
-      <div className="osc-zone osc-face">
-        <PadButton index={BTN.Y} label="Y" cls="osc-face-btn osc-y" update={update} />
-        <PadButton index={BTN.X} label="X" cls="osc-face-btn osc-x" update={update} />
-        <PadButton index={BTN.B} label="B" cls="osc-face-btn osc-b" update={update} />
-        <PadButton index={BTN.A} label="A" cls="osc-face-btn osc-a" update={update} />
-      </div>
-      <div className="osc-zone osc-rstick-zone"><Stick first={STICK_RIGHT} label="Right stick" update={update} /></div>
       <div className="osc-meta">
         <PadButton index={BTN.SELECT} label="Select" cls="osc-pill" update={update} />
         <PadButton index={BTN.START} label="Start" cls="osc-pill" update={update} />

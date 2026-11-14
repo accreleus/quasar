@@ -115,13 +115,19 @@
 
 /* #1401 on-screen controls. Neither DESIGN.md nor a mock covers this surface: only HUD
  * tokens and the look of `.session-summon`. Under the HUD (z 20) and the summon button
- * (z 22); the layer itself takes no touches, only the controls do. */
+ * (z 22); the layer itself takes no touches, only the controls do.
+ * Two thumb clusters grow up from the bottom corners, so they stay under the thumbs on
+ * any screen height. Every size is a multiple of --osc-u, one unit taken from the
+ * smaller viewport side (44px floor = the touch-target minimum). */
 .osc {
   position: fixed;
   inset: 0;
   z-index: 18;
   pointer-events: none;
-  --osc-edge: 20px;
+  --osc-u: clamp(44px, 13vmin, 80px);
+  --osc-edge: clamp(var(--s4), 3vmin, 28px);
+  --osc-key: max(44px, calc(var(--osc-u) * 0.8));
+  --osc-cluster-h: calc(var(--osc-key) + var(--osc-u) * 4.8 + var(--s2) * 2);
 }
 .osc-btn,
 .osc-stick,
@@ -158,49 +164,42 @@
 }
 .osc-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
-.osc-shoulder {
+/* Stacked top to bottom: shoulders, d-pad or face diamond, stick. */
+.osc-cluster {
   position: absolute;
-  top: calc(12px + env(safe-area-inset-top, 0px));
+  bottom: calc(var(--osc-edge) + env(safe-area-inset-bottom, 0px));
   display: flex;
+  flex-direction: column;
+  align-items: center;
   gap: var(--s2);
+  width: calc(var(--osc-u) * 2.8);
 }
-.osc-shoulder-l { left: calc(var(--osc-edge) + env(safe-area-inset-left, 0px)); }
-.osc-shoulder-r { right: calc(var(--osc-edge) + env(safe-area-inset-right, 0px)); }
+.osc-cluster-l { left: calc(var(--osc-edge) + env(safe-area-inset-left, 0px)); }
+/* Clear of the session-menu button (right 12px, 48px wide) at the right edge. */
+.osc-cluster-r { right: calc(var(--s10) + var(--s1) + env(safe-area-inset-right, 0px)); }
+.osc-shoulder { display: flex; gap: var(--s2); }
 .osc-trigger {
-  width: 64px;
-  height: 40px;
+  width: calc(var(--osc-u) * 1.3);
+  height: var(--osc-key);
   border-radius: var(--r-panel);
 }
 
-.osc-zone { position: absolute; }
-.osc-dpad-zone { left: calc(var(--osc-edge) + env(safe-area-inset-left, 0px)); top: 72px; }
-.osc-lstick-zone {
-  left: calc(var(--osc-edge) + env(safe-area-inset-left, 0px));
-  bottom: calc(var(--osc-edge) + env(safe-area-inset-bottom, 0px));
-}
-/* Clear of the session-menu button, which sits at the right edge. */
 .osc-face {
-  right: calc(76px + env(safe-area-inset-right, 0px));
-  top: 72px;
-  width: 148px;
-  height: 148px;
+  position: relative;
+  width: calc(var(--osc-u) * 2.6);
+  height: calc(var(--osc-u) * 2.6);
 }
-.osc-rstick-zone {
-  right: calc(76px + env(safe-area-inset-right, 0px));
-  bottom: calc(var(--osc-edge) + env(safe-area-inset-bottom, 0px));
-}
-
 .osc-stick {
   position: relative;
   display: grid;
   place-items: center;
-  width: 112px;
-  height: 112px;
+  width: calc(var(--osc-u) * 2.2);
+  height: calc(var(--osc-u) * 2.2);
   border-radius: 50%;
 }
 .osc-knob {
-  width: 48px;
-  height: 48px;
+  width: calc(var(--osc-u) * 0.95);
+  height: calc(var(--osc-u) * 0.95);
   border-radius: 50%;
   background: var(--ink-4);
   pointer-events: none;
@@ -208,33 +207,33 @@
 
 .osc-dpad {
   position: relative;
-  width: 96px;
-  height: 96px;
+  width: calc(var(--osc-u) * 2.2);
+  height: calc(var(--osc-u) * 2.2);
   border-radius: 50%;
 }
 .osc-dir {
   position: absolute;
-  width: 32px;
-  height: 32px;
+  width: calc(var(--osc-u) * 0.7);
+  height: calc(var(--osc-u) * 0.7);
   border-radius: var(--r-control);
   background: var(--ink-4);
   pointer-events: none;
 }
-.osc-up { left: 32px; top: 4px; }
-.osc-down { left: 32px; bottom: 4px; }
-.osc-left { left: 4px; top: 32px; }
-.osc-right { right: 4px; top: 32px; }
+.osc-up { left: calc(var(--osc-u) * 0.75); top: calc(var(--osc-u) * 0.1); }
+.osc-down { left: calc(var(--osc-u) * 0.75); bottom: calc(var(--osc-u) * 0.1); }
+.osc-left { left: calc(var(--osc-u) * 0.1); top: calc(var(--osc-u) * 0.75); }
+.osc-right { right: calc(var(--osc-u) * 0.1); top: calc(var(--osc-u) * 0.75); }
 
 .osc-face-btn {
   position: absolute;
-  width: 48px;
-  height: 48px;
+  width: var(--osc-u);
+  height: var(--osc-u);
   border-radius: 50%;
 }
-.osc-y { left: 50px; top: 0; }
-.osc-a { left: 50px; bottom: 0; }
-.osc-x { left: 0; top: 50px; }
-.osc-b { right: 0; top: 50px; }
+.osc-y { left: calc(var(--osc-u) * 0.8); top: 0; }
+.osc-a { left: calc(var(--osc-u) * 0.8); bottom: 0; }
+.osc-x { left: 0; top: calc(var(--osc-u) * 0.8); }
+.osc-b { right: 0; top: calc(var(--osc-u) * 0.8); }
 
 .osc-meta {
   position: absolute;
@@ -247,14 +246,12 @@
 }
 .osc-pill {
   width: 64px;
-  height: 32px;
+  height: 44px;
   border-radius: var(--r-pill);
   font-size: var(--t-xs);
 }
 
-/* Portrait: the sticks share the bottom edge, so everything else rides above them. */
+/* Portrait: the clusters fill the width, so Start/Select ride above them. */
 @media (orientation: portrait) {
-  .osc-meta { bottom: calc(140px + env(safe-area-inset-bottom, 0px)); }
-  .osc-dpad-zone { top: auto; bottom: calc(184px + env(safe-area-inset-bottom, 0px)); }
-  .osc-face { top: auto; bottom: calc(184px + env(safe-area-inset-bottom, 0px)); }
+  .osc-meta { bottom: calc(var(--osc-edge) + var(--osc-cluster-h) + var(--s2) + env(safe-area-inset-bottom, 0px)); }
 }
