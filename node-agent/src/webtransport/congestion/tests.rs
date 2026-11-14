@@ -1209,3 +1209,82 @@ fn a_report_is_evidence_only_when_the_link_held_the_sender_back() {
     est.apply(report(Some(7000.0), Some(7500.0), None), at(600), NO_QUIC);
     assert_eq!(est.measured(), Some(BETA * 7000.0));
 }
+
+/// A video-lane datagram as `packetize` numbers it: channel, then `pkt_seq` (§Channels).
+fn video_datagram(pkt_seq: u32) -> bytes::Bytes {
+    let mut d = vec![0x01];
+    d.extend_from_slice(&pkt_seq.to_le_bytes());
+    d.resize(SIZE, 0);
+    d.into()
+}
+
+fn held(pkt_seq: u32) -> Held {
+    Held {
+        datagram: video_datagram(pkt_seq),
+        logged: true,
+        resend: false,
+    }
+}
+
+/// QUIC taking a datagram: its wire `pkt_seq` is noted.
+fn quic(wire: &mut Vec<u32>, held: Held) -> Handed {
+    wire.push(u32::from_le_bytes(held.datagram[1..5].try_into().unwrap()));
+    Handed::Sent
+}
+
+#[test]
+fn audio_leaves_ahead_of_video_over_the_send_budget_and_video_waits() {
+    // 2 Mbit/s governed: 20 ms of it is 5000 bytes, four video datagrams.
+    let room = VideoQueue::room(Some(2000), 1 << 20);
+    assert_eq!(room, 5000);
+    let mut video = VideoQueue::default();
+    let mut wire = Vec::new();
+    // A keyframe of 40 datagrams lands on a path that has not drained.
+    let first = video.next_seq();
+    for i in 0..40 {
+        video.push(held(first + i), 1 << 20);
+    }
+    assert!(video.feed(room, |h| quic(&mut wire, h)));
+    // QUIC drains nothing while three audio datagrams arrive.
+    let mut audio = Vec::new();
+    for _ in 0..3 {
+        audio.push(video.take_seq());
+        assert!(video.feed(0, |h| quic(&mut wire, h)));
+    }
+    assert_eq!(
+        wire,
+        [0, 1, 2, 3],
+        "only the budget's worth of video is with QUIC"
+    );
+    assert_eq!(audio, [4, 5, 6], "audio goes next, ahead of the 36 held");
+    assert_eq!(video.bytes(), 36 * SIZE);
+
+    // The path drains: the rest follows, numbered after the audio, with no gap.
+    assert!(video.feed(usize::MAX, |h| quic(&mut wire, h)));
+    assert_eq!(wire[4..], (7..43).collect::<Vec<_>>());
+    assert!(video.is_empty());
+}
+
+#[test]
+fn held_video_over_the_cap_drops_oldest_first_and_leaves_no_gap() {
+    let mut video = VideoQueue::default();
+    for i in 0..5 {
+        video.push(held(i), 3 * SIZE);
+    }
+    assert_eq!(video.bytes(), 3 * SIZE);
+    let mut wire = Vec::new();
+    assert!(video.feed(usize::MAX, |h| quic(&mut wire, h)));
+    assert_eq!(
+        wire,
+        [0, 1, 2],
+        "the three newest, numbered from the wire's next"
+    );
+}
+
+#[test]
+fn ungoverned_video_has_quics_whole_queue() {
+    assert_eq!(VideoQueue::room(None, 1 << 20), 1 << 20);
+    let two = 2 * super::super::media::MAX_DATAGRAM;
+    assert_eq!(VideoQueue::room(Some(100), 1 << 20), two);
+    assert_eq!(VideoQueue::room(Some(10_000_000), 1 << 20), 1 << 19);
+}

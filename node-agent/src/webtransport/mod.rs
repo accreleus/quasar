@@ -64,6 +64,8 @@ const DATAGRAM_BUFFER: usize = 1 << 20;
 /// One transmit (up to ten packets where the socket batches them) per 100 ms, only behind a
 /// stalled queue on a path that acknowledges nothing: at most about 145 kB/s.
 const STARVED_PROBE_INTERVAL: Duration = Duration::from_millis(100);
+/// How often held video is offered to QUIC again (`congestion::VideoQueue`).
+const DRAIN_EVERY: Duration = Duration::from_millis(1);
 
 const CLOSE_NORMAL: u32 = 0;
 const CLOSE_PROTOCOL: u32 = 4400;
@@ -1150,14 +1152,15 @@ fn retransmit_window(session: &Session) -> Duration {
 }
 
 /// The backlog guard's verdict on the next video unit or `nack` answer; a skip that wants a
-/// keyframe has asked for it.
+/// keyframe has asked for it. `held`: video bytes not yet handed to QUIC.
 fn admit(
     backlog: &mut congestion::Backlog,
     session: &Session,
     media: &Media,
     keyframe: bool,
+    held: usize,
 ) -> congestion::Admit {
-    let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
+    let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space()) + held;
     let hold = retransmit_window(session);
     backlog.acknowledge(quinn::Connection::stats(session).frame_rx.acks);
     let admit = backlog.admit(queued, keyframe, std::time::Instant::now(), hold);
@@ -1179,27 +1182,39 @@ fn stalled() -> (Option<Value>, u32, &'static str) {
     )
 }
 
-/// Send `nack` answers; false when the connection is gone. A resend the path's maximum
-/// datagram size has shrunk below is dropped and counted: the client gives that frame up.
-fn resend(
+/// Hand QUIC the held video that fits beside audio (`VideoQueue::room`); false when the
+/// connection is gone. A datagram the path's maximum datagram size has shrunk below is
+/// skipped (a resend is counted): the client gives that frame up.
+fn feed(
     session: &Session,
-    datagrams: Vec<bytes::Bytes>,
+    video: &mut congestion::VideoQueue,
+    governor: &congestion::Governor,
     mut log: Option<&mut congestion::SendLog>,
-    too_large: &mut u64,
+    handed: &mut u64,
+    resends_too_large: &mut u64,
 ) -> bool {
-    for d in datagrams {
-        if let Some(log) = log.as_deref_mut() {
-            log.record(&d, std::time::Instant::now(), true);
+    let governed = governor.governs().then(|| governor.kbps());
+    let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
+    let room = congestion::VideoQueue::room(governed, DATAGRAM_BUFFER).saturating_sub(queued);
+    let now = std::time::Instant::now();
+    video.feed(room, |held| {
+        if let Some(log) = log.as_deref_mut().filter(|_| held.logged) {
+            log.record(&held.datagram, now, held.resend);
         }
-        match session.send_datagram(d) {
-            Ok(()) => {}
+        match session.send_datagram(held.datagram) {
+            Ok(()) => {
+                *handed += 1;
+                congestion::Handed::Sent
+            }
             Err(web_transport_quinn::SessionError::SendDatagramError(
                 quinn::SendDatagramError::TooLarge,
-            )) => *too_large += 1,
-            Err(_) => return false,
+            )) => {
+                *resends_too_large += u64::from(held.resend);
+                congestion::Handed::TooLarge
+            }
+            Err(_) => congestion::Handed::Gone,
         }
-    }
-    true
+    })
 }
 
 /// Hand over the first bidirectional stream as the control stream and refuse every
@@ -1465,6 +1480,9 @@ async fn stream(
         .rate()
         .map(|rate| Control::new(rate, client.gone.clone(), fec, governor.clone()));
     let mut backlog = congestion::Backlog::default();
+    let mut video = congestion::VideoQueue::default();
+    // Re-armed while video is held: QUIC says nothing when its queue drains.
+    let mut drain = pin!(tokio::time::sleep(Duration::ZERO));
     // Every datagram given to quinn: what it put on the wire is in its stats.
     let mut handed = 0u64;
     let mut starved_probes = 0u64;
@@ -1485,7 +1503,8 @@ async fn stream(
     let (message, code, why) = loop {
         tokio::select! {
             _ = probe_tick.tick() => {
-                let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
+                let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space())
+                    + video.bytes();
                 let acks = quinn::Connection::stats(session).frame_rx.acks;
                 // Only a session the estimate can govern (#1332's invariant): with ABR off (an
                 // ABR loop exists then, but retargets nothing), and while PyroWave is active,
@@ -1518,16 +1537,15 @@ async fn stream(
             packet = client.audio.recv(), if audio_open => match packet {
                 Some(packet) => {
                     // §Audio redundancy: the packet before this one, immediately before it.
+                    // Straight to QUIC, ahead of held video (#1321).
                     if let Some(previous) = previous_audio.as_ref().filter(|p| audio::repeats(p, &packet)) {
-                        let seq = pkt_seq;
-                        pkt_seq = pkt_seq.wrapping_add(1);
+                        let seq = video.take_seq();
                         handed += 1;
                         if session.send_datagram(audio::repeated(previous, seq)).is_err() {
                             break QUIET;
                         }
                     }
-                    let seq = pkt_seq;
-                    pkt_seq = pkt_seq.wrapping_add(1);
+                    let seq = video.take_seq();
                     // Not in the send log: the estimate is the video ABR's, and on WebRTC
                     // audio is a peer connection GCC never sees. Feedback naming an audio
                     // `pkt_seq` finds no record and counts for nothing. The `0x06` copy above is
@@ -1543,6 +1561,13 @@ async fn stream(
                 // Displaced or ended: the video queue says which, next.
                 None => audio_open = false,
             },
+            () = &mut drain, if !video.is_empty() => {
+                let log = control.as_mut().map(|c| &mut c.log);
+                if !feed(session, &mut video, &governor, log, &mut handed, &mut resends_too_large) {
+                    break QUIET;
+                }
+                drain.as_mut().reset(Instant::now() + DRAIN_EVERY);
+            }
             () = &mut idle => {
                 tracing::info!(
                     token = "webtransport-client-idle",
@@ -1553,13 +1578,14 @@ async fn stream(
             out = client.rx.recv() => match out {
                 Some(Out::Unit(unit)) if unit.config_id != current.config_id => {}
                 Some(Out::Unit(unit)) => {
-                    match admit(&mut backlog, session, media, unit.keyframe || unit.pyrowave) {
+                    match admit(&mut backlog, session, media, unit.keyframe || unit.pyrowave, video.bytes()) {
                         congestion::Admit::Send => {}
                         congestion::Admit::GiveUp => break stalled(),
                         _ => continue,
                     }
                     let now = std::time::Instant::now();
                     let max = session.max_datagram_size().min(media::MAX_DATAGRAM);
+                    pkt_seq = video.next_seq();
                     let Some(mut datagrams) = media::packetize(&unit, &current, max, &mut pkt_seq) else {
                         if !warned_oversized {
                             warned_oversized = true;
@@ -1593,17 +1619,15 @@ async fn stream(
                     }
                     // shortcut: a PyroWave frame (~380 datagrams at 1080p/200) goes as one burst;
                     // §Rate's SHOULD pace over half a frame interval is B09 (#1058).
-                    let mut log = control.as_mut().filter(|_| !unit.pyrowave).map(|c| &mut c.log);
-                    handed += datagrams.len() as u64;
-                    let sent = datagrams.into_iter().try_for_each(|d| {
-                        if let Some(log) = log.as_deref_mut() {
-                            log.record(&d, now, false);
-                        }
-                        session.send_datagram(d)
-                    });
-                    if sent.is_err() {
+                    let logged = control.is_some() && !unit.pyrowave;
+                    for datagram in datagrams {
+                        video.push(congestion::Held { datagram, logged, resend: false }, DATAGRAM_BUFFER);
+                    }
+                    let log = control.as_mut().map(|c| &mut c.log);
+                    if !feed(session, &mut video, &governor, log, &mut handed, &mut resends_too_large) {
                         break QUIET;
                     }
+                    drain.as_mut().reset(Instant::now() + DRAIN_EVERY);
                 }
                 Some(Out::Config(config, reason)) => {
                     if config.codec != "pyrowave" {
@@ -1637,7 +1661,7 @@ async fn stream(
                         // retransmission and no nack_miss.
                         Some("nack") if nack_of(&message).is_some_and(|(seq, _)| pyrowave_frames.ignores(seq)) => {}
                         Some("nack") if !nack_budget.take(std::time::Instant::now()) => nacks_capped += 1,
-                        Some("nack") => match admit(&mut backlog, session, media, false) {
+                        Some("nack") => match admit(&mut backlog, session, media, false, video.bytes()) {
                             congestion::Admit::GiveUp => break stalled(),
                             // Behind a stalled queue a resend is as stale as new video.
                             congestion::Admit::Skip | congestion::Admit::SkipForKeyframe => {}
@@ -1645,14 +1669,19 @@ async fn stream(
                                 let answer = nack_of(&message).map(|(frame_seq, ranges)| {
                                     let window = retransmit_window(session);
                                     let now = std::time::Instant::now();
+                                    pkt_seq = video.next_seq();
                                     (frame_seq, sent.answer(frame_seq, &ranges, &mut pkt_seq, now, window))
                                 });
                                 if let Some((frame_seq, answer)) = answer {
+                                    let logged = control.is_some();
+                                    for datagram in answer.resend {
+                                        video.push(congestion::Held { datagram, logged, resend: true }, DATAGRAM_BUFFER);
+                                    }
                                     let log = control.as_mut().map(|c| &mut c.log);
-                                    handed += answer.resend.len() as u64;
-                                    if !resend(session, answer.resend, log, &mut resends_too_large) {
+                                    if !feed(session, &mut video, &governor, log, &mut handed, &mut resends_too_large) {
                                         break QUIET;
                                     }
+                                    drain.as_mut().reset(Instant::now() + DRAIN_EVERY);
                                     if !answer.missed.is_empty() {
                                         let miss = json!({"type": "nack_miss", "frame_seq": frame_seq, "frags": answer.missed});
                                         let write = write_message(&mut send, &miss);

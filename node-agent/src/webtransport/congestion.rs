@@ -1211,5 +1211,112 @@ impl Backlog {
     }
 }
 
+/// Video QUIC may hold ahead of the next audio datagram, in time at the governed rate.
+const AUDIO_AHEAD_MS: u64 = 20;
+
+/// Video, FEC and `nack` answers waiting for room in QUIC's datagram queue, so audio, which
+/// goes straight to QUIC, never queues behind more than [`VideoQueue::room`] of video and
+/// is never the datagram QUIC drops to make space (#1321). `pkt_seq` is taken as a datagram
+/// is handed to QUIC, so it follows send order (§Channels) even when audio overtakes.
+#[derive(Default)]
+pub(crate) struct VideoQueue {
+    held: VecDeque<Held>,
+    bytes: usize,
+    /// The `pkt_seq` of the next datagram handed to QUIC.
+    wire: u32,
+}
+
+pub(crate) struct Held {
+    pub(crate) datagram: bytes::Bytes,
+    /// Goes in the send log.
+    pub(crate) logged: bool,
+    pub(crate) resend: bool,
+}
+
+/// What became of a datagram handed to QUIC.
+pub(crate) enum Handed {
+    Sent,
+    /// Over the path's datagram size: skipped, its `pkt_seq` not used.
+    TooLarge,
+    Gone,
+}
+
+impl VideoQueue {
+    /// Bytes of QUIC's datagram queue video may fill: [`AUDIO_AHEAD_MS`] at the governed rate,
+    /// at least two datagrams, at most half the queue so audio always fits beside it.
+    /// shortcut: ungoverned (no feedback, ABR off, PyroWave) video goes straight to QUIC as
+    /// before; give those sessions a rate here if their audio pops under congestion.
+    pub(crate) fn room(governed_kbps: Option<u64>, buffer: usize) -> usize {
+        governed_kbps.map_or(buffer, |kbps| {
+            ((kbps * AUDIO_AHEAD_MS / 8) as usize).clamp(2 * super::media::MAX_DATAGRAM, buffer / 2)
+        })
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The `pkt_seq` new video is numbered from: after everything held.
+    pub(crate) fn next_seq(&self) -> u32 {
+        self.wire.wrapping_add(self.held.len() as u32)
+    }
+
+    /// The `pkt_seq` of a datagram handed to QUIC now, ahead of everything held.
+    pub(crate) fn take_seq(&mut self) -> u32 {
+        let seq = self.wire;
+        self.wire = seq.wrapping_add(1);
+        seq
+    }
+
+    /// Past `cap` held bytes the oldest are dropped, as QUIC's own queue drops them.
+    pub(crate) fn push(&mut self, held: Held, cap: usize) {
+        while self.bytes + held.datagram.len() > cap {
+            let Some(old) = self.held.pop_front() else {
+                break;
+            };
+            self.bytes -= old.datagram.len();
+        }
+        self.bytes += held.datagram.len();
+        self.held.push_back(held);
+    }
+
+    /// Hands `send` the oldest datagrams that fit in `room` bytes, each carrying the next
+    /// wire `pkt_seq`. False when the connection is gone.
+    pub(crate) fn feed(&mut self, mut room: usize, mut send: impl FnMut(Held) -> Handed) -> bool {
+        while let Some(next) = self.held.front() {
+            let len = next.datagram.len();
+            if len > room {
+                break;
+            }
+            let mut held = self.held.pop_front().expect("front exists");
+            self.bytes -= len;
+            let seq = self.wire.to_le_bytes();
+            if held.datagram.get(1..5) != Some(&seq[..]) {
+                // Renumbered only after audio overtook it; a fragment the retransmit store
+                // shares is copied, a FEC repair or `nack` answer is not.
+                let mut d = held
+                    .datagram
+                    .try_into_mut()
+                    .unwrap_or_else(|d| bytes::BytesMut::from(&d[..]));
+                d[1..5].copy_from_slice(&seq);
+                held.datagram = d.freeze();
+            }
+            match send(held) {
+                Handed::Sent => {
+                    room -= len;
+                    self.wire = self.wire.wrapping_add(1);
+                }
+                Handed::TooLarge => {}
+                Handed::Gone => return false,
+            }
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests;
