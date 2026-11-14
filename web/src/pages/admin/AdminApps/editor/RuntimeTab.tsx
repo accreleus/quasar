@@ -91,9 +91,10 @@ export function RuntimeTab({
   // stored false of a preset-linked app is not what runs.
   const presetHome = !!preset?.managed_home;
   const managedHome = draft.managedHome || presetHome;
-  // Same rule as the launch (mergeManagedHome): an app still on the schema default path takes the preset's.
+  // Same rule as the launch (mergeManagedHome): an app with no path of its own (empty or the schema
+  // default) takes the preset's. Shown as a hint only; the field stays on what the app stores.
   const homePath =
-    presetHome && preset?.home_container_path && (!draft.containerPath || draft.containerPath === "/home/quasar")
+    preset?.home_container_path && (!draft.containerPath || draft.containerPath === "/home/quasar")
       ? preset.home_container_path
       : draft.containerPath;
   const overridden = draft.env.filter(([k]) => presetEnvKeys.includes(k.trim())).length;
@@ -251,10 +252,14 @@ export function RuntimeTab({
           <TextField
             label="Mount path inside container"
             mono
-            value={homePath}
+            value={draft.containerPath}
             onChange={(e) => onChange({ ...draft, containerPath: e.target.value })}
             placeholder="/home/quasar"
-            hint="Where the home appears inside the container, not where the data is stored."
+            hint={
+              homePath !== draft.containerPath
+                ? `The runtime preset mounts the home at ${homePath}. The app uses that path while this field is /home/quasar.`
+                : "Where the home appears inside the container, not where the data is stored."
+            }
           />
         )}
         {managedHome &&
