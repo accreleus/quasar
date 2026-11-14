@@ -860,6 +860,8 @@ impl Estimator {
 /// codec-pyrowave.md §Rate: the 1 s the estimate may sit under `floor_kbps`, and the latest
 /// the QUIC cap and that timer start after a switch on.
 const PYRO_STEP_DOWN_AFTER: Duration = Duration::from_secs(1);
+/// The shortest span the encoder's fill of its budget is read over: 6 frames at 60 fps.
+const PYRO_FILL_WINDOW: Duration = Duration::from_millis(100);
 /// What of a full PyroWave datagram is the encoder's bytes: §Rate's estimate is "less the
 /// agent's datagram overhead".
 const PYRO_PAYLOAD_SHARE: f64 =
@@ -890,10 +892,16 @@ pub(crate) enum PyroVerdict {
 /// silence does not decay it, as on the standard codec it never takes the encoder under
 /// the floor; QUIC's cap still applies, so withholding feedback cannot postpone a step-down.
 ///
-/// The cap counts only while QUIC limits the sender: its datagram queue holds bytes, or it
-/// saw congestion since the last judgement. Quinn's Cubic does not grow its window while the
-/// sender is application-limited (small frames: a dark or still screen), so window over RTT
-/// is then what was sent, not what the link carries, and must never step a session down.
+/// The cap counts only while QUIC limits the sender: more than a window of datagrams waits in
+/// its queue, or it saw congestion since the last judgement. Quinn's Cubic does not grow its
+/// window while the sender is application-limited (small frames: a dark or still screen), so
+/// window over RTT is then what was sent, not what the link carries, and must never step a
+/// session down. It also counts only while the encoder fills the budget asked of it: a
+/// picture that gives less (dark, still) is what sets the rate, not QUIC. Once a waiting
+/// queue has put the reading under the floor it stays latched until the reading is back over
+/// it or the encoder stops filling its budget: cutting the budget drains the queue, and our
+/// own reaction is not the link recovering. The window growing (Cubic grows it only on data
+/// acknowledged while window-limited) releases it; feedback never raises the estimate.
 pub(crate) struct PyroRate {
     estimator: Estimator,
     pub(crate) log: SendLog,
@@ -907,6 +915,12 @@ pub(crate) struct PyroRate {
     budget: u32,
     /// QUIC's congestion events at the last judgement.
     events: Option<u64>,
+    /// A waiting queue put the reading under the floor: the cap holds until it is back over.
+    latched: bool,
+    /// Encoder bytes handed to the stream loop, before the stall guard.
+    offered: u64,
+    /// (when, `offered` then): the older is 100-200 ms back, the window the fill is read over.
+    marks: [(Instant, u64); 2],
 }
 
 impl PyroRate {
@@ -922,6 +936,9 @@ impl PyroRate {
             // The first judgement always writes: a previous client may have left a lower one.
             budget: 0,
             events: None,
+            latched: false,
+            offered: 0,
+            marks: [(now, 0); 2],
         }
     }
 
@@ -944,16 +961,38 @@ impl PyroRate {
         self.judge(now, path)
     }
 
+    /// One encoded frame of `bytes`, counted whether or not the stall guard sends it.
+    pub(crate) fn offer(&mut self, bytes: usize) {
+        self.offered += bytes as u64;
+    }
+
+    /// The encoder's output over the last 100-200 ms, kbit/s.
+    fn offered_kbps(&mut self, now: Instant) -> f64 {
+        if now.saturating_duration_since(self.marks[1].0) >= PYRO_FILL_WINDOW {
+            self.marks = [self.marks[1], (now, self.offered)];
+        }
+        let (at, then) = self.marks[0];
+        let secs = now.saturating_duration_since(at).as_secs_f64();
+        if secs == 0.0 {
+            return f64::INFINITY;
+        }
+        (self.offered - then) as f64 * 8.0 / 1000.0 / secs
+    }
+
     fn judge(&mut self, now: Instant, path: QuicPath) -> PyroVerdict {
         let mut kbps = self.estimator.estimate_kbps.min(self.target_kbps);
         let events = self.events.replace(path.congestion_events);
-        let quic_limits =
-            path.queued_bytes > 0 || events.is_some_and(|was| path.congestion_events > was);
+        // A frame smaller than the window waits only while quinn flushes it.
+        let waiting = path.queued_bytes > path.cwnd_bytes;
+        let rose = events.is_some_and(|was| path.congestion_events > was);
+        let fills = self.offered_kbps(now) >= APP_LIMITED * f64::from(self.budget);
         if self.judged_from.is_some() {
-            if quic_limits {
+            if (waiting || rose || self.latched) && fills {
                 kbps = kbps.min(quic_kbps(path));
             }
             if kbps < self.floor_kbps {
+                // A single loss (`rose`) never latches: it buys this judgement only.
+                self.latched = (self.latched || waiting) && fills;
                 let since = *self.below_since.get_or_insert(now);
                 if now.saturating_duration_since(since) >= PYRO_STEP_DOWN_AFTER {
                     return PyroVerdict::StepDown {
@@ -962,6 +1001,7 @@ impl PyroRate {
                 }
             } else {
                 self.below_since = None;
+                self.latched = false;
             }
         }
         let budget = pyro_budget(kbps);

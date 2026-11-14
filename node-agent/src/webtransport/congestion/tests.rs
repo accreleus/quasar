@@ -1236,6 +1236,11 @@ fn budget_of(kbps: f64) -> u32 {
     pyro_budget(kbps)
 }
 
+/// The encoder fills its current budget for `ms`.
+fn fill(rate: &mut PyroRate, ms: u64) {
+    rate.offer((u64::from(rate.budget) * ms / 8) as usize);
+}
+
 /// 40 PyroWave datagrams sent at `at`, the next `pkt_seq` after `seq`.
 fn pyro_send(rate: &mut PyroRate, seq: &mut u32, at: Instant) -> u32 {
     let first = *seq;
@@ -1299,18 +1304,25 @@ fn pyrowave_quic_cap_applies_from_the_first_feedback_and_never_lifts_the_target(
         arrivals: (0..40).collect(),
     };
     let at = on + Duration::from_millis(600);
+    fill(&mut rate, 100);
     assert_eq!(
         rate.on_feedback(&fb, at, backed_up(150_000.0)),
         PyroVerdict::Budget(budget_of(150_000.0)),
         "min(target, estimate) with the estimate capped by QUIC"
     );
     assert_eq!(
-        rate.on_tick(at + Duration::from_millis(100), backed_up(8_000_000.0)),
+        {
+            fill(&mut rate, 100);
+            rate.on_tick(at + Duration::from_millis(100), backed_up(8_000_000.0))
+        },
         PyroVerdict::Budget(target),
         "a wider window never lifts the budget past the target"
     );
     assert_eq!(
-        rate.on_tick(at + Duration::from_millis(200), quic_at(150_000.0)),
+        {
+            fill(&mut rate, 100);
+            rate.on_tick(at + Duration::from_millis(200), quic_at(150_000.0))
+        },
         PyroVerdict::Hold,
         "a small window with nothing queued is the sender's own rate, not a cap"
     );
@@ -1319,12 +1331,18 @@ fn pyrowave_quic_cap_applies_from_the_first_feedback_and_never_lifts_the_target(
         ..quic_at(150_000.0)
     };
     assert_eq!(
-        rate.on_tick(at + Duration::from_millis(300), lossy),
+        {
+            fill(&mut rate, 100);
+            rate.on_tick(at + Duration::from_millis(300), lossy)
+        },
         PyroVerdict::Budget(budget_of(150_000.0)),
         "congestion since the last judgement: QUIC limits the sender"
     );
     assert_eq!(
-        rate.on_tick(at + Duration::from_millis(400), lossy),
+        {
+            fill(&mut rate, 100);
+            rate.on_tick(at + Duration::from_millis(400), lossy)
+        },
         PyroVerdict::Budget(target),
         "no new congestion and an empty queue: the cap lets go"
     );
@@ -1333,9 +1351,17 @@ fn pyrowave_quic_cap_applies_from_the_first_feedback_and_never_lifts_the_target(
         ..backed_up(150_000.0)
     };
     assert_eq!(
-        rate.on_tick(at + Duration::from_millis(500), unknown),
+        {
+            fill(&mut rate, 100);
+            rate.on_tick(at + Duration::from_millis(500), unknown)
+        },
         PyroVerdict::Hold,
         "no window known: no cap"
+    );
+    assert_eq!(
+        rate.on_tick(at + Duration::from_millis(700), backed_up(150_000.0)),
+        PyroVerdict::Hold,
+        "an encoder that does not fill its budget: the picture sets the rate, not QUIC"
     );
 }
 
@@ -1358,9 +1384,11 @@ fn pyrowave_under_the_floor_for_1_s_steps_down_and_not_before() {
         "under the floor the budget is still min(target, estimate)"
     );
     // Back over the floor for a moment: the 1 s starts again.
+    fill(&mut rate, 500);
     rate.on_tick(start + Duration::from_millis(500), quic_at(8_000_000.0));
     let again = start + Duration::from_millis(600);
     for ms in (0..1000).step_by(100) {
+        fill(&mut rate, 100);
         assert!(
             !matches!(
                 rate.on_tick(again + Duration::from_millis(ms), narrow),
@@ -1369,6 +1397,7 @@ fn pyrowave_under_the_floor_for_1_s_steps_down_and_not_before() {
             "stepped down after {ms} ms under the floor"
         );
     }
+    fill(&mut rate, 100);
     assert!(matches!(
         rate.on_tick(again + Duration::from_millis(1000), narrow),
         PyroVerdict::StepDown { estimate_kbps } if estimate_kbps < f64::from(PYRO_FLOOR)
@@ -1410,6 +1439,7 @@ fn pyrowave_withheld_feedback_is_judged_on_quic_from_1_s_after_the_switch_on() {
     let narrow = backed_up(80_000.0);
     let mut stepped = None;
     for ms in (0..=3000u64).step_by(100) {
+        fill(&mut rate, 100);
         if let PyroVerdict::StepDown { .. } = rate.on_tick(on + Duration::from_millis(ms), narrow) {
             stepped = Some(ms);
             break;
@@ -1526,4 +1556,162 @@ fn the_abr_resumes_from_the_estimate_it_is_handed_never_above_its_ceiling() {
     assert_eq!(est.estimate_kbps(), 3000.0);
     est.resume_at(2.0 * CEILING);
     assert_eq!(est.estimate_kbps(), CEILING);
+}
+
+/// A LAN path whose QUIC state answers the budget, judged by ticks alone (feedback withheld),
+/// 1 ms steps, 60 fps. Quinn's datagram queue (1 MiB) drains at min(window, link). While more
+/// than a window waits, Cubic grows the window 5 % a millisecond up to the link and holds it
+/// there with no loss (the link's queue is quinn's own: no delay or loss signal reaches
+/// feedback). Otherwise the sender is application-limited and the window holds. The stall
+/// guard (`Backlog`) skips frames once the queue has been non-empty for 250 ms, until it
+/// empties.
+struct QueuedPath {
+    link_kbps: f64,
+    window_kbps: f64,
+    queue: f64,
+    events: u64,
+    nonempty_since: Option<u64>,
+    skipping: bool,
+}
+
+impl QueuedPath {
+    fn new(link_kbps: f64) -> Self {
+        Self {
+            link_kbps,
+            // Quinn's first window, 12 000 B, at a 1 ms RTT.
+            window_kbps: 96_000.0,
+            queue: 0.0,
+            events: 0,
+            nonempty_since: None,
+            skipping: false,
+        }
+    }
+
+    fn cwnd_bytes(&self) -> f64 {
+        self.window_kbps * 1000.0 / 8.0 * 0.001
+    }
+
+    /// Judge every 100 ms for `secs`; `content_kbps(ms)` is the most the picture gives the
+    /// encoder, and a loss at `loss_ms` is one congestion event. (ms, verdict) for each change.
+    fn run(
+        &mut self,
+        rate: &mut PyroRate,
+        on: Instant,
+        secs: u64,
+        content_kbps: impl Fn(u64) -> f64,
+        loss_ms: Option<u64>,
+    ) -> Vec<(u64, PyroVerdict)> {
+        let mut out = Vec::new();
+        let mut budget = f64::from(pyro_budget(f64::from(PYRO_TARGET)));
+        let mut next_frame_us = 0u64;
+        for ms in 0..secs * 1000 {
+            if loss_ms == Some(ms) {
+                self.events += 1;
+                self.window_kbps *= 0.7;
+            }
+            if ms % 100 == 0 {
+                let path = QuicPath {
+                    rtt: Duration::from_millis(1),
+                    cwnd_bytes: self.cwnd_bytes() as u64,
+                    congestion_events: self.events,
+                    queued_bytes: self.queue as u64,
+                };
+                match rate.on_tick(on + Duration::from_millis(ms), path) {
+                    PyroVerdict::Hold => {}
+                    v => {
+                        if let PyroVerdict::Budget(b) = v {
+                            budget = f64::from(b);
+                        }
+                        out.push((ms, v));
+                        if matches!(v, PyroVerdict::StepDown { .. }) {
+                            return out;
+                        }
+                    }
+                }
+            }
+            if next_frame_us < (ms + 1) * 1000 {
+                next_frame_us += 16_667;
+                let bytes = content_kbps(ms).min(budget) * 1000.0 / 8.0 / 60.0;
+                rate.offer(bytes as usize);
+                if !self.skipping {
+                    self.queue = (self.queue + bytes).min(1024.0 * 1024.0);
+                }
+            }
+            let blocked = self.queue > self.cwnd_bytes();
+            self.queue = (self.queue - self.window_kbps.min(self.link_kbps) / 8.0).max(0.0);
+            if blocked {
+                self.window_kbps = (self.window_kbps * 1.05).min(self.link_kbps);
+            }
+            if self.queue > 0.0 {
+                let since = *self.nonempty_since.get_or_insert(ms);
+                self.skipping |= ms - since >= 250;
+            } else {
+                self.nonempty_since = None;
+                self.skipping = false;
+            }
+        }
+        out
+    }
+}
+
+fn steps_down(verdicts: &[(u64, PyroVerdict)]) -> Option<u64> {
+    verdicts
+        .iter()
+        .find(|(_, v)| matches!(v, PyroVerdict::StepDown { .. }))
+        .map(|&(ms, _)| ms)
+}
+
+#[test]
+fn pyrowave_a_link_under_the_floor_steps_down_with_feedback_withheld_and_the_budget_holds() {
+    let on = Instant::now();
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
+    let verdicts = QueuedPath::new(80_000.0).run(&mut rate, on, 4, |_| f64::MAX, None);
+    let stepped = steps_down(&verdicts);
+    assert!(
+        stepped.is_some_and(|ms| (1900..=2500).contains(&ms)),
+        "the cap from 1 s, then 1 s under the floor: {verdicts:?}"
+    );
+    let floor = pyro_budget(f64::from(PYRO_FLOOR));
+    let first_cut = verdicts
+        .iter()
+        .position(|(_, v)| matches!(v, PyroVerdict::Budget(b) if *b < floor))
+        .expect("a budget under the floor");
+    assert!(
+        !verdicts[first_cut..]
+            .iter()
+            .any(|(_, v)| matches!(v, PyroVerdict::Budget(b) if *b >= floor)),
+        "the budget bounced back once the cut drained the queue: {verdicts:?}"
+    );
+}
+
+#[test]
+fn pyrowave_through_a_responsive_path_a_dark_screen_and_a_single_loss_never_step_down() {
+    for loss_ms in [None, Some(3000)] {
+        let on = Instant::now();
+        let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
+        // A dark screen fits quinn's first window: nothing waits on it, and it never grows.
+        let verdicts = QueuedPath::new(1_000_000.0).run(&mut rate, on, 10, |_| 5_000.0, loss_ms);
+        assert_eq!(
+            steps_down(&verdicts),
+            None,
+            "loss {loss_ms:?}: {verdicts:?}"
+        );
+        assert_eq!(rate.budget, pyro_budget(f64::from(PYRO_TARGET)));
+    }
+}
+
+#[test]
+fn pyrowave_a_dark_screen_that_turns_to_full_detail_dips_once_and_does_not_step_down() {
+    let on = Instant::now();
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
+    let content = |ms: u64| if ms < 3000 { 5_000.0 } else { f64::MAX };
+    let verdicts = QueuedPath::new(1_000_000.0).run(&mut rate, on, 10, content, None);
+    assert_eq!(steps_down(&verdicts), None, "{verdicts:?}");
+    let floor = pyro_budget(f64::from(PYRO_FLOOR));
+    let dips = verdicts
+        .iter()
+        .filter(|(_, v)| matches!(v, PyroVerdict::Budget(b) if *b < floor))
+        .count();
+    assert!(dips <= 1, "{dips} dips: {verdicts:?}");
+    assert_eq!(rate.budget, pyro_budget(f64::from(PYRO_TARGET)));
 }

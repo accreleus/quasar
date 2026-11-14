@@ -1621,6 +1621,9 @@ async fn stream(
             out = client.rx.recv() => match out {
                 Some(Out::Unit(unit)) if unit.config_id != current.config_id => {}
                 Some(Out::Unit(unit)) => {
+                    if let Some(rate) = pyro.as_mut().filter(|_| unit.pyrowave) {
+                        rate.offer(unit.data.len());
+                    }
                     match admit(&mut backlog, session, media, unit.keyframe || unit.pyrowave) {
                         congestion::Admit::Send => {}
                         congestion::Admit::GiveUp => break stalled(),
