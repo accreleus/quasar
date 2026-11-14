@@ -847,6 +847,110 @@ impl Estimator {
     }
 }
 
+/// codec-pyrowave.md §Rate: the 1 s the estimate may sit under `floor_kbps`, and the latest
+/// the QUIC cap and that timer start after a switch on.
+const PYRO_STEP_DOWN_AFTER: Duration = Duration::from_secs(1);
+/// What of a full PyroWave datagram is the encoder's bytes: §Rate's estimate is "less the
+/// agent's datagram overhead".
+const PYRO_PAYLOAD_SHARE: f64 =
+    (super::media::MAX_DATAGRAM - super::media::HEADER - super::pyrowave::HEADER) as f64
+        / super::media::MAX_DATAGRAM as f64;
+
+/// What [`PyroRate`] asks of the session.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum PyroVerdict {
+    Hold,
+    /// The encoder's new `bitrate`, kbit/s; it budgets each frame at this over the fps.
+    Budget(u32),
+    /// The estimate stayed under the floor for 1 s: switch off, reason `congestion`.
+    StepDown {
+        estimate_kbps: f64,
+    },
+}
+
+/// PyroWave's per-session rate controller (codec-pyrowave.md §Rate), one per switch on: the
+/// estimate is seeded at the target and never above it, follows `feedback`, and is capped by
+/// what the QUIC connection carries from `min(first feedback, switch on + 1 s)`. Feedback
+/// silence does not decay it, as on the standard codec it never takes the encoder under
+/// the floor; QUIC's cap still applies, so withholding feedback cannot postpone a step-down.
+pub(crate) struct PyroRate {
+    estimator: Estimator,
+    pub(crate) log: SendLog,
+    target_kbps: f64,
+    floor_kbps: f64,
+    on: Instant,
+    /// When the QUIC cap and the floor timer started.
+    judged_from: Option<Instant>,
+    below_since: Option<Instant>,
+    /// The `bitrate` last asked for.
+    budget: u32,
+}
+
+impl PyroRate {
+    pub(crate) fn new(target_kbps: u32, floor_kbps: u32, now: Instant) -> Self {
+        Self {
+            estimator: Estimator::new(f64::from(target_kbps), now),
+            log: SendLog::new(now),
+            target_kbps: f64::from(target_kbps),
+            floor_kbps: f64::from(floor_kbps),
+            on: now,
+            judged_from: None,
+            below_since: None,
+            budget: target_kbps,
+        }
+    }
+
+    pub(crate) fn on_feedback(
+        &mut self,
+        fb: &Feedback,
+        now: Instant,
+        path: QuicPath,
+    ) -> PyroVerdict {
+        self.judged_from.get_or_insert(now);
+        self.estimator.on_feedback(fb, &mut self.log, now, path);
+        self.judge(now, path)
+    }
+
+    pub(crate) fn on_tick(&mut self, now: Instant, path: QuicPath) -> PyroVerdict {
+        let deadline = self.on + PYRO_STEP_DOWN_AFTER;
+        if now >= deadline {
+            self.judged_from.get_or_insert(deadline);
+        }
+        self.judge(now, path)
+    }
+
+    fn judge(&mut self, now: Instant, path: QuicPath) -> PyroVerdict {
+        let mut kbps = self.estimator.estimate_kbps.min(self.target_kbps);
+        if self.judged_from.is_some() {
+            kbps = kbps.min(quic_kbps(path));
+            if kbps < self.floor_kbps {
+                let since = *self.below_since.get_or_insert(now);
+                if now.saturating_duration_since(since) >= PYRO_STEP_DOWN_AFTER {
+                    return PyroVerdict::StepDown {
+                        estimate_kbps: kbps,
+                    };
+                }
+            } else {
+                self.below_since = None;
+            }
+        }
+        let budget = (kbps.max(self.floor_kbps) * PYRO_PAYLOAD_SHARE) as u32;
+        if budget == self.budget {
+            return PyroVerdict::Hold;
+        }
+        self.budget = budget;
+        PyroVerdict::Budget(budget)
+    }
+}
+
+/// What the connection's congestion controller permits: its window over the smoothed RTT.
+fn quic_kbps(path: QuicPath) -> f64 {
+    if path.rtt.is_zero() {
+        return f64::INFINITY;
+    }
+    path.cwnd_bytes as f64 * 8.0 / path.rtt.as_secs_f64() / 1000.0
+}
+
 /// QUIC's window over the estimate's rate × RTT: a keyframe burst and RTT jitter fit under
 /// it, and quinn paces at 1.25 × window / RTT, 2.5 × the rate.
 const WINDOW_GAIN: f64 = 2.0;

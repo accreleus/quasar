@@ -1209,3 +1209,177 @@ fn a_report_is_evidence_only_when_the_link_held_the_sender_back() {
     est.apply(report(Some(7000.0), Some(7500.0), None), at(600), NO_QUIC);
     assert_eq!(est.measured(), Some(BETA * 7000.0));
 }
+
+const PYRO_TARGET: u32 = 200_000;
+const PYRO_FLOOR: u32 = 100_000;
+
+/// A LAN path whose QUIC window allows `kbps` at a 1 ms RTT.
+fn quic_at(kbps: f64) -> QuicPath {
+    QuicPath {
+        rtt: Duration::from_millis(1),
+        cwnd_bytes: (kbps * 1000.0 / 8.0 * 0.001) as u64,
+        congestion_events: 0,
+    }
+}
+
+fn budget_of(kbps: f64) -> u32 {
+    (kbps * PYRO_PAYLOAD_SHARE) as u32
+}
+
+/// 40 PyroWave datagrams sent at `at`, the next `pkt_seq` after `seq`.
+fn pyro_send(rate: &mut PyroRate, seq: &mut u32, at: Instant) -> u32 {
+    let first = *seq;
+    for _ in 0..40 {
+        let mut d = vec![0u8; SIZE];
+        d[1..5].copy_from_slice(&seq.to_le_bytes());
+        rate.log.record(&d, at, false);
+        *seq += 1;
+    }
+    first
+}
+
+/// Feedback for 40 datagrams from `first`, of which only the first arrived.
+fn all_but_one_lost(first: u32) -> Feedback {
+    let mut arrivals = vec![NOT_RECEIVED; 40];
+    arrivals[0] = 0;
+    Feedback {
+        first_pkt_seq: first,
+        ref_us: 0,
+        arrivals,
+    }
+}
+
+#[test]
+fn pyrowave_budget_starts_at_the_target_and_follows_a_lower_estimate() {
+    let on = Instant::now();
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
+    let open = quic_at(8_000_000.0);
+    assert_eq!(
+        rate.on_tick(on, open),
+        PyroVerdict::Budget(budget_of(f64::from(PYRO_TARGET))),
+        "seeded at the target, less the datagram overhead"
+    );
+    let mut seq = 0;
+    let first = pyro_send(&mut rate, &mut seq, on + Duration::from_millis(10));
+    let at = on + Duration::from_millis(60);
+    let verdict = rate.on_feedback(&all_but_one_lost(first), at, open);
+    let estimate = rate.estimator.estimate_kbps;
+    assert!(
+        estimate < f64::from(PYRO_TARGET) && estimate > f64::from(PYRO_FLOOR),
+        "the loss cut the estimate under the target: {estimate:.0}"
+    );
+    assert_eq!(verdict, PyroVerdict::Budget(budget_of(estimate)));
+}
+
+#[test]
+fn pyrowave_quic_cap_applies_from_the_first_feedback_and_never_lifts_the_target() {
+    let on = Instant::now();
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
+    let target = budget_of(f64::from(PYRO_TARGET));
+    // Before the first feedback, and under 1 s: the window is the standard codec's, not judged.
+    assert_eq!(
+        rate.on_tick(on + Duration::from_millis(500), quic_at(150_000.0)),
+        PyroVerdict::Budget(target)
+    );
+    let mut seq = 0;
+    let first = pyro_send(&mut rate, &mut seq, on + Duration::from_millis(550));
+    let fb = Feedback {
+        first_pkt_seq: first,
+        ref_us: 0,
+        arrivals: (0..40).collect(),
+    };
+    let at = on + Duration::from_millis(600);
+    assert_eq!(
+        rate.on_feedback(&fb, at, quic_at(150_000.0)),
+        PyroVerdict::Budget(budget_of(150_000.0)),
+        "min(target, estimate) with the estimate capped by QUIC"
+    );
+    assert_eq!(
+        rate.on_tick(at + Duration::from_millis(100), quic_at(8_000_000.0)),
+        PyroVerdict::Budget(target),
+        "a wider window never lifts the budget past the target"
+    );
+}
+
+#[test]
+fn pyrowave_under_the_floor_for_1_s_steps_down_and_not_before() {
+    let on = Instant::now();
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
+    let narrow = quic_at(80_000.0);
+    let mut seq = 0;
+    let first = pyro_send(&mut rate, &mut seq, on);
+    let fb = Feedback {
+        first_pkt_seq: first,
+        ref_us: 0,
+        arrivals: (0..40).collect(),
+    };
+    let start = on + Duration::from_millis(50);
+    assert_eq!(
+        rate.on_feedback(&fb, start, narrow),
+        PyroVerdict::Budget(budget_of(f64::from(PYRO_FLOOR))),
+        "under the floor the budget holds at the floor"
+    );
+    // Back over the floor for a moment: the 1 s starts again.
+    rate.on_tick(start + Duration::from_millis(500), quic_at(8_000_000.0));
+    let again = start + Duration::from_millis(600);
+    for ms in (0..1000).step_by(100) {
+        assert!(
+            !matches!(
+                rate.on_tick(again + Duration::from_millis(ms), narrow),
+                PyroVerdict::StepDown { .. }
+            ),
+            "stepped down after {ms} ms under the floor"
+        );
+    }
+    assert!(matches!(
+        rate.on_tick(again + Duration::from_millis(1000), narrow),
+        PyroVerdict::StepDown { estimate_kbps } if estimate_kbps < f64::from(PYRO_FLOOR)
+    ));
+}
+
+#[test]
+fn pyrowave_feedback_silence_does_not_step_down() {
+    let on = Instant::now();
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
+    let open = quic_at(8_000_000.0);
+    let mut seq = 0;
+    let first = pyro_send(&mut rate, &mut seq, on);
+    let fb = Feedback {
+        first_pkt_seq: first,
+        ref_us: 0,
+        arrivals: (0..40).collect(),
+    };
+    rate.on_feedback(&fb, on + Duration::from_millis(50), open);
+    // Media goes on; feedback never comes back. The standard codec's silence decay would
+    // have cut its estimate by now (`feedback_silence_while_media_is_sent_decays_the_estimate`).
+    for step in 1..=50u64 {
+        let at = on + Duration::from_millis(50 + step * 100);
+        pyro_send(&mut rate, &mut seq, at);
+        let verdict = rate.on_tick(at, open);
+        assert!(
+            matches!(verdict, PyroVerdict::Hold | PyroVerdict::Budget(_)),
+            "silence stepped down at step {step}"
+        );
+    }
+    assert_eq!(rate.estimator.estimate_kbps, f64::from(PYRO_TARGET));
+    assert_eq!(rate.budget, budget_of(f64::from(PYRO_TARGET)));
+}
+
+#[test]
+fn pyrowave_withheld_feedback_is_judged_on_quic_from_1_s_after_the_switch_on() {
+    let on = Instant::now();
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
+    let narrow = quic_at(80_000.0);
+    let mut stepped = None;
+    for ms in (0..=3000u64).step_by(100) {
+        if let PyroVerdict::StepDown { .. } = rate.on_tick(on + Duration::from_millis(ms), narrow) {
+            stepped = Some(ms);
+            break;
+        }
+    }
+    assert_eq!(
+        stepped,
+        Some(2000),
+        "the cap from 1 s, then 1 s under the floor"
+    );
+}

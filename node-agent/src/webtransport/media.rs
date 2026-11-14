@@ -64,6 +64,8 @@ struct Pyro {
     width: i32,
     height: i32,
     fps: i32,
+    /// `pyrowaveenc`, once its branch is built: its `bitrate` is the §Rate budget.
+    encoder: Option<gst::glib::WeakRef<gst::Element>>,
 }
 
 #[derive(Debug, Clone)]
@@ -389,7 +391,33 @@ impl Media {
             width,
             height,
             fps,
+            encoder: None,
         });
+    }
+
+    /// The encoder the §Rate budget is written to.
+    pub(crate) fn pyrowave_encoder(&self, encoder: gst::glib::WeakRef<gst::Element>) {
+        if let Some(pyro) = self.lock().pyro.as_mut() {
+            pyro.encoder = Some(encoder);
+        }
+    }
+
+    pub(crate) fn pyrowave_grant(&self) -> Option<PyroWaveGrant> {
+        self.lock().pyro.as_ref().map(|p| p.grant)
+    }
+
+    /// codec-pyrowave.md §Rate: the encoder budgets each frame at `kbps` over the fps.
+    /// `pyrowaveenc` reads `bitrate` per frame, so this needs no restart.
+    pub(crate) fn pyrowave_budget(&self, kbps: u32) {
+        let encoder = self
+            .lock()
+            .pyro
+            .as_ref()
+            .and_then(|p| p.encoder.as_ref())
+            .and_then(|e| e.upgrade());
+        if let Some(encoder) = encoder {
+            encoder.set_property("bitrate", kbps.max(1));
+        }
     }
 
     /// `codec.switched` (agent-api.md, amendment 55), queued for [`Self::take_switched`].

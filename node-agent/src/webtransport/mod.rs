@@ -585,8 +585,8 @@ fn pyrowave_branch(
         Arc::downgrade(media),
         Arc::downgrade(media),
     );
-    // Rate: the encoder budgets `bitrate` / fps per frame; B09 (#1058) drives it live from
-    // the clamp of codec-pyrowave.md §Rate.
+    // Rate: the encoder budgets `bitrate` / fps per frame, starting at the target; each
+    // client's stream loop drives it live (`congestion::PyroRate`).
     let started = crate::session::pipeline::pyrowave_branch::start_encoder(
         cfg,
         feed,
@@ -608,7 +608,10 @@ fn pyrowave_branch(
         },
     );
     match started {
-        Ok(encoder) => Some(encoder),
+        Ok(encoder) => {
+            media.pyrowave_encoder(encoder.enc.clone());
+            Some(encoder)
+        }
         Err(error) => {
             tracing::warn!(
                 token = "pyrowave-encoder-start-failed",
@@ -1433,6 +1436,61 @@ async fn authenticate(
     .await;
 }
 
+fn quic_path(session: &Session) -> congestion::QuicPath {
+    let path = quinn::Connection::stats(session).path;
+    congestion::QuicPath {
+        rtt: path.rtt,
+        cwnd_bytes: path.cwnd,
+        congestion_events: path.congestion_events,
+    }
+}
+
+/// codec-pyrowave.md §Rate: a controller seeded at the target at each switch on, kept while
+/// the client stays on PyroWave, gone when it leaves.
+fn pyro_rate(
+    media: &Media,
+    config: &media::VideoConfig,
+    kept: Option<congestion::PyroRate>,
+) -> Option<congestion::PyroRate> {
+    if config.codec != "pyrowave" {
+        return None;
+    }
+    kept.or_else(|| {
+        let grant = media.pyrowave_grant()?;
+        Some(congestion::PyroRate::new(
+            grant.target_kbps,
+            grant.floor_kbps,
+            std::time::Instant::now(),
+        ))
+    })
+}
+
+fn pyro_act(
+    media: &Media,
+    client: &Attached,
+    pyro: &mut Option<congestion::PyroRate>,
+    verdict: congestion::PyroVerdict,
+) {
+    // A displaced client's loop must not write its successor's encoder.
+    if client.gone.get().is_some() {
+        return;
+    }
+    match verdict {
+        congestion::PyroVerdict::Hold => {}
+        congestion::PyroVerdict::Budget(kbps) => media.pyrowave_budget(kbps),
+        congestion::PyroVerdict::StepDown { estimate_kbps } => {
+            tracing::info!(
+                token = "pyrowave-congestion-step-down",
+                estimate_kbps = estimate_kbps as u64,
+                floor_kbps = media.pyrowave_grant().map_or(0, |g| g.floor_kbps),
+                "PyroWave estimate under the floor for 1 s; stepping down to the standard codec"
+            );
+            *pyro = None;
+            media.switch_off(Some(client.id), "congestion");
+        }
+    }
+}
+
 /// Hand the client its video until it leaves, is displaced or the session ends.
 #[allow(clippy::too_many_arguments)]
 async fn stream(
@@ -1479,6 +1537,7 @@ async fn stream(
     let mut previous_audio: Option<audio::Packet> = None;
     // The configuration the client was last sent: a PyroWave unit packs for its size.
     let mut current = client.config.clone();
+    let mut pyro = pyro_rate(media, &current, None);
     // What ends the stream: an optional last message, the close code and its reason.
     const QUIET: (Option<Value>, u32, &str) = (None, CLOSE_NORMAL, "");
     let mut idle = pin!(tokio::time::sleep(CONTROL_IDLE));
@@ -1509,9 +1568,12 @@ async fn stream(
                 }
             }
             // §Feedback: while PyroWave is active its own rate controller stands in for the
-            // ABR (B09, #1058), so nothing sent then is logged, and no estimate is fed.
-            _ = control_tick.tick(), if control.is_some() && current.codec != "pyrowave" => {
-                if let Some(control) = control.as_mut() {
+            // ABR, so the ABR's estimate is fed nothing then.
+            _ = control_tick.tick(), if pyro.is_some() || (control.is_some() && current.codec != "pyrowave") => {
+                if let Some(rate) = pyro.as_mut() {
+                    let verdict = rate.on_tick(std::time::Instant::now(), quic_path(session));
+                    pyro_act(media, &client, &mut pyro, verdict);
+                } else if let Some(control) = control.as_mut() {
                     control.tick(quinn::Connection::rtt(session), std::time::Instant::now());
                 }
             }
@@ -1592,8 +1654,11 @@ async fn stream(
                         datagrams.extend(repairs);
                     }
                     // shortcut: a PyroWave frame (~380 datagrams at 1080p/200) goes as one burst;
-                    // §Rate's SHOULD pace over half a frame interval is B09 (#1058).
-                    let mut log = control.as_mut().filter(|_| !unit.pyrowave).map(|c| &mut c.log);
+                    // pace it over half a frame interval (§Rate's SHOULD) if bursts lose datagrams.
+                    let mut log = match pyro.as_mut() {
+                        Some(rate) if unit.pyrowave => Some(&mut rate.log),
+                        _ => control.as_mut().filter(|_| !unit.pyrowave).map(|c| &mut c.log),
+                    };
                     handed += datagrams.len() as u64;
                     let sent = datagrams.into_iter().try_for_each(|d| {
                         if let Some(log) = log.as_deref_mut() {
@@ -1610,6 +1675,7 @@ async fn stream(
                         pyrowave_frames.forget();
                     }
                     current = config.clone();
+                    pyro = pyro_rate(media, &current, pyro);
                     let ack = hello_ack(&config, media.audio(), reason, fec, audio_red);
                     let write = write_message(&mut send, &ack);
                     if !matches!(tokio::time::timeout(CONTROL_WRITE, write).await, Ok(Ok(()))) {
@@ -1663,15 +1729,16 @@ async fn stream(
                                 }
                             }
                         },
-                        Some("feedback") if current.codec != "pyrowave" => {
+                        Some("feedback") if current.codec == "pyrowave" => {
+                            let fb = congestion::feedback_of(&message);
+                            if let (Some(rate), Ok(fb)) = (pyro.as_mut(), fb) {
+                                let verdict = rate.on_feedback(&fb, std::time::Instant::now(), quic_path(session));
+                                pyro_act(media, &client, &mut pyro, verdict);
+                            }
+                        }
+                        Some("feedback") => {
                             if let Some(control) = control.as_mut() {
-                                let path = quinn::Connection::stats(session).path;
-                                let path = congestion::QuicPath {
-                                    rtt: path.rtt,
-                                    cwnd_bytes: path.cwnd,
-                                    congestion_events: path.congestion_events,
-                                };
-                                control.feedback(&message, path, std::time::Instant::now());
+                                control.feedback(&message, quic_path(session), std::time::Instant::now());
                             }
                         }
                         Some("input") => {

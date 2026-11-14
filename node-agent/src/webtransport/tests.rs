@@ -4774,6 +4774,87 @@ async fn a_pyrowave_client_gets_frames_that_rejoin_byte_for_byte_and_can_fall_ba
     assert_eq!(nal_types(&first.data).last(), Some(&5));
 }
 
+/// codec-pyrowave.md §Rate: feedback that keeps the estimate under `floor_kbps` for 1 s steps
+/// the session down to the standard codec, reason `congestion`.
+#[tokio::test]
+async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
+    let agent = agent().await;
+    let media = agent.listener.registry().lock()[SESSION]
+        .media
+        .clone()
+        .unwrap();
+    media.grant_pyrowave(
+        PyroWaveGrant {
+            wanted: true,
+            target_kbps: 200_000,
+            floor_kbps: 100_000,
+            max_rtt_ms: 1_000,
+        },
+        (320, 192, 60),
+        true,
+    );
+    let raw = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../testdata/pyrowave/detail_320x192_xhi.pwv1"
+    ))
+    .unwrap();
+    let session = agent.connect().await;
+    let (mut send, mut recv) = session.open_bi().await.unwrap();
+    let hello = json!({"type": "hello", "wt_proto": 1, "token": TOKEN, "session_id": SESSION,
+                       "client": "browser", "pyrowave": true});
+    write_message(&mut send, &hello).await.unwrap();
+    let ack = read_message(&mut recv).await.unwrap();
+    assert_eq!(ack["video"]["codec"], "pyrowave");
+    let switched_on = Instant::now();
+
+    // A path that loses all but the first datagram of each report.
+    let (mut seqs, mut fb_seq) = (Vec::new(), 0u64);
+    let mut frame = tokio::time::interval(Duration::from_millis(10));
+    let mut report = tokio::time::interval(Duration::from_millis(50));
+    let deadline = tokio::time::sleep(Duration::from_secs(5));
+    tokio::pin!(deadline);
+    let back = loop {
+        tokio::select! {
+            _ = frame.tick() => media.on_pyrowave_frame(&gst::Buffer::from_slice(raw[28..].to_vec())),
+            d = session.read_datagram() => {
+                let d = d.unwrap();
+                seqs.push(u32::from_le_bytes(d[1..5].try_into().unwrap()));
+            }
+            _ = report.tick() => {
+                let (Some(&first), Some(&last)) = (seqs.iter().min(), seqs.iter().max()) else {
+                    continue;
+                };
+                seqs.clear();
+                let count = (last - first + 1) as usize;
+                let mut arrivals = vec![0xFFu8; count * 2];
+                arrivals[..2].fill(0);
+                fb_seq += 1;
+                let fb = json!({"type": "feedback", "seq": fb_seq, "first_pkt_seq": first,
+                    "count": count, "ref_us": 0,
+                    "arrivals_b64": base64::engine::general_purpose::STANDARD.encode(&arrivals),
+                    "recv_kbps": 0, "lost": count - 1, "interval_ms": 50});
+                write_message(&mut send, &fb).await.unwrap();
+            }
+            m = read_message(&mut recv) => break m.unwrap(),
+            () = &mut deadline => panic!("no step-down 5 s into a lossy path"),
+        }
+    };
+    assert_eq!(back["type"], "hello_ack");
+    assert_eq!(back["video"]["codec"], "h264");
+    assert_eq!(back["codec_switch_reason"], "congestion");
+    assert!(
+        switched_on.elapsed() >= Duration::from_secs(1),
+        "stepped down {:?} after the switch on",
+        switched_on.elapsed()
+    );
+    let reasons: Vec<_> = media
+        .take_switched(true)
+        .into_iter()
+        .map(|s| s["reason"].clone())
+        .collect();
+    assert_eq!(reasons, [json!("launch"), json!("congestion")]);
+}
+
 /// A session id assigned again while its tap runs gets a fresh registry entry, which no longer
 /// names that tap's media: the tap still ends its own when it drops, so the client on it is
 /// told the session ended.
