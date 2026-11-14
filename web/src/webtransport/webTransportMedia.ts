@@ -82,7 +82,7 @@ const CLOSE_REFUSALS: Record<number, string> = {
 /** How one attempt ended. `retry`: the agent is not ready, or the connection failed with no
  *  code, which is how the agent's refusal can arrive (its teardown races the `error`
  *  message, and Chrome may fail the connection before the page reads it). */
-type Answer = { kind: "ack" } | { kind: "retry" } | { kind: "refused"; code: string };
+type Answer = { kind: "ack" } | { kind: "retry" } | { kind: "refused"; code: string; detail?: string };
 
 export interface WebTransportMediaOptions {
   sessionId: string;
@@ -165,7 +165,8 @@ interface Router {
   stop(): void;
 }
 
-const refused = (code: string): Answer => ({ kind: "refused", code });
+const refused = (code: string, detail?: string): Answer => ({ kind: "refused", code, detail });
+const closeDetail = (code: number, reason?: string) => `close ${code}${reason ? ` ${reason}` : ""}`;
 const after = <T>(ms: number, value: T) => new Promise<T>((r) => setTimeout(() => r(value), ms));
 
 export class WebTransportMedia implements MediaTransport {
@@ -235,7 +236,7 @@ export class WebTransportMedia implements MediaTransport {
         reminted = true;
         continue;
       }
-      throw new TransportError(answer.code);
+      throw new TransportError(answer.code, answer.detail);
     }
   }
 
@@ -337,14 +338,16 @@ export class WebTransportMedia implements MediaTransport {
       return refused("connect_failed");
     }
     // Read here or below; a failed connect must not leave it unhandled.
-    const closeCode = wt.closed.then(
-      (info) => info.closeCode ?? null,
+    const closeInfo = wt.closed.then(
+      (info) => info,
       () => null,
     );
-    const abandon = (answer: Answer, closeInfo?: WebTransportCloseInfo): Answer => {
+    const abandon = (answer: Answer, sent?: WebTransportCloseInfo): Answer => {
       live.on = false;
+      // Our own close (a malformed hello_ack and the like) says why, in the close reason.
+      if (answer.kind === "refused" && sent?.closeCode && !answer.detail) answer.detail = closeDetail(sent.closeCode, sent.reason);
       try {
-        wt.close(closeInfo);
+        wt.close(sent);
       } catch {
         /* already closed */
       }
@@ -355,8 +358,9 @@ export class WebTransportMedia implements MediaTransport {
     this.abortAttempt = abort;
     /** The answer a connection that ended without a message gave, read off its close code. */
     const fromClose = async (): Promise<Answer> => {
-      const code = await Promise.race([closeCode, after(CLOSE_CODE_WAIT_MS, null)]);
-      return abandon(code === null || code === 0 ? { kind: "retry" } : refused(CLOSE_REFUSALS[code] ?? "internal"));
+      const info = await Promise.race([closeInfo, after(CLOSE_CODE_WAIT_MS, null)]);
+      const code = info?.closeCode ?? null;
+      return abandon(code === null || code === 0 ? { kind: "retry" } : refused(CLOSE_REFUSALS[code] ?? "internal", closeDetail(code, info?.reason)));
     };
 
     try {
@@ -428,7 +432,7 @@ export class WebTransportMedia implements MediaTransport {
     if (first === null) return fromClose();
     if (first.type === "error") {
       const code = typeof first.code === "string" ? first.code : "internal";
-      return abandon(code === "session_not_ready" ? { kind: "retry" } : refused(code));
+      return abandon(code === "session_not_ready" ? { kind: "retry" } : refused(code, typeof first.message === "string" ? first.message : undefined));
     }
     if (first.type !== "hello_ack") return abandon(refused("internal"), { closeCode: 4400, reason: "expected hello_ack" });
     if (first.wt_proto !== WT_PROTO) {

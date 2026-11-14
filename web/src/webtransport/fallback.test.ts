@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { fallbackReason, rememberedFallback, rememberFallback } from "./fallback";
+import { fallbackCause, fallbackReason, rememberedFallback, rememberFallback } from "./fallback";
+import { TransportError } from "./transport";
 
 describe("fallbackReason", () => {
   it.each([
@@ -33,5 +34,18 @@ describe("rememberFallback", () => {
     expect(rememberedFallback("s1")).toBe("connect_timeout");
     expect(rememberedFallback("s2")).toBeNull();
     expect(rememberedFallback(undefined)).toBeNull();
+  });
+});
+
+describe("fallbackCause (#1403)", () => {
+  it("keeps the name and message of an error that is not a TransportError", () => {
+    expect(fallbackCause("internal", new TypeError("boom"))).toBe("internal: TypeError: boom");
+  });
+  it("names a refusal by its code, plus the close detail when there is one", () => {
+    expect(fallbackCause("auth_failed", new TransportError("auth_failed"))).toBe("auth_failed");
+    expect(fallbackCause("internal", new TransportError("internal", "close 4400 bad"))).toBe("internal: close 4400 bad");
+  });
+  it("is capped at 200 characters", () => {
+    expect(fallbackCause("internal", new Error("x".repeat(500)))).toHaveLength(200);
   });
 });

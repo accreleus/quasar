@@ -47,6 +47,7 @@ export interface HudProps {
   transport?: string;
   /** Why the session fell back from WebTransport to WebRTC, when it did. */
   transportFallbackReason?: string | null;
+  transportFallbackCause?: string | null;
   sessionId?: string;
 
   inputCaptured: boolean;
@@ -420,6 +421,7 @@ export const Hud = forwardRef<HudHandle, HudProps>(function Hud(props, ref) {
             resolvedCodec={props.resolvedCodec}
             transport={props.transport}
             transportFallbackReason={props.transportFallbackReason}
+            transportFallbackCause={props.transportFallbackCause}
             sessionId={props.sessionId}
             startedAt={props.startedAt}
           />
