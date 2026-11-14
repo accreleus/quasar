@@ -93,6 +93,9 @@ export interface HudProps {
   /** #1349: the upscale + sharpen pass, on unless this device turned it off. */
   upscaleSharpen: boolean;
   onUpscaleSharpenChange: (on: boolean) => void;
+  /** #1401: the touch pad switch in the Input pane. */
+  onScreenControls?: boolean;
+  onOnScreenControlsChange?: (on: boolean) => void;
   /** `session.started_at`, for the stats pane's elapsed row. */
   startedAt?: string | null;
 
@@ -404,6 +407,8 @@ export const Hud = forwardRef<HudHandle, HudProps>(function Hud(props, ref) {
             escCombo={props.escCombo}
             pointerLockAvailable={props.pointerLockAvailable}
             touchLook={props.touchLook}
+            onScreenControls={props.onScreenControls}
+            onOnScreenControlsChange={props.onOnScreenControlsChange}
             scalingMode={props.scalingMode}
             onScalingChange={props.onScalingChange}
           />

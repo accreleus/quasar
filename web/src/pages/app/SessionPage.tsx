@@ -60,6 +60,8 @@ import { LOCK_TO_STREAM_MS, SessionLoader } from "./SessionLoader";
 import { accessRevokedFailure, isBannerVerdict, showsAfterReveal, takenOverFailure, unreachableFailure } from "./sessionFailure";
 import { useOverlaySummon } from "./useOverlaySummon";
 import { useMouseSettings } from "./useMouseSettings";
+import { OnScreenControls } from "./OnScreenControls";
+import type { VirtualPadState } from "../../input/virtualPad";
 import { useSessionStatus } from "./useSessionStatus";
 import { useDisplayPatch } from "./useDisplayPatch";
 import { enterLaunchFullscreen, leaveLaunchFullscreen } from "../../input/launchFullscreen";
@@ -69,6 +71,7 @@ import {
   loadDisplayPreferences,
   saveDisplayPreferences,
   upscaleSharpen,
+  onScreenControls,
   type ScalingMode,
 } from "../../settings/displayPreferences";
 import { reportBestEffortFailure } from "../../lib/reportBestEffortFailure";
@@ -198,6 +201,7 @@ function SessionPageBody() {
   );
   // #1349: the upscale + sharpen pass, device-local beside the scaling mode.
   const [sharpenOn, setSharpenOn] = useState(upscaleSharpen);
+  const [controlsOn, setControlsOn] = useState(onScreenControls);
   // Mic spec §3.4: never persisted/restored — every session starts mic-off.
   const [micOn, setMicOn] = useState(false);
   const [micBusy, setMicBusy] = useState(false);
@@ -884,6 +888,13 @@ function SessionPageBody() {
     saveDisplayPreferences({ upscaleSharpen: on });
   }, []);
 
+  const setVirtualPad = useCallback((pad: VirtualPadState | null) => runtimeRef.current?.setVirtualPad(pad), []);
+
+  const handleOnScreenControlsChange = useCallback((on: boolean) => {
+    setControlsOn(on);
+    saveDisplayPreferences({ onScreenControls: on });
+  }, []);
+
   // Render resolution + interface size (control-api.md session-display-update)
   // lives in useDisplayPatch.ts. `externalSize`/`externalResizeSupported` live
   // in useSessionStatus above (the 5s poll can also change them); this hook
@@ -1391,6 +1402,8 @@ function SessionPageBody() {
             onScalingChange={handleScalingChange}
             upscaleSharpen={sharpenOn}
             onUpscaleSharpenChange={handleUpscaleSharpenChange}
+            onScreenControls={controlsOn}
+            onOnScreenControlsChange={handleOnScreenControlsChange}
             startedAt={startedAt}
             streamSize={streamSize}
             // Null = "match the stream" / still at launch size — the pane
@@ -1448,6 +1461,11 @@ function SessionPageBody() {
             <path d="M4 7h16M4 12h16M4 17h16" />
           </svg>
         </button>
+      )}
+
+      {/* #1401: touch pad. Own gate for "captured on a touch device": the HUD switch is the user's. */}
+      {controlsOn && touchLookSupported() && inputCaptured && !sessionOver && (
+        <OnScreenControls register={registerTelemetry} setPad={setVirtualPad} />
       )}
 
       {/* A swap finishing under a held verdict must not announce itself next to the notice. */}

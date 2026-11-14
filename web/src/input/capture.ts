@@ -29,6 +29,7 @@
 // (matched by pointerId, so chrome taps are never seen here).
 
 import { EVDEV, MB_MAP } from "./evdev";
+import { type VirtualPadState } from "./virtualPad";
 import { detectPadEnv, isRemapped, remapGamepad, type PadEnv } from "./gamepadRemap";
 import { createMouseScaler, mouseGain, NEUTRAL_MOUSE, type MouseSettings } from "./mouseScale";
 import { isSendEscCombo, isSummonCombo, sendEscComboEnabled } from "./summonCombo";
@@ -229,6 +230,8 @@ export function setupCapture({
   engage: () => Promise<EngageResult>;
   release: () => void;
   setMouse: (settings: MouseSettings) => void;
+  /** On-screen controls' pad (null = none). Sent as `gp` like a real pad, but never alongside one. */
+  setVirtualPad: (pad: VirtualPadState | null) => void;
 } {
   /** Gates `mm` and nothing else. */
   let pointerLocked = false;
@@ -306,6 +309,10 @@ export function setupCapture({
   // Gamepad state for delta-only sends.
   const gpPrev: Record<number, { buttons: number[]; axes: number[] }> = {};
   const padEnv = detectPadEnv();
+  // The on-screen controls' pad. The host drives ONE virtual pad whatever `i` says, so it is only
+  // sent while no real pad is connected; `virtualSent` is what the host holds, for the release.
+  let virtualPad: VirtualPadState | null = null;
+  let virtualSent: VirtualPadState | null = null;
   // Pad ids already reported through onNonStandardGamepad (one notice each).
   const nonStandardReported = new Set<string>();
   let rafId: number;
@@ -415,6 +422,20 @@ export function setupCapture({
     }
   };
 
+  /** All-zero state for the on-screen pad if the host holds anything from it. */
+  const releaseVirtualPad = (sendFn: (msg: InputMsg) => void = send) => {
+    if (!virtualSent) return;
+    sendFn({ t: "gp", i: 0, buttons: virtualSent.buttons.map(() => 0), axes: virtualSent.axes.map(() => 0) });
+    virtualSent = null;
+    // the host's one pad is neutral now: a real pad's state must go out again
+    for (const key of Object.keys(gpPrev)) delete gpPrev[Number(key)];
+  };
+
+  const setVirtualPad = (pad: VirtualPadState | null) => {
+    virtualPad = pad;
+    if (!pad) releaseVirtualPad();
+  };
+
   /** Single writer for `captured`. The captured→released transition releases
    *  everything the host still thinks is held, covering every release path. */
   const setCaptured = (next: boolean) => {
@@ -428,6 +449,7 @@ export function setupCapture({
     if (was && !captured) {
       flushHeldKeys();
       resetGamepads();
+      releaseVirtualPad();
       // a mid-gesture finger must not leave a long-press right button held
       resetTouch();
     }
@@ -537,6 +559,26 @@ export function setupCapture({
     captureMode = "none";
     setCaptured(false);
   };
+
+  // A hidden page gets no rAF and may get no pointer events, so nothing would release what the
+  // host holds. Releases at once through the same path as any other release; the lock's own
+  // pointerlockchange arrives later and finds nothing left to do.
+  const onPageHidden = () => {
+    try {
+      release();
+      if (captured) {
+        captureMode = "none";
+        setCaptured(false);
+      }
+    } catch {
+      // channel closing: nothing more can be sent
+    }
+  };
+  const onVisibilityChange = () => {
+    if (document.hidden) onPageHidden();
+  };
+  document.addEventListener("visibilitychange", onVisibilityChange);
+  window.addEventListener("pagehide", onPageHidden);
 
   // ── Mouse ─────────────────────────────────────────────────────────────────
 
@@ -905,6 +947,10 @@ export function setupCapture({
     // release, so the first post-capture poll resends full state.
     if (captured) {
       const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+      const realPad = Array.prototype.some.call(pads, Boolean);
+      // Release before any real pad's state goes out: the host has one pad, so a later
+      // neutral would wipe it.
+      if (realPad) releaseVirtualPad();
       for (const pad of pads) {
         if (!pad) continue;
         const { buttons, axes, identity } = readPad(pad, padEnv);
@@ -928,6 +974,18 @@ export function setupCapture({
           send({ t: "gp", i: pad.index, buttons, axes });
           gpSendCount++;
           gpPrev[pad.index] = { buttons, axes };
+        }
+      }
+      if (virtualPad && !realPad) {
+        const { buttons, axes } = virtualPad;
+        if (
+          !virtualSent ||
+          buttons.some((v, i) => v !== virtualSent!.buttons[i]) ||
+          axes.some((v, i) => v !== virtualSent!.axes[i])
+        ) {
+          virtualSent = { buttons: buttons.slice(), axes: axes.slice() };
+          send({ t: "gp", i: 0, buttons: virtualSent.buttons.slice(), axes: virtualSent.axes.slice() });
+          gpSendCount++;
         }
       }
     }
@@ -993,6 +1051,7 @@ export function setupCapture({
     if (captured) {
       flushHeldKeys(sendBestEffort);
       resetGamepads(sendBestEffort);
+      releaseVirtualPad(sendBestEffort);
     }
     resetTouch(sendBestEffort);
     captured = false;
@@ -1000,6 +1059,8 @@ export function setupCapture({
     cleanedUp = true;
     if (liveCapture.get(videoEl) === self) liveCapture.delete(videoEl);
     document.removeEventListener("pointerlockchange", onLockChange);
+    document.removeEventListener("visibilitychange", onVisibilityChange);
+    window.removeEventListener("pagehide", onPageHidden);
     document.removeEventListener("pointerdown", onPointerDown, true);
     document.removeEventListener("pointermove", onPointerMove);
     document.removeEventListener("mousedown", onMouseDown);
@@ -1033,5 +1094,5 @@ export function setupCapture({
     updateGain();
   };
 
-  return { cleanup, getMetrics, syncKeyboardLock: updateKeyboardLock, engage, release, setMouse };
+  return { cleanup, getMetrics, syncKeyboardLock: updateKeyboardLock, engage, release, setMouse, setVirtualPad };
 }

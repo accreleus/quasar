@@ -36,6 +36,7 @@ import { mintSignalingToken } from "../../api/library";
 import { ApiError } from "../../api/client";
 import type { ICEServer } from "../../api/types";
 import { setupCapture, type GamepadIdentity } from "../../input/capture";
+import type { VirtualPadState } from "../../input/virtualPad";
 import { dataChannelSender } from "../../input/inputSender";
 import { NEUTRAL_MOUSE, type MouseSettings } from "../../input/mouseScale";
 import { QuasarSession, type RebindOutcome, type TakeoverRefusal } from "../../webrtc/session";
@@ -347,6 +348,8 @@ export interface SessionRuntime {
   syncKeyboardLock(): void;
   /** Relative mouse speed; held for a channel that opens later. */
   setMouse(settings: MouseSettings): void;
+  /** On-screen controls' pad; null clears it (the host is left nothing held). */
+  setVirtualPad(pad: VirtualPadState | null): void;
   /** SYNCHRONOUS truth for gesture handlers, which must not read last-rendered
    *  state. This is why the runtime is an object and not a hook. */
   isCaptured(): boolean;
@@ -382,6 +385,7 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
   let captureEngage: ReturnType<typeof setupCapture>["engage"] | null = null;
   let captureRelease: (() => void) | null = null;
   let captureSetMouse: ((m: MouseSettings) => void) | null = null;
+  let captureSetVirtualPad: ((p: VirtualPadState | null) => void) | null = null;
   let mouse: MouseSettings = NEUTRAL_MOUSE;
   let audioCleanup: (() => void) | null = null;
   let audioEl: HTMLAudioElement | null = null;
@@ -478,6 +482,7 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
     captureEngage = null;
     captureRelease = null;
     captureSetMouse = null;
+    captureSetVirtualPad = null;
     // Bench stops before telemetry: its final flush reads the clock offset off
     // the telemetry instance. __qBench stays on window for the harness.
     bench?.stop();
@@ -513,6 +518,7 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
       mouse,
     });
     captureSetMouse = capture.setMouse;
+    captureSetVirtualPad = capture.setVirtualPad;
     captureCleanup = capture.cleanup;
     captureKbSync = capture.syncKeyboardLock;
     captureEngage = capture.engage;
@@ -957,6 +963,7 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
       mouse = m;
       captureSetMouse?.(m);
     },
+    setVirtualPad: (p) => captureSetVirtualPad?.(p),
     isCaptured: () => captured,
 
     cancelRecovery: () => transport?.cancelRecovery(),

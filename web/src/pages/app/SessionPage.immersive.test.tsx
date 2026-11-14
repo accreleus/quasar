@@ -27,6 +27,7 @@ vi.mock("../../auth/context", () => ({
 }));
 
 const engageSpy = vi.hoisted(() => vi.fn());
+const touch = vi.hoisted(() => ({ on: false }));
 vi.mock("../../input/capture", () => ({
   setupCapture: () => ({
     cleanup: () => {},
@@ -49,7 +50,7 @@ vi.mock("../../input/capture", () => ({
   }),
   keyboardLockSupported: () => false,
   pointerLockSupported: () => true,
-  touchLookSupported: () => false,
+  touchLookSupported: () => touch.on,
 }));
 
 vi.mock("../../webrtc/mic", () => ({
@@ -116,6 +117,7 @@ vi.mock("./webTransportRuntime", async () => {
         release() {},
         syncKeyboardLock() {},
         setMouse() {},
+        setVirtualPad() {},
         isCaptured: () => false,
         cancelRecovery() {},
         hasMicSlot: () => false,
@@ -276,6 +278,7 @@ beforeEach(() => {
   lastDrawerProps = null;
   wt.set = null;
   wt.callbacks = null;
+  touch.on = false;
   updateSessionDisplay.mockResolvedValue({ session: makeSession({ state: "running" }) });
   getSession.mockImplementation(async () => ({ session: currentSession }));
   stopSession.mockResolvedValue(undefined);
@@ -513,6 +516,38 @@ describe("SessionPage — a WebTransport launch goes straight in (#647)", () => 
     expect(document.fullscreenElement).toBeNull();
     expect(engageSpy).not.toHaveBeenCalled();
     expect(playLayer()).not.toBeNull();
+  });
+});
+
+describe("SessionPage — on-screen controls mount gate (#1401)", () => {
+  const webtransport = { url: "https://agent/wt", token: "w", expires_at: "2026-11-06T12:01:00Z", cert_hashes: [] };
+
+  async function captured() {
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    renderPage({ webtransport });
+    await advance(1_000);
+    await act(async () => {
+      wt.set!({ channelOpen: true, wsOpen: true, pcConnected: true, firstFrame: true, inputCaptured: true });
+    });
+    await advance(1_500);
+  }
+
+  it("is shown when captured on a touch device with the switch on", async () => {
+    touch.on = true;
+    localStorage.setItem(PREFS_KEY, JSON.stringify({ scalingMode: "contain", onScreenControls: true }));
+    await captured();
+    expect(screen.queryByTestId("on-screen-controls")).not.toBeNull();
+  });
+
+  it("is hidden with the switch off (the default), or on a device with a mouse", async () => {
+    touch.on = true;
+    await captured();
+    expect(screen.queryByTestId("on-screen-controls")).toBeNull();
+    cleanup();
+    touch.on = false;
+    localStorage.setItem(PREFS_KEY, JSON.stringify({ scalingMode: "contain", onScreenControls: true }));
+    await captured();
+    expect(screen.queryByTestId("on-screen-controls")).toBeNull();
   });
 });
 

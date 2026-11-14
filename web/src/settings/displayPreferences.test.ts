@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   launchImmersive,
+  onScreenControls,
   loadDisplayPreferences,
   saveDisplayPreferences,
   upscaleSharpen,
@@ -135,5 +136,16 @@ describe("launchImmersive (#647)", () => {
     expect(loadDisplayPreferences().scalingMode).toBe("contain");
     saveDisplayPreferences({ launchImmersive: true });
     expect(launchImmersive()).toBe(true);
+  });
+});
+
+describe("onScreenControls (#1401)", () => {
+  it("defaults off (opt-in), and reads back a stored on", () => {
+    localStorage.removeItem("quasar.display.preferences");
+    expect(onScreenControls()).toBe(false);
+    saveDisplayPreferences({ onScreenControls: true });
+    expect(onScreenControls()).toBe(true);
+    saveDisplayPreferences({ onScreenControls: false });
+    expect(onScreenControls()).toBe(false);
   });
 });

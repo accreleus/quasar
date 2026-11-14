@@ -274,6 +274,22 @@ describe("InputPane scaling", () => {
   });
 });
 
+describe("InputPane on-screen controls switch (#1401)", () => {
+  it("is absent where touch is not the mouse", () => {
+    render(<InputPane {...base} onScreenControls onOnScreenControlsChange={vi.fn()} />);
+    expect(screen.queryByRole("checkbox", { name: /on-screen controls/i })).toBeNull();
+  });
+
+  it("is off unless turned on, on a touch device, and reports the change", () => {
+    const onChange = vi.fn();
+    render(<InputPane {...base} touchLook pointerLockAvailable={false} onOnScreenControlsChange={onChange} />);
+    const sw = screen.getByRole("checkbox", { name: /on-screen controls/i }) as HTMLInputElement;
+    expect(sw.checked).toBe(false);
+    fireEvent.click(sw);
+    expect(onChange).toHaveBeenCalledWith(true);
+  });
+});
+
 describe("shortGamepadLabel", () => {
   it("strips the parenthesized STANDARD GAMEPAD/vendor/product suffix", () => {
     expect(

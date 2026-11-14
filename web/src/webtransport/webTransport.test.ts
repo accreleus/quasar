@@ -1018,7 +1018,7 @@ describe("createWebTransportRuntime fallback", () => {
           isConfigSupported: async (c) => ({ supported: true, config: c }),
         },
         setupCapture: ((o: { sendInput: (m: InputMsg) => void }) => {
-          const c = { sendInput: o.sendInput, cleanup: vi.fn(), engage: vi.fn(() => null), release: vi.fn(), syncKeyboardLock: vi.fn(), setMouse: vi.fn() };
+          const c = { sendInput: o.sendInput, cleanup: vi.fn(), engage: vi.fn(() => null), release: vi.fn(), syncKeyboardLock: vi.fn(), setMouse: vi.fn(), setVirtualPad: vi.fn() };
           captures.push(c);
           return c;
         }) as never,
