@@ -168,6 +168,8 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
    *  tab last became visible; null until a keyframe has. A hidden tab shows nothing, so this is only
    *  judged while visible. */
   let presentRefAt: number | null = null;
+  /** Times the no-picture check has tripped on this session. */
+  let noPictureTrips = 0;
   /** When the last tick ran; null until ticking starts (connecting is not a stall). */
   let lastTickAt: number | null = null;
 
@@ -287,6 +289,8 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     }
     // Video keeps arriving but no picture has been shown: a decoder or presenter that takes the
     // data and never outputs. (Video not arriving at all is the check above.)
+    // Time spent waiting for a keyframe is not a decoder showing nothing: it counts from the keyframe.
+    if (presentRefAt !== null && stage?.needsKey()) presentRefAt = now;
     if (
       transport &&
       snapshot.channelOpen &&
@@ -294,8 +298,14 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       document.visibilityState === "visible" &&
       now - presentRefAt > MEDIA_SILENCE_MS
     ) {
-      fail("decode_error", false, undefined, "no picture shown for 5 s while video kept arriving");
-      return;
+      // The first trip gets the one media reconnect media_silent gets; a second one is a decoder that cannot show.
+      if (noPictureTrips++ === 0 && !reconnected) {
+        onEnd(transport, { code: null, reason: "no_picture" });
+        if (failed) return;
+      } else {
+        fail("decode_error", false, undefined, `no picture shown for ${MEDIA_SILENCE_MS / 1000} s while video kept arriving`);
+        return;
+      }
     }
     const audio = harvestAudio();
     telemetry.setPlayout(playout?.cushion() ?? 0, playout?.arrivalJitterMs() ?? null);

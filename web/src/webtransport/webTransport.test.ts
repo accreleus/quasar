@@ -1514,10 +1514,13 @@ describe("createWebTransportRuntime fallback", () => {
         }
       };
 
-      it("falls back with decode_error and a cause, and stops asking for keyframes", async () => {
+      it("reconnects once on the first trip, then falls back with decode_error and a cause, and stops asking for keyframes", async () => {
         const s = await stuckDecoder();
         await feed(s, 7);
-        expect(s.callbacks.onFallback).toHaveBeenCalledWith("decode_error", expect.stringContaining("no picture shown"));
+        expect(s.agent.sent("hello")).toHaveLength(2);
+        expect(s.callbacks.onFallback).not.toHaveBeenCalled();
+        await feed(s, 8, 7);
+        expect(s.callbacks.onFallback).toHaveBeenCalledWith("decode_error", expect.stringContaining("no picture shown for 5 s"));
         const asked = s.agent.sent("keyframe_request").length;
         await vi.advanceTimersByTimeAsync(3_000);
         expect(s.agent.sent("keyframe_request")).toHaveLength(asked);
@@ -1552,7 +1555,28 @@ describe("createWebTransportRuntime fallback", () => {
         await feed(s, 3, 16);
         expect(s.callbacks.onFallback).not.toHaveBeenCalled();
         await feed(s, 4, 19);
-        expect(s.callbacks.onFallback).toHaveBeenCalledWith("decode_error", expect.any(String));
+        expect(s.agent.sent("hello")).toHaveLength(2); // the first trip: a reconnect
+        s.rt.destroy();
+      });
+
+      it("does not count the wait for a keyframe: units of a new configuration arrive for over 5 s before its keyframe", async () => {
+        vi.useFakeTimers();
+        const s = setup();
+        s.rt.start();
+        await vi.advanceTimersByTimeAsync(10);
+        await feed(s, 2);
+        // A rung change: the live connection announces configuration 1, whose deltas reach the decode stage first.
+        s.agent.last.control(helloAck(1, avcC(0x28), 1280, 720));
+        const delta1 = (agent: FakeAgent, seq: number) =>
+          agent.last.datagrams(packetize({ configId: 1, frameSeq: seq, keyframe: false, data: bytes(10, seq) }));
+        await feed(s, 9, 2, delta1);
+        expect(s.agent.sent("hello")).toHaveLength(1);
+        expect(s.callbacks.onFallback).not.toHaveBeenCalled();
+        // The keyframe lands and is shown; the clock then starts from it.
+        s.agent.last.datagrams(packetize({ configId: 1, frameSeq: 11, keyframe: true, data: bytes(10, 11) }));
+        await feed(s, 8, 12, delta1);
+        expect(s.agent.sent("hello")).toHaveLength(1);
+        expect(s.callbacks.onFallback).not.toHaveBeenCalled();
         s.rt.destroy();
       });
     });
