@@ -7,6 +7,7 @@ import {
   CHANNEL_AUDIO,
   CHANNEL_AUDIO_RED,
   CHANNEL_FEC,
+  CHANNEL_VIDEO,
   ControlDecoder,
   ControlProtocolError,
   encodeControl,
@@ -20,7 +21,7 @@ import {
 import { blockLayout } from "../pyrowave/bitstream";
 import { PyroWaveReceiver } from "../pyrowave/receiver";
 import type { WebTransportCoords } from "../api/types";
-import { FEEDBACK_MS, FeedbackRecorder } from "./feedback";
+import { FEEDBACK_MS, FeedbackRecorder, MAX_REORDER_MS } from "./feedback";
 import type { InputWire } from "./inputSender";
 import { workerTicker, type Ticker } from "./pingTicker";
 import { FrameAssembler, type Reassembled } from "./reassembly";
@@ -415,8 +416,12 @@ export class WebTransportMedia implements MediaTransport {
 
     // Datagrams can overtake the hello_ack; the decode stage holds units by config_id, the
     // router PyroWave fragments.
-    const router = this.makeRouter(sink, live);
     const feedback = new FeedbackRecorder(this.now());
+    /** `hello_ack.retransmit_window_ms`, and the path's round trip from the latest pong; until
+     *  both are known, no gap is held. */
+    let retransmitWindowMs = 0;
+    let pathRttMs = Infinity;
+    const router = this.makeRouter(sink, live, feedback, () => retransmitWindowMs - pathRttMs);
     /** Set once this attempt's datagram reader has failed: `datagrams: <name>: <message>`. */
     const datagramReader = { death: null as string | null };
     void this.readDatagrams(wt, sink, router, live, feedback, datagramReader).catch((err: unknown) => {
@@ -444,6 +449,7 @@ export class WebTransportMedia implements MediaTransport {
     let config: VideoConfig;
     try {
       config = videoConfigFrom(first);
+      if (typeof first.retransmit_window_ms === "number") retransmitWindowMs = first.retransmit_window_ms;
     } catch {
       return abandon(refused("internal"), { closeCode: 4400, reason: "malformed hello_ack" });
     }
@@ -480,7 +486,10 @@ export class WebTransportMedia implements MediaTransport {
           if (m.type === "hello_ack") router.config(videoConfigFrom(m));
           else if (m.type === "nack_miss" && typeof m.frame_seq === "number" && Array.isArray(m.frags)) {
             router.miss(m.frame_seq, m.frags as [number, number][]);
-          } else if (m.type === "pong" && typeof m.tc === "number") sink.rtt?.(Math.max(0, this.now() - m.tc), typeof m.tw === "number" ? m.tw : undefined);
+          } else if (m.type === "pong" && typeof m.tc === "number") {
+            pathRttMs = Math.max(0, this.now() - m.tc);
+            sink.rtt?.(pathRttMs, typeof m.tw === "number" ? m.tw : undefined);
+          }
           else if (m.type === "ping") {
             this.send({ type: "pong", id: m.id, ts: m.ts, tw: m.tw, tc: this.now() });
           }
@@ -551,16 +560,23 @@ export class WebTransportMedia implements MediaTransport {
         if (repair) router.repair(repair);
         continue;
       }
+      if (channel === CHANNEL_VIDEO) sink.videoDatagram?.();
       const frag = parseVideoDatagram(value as Uint8Array);
       if (!frag) continue; // another channel, or malformed: dropped (§Channels)
       router.datagram(frag);
     }
   }
 
-  private makeRouter(sink: MediaSink, live: { on: boolean }): Router {
-    const assembler = new FrameAssembler(this.now);
+  private makeRouter(sink: MediaSink, live: { on: boolean }, feedback: FeedbackRecorder, headroomMs: () => number): Router {
+    const assembler = new FrameAssembler(this.now, (now) => feedback.reorderMs(now));
     const configs = new Map<number, VideoConfig>();
     let latest: number | null = null;
+    // A held first NACK reaches the agent one frame interval (until a later datagram shows the gap),
+    // the hold and a round trip after the fragment was sent: all inside the retransmit window.
+    feedback.capMs = () => {
+      const fps = (latest !== null && configs.get(latest)?.fps) || 60;
+      return Math.min(MAX_REORDER_MS, headroomMs() - 1000 / fps);
+    };
     let pyro: PyroWaveReceiver | null = null;
     /** What the PyroWave receivers already replaced counted lost. */
     let pyroLost = 0;

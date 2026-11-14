@@ -36,6 +36,11 @@ struct Sim {
     extra_us: Box<dyn Fn(u64) -> u64>,
     offset_us: u64,
     drift: f64,
+    /// Extra one-way delay of each `pkt_seq` on its own, µs: a path that reorders.
+    reorder_us: Box<dyn Fn(u32) -> u64>,
+    /// The client reports a gap only once a later datagram has been in this long (µs), and
+    /// counts a datagram as received when it comes within it: the browser's reorder window.
+    hold_us: u64,
     /// Every `n`th datagram is dropped on the way (0: none).
     drop_every: u32,
     /// Datagrams the full bottleneck queue dropped.
@@ -68,6 +73,8 @@ impl Sim {
             extra_us: Box::new(|_| 0),
             offset_us: 0,
             drift: 0.0,
+            reorder_us: Box::new(|_| 0),
+            hold_us: 0,
             drop_every: 0,
             queue_drops: 0,
             pending: VecDeque::new(),
@@ -115,7 +122,7 @@ impl Sim {
                 self.last_arrival = self
                     .last_arrival
                     .max(self.free_at + 10_000 + (self.extra_us)(self.t));
-                self.last_arrival
+                self.last_arrival + (self.reorder_us)(self.seq)
             });
             self.pending.push_back((self.seq, arrival));
             self.seq = self.seq.wrapping_add(1);
@@ -128,20 +135,36 @@ impl Sim {
 
     fn feedback(&mut self) {
         let now = self.t;
-        let Some(last) = self
+        let Some(mut last) = self
             .pending
             .iter()
             .rposition(|&(_, a)| a.is_some_and(|a| a <= now))
         else {
             return;
         };
-        let batch: Vec<_> = self.pending.drain(..=last).collect();
+        // A gap is reported only once the first datagram behind it has been in for `hold_us`.
+        let mut exposed = u64::MAX;
+        for i in (0..=last).rev() {
+            match self.pending[i].1.filter(|&a| a <= now) {
+                Some(a) => exposed = exposed.min(a),
+                None if exposed.saturating_add(self.hold_us) > now => last = i.wrapping_sub(1),
+                None => {}
+            }
+        }
+        if last == usize::MAX {
+            return;
+        }
+        let batch: Vec<_> = self
+            .pending
+            .drain(..=last)
+            .map(|(s, a)| (s, a.filter(|&a| a <= now)))
+            .collect();
         let ref_us = batch
             .iter()
             .filter_map(|&(_, a)| a)
             .map(|a| self.client_us(a))
             .min()
-            .unwrap();
+            .unwrap_or(self.client_us(now));
         let arrivals = batch
             .iter()
             .map(|&(_, a)| match a {
@@ -608,6 +631,37 @@ fn a_link_that_drops_to_a_third_drives_the_estimate_down() {
     s.run(10.0);
     let mean = s.mean_after(16.0);
     assert!((2000.0..3300.0).contains(&mean), "mean {mean:.0}");
+}
+
+/// A link that reorders (#1330): each datagram held 0–40 ms on its own, the netem jitter with
+/// no rate the browser still receives (`web/src/webtransport/reorder.test.ts`), one in `drop_every`
+/// lost. The client waits out its reorder window before it reports a gap.
+fn reordering(drop_every: u32) -> Sim {
+    let mut s = Sim::new(15_000.0);
+    s.reorder_us = Box::new(|seq| u64::from(seq).wrapping_mul(2_654_435_761) % 40_000);
+    s.drop_every = drop_every;
+    s.hold_us = 45_000;
+    s
+}
+
+#[test]
+fn a_link_that_reorders_keeps_the_estimate_at_the_link_rate() {
+    let mut s = reordering(1000);
+    s.run(30.0);
+    let (low, mean) = (s.min_after(3.0), s.mean_after(3.0));
+    assert!(
+        low > 0.85 * CEILING && mean > 0.95 * CEILING,
+        "lowest {low:.0}, mean {mean:.0}"
+    );
+}
+
+#[test]
+fn a_link_that_reorders_and_loses_still_cuts_on_the_loss() {
+    // Over LOSS_HIGH: 5 % sits in the band that holds the estimate (libwebrtc's rule).
+    let mut s = reordering(7);
+    s.run(30.0);
+    let mean = s.mean_after(10.0);
+    assert!(mean < 0.5 * CEILING, "mean {mean:.0}");
 }
 
 fn window(governor: &Governor, now: Instant) -> Box<Window> {
