@@ -443,7 +443,7 @@ describe("WebTransportMedia receiver feedback", () => {
 
   /** How long after a later datagram passes a lost one the feedback reports it, on a link where ten
    *  datagrams in the last second came 100 ms late. One datagram a millisecond, a message every 5 ms. */
-  async function heldFor(ack: object, rttMs: number): Promise<number> {
+  async function heldFor(ack: Record<string, unknown>, rttMs: number): Promise<number> {
     let clock = 0;
     let report = () => {};
     const agent = new FakeAgent();
