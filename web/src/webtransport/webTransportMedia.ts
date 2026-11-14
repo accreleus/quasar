@@ -415,8 +415,8 @@ export class WebTransportMedia implements MediaTransport {
 
     // Datagrams can overtake the hello_ack; the decode stage holds units by config_id, the
     // router PyroWave fragments.
-    const router = this.makeRouter(sink, live);
     const feedback = new FeedbackRecorder(this.now());
+    const router = this.makeRouter(sink, live, feedback);
     /** Set once this attempt's datagram reader has failed: `datagrams: <name>: <message>`. */
     const datagramReader = { death: null as string | null };
     void this.readDatagrams(wt, sink, router, live, feedback, datagramReader).catch((err: unknown) => {
@@ -557,8 +557,8 @@ export class WebTransportMedia implements MediaTransport {
     }
   }
 
-  private makeRouter(sink: MediaSink, live: { on: boolean }): Router {
-    const assembler = new FrameAssembler(this.now);
+  private makeRouter(sink: MediaSink, live: { on: boolean }, feedback: FeedbackRecorder): Router {
+    const assembler = new FrameAssembler(this.now, (now) => feedback.reorderMs(now));
     const configs = new Map<number, VideoConfig>();
     let latest: number | null = null;
     let pyro: PyroWaveReceiver | null = null;
