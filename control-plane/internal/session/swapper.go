@@ -224,7 +224,7 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 	// Mark swapping + remember the target; app_id stays the OLD app until commit.
 	if !app.ManagedHome {
 		s.noteSwapStart(sessionID)
-		if err := s.store.GuardPlacementForSwap(ctx, sessionID, homeAppID(app), *sess.HostID); err != nil {
+		if err := s.store.GuardPlacementForSwap(ctx, sessionID, app, *sess.HostID); err != nil {
 			return Session{}, err
 		}
 	}
