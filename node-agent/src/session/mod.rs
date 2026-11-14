@@ -1823,7 +1823,9 @@ mod tests {
             s.apply_json(&push);
             let mut cfg = SessionConfig::for_assignment_with(&s, stream_with_floor(0), None);
             cfg.webtransport = webtransport;
-            let lc = cfg.ladder_config().expect("smooth + speed-bias rung ⇒ Some");
+            let lc = cfg
+                .ladder_config()
+                .expect("smooth + speed-bias rung ⇒ Some");
             (lc.resolution_enabled, lc.order)
         };
         let none = serde_json::json!({});
