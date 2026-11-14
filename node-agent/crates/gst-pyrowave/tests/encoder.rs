@@ -320,6 +320,64 @@ fn nv12_input_encodes_like_i420() {
     }
 }
 
+/// codec-pyrowave.md §Rate: the agent retargets a running encoder by writing `bitrate`; the
+/// next frame lands within the new budget, with no restart.
+#[test]
+fn a_bitrate_written_while_playing_budgets_the_next_frame() {
+    if device().is_none() {
+        return;
+    }
+    let (w, h) = (320, 192);
+    let src = std::fs::read(fixtures().join("detail_320x192.src.yuv")).unwrap();
+    // The fixtures' xhi and lo budgets at 60 fps (testdata/pyrowave/manifest.json).
+    let (high, low) = (92_160 * 8 * 60 / 1000, 12_288 * 8 * 60 / 1000);
+    let mut desc = format!(
+        "appsrc name=src format=time caps=\"video/x-raw,format=I420,width={w},height={h},\
+         framerate=60/1,colorimetry=bt709\" ! pyrowaveenc name=enc bitrate={high} "
+    );
+    if let Some(node) = device_node() {
+        desc += &format!("device={node} ");
+    }
+    desc += "! appsink name=sink sync=false";
+    let pipeline = gst::parse::launch(&desc)
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+    let src_el = pipeline
+        .by_name("src")
+        .unwrap()
+        .downcast::<gst_app::AppSrc>()
+        .unwrap();
+    let sink = pipeline
+        .by_name("sink")
+        .unwrap()
+        .downcast::<gst_app::AppSink>()
+        .unwrap();
+    let enc = pipeline.by_name("enc").unwrap();
+    pipeline.set_state(gst::State::Playing).unwrap();
+    let encode_one = |i: u64| {
+        let mut buf = gst::Buffer::from_slice(src.clone());
+        buf.get_mut()
+            .unwrap()
+            .set_pts(gst::ClockTime::from_mseconds(i * 16));
+        src_el.push_buffer(buf).unwrap();
+        sink.try_pull_sample(gst::ClockTime::from_seconds(10))
+            .expect("a frame")
+            .buffer_owned()
+            .unwrap()
+            .size()
+    };
+    let before = encode_one(0);
+    enc.set_property("bitrate", low as u32);
+    let after = encode_one(1);
+    pipeline.set_state(gst::State::Null).unwrap();
+    let budget = gstpyrowave::frame_budget(low as u32, 60, 1, w * h * 3 / 2);
+    assert!(
+        after <= budget && before > budget,
+        "{before} B at {high} kbit/s, then {after} B for a {budget} B budget"
+    );
+}
+
 /// Encode time per frame in a running pipeline: from a buffer entering the element's sink
 /// pad to its frame leaving the src pad. `cargo test -- --ignored encode_time` on a GPU host.
 #[test]

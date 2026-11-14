@@ -113,6 +113,11 @@ func TestLaunchGrantsPyroWaveAndTheCeilingRefusesTheNext(t *testing.T) {
 	if slotOf(first) {
 		t.Fatal("the stepped-down session still holds the GPU's only PyroWave slot")
 	}
+	// The same for a congestion step-down (#1058).
+	must(t, exec(t, f.pool, `UPDATE sessions SET pyrowave_slot = true, pyrowave = pyrowave || '{"wanted": true}' WHERE id = $1::uuid`, first))
+	if r := switched("h264", "congestion"); r.Wanted || slotOf(first) {
+		t.Errorf("a congestion step-down keeps wanting or its slot: %+v", r)
+	}
 	must(t, exec(t, f.pool, `UPDATE sessions SET state = 'stopped', ended_at = now() WHERE id = $1::uuid`, second))
 	status, body = f.launch(t, map[string]any{"pyrowave": true})
 	if status != http.StatusCreated {

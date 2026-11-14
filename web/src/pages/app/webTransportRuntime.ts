@@ -81,7 +81,7 @@ export interface WebTransportRuntimeConfig {
   /** The session wants PyroWave (`session.pyrowave.wanted`): offer it in `hello` if this browser can decode it. */
   pyrowave?: boolean;
   callbacks: Pick<SessionRuntimeCallbacks, "onDisconnectSuspected" | "onSessionTakenOver"> &
-    Partial<Pick<SessionRuntimeCallbacks, "onSummonOverlay" | "onKeyboardLockRefused" | "onNonStandardGamepad">> & {
+    Partial<Pick<SessionRuntimeCallbacks, "onSummonOverlay" | "onKeyboardLockRefused" | "onNonStandardGamepad" | "onCodecSwitched">> & {
     /** Terminal and not a fallback: the session ended or WebTransport cannot be used. `detail` is
      *  human copy for the failure card. */
     onTransportFailed(detail: string): void;
@@ -447,6 +447,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
           if (destroyed || failed || t !== transport) return;
           telemetry.setCodec(CODEC_MIME[c.codec] ?? c.codec);
           if (c.switchReason) console.info(`WebTransport codec ${c.codec}: ${c.switchReason}`);
+          if (c.switchReason && c.codec !== "pyrowave") cfg.callbacks.onCodecSwitched?.(c.codec, c.switchReason);
           // capture.ts scales the mouse by the stream size, which a canvas does not know.
           cfg.canvas.dataset.streamW = String(c.width);
           cfg.canvas.dataset.streamH = String(c.height);

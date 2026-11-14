@@ -134,6 +134,16 @@ interface SessionState {
   pyrowave?: boolean;
 }
 
+/** Why WebTransport left PyroWave (codec-pyrowave.md §Switching codec, open strings). */
+const CODEC_SWITCH_COPY: Record<string, string> = {
+  congestion: "Ultra-low latency is off: the connection can't carry it.",
+  rtt_too_high: "Ultra-low latency is off: the connection takes too long to reach the host.",
+  client_no_decoder: "Ultra-low latency is off: this browser can't decode it.",
+  client_decode_error: "Ultra-low latency is off: this browser couldn't decode the stream.",
+  encoder_error: "Ultra-low latency is off: the host couldn't encode it.",
+};
+const CODEC_SWITCH_FALLBACK = "Ultra-low latency is off for this session.";
+
 // Keyed on the id so a route change between two sessions (a toast's "Go to
 // session", back/forward) starts the next one with fresh state (#560).
 export function SessionPage() {
@@ -489,7 +499,7 @@ function SessionPageBody() {
 
     const inputCallbacks: Pick<
       SessionRuntimeCallbacks,
-      "onSummonOverlay" | "onKeyboardLockRefused" | "onNonStandardGamepad"
+      "onSummonOverlay" | "onKeyboardLockRefused" | "onNonStandardGamepad" | "onCodecSwitched"
     > = {
       // capture.ts owns the chord while the pointer is locked: it releases
       // the lock, swallows the key, then calls back here. The HUD's own
@@ -524,6 +534,10 @@ function SessionPageBody() {
           body: `${shortGamepadLabel(pad.id)}: ${NON_STANDARD_PAD_ADVICE}`,
           duration: 10000,
         });
+      },
+      // #1058: PyroWave stepped down for the rest of the session; say why once.
+      onCodecSwitched: (_codec, reason) => {
+        addToast({ variant: "info", title: CODEC_SWITCH_COPY[reason] ?? CODEC_SWITCH_FALLBACK });
       },
     };
 

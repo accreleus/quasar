@@ -165,6 +165,7 @@ pub(crate) fn feed_at(pad: gst::Pad, raw: &gst::Caps) -> Result<Feed> {
 /// stops the pipeline.
 pub(crate) struct Encoder {
     pub(crate) pipeline: gst::Pipeline,
+    pub(crate) enc: glib::WeakRef<gst::Element>,
     pad: gst::Pad,
     probe: Option<gst::PadProbeId>,
     /// Set under its lock with the stop; the start thread reads it under the same lock, so a
@@ -548,6 +549,7 @@ pub(crate) fn start_with(
         .context("could not watch the encode queue")?;
     Ok(Encoder {
         pipeline,
+        enc: enc.downgrade(),
         pad: feed.pad,
         probe: Some(probe),
         stopped,
