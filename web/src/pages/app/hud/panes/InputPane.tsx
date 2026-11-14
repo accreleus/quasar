@@ -13,6 +13,7 @@
 import { Fragment, memo, useEffect, useState } from "react";
 import { SCALING_MODES, type ScalingMode } from "../../../../settings/displayPreferences";
 import { EMPTY_SNAPSHOT, type TelemetrySnapshot } from "../../../../webrtc/telemetry";
+import { Switch } from "../../../../components/TextField";
 import { IconGamepadLarge } from "../icons";
 import type { TelemetryRegistrar } from "../HudBar";
 import { isStandardMapping } from "../../../../input/capture";
@@ -44,6 +45,9 @@ export interface InputPaneProps {
   pointerLockAvailable: boolean;
   /** True where touch gestures are the mouse (touchscreen + no Pointer Lock). */
   touchLook: boolean;
+  /** #1401: the touch pad, shown only where touch is the mouse. */
+  onScreenControls?: boolean;
+  onOnScreenControlsChange?: (on: boolean) => void;
   scalingMode: ScalingMode;
   onScalingChange: (m: ScalingMode) => void;
 }
@@ -276,6 +280,16 @@ export function InputPane(props: InputPaneProps) {
         <div>
           <div className="col-lb">Connected</div>
           <Gamepads register={props.register} />
+          {props.touchLook && props.onOnScreenControlsChange && (
+            <div className="ctl-row">
+              <Switch
+                label="On-screen controls"
+                id="hud-on-screen-controls"
+                checked={props.onScreenControls !== false}
+                onChange={props.onOnScreenControlsChange}
+              />
+            </div>
+          )}
           <div className="ctl-row">
             Scaling
             <div className="segmented" role="tablist" aria-label="Scaling mode">

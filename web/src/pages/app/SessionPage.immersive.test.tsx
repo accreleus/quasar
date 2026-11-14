@@ -116,6 +116,7 @@ vi.mock("./webTransportRuntime", async () => {
         release() {},
         syncKeyboardLock() {},
         setMouse() {},
+        setVirtualPad() {},
         isCaptured: () => false,
         cancelRecovery() {},
         hasMicSlot: () => false,

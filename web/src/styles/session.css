@@ -112,3 +112,149 @@
   .switcher { transition: none; }
   .switcher svg { animation: none; }
 }
+
+/* #1401 on-screen controls. Neither DESIGN.md nor a mock covers this surface: only HUD
+ * tokens and the look of `.session-summon`. Under the HUD (z 20) and the summon button
+ * (z 22); the layer itself takes no touches, only the controls do. */
+.osc {
+  position: fixed;
+  inset: 0;
+  z-index: 18;
+  pointer-events: none;
+  --osc-edge: 20px;
+}
+.osc-btn,
+.osc-stick,
+.osc-dpad {
+  pointer-events: auto;
+  touch-action: none;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.osc-btn,
+.osc-knob,
+.osc-stick,
+.osc-dpad {
+  border: 1px solid var(--line-2);
+  background: var(--session-summon-bg);
+  color: var(--text-2);
+  box-shadow: var(--shadow-lg);
+}
+.osc-btn {
+  display: grid;
+  place-items: center;
+  padding: 0;
+  font: inherit;
+  font-size: var(--t-sm);
+  font-weight: 600;
+  cursor: pointer;
+}
+.osc-btn[data-down],
+.osc-dir[data-down] {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+.osc-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.osc-shoulder {
+  position: absolute;
+  top: calc(12px + env(safe-area-inset-top, 0px));
+  display: flex;
+  gap: var(--s2);
+}
+.osc-shoulder-l { left: calc(var(--osc-edge) + env(safe-area-inset-left, 0px)); }
+.osc-shoulder-r { right: calc(var(--osc-edge) + env(safe-area-inset-right, 0px)); }
+.osc-trigger {
+  width: 64px;
+  height: 40px;
+  border-radius: var(--r-panel);
+}
+
+.osc-zone { position: absolute; }
+.osc-dpad-zone { left: calc(var(--osc-edge) + env(safe-area-inset-left, 0px)); top: 72px; }
+.osc-lstick-zone {
+  left: calc(var(--osc-edge) + env(safe-area-inset-left, 0px));
+  bottom: calc(var(--osc-edge) + env(safe-area-inset-bottom, 0px));
+}
+/* Clear of the session-menu button, which sits at the right edge. */
+.osc-face {
+  right: calc(76px + env(safe-area-inset-right, 0px));
+  top: 72px;
+  width: 148px;
+  height: 148px;
+}
+.osc-rstick-zone {
+  right: calc(76px + env(safe-area-inset-right, 0px));
+  bottom: calc(var(--osc-edge) + env(safe-area-inset-bottom, 0px));
+}
+
+.osc-stick {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 112px;
+  height: 112px;
+  border-radius: 50%;
+}
+.osc-knob {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: var(--ink-4);
+  pointer-events: none;
+}
+
+.osc-dpad {
+  position: relative;
+  width: 96px;
+  height: 96px;
+  border-radius: 50%;
+}
+.osc-dir {
+  position: absolute;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--r-control);
+  background: var(--ink-4);
+  pointer-events: none;
+}
+.osc-up { left: 32px; top: 4px; }
+.osc-down { left: 32px; bottom: 4px; }
+.osc-left { left: 4px; top: 32px; }
+.osc-right { right: 4px; top: 32px; }
+
+.osc-face-btn {
+  position: absolute;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+}
+.osc-y { left: 50px; top: 0; }
+.osc-a { left: 50px; bottom: 0; }
+.osc-x { left: 0; top: 50px; }
+.osc-b { right: 0; top: 50px; }
+
+.osc-meta {
+  position: absolute;
+  left: 50%;
+  /* Above the HUD pill, which docks along the bottom edge. */
+  bottom: calc(84px + env(safe-area-inset-bottom, 0px));
+  transform: translateX(-50%);
+  display: flex;
+  gap: var(--s3);
+}
+.osc-pill {
+  width: 64px;
+  height: 32px;
+  border-radius: var(--r-pill);
+  font-size: var(--t-xs);
+}
+
+/* Portrait: the sticks share the bottom edge, so everything else rides above them. */
+@media (orientation: portrait) {
+  .osc-meta { bottom: calc(140px + env(safe-area-inset-bottom, 0px)); }
+  .osc-dpad-zone { top: auto; bottom: calc(184px + env(safe-area-inset-bottom, 0px)); }
+  .osc-face { top: auto; bottom: calc(184px + env(safe-area-inset-bottom, 0px)); }
+}
