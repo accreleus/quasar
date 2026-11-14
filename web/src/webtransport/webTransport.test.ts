@@ -1486,6 +1486,77 @@ describe("createWebTransportRuntime fallback", () => {
       s.rt.destroy();
     });
 
+    describe("video arrives but no picture is shown", () => {
+      const delta = (agent: FakeAgent, frameSeq: number) =>
+        agent.last.datagrams(packetize({ configId: 0, frameSeq, keyframe: false, data: bytes(10, frameSeq) }));
+      /** A decoder that takes every unit and outputs nothing. */
+      async function stuckDecoder() {
+        vi.useFakeTimers();
+        const s = setup({
+          decoder: {
+            createDecoder: (init) => {
+              const d = new FakeDecoder(init);
+              d.holdOutput = true;
+              return d as unknown as VideoDecoder;
+            },
+            isConfigSupported: async (c) => ({ supported: true, config: c }),
+          },
+        });
+        s.rt.start();
+        await vi.advanceTimersByTimeAsync(10);
+        return s;
+      }
+      const feed = async (s: { agent: FakeAgent; callbacks: { onFallback: unknown } }, seconds: number, from = 0, send = frame) => {
+        for (let i = 0; i < seconds; i++) {
+          if (vi.mocked(s.callbacks.onFallback as () => void).mock.calls.length) return; // the connection is closed
+          send(s.agent, from + i);
+          await vi.advanceTimersByTimeAsync(1_000);
+        }
+      };
+
+      it("falls back with decode_error and a cause, and stops asking for keyframes", async () => {
+        const s = await stuckDecoder();
+        await feed(s, 7);
+        expect(s.callbacks.onFallback).toHaveBeenCalledWith("decode_error", expect.stringContaining("no picture shown"));
+        const asked = s.agent.sent("keyframe_request").length;
+        await vi.advanceTimersByTimeAsync(3_000);
+        expect(s.agent.sent("keyframe_request")).toHaveLength(asked);
+        expect(s.callbacks.onFallback).toHaveBeenCalledTimes(1);
+      });
+
+      it("does not fire on a normal start, nor on units that arrive before the first keyframe", async () => {
+        vi.useFakeTimers();
+        const ok = setup();
+        ok.rt.start();
+        await vi.advanceTimersByTimeAsync(10);
+        await feed(ok, 12);
+        expect(ok.callbacks.onFallback).not.toHaveBeenCalled();
+        ok.rt.destroy();
+
+        const s = await stuckDecoder();
+        await feed(s, 12, 0, delta);
+        expect(s.callbacks.onFallback).not.toHaveBeenCalled();
+        s.rt.destroy();
+      });
+
+      it("does not count a hidden tab, which shows nothing, and gives it the whole bound once visible", async () => {
+        const s = await stuckDecoder();
+        await feed(s, 1);
+        const vis = vi.spyOn(document, "visibilityState", "get");
+        vis.mockReturnValue("hidden");
+        document.dispatchEvent(new Event("visibilitychange"));
+        await feed(s, 15, 1);
+        expect(s.callbacks.onFallback).not.toHaveBeenCalled();
+        vis.mockReturnValue("visible");
+        document.dispatchEvent(new Event("visibilitychange"));
+        await feed(s, 3, 16);
+        expect(s.callbacks.onFallback).not.toHaveBeenCalled();
+        await feed(s, 4, 19);
+        expect(s.callbacks.onFallback).toHaveBeenCalledWith("decode_error", expect.any(String));
+        s.rt.destroy();
+      });
+    });
+
     it("does not fire in a hidden tab, and gives a tab that shows again the whole bound", async () => {
       const { agent, rt } = await streaming();
       const vis = vi.spyOn(document, "visibilityState", "get");
