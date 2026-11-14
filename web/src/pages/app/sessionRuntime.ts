@@ -168,6 +168,9 @@ export interface SessionRuntimeCallbacks {
    *  fires this once per pad). Optional and informational: the page explains
    *  that its buttons may be mixed up; the pad is still forwarded. */
   onNonStandardGamepad?(pad: GamepadIdentity): void;
+  /** WebTransport moved off PyroWave to `codec` (`hello_ack.codec_switch_reason`,
+   *  codec-pyrowave.md §Switching codec). Optional and informational: the page says why. */
+  onCodecSwitched?(codec: string, reason: string): void;
   /** A disconnect signature was seen on the status channel. The host-lost poll
    *  stays on the page: hostLost is page state and the poller is page-owned. */
   onDisconnectSuspected(): void;
