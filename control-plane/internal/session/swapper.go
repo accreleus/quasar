@@ -110,6 +110,13 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 	if !entitled {
 		return Session{}, ErrNotEntitled
 	}
+	// A swap cannot move hosts, so a mapped GE tool the live host lacks refuses
+	// here, before any claim or durable write (control-api.md §Compatibility tools).
+	if app.IsDerived() && app.ExternalSource == "steam" {
+		if err := s.store.compatToolMissingOnHost(ctx, app.ExternalID, *sess.HostID); err != nil {
+			return Session{}, err
+		}
+	}
 	// The swap must fit the held reservation; there is no resize. Slots only
 	// (#383): sessions now reserve 0 MB, so comparing declared VRAM would reject
 	// every swap into an app with any default_vram_mb at all.

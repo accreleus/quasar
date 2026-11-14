@@ -272,3 +272,42 @@ func TestOfflineHomeHostWithoutTheToolStaysHomeHostUnavailable(t *testing.T) {
 		t.Fatalf("body %s", rec.Body.String())
 	}
 }
+
+// A swap cannot move hosts, so it refuses (not waits) when the live host lacks the target game's
+// mapped GE tool, and leaves the session untouched. A present tool and an unmapped game swap.
+// Deleting the compatToolMissingOnHost call in swapper.Swap fails the refusal.
+func TestSwapRefusesATileWhoseMappedToolTheLiveHostLacks(t *testing.T) {
+	f := newWarmFixture(t, 8)
+	desktop := seedDesktop(t, f, true)
+	must(t, exec(t, f.pool, `UPDATE apps SET default_encode_slots=2 WHERE id=$1::uuid`, desktop))
+	mapped := seedTile(t, f.pool, f.steam, "Hades", compatGameID)
+	unmapped := seedTile(t, f.pool, f.steam, "Celeste", "504230")
+	seedGETool(t, f.pool)
+	sess := f.startedLaunch(t, desktop)
+	ctx := context.Background()
+
+	_, err := f.coord.Swap(ctx, sess, mapped)
+	var rej *CompatToolRejection
+	if !errors.Is(err, ErrNoHostAvailable) || !errors.As(err, &rej) || rej.Tool != compatTag || !rej.Usable {
+		t.Fatalf("swap before the install: got %v, want ErrNoHostAvailable carrying CompatToolRejection for %s", err, compatTag)
+	}
+	if got := readRow(t, f.pool, sess); got.Detail == swapDetailInProgress {
+		t.Error("a refused swap left the session marked swapping")
+	}
+	rec := httptest.NewRecorder()
+	writeNoHostAvailable(rec, err)
+	if !strings.Contains(rec.Body.String(), `"reason":"compat_tool_missing"`) {
+		t.Fatalf("body %s", rec.Body.String())
+	}
+
+	if _, err := f.coord.Swap(ctx, sess, unmapped); err != nil {
+		t.Fatalf("swap into a game with no mapping: %v", err)
+	}
+	f.disp.waitFor(t, "swap")
+	f.commitSwap(t, sess)
+
+	hostHasTool(t, f.pool, f.hostID, true)
+	if _, err := f.coord.Swap(ctx, sess, mapped); err != nil {
+		t.Fatalf("swap with the tool on the live host: %v", err)
+	}
+}

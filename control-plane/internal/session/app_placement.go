@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
@@ -62,4 +63,28 @@ func (s *Store) GuardPlacementForSwap(ctx context.Context, sessionID, canonicalA
 		return fmt.Errorf("persist pending swap: %w", err)
 	}
 	return tx.Commit(ctx)
+}
+
+// compatToolMissingOnHost is compatGate for a swap, which is pinned to hostID: nil when the game
+// has no per-game GE mapping or the host holds its usable tool, else a CompatToolRejection (an
+// ErrNoHostAvailable). SQL twin of compat.Store.mountable, like compatGate (the C10 share locks
+// are not taken here either).
+func (s *Store) compatToolMissingOnHost(ctx context.Context, gameID, hostID string) error {
+	var tag string
+	var usable, onHost bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT t.tag, t.enabled AND NOT t.name_conflict AND NOT t.pin_conflict,
+		       EXISTS (SELECT 1 FROM host_compat_tools ht WHERE ht.host_id = $2::uuid
+		               AND ht.sha512 = t.asset_sha512 AND ht.name = t.steam_name)
+		FROM compat_tool_mappings m JOIN compat_tools t ON t.id = m.tool_id
+		WHERE m.provider = 'steam' AND m.external_id = $1 AND t.family = 'ge'`, gameID, hostID).Scan(&tag, &usable, &onHost)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil
+	case err != nil:
+		return fmt.Errorf("swap compat tool check: %w", err)
+	case usable && onHost:
+		return nil
+	}
+	return &CompatToolRejection{err: ErrNoHostAvailable, Tool: tag, Usable: usable}
 }

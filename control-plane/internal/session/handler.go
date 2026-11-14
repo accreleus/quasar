@@ -879,6 +879,9 @@ func (h *Handler) handleSwap(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, ErrHomeConflict):
 		h.writeHomeConflict(w, r.Context(), req.AppID)
 		return
+	case errors.As(err, new(*CompatToolRejection)):
+		writeNoHostAvailable(w, err)
+		return
 	case errors.Is(err, ErrNoHostAvailable):
 		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeNoHostAvailable,
 			"this app is not selected for the current session's host")
