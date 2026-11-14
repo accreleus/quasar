@@ -88,6 +88,7 @@ describe("RuntimeTab managed home", () => {
     renderTab(true);
     fireEvent.change(pathField(), { target: { value: "" } });
     expect(pathField().value).toBe("");
+    expect(screen.getByText(/while this field is empty or \/home\/quasar\./)).toBeTruthy();
     fireEvent.change(pathField(), { target: { value: "/srv/own" } });
     expect(pathField().value).toBe("/srv/own");
   });

@@ -257,7 +257,7 @@ export function RuntimeTab({
             placeholder="/home/quasar"
             hint={
               homePath !== draft.containerPath
-                ? `The runtime preset mounts the home at ${homePath}. The app uses that path while this field is /home/quasar.`
+                ? `The runtime preset mounts the home at ${homePath}. The app uses that path while this field is empty or /home/quasar.`
                 : "Where the home appears inside the container, not where the data is stored."
             }
           />
