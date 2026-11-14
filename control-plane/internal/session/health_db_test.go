@@ -48,7 +48,7 @@ func TestEvaluateHealthFailStampsUnsustainableDetail(t *testing.T) {
 	coord.health.mu.Lock()
 	coord.health.healthRuns[sess.ID] = time.Now().Add(-5 * time.Minute)
 	coord.health.mu.Unlock()
-	coord.health.evaluateHealth(ctx, sess.ID, 3000) // below the 4000 kbps floor
+	coord.health.evaluateHealth(ctx, sess.ID, 3000, nil) // below the 4000 kbps floor
 
 	got, err := store.Get(ctx, sess.ID)
 	if err != nil {
@@ -73,6 +73,63 @@ func TestEvaluateHealthFailStampsUnsustainableDetail(t *testing.T) {
 			e = *got.ErrorMessage
 		}
 		t.Fatalf("error_message: got %q want prefix \"unsustainable:\"", e)
+	}
+}
+
+// #1375: health judges the floor of the rung the session is on (the sample's
+// abr_floor_kbps), not the launch rung's. A ladder-on session streaming at 360p
+// above 360p's floor is healthy however long it has been under the launch floor;
+// one pinned at the lowest rung's floor for over 3 min still fails.
+func TestEvaluateHealthJudgesTheCurrentRungFloor(t *testing.T) {
+	pool := testDB(t)
+	store, coord, _ := newCoord(t, pool)
+	s := seed(t, pool, 4)
+	ctx := context.Background()
+
+	running := func() string {
+		sess, err := store.ScheduleAndCreate(ctx, launchParams(s))
+		if err != nil {
+			t.Fatalf("launch: %v", err)
+		}
+		if _, err := pool.Exec(ctx,
+			`UPDATE sessions SET profile_id = '1080p60', stream_profile_id = '1080p60-h264' WHERE id::text = $1`,
+			sess.ID); err != nil {
+			t.Fatalf("set profile ids: %v", err)
+		}
+		for _, st := range []State{StateStarting, StateRunning} {
+			if _, err := store.Transition(ctx, sess.ID, st, nil, nil); err != nil {
+				t.Fatalf("→ %s: %v", st, err)
+			}
+		}
+		// Ten minutes under the 4000 kbps launch floor already.
+		coord.health.mu.Lock()
+		coord.health.healthRuns[sess.ID] = time.Now().Add(-10 * time.Minute)
+		coord.health.mu.Unlock()
+		return sess.ID
+	}
+	floor360 := 577.0
+
+	healthy := running()
+	coord.health.evaluateHealth(ctx, healthy, 1468, &floor360)
+	got, err := store.Get(ctx, healthy)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.State != StateRunning || got.HealthState != HealthHealthy {
+		t.Fatalf("360p above its floor: got state %s health %q, want running/healthy", got.State, got.HealthState)
+	}
+	if in, _ := healthMapsContain(coord, healthy); in {
+		t.Fatal("above the rung floor must clear the below-floor run")
+	}
+
+	pinned := running()
+	coord.health.evaluateHealth(ctx, pinned, floor360, &floor360)
+	got, err = store.Get(ctx, pinned)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.State != StateFailed || got.HealthState != HealthUnsustainable {
+		t.Fatalf("pinned at the lowest rung floor: got state %s health %q, want failed/unsustainable", got.State, got.HealthState)
 	}
 }
 
@@ -113,7 +170,7 @@ func TestEvaluateHealthYieldsToClientState(t *testing.T) {
 	}
 
 	// (1) A healthy (above-floor) agent sample must NOT clobber the client_* state.
-	coord.health.evaluateHealth(ctx, sess.ID, 5000) // above the 4000 kbps floor
+	coord.health.evaluateHealth(ctx, sess.ID, 5000, nil) // above the 4000 kbps floor
 	got, err := store.Get(ctx, sess.ID)
 	if err != nil {
 		t.Fatalf("get after healthy sample: %v", err)
@@ -128,7 +185,7 @@ func TestEvaluateHealthYieldsToClientState(t *testing.T) {
 	coord.health.mu.Lock()
 	coord.health.healthRuns[sess.ID] = time.Now().Add(-5 * time.Minute)
 	coord.health.mu.Unlock()
-	coord.health.evaluateHealth(ctx, sess.ID, 3000) // below the 4000 kbps floor
+	coord.health.evaluateHealth(ctx, sess.ID, 3000, nil) // below the 4000 kbps floor
 
 	got, err = store.Get(ctx, sess.ID)
 	if err != nil {

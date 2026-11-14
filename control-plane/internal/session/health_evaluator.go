@@ -52,10 +52,12 @@ type ClientHealthSample struct {
 }
 
 // evaluateHealth computes stream health from the latest ABR setpoint against the
-// rung's floor, persists a change, and fails a session unsustainable too long.
-// The state machine is Evaluate; this does the I/O, in its own goroutine off the
-// metrics hot path, logging errors rather than propagating them.
-func (h *healthEvaluator) evaluateHealth(ctx context.Context, sessionID string, setpointKbps float64) {
+// floor of the rung the session is on now, persists a change, and fails a session
+// unsustainable too long. reportedFloorKbps is the sample's abr_floor_kbps (nil ⇒
+// the launch floor, agent-api.md §session_metrics). The state machine is Evaluate;
+// this does the I/O, in its own goroutine off the metrics hot path, logging errors
+// rather than propagating them.
+func (h *healthEvaluator) evaluateHealth(ctx context.Context, sessionID string, setpointKbps float64, reportedFloorKbps *float64) {
 	sess, err := h.store.Get(ctx, sessionID)
 	if err != nil {
 		return
@@ -67,8 +69,13 @@ func (h *healthEvaluator) evaluateHealth(ctx context.Context, sessionID string, 
 	if sess.StreamProfileID == nil {
 		return
 	}
-	floorKbps, err := h.store.RungABRFloor(ctx, *sess.StreamProfileID)
-	if err != nil {
+	// A ladder step down lowers the floor; judging the launch floor failed sessions
+	// streaming fine on a lower rung (#1375). Only a sample with no reported floor
+	// falls back to the launch rung's.
+	var floorKbps int32
+	if reportedFloorKbps != nil && *reportedFloorKbps > 0 {
+		floorKbps = int32(*reportedFloorKbps)
+	} else if floorKbps, err = h.store.RungABRFloor(ctx, *sess.StreamProfileID); err != nil {
 		h.log.Warn("read rung abr floor failed, skipping health evaluation",
 			"session_id", sessionID, "stream_profile_id", *sess.StreamProfileID, "err", err)
 		return
