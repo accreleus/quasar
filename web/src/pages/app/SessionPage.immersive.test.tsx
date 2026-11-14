@@ -95,7 +95,7 @@ vi.mock("../../webrtc/traceEvents", () => ({
 /** The WebTransport runtime double: a test plays its snapshot and its fallback by hand. */
 const wt = vi.hoisted(() => ({
   set: null as null | ((patch: Record<string, unknown>) => void),
-  callbacks: null as null | { onFallback(reason: string): void },
+  callbacks: null as null | { onFallback(reason: string): void; onCodecSwitched?(codec: string, reason: string): void },
 }));
 vi.mock("./webTransportRuntime", async () => {
   const { IDLE_SNAPSHOT } = await import("./sessionRuntime");
@@ -516,6 +516,19 @@ describe("SessionPage — a WebTransport launch goes straight in (#647)", () => 
     expect(document.fullscreenElement).toBeNull();
     expect(engageSpy).not.toHaveBeenCalled();
     expect(playLayer()).not.toBeNull();
+  });
+
+  // #1058: a PyroWave step-down is for the rest of the session, so the player is told why.
+  it.each([
+    ["congestion", "Ultra-low latency is off: the connection can't carry it."],
+    ["rtt_too_high", "Ultra-low latency is off: the connection takes too long to reach the host."],
+    ["client_decode_error", "Ultra-low latency is off: this browser couldn't decode the stream."],
+    ["encoder_error", "Ultra-low latency is off: the host couldn't encode it."],
+    ["a_reason_from_later", "Ultra-low latency is off for this session."],
+  ])("a step-down off PyroWave for %s says why", async (reason, line) => {
+    await revealOverWebTransport();
+    await act(async () => wt.callbacks!.onCodecSwitched!("h264", reason));
+    expect(screen.getByText(line)).toBeTruthy();
   });
 });
 
