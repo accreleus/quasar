@@ -123,6 +123,13 @@ export class DecodeStage {
     });
   }
 
+  /** Waiting for a keyframe that is on its way (a new configuration, a restart, a skip): units
+   *  arriving meanwhile are dropped, so no picture is expected. Not so for a decoder that stopped
+   *  taking units (its queue is at the hard cap), whose keyframe wait never ends. */
+  needsKey(): boolean {
+    return this.needKey && this.current !== null && (this.decoder?.decodeQueueSize ?? 0) < MAX_DECODE_QUEUE_HARD;
+  }
+
   unit(unit: AccessUnit): void {
     if (this.stopped) return;
     const cur = this.current;
