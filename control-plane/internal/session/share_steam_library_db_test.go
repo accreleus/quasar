@@ -763,7 +763,6 @@ func TestSwapThatNeverReachesTheAgentReleasesAnUnusedSteamClaim(t *testing.T) {
 // nothing on the claim itself marks it.
 func TestUnusedClaimCleanupKeepsAClaimASwappingSessionTargets(t *testing.T) {
 	f := newWarmFixture(t, 8)
-	sharing := seedDesktop(t, f, true)
 	mine := seedDesktop(t, f, false)
 	other := seedDesktop(t, f, false)
 	a := f.startedLaunch(t, mine)
@@ -773,11 +772,11 @@ func TestUnusedClaimCleanupKeepsAClaimASwappingSessionTargets(t *testing.T) {
 	must(t, exec(t, f.pool, `DELETE FROM managed_home_claims WHERE canonical_app_id=$1::uuid`, f.steam))
 	must(t, exec(t, f.pool, `DELETE FROM user_homes WHERE app_id=$1::uuid`, f.steam))
 
-	// B's swap into the sharing desktop commits its guard and has not dispatched;
-	// the connection takes no holds, so only the durable `swapping` state marks it.
-	app, err := f.store.GetLaunchApp(ctx, sharing)
+	// B's swap into Steam commits its guard and has not dispatched; the
+	// connection takes no holds, so only the durable `swapping` state marks it.
+	app, err := f.store.GetLaunchApp(ctx, f.steam)
 	must(t, err)
-	if _, err := f.store.GuardHomeForSwapWithHold(ctx, b, f.userID, app, f.hostID, false, f.steam); err != nil {
+	if _, err := f.store.GuardHomeForSwapWithHold(ctx, b, f.userID, app, f.hostID, false, ""); err != nil {
 		t.Fatalf("guard B's swap: %v", err)
 	}
 	if n := f.steamClaimCount(t); n != 1 {
