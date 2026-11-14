@@ -59,6 +59,8 @@ export class FeedbackRecorder {
   /** Datagrams that arrived since the last message, and the rate of the last message's interval. */
   private received = 0;
   private perMs = 0;
+  /** Lateness measured since the last {@link takeLate}. */
+  private late = 0;
 
   constructor(private lastTake: number) {}
 
@@ -119,6 +121,18 @@ export class FeedbackRecorder {
     const bucket = Math.min(Math.floor((at - passed) / BUCKET_MS), this.buckets.length - 1);
     this.lateness.push({ at, bucket });
     this.buckets[bucket]++;
+    this.late++;
+  }
+
+  /** How many late datagrams were measured since the last call. Only a datagram that fills a gap
+   *  a later one opened counts: a path that loses without reordering (a resend has its own
+   *  `pkt_seq`) or an outage (a gap too wide to time) measures none, and nothing is measured at all
+   *  while {@link capMs} is 0 or less (before the first pong, or a round trip near the agent's
+   *  retransmit window), so a rule reading this is off then (#1330). */
+  takeLate(): number {
+    const n = this.late;
+    this.late = 0;
+    return n;
   }
 
   /** The message for everything up to the newest `pkt_seq` that arrived at least

@@ -22,7 +22,8 @@ import { WtTelemetry, type WtTelemetryOptions } from "../../webtransport/telemet
 import { PyroWaveStage, warmPyroWave, type PyroWaveStageOptions } from "../../pyrowave/stage";
 import { TransportError, type MediaTransport, type TransportEnd } from "../../webtransport/transport";
 import { webTransportInputSender } from "../../webtransport/inputSender";
-import { WebTransportMedia } from "../../webtransport/webTransportMedia";
+import { PING_MS, WebTransportMedia } from "../../webtransport/webTransportMedia";
+import { REORDER_MIN_SAMPLES } from "../../webtransport/feedback";
 import {
   IDLE_SNAPSHOT,
   type SessionRuntime,
@@ -39,6 +40,11 @@ const POST_MS = 5_000;
 /** No video frame for this long on a visible tab ends the connection as lost. The compositor
  *  source yields a frame every interval, a still screen included (33 ms at 30 fps): 150 of them. */
 export const MEDIA_SILENCE_MS = 5_000;
+/** The longest a keyframe wait may last, however slow the path: a connection that never shows a
+ *  picture must still end (#1426). */
+export const KEY_WAIT_MAX_MS = 30_000;
+/** Seconds in a row the reordering rule must hold (#1330). */
+export const REORDER_DAMAGE_S = 3;
 /** The mime form telemetry's negotiatedCodec uses, from the hello_ack's wire codec. */
 const CODEC_MIME: Record<string, string> = { h264: "video/H264", h265: "video/H265", av1: "video/AV1", pyrowave: "video/pyrowave" };
 /** The failure card's sentence for a failure that stops the view. Every other failure falls back
@@ -174,6 +180,13 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   let keyWaitSince: number | null = null;
   /** When a video datagram last arrived on this connection, whether or not its frame completed. */
   let lastDatagramAt: number | null = null;
+  /** This connection's latest pong: when it came and its round trip; null until one has. */
+  let pong: { at: number; rttMs: number } | null = null;
+  /** When this connection first showed a picture; null until it has. */
+  let shownAt: number | null = null;
+  /** Keyframe requests sent since the last `second`, and the seconds in a row the reorder rule held. */
+  let keyAsks = 0;
+  let reorderRun: string[] = [];
   /** When the last tick ran; null until ticking starts (connecting is not a stall). */
   let lastTickAt: number | null = null;
 
@@ -279,40 +292,59 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       lastVideoAt = Math.min(now, lastVideoAt + now - lastTickAt - TELEMETRY_MS);
       if (presentRefAt !== null) presentRefAt = Math.min(now, presentRefAt + now - lastTickAt - TELEMETRY_MS);
       if (keyWaitSince !== null) keyWaitSince = Math.min(now, keyWaitSince + now - lastTickAt - TELEMETRY_MS);
+      if (pong) pong.at = Math.min(now, pong.at + now - lastTickAt - TELEMETRY_MS);
       stableVideoSince = null;
     }
     lastTickAt = now;
-    // A connection that is up and carries no media never ends by itself.
+    // A keyframe wait may last 5 s plus four of the path's round trips (the request up, the keyframe
+    // behind the queue, a resend), at most KEY_WAIT_MAX_MS, counted from when it began: a fragment
+    // arriving does not restart it, a completed keyframe ends it. A slow link after a size step
+    // needs that long (5–6 s round trips at 1 Mbit/s, #1330 D7); a fast one still ends at about
+    // 5 s. The round trip is the latest pong's, or the age of an overdue one (pings go every
+    // second); before the first pong the path is unknown and the wait is the plain 5 s.
+    const pathMs = pong ? Math.max(pong.rttMs, now - pong.at - PING_MS) : 0;
+    const keyWaitMs = Math.min(KEY_WAIT_MAX_MS, MEDIA_SILENCE_MS + 4 * pathMs);
+    const arriving = lastDatagramAt !== null && now - lastDatagramAt <= MEDIA_SILENCE_MS;
+    const keyWaitEnd = (t: MediaTransport, reason: string, waitedMs: number) => {
+      onEnd(t, { code: null, reason });
+      lostCause = `keyframe_wait: none for ${(waitedMs / 1000).toFixed(1)} s, round trip ${Math.round(pathMs)} ms, limit ${(keyWaitMs / 1000).toFixed(1)} s`;
+      console.warn("webtransport:", lostCause);
+    };
+    // A connection that is up and carries no media never ends by itself. With nothing arriving
+    // that is 5 s; frames that stop while their datagrams still arrive are a keyframe wait (after
+    // a lost frame the assembler releases nothing until a keyframe completes).
     if (
       transport &&
       snapshot.channelOpen &&
       lastVideoAt !== null &&
       document.visibilityState === "visible" &&
-      now - lastVideoAt > MEDIA_SILENCE_MS
+      now - lastVideoAt > (arriving ? keyWaitMs : MEDIA_SILENCE_MS)
     ) {
-      onEnd(transport, { code: null, reason: "media_silent" });
+      if (arriving) keyWaitEnd(transport, "media_silent", now - lastVideoAt);
+      else onEnd(transport, { code: null, reason: "media_silent" });
       if (failed) return;
     }
     // No picture can come while a keyframe is awaited, by the decode stage or on a connection none has
-    // reached yet. With video arriving, a wait as long as the bound is a path that loses keyframes: the
-    // stream is lost, as media_silent, whether or not this connection ever showed a picture (#1426).
+    // reached yet. A wait begun with video arriving that outlasts the limit is a path that loses
+    // keyframes: the stream is lost, whether or not this connection ever showed a picture (#1426).
+    // Arrivals stopping do not end the wait, so datagrams in clumps cannot restart it.
     const awaitingKey = presentRefAt === null || !!stage?.needsKey();
-    const arriving = lastDatagramAt !== null && now - lastDatagramAt <= MEDIA_SILENCE_MS;
-    keyWaitSince = awaitingKey && arriving ? (keyWaitSince ?? now) : null;
+    keyWaitSince = awaitingKey ? (keyWaitSince ?? (arriving ? now : null)) : null;
     if (
       transport &&
       snapshot.channelOpen &&
       keyWaitSince !== null &&
       document.visibilityState === "visible" &&
-      now - keyWaitSince > MEDIA_SILENCE_MS
+      now - keyWaitSince > keyWaitMs
     ) {
-      onEnd(transport, { code: null, reason: "keyframe_lost" });
+      keyWaitEnd(transport, "keyframe_lost", now - keyWaitSince);
       if (failed) return;
     }
     // Video keeps arriving but no picture has been shown: a decoder or presenter that takes the
     // data and never outputs. (Video not arriving at all is the check above.)
-    // Time spent waiting for a keyframe is not a decoder showing nothing: it counts from the keyframe.
-    if (presentRefAt !== null && awaitingKey) presentRefAt = now;
+    // Time spent waiting for a keyframe, or with no frame to decode (the assembler holds them all
+    // until one completes), is not a decoder showing nothing: it counts from the keyframe.
+    if (presentRefAt !== null && (awaitingKey || (lastVideoAt !== null && now - lastVideoAt > 2 * TELEMETRY_MS))) presentRefAt = now;
     if (
       transport &&
       snapshot.channelOpen &&
@@ -385,6 +417,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     const presented = (captureUs: number) => {
       audioOut?.noteVideo(captureUs);
       presentRefAt = performance.now();
+      shownAt ??= presentRefAt;
       telemetry.presented(captureUs);
       if (!snapshot.firstFrame) set({ firstFrame: true, status: "streaming over WebTransport" });
     };
@@ -416,6 +449,24 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     });
     stage = s;
     await connectTransport(cfg.coords, false);
+  }
+
+  /** #1330: Chrome discards the datagrams a reordering path delivers late, so there frames are lost
+   *  for good. The view leaves WebTransport, without the reconnect (the same path loses the same
+   *  way), only when that damages the picture: in each of REORDER_DAMAGE_S seconds running, the
+   *  reorder window's gate of lateness AND a keyframe asked for, i.e. a frame given up. Loss that
+   *  NACK or FEC repaired asks for none. Not before this connection has shown a picture for
+   *  MEDIA_SILENCE_MS, nor in a hidden tab. Both counts cover the same second, between two calls. */
+  function judgeReordering(late: number): void {
+    const asks = keyAsks;
+    keyAsks = 0;
+    const now = performance.now();
+    const counts =
+      shownAt !== null && now - shownAt >= MEDIA_SILENCE_MS && document.visibilityState === "visible" &&
+      late >= REORDER_MIN_SAMPLES && asks > 0;
+    reorderRun = counts ? [...reorderRun, `${late} late ${asks} kf`] : [];
+    // The per-second numbers go into the cause, which fail() logs once.
+    if (reorderRun.length >= REORDER_DAMAGE_S) fail("stream_lost", false, undefined, `reorder: ${reorderRun.join(", ")}`);
   }
 
   /** ?bench=1 only: the marker is read off the frame about to be presented, at its own size, before
@@ -500,14 +551,22 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
           for (const b of f.packets) telemetry.bytes(b.byteLength);
           pyroStage?.frame(f);
         },
-        keyframeRequested: () => telemetry.keyframeRequested(),
+        keyframeRequested: () => {
+          telemetry.keyframeRequested();
+          if (t === transport) keyAsks++;
+        },
+        second: (late) => {
+          if (t === transport) judgeReordering(late);
+        },
         lost: (fragments) => {
           // The count is this connection's own, from 0: a reconnect's must add, not replace.
           if (t === transport) telemetry.addLost(fragments - lostOnThisConnection);
           lostOnThisConnection = fragments;
         },
         rtt: (ms, agentWallMs) => {
-          if (t === transport) telemetry.pong(ms, agentWallMs);
+          if (t !== transport) return;
+          telemetry.pong(ms, agentWallMs);
+          pong = { at: performance.now(), rttMs: ms };
         },
         end: (e) => onEnd(t, e),
       });
@@ -531,6 +590,10 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     presentRefAt = null; // a new connection counts from its own first keyframe
     keyWaitSince = null;
     lastDatagramAt = null;
+    pong = null;
+    shownAt = null;
+    keyAsks = 0;
+    reorderRun = [];
     startInput(t);
     if (timer === null) {
       telemetry.startWindow();
@@ -676,7 +739,8 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
             try {
               const { session } = await getSession(cfg.authToken, cfg.sessionId);
               if (destroyed || failed) return;
-              fail(session.state === "running" ? "stream_lost" : "session_ended", false, undefined, err);
+              const why = lostCause ? `${lostCause}; then ${err instanceof Error ? err.message : String(err)}` : err;
+              fail(session.state === "running" ? "stream_lost" : "session_ended", false, undefined, why);
               return;
             } catch (probeError) {
               if (probeError instanceof ApiError && probeError.status < 500) {

@@ -69,4 +69,38 @@ describe("FeedbackRecorder", () => {
     expect(r.take(50)).toMatchObject({ first_pkt_seq: 0, count: 8192 });
     expect(r.take(100)).toMatchObject({ first_pkt_seq: 8192, count: 808 });
   });
+
+  describe("takeLate (#1330)", () => {
+    it("counts each datagram that fills a gap a later one opened, once, and starts again from 0", () => {
+      const r = new FeedbackRecorder(0);
+      for (let ms = 0; ms < 100; ms++) r.record(dgram(ms), ms); // a rate, for the gap bound
+      r.take(100);
+      r.record(dgram(102), 101);
+      r.record(dgram(100), 102);
+      r.record(dgram(101), 103);
+      expect(r.takeLate()).toBe(2);
+      expect(r.takeLate()).toBe(0);
+    });
+
+    it("counts none on a path that loses without reordering", () => {
+      const r = new FeedbackRecorder(0);
+      for (let s = 0; s < 1_000; s++) if (s % 10 !== 3) r.record(dgram(s), s);
+      r.take(1_000);
+      expect(r.takeLate()).toBe(0);
+    });
+
+    it("does not time a gap wider than reordering could open, even when the burst fills it", () => {
+      const run = (gap: number) => {
+        const r = new FeedbackRecorder(0);
+        let t = 0;
+        for (let s = 0; s < 100; s++) r.record(dgram(s), t++);
+        r.take(t); // about one datagram a millisecond
+        for (let s = 100 + gap; s < 200 + gap; s++) r.record(dgram(s), t++);
+        for (let s = 100; s < 100 + gap; s++) r.record(dgram(s), t);
+        return r.takeLate();
+      };
+      expect(run(50)).toBe(50); // within the 150 ms bound at this rate: reordering
+      expect(run(300)).toBe(0); // an outage, filled late: not reordering
+    });
+  });
 });
