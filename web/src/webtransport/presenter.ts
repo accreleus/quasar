@@ -19,6 +19,27 @@
 // the last drawn; a decoder surface) or, in the copy fallback, the retired copy target
 // for the length of a fade.
 
+/** How long the adapter and device requests get. A null here ends the session on WebTransport, so
+ *  this is longer than the capability probe's bound (a cold GPU can take seconds, a hang never answers). */
+export const GPU_REQUEST_TIMEOUT_MS = 5_000;
+
+/** `p`'s value, or null after `ms`. A rejection still rejects, so a refusal keeps its own cause;
+ *  a value that arrives after the timeout goes to `late`, which releases it. */
+function boundedRequest<T>(p: Promise<T>, ms: number, late: (v: T) => void = () => {}): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
+  void p.then((v) => timedOut && late(v), () => {});
+  return Promise.race([
+    p,
+    new Promise<null>((resolve) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        resolve(null);
+      }, ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 /** What the runtime needs of a presenter; a test supplies a fake. */
 export interface Presenter {
   /** Draws `frame` and closes it; false when nothing was drawn. */
@@ -282,14 +303,19 @@ export async function createWebGpuPresenter(
   opts: { pyrowave?: boolean } = {},
 ): Promise<Presenter | null> {
   const gpu = navigator.gpu as GPU | undefined;
-  const adapter = await gpu?.requestAdapter();
+  // Bounded: a browser that never answers falls back to WebRTC (null is no_webgpu).
+  const adapter = gpu && (await boundedRequest(gpu.requestAdapter(), GPU_REQUEST_TIMEOUT_MS));
   if (!gpu || !adapter) return null;
   // The PyroWave decoder's fast path wants these (pyroWaveDeviceFeatures in pyrowave/decoder.ts,
   // not imported: the decoder loads only for a PyroWave session).
   const requiredFeatures = opts.pyrowave ? (["subgroups", "shader-f16"] as const).filter((f) => adapter.features.has(f)) : [];
-  const device = await adapter.requestDevice({ requiredFeatures });
+  const device = await boundedRequest(adapter.requestDevice({ requiredFeatures }), GPU_REQUEST_TIMEOUT_MS, (d) => d.destroy());
+  if (!device) return null;
   const context = canvas.getContext("webgpu");
-  if (!context) return null;
+  if (!context) {
+    device.destroy();
+    return null;
+  }
 
   let failed = false;
   let destroyed = false;
