@@ -495,7 +495,6 @@ impl Estimator {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn estimate_kbps(&self) -> f64 {
         self.estimate_kbps
     }

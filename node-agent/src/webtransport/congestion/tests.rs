@@ -45,8 +45,8 @@ struct Sim {
     trace: Vec<(f64, f64)>,
     /// Video goes through the agent's queue and QUIC's governed window, not straight out.
     quic: Option<Quic>,
-    /// The most video the queue held, bytes.
-    held_max: usize,
+    /// The most video the queue held, bytes, and when, seconds.
+    held_max: (usize, f64),
 }
 
 /// The agent's [`VideoQueue`] and QUIC behind it: a datagram leaves QUIC's queue once the
@@ -89,7 +89,7 @@ impl Sim {
             pending: VecDeque::new(),
             trace: Vec::new(),
             quic: None,
-            held_max: 0,
+            held_max: (0, 0.0),
         }
     }
 
@@ -182,7 +182,9 @@ impl Sim {
             queue.push_back(held.datagram);
             Handed::Sent
         });
-        self.held_max = self.held_max.max(quic.video.bytes());
+        if quic.video.bytes() > self.held_max.0 {
+            self.held_max = (quic.video.bytes(), self.t as f64 / 1e6);
+        }
         self.send_window(&mut quic, est);
         self.quic = Some(quic);
     }
@@ -1492,7 +1494,11 @@ fn a_step_cut_under_a_deep_buffer_brings_the_estimate_down_through_the_queue() {
     };
     let (direct, _) = cut(false);
     let (queued, held_max) = cut(true);
-    eprintln!("estimate 10-20 s after the cut: direct {direct:.0}, through the queue {queued:.0}; most held {held_max} B");
+    eprintln!(
+        "estimate 10-20 s after the cut: direct {direct:.0}, through the queue {queued:.0}; \
+         most held {} B at {:.2} s",
+        held_max.0, held_max.1
+    );
     assert!(direct < 2400.0, "no queue: {direct:.0}");
     assert!(queued < 2400.0, "through the queue: {queued:.0}");
 }
