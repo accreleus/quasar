@@ -1559,7 +1559,10 @@ describe("createWebTransportRuntime fallback", () => {
         s.rt.destroy();
       });
 
-      it("does not count the wait for a keyframe: units of a new configuration arrive for over 5 s before its keyframe", async () => {
+      const delta1 = (agent: FakeAgent, seq: number) =>
+        agent.last.datagrams(packetize({ configId: 1, frameSeq: seq, keyframe: false, data: bytes(10, seq) }));
+
+      it("does not count the wait for a keyframe: units of a new configuration arrive for 3 s before its keyframe", async () => {
         vi.useFakeTimers();
         const s = setup();
         s.rt.start();
@@ -1567,17 +1570,34 @@ describe("createWebTransportRuntime fallback", () => {
         await feed(s, 2);
         // A rung change: the live connection announces configuration 1, whose deltas reach the decode stage first.
         s.agent.last.control(helloAck(1, avcC(0x28), 1280, 720));
-        const delta1 = (agent: FakeAgent, seq: number) =>
-          agent.last.datagrams(packetize({ configId: 1, frameSeq: seq, keyframe: false, data: bytes(10, seq) }));
-        await feed(s, 9, 2, delta1);
-        expect(s.agent.sent("hello")).toHaveLength(1);
-        expect(s.callbacks.onFallback).not.toHaveBeenCalled();
+        await feed(s, 3, 2, delta1);
         // The keyframe lands and is shown; the clock then starts from it.
-        s.agent.last.datagrams(packetize({ configId: 1, frameSeq: 11, keyframe: true, data: bytes(10, 11) }));
-        await feed(s, 8, 12, delta1);
+        s.agent.last.datagrams(packetize({ configId: 1, frameSeq: 5, keyframe: true, data: bytes(10, 5) }));
+        await feed(s, 8, 6, delta1);
         expect(s.agent.sent("hello")).toHaveLength(1);
         expect(s.callbacks.onFallback).not.toHaveBeenCalled();
         s.rt.destroy();
+      });
+
+      it("takes a keyframe wait longer than the bound for a lost stream: reconnects at about 5 s, falls back on the second (#1426)", async () => {
+        vi.useFakeTimers();
+        const s = setup();
+        s.rt.start();
+        await vi.advanceTimersByTimeAsync(10);
+        await feed(s, 2);
+        // Deltas keep arriving and the keyframe they need never does (a path that loses it).
+        s.agent.last.control(helloAck(1, avcC(0x28), 1280, 720));
+        await feed(s, 5, 2, delta1);
+        expect(s.agent.sent("hello")).toHaveLength(1);
+        await feed(s, 2, 7, delta1);
+        expect(s.agent.sent("hello")).toHaveLength(2);
+        expect(s.callbacks.onFallback).not.toHaveBeenCalled();
+        // The new connection shows a picture, then loses a keyframe the same way.
+        await feed(s, 2, 9);
+        s.agent.last.control(helloAck(1, avcC(0x28), 1280, 720));
+        await feed(s, 8, 11, delta1);
+        expect(s.callbacks.onFallback).toHaveBeenCalledWith("decode_error", expect.stringContaining("no picture shown for 5 s"));
+        expect(s.agent.sent("hello")).toHaveLength(2);
       });
     });
 
