@@ -374,6 +374,12 @@ services:
       QUASAR_TEMPLATE_ROOT: ${QUASAR_TEMPLATE_ROOT:-}
       # The compatibility-tools root, bind-mounted below; empty = /var/lib/quasar/compat-tools.
       QUASAR_COMPAT_TOOLS_ROOT: ${QUASAR_COMPAT_TOOLS_ROOT:-}
+      # WebTransport listener (UDP; the agent runs on the host network, so no ports: entry).
+      # Port 0 turns it off; per-source = unauthenticated connections one source may hold.
+      QUASAR_WT_PORT: ${QUASAR_WT_PORT:-4433}
+      QUASAR_WT_UNAUTH_PER_SOURCE: ${QUASAR_WT_UNAUTH_PER_SOURCE:-4}
+      # PyroWave: 1 = take the compositor frames through system memory (escape hatch).
+      QUASAR_PYROWAVE_CPU_INPUT: ${QUASAR_PYROWAVE_CPU_INPUT:-}
       QUASAR_TEMPLATE_CLONE_MODE: ${QUASAR_TEMPLATE_CLONE_MODE:-}
       QUASAR_TEMPLATE_ALLOW_CROSSFS: ${QUASAR_TEMPLATE_ALLOW_CROSSFS:-}
       QUASAR_TEMPLATE_SETTLE_SECS: ${QUASAR_TEMPLATE_SETTLE_SECS:-}
