@@ -174,8 +174,126 @@ describe("WebTransportMedia connect", () => {
   it("closes with 4400 on a malformed hello_ack", async () => {
     const agent = new FakeAgent();
     agent.replies = [[{ type: "hello_ack", wt_proto: 1, config_id: 0, video: null }]];
-    await expect(transport(agent).connect(NO_SINK)).rejects.toMatchObject({ code: "internal" });
+    // The refusal keeps our own close code and reason, which is all a phone user can read (#1403).
+    await expect(transport(agent).connect(NO_SINK)).rejects.toMatchObject({ code: "internal", message: "close 4400 malformed hello_ack" });
     expect(agent.last.closes[0]).toMatchObject({ closeCode: 4400 });
+  });
+
+  it("sends datagrams through createWritable() where there is no datagrams.writable, as on Safari", async () => {
+    const agent = new FakeAgent();
+    agent.safariDatagrams = true;
+    agent.replies = [[helloAck(0, avcC())]];
+    const t = transport(agent);
+    await t.connect(NO_SINK);
+    expect(t.input.datagram(Uint8Array.from([3, 0x7b, 0x7d]))).toBe(true);
+    await flush();
+    expect(agent.datagramsSent.map((d) => Array.from(d))).toEqual([[3, 0x7b, 0x7d]]);
+    t.close();
+  });
+
+  it("lets the session's own close outrank a datagram reader that failed first, as Safari's does", async () => {
+    const agent = new FakeAgent();
+    agent.hold = "answer";
+    const up = transport(agent).connect(NO_SINK);
+    await vi.waitFor(() => expect(agent.reached).toBe("answer"));
+    agent.last.failDatagrams(new DOMException("A network error occurred.", "NetworkError"));
+    await flush();
+    agent.last.closeWith(4404);
+    await expect(up).rejects.toMatchObject({ code: "session_ended" });
+    expect(agent.last.closes.every((c) => c?.closeCode !== 4400)).toBe(true);
+  });
+
+  it("names the datagram reader in its 4400 when the session stays up without it", async () => {
+    const agent = new FakeAgent();
+    agent.hold = "answer";
+    const up = transport(agent).connect(NO_SINK);
+    await vi.waitFor(() => expect(agent.reached).toBe("answer"));
+    agent.last.failDatagrams(new DOMException("A network error occurred.", "NetworkError"));
+    await expect(up).rejects.toMatchObject({ code: "internal", message: "close 4400 datagrams: NetworkError: A network error occurred." });
+  });
+
+  const NETWORK_ERROR = () => new DOMException("A network error occurred.", "NetworkError");
+  const READER_DETAIL = "datagrams: NetworkError: A network error occurred.";
+
+  it("retries a not-ready refusal whose datagram reader Safari failed first, and sends no 4400 (#1403)", async () => {
+    // The agent's real order (webtransport/mod.rs): the error message, the stream finished, close code 0.
+    const agent = new FakeAgent();
+    agent.hold = "answer";
+    const t = transport(agent);
+    const up = t.connect(NO_SINK);
+    await vi.waitFor(() => expect(agent.reached).toBe("answer"));
+    agent.hold = null;
+    agent.replies = [[helloAck(0, avcC())]];
+    agent.last.failDatagrams(NETWORK_ERROR());
+    await flush();
+    agent.last.control({ type: "error", code: "session_not_ready" });
+    agent.last.closeWith(0);
+    await up;
+    expect(agent.conns).toHaveLength(2);
+    expect(agent.conns.flatMap((c) => c.closes).some((c) => c?.closeCode === 4400)).toBe(false);
+    t.close();
+  });
+
+  it("does not take a hello_ack on an attempt whose datagram reader already died (#1403)", async () => {
+    const agent = new FakeAgent();
+    agent.hold = "answer";
+    const t = transport(agent);
+    const up = t.connect(NO_SINK);
+    await vi.waitFor(() => expect(agent.reached).toBe("answer"));
+    agent.last.failDatagrams(NETWORK_ERROR());
+    await flush();
+    agent.last.control(helloAck(0, avcC()));
+    await expect(up).rejects.toMatchObject({ code: "internal", message: READER_DETAIL });
+    expect(agent.last.closes).toEqual([{ closeCode: 4400, reason: READER_DETAIL }]);
+    expect(agent.sent("ping")).toHaveLength(0);
+  });
+
+  it("ends a connected session whose datagram reader died with one 4400 that names it (#1403)", async () => {
+    vi.useFakeTimers();
+    const agent = new FakeAgent();
+    agent.replies = [[helloAck(0, avcC())]];
+    const ends: TransportEnd[] = [];
+    await transport(agent).connect({ ...NO_SINK, end: (e) => ends.push(e) });
+    agent.last.failDatagrams(NETWORK_ERROR());
+    await vi.advanceTimersByTimeAsync(999);
+    expect(agent.last.closes).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(agent.last.closes).toEqual([{ closeCode: 4400, reason: READER_DETAIL }]);
+    expect(ends).toEqual([{ code: 4400, reason: READER_DETAIL }]);
+  });
+
+  it("lets a connected session's own close inside the wait outrank its dead datagram reader (#1403)", async () => {
+    vi.useFakeTimers();
+    const agent = new FakeAgent();
+    agent.replies = [[helloAck(0, avcC())]];
+    const ends: TransportEnd[] = [];
+    await transport(agent).connect({ ...NO_SINK, end: (e) => ends.push(e) });
+    agent.last.failDatagrams(NETWORK_ERROR());
+    await vi.advanceTimersByTimeAsync(500);
+    agent.last.closeWith(4404);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(agent.last.closes).toHaveLength(0);
+    expect(ends).toEqual([{ code: 4404, reason: "" }]);
+  });
+
+  it("sends datagrams through datagrams.writable when the browser has both shapes (#1403)", async () => {
+    const writes: string[] = [];
+    const agent = new FakeAgent();
+    agent.replies = [[helloAck(0, avcC())]];
+    const t = transport(agent, {
+      createWebTransport: (url, o) => {
+        const wt = agent.create(url, o);
+        const dg = wt.datagrams as unknown as { createWritable?: () => WritableStream<Uint8Array> };
+        dg.createWritable = () => new WritableStream({ write: () => void writes.push("createWritable") });
+        return wt;
+      },
+    });
+    await t.connect(NO_SINK);
+    expect(t.input.datagram(Uint8Array.from([3, 1]))).toBe(true);
+    await flush();
+    expect(writes).toEqual([]);
+    expect(agent.datagramsSent).toHaveLength(1);
+    t.close();
   });
 
   it("refuses a PyroWave hello_ack whose picture size no PWV1 header can state", async () => {
@@ -634,7 +752,7 @@ describe("createWebTransportRuntime", () => {
   it("reports a browser with no WebGPU adapter", async () => {
     const { callbacks, rt } = setup({ noWebGpu: true });
     rt.start();
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("decoder_unsupported"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("decoder_unsupported", expect.any(String)));
     expect(callbacks.onTransportFailed).not.toHaveBeenCalled();
   });
 
@@ -648,7 +766,7 @@ describe("createWebTransportRuntime", () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     presenterFatal()("the GPU device was lost");
     // The fallback follows the close (control-api.md §Transport fallback, "Close first").
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("internal"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("internal", expect.any(String)));
   });
 
   it("reports a presenter that cannot be made, and builds no transport", async () => {
@@ -665,7 +783,7 @@ describe("createWebTransportRuntime", () => {
       deps: { createTransport, createPresenter: () => Promise.reject(new Error("requestDevice failed")) },
     });
     rt.start();
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("internal"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("internal", expect.any(String)));
     expect(createTransport).not.toHaveBeenCalled();
     expect(agent.conns).toHaveLength(0);
   });
@@ -756,7 +874,7 @@ describe("createWebTransportRuntime", () => {
       },
     });
     rt.start();
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("decoder_unsupported"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("decoder_unsupported", expect.any(String)));
     expect(callbacks.onTransportFailed).not.toHaveBeenCalled();
   });
 
@@ -879,7 +997,7 @@ describe("WebTransportMedia unreachable agent", () => {
 });
 
 describe("createWebTransportRuntime fallback", () => {
-  function setup() {
+  function setup(deps: Partial<WebTransportRuntimeDeps> = {}) {
     /** One per connection the runtime brought up; `sendInput` is what that capture sends with. */
     const captures: { sendInput: (m: InputMsg) => void; cleanup: ReturnType<typeof vi.fn>; engage: ReturnType<typeof vi.fn> }[] = [];
     const agent = new FakeAgent();
@@ -904,6 +1022,7 @@ describe("createWebTransportRuntime fallback", () => {
           captures.push(c);
           return c;
         }) as never,
+        ...deps,
       },
     });
     return { agent, callbacks, rt, captures };
@@ -922,7 +1041,7 @@ describe("createWebTransportRuntime fallback", () => {
     const { agent, callbacks, rt } = setup();
     agent.refuseHandshake = true;
     rt.start();
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("connect_failed"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("connect_failed", expect.any(String)));
     expect(agent.conns).toHaveLength(1);
     expect(agent.sent("hello")).toHaveLength(0);
     expect(callbacks.onTransportFailed).not.toHaveBeenCalled();
@@ -935,7 +1054,7 @@ describe("createWebTransportRuntime fallback", () => {
     agent.hold = "ready";
     rt.start();
     await vi.advanceTimersByTimeAsync(HANDSHAKE_DEADLINE_MS + 1);
-    expect(callbacks.onFallback).toHaveBeenCalledWith("connect_timeout");
+    expect(callbacks.onFallback).toHaveBeenCalledWith("connect_timeout", expect.any(String));
     expect(callbacks.onFallback).toHaveBeenCalledTimes(1);
   });
 
@@ -943,7 +1062,7 @@ describe("createWebTransportRuntime fallback", () => {
     const { agent, callbacks, rt } = setup();
     agent.replies = [[{ ...helloAck(0, avcC()), wt_proto: 2 }]];
     rt.start();
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("unsupported_version"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("unsupported_version", expect.any(String)));
     expect(agent.conns[0].closes).toHaveLength(1);
   });
 
@@ -951,20 +1070,39 @@ describe("createWebTransportRuntime fallback", () => {
     const { agent, callbacks, rt } = setup();
     agent.replies = [[{ type: "error", code: "auth_failed" }]];
     rt.start();
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("auth_failed"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("auth_failed", expect.any(String)));
     expect(agent.sent("hello").map((h) => h.token)).toEqual(["tok-1", "tok-2"]);
 
     const other = setup();
     other.agent.replies = [[{ type: "error", code: "takeover_rate_limited" }]];
     other.rt.start();
-    await vi.waitFor(() => expect(other.callbacks.onFallback).toHaveBeenCalledWith("takeover_rate_limited"));
+    await vi.waitFor(() => expect(other.callbacks.onFallback).toHaveBeenCalledWith("takeover_rate_limited", expect.any(String)));
+  });
+
+  it("a non-TransportError thrown during connect falls back as internal and keeps its name and message (#1403)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { callbacks, rt } = setup({
+      createTransport: () => ({ connect: () => Promise.reject(new TypeError("datagrams are not readable")), close: async () => {} }) as never,
+    });
+    rt.start();
+    await vi.waitFor(() =>
+      expect(callbacks.onFallback).toHaveBeenCalledWith("internal", "internal: TypeError: datagrams are not readable"),
+    );
+    expect(warn).toHaveBeenCalledWith("webtransport: falling back to WebRTC:", "internal: TypeError: datagrams are not readable");
+  });
+
+  it("a refusal falls back with its code in the cause (#1403)", async () => {
+    const { agent, callbacks, rt } = setup();
+    agent.replies = [[{ type: "error", code: "unsupported_version" }]];
+    rt.start();
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("unsupported_version", "unsupported_version"));
   });
 
   it("a code outside the contract's vocabulary is reported as internal", async () => {
     const { agent, callbacks, rt } = setup();
     agent.replies = [[{ type: "error", code: "bad_request" }]];
     rt.start();
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("internal"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("internal", expect.any(String)));
   });
 
   it("mid-session loss: one reconnect on a fresh token, then falls back with stream_lost", async () => {
@@ -976,7 +1114,23 @@ describe("createWebTransportRuntime fallback", () => {
     await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
     expect(callbacks.onFallback).not.toHaveBeenCalled();
     agent.last.closeWith(4400);
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost", expect.any(String)));
+    expect(callbacks.onFallback).toHaveBeenCalledTimes(1);
+  });
+
+  it("a datagram reader that dies after connect ends the session, reconnects once, then falls back naming it (#1403)", async () => {
+    const { agent, callbacks, rt } = setup();
+    rt.start();
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    agent.last.failDatagrams(new DOMException("A network error occurred.", "NetworkError"));
+    await vi.waitFor(() => expect(agent.conns).toHaveLength(2), { timeout: 3_000 });
+    expect(agent.conns[0].closes[0]).toEqual({ closeCode: 4400, reason: "datagrams: NetworkError: A network error occurred." });
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    agent.last.failDatagrams(new DOMException("A network error occurred.", "NetworkError"));
+    await vi.waitFor(
+      () => expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost", "stream_lost: datagrams: NetworkError: A network error occurred."),
+      { timeout: 3_000 },
+    );
     expect(callbacks.onFallback).toHaveBeenCalledTimes(1);
   });
 
@@ -1000,7 +1154,7 @@ describe("createWebTransportRuntime fallback", () => {
     rt.start();
     await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
     first.end({ code: null, reason: "lost" });
-    await vi.waitFor(() => expect(onFallback).toHaveBeenCalledWith("stream_lost"));
+    await vi.waitFor(() => expect(onFallback).toHaveBeenCalledWith("stream_lost", expect.any(String)));
     expect(connections).toBe(3); // the lost one and two replacements, not hundreds
     rt.destroy();
   });
@@ -1146,7 +1300,7 @@ describe("createWebTransportRuntime fallback", () => {
       agent.refuseHandshake = true;
       networkBack();
       await vi.advanceTimersByTimeAsync(4_000);
-      expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost");
+      expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost", expect.any(String));
       expect(callbacks.onFallback).toHaveBeenCalledTimes(1);
     });
 
@@ -1258,7 +1412,7 @@ describe("createWebTransportRuntime fallback", () => {
       expect(agent.sent("hello").map((h) => h.token)).toEqual(["tok-1", "tok-2"]);
       expect(callbacks.onFallback).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(SILENT + BYE_FLUSH_MS);
-      expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost");
+      expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost", expect.any(String));
       expect(agent.conns).toHaveLength(2);
     });
 
@@ -1355,14 +1509,14 @@ describe("createWebTransportRuntime fallback", () => {
     rt.start();
     await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
     agent.last.closeWith(4400);
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost", expect.any(String)));
 
     const refused = setup();
     refused.rt.start();
     await vi.waitFor(() => expect(refused.rt.getSnapshot().channelOpen).toBe(true));
     refused.agent.replies = [[{ type: "error", code: "takeover_rate_limited" }]];
     refused.agent.last.closeWith(4400);
-    await vi.waitFor(() => expect(refused.callbacks.onFallback).toHaveBeenCalledWith("stream_lost"));
+    await vi.waitFor(() => expect(refused.callbacks.onFallback).toHaveBeenCalledWith("stream_lost", expect.any(String)));
     expect(refused.callbacks.onFallback).toHaveBeenCalledTimes(1);
   });
 
@@ -1413,7 +1567,7 @@ describe("createWebTransportRuntime fallback", () => {
     agent.last.closeWith(4400);
     await vi.waitFor(() => expect(release).toBeDefined());
     fatal("the GPU device was lost");
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("internal"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("internal", expect.any(String)));
     release();
     await flush();
     expect(agent.conns).toHaveLength(1);
@@ -1532,7 +1686,7 @@ describe("createWebTransportRuntime fallback", () => {
     await vi.waitFor(() => expect(captures).toHaveLength(2));
     await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
     agent.last.closeWith(4400); // second loss: fallback, from a connection with a live capture
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost", expect.any(String)));
     expect(captures[1].cleanup).toHaveBeenCalledTimes(1);
     const before = inputs(agent).length;
     captures[1].sendInput(key);
@@ -1547,7 +1701,7 @@ describe("createWebTransportRuntime fallback", () => {
     const { agent, callbacks, rt, captures } = setup();
     agent.refuseHandshake = true;
     rt.start();
-    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("connect_failed"));
+    await vi.waitFor(() => expect(callbacks.onFallback).toHaveBeenCalledWith("connect_failed", expect.any(String)));
     expect(captures).toHaveLength(0);
   });
 });
