@@ -179,6 +179,39 @@ describe("WebTransportMedia connect", () => {
     expect(agent.last.closes[0]).toMatchObject({ closeCode: 4400 });
   });
 
+  it("sends datagrams through createWritable() where there is no datagrams.writable, as on Safari", async () => {
+    const agent = new FakeAgent();
+    agent.safariDatagrams = true;
+    agent.replies = [[helloAck(0, avcC())]];
+    const t = transport(agent);
+    await t.connect(NO_SINK);
+    expect(t.input.datagram(Uint8Array.from([3, 0x7b, 0x7d]))).toBe(true);
+    await flush();
+    expect(agent.datagramsSent.map((d) => Array.from(d))).toEqual([[3, 0x7b, 0x7d]]);
+    t.close();
+  });
+
+  it("lets the session's own close outrank a datagram reader that failed first, as Safari's does", async () => {
+    const agent = new FakeAgent();
+    agent.hold = "answer";
+    const up = transport(agent).connect(NO_SINK);
+    await vi.waitFor(() => expect(agent.reached).toBe("answer"));
+    agent.last.failDatagrams(new DOMException("A network error occurred.", "NetworkError"));
+    await flush();
+    agent.last.closeWith(4404);
+    await expect(up).rejects.toMatchObject({ code: "session_ended" });
+    expect(agent.last.closes.every((c) => c?.closeCode !== 4400)).toBe(true);
+  });
+
+  it("names the datagram reader in its 4400 when the session stays up without it", async () => {
+    const agent = new FakeAgent();
+    agent.hold = "answer";
+    const up = transport(agent).connect(NO_SINK);
+    await vi.waitFor(() => expect(agent.reached).toBe("answer"));
+    agent.last.failDatagrams(new DOMException("A network error occurred.", "NetworkError"));
+    await expect(up).rejects.toMatchObject({ code: "internal", message: "close 4400 datagrams: NetworkError: A network error occurred." });
+  });
+
   it("refuses a PyroWave hello_ack whose picture size no PWV1 header can state", async () => {
     const agent = new FakeAgent();
     const ack = helloAck(0, avcC(), 1_000_000, 1_000_000);
