@@ -129,6 +129,10 @@ struct Journal {
     seeded_idle_timeout_secs: Option<u64>,
     #[serde(default)]
     verified_idle_digest: Option<String>,
+    /// Seeded next-session groups whose latched value came from an operator's legacy
+    /// override, not the deployment baseline; the seed itself cannot tell.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    seeded_from_override: BTreeSet<String>,
 }
 
 impl Journal {
@@ -480,6 +484,16 @@ impl PolicyAgent {
                 continue;
             };
             let resolved = json!({ *group: value });
+            if self
+                .journal
+                .legacy_overlay
+                .as_ref()
+                .is_some_and(|overlay| overlay.get(*group).is_some())
+            {
+                self.journal.seeded_from_override.insert(group.to_string());
+            } else {
+                self.journal.seeded_from_override.remove(*group);
+            }
             self.journal.active_groups.insert(
                 group.to_string(),
                 ActiveGroup {
@@ -537,8 +551,10 @@ impl PolicyAgent {
     /// `apply_json` marks every ladder value it is given as set, but a typed group's
     /// value is only an operator's when its active snapshot came from an explicit
     /// choice (#1375). A `deployment` choice keeps the baseline's flag (env).
-    /// shortcut: a seed has no choice, so it counts as set only where it differs from
-    /// the baseline; a pre-ownership legacy override equal to the baseline reads unset.
+    /// A seed counts as set when a legacy override supplied it, or where it differs from
+    /// the baseline (seeds latched before the override was recorded).
+    /// shortcut: such an old seed equal to the baseline reads unset for good if the control
+    /// plane never offers the group (a pre-0087 override); fix that on the control plane.
     fn mark_ladder_choices(&self, settings: &mut RuntimeSettings) {
         let baseline = self.deployment_baseline.deployment_map();
         for key in ["abr_ladder_resolution", "abr_ladder_order"] {
@@ -551,12 +567,13 @@ impl PolicyAgent {
                 continue;
             };
             let chosen = if active.kind == "seeded" {
-                !baseline.get(key).is_some_and(|base| {
-                    active
-                        .resolved_settings
-                        .get(key)
-                        .is_some_and(|got| policy_catalog::json_equal(base, got))
-                })
+                self.journal.seeded_from_override.contains(key)
+                    || !baseline.get(key).is_some_and(|base| {
+                        active
+                            .resolved_settings
+                            .get(key)
+                            .is_some_and(|got| policy_catalog::json_equal(base, got))
+                    })
             } else {
                 self.journal.records.values().any(|record| {
                     record.group == key
@@ -2852,7 +2869,12 @@ mod tests {
         let baseline = RuntimeSettings::baseline_with(&|_| None);
         let mut runtime = baseline.clone();
         let mut agent = owned_agent(dir.path(), &LADDER_KEYS, &mut runtime);
+        // The never-touched host: no offer, the seeds composed by the next legacy map.
+        agent
+            .apply_legacy_overlay(&baseline, &mut runtime, &json!({}), Some("d1"))
+            .unwrap();
         assert_eq!(ladder_set(&runtime), (false, false), "seeded");
+        assert!(runtime.ladder.for_session(true).resolution_enabled);
         let deployed = runtime.deployment_map();
         for key in LADDER_KEYS {
             let o = offer(
@@ -2919,6 +2941,67 @@ mod tests {
             ("applied", None)
         );
         assert_eq!(ladder_set(&restarted), (false, true));
+    }
+
+    /// A legacy override latched into a seed before the group became typed-owned counts
+    /// as set, also when it equals the baseline: the WebTransport rung stays off.
+    #[test]
+    fn a_seed_from_a_legacy_override_marks_the_knob_set_at_the_baseline_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.json");
+        let baseline = RuntimeSettings::baseline_with(&|_| None);
+        let mut runtime = baseline.clone();
+        let mut agent = open_at(&path, &mut runtime);
+        agent
+            .apply_legacy_overlay(
+                &baseline,
+                &mut runtime,
+                &json!({"abr_ladder_resolution": false}),
+                Some("d1"),
+            )
+            .unwrap();
+        let advertised: Vec<String> = agent.journal.groups().into_iter().collect();
+        let owned = vec!["abr_ladder_order".into(), "abr_ladder_resolution".into()];
+        agent.confirm_groups(&advertised, &owned).unwrap();
+        agent
+            .apply_legacy_overlay(&baseline, &mut runtime, &json!({}), Some("d2"))
+            .unwrap();
+        assert_eq!(ladder_set(&runtime), (true, false));
+        assert!(!runtime.ladder.for_session(true).resolution_enabled);
+        drop(agent);
+        let mut restarted = baseline.clone();
+        open_at(&path, &mut restarted);
+        assert_eq!(ladder_set(&restarted), (true, false), "reopen");
+    }
+
+    /// One ladder group typed-owned as `deployment`, the other a legacy override.
+    #[test]
+    fn a_mixed_host_marks_only_the_legacy_override_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let baseline = RuntimeSettings::baseline_with(&|_| None);
+        let mut runtime = baseline.clone();
+        let mut agent = owned_agent(dir.path(), &["abr_ladder_resolution"], &mut runtime);
+        let o = offer(
+            &agent,
+            "r",
+            "0",
+            "abr_ladder_resolution",
+            json!({"source":"deployment"}),
+            json!(false),
+        );
+        assert_eq!(phase_of(&agent.accept(o, &mut runtime)), ("applied", None));
+        agent
+            .apply_legacy_overlay(
+                &baseline,
+                &mut runtime,
+                &json!({"abr_ladder_order":"res_first"}),
+                Some("d2"),
+            )
+            .unwrap();
+        assert_eq!(ladder_set(&runtime), (false, true));
+        let wt = runtime.ladder.for_session(true);
+        assert!(wt.resolution_enabled);
+        assert_eq!(wt.order, crate::session::ladder::LadderOrder::ResFirst);
     }
 
     /// The env var decides for a `deployment` choice: set when non-empty, unset when
