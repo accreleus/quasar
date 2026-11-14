@@ -65,8 +65,11 @@ export interface MediaSink {
   audio?(packet: AudioPacket): void;
   /** Reassembled units, in completion order. */
   unit(unit: AccessUnit): void;
-  /** A video datagram arrived, whether or not its frame will complete. */
-  videoDatagram?(): void;
+  /** A video datagram arrived, whether or not its frame will complete; `keyframe`: a fragment of one. */
+  videoDatagram?(keyframe: boolean): void;
+  /** The path has reordered while losing datagrams for seconds on end (`FeedbackRecorder.reorderingLoss`):
+   *  Chrome discards the late ones, so this transport cannot carry the stream on it. */
+  reorderingLoss?(): void;
   /** PyroWave frames, complete or at their deadline, in frame_seq order. */
   pyrowave(frame: PyroWaveFrame): void;
   /** Called once, after connect resolved, when the transport is gone. */

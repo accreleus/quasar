@@ -18,6 +18,12 @@ export const REORDER_HISTORY_MS = 1_000;
 export const REORDER_MIN_SAMPLES = 8;
 /** Below about 100 measurements in the history this is the largest one or two. */
 const REORDER_PERCENTILE = 0.99;
+/** A path that reorders while this share of what it reports never arrives cannot carry the stream:
+ *  Chrome's QUIC discards a datagram that arrives after the agent acknowledged an ACK naming a later
+ *  one, so on such a path the late ones are lost, not late, and no wait brings them (#1330). */
+export const REORDER_LOSS_SHARE = 0.03;
+/** Seconds in a row both must hold, so a burst does not end the transport. */
+export const REORDER_LOSS_S = 3;
 const BUCKET_MS = 5;
 /** Channels whose datagrams carry `pkt_seq` (§Channels): video, audio, audio redundancy, FEC. */
 const COUNTED = new Set([0x01, 0x02, 0x04, 0x06]);
@@ -59,6 +65,10 @@ export class FeedbackRecorder {
   /** Datagrams that arrived since the last message, and the rate of the last message's interval. */
   private received = 0;
   private perMs = 0;
+  /** Since the last {@link reorderingLoss}: lateness measured, `pkt_seq`s reported, and lost; and
+   *  the seconds in a row the path both reordered and lost. */
+  private second = { late: 0, reported: 0, lost: 0 };
+  private badSeconds = 0;
 
   constructor(private lastTake: number) {}
 
@@ -119,6 +129,21 @@ export class FeedbackRecorder {
     const bucket = Math.min(Math.floor((at - passed) / BUCKET_MS), this.buckets.length - 1);
     this.lateness.push({ at, bucket });
     this.buckets[bucket]++;
+    this.second.late++;
+  }
+
+  /** Called once a second: true once the path has measurably reordered (the reorder window's own
+   *  gate, {@link REORDER_MIN_SAMPLES} measurements) while losing at least
+   *  {@link REORDER_LOSS_SHARE} of what it reported, for {@link REORDER_LOSS_S} seconds running.
+   *  Lateness is only measured when a datagram fills a gap a later one opened: a path that loses
+   *  without reordering (a retransmission has its own `pkt_seq`) or an outage (a gap too wide to
+   *  time) never counts. */
+  reorderingLoss(): boolean {
+    const { late, reported, lost } = this.second;
+    this.second = { late: 0, reported: 0, lost: 0 };
+    const bad = late >= REORDER_MIN_SAMPLES && reported > 0 && lost >= REORDER_LOSS_SHARE * reported;
+    this.badSeconds = bad ? this.badSeconds + 1 : 0;
+    return this.badSeconds >= REORDER_LOSS_S;
   }
 
   /** The message for everything up to the newest `pkt_seq` that arrived at least
@@ -155,6 +180,8 @@ export class FeedbackRecorder {
       view.setUint16(i * 2, unit, true);
     }
     this.next = (first + count) >>> 0;
+    this.second.reported += count;
+    this.second.lost += lost;
     const interval = Math.max(now - this.lastTake, 1);
     this.lastTake = now;
     this.perMs = this.received / interval;

@@ -68,7 +68,7 @@ export const MAX_HELD_FRAGMENTS = 4_096;
 export const TOKEN_REFRESH_AGE_MS = 45_000;
 
 /** The client pings once a second (§Ping and pong). */
-const PING_MS = 1_000;
+export const PING_MS = 1_000;
 /** A datagram carries at least this much on any path (§Channels, "Datagram size"). */
 const MAX_INPUT_DATAGRAM = 1148;
 
@@ -478,7 +478,12 @@ export class WebTransportMedia implements MediaTransport {
       const message = live.on ? feedback.take(this.now()) : null;
       if (message) this.send(message);
     };
-    this.stopTickers.push(ticker(PING_MS, ping), ticker(FEEDBACK_MS, report));
+    // Once a second, as the ping: a path that reorders and loses is said each second it still does.
+    const second = () => {
+      ping();
+      if (live.on && feedback.reorderingLoss()) sink.reorderingLoss?.();
+    };
+    this.stopTickers.push(ticker(PING_MS, second), ticker(FEEDBACK_MS, report));
     void (async () => {
       try {
         for (let m = await next(); m && live.on; m = await next()) {
@@ -560,8 +565,8 @@ export class WebTransportMedia implements MediaTransport {
         if (repair) router.repair(repair);
         continue;
       }
-      if (channel === CHANNEL_VIDEO) sink.videoDatagram?.();
       const frag = parseVideoDatagram(value as Uint8Array);
+      if (channel === CHANNEL_VIDEO) sink.videoDatagram?.(frag?.keyframe === true);
       if (!frag) continue; // another channel, or malformed: dropped (§Channels)
       router.datagram(frag);
     }

@@ -22,7 +22,7 @@ import { WtTelemetry, type WtTelemetryOptions } from "../../webtransport/telemet
 import { PyroWaveStage, warmPyroWave, type PyroWaveStageOptions } from "../../pyrowave/stage";
 import { TransportError, type MediaTransport, type TransportEnd } from "../../webtransport/transport";
 import { webTransportInputSender } from "../../webtransport/inputSender";
-import { WebTransportMedia } from "../../webtransport/webTransportMedia";
+import { PING_MS, WebTransportMedia } from "../../webtransport/webTransportMedia";
 import {
   IDLE_SNAPSHOT,
   type SessionRuntime,
@@ -39,6 +39,9 @@ const POST_MS = 5_000;
 /** No video frame for this long on a visible tab ends the connection as lost. The compositor
  *  source yields a frame every interval, a still screen included (33 ms at 30 fps): 150 of them. */
 export const MEDIA_SILENCE_MS = 5_000;
+/** However slow the path and however its keyframe trickles in, a keyframe wait this long ends the
+ *  connection: one that never shows a picture must still end (#1426). */
+export const KEY_WAIT_MAX_MS = 30_000;
 /** The mime form telemetry's negotiatedCodec uses, from the hello_ack's wire codec. */
 const CODEC_MIME: Record<string, string> = { h264: "video/H264", h265: "video/H265", av1: "video/AV1", pyrowave: "video/pyrowave" };
 /** The failure card's sentence for a failure that stops the view. Every other failure falls back
@@ -174,6 +177,10 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   let keyWaitSince: number | null = null;
   /** When a video datagram last arrived on this connection, whether or not its frame completed. */
   let lastDatagramAt: number | null = null;
+  /** When a fragment of a keyframe last arrived on this connection. */
+  let lastKeyFragAt: number | null = null;
+  /** This connection's latest pong: when it came and its round trip; null until one has. */
+  let pong: { at: number; rttMs: number } | null = null;
   /** When the last tick ran; null until ticking starts (connecting is not a stall). */
   let lastTickAt: number | null = null;
 
@@ -282,37 +289,48 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       stableVideoSince = null;
     }
     lastTickAt = now;
-    // A connection that is up and carries no media never ends by itself.
+    // A missing keyframe ends the connection only once the path cannot explain the wait: the bound
+    // plus two of its round trips (the request up, the keyframe behind the queue), counted from the
+    // last keyframe fragment to arrive, and never past KEY_WAIT_MAX_MS. A slow link after a size step
+    // takes that long (5–6 s round trips at 1 Mbit/s, #1330 D7). Pings go every second, so a pong
+    // overdue by more than that is a round trip at least that long.
+    const pathMs = pong ? Math.max(pong.rttMs, now - pong.at - PING_MS) : 0;
+    const keyWaitOver = (since: number) =>
+      now - Math.max(since, lastKeyFragAt ?? since) > MEDIA_SILENCE_MS + 2 * pathMs || now - since > KEY_WAIT_MAX_MS;
+    const arriving = lastDatagramAt !== null && now - lastDatagramAt <= MEDIA_SILENCE_MS;
+    // A connection that is up and carries no media never ends by itself. Frames that stop while
+    // their datagrams still arrive are a keyframe wait: after a lost frame the assembler releases
+    // nothing until a keyframe completes.
     if (
       transport &&
       snapshot.channelOpen &&
       lastVideoAt !== null &&
       document.visibilityState === "visible" &&
-      now - lastVideoAt > MEDIA_SILENCE_MS
+      (arriving ? keyWaitOver(lastVideoAt) : now - lastVideoAt > MEDIA_SILENCE_MS)
     ) {
       onEnd(transport, { code: null, reason: "media_silent" });
       if (failed) return;
     }
     // No picture can come while a keyframe is awaited, by the decode stage or on a connection none has
-    // reached yet. With video arriving, a wait as long as the bound is a path that loses keyframes: the
-    // stream is lost, as media_silent, whether or not this connection ever showed a picture (#1426).
+    // reached yet. With video arriving, a wait the path cannot explain is a path that loses keyframes:
+    // the stream is lost, as media_silent, whether or not this connection ever showed a picture (#1426).
     const awaitingKey = presentRefAt === null || !!stage?.needsKey();
-    const arriving = lastDatagramAt !== null && now - lastDatagramAt <= MEDIA_SILENCE_MS;
     keyWaitSince = awaitingKey && arriving ? (keyWaitSince ?? now) : null;
     if (
       transport &&
       snapshot.channelOpen &&
       keyWaitSince !== null &&
       document.visibilityState === "visible" &&
-      now - keyWaitSince > MEDIA_SILENCE_MS
+      keyWaitOver(keyWaitSince)
     ) {
       onEnd(transport, { code: null, reason: "keyframe_lost" });
       if (failed) return;
     }
     // Video keeps arriving but no picture has been shown: a decoder or presenter that takes the
     // data and never outputs. (Video not arriving at all is the check above.)
-    // Time spent waiting for a keyframe is not a decoder showing nothing: it counts from the keyframe.
-    if (presentRefAt !== null && awaitingKey) presentRefAt = now;
+    // Time spent waiting for a keyframe, or with no frame to decode (the assembler holds them all
+    // until one completes), is not a decoder showing nothing: it counts from the keyframe.
+    if (presentRefAt !== null && (awaitingKey || (lastVideoAt !== null && now - lastVideoAt > 2 * TELEMETRY_MS))) presentRefAt = now;
     if (
       transport &&
       snapshot.channelOpen &&
@@ -484,8 +502,14 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
             t.codecFallback("decode_error");
           }
         },
-        videoDatagram: () => {
-          if (t === transport) lastDatagramAt = performance.now();
+        videoDatagram: (keyframe) => {
+          if (t !== transport) return;
+          lastDatagramAt = performance.now();
+          if (keyframe) lastKeyFragAt = lastDatagramAt;
+        },
+        // No reconnect: the same path would lose the same way (#1330). WebRTC carries it.
+        reorderingLoss: () => {
+          if (t === transport) fail("stream_lost", false, undefined, "the path reorders and Chrome discards the late datagrams");
         },
         unit: (u) => {
           if (destroyed || failed || t !== transport) return;
@@ -507,7 +531,9 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
           lostOnThisConnection = fragments;
         },
         rtt: (ms, agentWallMs) => {
-          if (t === transport) telemetry.pong(ms, agentWallMs);
+          if (t !== transport) return;
+          telemetry.pong(ms, agentWallMs);
+          pong = { at: performance.now(), rttMs: ms };
         },
         end: (e) => onEnd(t, e),
       });
@@ -531,6 +557,8 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     presentRefAt = null; // a new connection counts from its own first keyframe
     keyWaitSince = null;
     lastDatagramAt = null;
+    lastKeyFragAt = null;
+    pong = null;
     startInput(t);
     if (timer === null) {
       telemetry.startWindow();
