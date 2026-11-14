@@ -1,6 +1,6 @@
 // #1330: a datagram that arrives late is not lost (netem jitter with no rate reorders).
 import { describe, expect, it } from "vitest";
-import { FeedbackRecorder, HOLD_BACK_MS, MAX_REORDER_MS, REORDER_HISTORY_MS, REORDER_MIN_SAMPLES, type FeedbackMessage } from "./feedback";
+import { FeedbackRecorder, HOLD_BACK_MS, REORDER_HISTORY_MS, REORDER_MIN_SAMPLES, type FeedbackMessage } from "./feedback";
 import { parseVideoDatagram } from "./framing";
 import { FrameAssembler, type Reassembled } from "./reassembly";
 import { bytes, packetize } from "./testSupport";
