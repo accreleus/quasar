@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { FeedbackRecorder, REORDER_LOSS_S } from "./feedback";
+import { FeedbackRecorder } from "./feedback";
 import { base64Bytes } from "./framing";
 
 /** A datagram on `channel` carrying `pktSeq` (§Channels: bytes 1..5). */
@@ -70,56 +70,37 @@ describe("FeedbackRecorder", () => {
     expect(r.take(100)).toMatchObject({ first_pkt_seq: 8192, count: 808 });
   });
 
-  describe("reorderingLoss (#1330)", () => {
-    /** `secs` of one datagram a millisecond, reported every 50 ms and judged every second as the media
-     *  path does. `swap`: each pair arrives second one first; `dropEvery`: that pkt_seq never comes;
-     *  `outageAt`: that second delivers nothing. The seconds reorderingLoss said true. */
-    function judge(secs: number, o: { swap?: boolean; dropEvery?: number; outageAt?: number }): number[] {
+  describe("takeLate (#1330)", () => {
+    it("counts each datagram that fills a gap a later one opened, once, and starts again from 0", () => {
       const r = new FeedbackRecorder(0);
-      const fired: number[] = [];
-      let seq = 0;
-      for (let ms = 0; ms < secs * 1000; ms += 2) {
-        const pair = [seq, seq + 1];
-        seq += 2;
-        if (o.swap) pair.reverse();
-        const silent = o.outageAt !== undefined && Math.floor(ms / 1000) === o.outageAt;
-        pair.forEach((s, i) => {
-          if (!silent && !(o.dropEvery && s % o.dropEvery === 0)) r.record(dgram(s), ms + i);
-        });
-        if ((ms + 2) % 50 === 0) r.take(ms + 2);
-        if ((ms + 2) % 1000 === 0 && r.reorderingLoss()) fired.push((ms + 2) / 1000);
-      }
-      return fired;
-    }
-
-    it(`ends a path that reorders and loses 5 % after ${REORDER_LOSS_S} s`, () => {
-      expect(judge(6, { swap: true, dropEvery: 20 })[0]).toBe(REORDER_LOSS_S);
+      for (let ms = 0; ms < 100; ms++) r.record(dgram(ms), ms); // a rate, for the gap bound
+      r.take(100);
+      r.record(dgram(102), 101);
+      r.record(dgram(100), 102);
+      r.record(dgram(101), 103);
+      expect(r.takeLate()).toBe(2);
+      expect(r.takeLate()).toBe(0);
     });
 
-    it("never on a lossy path that does not reorder (2 % and 10 %), nor on one that reorders without loss", () => {
-      expect(judge(10, { dropEvery: 50 })).toEqual([]);
-      expect(judge(10, { dropEvery: 10 })).toEqual([]);
-      expect(judge(10, { swap: true })).toEqual([]);
-    });
-
-    it("never after an outage: a gap too wide to time is not reordering", () => {
-      expect(judge(10, { outageAt: 3 })).toEqual([]);
-      expect(judge(10, { dropEvery: 25, outageAt: 3 })).toEqual([]);
-    });
-
-    it("a second without loss starts the count again", () => {
+    it("counts none on a path that loses without reordering", () => {
       const r = new FeedbackRecorder(0);
-      let seq = 0;
-      let ms = 0;
-      const second = (lossy: boolean) => {
-        for (const end = ms + 1000; ms < end; ms += 2, seq += 2) {
-          if (!(lossy && seq % 20 === 0)) r.record(dgram(seq + 1), ms);
-          r.record(dgram(seq), ms + 1);
-          if ((ms + 2) % 50 === 0) r.take(ms + 2);
-        }
-        return r.reorderingLoss();
+      for (let s = 0; s < 1_000; s++) if (s % 10 !== 3) r.record(dgram(s), s);
+      r.take(1_000);
+      expect(r.takeLate()).toBe(0);
+    });
+
+    it("does not time a gap wider than reordering could open, even when the burst fills it", () => {
+      const run = (gap: number) => {
+        const r = new FeedbackRecorder(0);
+        let t = 0;
+        for (let s = 0; s < 100; s++) r.record(dgram(s), t++);
+        r.take(t); // about one datagram a millisecond
+        for (let s = 100 + gap; s < 200 + gap; s++) r.record(dgram(s), t++);
+        for (let s = 100; s < 100 + gap; s++) r.record(dgram(s), t);
+        return r.takeLate();
       };
-      expect([second(true), second(true), second(false), second(true), second(true), second(true)]).toEqual([false, false, false, false, false, true]);
+      expect(run(50)).toBe(50); // within the 150 ms bound at this rate: reordering
+      expect(run(300)).toBe(0); // an outage, filled late: not reordering
     });
   });
 });

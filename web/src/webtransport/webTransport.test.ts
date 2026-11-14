@@ -1167,27 +1167,61 @@ describe("createWebTransportRuntime fallback", () => {
     expect(callbacks.onFallback).toHaveBeenCalledTimes(1);
   });
 
-  it("a path that reorders and loses falls back with stream_lost at once, without the reconnect (#1330)", async () => {
-    vi.useFakeTimers();
-    const { agent, callbacks, rt } = setup();
-    agent.replies = [[{ ...helloAck(0, avcC()), retransmit_window_ms: 250 }]];
-    rt.start();
-    await vi.advanceTimersByTimeAsync(10);
-    // A round trip and the agent's retransmit window: the reorder window opens only once both are known.
-    agent.last.control({ type: "pong", id: 1, tc: performance.now() - 20, ts: 0, tw: 0 });
-    const pkt = { n: 0 };
-    let ms = 0;
-    for (; ms < 8_000 && rt.getSnapshot().channelOpen; ms += 10) {
-      const d = [0, 1].flatMap((i) => packetize({ configId: 0, frameSeq: ms / 5 + i, keyframe: true, data: bytes(10, i) }, pkt));
-      // Each pair second one first, and one datagram in ten never arrives.
-      agent.last.datagrams(d.reverse().filter((x) => new DataView(x.buffer, x.byteOffset).getUint32(1, true) % 10 !== 3));
-      await vi.advanceTimersByTimeAsync(10);
+  describe("a path that reorders and damages the picture (#1330)", () => {
+    /** Up with a known round trip and retransmit window (the reorder window opens only then), then
+     *  60 fps, a keyframe every 30 frames: `swap` sends each pair of frames second one first; `lose`
+     *  drops one delta in ten, which the client gives up and asks a keyframe for. Runs `ms` or until
+     *  the connection closes; returns how long it ran. */
+    async function streamFor(s: ReturnType<typeof setup>, ms: number, o: { swap: boolean; lose: boolean }, from = { seq: 0, pkt: { n: 0 } }) {
+      let ran = 0;
+      for (; ran < ms && s.rt.getSnapshot().channelOpen; ran += 33) {
+        const pair = [from.seq, from.seq + 1].filter((q) => !(o.lose && q % 10 === 3));
+        from.seq += 2;
+        const d = pair.flatMap((q) => packetize({ configId: 0, frameSeq: q & 0xffff, keyframe: q % 30 === 0, data: bytes(10, q) }, from.pkt));
+        s.agent.last.datagrams(o.swap ? d.reverse() : d);
+        await vi.advanceTimersByTimeAsync(33);
+      }
+      return ran;
     }
-    expect(ms).toBeLessThanOrEqual(5_000);
-    await vi.advanceTimersByTimeAsync(BYE_FLUSH_MS + 100);
-    expect(callbacks.onFallback).toHaveBeenCalledWith("stream_lost", expect.stringContaining("reorders"));
-    expect(agent.sent("hello")).toHaveLength(1);
-    rt.destroy();
+    async function up() {
+      vi.useFakeTimers();
+      const s = setup();
+      s.agent.replies = [[{ ...helloAck(0, avcC()), retransmit_window_ms: 250 }]];
+      s.rt.start();
+      await vi.advanceTimersByTimeAsync(10);
+      s.agent.last.control({ type: "pong", id: 1, tc: performance.now() - 20, ts: 0, tw: 0 });
+      return s;
+    }
+
+    it("falls back with a reorder: cause, without the reconnect, once the picture has been up 5 s and frames are given up 3 seconds running", async () => {
+      const s = await up();
+      const from = { seq: 0, pkt: { n: 0 } };
+      expect(await streamFor(s, 7_500, { swap: true, lose: true }, from)).toBeGreaterThanOrEqual(7_500);
+      expect(s.callbacks.onFallback).not.toHaveBeenCalled();
+      await streamFor(s, 2_000, { swap: true, lose: true }, from);
+      await vi.advanceTimersByTimeAsync(BYE_FLUSH_MS + 100);
+      expect(s.callbacks.onFallback).toHaveBeenCalledWith("stream_lost", expect.stringMatching(/^stream_lost: reorder: \d+ late \d+ kf, /));
+      expect(s.agent.sent("hello")).toHaveLength(1);
+      s.rt.destroy();
+    });
+
+    it("never on loss without reordering, nor on reordering that costs no frame", async () => {
+      for (const o of [{ swap: false, lose: true }, { swap: true, lose: false }]) {
+        const s = await up();
+        expect(await streamFor(s, 12_000, o)).toBeGreaterThanOrEqual(12_000);
+        expect(s.callbacks.onFallback).not.toHaveBeenCalled();
+        s.rt.destroy();
+      }
+    });
+
+    it("never in a hidden tab", async () => {
+      const s = await up();
+      const vis = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+      expect(await streamFor(s, 12_000, { swap: true, lose: true })).toBeGreaterThanOrEqual(12_000);
+      expect(s.callbacks.onFallback).not.toHaveBeenCalled();
+      vis.mockRestore();
+      s.rt.destroy();
+    });
   });
 
   it("a datagram reader that dies after connect ends the session, reconnects once, then falls back naming it (#1403)", async () => {
@@ -1682,46 +1716,48 @@ describe("createWebTransportRuntime fallback", () => {
 
       const pongWith = (agent: FakeAgent, rttMs: number) =>
         agent.last.control({ type: "pong", id: 0, tc: performance.now() - rttMs, ts: 0, tw: 0 });
+      /** A delta, then a keyframe short of its last fragment: the assembler gives the keyframe up and
+       *  releases nothing after it, while keyframe fragments keep arriving. */
+      const trickle = (agent: FakeAgent, seq: number) => {
+        delta(agent, 2 * seq);
+        agent.last.datagrams(packetize({ configId: 0, frameSeq: 2 * seq + 1, keyframe: true, data: bytes(3_000, seq) }).slice(0, -1));
+      };
 
-      it("waits as long as the path's round trip explains: a keyframe 9 s late on a 3 s path is no lost stream (D7)", async () => {
+      it("ends a fast path whose keyframes arrive but never complete in about 6 s (#1330 D7, #1426)", async () => {
+        vi.useFakeTimers();
+        const s = setup();
+        s.rt.start();
+        await vi.advanceTimersByTimeAsync(10);
+        await feed(s, 2);
+        for (let i = 0; i < 7; i++) {
+          pongWith(s.agent, 50);
+          await feed(s, 1, 2 + i, trickle);
+        }
+        expect(s.agent.sent("hello")).toHaveLength(2);
+        s.rt.destroy();
+      });
+
+      it("waits about 25 s for a keyframe on a 5 s round-trip path, from when the wait began (#1330 D7)", async () => {
         vi.useFakeTimers();
         const s = setup();
         s.rt.start();
         await vi.advanceTimersByTimeAsync(10);
         await feed(s, 2);
         s.agent.last.control(helloAck(1, avcC(0x28), 640, 360));
-        for (let i = 0; i < 9; i++) {
-          pongWith(s.agent, 3_000);
+        for (let i = 0; i < 22; i++) {
+          pongWith(s.agent, 5_000);
           await feed(s, 1, 2 + i, delta1);
         }
         expect(s.agent.sent("hello")).toHaveLength(1);
-        s.agent.last.datagrams(packetize({ configId: 1, frameSeq: 11, keyframe: true, data: bytes(10, 11) }));
-        await feed(s, 6, 12, delta1);
-        expect(s.agent.sent("hello")).toHaveLength(1);
-        expect(s.callbacks.onFallback).not.toHaveBeenCalled();
-        s.rt.destroy();
-      });
-
-      it("keeps waiting while a keyframe's fragments arrive, up to 30 s (D7, #1426)", async () => {
-        vi.useFakeTimers();
-        const s = setup();
-        s.rt.start();
-        await vi.advanceTimersByTimeAsync(10);
-        await feed(s, 2);
-        // Each second a delta, then a keyframe missing its last fragment: the assembler releases
-        // nothing after the first loss, but a keyframe is on its way.
-        const trickle = (agent: FakeAgent, seq: number) => {
-          delta(agent, 2 * seq);
-          agent.last.datagrams(packetize({ configId: 0, frameSeq: 2 * seq + 1, keyframe: true, data: bytes(3_000, seq) }).slice(0, -1));
-        };
-        await feed(s, 12, 2, trickle);
-        expect(s.agent.sent("hello")).toHaveLength(1);
-        await feed(s, 21, 14, trickle);
+        for (let i = 22; i < 27; i++) {
+          pongWith(s.agent, 5_000);
+          await feed(s, 1, 2 + i, delta1);
+        }
         expect(s.agent.sent("hello")).toHaveLength(2);
         s.rt.destroy();
       });
 
-      it("counts an overdue pong as a round trip that long, and still ends a keyframe wait past 30 s (D7, #1426)", async () => {
+      it("pongs stopped: the wait runs to the 30 s cap and no further (#1330 D7, #1426)", async () => {
         vi.useFakeTimers();
         const s = setup();
         s.rt.start();
@@ -1729,10 +1765,22 @@ describe("createWebTransportRuntime fallback", () => {
         await feed(s, 2);
         pongWith(s.agent, 50);
         s.agent.last.control(helloAck(1, avcC(0x28), 640, 360));
-        // No pong after this one: the queue holds the control stream too.
-        await feed(s, 14, 2, delta1);
+        await feed(s, 26, 2, delta1);
         expect(s.agent.sent("hello")).toHaveLength(1);
-        await feed(s, 19, 16, delta1);
+        await feed(s, 6, 28, delta1);
+        expect(s.agent.sent("hello")).toHaveLength(2);
+        s.rt.destroy();
+      });
+
+      it("datagrams in clumps do not restart a first connection's keyframe wait (#1426)", async () => {
+        vi.useFakeTimers();
+        const s = setup();
+        s.rt.start();
+        await vi.advanceTimersByTimeAsync(10);
+        for (let i = 0; i < 3 && s.agent.sent("hello").length === 1; i++) {
+          delta(s.agent, i);
+          await vi.advanceTimersByTimeAsync(6_000);
+        }
         expect(s.agent.sent("hello")).toHaveLength(2);
         s.rt.destroy();
       });

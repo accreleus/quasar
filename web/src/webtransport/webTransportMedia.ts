@@ -478,10 +478,9 @@ export class WebTransportMedia implements MediaTransport {
       const message = live.on ? feedback.take(this.now()) : null;
       if (message) this.send(message);
     };
-    // Once a second, as the ping: a path that reorders and loses is said each second it still does.
     const second = () => {
       ping();
-      if (live.on && feedback.reorderingLoss()) sink.reorderingLoss?.();
+      if (live.on) sink.second?.(feedback.takeLate());
     };
     this.stopTickers.push(ticker(PING_MS, second), ticker(FEEDBACK_MS, report));
     void (async () => {
@@ -565,8 +564,8 @@ export class WebTransportMedia implements MediaTransport {
         if (repair) router.repair(repair);
         continue;
       }
+      if (channel === CHANNEL_VIDEO) sink.videoDatagram?.();
       const frag = parseVideoDatagram(value as Uint8Array);
-      if (channel === CHANNEL_VIDEO) sink.videoDatagram?.(frag?.keyframe === true);
       if (!frag) continue; // another channel, or malformed: dropped (§Channels)
       router.datagram(frag);
     }
