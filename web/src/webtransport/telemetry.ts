@@ -4,6 +4,7 @@
 // frames the runtime handles, and the control stream's ping/pong. There is no RTCPeerConnection to ask.
 
 import { median, percentile } from "../lib/stats";
+import type { CaptureMetrics } from "../input/capture";
 import { getOrCreateDeviceKey } from "../webrtc/capability";
 import { classifyClientHealth } from "../webrtc/clientHealth";
 import { estimateClockOffset, shouldPostClock, type ClockSample, type PostedClock } from "../webrtc/clockOffset";
@@ -37,6 +38,8 @@ export interface WtTelemetryOptions {
   deviceKey?: string;
   /** The page view's posted totals, carried into a WebRTC fallback. */
   counters?: PostedCounters;
+  /** The input capture's metrics (null: none yet). Called once a tick, as WebRTC calls it once a poll. */
+  getCaptureMetrics?: () => CaptureMetrics | null;
 }
 
 /**
@@ -255,6 +258,7 @@ export class WtTelemetry {
     const g2gMs = median(this.g2g);
     const snap: TelemetrySnapshot = {
       ...EMPTY_SNAPSHOT,
+      inputMetrics: this.opts.getCaptureMetrics?.() ?? null,
       fps: this.framesInWindow / dtSec,
       bitrateKbps: (this.bytesInWindow * 8) / 1000 / dtSec,
       rttMs: this.rttMs,

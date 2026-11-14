@@ -144,7 +144,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   let inputSender: ReturnType<typeof webTransportInputSender> | null = null;
   let captured = false;
   let mouse: MouseSettings = NEUTRAL_MOUSE;
-  const telemetry = new WtTelemetry({ sessionId: cfg.sessionId, authToken: cfg.authToken, profileFps: cfg.tierFps, counters: cfg.counters, ...deps.telemetry });
+  const telemetry = new WtTelemetry({ sessionId: cfg.sessionId, authToken: cfg.authToken, profileFps: cfg.tierFps, counters: cfg.counters, getCaptureMetrics: () => capture?.getMetrics() ?? null, ...deps.telemetry });
   let postTimer: ReturnType<typeof setInterval> | null = null;
   // The trace is HTTP, not the transport's: bench windows are posted through it as on WebRTC.
   const tracer = deps.createTracer(cfg.sessionId, cfg.authToken);
