@@ -1009,6 +1009,9 @@ func writeNoHostAvailable(w http.ResponseWriter, err error) {
 	var ct *CompatToolRejection
 	if errors.As(err, &ct) {
 		msg := fmt.Sprintf("no host can run the compatibility tool %s this game needs yet; hosts install it in the background, so try again shortly, and if it persists ask your administrator to check Library > Compatibility", ct.Tool)
+		if ct.Swap {
+			msg = fmt.Sprintf("this session started without the compatibility tool %s this game needs; launch the game on its own instead", ct.Tool)
+		}
 		if !ct.Usable {
 			msg = fmt.Sprintf("the compatibility tool %s this game needs is disabled or marked unusable; ask your administrator", ct.Tool)
 		}

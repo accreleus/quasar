@@ -30,10 +30,12 @@ func placementSelectedForHost(ctx context.Context, tx pgx.Tx, canonicalAppID, ho
 }
 
 // GuardPlacementForSwap persists an unmanaged swap's pending detail only while
-// the existing session's host remains selected for its target app. Managed
+// the existing session's host remains selected for its target app and, for a
+// derived Steam game, the session mounted the game's mapped tool. Managed
 // swaps use GuardHomeForSwapWithHold, which performs the same check before its
 // claim and durable hold writes.
-func (s *Store) GuardPlacementForSwap(ctx context.Context, sessionID, canonicalAppID, hostID string) error {
+func (s *Store) GuardPlacementForSwap(ctx context.Context, sessionID string, app LaunchApp, hostID string) error {
+	canonicalAppID := homeAppID(app)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -59,32 +61,41 @@ func (s *Store) GuardPlacementForSwap(ctx context.Context, sessionID, canonicalA
 	if !selected {
 		return ErrNoHostAvailable
 	}
+	if err := compatToolNotMounted(ctx, tx, sessionID, app); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `UPDATE sessions SET state_detail=$2, launch_progress=NULL WHERE id=$1::uuid`, sessionID, swapDetailInProgress); err != nil {
 		return fmt.Errorf("persist pending swap: %w", err)
 	}
 	return tx.Commit(ctx)
 }
 
-// compatToolMissingOnHost is compatGate for a swap, which is pinned to hostID: nil when the game
-// has no per-game GE mapping or the host holds its usable tool, else a CompatToolRejection (an
-// ErrNoHostAvailable). SQL twin of compat.Store.mountable, like compatGate (the C10 share locks
-// are not taken here either).
-func (s *Store) compatToolMissingOnHost(ctx context.Context, gameID, hostID string) error {
+// compatToolNotMounted refuses a swap into a derived Steam game whose per-game GE mapping names a
+// tool this session did not mount at launch. A swap sends no compat block and the agent carries the
+// running container's launch-time table (compat_tools::carry), so what decides whether the tool
+// applies is sessions.compat_tool_names, never the host's report now: the check is claimToolMissing's,
+// for the same reason. A running session with NULL names mounts nothing. Runs in the guard
+// transaction after its placement and home checks and before any claim, hold or write.
+// semantics: control-api.md §Compatibility tools, "Placement".
+func compatToolNotMounted(ctx context.Context, q rowQuerier, sessionID string, app LaunchApp) error {
+	if !app.IsDerived() || app.ExternalSource != "steam" {
+		return nil
+	}
 	var tag string
-	var usable, onHost bool
-	err := s.pool.QueryRow(ctx, `
+	var usable, mounted bool
+	err := q.QueryRow(ctx, `
 		SELECT t.tag, t.enabled AND NOT t.name_conflict AND NOT t.pin_conflict,
-		       EXISTS (SELECT 1 FROM host_compat_tools ht WHERE ht.host_id = $2::uuid
-		               AND ht.sha512 = t.asset_sha512 AND ht.name = t.steam_name)
-		FROM compat_tool_mappings m JOIN compat_tools t ON t.id = m.tool_id
-		WHERE m.provider = 'steam' AND m.external_id = $1 AND t.family = 'ge'`, gameID, hostID).Scan(&tag, &usable, &onHost)
+		       COALESCE(t.steam_name = ANY(k.compat_tool_names), false)
+		FROM sessions k, compat_tool_mappings m JOIN compat_tools t ON t.id = m.tool_id
+		WHERE k.id = $1::uuid AND m.provider = 'steam' AND m.external_id = $2 AND t.family = 'ge'`,
+		sessionID, app.ExternalID).Scan(&tag, &usable, &mounted)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		return nil
 	case err != nil:
 		return fmt.Errorf("swap compat tool check: %w", err)
-	case usable && onHost:
+	case mounted:
 		return nil
 	}
-	return &CompatToolRejection{err: ErrNoHostAvailable, Tool: tag, Usable: usable}
+	return &CompatToolRejection{err: ErrNoHostAvailable, Tool: tag, Usable: usable, Swap: true}
 }

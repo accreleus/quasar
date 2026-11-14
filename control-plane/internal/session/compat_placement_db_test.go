@@ -273,41 +273,57 @@ func TestOfflineHomeHostWithoutTheToolStaysHomeHostUnavailable(t *testing.T) {
 	}
 }
 
-// A swap cannot move hosts, so it refuses (not waits) when the live host lacks the target game's
-// mapped GE tool, and leaves the session untouched. A present tool and an unmapped game swap.
-// Deleting the compatToolMissingOnHost call in swapper.Swap fails the refusal.
-func TestSwapRefusesATileWhoseMappedToolTheLiveHostLacks(t *testing.T) {
+// A swap sends no compat block: the agent carries the session's launch-time tool table, so a swap
+// into a mapped game is admitted only if the tool is among those THIS SESSION mounted
+// (sessions.compat_tool_names; NULL on a running session mounts nothing), whatever the host holds
+// now. A refusal says so and writes nothing. Deleting the compatToolNotMounted calls fails the
+// refusals.
+func TestSwapIntoAMappedGameNeedsTheToolTheSessionMounted(t *testing.T) {
 	f := newWarmFixture(t, 8)
 	desktop := seedDesktop(t, f, true)
 	must(t, exec(t, f.pool, `UPDATE apps SET default_encode_slots=2 WHERE id=$1::uuid`, desktop))
 	mapped := seedTile(t, f.pool, f.steam, "Hades", compatGameID)
 	unmapped := seedTile(t, f.pool, f.steam, "Celeste", "504230")
 	seedGETool(t, f.pool)
-	sess := f.startedLaunch(t, desktop)
+	sess := f.startedLaunch(t, desktop) // compat_tool_names NULL: mounted nothing
 	ctx := context.Background()
 
-	_, err := f.coord.Swap(ctx, sess, mapped)
-	var rej *CompatToolRejection
-	if !errors.Is(err, ErrNoHostAvailable) || !errors.As(err, &rej) || rej.Tool != compatTag || !rej.Usable {
-		t.Fatalf("swap before the install: got %v, want ErrNoHostAvailable carrying CompatToolRejection for %s", err, compatTag)
+	refused := func(why string) {
+		t.Helper()
+		_, err := f.coord.Swap(ctx, sess, mapped)
+		var rej *CompatToolRejection
+		if !errors.Is(err, ErrNoHostAvailable) || !errors.As(err, &rej) || rej.Tool != compatTag || !rej.Usable || !rej.Swap {
+			t.Fatalf("%s: got %v, want ErrNoHostAvailable carrying a swap CompatToolRejection for %s", why, err, compatTag)
+		}
+		if got := readRow(t, f.pool, sess); got.Detail == swapDetailInProgress {
+			t.Errorf("%s: a refused swap left the session marked swapping", why)
+		}
+		rec := httptest.NewRecorder()
+		writeNoHostAvailable(rec, err)
+		if b := rec.Body.String(); !strings.Contains(b, `"reason":"compat_tool_missing"`) ||
+			!strings.Contains(b, "started without") || strings.Contains(b, "try again") {
+			t.Fatalf("%s: body %s", why, b)
+		}
 	}
-	if got := readRow(t, f.pool, sess); got.Detail == swapDetailInProgress {
-		t.Error("a refused swap left the session marked swapping")
-	}
-	rec := httptest.NewRecorder()
-	writeNoHostAvailable(rec, err)
-	if !strings.Contains(rec.Body.String(), `"reason":"compat_tool_missing"`) {
-		t.Fatalf("body %s", rec.Body.String())
-	}
-
-	if _, err := f.coord.Swap(ctx, sess, unmapped); err != nil {
-		t.Fatalf("swap into a game with no mapping: %v", err)
-	}
-	f.disp.waitFor(t, "swap")
-	f.commitSwap(t, sess)
-
+	refused("session mounted nothing, host lacks the tool")
+	// Installed on the host after the session started: the swap target would still inherit the
+	// launch table, so it is refused (a retry is exactly what would run it on Steam's choice).
 	hostHasTool(t, f.pool, f.hostID, true)
+	refused("tool installed after the session started")
+
+	// A canonical Steam app and an unmapped game are never checked.
+	for _, target := range []string{f.steam, unmapped} {
+		if _, err := f.coord.Swap(ctx, sess, target); err != nil {
+			t.Fatalf("swap into %s: %v", target, err)
+		}
+		f.disp.waitFor(t, "swap")
+		f.commitSwap(t, sess)
+	}
+
+	// Mounted at launch is admitted even if the host's report has since dropped the tool.
+	must(t, exec(t, f.pool, `UPDATE sessions SET compat_tool_names = ARRAY[$2]::text[] WHERE id=$1::uuid`, sess, compatSteamNm))
+	hostHasTool(t, f.pool, f.hostID, false)
 	if _, err := f.coord.Swap(ctx, sess, mapped); err != nil {
-		t.Fatalf("swap with the tool on the live host: %v", err)
+		t.Fatalf("swap with the tool mounted at launch: %v", err)
 	}
 }

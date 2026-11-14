@@ -287,10 +287,27 @@ describe("game compatibility tool", () => {
     const warning = () => screen.queryByTestId("compat-tool-nowhere");
     expect(warning()).toBeNull(); // Steam's default
     fireEvent.change(sel, { target: { value: "ge-10" } });
-    expect(warning()?.textContent).toContain("No host has GE-Proton10-4 yet");
+    expect(warning()?.textContent).toContain("No host has GE-Proton10-4 installed");
     fireEvent.change(sel, { target: { value: "ge-9" } });
     expect(warning()).toBeNull();
     fireEvent.change(sel, { target: { value: "v-10" } });
     expect(warning()).toBeNull();
+  });
+
+  it("warns on opening the editor with a saved mapping to a tool installed nowhere", async () => {
+    mocked.listCompatTools.mockResolvedValue({
+      items: [
+        ...CATALOGUE.filter((t) => t.id !== "ge-10"),
+        tool("ge-10", "ge", "GE-Proton10-4", {
+          hosts: { installed: 0, installing: 0, waiting: 0, failed: 1, unsupported: 1 },
+        }),
+      ],
+      default_tool_id: null,
+    });
+    mocked.listCompatToolMappings.mockResolvedValue({ items: [mapping()] });
+    renderEditor();
+    const warning = await screen.findByTestId("compat-tool-nowhere");
+    expect(warning.textContent).toContain("No host has GE-Proton10-4 installed");
+    expect(warning.textContent).not.toContain("installing it");
   });
 });
