@@ -613,6 +613,9 @@ func (s *Store) GuardHomeForSwapWithHold(ctx context.Context, sessionID, userID 
 	if owner != "" && owner != hostID {
 		return swapHomeGuard{}, ErrHomeNotProvisioned
 	}
+	if err := compatToolNotMounted(ctx, tx, sessionID, app); err != nil {
+		return swapHomeGuard{}, err
+	}
 	if err := claimSelectedHome(ctx, tx, p, hostID, sessionID); err != nil {
 		return swapHomeGuard{}, s.finishRefusedSwapHome(ctx, tx, p, err)
 	}

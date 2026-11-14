@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
@@ -29,10 +30,12 @@ func placementSelectedForHost(ctx context.Context, tx pgx.Tx, canonicalAppID, ho
 }
 
 // GuardPlacementForSwap persists an unmanaged swap's pending detail only while
-// the existing session's host remains selected for its target app. Managed
+// the existing session's host remains selected for its target app and, for a
+// derived Steam game, the session mounted the game's mapped tool. Managed
 // swaps use GuardHomeForSwapWithHold, which performs the same check before its
 // claim and durable hold writes.
-func (s *Store) GuardPlacementForSwap(ctx context.Context, sessionID, canonicalAppID, hostID string) error {
+func (s *Store) GuardPlacementForSwap(ctx context.Context, sessionID string, app LaunchApp, hostID string) error {
+	canonicalAppID := homeAppID(app)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -58,8 +61,41 @@ func (s *Store) GuardPlacementForSwap(ctx context.Context, sessionID, canonicalA
 	if !selected {
 		return ErrNoHostAvailable
 	}
+	if err := compatToolNotMounted(ctx, tx, sessionID, app); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `UPDATE sessions SET state_detail=$2, launch_progress=NULL WHERE id=$1::uuid`, sessionID, swapDetailInProgress); err != nil {
 		return fmt.Errorf("persist pending swap: %w", err)
 	}
 	return tx.Commit(ctx)
+}
+
+// compatToolNotMounted refuses a swap into a derived Steam game whose per-game GE mapping names a
+// tool this session did not mount at launch. A swap sends no compat block and the agent carries the
+// running container's launch-time table (compat_tools::carry), so what decides whether the tool
+// applies is sessions.compat_tool_names, never the host's report now (the same
+// question claimToolMissing asks of a parked Steam). A running session with NULL names mounts nothing. Runs in the guard
+// transaction after its placement and home checks and before any claim, hold or write.
+// semantics: control-api.md §Compatibility tools, "Placement".
+func compatToolNotMounted(ctx context.Context, q rowQuerier, sessionID string, app LaunchApp) error {
+	if !app.IsDerived() || app.ExternalSource != "steam" {
+		return nil
+	}
+	var tag string
+	var usable, mounted bool
+	err := q.QueryRow(ctx, `
+		SELECT t.tag, t.enabled AND NOT t.name_conflict AND NOT t.pin_conflict,
+		       COALESCE(t.steam_name = ANY(k.compat_tool_names), false)
+		FROM sessions k, compat_tool_mappings m JOIN compat_tools t ON t.id = m.tool_id
+		WHERE k.id = $1::uuid AND m.provider = 'steam' AND m.external_id = $2 AND t.family = 'ge'`,
+		sessionID, app.ExternalID).Scan(&tag, &usable, &mounted)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil
+	case err != nil:
+		return fmt.Errorf("swap compat tool check: %w", err)
+	case mounted:
+		return nil
+	}
+	return &CompatToolRejection{err: ErrNoHostAvailable, Tool: tag, Usable: usable, Swap: true}
 }

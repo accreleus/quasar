@@ -446,7 +446,9 @@ func TestUncertainUnmanagedSwapAckKeepsTheSwapPending(t *testing.T) {
 
 			// What Swap has done by the time it dispatches.
 			swap.noteSwapStart(sess.ID)
-			must(t, store.GuardPlacementForSwap(ctx, sess.ID, target, s.hostID))
+			targetApp, err := store.GetLaunchApp(ctx, target)
+			must(t, err)
+			must(t, store.GuardPlacementForSwap(ctx, sess.ID, targetApp, s.hostID))
 			swap.pendingSwaps[sess.ID] = target
 			swap.dispatchSwap(s.hostID, sess.ID, []byte(`{}`), false, false, s.userID, target, nil, nil)
 

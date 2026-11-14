@@ -3446,6 +3446,15 @@ export interface paths {
                         "application/json": components["schemas"]["ErrorEnvelope"];
                     };
                 };
+                /** @description no_host_available (amendment 71, accreleus/quasar#1178) - the app is not selected for the session's host, or, with error.reason compat_tool_missing, the target is a derived Steam game whose mapped GE tool the session did not mount at launch. NOT retryable: a swap does not move hosts or wait for an install. */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
             };
         };
         delete?: never;
