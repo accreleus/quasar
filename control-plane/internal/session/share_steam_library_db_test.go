@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -762,7 +763,6 @@ func TestSwapThatNeverReachesTheAgentReleasesAnUnusedSteamClaim(t *testing.T) {
 // nothing on the claim itself marks it.
 func TestUnusedClaimCleanupKeepsAClaimASwappingSessionTargets(t *testing.T) {
 	f := newWarmFixture(t, 8)
-	sharing := seedDesktop(t, f, true)
 	mine := seedDesktop(t, f, false)
 	other := seedDesktop(t, f, false)
 	a := f.startedLaunch(t, mine)
@@ -772,11 +772,11 @@ func TestUnusedClaimCleanupKeepsAClaimASwappingSessionTargets(t *testing.T) {
 	must(t, exec(t, f.pool, `DELETE FROM managed_home_claims WHERE canonical_app_id=$1::uuid`, f.steam))
 	must(t, exec(t, f.pool, `DELETE FROM user_homes WHERE app_id=$1::uuid`, f.steam))
 
-	// B's swap into the sharing desktop commits its guard and has not dispatched;
-	// the connection takes no holds, so only the durable `swapping` state marks it.
-	app, err := f.store.GetLaunchApp(ctx, sharing)
+	// B's swap into Steam commits its guard and has not dispatched; the
+	// connection takes no holds, so only the durable `swapping` state marks it.
+	app, err := f.store.GetLaunchApp(ctx, f.steam)
 	must(t, err)
-	if _, err := f.store.GuardHomeForSwapWithHold(ctx, b, f.userID, app, f.hostID, false, f.steam); err != nil {
+	if _, err := f.store.GuardHomeForSwapWithHold(ctx, b, f.userID, app, f.hostID, false, ""); err != nil {
 		t.Fatalf("guard B's swap: %v", err)
 	}
 	if n := f.steamClaimCount(t); n != 1 {
@@ -802,6 +802,220 @@ func TestUnusedClaimCleanupKeepsAClaimASwappingSessionTargets(t *testing.T) {
 	}
 	if n := f.steamClaimCount(t); n != 0 {
 		t.Errorf("Steam claims = %d after B's swap resolved, want the unused claim released", n)
+	}
+}
+
+// #1253: a swap into a sharing desktop owns the Steam claim from its guard
+// through its hold. An epoch without cleanup can take none and the row records
+// the share only at the commit, so there the swap runs without the library.
+func TestSwapIntoASharingDesktopSharesOnlyWithAHold(t *testing.T) {
+	for _, capable := range []bool{true, false} {
+		t.Run(fmt.Sprintf("capable=%v", capable), func(t *testing.T) {
+			f := newWarmFixture(t, 8)
+			sharingA := seedDesktop(t, f, true)
+			sharingB := seedDesktop(t, f, true)
+			a := f.startedLaunch(t, seedDesktop(t, f, false))
+			b := f.startedLaunch(t, seedDesktop(t, f, false))
+			ctx := context.Background()
+			if !capable { // a legacy agent's launches took no holds
+				must(t, exec(t, f.pool, `UPDATE managed_home_claims SET pending_home_session_id=NULL,
+					pending_home_token=NULL, pending_home_started_at=NULL`))
+			}
+			appA, err := f.store.GetLaunchApp(ctx, sharingA)
+			must(t, err)
+			appB, err := f.store.GetLaunchApp(ctx, sharingB)
+			must(t, err)
+			guard, err := f.store.GuardHomeForSwapWithHold(ctx, a, f.userID, appA, f.hostID, capable, f.steam)
+			must(t, err)
+			guardB, errB := f.store.GuardHomeForSwapWithHold(ctx, b, f.userID, appB, f.hostID, capable, f.steam)
+			p := launchParams(f.seedIDs)
+			p.AppID, p.HomeAppID, p.ManagedHome = f.steam, f.steam, true
+			_, errSteam := f.store.ScheduleAndCreate(ctx, p)
+
+			if capable {
+				if guard.sharedID != f.steam {
+					t.Fatalf("capable guard shared %q, want the Steam home", guard.sharedID)
+				}
+				for name, err := range map[string]error{"sharing swap": errB, "steam launch": errSteam} {
+					var inUse *HomeInUseError
+					if !errors.As(err, &inUse) || inUse.SessionID != a {
+						t.Errorf("%s beside A's swap = %v, want home_in_use naming %s", name, err, a)
+					}
+				}
+				return
+			}
+			if guard.sharedID != "" || guard.notice != noticeSharedUnavailable || guard.sharedHold != nil {
+				t.Fatalf("legacy guard = %+v, want no share and the notice", guard)
+			}
+			if h, _ := f.claimHolder(t, f.steam); h != "" {
+				t.Errorf("Steam hold = %q after a legacy swap, want none", h)
+			}
+			if errB != nil || guardB.sharedID != "" {
+				t.Errorf("second legacy sharing swap = %+v, %v; want admitted without the library", guardB, errB)
+			}
+			if errSteam != nil {
+				t.Errorf("Steam launch beside legacy swaps that do not share = %v, want admitted", errSteam)
+			}
+		})
+	}
+}
+
+// #1253 review: the claim's sticky legacy_unprotected_dispatch is history, not
+// a capability. A pre-0090 Steam claim beside a capable swap into an unmanaged
+// app refuses nothing.
+func TestSwapIntoAnUnmanagedAppBesideALegacyMarkedSteamClaimRefusesNothing(t *testing.T) {
+	f := newWarmFixture(t, 8)
+	ctx := context.Background()
+	a := f.startedLaunch(t, seedDesktop(t, f, false))
+	var unmanaged string
+	must(t, f.pool.QueryRow(ctx, `INSERT INTO apps (name, default_encode_slots, default_width, default_height,
+		default_fps, default_bitrate_kbps, runtime_spec) VALUES ('Plain', 1, 1280, 720, 60, 6000, '{"image":"plain:1"}')
+		RETURNING id::text`).Scan(&unmanaged))
+	entitleAll(t, f.pool, unmanaged)
+	must(t, exec(t, f.pool, `UPDATE managed_home_claims SET legacy_unprotected_dispatch=true`))
+	unmanagedApp, err := f.store.GetLaunchApp(ctx, unmanaged)
+	must(t, err)
+	must(t, f.store.GuardPlacementForSwap(ctx, a, unmanagedApp, f.hostID))
+
+	p := launchParams(f.seedIDs)
+	p.AppID, p.HomeAppID, p.ManagedHome = f.steam, f.steam, true
+	if _, err := f.store.ScheduleAndCreate(ctx, p); err != nil {
+		t.Fatalf("Steam launch beside a swap into an unmanaged app = %v, want admitted", err)
+	}
+}
+
+// The refusal a sharing swap's Steam hold gives ends with the swap: a rejected
+// swap and a failed session release it, and a Steam launch is admitted.
+func TestSharingSwapRefusalEndsWithTheSwap(t *testing.T) {
+	for _, end := range []string{"rejected", "failed"} {
+		t.Run(end, func(t *testing.T) {
+			f := newWarmFixture(t, 8)
+			desktop := seedDesktop(t, f, true)
+			sess := f.startedLaunch(t, seedDesktop(t, f, false))
+			ctx := context.Background()
+			if end == "rejected" {
+				f.disp.setReject("swap")
+			}
+			if _, err := f.coord.Swap(ctx, sess, desktop); err != nil {
+				t.Fatalf("swap into a sharing desktop: %v", err)
+			}
+			f.disp.waitFor(t, "swap")
+			if end == "failed" {
+				f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: sess, State: "failed",
+					HomeCleanupQualified: true})
+			}
+			f.waitSteamHold(t, "")
+
+			p := launchParams(f.seedIDs)
+			p.AppID, p.HomeAppID, p.ManagedHome = f.steam, f.steam, true
+			if _, err := f.store.ScheduleAndCreate(ctx, p); err != nil {
+				t.Fatalf("Steam launch after the swap %s = %v, want admitted", end, err)
+			}
+		})
+	}
+}
+
+// #1253 review (own home): the swap guard repeats the single-writer check under
+// the user lock, so a Steam session admitted after the swapper's own check, on
+// an epoch whose launches leave no hold, still refuses a swap into Steam.
+func TestSwapGuardRechecksTheOwnHomeUnderTheUserLock(t *testing.T) {
+	f := newWarmFixture(t, 8)
+	ctx := context.Background()
+	sess := f.startedLaunch(t, seedDesktop(t, f, false))
+	must(t, exec(t, f.pool, `UPDATE managed_home_claims SET pending_home_session_id=NULL,
+		pending_home_token=NULL, pending_home_started_at=NULL`))
+	var game string
+	must(t, f.pool.QueryRow(ctx, `INSERT INTO sessions (user_id, app_id, host_id, gpu_id, state, width, height,
+		fps, bitrate_kbps, h264_profile, reserved_encode_slots, assigned_at, started_at)
+		VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 'running', 1280, 720, 60, 6000, 'constrained-baseline',
+		        1, now(), now()) RETURNING id::text`, f.userID, f.steam, f.hostID, f.gpuID).Scan(&game))
+	app, err := f.store.GetLaunchApp(ctx, seedTile(t, f.pool, f.steam, "Hades", "1145360"))
+	must(t, err)
+
+	_, err = f.store.GuardHomeForSwapWithHold(ctx, sess, f.userID, app, f.hostID, false, "")
+	var inUse *HomeInUseError
+	if !errors.As(err, &inUse) || inUse.SessionID != game {
+		t.Fatalf("swap into Steam beside a live Steam game = %v, want home_in_use naming %s", err, game)
+	}
+}
+
+// #1246: after game -> desktop -> game swaps the session holds the Steam and
+// desktop claims. Once it ends, by a stop or by a park on exit that a desktop
+// launch then supersedes, a desktop launch minutes later shares the library.
+func TestDesktopStartAfterGameDesktopGameSwapsSharesTheLibrary(t *testing.T) {
+	for _, end := range []string{"stop", "park on exit"} {
+		t.Run(end, func(t *testing.T) {
+			f := newWarmFixture(t, 8)
+			desktop := seedDesktop(t, f, true)
+			must(t, exec(t, f.pool, `UPDATE apps SET default_encode_slots=2 WHERE id=$1::uuid`, desktop))
+			ctx := context.Background()
+			s := f.runningTile(t)
+			var tile string
+			must(t, f.pool.QueryRow(ctx, `SELECT app_id::text FROM sessions WHERE id=$1::uuid`, s).Scan(&tile))
+			for _, target := range []string{desktop, tile} {
+				if _, err := f.coord.Swap(ctx, s, target); err != nil {
+					t.Fatalf("swap into %s: %v", target, err)
+				}
+				f.disp.waitFor(t, "swap")
+				f.commitSwap(t, s)
+			}
+			ender := s
+			if end == "stop" {
+				if _, err := f.coord.Stop(ctx, s, "user_requested"); err != nil {
+					t.Fatalf("stop: %v", err)
+				}
+			} else {
+				f.coord.AgentState(ctx, f.hostID, heldStop(s))
+				ender = f.parkedID(t)
+				f.disp.waitFor(t, "start")
+				f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: ender, State: "running"})
+				if _, err := f.launch(t, desktop); err == nil {
+					t.Fatalf("desktop launch beside the parked Steam = %v, want it superseded and refused", err)
+				}
+			}
+			f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: ender, State: "stopped", HomeCleanupQualified: true})
+			must(t, exec(t, f.pool, `UPDATE sessions SET ended_at=now()-interval '5 minutes' WHERE ended_at IS NOT NULL`))
+
+			res := f.mustLaunch(t, desktop)
+			if res.Notice != "" || f.sharingOf(t, res.Session.ID) != f.steam {
+				t.Fatalf("desktop launch notice=%q shared=%q, want the library shared", res.Notice, f.sharingOf(t, res.Session.ID))
+			}
+		})
+	}
+}
+
+// #1246, the order where the first desktop start replaces the parked row before
+// that row's first report: the Steam hold stays on the ended game's id, and
+// only the pending-home reconcile's stop for that id, answered by the agent with
+// its qualified terminal (a retired id, agent.rs SessionStop), releases it.
+func TestDesktopStartAfterAParkReplacedBeforeItsFirstReportSharesTheLibrary(t *testing.T) {
+	f := newWarmFixture(t, 8)
+	desktop := seedDesktop(t, f, true)
+	ctx := context.Background()
+	game := f.runningTile(t)
+	f.coord.AgentState(ctx, f.hostID, heldStop(game))
+	parked := f.parkedID(t)
+	f.disp.waitFor(t, "start")
+	if _, err := f.launch(t, desktop); err == nil {
+		t.Fatal("desktop launch beside the parked Steam was admitted, want it superseded and refused")
+	}
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: parked, State: "stopped", HomeCleanupQualified: true})
+	if h, _ := f.claimHolder(t, f.steam); h != game {
+		t.Fatalf("Steam hold = %q after the parked row ended unreported, want still the game's %s", h, game)
+	}
+
+	epoch, _ := f.disp.CurrentHomeCommandEpoch(f.hostID)
+	before := f.disp.stopsFor(game)
+	f.coord.ReconcilePendingHomes(ctx, f.hostID, epoch)
+	if f.disp.stopsFor(game) == before {
+		t.Fatalf("no reconcile stop for the stranded holder %s", game)
+	}
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: game, State: "stopped", HomeCleanupQualified: true})
+	must(t, exec(t, f.pool, `UPDATE sessions SET ended_at=now()-interval '5 minutes' WHERE ended_at IS NOT NULL`))
+
+	res := f.mustLaunch(t, desktop)
+	if res.Notice != "" || f.sharingOf(t, res.Session.ID) != f.steam {
+		t.Fatalf("desktop launch notice=%q shared=%q, want the library shared", res.Notice, f.sharingOf(t, res.Session.ID))
 	}
 }
 
