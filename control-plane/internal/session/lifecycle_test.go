@@ -718,7 +718,7 @@ func TestHostDisconnectedKeepsHeldSessionRegistered(t *testing.T) {
 	coord.AgentState(ctx, s.hostID, agentws.SessionStateMsg{SessionID: res.Session.ID, State: "running"})
 
 	coord.health.mu.Lock()
-	coord.health.healthRuns[res.Session.ID] = time.Now()
+	coord.health.healthRuns[res.Session.ID] = belowFloorRun{since: time.Now()}
 	coord.health.mu.Unlock()
 
 	coord.HostDisconnected(ctx, s.hostID)
