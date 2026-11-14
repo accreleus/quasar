@@ -118,8 +118,10 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   let stableVideoSince: number | null = null;
   // Thirty seconds of arriving video separates a recovered stream from repeated quick failures.
   const MEDIA_RETRY_RESET_MS = 30_000;
-  function noteVideo(): void {
+  function noteVideo(keyframe: boolean): void {
     const now = performance.now();
+    // The count for "arriving but never shown" starts at the first keyframe: until then nothing can be decoded.
+    if (presentRefAt === null && keyframe) presentRefAt = now;
     if (stableVideoSince === null || lastVideoAt === null || now - lastVideoAt > MEDIA_SILENCE_MS) stableVideoSince = now;
     lastVideoAt = now;
     if (now - stableVideoSince >= MEDIA_RETRY_RESET_MS) reconnected = false;
@@ -144,7 +146,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   let inputSender: ReturnType<typeof webTransportInputSender> | null = null;
   let captured = false;
   let mouse: MouseSettings = NEUTRAL_MOUSE;
-  const telemetry = new WtTelemetry({ sessionId: cfg.sessionId, authToken: cfg.authToken, profileFps: cfg.tierFps, counters: cfg.counters, ...deps.telemetry });
+  const telemetry = new WtTelemetry({ sessionId: cfg.sessionId, authToken: cfg.authToken, profileFps: cfg.tierFps, counters: cfg.counters, getCaptureMetrics: () => capture?.getMetrics() ?? null, ...deps.telemetry });
   let postTimer: ReturnType<typeof setInterval> | null = null;
   // The trace is HTTP, not the transport's: bench windows are posted through it as on WebRTC.
   const tracer = deps.createTracer(cfg.sessionId, cfg.authToken);
@@ -162,6 +164,12 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   const startedAt = performance.now();
   /** When video last arrived; null until the stream has started. */
   let lastVideoAt: number | null = null;
+  /** When a picture was last shown, or (before the first one) when the first keyframe arrived, or the
+   *  tab last became visible; null until a keyframe has. A hidden tab shows nothing, so this is only
+   *  judged while visible. */
+  let presentRefAt: number | null = null;
+  /** Times the no-picture check has tripped on this session. */
+  let noPictureTrips = 0;
   /** When the last tick ran; null until ticking starts (connecting is not a stall). */
   let lastTickAt: number | null = null;
 
@@ -234,6 +242,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     if (document.visibilityState !== "visible") return;
     // A tab back from hidden gets the whole bound again.
     if (lastVideoAt !== null) lastVideoAt = performance.now();
+    if (presentRefAt !== null) presentRefAt = performance.now();
     stableVideoSince = null;
     telemetry.breakCadence();
     playout?.reset();
@@ -263,6 +272,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     const now = performance.now();
     if (lastVideoAt !== null && lastTickAt !== null && now - lastTickAt > 2 * TELEMETRY_MS) {
       lastVideoAt = Math.min(now, lastVideoAt + now - lastTickAt - TELEMETRY_MS);
+      if (presentRefAt !== null) presentRefAt = Math.min(now, presentRefAt + now - lastTickAt - TELEMETRY_MS);
       stableVideoSince = null;
     }
     lastTickAt = now;
@@ -276,6 +286,26 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     ) {
       onEnd(transport, { code: null, reason: "media_silent" });
       if (failed) return;
+    }
+    // Video keeps arriving but no picture has been shown: a decoder or presenter that takes the
+    // data and never outputs. (Video not arriving at all is the check above.)
+    // Time spent waiting for a keyframe is not a decoder showing nothing: it counts from the keyframe.
+    if (presentRefAt !== null && stage?.needsKey()) presentRefAt = now;
+    if (
+      transport &&
+      snapshot.channelOpen &&
+      presentRefAt !== null &&
+      document.visibilityState === "visible" &&
+      now - presentRefAt > MEDIA_SILENCE_MS
+    ) {
+      // The first trip gets the one media reconnect media_silent gets; a second one is a decoder that cannot show.
+      if (noPictureTrips++ === 0 && !reconnected) {
+        onEnd(transport, { code: null, reason: "no_picture" });
+        if (failed) return;
+      } else {
+        fail("decode_error", false, undefined, `no picture shown for ${MEDIA_SILENCE_MS / 1000} s while video kept arriving`);
+        return;
+      }
     }
     const audio = harvestAudio();
     telemetry.setPlayout(playout?.cushion() ?? 0, playout?.arrivalJitterMs() ?? null);
@@ -332,6 +362,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     if (destroyed || failed) return;
     const presented = (captureUs: number) => {
       audioOut?.noteVideo(captureUs);
+      presentRefAt = performance.now();
       telemetry.presented(captureUs);
       if (!snapshot.firstFrame) set({ firstFrame: true, status: "streaming over WebTransport" });
     };
@@ -433,14 +464,14 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
         },
         unit: (u) => {
           if (destroyed || failed || t !== transport) return;
-          noteVideo();
+          noteVideo(u.keyframe);
           telemetry.bytes(u.data.length);
           telemetry.decodeIn(u.captureUs);
           stage?.unit(u);
         },
         pyrowave: (f) => {
           if (destroyed || failed || t !== transport) return;
-          noteVideo();
+          noteVideo(true); // every PyroWave frame is intra
           for (const b of f.packets) telemetry.bytes(b.byteLength);
           pyroStage?.frame(f);
         },
@@ -472,6 +503,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     set({ wsOpen: true, pcConnected: true, channelOpen: true, iceState: "connected" });
     // A reconnect's connection gets the whole bound to deliver its first frame.
     if (lastVideoAt !== null) lastVideoAt = performance.now();
+    presentRefAt = null; // a new connection counts from its own first keyframe
     startInput(t);
     if (timer === null) {
       telemetry.startWindow();

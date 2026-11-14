@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { MIN_CLOCK_SAMPLES } from "../webrtc/clockOffset";
 import { summarizePresentWindow } from "../webrtc/presentCadence";
-import { isFreeze, WtTelemetry } from "./telemetry";
+import { isFreeze, WtTelemetry, type WtTelemetryOptions } from "./telemetry";
 
 /** A telemetry on fake clocks: `mono` is performance.now(), `epoch` is Date.now(). */
-function harness(profileFps = 60) {
+function harness(profileFps = 60, extra: Partial<WtTelemetryOptions> = {}) {
   const clock = { mono: 0, epoch: 1_000_000 };
   const posts: { url: string; body: Record<string, unknown> }[] = [];
   let hidden = false;
@@ -15,6 +15,7 @@ function harness(profileFps = 60) {
     sessionId: "s1",
     authToken: "tok",
     profileFps,
+    ...extra,
     deviceKey: "dev",
     nowMs: () => clock.mono,
     nowEpochMs: () => clock.epoch,
@@ -68,6 +69,13 @@ describe("WtTelemetry", () => {
     // The next window starts empty.
     h.advance(1000);
     expect(h.t.tick()).toMatchObject({ fps: 0, bitrateKbps: 0 });
+  });
+
+  it("carries the input capture's metrics, so a connected controller is seen", () => {
+    const h = harness();
+    expect(h.t.tick().inputMetrics).toBeNull();
+    const withPad = harness(60, { getCaptureMetrics: () => ({ gamepadCount: 1 }) as never });
+    expect(withPad.t.tick().inputMetrics?.gamepadCount).toBe(1);
   });
 
   it("measures decode time from the unit going in to its frame coming out", () => {

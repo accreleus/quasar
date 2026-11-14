@@ -234,7 +234,9 @@ export function patchBody(app: AdminApp, draft: AppDraft): UpdateAppRequest {
   if (!sameJson(spec, specOf(from))) body.runtime_spec = spec;
 
   if (draft.managedHome !== from.managedHome) body.managed_home = draft.managedHome;
-  if (draft.containerPath !== from.containerPath) body.home_container_path = draft.containerPath;
+  // An empty path means "no preference", which the app stores as the default (the server refuses "").
+  const homePath = draft.containerPath || "/home/quasar";
+  if (homePath !== from.containerPath) body.home_container_path = homePath;
   if (draft.shareSteamLibrary !== from.shareSteamLibrary) body.share_steam_library = draft.shareSteamLibrary;
   if (draft.runtimePresetId !== from.runtimePresetId) {
     body.runtime_preset_id = draft.runtimePresetId || null;
@@ -264,7 +266,7 @@ export function createBody(draft: AppDraft): CreateAppRequest {
     profile_policy: draft.profilePolicy,
     runtime_spec: specOf(draft),
     managed_home: draft.managedHome,
-    home_container_path: draft.containerPath,
+    home_container_path: draft.containerPath || "/home/quasar",
     share_steam_library: draft.shareSteamLibrary,
     runtime_preset_id: draft.runtimePresetId || null,
     launchable_profile_ids: launchableToSend(draft),
