@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -802,6 +803,47 @@ func TestUnusedClaimCleanupKeepsAClaimASwappingSessionTargets(t *testing.T) {
 	}
 	if n := f.steamClaimCount(t); n != 0 {
 		t.Errorf("Steam claims = %d after B's swap resolved, want the unused claim released", n)
+	}
+}
+
+// #1253: a swap into a sharing desktop owns the Steam claim from its guard until
+// it commits or fails, on a connection that takes holds and on one that does
+// not. A Steam launch or a second sharing swap by the same user is refused.
+func TestSwapIntoASharingDesktopOwnsTheSteamClaimOnEveryEpoch(t *testing.T) {
+	for _, tc := range []struct {
+		second  string
+		capable bool
+	}{{"steam launch", false}, {"sharing swap", false}, {"steam launch", true}, {"sharing swap", true}} {
+		t.Run(fmt.Sprintf("%s capable=%v", tc.second, tc.capable), func(t *testing.T) {
+			f := newWarmFixture(t, 8)
+			sharing := seedDesktop(t, f, true)
+			mine := seedDesktop(t, f, false)
+			other := seedDesktop(t, f, false)
+			a := f.startedLaunch(t, mine)
+			b := f.startedLaunch(t, other)
+			ctx := context.Background()
+			if !tc.capable { // a legacy agent's launches took no holds
+				must(t, exec(t, f.pool, `UPDATE managed_home_claims SET pending_home_session_id=NULL,
+					pending_home_token=NULL, pending_home_started_at=NULL`))
+			}
+			app, err := f.store.GetLaunchApp(ctx, sharing)
+			must(t, err)
+			if _, err := f.store.GuardHomeForSwapWithHold(ctx, a, f.userID, app, f.hostID, tc.capable, f.steam); err != nil {
+				t.Fatalf("guard A's swap: %v", err)
+			}
+
+			if tc.second == "steam launch" {
+				p := launchParams(f.seedIDs)
+				p.AppID, p.HomeAppID, p.ManagedHome = f.steam, f.steam, true
+				_, err = f.store.ScheduleAndCreate(ctx, p)
+			} else {
+				_, err = f.store.GuardHomeForSwapWithHold(ctx, b, f.userID, app, f.hostID, tc.capable, f.steam)
+			}
+			var inUse *HomeInUseError
+			if !errors.As(err, &inUse) || inUse.SessionID != a {
+				t.Fatalf("%s beside A's unresolved swap = %v, want home_in_use naming %s", tc.second, err, a)
+			}
+		})
 	}
 }
 

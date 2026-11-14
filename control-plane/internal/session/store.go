@@ -1216,17 +1216,28 @@ func (s *Store) NonTerminalSessionIDsOnHost(ctx context.Context, hostID string) 
 //     counts, through either home: the agent proves the outgoing container's
 //     exit before the target starts (control-api.md §Storage, amendment 62).
 //
+//  4. A swap in flight owns its target's claims until it commits or fails. On a
+//     cleanup-capable connection its hold says so; on one without (no hold, the
+//     claim marked legacy_unprotected_dispatch) its target is only in memory, so
+//     a holdless `swapping` session counts against every legacy-marked claim
+//     (#1253). shortcut: may also refuse beside a holdless swap into another app;
+//     a durable swap target would need a schema change.
+//
 // It returns the conflicting SESSION ID, not a count (§2.1's 409 body carries
 // it), with its kind and whether it is stopping (homeInUse). $3 (excludeID) is
 // "" at the launch call site, so the exclusion must stay a short-circuited text
 // comparison: an unconditional `::uuid` cast would error on the empty string
 // instead of being the always-true no-op that path needs.
 const liveHomeSessionSQL = `
-	SELECT s.id::text, s.kind, s.state = 'stopping', COALESCE(a.parent_app_id, a.id) <> $2::uuid
+	SELECT s.id::text, s.kind, s.state = 'stopping', COALESCE(s.shared_home_app_id = $2::uuid, false)
 	FROM sessions s
 	JOIN apps a ON a.id = s.app_id
 	WHERE s.user_id = $1::uuid
-	  AND (COALESCE(a.parent_app_id, a.id) = $2::uuid OR s.shared_home_app_id = $2::uuid)
+	  AND (COALESCE(a.parent_app_id, a.id) = $2::uuid OR s.shared_home_app_id = $2::uuid
+	       OR (s.state_detail = 'swapping'
+	           AND NOT EXISTS (SELECT 1 FROM managed_home_claims h WHERE h.pending_home_session_id = s.id)
+	           AND EXISTS (SELECT 1 FROM managed_home_claims c WHERE c.user_id = s.user_id
+	                 AND c.canonical_app_id = $2::uuid AND c.legacy_unprotected_dispatch)))
 	  AND ($3 = '' OR s.id != $3::uuid)
 	  AND s.state IN ('pending','assigned','starting','running','stopping')
 	LIMIT 1`
