@@ -20,7 +20,7 @@ import {
 import { blockLayout } from "../pyrowave/bitstream";
 import { PyroWaveReceiver } from "../pyrowave/receiver";
 import type { WebTransportCoords } from "../api/types";
-import { FEEDBACK_MS, FeedbackRecorder } from "./feedback";
+import { FEEDBACK_MS, FeedbackRecorder, MAX_REORDER_MS } from "./feedback";
 import type { InputWire } from "./inputSender";
 import { workerTicker, type Ticker } from "./pingTicker";
 import { FrameAssembler, type Reassembled } from "./reassembly";
@@ -416,7 +416,9 @@ export class WebTransportMedia implements MediaTransport {
     // Datagrams can overtake the hello_ack; the decode stage holds units by config_id, the
     // router PyroWave fragments.
     const feedback = new FeedbackRecorder(this.now());
-    const router = this.makeRouter(sink, live, feedback);
+    /** `hello_ack.retransmit_window_ms`; until it comes, no gap is held. */
+    let retransmitWindowMs = 0;
+    const router = this.makeRouter(sink, live, feedback, () => retransmitWindowMs);
     /** Set once this attempt's datagram reader has failed: `datagrams: <name>: <message>`. */
     const datagramReader = { death: null as string | null };
     void this.readDatagrams(wt, sink, router, live, feedback, datagramReader).catch((err: unknown) => {
@@ -444,6 +446,7 @@ export class WebTransportMedia implements MediaTransport {
     let config: VideoConfig;
     try {
       config = videoConfigFrom(first);
+      if (typeof first.retransmit_window_ms === "number") retransmitWindowMs = first.retransmit_window_ms;
     } catch {
       return abandon(refused("internal"), { closeCode: 4400, reason: "malformed hello_ack" });
     }
@@ -557,10 +560,16 @@ export class WebTransportMedia implements MediaTransport {
     }
   }
 
-  private makeRouter(sink: MediaSink, live: { on: boolean }, feedback: FeedbackRecorder): Router {
+  private makeRouter(sink: MediaSink, live: { on: boolean }, feedback: FeedbackRecorder, retransmitWindowMs: () => number): Router {
     const assembler = new FrameAssembler(this.now, (now) => feedback.reorderMs(now));
     const configs = new Map<number, VideoConfig>();
     let latest: number | null = null;
+    // A held NACK must reach the agent inside its retransmit window, counted from the send: the gap
+    // shows a frame interval late at most, and the NACK takes half a round trip to get there.
+    feedback.capMs = () => {
+      const fps = (latest !== null && configs.get(latest)?.fps) || 60;
+      return Math.min(MAX_REORDER_MS, retransmitWindowMs() - 1000 / fps - assembler.rttMs / 2);
+    };
     let pyro: PyroWaveReceiver | null = null;
     /** What the PyroWave receivers already replaced counted lost. */
     let pyroLost = 0;

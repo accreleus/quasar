@@ -10,12 +10,14 @@ const NOT_RECEIVED = 0xffff;
 /** A datagram is reported only once it is this old: one reordered by less is not a loss. */
 export const HOLD_BACK_MS = 5;
 /** The reorder window never grows past this, so a real loss is still reported within it (#1330).
- *  Under the agent's 250 ms retransmit hold, so a NACK held this long still finds its fragment. */
+ *  The media path also caps it by the agent's retransmit window ({@link FeedbackRecorder.capMs}). */
 export const MAX_REORDER_MS = 150;
-/** Measured reordering is forgotten at this half-life once it stops. */
-const REORDER_HALF_LIFE_MS = 2_000;
-/** A jump in `pkt_seq` wider than this (an outage, a new sender) is not timed gap by gap. */
-const MAX_GAP_TIMED = 4_096;
+/** The window is a high percentile of the lateness measured over this much recent time, and none
+ *  until there are enough measurements: one late datagram is a spike, not a path that reorders. */
+export const REORDER_HISTORY_MS = 1_000;
+export const REORDER_MIN_SAMPLES = 8;
+const REORDER_PERCENTILE = 0.99;
+const BUCKET_MS = 5;
 /** Channels whose datagrams carry `pkt_seq` (§Channels): video, audio, audio redundancy, FEC. */
 const COUNTED = new Set([0x01, 0x02, 0x04, 0x06]);
 
@@ -48,17 +50,37 @@ export class FeedbackRecorder {
    *  later arrival, in time order; dropped once older than {@link MAX_REORDER_MS}. */
   private highest: number | null = null;
   private passedAt = new Map<number, number>();
-  /** The longest a datagram recently came after a later one, and when. */
-  private peak = 0;
-  private peakAt = 0;
+  /** Lateness measured in the last {@link REORDER_HISTORY_MS} (from `head` on), and how many fall
+   *  in each {@link BUCKET_MS} bucket. */
+  private lateness: { at: number; bucket: number }[] = [];
+  private head = 0;
+  private readonly buckets = new Array<number>(Math.ceil(MAX_REORDER_MS / BUCKET_MS)).fill(0);
+  /** Datagrams that arrived since the last message, and the rate of the last message's interval. */
+  private received = 0;
+  private perMs = 0;
 
   constructor(private lastTake: number) {}
+
+  /** The most the window may be, in ms: the media path sets it so a held NACK still finds its
+   *  fragment in the agent's retransmit window (§Hello ack `retransmit_window_ms`). */
+  capMs: () => number = () => MAX_REORDER_MS;
 
   /** How long a gap may stay open before it is a loss, in ms beyond {@link HOLD_BACK_MS}: how
    *  late reordered datagrams have recently come, 0 on a path that does not reorder. The frame
    *  assembler holds its NACKs by it too, so a late fragment is neither lost nor resent. */
   reorderMs(now: number): number {
-    return this.peak * 0.5 ** (Math.max(0, now - this.peakAt) / REORDER_HALF_LIFE_MS);
+    for (; this.head < this.lateness.length && now - this.lateness[this.head].at > REORDER_HISTORY_MS; this.head++) {
+      this.buckets[this.lateness[this.head].bucket]--;
+    }
+    if (this.head > 1024) {
+      this.lateness = this.lateness.slice(this.head);
+      this.head = 0;
+    }
+    const n = this.lateness.length - this.head;
+    if (n < REORDER_MIN_SAMPLES) return 0;
+    let b = 0;
+    for (let k = Math.ceil(REORDER_PERCENTILE * n); (k -= this.buckets[b]) > 0; b++);
+    return Math.max(0, Math.min((b + 1) * BUCKET_MS, this.capMs()));
   }
 
   /** One datagram as it arrived, at `at` ms on the monotonic clock. */
@@ -66,6 +88,7 @@ export class FeedbackRecorder {
     if (datagram.length < 5 || !COUNTED.has(datagram[0])) return;
     const pktSeq = new DataView(datagram.buffer, datagram.byteOffset, datagram.byteLength).getUint32(1, true);
     this.timeReordering(pktSeq, at);
+    this.received++;
     if (this.next === null) this.next = pktSeq;
     else if (after(this.next, pktSeq)) return; // already reported as lost
     // A bound on what a stalled reader holds: past it, the oldest go first.
@@ -80,7 +103,10 @@ export class FeedbackRecorder {
       this.passedAt.delete(s);
     }
     if (this.highest === null || after(pktSeq, this.highest)) {
-      if (this.highest !== null && ((pktSeq - this.highest) >>> 0) <= MAX_GAP_TIMED) {
+      // Reordering within the window can only open a gap of what arrives within it at the current
+      // rate; a wider one is an outage, reported at once.
+      const missing = (pktSeq - (this.highest ?? pktSeq) - 1) >>> 0;
+      if (this.highest !== null && missing <= this.perMs * Math.min(MAX_REORDER_MS, this.capMs())) {
         for (let s = (this.highest + 1) >>> 0; s !== pktSeq; s = (s + 1) >>> 0) this.passedAt.set(s, at);
       }
       this.highest = pktSeq;
@@ -89,11 +115,9 @@ export class FeedbackRecorder {
     const passed = this.passedAt.get(pktSeq);
     if (passed === undefined) return;
     this.passedAt.delete(pktSeq);
-    const late = Math.min(at - passed, MAX_REORDER_MS);
-    if (late >= this.reorderMs(at)) {
-      this.peak = late;
-      this.peakAt = at;
-    }
+    const bucket = Math.min(Math.floor((at - passed) / BUCKET_MS), this.buckets.length - 1);
+    this.lateness.push({ at, bucket });
+    this.buckets[bucket]++;
   }
 
   /** The message for everything up to the newest `pkt_seq` that arrived at least
@@ -132,6 +156,8 @@ export class FeedbackRecorder {
     this.next = (first + count) >>> 0;
     const interval = Math.max(now - this.lastTake, 1);
     this.lastTake = now;
+    this.perMs = this.received / interval;
+    this.received = 0;
     const recvKbps = Math.round((this.bytes * 8) / interval);
     this.bytes = 0;
     let bin = "";
