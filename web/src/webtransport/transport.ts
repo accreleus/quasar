@@ -65,6 +65,8 @@ export interface MediaSink {
   audio?(packet: AudioPacket): void;
   /** Reassembled units, in completion order. */
   unit(unit: AccessUnit): void;
+  /** A video datagram arrived, whether or not its frame will complete. */
+  videoDatagram?(): void;
   /** PyroWave frames, complete or at their deadline, in frame_seq order. */
   pyrowave(frame: PyroWaveFrame): void;
   /** Called once, after connect resolved, when the transport is gone. */

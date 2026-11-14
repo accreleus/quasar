@@ -170,8 +170,10 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   let presentRefAt: number | null = null;
   /** Times the no-picture check has tripped on this session. */
   let noPictureTrips = 0;
-  /** When the decode stage began waiting for a keyframe; null while it is not. */
+  /** When this connection began waiting for a keyframe with video arriving; null while it is not. */
   let keyWaitSince: number | null = null;
+  /** When a video datagram last arrived on this connection, whether or not its frame completed. */
+  let lastDatagramAt: number | null = null;
   /** When the last tick ran; null until ticking starts (connecting is not a stall). */
   let lastTickAt: number | null = null;
 
@@ -291,19 +293,32 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       onEnd(transport, { code: null, reason: "media_silent" });
       if (failed) return;
     }
+    // No picture can come while a keyframe is awaited, by the decode stage or on a connection none has
+    // reached yet. With video arriving, a wait as long as the bound is a path that loses keyframes: the
+    // stream is lost, as media_silent, whether or not this connection ever showed a picture (#1426).
+    const awaitingKey = presentRefAt === null || !!stage?.needsKey();
+    const arriving = lastDatagramAt !== null && now - lastDatagramAt <= MEDIA_SILENCE_MS;
+    keyWaitSince = awaitingKey && arriving ? (keyWaitSince ?? now) : null;
+    if (
+      transport &&
+      snapshot.channelOpen &&
+      keyWaitSince !== null &&
+      document.visibilityState === "visible" &&
+      now - keyWaitSince > MEDIA_SILENCE_MS
+    ) {
+      onEnd(transport, { code: null, reason: "keyframe_lost" });
+      if (failed) return;
+    }
     // Video keeps arriving but no picture has been shown: a decoder or presenter that takes the
     // data and never outputs. (Video not arriving at all is the check above.)
-    // Time spent waiting for a keyframe is not a decoder showing nothing: it counts from the keyframe,
-    // for as long as a picture would be waited for. A wait past that is a path that loses keyframes (#1426).
-    keyWaitSince = stage?.needsKey() ? (keyWaitSince ?? now) : null;
-    const keyLost = keyWaitSince !== null && now - keyWaitSince > MEDIA_SILENCE_MS;
-    if (presentRefAt !== null && keyWaitSince !== null && !keyLost) presentRefAt = now;
+    // Time spent waiting for a keyframe is not a decoder showing nothing: it counts from the keyframe.
+    if (presentRefAt !== null && awaitingKey) presentRefAt = now;
     if (
       transport &&
       snapshot.channelOpen &&
       presentRefAt !== null &&
       document.visibilityState === "visible" &&
-      (keyLost || now - presentRefAt > MEDIA_SILENCE_MS)
+      now - presentRefAt > MEDIA_SILENCE_MS
     ) {
       // The first trip gets the one media reconnect media_silent gets; a second one is a decoder that cannot show.
       if (noPictureTrips++ === 0 && !reconnected) {
@@ -469,6 +484,9 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
             t.codecFallback("decode_error");
           }
         },
+        videoDatagram: () => {
+          if (t === transport) lastDatagramAt = performance.now();
+        },
         unit: (u) => {
           if (destroyed || failed || t !== transport) return;
           noteVideo(u.keyframe);
@@ -512,6 +530,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     if (lastVideoAt !== null) lastVideoAt = performance.now();
     presentRefAt = null; // a new connection counts from its own first keyframe
     keyWaitSince = null;
+    lastDatagramAt = null;
     startInput(t);
     if (timer === null) {
       telemetry.startWindow();

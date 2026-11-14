@@ -16,6 +16,7 @@ export const MAX_REORDER_MS = 150;
  *  until there are enough measurements: one late datagram is a spike, not a path that reorders. */
 export const REORDER_HISTORY_MS = 1_000;
 export const REORDER_MIN_SAMPLES = 8;
+/** Below about 100 measurements in the history this is the largest one or two. */
 const REORDER_PERCENTILE = 0.99;
 const BUCKET_MS = 5;
 /** Channels whose datagrams carry `pkt_seq` (§Channels): video, audio, audio redundancy, FEC. */

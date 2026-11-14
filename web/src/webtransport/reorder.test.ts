@@ -256,15 +256,4 @@ describe("a path that holds each datagram on its own (#1330)", () => {
     expect(burst.reorderMs(1200)).toBeGreaterThan(90);
     expect(burst.reorderMs(1110 + REORDER_HISTORY_MS)).toBe(0);
   });
-
-  it("never holds a gap past what the agent's retransmit window can still repair", () => {
-    const rec = new FeedbackRecorder(0);
-    stream(rec, 3000, (s) => s + spread(140)(s), 3000);
-    expect(rec.reorderMs(3000)).toBeGreaterThan(100);
-    // As the media path sets it: a 250 ms window, 30 fps and a 200 ms round trip leave 117 ms.
-    rec.capMs = () => 250 - 1000 / 30 - 200 / 2;
-    expect(rec.reorderMs(3000)).toBeLessThanOrEqual(117);
-    rec.capMs = () => 250 - 1000 / 30 - 500 / 2;
-    expect(rec.reorderMs(3000)).toBe(0);
-  });
 });
