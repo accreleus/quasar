@@ -83,8 +83,8 @@ export function CompatToolSection({
       {nowhere && (
         <div className="note warn" data-testid="compat-tool-nowhere">
           <div>
-            <b>No host has {picked.display_name} installed.</b> A launch of this game waits or is
-            refused until one does.
+            <b>No host has {picked.display_name} installed.</b> A launch of this game is refused
+            until one does.
           </div>
         </div>
       )}

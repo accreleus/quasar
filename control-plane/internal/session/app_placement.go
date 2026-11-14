@@ -73,8 +73,8 @@ func (s *Store) GuardPlacementForSwap(ctx context.Context, sessionID string, app
 // compatToolNotMounted refuses a swap into a derived Steam game whose per-game GE mapping names a
 // tool this session did not mount at launch. A swap sends no compat block and the agent carries the
 // running container's launch-time table (compat_tools::carry), so what decides whether the tool
-// applies is sessions.compat_tool_names, never the host's report now: the check is claimToolMissing's,
-// for the same reason. A running session with NULL names mounts nothing. Runs in the guard
+// applies is sessions.compat_tool_names, never the host's report now (the same
+// question claimToolMissing asks of a parked Steam). A running session with NULL names mounts nothing. Runs in the guard
 // transaction after its placement and home checks and before any claim, hold or write.
 // semantics: control-api.md §Compatibility tools, "Placement".
 func compatToolNotMounted(ctx context.Context, q rowQuerier, sessionID string, app LaunchApp) error {
