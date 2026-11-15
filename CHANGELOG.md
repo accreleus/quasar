@@ -24,6 +24,8 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+## 0.6.0 — 2026-11-15
+
 ### Upgrading
 - **This release changes the database (migrations 0111 and 0113 to 0116), so there is no going back below it.** Once applied, an older control plane will not start. For Quasar's own database the way back is a restore of the dump the update takes first (`docs/upgrading.md`, "The one-way migration rule"); on your own database, back up first. Fleet ▸ Releases ▸ Update Quasar waits for live sessions to end before it replaces the control plane (or tick "Update now" to end them), and automatic updates never install a release that changes the database. No session changes transport on upgrade: every launch profile that was on WebRTC now follows the new Default transport, which is WebRTC.
 - **The node agent now listens on UDP port 4433 on its host (`QUASAR_WT_PORT`; `0` turns the listener off).** Nothing connects to it until an admin turns WebTransport on for a launch profile. A firewall that blocks UDP 4433 between the browser and the host makes a WebTransport launch fall back to WebRTC after about 10 seconds. If the port cannot be opened, the agent logs it and streams over WebRTC only.
