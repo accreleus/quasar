@@ -94,19 +94,19 @@ describe("preferredMicDeviceId (microphone spec §3.4)", () => {
 });
 
 describe("upscaleSharpen (#1349)", () => {
-  it("defaults on, and reads back a stored off", () => {
-    expect(upscaleSharpen()).toBe(true);
-    saveDisplayPreferences({ upscaleSharpen: false });
+  it("defaults off (opt-in), and reads back a stored on", () => {
     expect(upscaleSharpen()).toBe(false);
     saveDisplayPreferences({ upscaleSharpen: true });
     expect(upscaleSharpen()).toBe(true);
+    saveDisplayPreferences({ upscaleSharpen: false });
+    expect(upscaleSharpen()).toBe(false);
   });
 
   it("survives a scaling-only save, and a scaling save survives it", () => {
-    saveDisplayPreferences({ upscaleSharpen: false });
-    saveDisplayPreferences({ scalingMode: "cover" });
-    expect(loadDisplayPreferences()).toEqual({ scalingMode: "cover", upscaleSharpen: false });
     saveDisplayPreferences({ upscaleSharpen: true });
+    saveDisplayPreferences({ scalingMode: "cover" });
+    expect(loadDisplayPreferences()).toEqual({ scalingMode: "cover", upscaleSharpen: true });
+    saveDisplayPreferences({ upscaleSharpen: false });
     expect(loadDisplayPreferences().scalingMode).toBe("cover");
   });
 });
