@@ -23,7 +23,7 @@ export interface DisplayPreferences {
   launchImmersive?: boolean;
   /** #1349: reconstruct and sharpen a stream smaller than the picture it is drawn
    *  into, instead of stretching it. Per device like the scaling mode beside it;
-   *  absent means on. */
+   *  opt-in, absent means off: the pass can cost more than a frame at high refresh (#1449). */
   upscaleSharpen?: boolean;
   /** #1401: the touch pad drawn over the picture. Per device; opt-in, absent means off
    *  (the layout is a first pass, #1405). */
@@ -53,7 +53,7 @@ export function loadDisplayPreferences(): DisplayPreferences {
       scalingMode,
       ...(preferredMicDeviceId ? { preferredMicDeviceId } : {}),
       ...(parsed.launchImmersive === false ? { launchImmersive: false } : {}),
-      ...(parsed.upscaleSharpen === false ? { upscaleSharpen: false } : {}),
+      ...(parsed.upscaleSharpen === true ? { upscaleSharpen: true } : {}),
       ...(parsed.onScreenControls === true ? { onScreenControls: true } : {}),
     };
   } catch {
@@ -81,7 +81,7 @@ export function launchImmersive(): boolean {
 
 /** #1349: whether an upscaled stream is reconstructed and sharpened on this device. */
 export function upscaleSharpen(): boolean {
-  return loadDisplayPreferences().upscaleSharpen !== false;
+  return loadDisplayPreferences().upscaleSharpen === true;
 }
 
 /** #1401: whether the on-screen controls are on for this device. */
