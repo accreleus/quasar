@@ -20,9 +20,10 @@
 //!     doesn't touch compositor/interpipe caps or trigger renegotiation), implemented
 //!     here as [`ResolutionRung`] with its own hysteresis/dwell/settle/emergency policy
 //!     ([`ResolutionPolicy`]), actuated through `ResolutionLever` in
-//!     [`crate::session::pipeline::abr_glue`]. Ships DARK behind
-//!     [`LadderConfig::resolution_enabled`] (`abr_ladder_resolution`, default false)
-//!     until the per-host netem soak signs it off.
+//!     [`crate::session::pipeline::abr_glue`]. Behind
+//!     [`LadderConfig::resolution_enabled`] (`abr_ladder_resolution`): off by default for
+//!     WebRTC, on for a session assigned WebTransport unless the host set it
+//!     ([`LadderSettings::for_session`]).
 //!  5. **Playout increase** — `client_presentation_limited` is a control-plane/browser-trace
 //!     signal the agent never sees (invariant #1); stays with the AS-05 client-side
 //!     playout controller.
@@ -87,6 +88,13 @@ pub struct LadderSettings {
     pub floor_follows_rung: bool,
     pub order: LadderOrder,
     pub res: ResolutionPolicy,
+    /// Whether an operator set `abr_ladder_resolution` / `abr_ladder_order` (env or
+    /// override). Unset ones take the WebTransport defaults in [`Self::for_session`].
+    /// A typed-policy explicit choice counts, a `deployment` choice does not
+    /// (`PolicyAgent::mark_ladder_choices` corrects what `apply_json` marks). An empty env var is unset, since compose passes
+    /// an unset variable through as "".
+    pub resolution_set: bool,
+    pub order_set: bool,
 }
 
 impl LadderSettings {
@@ -116,6 +124,8 @@ impl LadderSettings {
             order: lookup("QUASAR_ABR_LADDER_ORDER")
                 .and_then(|s| LadderOrder::parse(&s))
                 .unwrap_or(LadderOrder::Hybrid),
+            resolution_set: env_set("QUASAR_ABR_LADDER_RESOLUTION", lookup),
+            order_set: env_set("QUASAR_ABR_LADDER_ORDER", lookup),
             res: ResolutionPolicy {
                 exponent: env_f64(
                     "QUASAR_ABR_LADDER_RES_EXPONENT",
@@ -187,6 +197,7 @@ impl LadderSettings {
         }
         if let Some(x) = v.get("abr_ladder_resolution").and_then(|x| x.as_bool()) {
             self.resolution_enabled = x;
+            self.resolution_set = true;
         }
         if let Some(x) = v.get("abr_ladder_fps").and_then(|x| x.as_bool()) {
             self.fps_enabled = x;
@@ -200,6 +211,7 @@ impl LadderSettings {
         if let Some(x) = v.get("abr_ladder_order").and_then(|x| x.as_str()) {
             if let Some(o) = LadderOrder::parse(x) {
                 self.order = o;
+                self.order_set = true;
             }
         }
         if let Some(x) = v.get("abr_ladder_res_exponent").and_then(|x| x.as_f64()) {
@@ -307,10 +319,31 @@ impl LadderSettings {
     }
 }
 
+impl LadderSettings {
+    /// The knobs one session runs with (#1375): on WebTransport an unset resolution
+    /// rung is on, with `res_first` unless the host set the order, so a link under the
+    /// launch floor steps down a size instead of losing the transport. WebRTC keeps the
+    /// host values. A host that set the rung keeps its own order, and a floor that cannot
+    /// follow the rung would leave the step useless, so neither gets the default.
+    pub fn for_session(mut self, webtransport: bool) -> Self {
+        if webtransport && !self.resolution_set && self.floor_follows_rung {
+            self.resolution_enabled = true;
+            if !self.order_set {
+                self.order = LadderOrder::ResFirst;
+            }
+        }
+        self
+    }
+}
+
 impl Default for LadderSettings {
     fn default() -> Self {
         Self::from_env()
     }
+}
+
+fn env_set(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
+    lookup(var).is_some_and(|v| !v.trim().is_empty())
 }
 
 fn env_flag(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
@@ -322,7 +355,7 @@ fn env_flag(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
 
 /// A boolean env knob whose default is **on** — only an explicit `0`/`false` turns it off
 /// (the `QUASAR_ABR_LADDER` convention, not `env_flag`'s opt-in one).
-fn env_flag_default_true(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
+pub(crate) fn env_flag_default_true(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
     !matches!(
         lookup(var).as_deref(),
         Some("0") | Some("false") | Some("FALSE")
@@ -709,7 +742,7 @@ impl ResolutionPolicy {
     /// for the measured gain (this is the resolution-rung half of the same arm).
     pub const DEFAULT_RECOVER_DWELL: u8 = 2;
     pub const DEFAULT_MIN_STEP_S: u64 = 10;
-    pub const DEFAULT_MIN_HEIGHT: i32 = 720;
+    pub const DEFAULT_MIN_HEIGHT: i32 = 360;
     pub const DEFAULT_SETTLE_WINDOWS: u8 = 1;
 
     pub fn new() -> Self {
@@ -811,6 +844,9 @@ pub enum StepReason {
     Recover,
     /// The governor is already at the floor and the path is still congested.
     Emergency,
+    /// WebTransport: the rate left the rung's band for [`LadderPlanner::RATE_CONFIRM`]: to
+    /// the rung that fits it, several at once if need be ([`LadderPlanner::observe_rate`]).
+    Rate,
 }
 
 impl StepReason {
@@ -819,6 +855,7 @@ impl StepReason {
             StepReason::Engage => "engage",
             StepReason::Recover => "recover",
             StepReason::Emergency => "emergency",
+            StepReason::Rate => "rate",
         }
     }
 }
@@ -1342,9 +1379,30 @@ pub struct LadderPlanner {
     /// Set once a lever has refused a step — see [`LadderPlanner::set_res_retired`].
     res_retired: bool,
     fps_retired: bool,
+    /// WebTransport (#1376): the resolution rung follows the rate per report
+    /// ([`Self::observe_rate`]); the windows move only the frame rate.
+    per_report: bool,
+    /// [`Self::observe_rate`]: since when the rate has been out of the rung's band, which
+    /// way, and the lowest rate of that run.
+    run: Option<(Instant, StepDir, f64)>,
+    /// When the last rate step went down: the next up waits until that down is `min_step_s`
+    /// old as well as for [`Self::RATE_CONFIRM`] over the line (the restart budget, #1376
+    /// review A1/R1). Holds the decision, not the signal: a dip inside it costs nothing.
+    last_down_at: Option<Instant>,
+    /// The last size change made outside the ladder (a manual resize), for the settle.
+    resized: Option<Instant>,
 }
 
 impl LadderPlanner {
+    /// How long the rate must stay out of the rung's band before the rung moves: about ten
+    /// WebTransport reports (`webtransport::congestion::REPORT_EVERY`), so one bad report
+    /// cannot step.
+    pub const RATE_CONFIRM: std::time::Duration = std::time::Duration::from_secs(1);
+    /// No reading counts this long after any step of either lever or a manual resize: a
+    /// resolution step restarts the encoder, which pauses the stream and then sends a
+    /// keyframe burst, so what the receiver measures then is the restart, not the link.
+    pub const STEP_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
     /// The hybrid pivot: the height at and below which the fps rung is taken before any
     /// further resolution step. Michael's rule — "120→60 as the step before dropping
     /// below 1080p".
@@ -1364,7 +1422,16 @@ impl LadderPlanner {
             fps_enabled: cfg.fps_enabled,
             res_retired: false,
             fps_retired: false,
+            per_report: false,
+            run: None,
+            last_down_at: None,
+            resized: None,
         }
+    }
+
+    /// WebTransport: the resolution rung moves on [`Self::observe_rate`], never on a window.
+    pub fn set_per_report(&mut self) {
+        self.per_report = true;
     }
 
     /// The resolution rung index (0 = launch).
@@ -1435,6 +1502,31 @@ impl LadderPlanner {
         self.res.sync_rung(size);
     }
 
+    /// A size change the ladder did not make (a manual resize restarts the encoder too):
+    /// starts the settle and drops the rate's run. Keeps the up hold: the glue calls this
+    /// for the ladder's own step too once it lands, and a manual resize waiting out what is
+    /// left of 10 s is harmless (#1376 review R6).
+    pub fn mark_resized(&mut self, now: Instant) {
+        self.resized = Some(now);
+        self.run = None;
+    }
+
+    /// Within [`Self::STEP_SETTLE`] of the last step of either lever or a manual resize.
+    pub fn settling(&self, now: Instant) -> bool {
+        let last = self.res.last_step.max(self.fps.last_step);
+        let last = self.resized.map_or(last, |r| r.max(last));
+        now.saturating_duration_since(last) < Self::STEP_SETTLE
+    }
+
+    /// The deepest rung at or above the hybrid pivot.
+    fn pivot_rung(&self) -> usize {
+        self.res
+            .rungs
+            .iter()
+            .rposition(|r| r.1 >= Self::HYBRID_PIVOT_HEIGHT)
+            .unwrap_or(0)
+    }
+
     /// Whether the fps rung is eligible to move under `hybrid` — i.e. the resolution rung
     /// has already come down to the pivot (1080p or shorter).
     fn at_or_below_pivot(&self) -> bool {
@@ -1491,6 +1583,112 @@ impl LadderPlanner {
         floor_kbps: f64,
         now: Instant,
     ) -> Option<PlannedStep> {
+        let step = self.observe_window(state, setpoint_kbps, floor_kbps, now);
+        if step.is_some() {
+            // The rate's run is judged against the rungs now in force.
+            self.run = None;
+        }
+        step
+    }
+
+    /// WebTransport, once per report (#1376): the resolution rung from the governor's rate
+    /// (`Governor::rate_kbps`, not clamped to the floor), with the window path's band and
+    /// without its dwell windows. Under `engage_frac × B(current)` for
+    /// [`Self::RATE_CONFIRM`]: down to the least-deep rung the rate fits (`engage_frac ×
+    /// B(r)` at or under it), the floor rung when none does, in one step. At or over
+    /// `recover_frac × B(current − 1)` for as long: up to the least-deep rung the lowest rate
+    /// of that run reaches by `recover_frac × B(r)`, in one step; the first up after a down
+    /// also waits until that down is `min_step_s` (10 s) old. The band holds a link noisy at
+    /// a line; the up hold bounds a slow oscillation across the band to one down-and-up cycle
+    /// per `min_step_s + STEP_SETTLE + RATE_CONFIRM` (14 s, about 8.6 restarts a minute, at
+    /// the defaults), and a dip inside the hold does not restart it. A down
+    /// step is never held longer than `RATE_CONFIRM`: a queue costs more than a size. Nothing
+    /// within [`Self::STEP_SETTLE`] of a step; only when resolution is the lever the order
+    /// moves next, and under `hybrid` never past the pivot while 120 → 60 is still to come
+    /// (down) or still engaged (up). Never moves the frame rate.
+    pub fn observe_rate(&mut self, rate: f64, now: Instant) -> Option<PlannedStep> {
+        if self.settling(now) {
+            self.run = None;
+            return None;
+        }
+        let (cur, policy) = (self.res.current, self.res.policy);
+        let dir = if self.res.can_step(StepDir::Down)
+            && rate < policy.engage_frac * self.res.comfort(cur)
+        {
+            StepDir::Down
+        } else if self.res.can_step(StepDir::Up)
+            && rate >= policy.recover_frac * self.res.comfort(cur - 1)
+        {
+            StepDir::Up
+        } else {
+            self.run = None;
+            return None;
+        };
+        let priority = match dir {
+            StepDir::Down => self.down_priority(),
+            StepDir::Up => self.up_priority(),
+        };
+        if priority.into_iter().find(|l| self.can_step(*l, dir)) != Some(Lever::Res) {
+            self.run = None;
+            return None;
+        }
+        let run = match self.run {
+            Some((since, d, lowest)) if d == dir => (since, d, lowest.min(rate)),
+            _ => (now, dir, rate),
+        };
+        self.run = Some(run);
+        let held = dir == StepDir::Up
+            && self
+                .last_down_at
+                .is_some_and(|d| now.saturating_duration_since(d).as_secs() < policy.min_step_s);
+        // A pin holds the step, not the run: released, it steps at once.
+        if now.saturating_duration_since(run.0) < Self::RATE_CONFIRM || held || self.res.pinned {
+            return None;
+        }
+        let hybrid = self.order == LadderOrder::Hybrid;
+        let to = match dir {
+            StepDir::Down => {
+                let mut deepest = self.res.floor_rung;
+                if hybrid && self.can_step(Lever::Fps, StepDir::Down) {
+                    deepest = deepest.min(self.pivot_rung());
+                }
+                // Capped at the pivot, the run stays armed (deliberate, as for a pin). The fps
+                // step that frees it starts the settle, which drops the run; a retired fps
+                // lever frees it with no step, and then it fires on the next report.
+                if deepest <= cur {
+                    return None;
+                }
+                (cur + 1..=deepest)
+                    .find(|&i| rate >= policy.engage_frac * self.res.comfort(i))
+                    .unwrap_or(deepest)
+            }
+            StepDir::Up => {
+                let shallowest = if hybrid && self.fps.rung() > 0 {
+                    self.pivot_rung()
+                } else {
+                    0
+                };
+                (shallowest..cur).find(|&i| run.2 >= policy.recover_frac * self.res.comfort(i))?
+            }
+        };
+        self.res.engage_run = 0;
+        self.res.recover_run = 0;
+        self.run = None;
+        self.last_down_at = (dir == StepDir::Down).then_some(now);
+        Some(PlannedStep::Resolution(self.res.step_to(
+            to,
+            StepReason::Rate,
+            now,
+        )))
+    }
+
+    fn observe_window(
+        &mut self,
+        state: AdaptationState,
+        setpoint_kbps: f64,
+        floor_kbps: f64,
+        now: Instant,
+    ) -> Option<PlannedStep> {
         // Read from the resolution rung first, fall back to fps. Pure — neither call
         // advances a counter.
         let dir = self
@@ -1531,6 +1729,8 @@ impl LadderPlanner {
             return None;
         };
         match lever {
+            // WebTransport: the rate moves the size (`observe_rate`), the windows hold it.
+            Lever::Res if self.per_report => None,
             Lever::Res => self
                 .res
                 .observe(state, setpoint_kbps, floor_kbps, now)
@@ -2129,11 +2329,15 @@ mod tests {
         assert_eq!(r.rung(), 2);
     }
 
-    // Floor rung: never below min_height (720 by default).
+    // Floor rung: never below min_height.
     #[test]
     fn never_steps_below_the_min_height() {
         let t = Instant::now();
-        let mut r = rung_at(t);
+        let policy = ResolutionPolicy {
+            min_height: 720,
+            ..ResolutionPolicy::new()
+        };
+        let mut r = ResolutionRung::new(policy, rungs_1440(), CEILING, t);
         let mut steps = Vec::new();
         for i in 0..40u64 {
             if let Some(d) = r.observe(
@@ -2360,6 +2564,26 @@ mod tests {
             "fps only after every resolution rung"
         );
         assert_eq!(p.fps(), 60);
+    }
+
+    /// The owner's rule for #1320: resolution first, then 120 → 60, never below 60.
+    ///
+    /// Distinct from `res_first_never_touches_fps_until_the_floor_rung` above, which stops
+    /// as soon as the frame-rate step lands: this one keeps the collapse going past every
+    /// rung and pins the END state — 60 fps at the floor resolution, with nothing left to
+    /// take. An fps ladder is `[launch, launch/2]`, so a 120 fps session halving once is
+    /// the only step it has and no series of windows can reach 30.
+    #[test]
+    fn res_first_ends_at_60fps_on_the_floor_rung_and_never_goes_lower() {
+        let t = Instant::now();
+        let mut p = planner(LadderOrder::ResFirst, true, 120, t);
+        assert_eq!(
+            congested_run(&mut p, t, 20),
+            vec!["res->1", "res->2", "res->3", "fps->60"],
+            "every resolution rung first, then the halving, then nothing"
+        );
+        assert_eq!(p.res_rung(), 3, "the floor rung is the last pixel step");
+        assert_eq!(p.fps(), 60, "120 halves once and never below 60");
     }
 
     #[test]
@@ -2592,6 +2816,393 @@ mod tests {
                 later(t, 30)
             ),
             None
+        );
+    }
+
+    // ── #1376: the resolution rung from the WebTransport rate ─────────────────
+    //
+    // `CEILING` 10 000 over the 1440p ladder: B = 10 000, 6495, 4941, 3536, so the engage
+    // lines (0.6 × B) are 6000, 3897, 2965, 2121 and the recover lines (0.8 × B) 8000, 5196,
+    // 3953, 2828.
+
+    /// A per-report planner (`set_per_report`), as a WebTransport session arms it.
+    fn rate_planner(
+        order: LadderOrder,
+        fps_enabled: bool,
+        launch_fps: i32,
+        t: Instant,
+    ) -> LadderPlanner {
+        let mut p = planner(order, fps_enabled, launch_fps, t);
+        p.set_per_report();
+        p
+    }
+
+    /// Feed the rate once per report (every 100 ms, WebTransport's `REPORT_EVERY`) from
+    /// `from_ms` for `secs`; each step with the time it landed at.
+    fn rates(
+        p: &mut LadderPlanner,
+        t: Instant,
+        from_ms: u64,
+        secs: u64,
+        rate: impl Fn(u64) -> f64,
+    ) -> Vec<(u64, String)> {
+        let mut steps = Vec::new();
+        for ms in (from_ms..from_ms + secs * 1000).step_by(100) {
+            if let Some(s) = p.observe_rate(rate(ms), t + Duration::from_millis(ms)) {
+                steps.push((ms, label(s)));
+            }
+        }
+        steps
+    }
+
+    /// Down goes straight to the rung the rate fits, in one step, `RATE_CONFIRM` after the
+    /// rate left the band: 5100 (an ordinary drop to 6 Mbit/s) fits 1080p (3897), 1275 (the
+    /// #1320 cut to 1.5 Mbit/s) fits none, so the floor rung. The old code had no per-report
+    /// path: one rung per 5 s windows and a 10 s `min_step_s`.
+    #[test]
+    fn the_rate_steps_down_straight_to_the_rung_it_fits() {
+        let t = Instant::now();
+        for (rate, to) in [
+            (5100.0, "res->1"),
+            (2500.0, "res->3"),
+            (3000.0, "res->2"),
+            (1275.0, "res->3"),
+        ] {
+            let mut p = rate_planner(LadderOrder::ResFirst, false, 120, t);
+            assert!(
+                rates(&mut p, t, 0, 5, |_| 10_000.0).is_empty(),
+                "a clean link never steps"
+            );
+            let steps = rates(&mut p, t, 5000, 3, |_| rate);
+            assert_eq!(steps, vec![(6000, to.to_string())], "rate {rate}");
+            assert_eq!(p.fps(), 120, "resolution only");
+        }
+        let mut p = rate_planner(LadderOrder::ResFirst, false, 120, t);
+        let step = (0..20)
+            .find_map(|i| p.observe_rate(1275.0, t + Duration::from_millis(i * 100)))
+            .unwrap();
+        assert_eq!(
+            step,
+            PlannedStep::Resolution(StepDecision {
+                from: 0,
+                to: 3,
+                reason: StepReason::Rate
+            })
+        );
+    }
+
+    /// A 1440p120 session on the real 16:9 table at the default floor: 1000 kbit/s is under
+    /// every line down to 540p (engage 1378), so it lands on 640x360 (engage 750); 1400
+    /// fits 540p. With the table and floor of 720p, both land on 720p (`res->3`).
+    #[test]
+    fn a_link_under_the_720p_floor_steps_under_720p() {
+        let t = Instant::now();
+        let cfg = LadderConfig {
+            resolution_enabled: true,
+            order: LadderOrder::ResFirst,
+            ..LadderConfig::new()
+        };
+        for (rate, to, size) in [(1000.0, 5, (640, 360)), (1400.0, 4, (960, 540))] {
+            let rungs = crate::session::rungs::available_rungs(2560, 1440);
+            let mut p = LadderPlanner::new(&cfg, rungs, 120, CEILING, t);
+            p.set_per_report();
+            let steps = rates(&mut p, t, 0, 3, |_| rate);
+            assert_eq!(steps, vec![(1000, format!("res->{to}"))], "rate {rate}");
+            assert_eq!(p.res_size(), size, "rate {rate}");
+        }
+    }
+
+    /// One report, or a run shorter than `RATE_CONFIRM`, moves nothing; nor does a rate in
+    /// the band. New logic, nothing to fire on the old code.
+    #[test]
+    fn a_short_run_out_of_the_band_does_not_step() {
+        let t = Instant::now();
+        let mut p = rate_planner(LadderOrder::ResFirst, true, 120, t);
+        let steps = rates(&mut p, t, 0, 30, |ms| {
+            if ms % 1000 == 900 {
+                10_000.0
+            } else {
+                500.0
+            }
+        });
+        assert!(steps.is_empty(), "{steps:?}");
+        assert!(
+            rates(&mut p, t, 30_000, 5, |_| 6000.0).is_empty(),
+            "the engage line itself holds"
+        );
+        assert_eq!(p.res_rung(), 0);
+    }
+
+    /// Up waits `RATE_CONFIRM` over the next rung's recover line (and, for the first up
+    /// after a down, until that down is `min_step_s` old), then goes to the least-deep rung
+    /// the lowest rate of that run reaches, in one step: from 720p, 9000 reaches the launch
+    /// rung (8000), 6000 reaches 1080p (5196) and no further. Old code (24ad172a): the first
+    /// up came after 1 s, at 6000 ms.
+    #[test]
+    fn the_rate_steps_up_to_the_highest_rung_it_holds() {
+        let t = Instant::now();
+        for (rate, to) in [(9000.0, "res->0"), (6000.0, "res->1"), (4000.0, "res->2")] {
+            let mut p = rate_planner(LadderOrder::ResFirst, false, 120, t);
+            assert_eq!(
+                rates(&mut p, t, 0, 2, |_| 1000.0),
+                vec![(1000, "res->3".to_string())]
+            );
+            assert!(
+                rates(&mut p, t, 2000, 3, |_| 2800.0).is_empty(),
+                "under 900p's recover line"
+            );
+            assert!(
+                rates(&mut p, t, 5000, 6, |_| rate).is_empty(),
+                "the first up after a down holds until the down is `min_step_s` old"
+            );
+            assert_eq!(
+                rates(&mut p, t, 11_000, 1, |_| rate),
+                vec![(11_000, to.to_string())],
+                "rate {rate}"
+            );
+        }
+        // The lowest rate of the run decides: one dip to 6000 at 9000 is 1080p.
+        let mut p = rate_planner(LadderOrder::ResFirst, false, 120, t);
+        rates(&mut p, t, 0, 4, |_| 1000.0);
+        let steps = rates(
+            &mut p,
+            t,
+            4000,
+            8,
+            |ms| {
+                if ms == 4500 {
+                    6000.0
+                } else {
+                    9000.0
+                }
+            },
+        );
+        assert_eq!(steps, vec![(11_000, "res->1".to_string())]);
+        // An up after an up confirms in `RATE_CONFIRM`.
+        assert_eq!(
+            rates(&mut p, t, 17_000, 2, |_| 9000.0),
+            vec![(18_000, "res->0".to_string())]
+        );
+    }
+
+    /// #1376 review A1/R1, the restart budget: a rate swinging 2900 ↔ 4200 every 6 s from
+    /// 900p crosses both lines (900p's engage 2965, 720p's recover 3953). Old code
+    /// (24ad172a): down and back up every cycle, about 10 restarts a minute. Now the first
+    /// up after a down waits until the down is `min_step_s` (10 s) old, so a cycle takes at
+    /// least `min_step_s + STEP_SETTLE + RATE_CONFIRM` (14 s): 7 steps in the minute, every
+    /// down at least 14 s after the one before. A down after an up stays prompt
+    /// (`STEP_SETTLE` + `RATE_CONFIRM`).
+    #[test]
+    fn a_slow_oscillation_across_the_band_is_bounded() {
+        let t = Instant::now();
+        let mut p = rate_planner(LadderOrder::ResFirst, false, 120, t);
+        assert_eq!(
+            rates(&mut p, t, 0, 2, |_| 3000.0),
+            vec![(1000, "res->2".to_string())]
+        );
+        let steps = rates(&mut p, t, 4000, 60, |ms| {
+            if ((ms - 4000) / 6000) % 2 == 0 {
+                2900.0
+            } else {
+                4200.0
+            }
+        });
+        let at = |ms: u64, s: &str| (ms, s.to_string());
+        assert_eq!(
+            steps,
+            vec![
+                at(5000, "res->3"),
+                at(15_000, "res->2"),
+                at(19_000, "res->3"),
+                at(35_000, "res->2"),
+                at(41_000, "res->3"),
+                at(51_000, "res->2"),
+                at(55_000, "res->3"),
+            ]
+        );
+        let downs: Vec<u64> = steps
+            .iter()
+            .filter(|s| s.1 == "res->3")
+            .map(|s| s.0)
+            .collect();
+        assert!(downs.windows(2).all(|d| d[1] - d[0] >= 14_000), "{downs:?}");
+    }
+
+    /// #1376 review R1: the up hold holds the decision, not the signal. From 720p a link at
+    /// 4200 (over 720p's recover line 3953) with a 200 ms dip to 3900 every 9 s steps back
+    /// up once. Old code (bf9c1e69): the 10 s was an unbroken run, so the dips reset it and
+    /// the session stayed at 720p for good.
+    #[test]
+    fn a_dip_inside_the_up_hold_does_not_strand_the_rung() {
+        let t = Instant::now();
+        let mut p = rate_planner(LadderOrder::ResFirst, false, 120, t);
+        assert_eq!(
+            rates(&mut p, t, 0, 2, |_| 1000.0),
+            vec![(1000, "res->3".to_string())]
+        );
+        let steps = rates(&mut p, t, 4000, 46, |ms| {
+            if (ms - 4000) % 9200 >= 9000 {
+                3900.0
+            } else {
+                4200.0
+            }
+        });
+        assert_eq!(steps, vec![(11_000, "res->2".to_string())]);
+    }
+
+    /// No flap: a rate swinging 3000 ↔ 4500 every second sits inside 900p's band (engage
+    /// 2965, recover to 1080p 5196), so the rung holds for a minute.
+    #[test]
+    fn a_rate_oscillating_inside_the_band_holds_the_rung() {
+        let t = Instant::now();
+        let mut p = rate_planner(LadderOrder::ResFirst, false, 120, t);
+        assert_eq!(
+            rates(&mut p, t, 0, 2, |_| 3000.0),
+            vec![(1000, "res->2".to_string())]
+        );
+        let steps = rates(&mut p, t, 2000, 60, |ms| {
+            if (ms / 1000) % 2 == 0 {
+                3000.0
+            } else {
+                4500.0
+            }
+        });
+        assert!(steps.is_empty(), "{steps:?}");
+    }
+
+    /// The restart's pause and keyframe burst are not the link: nothing counts for
+    /// `STEP_SETTLE` after a step of either lever or a manual resize. Old code: a window
+    /// step only held the windows (`settle_windows`, `min_step_s`).
+    #[test]
+    fn no_rate_step_inside_the_settle_after_a_step_or_a_resize() {
+        let t = Instant::now();
+        let mut p = rate_planner(LadderOrder::ResFirst, false, 120, t);
+        assert_eq!(
+            rates(&mut p, t, 0, 2, |_| 3000.0),
+            vec![(1000, "res->2".to_string())]
+        );
+        assert!(rates(&mut p, t, 2000, 2, |_| 1000.0).is_empty(), "settle");
+        assert_eq!(
+            rates(&mut p, t, 4000, 2, |_| 1000.0),
+            vec![(5000, "res->3".to_string())]
+        );
+
+        let mut p = rate_planner(LadderOrder::ResFirst, false, 120, t);
+        p.sync_res((1600, 900));
+        p.mark_resized(t + Duration::from_millis(500));
+        assert!(p.settling(t + Duration::from_millis(3400)));
+        assert!(
+            rates(&mut p, t, 0, 3, |_| 1000.0).is_empty(),
+            "a manual resize settles too"
+        );
+        assert_eq!(
+            rates(&mut p, t, 3500, 2, |_| 1000.0),
+            vec![(4500, "res->3".to_string())]
+        );
+    }
+
+    /// The order keeps its meaning: `hybrid` stops at the pivot while 120 → 60 is still to
+    /// come, `fps_first` leaves the frame rate to the windows first, and a pin holds the step
+    /// (not the run: released, it steps at once).
+    #[test]
+    fn the_rate_follows_the_ladder_order() {
+        let t = Instant::now();
+        let down = |order, fps_on, fps| {
+            let mut p = rate_planner(order, fps_on, fps, t);
+            rates(&mut p, t, 0, 2, |_| 500.0);
+            p.res_rung()
+        };
+        assert_eq!(
+            down(LadderOrder::Hybrid, true, 120),
+            1,
+            "stops at the pivot"
+        );
+        assert_eq!(
+            down(LadderOrder::Hybrid, true, 60),
+            3,
+            "no frame-rate step to wait for"
+        );
+        assert_eq!(
+            down(LadderOrder::FpsFirst, true, 120),
+            0,
+            "the frame rate goes first"
+        );
+        assert_eq!(
+            down(LadderOrder::FpsFirst, false, 120),
+            3,
+            "no fps rung: pixels"
+        );
+
+        let mut p = rate_planner(LadderOrder::ResFirst, true, 120, t);
+        p.set_pinned(true);
+        assert!(
+            rates(&mut p, t, 0, 3, |_| 500.0).is_empty(),
+            "a human pin holds"
+        );
+        p.set_pinned(false);
+        assert_eq!(
+            rates(&mut p, t, 3000, 1, |_| 500.0),
+            vec![(3000, "res->3".to_string())]
+        );
+
+        // Up under `res_first` with the frame rate down: the windows bring 120 back first.
+        let w = |s: u64| t + Duration::from_secs(s);
+        let mut p = rate_planner(LadderOrder::ResFirst, true, 120, t);
+        rates(&mut p, t, 0, 2, |_| 500.0);
+        let fps = p.observe(AdaptationState::NetworkCongested, 1061.0, 1061.0, w(10));
+        assert_eq!(fps.map(label), Some("fps->60".into()));
+        assert!(
+            rates(&mut p, t, 14_000, 3, |_| 9000.0).is_empty(),
+            "fps recovers first"
+        );
+        let ups: Vec<_> = [20, 25, 30]
+            .into_iter()
+            .filter_map(|s| {
+                p.observe(AdaptationState::Healthy, 9000.0, 1000.0, w(s))
+                    .map(|x| (s, label(x)))
+            })
+            .collect();
+        assert_eq!(
+            ups,
+            vec![(30, "fps->120".to_string())],
+            "the window path's settle and dwell"
+        );
+        assert_eq!(
+            rates(&mut p, t, 34_000, 2, |_| 9000.0),
+            vec![(35_000, "res->0".to_string())],
+            "the down is long past `min_step_s`: `RATE_CONFIRM`"
+        );
+    }
+
+    /// On WebTransport the windows move the frame rate only: a congested window that would
+    /// step the resolution rung on WebRTC (`emergency_steps_down_immediately_at_the_floor`)
+    /// holds, and the planner's rung is the rate's.
+    #[test]
+    fn per_report_windows_never_move_the_resolution_rung() {
+        let t = Instant::now();
+        let mut p = rate_planner(LadderOrder::ResFirst, false, 120, t);
+        for s in (5..60).step_by(5) {
+            assert_eq!(
+                p.observe(
+                    AdaptationState::NetworkCongested,
+                    3000.0,
+                    3000.0,
+                    later(t, s)
+                ),
+                None
+            );
+        }
+        assert_eq!(p.res_rung(), 0);
+        let mut p = planner(LadderOrder::ResFirst, false, 120, t);
+        assert!(
+            p.observe(
+                AdaptationState::NetworkCongested,
+                3000.0,
+                3000.0,
+                later(t, 5)
+            )
+            .is_some(),
+            "WebRTC steps"
         );
     }
 }

@@ -30,6 +30,11 @@ expect cp control-plane/internal/auth/auth.go control-plane/migrations/0001_x.up
 expect cp deploy/Dockerfile.control.prod
 expect cp deploy/enroll-host.sh
 expect cp deploy/control-entrypoint.sh
+# The control image's web stage copies only the PyroWave manifest, because
+# `tsc -b` typechecks the decoder test that imports it (#1105, #1267).
+expect cp testdata/pyrowave/manifest.json
+# A golden bitstream is read at test time and never reaches the image.
+expect - testdata/pyrowave/detail_200x114_hi.pwv1
 expect na,rec node-agent/src/main.rs
 expect na,rec node-agent/crates/quasar-recovery/src/lib.rs
 expect na deploy/Dockerfile.vulkan

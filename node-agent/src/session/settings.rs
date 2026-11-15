@@ -915,7 +915,7 @@ mod tests {
         assert_eq!(l.order, crate::session::ladder::LadderOrder::Hybrid);
         assert_eq!(l.max_bias, 2);
         assert!((l.res.exponent - 0.75).abs() < 1e-9);
-        assert_eq!(l.res.min_height, 720);
+        assert_eq!(l.res.min_height, 360);
     }
 
     #[test]

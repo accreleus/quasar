@@ -66,6 +66,8 @@ func Catalog() []Knob {
 		{Key: "abr_ladder_max_bias", Type: TypeInt, Default: float64(2), Min: f(0), Max: f(255), Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_MAX_BIAS"},
 		{Key: "abr_ladder_engage_dwell", Type: TypeInt, Default: float64(2), Min: f(1), Max: f(255), Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_ENGAGE_DWELL"},
 		{Key: "abr_ladder_recover_dwell", Type: TypeInt, Default: float64(2), Min: f(1), Max: f(255), Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_RECOVER_DWELL"},
+		// Default false is WebRTC's: the agent turns an unset rung on, res_first, for a
+		// session assigned WebTransport (#1375, ladder.rs LadderSettings::for_session).
 		{Key: "abr_ladder_resolution", Type: TypeBool, Default: false, Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_RESOLUTION"},
 		{Key: "abr_ladder_res_exponent", Type: TypeFloat, Default: 0.75, Min: f(0.5), Max: f(1.0), Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_RES_EXPONENT"},
 		{Key: "abr_ladder_res_engage_frac", Type: TypeFloat, Default: 0.6, Min: f(0.2), Max: f(0.95), Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_RES_ENGAGE_FRAC"},
@@ -75,7 +77,7 @@ func Catalog() []Knob {
 		// (docs/reports/2026-08-18-overnight-optimisation/t3-ladder-step-recovery.md).
 		{Key: "abr_ladder_res_recover_dwell", Type: TypeInt, Default: float64(2), Min: f(1), Max: f(60), Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_RES_RECOVER_DWELL"},
 		{Key: "abr_ladder_res_min_step_s", Type: TypeInt, Default: float64(10), Min: f(5), Max: f(120), Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_RES_MIN_STEP_S"},
-		{Key: "abr_ladder_res_min_height", Type: TypeInt, Default: float64(720), Min: f(360), Max: f(2160), Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_RES_MIN_HEIGHT"},
+		{Key: "abr_ladder_res_min_height", Type: TypeInt, Default: float64(360), Min: f(360), Max: f(2160), Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_RES_MIN_HEIGHT"},
 		{Key: "abr_ladder_fps", Type: TypeBool, Default: false, Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_FPS"},
 		{Key: "abr_ladder_floor_follows_rung", Type: TypeBool, Default: true, Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_FLOOR_FOLLOWS_RUNG"},
 		{Key: "abr_ladder_order", Type: TypeEnum, Default: "hybrid", Enum: []string{"res_first", "fps_first", "hybrid"}, Class: ClassLive, EnvVar: "QUASAR_ABR_LADDER_ORDER"},

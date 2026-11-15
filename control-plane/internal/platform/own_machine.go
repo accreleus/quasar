@@ -198,6 +198,7 @@ func NewOwnMachineReader(socketPath string) *OwnMachineReader {
 	return &OwnMachineReader{
 		socket: socketPath,
 		TTL:    DefaultInstallModeTTL,
+		// Exception to internal/outbound: dials only the local recovery-actor unix socket.
 		http: &http.Client{
 			Timeout: ownMachineReadTimeout,
 			Transport: &http.Transport{

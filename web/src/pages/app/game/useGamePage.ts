@@ -231,7 +231,8 @@ export function useGamePage(app: App) {
       // Remember what was launched, unless it is just the default selection.
       const seed = model.seed;
       const isSeed = chosen.codec === seed.codec && chosen.fps === seed.fps && chosen.height === seed.height;
-      if (token) {
+      // Game settings have no field for PyroWave: saving the pick would save it as Auto.
+      if (token && !r.wantsPyroWave) {
         const write = isSeed
           ? saved
             ? clearGameSettings(token, app.id)
@@ -240,7 +241,7 @@ export function useGamePage(app: App) {
         void write?.catch(() => {});
       }
       if (oneClick && !change) void launch.launchApp(app);
-      else void launch.launchApp(app, profileId, wireCodec);
+      else void launch.launchApp(app, profileId, wireCodec, r.wantsPyroWave);
     },
     [model, selection.committed, remembered, locked, token, saved, app, launch, oneClick],
   );

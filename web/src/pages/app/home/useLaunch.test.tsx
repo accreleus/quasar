@@ -41,6 +41,56 @@ function renderLaunch() {
   );
 }
 
+describe("useLaunch PyroWave request", () => {
+  const launched = {
+    session: { id: "new-1", stream: { width: 1920, height: 1080, fps: 60, codec: "h264" } },
+    signaling: { url: "ws://x", token: "t" },
+  } as never;
+  const body = () => vi.mocked(libraryApi.launchSession).mock.calls[0][1];
+  beforeEach(() => {
+    sessionStorage.clear();
+    vi.mocked(libraryApi.launchSession).mockResolvedValue(launched);
+  });
+  afterEach(() => {
+    sessionStorage.clear();
+    vi.resetAllMocks();
+  });
+
+  it("asks for pyrowave and sends no codec when the pick says so", async () => {
+    const { result } = renderLaunch();
+    await act(async () => {
+      await result.current.launchApp(app, "1080p60", undefined, true);
+    });
+    expect(body()).toEqual({ app_id: "app-1", mic: true, profile_id: "1080p60", pyrowave: true });
+  });
+
+  it("does not ask for it on an ordinary launch", async () => {
+    const { result } = renderLaunch();
+    await act(async () => {
+      await result.current.launchApp(app, "1080p60", "h264");
+    });
+    expect(body()).not.toHaveProperty("pyrowave");
+  });
+
+  it("lets an explicit standard codec win over the remembered ?codec=pyrowave switch", async () => {
+    sessionStorage.setItem("quasar.switch.codec", "pyrowave");
+    const { result } = renderLaunch();
+    await act(async () => {
+      await result.current.launchApp(app, "1080p60", "av1");
+    });
+    expect(body()).toEqual({ app_id: "app-1", mic: true, profile_id: "1080p60", stream: { codec: "av1" } });
+  });
+
+  it("still applies the remembered ?codec=pyrowave switch to an Auto launch", async () => {
+    sessionStorage.setItem("quasar.switch.codec", "pyrowave");
+    const { result } = renderLaunch();
+    await act(async () => {
+      await result.current.launchApp(app, "1080p60");
+    });
+    expect(body()).toMatchObject({ pyrowave: true });
+  });
+});
+
 describe("useLaunch waiting toast", () => {
   afterEach(() => vi.resetAllMocks());
 
@@ -71,6 +121,40 @@ describe("useLaunch waiting toast", () => {
 
     expect(await screen.findByText("Waiting for a slot to free up…")).toBeTruthy();
     unmount();
+  });
+});
+
+describe("useLaunch while the parked Steam restarts (#1163)", () => {
+  afterEach(() => vi.resetAllMocks());
+
+  it("retries quietly in the ordinary launching state, with no toast, until accepted", async () => {
+    const launched = {
+      session: { id: "new-1", stream: { width: 1920, height: 1080, fps: 60, codec: "h264" } },
+      signaling: { url: "ws://x", token: "t" },
+    } as never;
+    vi.mocked(libraryApi.launchSession)
+      .mockRejectedValueOnce(
+        new ApiError(503, "capacity_exhausted", "restarting", undefined, undefined, 0, "steam_restarting"),
+      )
+      .mockResolvedValueOnce(launched);
+    const { result } = renderLaunch();
+
+    act(() => {
+      void result.current.launchApp(app, "1080p60");
+    });
+
+    await waitFor(() => expect(libraryApi.launchSession).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(result.current.launching).toBe(true));
+    expect(result.current.waitingForSlot).toBe(false);
+    expect(result.current.waitingReason).toBeNull();
+    expect(screen.queryByText(/Waiting for a slot/)).toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
+
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith("/app/session/new-1", expect.anything()), {
+      timeout: 3000,
+    });
+    expect(libraryApi.launchSession).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText(/Waiting for a slot/)).toBeNull();
   });
 });
 
@@ -396,5 +480,135 @@ describe("useLaunch full screen on Play (#647)", () => {
     });
     expect(document.documentElement.requestFullscreen).not.toHaveBeenCalled();
     expect(order).toEqual([]);
+  });
+
+  /** A launch that lands: the response the page navigates with. */
+  const landed = {
+    session: { id: "new-1", stream: { width: 1920, height: 1080, fps: 60, codec: "h264" } },
+    signaling: { url: "ws://x", token: "t" },
+  } as never;
+
+  /** The click's own grant, not a pre-set flag: the browser sets fullscreenElement
+   *  when the request settles. */
+  function grantAtTheClick() {
+    document.documentElement.requestFullscreen = vi.fn(() => {
+      fsEl = document.documentElement;
+      return Promise.resolve();
+    });
+  }
+
+  it("a launch that lands hands the full screen to the session page", async () => {
+    // The route change unmounts the home page. What Play spent belongs to the session
+    // page from then on, so the unmount must leave it: leaving it here takes the
+    // player out of full screen the moment the picture arrives, and the reveal then
+    // offers "Click to play" instead of capturing (#647).
+    grantAtTheClick();
+    vi.mocked(libraryApi.launchSession).mockResolvedValue(landed);
+    const { result, unmount } = renderLaunch();
+    await act(async () => {
+      await result.current.launchApp(app, "1080p60");
+    });
+    expect(navigate).toHaveBeenCalledWith("/app/session/new-1", expect.anything());
+
+    unmount();
+    await act(async () => {});
+    expect(document.exitFullscreen).not.toHaveBeenCalled();
+  });
+
+  it("a launch that lands after a capacity retry hands it over the same way", async () => {
+    // The retry wait's own timer (#494) must be clear before the route change too: the
+    // unmount treats a live one as an abandoned launch and leaves the full screen.
+    grantAtTheClick();
+    vi.useFakeTimers();
+    vi.mocked(libraryApi.launchSession)
+      .mockRejectedValueOnce(new ApiError(503, "capacity_exhausted", "full right now", undefined, undefined, 1))
+      .mockResolvedValueOnce(landed);
+    const { result, unmount } = renderLaunch();
+    await act(async () => {
+      void result.current.launchApp(app, "1080p60");
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(libraryApi.launchSession).toHaveBeenCalledTimes(2);
+    expect(navigate).toHaveBeenCalledWith("/app/session/new-1", expect.anything());
+
+    unmount();
+    await act(async () => {});
+    expect(document.exitFullscreen).not.toHaveBeenCalled();
+  });
+});
+
+describe("useLaunch carries the URL switches from the library to a game page (#1216)", () => {
+  const launched = {
+    session: { id: "new-1", stream: { width: 1920, height: 1080, fps: 60, codec: "h264" } },
+    signaling: { url: "ws://x", token: "t" },
+  } as never;
+
+  // The switches are read from window.location at launch and remembered from the router's
+  // location, so a page at `url` sets both, as the browser router does.
+  function atUrl(url: string) {
+    window.history.replaceState({}, "", url);
+    const { result, unmount } = renderHook(
+      () =>
+        useLaunch({
+          token: "tok",
+          apps: [app],
+          liveSession: null,
+          canDecodeH264: true,
+          fetchProfiles: async () => null,
+          revealDetail: () => {},
+        }),
+      {
+        wrapper: ({ children }: { children: ReactNode }) => (
+          <MemoryRouter initialEntries={[url]}>
+            <ToastProvider>{children}</ToastProvider>
+          </MemoryRouter>
+        ),
+      },
+    );
+    return { result, unmount };
+  }
+
+  async function launchedRequest(url: string) {
+    const page = atUrl(url);
+    await act(async () => {
+      await page.result.current.launchApp(app, "1080p60");
+    });
+    page.unmount();
+    return vi.mocked(libraryApi.launchSession).mock.lastCall?.[1];
+  }
+
+  beforeEach(() => {
+    sessionStorage.clear();
+    vi.mocked(libraryApi.launchSession).mockResolvedValue(launched);
+  });
+  afterEach(() => {
+    vi.resetAllMocks();
+    window.history.replaceState({}, "", "/");
+  });
+
+  it("keeps ?codec=pyrowave set on the library page for a launch from the game page", async () => {
+    atUrl("/app?codec=pyrowave").unmount();
+    expect(await launchedRequest("/app/game/app-1")).toMatchObject({ pyrowave: true });
+  });
+
+  it("keeps ?transport= set on the library page for a launch from the game page", async () => {
+    atUrl("/app?transport=webtransport").unmount();
+    expect(await launchedRequest("/app/game/app-1")).toMatchObject({ transport: "webtransport" });
+  });
+
+  it("lets an explicit value in the game page URL replace the remembered one", async () => {
+    atUrl("/app?codec=pyrowave&transport=webtransport").unmount();
+    const req = await launchedRequest("/app/game/app-1?codec=h264&transport=webrtc");
+    expect(req).toMatchObject({ transport: "webrtc" });
+    expect(req).not.toHaveProperty("pyrowave");
+  });
+
+  it("sends neither switch from a fresh tab", async () => {
+    const req = await launchedRequest("/app/game/app-1");
+    expect(req).not.toHaveProperty("pyrowave");
+    expect(req).not.toHaveProperty("transport");
   });
 });

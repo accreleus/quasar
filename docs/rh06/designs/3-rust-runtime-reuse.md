@@ -6,7 +6,7 @@ D17 cut, D6 = option (a), Postgres created but never updated, Portainer dropped,
 database first-class, D7 restore is one operator command, D12 kept).
 
 Conventions. **[F]** = a fact about today's code, with `path:line`. **[P]** = a proposal in
-this design. Vocabulary is `CONTEXT.md`'s (Platform service, Service owner, External manager,
+this design. Vocabulary is `GLOSSARY.md`'s (Platform service, Service owner, External manager,
 Seed, Recovery actor, Replacement, Attempt, Fleet run, Preflight, Install mode, Host identity,
 Enrollment, Legacy container) plus the architecture vocabulary (Module, Interface,
 Implementation, Depth, Seam, Adapter, Leverage, Locality). Hosts are named by role only.
@@ -1033,7 +1033,7 @@ executor is new code either way, Rust is cheaper overall and gives one engine vo
 ## 12. Slice order (vertical tracer bullets)
 
 0. **Contract + ADR ticket** (Tier 3, blocks all implementation, like RH-05's #334): §9 text,
-   ADR 0007, CONTEXT terms (Service template; Kept container; Handover). **Design ticket**
+   ADR 0007, GLOSSARY terms (Service template; Kept container; Handover). **Design ticket**
    (D16): mockups for service inventory, Add-host tabs, "must update before it can be
    managed", restore/uninstall prompts, developer apply.
 1. **Extract `quasar-runtime`** (pure refactor; agent behaviour identical; `make test-rust`

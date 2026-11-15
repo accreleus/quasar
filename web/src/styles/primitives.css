@@ -1300,7 +1300,8 @@ table.qtable {
   font-size: var(--t-xs);
 }
 
-/* A toned sub-line keeps its tone: `.qtable .sub` out-ranks the bare `.tone-*`. */
+/* A toned cell keeps its tone: `.qtable .primary` and `.qtable .sub` out-rank the bare `.tone-*`. */
+.qtable .primary.tone-warning { color: var(--warning-text); }
 .qtable .sub.tone-danger { color: var(--danger-text); }
 .qtable .sub.tone-warning { color: var(--warning-text); }
 .qtable .sub.tone-info { color: var(--info-text); }

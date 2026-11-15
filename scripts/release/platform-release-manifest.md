@@ -1,6 +1,6 @@
 # The platform release manifest
 
-The machine-readable half of a stable **platform release** (`CONTEXT.md`): which
+The machine-readable half of a stable **platform release** (`GLOSSARY.md`): which
 component images the release contains, by digest, and the commit they were built
 from. It is attached as an asset to the GitHub Release for a `vX.Y.Z` tag, from
 the same workflow run that built and promoted those images, so the human-readable
@@ -87,7 +87,7 @@ format 2 adds:
 | `components` | array | exactly three, in this order | `control-plane`, `node-agent`, `recovery-actor`. The image of `recovery-actor` is `<namespace>/quasar-recovery`; the seed is a mode of the same image, so it is not a component. |
 | `floor` | array | exactly two, in this order | `node-agent`, then `recovery-actor`. |
 | `floor[].name` | string | `node-agent`, then `recovery-actor` | Fixed set, fixed order. |
-| `floor[].version` | string | the grammar of `version`; must not order above `version` by SemVer precedence | The oldest release of that component this release's control plane still manages (`CONTEXT.md` "Floor"). |
+| `floor[].version` | string | the grammar of `version`; must not order above `version` by SemVer precedence | The oldest release of that component this release's control plane still manages (`GLOSSARY.md` "Floor"). |
 
 No other keys, at either level.
 

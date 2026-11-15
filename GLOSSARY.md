@@ -1,4 +1,4 @@
-# CONTEXT
+# Glossary
 
 The domain glossary for Quasar. One entry per term the code and the docs both
 lean on. Use these words exactly; the "avoid" notes are there because the
@@ -120,6 +120,15 @@ it out; admins see it.
 _Avoid_: "warm session", "idle session", "pre-launch" (not a session the user
 started).
 
+**Adoption** — a Steam launch taking over the parked session's running runtime
+instead of starting a container of its own. The control plane checks the claim in
+the launch's scheduling transaction, the agent adopts at `session_start`, the play
+session records `adopt_session_id` and the parked row goes `stopped` with
+`state_detail = "claimed"`. An agent that no longer holds that runtime builds the
+session fresh, so an adoption never fails because the park was lost. _Avoid_:
+"resume" (the adopting session is new: it takes the runtime and the parked home's
+hold, never the parked session's stream).
+
 **Missing** — the state of a library observation (one game a scan saw installed
 for one user on one host) that the last complete scan of that home did not
 list. A missing game still counts as installed: its tile, entitlement and any
@@ -158,6 +167,14 @@ that exact identity. _Avoid_: "retry count" (a rolled-back swap relaunches the
 previous app under the previous generation's name; the counter is a name, not
 a tally of what is running), and the unrelated policy epoch in `source_policy`.
 
+**Quick switch** — swapping the app a running session is running, from its Switch
+game rail (`POST /v1/sessions/{id}/swap`), without ending the session or its
+stream. Two tiles of one Steam parent switch inside the running Steam when the
+agent can (`in_place: true`); anything else replaces the container with a new
+generation, and the switch screen stays up until the new app is on screen — its
+window for a game, its first frame otherwise. _Avoid_: "Hot Loading" (that is
+parked Steam, a session with no viewer), "restart" (the session keeps running).
+
 **Intentional stop** — the agent's own teardown of a generation (a swap's step
 2, a session stop, a drop). The marker is set on the container handle BEFORE
 the engine sees the stop, so an exit the observer sees afterwards is discarded
@@ -184,7 +201,44 @@ name that merely contains the prefix, an API-owned application, an audio sidecar
 prove is left to the next boot rather than retried immediately. Removal is
 boot-only, behind the persistent owner lease. _Avoid_: "orphan" (the old CLI
 sweep's word; it suggested anything unclaimed was ours to delete), and "adoption"
-— nothing here resumes or observes a prior session.
+for a leftover container — *adoption* is a Steam launch taking a parked session's
+runtime, and nothing in this sweep resumes or observes a prior session.
+
+## Transports
+
+**Transport** — how a session's media reaches the client: the implementation of the
+transport slot between the encoded frame and the client. Two exist: `webrtc` (the
+default and the guaranteed floor) and `webtransport` (experimental, opt-in). The stream
+plan chooses it once, at launch, after the codec. _Avoid_: "protocol" and "connection
+type" for this meaning.
+
+**Transport fallback** — a session on WebTransport moving to WebRTC on its own because
+the WebTransport connect failed, was refused, or the stream died. It keeps the session's standard codec
+(a PyroWave session switches to it, since PyroWave runs only on WebTransport), and the session's
+details say that it happened and why. _Avoid_:
+"downgrade" (that is a rung or codec step).
+
+**WebTransport endpoint** — the one opaque URL through which a browser reaches a host's
+WebTransport listener: **direct** (the agent's own listener, certificate pinned by hash)
+or **edge** (an admin-set public URL through an edge proxy, publicly trusted
+certificate). Only a host with a working endpoint is offered WebTransport.
+
+**Edge proxy** — an operator's own reverse proxy (for example Caddy) sitting in front of
+the node agent's listener and terminating the browser's public certificate. Quasar does
+not run one. _Avoid_: "relay" (a Quasar-run server that carries media for peers that
+cannot connect, planned, is a different thing).
+
+**Active rectangle** — on a WebTransport session that moves resolution inside a fixed coded
+size, the part of each encoded frame that holds the game picture; the rest is padding the client
+never shows. Inside one coded size it changes per frame without a configuration change; a rung
+restart resets it to the full frame (ADR 0014). _Avoid_: "viewport", "crop" (the crop is what the
+presenter does with it), "`visibleRect`" (WebCodecs' name; on this design it is the whole coded
+frame).
+
+**Presenter** — the client-side component that draws decoded frames to the screen and owns
+the scaling modes and the present-cadence readout (**Present cadence**, under Stream health); on WebTransport it is a WebGPU
+canvas Quasar owns, in place of the browser's `<video>` element. _Avoid_: "renderer",
+"player".
 
 ## Stream health
 
@@ -335,6 +389,34 @@ no numbering and no stability guarantee to any client — it is for humans and
 agents reading logs, never for a wire contract), "log tag" (that reads like the
 tracing `target`, which is the module path and a different axis).
 
+## The end-to-end test suite
+
+**Scenario** — one scripted exercise of a stream with its own pass rule, run with no
+model in the loop: a stream hold, a transport fallback, an input pass. It takes
+parameters (transport, codec, profile). Also the name quasar-bench files its run under.
+
+**Plan** — an ordered list of scenarios with their parameters, run as one command.
+Not the *stream plan* (a session's post-placement decision).
+
+**Criterion** — one named, checkable part of a scenario's pass rule, recorded with the
+observed and the expected value; `pass` is true, false, or null when it could not be
+judged. Not a *verdict* (the stream-health judgement) and not a *readiness check*.
+
+**Suite run** — one execution of a plan against one stack from one test client.
+
+**Run bundle** — the self-describing directory a suite run leaves: what was run, on
+which builds, from which client, and everything recorded, in a versioned format
+(`docs/testing-e2e-suite.md`). It has a client half and a host half, joined by session
+id. Not the *diagnostic bundle*, which is one session's trace and which it contains.
+_Avoid_: bare "bundle".
+
+**Test client** — the machine and client software (a browser now, the native client
+later) that receives the stream in a suite run. Distinct from the host that sends it.
+
+**Reference app** — the app a scenario streams when the picture must be attributable
+and repeatable: it stamps a machine-readable marker into every frame (today the bench
+app described in `docs/testing-bench-mode.md`).
+
 ## Images
 
 **Platform image** — a container image that runs Quasar itself, or builds it:
@@ -388,6 +470,29 @@ signature" and "manifest verification" (nothing is verified), "manifest digest"
 on its own when the ref/commit/URL are also meant (the digest is one field of
 the record).
 
+## Compatibility tools
+
+**Library provider** — a source of games a host can launch (Steam today; Heroic or a
+Lutris-style launcher later) that discovers its own library and binds a compatibility tool its
+own way. _Avoid_: "store", "launcher" for this meaning.
+
+**Compatibility tool** — a build that runs a Windows game on a Linux host: today a Proton,
+Valve's own or GE-Proton. A host resource with an identity (kind, family, version or tag), a
+source and a per-host install state; it knows nothing of any provider. A tool is named by the key
+in its own `compatibilitytool.vdf` (the name Steam stores), which for GE-Proton is not the release tag. _Avoid_: "Proton version"
+for the general concept, "runner".
+
+**Tool mapping** — the admin's choice of compatibility tool for one game (keyed by its Steam
+appid, applying to every user's tile of it) or, as the **fleet default**, for every Windows game
+without one. It fills only where the user has chosen nothing in Steam. _Avoid_: "override".
+
+**Forced mapping** — a tool mapping marked so the admin's choice wins over a tool the user
+picked inside Steam. _Avoid_: "locked".
+
+**Recommended tool list** — the GE-Proton releases shipped with each Quasar release, each
+with its pinned digest, so choosing one needs no checksum fetch. _Avoid_: "allowlist" (an
+admin can add any other release tag, verified against its published checksum).
+
 ## Host management (RH05 proposal)
 
 **Setting source** — how a supported host setting is chosen: Automatic,
@@ -423,6 +528,26 @@ _Avoid_: "downloaded" when additional preparation is required.
 
 **Home template** — an authorized prepared app home from which a new empty user
 home can be initialized. Existing user homes are preserved. _Avoid_: "backup".
+
+## Ultra-low latency (PyroWave)
+
+**Ultra-low latency (PyroWave)** — the user-facing name of the PyroWave stream: the launch asks
+for it with `?codec=pyrowave` on the library URL (in 0.6 the only way in; the Launch options Codec
+entry that sends the same `pyrowave: true` arrives with #1060), and a profile setting an admin makes
+(Off / Allow / Prefer when possible, through the admin launch-profile API for now) decides whether it
+may run. It applies at launch, in a browser with WebGPU and on a
+WebTransport session whose QUIC round trip the agent measures as local; on a `prefer` profile an
+Auto launch may get it by the Auto rule. Otherwise the session streams its standard codec and says
+why. _Avoid_: "PyroWave mode" in the UI, "LAN mode", "Ultra-low latency (LAN)".
+
+**PyroWave** — the intra-only wavelet codec behind Ultra-low latency (PyroWave): encoded on the
+host GPU in Vulkan compute, decoded in the browser in WebGPU, carried only on WebTransport.
+It is a wire codec (`pyrowave`) beside `h264`, `h265` and `av1`, never a rung of a chain and
+never chosen automatically over the internet.
+
+**Block concealment** — how a PyroWave stream absorbs loss: a lost 32x32 block is filled
+from the same block of the last frame that had it, so loss is a brief local smear, never a
+freeze or a keyframe wait. A block the encoder never sent is zero, not lost.
 
 ## Host readiness
 

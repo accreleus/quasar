@@ -1,5 +1,6 @@
 //! GStreamer glue for the AS-03 adaptive-bitrate loop: arms `rtpgccbwe` on the
-//! webrtcbin send path, runs the pure `abr::Governor` on each estimate, and applies
+//! webrtcbin send path (or takes a WebTransport client's feedback estimate,
+//! [`feedback_abr`]), runs the pure `abr::Governor` on each estimate, and applies
 //! retargets to the live encoder (bitrate + single-frame VBV/CPB). Decision logic is
 //! the pure half in `crate::session::abr`.
 
@@ -18,6 +19,9 @@ use super::encoders::{cpb_size_kbits, is_mutable_playing};
 use super::scale_stage::ScaleStage;
 use super::TraceTx;
 use crate::session::Codec;
+
+/// WebRTC's estimator, by its `AbrLoop::source` name.
+const RTPGCCBWE: &str = "rtpgccbwe";
 
 /// The armed ABR control loop: one [`abr::Governor`] plus the retarget side-effects
 /// (encoder write + setpoint telemetry), driven from both observation sources — the
@@ -51,9 +55,32 @@ struct AbrLoop {
     bwe: Mutex<Option<glib::WeakRef<gst::Element>>>,
     /// One-shot latch for the "estimator handle is gone" warning.
     bwe_warned: std::sync::atomic::AtomicBool,
+    /// The estimator feeding [`AbrLoop::observe`], for the log.
+    source: &'static str,
+    /// Unique per loop: only the loop `SessionMetrics::abr_owner` names writes the
+    /// encoder, so a takeover across transports leaves one writer.
+    id: u64,
+    /// The rungs the last [`start`] armed, for [`AbrLoop::step_rung`].
+    rungs: Mutex<Option<Arc<Rungs>>>,
+    /// The governor runs the per-report loop (`AbrConfig::per_report`).
+    per_report: bool,
 }
 
+/// `AbrLoop::id`s; 0 is "no owner".
+static NEXT_LOOP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 impl AbrLoop {
+    fn owns_encoder(&self) -> bool {
+        self.metrics
+            .upgrade()
+            .is_some_and(|m| m.abr_owner() == self.id)
+    }
+
+    /// No loop owns the session's encoder.
+    fn orphaned(&self) -> bool {
+        self.metrics.upgrade().is_some_and(|m| m.abr_owner() == 0)
+    }
+
     fn fps(&self) -> u32 {
         self.fps.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -68,7 +95,7 @@ impl AbrLoop {
     fn retune_for_fps(&self, fps: u32) {
         self.fps
             .store(fps.max(1), std::sync::atomic::Ordering::Relaxed);
-        if self.mode == AbrMode::Off {
+        if self.mode == AbrMode::Off || !self.owns_encoder() {
             return;
         }
         let kbps = self.governor.lock().unwrap().setpoint_kbps();
@@ -87,7 +114,7 @@ impl AbrLoop {
     /// picture's bitrate while the ladder has already restored the bigger one. No-op in
     /// `Off` mode.
     fn set_floor(&self, floor_kbps: u32) -> u32 {
-        if self.mode == AbrMode::Off {
+        if self.mode == AbrMode::Off || !self.owns_encoder() {
             return floor_kbps;
         }
         let (old, raised, now) = {
@@ -124,6 +151,8 @@ impl AbrLoop {
                         bwe.set_property("min-bitrate", now.saturating_mul(1000));
                     }
                 }
+                // WebTransport feedback has no estimator element to bound.
+                None if self.source != RTPGCCBWE => {}
                 // Warn once per session: without the estimator bound this degrades to the
                 // run-D null result, indistinguishable in a report from a dead ladder.
                 None => {
@@ -148,14 +177,18 @@ impl AbrLoop {
 
     /// Feed one estimate (kbps) through the governor; apply any retarget to the encoder
     /// and publish it. `from_notify` marks real-feedback observations vs tick re-observes.
-    fn observe(&self, est_kbps: f64, from_notify: bool) {
+    fn observe(&self, est_kbps: f64, from_notify: bool, now: std::time::Instant) {
+        if !self.owns_encoder() {
+            return;
+        }
         if from_notify
             && !self
                 .first_estimate
                 .swap(true, std::sync::atomic::Ordering::Relaxed)
         {
             tracing::info!(
-                "AS-03 ABR live: first rtpgccbwe estimate {est_kbps:.0} kbps (TWCC feedback loop closed)"
+                "AS-03 ABR live: first {} estimate {est_kbps:.0} kbps (feedback loop closed)",
+                self.source
             );
         }
         // SPT-01: the raw pre-smoothing, pre-deadband estimate; its gap to the setpoint is
@@ -168,49 +201,173 @@ impl AbrLoop {
         let (prev_setpoint, retarget) = {
             let mut gov = self.governor.lock().unwrap();
             let prev = gov.setpoint_kbps();
-            let r = gov.observe(est_kbps, std::time::Instant::now());
+            let r = gov.observe(est_kbps, now);
             (prev, r)
         };
         // In `Off` the governor still tracks, but its output is discarded. `Protective`
         // and `Smooth` both retarget; they differ only in the pure governor's down policy.
         if let Some(new_kbps) = retarget.filter(|_| self.mode != AbrMode::Off) {
-            write_encoder_bitrate(&self.encoder, self.choice, new_kbps, self.fps());
-            if let Some(m) = self.metrics.upgrade() {
-                m.set_abr_setpoint(new_kbps);
-            }
-            tracing::info!(
-                "AS-03 ABR retarget ({:?}/{}): estimate {:.0} kbps → setpoint {} kbps (cpb {} kbit)",
-                self.choice,
-                self.codec.as_str(),
-                est_kbps,
-                new_kbps,
-                cpb_size_kbits(new_kbps, self.fps())
-            );
-            if let Some(ref tx) = self.trace_tx {
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64;
-                let reason = if new_kbps < prev_setpoint {
-                    "gcc_downshift"
-                } else {
-                    "recover"
-                };
-                let payload = serde_json::json!({
-                    "from_kbps": prev_setpoint,
-                    "to_kbps": new_kbps,
-                    "reason": reason,
-                });
-                tx.try_emit(
-                    self.session_id.clone(),
-                    TraceEvent {
-                        ts_unix_ms: ts,
-                        event: "abr.retarget",
-                        payload,
-                    },
-                );
-            }
+            self.retarget(prev_setpoint, new_kbps, est_kbps);
         }
+    }
+
+    /// Write a new setpoint to the encoder and publish it (log, metric, `abr.retarget`).
+    fn retarget(&self, prev_setpoint: u32, new_kbps: u32, est_kbps: f64) {
+        write_encoder_bitrate(&self.encoder, self.choice, new_kbps, self.fps());
+        if let Some(m) = self.metrics.upgrade() {
+            m.set_abr_setpoint(new_kbps);
+        }
+        tracing::info!(
+            "AS-03 ABR retarget ({:?}/{}): estimate {:.0} kbps → setpoint {} kbps (cpb {} kbit)",
+            self.choice,
+            self.codec.as_str(),
+            est_kbps,
+            new_kbps,
+            cpb_size_kbits(new_kbps, self.fps())
+        );
+        if let Some(ref tx) = self.trace_tx {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            let reason = if new_kbps < prev_setpoint {
+                "gcc_downshift"
+            } else {
+                "recover"
+            };
+            let payload = serde_json::json!({
+                "from_kbps": prev_setpoint,
+                "to_kbps": new_kbps,
+                "reason": reason,
+            });
+            tx.try_emit(
+                self.session_id.clone(),
+                TraceEvent {
+                    ts_unix_ms: ts,
+                    event: "abr.retarget",
+                    payload,
+                },
+            );
+        }
+    }
+
+    /// Per-report loop (#1376), once per WebTransport receiver report, after its estimate
+    /// (`webtransport::Rate::measured`), never for the silence decay: the governor's down
+    /// path, then the resolution rung. A reading taken while a step is in flight or within
+    /// `LadderPlanner::STEP_SETTLE` of a step or a manual resize is the encoder restart's
+    /// pause and keyframe burst, not the link, so it counts as none.
+    fn report(&self, reading: Option<f64>, now: std::time::Instant) {
+        if !self.per_report || self.mode == AbrMode::Off || !self.owns_encoder() {
+            return;
+        }
+        let rungs = self.rungs.lock().unwrap().clone();
+        let settling = rungs.is_some_and(|r| {
+            let st = r.state.lock().unwrap();
+            st.in_flight || st.planner.settling(now)
+        });
+        let (prev, cut) = {
+            let mut gov = self.governor.lock().unwrap();
+            let prev = gov.setpoint_kbps();
+            (prev, gov.observe_report(reading.filter(|_| !settling), now))
+        };
+        if let Some(kbps) = cut {
+            self.retarget(prev, kbps, reading.unwrap_or_default());
+        }
+        self.step_rung(now);
+    }
+
+    /// Per-report loop (#1376): the resolution rung from the governor's rate
+    /// ([`ladder::LadderPlanner::observe_rate`]), with the floor, the setpoint and the
+    /// encoder's bitrate moved in the same action. WebRTC never calls this.
+    fn step_rung(&self, now: std::time::Instant) {
+        let Some(rungs) = self.rungs.lock().unwrap().clone() else {
+            return;
+        };
+        // Lock order as the window hook's: rungs, then the governor.
+        let mut guard = rungs.state.lock().unwrap();
+        let st = &mut *guard;
+        let live = rungs.lever.current();
+        if st.in_flight {
+            // A step not negotiated yet: the encoder is restarting.
+            if live != st.planner.res_size() {
+                return;
+            }
+            st.in_flight = false;
+        }
+        if live != st.live {
+            // Every size change restarts the encoder, ours once it lands and a manual one,
+            // which `sync_res` adopts when it is a rung.
+            st.live = live;
+            st.planner.sync_res(live);
+            st.planner.mark_resized(now);
+        }
+        st.planner.set_res_retired(st.res_disabled);
+        st.planner.set_fps_retired(st.fps_disabled);
+        st.planner.set_pinned(rungs.lever.pinned());
+        let rate = self.governor.lock().unwrap().rate_kbps();
+        let Some(planned) = st.planner.observe_rate(rate, now) else {
+            return;
+        };
+        let Some(ladder::PlannedStep::Resolution(d)) = actuate(st, &*rungs.lever, planned) else {
+            return;
+        };
+        let (w, h) = st.planner.res_size();
+        let floor_now = self.set_floor(
+            rungs
+                .floors
+                .floor_for(w as i64 * h as i64, st.planner.fps_rung() > 0),
+        );
+        drop(guard);
+        let (prev, cut) = {
+            let mut gov = self.governor.lock().unwrap();
+            (gov.setpoint_kbps(), gov.cut_to(rate, now))
+        };
+        if let Some(kbps) = cut {
+            self.retarget(prev, kbps, rate);
+        }
+        let setpoint = self.governor.lock().unwrap().setpoint_kbps();
+        if let Some(m) = self.metrics.upgrade() {
+            m.set_abr_floor(if floor_now == rungs.launch_floor_kbps {
+                0
+            } else {
+                floor_now
+            });
+            m.set_ladder_res_rung(d.to);
+        }
+        tracing::info!(
+            "SPT-08 ladder step: resolution rung {} → {} ({}), {w}x{h}, rate {rate:.0} kbps; \
+             floor {floor_now} kbps, setpoint {setpoint} kbps",
+            d.from,
+            d.to,
+            d.reason.as_str()
+        );
+        if let Some(ref tx) = self.trace_tx {
+            emit_ladder_step(
+                tx,
+                &self.session_id,
+                "resolution",
+                d.from as i64,
+                d.to as i64,
+                d.reason.as_str(),
+                StepRates {
+                    setpoint_kbps: setpoint as f64,
+                    floor_kbps: floor_now as f64,
+                },
+            );
+        }
+    }
+}
+
+/// #1376: the least time between two per-report bitrate writes on `encoder` (see `arm`).
+fn report_write_gap(
+    encoder: EncoderChoice,
+    min_interval: std::time::Duration,
+) -> std::time::Duration {
+    match encoder {
+        EncoderChoice::Nvenc | EncoderChoice::Va => {
+            min_interval.max(std::time::Duration::from_secs(1))
+        }
+        EncoderChoice::Vulkan | EncoderChoice::Openh264 => std::time::Duration::ZERO,
     }
 }
 
@@ -385,10 +542,20 @@ struct ResRungState {
     /// image without `videorate` has a working resolution lever and no rate lever), and
     /// one shared flag silently took the whole ladder down with it.
     fps_disabled: bool,
-    /// Set for exactly one window after a step: `set_rung` is asynchronous, so
-    /// `lever.current()` can still report the previous size and a resync would drag the
-    /// machine back onto the rung it just left. Mirrors `ResolutionPolicy::settle_windows`.
+    /// Set by a step: `set_rung` is asynchronous, so `lever.current()` can still report the
+    /// previous size and a resync would drag the machine back onto the rung it just left.
+    /// Cleared by the next window, or by [`AbrLoop::step_rung`] once the size has landed.
     in_flight: bool,
+    /// The size [`AbrLoop::step_rung`] last saw negotiated.
+    live: (i32, i32),
+}
+
+/// The rungs one [`start`] armed, shared by its window hook and [`AbrLoop::step_rung`].
+struct Rungs {
+    state: Mutex<ResRungState>,
+    lever: Arc<EncodeResolutionLever>,
+    floors: ladder::FloorFollow,
+    launch_floor_kbps: u32,
 }
 
 /// One window of the resolution rung: resync to the live size, decide, actuate. `None`
@@ -430,6 +597,16 @@ fn observe_resolution_rung(
     st.planner.set_fps_retired(st.fps_disabled);
     st.planner.set_pinned(human_pinned);
     let planned = st.planner.observe(state, setpoint_kbps, floor_kbps, now)?;
+    actuate(st, lever, planned)
+}
+
+/// Apply a step the planner already committed. `None` when the lever refused it; that
+/// lever is then retired for the session.
+fn actuate(
+    st: &mut ResRungState,
+    lever: &dyn ResolutionLever,
+    planned: ladder::PlannedStep,
+) -> Option<ladder::PlannedStep> {
     let (what, actuated) = match planned {
         ladder::PlannedStep::Resolution(_) => {
             let (w, h) = st.planner.res_size();
@@ -547,18 +724,37 @@ pub(super) fn enable_abr(
     if let Some(why) = cfg.ladder_gate_warning() {
         tracing::warn!(token = "abr-disarmed", "{why}");
     }
-    // Both modes need ceiling/floor/fps: `Off` still bounds the rtpgccbwe estimator and
-    // still runs a Governor so the tick stall-rescue can re-observe (its output is
-    // discarded in `AbrLoop::observe`).
-    let abr_cfg = match cfg.abr_config() {
-        Some(c) => c,
-        None => {
-            let ceiling = cfg.stream.bitrate_kbps;
-            let fps = cfg.stream.fps.max(1) as u32;
-            abr::AbrConfig::new(ceiling.saturating_sub(1).max(500), ceiling, fps)
-        }
+    let host = cfg.ladder;
+    let session = host.for_session(cfg.webtransport);
+    let origin = |set: bool, changed: bool| match (set, changed) {
+        (true, _) => "set on the host",
+        (false, true) => "WebTransport default",
+        (false, false) => "default",
     };
-
+    tracing::info!(
+        token = "abr-ladder-effective",
+        "SPT-08 ladder for this session: resolution rung {} ({}), order {} ({}), \
+         fps rung {}, floor follows rung {}, abr_mode {}, transport {}",
+        if session.resolution_enabled {
+            "on"
+        } else {
+            "off"
+        },
+        origin(
+            host.resolution_set,
+            session.resolution_enabled != host.resolution_enabled
+        ),
+        session.order.as_str(),
+        origin(host.order_set, session.order != host.order),
+        if session.fps_enabled { "on" } else { "off" },
+        session.floor_follows_rung,
+        mode.as_str(),
+        if cfg.webtransport {
+            "webtransport"
+        } else {
+            "webrtc"
+        },
+    );
     if gst::ElementFactory::find("rtpgccbwe").is_none() {
         tracing::warn!(
             token = "abr-rtpgccbwe-missing",
@@ -569,6 +765,148 @@ pub(super) fn enable_abr(
         );
         return;
     }
+    let Some((abr_loop, plan)) = arm(
+        encoder,
+        cfg,
+        session_metrics,
+        trace_tx,
+        session_id,
+        lever,
+        RTPGCCBWE,
+    ) else {
+        return;
+    };
+    let choice = cfg.encoder;
+    let codec = cfg.stream.codec;
+    let fps = abr_loop.fps();
+    let floor_bps = (plan.launch_floor_kbps as u64).saturating_mul(1000);
+    let ceiling_bps = (plan.ceiling_kbps as u64).saturating_mul(1000);
+
+    // webrtcbin emits request-aux-sender once per send RTP session (one transport under
+    // max-bundle). Guard to exactly one rtpgccbwe so two estimators can never fight over
+    // the same encoder.
+    let created = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    webrtc.connect("request-aux-sender", false, move |_values| {
+        if created.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return None; // already wired — let webrtcbin use its default for any extra session
+        }
+        let bwe = match gst::ElementFactory::make("rtpgccbwe").build() {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(
+                    token = "abr-rtpgccbwe-build-failed","AS-03: rtpgccbwe build failed: {e}; ABR disarmed for this session");
+                return None;
+            }
+        };
+        // Keep the estimator's own search within the tier bounds (bps); guarded in case a
+        // future plugin rev renames these.
+        if bwe.find_property("min-bitrate").is_some() {
+            bwe.set_property("min-bitrate", floor_bps as u32);
+        }
+        if bwe.find_property("max-bitrate").is_some() {
+            bwe.set_property("max-bitrate", ceiling_bps as u32);
+        }
+        // Seed the initial estimate AT THE CEILING. Unseeded, rtpgccbwe starts at
+        // min-bitrate and ramps, throttling every session to the floor for its first ~30 s
+        // on a clean LAN (measured). Seeded, it only walks down on real congestion.
+        if bwe.find_property("estimated-bitrate").is_some() {
+            bwe.set_property("estimated-bitrate", ceiling_bps as u32);
+        }
+
+        // Weak handle, so a ladder-driven floor move can lower `min-bitrate` too (see
+        // `AbrLoop::set_floor`). Weak because the notify closure below holds a strong
+        // `Arc<AbrLoop>` — a strong handle back is a ref cycle.
+        *abr_loop.bwe.lock().unwrap() = Some(bwe.downgrade());
+
+        // Fast path: react within the 2 s hysteresis while estimates are changing.
+        let notify_loop = abr_loop.clone();
+        bwe.connect_notify(Some("estimated-bitrate"), move |bwe, _pspec| {
+            // `estimated-bitrate` is bits/s; the governor works in kbps.
+            let est_bps: u32 = bwe.property("estimated-bitrate");
+            notify_loop.observe(est_bps as f64 / 1000.0, true, std::time::Instant::now());
+        });
+        let tick_bwe = bwe.clone();
+        start(
+            &abr_loop,
+            &plan,
+            Box::new(move || tick_bwe.property::<u32>("estimated-bitrate") as f64 / 1000.0),
+        );
+        tracing::info!(
+            "AS-03 ABR armed (mode={}): rtpgccbwe → {:?} encoder, codec={}, bounds [{}, {}] kbps @ {} fps",
+            mode.as_str(),
+            choice,
+            codec.as_str(),
+            floor_bps / 1000,
+            ceiling_bps / 1000,
+            fps
+        );
+        Some(bwe.to_value())
+    });
+}
+
+/// The resolution/fps rungs' lever, config and sizes, when either rung is armed.
+type RungSeed = (
+    Arc<EncodeResolutionLever>,
+    ladder::LadderConfig,
+    Vec<(i32, i32)>,
+);
+
+/// What [`arm`] resolved for the hooks [`start`] registers: the ladder's rungs, levers and
+/// floor policy, built once per transport.
+#[derive(Clone)]
+struct Plan {
+    mode: AbrMode,
+    choice: EncoderChoice,
+    ladder_cfg: Option<ladder::LadderConfig>,
+    ladder_encoder: gst::Element,
+    base_target_usage: u32,
+    res_rung_seed: Option<RungSeed>,
+    floor_follow: ladder::FloorFollow,
+    launch_fps: i32,
+    ceiling_kbps: u32,
+    launch_floor_kbps: u32,
+    trace_tx: TraceTx,
+    session_id: String,
+    /// What a takeover from another loop writes back ([`take_over`]).
+    launch_cfg: Arc<SessionConfig>,
+    abr_cfg: abr::AbrConfig,
+    lever: Option<Arc<EncodeResolutionLever>>,
+}
+
+/// Build one transport's governor loop on `encoder`; `None` when the encoder takes no live
+/// writes. `source` names the estimator in the log. Nothing runs until [`start`].
+fn arm(
+    encoder: &gst::Element,
+    cfg: &SessionConfig,
+    session_metrics: Arc<SessionMetrics>,
+    trace_tx: TraceTx,
+    session_id: String,
+    lever: Option<Arc<EncodeResolutionLever>>,
+    source: &'static str,
+) -> Option<(Arc<AbrLoop>, Plan)> {
+    let mode = cfg.abr_mode;
+    // Both modes need ceiling/floor/fps: `Off` still bounds the rtpgccbwe estimator and
+    // still runs a Governor so the tick stall-rescue can re-observe (its output is
+    // discarded in `AbrLoop::observe`).
+    let mut abr_cfg = match cfg.abr_config() {
+        Some(c) => c,
+        None => {
+            let ceiling = cfg.stream.bitrate_kbps;
+            let fps = cfg.stream.fps.max(1) as u32;
+            abr::AbrConfig::new(ceiling.saturating_sub(1).max(500), ceiling, fps)
+        }
+    };
+    // #1376: WebTransport's receiver reports drive `smooth` per report. A live bitrate
+    // write re-initialises NVENC (the VBV write is an rc-param change) and VA (any
+    // rate-control write), each with a keyframe, so those are written at most once per
+    // `min_interval` and never more than once a second, whatever that knob says; the Vulkan
+    // encoders' write is rate-control only (`deploy/patches/vulkan/README.md`, rc-fix), and
+    // openh264enc's (`gstopenh264enc.cpp` `handle_frame`) is a `SetOption` that
+    // `WelsEncoderParamAdjust` applies without the reset that would force an IDR.
+    if source != RTPGCCBWE && mode == AbrMode::Smooth {
+        abr_cfg.per_report = Some(report_write_gap(cfg.encoder, abr_cfg.min_interval));
+    }
+
     if mode != AbrMode::Off && !encoder_abr_writable(encoder, cfg.encoder) {
         tracing::warn!(
             token = "abr-encoder-not-retargetable",
@@ -577,13 +915,11 @@ pub(super) fn enable_abr(
             mode.as_str(),
             cfg.encoder
         );
-        return;
+        return None;
     }
 
     let choice = cfg.encoder;
     let fps = abr_cfg.fps;
-    let floor_bps = (abr_cfg.floor_kbps as u64).saturating_mul(1000);
-    let ceiling_bps = (abr_cfg.ceiling_kbps as u64).saturating_mul(1000);
     // SPT-08 ladder config: `Some` in Smooth mode whenever any rung is armed (#502;
     // `abr_ladder=false` only retires the speed-bias rung, via `max_bias = 0`).
     let ladder_cfg = cfg.ladder_config();
@@ -660,328 +996,431 @@ pub(super) fn enable_abr(
         session_id,
         bwe: Mutex::new(None),
         bwe_warned: std::sync::atomic::AtomicBool::new(false),
+        source,
+        id: NEXT_LOOP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        rungs: Mutex::new(None),
+        per_report: abr_cfg.per_report.is_some(),
     });
 
-    // webrtcbin emits request-aux-sender once per send RTP session (one transport under
-    // max-bundle). Guard to exactly one rtpgccbwe so two estimators can never fight over
-    // the same encoder.
-    let created = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    webrtc.connect("request-aux-sender", false, move |_values| {
-        if created.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            return None; // already wired — let webrtcbin use its default for any extra session
-        }
-        let bwe = match gst::ElementFactory::make("rtpgccbwe").build() {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(
-                    token = "abr-rtpgccbwe-build-failed","AS-03: rtpgccbwe build failed: {e}; ABR disarmed for this session");
-                return None;
-            }
-        };
-        // Keep the estimator's own search within the tier bounds (bps); guarded in case a
-        // future plugin rev renames these.
-        if bwe.find_property("min-bitrate").is_some() {
-            bwe.set_property("min-bitrate", floor_bps as u32);
-        }
-        if bwe.find_property("max-bitrate").is_some() {
-            bwe.set_property("max-bitrate", ceiling_bps as u32);
-        }
-        // Seed the initial estimate AT THE CEILING. Unseeded, rtpgccbwe starts at
-        // min-bitrate and ramps, throttling every session to the floor for its first ~30 s
-        // on a clean LAN (measured). Seeded, it only walks down on real congestion.
-        if bwe.find_property("estimated-bitrate").is_some() {
-            bwe.set_property("estimated-bitrate", ceiling_bps as u32);
-        }
+    let plan = Plan {
+        mode,
+        choice,
+        ladder_cfg,
+        ladder_encoder,
+        base_target_usage,
+        res_rung_seed,
+        floor_follow,
+        launch_fps,
+        ceiling_kbps: abr_cfg.ceiling_kbps,
+        launch_floor_kbps,
+        trace_tx: trace_tx_for_ladder,
+        session_id: session_id_for_ladder,
+        launch_cfg: Arc::new(cfg.clone()),
+        abr_cfg,
+        lever,
+    };
+    Some((abr_loop, plan))
+}
 
-        // Weak handle, so a ladder-driven floor move can lower `min-bitrate` too (see
-        // `AbrLoop::set_floor`). Weak because the notify closure below holds a strong
-        // `Arc<AbrLoop>` — a strong handle back is a ref cycle.
-        *abr_loop.bwe.lock().unwrap() = Some(bwe.downgrade());
-
-        // Fast path: react within the 2 s hysteresis while estimates are changing.
-        let notify_loop = abr_loop.clone();
-        bwe.connect_notify(Some("estimated-bitrate"), move |bwe, _pspec| {
-            // `estimated-bitrate` is bits/s; the governor works in kbps.
-            let est_bps: u32 = bwe.property("estimated-bitrate");
-            notify_loop.observe(est_bps as f64 / 1000.0, true);
-        });
-        // Stall rescue: rtpgccbwe notifies only on CHANGE, and GCC pins its estimate under
-        // sustained loss and at max-bitrate, so a notification-only governor strands
-        // mid-descent or mid-recovery (both measured). Re-observe on the existing
-        // heartbeat-drain (~5 s); the hook dies with `SessionMetrics`, so there is no
-        // per-session thread and no teardown plumbing.
-        let tick_loop = abr_loop.clone();
-        let tick_bwe = bwe.clone();
-        if let Some(m) = tick_loop.metrics.upgrade() {
-            m.set_on_drain(Box::new(move || {
-                let est_bps: u32 = tick_bwe.property("estimated-bitrate");
-                tick_loop.observe(est_bps as f64 / 1000.0, false);
-            }));
+/// Register the loop's per-window hooks: the stall-rescue tick, which re-observes
+/// `estimate()`, and in Smooth mode the adaptation hint and the ladder; and make this loop
+/// the encoder's one writer. Hooks and owner are both single on `SessionMetrics`, so the
+/// transport that starts last drives the encoder.
+///
+/// Its governor must match the encoder when it starts. It does not after another loop
+/// owned the encoder, or when this loop drove it and then lost it to nobody (a transport
+/// replacement put the encoder back at launch): both start from the launch point.
+fn start(abr_loop: &Arc<AbrLoop>, plan: &Plan, estimate: Box<dyn Fn() -> f64 + Send + Sync>) {
+    if let Some(m) = abr_loop.metrics.upgrade() {
+        let previous = m.abr_owner();
+        m.claim_abr(abr_loop.id);
+        let drove = abr_loop
+            .first_estimate
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if previous != abr_loop.id && (previous != 0 || drove) {
+            take_over(abr_loop, plan, &m);
         }
+    }
+    let Plan {
+        mode,
+        choice,
+        ladder_cfg,
+        ladder_encoder,
+        base_target_usage,
+        res_rung_seed,
+        floor_follow,
+        launch_fps,
+        ceiling_kbps,
+        launch_floor_kbps,
+        trace_tx: trace_tx_for_ladder,
+        session_id: session_id_for_ladder,
+        abr_cfg,
+        ..
+    } = plan.clone();
+    // Stall rescue: an estimator may notify only on CHANGE (`rtpgccbwe` does), and GCC pins its estimate under
+    // sustained loss and at max-bitrate, so a notification-only governor strands
+    // mid-descent or mid-recovery (both measured). Re-observe on the existing
+    // heartbeat-drain (~5 s); the hook dies with `SessionMetrics`, so there is no
+    // per-session thread and no teardown plumbing.
+    let tick_loop = abr_loop.clone();
+    if let Some(m) = tick_loop.metrics.upgrade() {
+        m.set_on_drain(Box::new(move || {
+            tick_loop.observe(estimate(), false, std::time::Instant::now())
+        }));
+    }
 
-        // SPT-04: in Smooth mode derive the governor's per-window AdaptationHint from the
-        // SPT-03 classifier label plus a rolling encode-time baseline, for the NEXT
-        // observe. #328: a steady Renoir at its ceiling trips `encoder_saturated` every
-        // window, so saturation counts as fresh only on a transition or a rising p95.
-        if mode == AbrMode::Smooth {
-            let hint_loop = abr_loop.clone();
-            // SPT-08: the ladder MUST share this same `on_window` closure — the slot is
-            // single-registration, last wins, so a second hook would silently replace this
-            // one. The speed-bias rung engages only when the rung is armed (`max_bias > 0`)
-            // and the encoder takes the live write; bitrate stays the governor's, and the
-            // resolution/fps rungs are seeded below independently of this rung.
-            let ladder_state = ladder_cfg
-                .filter(|lc| lc.max_bias > 0)
-                .filter(|_| encoder_speed_bias_writable(&ladder_encoder, choice))
-                .map(|lc| {
-                    tracing::info!(
-                        "SPT-08 ladder engaged ({:?}): encoder speed-bias rung active \
-                         (max {} steps); fps rung {}, resolution rung {} (deferred — not actuated)",
-                        choice,
-                        lc.max_bias,
-                        if lc.fps_enabled { "requested" } else { "off" },
-                        if lc.resolution_enabled {
-                            "requested"
-                        } else {
-                            "off"
-                        },
-                    );
-                    Mutex::new(ladder::Ladder::new(lc))
-                });
-            let res_state = res_rung_seed.clone().map(|(lever, lc, rungs)| {
-                let policy = lc.res;
-                let planner = ladder::LadderPlanner::new(
-                    &lc,
-                    rungs.clone(),
-                    launch_fps,
-                    abr_cfg.ceiling_kbps,
-                    std::time::Instant::now(),
-                );
+    // SPT-04: in Smooth mode derive the governor's per-window AdaptationHint from the
+    // SPT-03 classifier label plus a rolling encode-time baseline, for the NEXT
+    // observe. #328: a steady Renoir at its ceiling trips `encoder_saturated` every
+    // window, so saturation counts as fresh only on a transition or a rising p95.
+    if mode == AbrMode::Smooth {
+        let hint_loop = abr_loop.clone();
+        // SPT-08: the ladder MUST share this same `on_window` closure — the slot is
+        // single-registration, last wins, so a second hook would silently replace this
+        // one. The speed-bias rung engages only when the rung is armed (`max_bias > 0`)
+        // and the encoder takes the live write; bitrate stays the governor's, and the
+        // resolution/fps rungs are seeded below independently of this rung.
+        let ladder_state = ladder_cfg
+            .filter(|lc| lc.max_bias > 0)
+            .filter(|_| encoder_speed_bias_writable(&ladder_encoder, choice))
+            .map(|lc| {
                 tracing::info!(
-                    "SPT-08 ladder rungs ENGAGED: resolution rung {}, {} rungs {:?}, k={}, \
-                     engage {}×B for {} windows, recover {}×B for {} windows, min step {}s, \
-                     floor {}p; fps rung {} (order {})",
-                    if lc.resolution_enabled { "on" } else { "OFF (retired — fps-only)" },
-                    rungs.len(), rungs, policy.exponent, policy.engage_frac, policy.engage_dwell,
-                    policy.recover_frac, policy.recover_dwell, policy.min_step_s, policy.min_height,
-                    if planner.fps_rung_active() {
-                        format!("ENGAGED ({launch_fps} → {})", launch_fps / 2)
-                    } else if lc.fps_enabled {
-                        format!("inert ({launch_fps} fps admits no halving)")
+                    "SPT-08 ladder engaged ({:?}): encoder speed-bias rung active \
+                     (max {} steps); fps rung {}, resolution rung {} (deferred — not actuated)",
+                    choice,
+                    lc.max_bias,
+                    if lc.fps_enabled { "requested" } else { "off" },
+                    if lc.resolution_enabled {
+                        "requested"
                     } else {
-                        "off".to_string()
+                        "off"
                     },
-                    lc.order.as_str(),
                 );
-                tracing::info!(
-                    "SPT-08 ladder: ABR floor follows the rung = {} (launch floor {} kbps, \
-                     operator floor {:?})",
-                    floor_follow.enabled,
-                    floor_follow.launch_floor_kbps,
-                    floor_follow.operator_floor_kbps,
-                );
-                (
-                    Mutex::new(ResRungState {
-                        planner,
-                        // Retirement, not a pin, is what makes a rung ineligible for
-                        // selection, so an fps-only `hybrid` window falls through to fps.
-                        res_disabled: !lc.resolution_enabled,
-                        fps_disabled: false,
-                        in_flight: false,
-                    }),
-                    lever,
-                )
+                Mutex::new(ladder::Ladder::new(lc))
             });
-            // The last actuated speed-bias rung: `Ladder` returns only the new level, and
-            // the trace event needs a real `from` plus a direction-derived reason.
-            let last_bias = std::sync::atomic::AtomicU8::new(0);
-            let res_trace_tx = trace_tx_for_ladder.clone();
-            let res_session_id = session_id_for_ladder.clone();
-            if let Some(m) = hint_loop.metrics.upgrade() {
-                // (was-saturated-last-window, EWMA baseline of encode p95 ms).
-                let roll = Arc::new(Mutex::new((false, None::<f64>)));
-                // The outer request-aux-sender closure is `Fn` and must keep its own
-                // `ladder_encoder`.
-                let window_encoder = ladder_encoder.clone();
-                m.set_on_window(Box::new(move |state, encode_p95| {
-                    use crate::session::adaptation::AdaptationState;
-                    let saturated = matches!(state, AdaptationState::EncoderSaturated);
-                    let fresh = {
-                        let mut st = roll.lock().unwrap();
-                        let (f, new_state) = encoder_saturation_fresh(saturated, encode_p95, *st);
-                        *st = new_state;
-                        f
-                    };
-                    let hint = abr::AdaptationHint {
-                        network_congested: matches!(state, AdaptationState::NetworkCongested),
-                        encoder_saturation_fresh: fresh,
-                    };
-                    hint_loop.governor.lock().unwrap().set_adaptation_hint(hint);
-                    // Read once for both rungs: the resolution rung's input signal and both
-                    // rungs' trace context. Neither rung ever writes bitrate.
-                    let setpoint = hint_loop.governor.lock().unwrap().setpoint_kbps() as f64;
+        let res_state = res_rung_seed.clone().map(|(lever, lc, rungs)| {
+            let policy = lc.res;
+            let mut planner = ladder::LadderPlanner::new(
+                &lc,
+                rungs.clone(),
+                launch_fps,
+                ceiling_kbps,
+                std::time::Instant::now(),
+            );
+            if abr_cfg.per_report.is_some() {
+                planner.set_per_report();
+            }
+            tracing::info!(
+                "SPT-08 ladder rungs ENGAGED: resolution rung {}, {} rungs {:?}, k={}, \
+                 engage {}×B for {} windows, recover {}×B for {} windows, min step {}s, \
+                 floor {}p; fps rung {} (order {})",
+                if lc.resolution_enabled {
+                    "on"
+                } else {
+                    "OFF (retired — fps-only)"
+                },
+                rungs.len(),
+                rungs,
+                policy.exponent,
+                policy.engage_frac,
+                policy.engage_dwell,
+                policy.recover_frac,
+                policy.recover_dwell,
+                policy.min_step_s,
+                policy.min_height,
+                if planner.fps_rung_active() {
+                    format!("ENGAGED ({launch_fps} → {})", launch_fps / 2)
+                } else if lc.fps_enabled {
+                    format!("inert ({launch_fps} fps admits no halving)")
+                } else {
+                    "off".to_string()
+                },
+                lc.order.as_str(),
+            );
+            tracing::info!(
+                "SPT-08 ladder: ABR floor follows the rung = {} (launch floor {} kbps, \
+                 operator floor {:?})",
+                floor_follow.enabled,
+                floor_follow.launch_floor_kbps,
+                floor_follow.operator_floor_kbps,
+            );
+            Arc::new(Rungs {
+                state: Mutex::new(ResRungState {
+                    planner,
+                    // Retirement, not a pin, is what makes a rung ineligible for
+                    // selection, so an fps-only `hybrid` window falls through to fps.
+                    res_disabled: !lc.resolution_enabled,
+                    fps_disabled: false,
+                    in_flight: false,
+                    live: lever.current(),
+                }),
+                lever,
+                floors: floor_follow,
+                launch_floor_kbps,
+            })
+        });
+        *abr_loop.rungs.lock().unwrap() = res_state.clone();
+        // The last actuated speed-bias rung: `Ladder` returns only the new level, and
+        // the trace event needs a real `from` plus a direction-derived reason.
+        let last_bias = std::sync::atomic::AtomicU8::new(0);
+        let res_trace_tx = trace_tx_for_ladder.clone();
+        let res_session_id = session_id_for_ladder.clone();
+        if let Some(m) = hint_loop.metrics.upgrade() {
+            // (was-saturated-last-window, EWMA baseline of encode p95 ms).
+            let roll = Arc::new(Mutex::new((false, None::<f64>)));
+            // The outer request-aux-sender closure is `Fn` and must keep its own
+            // `ladder_encoder`.
+            let window_encoder = ladder_encoder.clone();
+            m.set_on_window(Box::new(move |state, encode_p95| {
+                use crate::session::adaptation::AdaptationState;
+                let saturated = matches!(state, AdaptationState::EncoderSaturated);
+                let fresh = {
+                    let mut st = roll.lock().unwrap();
+                    let (f, new_state) = encoder_saturation_fresh(saturated, encode_p95, *st);
+                    *st = new_state;
+                    f
+                };
+                let hint = abr::AdaptationHint {
+                    network_congested: matches!(state, AdaptationState::NetworkCongested),
+                    encoder_saturation_fresh: fresh,
+                };
+                hint_loop.governor.lock().unwrap().set_adaptation_hint(hint);
+                // Read once for both rungs: the resolution rung's input signal and both
+                // rungs' trace context. Neither rung ever writes bitrate.
+                let setpoint = hint_loop.governor.lock().unwrap().setpoint_kbps() as f64;
 
-                    // Runs after the hint feed so the governor's bitrate lever is set
-                    // first. The bias rung escalates only on `EncoderSaturated`, never on
-                    // a network dip.
-                    if let Some(ref lad) = ladder_state {
-                        if let Some(bias) = lad.lock().unwrap().observe(state) {
-                            write_encoder_speed_bias(
-                                &window_encoder,
-                                choice,
-                                bias,
-                                base_target_usage,
+                // Runs after the hint feed so the governor's bitrate lever is set
+                // first. The bias rung escalates only on `EncoderSaturated`, never on
+                // a network dip.
+                if let Some(ref lad) = ladder_state {
+                    if let Some(bias) = lad.lock().unwrap().observe(state) {
+                        write_encoder_speed_bias(&window_encoder, choice, bias, base_target_usage);
+                        if let Some(m) = hint_loop.metrics.upgrade() {
+                            m.set_ladder_bias(bias);
+                        }
+                        let prev = last_bias.swap(bias, std::sync::atomic::Ordering::Relaxed);
+                        emit_ladder_step(
+                            &res_trace_tx,
+                            &res_session_id,
+                            "bias",
+                            prev as i64,
+                            bias as i64,
+                            if bias > prev { "engage" } else { "recover" },
+                            StepRates {
+                                setpoint_kbps: setpoint,
+                                floor_kbps: hint_loop.governor.lock().unwrap().floor_kbps() as f64,
+                            },
+                        );
+                    }
+                }
+
+                // Rung 4: pixels, decided off the governor's setpoint. After the bias
+                // rung; the two are independent signals (encoder saturation vs
+                // bandwidth) and may both engage in one window.
+                if let Some(ref rungs) = res_state {
+                    let (rung, lever) = (&rungs.state, &rungs.lever);
+                    let mut st = rung.lock().unwrap();
+                    // The rung's "governor pinned at its floor" emergency test must
+                    // read the LIVE floor: it moves with the rung, and a stale higher
+                    // value fires the emergency on a setpoint nowhere near pinned.
+                    let live_floor = hint_loop.governor.lock().unwrap().floor_kbps() as f64;
+                    let decision = observe_resolution_rung(
+                        &mut st,
+                        &**lever,
+                        lever.pinned(),
+                        state,
+                        setpoint,
+                        live_floor,
+                        std::time::Instant::now(),
+                    );
+                    // Re-derive the floor from wherever the rung ENDED this window,
+                    // unconditionally: a manual `session_display_update` moves the size
+                    // underneath the machine and the resync above adopts it, a rung
+                    // change with no `PlannedStep` to hang the update off.
+                    let (rung_w, rung_h) = st.planner.res_size();
+                    let floor_now = hint_loop.set_floor(
+                        floor_follow
+                            .floor_for(rung_w as i64 * rung_h as i64, st.planner.fps_rung() > 0),
+                    ) as f64;
+                    if let Some(m) = hint_loop.metrics.upgrade() {
+                        // Omit-when-default: 0 ⇒ "at the launch floor".
+                        m.set_abr_floor(if floor_now as u32 == launch_floor_kbps {
+                            0
+                        } else {
+                            floor_now as u32
+                        });
+                    }
+                    // Every window, not only on a step — same resync reason as above:
+                    // otherwise the echo reports the stale rung until the next step.
+                    if let Some(m) = hint_loop.metrics.upgrade() {
+                        m.set_ladder_res_rung(st.planner.res_rung());
+                    }
+                    match decision {
+                        Some(ladder::PlannedStep::Resolution(d)) => {
+                            let (w, h) = st.planner.res_size();
+                            drop(st);
+                            tracing::info!(
+                                "SPT-08 ladder step: resolution rung {} → {} ({}), \
+                                 {w}x{h}, setpoint {setpoint:.0} kbps",
+                                d.from,
+                                d.to,
+                                d.reason.as_str()
                             );
                             if let Some(m) = hint_loop.metrics.upgrade() {
-                                m.set_ladder_bias(bias);
+                                m.set_ladder_res_rung(d.to);
                             }
-                            let prev =
-                                last_bias.swap(bias, std::sync::atomic::Ordering::Relaxed);
                             emit_ladder_step(
                                 &res_trace_tx,
                                 &res_session_id,
-                                "bias",
-                                prev as i64,
-                                bias as i64,
-                                if bias > prev { "engage" } else { "recover" },
+                                "resolution",
+                                d.from as i64,
+                                d.to as i64,
+                                d.reason.as_str(),
                                 StepRates {
                                     setpoint_kbps: setpoint,
-                                    floor_kbps: hint_loop
-                                        .governor
-                                        .lock()
-                                        .unwrap()
-                                        .floor_kbps()
-                                        as f64,
+                                    floor_kbps: floor_now,
                                 },
                             );
                         }
-                    }
-
-                    // Rung 4: pixels, decided off the governor's setpoint. After the bias
-                    // rung; the two are independent signals (encoder saturation vs
-                    // bandwidth) and may both engage in one window.
-                    if let Some((ref rung, ref lever)) = res_state {
-                        let mut st = rung.lock().unwrap();
-                        // The rung's "governor pinned at its floor" emergency test must
-                        // read the LIVE floor: it moves with the rung, and a stale higher
-                        // value fires the emergency on a setpoint nowhere near pinned.
-                        let live_floor = hint_loop.governor.lock().unwrap().floor_kbps() as f64;
-                        let decision = observe_resolution_rung(
-                            &mut st,
-                            &**lever,
-                            lever.pinned(),
-                            state,
-                            setpoint,
-                            live_floor,
-                            std::time::Instant::now(),
-                        );
-                        // Re-derive the floor from wherever the rung ENDED this window,
-                        // unconditionally: a manual `session_display_update` moves the size
-                        // underneath the machine and the resync above adopts it, a rung
-                        // change with no `PlannedStep` to hang the update off.
-                        let (rung_w, rung_h) = st.planner.res_size();
-                        let floor_now = hint_loop.set_floor(floor_follow.floor_for(
-                            rung_w as i64 * rung_h as i64,
-                            st.planner.fps_rung() > 0,
-                        )) as f64;
-                        if let Some(m) = hint_loop.metrics.upgrade() {
-                            // Omit-when-default: 0 ⇒ "at the launch floor".
-                            m.set_abr_floor(if floor_now as u32 == launch_floor_kbps {
-                                0
-                            } else {
-                                floor_now as u32
-                            });
-                        }
-                        // Every window, not only on a step — same resync reason as above:
-                        // otherwise the echo reports the stale rung until the next step.
-                        if let Some(m) = hint_loop.metrics.upgrade() {
-                            m.set_ladder_res_rung(st.planner.res_rung());
-                        }
-                        match decision {
-                            Some(ladder::PlannedStep::Resolution(d)) => {
-                                let (w, h) = st.planner.res_size();
-                                drop(st);
-                                tracing::info!(
-                                    "SPT-08 ladder step: resolution rung {} → {} ({}), \
-                                     {w}x{h}, setpoint {setpoint:.0} kbps",
-                                    d.from,
-                                    d.to,
-                                    d.reason.as_str()
-                                );
-                                if let Some(m) = hint_loop.metrics.upgrade() {
-                                    m.set_ladder_res_rung(d.to);
-                                }
-                                emit_ladder_step(
-                                    &res_trace_tx,
-                                    &res_session_id,
-                                    "resolution",
-                                    d.from as i64,
-                                    d.to as i64,
-                                    d.reason.as_str(),
-                                    StepRates {
-                                        setpoint_kbps: setpoint,
-                                        floor_kbps: floor_now,
-                                    },
-                                );
+                        // D7: `from`/`to` are frame RATES here, not indices.
+                        Some(ladder::PlannedStep::Fps(d)) => {
+                            drop(st);
+                            tracing::info!(
+                                "SPT-08 ladder step: fps rung {} → {} fps ({}), \
+                                 setpoint {setpoint:.0} kbps",
+                                d.from,
+                                d.to,
+                                d.reason.as_str()
+                            );
+                            // `cpb = kbps / fps`: a rate write alone leaves the
+                            // per-frame VBV budget wrong by 2x.
+                            hint_loop.retune_for_fps(d.to as u32);
+                            if let Some(m) = hint_loop.metrics.upgrade() {
+                                // Omit-when-default: 0 ⇒ "at the launch rate".
+                                m.set_ladder_fps(if d.to as i32 == launch_fps {
+                                    0
+                                } else {
+                                    d.to as i32
+                                });
+                                // Move the CLASSIFIER's expectation with it: its
+                                // host-fps-steady guard trips `Unknown` below
+                                // `target × 0.83`, an `Unknown` window resets both
+                                // rungs' dwell counters, and a stale target therefore
+                                // freezes the ladder at the rung it just took
+                                // (measured live 2026-08-16).
+                                m.set_target_fps(d.to as u32);
                             }
-                            // D7: `from`/`to` are frame RATES here, not indices.
-                            Some(ladder::PlannedStep::Fps(d)) => {
-                                drop(st);
-                                tracing::info!(
-                                    "SPT-08 ladder step: fps rung {} → {} fps ({}), \
-                                     setpoint {setpoint:.0} kbps",
-                                    d.from,
-                                    d.to,
-                                    d.reason.as_str()
-                                );
-                                // `cpb = kbps / fps`: a rate write alone leaves the
-                                // per-frame VBV budget wrong by 2x.
-                                hint_loop.retune_for_fps(d.to as u32);
-                                if let Some(m) = hint_loop.metrics.upgrade() {
-                                    // Omit-when-default: 0 ⇒ "at the launch rate".
-                                    m.set_ladder_fps(if d.to as i32 == launch_fps {
-                                        0
-                                    } else {
-                                        d.to as i32
-                                    });
-                                    // Move the CLASSIFIER's expectation with it: its
-                                    // host-fps-steady guard trips `Unknown` below
-                                    // `target × 0.83`, an `Unknown` window resets both
-                                    // rungs' dwell counters, and a stale target therefore
-                                    // freezes the ladder at the rung it just took
-                                    // (measured live 2026-08-16).
-                                    m.set_target_fps(d.to as u32);
-                                }
-                                emit_ladder_step(
-                                    &res_trace_tx,
-                                    &res_session_id,
-                                    "fps",
-                                    d.from as i64,
-                                    d.to as i64,
-                                    d.reason.as_str(),
-                                    StepRates {
-                                        setpoint_kbps: setpoint,
-                                        floor_kbps: floor_now,
-                                    },
-                                );
-                            }
-                            None => {}
+                            emit_ladder_step(
+                                &res_trace_tx,
+                                &res_session_id,
+                                "fps",
+                                d.from as i64,
+                                d.to as i64,
+                                d.reason.as_str(),
+                                StepRates {
+                                    setpoint_kbps: setpoint,
+                                    floor_kbps: floor_now,
+                                },
+                            );
                         }
+                        None => {}
                     }
-                }));
-            }
+                }
+            }));
         }
-        tracing::info!(
-            "AS-03 ABR armed (mode={}): rtpgccbwe → {:?} encoder, codec={}, bounds [{}, {}] kbps @ {} fps",
-            mode.as_str(),
-            choice,
-            codec.as_str(),
-            floor_bps / 1000,
-            ceiling_bps / 1000,
-            fps
+    }
+}
+
+/// The ABR a WebTransport client's receiver feedback drives
+/// (`protocol/transport-webtransport.md` §Feedback): a loop of its own on the session's
+/// encoder, beside the WebRTC fallback's, started by each client's first estimate. The
+/// governor and ladder are the same code either way. `None` when the encoder takes no live
+/// writes.
+pub(crate) fn feedback_abr(
+    encoder: &gst::Element,
+    cfg: &SessionConfig,
+    session_metrics: Arc<SessionMetrics>,
+    trace_tx: TraceTx,
+    session_id: String,
+    lever: Option<Arc<EncodeResolutionLever>>,
+) -> Option<crate::webtransport::Rate> {
+    // The WebRTC fallback's `enable_abr` already said any `ladder_gate_warning`.
+    let (abr_loop, plan) = arm(
+        encoder,
+        cfg,
+        session_metrics,
+        trace_tx,
+        session_id,
+        lever.filter(|l| l.stage().supported),
+        "webtransport feedback",
+    )?;
+    let ceiling_kbps = plan.ceiling_kbps as f64;
+    let latest = Arc::new(std::sync::atomic::AtomicU64::new(ceiling_kbps.to_bits()));
+    let mode = cfg.abr_mode;
+    let observe_loop = abr_loop.clone();
+    let floor_loop = abr_loop.clone();
+    let report_loop = abr_loop.clone();
+    let observed = latest.clone();
+    let begin: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let latest = latest.clone();
+        start(
+            &abr_loop,
+            &plan,
+            Box::new(move || f64::from_bits(latest.load(std::sync::atomic::Ordering::Relaxed))),
         );
-        Some(bwe.to_value())
+        tracing::info!(
+            "AS-03 ABR armed (mode={}): WebTransport receiver feedback → encoder, \
+             bounds [{}, {}] kbps",
+            mode.as_str(),
+            plan.launch_floor_kbps,
+            plan.ceiling_kbps
+        );
     });
+    let retake = begin.clone();
+    Some(crate::webtransport::Rate {
+        ceiling_kbps,
+        // The governor's lock, alone and released: `observe` takes it again after.
+        floor_kbps: Box::new(move || f64::from(floor_loop.governor.lock().unwrap().floor_kbps())),
+        retargets: mode != AbrMode::Off,
+        // Each client starts afresh: it takes the encoder over (a WebRTC peer that started
+        // since owns it until then) and registers new hooks.
+        start: Box::new(move || begin()),
+        observe: Box::new(move |kbps| {
+            observed.store(kbps.to_bits(), std::sync::atomic::Ordering::Relaxed);
+            // One ABR owner per encoder; an owner that lost the encoder re-takes it from
+            // the launch point on its next estimate. Lost to nobody, that is: a WebRTC
+            // answer replaced the video transport (`reset_to_launch`) and that peer never
+            // connected. A live owner is never taken from here, only by a client's `start`.
+            if observe_loop.orphaned() {
+                retake();
+            }
+            observe_loop.observe(kbps, true, std::time::Instant::now());
+        }),
+        measured: Box::new(move |reading| report_loop.report(reading, std::time::Instant::now())),
+    })
+}
+
+/// Another transport's loop owned the encoder and left its bitrate, bias and rungs on it,
+/// while this loop's governor sits at the ceiling, inside its deadband: it would never
+/// write them back. Start both at launch.
+fn take_over(abr_loop: &AbrLoop, plan: &Plan, metrics: &SessionMetrics) {
+    *abr_loop.governor.lock().unwrap() =
+        abr::Governor::new(plan.abr_cfg, std::time::Instant::now());
+    abr_loop
+        .fps
+        .store(plan.abr_cfg.fps, std::sync::atomic::Ordering::Relaxed);
+    metrics.set_abr_setpoint(plan.abr_cfg.ceiling_kbps);
+    let written = write_launch_point(
+        &abr_loop.encoder,
+        &plan.launch_cfg,
+        plan.lever.as_deref(),
+        metrics,
+    );
+    tracing::info!(
+        token = "abr-encoder-taken-over",
+        "{} took the encoder over from another transport's ABR; written: {written}",
+        abr_loop.source
+    );
 }
 
 /// Put the encoder back at its launch operating point for a transport that replaces
@@ -1001,7 +1440,7 @@ pub(super) fn reset_to_launch(
     metrics: &SessionMetrics,
 ) {
     metrics.clear_hooks();
-    let written = write_launch_point(encoder, cfg, lever, metrics);
+    let written = write_launch_point(encoder, cfg, Some(lever), metrics);
     tracing::info!(
         token = "transport-replaced-encoder-kept",
         "encoder {} kept across the transport replacement; written: {written}",
@@ -1009,11 +1448,26 @@ pub(super) fn reset_to_launch(
     );
 }
 
+/// Write `kbps` to the encoder live, with its CPB, for an adoption's new stream
+/// (amendment 59). `false` when this encoder cannot take it live.
+pub(super) fn write_bitrate_live(
+    encoder: &gst::Element,
+    cfg: &SessionConfig,
+    kbps: u32,
+    fps: i32,
+) -> bool {
+    if !encoder_abr_writable(encoder, cfg.encoder) {
+        return false;
+    }
+    write_encoder_bitrate(encoder, cfg.encoder, kbps, fps.max(1) as u32);
+    true
+}
+
 /// What [`reset_to_launch`] writes, and its account of it.
 fn write_launch_point(
     encoder: &gst::Element,
     cfg: &SessionConfig,
-    lever: &EncodeResolutionLever,
+    lever: Option<&EncodeResolutionLever>,
     metrics: &SessionMetrics,
 ) -> String {
     if cfg.abr_mode == AbrMode::Off || !encoder_abr_writable(encoder, cfg.encoder) {
@@ -1028,7 +1482,7 @@ fn write_launch_point(
     metrics.set_ladder_bias(0);
     metrics.set_abr_floor(0);
     let (mut fps_moved, mut size) = (false, "not written (no scale stage)");
-    if lever.stage().supported {
+    if let Some(lever) = lever.filter(|l| l.stage().supported) {
         // `Err` is a stage with no fps rung.
         fps_moved = lever.set_fps(cfg.stream.fps).unwrap_or(false);
         metrics.set_ladder_fps(0);
@@ -1062,7 +1516,8 @@ fn write_launch_point(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The second knob a congestion controller can turn: frame size, not bitrate.
-/// `LadderConfig::resolution_enabled` is `false` by default; the other caller is the
+/// `LadderConfig::resolution_enabled` is off by default for WebRTC and on for a session
+/// assigned WebTransport (`LadderSettings::for_session`); the other caller is the
 /// runner's `session_display_update.stream_*` path (an explicit operator/user request).
 pub trait ResolutionLever: Send + Sync {
     /// The external sizes this session may be stepped to, descending, launch size first.
@@ -1393,6 +1848,666 @@ mod tests {
         assert!(ff.floor_for(1280 * 720, true) < 1400);
     }
 
+    // ---- one writer per encoder (#1040) ----
+
+    /// Two transports' loops on one encoder, as after a takeover across transports: only
+    /// the one that started last writes, until another starts.
+    #[test]
+    fn of_two_loops_on_one_encoder_only_the_last_started_writes() {
+        init();
+        let metrics = Arc::new(SessionMetrics::new("smooth", 60));
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let trace =
+            crate::session::runner::DiagnosticEventTx::new(tx, Arc::default(), Arc::default());
+        let cfg = cfg_with_floors(0, None);
+        let encoder = gst::ElementFactory::make("openh264enc").build().unwrap();
+        let rate = || {
+            feedback_abr(
+                &encoder,
+                &cfg,
+                metrics.clone(),
+                trace.clone(),
+                "s".into(),
+                None,
+            )
+            .unwrap()
+        };
+        let estimate = || {
+            metrics
+                .drain_window(std::time::Instant::now())
+                .gcc_estimate_kbps
+        };
+        let (first, second) = (rate(), rate());
+        (first.start)();
+        (second.start)();
+        (first.observe)(1234.0);
+        assert_eq!(estimate(), None, "the loop started first no longer writes");
+        (second.observe)(2345.0);
+        assert_eq!(estimate(), Some(2345.0));
+        (first.start)();
+        (second.observe)(3456.0);
+        (first.observe)(1111.0);
+        assert_eq!(
+            estimate(),
+            Some(1111.0),
+            "a new client on the first transport took it back"
+        );
+    }
+
+    /// A takeover across transports: loop A drove the encoder down, then B claims it. B's
+    /// governor starts at the ceiling, inside its deadband, so B must write launch itself.
+    #[test]
+    fn a_loop_taking_the_encoder_over_puts_it_back_at_launch() {
+        init();
+        let metrics = Arc::new(SessionMetrics::new("smooth", 60));
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let trace =
+            crate::session::runner::DiagnosticEventTx::new(tx, Arc::default(), Arc::default());
+        let mut cfg = cfg_with_floors(0, Some(500));
+        cfg.abr_governor.min_interval_ms = 1;
+        let encoder = gst::ElementFactory::make("openh264enc").build().unwrap();
+        let rate = || {
+            feedback_abr(
+                &encoder,
+                &cfg,
+                metrics.clone(),
+                trace.clone(),
+                "s".into(),
+                None,
+            )
+            .unwrap()
+        };
+        let bitrate = || encoder.property::<u32>("bitrate") / 1000;
+        let (a, b) = (rate(), rate());
+        (a.start)();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        (a.observe)(2000.0);
+        let driven = bitrate();
+        assert!(
+            driven < 11_500,
+            "loop A drove the encoder down ({driven} kbit/s)"
+        );
+        (b.start)();
+        assert_eq!(bitrate(), 11_500, "back at launch under its new owner");
+        (b.observe)(11_500.0);
+        assert_eq!(bitrate(), 11_500);
+    }
+
+    /// #1040: a WebRTC answer replaced the video transport under a streaming WebTransport
+    /// client (`WebRtcSlot::replace_video`), and that peer never connected. The client's
+    /// loop lost the encoder to nobody: its next estimate takes it back, from launch, with
+    /// no second `start` (`webtransport::Control` starts once per client).
+    #[test]
+    fn a_loop_that_lost_the_encoder_to_nobody_drives_it_again_from_launch() {
+        init();
+        let metrics = Arc::new(SessionMetrics::new("smooth", 60));
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let trace =
+            crate::session::runner::DiagnosticEventTx::new(tx, Arc::default(), Arc::default());
+        let mut cfg = cfg_with_floors(0, Some(500));
+        cfg.abr_governor.min_interval_ms = 1;
+        let encoder = gst::ElementFactory::make("openh264enc").build().unwrap();
+        let lever = software_lever((cfg.stream.width, cfg.stream.height));
+        let client =
+            feedback_abr(&encoder, &cfg, metrics.clone(), trace, "s".into(), None).unwrap();
+        let bitrate = || encoder.property::<u32>("bitrate") / 1000;
+        let pause = || std::thread::sleep(std::time::Duration::from_millis(5));
+        (client.start)();
+        pause();
+        (client.observe)(2000.0);
+        assert!(
+            bitrate() < 11_500,
+            "the client's loop drove the encoder down"
+        );
+
+        reset_to_launch(&encoder, &cfg, &lever, &metrics);
+        assert_eq!(bitrate(), 11_500, "the replacement put it back at launch");
+
+        // Its governor starts again too: the old one would sit out its down dwell here.
+        (client.observe)(2000.0);
+        pause();
+        (client.observe)(2000.0);
+        let driven = bitrate();
+        assert!(
+            driven < 11_500,
+            "the abandoned takeover left the client with no ABR ({driven} kbit/s)"
+        );
+    }
+
+    // ---- the ladder on a WebTransport session (#1320) ----
+
+    /// #1320: the WebTransport loop's own resolution rung, end to end, through the `Rate`
+    /// closures `feedback_abr` hands the transport (`observe`, then `measured`, as
+    /// `Control::feedback` calls them). A link that carries far less than the floor steps the
+    /// ENCODE size down through the same [`EncodeResolutionLever`] the manual display PATCH
+    /// uses, keeps the frame rate, and takes the floor and the setpoint with it.
+    ///
+    /// Nothing else covers this: every other `feedback_abr` test passes `None` for the lever,
+    /// and the replays below arm the loop directly.
+    ///
+    /// What it does NOT prove: that a session's start hands the session's own lever in.
+    /// This test supplies the lever itself, so deleting the `Some(session.lever.clone())`
+    /// argument at the WebTransport attach site (`runner.rs`, `SessionTransports::attach`)
+    /// leaves it green. Pinning that needs a runner-level attach, which builds the encode
+    /// pipeline and the WebRTC slot beside it (a registry, a real encoder, an audio plan) —
+    /// a harness of its own, not a unit test.
+    #[test]
+    fn a_webtransport_client_under_the_floor_steps_the_resolution_rung() {
+        init();
+        let metrics = Arc::new(SessionMetrics::new("smooth", 60));
+        let (tx, mut traces) = tokio::sync::mpsc::channel(64);
+        let trace =
+            crate::session::runner::DiagnosticEventTx::new(tx, Arc::default(), Arc::default());
+        // The owner's shape at a size the software arm can encode: the 16:9 family down to
+        // 720p, the ladder armed resolution-first, the fps rung off.
+        let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
+        settings.encoder = EncoderChoice::Openh264;
+        settings.abr_mode = AbrMode::Smooth;
+        settings.ladder.resolution_enabled = true;
+        settings.ladder.res.min_height = 720; // these tests pin the 720p floor, whatever the default
+        settings.ladder.order = ladder::LadderOrder::ResFirst;
+        let stream = crate::session::StreamParams {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_kbps: 8000,
+            h264_profile: "constrained-baseline".to_string(),
+            codec: Codec::H264,
+            abr_floor_kbps: 0,
+            mic: false,
+        };
+        let cfg = SessionConfig::for_assignment_with(&settings, stream, None);
+        let launch_floor = cfg.abr_config().expect("smooth arms the ABR").floor_kbps;
+        assert_eq!(launch_floor, 2400, "8000 kbit/s at abr_floor_ratio 0.3");
+        let encoder = gst::ElementFactory::make("openh264enc").build().unwrap();
+        let stage = super::super::scale_stage::build_scale_stage(&cfg, None).unwrap();
+        assert!(stage.supported, "the software arm always carries the lever");
+        let lever = Arc::new(EncodeResolutionLever::new(stage, encoder.clone(), |_| {}));
+
+        let client = feedback_abr(
+            &encoder,
+            &cfg,
+            metrics.clone(),
+            trace,
+            "s".into(),
+            Some(lever.clone()),
+        )
+        .expect("openh264enc takes live writes");
+        (client.start)();
+
+        // A report every 100 ms (`REPORT_EVERY`) saying the link held the sender to
+        // 1000 kbit/s. The closures read the wall clock, so this test waits out
+        // `RATE_CONFIRM` for real.
+        for _ in 0..15 {
+            (client.observe)(1000.0);
+            (client.measured)(Some(1000.0));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert_eq!(
+            lever.stage().requested(),
+            (1280, 720),
+            "1000 kbit/s fits no engage line (900p 3651, 720p 2612): the floor rung, in one step"
+        );
+        assert_eq!(lever.stage().current_fps(), 60, "the frame rate is kept");
+        assert_eq!(
+            encoder.property::<u32>("bitrate"),
+            1_306_000,
+            "the encoder at the new floor"
+        );
+        let w = metrics.drain_window(std::time::Instant::now());
+        assert_eq!(w.ladder_res_rung, Some(2));
+        assert_eq!(
+            w.abr_floor_kbps,
+            Some(1306.0),
+            "2400 × (1280×720 / 1920×1080)^0.75, in force with the step"
+        );
+        assert_eq!(
+            w.abr_setpoint_kbps,
+            Some(1306.0),
+            "under the launch floor of 2400"
+        );
+
+        let steps: Vec<_> = std::iter::from_fn(|| traces.try_recv().ok())
+            .map(|(_, e)| e)
+            .filter(|e| e.event == "abr.ladder.step")
+            .collect();
+        assert_eq!(steps.len(), 1, "one step, not one per report");
+        assert_eq!(steps[0].payload["rung"], "resolution");
+        assert_eq!(steps[0].payload["reason"], "rate");
+        assert_eq!(steps[0].payload["from"], 0);
+        assert_eq!(steps[0].payload["to"], 2);
+        assert_eq!(
+            steps[0].payload["floor_kbps"], 1306,
+            "the floor in effect AFTER the step"
+        );
+        assert_eq!(steps[0].payload["setpoint_kbps"], 1306);
+    }
+
+    // ---- #1376: the per-report loop on WebTransport, replayed ----
+
+    /// A WebTransport session as the owner's throttle round runs it (1440p120 at 10 Mbit/s,
+    /// `res_first`, the frame-rate rung off) on a software encoder and lever, armed and
+    /// started as `feedback_abr` does, fed one receiver report every 100 ms on a test clock
+    /// through [`Wt::report`]'s link.
+    struct Wt {
+        abr_loop: Arc<AbrLoop>,
+        lever: Arc<EncodeResolutionLever>,
+        encoder: gst::Element,
+        traces: tokio::sync::mpsc::Receiver<(String, TraceEvent)>,
+        /// Every trace event so far, in order.
+        seen: Vec<TraceEvent>,
+        est: f64,
+        t0: std::time::Instant,
+    }
+
+    impl Wt {
+        fn new(floor_follows_rung: bool) -> Self {
+            init();
+            let metrics = Arc::new(SessionMetrics::new("smooth", 120));
+            let (tx, traces) = tokio::sync::mpsc::channel(4096);
+            let trace =
+                crate::session::runner::DiagnosticEventTx::new(tx, Arc::default(), Arc::default());
+            let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
+            settings.encoder = EncoderChoice::Openh264;
+            settings.abr_mode = AbrMode::Smooth;
+            settings.ladder.resolution_enabled = true;
+            settings.ladder.res.min_height = 720; // pins the 720p floor, whatever the default
+            settings.ladder.order = ladder::LadderOrder::ResFirst;
+            settings.ladder.floor_follows_rung = floor_follows_rung;
+            let stream = crate::session::StreamParams {
+                width: 2560,
+                height: 1440,
+                fps: 120,
+                bitrate_kbps: 10_000,
+                h264_profile: "constrained-baseline".to_string(),
+                codec: Codec::H264,
+                abr_floor_kbps: 0,
+                mic: false,
+            };
+            let cfg = SessionConfig::for_assignment_with(&settings, stream, None);
+            let encoder = gst::ElementFactory::make("openh264enc").build().unwrap();
+            let stage = super::super::scale_stage::build_scale_stage(&cfg, None).unwrap();
+            let lever = Arc::new(EncodeResolutionLever::new(stage, encoder.clone(), |_| {}));
+            let (abr_loop, plan) = arm(
+                &encoder,
+                &cfg,
+                metrics.clone(),
+                trace,
+                "s".into(),
+                Some(lever.clone()),
+                "webtransport feedback",
+            )
+            .expect("openh264enc takes live writes");
+            start(&abr_loop, &plan, Box::new(|| 10_000.0));
+            // The loop holds the metrics weakly; they live as long as the session.
+            std::mem::forget(metrics);
+            Self {
+                abr_loop,
+                lever,
+                encoder,
+                traces,
+                seen: Vec::new(),
+                est: 10_000.0,
+                t0: std::time::Instant::now(),
+            }
+        }
+
+        /// One receiver report at `ms` through a link that carries at most `link_kbps`,
+        /// with `webtransport::congestion`'s estimator coarsely modelled: the encoder sends
+        /// at the setpoint; a link that holds it back cuts the estimate to 0.85 × what
+        /// arrived and makes the report a reading (`Estimator::measured`), otherwise the
+        /// estimate grows 8 %/s, never past 1.5 × what arrived. `Control::feed`'s order: the
+        /// reading, then the estimate.
+        fn report(&mut self, ms: u64, link_kbps: f64) {
+            let sent = self.setpoint() as f64;
+            let recv = sent.min(link_kbps);
+            let reading = if recv < 0.95 * sent {
+                self.est = self.est.min(0.85 * recv);
+                Some(self.est.max(0.85 * recv))
+            } else {
+                self.est = (self.est * 1.08f64.powf(0.1))
+                    .min(1.5 * recv + 10.0)
+                    .min(10_000.0);
+                None
+            };
+            self.feed(ms, self.est, reading);
+        }
+
+        fn feed(&mut self, ms: u64, est: f64, reading: Option<f64>) {
+            let now = self.t0 + std::time::Duration::from_millis(ms);
+            self.abr_loop.report(reading, now);
+            self.abr_loop.observe(est, true, now);
+            while let Ok((_, e)) = self.traces.try_recv() {
+                self.seen.push(e);
+            }
+        }
+
+        /// Reports every 100 ms over `[from_ms, to_ms)`.
+        fn link(&mut self, from_ms: u64, to_ms: u64, link_kbps: impl Fn(u64) -> f64) {
+            for ms in (from_ms..to_ms).step_by(100) {
+                self.report(ms, link_kbps(ms));
+            }
+        }
+
+        fn setpoint(&self) -> u32 {
+            self.abr_loop.governor.lock().unwrap().setpoint_kbps()
+        }
+
+        /// openh264enc's `bitrate` is bit/s.
+        fn bitrate(&self) -> u32 {
+            self.encoder.property::<u32>("bitrate") / 1000
+        }
+
+        fn size(&self) -> (i32, i32) {
+            self.lever.stage().requested()
+        }
+
+        /// Make the scale stage report `size` as negotiated (`ScaleStage::current`), as a
+        /// running pipeline does until a resize lands; without it the stage reports the
+        /// size it was asked for, so every step lands at once.
+        fn negotiated(&self, (w, h): (i32, i32)) {
+            let pad = self.lever.stage().filter.as_ref().unwrap();
+            let pad = pad.static_pad("src").unwrap();
+            pad.set_active(true).unwrap();
+            pad.push_event(gst::event::StreamStart::new("s"));
+            let caps = gst::Caps::builder("video/x-raw")
+                .field("width", w)
+                .field("height", h)
+                .build();
+            pad.push_event(gst::event::Caps::new(&caps));
+            assert_eq!(self.lever.current(), (w, h));
+        }
+
+        fn rung_steps(&self) -> Vec<(i64, i64)> {
+            self.events("abr.ladder.step")
+                .iter()
+                .map(|s| (s["from"].as_i64().unwrap(), s["to"].as_i64().unwrap()))
+                .collect()
+        }
+
+        fn events(&self, name: &str) -> Vec<&serde_json::Value> {
+            self.seen
+                .iter()
+                .filter(|e| e.event == name)
+                .map(|e| &e.payload)
+                .collect()
+        }
+    }
+
+    /// An ordinary drop, 10 → 6 Mbit/s, a rung's worth: the setpoint is at the estimate
+    /// 100 ms after the first report under the link, and the rung at 1080p 1 s after that,
+    /// in one step that holds for a minute. On the old code the governor took −12.5 % per 7 s
+    /// and the rung moved on 5 s windows: neither within a second.
+    #[test]
+    fn an_ordinary_drop_moves_the_setpoint_in_100_ms_and_the_rung_once_in_a_second() {
+        let mut wt = Wt::new(true);
+        wt.link(0, 5000, |_| 20_000.0);
+        assert_eq!(
+            (wt.setpoint(), wt.size()),
+            (10_000, (2560, 1440)),
+            "a clean link holds"
+        );
+        assert!(
+            wt.seen.is_empty(),
+            "{:?}",
+            wt.seen.iter().map(|e| e.event).collect::<Vec<_>>()
+        );
+
+        wt.link(5000, 5200, |_| 6000.0);
+        assert_eq!(
+            wt.bitrate(),
+            5100,
+            "the estimate (0.85 × 6000) within 200 ms"
+        );
+        wt.link(5200, 6100, |_| 6000.0);
+        assert_eq!(
+            wt.size(),
+            (2560, 1440),
+            "not before a second of the rate under the band"
+        );
+        wt.link(6100, 6200, |_| 6000.0);
+        assert_eq!(
+            wt.size(),
+            (1920, 1080),
+            "1080p: 0.6 × B = 3897 fits the rate"
+        );
+        wt.link(6200, 66_000, |_| 6000.0);
+        let steps = wt.events("abr.ladder.step");
+        assert_eq!(steps.len(), 1, "one step: {steps:?}");
+        assert_eq!(steps[0]["reason"], "rate");
+        assert_eq!(wt.size(), (1920, 1080));
+        let retargets = wt.events("abr.retarget").len();
+        assert!(
+            retargets <= 61,
+            "under one a second, not one per report (610): {retargets}"
+        );
+    }
+
+    /// The #1320 series, 10 → 1.5 Mbit/s: the rung, the floor and the setpoint reach 720p
+    /// together in one step, 1.1 s after the first report under the link, and stay there
+    /// for the minute; the frame rate is kept. With `abr_ladder_floor_follows_rung=false`
+    /// the rung still goes to the size the rate fits (the old collapse went by floors, which
+    /// then never fit, and stopped at the deepest rung with the floor unmoved, as it is
+    /// here by the operator's choice). The old window path took 10 s for the first rung.
+    #[test]
+    fn the_1320_cut_steps_once_to_the_rung_that_fits_and_holds() {
+        for follows in [true, false] {
+            let mut wt = Wt::new(follows);
+            wt.link(0, 5000, |_| 20_000.0);
+            wt.link(5000, 6000, |_| 1500.0);
+            assert_eq!(wt.size(), (2560, 1440));
+            assert_eq!(
+                wt.bitrate(),
+                3000,
+                "the rate is 1275; the 1440p floor holds the setpoint"
+            );
+            wt.link(6000, 6200, |_| 1500.0);
+            assert_eq!(wt.size(), (1280, 720), "no rung fits 1275: the floor rung");
+            let floor = if follows { 1061 } else { 3000 };
+            assert_eq!(
+                wt.bitrate(),
+                1275.max(floor),
+                "floor_follows_rung={follows}"
+            );
+            assert_eq!(
+                wt.lever.stage().current_fps(),
+                120,
+                "the frame rate is kept"
+            );
+            wt.link(6200, 66_000, |_| 1500.0);
+            let steps = wt.events("abr.ladder.step");
+            assert_eq!(steps.len(), 1, "{steps:?}");
+            assert_eq!((&steps[0]["from"], &steps[0]["to"]), (&0.into(), &3.into()));
+            assert_eq!(steps[0]["floor_kbps"], floor);
+            assert_eq!(wt.size(), (1280, 720));
+            if follows {
+                // The up path probes one deadband over the link before a reading cuts it.
+                assert!(wt.setpoint() <= 1725, "around the link: {}", wt.setpoint());
+            }
+        }
+    }
+
+    /// Recovery, 1.5 → 10 Mbit/s after the #1320 cut: the setpoint is never above the
+    /// estimate, no step goes down, at most one step per rung crossed, and the launch size
+    /// and the ceiling arrive as soon as the estimate does. The old code climbed one rung
+    /// per two windows, 10 s apart.
+    #[test]
+    fn recovery_climbs_under_the_estimate_one_step_per_rung_at_most() {
+        let mut wt = Wt::new(true);
+        wt.link(0, 5000, |_| 20_000.0);
+        wt.link(5000, 66_000, |_| 1500.0);
+        let before = wt.events("abr.ladder.step").len();
+        let (mut est_ceiling_at, mut sp_ceiling_at, mut rate_8000_at) = (None, None, None);
+        for ms in (66_000..126_000).step_by(100) {
+            wt.report(ms, 20_000.0);
+            assert!(
+                wt.setpoint() as f64 <= wt.est.max(1061.0),
+                "{ms}: {} > {}",
+                wt.setpoint(),
+                wt.est
+            );
+            let rate = wt.abr_loop.governor.lock().unwrap().rate_kbps();
+            if rate >= 8000.0 {
+                rate_8000_at.get_or_insert(ms);
+            }
+            if wt.est >= 10_000.0 {
+                est_ceiling_at.get_or_insert(ms);
+            }
+            if wt.setpoint() == 10_000 {
+                sp_ceiling_at.get_or_insert(ms);
+            }
+        }
+        let ups: Vec<_> = wt.events("abr.ladder.step")[before..]
+            .iter()
+            .map(|s| (s["from"].as_i64().unwrap(), s["to"].as_i64().unwrap()))
+            .collect();
+        assert!(ups.iter().all(|(f, t)| t < f), "no down step: {ups:?}");
+        assert!(ups.len() <= 3, "at most one per rung crossed: {ups:?}");
+        assert_eq!(wt.size(), (2560, 1440));
+        let (est_at, sp_at) = (est_ceiling_at.unwrap(), sp_ceiling_at.unwrap());
+        assert!(
+            sp_at <= est_at + 1000,
+            "the ceiling {sp_at} ms, the estimate's {est_at} ms"
+        );
+        let back = wt
+            .seen
+            .iter()
+            .rfind(|e| e.event == "abr.ladder.step")
+            .unwrap();
+        assert_eq!(back.payload["to"], 0);
+        assert!(rate_8000_at.is_some());
+    }
+
+    /// A link oscillating 3 ↔ 5 Mbit/s at 0.5 Hz for a minute moves the rung exactly once
+    /// (to 720p, the size the low phase fits) and never back: the band and the up hold keep
+    /// it. Old assertion (24ad172a): `<= 1`, which zero steps also passed.
+    #[test]
+    fn an_oscillating_link_changes_the_rung_exactly_once() {
+        let mut wt = Wt::new(true);
+        wt.link(0, 5000, |_| 20_000.0);
+        wt.link(5000, 65_000, |ms| {
+            if (ms / 1000) % 2 == 1 {
+                3000.0
+            } else {
+                5000.0
+            }
+        });
+        assert_eq!(wt.rung_steps(), vec![(0, 3)]);
+    }
+
+    /// #1376 review A1/R1, seat A's replay on the owner's profile: at 900p a link
+    /// alternating 2900 and 4200 kbit/s every 6 s crosses 900p's engage line (2965) in its
+    /// low phase and 720p's recover line (3953) in its high one. Old code (24ad172a): down
+    /// and back up every cycle. Now the first up after a down waits until the down is
+    /// `min_step_s` (10 s) old, so every down comes at least `min_step_s + STEP_SETTLE +
+    /// RATE_CONFIRM` (14 s) after the one before. A down stays prompt: 1 s after the first
+    /// low phase begins.
+    #[test]
+    fn a_slow_oscillation_across_the_band_is_bounded() {
+        let mut wt = Wt::new(true);
+        wt.link(0, 5000, |_| 20_000.0);
+        wt.link(5000, 20_000, |_| 4000.0);
+        assert_eq!(wt.size(), (1600, 900), "0.85 × 4000 fits 900p");
+        let before = wt.rung_steps().len();
+        let mut downs = Vec::new();
+        for ms in (20_000..80_000).step_by(100) {
+            let low = ((ms - 20_000) / 6000) % 2 == 0;
+            let was = wt.size();
+            wt.report(ms, if low { 2900.0 } else { 4200.0 });
+            if was != (1280, 720) && wt.size() == (1280, 720) {
+                downs.push(ms);
+            }
+        }
+        let steps = &wt.rung_steps()[before..];
+        assert!(
+            steps.iter().all(|s| *s == (2, 3) || *s == (3, 2)),
+            "{steps:?}"
+        );
+        assert!(downs[0] <= 21_200, "down at {downs:?}");
+        assert!(
+            downs.len() >= 2 && downs.windows(2).all(|d| d[1] - d[0] >= 14_000),
+            "{downs:?} {steps:?}"
+        );
+    }
+
+    /// #1376 review A5 and S2: while a step has not landed (the encoder still reports the
+    /// old size) nothing moves: the readings neither move the setpoint (old code, 24ad172a:
+    /// they did once the 3 s settle ran out) nor step the rung again; when it lands the
+    /// settle starts and the next step follows the rate. Deleting the `in_flight` latch in
+    /// `step_rung` leaves the latch set and the session deaf to the rate.
+    #[test]
+    fn a_step_in_flight_holds_the_rate_and_the_rung_until_it_lands() {
+        let mut wt = Wt::new(true);
+        wt.negotiated((2560, 1440));
+        wt.link(0, 5000, |_| 20_000.0);
+        wt.link(5000, 6200, |_| 6000.0);
+        assert_eq!(wt.size(), (1920, 1080), "asked for");
+        assert_eq!(wt.lever.current(), (2560, 1440), "not landed");
+        let setpoint = wt.setpoint();
+        wt.link(6200, 12_000, |_| 1500.0);
+        assert_eq!(wt.setpoint(), setpoint, "no reading counts in flight");
+        assert_eq!(wt.rung_steps(), vec![(0, 1)]);
+        wt.negotiated((1920, 1080));
+        wt.link(12_000, 14_900, |_| 1500.0);
+        assert_eq!(wt.setpoint(), setpoint, "the settle after it lands");
+        wt.link(14_900, 20_000, |_| 1500.0);
+        assert_eq!(wt.rung_steps(), vec![(0, 1), (1, 3)]);
+    }
+
+    /// #1376 review S2: a manual resize starts the settle (`mark_resized`), so the rate's
+    /// next step waits 3 s after the size moved. Deleting the call steps 1 s after the cut.
+    #[test]
+    fn a_manual_resize_settles_before_the_rate_steps() {
+        let mut wt = Wt::new(true);
+        wt.link(0, 5000, |_| 20_000.0);
+        wt.lever.set_rung_tagged(1600, 900, "test").unwrap();
+        wt.link(5000, 7900, |_| 1500.0);
+        assert!(wt.rung_steps().is_empty());
+        assert_eq!(wt.setpoint(), 10_000, "no reading counts in the settle");
+        wt.link(7900, 12_000, |_| 1500.0);
+        assert_eq!(wt.rung_steps(), vec![(2, 3)]);
+    }
+
+    /// #1376 review A3: an encoder whose bitrate write costs a keyframe is written at most
+    /// once a second however low `QUASAR_ABR_MIN_INTERVAL_MS` is set. Old code (24ad172a):
+    /// the gap was `min_interval` itself, down to 1 ms.
+    #[test]
+    fn a_keyframe_costing_write_is_at_most_once_a_second() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        for enc in [EncoderChoice::Nvenc, EncoderChoice::Va] {
+            assert_eq!(report_write_gap(enc, ms(1)), ms(1000), "{enc:?}");
+            assert_eq!(report_write_gap(enc, ms(3000)), ms(3000), "{enc:?}");
+        }
+        for enc in [EncoderChoice::Vulkan, EncoderChoice::Openh264] {
+            assert_eq!(report_write_gap(enc, ms(1)), Duration::ZERO, "{enc:?}");
+        }
+    }
+
+    /// #68: a clean link whose delay detector misreads it (the estimate under the setpoint
+    /// every third report) while every datagram arrives as sent (no reading) moves nothing:
+    /// no retarget and no step for a minute. The old governor took −12.5 % at once and every
+    /// 7 s after.
+    #[test]
+    fn a_clean_link_misread_as_congested_moves_nothing() {
+        let mut wt = Wt::new(true);
+        for ms in (0..60_000).step_by(100) {
+            let est = if (ms / 100) % 3 == 0 {
+                6300.0
+            } else {
+                10_000.0
+            };
+            wt.feed(ms, est, None);
+        }
+        assert_eq!(wt.setpoint(), 10_000);
+        assert!(
+            wt.events("abr.retarget").is_empty(),
+            "{:?}",
+            wt.events("abr.retarget")
+        );
+        assert!(wt.events("abr.ladder.step").is_empty());
+    }
+
     // ---- ResolutionLever ----
 
     fn software_lever(launch: (i32, i32)) -> EncodeResolutionLever {
@@ -1422,7 +2537,13 @@ mod tests {
         let lever = software_lever((1920, 1080));
         assert_eq!(
             lever.available_rungs(),
-            vec![(1920, 1080), (1600, 900), (1280, 720)]
+            vec![
+                (1920, 1080),
+                (1600, 900),
+                (1280, 720),
+                (960, 540),
+                (640, 360)
+            ]
         );
         assert_eq!(lever.current(), (1920, 1080));
     }
@@ -1655,6 +2776,7 @@ mod tests {
             res_disabled: false,
             fps_disabled: false,
             in_flight: false,
+            live: res_rungs()[0],
         }
     }
     /// One congested-at-the-floor window: the emergency path steps on the first qualifying

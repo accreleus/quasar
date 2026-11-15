@@ -10,6 +10,7 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/agentws"
 	"github.com/accreleus/quasar/control-plane/internal/profile"
 	"github.com/accreleus/quasar/control-plane/internal/tier"
+	"github.com/accreleus/quasar/control-plane/internal/wtendpoint"
 )
 
 // LaunchByProfile resolves the selected launch profile (or the legacy tier) to
@@ -247,6 +248,11 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		// The effective runtime app's image; engages the placement filter only when
 		// it is an installed catalog entry.
 		AppImage: app.Image(),
+		// A PyroWave slot is taken under the scheduler's locks (§The PyroWave ceiling).
+		PyroWaveCandidate: pyrowaveCandidate(launchProfile, lp),
+	}
+	if app.IsDerived() && app.ExternalSource == "steam" {
+		p.CompatGameID = app.ExternalID
 	}
 	if p.RequireCodec, err = codecConstraint(launchProfile, ov); err != nil {
 		return LaunchResult{}, err
@@ -290,6 +296,11 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		if owner == "" || !c.hostParks(owner) {
 			return LaunchResult{}, errParkRefused
 		}
+		// Every park is WebRTC-only (#1161): a launch that would plan WebTransport supersedes it
+		// and cold-starts Steam behind a 503, so park nothing for that user (#1163).
+		if c.launchWouldPlanWebTransport(ctx, p, owner, launchProfile, lp, ov, env, source) {
+			return LaunchResult{}, errParkRefused
+		}
 		// A heartbeat never waits on a settling hold: it simply parks nothing.
 		p.Kind, p.PinHostID, p.NoHomeSettleWait = KindParked, owner, true
 	} else if parked, err = c.store.liveParked(ctx, userID); err != nil {
@@ -298,7 +309,8 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		claimStream, err = c.claimCandidate(ctx, &p, parked, launchProfile, lp, ov, env, source)
 		if errors.Is(err, ErrCodecUnsupportedByHost) {
 			// The parked GPU cannot encode the launch's codec: a failed check 4.
-			c.supersedeParkedHolder(ctx, userID, parked.ID)
+			cause := c.store.codecGatedCause(ctx, p, parked, c.hostParks(parked.HostID), c.hostRestreams(parked.HostID))
+			c.supersedeParkedHolder(ctx, userID, parked.ID, cause)
 			return LaunchResult{}, &ParkedClaimRefusedError{HolderID: parked.ID}
 		}
 		if err != nil {
@@ -309,13 +321,8 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		afterParkedRead()
 	}
 	notice := ""
-	if app.ShareSteamLibrary && app.ManagedHome && !lp.parked {
-		if p.SharedHomeAppID, err = c.store.sharedSteamApp(ctx, userID); err != nil {
-			return LaunchResult{}, err
-		}
-		if p.SharedHomeAppID == "" {
-			notice = noticeSharedUnavailable
-		}
+	if p.SharedHomeAppID, notice, err = c.store.sharedHomeChoice(ctx, app, userID, lp.parked); err != nil {
+		return LaunchResult{}, err
 	}
 
 	sess, err := c.store.ScheduleAndCreate(ctx, p)
@@ -328,19 +335,22 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		holder := inUse.releasedID
 		if inUse.parkedID != "" {
 			holder = inUse.parkedID
-			c.supersedeParkedHolder(ctx, userID, inUse.parkedID)
+			c.supersedeParkedHolder(ctx, userID, inUse.parkedID, "")
 		}
 		err = &ParkedClaimRefusedError{HolderID: holder}
 	case p.claim != nil && errors.As(err, &refused) && refused.Warming:
 		// Left to finish warming; the client's retry claims it once running.
+	case p.claim != nil && errors.Is(err, errClaimLost):
+		// A racing launch claimed it: nothing to stop.
 	case p.claim != nil && errors.Is(err, ErrCapacityExhausted):
 		// The parked session stops and the client's retry launches cold. This
 		// includes a claim that ran out of placement retries under contention,
 		// which is rare enough not to tell apart.
-		c.supersedeParkedHolder(ctx, userID, p.claim.id)
 		if !errors.As(err, &refused) {
-			err = &ParkedClaimRefusedError{HolderID: p.claim.id}
+			refused = &ParkedClaimRefusedError{HolderID: p.claim.id, Cause: causeNoRoom}
+			err = refused
 		}
+		c.supersedeParkedHolder(ctx, userID, p.claim.id, refused.Cause)
 	case !lp.parked && errors.Is(err, ErrCapacityExhausted):
 		c.evictParkedFor(ctx, p)
 	}
@@ -354,6 +364,9 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	}
 	if p.claim != nil {
 		sess.AdoptSessionID = p.claim.id
+		if len(sess.restream) > 0 {
+			c.log.Info("warm steam: claim adopted", "session_id", sess.ID, "adopts", p.claim.id, "restream", sess.restream)
+		}
 	}
 	if sess.notice == "" {
 		sess.notice = notice
@@ -370,13 +383,33 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	// Post-placement: rung resolution, cert cap, re-resolve, one write. Placement
 	// picks the GPU, not the rung, so the rung resolves here, where the GPU is
 	// known. A claim resolved it on the parked session's GPU before placement.
+	placed := claimStream
 	if p.claim != nil {
+		// Planned as holding a PyroWave slot the INSERT found taken: plan it again as busy.
+		// PyroWave moves no standard-stream field claim check 4 compared.
+		if ps := claimStream.plan; ps != nil && ps.Update.KeepPyroWaveSlot && !sess.PyroWaveSlot {
+			again, err := c.planPostPlacement(ctx, &sess, launchProfile, lp, ov, env, source)
+			if err != nil {
+				c.log.Warn("pyrowave: re-planning a claim without a slot failed, planning it busy on WebRTC",
+					"session_id", sess.ID, "err", err)
+			}
+			claimStream = claimWithoutSlot(claimStream, again, err)
+			placed = claimStream
+		}
 		c.persistPlacedStream(ctx, &sess, claimStream)
-	} else if err := c.applyPostPlacement(ctx, &sess, launchProfile, lp, ov, env, source); err != nil {
+	} else if placed, err = c.applyPostPlacement(ctx, &sess, launchProfile, lp, ov, env, source); err != nil {
 		// The codec constraint pre-empts both codec refusals; this stays the
 		// backstop. Fail the session, releasing its reservation, rather than
 		// dispatching a doomed assignment.
 		c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, fmt.Sprintf("rung resolution failed: %v", err))
+		return LaunchResult{}, err
+	}
+
+	// A WebTransport session gets its first transport token now: the transport is only known
+	// after placement, and the assign below carries the token's hash.
+	transport, err := c.mintLaunchTransport(ctx, &sess, placed)
+	if err != nil {
+		c.failBeforeAgent(sess.ID, sess.AdoptSessionID, sess.HostID, fmt.Sprintf("transport token: %v", err))
 		return LaunchResult{}, err
 	}
 
@@ -418,7 +451,24 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	expectedHome := expectedHomeDispatch(app)
 	go c.prepareAndDispatch(sess, dispatchSpec, app.Image(), &expectedHome)
 
-	return LaunchResult{Session: sess, SignalingToken: tok.Plaintext, TokenExpiresAt: tok.ExpiresAt, Notice: sess.notice}, nil
+	return LaunchResult{Session: sess, SignalingToken: tok.Plaintext, TokenExpiresAt: tok.ExpiresAt, Notice: sess.notice, Transport: transport}, nil
+}
+
+// mintLaunchTransport mints the first transport token when the plan chose WebTransport, sets it
+// on sess for the assign dispatch and returns the options for the 201. Nil for a WebRTC session,
+// including one whose plan write failed: sess then still holds the inserted webrtc values.
+func (c *Coordinator) mintLaunchTransport(ctx context.Context, sess *Session, ps placedStream) (*TransportOptions, error) {
+	if sess.Transport != transportWebTransport || ps.plan == nil || ps.plan.Endpoint == nil {
+		return nil, nil
+	}
+	grant, err := c.store.MintTransportToken(ctx, sess.ID)
+	if err != nil {
+		return nil, err
+	}
+	sess.wt = &grant
+	return &TransportOptions{
+		URL: ps.plan.Endpoint.URL, Token: grant.Plaintext, ExpiresAt: grant.ExpiresAt, CertHashes: ps.plan.Endpoint.CertHashes,
+	}, nil
 }
 
 func (c *Coordinator) prepareAndDispatch(sess Session, runtimeSpec []byte, imageRef string, expected *homeDispatchExpectation) {
@@ -512,13 +562,13 @@ func (c *Coordinator) applyPostPlacement(
 	ov StreamOverride,
 	env ProbeEnvelope,
 	source string,
-) error {
+) (placedStream, error) {
 	ps, err := c.planPostPlacement(ctx, sess, launchProfile, lp, ov, env, source)
 	if err != nil {
-		return err
+		return placedStream{}, err
 	}
 	c.persistPlacedStream(ctx, sess, ps)
-	return nil
+	return ps, nil
 }
 
 // planPostPlacement is applyPostPlacement's decision with no write: the rung
@@ -597,6 +647,8 @@ func (c *Coordinator) claimCandidate(ctx context.Context, p *CreateParams, k par
 		ID: k.ID, UserID: p.UserID, AppID: p.AppID, HostID: &k.HostID, GPUIndex: &k.GPUIndex,
 		Width: p.Width, Height: p.Height, FPS: p.FPS, BitrateKbps: p.BitrateKbps,
 		H264Profile: p.H264Profile, Codec: wireCodecH264, Playout0Ms: p.Playout0Ms,
+		// A claim plans like any launch: as holding the slot its INSERT will try to take.
+		PyroWaveSlot: p.PyroWaveCandidate,
 	}
 	if lp.DeviceID != "" {
 		prov.DeviceID = &lp.DeviceID
@@ -608,16 +660,23 @@ func (c *Coordinator) claimCandidate(ctx context.Context, p *CreateParams, k par
 	ps.applyTo(&prov)
 	p.Width, p.Height, p.FPS, p.BitrateKbps = prov.Width, prov.Height, prov.FPS, prov.BitrateKbps
 	p.Codec, p.Playout0Ms = prov.Codec, prov.Playout0Ms
-	p.claim = &parkedClaim{id: k.ID, hostParks: c.hostParks(k.HostID)}
+	p.claim = &parkedClaim{id: k.ID, hostParks: c.hostParks(k.HostID), restream: c.hostRestreams(k.HostID),
+		transport: transportOrWebRTC(prov.Transport)}
 	return ps, nil
 }
 
 // supersedeParkedHolder stops the caller's parked session that a launch inside
 // its family could not adopt or must not wait behind. No suppression: the
-// launch is inside the family.
-func (c *Coordinator) supersedeParkedHolder(ctx context.Context, userID, parkedID string) {
-	if _, err := c.stopParked(ctx, StopReasonParkedSuperseded, parkedFilter{UserID: userID, ID: parkedID}); err != nil {
+// launch is inside the family. cause is the failed claim check, "" when the
+// launch did not try to claim it.
+func (c *Coordinator) supersedeParkedHolder(ctx context.Context, userID, parkedID, cause string) {
+	stopped, err := c.stopParked(ctx, StopReasonParkedSuperseded, parkedFilter{UserID: userID, ID: parkedID})
+	if err != nil {
 		c.log.Warn("warm steam: stopping an unclaimable parked session failed", "session_id", parkedID, "err", err)
+		return
+	}
+	if stopped > 0 && cause != "" {
+		c.log.Info("warm steam: claim superseded", "session_id", parkedID, "cause", cause)
 	}
 }
 
@@ -674,6 +733,18 @@ func (c *Coordinator) gatherStreamInputs(
 		Chain:       chain,
 		CertMaxAge:  CertStaleness,
 		Now:         time.Now(),
+		Transport:   TransportInputs{Requested: lp.Transport},
+
+		HoldsPyroWaveSlot: sess.PyroWaveSlot,
+	}
+	// Only a profile that can want WebTransport pays for the endpoint read.
+	if sess.HostID != nil && (chain.Transport == transportWebTransport || chain.Transport == transportOptIn) {
+		if host, err := wtendpoint.Load(ctx, c.store.pool, *sess.HostID); err != nil {
+			c.log.Warn("transport: host endpoint load failed, planning WebRTC",
+				"host_id", *sess.HostID, "err", err)
+		} else {
+			in.Transport.Endpoint = wtendpoint.Resolve(host, in.Now).Endpoint
+		}
 	}
 
 	// Placed-host encoder capability. A missing host is an h264-only host; an
@@ -1017,6 +1088,12 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 		Kind:           sess.Kind,
 		AdoptSessionID: sess.AdoptSessionID,
 	}
+	assign.CompatTools = c.compatToolsFor(sess.AppID, hostID)
+	if sess.wt != nil {
+		exp := sess.wt.ExpiresAt
+		assign.Transport, assign.WTTokenHash, assign.WTTokenExpiresAt = transportWebTransport, sess.wt.Hash, &exp
+		assign.PyroWave = sess.PyroWave.grant()
+	}
 	if !c.sendHomeBoundAssign(hostID, sess.ID, runtimeSpec, assign, expected) {
 		return
 	}
@@ -1053,6 +1130,11 @@ func (c *Coordinator) sendHomeBoundAssign(hostID, sessionID string, app []byte, 
 		if !ok {
 			c.failBeforeAgent(sessionID, assign.AdoptSessionID, &hostID,
 				"assign dispatch failed: the agent connection cannot take a parked session or an adoption")
+			return false
+		}
+		wire, err := c.fitCompatTools(wire, epoch, hostID)
+		if err != nil {
+			c.failBeforeAgent(sessionID, assign.AdoptSessionID, &hostID, "compat_tool_missing: "+err.Error())
 			return false
 		}
 		capable := epoch != nil && epoch.SupportsHomeCleanup()

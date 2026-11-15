@@ -181,7 +181,7 @@ type Dump struct {
 	SizeBytes     int64  `json:"size_bytes"`
 }
 
-// Role is what a machine runs (CONTEXT.md "Combined host").
+// Role is what a machine runs (GLOSSARY.md "Combined host").
 type Role string
 
 const (

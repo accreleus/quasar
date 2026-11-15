@@ -1,0 +1,7 @@
+{
+  "name": "fallback",
+  "scenarios": [
+    { "scenario": "transport-fallback", "params": { "transport": "webtransport", "codec": "h264", "profile": "1080p60", "when": "mid", "hold_s": 60 } },
+    { "scenario": "transport-fallback", "params": { "transport": "webtransport", "codec": "h264", "profile": "1080p60", "when": "connect", "hold_s": 60 } }
+  ]
+}

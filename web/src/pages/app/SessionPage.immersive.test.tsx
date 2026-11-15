@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionPage } from "./SessionPage";
 import { ToastProvider } from "../../components/Toast";
 import { ThemeProvider } from "../../settings/ThemeContext";
+import { enterLaunchFullscreen } from "../../input/launchFullscreen";
 
 const getSession = vi.fn();
 const stopSession = vi.fn();
@@ -15,6 +16,7 @@ const mintSignalingToken = vi.fn();
 const updateSessionDisplay = vi.fn();
 vi.mock("../../api/library", () => ({
   getSession: (...a: unknown[]) => getSession(...a),
+  listApps: () => Promise.resolve({ items: [] }),
   stopSession: (...a: unknown[]) => stopSession(...a),
   mintSignalingToken: (...a: unknown[]) => mintSignalingToken(...a),
   updateSessionDisplay: (...a: unknown[]) => updateSessionDisplay(...a),
@@ -25,6 +27,7 @@ vi.mock("../../auth/context", () => ({
 }));
 
 const engageSpy = vi.hoisted(() => vi.fn());
+const touch = vi.hoisted(() => ({ on: false }));
 vi.mock("../../input/capture", () => ({
   setupCapture: () => ({
     cleanup: () => {},
@@ -47,7 +50,7 @@ vi.mock("../../input/capture", () => ({
   }),
   keyboardLockSupported: () => false,
   pointerLockSupported: () => true,
-  touchLookSupported: () => false,
+  touchLookSupported: () => touch.on,
 }));
 
 vi.mock("../../webrtc/mic", () => ({
@@ -85,8 +88,49 @@ vi.mock("../../webrtc/traceEvents", () => ({
     emitPlayoutChanged() {}
     emitWebRtcStateChanged() {}
     emitFreezeDetected() {}
+    emitTransportFallback() {}
   },
 }));
+
+/** The WebTransport runtime double: a test plays its snapshot and its fallback by hand. */
+const wt = vi.hoisted(() => ({
+  set: null as null | ((patch: Record<string, unknown>) => void),
+  callbacks: null as null | { onFallback(reason: string): void; onCodecSwitched?(codec: string, reason: string): void },
+}));
+vi.mock("./webTransportRuntime", async () => {
+  const { IDLE_SNAPSHOT } = await import("./sessionRuntime");
+  return {
+    createWebTransportRuntime: (cfg: { callbacks: { onFallback(reason: string): void } }) => {
+      let snap = { ...IDLE_SNAPSHOT };
+      const listeners = new Set<() => void>();
+      wt.callbacks = cfg.callbacks;
+      wt.set = (patch) => {
+        snap = { ...snap, ...patch };
+        listeners.forEach((l) => l());
+      };
+      return {
+        getSnapshot: () => snap,
+        subscribe: (fn: () => void) => (listeners.add(fn), () => listeners.delete(fn)),
+        start() {},
+        destroy() {},
+        engage: () => engageSpy(),
+        release() {},
+        syncKeyboardLock() {},
+        setMouse() {},
+        setVirtualPad() {},
+        isCaptured: () => false,
+        cancelRecovery() {},
+        hasMicSlot: () => false,
+        attachMicTrack: () => Promise.resolve(),
+        detachMicTrack: () => Promise.resolve(),
+        registerTelemetry: () => () => {},
+        summary: () => ({ elapsedMs: 0, fps: [], latency: [] }),
+        releaseAudio() {},
+        holdAudio() {},
+      };
+    },
+  };
+});
 
 /** Captured from the last QuasarSession constructor call so tests can flip
  *  channelOpen by hand — exactly the ondatachannel/onopen path SessionPage
@@ -95,6 +139,8 @@ let lastOnChannel: ((ch: { readyState: string; onclose: (() => void) | null }) =
 /** The runtime's recovery sink, same capture: a test plays the transport's
  *  verdict (e.g. the 4404 close) without a WebSocket. */
 let lastOnRecovery: ((state: Record<string, unknown>) => void) | null = null;
+/** The last WebRTC transport, for the audio track a test hands its runtime. */
+let lastTransport: { onAudioTrack: unknown } | null = null;
 vi.mock("../../webrtc/session", () => ({
   QuasarSession: class {
     videoReceiver = null;
@@ -111,6 +157,7 @@ vi.mock("../../webrtc/session", () => ({
     ) {
       lastOnChannel = onChannel;
       lastOnRecovery = onRecoveryState ?? null;
+      lastTransport = this;
     }
     close() {}
     // As QuasarSession does: abandoning the reconnect terminalises recovery.
@@ -189,7 +236,7 @@ function SummaryProbe() {
   return <pre data-testid="summary">{JSON.stringify(state?.sessionSummary ?? null)}</pre>;
 }
 
-function renderPage() {
+function renderPage(extra: Record<string, unknown> = {}) {
   return render(
     <MemoryRouter
       initialEntries={[
@@ -201,6 +248,7 @@ function renderPage() {
             appName: "Portal 2",
             appId: "a1",
             tier: "1920×1080@60",
+            ...extra,
           },
         },
       ]}
@@ -226,7 +274,11 @@ beforeEach(() => {
   vi.clearAllMocks();
   lastOnChannel = null;
   lastOnRecovery = null;
+  lastTransport = null;
   lastDrawerProps = null;
+  wt.set = null;
+  wt.callbacks = null;
+  touch.on = false;
   updateSessionDisplay.mockResolvedValue({ session: makeSession({ state: "running" }) });
   getSession.mockImplementation(async () => ({ session: currentSession }));
   stopSession.mockResolvedValue(undefined);
@@ -414,6 +466,104 @@ describe("SessionPage — #647 straight-in capture", () => {
   });
 });
 
+// The owner's flow on the WebTransport transport: Play spends its click on full screen,
+// the route change to the session page keeps it, and the reveal captures with no second
+// click. Every other test in this file sets `document.fullscreenElement` by hand, which
+// cannot tell the launch's own full screen from any other grant — and a WebTransport page
+// differs in what it captures (a canvas, not the <video>) and in how its channel opens.
+describe("SessionPage — a WebTransport launch goes straight in (#647)", () => {
+  const webtransport = { url: "https://agent/wt", token: "w", expires_at: "2026-11-06T12:01:00Z", cert_hashes: [] };
+
+  /** The Play click's full screen, as the browser does it: the element is only full
+   *  screen once the request settles, which is after the click, not inside it. */
+  function playClick(settle = true) {
+    requestFullscreen.mockImplementation(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          setTimeout(() => {
+            if (!settle) return reject(new TypeError("fullscreen refused"));
+            fsEl = document.documentElement;
+            resolve();
+          }, 0);
+        }),
+    );
+    act(() => {
+      enterLaunchFullscreen();
+    });
+  }
+
+  async function revealOverWebTransport() {
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    renderPage({ webtransport });
+    await advance(1_000);
+    await act(async () => {
+      wt.set!({ channelOpen: true, wsOpen: true, pcConnected: true, firstFrame: true });
+    });
+    await advance(1_500);
+  }
+
+  it("engages once at the reveal, under the full screen Play asked for, with no Click to play", async () => {
+    playClick();
+    await revealOverWebTransport();
+    expect(document.fullscreenElement).toBe(document.documentElement);
+    expect(engageSpy).toHaveBeenCalledTimes(1);
+    expect(playLayer()).toBeNull();
+  });
+
+  it("offers one Click to play when the browser refused that full screen", async () => {
+    playClick(false);
+    await revealOverWebTransport();
+    expect(document.fullscreenElement).toBeNull();
+    expect(engageSpy).not.toHaveBeenCalled();
+    expect(playLayer()).not.toBeNull();
+  });
+
+  // #1058: a PyroWave step-down is for the rest of the session, so the player is told why.
+  it.each([
+    ["congestion", "Ultra-low latency is off: the connection can't carry it."],
+    ["rtt_too_high", "Ultra-low latency is off: the connection takes too long to reach the host."],
+    ["client_decode_error", "Ultra-low latency is off: this browser couldn't decode the stream."],
+    ["encoder_error", "Ultra-low latency is off: the host couldn't encode it."],
+    ["a_reason_from_later", "Ultra-low latency is off for this session."],
+  ])("a step-down off PyroWave for %s says why", async (reason, line) => {
+    await revealOverWebTransport();
+    await act(async () => wt.callbacks!.onCodecSwitched!("h264", reason));
+    expect(screen.getByText(line)).toBeTruthy();
+  });
+});
+
+describe("SessionPage — on-screen controls mount gate (#1401)", () => {
+  const webtransport = { url: "https://agent/wt", token: "w", expires_at: "2026-11-06T12:01:00Z", cert_hashes: [] };
+
+  async function captured() {
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    renderPage({ webtransport });
+    await advance(1_000);
+    await act(async () => {
+      wt.set!({ channelOpen: true, wsOpen: true, pcConnected: true, firstFrame: true, inputCaptured: true });
+    });
+    await advance(1_500);
+  }
+
+  it("is shown when captured on a touch device with the switch on", async () => {
+    touch.on = true;
+    localStorage.setItem(PREFS_KEY, JSON.stringify({ scalingMode: "contain", onScreenControls: true }));
+    await captured();
+    expect(screen.queryByTestId("on-screen-controls")).not.toBeNull();
+  });
+
+  it("is hidden with the switch off (the default), or on a device with a mouse", async () => {
+    touch.on = true;
+    await captured();
+    expect(screen.queryByTestId("on-screen-controls")).toBeNull();
+    cleanup();
+    touch.on = false;
+    localStorage.setItem(PREFS_KEY, JSON.stringify({ scalingMode: "contain", onScreenControls: true }));
+    await captured();
+    expect(screen.queryByTestId("on-screen-controls")).toBeNull();
+  });
+});
+
 describe("SessionPage — Match cursor compositor size (#898)", () => {
   const compositor = () => {
     const v = document.querySelector("video")!;
@@ -566,5 +716,177 @@ describe("SessionPage — Match cursor compositor size (#898)", () => {
     cleanup();
     await reveal();
     expect(lastDrawerProps?.uiScale).toBe(1);
+  });
+});
+
+// Capture goes with a WebTransport connection: a reconnect or a fallback must ask for it again,
+// or the player has a picture, no input and no hint why.
+describe("SessionPage — capture after a WebTransport reconnect or fallback", () => {
+  const webtransport = { url: "https://agent/wt", token: "w", expires_at: "2026-11-06T12:01:00Z", cert_hashes: [] };
+  // An earlier test's implementation survives clearAllMocks; here a click must not enter full screen.
+  beforeEach(() => requestFullscreen.mockImplementation(() => Promise.resolve()));
+
+  /** The WebTransport page up and revealed: channel open, app presented, lock animation done. */
+  async function revealOverWebTransport() {
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    renderPage({ webtransport });
+    await advance(1_000);
+    await act(async () => {
+      wt.set!({ channelOpen: true, wsOpen: true, pcConnected: true, firstFrame: true });
+    });
+    await advance(1_500);
+  }
+
+  it("re-engages without a click in full screen after a reconnect", async () => {
+    fsEl = document.documentElement;
+    await revealOverWebTransport();
+    expect(engageSpy).toHaveBeenCalledTimes(1);
+
+    await act(async () => wt.set!({ channelOpen: false, inputCaptured: false, pointerLocked: false }));
+    await advance(100);
+    expect(engageSpy).toHaveBeenCalledTimes(1); // nothing to capture for until the channel is back
+    await act(async () => wt.set!({ channelOpen: true }));
+    await advance(100);
+    expect(engageSpy).toHaveBeenCalledTimes(2);
+    expect(playLayer()).toBeNull();
+  });
+
+  it("asks for capture, with no Click to play, after a reconnect outside full screen (#1300)", async () => {
+    await revealOverWebTransport();
+    await act(async () => {
+      fireEvent.click(screen.getByText("Click to play"));
+    });
+    expect(engageSpy).toHaveBeenCalledTimes(1);
+
+    await act(async () => wt.set!({ channelOpen: false, inputCaptured: false, pointerLocked: false }));
+    await advance(100);
+    await act(async () => wt.set!({ channelOpen: true }));
+    await advance(100);
+    expect(engageSpy).toHaveBeenCalledTimes(2);
+    expect(playLayer()).toBeNull();
+  });
+
+  it("offers a gesture only when the browser refuses capture after a reconnect", async () => {
+    fsEl = document.documentElement;
+    await revealOverWebTransport();
+    expect(playLayer()).toBeNull();
+    await act(async () => wt.set!({ channelOpen: false, inputCaptured: false, pointerLocked: false }));
+    engageSpy.mockResolvedValue({ mode: "failed" });
+    await act(async () => wt.set!({ channelOpen: true }));
+    await advance(100);
+    expect(engageSpy).toHaveBeenCalledTimes(2);
+    expect(playLayer()).not.toBeNull();
+    await advance(5_000);
+    expect(engageSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["reconnect", "fallback"])("a refused %s capture keeps the windowed user windowed on click", async (kind) => {
+    await revealOverWebTransport();
+    await act(async () => fireEvent.click(screen.getByText("Click to play")));
+    requestFullscreen.mockClear();
+    engageSpy.mockResolvedValue({ mode: "failed", error: new DOMException("gesture lost", "NotAllowedError") });
+    if (kind === "reconnect") {
+      await act(async () => wt.set!({ channelOpen: false, inputCaptured: false, pointerLocked: false }));
+      await act(async () => wt.set!({ channelOpen: true }));
+    } else {
+      await act(async () => wt.callbacks!.onFallback("stream_lost"));
+      await advance(100);
+      await act(async () => { openChannel(); });
+    }
+    await advance(100);
+    // The browser error does not distinguish a lost gesture from a persistent refusal.
+    expect(playLayer()).not.toBeNull();
+    await act(async () => fireEvent.click(screen.getByText("Click to play")));
+    expect(requestFullscreen).not.toHaveBeenCalled();
+  });
+
+  it("re-engages in full screen once WebRTC's channel opens after a fallback", async () => {
+    fsEl = document.documentElement;
+    await revealOverWebTransport();
+    expect(engageSpy).toHaveBeenCalledTimes(1);
+
+    await act(async () => wt.callbacks!.onFallback("connect_timeout"));
+    await advance(100);
+    expect(engageSpy).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      openChannel();
+    });
+    await advance(100);
+    expect(engageSpy).toHaveBeenCalledTimes(2);
+    expect(playLayer()).toBeNull();
+  });
+
+  /** The audio element WebRTC's runtime makes for the session's sound. */
+  const webRtcAudio = () => {
+    act(() => (lastTransport!.onAudioTrack as (s: unknown) => void)(null));
+    return document.body.querySelector("audio") as HTMLAudioElement;
+  };
+
+  it("a fallback stays revealed and audible; only a refused capture asks for a gesture", async () => {
+    await revealOverWebTransport();
+    await act(async () => {
+      fireEvent.click(screen.getByText("Click to play"));
+    });
+    expect(engageSpy).toHaveBeenCalledTimes(1);
+
+    // Outside full screen the browser may refuse a lock with no click.
+    engageSpy.mockImplementation(() => Promise.resolve({ mode: "failed" }));
+    await act(async () => wt.callbacks!.onFallback("stream_lost"));
+    await advance(100);
+    await act(async () => {
+      openChannel();
+    });
+    await advance(100);
+    expect(engageSpy).toHaveBeenCalledTimes(2);
+    expect(playLayer()).not.toBeNull();
+    expect(webRtcAudio().muted).toBe(false);
+    await advance(5_000);
+    expect(engageSpy).toHaveBeenCalledTimes(2);
+    expect(playLayer()).not.toBeNull();
+  });
+
+  it("a fallback before the first reveal still owes Click to play outside full screen", async () => {
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    renderPage({ webtransport });
+    await advance(1_000);
+    await act(async () => wt.callbacks!.onFallback("connect_failed"));
+    await advance(100);
+    await act(async () => {
+      openChannel();
+    });
+    await advance(1_500);
+    expect(engageSpy).not.toHaveBeenCalled();
+    expect(playLayer()).not.toBeNull();
+  });
+
+  it("a reconnect before the first reveal still owes Click to play outside full screen", async () => {
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    renderPage({ webtransport });
+    await advance(1_000);
+    await act(async () => wt.set!({ channelOpen: true }));
+    await act(async () => wt.set!({ channelOpen: false }));
+    await act(async () => wt.set!({ channelOpen: true, wsOpen: true, pcConnected: true, firstFrame: true }));
+    await advance(1_500);
+    expect(engageSpy).not.toHaveBeenCalled();
+    expect(playLayer()).not.toBeNull();
+  });
+
+  it("a reload after a fallback is a first load: WebRTC from the start, behind Click to play", async () => {
+    sessionStorage.setItem("quasar.wt-fallback.s1", "stream_lost");
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    renderPage({ webtransport });
+    await advance(1_000);
+    expect(wt.set, "no WebTransport runtime").toBeNull();
+    await act(async () => {
+      openChannel();
+    });
+    await advance(1_500);
+    expect(engageSpy).not.toHaveBeenCalled();
+    expect(playLayer()).not.toBeNull();
+    await act(async () => {
+      fireEvent.click(screen.getByText("Click to play"));
+    });
+    expect(engageSpy).toHaveBeenCalledTimes(1);
+    expect(playLayer()).toBeNull();
   });
 });

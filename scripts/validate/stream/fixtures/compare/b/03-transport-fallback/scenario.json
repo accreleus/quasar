@@ -1,0 +1,21 @@
+{
+  "id": "03-transport-fallback",
+  "scenario": "transport-fallback",
+  "params": {
+    "transport": "webtransport",
+    "codec": "h264",
+    "profile": "1080p60",
+    "when": "mid"
+  },
+  "status": "pass",
+  "sessions": [],
+  "clock_offset_ms": null,
+  "criteria": [
+    {
+      "id": "continues_on_webrtc",
+      "pass": true,
+      "observed": true,
+      "expected": true
+    }
+  ]
+}

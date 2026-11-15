@@ -58,13 +58,25 @@ func (f *fakeCleanupWire) SendImageInventoryReconcile(_ string, c agentws.ImageI
 		return sendErr
 	}
 	if f.inventoryRequests != nil {
-		f.inventoryRequests <- c
+		// Non-blocking: the service sends under its lock, and production's enqueue never
+		// blocks (cleanup.go). A full fake queue fails the test by name, not by a hang.
+		select {
+		case f.inventoryRequests <- c:
+		default:
+			panic("fake inventory reconcile queue full: raise its capacity or read it")
+		}
 	}
 	return nil
 }
 func (f *fakeCleanupWire) SendImageCleanupJournalRequest(_ string, c agentws.ImageCleanupJournalRequestCmd) error {
 	if f.journalRequests != nil {
-		f.journalRequests <- c
+		// Non-blocking: the service sends under its lock, and production's enqueue never
+		// blocks (cleanup.go). A full fake queue fails the test by name, not by a hang.
+		select {
+		case f.journalRequests <- c:
+		default:
+			panic("fake cleanup journal request queue full: raise its capacity or read it")
+		}
 	}
 	return nil
 }
@@ -93,6 +105,26 @@ func (f *fakeCleanupWire) setRaw(host string, s agentws.ImageCleanupSnapshot) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.snapshots[host] = s
+}
+
+// waitCleanupTriggersIdle waits for the host's managed-identity worker to
+// finish. It retries after 100 ms when a concurrent scan moves the reconcile
+// epoch, so a test asserting "no further scan" must not race it.
+func waitCleanupTriggersIdle(t *testing.T, svc *CleanupService, host string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		svc.mu.Lock()
+		running := svc.hostTriggerRunning[host]
+		svc.mu.Unlock()
+		if !running {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("managed-identity worker still running")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 func TestCleanupHTTPPreviewAndExactAttemptAreCurrentConnectionBound(t *testing.T) {
@@ -541,8 +573,8 @@ func TestCleanupSecondAttemptRequiresItsOwnFreshInventoryBeforeRetiredJournal(t 
 	seedCatalog(t, env.pool)
 	install(t, env.pool, false)
 	env.cleanupWire.cleanup = make(chan agentws.ImageCleanupCmd, 2)
-	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 2)
-	env.cleanupWire.journalRequests = make(chan agentws.ImageCleanupJournalRequestCmd, 2)
+	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 32)
+	env.cleanupWire.journalRequests = make(chan agentws.ImageCleanupJournalRequestCmd, 32)
 	entry := agentws.ImageVersionEntry{ImageID: imgID, Version: imgVer2, ImageRef: imgDigest2, RuntimeImageID: "sha256:retry-same-connection", State: "present"}
 	snapshot := agentws.ImageCleanupSnapshot{ConnectionID: "same", Capable: true, Complete: true, Versions: []agentws.ImageVersionEntry{entry}}
 	env.cleanupWire.set(host, snapshot)
@@ -630,9 +662,12 @@ func TestCleanupSecondAttemptRequiresItsOwnFreshInventoryBeforeRetiredJournal(t 
 	snapshot.Versions[0].State = "absent"
 	env.cleanupWire.set(host, snapshot)
 	env.cleanup.ImageVersionsChanged(context.Background(), host)
-	// The rev-2 notification above can overlap the dispatch's own reconcile; the
-	// trigger that loses that race asks for one more scan (#960). Answer every
-	// scan as the agent does until the journal request arrives.
+	// Every trigger that loses a race with another scan (dispatch, the
+	// managed-identity worker's retries, the notifications above) asks for one
+	// more (#960), so how many follow-ups arrive depends on timing. Answer every
+	// scan as the agent does until the journal request arrives. The bound only
+	// catches a scan loop that never converges. Channel capacities exceed it:
+	// the fake's send blocks under the service lock.
 	for journaled := false; !journaled; {
 		select {
 		case journal := <-env.cleanupWire.journalRequests:
@@ -644,7 +679,7 @@ func TestCleanupSecondAttemptRequiresItsOwnFreshInventoryBeforeRetiredJournal(t 
 			})
 			journaled = true
 		case followup := <-env.cleanupWire.inventoryRequests:
-			if snapshot.ReconciledRevision++; snapshot.ReconciledRevision > 6 {
+			if snapshot.ReconciledRevision++; snapshot.ReconciledRevision > 3+32 {
 				t.Fatalf("follow-up scans never requested journal: %+v", followup)
 			}
 			snapshot.ReconciledRequestID = followup.ID
@@ -1025,7 +1060,7 @@ func TestCleanupReadyHistoryWriterQueuesFollowupDuringScan(t *testing.T) {
 	install(t, env.pool, false)
 	env.ens.AgentImageState(context.Background(), host, agentws.ImageStateMsg{ImageID: imgID, Version: imgVer, State: "ready"})
 	env.ens.SetCleanupService(env.cleanup)
-	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 2)
+	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 32)
 	snapshot := agentws.ImageCleanupSnapshot{ConnectionID: "same", Capable: true, Complete: true,
 		Versions: []agentws.ImageVersionEntry{{ImageID: imgID, Version: imgVer, ImageRef: imgRef,
 			RuntimeImageID: "sha256:ready-old", State: "present"}}}
@@ -1068,9 +1103,20 @@ func TestCleanupReadyHistoryWriterQueuesFollowupDuringScan(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("ready history change did not trigger follow-up")
 	}
-	snapshot.ReconciledRevision, snapshot.ReconciledRequestID = 2, second.ID
-	env.cleanupWire.set(host, snapshot)
-	env.cleanup.ImageVersionsChanged(context.Background(), host)
+	// The managed-identity worker and the test's own trigger can race for the
+	// second scan, and the loser asks for one more. Answer scans until quiet.
+	for pending, rev := second, uint64(2); ; rev++ {
+		snapshot.ReconciledRevision, snapshot.ReconciledRequestID = rev, pending.ID
+		env.cleanupWire.set(host, snapshot)
+		env.cleanup.ImageVersionsChanged(context.Background(), host)
+		waitCleanupTriggersIdle(t, env.cleanup, host)
+		select {
+		case pending = <-env.cleanupWire.inventoryRequests:
+			continue
+		default:
+		}
+		break
+	}
 	env.ens.AgentImageState(context.Background(), host, agentws.ImageStateMsg{ImageID: imgID, Version: imgVer2, State: "ready"})
 	select {
 	case extra := <-env.cleanupWire.inventoryRequests:

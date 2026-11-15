@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -213,5 +215,104 @@ func TestDisplacedSocketForwardsNothingItHadAlreadyRead(t *testing.T) {
 		first.Close()
 		secondConn.Close()
 		srv.Close()
+	}
+}
+
+// A WebTransport client taking the session over reaches this socket as an agent error frame
+// (agent-api.md §Signaling relay): the browser gets it, then the same 4410 as a later attach.
+func TestAgentTakenOverErrorClosesWith4410(t *testing.T) {
+	pool := testDB(t)
+	srv, relay, _ := newTestServerWithRelay(t, pool)
+	sess, token := seedAssignedSession(t, pool)
+
+	conn, _, err := websocket.DefaultDialer.Dial(signalURL(srv, token), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	if err := relay.Deliver(sess.ID, []byte(`{"type":"ice","pc":"video","candidate":"registration probe"}`)); err != nil {
+		t.Fatal(err)
+	}
+	readBrowserFrame(t, conn)
+
+	// The frame the node agent sends, pinned on its side by
+	// signaling::tests::taken_over_is_the_frame_the_control_plane_is_tested_with.
+	raw, err := os.ReadFile("../../../testdata/signaling/taken_over.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	taken := strings.TrimSpace(string(raw))
+	if err := relay.Deliver(sess.ID, []byte(taken)); err != nil {
+		t.Fatal(err)
+	}
+	if got := readBrowserFrame(t, conn); got != taken {
+		t.Errorf("relayed frame = %q, want the agent's error verbatim", got)
+	}
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, _, err = conn.ReadMessage()
+	var ce *websocket.CloseError
+	if !errors.As(err, &ce) || ce.Code != wsCloseTakenOver {
+		t.Fatalf("after the error: %v, want close %d", err, wsCloseTakenOver)
+	}
+}
+
+// A taken_over error that lands while the attach-time flush is still writing
+// buffered frames must close with 4410 too: the flush never reaches the pump.
+// The buffered frames are large enough that the flush stays blocked in a write
+// until the client reads on, so the error is queued behind it deterministically.
+func TestTakenOverErrorDuringTheAttachFlushClosesWith4410(t *testing.T) {
+	pool := testDB(t)
+	srv, relay, _ := newTestServerWithRelay(t, pool)
+	sess, token := seedAssignedSession(t, pool)
+
+	big := `{"type":"ice","pc":"video","candidate":"` + strings.Repeat("x", 64<<10) + `"}`
+	for i := 0; i < 254; i++ {
+		if err := relay.Deliver(sess.ID, []byte(big)); err != nil {
+			t.Fatalf("buffer frame %d: %v", i, err)
+		}
+	}
+	conn, _, err := websocket.DefaultDialer.Dial(signalURL(srv, token), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// The first buffered frame arrives only after Register, with the rest of the flush pending.
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if _, _, err := conn.ReadMessage(); err != nil {
+		t.Fatalf("read first buffered frame: %v", err)
+	}
+	if err := relay.Deliver(sess.ID, []byte(`{"type":"error","code":"taken_over","message":"taken over by a webtransport client"}`)); err != nil {
+		t.Fatal(err)
+	}
+	// Queued behind the error: it must not reach the browser.
+	if err := relay.Deliver(sess.ID, []byte(`{"type":"ice","pc":"video","candidate":"behind the error"}`)); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		_, frame, err := conn.ReadMessage()
+		if err == nil {
+			if strings.Contains(string(frame), "behind the error") {
+				t.Fatalf("a frame queued behind taken_over reached the browser")
+			}
+			continue
+		}
+		var ce *websocket.CloseError
+		if !errors.As(err, &ce) || ce.Code != wsCloseTakenOver {
+			t.Fatalf("socket ended with %v, want close %d", err, wsCloseTakenOver)
+		}
+		return
+	}
+}
+
+// Any other agent error leaves the socket open.
+func TestOtherAgentErrorsDoNotClose(t *testing.T) {
+	for _, f := range []string{
+		`{"type":"error","code":"other","message":"x"}`, `{"type":"ice"}`, `not json`,
+		`{"type":"offer","code":"taken_over"}`,
+	} {
+		if isTakenOverError([]byte(f)) {
+			t.Errorf("isTakenOverError(%s) = true", f)
+		}
 	}
 }

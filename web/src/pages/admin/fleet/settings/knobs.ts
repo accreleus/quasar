@@ -143,7 +143,7 @@ export const KNOB_COPY: Record<string, { label: string; help: string; group: Kno
   },
   abr_ladder_resolution: {
     label: "Resolution ladder",
-    help: "Lets a session drop the STREAMED resolution when the bitrate can no longer carry the picture, and climb back when it recovers. Off by default until this host has been soak-tested.",
+    help: "Lets a session drop the STREAMED resolution when the bitrate can no longer carry the picture, and climb back when it recovers. Not set: on for WebTransport sessions (order res_first), off for WebRTC. Set off here to turn it off for both.",
     group: "adaptation",
   },
   abr_ladder_res_exponent: {
@@ -193,7 +193,7 @@ export const KNOB_COPY: Record<string, { label: string; help: string; group: Kno
   },
   abr_ladder_order: {
     label: "Ladder order",
-    help: "hybrid = resolution down to 1080p, then frame rate, then lower resolutions. res_first / fps_first are the two pure orders.",
+    help: "hybrid = resolution down to 1080p, then frame rate, then lower resolutions. res_first / fps_first are the two pure orders. Not set: res_first for WebTransport sessions with the resolution ladder not set, hybrid otherwise.",
     group: "adaptation",
   },
   gop: {

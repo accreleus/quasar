@@ -513,6 +513,14 @@ jobs:
       #   the toolchain stage, deploy/toolchain-hash.sh and the resolved base digest, so a
       #   base rebuild or a pin change moves it without touching any image-input path;
       #   it is resolved just above, which is why this step comes after it.
+      #   ALSO, ON A PUSH TO DEVELOP: a base that moved since the preview was built (#1092).
+      #   The Toolchain refresh workflow publishes the toolchain for a rebuilt base ahead of
+      #   any landing, so "the toolchain is not published" no longer says the base moved;
+      #   scripts/release/base-changed.sh compares this run's base digest with the
+      #   `org.quasar.pins.base` label of the preview's node-agent image.
+      #   A BRANCH DISPATCH has no preview to compare, so after a base rebuild (once the
+      #   Toolchain refresh has published the toolchain) it skips as "nothing changed":
+      #   dispatch with `force` to build the new base into a branch.
       #   Skipping works by `if:` on the toolchain and build-* jobs: their dependants (the
       #   validate-* jobs, preflight, promote, release, preview) are skipped with them, so
       #   nothing is validated or promoted either.
@@ -524,6 +532,7 @@ jobs:
           RELEASE_CANDIDATE: ${{ steps.resolve.outputs.release_candidate }}
           FORCE: ${{ inputs.force }}
           TOOLCHAIN_BUILD: ${{ steps.toolchain.outputs.build }}
+          BASE_REF: ${{ steps.resolve.outputs.base_ref }}
           PREVIEW_TAG: ${{ steps.preview.outputs.tag }}
           REGISTRY_USER: ${{ github.actor }}
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -546,7 +555,19 @@ jobs:
           elif [ "$TOOLCHAIN_BUILD" = true ]; then why="the toolchain for these pins and this base is not published: builds everything"
           elif [ "$PREVIEW_TAG" = preview ]; then
             prev="$current"
-            [ -n "$prev" ] || why="no preview is published yet: builds everything"
+            if [ -z "$prev" ]; then why="no preview is published yet: builds everything"
+            else
+              # The nightly Toolchain refresh publishes the toolchain for a rebuilt base ahead
+              # of any landing, so `TOOLCHAIN_BUILD` no longer notices one (#1092). Ask the
+              # preview's own agent image what base it was built on. An unreadable registry
+              # fails the step; a missing image or label builds.
+              agent="$(bash scripts/release/publish-preview-manifest.sh --current "$REGISTRY_NS/quasar-release-manifest:preview" --component node-agent)"
+              moved="$(bash scripts/release/base-changed.sh "$agent" "$BASE_REF")"
+              echo "$moved"
+              if grep -qx 'rebuild=true' <<<"$moved"; then
+                why="the base image changed since the preview was built: builds everything ($(sed -n 's/^why=//p' <<<"$moved"))"
+              fi
+            fi
           else
             prev="$(gh run list --workflow images.yml --branch "$BRANCH" --status success \
                       --limit 1 --json headSha --jq '.[0].headSha // empty' || true)"

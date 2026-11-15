@@ -36,6 +36,9 @@ func homeCleanupDeleteError(err error) error {
 // (spec §4.1). See deleteApp for why the FK cascade alone isn't enough.
 var ErrAppHasDerivedTiles = errors.New("app has derived tiles")
 
+// ErrHostIsOwnMachine: deleting the host that shares the control plane's machine.
+var ErrHostIsOwnMachine = errors.New("host shares the control plane's machine")
+
 // ErrHostHasActiveSessions: deleting a host with non-terminal sessions.
 var ErrHostHasActiveSessions = errors.New("host has active sessions")
 
@@ -48,6 +51,9 @@ var ErrCoverURLOwnedByArtwork = errors.New("cover_url is owned by the artwork se
 // store is the CRUD data-access layer over the pgx pool.
 type store struct {
 	pool *pgxpool.Pool
+	// sharesOwnMachine is the control plane's own-machine decision (SetOwnMachine);
+	// nil refuses nothing.
+	sharesOwnMachine func(nodeName string) bool
 	// readinessStaleSecs is the readiness gate's freshness window; it must be
 	// the value the session store gates on, or a host reads `active` here while
 	// admission abstains. <= 0 means the default.
@@ -1666,6 +1672,9 @@ func (s *store) deleteHost(ctx context.Context, id string) (string, error) {
 	}
 	if err != nil {
 		return "", fmt.Errorf("check host exists: %w", err)
+	}
+	if s.sharesOwnMachine != nil && s.sharesOwnMachine(nodeName) {
+		return "", ErrHostIsOwnMachine
 	}
 
 	// The running callback takes session → claim → home locks. Lock every

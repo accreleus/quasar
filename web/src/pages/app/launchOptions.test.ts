@@ -10,6 +10,7 @@ import {
   fpsUniverse,
   isRecommendationEligible,
   normalizeDraft,
+  pyrowaveTargetKbps,
   recommendedProfile,
   resolveSelection,
   toWireCodec,
@@ -144,12 +145,12 @@ describe("buildOptionSpace", () => {
 
   it("offers auto + every catalog codec the client can decode", () => {
     const space = buildOptionSpace(catalog120(), ALL_CODECS, "1080p120");
-    expect(space.codecs).toEqual(["auto", "h264", "hevc", "av1"]);
+    expect(space.codecs).toEqual(["auto", "h264", "hevc", "av1", "pyrowave"]);
   });
 
   it("hides a codec entirely (not merely disables it) when the client cannot decode it", () => {
     const space = buildOptionSpace(catalog120(), H264_ONLY, "1080p120");
-    expect(space.codecs).toEqual(["auto", "h264"]);
+    expect(space.codecs).toEqual(["auto", "h264", "pyrowave"]);
     expect(space.entriesByCodec.has("hevc")).toBe(false);
     expect(space.entriesByCodec.has("av1")).toBe(false);
   });
@@ -409,5 +410,16 @@ describe("recommendedProfile / isRecommendationEligible", () => {
       const slow = [...noAv1, { code: "bandwidth_too_low", message: "" }];
       expect(isRecommendationEligible(data(chain("eligible", slow)))).toBe(false);
     });
+  });
+});
+
+describe("pyrowaveTargetKbps", () => {
+  it("follows codec-pyrowave.md §Rate: 200/300/400 Mb/s at 60 fps by height, scaled by fps, never above 1 Gb/s", () => {
+    expect(pyrowaveTargetKbps(1080, 60)).toBe(200_000);
+    expect(pyrowaveTargetKbps(1440, 60)).toBe(300_000);
+    expect(pyrowaveTargetKbps(2160, 60)).toBe(400_000);
+    expect(pyrowaveTargetKbps(1080, 120)).toBe(400_000);
+    expect(pyrowaveTargetKbps(2160, 144)).toBe(960_000);
+    expect(pyrowaveTargetKbps(2160, 240)).toBe(1_000_000);
   });
 });

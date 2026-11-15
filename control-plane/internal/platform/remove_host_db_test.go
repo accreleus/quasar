@@ -92,8 +92,8 @@ func newRemoveHarness(t *testing.T) *removeHarness {
 	handler := NewRemoveHandler(RemoveDeps{
 		Store:     store,
 		Connected: func(string) bool { return h.agent.connected },
-		OwnNodeName: func(context.Context) (string, bool) {
-			return h.ownNode, h.ownNode != ""
+		SharesOwnMachine: func(node string) bool {
+			return MachineShape{Role: MachineRoleCombined, NodeName: h.ownNode}.SharesMachineWith(node)
 		},
 		Cordon: func(ctx context.Context, hostID string) (func(context.Context), error) {
 			held, err := adm.List(ctx, hostID)

@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/accreleus/quasar/control-plane/internal/outbound"
 )
 
 // valveFromFixture serves testdata/appdetails/<appid>.json, recorded from the live store
@@ -33,6 +35,7 @@ func fetchFixture(t *testing.T, name, appid string) (AppDetail, bool, []string) 
 	srv, queries := valveFromFixture(t, name)
 	a := NewAppDetails(true, quietLogger())
 	a.endpoint = srv.URL
+	a.client = &http.Client{} // the stub is plain http on loopback, which the production client refuses
 	det, ok := a.Fetch(context.Background(), []string{appid})[appid]
 	return det, ok, *queries
 }
@@ -131,5 +134,13 @@ func TestAppDetailsStripsNULAndInvalidUTF8(t *testing.T) {
 	}
 	if got := storableText("a\x00b\xffc"); got != "abc" {
 		t.Fatalf("storableText = %q", got)
+	}
+}
+
+// The production client is the shared outbound client (public addresses only, no proxy,
+// no redirects), not a bare http.Client (#1107).
+func TestNewAppDetailsUsesTheGuardedClient(t *testing.T) {
+	if _, ok := NewAppDetails(true, quietLogger()).client.(*outbound.Client); !ok {
+		t.Fatalf("client is %T, want *outbound.Client", NewAppDetails(true, quietLogger()).client)
 	}
 }

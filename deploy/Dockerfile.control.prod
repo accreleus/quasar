@@ -36,6 +36,9 @@ COPY web/ .
 # vite copies ../deploy/enroll-host.sh into dist so the control plane serves it
 # (/enroll-host.sh).
 COPY deploy/enroll-host.sh /deploy/
+# `tsc -b` typechecks the tests too, and the PyroWave decoder test imports the fixture
+# manifest from the repo root (#1105). Only the manifest: the fixtures are read at test time.
+COPY testdata/pyrowave/manifest.json /testdata/pyrowave/
 RUN npm run build
 
 # ── Go build stage ────────────────────────────────────────────────────────────

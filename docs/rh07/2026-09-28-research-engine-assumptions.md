@@ -203,7 +203,7 @@ The operator surface is mainly `docker exec quasar-recovery quasar-recovery stat
 - **#220:** "Detect capability differences in devices/CDI, networking, labels, mounts, user namespaces, events and lifecycle semantics… no silent privileged fallback."
 - **#221:** test "UID/GID mapping, home ownership, supplementary groups, GPU/CDI, uinput, cgroups, Steam/Proton namespaces, audio and WebRTC"; "Do not equate GPU visibility with a functional rootless gaming session."
 
-**Name collision.** In the control plane's library and storage code (`control-plane/internal/storage/storage.go:286`, `control-plane/internal/library/janitor.go:73`, `web/src/pages/setup/StepHosts.tsx:190,311`), "rootless" means **a host with no storage root**. It has nothing to do with rootless containers, and RH-07 terminology should avoid overloading it (for example in CONTEXT.md).
+**Name collision.** In the control plane's library and storage code (`control-plane/internal/storage/storage.go:286`, `control-plane/internal/library/janitor.go:73`, `web/src/pages/setup/StepHosts.tsx:190,311`), "rootless" means **a host with no storage root**. It has nothing to do with rootless containers, and RH-07 terminology should avoid overloading it (for example in GLOSSARY.md).
 
 ## Top 10 risks for rootless Podman GPU streaming (highest first)
 

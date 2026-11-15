@@ -165,6 +165,15 @@ describe("dirty tracking", () => {
 });
 
 describe("patchBody", () => {
+  it("sends the default for an emptied home path, and nothing when it was already the default", () => {
+    const base = app();
+    expect(patchBody(base, { ...draftFromApp(base), containerPath: "" })).toEqual({});
+    const own = app({ home_container_path: "/srv/own" });
+    expect(patchBody(own, { ...draftFromApp(own), containerPath: "" })).toEqual({
+      home_container_path: "/home/quasar",
+    });
+  });
+
   it("sends only the keys that changed, across tabs, in one body", () => {
     const base = app();
     const draft = {

@@ -1,4 +1,4 @@
-//! The pre-update dumps kept in machine state (`CONTEXT.md` "Pre-update dump"; #364). Not
+//! The pre-update dumps kept in machine state (`GLOSSARY.md` "Pre-update dump"; #364). Not
 //! `crate::dump`, which is `uninstall --purge`'s final dump. `dumps/` holds each dump as
 //! `<name>.dump` beside `<name>.json`, its record. A dump exists once its record does;
 //! `pg_dump` writes `<name>.dump.partial` first, which is never read.

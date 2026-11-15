@@ -13,3 +13,6 @@ dist-ssr
 !.vscode/extensions.json
 .idea
 .DS_Store
+
+# Vitest browser-mode failure screenshots (make test-webgpu)
+.vitest

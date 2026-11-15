@@ -140,7 +140,7 @@ func NewCoordinator(store *Store, dispatcher Dispatcher, log *slog.Logger, opts 
 	for _, o := range opts {
 		o(c)
 	}
-	c.swapper = newSwapper(c.store, c.dispatcher, c.log, c.swapSpec)
+	c.swapper = newSwapper(c.store, c.dispatcher, c.log, c.swapSpec, c.supersedeParkedHolder)
 	c.health = newHealthEvaluator(c.store, c.log, c.failSessionWithDetail)
 	c.display = newDisplayState()
 	c.certRuns = newCertRunManager()
@@ -221,6 +221,16 @@ func (c *Coordinator) Stop(ctx context.Context, sessionID, reason string) (Sessi
 	return c.stop(ctx, sessionID, nil, reason, true)
 }
 
+// StopByAdmin stops a session as an admin's DELETE /v1/sessions/{id} does, without awaiting the
+// agent's ack.
+func (c *Coordinator) StopByAdmin(ctx context.Context, sessionID string) error {
+	_, err := c.stop(ctx, sessionID, nil, stopReasonUserRequested, false)
+	if errors.Is(err, errStopNotDelivered) {
+		return nil // AgentHeartbeat re-sends it
+	}
+	return err
+}
+
 // errStopNotDelivered: the row is `stopping` but the non-awaited session_stop
 // did not reach the agent's queue. AgentHeartbeat re-sends it.
 var errStopNotDelivered = errors.New("session_stop not delivered")
@@ -233,6 +243,7 @@ func (c *Coordinator) stop(ctx context.Context, sessionID string, only rowGuard,
 	if err != nil {
 		return Session{}, err
 	}
+	sessionID = sess.ID // canonical spelling: stopRequested is keyed on it (#1100)
 	if sess.State.IsTerminal() {
 		return sess, nil
 	}

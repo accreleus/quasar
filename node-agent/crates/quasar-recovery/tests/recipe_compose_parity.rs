@@ -30,6 +30,11 @@ const ALLOWED: &[(&str, &str, &str, &str)] = &[
     ("+bind", "quasar-recovery-agent:/run/quasar-recovery:ro", "*", "the agent-socket volume, read-only in the agent (D6(a))"),
     ("-key", "depends_on", "*", "Compose-only start ordering; a GPU host has no local control plane"),
     ("-device", "/dev/dri", "none", "the engine refuses a container naming a device the host lacks; readiness reports the missing GPU"),
+    ("-bind", "/var/lib/quasar/compat-tools:/var/lib/quasar/compat-tools", "*", "this test renders revision 1; revision 5 binds the compatibility-tools root (recipe_golden)"),
+    ("-env", "QUASAR_COMPAT_TOOLS_ROOT", "*", "revision 5 sets it, beside the template root (recipe_golden)"),
+    ("-env", "QUASAR_WT_PORT", "*", "an agent variable on an owned install: reconfigure sets it (AGENT_VARIABLES), so the recipe carries no default"),
+    ("-env", "QUASAR_WT_UNAUTH_PER_SOURCE", "*", "an agent variable on an owned install: reconfigure sets it (AGENT_VARIABLES)"),
+    ("-env", "QUASAR_PYROWAVE_CPU_INPUT", "*", "an agent variable on an owned install: reconfigure sets it (AGENT_VARIABLES)"),
 ];
 
 fn deploy(file: &str) -> Value {

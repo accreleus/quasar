@@ -403,7 +403,7 @@ execve (`deploy/docker-compose.nvidia.yml:102-117`).
 - Host runtime dir: bind `/run/quasar-agent` (fixed path; two agents on one engine would share it,
   `deploy/README.md` "A second install on the same host" §, `:1043-1071`).
 - Session and app images: pulled by the agent. Tag or digest per catalog `runtime_spec.image`
-  (CONTEXT "Session image", `CONTEXT.md:275-281`). The PulseAudio sidecar follows the agent image
+  (GLOSSARY "Session image", `GLOSSARY.md:275-281`). The PulseAudio sidecar follows the agent image
   (`deploy/docker-compose.yml:543-548`).
 - Volume names are always `<project>_<key>` unless the adopt-volumes overlay renames them
   (`deploy/docker-compose.yml:700-710`).
@@ -456,8 +456,8 @@ execve (`deploy/docker-compose.nvidia.yml:102-117`).
 - Skips operation-labelled, `quasar-pulse-` and `quasar-probe-` containers (`:130-158`).
 - Force-removes with `v:false` (`:76-84`) and counts a container removed only on a 404 re-inspect
   (`:94-108`).
-- Everything foreign or unlabelled is preserved and counted (CONTEXT "Legacy container",
-  `CONTEXT.md:104-115`).
+- Everything foreign or unlabelled is preserved and counted (GLOSSARY "Legacy container",
+  `GLOSSARY.md:104-115`).
 
 **Does the agent touch its own container, the CP's, Postgres or the updater?**
 - **Its own container: reads only.**
@@ -491,8 +491,8 @@ execve (`deploy/docker-compose.nvidia.yml:102-117`).
   device/security settings, volumes and endpoint", verify an "unchanged host identity, and preserved
   mounts", then uncordon.
 - "Startup retires owned work from the previous agent; it does not adopt sessions" (`:45-46`).
-- Diagnostic mode when startup cleanup or the runtime fails (`:90-108`; CONTEXT "Diagnostic
-  registration" `CONTEXT.md:442-444`).
+- Diagnostic mode when startup cleanup or the runtime fails (`:90-108`; GLOSSARY "Diagnostic
+  registration" `GLOSSARY.md:442-444`).
 - "Podman/rootless certification and running-session adoption remain separate work" (`:170-171`).
 
 **Session images.**
@@ -588,14 +588,14 @@ replacement remains with the updater.**"
 - **Admission restrictions with named owners** (`0088`). A platform or RH-06 owner kind already
   exists (`platform`). A deployment-migration owner could be added without inventing a new cordon.
 - **Deployment baseline** (`hosts.deployment_settings`) already records the env-derived setting
-  source ("Setting source" = deployment baseline, `CONTEXT.md:322-325`). That is the seam where
+  source ("Setting source" = deployment baseline, `GLOSSARY.md:322-325`). That is the seam where
   moving settings out of the manager's `.env` would surface.
 - **Not reusable as-is:** nothing in RH-05 stores desired *platform* image digests per host, or
   agent or CP versions. The prerequisite "agent image digest" fact was specified but deliberately not
   emitted.
 
 ### Inferences / open questions
-- **(inference)** CONTEXT's "Generation" (an app container in a session) and RH-05's
+- **(inference)** GLOSSARY's "Generation" (an app container in a session) and RH-05's
   "revision"/"incarnation" already occupy the obvious words. Versioned *service* specs in RH-06 need
   a distinct term.
 - Open: should the RH-05 prerequisite "agent image digest" become real under RH-06? It would bind
@@ -696,9 +696,9 @@ replacement remains with the updater.**"
 
 ---
 
-## 8. CONTEXT.md vocabulary relevant to RH-06 (avoid collisions)
+## 8. GLOSSARY.md vocabulary relevant to RH-06 (avoid collisions)
 
-Existing terms (line numbers in `CONTEXT.md`):
+Existing terms (line numbers in `GLOSSARY.md`):
 
 | Term | Line | Gist / avoid-notes |
 |---|---|---|
@@ -735,7 +735,7 @@ Existing terms (line numbers in `CONTEXT.md`):
 | Release notification | 517 | |
 | Fleet run | 525 | _avoid_ "rollout", "batch", "deployment" |
 
-**Absent from CONTEXT.md today:** enrollment, enrollment token/string, node secret, host identity,
+**Absent from GLOSSARY.md today:** enrollment, enrollment token/string, node secret, host identity,
 service ownership, owner, manager, deployment/stack, desired state/spec, service spec, adoption
 (explicitly *avoided* under "Legacy container"), phase journal, control-only host, combined host.
 New RH-06 terms should not reuse **Generation**, **Attempt**, **Preflight**, **Adoption** or

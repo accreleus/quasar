@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/accreleus/quasar/control-plane/internal/outbound"
 )
 
 // appdetails is the opt-in fifth rung of §8.2's ladder (§8.3): QUASAR_STEAM_APPDETAILS_LOOKUP,
@@ -19,11 +21,14 @@ import (
 // A Valve outage or rate-limit fails open to "the denylist alone decided" — the default anyway.
 
 // appDetailsEndpoint is Valve's undocumented, unversioned, rate-limited store endpoint.
-const appDetailsEndpoint = "https://store.steampowered.com/api/appdetails"
+const (
+	appDetailsHost     = "store.steampowered.com"
+	appDetailsEndpoint = "https://" + appDetailsHost + "/api/appdetails"
+)
 
 // AppDetails answers "is this appid a game" plus short_description for a bounded set of appids.
 type AppDetails struct {
-	client   *http.Client
+	client   outbound.Doer // test seam: a stub server is plain http on loopback
 	endpoint string
 	log      *slog.Logger
 	enabled  bool
@@ -45,8 +50,15 @@ type AppDetail struct {
 // NewAppDetails: a disabled instance is not nil, it answers "not consulted" for everything,
 // so no caller needs a nil check or risks an accidental request.
 func NewAppDetails(enabled bool, log *slog.Logger) *AppDetails {
+	c, err := outbound.New(outbound.Config{
+		AllowHosts: outbound.ParseHostList("", appDetailsHost),
+		Timeout:    10 * time.Second,
+	})
+	if err != nil { // ParseHostList never returns an empty set
+		panic(fmt.Sprintf("library: build appdetails outbound client: %v", err))
+	}
 	return &AppDetails{
-		client:   &http.Client{Timeout: 10 * time.Second},
+		client:   c,
 		endpoint: appDetailsEndpoint,
 		log:      log,
 		enabled:  enabled,

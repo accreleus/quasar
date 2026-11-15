@@ -13,12 +13,33 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/accreleus/quasar/control-plane/internal/outbound"
 )
 
 // SteamGridDBBaseURL is the public API root. Overridable on the client so tests
 // can point at a stub server — no test in this package ever reaches the real
 // service.
 const SteamGridDBBaseURL = "https://www.steamgriddb.com/api/v2"
+
+const sgdbMaxBodyBytes = 4 << 20
+
+// guardedClient is the shared outbound client allowlisted to baseURL's host.
+func guardedClient(baseURL string, timeout time.Duration, maxBody int64) outbound.Doer {
+	host := ""
+	if u, err := url.Parse(baseURL); err == nil {
+		host = u.Hostname()
+	}
+	c, err := outbound.New(outbound.Config{
+		AllowHosts:   outbound.ParseHostList("", host),
+		Timeout:      timeout,
+		MaxBodyBytes: maxBody,
+	})
+	if err != nil { // ParseHostList never returns an empty set
+		panic(fmt.Sprintf("artwork: build outbound client: %v", err))
+	}
+	return c
+}
 
 // SteamGridDB publishes no numeric rate limit (docs/configuration.md), so be
 // conservative by construction rather than discover the limit by tripping it —
@@ -35,7 +56,7 @@ const sgdbMinInterval = 500 * time.Millisecond
 type SteamGridDBClient struct {
 	apiKey  string
 	baseURL string
-	http    *http.Client
+	http    outbound.Doer
 
 	mu       sync.Mutex
 	lastCall time.Time
@@ -43,18 +64,15 @@ type SteamGridDBClient struct {
 
 // NewSteamGridDBClient builds the provider. httpClient is injected so tests
 // supply a stub transport; pass nil for a sane default.
-func NewSteamGridDBClient(apiKey, baseURL string, httpClient *http.Client) *SteamGridDBClient {
+func NewSteamGridDBClient(apiKey, baseURL string, httpClient outbound.Doer) *SteamGridDBClient {
 	if baseURL == "" {
 		baseURL = SteamGridDBBaseURL
 	}
+	baseURL = strings.TrimRight(baseURL, "/")
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 20 * time.Second}
+		httpClient = guardedClient(baseURL, 20*time.Second, sgdbMaxBodyBytes)
 	}
-	return &SteamGridDBClient{
-		apiKey:  apiKey,
-		baseURL: strings.TrimRight(baseURL, "/"),
-		http:    httpClient,
-	}
+	return &SteamGridDBClient{apiKey: apiKey, baseURL: baseURL, http: httpClient}
 }
 
 func (c *SteamGridDBClient) Name() string { return "steamgriddb" }
@@ -385,7 +403,7 @@ func (c *SteamGridDBClient) do(ctx context.Context, path string, out any) error 
 	}
 	// A provider response is untrusted input; an unbounded json.Decode on a
 	// hostile body is a memory DoS.
-	body, err := copyLimited(resp.Body, 4<<20)
+	body, err := copyLimited(resp.Body, sgdbMaxBodyBytes)
 	if err != nil {
 		return err
 	}

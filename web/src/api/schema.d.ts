@@ -3290,6 +3290,69 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/sessions/{id}/transport-token": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mint a fresh WebTransport token for the same live session (amendment 54).
+         * @description Amendment 54 (accreleus/quasar#1026). Mirrors POST /v1/sessions/{id}/signaling-token: owner only, states assigned/starting/running, independent single-use tokens. The endpoint URL and certificate hashes are resolved again at mint time. The 201 is sent only after the agent acked the token's hash (agent-api.md session_transport_token).
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Independent single-use transport token created. */
+                201: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["TransportEnvelope"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                404: components["responses"]["NotFound"];
+                /** @description session_not_reconnectable (terminal or stopping), or transport_unavailable (the session's transport is webrtc, or its host's WebTransport endpoint is no longer usable; use signaling-token instead). */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+                /** @description agent_not_connected — the agent is reconnecting or did not ack within 5 s. RETRYABLE. */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/sessions/{id}/swap": {
         parameters: {
             query?: never;
@@ -3376,6 +3439,15 @@ export interface paths {
                 404: components["responses"]["NotFound"];
                 /** @description session_not_swappable / swap_exceeds_reservation / conflict (pre-existing), or (Phase 3) home_not_provisioned - the target tile's parent has no home on THIS session's host - or parent_app_disabled. RH05 home_conflict takes precedence for a conflicting claim or known tombstone. */
                 409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+                /** @description no_host_available (amendment 71, accreleus/quasar#1178) - the app is not selected for the session's host, or, with error.reason compat_tool_missing, the target is a derived Steam game whose mapped GE tool the session did not mount at launch. NOT retryable: a swap does not move hosts or wait for an install. */
+                503: {
                     headers: {
                         [name: string]: unknown;
                     };
@@ -4301,6 +4373,17 @@ export interface paths {
                         steam_warm_rewarm?: "library_open" | "next_steam_launch";
                         /** @description Amendment 39. Each heartbeat, and a park on exit, sets a parked session's deadline to now plus this many minutes. Absent = unchanged; outside 1-60 is 400 validation_failed. */
                         steam_warm_idle_minutes?: number;
+                        /** @description Amendment 56 (accreleus/quasar#1066). How many GE compatibility tools may be enabled at once. Default 8. Absent = unchanged; outside 1-32 is 400 validation_failed. */
+                        compat_tools_max_enabled?: number;
+                        /** @description Amendment 58 (accreleus/quasar#1059). How many sessions on one GPU may hold a PyroWave slot at once (control-api.md §The PyroWave ceiling). Default 1. Absent = unchanged; outside 1-4 is 400 validation_failed. Lowering it ends no session. */
+                        pyrowave_max_per_gpu?: number;
+                        /**
+                         * @description Amendment 61 (accreleus/quasar#1217). The transport of every launch profile whose transport is default (control-api.md §Transport ▸ The instance default). Default webrtc. Absent = unchanged; any other value is 400 validation_failed. Applies to launches that start afterwards; a running session keeps its transport.
+                         * @enum {string}
+                         */
+                        default_transport?: "webrtc" | "webtransport";
+                        /** @description Amendment 56. Free GiB a tool install must leave on a host beyond the asset and the 4 GiB unpacked cap (trust rule T7). Default 10. Absent = unchanged. */
+                        compat_tools_disk_reserve_gib?: number;
                         /** @description Amendment 49 (#845). As RegionSettings.timezone. Default UTC. Absent = unchanged. */
                         default_timezone?: string;
                         /** @description Amendment 49. Default en-US. Absent = unchanged. */
@@ -5732,6 +5815,536 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/admin/compat-tools": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The compatibility-tool catalogue and the fleet default (amendment 56).
+         * @description Amendment 56 (accreleus/quasar#1066). Valve Proton builds (mapped, never installed by Quasar), the shipped recommended GE-Proton list and admin-added GE-Proton tags, each with per-host install counts. control-api.md §Compatibility tools.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description The catalogue. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["CompatToolList"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+            };
+        };
+        put?: never;
+        /**
+         * Add a GE-Proton release by tag, pinned to its release checksum (amendment 56).
+         * @description Amendment 56. Resolves the release on github.com (GloriousEggroll/proton-ge-custom only), picks <tag>-x86_64.tar.gz else <tag>.tar.gz, fetches <asset stem>.sha512sum once (4 KiB cap), checks its format and that the file name in it is the asset's (trust rules T1-T4), and stores the tool disabled with that SHA-512 as fleet desired state; agents verify against it and never fetch a checksum. Nothing installs until it is enabled. Audited as compat_tool.add.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["CompatToolAdd"];
+                };
+            };
+            responses: {
+                /** @description Added, disabled. */
+                201: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["CompatTool"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                /** @description compat_tool_exists - a tool with this tag exists. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+                /** @description compat_tool_unverifiable - the message names release_not_found, asset_not_found, checksum_missing, checksum_malformed or asset_too_large. Nothing is stored. */
+                422: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+                /** @description upstream_unavailable - github.com unreachable, 5xx or rate-limited; retryable, nothing stored. */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/compat-tools/available": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * GE-Proton releases available to install - the shipped recommended list plus the latest on github.com (amendment 57).
+         * @description Amendment 57 (accreleus/quasar#1067). Read-only, not audited. The recommended list this release ships, then the 5 newest GE-Proton releases fetched from api.github.com/repos/GloriousEggroll/proton-ge-custom/releases?per_page=10 under trust rule T2 (https 443, no credential, no redirect, direct, connect-time address check, Accept-Encoding identity, a 1 MiB cap on decoded bytes, a 10 s deadline), each with its live catalogue state including pin_conflict and name_conflict. Pins nothing: install with POST /v1/admin/compat-tools then PATCH /v1/admin/compat-tools/{id}. The GitHub outcome is cached in memory per process (success 1 h, failure 5 min or until a valid GitHub reset, at most 1 h); the single-flight fetch runs under its own context, so an aborting caller only stops waiting and is never cached as a failure. At most one upstream request per window. An upstream failure is 200 with github_latest.available false and a reason, never a 5xx. control-api.md §Compatibility tools, Available tools.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description The available tools. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["CompatToolAvailableList"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/compat-tools/default": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Set or clear the fleet default compatibility tool (amendment 56).
+         * @description Amendment 56. null = Steam's own default. A change supersedes every parked Steam (parked_superseded). Audited as compat_tool.default.set.
+         */
+        put: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["CompatToolDefaultWrite"];
+                };
+            };
+            responses: {
+                /** @description The default now in force. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            /** Format: uuid */
+                            default_tool_id: string | null;
+                        };
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description compat_tool_disabled - the tool is not usable (disabled, or marked name_conflict or pin_conflict). */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+            };
+        };
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/compat-tools/mappings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The per-game compatibility-tool mappings (amendment 56). */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Every mapping, by provider then appid. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            items: components["schemas"]["CompatToolMapping"][];
+                        };
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/compat-tools/mappings/steam/{external_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Steam library discovery Phase 4: the provider title id an appid rule applies to - today a Steam appid. VALIDATED AT THE HANDLER AS WELL AS BY THE DATABASE CHECK, deliberately: this table is ADMIN-WRITABLE and takes the value straight from a URL, and the value ends up in STEAM_STARTUP_FLAGS, which the quasar-steam entrypoint word-splits with `read -r -a`. The handler is what makes a bad value a 400 instead of a 500; the CHECK is the durable guard and the only one of the two that survives an admin editing the row directly later. Bounded below 2^32 in addition to the pattern. */
+                external_id: components["parameters"]["PathExternalId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Set the tool mapping for one Steam game, fleet-wide (amendment 56).
+         * @description Amendment 56. Keyed by Steam appid, never by an app or a user's tile. Unforced: written into a home only where the user has no choice of their own; forced: overwrites it. A change supersedes every parked Steam (parked_superseded). Audited as compat_tool.mapping.set.
+         */
+        put: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description Steam library discovery Phase 4: the provider title id an appid rule applies to - today a Steam appid. VALIDATED AT THE HANDLER AS WELL AS BY THE DATABASE CHECK, deliberately: this table is ADMIN-WRITABLE and takes the value straight from a URL, and the value ends up in STEAM_STARTUP_FLAGS, which the quasar-steam entrypoint word-splits with `read -r -a`. The handler is what makes a bad value a 400 instead of a 500; the CHECK is the durable guard and the only one of the two that survives an admin editing the row directly later. Bounded below 2^32 in addition to the pattern. */
+                    external_id: components["parameters"]["PathExternalId"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["CompatToolMappingWrite"];
+                };
+            };
+            responses: {
+                /** @description The mapping now in force. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["CompatToolMapping"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description compat_tool_disabled - the tool is not usable (disabled or marked); conflict - 1000 mappings exist and this appid is not one. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+            };
+        };
+        post?: never;
+        /**
+         * Clear the tool mapping for one Steam game (amendment 56).
+         * @description Amendment 56. The game falls back to the fleet default, else Steam's own choice. 204 also when none existed (not audited then). Audited as compat_tool.mapping.clear.
+         */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description Steam library discovery Phase 4: the provider title id an appid rule applies to - today a Steam appid. VALIDATED AT THE HANDLER AS WELL AS BY THE DATABASE CHECK, deliberately: this table is ADMIN-WRITABLE and takes the value straight from a URL, and the value ends up in STEAM_STARTUP_FLAGS, which the quasar-steam entrypoint word-splits with `read -r -a`. The handler is what makes a bad value a 400 instead of a 500; the CHECK is the durable guard and the only one of the two that survives an admin editing the row directly later. Bounded below 2^32 in addition to the pattern. */
+                    external_id: components["parameters"]["PathExternalId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Cleared. */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/compat-tools/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete a GE tag row that was never enabled (amendment 56).
+         * @description Amendment 56. One conditional statement deletes a disabled GE row that was never enabled and is not on the shipped list, or a disabled pin_conflict row that no mapping, default, host install or live session references; the latter inserts the shipped entry in the same transaction. Audited as compat_tool.delete.
+         */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Deleted. */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description conflict - the statement deleted nothing (a Valve row, an enabled row, a row once enabled and not in pin_conflict, or one still mapped, installed or mounted). */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+            };
+        };
+        options?: never;
+        head?: never;
+        /**
+         * Enable or disable a compatibility tool (amendment 56).
+         * @description Amendment 56. Enabling a GE tool installs it on every host (compat_tools.converge); disabling removes it from every host. A repeat of the current value is a no-op. Audited as compat_tool.enable / compat_tool.disable.
+         */
+        patch: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["CompatToolPatch"];
+                };
+            };
+            responses: {
+                /** @description The tool. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["CompatTool"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description compat_tool_in_use - disabling a tool a mapping names or that is the fleet default; compat_tool_limit - enabling past instance_settings.compat_tools_max_enabled; compat_tool_pin_conflict - enabling a tool marked pin_conflict. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+            };
+        };
+        trace?: never;
+    };
+    "/v1/admin/compat-tools/{id}/force-remove": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Emergency pull of a GE tool - clear its mappings and default, disable it, stop the sessions that mount it (amendment 56).
+         * @description Amendment 56. One transaction deletes every mapping naming the tool, clears the fleet default if it is the tool, disables it (bypassing compat_tool_in_use) and supersedes every parked session; after commit every live session whose compat_tool_names holds the tool's Steam name is stopped as an admin DELETE /v1/sessions/{id} would. The row is locked FOR UPDATE, so it serializes with launches holding its share lock; the stop step is recorded (force_remove_pending_at) and re-run at startup and every 60 s; it targets only sessions created at or before that time and clears when none of those remain live; a repeat on a disabled tool stops any remaining holders. Audited as compat_tool.force_remove.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            responses: {
+                /** @description Pulled. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            tool: components["schemas"]["CompatTool"];
+                            mappings_cleared: number;
+                            default_cleared: boolean;
+                            sessions_stopped: number;
+                        };
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description conflict - a Valve build (Quasar installs none). */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/hosts/{id}/compat-tools": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        /** Compatibility tools on one host - installed, installing, failed - and its free space (amendment 56). */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description The host's tools. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostCompatTools"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/admin/hosts/{id}/settings": {
         parameters: {
             query?: never;
@@ -6346,6 +6959,79 @@ export interface paths {
         options?: never;
         head?: never;
         patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/hosts/{id}/webtransport": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        /** Read a host's WebTransport endpoint, its override and the resolved endpoint (amendment 54). */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostWebTransport"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Set or clear a host's public WebTransport URL (edge proxy) (amendment 54). Audited as host.webtransport.update. */
+        patch: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["HostWebTransportWrite"];
+                };
+            };
+            responses: {
+                /** @description New state. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostWebTransport"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+            };
+        };
         trace?: never;
     };
     "/v1/admin/hosts/{id}/console-config": {
@@ -8339,6 +9025,186 @@ export interface components {
          * @enum {string}
          */
         Codec: "h264" | "h265" | "av1";
+        /** @description Amendment 56: the name Steam registers a compatibility tool under (a GE tool's is read from its verified compatibilitytool.vdf). A directory name on hosts and a token in QUASAR_COMPAT_TOOLS. */
+        CompatToolSteamName: string;
+        /** @description Amendment 56 (accreleus/quasar#1066): one compatibility tool. control-api.md §Compatibility tools. */
+        CompatTool: {
+            /** Format: uuid */
+            id: string;
+            /** @enum {string} */
+            kind: "proton";
+            /** @enum {string} */
+            family: "valve" | "ge";
+            /** @enum {string} */
+            source: "steam" | "recommended" | "tag";
+            /** @description The GE-Proton release tag; null for a Valve build. */
+            tag: string | null;
+            /** @description null only for a GE tag no host has installed yet. */
+            steam_name: components["schemas"]["CompatToolSteamName"] | null;
+            display_name: string;
+            /** @description On this Quasar release's recommended list. */
+            recommended: boolean;
+            /** @description For a GE tool: desired on every host. */
+            enabled: boolean;
+            asset: components["schemas"]["CompatToolAsset"] | null;
+            hosts: components["schemas"]["CompatToolHostCounts"] | null;
+            /** @description Per-game mappings naming this tool. */
+            mappings: number;
+            is_default: boolean;
+            /** @description A host reported a Steam name for this tag that is reserved, fails the grammar or another tool holds; the tool is out of desired state until disabled and re-enabled. */
+            name_conflict: boolean;
+            /** @description The recommended list ships this tag with a different SHA-512; the tool is out of desired state and cannot be enabled. */
+            pin_conflict: boolean;
+            /** Format: date-time */
+            created_at: string;
+        };
+        CompatToolAsset: {
+            /** @description <tag>-x86_64.tar.gz, or <tag>.tar.gz before GE-Proton 11. */
+            name: string;
+            /**
+             * Format: uri
+             * @description Derived for display: https://github.com/GloriousEggroll/proton-ge-custom/releases/download/<tag>/<name>. Never sent to an agent: the job carries only the tag (trust rule T1).
+             */
+            url: string;
+            size_bytes: number;
+            sha512: string;
+        };
+        CompatToolHostCounts: {
+            installed: number;
+            /** @description Installing or removing. */
+            installing: number;
+            waiting: number;
+            failed: number;
+            unsupported: number;
+        };
+        CompatToolList: {
+            items: components["schemas"]["CompatTool"][];
+            /** Format: uuid */
+            default_tool_id: string | null;
+        };
+        /** @description Amendment 57 (accreleus/quasar#1067): one GE-Proton release an admin can install. control-api.md §Available tools. */
+        CompatToolAvailable: {
+            tag: string;
+            /** @enum {string} */
+            source: "recommended" | "github_latest";
+            /** @description The catalogue row's display_name, else the tag. GitHub release names are never passed through. */
+            display_name: string;
+            /**
+             * Format: date-time
+             * @description GitHub's published_at when the served GitHub list holds the tag and it is RFC 3339, else null.
+             */
+            published_at: string | null;
+            /**
+             * Format: uuid
+             * @description The catalogue row with this tag, read live; null when none (install with POST /v1/admin/compat-tools).
+             */
+            tool_id: string | null;
+            /** @description The row's enabled; false when tool_id is null. */
+            enabled: boolean;
+            /** @description The row's pin_conflict; false when tool_id is null. When true the enable is 409 compat_tool_pin_conflict. */
+            pin_conflict: boolean;
+            /** @description The row's name_conflict; false when tool_id is null. When true the exit is disable, then enable. */
+            name_conflict: boolean;
+            /** @description The row's per-host install counts; null when tool_id is null. */
+            hosts: components["schemas"]["CompatToolHostCounts"] | null;
+        };
+        CompatToolAvailableList: {
+            /** @description Recommended entries (newest tag first), then up to 5 GitHub entries not on the recommended list (published_at descending, null last, then tag descending); each tag once. */
+            items: components["schemas"]["CompatToolAvailable"][];
+            github_latest: {
+                /** @description false when the GitHub fetch failed; items then holds only the recommended entries. */
+                available: boolean;
+                /** @description Open string for clients; null when available. The control plane emits exactly one of unreachable, rate_limited, upstream_error, response_invalid, never a raw error (detail goes to its log). */
+                reason: string | null;
+                /**
+                 * Format: date-time
+                 * @description When the served GitHub list was fetched; null when not available.
+                 */
+                fetched_at: string | null;
+            };
+        };
+        CompatToolAdd: {
+            tag: string;
+        };
+        CompatToolPatch: {
+            enabled: boolean;
+        };
+        CompatToolDefaultWrite: {
+            /**
+             * Format: uuid
+             * @description null = Steam's own default.
+             */
+            tool_id: string | null;
+        };
+        CompatToolMappingWrite: {
+            /** Format: uuid */
+            tool_id: string;
+            /** @description Absent = false. true overwrites the user's own choice in Steam. */
+            forced?: boolean;
+        };
+        CompatToolMapping: {
+            /** @enum {string} */
+            provider: "steam";
+            external_id: string;
+            /** Format: uuid */
+            tool_id: string;
+            forced: boolean;
+            /** @description Apps that are this game (derived tiles); may be empty. */
+            app_ids: string[];
+            /** Format: date-time */
+            updated_at: string;
+        };
+        HostCompatTools: {
+            /** @description The host's current agent connection advertised compat_tools_v1. */
+            supported: boolean;
+            free_bytes: number | null;
+            /** Format: date-time */
+            reported_at: string | null;
+            tools: {
+                /**
+                 * Format: uuid
+                 * @description null for an installed tool no catalogue row matches (listed for removal).
+                 */
+                tool_id: string | null;
+                steam_name: components["schemas"]["CompatToolSteamName"] | null;
+                tag: string;
+                /** @enum {string} */
+                state: "unsupported" | "removing" | "installing" | "installed" | "failed" | "waiting";
+                bytes: number | null;
+                /** @description A failed or deferred run's summary.reason (an open string). */
+                reason: string | null;
+                /** Format: uuid */
+                run_id: string | null;
+            }[];
+        };
+        /**
+         * @description A host or GPU codec set entry (agent-api.md capacity.codecs, capacity.gpus[].codecs): the wire Codec vocabulary plus, since amendment 55 (accreleus/quasar#1050), pyrowave, listed after a passing PyroWave codec probe. pyrowave is never a session's stream.codec and never a rung's codec.
+         * @enum {string}
+         */
+        HostCodec: "h264" | "h265" | "av1" | "pyrowave";
+        /** @description Amendment 55 (accreleus/quasar#1050), revised by amendment 58 (accreleus/quasar#1059): a session's Ultra-low latency (PyroWave) record. allowed, reason, choice and auto_reason are the stream plan's launch-time decision, written once; wanted, active, used and switch_reason follow the agent's codec.switched trace events. Observability and UI state (the Launch options Codec note): nothing decides on it. */
+        SessionPyroWave: {
+            allowed: boolean;
+            /** @description Why not allowed: profile_disallows, host_no_pyrowave, device_no_webgpu, gpu_pyrowave_busy (amendment 58: the GPU's PyroWave slots, instance setting pyrowave_max_per_gpu, were all held), not_webtransport (an open string); null when allowed. */
+            reason: string | null;
+            /** @description The session wants PyroWave now: the stream plan's launch decision (the user picked it, or Auto picked it on a prefer profile). Cleared by a step-down for rtt_too_high, congestion, client_decode_error or encoder_error. */
+            wanted: boolean;
+            /**
+             * @description Amendment 58: why PyroWave was wanted at launch - explicit (the user picked it in Launch options) or auto (Auto, on a prefer profile); null when not wanted, including an explicit pick the plan refused (reason says why). The plan's record; the client keeps its own record of the user's pick. Always serialized by a server implementing amendment 58.
+             * @enum {string|null}
+             */
+            choice?: "explicit" | "auto" | null;
+            /** @description Amendment 58: on an Auto launch of an eligible session on a prefer profile that Auto did not pick, why: no_measurement, rtt_too_high, link_too_slow (an open string); otherwise null. Always serialized by a server implementing amendment 58. */
+            auto_reason?: string | null;
+            /** @description The media client is receiving PyroWave now. */
+            active: boolean;
+            /** @description The media client received PyroWave at some point in this session. */
+            used: boolean;
+            /** @description The PyroWave target bitrate granted: min(floor(height_default * fps / 60), pyrowave_kbps ?? 1000000) (codec-pyrowave.md §Rate); null when not allowed. */
+            target_kbps: number | null;
+            /** @description The reason of the latest switch on or off (launch, reconnect, rtt_too_high, client_no_decoder, congestion, client_decode_error, encoder_error, webrtc; an open string); null before the first. */
+            switch_reason: string | null;
+        };
         /**
          * @description The CATALOG codec vocabulary used by stream profiles (rungs). Note 'hevc', not the wire 'h265' - the rename is bridged in exactly one place server-side and never on this surface.
          * @enum {string}
@@ -8384,10 +9250,10 @@ export interface components {
         /** @description UI-P4: a non-fatal advisory returned on an admin profile write. A warning NEVER fails the request - it reports a configuration that is legal but almost certainly not what the operator meant. */
         WriteWarning: {
             /**
-             * @description h264_floor_not_last - every rung after the H.264 rung is unreachable, because H.264 passes every clamp. floor_not_least_demanding - the H.264 rung has a higher min_offer_bandwidth_kbps or min_decode_height than a rung above it, or requires a hardware encoder while a rung above it does not; a floor harder to satisfy than the rung above it is a misconfiguration.
+             * @description h264_floor_not_last - every rung after the H.264 rung is unreachable, because H.264 passes every clamp. floor_not_least_demanding - the H.264 rung has a higher min_offer_bandwidth_kbps or min_decode_height than a rung above it, or requires a hardware encoder while a rung above it does not; a floor harder to satisfy than the rung above it is a misconfiguration. pyrowave_needs_webtransport (amendments 55, 58) - pyrowave_mode is allow or prefer on a launch profile whose transport is webrtc (amendment 61: whose effective transport is webrtc, so it also follows default_transport), so PyroWave can never be offered.
              * @enum {string}
              */
-            code: "h264_floor_not_last" | "floor_not_least_demanding";
+            code: "h264_floor_not_last" | "floor_not_least_demanding" | "pyrowave_needs_webtransport";
             message: string;
         };
         /** @enum {string} */
@@ -8409,7 +9275,7 @@ export interface components {
                 id: string;
                 name: string;
             }[];
-            /** @description Amendment 40 (#602), ADDITIVE: a machine-readable cause under code. On 503 no_host_available, home_host_unavailable: the launch is pinned to the host that holds the caller's home for this app (Amendment 53: or it is pinned to the host of the caller's Steam home for a sharing launch) and that host is offline or no longer enrolled. Only an admin clears it, so a client does not spend its automatic retry on it. Names no host. Amendment 53 (#1001), on 409 home_in_use: steam_library_open_in_desktop (the holder mounts the Steam library as a shared home) or steam_game_running (the refused launch shares the library and a Steam session holds it); absent when the holder is already stopping. Open string: a client treats an unknown value as absent. */
+            /** @description Amendment 40 (#602), ADDITIVE: a machine-readable cause under code. On 503 no_host_available, home_host_unavailable: the launch is pinned to the host that holds the caller's home for this app (Amendment 53: or it is pinned to the host of the caller's Steam home for a sharing launch) and that host is offline or no longer enrolled. Only an admin clears it, so a client does not spend its automatic retry on it. Names no host. Amendment 56 (accreleus/quasar#1066), on 503 no_host_available: compat_tool_missing (no online host has the GE compatibility tool the launched game's per-game mapping names; never for the fleet default). Amendment 53 (#1001), on 409 home_in_use: steam_library_open_in_desktop (the holder mounts the Steam library as a shared home) or steam_game_running (the refused launch shares the library and a Steam session holds it); absent when the holder is already stopping. Amendment 59 (accreleus/quasar#1133), on 503 capacity_exhausted: steam_restarting, on every one a launch gets while the caller's parked session is stopping (a claim that fails stops it) or the caller's released runtime holds the home (control-api.md §Warm Steam, "Claim" and "Park on exit"); the client keeps its automatic retry. Open string: a client treats an unknown value as absent. */
             reason?: string;
         };
         ErrorEnvelope: {
@@ -8944,6 +9810,14 @@ export interface components {
              * @description Amendment 53 (#1001): the Steam app whose library this session mounts, null otherwise. Always serialized. While that session is live, every launch of that app's family is 409 home_in_use. A client may mark that family in use.
              */
             shared_home_app_id: string | null;
+            /** @description Amendment 54: the transport the stream plan chose. Always serialized by a server implementing the amendment; absent from an older one, read as webrtc. */
+            transport?: components["schemas"]["Transport"];
+            /** @description Amendment 54: why a wanted WebTransport was not chosen (profile_disallows, amendment 61's instance_default_disallows, host_no_endpoint, device_no_webtransport, device_no_webcodecs; an open string), else null. Absent from an older server. */
+            transport_reason?: string | null;
+            /** @description Amendment 54: the reason in the latest transport.fallback trace event the client posted, else null. Observability only. Absent from an older server. */
+            transport_fallback_reason?: string | null;
+            /** @description Amendments 55 and 58: the session's Ultra-low latency (PyroWave) record. Always serialized by a server implementing the amendment; null for every earlier session; absent from an older server. */
+            pyrowave?: components["schemas"]["SessionPyroWave"] | null;
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
@@ -9003,6 +9877,9 @@ export interface components {
             client_type?: "browser" | "native";
             /** @description Microphone capture request (2026-08-02). Absent ⇒ false. Granted only when instance setting mic_capture_enabled is on; an ungranted request is not an error — the session stream body reports the granted state. */
             mic?: boolean;
+            transport?: components["schemas"]["TransportPreference"];
+            /** @description Amendments 55 and 58: true when the user picked Ultra-low latency (PyroWave) in the Launch options Codec list (the client then sends no stream.codec). Absent = false. A wish, never an error: Session.pyrowave says whether it was allowed and why not. On a prefer profile an Auto launch (no stream.codec, no pyrowave true) may also get PyroWave (control-api.md §Ultra-low latency (PyroWave)). */
+            pyrowave?: boolean;
             /** @description Admin/debug/back-compat override; beats profile_id field-by-field. */
             stream?: {
                 width?: number;
@@ -9017,6 +9894,7 @@ export interface components {
         LaunchResponse: {
             session: components["schemas"]["Session"];
             signaling: components["schemas"]["SignalingCoords"];
+            transport_options?: components["schemas"]["TransportOptions"];
             /** @description Amendment 53 (#1001): present only when the app shares the user's Steam library and this launch runs without it (the caller has no Steam app, the Steam home is on a host this launch cannot run on, Steam may not run on this launch's host, or the Steam home needs operator review). Omitted, never empty. */
             notice?: {
                 /** @enum {string} */
@@ -9043,6 +9921,108 @@ export interface components {
             username?: string;
             /** @description TURN credential. Present for turn:/turns: entries. Readable by every authenticated user who launches a session, which is inherent to browser TURN — deployments should issue ephemeral, time-limited credentials rather than a shared static password. */
             credential?: string;
+        };
+        /**
+         * @description Amendment 54 (accreleus/quasar#1026): the client's transport preference on POST /v1/sessions. Absent means the launch profile decides. Honoured only as the profile's transport allows (control-api.md §Transport); WebRTC is always the floor. Amendment 58: a developer and test switch only (the web client's ?transport= URL parameter); no player UI offers a transport choice, and a session that wants PyroWave wants WebTransport whatever this says.
+         * @enum {string}
+         */
+        TransportPreference: "webrtc" | "webtransport";
+        /**
+         * @description Amendment 54: the transport the stream plan chose for a session.
+         * @enum {string}
+         */
+        Transport: "webrtc" | "webtransport";
+        /**
+         * @description Amendment 54: whether a launch profile's sessions may use WebTransport. webrtc = never; webtransport_opt_in = only when the launch request asks for it (the developer URL switch) or, amendment 58, the stream plan wants PyroWave; webtransport = unless the launch request asks for webrtc (or, amendment 58, the plan wants PyroWave). Amendment 61 (accreleus/quasar#1217): default = follow the instance setting default_transport, which behaves as webrtc or webtransport above. Wherever a description here reads a launch profile's transport, it means this effective transport.
+         * @enum {string}
+         */
+        LaunchProfileTransport: "default" | "webrtc" | "webtransport_opt_in" | "webtransport";
+        /**
+         * @description Amendment 58 (accreleus/quasar#1059): a launch profile's Ultra-low latency (PyroWave) setting. off = never; allow = only when the user picks it in the Launch options Codec list; prefer = as allow, and an Auto launch gets it when the launch-time Auto rule holds (device probe shows WebGPU; within the 10-minute network-figure window, probe rtt_ms <= 5 and probe bandwidth_kbps >= the PyroWave target; the figures are unauthenticated hints; control-api.md §Ultra-low latency (PyroWave)). Either way subject to the per-GPU ceiling pyrowave_max_per_gpu.
+         * @enum {string}
+         */
+        LaunchProfilePyroWaveMode: "off" | "allow" | "prefer";
+        /** @description Amendment 58 (accreleus/quasar#1059): what the Launch options Codec list needs to show the Ultra-low latency (PyroWave) entry enabled, or disabled with its reason. Advisory, like the rest of GET /v1/me/profiles: the launch decides, and Session.pyrowave records it. */
+        LaunchProfilePyroWave: {
+            mode: components["schemas"]["LaunchProfilePyroWaveMode"];
+            /** @description The entry is enabled: mode is allow or prefer, the profile's transport is not webrtc, a GPU in the caller's candidate union lists pyrowave, and the fresh probe shows WebGPU and WebTransport with datagrams. */
+            available: boolean;
+            /** @description Why not available, first failing: profile_disallows, host_no_pyrowave, device_no_webgpu, device_no_webtransport (an open string); null when available. */
+            reason: string | null;
+            /** @description An Auto launch would pick PyroWave by the Auto rule, with the top rung's height and fps for the target. False unless mode is prefer and available is true. */
+            auto: boolean;
+            /** @description When mode is prefer, available is true and auto is false: no_measurement, rtt_too_high or link_too_slow (an open string); otherwise null. */
+            auto_reason: string | null;
+        };
+        /** @description Amendment 54 (accreleus/quasar#1026): the coordinates for the session's WebTransport transport. On the POST /v1/sessions 201 it is present only when session.transport is webtransport (omitted otherwise, never null), beside the signaling block that is the client's fallback. It is also the body of POST /v1/sessions/{id}/transport-token (TransportEnvelope), freshly resolved and minted. */
+        TransportOptions: {
+            webtransport: components["schemas"]["WebTransportCoords"];
+        };
+        WebTransportCoords: {
+            /** @description Opaque https URL; pass to new WebTransport(url) unchanged. The agent's listener (direct) or an admin-set public URL (edge). */
+            url: string;
+            /** @description Transport token: single-use, 60 s, plaintext in this response only, presented in the WebTransport hello (transport-webtransport.md), never in the URL. Never accepted by /v1/signal. */
+            token: string;
+            /** Format: date-time */
+            expires_at: string;
+            /** @description serverCertificateHashes for a direct endpoint: the agent's unexpired self-signed certificates (current and, during a rotation, next). Empty for an edge endpoint or a publicly trusted certificate. */
+            cert_hashes: components["schemas"]["CertHash"][];
+        };
+        CertHash: {
+            /** @enum {string} */
+            algorithm: "sha-256";
+            /** @description Base64 SHA-256 of the certificate's DER encoding. */
+            value: string;
+        };
+        TransportEnvelope: {
+            transport_options: components["schemas"]["TransportOptions"];
+        };
+        WebTransportCertificate: {
+            /** @description Base64 SHA-256 of the DER certificate. */
+            sha256: string;
+            /** Format: date-time */
+            not_before: string;
+            /** Format: date-time */
+            not_after: string;
+        };
+        /** @description Amendment 54: a host's WebTransport endpoint as reported, its admin override, and the endpoint the control plane resolves from them. */
+        HostWebTransport: {
+            /** @description The agent's capacity.transports and capacity.webtransport; null until it reports webtransport. */
+            reported: {
+                transports: components["schemas"]["Transport"][];
+                port: number;
+                addresses: string[];
+                certificates: components["schemas"]["WebTransportCertificate"][];
+            } | null;
+            override: components["schemas"]["HostWebTransportOverride"] | null;
+            /** @description The resolved endpoint; null when not usable. */
+            endpoint: {
+                url: string;
+                /** @enum {string} */
+                mode: "direct" | "edge";
+                cert_hashes: components["schemas"]["CertHash"][];
+            } | null;
+            usable: boolean;
+            /** @description Why the endpoint is not usable: not_reported, host_offline, no_address or certificate_expired (an open string); null when usable. */
+            reason: string | null;
+        };
+        HostWebTransportOverride: {
+            /** @description Absolute https URL with a host, no user info, no fragment. */
+            public_url: string;
+            /**
+             * @description public: the URL presents a publicly trusted certificate (edge proxy), no hashes sent. agent: it presents the agent's own, hashes sent.
+             * @enum {string}
+             */
+            certificate: "public" | "agent";
+        };
+        HostWebTransportWrite: {
+            /** @description Absolute https URL, or null to clear the override. */
+            public_url: string | null;
+            /**
+             * @description Default public.
+             * @enum {string}
+             */
+            certificate?: "public" | "agent";
         };
         SignalingEnvelope: {
             signaling: components["schemas"]["SignalingCoords"];
@@ -9242,7 +10222,7 @@ export interface components {
             effective?: {
                 [key: string]: string;
             } | null;
-            codecs?: components["schemas"]["Codec"][] | null;
+            codecs?: components["schemas"]["HostCodec"][] | null;
             pending_restart?: boolean;
             restart_triggered?: boolean;
         };
@@ -9593,6 +10573,17 @@ export interface components {
                 steam_warm_rewarm?: "library_open" | "next_steam_launch";
                 /** @description Amendment 39. Default 10. */
                 steam_warm_idle_minutes?: number;
+                /** @description Amendment 56 (accreleus/quasar#1066). Default 8. Optional in the envelope so a pre-amendment server stays conformant. */
+                compat_tools_max_enabled?: number;
+                /** @description Amendment 56. Default 10. */
+                compat_tools_disk_reserve_gib?: number;
+                /** @description Amendment 58 (accreleus/quasar#1059). The per-GPU PyroWave ceiling. Default 1. Optional in the envelope so a pre-amendment server stays conformant. */
+                pyrowave_max_per_gpu?: number;
+                /**
+                 * @description Amendment 61 (accreleus/quasar#1217). The instance default transport. Default webrtc. Optional in the envelope so a pre-amendment server stays conformant; absent reads as webrtc.
+                 * @enum {string}
+                 */
+                default_transport?: "webrtc" | "webtransport";
                 /** @description Amendment 49 (#845). Default UTC. Optional in the envelope so a pre-amendment server stays conformant. */
                 default_timezone?: string;
                 /** @description Amendment 49. Default en-US. */
@@ -10543,7 +11534,7 @@ export interface components {
             active_sessions: number;
             render_node: string | null;
             /** @description Amendment 12 (#296), additive. ALWAYS SERIALIZED. The wire codecs this GPU can encode (agent-api.md capacity.gpus[].codecs, schema.md gpus.codecs), as the launch path reads them: the GPU's own reported set, or - for a GPU whose agent reports no per-GPU set - its host's codecs (inheritance). Null when neither this GPU nor its host has ever reported a codec set (a pre-multi-codec agent), which the launch path treats as h264-only; like HostSettingsResponse.codecs it is deliberately NOT normalised to ["h264"] here, because "never reported" and "reported h264 only" need different operator advice. HostSettingsResponse.codecs keeps serving the host union. */
-            codecs: components["schemas"]["Codec"][] | null;
+            codecs: components["schemas"]["HostCodec"][] | null;
         };
         GPUsResponse: {
             items: components["schemas"]["GPUAvailability"][];
@@ -10650,6 +11641,12 @@ export interface components {
             visibility: "user" | "debug" | "internal";
             sort_order: number;
             rungs: components["schemas"]["LaunchProfileRung"][];
+            /** @description Amendment 54. Always serialized by a server implementing the amendment; absent from an older one, read as webrtc. Amendment 61: default on every profile that read webrtc before migration 0116. */
+            transport?: components["schemas"]["LaunchProfileTransport"];
+            /** @description Amendment 58 (amendment 55's pyrowave_allowed is deleted): Ultra-low latency (PyroWave) for this profile. Always serialized by a server implementing the amendment; absent from an older one, read as off. */
+            pyrowave_mode?: components["schemas"]["LaunchProfilePyroWaveMode"];
+            /** @description Amendment 55: the MAXIMUM PyroWave bitrate, kbit/s - a cap, not a fixed target. A session's target is min(floor(height_default * fps / 60), pyrowave_kbps ?? 1000000) (codec-pyrowave.md §Rate), height_default 200000 / 300000 / 400000 for an encoded stream height at launch up to 1080 / up to 1440 / above. null = no cap below 1000000. */
+            pyrowave_kbps?: number | null;
             used_by?: components["schemas"]["LaunchProfileUsedBy"];
             warnings?: components["schemas"]["WriteWarning"][];
         };
@@ -10662,6 +11659,12 @@ export interface components {
             /** @enum {string} */
             visibility?: "user" | "debug" | "internal";
             sort_order?: number;
+            /** @description Amendment 54. Absent on POST = default (amendment 61; it was webrtc); absent on PATCH = unchanged. */
+            transport?: components["schemas"]["LaunchProfileTransport"];
+            /** @description Amendment 58. Absent on POST = off; absent on PATCH = unchanged; any other value = 400 validation_failed. allow or prefer with transport webrtc draws the warning pyrowave_needs_webtransport. Amendment 55's pyrowave_allowed is deleted: sent, it is an unknown key, 400 validation_failed like any other on this decoder. */
+            pyrowave_mode?: components["schemas"]["LaunchProfilePyroWaveMode"];
+            /** @description Amendment 55: the maximum PyroWave bitrate (a cap; the console's Maximum bitrate, blank = automatic by resolution). Absent on POST = null (no cap below 1000000); absent on PATCH = unchanged; out of range = 400 validation_failed. */
+            pyrowave_kbps?: number | null;
             /** @description ORDERED stream-profile ids, best first. ORDER IS PREFERENCE. A stream profile may appear at most once (a duplicate is 400 validation_failed). An id that does not resolve is 400 validation_failed at write time, never an FK error surfacing at launch. */
             rungs: string[];
         };
@@ -10696,6 +11699,8 @@ export interface components {
             eligibility: "eligible" | "risky" | "ineligible";
             reasons: components["schemas"]["ProfileReason"][];
             rungs: components["schemas"]["ProfileEvaluation"][];
+            /** @description Amendment 58: the Launch options Ultra-low latency (PyroWave) entry for this profile. Always serialized by a server implementing the amendment; absent from an older one, read as mode off, not available. */
+            pyrowave?: components["schemas"]["LaunchProfilePyroWave"];
         };
         /** @description GET /v1/me/profiles response: eligibility + recommendation. BREAKING (UI-P4) - `profiles[]` now holds LAUNCH PROFILES, which have no single top-level resolution. A consumer reading profiles[].width breaks; quasar-client (ffi_control.rs, ffi.rs) hand-projects width/height/fps off this shape and needs a re-pin, deliberately deferred to its own work. */
         ProfilesResponse: {
@@ -10891,7 +11896,7 @@ export interface components {
             encode_ms_p95?: number;
             encode_ms_max?: number;
             overlay_frames?: number;
-            /** @description The governor's live floor, sent ONLY when the ladder has moved it off the launch floor. Absent means 'the floor the session launched with', never 'unknown'. Uncurated: readable via GET .../metrics, not in the diagnostic lens. */
+            /** @description The governor's live floor, sent ONLY when the ladder has moved it off the launch floor. Absent means 'the floor the session launched with', never 'unknown'. Stream health judges the setpoint against it when present (amendment 75). Uncurated: readable via GET .../metrics, not in the diagnostic lens. */
             abr_floor_kbps?: number;
             /** @description The ABR mode this session is actually running ('smooth' | 'protective' | 'off'). Reported rather than inferred: deriving it from setpoint presence was wrong for 'off', where rtpgccbwe stays attached. Uncurated (a label, not a series). */
             abr_mode?: string;
@@ -10971,6 +11976,7 @@ export interface components {
             rtt_ms?: number;
             jitter_buffer_ms?: number;
             decode_ms?: number;
+            /** @description CUMULATIVE receiver loss. WebRTC: getStats packetsLost. WebTransport (amendment 63): video fragments the client found missing, each counted once when first NACKed, whether or not the resend arrived. */
             packets_lost?: number;
             frames_dropped?: number;
             /** @description Presentation fps derived from the MEAN RVFC interval. DEPRECATED as a headline: at source fps == display Hz a single missed vsync doubles one interval and drags the mean (a healthy 1440p120 session read 88-108 on 2026-08-22). Read present_fps_median. Retained unchanged for series continuity. */
@@ -10989,6 +11995,7 @@ export interface components {
             present_long_frames?: number;
             /** @description Intervals the window actually contained. Below 5 every other present_* key is omitted rather than computed from a fragment. */
             present_n?: number;
+            /** @description The display buffer this sample was measured under, ms. WebRTC: the jitter-buffer target. WebTransport *(amendment 66)*: the display cushion in force, 0 on a clean link, at most three frame intervals and 50 ms. */
             playout_target_ms?: number;
             /** @description RVFC captureTime has a current validated sample (0/1); stale/missing/invalid captureTime resets it. Not proof of abs-capture-time RTP negotiation. */
             rvfc_capture_time_available?: number;
@@ -11002,6 +12009,22 @@ export interface components {
             glass_to_glass_ms?: number;
             /** @description RTP capture-time to browser present (ms), median over a rolling ring of up to 600 RVFC samples. Identical in value to glass_to_glass_ms, which it replaces; both are posted this release so no stored series breaks. Additive, approved by Michael 2026-08-23. */
             rvfc_capture_to_display_ms?: number;
+            /** @description Amendment 63 (accreleus/quasar#1035), additive. A WebTransport session's counterpart of rvfc_capture_to_display_ms: the agent's capture_us (transport-webtransport.md Clocks) to the moment the client hands the frame to its presenter, in ms, median over a rolling ring of up to 600 frames, compared on the agent's clock through the control-stream ping/pong offset. Absent until that offset is stable. It ends at present submission, not display scan-out, and is not RVFC-qualified. A WebRTC session never posts it. */
+            wt_capture_to_present_ms?: number;
+            /** @description Amendment 63 (accreleus/quasar#1035), additive. keyframe_request messages a WebTransport client put on the wire in the sample's window (transport-webtransport.md Loss recovery), whoever asked: the decoder, a frame given up as late, a tab shown again. Requests merged by the client's spacing window count once. A WebRTC session never posts it. */
+            wt_keyframe_requests?: number;
+            /** @description Amendment 66 (accreleus/quasar#1317), additive. A WebTransport session's smoothed video frame arrival jitter in ms (the change in transit time between consecutive decoded frames, averaged over about 16 frames): the input to the client's display cushion, whose size is playout_target_ms. Absent on a PyroWave session and on WebRTC. */
+            wt_arrival_jitter_ms?: number;
+            /** @description Amendment 66 (accreleus/quasar#1318), additive. CUMULATIVE for the page view: audio sample frames played that the stream did not supply (48000 is one second). WebRTC: the browser's inbound-rtp concealedSamples. WebTransport: silence played for want of audio plus the fade that replaces a lost packet. Absent until the transport has measured audio. */
+            audio_concealed_samples?: number;
+            /** @description Amendment 66 (accreleus/quasar#1318), additive. CUMULATIVE for the page view: separate audible dropouts. WebRTC: the browser's inbound-rtp concealmentEvents. WebTransport: runs of silence from an empty audio queue (one per run) plus lost packets concealed (a gap of several lost packets, with the silence after its fade, counts once). Absent until the transport has measured audio. */
+            audio_concealment_events?: number;
+            /** @description Amendment 68 (accreleus/quasar#1346), additive. A WebTransport session's audio playout buffer: the LEAST audio queued in the ring at a quantum since the previous sample, ms. 0 means the ring ran empty and played silence; a value at wt_audio_target_ms means it was never in danger. Absent before any audio has played and on WebRTC, which reports the browser's jitter buffer instead. */
+            wt_audio_buffer_ms?: number;
+            /** @description Amendment 68 (accreleus/quasar#1346), additive. The depth a WebTransport session's audio ring is aiming for, ms: the largest of its base target (the median video capture-to-present latency), 40 ms, and what the output device and posting need plus the jitter allowance it measures from audio packet arrival; capped at 150 ms. A setting, not a measurement; read beside wt_audio_buffer_ms. Absent before any audio has played and on WebRTC. */
+            wt_audio_target_ms?: number;
+            /** @description Amendment 68 (accreleus/quasar#1346), additive. CUMULATIVE for the page view: times a WebTransport session's audio ring ran empty and played silence, however long each run lasted. The silence-run half of audio_concealment_events, so that count minus this one is the dropouts a lost packet's fade caused. Absent until audio has played, and never posted by a WebRTC session. */
+            wt_audio_underruns?: number;
             /** @description Accepted by the browser ingest allow-list and declared here, but no client has ever posted it — the browser cannot observe host encode time. Kept declared so the ingest contract does not change. */
             encode_ms?: number;
             network_pacing_ms?: number;
@@ -12179,7 +13202,7 @@ export interface components {
                 "application/json": components["schemas"]["ClientTooOldError"];
             };
         };
-        /** @description no_host_available / capacity_exhausted / host_not_ready (amendment 11: a failing evidence-based readiness check is the only reason no host qualified) — well-formed but cannot be placed now (retryable). Amendment 12 (#296): an explicit stream.codec is a codec constraint applied at placement; when a GPU that can encode it exists but none is free the answer is capacity_exhausted, and when no online usable GPU can encode it the answer is no_host_available, both with a message naming the codec. No new code. Amendment 40 (#602): no_host_available MAY carry error.reason home_host_unavailable (the caller's home is on a host that is offline or no longer enrolled); a client does not auto-retry it. */
+        /** @description no_host_available / capacity_exhausted / host_not_ready (amendment 11: a failing evidence-based readiness check is the only reason no host qualified) — well-formed but cannot be placed now (retryable). Amendment 12 (#296): an explicit stream.codec is a codec constraint applied at placement; when a GPU that can encode it exists but none is free the answer is capacity_exhausted, and when no online usable GPU can encode it the answer is no_host_available, both with a message naming the codec. No new code. Amendment 40 (#602): no_host_available MAY carry error.reason home_host_unavailable (the caller's home is on a host that is offline or no longer enrolled); a client does not auto-retry it. Amendment 56 (accreleus/quasar#1066): no_host_available MAY carry error.reason compat_tool_missing (no online host has the GE compatibility tool the launched game's per-game mapping names; the fleet default never causes it; it clears as hosts install it). Amendment 59 (accreleus/quasar#1133): capacity_exhausted carries error.reason steam_restarting on every one a launch gets while the caller's parked session is stopping (a claim that fails stops it) or the caller's released runtime holds the home (control-api.md §Warm Steam, "Claim" and "Park on exit"); the client keeps its automatic retry. */
         Unavailable: {
             headers: {
                 /** @description delta-seconds; MAY accompany capacity_exhausted (control-api.md §Admission control, (4)); 2 on a refused warm-Steam claim (amendment 39). */

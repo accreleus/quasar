@@ -75,6 +75,10 @@ TARGET ?= local
 KEEP ?= 0
 export LEVEL TARGET KEEP
 
+# e2e-review passthrough: make e2e-review BUNDLE=<bundle-dir>
+BUNDLE ?=
+export BUNDLE
+
 # bench passthrough: make bench-submit DIR=<run dir> ARGS='--suite ... --tag k=v'
 DIR ?=
 export DIR
@@ -100,9 +104,10 @@ DRY_RUN ?= 0
 export VERSION DRY_RUN
 
 .PHONY: help init doctor config-check verify docs-metrics-sync docs-trace \
-	test test-go test-rust test-uinput test-web test-engines test-engines-build \
+	test test-go test-rust test-uinput test-web test-webgpu test-engines test-engines-build \
         test-db preflight release up down restart rebuild redeploy-cp status health logs logs-follow \
         dev-web dev-cp diagnose diagnose-bundle clean reset agent-creds validate \
+        e2e-run e2e-collect e2e-review e2e-post e2e-pack e2e-compare \
         ui-audit ui-audit-routes ui-audit-ab session-display session-soak abr-ladder \
         bench-submit bench-retro bench-run bench-suite bench-budget bench-baseline \
         homes-gc \
@@ -159,6 +164,12 @@ test-uinput: ## Node-agent virtual input against this host's real /dev/uinput (r
 test-web: ## Web SPA: install, typecheck, unit tests, production build
 	@bash $(DX)/common.sh require-local test-web
 	@bash scripts/verify.sh web
+# Same image and digest as CI's web-webgpu job; its version must match web/package.json's pinned `playwright`.
+# The image's version must match web/package.json's pinned `playwright` (and CI's web-webgpu job).
+test-webgpu: ## Web WebGPU tests (the PyroWave decoder vs the golden fixtures) in headless Chromium
+	@bash $(DX)/common.sh require-local test-webgpu
+	docker run --rm --user "$$(id -u):$$(id -g)" -e HOME=/tmp/h -v "$(CURDIR)":/w -w /w/web \
+	  mcr.microsoft.com/playwright:v1.56.0-noble@sha256:35246d87a7c88ea9b771c65d33171b2611b02a8253b4b12ce6f94376c55f99f2 sh -c 'npm ci --no-audit --no-fund && npx vitest run --config vitest.webgpu.config.ts'
 
 test-db: ## Control-plane DB tests against a FRESH ephemeral Postgres (-p 1)
 	@bash $(DX)/testdb.sh
@@ -303,6 +314,24 @@ nightly-budget-status: ## Tail today's nightly-budget log + LAST_REGRESSION if a
 
 validate: ## End-to-end validation report — LEVEL=ui|api|session|all TARGET=local|<url> KEEP=1 ARGS='--reuse-web'
 	@bash $(DX)/validate.sh
+
+e2e-run: ## Run a plan of the end-to-end streaming suite from this client — TARGET=<stack url> PLAN=<plan> [CDP=<DevTools endpoint> OUT=<dir> CLIENT=<label> HOOKS=<hook dir> WEB_DIST=<web build dir> INSECURE_TLS=1]
+	@bash $(DX)/e2e_run.sh
+
+e2e-collect: ## The host half of a run bundle, by session id — BUNDLE=<dir> [HOST=<role|name>] [RESUME=1: finish a collection this machine started]
+	@bash $(DX)/e2e_collect.sh
+
+e2e-review: ## The deterministic summary an agent reads first — BUNDLE=<bundle-dir>
+	@node scripts/validate/stream/review.mjs "$$BUNDLE"
+
+e2e-post: ## Put a suite run on quasar-bench: one run per scenario — BUNDLE=<dir> HOST=<role> [DRY_RUN=1]
+	@bash $(DX)/e2e_post.sh
+
+e2e-compare: ## What changed between two run bundles: criteria, metric medians, pictures — A=<bundle-dir> B=<bundle-dir> [OUT=<dir>]
+	@bash $(DX)/e2e_compare.sh
+
+e2e-pack: ## The client half of the suite as one archive for a remote tester (Node 22 + Chrome only) — [OUT=<path without extension>]
+	@bash $(DX)/e2e_pack.sh
 
 ## ── Image QA ────────────────────────────────────────────────────────────────
 

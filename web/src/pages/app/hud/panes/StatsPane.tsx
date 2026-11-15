@@ -38,6 +38,10 @@ export interface StatsPaneProps {
   tier?: string;
   /** Server-resolved codec (wire id), for the multi-codec mismatch check. */
   resolvedCodec?: string;
+  /** The session's transport: webrtc | webtransport. */
+  transport?: string;
+  transportFallbackReason?: string | null;
+  transportFallbackCause?: string | null;
   /** Without it the pane shows only client-side numbers (no server verdict). */
   sessionId?: string;
   /** ISO `session.started_at`. The v1 drawer header carried this timer and the
@@ -358,6 +362,24 @@ export function StatsPane(props: StatsPaneProps) {
                     <td>{props.tier}</td>
                   </tr>
                 )}
+                {props.transport && (
+                  <tr>
+                    <td>transport</td>
+                    <td>{props.transport === "webtransport" ? "WebTransport" : "WebRTC"}</td>
+                  </tr>
+                )}
+                {props.transportFallbackCause && (
+                  <tr>
+                    <td>WebTransport fallback</td>
+                    <td className="diag-cause">{props.transportFallbackCause}</td>
+                  </tr>
+                )}
+                {props.transportFallbackReason && (
+                  <tr>
+                    <td>fell back</td>
+                    <td>{props.transportFallbackReason.replaceAll("_", " ")}</td>
+                  </tr>
+                )}
                 {codecs.resolved && (
                   <tr>
                     <td>codec (server)</td>
@@ -440,6 +462,24 @@ export function StatsPane(props: StatsPaneProps) {
                   <td>drops / freezes</td>
                   <td>
                     {telemetry.framesDropped} / {telemetry.freezeCount}
+                  </td>
+                </tr>
+                <tr>
+                  <MetricLabel text="audio dropouts" metric="audio_concealment_events" />
+                  <td className={telemetry.audioConcealmentEvents ? "diag-warn" : undefined}>
+                    {telemetry.audioConcealmentEvents == null
+                      ? "–"
+                      : `${telemetry.audioConcealmentEvents} · ${Math.round((telemetry.audioConcealedSamples ?? 0) / 48)} ms`}
+                  </td>
+                </tr>
+                <tr>
+                  {/* WebTransport only: the least the audio ring held this second, against the
+                      depth it aims for. A left number at 0 is the ring running empty (#1346). */}
+                  <MetricLabel text="audio buffer" metric="wt_audio_buffer_ms" />
+                  <td className={telemetry.audioBufferMs === 0 ? "diag-warn" : undefined}>
+                    {telemetry.audioBufferMs == null
+                      ? "–"
+                      : `${Math.round(telemetry.audioBufferMs)} / ${Math.round(telemetry.audioTargetMs ?? 0)} ms`}
                   </td>
                 </tr>
                 <tr>

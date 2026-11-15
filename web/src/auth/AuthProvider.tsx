@@ -9,13 +9,8 @@ import { onUnauthorized } from "../api/unauthorized";
 import type { User } from "../api/types";
 import { AuthContext, type AuthStatus, type AuthContextValue } from "./context";
 import { clearSession, isRemembered, loadSession, saveSession } from "./storage";
-import {
-  deviceProbeIsFresh,
-  getOrCreateDeviceKey,
-  markDeviceProbePosted,
-  probeCapabilities,
-  probeH264Decodable,
-} from "../webrtc/capability";
+import { getOrCreateDeviceKey } from "../webrtc/capability";
+import { ensureDeviceProbe } from "./deviceProbe";
 import { reportBestEffortFailure } from "../lib/reportBestEffortFailure";
 
 export function AuthProvider({ children }: { children: ReactNode }) {
@@ -57,18 +52,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         // unthrottled it rate-limited /v1/me/devices (429). Best-effort:
         // failures are silent (same posture as the login path).
         // A changed H.264 verdict (plugin installed) posts at once (#688).
-        const tok = persisted.token;
-        void (async () => {
-          try {
-            if (deviceProbeIsFresh(fresh.id, await probeH264Decodable())) return;
-            const deviceKey = getOrCreateDeviceKey();
-            const caps = await probeCapabilities();
-            await authApi.postDevice(tok, deviceKey, caps);
-            markDeviceProbePosted(fresh.id, caps.codecs.h264);
-          } catch (err) {
-            reportBestEffortFailure("silent-debug", "auth: rehydrate device capability post", err);
-          }
-        })();
+        void ensureDeviceProbe(persisted.token, fresh.id).catch((err) =>
+          reportBestEffortFailure("silent-debug", "auth: rehydrate device capability post", err),
+        );
       })
       .catch((err: unknown) => {
         if (cancelled) return;
@@ -119,22 +105,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setSessionExpired(false);
     setStatus("authenticated");
 
-    // Fire the device capability probe asynchronously AFTER setting
-    // authenticated state so the redirect to /app is never blocked.
-    // Failures are silent (best-effort per P4-08 and control-api.md).
-    const tok = res.access_token;
-    void (async () => {
-      try {
-        const deviceKey = getOrCreateDeviceKey();
-        const caps = await probeCapabilities();
-        await authApi.postDevice(tok, deviceKey, caps);
-        markDeviceProbePosted(res.user.id, caps.codecs.h264);
-      } catch (err) {
-        // Intentionally silent — capability data is best-effort and must never
-        // degrade the login experience (P4-08: "failures silent/logged, not fatal").
-        reportBestEffortFailure("silent-debug", "auth: device capability post", err);
-      }
-    })();
+    // The device capability probe, after the state flip so the redirect to /app is never
+    // blocked; best-effort (P4-08). Through ensureDeviceProbe, as on rehydrate: a probe with
+    // a timed-out step must be asked again soon, not read as fresh for a day (WebRTC meanwhile).
+    // Forced: a sign-in always posts, since the server may have dropped this browser's record.
+    void ensureDeviceProbe(res.access_token, res.user.id, { force: true }).catch((err) =>
+      reportBestEffortFailure("silent-debug", "auth: device capability post", err),
+    );
   }, []);
 
   const claim = useCallback(
@@ -154,16 +131,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // Same best-effort capability probe as login(), fired AFTER the state
       // flip so the wizard's next step is never blocked on it. Failures are
       // silent (P4-08 posture).
-      const tok = res.access_token;
-      void (async () => {
-        try {
-          const caps = await probeCapabilities();
-          await authApi.postDevice(tok, deviceKey, caps);
-          markDeviceProbePosted(res.user.id, caps.codecs.h264);
-        } catch (err) {
-          reportBestEffortFailure("silent-debug", "auth: claim device capability post", err);
-        }
-      })();
+      void ensureDeviceProbe(res.access_token, res.user.id, { force: true }).catch((err) =>
+        reportBestEffortFailure("silent-debug", "auth: claim device capability post", err),
+      );
     },
     [],
   );

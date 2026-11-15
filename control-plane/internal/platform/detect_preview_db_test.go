@@ -151,6 +151,32 @@ func TestDetectPreviewSurvivesAFailedStableListing(t *testing.T) {
 	}
 }
 
+// When the listing AND the branch pass fail, the run reports both causes on one
+// line: the view shows last_error as a single sentence, so a newline would run
+// them together with no break between them (#1003).
+func TestDetectReportsBothFailedPassesOnOneLine(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	store := NewStore(pool)
+
+	channel := ChannelPreview
+	src := twoReleaseSource()
+	src.listErr = errors.New("list releases: api.github.com answered 403 Forbidden")
+	_, err := NewDetector(src, store, nil).WithEdge(&fakeEdge{}, channelIs(&channel)).
+		WithPreview(&fakePreview{err: errors.New("dial tcp: i/o timeout")}).Detect(ctx)
+	if err == nil {
+		t.Fatal("want a failed run when both passes fail")
+	}
+	if strings.Contains(err.Error(), "\n") {
+		t.Fatalf("err = %q, want one line", err.Error())
+	}
+	for _, want := range []string{"403 Forbidden", "i/o timeout"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("err = %q, want it to name %q", err.Error(), want)
+		}
+	}
+}
+
 func TestDetectPreviewFailures(t *testing.T) {
 	notFound := fmt.Errorf("get tag: status 404: %w", images.ErrRegistryNotFound)
 	shape := fmt.Errorf("%w: two layers", images.ErrArtifactShape)

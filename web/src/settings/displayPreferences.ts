@@ -21,6 +21,13 @@ export interface DisplayPreferences {
   /** #647: Play goes full screen and the reveal captures input. Per device (a
    *  phone and a desktop want different things); absent means on. */
   launchImmersive?: boolean;
+  /** #1349: reconstruct and sharpen a stream smaller than the picture it is drawn
+   *  into, instead of stretching it. Per device like the scaling mode beside it;
+   *  opt-in, absent means off: the pass can cost more than a frame at high refresh (#1449). */
+  upscaleSharpen?: boolean;
+  /** #1401: the touch pad drawn over the picture. Per device; opt-in, absent means off
+   *  (the layout is a first pass, #1405). */
+  onScreenControls?: boolean;
 }
 
 const DEFAULT_PREFS: DisplayPreferences = {
@@ -46,6 +53,8 @@ export function loadDisplayPreferences(): DisplayPreferences {
       scalingMode,
       ...(preferredMicDeviceId ? { preferredMicDeviceId } : {}),
       ...(parsed.launchImmersive === false ? { launchImmersive: false } : {}),
+      ...(parsed.upscaleSharpen === true ? { upscaleSharpen: true } : {}),
+      ...(parsed.onScreenControls === true ? { onScreenControls: true } : {}),
     };
   } catch {
     return { ...DEFAULT_PREFS };
@@ -68,4 +77,14 @@ export function saveDisplayPreferences(prefs: Partial<DisplayPreferences>): void
 /** #647: whether a launch goes full screen and captures input on this device. */
 export function launchImmersive(): boolean {
   return loadDisplayPreferences().launchImmersive !== false;
+}
+
+/** #1349: whether an upscaled stream is reconstructed and sharpened on this device. */
+export function upscaleSharpen(): boolean {
+  return loadDisplayPreferences().upscaleSharpen === true;
+}
+
+/** #1401: whether the on-screen controls are on for this device. */
+export function onScreenControls(): boolean {
+  return loadDisplayPreferences().onScreenControls === true;
 }

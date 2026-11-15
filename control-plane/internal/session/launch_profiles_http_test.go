@@ -211,6 +211,8 @@ func TestLaunchProfileWriteValidation(t *testing.T) {
 		{"unknown rung id", map[string]any{"id": "x", "display_name": "x", "rungs": []string{"1080p60-h264", "nope"}}},
 		{"duplicate rung", map[string]any{"id": "x", "display_name": "x", "rungs": []string{"1080p60-h264", "1080p60-h264"}}},
 		{"bad visibility", map[string]any{"id": "x", "display_name": "x", "visibility": "public", "rungs": []string{"1080p60-h264"}}},
+		{"bad transport", map[string]any{"id": "x", "display_name": "x", "transport": "quic", "rungs": []string{"1080p60-h264"}}},
+		{"null-ish transport", map[string]any{"id": "x", "display_name": "x", "transport": "", "rungs": []string{"1080p60-h264"}}},
 		// A LEGACY (pre-0036, codec IS NULL) stream_profiles row still EXISTS —
 		// the expand migration keeps it so a code-level revert finds its data — and
 		// GetStreamProfile does not filter to rungs, so it resolves happily. Listing
@@ -421,4 +423,163 @@ func hasWarning(b launchProfileBody, code string) bool {
 		}
 	}
 	return false
+}
+
+// TestLaunchProfileTransport: the profile's transport defaults to webrtc, round-trips through
+// create, patch (absent leaves it) and the read, and any other value is a 400 on both writes.
+func TestLaunchProfileTransport(t *testing.T) {
+	pool := testDB(t)
+	base, adminTok, _ := newProfileAdminServer(t, pool)
+
+	transportOf := func(resp *http.Response) string {
+		t.Helper()
+		var b struct {
+			Transport string `json:"transport"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&b); err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		return b.Transport
+	}
+
+	resp := doJSON(t, "POST", base+"/v1/admin/launch-profiles", adminTok,
+		map[string]any{"id": "wt-default", "display_name": "d", "rungs": []string{"1080p60-h264"}})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create: %d", resp.StatusCode)
+	}
+	if got := transportOf(resp); got != "default" {
+		t.Errorf("default transport = %q, want default (amendment 61)", got)
+	}
+
+	resp = doJSON(t, "POST", base+"/v1/admin/launch-profiles", adminTok,
+		map[string]any{"id": "wt-opt", "display_name": "o", "transport": "webtransport_opt_in", "rungs": []string{"1080p60-h264"}})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create opt-in: %d", resp.StatusCode)
+	}
+	if got := transportOf(resp); got != "webtransport_opt_in" {
+		t.Errorf("created transport = %q", got)
+	}
+
+	// A patch that does not mention transport leaves it.
+	resp = doJSON(t, "PATCH", base+"/v1/admin/launch-profiles/wt-opt", adminTok, map[string]any{"display_name": "renamed"})
+	if got := transportOf(resp); got != "webtransport_opt_in" {
+		t.Errorf("transport after an unrelated patch = %q, want unchanged", got)
+	}
+	resp = doJSON(t, "PATCH", base+"/v1/admin/launch-profiles/wt-opt", adminTok, map[string]any{"transport": "webtransport"})
+	if got := transportOf(resp); got != "webtransport" {
+		t.Errorf("transport after patch = %q", got)
+	}
+	resp = doJSON(t, "PATCH", base+"/v1/admin/launch-profiles/wt-opt", adminTok, map[string]any{"transport": "default"})
+	if got := transportOf(resp); got != "default" {
+		t.Errorf("transport after patch to default = %q", got)
+	}
+	_ = doJSON(t, "PATCH", base+"/v1/admin/launch-profiles/wt-opt", adminTok, map[string]any{"transport": "webtransport"}).Body.Close()
+	resp = doJSON(t, "PATCH", base+"/v1/admin/launch-profiles/wt-opt", adminTok, map[string]any{"transport": "udp"})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("bad transport on patch: %d, want 400", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+
+	// The list and the single read carry it, and the stored value is what launch reads.
+	resp = doJSON(t, "GET", base+"/v1/admin/launch-profiles/wt-opt", adminTok, nil)
+	if got := transportOf(resp); got != "webtransport" {
+		t.Errorf("read transport = %q", got)
+	}
+	lp, err := NewStore(pool).GetLaunchProfile(context.Background(), "wt-opt")
+	if err != nil || lp.Transport != "webtransport" {
+		t.Errorf("store transport = %q (%v)", lp.Transport, err)
+	}
+}
+
+// TestLaunchProfilePyroWave: pyrowave_mode defaults to off and pyrowave_kbps to null; both
+// round-trip, a null kbps clears the cap, a null or unknown mode and an out-of-range kbps are
+// 400, and allow on a webrtc profile draws pyrowave_needs_webtransport (amendment 58).
+func TestLaunchProfilePyroWave(t *testing.T) {
+	pool := testDB(t)
+	base, adminTok, userTok := newProfileAdminServer(t, pool)
+
+	type pw struct {
+		Mode     string         `json:"pyrowave_mode"`
+		Kbps     *int32         `json:"pyrowave_kbps"`
+		Warnings []writeWarning `json:"warnings"`
+	}
+	read := func(resp *http.Response) pw {
+		t.Helper()
+		defer resp.Body.Close()
+		var b pw
+		if err := json.NewDecoder(resp.Body).Decode(&b); err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	warned := func(b pw) bool {
+		for _, w := range b.Warnings {
+			if w.Code == warnPyroWaveNeedsWebTransport {
+				return true
+			}
+		}
+		return false
+	}
+	status := func(method, path string, body map[string]any, tok string) int {
+		t.Helper()
+		resp := doJSON(t, method, base+path, tok, body)
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	resp := doJSON(t, "POST", base+"/v1/admin/launch-profiles", adminTok,
+		map[string]any{"id": "pw", "display_name": "p", "rungs": []string{"1080p60-h264"}})
+	if b := read(resp); resp.StatusCode != http.StatusCreated || b.Mode != "off" || b.Kbps != nil || warned(b) {
+		t.Fatalf("create: %d %+v", resp.StatusCode, b)
+	}
+	b := read(doJSON(t, "PATCH", base+"/v1/admin/launch-profiles/pw", adminTok,
+		map[string]any{"pyrowave_mode": "allow", "pyrowave_kbps": 300000}))
+	if b.Mode != "allow" || b.Kbps == nil || *b.Kbps != 300000 || !warned(b) {
+		t.Errorf("allow on webrtc: %+v, want the warning", b)
+	}
+	b = read(doJSON(t, "PATCH", base+"/v1/admin/launch-profiles/pw", adminTok,
+		map[string]any{"transport": "webtransport_opt_in"}))
+	if b.Mode != "allow" || b.Kbps == nil || warned(b) {
+		t.Errorf("an unrelated patch: %+v, want unchanged and no warning", b)
+	}
+	b = read(doJSON(t, "PATCH", base+"/v1/admin/launch-profiles/pw", adminTok, map[string]any{"pyrowave_kbps": nil}))
+	if b.Mode != "allow" || b.Kbps != nil {
+		t.Errorf("a null kbps: %+v, want no cap", b)
+	}
+	for name, body := range map[string]map[string]any{
+		"null mode":         {"pyrowave_mode": nil},
+		"unknown mode":      {"pyrowave_mode": "always"},
+		"mode not a text":   {"pyrowave_mode": true},
+		"kbps too low":      {"pyrowave_kbps": 49999},
+		"kbps too high":     {"pyrowave_kbps": 1000001},
+		"kbps not a number": {"pyrowave_kbps": "fast"},
+	} {
+		if got := status("PATCH", "/v1/admin/launch-profiles/pw", body, adminTok); got != http.StatusBadRequest {
+			t.Errorf("%s: %d, want 400", name, got)
+		}
+	}
+	// A default profile warns by the EFFECTIVE transport, so the instance setting moves it
+	// (amendment 61).
+	read(doJSON(t, "PATCH", base+"/v1/admin/launch-profiles/pw", adminTok, map[string]any{"transport": "default"}))
+	for _, tc := range []struct {
+		setting    string
+		wantWarned bool
+	}{{"webrtc", true}, {"webtransport", false}} {
+		t.Cleanup(func() {
+			_, _ = pool.Exec(context.Background(), `UPDATE instance_settings SET default_transport = 'webrtc'`)
+		})
+		must(t, exec(t, pool, `INSERT INTO instance_settings (id, default_transport) VALUES (true, $1)
+			ON CONFLICT (id) DO UPDATE SET default_transport = EXCLUDED.default_transport`, tc.setting))
+		if got := warned(read(doJSON(t, "GET", base+"/v1/admin/launch-profiles/pw", adminTok, nil))); got != tc.wantWarned {
+			t.Errorf("default profile on a %s instance: warned = %v, want %v", tc.setting, got, tc.wantWarned)
+		}
+	}
+	if got := status("PATCH", "/v1/admin/launch-profiles/pw", map[string]any{"pyrowave_mode": "prefer"}, userTok); got != http.StatusForbidden {
+		t.Errorf("a non-admin patch: %d, want 403", got)
+	}
+	lp, err := NewStore(pool).GetLaunchProfile(context.Background(), "pw")
+	if err != nil || lp.PyroWaveMode != "allow" || lp.PyroWaveKbps != nil {
+		t.Errorf("store: %+v (%v)", lp, err)
+	}
 }

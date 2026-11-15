@@ -690,6 +690,8 @@
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
+/* A WebTransport fallback cause can be one long token (#1403): it wraps in a phone-width pane. */
+.diag-grid td.diag-cause { overflow-wrap: anywhere; }
 
 /* The verdict block and the Advanced disclosure sit below the four tables:
    they are the support read, not the glanceable one. */

@@ -1,7 +1,7 @@
 //! The race guard (#352 decision D3, architecture §5.4): which containers on this machine
 //! look like a Quasar platform service but were not created by this installation.
 //!
-//! Such a container is an **owner conflict** (`CONTEXT.md`): a leftover Compose stack, a
+//! Such a container is an **owner conflict** (`GLOSSARY.md`): a leftover Compose stack, a
 //! definition an external manager still holds, another installation's service. The actor
 //! never stops, renames or removes one. It reports each in `status`, the agent raises the
 //! readiness check `owner_conflict` from that report, the control plane blocks the target,

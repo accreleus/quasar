@@ -64,6 +64,7 @@ pub mod probe_encoder;
 /// `media-probe`: the media host probe's child half (compositor source + production
 /// encode chain).
 pub mod probe_media;
+pub mod probe_pyrowave;
 /// Adaptive external resolution rung ladder. Mirror of the control plane's
 /// `internal/profile/rungs.go`; advertised to the guest compositor and checked
 /// against `session_display_update.stream_*`.
@@ -195,7 +196,7 @@ impl Codec {
 
 /// Per-session stream parameters. Mirrors the `stream` object of `session_assign`
 /// (`protocol/agent-api.md`); env/flags supply them on the standalone path.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StreamParams {
     pub width: i32,
     pub height: i32,
@@ -490,6 +491,12 @@ pub struct SessionConfig {
     /// `Auto` negotiates `ulp-red` at 0% up front and ramps `fec-percentage` on the
     /// agent-local loss signal ([`fec::FecController`]).
     pub fec_mode: fec::FecMode,
+    /// Largest RTP packet the host sends, RTP header included, before SRTP/UDP/IP.
+    /// Knob: `QUASAR_RTP_MTU`.
+    pub rtp_mtu: u32,
+    /// Shrink `rtp_mtu` mid-session when the path drops full-size packets (#1134).
+    /// Knob: `QUASAR_RTP_MTU_SHRINK`.
+    pub rtp_mtu_shrink: bool,
     /// The host's console-mode config, snapshotted from the agent's latched
     /// `config_update.console_config`. A `local_only` session needs it enabled; a streamed
     /// session never reads it.
@@ -527,6 +534,11 @@ pub struct SessionConfig {
     /// `session_assign.kind` (amendment 39); `None` from a control plane that predates it,
     /// whose sessions are never held or parked.
     pub kind: Option<crate::messages::SessionKind>,
+    /// `session_assign.transport` is `"webtransport"` (amendment 54): the encode chain
+    /// also feeds the agent's WebTransport listener. WebRTC stays available as fallback.
+    pub webtransport: bool,
+    /// `session_assign.pyrowave` (amendment 55), kept only for a served WebTransport session.
+    pub pyrowave: Option<crate::webtransport::PyroWaveGrant>,
 }
 
 /// Default `XDG_RUNTIME_DIR` for the Wayland socket. Matches the deploy run scripts.
@@ -594,6 +606,10 @@ impl SessionConfig {
             abr_governor: abr::AbrGovernorSettings::from_env(),
             fec_percentage: env_fec_percentage("QUASAR_FEC_PERCENTAGE"),
             fec_mode: resolve_fec_mode(env_fec_percentage("QUASAR_FEC_PERCENTAGE")),
+            rtp_mtu: env_rtp_mtu("QUASAR_RTP_MTU"),
+            rtp_mtu_shrink: ladder::env_flag_default_true("QUASAR_RTP_MTU_SHRINK", &|k| {
+                std::env::var(k).ok()
+            }),
             console_config: None,
             video_topology: crate::messages::VideoTopology::StreamOnly,
             // env-direct: from_env has no settings overlay. The assign path snapshots
@@ -608,6 +624,8 @@ impl SessionConfig {
             image_id: None,
             mic_jitter_ms: env_mic_jitter_ms("QUASAR_MIC_JITTER_MS"),
             kind: None,
+            webtransport: false,
+            pyrowave: None,
         }
     }
 
@@ -661,7 +679,7 @@ impl SessionConfig {
         if self.abr_mode != AbrMode::Smooth {
             return None;
         }
-        let s = &self.ladder;
+        let s = &self.ladder.for_session(self.webtransport);
         if !s.enabled && !s.resolution_enabled && !s.fps_enabled {
             return None;
         }
@@ -683,6 +701,7 @@ impl SessionConfig {
     /// `GET /v1/admin/hosts/{id}/settings`, so the agent says it out loud once per
     /// session. Pure (the caller logs it) so it is testable with no tracing subscriber.
     pub fn ladder_gate_warning(&self) -> Option<String> {
+        // The host's own settings: a default nobody set is not worth a warning.
         let s = &self.ladder;
         if self.abr_mode == AbrMode::Smooth || !(s.resolution_enabled || s.fps_enabled) {
             return None;
@@ -844,6 +863,10 @@ impl SessionConfig {
             // env-direct, not a RuntimeSettings/hostcfg knob.
             fec_percentage: env_fec_percentage("QUASAR_FEC_PERCENTAGE"),
             fec_mode: resolve_fec_mode(env_fec_percentage("QUASAR_FEC_PERCENTAGE")),
+            rtp_mtu: env_rtp_mtu("QUASAR_RTP_MTU"),
+            rtp_mtu_shrink: ladder::env_flag_default_true("QUASAR_RTP_MTU_SHRINK", &|k| {
+                std::env::var(k).ok()
+            }),
             console_config: None,
             video_topology: crate::messages::VideoTopology::StreamOnly,
             // Snapshot so provision + measurement use the value this session was
@@ -859,6 +882,8 @@ impl SessionConfig {
             image_id: None,
             mic_jitter_ms: env_mic_jitter_ms("QUASAR_MIC_JITTER_MS"),
             kind: None,
+            webtransport: false,
+            pyrowave: None,
         }
     }
 
@@ -1135,9 +1160,47 @@ fn fec_percentage_from(var: &str, raw: Option<&str>) -> u32 {
     }
 }
 
+/// Default `QUASAR_RTP_MTU`: libwebrtc's own packet cap, so a 1280-MTU IPv6 path (VPN,
+/// mobile tunnel) carries every packet with room for SRTP, UDP and IPv6 (#1131).
+pub const DEFAULT_RTP_MTU: u32 = 1200;
+/// `QUASAR_RTP_MTU` bounds. 1436 fills a 1500-byte IPv6 path after SRTP's largest tag
+/// (16), UDP (8) and IPv6 (40). 900 is a packet-rate floor, not a path size (#1134 shrinks
+/// no lower): its payload is 852 bytes, 1.6x the packets of the old 1400-byte default.
+pub(crate) const RTP_MTU_RANGE: std::ops::RangeInclusive<u32> = 900..=1436;
+
+fn env_rtp_mtu(var: &str) -> u32 {
+    rtp_mtu_from(var, std::env::var(var).ok().as_deref())
+}
+
+/// Pure core of [`env_rtp_mtu`]: unset/empty ⇒ default; unparseable or out of range ⇒
+/// warn and default.
+fn rtp_mtu_from(var: &str, raw: Option<&str>) -> u32 {
+    match raw {
+        None | Some("") => DEFAULT_RTP_MTU,
+        Some(s) => match s.parse::<u32>() {
+            Ok(n) if RTP_MTU_RANGE.contains(&n) => n,
+            _ => {
+                tracing::warn!(
+                    token = "knob-invalid-rtp-mtu",
+                    "{var}={s:?} is not a valid RTP packet size ({}-{} bytes) — \
+                     falling back to the default ({DEFAULT_RTP_MTU})",
+                    RTP_MTU_RANGE.start(),
+                    RTP_MTU_RANGE.end()
+                );
+                DEFAULT_RTP_MTU
+            }
+        },
+    }
+}
+
+/// The deepest microphone jitter buffer accepted. The WebTransport microphone queues at most
+/// 100 packets (1 s), and a buffer that fills that before it primes resets on every push and
+/// plays nothing: half of it leaves room.
+pub(crate) const MIC_JITTER_MAX_MS: u32 = 500;
+
 /// Parse `QUASAR_MIC_JITTER_MS`: unset/empty ⇒ 60 ms. Unparseable or `0` ⇒ warn and use
 /// the default; a 0 ms jitter buffer turns any reorder or late arrival into an audible
-/// gap.
+/// gap. Over [`MIC_JITTER_MAX_MS`] ⇒ warn and use that.
 fn env_mic_jitter_ms(var: &str) -> u32 {
     mic_jitter_ms_from(var, std::env::var(var).ok().as_deref())
 }
@@ -1149,6 +1212,14 @@ fn mic_jitter_ms_from(var: &str, raw: Option<&str>) -> u32 {
     match raw {
         None | Some("") => DEFAULT_MIC_JITTER_MS,
         Some(s) => match s.parse::<u32>() {
+            Ok(n) if n > MIC_JITTER_MAX_MS => {
+                tracing::warn!(
+                    token = "knob-clamped-mic-jitter-ms",
+                    "{var}={s:?} is over the {MIC_JITTER_MAX_MS} ms the microphone buffer can hold \
+                     — using {MIC_JITTER_MAX_MS} ms"
+                );
+                MIC_JITTER_MAX_MS
+            }
             Ok(n) if n > 0 => n,
             _ => {
                 tracing::warn!(
@@ -1427,6 +1498,25 @@ mod tests {
     }
 
     #[test]
+    fn rtp_mtu_env_parsing() {
+        const VAR: &str = "QUASAR_RTP_MTU";
+        for (raw, want) in [
+            (None, DEFAULT_RTP_MTU),
+            (Some(""), DEFAULT_RTP_MTU),
+            (Some("1000"), 1000),
+            (Some("900"), 900),
+            (Some("1436"), 1436),
+            (Some("899"), DEFAULT_RTP_MTU),
+            (Some("576"), DEFAULT_RTP_MTU),
+            (Some("1437"), DEFAULT_RTP_MTU),
+            (Some("1400 "), DEFAULT_RTP_MTU),
+            (Some("junk"), DEFAULT_RTP_MTU),
+        ] {
+            assert_eq!(rtp_mtu_from(VAR, raw), want, "{VAR}={raw:?}");
+        }
+    }
+
+    #[test]
     fn fec_percentage_env_parsing() {
         const VAR: &str = "QUASAR_FEC_PERCENTAGE";
 
@@ -1480,6 +1570,24 @@ mod tests {
         assert_eq!(mic_jitter_ms_from(VAR, Some("75")), 75, "\"75\" ⇒ 75");
 
         assert_eq!(mic_jitter_ms_from(VAR, Some("50")), 50, "\"50\" ⇒ 50");
+
+        assert_eq!(
+            mic_jitter_ms_from(VAR, Some("500")),
+            500,
+            "the largest value is kept"
+        );
+        for over in ["501", "1000", "60000", "4294967295"] {
+            assert_eq!(
+                mic_jitter_ms_from(VAR, Some(over)),
+                MIC_JITTER_MAX_MS,
+                "{over} ⇒ clamped"
+            );
+        }
+        assert_eq!(
+            mic_jitter_ms_from(VAR, Some("4294967296")),
+            60,
+            "past u32 does not parse: default"
+        );
 
         assert_eq!(
             mic_jitter_ms_from(VAR, Some("junk")),
@@ -1704,6 +1812,94 @@ mod tests {
             .is_none(),
             "mode gate precedes the fps/resolution flags"
         );
+    }
+
+    // #1375: an unset resolution rung/order is on/res_first for a WebTransport session,
+    // WebRTC keeps the host values, and an operator's explicit setting wins on both.
+    #[test]
+    fn webtransport_defaults_the_resolution_rung_on_unless_an_operator_set_it() {
+        let ladder = |webtransport: bool, env: &[(&str, &str)], push: serde_json::Value| {
+            let mut s = settings::RuntimeSettings::baseline_with(&crate::test_env::lookup(env));
+            s.abr_mode = AbrMode::Smooth;
+            s.apply_json(&push);
+            let mut cfg = SessionConfig::for_assignment_with(&s, stream_with_floor(0), None);
+            cfg.webtransport = webtransport;
+            let lc = cfg
+                .ladder_config()
+                .expect("smooth + speed-bias rung ⇒ Some");
+            (lc.resolution_enabled, lc.order)
+        };
+        let none = serde_json::json!({});
+        assert_eq!(
+            ladder(true, &[], none.clone()),
+            (true, ladder::LadderOrder::ResFirst),
+            "unset + WebTransport"
+        );
+        assert_eq!(
+            ladder(false, &[], none.clone()),
+            (false, ladder::LadderOrder::Hybrid),
+            "unset + WebRTC"
+        );
+        assert_eq!(
+            ladder(
+                true,
+                &[],
+                serde_json::json!({"abr_ladder_resolution": false, "abr_ladder_order": "hybrid"})
+            ),
+            (false, ladder::LadderOrder::Hybrid),
+            "override off + WebTransport"
+        );
+        assert_eq!(
+            ladder(
+                true,
+                &[
+                    ("QUASAR_ABR_LADDER_RESOLUTION", "0"),
+                    ("QUASAR_ABR_LADDER_ORDER", "fps_first")
+                ],
+                none.clone()
+            ),
+            (false, ladder::LadderOrder::FpsFirst),
+            "env off + WebTransport"
+        );
+        assert_eq!(
+            ladder(
+                true,
+                &[],
+                serde_json::json!({"abr_ladder_order": "fps_first"})
+            ),
+            (true, ladder::LadderOrder::FpsFirst),
+            "only order set + WebTransport: rung default on, the host's order"
+        );
+        assert_eq!(
+            ladder(
+                true,
+                &[],
+                serde_json::json!({"abr_ladder_resolution": true})
+            ),
+            (true, ladder::LadderOrder::Hybrid),
+            "rung set, order unset + WebTransport: the host's order, not res_first"
+        );
+        assert_eq!(
+            ladder(
+                true,
+                &[],
+                serde_json::json!({"abr_ladder_floor_follows_rung": false})
+            ),
+            (false, ladder::LadderOrder::Hybrid),
+            "floor cannot follow the rung + WebTransport: no default"
+        );
+        assert_eq!(
+            ladder(true, &[("QUASAR_ABR_LADDER_RESOLUTION", "")], none),
+            (true, ladder::LadderOrder::ResFirst),
+            "an empty env var is unset"
+        );
+
+        // A protective host warns only about a rung it set, not about the WT default.
+        let mut s = settings::RuntimeSettings::baseline_with(&|_| None);
+        s.abr_mode = AbrMode::Protective;
+        let mut cfg = SessionConfig::for_assignment_with(&s, stream_with_floor(0), None);
+        cfg.webtransport = true;
+        assert_eq!(cfg.ladder_gate_warning(), None);
     }
 
     // Ladder settings are snapshotted at assign time: a later config_update cannot

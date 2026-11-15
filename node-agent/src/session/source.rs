@@ -497,6 +497,15 @@ impl GenerationObservation {
         Some(status)
     }
 
+    /// An exit is waiting for `take_exit`; leaves it there.
+    pub(crate) fn has_exit(&self) -> bool {
+        let guard = match self.exit_result.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.is_some()
+    }
+
     pub(crate) fn log_tail(&self) -> Vec<String> {
         self.logs.tail()
     }
@@ -605,6 +614,31 @@ pub struct AppSource {
     /// "may the next release ask the engine again?" — see
     /// [`AppSource::finish_app_stop`].
     ended: Option<StopAttempt>,
+}
+
+/// The spec an app container is handed, and the appid [`AppSource::launch`] must then
+/// launch through the helper. A Steam game reached by a container swap or a rollback
+/// starts Steam parked (`-silent`) and is launched afterwards, so no Steam UI shows during
+/// the switch. A session's own cold launch keeps its flags, and so does a container with no
+/// helper mounted (an image without one, a console session): neither has anything that
+/// could launch the game. Only the container's copy changes — the logical spec keeps
+/// `-applaunch`, which `in_place_plan`, `for_app` and a rollback's relaunch all read.
+fn parked_steam_start(
+    spec: ContainerSpec,
+    cold_launch: bool,
+    helper_mounted: bool,
+) -> (ContainerSpec, Option<u32>) {
+    if cold_launch || !helper_mounted {
+        return (spec, None);
+    }
+    let Some(appid) = super::launch_helper::appid_from_env(&spec.env) else {
+        return (spec, None);
+    };
+    let mut container = spec;
+    container
+        .env
+        .insert("STEAM_STARTUP_FLAGS".to_string(), "-silent".to_string());
+    (container, Some(appid))
 }
 
 impl AppSource {
@@ -954,6 +988,11 @@ impl AppSource {
         self.observation.take_exit()
     }
 
+    /// The container has exited and [`Self::take_container_exit`] has not yet taken it.
+    pub fn container_exited(&self) -> bool {
+        self.observation.has_exit()
+    }
+
     /// Whether the CURRENT app container has presented a frame. Built on
     /// [`Self::app_surface_commits`], never [`Self::first_frame_ready`] or
     /// [`Self::sink_frames`]: those count COMPOSITOR output, which flows within
@@ -1015,7 +1054,7 @@ impl AppSource {
             return;
         };
         self.launched = true;
-        self.launch(&display);
+        self.launch(&display, false);
     }
 
     /// Feed every source-pipeline bus message here. The first `wayland.src` announcement
@@ -1032,7 +1071,8 @@ impl AppSource {
                 return;
             }
             self.launched = true;
-            self.launch(&display);
+            // Generation 0: the session's own cold launch keeps its flags-driven start.
+            self.launch(&display, true);
         }
     }
 
@@ -1127,7 +1167,7 @@ impl AppSource {
         // poll; consume it here so the rollback reports it once and the runner does not
         // also trip on it a moment later.
         let _ = self.launch_error.take();
-        self.launch(&display);
+        self.launch(&display, false);
         match self.launch_error.take() {
             Some(e) => Err(e),
             None if self.container.is_some() => Ok(()),
@@ -1165,7 +1205,10 @@ impl AppSource {
         Some(effective_spec)
     }
 
-    fn launch(&mut self, wl_display: &str) {
+    /// `cold_launch` marks the session's first container (generation 0). It keeps the
+    /// flags-driven start every launch used to take; a swap's replacement and a rollback
+    /// relaunch start a Steam game parked instead ([`parked_steam_start`]).
+    fn launch(&mut self, wl_display: &str, cold_launch: bool) {
         let Some(effective_spec) = self.launch_spec() else {
             tracing::info!(
                 "source '{}': no app image configured (bare compositor)",
@@ -1173,6 +1216,13 @@ impl AppSource {
             );
             return;
         };
+        // A swap to another app gets no helper: the socket reports one appid.
+        let launch_helper = self
+            .launch
+            .as_ref()
+            .and_then(|mount| mount.for_app(&effective_spec.env));
+        let (container_spec, parked_appid) =
+            parked_steam_start(effective_spec, cold_launch, launch_helper.is_some());
         let params = LaunchParams {
             session_id: &self.session_id,
             wayland_display: wl_display,
@@ -1182,11 +1232,7 @@ impl AppSource {
             nvidia_lib32_path: &self.nvidia_lib32_path,
             display: self.display,
             direct_display: None,
-            // A swap to another app gets no helper: the socket reports one appid.
-            launch_helper: self
-                .launch
-                .as_ref()
-                .and_then(|mount| mount.for_app(&effective_spec.env)),
+            launch_helper,
         };
         // Snapshot the commit counter BEFORE the container exists, so anything counted
         // from here on can only have been drawn by the container about to start. Read
@@ -1201,7 +1247,7 @@ impl AppSource {
         // The previous observer keeps only its own retired handles and publishes into
         // them harmlessly.
         self.observation = GenerationObservation::new();
-        match self.runtime.run(&effective_spec, &params) {
+        match self.runtime.run(&container_spec, &params) {
             Ok(c) => {
                 tracing::info!(
                     "source '{}': app container '{}' launched into compositor socket '{}'",
@@ -1216,6 +1262,13 @@ impl AppSource {
                 self.spawn_exit_waiter(c.application_id(), observer);
                 self.container = Some(c);
                 self.shared.mount_live.store(true, Ordering::Relaxed);
+                // The container's entrypoint starts Steam parked; the game it was started
+                // for is launched once the helper sees that client up (#1243).
+                if let Some(appid) = parked_appid {
+                    if let Some(mount) = &self.launch {
+                        mount.send(super::launch_helper::HelperCommand::Launch(appid));
+                    }
+                }
             }
             Err(e) => {
                 let msg = format!("{e:#}");
@@ -1457,8 +1510,9 @@ impl Drop for AppSource {
 #[cfg(test)]
 mod tests {
     use super::{
-        app_presented_since_launch, observe_until_exit, retry_application_observation,
-        source_commit_advanced, teardown, GenerationObservation, SharedSessionRuntime, StopAttempt,
+        app_presented_since_launch, observe_until_exit, parked_steam_start,
+        retry_application_observation, source_commit_advanced, teardown, GenerationObservation,
+        SharedSessionRuntime, StopAttempt,
     };
     use crate::runtime::{ApplicationResult, ErrorKind, RuntimeError};
     use crate::session::container::AppExitStatus;
@@ -1858,5 +1912,54 @@ mod tests {
         assert_eq!(source_commit_advanced(9, 4), 1);
         // A compositor restart/reset must not create a synthetic source frame.
         assert_eq!(source_commit_advanced(1, 9), 0);
+    }
+
+    fn steam_game() -> crate::session::container::ContainerSpec {
+        crate::session::container::ContainerSpec {
+            env: [(
+                "STEAM_STARTUP_FLAGS".to_string(),
+                "-bigpicture -applaunch 620".to_string(),
+            )]
+            .into(),
+            ..Default::default()
+        }
+    }
+
+    /// #1243: a swap or a rollback into a Steam game hands the container `-silent` and
+    /// returns the appid to launch through the helper. A cold launch, a launch with no
+    /// helper mounted and a non-Steam app keep their flags, and the logical spec is never
+    /// the copy that changes.
+    #[test]
+    fn a_swap_into_a_steam_game_starts_steam_parked_and_leaves_the_logical_spec_alone() {
+        let logical = steam_game();
+        let (container, appid) = parked_steam_start(steam_game(), false, true);
+        assert_eq!(appid, Some(620));
+        assert_eq!(container.env["STEAM_STARTUP_FLAGS"], "-silent");
+        assert_eq!(
+            logical.env["STEAM_STARTUP_FLAGS"], "-bigpicture -applaunch 620",
+            "in_place_plan, for_app and rollback read the logical spec"
+        );
+
+        let (cold, appid) = parked_steam_start(steam_game(), true, true);
+        assert_eq!(appid, None, "generation 0 stays on its flags");
+        assert_eq!(
+            cold.env["STEAM_STARTUP_FLAGS"],
+            "-bigpicture -applaunch 620"
+        );
+
+        let (no_helper, appid) = parked_steam_start(steam_game(), false, false);
+        assert_eq!(appid, None, "nothing would launch the game");
+        assert_eq!(
+            no_helper.env["STEAM_STARTUP_FLAGS"],
+            "-bigpicture -applaunch 620"
+        );
+
+        let desktop = crate::session::container::ContainerSpec {
+            env: [("STEAM_STARTUP_FLAGS".to_string(), "-silent".to_string())].into(),
+            ..Default::default()
+        };
+        let (other, appid) = parked_steam_start(desktop, false, true);
+        assert_eq!(appid, None, "not a Steam tile");
+        assert_eq!(other.env["STEAM_STARTUP_FLAGS"], "-silent");
     }
 }

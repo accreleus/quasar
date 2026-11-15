@@ -495,13 +495,10 @@ pub(super) fn attach_vulkan_parent_meta_probe(encoder: &gst::Element) {
     });
 }
 
-/// Wave 4.1 correlated stage probes. These observe existing pads only; they do
-/// not add elements, alter caps, or participate in negotiation.
-pub(super) fn attach_stage_probes(
-    queue: &gst::Element,
-    pay: &gst::Element,
-    state: Arc<SessionMetrics>,
-) {
+/// Wave 4.1 correlated stage probes, encode-chain half: the leaky queue ahead of the
+/// encoder. These observe existing pads only; they do not add elements, alter caps, or
+/// participate in negotiation. The RTP half is [`attach_rtp_out_probe`].
+pub(super) fn attach_queue_probes(queue: &gst::Element, state: Arc<SessionMetrics>) {
     if let Some(sink) = queue.static_pad("sink") {
         let queue_state = state.clone();
         // Read the queue via `pad.parent_element()`, NEVER a captured strong clone: that is
@@ -524,12 +521,15 @@ pub(super) fn attach_stage_probes(
             gst::PadProbeReturn::Ok
         });
     }
-    let overrun_state = state.clone();
     queue.connect("overrun", false, move |_| {
-        overrun_state.record_queue_overrun();
+        state.record_queue_overrun();
         None
     });
+}
 
+/// Wave 4.1 correlated stage probes, WebRTC half: what the RTP payloader sends
+/// (`rtp_fps`, `rtp_bitrate_kbps`).
+pub(super) fn attach_rtp_out_probe(pay: &gst::Element, state: Arc<SessionMetrics>) {
     if let Some(src) = pay.static_pad("src") {
         // rtph264pay pushes a buffer LIST whenever an AU is fragmented or aggregated, and
         // a BUFFER probe never fires for a list, so a BUFFER-only probe saw only the rare
@@ -680,7 +680,8 @@ mod tests {
                 gst::PadProbeReturn::Ok
             });
         attach_encode_probes(&encoder, metrics.clone(), true);
-        attach_stage_probes(&queue, &pay, metrics.clone());
+        attach_queue_probes(&queue, metrics.clone());
+        attach_rtp_out_probe(&pay, metrics.clone());
 
         pipeline.set_state(gst::State::Playing).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -720,7 +721,8 @@ mod tests {
             let queue = gst::ElementFactory::make("queue").build().unwrap();
             let pay = gst::ElementFactory::make("identity").build().unwrap();
             let metrics = Arc::new(SessionMetrics::new("off", 60));
-            attach_stage_probes(&queue, &pay, metrics.clone());
+            attach_queue_probes(&queue, metrics.clone());
+            attach_rtp_out_probe(&pay, metrics.clone());
             let weak_queue = queue.downgrade();
             drop(queue);
             drop(pay);
@@ -783,7 +785,8 @@ mod tests {
 
         let metrics = Arc::new(SessionMetrics::new("off", 30));
         attach_encode_probes(&encoder, metrics.clone(), true);
-        attach_stage_probes(&queue, &pay, metrics.clone());
+        attach_queue_probes(&queue, metrics.clone());
+        attach_rtp_out_probe(&pay, metrics.clone());
 
         enc_pipe.set_state(gst::State::Playing).unwrap();
         src_pipe.set_state(gst::State::Playing).unwrap();
@@ -883,7 +886,8 @@ mod tests {
 
         let metrics = Arc::new(SessionMetrics::new("off", 30));
         attach_encode_probes(&encoder, metrics.clone(), false);
-        attach_stage_probes(&queue, &pay, metrics.clone());
+        attach_queue_probes(&queue, metrics.clone());
+        attach_rtp_out_probe(&pay, metrics.clone());
 
         let t0 = std::time::Instant::now();
         metrics.drain_window(t0);

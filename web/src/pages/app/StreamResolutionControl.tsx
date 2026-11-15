@@ -23,7 +23,8 @@ const ASPECT_TOLERANCE = 0.01;
  * Control plane's 16:9 external-rung family, verbatim
  * (`docs/superpowers/specs/2026-08-16-adaptive-external-resolution-design.md` §D4).
  * Mirror of server data, used only when `session.stream.rungs` is absent (an
- * older control plane). 16:9 only — the server also owns 16:10/21:9/4:3, and
+ * older control plane). Kept at the old 720p-floored table on purpose: an older
+ * control plane rejects 540p/360p with 400. 16:9 only — the server also owns 16:10/21:9/4:3, and
  * guessing a family we can't see risks offering rungs it would reject; other
  * aspects fall back to launch-size-only.
  */

@@ -13,7 +13,7 @@ import { ToastProvider } from "../../../components/Toast";
 import { SectionHeadProvider } from "../../../components/shell/sectionHead";
 import * as adminApi from "../../../api/admin";
 import { ApiError } from "../../../api/client";
-import type { LaunchProfile, StreamProfile } from "../../../api/types";
+import type { InstanceSettings, LaunchProfile, SettingsResponse, StreamProfile } from "../../../api/types";
 
 vi.mock("../../../auth/context", () => ({ useAuth: () => ({ token: "tok" }) }));
 vi.mock("../../../api/admin");
@@ -70,6 +70,46 @@ beforeEach(() => {
   mocked.getProfilePolicy.mockResolvedValue({
     global_default_profile_id: null,
     user_overrides_allowed: true,
+  });
+  mocked.getSettings.mockResolvedValue(settingsWith({ default_transport: "webrtc" }));
+});
+
+// Only the field the tab reads; the rest of the envelope is the Settings page's.
+function settingsWith(over: Partial<InstanceSettings>): SettingsResponse {
+  return { settings: over as InstanceSettings };
+}
+
+describe("LaunchTab — default transport", () => {
+  it("shows the instance default transport and PATCHes only default_transport", async () => {
+    mocked.updateSettings.mockResolvedValue(settingsWith({ default_transport: "webtransport" }));
+    renderPage();
+    await act(async () => {});
+
+    const select = screen.getByRole("combobox", { name: "Default transport" });
+    expect(select).toHaveValue("webrtc");
+    await act(async () => {
+      fireEvent.change(select, { target: { value: "webtransport" } });
+    });
+
+    expect(mocked.updateSettings).toHaveBeenCalledWith("tok", { default_transport: "webtransport" });
+  });
+
+  it("reads WebRTC when a pre-amendment server sent no default_transport", async () => {
+    mocked.getSettings.mockResolvedValue(settingsWith({ default_transport: undefined }));
+    renderPage();
+    await act(async () => {});
+
+    expect(screen.getByRole("combobox", { name: "Default transport" })).toHaveValue("webrtc");
+  });
+
+  it("says the settings did not load rather than hiding the only transport control", async () => {
+    mocked.getSettings.mockRejectedValue(new ApiError(502, "internal", "gateway"));
+    renderPage();
+    await act(async () => {});
+
+    expect(screen.getByText("Default transport")).toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "Default transport" })).toBeNull();
+    expect(screen.getByRole("alert")).toBeInTheDocument();
   });
 });
 
@@ -355,6 +395,282 @@ describe("LaunchTab", () => {
       display_name: "Balanced",
       description: "",
       rungs: ["h264", "av1-new"],
+    });
+  });
+
+  it("saves the Delivery transport as soon as it changes, with the rungs untouched", async () => {
+    mocked.updateLaunchProfile.mockResolvedValue(launchProfile({ transport: "webtransport" }));
+    renderPage();
+    await act(async () => {});
+
+    const select = screen.getByRole("combobox", { name: "Transport for Balanced" });
+    expect(select).toHaveValue("webrtc"); // an absent field reads as webrtc
+    await act(async () => {
+      fireEvent.change(select, { target: { value: "webtransport" } });
+    });
+
+    expect(mocked.updateLaunchProfile).toHaveBeenCalledWith("tok", "lp1", {
+      display_name: "Balanced",
+      description: "",
+      rungs: ["sp1"],
+      transport: "webtransport",
+    });
+    expect(screen.getByRole("combobox", { name: "Transport for Balanced" })).toHaveValue("webtransport");
+  });
+
+  it("offers Use instance default and saves it as the value default", async () => {
+    mocked.listLaunchProfiles.mockResolvedValue({ items: [launchProfile({ transport: "webtransport" })] });
+    mocked.updateLaunchProfile.mockResolvedValue(launchProfile({ transport: "default" }));
+    renderPage();
+    await act(async () => {});
+
+    const select = screen.getByRole("combobox", { name: "Transport for Balanced" });
+    expect(within(select).getByRole("option", { name: "Use instance default" })).toHaveValue("default");
+    await act(async () => {
+      fireEvent.change(select, { target: { value: "default" } });
+    });
+
+    expect(mocked.updateLaunchProfile.mock.calls[0][2]).toMatchObject({ transport: "default" });
+    expect(screen.getByRole("combobox", { name: "Transport for Balanced" })).toHaveValue("default");
+  });
+
+  it("keeps a developer opt-in profile visible, and a rung edit leaves its transport alone", async () => {
+    mocked.listLaunchProfiles.mockResolvedValue({ items: [launchProfile({ transport: "webtransport_opt_in" })] });
+    mocked.listStreamProfiles.mockResolvedValue({
+      items: [streamProfile(), streamProfile({ id: "av1-new", codec: "av1", display_name: "AV1 new" })],
+    });
+    mocked.updateLaunchProfile.mockResolvedValue(launchProfile({ transport: "webtransport_opt_in" }));
+    renderPage();
+    await act(async () => {});
+    expect(screen.getByRole("combobox", { name: "Transport for Balanced" })).toHaveValue("webtransport_opt_in");
+
+    await act(async () => {
+      fireEvent.change(screen.getByRole("combobox", { name: "Add a stream profile" }), { target: { value: "av1-new" } });
+    });
+    await act(async () => {
+      screen.getByRole("button", { name: "Add" }).click();
+    });
+    expect(mocked.updateLaunchProfile).toHaveBeenCalledTimes(1);
+    expect(mocked.updateLaunchProfile.mock.calls[0][2]).not.toHaveProperty("transport");
+  });
+
+  it("shows a transport it does not know as itself and disabled, not as WebRTC", async () => {
+    mocked.listLaunchProfiles.mockResolvedValue({ items: [launchProfile({ transport: "quic" as never })] });
+    renderPage();
+    await act(async () => {});
+    const select = screen.getByRole("combobox", { name: "Transport for Balanced" });
+    expect(select).toHaveValue("quic");
+    expect(select).toBeDisabled();
+    expect(within(select).getByRole("option", { name: "quic" })).toBeInTheDocument();
+  });
+
+  it("puts the select back and toasts when the transport save fails", async () => {
+    mocked.updateLaunchProfile.mockRejectedValue(new ApiError(500, "internal", "disk full"));
+    renderPage();
+    await act(async () => {});
+    const select = screen.getByRole("combobox", { name: "Transport for Balanced" });
+    await act(async () => {
+      fireEvent.change(select, { target: { value: "webtransport" } });
+    });
+    expect(screen.getByRole("combobox", { name: "Transport for Balanced" })).toHaveValue("webrtc");
+    expect(await screen.findByText("disk full")).toBeInTheDocument();
+  });
+
+  describe("Ultra-low latency (PyroWave)", () => {
+    const modeSelect = () => screen.getByRole("combobox", { name: "Ultra-low latency (PyroWave) for Balanced" });
+    const bitrate = () => screen.queryByRole("spinbutton", { name: "Maximum bitrate for Balanced" });
+    const patched = () => mocked.updateLaunchProfile.mock.calls[0][2];
+
+    it("reads Off when the server sent no mode, and shows no Maximum bitrate row", async () => {
+      renderPage();
+      await act(async () => {});
+      expect(modeSelect()).toHaveValue("off");
+      expect(within(modeSelect()).getAllByRole("option").map((o) => o.textContent)).toEqual([
+        "Off",
+        "Allow",
+        "Prefer when possible",
+      ]);
+      expect(bitrate()).toBeNull();
+    });
+
+    it("saves the mode alone as soon as it changes, then shows the bitrate row", async () => {
+      mocked.updateLaunchProfile.mockResolvedValue(launchProfile({ pyrowave_mode: "allow", pyrowave_kbps: null }));
+      renderPage();
+      await act(async () => {});
+      await act(async () => {
+        fireEvent.change(modeSelect(), { target: { value: "allow" } });
+      });
+
+      expect(patched()).toEqual({ display_name: "Balanced", description: "", rungs: ["sp1"], pyrowave_mode: "allow" });
+      expect(modeSelect()).toHaveValue("allow");
+      expect(bitrate()).toHaveValue(null); // blank is automatic
+      expect(bitrate()).toHaveAttribute("placeholder", "Auto");
+    });
+
+    it("shows Prefer with its bitrate in Mb/s, and Off hides the row again", async () => {
+      mocked.listLaunchProfiles.mockResolvedValue({
+        items: [launchProfile({ pyrowave_mode: "prefer", pyrowave_kbps: 200000 })],
+      });
+      mocked.updateLaunchProfile.mockResolvedValue(launchProfile({ pyrowave_mode: "off", pyrowave_kbps: 200000 }));
+      renderPage();
+      await act(async () => {});
+      expect(modeSelect()).toHaveValue("prefer");
+      expect(bitrate()).toHaveValue(200);
+
+      await act(async () => {
+        fireEvent.change(modeSelect(), { target: { value: "off" } });
+      });
+      expect(patched()).toMatchObject({ pyrowave_mode: "off" });
+      expect(patched()).not.toHaveProperty("pyrowave_kbps");
+      expect(bitrate()).toBeNull();
+    });
+
+    it("saves a number as kbit/s on blur", async () => {
+      mocked.listLaunchProfiles.mockResolvedValue({ items: [launchProfile({ pyrowave_mode: "allow" })] });
+      mocked.updateLaunchProfile.mockResolvedValue(launchProfile({ pyrowave_mode: "allow", pyrowave_kbps: 150500 }));
+      renderPage();
+      await act(async () => {});
+      fireEvent.change(bitrate()!, { target: { value: "150.5" } });
+      expect(mocked.updateLaunchProfile).not.toHaveBeenCalled(); // not per keystroke
+      await act(async () => {
+        fireEvent.blur(bitrate()!);
+      });
+
+      expect(patched()).toMatchObject({ pyrowave_kbps: 150500 });
+      expect(patched()).not.toHaveProperty("pyrowave_mode");
+      expect(bitrate()).toHaveValue(150.5);
+    });
+
+    it("saves a cleared field as null (automatic) on Enter", async () => {
+      mocked.listLaunchProfiles.mockResolvedValue({
+        items: [launchProfile({ pyrowave_mode: "prefer", pyrowave_kbps: 200000 })],
+      });
+      mocked.updateLaunchProfile.mockResolvedValue(launchProfile({ pyrowave_mode: "prefer", pyrowave_kbps: null }));
+      renderPage();
+      await act(async () => {});
+      fireEvent.change(bitrate()!, { target: { value: "" } });
+      await act(async () => {
+        fireEvent.keyDown(bitrate()!, { key: "Enter" });
+      });
+
+      expect(patched()).toMatchObject({ pyrowave_kbps: null });
+      expect(bitrate()).toHaveValue(null);
+    });
+
+    it("saves nothing when the bitrate did not change", async () => {
+      mocked.listLaunchProfiles.mockResolvedValue({
+        items: [launchProfile({ pyrowave_mode: "prefer", pyrowave_kbps: 200000 })],
+      });
+      renderPage();
+      await act(async () => {});
+      await act(async () => {
+        fireEvent.blur(bitrate()!);
+      });
+      expect(mocked.updateLaunchProfile).not.toHaveBeenCalled();
+    });
+
+    it.each(["10", "1001", "0"])("refuses %s Mb/s with a message and saves nothing", async (value) => {
+      mocked.listLaunchProfiles.mockResolvedValue({ items: [launchProfile({ pyrowave_mode: "allow" })] });
+      renderPage();
+      await act(async () => {});
+      fireEvent.change(bitrate()!, { target: { value } });
+      await act(async () => {
+        fireEvent.blur(bitrate()!);
+      });
+
+      expect(screen.getByRole("alert")).toHaveTextContent("Enter 50 to 1000 Mb/s, or leave it blank for automatic.");
+      expect(bitrate()).toHaveAttribute("aria-invalid", "true");
+      expect(mocked.updateLaunchProfile).not.toHaveBeenCalled();
+    });
+
+    describe("Maximum bitrate edge cases", () => {
+      const saved = (kbps: number | null) => launchProfile({ pyrowave_mode: "prefer", pyrowave_kbps: kbps });
+      const open = async (kbps: number | null = 200000) => {
+        mocked.listLaunchProfiles.mockResolvedValue({ items: [saved(kbps)] });
+        renderPage();
+        await act(async () => {});
+      };
+
+      it("puts the stored value back, and keeps the error toast, when the save fails", async () => {
+        mocked.updateLaunchProfile.mockRejectedValue(new ApiError(500, "internal", "disk full"));
+        await open();
+        fireEvent.change(bitrate()!, { target: { value: "150" } });
+        await act(async () => {
+          fireEvent.blur(bitrate()!);
+        });
+        expect(await screen.findByText("disk full")).toBeInTheDocument();
+        expect(bitrate()).toHaveValue(200);
+      });
+
+      it("treats text the number input cannot parse as an error, never as automatic", async () => {
+        await open();
+        const input = bitrate()!;
+        Object.defineProperty(input, "validity", { value: { badInput: true }, configurable: true });
+        fireEvent.change(input, { target: { value: "200 Mb/s" } }); // a number input reads this as ""
+        await act(async () => {
+          fireEvent.blur(input);
+        });
+        expect(screen.getByRole("alert")).toHaveTextContent("Enter 50 to 1000 Mb/s");
+        expect(mocked.updateLaunchProfile).not.toHaveBeenCalled();
+      });
+
+      it("shows what it committed: 0300 reads 300", async () => {
+        await open(300000);
+        fireEvent.change(bitrate()!, { target: { value: "0300" } });
+        await act(async () => {
+          fireEvent.blur(bitrate()!);
+        });
+        expect((bitrate() as HTMLInputElement).value).toBe("300");
+        expect(mocked.updateLaunchProfile).not.toHaveBeenCalled();
+      });
+
+      it("sends one PATCH for Enter followed by blur while the save is in flight", async () => {
+        let finish!: (p: LaunchProfile) => void;
+        mocked.updateLaunchProfile.mockReturnValue(new Promise<LaunchProfile>((r) => (finish = r)));
+        await open();
+        fireEvent.change(bitrate()!, { target: { value: "150" } });
+        await act(async () => {
+          fireEvent.keyDown(bitrate()!, { key: "Enter" });
+          fireEvent.blur(bitrate()!);
+        });
+        expect(mocked.updateLaunchProfile).toHaveBeenCalledTimes(1);
+        await act(async () => finish(saved(150000)));
+      });
+
+      it("ties the error to the field", async () => {
+        await open();
+        fireEvent.change(bitrate()!, { target: { value: "10" } });
+        await act(async () => {
+          fireEvent.blur(bitrate()!);
+        });
+        expect(bitrate()).toHaveAccessibleDescription("Enter 50 to 1000 Mb/s, or leave it blank for automatic.");
+      });
+    });
+
+    it("puts the mode back and toasts when the save fails", async () => {
+      mocked.updateLaunchProfile.mockRejectedValue(new ApiError(500, "internal", "disk full"));
+      renderPage();
+      await act(async () => {});
+      await act(async () => {
+        fireEvent.change(modeSelect(), { target: { value: "prefer" } });
+      });
+      expect(modeSelect()).toHaveValue("off");
+      expect(await screen.findByText("disk full")).toBeInTheDocument();
+    });
+
+    it("toasts the server's warning that PyroWave needs WebTransport", async () => {
+      mocked.updateLaunchProfile.mockResolvedValue(
+        launchProfile({
+          pyrowave_mode: "allow",
+          warnings: [{ code: "pyrowave_needs_webtransport", message: "PyroWave needs WebTransport." }],
+        }),
+      );
+      renderPage();
+      await act(async () => {});
+      await act(async () => {
+        fireEvent.change(modeSelect(), { target: { value: "allow" } });
+      });
+      expect(await screen.findByText("PyroWave needs WebTransport.")).toBeInTheDocument();
     });
   });
 });

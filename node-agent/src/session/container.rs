@@ -1344,6 +1344,14 @@ impl ContainerRuntime {
             args.push("-v".into());
             args.push(m.clone());
         }
+        for arg in spec
+            .compat_tools
+            .iter()
+            .filter_map(|n| crate::compat_tools::mount_arg(n))
+        {
+            args.push("--mount".into());
+            args.push(arg);
+        }
         args.push(spec.image.clone());
         args.extend(spec.args.iter().cloned());
 
@@ -1519,6 +1527,9 @@ pub struct ContainerSpec {
     pub systempaths_unconfined: bool,
     /// The image can run its desktop directly on the display (`runtime_spec.direct_display`).
     pub direct_display: bool,
+    /// Installed compatibility tools mounted read-only at `compat_tools::MOUNT_DIR/<name>`
+    /// (`session_assign.compat_tools.mount`, filtered to what this host holds).
+    pub compat_tools: Vec<String>,
 }
 
 /// The docker network modes an APP may ask for over the wire (`AppSpec.network`, which
@@ -1651,6 +1662,7 @@ impl ContainerSpec {
             systempaths_unconfined: false,
             require_local_image: false,
             direct_display: false,
+            compat_tools: Vec::new(),
         })
     }
 }

@@ -15,9 +15,9 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import "../../styles/session.css";
 import "../../styles/hud.css";
-import { getSession, mintSignalingToken, stopSession } from "../../api/library";
+import { getSession, listApps, mintSignalingToken, stopSession } from "../../api/library";
 import { ApiError } from "../../api/client";
-import type { ICEServer } from "../../api/types";
+import type { ICEServer, WebTransportCoords } from "../../api/types";
 import { useAuth } from "../../auth/context";
 import {
   keyboardLockSupported,
@@ -28,13 +28,17 @@ import {
   createSessionRuntime,
   IDLE_SNAPSHOT,
   type SessionRuntime,
+  type SessionRuntimeCallbacks,
   type SessionRuntimeSnapshot,
 } from "./sessionRuntime";
+import { createWebTransportRuntime } from "./webTransportRuntime";
+import { TraceEventEmitter } from "../../webrtc/traceEvents";
+import { rememberedFallback, rememberFallback } from "../../webtransport/fallback";
 import { MicCapture, MicCaptureError, withUntrustedCertContext } from "../../webrtc/mic";
 import { probeCertificateTrust, type CertTrust } from "../../lib/certTrust";
 import { useToast } from "../../components/Toast";
 import { playoutOverride } from "../../webrtc/playout";
-import type { TelemetrySnapshot } from "../../webrtc/telemetry";
+import { newPostedCounters, type TelemetrySnapshot } from "../../webrtc/telemetry";
 import { Button } from "../../components/Button";
 import { Hud, type HudHandle } from "./hud/Hud";
 import {
@@ -56,6 +60,8 @@ import { LOCK_TO_STREAM_MS, SessionLoader } from "./SessionLoader";
 import { accessRevokedFailure, isBannerVerdict, showsAfterReveal, takenOverFailure, unreachableFailure } from "./sessionFailure";
 import { useOverlaySummon } from "./useOverlaySummon";
 import { useMouseSettings } from "./useMouseSettings";
+import { OnScreenControls } from "./OnScreenControls";
+import type { VirtualPadState } from "../../input/virtualPad";
 import { useSessionStatus } from "./useSessionStatus";
 import { useDisplayPatch } from "./useDisplayPatch";
 import { enterLaunchFullscreen, leaveLaunchFullscreen } from "../../input/launchFullscreen";
@@ -64,12 +70,16 @@ import {
   launchImmersive,
   loadDisplayPreferences,
   saveDisplayPreferences,
+  upscaleSharpen,
+  onScreenControls,
   type ScalingMode,
 } from "../../settings/displayPreferences";
 import { reportBestEffortFailure } from "../../lib/reportBestEffortFailure";
 import { useScreenWakeLock } from "../../lib/screenWakeLock";
 import { useDarkLock } from "../../settings/ThemeContext";
 import { percentileFraction, recommendation } from "./sessionSummary";
+
+const SWITCHING_STATUS = "Switching to WebRTC…";
 
 /**
  * Stream size out of the tier string ("1920×1080@60" → {w:1920,h:1080}).
@@ -118,7 +128,21 @@ interface SessionState {
   micGranted?: boolean;
   /** ?playout= override from the App page URL, carried through navigation. */
   playoutOverride?: number | null;
+  /** Amendment 54: present when the stream plan chose WebTransport. */
+  webtransport?: WebTransportCoords;
+  /** Amendment 58: the session wants PyroWave, so its WebTransport client offers it. */
+  pyrowave?: boolean;
 }
+
+/** Why WebTransport left PyroWave (codec-pyrowave.md §Switching codec, open strings). */
+const CODEC_SWITCH_COPY: Record<string, string> = {
+  congestion: "Ultra-low latency is off: the connection can't carry it.",
+  rtt_too_high: "Ultra-low latency is off: the connection takes too long to reach the host.",
+  client_no_decoder: "Ultra-low latency is off: this browser can't decode it.",
+  client_decode_error: "Ultra-low latency is off: this browser couldn't decode the stream.",
+  encoder_error: "Ultra-low latency is off: the host couldn't encode it.",
+};
+const CODEC_SWITCH_FALLBACK = "Ultra-low latency is off for this session.";
 
 // Keyed on the id so a route change between two sessions (a toast's "Go to
 // session", back/forward) starts the next one with fresh state (#560).
@@ -138,6 +162,17 @@ function SessionPageBody() {
   useDarkLock();
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  // WebTransport draws here; the <video> stays mounted and empty.
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  // Set when WebTransport gave up and the session carries on over WebRTC.
+  // A reload of a session that already fell back goes straight to WebRTC.
+  const [remembered] = useState(() => rememberedFallback(sessionId));
+  const [fallbackReason, setFallbackReason] = useState<string | null>(remembered);
+  // Only this page load's fallback has a cause; a remembered one (reload) has none.
+  const [fallbackCause, setFallbackCause] = useState<string | null>(null);
+  // The status line from the moment WebTransport gives up until WebRTC's signaling is open.
+  const [switching, setSwitching] = useState(false);
+  const webtransport = fallbackReason ? undefined : state?.webtransport;
   const containerRef = useRef<HTMLDivElement>(null);
   // The HUD owns whether it is open and on which section; this page only asks
   // it to open (summon chord, stage click, touch button) and to collapse.
@@ -152,10 +187,14 @@ function SessionPageBody() {
   // handler here. SessionPage never holds the per-tick snapshot itself, keeping
   // the video/input subtree off the 1 Hz telemetry path (#139).
   const telemetrySubsRef = useRef<Set<(snap: TelemetrySnapshot) => void>>(new Set());
+  // One for the page view: every runtime built here (re-seat, fallback) continues it.
+  const postedCountersRef = useRef(newPostedCounters());
 
   const [signalCoords, setSignalCoords] = useState(() => ({
-    url: state?.signalingUrl ?? "",
-    token: state?.signalingToken ?? "",
+    // Empty after a remembered fallback: the launch token was meant for WebTransport's fallback
+    // only once, so the resume path below mints a fresh one.
+    url: remembered ? "" : state?.signalingUrl ?? "",
+    token: remembered ? "" : state?.signalingToken ?? "",
     replacement: false,
     // #509 — kept in the same state object as its url/token so re-seating
     // coords can never leave a stale ICE list behind.
@@ -170,6 +209,9 @@ function SessionPageBody() {
   const [scalingMode, setScalingMode] = useState<ScalingMode>(
     () => loadDisplayPreferences().scalingMode,
   );
+  // #1349: the upscale + sharpen pass, device-local beside the scaling mode.
+  const [sharpenOn, setSharpenOn] = useState(upscaleSharpen);
+  const [controlsOn, setControlsOn] = useState(onScreenControls);
   // Mic spec §3.4: never persisted/restored — every session starts mic-off.
   const [micOn, setMicOn] = useState(false);
   const [micBusy, setMicBusy] = useState(false);
@@ -355,6 +397,7 @@ function SessionPageBody() {
     health,
     startedAt,
     polledStreamSize,
+    polledAppId,
     externalSize,
     setExternalSize,
     streamRungs,
@@ -370,6 +413,34 @@ function SessionPageBody() {
     sessionRunning,
     pollEndReason,
   } = useSessionStatus(authToken, sessionId, stopping, revealStartedRef);
+
+  // The server's app_id is the truth for the current app: router state survives a
+  // reload and a swap's own poll can end unseen.
+  const currentAppIdRef = useRef(currentApp.id);
+  currentAppIdRef.current = currentApp.id;
+  useEffect(() => {
+    if (!authToken || !polledAppId || polledAppId === currentAppIdRef.current) return;
+    const from = currentAppIdRef.current;
+    let live = true;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    const seat = () =>
+      listApps(authToken).then(
+        (apps) => {
+          if (!live) return;
+          const name = apps.items.find((a) => a.id === polledAppId)?.name ?? "Session";
+          // A swap commit the page saw while the lookup ran wins.
+          setCurrentApp((prev) => (prev.id === from ? { id: polledAppId, name } : prev));
+        },
+        () => {
+          if (live) retry = setTimeout(() => void seat(), 5_000);
+        },
+      );
+    void seat();
+    return () => {
+      live = false;
+      clearTimeout(retry);
+    };
+  }, [authToken, polledAppId]);
 
   // sessionRuntime.ts: one runtime instance per transport generation (law L1)
   // — a replacement token re-seats signalCoords, destroying this runtime and
@@ -399,10 +470,97 @@ function SessionPageBody() {
     runtimeRef.current?.setMouse(mouse);
   }, [mouse]);
 
+  // The runtime has already closed WebTransport (control-api.md §Transport fallback, "Close first").
+  // The launch's signaling token may have expired, so a fresh one is minted.
+  const fallBackToWebRtc = async (reason: string, cause: string) => {
+    setSwitching(true);
+    // Capture went with the WebTransport connection: ask for it again once WebRTC is up.
+    // `||`: a first reveal still owed keeps its "Click to play".
+    if (!autoArmedRef.current) resumeFullscreenRef.current = document.fullscreenElement !== null;
+    autoArmedRef.current ||= "resume";
+    rememberFallback(sessionId ?? "", reason);
+    new TraceEventEmitter(sessionId ?? "", authToken ?? "").emitTransportFallback(reason);
+    // Before the mint: a mint that hangs or fails must not hide why WebTransport gave up.
+    setFallbackCause(cause);
+    try {
+      const { signaling } = await mintSignalingToken(authToken ?? "", sessionId ?? "");
+      if (!signaling?.url || !signaling?.token) throw new Error("no signaling coordinates");
+      setFallbackReason(reason);
+      setSignalCoords({ url: signaling.url, token: signaling.token, replacement: true, iceServers: signaling.ice_servers ?? [] });
+    } catch (err) {
+      setSwitching(false);
+      noteFailure(unreachableFailure(err instanceof ApiError ? err.message : undefined));
+      void pollEndReason();
+    }
+  };
+
   useEffect(() => {
     if (!signalCoords.url || !signalCoords.token || !videoRef.current) return;
 
-    const rt = createSessionRuntime({
+    const inputCallbacks: Pick<
+      SessionRuntimeCallbacks,
+      "onSummonOverlay" | "onKeyboardLockRefused" | "onNonStandardGamepad" | "onCodecSwitched"
+    > = {
+      // capture.ts owns the chord while the pointer is locked: it releases
+      // the lock, swallows the key, then calls back here. The HUD's own
+      // listener answers the unlocked case (hudKeys.ts).
+      onSummonOverlay: () => hudRef.current?.open(),
+      // Never silently degrade: a refused lock means Esc quits the game, so
+      // say it before the user finds out the hard way. The bypassed-cert case
+      // does NOT arrive here — lock() resolves there (lib/certTrust.ts).
+      onKeyboardLockRefused: (error) => {
+        reportBestEffortFailure("silent-debug", "session: keyboard.lock", error);
+        setKbLockRefused(true);
+        addToast({
+          variant: "danger",
+          title: "Esc will leave the game",
+          body:
+            certTrustRef.current === "untrusted-cert"
+              ? "The browser refused to hand Esc to the game — this address uses " +
+                "a certificate your device doesn't trust. Download the server " +
+                "certificate from /v1/tls/certificate.pem, trust it, then reload."
+              : "The browser refused to hand Esc to the game (Keyboard Lock), so " +
+                "pressing Esc releases input instead of reaching the game. " +
+                "Re-entering fullscreen usually restores it.",
+        });
+      },
+      // quasar#348: the browser didn't recognise this pad, so its raw
+      // button order is going out as if it were the standard layout. Say so
+      // once per pad; the Controller & input pane repeats it under the pad.
+      onNonStandardGamepad: (pad) => {
+        addToast({
+          variant: "info",
+          title: "Controller not recognised by your browser",
+          body: `${shortGamepadLabel(pad.id)}: ${NON_STANDARD_PAD_ADVICE}`,
+          duration: 10000,
+        });
+      },
+      // #1058: PyroWave stepped down for the rest of the session; say why once.
+      onCodecSwitched: (_codec, reason) => {
+        addToast({ variant: "info", title: CODEC_SWITCH_COPY[reason] ?? CODEC_SWITCH_FALLBACK });
+      },
+    };
+
+    // A replacement re-seat is WebRTC's recovery; it never comes back here as WebTransport.
+    const rt = webtransport && canvasRef.current && !signalCoords.replacement
+      ? createWebTransportRuntime({
+          sessionId: sessionId ?? "",
+          authToken: authToken ?? "",
+          coords: webtransport,
+          canvas: canvasRef.current,
+          pyrowave: state?.pyrowave === true,
+          tierFps: state?.tier ? parseInt(state.tier.split("@")[1] ?? "", 10) || undefined : undefined,
+          counters: postedCountersRef.current,
+          callbacks: {
+            ...inputCallbacks,
+            onDisconnectSuspected: () => void pollEndReason(),
+            onSessionTakenOver: () => noteFailure(takenOverFailure()),
+            // A poll verdict about the session's end outranks this one (settleFailure).
+            onTransportFailed: (detail) => noteFailure(unreachableFailure(detail)),
+            onFallback: (reason, cause) => void fallBackToWebRtc(reason, cause),
+          },
+        })
+      : createSessionRuntime({
       sessionId: sessionId ?? "",
       authToken: authToken ?? "",
       signaling: signalCoords,
@@ -412,41 +570,9 @@ function SessionPageBody() {
       playoutOverrideMs: state?.playoutOverride ?? playoutOverride(),
       // Parsed from tier "W×H@fps"; undefined falls back to an absolute decode ceiling.
       tierFps: state?.tier ? parseInt(state.tier.split("@")[1] ?? "", 10) || undefined : undefined,
+      counters: postedCountersRef.current,
       callbacks: {
-        // capture.ts owns the chord while the pointer is locked: it releases
-        // the lock, swallows the key, then calls back here. The HUD's own
-        // listener answers the unlocked case (hudKeys.ts).
-        onSummonOverlay: () => hudRef.current?.open(),
-        // Never silently degrade: a refused lock means Esc quits the game, so
-        // say it before the user finds out the hard way. The bypassed-cert case
-        // does NOT arrive here — lock() resolves there (lib/certTrust.ts).
-        onKeyboardLockRefused: (error) => {
-          reportBestEffortFailure("silent-debug", "session: keyboard.lock", error);
-          setKbLockRefused(true);
-          addToast({
-            variant: "danger",
-            title: "Esc will leave the game",
-            body:
-              certTrustRef.current === "untrusted-cert"
-                ? "The browser refused to hand Esc to the game — this address uses " +
-                  "a certificate your device doesn't trust. Download the server " +
-                  "certificate from /v1/tls/certificate.pem, trust it, then reload."
-                : "The browser refused to hand Esc to the game (Keyboard Lock), so " +
-                  "pressing Esc releases input instead of reaching the game. " +
-                  "Re-entering fullscreen usually restores it.",
-          });
-        },
-        // quasar#348: the browser didn't recognise this pad, so its raw
-        // button order is going out as if it were the standard layout. Say so
-        // once per pad; the Controller & input pane repeats it under the pad.
-        onNonStandardGamepad: (pad) => {
-          addToast({
-            variant: "info",
-            title: "Controller not recognised by your browser",
-            body: `${shortGamepadLabel(pad.id)}: ${NON_STANDARD_PAD_ADVICE}`,
-            duration: 10000,
-          });
-        },
+        ...inputCallbacks,
         onDisconnectSuspected: () => void pollEndReason(),
         onReplacementSignaling: ({ url, token, iceServers }) =>
           setSignalCoords({ url, token, replacement: true, iceServers }),
@@ -469,7 +595,11 @@ function SessionPageBody() {
     const unsubscribeTelemetry = rt.registerTelemetry((snap) => {
       for (const fn of telemetrySubsRef.current) fn(snap);
     });
-    const unsubscribe = rt.subscribe(() => setRuntimeSnap(rt.getSnapshot()));
+    const unsubscribe = rt.subscribe(() => {
+      const snap = rt.getSnapshot();
+      setRuntimeSnap(snap);
+      if (snap.wsOpen || snap.recovery?.phase === "failed") setSwitching(false);
+    });
     rt.start();
     setRuntimeSnap(rt.getSnapshot());
 
@@ -766,6 +896,19 @@ function SessionPageBody() {
     saveDisplayPreferences({ scalingMode: mode });
   }, []);
 
+  // #1349: the presenter reads this off the canvas per frame, so it applies at once.
+  const handleUpscaleSharpenChange = useCallback((on: boolean) => {
+    setSharpenOn(on);
+    saveDisplayPreferences({ upscaleSharpen: on });
+  }, []);
+
+  const setVirtualPad = useCallback((pad: VirtualPadState | null) => runtimeRef.current?.setVirtualPad(pad), []);
+
+  const handleOnScreenControlsChange = useCallback((on: boolean) => {
+    setControlsOn(on);
+    saveDisplayPreferences({ onScreenControls: on });
+  }, []);
+
   // Render resolution + interface size (control-api.md session-display-update)
   // lives in useDisplayPatch.ts. `externalSize`/`externalResizeSupported` live
   // in useSessionStatus above (the 5s poll can also change them); this hook
@@ -882,16 +1025,32 @@ function SessionPageBody() {
   // never went full screen) gets one "Click to play" layer, never a retry loop.
   // Armed again by a quick switch, which spends its own click the same way.
   const [immersive] = useState(launchImmersive);
-  const autoArmedRef = useRef(immersive);
+  // `resume`: armed mid-session by a transport that changed under a picture already showing.
+  // It takes capture back without a click; a refused lock offers the existing gesture layer.
+  const autoArmedRef = useRef<false | "reveal" | "resume">(immersive ? "reveal" : false);
   const [clickToPlay, setClickToPlay] = useState(false);
+  const resumeFullscreenRef = useRef(false);
+  const clickFullscreenRef = useRef(true);
+  // A WebTransport connection lost and rebuilt takes capture with it: arm again for the new one.
+  const wasOpenRef = useRef(false);
   useEffect(() => {
-    if (!autoArmedRef.current || !loaderInert || swapScreenUp || sessionOver) return;
+    if (webtransport && wasOpenRef.current && !channelOpen && !autoArmedRef.current) {
+      resumeFullscreenRef.current = document.fullscreenElement !== null;
+      autoArmedRef.current = "resume";
+    }
+    wasOpenRef.current = channelOpen;
+  }, [channelOpen, webtransport]);
+  useEffect(() => {
+    // A channel that is not open has nothing to capture for yet; stays armed.
+    if (!autoArmedRef.current || !loaderInert || !channelOpen || swapScreenUp || sessionOver) return;
     const rt = runtimeRef.current;
     if (!rt || !videoRef.current) return; // stays armed for the runtime to arrive
+    const offerClick = autoArmedRef.current === "reveal";
     autoArmedRef.current = false;
+    clickFullscreenRef.current = offerClick || resumeFullscreenRef.current;
     if (rt.isCaptured()) return;
     // No Pointer Lock (touch, gesture mode): engaging needs no gesture at all.
-    if (pointerLockSupported() && !document.fullscreenElement) {
+    if (offerClick && pointerLockSupported() && !document.fullscreenElement) {
       setClickToPlay(true);
       return;
     }
@@ -900,14 +1059,16 @@ function SessionPageBody() {
     if (ua?.hasBeenActive) unmute();
     const engaging = rt.engage();
     if (!engaging) {
-      setClickToPlay(true);
+      if (offerClick) setClickToPlay(true);
       return;
     }
     void engaging.then((result) => {
       noteRawUnavailable(result);
+      // Pointer Lock refusals (including NotAllowedError) do not reliably distinguish
+      // a post-Esc cool-down/lost gesture from a persistent denial; offer a manual retry.
       if (result.mode === "failed") setClickToPlay(true);
     });
-  }, [loaderInert, swapScreenUp, sessionOver, runtimeSnap, unmute, noteRawUnavailable]);
+  }, [loaderInert, channelOpen, swapScreenUp, sessionOver, runtimeSnap, unmute, noteRawUnavailable]);
   useEffect(() => {
     if (inputCaptured) setClickToPlay(false);
   }, [inputCaptured]);
@@ -916,7 +1077,7 @@ function SessionPageBody() {
   const handleClickToPlay = useCallback(() => {
     setClickToPlay(false);
     handleGrab();
-    enterLaunchFullscreen();
+    if (clickFullscreenRef.current) enterLaunchFullscreen();
   }, [handleGrab]);
   // Leaving the session leaves the full screen Play entered (a quick switch stays on this page).
   useEffect(() => () => leaveLaunchFullscreen(), []);
@@ -1025,12 +1186,23 @@ function SessionPageBody() {
           muted
           playsInline
           autoPlay
+          hidden={webtransport !== undefined}
         />
+        {webtransport && (
+          <canvas
+            ref={canvasRef}
+            className="session-video"
+            data-scaling-mode={scalingMode}
+            data-upscale-sharpen={sharpenOn ? undefined : "off"}
+            data-compositor-w={compositorSize?.w}
+            data-compositor-h={compositorSize?.h}
+          />
+        )}
       </div>
 
       {/* The launch/status line stays bottom-anchored and click-through. */}
       <div className="session-bottom-stack">
-        {!channelOpen && <div className="session-hint muted">{status}</div>}
+        {!channelOpen && <div className="session-hint muted">{switching ? SWITCHING_STATUS : status}</div>}
       </div>
 
       {/* Actionable notices: full-width at the top, stacked so two live ones
@@ -1141,6 +1313,7 @@ function SessionPageBody() {
       {!loaderDone && (
         <SessionLoader
           statusMsg={launchDetail ?? status}
+          notice={switching ? SWITCHING_STATUS : undefined}
           streaming={revealReady}
           appName={state?.appName}
           failure={launchFailure}
@@ -1160,6 +1333,7 @@ function SessionPageBody() {
           hostAssigned={hostAssigned}
           sessionRunning={sessionRunning}
           iceState={iceState}
+          transport={webtransport ? "webtransport" : "webrtc"}
           takeoverRefused={takeoverRefused}
           // handleStop tears the session down server-side so "Back to
           // library" from a dead launch never orphans a session. Not for a
@@ -1190,7 +1364,7 @@ function SessionPageBody() {
         onSwapStart={() => {
           hudRef.current?.close();
           // #647: the tile click is a gesture; spend it like Play does.
-          if (immersive && enterLaunchFullscreen()) autoArmedRef.current = true;
+          if (immersive && enterLaunchFullscreen()) autoArmedRef.current = "reveal";
         }}
         onScreenChange={setSwapScreenUp}
       >
@@ -1203,6 +1377,9 @@ function SessionPageBody() {
             appName={appTitle}
             tier={state?.tier}
             resolvedCodec={state?.resolvedCodec}
+            transport={webtransport ? "webtransport" : "webrtc"}
+            transportFallbackReason={fallbackReason}
+            transportFallbackCause={fallbackCause}
             sessionId={sessionId}
             inputCaptured={inputCaptured}
             onGrab={handleGrab}
@@ -1237,6 +1414,10 @@ function SessionPageBody() {
             games={quickSwitch}
             scalingMode={scalingMode}
             onScalingChange={handleScalingChange}
+            upscaleSharpen={sharpenOn}
+            onUpscaleSharpenChange={handleUpscaleSharpenChange}
+            onScreenControls={controlsOn}
+            onOnScreenControlsChange={handleOnScreenControlsChange}
             startedAt={startedAt}
             streamSize={streamSize}
             // Null = "match the stream" / still at launch size — the pane
@@ -1294,6 +1475,11 @@ function SessionPageBody() {
             <path d="M4 7h16M4 12h16M4 17h16" />
           </svg>
         </button>
+      )}
+
+      {/* #1401: touch pad. Own gate for "captured on a touch device": the HUD switch is the user's. */}
+      {controlsOn && touchLookSupported() && inputCaptured && !sessionOver && (
+        <OnScreenControls register={registerTelemetry} setPad={setVirtualPad} />
       )}
 
       {/* A swap finishing under a held verdict must not announce itself next to the notice. */}

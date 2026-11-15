@@ -4,7 +4,7 @@ date: 2026-10-05
 ---
 # Console sessions drive the display directly
 
-A console session is a session whose desktop owns the host's own screen (`CONTEXT.md`: console
+A console session is a session whose desktop owns the host's own screen (`GLOSSARY.md`: console
 session, direct display). We decided that **the desktop drives the display itself**: the node
 agent hands the session's container the GPU's card node, the input devices, the sound device and
 the host's udev event stream, and the desktop inside opens the display the way it does on bare

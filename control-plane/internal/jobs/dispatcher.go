@@ -692,6 +692,17 @@ func (d *Dispatcher) validateParams(ctx context.Context, jobID, hostID string, p
 	return def.ValidateParams(ctx, hostID, params)
 }
 
+func (d *Dispatcher) fillParams(jobID string) func(context.Context, string) (any, error) {
+	if d.reg == nil {
+		return nil
+	}
+	def, ok := d.reg.Get(jobID)
+	if !ok {
+		return nil
+	}
+	return def.FillParams
+}
+
 func (d *Dispatcher) onTerminal(ctx context.Context, run Run) {
 	if d.reg == nil {
 		return

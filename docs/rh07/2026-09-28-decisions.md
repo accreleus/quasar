@@ -3,7 +3,7 @@
 Agreed with the owner on 2026-09-28, in a question-by-question review of RH-07's scope.
 This record is the product authority for RH-07. Where the original tracker text in #220
 and #221 differs, this record wins. The survey of where Quasar assumes Docker today is
-`2026-09-28-research-engine-assumptions.md`. Terms are defined in `CONTEXT.md`, "Engines
+`2026-09-28-research-engine-assumptions.md`. Terms are defined in `GLOSSARY.md`, "Engines
 and privilege".
 
 ## Guiding principle

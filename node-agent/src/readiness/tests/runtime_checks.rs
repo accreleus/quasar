@@ -564,7 +564,7 @@ fn the_engine_check_names_the_engine_its_version_and_mode() {
 }
 
 /// Every profile but rootful Docker reads as experimental on any Linux: a combination
-/// not yet through every release check is never implied supported (CONTEXT.md
+/// not yet through every release check is never implied supported (GLOSSARY.md
 /// "Engine profile").
 #[test]
 fn a_profile_without_evidence_warns_as_experimental_and_blocks_nothing() {

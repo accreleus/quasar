@@ -35,9 +35,13 @@ Inbound to each GPU host, from your LAN or VPN clients:
 | --- | --- |
 | UDP, the ephemeral range (Linux default `32768-60999`; check `cat /proc/sys/net/ipv4/ip_local_port_range`) | WebRTC media. |
 | UDP/5353 (mDNS) | Chrome sends `.local` ICE candidates. |
+| UDP/4433 (`QUASAR_WT_PORT`) | Optional: WebTransport, used only by sessions on that transport. Without it they fall back to WebRTC. |
 
 <Aside type="danger" title="Scope the rule to your subnet">
-Use the client LAN or VPN subnet, never `0.0.0.0/0`.
+Use the client LAN or VPN subnet, never `0.0.0.0/0`. The one exception is UDP/4433
+when you forward it from the internet for WebTransport: a remote browser's address is
+not in your subnet, so allow that port from any source, and only that port. See
+[WebTransport from the internet](/quasar/network/remote-access/#webtransport-from-the-internet).
 </Aside>
 
 ### How Quasar tells you
@@ -57,6 +61,9 @@ sudo firewall-cmd --get-default-zone   # confirm <zone>
 sudo firewall-cmd --permanent --zone=<zone> \
   --add-rich-rule='rule family=ipv4 source address=<lan-subnet> port port=<port-range> protocol=udp accept'
 sudo firewall-cmd --permanent --zone=<zone> --add-service=mdns
+# WebTransport only (UDP/4433), LAN clients:
+sudo firewall-cmd --permanent --zone=<zone> \
+  --add-rich-rule='rule family=ipv4 source address=<lan-subnet> port port=4433 protocol=udp accept'
 sudo firewall-cmd --reload
 ```
 
@@ -65,6 +72,7 @@ sudo firewall-cmd --reload
 ```bash
 sudo ufw allow proto udp from <lan-subnet> to any port <port-range>
 sudo ufw allow from <lan-subnet> to any port 5353 proto udp
+sudo ufw allow proto udp from <lan-subnet> to any port 4433   # WebTransport only
 sudo ufw reload
 ```
 
@@ -73,9 +81,10 @@ sudo ufw reload
 ```bash
 sudo iptables -I INPUT -p udp -s <lan-subnet> --dport <port-range> -j ACCEPT
 sudo iptables -I INPUT -p udp -s <lan-subnet> --dport 5353 -j ACCEPT
+sudo iptables -I INPUT -p udp -s <lan-subnet> --dport 4433 -j ACCEPT   # WebTransport only
 ```
 
-**nftables:** add input accept rules for UDP `<port-range>` and `5353`, scoped to
+**nftables:** add input accept rules for UDP `<port-range>`, `5353` and (for WebTransport) `4433`, scoped to
 `<lan-subnet>`, ahead of the default-deny rule.
 
 ## Endpoints worth knowing

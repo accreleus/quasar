@@ -17,8 +17,9 @@ import (
 // each new one's manifest, record it. The jobs.Definition that schedules this is
 // in cmd/quasar-control/app.go; a test runs a pass without the dispatcher.
 //
-// Idempotent (the store keys on channel+source_commit) and non-destructive: an
-// unreachable listing leaves every existing row as it was.
+// Idempotent (the store keys on channel+source_commit) and non-destructive: a
+// failed pass never deletes or rewrites a release row. It can still add one for
+// the branch channel — see Detect.
 
 // DetectJobID is the jobs-framework id AND the id the release view reads run
 // history under; the two must stay one name.
@@ -99,11 +100,13 @@ func (d *Detector) WithPreview(p PreviewSource) *Detector {
 
 // Detect runs one pass over the stable channel.
 //
-// A returned error is a FAILED run (the listing was unreachable); stored rows
-// are untouched and the caller records it as last_error. An invalid manifest is
-// NOT a failed run: it is counted and the release is not stored, because
-// nothing pins it (ADR 0001) and its three NOT NULL identity columns would have
-// to be invented.
+// A returned error is a FAILED run (the listing was unreachable); existing rows
+// are left as they were and the caller records it as last_error. One write is
+// still possible: on edge or preview the branch half runs after a failed listing
+// and records the build it read, because that read is the registry's and needs
+// no listing (#892). An invalid manifest is NOT a failed run: it is counted and
+// the release is not stored, because nothing pins it (ADR 0001) and its three
+// NOT NULL identity columns would have to be invented.
 func (d *Detector) Detect(ctx context.Context) (Report, error) {
 	var rep Report
 
@@ -111,7 +114,7 @@ func (d *Detector) Detect(ctx context.Context) (Report, error) {
 	if err != nil {
 		// The listing is GitHub's and can be rate limited; the preview tag is the registry's,
 		// so the branch pass still runs and the failed listing is what the run reports.
-		return rep, errors.Join(err, d.detectBranch(ctx, &rep))
+		return rep, joinPassFailures(err, d.detectBranch(ctx, &rep))
 	}
 	existing, err := d.store.Releases(ctx, ChannelStable)
 	if err != nil {
@@ -163,6 +166,17 @@ func (d *Detector) Detect(ctx context.Context) (Report, error) {
 		return rep, err
 	}
 	return rep, nil
+}
+
+// joinPassFailures reports a listing failure and a branch-pass failure on ONE
+// line. The view shows last_error as a single sentence, so the newline
+// errors.Join inserts ran the two causes together with no break between them
+// (#1003); "; " keeps them apart, and both stay in the error chain.
+func joinPassFailures(listing, branch error) error {
+	if branch == nil {
+		return listing
+	}
+	return fmt.Errorf("%w; %w", listing, branch)
 }
 
 // detectBranch records the edge or preview build while the instance is on that

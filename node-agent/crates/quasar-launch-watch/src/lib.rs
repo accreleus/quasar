@@ -15,7 +15,9 @@
 //! - `console_log.txt` in Steam's log directory, read incrementally from the
 //!   end of whatever a previous session left behind — the second source,
 //!   which may move the state earlier than the reaper and may end it when
-//!   the reaper scan is unreadable; `steamui_login.txt` beside it says when
+//!   the reaper scan is unreadable; `content_log.txt` beside it says when an
+//!   update of the target was suspended and Steam then dropped it from its
+//!   schedule without ever running it (#1314); `steamui_login.txt` says when
 //!   Steam waits for a sign-in;
 //! - a caller-supplied window list and gamescope's published focus,
 //!   classified here; the core makes no X11 call. "Game window on screen" is
@@ -146,6 +148,26 @@ pub struct Watcher {
     windows_read: bool,
     /// The last window list read, for the helper's pin.
     last_windows: Vec<WindowInfo>,
+    /// The target's latest `LaunchApp` action in Steam's log, by ActionID, and whether it
+    /// failed (#1159). Progress on an action means Steam took the launch up; a failure of that
+    /// same action wins over its earlier progress, and a later action's progress counts anew.
+    action: Option<(u32, bool)>,
+    /// The target's last `GameAction` line in `console_log.txt`: the stamp it carried, and
+    /// whether that line moved the launch into a shader or depot update. Any later line for the
+    /// app replaces it, so an older attempt is never read as the current one (#1314).
+    last_action: Option<(String, bool)>,
+    /// `content_log.txt`, tailed from the same baseline as the console log: the stamps of the
+    /// target's `staying in schedule (result Suspended` and of the later
+    /// `removed from schedule (result No Error`, and whether the app is running (#1314).
+    content: LogTail,
+    suspended: Option<String>,
+    dropped: Option<String>,
+    content_running: bool,
+    /// The last window-derived need, kept across a pass whose window list could not be read.
+    window_need: Option<NeedsUser>,
+    /// Another game's reaper was seen, or Steam logged a launch of another app: the user is
+    /// doing something else (#1159). Latched.
+    elsewhere: bool,
 }
 
 impl Watcher {
@@ -155,6 +177,10 @@ impl Watcher {
             Some(cfg.steam_log_dir.join("console_log.previous.txt")),
         );
         let shader = LogTail::new(cfg_shader_log(&cfg.steam_log_dir), None);
+        let content = LogTail::new(
+            cfg.steam_log_dir.join("content_log.txt"),
+            Some(cfg.steam_log_dir.join("content_log.previous.txt")),
+        );
         let login = LoginLog {
             tail: LogTail::new(cfg.steam_log_dir.join("steamui_login.txt"), None),
             needs: None,
@@ -179,7 +205,65 @@ impl Watcher {
             focused: None,
             windows_read: false,
             last_windows: Vec::new(),
+            action: None,
+            last_action: None,
+            content,
+            suspended: None,
+            dropped: None,
+            content_running: false,
+            window_need: None,
+            elsewhere: false,
         }
+    }
+
+    /// Where the target is now, as last reported.
+    pub fn launch_state(&self) -> LaunchState {
+        self.state
+    }
+
+    /// Steam's log has shown a `LaunchApp` making progress for the target (a task change, a
+    /// wait for the user, or the answer to one) and has not since failed that action: a launch
+    /// it ignored (mid sign-in) leaves no such line, so a caller may send it again only while
+    /// this is false.
+    pub fn launch_taken(&self) -> bool {
+        matches!(self.action, Some((_, false)))
+    }
+
+    /// Why Steam needs the user right now, if it does; it clears when the need does.
+    pub fn needs_now(&self) -> Option<NeedsUser> {
+        self.active_needs
+    }
+
+    /// Steam took the launch up, moved it into a shader or depot update, another app's update
+    /// suspended that update, and Steam then dropped the app from its schedule without ever
+    /// running it or logging anything newer for it (#1314).
+    ///
+    /// That launch request is lost — Steam does not resume it, and launching the app again is
+    /// what starts the game (a launch by hand after the reveal did, on the observed run). Every
+    /// signal here is evidence *against* a launch in progress: a newer `GameAction` line for the
+    /// app, the game running, or a log the tail lost clears it.
+    pub fn launch_dropped(&self) -> bool {
+        let Some((action_at, true)) = &self.last_action else {
+            return false;
+        };
+        let (Some(suspended), Some(dropped)) = (&self.suspended, &self.dropped) else {
+            return false;
+        };
+        // The stamps are seconds: Steam wrote the shader task and the suspension of it in the
+        // same second on the observed run, so a suspension not *older* than the task counts.
+        // A log that is not there right now (mid-rotation, or gone) may be hiding the line
+        // that says Steam carried the launch on: no retry on what cannot be read.
+        !self.console.absent
+            && !self.content.absent
+            && suspended >= action_at
+            && dropped > suspended
+            && !self.content_running
+            && self.log_game != Some(true)
+    }
+
+    /// Another game ran, or Steam launched another app, since this watcher began.
+    pub fn elsewhere(&self) -> bool {
+        self.elsewhere
     }
 
     /// The appid this watcher follows.
@@ -221,7 +305,9 @@ impl Watcher {
         if scan.reaper_alive {
             self.running_via_reaper = true;
         }
+        self.elsewhere |= scan.other_reaper;
         self.read_console_log(now);
+        self.read_content_log();
         self.read_login_state();
 
         let next = self.next_launch_state(&scan);
@@ -254,23 +340,23 @@ impl Watcher {
         match mapped {
             Ok(windows) => {
                 // The higher-ranked of the window and log reasons wins.
-                let desired = [
-                    classify_windows(&windows, self.cfg.appid),
-                    self.held_log_needs(now),
-                ]
-                .into_iter()
-                .flatten()
-                .min_by_key(|reason| needs_rank(*reason));
+                self.window_need = classify_windows(&windows, self.cfg.appid);
+                let desired = [self.window_need, self.held_log_needs(now)]
+                    .into_iter()
+                    .flatten()
+                    .min_by_key(|reason| needs_rank(*reason));
                 self.update_needs(desired, &mut reports);
                 self.last_windows = windows;
             }
             Err(_) => {
-                // The mapped list is skipped for this pass: no window-derived
-                // reason changes, but a log-derived wait-for-user can still
-                // be reported.
-                if let Some(reason) = self.held_log_needs(now) {
-                    self.update_needs(Some(reason), &mut reports);
-                }
+                // The mapped list is skipped for this pass: the window-derived reason
+                // stands as it was, but the log-derived one is read afresh, so a sign-in
+                // that finished clears even when the windows cannot be read.
+                let desired = [self.window_need, self.held_log_needs(now)]
+                    .into_iter()
+                    .flatten()
+                    .min_by_key(|reason| needs_rank(*reason));
+                self.update_needs(desired, &mut reports);
             }
         }
 
@@ -418,9 +504,54 @@ impl Watcher {
             self.log_game = None;
             self.log_waiting = None;
             self.interstitial_since = None;
+            self.last_action = None;
         }
         for line in lines {
             self.parse_log_line(line.trim_end(), now);
+        }
+    }
+
+    /// `content_log.txt`: another app's update pre-empting the target's, and Steam dropping the
+    /// target from its schedule afterwards without running it (#1314). A missing log is no
+    /// evidence either way; a rotation or truncation the tail cannot follow forgets what it
+    /// said, so a lost file never retries a launch.
+    fn read_content_log(&mut self) {
+        let (lines, forgot) = self.content.read();
+        if forgot {
+            self.suspended = None;
+            self.dropped = None;
+            self.content_running = false;
+        }
+        for line in lines {
+            self.parse_content_line(line.trim_end());
+        }
+    }
+
+    fn parse_content_line(&mut self, line: &str) {
+        if !line.contains("state changed") && !line.contains("scheduler finished") {
+            return;
+        }
+        if extract_appid(line) != Some(self.cfg.appid) {
+            return;
+        }
+        let Some(at) = log_stamp(line) else {
+            return;
+        };
+        if line.contains("state changed") {
+            // `Fully Installed,App Running,` while the game runs, and any later state without
+            // it is the game gone. Latched either way by the line itself.
+            self.content_running = line.contains("App Running");
+        } else if line.contains("staying in schedule (result Suspended") {
+            self.suspended = Some(at.to_owned());
+            // A new suspension: what was decided about the last one no longer holds.
+            self.dropped = None;
+        } else if line.contains("removed from schedule (result No Error")
+            && self
+                .suspended
+                .as_deref()
+                .is_some_and(|suspended| at > suspended)
+        {
+            self.dropped = Some(at.to_owned());
         }
     }
 
@@ -448,8 +579,44 @@ impl Watcher {
                 self.interstitial_since = None;
             }
         } else if line.contains("GameAction") {
+            // A refusal logs progress, then `failed with AppError_n` and `changed task to
+            // Failed` for the same ActionID (#1159): the failure is the terminal word.
+            let failed = line.contains("LaunchApp failed with")
+                || line.contains("LaunchApp changed task to Failed");
+            let progress = !failed
+                && (line.contains("LaunchApp changed task to")
+                    || line.contains("LaunchApp waiting for user response to")
+                    || line.contains("LaunchApp continues with user response"));
             if extract_appid(line) != Some(self.cfg.appid) {
+                self.elsewhere |= progress && line.contains("LaunchApp");
                 return;
+            }
+            if let Some(id) = extract_action_id(line) {
+                match self.action {
+                    Some((current, _)) if current == id => {
+                        if failed {
+                            self.action = Some((id, true));
+                        }
+                    }
+                    // A later action: its progress is a new launch taken up.
+                    _ if progress => self.action = Some((id, false)),
+                    _ => {}
+                }
+            }
+            // Where this line is in the launch's story, and whether it moved the launch into a
+            // shader or depot update: that line being the last one for the app, with a
+            // suspension of it after, is how a dropped launch is read (#1314). Any newer
+            // GameAction line for the app replaces it — a failure, a wait, the next attempt.
+            if let Some(at) = log_stamp(line) {
+                let depot_task = line.contains("changed task to CheckShaderDepotManifest")
+                    || line.contains("changed task to DownloadingDepots");
+                self.last_action = Some((at.to_owned(), depot_task));
+                // Steam took the launch up again after the schedule drop: the suspension behind
+                // it belonged to the attempt that was lost.
+                if self.dropped.as_deref().is_some_and(|dropped| at > dropped) {
+                    self.suspended = None;
+                    self.dropped = None;
+                }
             }
             if let Some(task_at) = line.find("LaunchApp waiting for user response to") {
                 // The one log line that means Steam is actually stopped for
@@ -523,6 +690,8 @@ struct LogTail {
     file_id: Option<u64>,
     pending: Vec<u8>,
     discarding: bool,
+    /// The file was not there at the last read: what it would have said since is unknown.
+    absent: bool,
 }
 
 impl LogTail {
@@ -535,6 +704,7 @@ impl LogTail {
             file_id: None,
             pending: Vec::new(),
             discarding: false,
+            absent: false,
         }
     }
 
@@ -550,6 +720,7 @@ impl LogTail {
 
     fn read_pass(&mut self, lines: &mut Vec<String>, forgot: &mut bool) {
         let metadata = std::fs::metadata(&self.path);
+        self.absent = metadata.is_err();
 
         // Decided on the first poll, not the first sighting: the home
         // persists between sessions and the helper polls before Steam
@@ -658,6 +829,12 @@ impl LogTail {
     }
 }
 
+fn extract_action_id(line: &str) -> Option<u32> {
+    let rest = line.get(line.find("ActionID ")? + "ActionID ".len()..)?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
 fn extract_appid(line: &str) -> Option<u32> {
     let at = line.find("AppID")? + "AppID".len();
     let rest = line.get(at..)?;
@@ -674,6 +851,8 @@ fn extract_appid(line: &str) -> Option<u32> {
 struct ProcScan {
     readable: bool,
     reaper_alive: bool,
+    /// A game's reaper for some other app is alive.
+    other_reaper: bool,
     steam_client: bool,
 }
 
@@ -681,6 +860,7 @@ fn scan_proc(proc_root: &std::path::Path, appid: u32) -> ProcScan {
     let unreadable = ProcScan {
         readable: false,
         reaper_alive: false,
+        other_reaper: false,
         steam_client: false,
     };
     let Ok(entries) = std::fs::read_dir(proc_root) else {
@@ -692,6 +872,7 @@ fn scan_proc(proc_root: &std::path::Path, appid: u32) -> ProcScan {
     let mut scan = ProcScan {
         readable: true,
         reaper_alive: false,
+        other_reaper: false,
         steam_client: false,
     };
     for entry in entries {
@@ -714,8 +895,10 @@ fn scan_proc(proc_root: &std::path::Path, appid: u32) -> ProcScan {
             .map(|part| String::from_utf8_lossy(part).into_owned())
             .filter(|arg| !arg.is_empty())
             .collect();
-        if is_reaper_for(&args, appid) {
-            scan.reaper_alive = true;
+        match reaper_appid(&args) {
+            Some(found) if found == appid => scan.reaper_alive = true,
+            Some(_) => scan.other_reaper = true,
+            None => {}
         }
         if args
             .first()
@@ -746,6 +929,11 @@ fn read_cmdline(path: &std::path::Path) -> Result<Option<Vec<u8>>, ()> {
 }
 
 fn is_reaper_for(args: &[String], appid: u32) -> bool {
+    reaper_appid(args) == Some(appid)
+}
+
+/// The app a game's reaper runs, when `args` are one.
+fn reaper_appid(args: &[String]) -> Option<u32> {
     // An Install=1 reaper runs an install script (Proton's
     // iscriptevaluator.exe) before the game; it is not the game, and its
     // exit must never read as the game's.
@@ -754,12 +942,15 @@ fn is_reaper_for(args: &[String], appid: u32) -> bool {
             .iter()
             .any(|arg| basename(arg).to_lowercase() == "iscriptevaluator.exe")
     {
-        return false;
+        return None;
     }
-    let appid_arg = format!("AppId={appid}");
-    args.iter().any(|arg| basename(arg) == "reaper")
-        && args.iter().any(|arg| arg == "SteamLaunch")
-        && args.iter().any(|arg| arg == &appid_arg)
+    if !args.iter().any(|arg| basename(arg) == "reaper")
+        || !args.iter().any(|arg| arg == "SteamLaunch")
+    {
+        return None;
+    }
+    args.iter()
+        .find_map(|arg| arg.strip_prefix("AppId=")?.parse().ok())
 }
 
 fn basename(arg: &str) -> &str {
@@ -905,6 +1096,16 @@ fn after_timestamp(line: &str) -> Option<&str> {
     (all(date, b'-') && all(time, b':')).then_some(rest)
 }
 
+/// The `[YYYY-MM-DD HH:MM:SS]` stamp of a line, for ordering a line in one of Steam's logs
+/// against a line in another (`console_log.txt` and `content_log.txt` are read in the same
+/// pass, and only the stamp says which came first). The format is fixed width, so the strings
+/// compare in time order; two lines in the same second cannot be told apart.
+fn log_stamp(line: &str) -> Option<&str> {
+    after_timestamp(line)?;
+    let (stamp, _) = line.strip_prefix('[')?.split_once("] ")?;
+    (stamp.len() == 19).then_some(stamp)
+}
+
 /// How Steam's exit cloud sync for an app ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloudEnd {
@@ -976,6 +1177,13 @@ impl CloudSync {
 pub fn game_running(proc_root: &Path, appid: u32) -> Option<bool> {
     let scan = scan_proc(proc_root, appid);
     scan.readable.then_some(scan.reaper_alive)
+}
+
+/// Whether a Steam client process runs under `proc_root`; `None` when `/proc` could not be
+/// read in full, which never counts as gone.
+pub fn steam_client_running(proc_root: &Path) -> Option<bool> {
+    let scan = scan_proc(proc_root, 0);
+    scan.readable.then_some(scan.steam_client)
 }
 
 /// The pids of `appid`'s launch reaper and every process under it, at most 4096. Parents

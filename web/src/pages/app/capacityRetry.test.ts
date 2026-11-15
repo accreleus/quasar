@@ -178,6 +178,10 @@ describe("isCapacityRetryable (#602)", () => {
     expect(isCapacityRetryable({ code: "no_host_available", reason: "home_host_unavailable" })).toBe(false);
   });
 
+  it("does not retry a game whose compatibility tool no host can run yet", () => {
+    expect(isCapacityRetryable({ code: "no_host_available", reason: "compat_tool_missing" })).toBe(false);
+  });
+
   it("retries nothing else", () => {
     expect(isCapacityRetryable({ code: "host_not_ready" })).toBe(false);
   });

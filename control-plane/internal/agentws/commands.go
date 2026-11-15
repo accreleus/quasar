@@ -2,6 +2,7 @@ package agentws
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/preparation"
 )
@@ -37,6 +38,48 @@ type SessionAssignCmd struct {
 	// parked_sessions_v1, which always gets Kind.
 	Kind           string `json:"kind,omitempty"`
 	AdoptSessionID string `json:"adopt_session_id,omitempty"`
+	// Amendment 54: sent only for a WebTransport session ("webtransport"), with the first
+	// transport token's hash and expiry. Omitted ⇒ webrtc.
+	Transport        string     `json:"transport,omitempty"`
+	WTTokenHash      string     `json:"wt_token_hash,omitempty"`
+	WTTokenExpiresAt *time.Time `json:"wt_token_expires_at,omitempty"`
+	// Amendment 56: sent only on a connection that advertised compat_tools_v1.
+	CompatTools *CompatToolsSpec `json:"compat_tools,omitempty"`
+	// Amendment 55: the grant to send this WebTransport session's client PyroWave; present
+	// only when the stream plan allowed it.
+	PyroWave *PyroWaveGrant `json:"pyrowave,omitempty"`
+}
+
+// PyroWaveGrant is session_assign.pyrowave (agent-api.md, amendment 55).
+type PyroWaveGrant struct {
+	Wanted     bool  `json:"wanted"`
+	TargetKbps int32 `json:"target_kbps"`
+	FloorKbps  int32 `json:"floor_kbps"`
+	MaxRTTMs   int32 `json:"max_rtt_ms"`
+}
+
+// CompatToolsSpec is the tools to mount and the effective compatibility-tool mapping for a
+// Steam-family session (agent-api.md §session_assign). Mount marshals as [], never null.
+type CompatToolsSpec struct {
+	Mount   []string          `json:"mount"`
+	Entries []CompatToolEntry `json:"entries"`
+}
+
+type CompatToolEntry struct {
+	AppID  string `json:"appid"`
+	Name   string `json:"name"`
+	Forced bool   `json:"forced"`
+}
+
+// SessionTransportTokenCmd delivers the hash of a transport token minted after the assign
+// (agent-api.md `session_transport_token`). The control plane hands the token to the client only
+// after ack{ok:true}.
+type SessionTransportTokenCmd struct {
+	Type             string    `json:"type"` // "session_transport_token"
+	ID               string    `json:"id"`
+	SessionID        string    `json:"session_id"`
+	WTTokenHash      string    `json:"wt_token_hash"`
+	WTTokenExpiresAt time.Time `json:"wt_token_expires_at"`
 }
 
 // StreamSpec is the per-session pipeline parameterization (P1-5 StreamParams).

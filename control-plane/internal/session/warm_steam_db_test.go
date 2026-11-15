@@ -22,11 +22,13 @@ import (
 
 // warmDispatcher records every command and answers parked_sessions_v1.
 type warmDispatcher struct {
-	mu      sync.Mutex
-	parks   bool
-	noEpoch bool // the agent's socket is gone: no command epoch to send on
-	// reject answers one command kind: "assign" or "start" refused, or
-	// "assign-ack" queued with its ack lost.
+	mu       sync.Mutex
+	parks    bool
+	compat   bool // answers compat_tools_v1
+	restream bool // adopt_restream_v1
+	noEpoch  bool // the agent's socket is gone: no command epoch to send on
+	// reject answers one command kind: "assign" or "start" refused, "assign-ack"
+	// queued with its ack lost, or "swap" refused.
 	reject  string
 	assigns []agentws.SessionAssignCmd
 	stops   []agentws.SessionStopCmd
@@ -42,6 +44,18 @@ func (d *warmDispatcher) SupportsParkedSessions(string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.parks
+}
+
+func (d *warmDispatcher) SupportsAdoptRestream(string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.parks && d.restream
+}
+
+func (d *warmDispatcher) setRestream(v bool) {
+	d.mu.Lock()
+	d.restream = v
+	d.mu.Unlock()
 }
 
 func (d *warmDispatcher) setParks(v bool) {
@@ -96,15 +110,21 @@ type warmEpoch struct{ d *warmDispatcher }
 
 func (warmEpoch) SupportsHomeCleanup() bool      { return true }
 func (e warmEpoch) SupportsParkedSessions() bool { return e.d.SupportsParkedSessions("") }
+func (e warmEpoch) SupportsCompatTools() bool    { return e.d.compat }
 func (e warmEpoch) Send(v any) (bool, error)     { e.d.record(v); return true, nil }
 func (e warmEpoch) SendWithAck(_ context.Context, _ string, v any) (agentws.AckResult, bool, error) {
 	e.d.record(v)
-	if _, ok := v.(agentws.SessionAssignCmd); ok {
+	switch v.(type) {
+	case agentws.SessionAssignCmd:
 		switch e.d.rejecting() {
 		case "assign":
 			return agentws.AckResult{OK: false, Error: "refused"}, true, nil
 		case "assign-ack":
 			return agentws.AckResult{}, true, errors.New("ack timeout")
+		}
+	case agentws.SessionSwapAppCmd:
+		if e.d.rejecting() == "swap" {
+			return agentws.AckResult{OK: false, Error: "refused"}, true, nil
 		}
 	}
 	return agentws.AckResult{OK: true}, true, nil
@@ -545,6 +565,216 @@ func TestTwoConcurrentClaimsAdoptOnce(t *testing.T) {
 	if adopted != 1 || readRow(t, f.pool, k).Detail != "claimed" {
 		t.Fatalf("play sessions = %d, parked = %+v; want one play and the parked row claimed", adopted, readRow(t, f.pool, k))
 	}
+	// The loser is told the winner holds the home, never a Steam restart (amendment 59).
+	loser := errs[0]
+	if loser == nil {
+		loser = errs[1]
+	}
+	var inUse *HomeInUseError
+	if !errors.As(loser, &inUse) || inUse.SessionID == "" {
+		t.Errorf("loser err = %v, want home_in_use naming the winner", loser)
+	}
+	if f.disp.stopReason(k) != "" {
+		t.Error("the loser stopped the claimed session")
+	}
+}
+
+type streamRow struct {
+	Codec, H264Profile              string
+	Width, Height, FPS, BitrateKbps int32
+}
+
+func readStream(t *testing.T, pool *pgxpool.Pool, id string) streamRow {
+	t.Helper()
+	var r streamRow
+	must(t, pool.QueryRow(context.Background(), `SELECT codec, h264_profile, width, height, fps, bitrate_kbps
+		FROM sessions WHERE id = $1::uuid`, id).Scan(&r.Codec, &r.H264Profile, &r.Width, &r.Height, &r.FPS, &r.BitrateKbps))
+	return r
+}
+
+// The ratchet (amendment 59): a smaller, slower claim adopts the park; its park on
+// exit keeps the size and fps the runtime was built with (from the adopted row), with
+// the play's bitrate; and a third launch at the park's own size and fps adopts that.
+func TestClaimAdoptsAcrossStreamSettingsAndTheReparkKeepsTheBuiltSize(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	ctx := context.Background()
+	f.disp.setRestream(true)
+	tile := seedTile(t, f.pool, f.steam, "Hades", "1145360")
+	k := f.park(t)
+	built := readStream(t, f.pool, k)
+	half := func(v int32) *int32 { h := v / 2; return &h }
+
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: tile, DeviceID: f.deviceID, Mic: true,
+		IsAdmin: true, Override: StreamOverride{Width: half(built.Width), Height: half(built.Height), FPS: half(built.FPS)}})
+	if err != nil {
+		t.Fatalf("smaller claim: %v", err)
+	}
+	play := res.Session.ID
+	if got := readRow(t, f.pool, k); got.Detail != "claimed" || f.disp.stopReason(k) != "" {
+		t.Fatalf("parked row %+v stop=%q, want claimed and not stopped", got, f.disp.stopReason(k))
+	}
+	if a := f.disp.assignFor(t, play); a.AdoptSessionID != k {
+		t.Fatalf("assign adopts %q, want %s", a.AdoptSessionID, k)
+	}
+	small := readStream(t, f.pool, play)
+	if small.Width != built.Width/2 || small.Height != built.Height/2 || small.FPS != built.FPS/2 {
+		t.Fatalf("play stream %+v, want half of %+v", small, built)
+	}
+
+	f.disp.waitFor(t, "start")
+	// The agent's first report adopts: the hold moves to the play session.
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: play, State: "starting"})
+	f.running(t, play)
+	f.coord.AgentState(ctx, f.hostID, heldStop(play))
+	again := f.parkedID(t)
+	if again == "" {
+		t.Fatal("no park on exit")
+	}
+	if got := readStream(t, f.pool, again); got.Width != built.Width || got.Height != built.Height ||
+		got.FPS != built.FPS || got.BitrateKbps != small.BitrateKbps {
+		t.Fatalf("re-parked stream %+v, want %dx%d@%d at the play's bitrate %d",
+			got, built.Width, built.Height, built.FPS, small.BitrateKbps)
+	}
+
+	f.disp.waitFor(t, "start")
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: again, State: "starting"})
+	f.running(t, again)
+	res, err = f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: tile, DeviceID: f.deviceID, Mic: true})
+	if err != nil {
+		t.Fatalf("third launch, at the park's own size: %v", err)
+	}
+	if a := f.disp.assignFor(t, res.Session.ID); a.AdoptSessionID != again {
+		t.Fatalf("third launch adopts %q, want the re-park %s", a.AdoptSessionID, again)
+	}
+	if got := readStream(t, f.pool, res.Session.ID); got.Width != built.Width || got.FPS != built.FPS {
+		t.Errorf("third launch stream %+v, want the built %dx%d@%d", got, built.Width, built.Height, built.FPS)
+	}
+}
+
+// A declined claim (the parked runtime's proof arrives while the play is live, as
+// when the agent builds fresh) adopted nothing: its park on exit takes the play's
+// own size, not the parked row's (amendment 59).
+func TestADeclinedClaimsReparkTakesThePlaysOwnSize(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	ctx := context.Background()
+	f.disp.setRestream(true)
+	tile := seedTile(t, f.pool, f.steam, "Hades", "1145360")
+	k := f.park(t)
+	built := readStream(t, f.pool, k)
+	half := func(v int32) *int32 { h := v / 2; return &h }
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: tile, DeviceID: f.deviceID, Mic: true,
+		IsAdmin: true, Override: StreamOverride{Width: half(built.Width), Height: half(built.Height)}})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	play := res.Session.ID
+	f.disp.waitFor(t, "start")
+	// The agent declined: the parked runtime's proof, then the fresh build's reports.
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: k, State: "stopped", HomeCleanupQualified: true})
+	var adopts *string
+	must(t, f.pool.QueryRow(ctx, `SELECT adopt_session_id::text FROM sessions WHERE id = $1::uuid`, play).Scan(&adopts))
+	if adopts != nil {
+		t.Fatalf("declined play row still adopts %s", *adopts)
+	}
+	if got := f.holder(t); got != play {
+		t.Fatalf("hold = %q, want passed to the live play %s", got, play)
+	}
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: play, State: "starting"})
+	f.running(t, play)
+	f.coord.AgentState(ctx, f.hostID, heldStop(play))
+	again := f.parkedID(t)
+	if again == "" {
+		t.Fatal("no park on exit")
+	}
+	small := readStream(t, f.pool, play)
+	if got := readStream(t, f.pool, again); got.Width != small.Width || got.Height != small.Height || got.FPS != small.FPS {
+		t.Fatalf("re-park stream %+v, want the play's own %dx%d@%d", got, small.Width, small.Height, small.FPS)
+	}
+}
+
+// #1161: a park is always WebRTC and no restream moves a runtime between transports, so a
+// claim the stream plan sends over WebTransport supersedes the park (transport_differs), and
+// the client's retry launches cold on WebTransport.
+func TestAWebTransportClaimOnAWebRTCParkLaunchesCold(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	ctx := context.Background()
+	f.disp.setRestream(true)
+	// The park is made with the device the launch probes from, so only the transport differs.
+	caps := `{"bandwidth_kbps":50000,"rtt_ms":5,"max_decode_height":2160,"measured_at":"` +
+		time.Now().UTC().Format(time.RFC3339) + `","codecs":{"h264":true},
+		"webtransport":{"available":true,"datagrams":true},
+		"webcodecs":{"h264":true,"opus_decode":true,"opus_encode":true}}`
+	must(t, exec(t, f.pool, `UPDATE user_devices SET capabilities = $2::jsonb WHERE id = $1::uuid`, f.deviceID, caps))
+	k := f.park(t)
+	var parkTransport string
+	must(t, f.pool.QueryRow(ctx, `SELECT transport FROM sessions WHERE id = $1::uuid`, k).Scan(&parkTransport))
+	if parkTransport != transportWebRTC {
+		t.Fatalf("park transport %q, want webrtc", parkTransport)
+	}
+	must(t, exec(t, f.pool, `UPDATE launch_profiles SET transport = 'webtransport'`))
+	must(t, exec(t, f.pool, `UPDATE hosts SET transports = '["webrtc","webtransport"]', wt_port = 4433,
+		wt_addresses = '["192.0.2.10"]',
+		wt_certificates = jsonb_build_array(jsonb_build_object('sha256', $2::text,
+			'not_before', now() - interval '1 day', 'not_after', now() + interval '10 days'))
+		WHERE id = $1::uuid`, f.hostID, wtCertA))
+
+	_, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID, Mic: true})
+	var refused *ParkedClaimRefusedError
+	if !errors.As(err, &refused) || refused.Cause != causeTransportDiffers {
+		t.Fatalf("err = %v, want a refused claim with cause transport_differs", err)
+	}
+	if r := f.disp.stopReason(k); r != StopReasonParkedSuperseded {
+		t.Errorf("session_stop reason = %q, want parked_superseded", r)
+	}
+
+	// The retry, once the parked Steam has stopped: a cold launch on WebTransport.
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: k, State: "stopped", HomeCleanupQualified: true})
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID, Mic: true})
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if res.Session.Transport != transportWebTransport {
+		t.Errorf("retry transport %q, want webtransport", res.Session.Transport)
+	}
+	if a := f.disp.assignFor(t, res.Session.ID); a.AdoptSessionID != "" {
+		t.Errorf("retry adopts %q, want a cold launch", a.AdoptSessionID)
+	}
+}
+
+// Only a parked row a racing launch claimed reads as a lost claim (409 home_in_use);
+// one stopped by expiry or eviction in the window is a Steam restart (503).
+func TestAParkStoppedByExpiryInTheWindowIsASteamRestartNotHomeInUse(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	k := f.park(t)
+	afterParkedRead = func() {
+		must(t, exec(t, f.pool, `UPDATE sessions SET state = 'stopped', state_detail = 'stop requested',
+			stop_reason = $2, ended_at = now() WHERE id = $1::uuid`, k, StopReasonParkedExpired))
+	}
+	t.Cleanup(func() { afterParkedRead = nil })
+	_, err := f.coord.LaunchByProfile(context.Background(), f.userID,
+		LaunchParams{AppID: f.steam, DeviceID: f.deviceID, Mic: true})
+	var refused *ParkedClaimRefusedError
+	var inUse *HomeInUseError
+	if !errors.As(err, &refused) || refused.Warming || errors.As(err, &inUse) {
+		t.Fatalf("err = %v, want the retryable refused claim (steam_restarting), never home_in_use", err)
+	}
+}
+
+// Without adopt_restream_v1 the same launch supersedes, and a park on exit
+// copies the play row's stream as before.
+func TestClaimWithoutRestreamSupersedesOnBitrate(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	k := f.park(t)
+	must(t, exec(t, f.pool, `UPDATE sessions SET bitrate_kbps = bitrate_kbps + 5000 WHERE id = $1::uuid`, k))
+	_, err := f.coord.LaunchByProfile(context.Background(), f.userID,
+		LaunchParams{AppID: f.steam, DeviceID: f.deviceID, Mic: true})
+	var refused *ParkedClaimRefusedError
+	if !errors.As(err, &refused) || refused.Cause != causeStreamDiffers {
+		t.Fatalf("err = %v, want a refused claim with cause stream_differs", err)
+	}
+	if r := f.disp.stopReason(k); r != StopReasonParkedSuperseded {
+		t.Errorf("session_stop reason = %q, want parked_superseded", r)
+	}
 }
 
 func TestClaimRacingExpiryHasOneWinner(t *testing.T) {
@@ -705,6 +935,131 @@ func TestParkOnExitParksTheHeldRuntime(t *testing.T) {
 	if got := f.holder(t); got != k {
 		t.Errorf("hold = %s after the parked session's first report, want %s", got, k)
 	}
+}
+
+// #1163: only WebRTC plays park on exit. Every park is inserted with the
+// transport column's WebRTC default, and no restream moves a runtime between
+// transports (#1161), so a WebTransport launch could never adopt a park a
+// WebTransport play left behind. Such a play releases its runtime instead, and
+// Steam stops with it; a WebRTC play still parks.
+func TestParkOnExitIsWebRTCOnly(t *testing.T) {
+	t.Run("a WebRTC play still parks", func(t *testing.T) {
+		f := newWarmFixture(t, 4)
+		play := f.runningTile(t)
+		f.coord.AgentState(context.Background(), f.hostID, heldStop(play))
+		if n := countParked(t, f.pool); n != 1 {
+			t.Fatalf("parked rows = %d, want the WebRTC play's park", n)
+		}
+		if k := f.parkedID(t); k == "" || f.disp.assignFor(t, k).AdoptSessionID != play {
+			t.Fatalf("park = %q, want a parked row adopting %s", k, play)
+		}
+	})
+
+	t.Run("a WebTransport play does not park", func(t *testing.T) {
+		f := newWarmFixture(t, 4)
+		play := f.runningWebTransportTile(t)
+		f.coord.AgentState(context.Background(), f.hostID, heldStop(play))
+		if got := readRow(t, f.pool, play); got.State != "stopped" || got.StopReason != stopReasonRuntimeReleased {
+			t.Fatalf("play row %+v, want stopped / %s", got, stopReasonRuntimeReleased)
+		}
+		if n := countParked(t, f.pool); n != 0 {
+			t.Fatalf("parked rows = %d, want none: no launch can adopt a WebTransport play's park", n)
+		}
+		if r := f.disp.stopReason(play); r != "user_requested" {
+			t.Errorf("session_stop reason = %q, want user_requested (the runtime is released, Steam stops)", r)
+		}
+	})
+}
+
+// runningWebTransportTile launches the Steam app on a WebTransport profile and
+// reports it running, as the agent would.
+func (f *warmFixture) runningWebTransportTile(t *testing.T) string {
+	t.Helper()
+	ctx := context.Background()
+	f.enableWebTransport(t)
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID})
+	if err != nil {
+		t.Fatalf("WebTransport launch: %v", err)
+	}
+	if res.Session.Transport != transportWebTransport {
+		t.Fatalf("launch transport %q, want %s", res.Session.Transport, transportWebTransport)
+	}
+	f.disp.waitFor(t, "start")
+	f.running(t, res.Session.ID)
+	return res.Session.ID
+}
+
+// enableWebTransport makes the fixture's device and host able to stream on
+// WebTransport and every launch profile ask for it.
+func (f *warmFixture) enableWebTransport(t *testing.T) {
+	t.Helper()
+	caps := `{"bandwidth_kbps":50000,"rtt_ms":5,"max_decode_height":2160,"measured_at":"` +
+		time.Now().UTC().Format(time.RFC3339) + `","codecs":{"h264":true},
+		"webtransport":{"available":true,"datagrams":true},
+		"webcodecs":{"h264":true,"opus_decode":true,"opus_encode":true}}`
+	must(t, exec(t, f.pool, `UPDATE user_devices SET capabilities = $2::jsonb WHERE id = $1::uuid`, f.deviceID, caps))
+	must(t, exec(t, f.pool, `UPDATE launch_profiles SET transport = 'webtransport'`))
+	must(t, exec(t, f.pool, `UPDATE hosts SET transports = '["webrtc","webtransport"]', wt_port = 4433,
+		wt_addresses = '["192.0.2.10"]',
+		wt_certificates = jsonb_build_array(jsonb_build_object('sha256', $2::text,
+			'not_before', now() - interval '1 day', 'not_after', now() + interval '10 days'))
+		WHERE id = $1::uuid`, f.hostID, wtCertA))
+}
+
+// A library-open heartbeat parks nothing exactly when the launch it warms for would plan
+// WebTransport, by the launch's own transport decision: every park is WebRTC-only, so such a
+// launch would supersede it and cold-start Steam behind a 503 (#1163). Every arm where the
+// launch plans WebRTC still parks.
+func TestHeartbeatSkipsAUserWhoseLaunchWouldBeWebTransport(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name   string
+		setup  func(t *testing.T, f *warmFixture)
+		parked int
+	}{
+		{"a WebTransport-capable device on a webtransport profile", func(t *testing.T, f *warmFixture) {}, 0},
+		{"a device without WebTransport still parks", func(t *testing.T, f *warmFixture) {
+			must(t, exec(t, f.pool, `UPDATE user_devices SET capabilities = capabilities - 'webtransport' WHERE id = $1::uuid`, f.deviceID))
+		}, 1},
+		{"a host with no WebTransport endpoint still parks", func(t *testing.T, f *warmFixture) {
+			must(t, exec(t, f.pool, `UPDATE hosts SET transports = '["webrtc"]' WHERE id = $1::uuid`, f.hostID))
+		}, 1},
+		{"a device that cannot decode the codec over WebCodecs still parks", func(t *testing.T, f *warmFixture) {
+			must(t, exec(t, f.pool, `UPDATE user_devices SET capabilities = capabilities || '{"webcodecs":{"opus_decode":true}}'
+				WHERE id = $1::uuid`, f.deviceID))
+		}, 1},
+		{"an opt-in profile still parks", func(t *testing.T, f *warmFixture) {
+			must(t, exec(t, f.pool, `UPDATE launch_profiles SET transport = 'webtransport_opt_in'`))
+		}, 1},
+		{"an opt-in profile on PyroWave prefer, with PyroWave eligible, parks nothing", func(t *testing.T, f *warmFixture) {
+			f.enablePyroWavePrefer(t)
+		}, 0},
+		{"the same with PyroWave off still parks", func(t *testing.T, f *warmFixture) {
+			f.enablePyroWavePrefer(t)
+			must(t, exec(t, f.pool, `UPDATE launch_profiles SET pyrowave_mode = 'off'`))
+		}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newWarmFixture(t, 4)
+			f.enableWebTransport(t)
+			tc.setup(t, f)
+			f.coord.SteamWarmHeartbeat(ctx, f.userID, false, f.deviceID)
+			if n := countParked(t, f.pool); n != tc.parked {
+				t.Fatalf("parked rows = %d, want %d", n, tc.parked)
+			}
+		})
+	}
+}
+
+// enablePyroWavePrefer makes an Auto launch pick PyroWave, hence WebTransport, with no request
+// switch: an opt-in profile on prefer, a GPU that passed its probe, a WebGPU device with a fresh
+// fast link.
+func (f *warmFixture) enablePyroWavePrefer(t *testing.T) {
+	t.Helper()
+	must(t, exec(t, f.pool, `UPDATE launch_profiles SET transport = 'webtransport_opt_in', pyrowave_mode = 'prefer'`))
+	must(t, exec(t, f.pool, `UPDATE gpus SET codecs = '["h264","pyrowave"]' WHERE host_id = $1::uuid`, f.hostID))
+	must(t, exec(t, f.pool, `UPDATE user_devices SET capabilities = capabilities ||
+		'{"webgpu":{"available":true},"bandwidth_kbps":900000,"rtt_ms":2}' WHERE id = $1::uuid`, f.deviceID))
 }
 
 func TestParkOnExitReleasesWhenARuleSaysNo(t *testing.T) {

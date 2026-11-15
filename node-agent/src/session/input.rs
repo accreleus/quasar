@@ -269,7 +269,7 @@ fn input_trace_enabled() -> bool {
 }
 
 /// Host monotonic time in ms, for correlation with the client `tc`.
-fn host_monotonic_ms() -> f64 {
+pub(crate) fn host_monotonic_ms() -> f64 {
     use std::sync::OnceLock;
     use std::time::Instant;
     static EPOCH: OnceLock<Instant> = OnceLock::new();

@@ -517,6 +517,19 @@ func openRunTx(ctx context.Context, tx pgx.Tx, jobID, hostID string) (Run, bool,
 	return r, true, nil
 }
 
+// SetRunParams replaces a claimed run's params (Definition.FillParams).
+func (s *Store) SetRunParams(ctx context.Context, runID string, params any) (json.RawMessage, error) {
+	raw, err := marshalBounded(params, "params")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.pool.Exec(ctx, `UPDATE job_runs SET params = $2::jsonb WHERE id = $1::uuid AND state = 'running'`,
+		runID, raw); err != nil {
+		return nil, fmt.Errorf("set run params: %w", err)
+	}
+	return raw, nil
+}
+
 // OpenRun returns the pending-or-running run for (job, target), if any.
 func (s *Store) OpenRun(ctx context.Context, jobID, hostID string) (Run, bool, error) {
 	r, err := scanRun(s.pool.QueryRow(ctx, `

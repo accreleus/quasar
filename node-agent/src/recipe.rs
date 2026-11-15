@@ -1,4 +1,4 @@
-//! The recipe revision this node-agent image needs (ADR 0008, `CONTEXT.md` "Recipe").
+//! The recipe revision this node-agent image needs (ADR 0008, `GLOSSARY.md` "Recipe").
 //!
 //! A recovery actor creates this agent's container from a recipe compiled into the actor,
 //! and refuses a revision it does not carry. `deploy/build-images.sh` stamps this constant
@@ -21,4 +21,6 @@
 /// console PipeWire socket; the console session's container holds the screen, the input
 /// and the sound device (ADR 0009). The agent is told whether the host has a sound device
 /// (`QUASAR_HOST_SOUND`) instead of reading its own `/dev/snd`.
-pub const RECIPE_REVISION: u32 = 4;
+/// 5 (#1071): the compatibility-tools root (`QUASAR_COMPAT_TOOLS_ROOT`), bound at the same
+/// path, where the agent installs GE-Proton for sessions to mount read-only.
+pub const RECIPE_REVISION: u32 = 5;

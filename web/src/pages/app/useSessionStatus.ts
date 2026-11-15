@@ -30,6 +30,9 @@ export interface SessionStatus {
   startedAt: string | null;
   /** The session's pinned stream WxH, from the 5s poll. Null until the first poll answers. */
   polledStreamSize: { w: number; h: number } | null;
+  /** The server's `app_id` from the health poll; null until it answers. Never from an
+   *  answer older than one already applied. */
+  polledAppId: string | null;
   /** Adaptive external resolution (§D5/§D6): what is ENCODED right now; null = still at launch size. */
   externalSize: { w: number; h: number } | null;
   /** Raw setter — also called by useDisplayPatch on ack/revert (see module header). */
@@ -90,6 +93,7 @@ export function useSessionStatus(
   // Null until first poll answers; the router-state tier string covers that
   // gap so display controls are usable immediately after launch.
   const [polledStreamSize, setPolledStreamSize] = useState<{ w: number; h: number } | null>(null);
+  const [polledAppId, setPolledAppId] = useState<string | null>(null);
   // Adaptive external resolution (§D5/§D6), all three off the same 5s poll:
   // streamRungs is null until first poll answers (client 16:9 fallback covers
   // a pre-amendment control plane in the meantime).
@@ -154,10 +158,19 @@ export function useSessionStatus(
   useEffect(() => {
     if (!authToken || !sessionId) return;
     let cancelled = false;
+    // The interval does not wait for a slow answer: an answer older than one already
+    // applied must not move the app back (a pre-swap read landing after the commit).
+    let issued = 0;
+    let applied = 0;
     const poll = async () => {
+      const seq = ++issued;
       try {
         const { session } = await getSession(authToken, sessionId);
         if (cancelled) return;
+        if (seq > applied) {
+          applied = seq;
+          setPolledAppId(session.app_id);
+        }
         if (session.state === "failed" && session.state_detail === "host_lost") {
           setHostLost(true);
           return;
@@ -290,6 +303,7 @@ export function useSessionStatus(
     health,
     startedAt,
     polledStreamSize,
+    polledAppId,
     externalSize,
     setExternalSize,
     streamRungs,

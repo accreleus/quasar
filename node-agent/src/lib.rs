@@ -10,6 +10,7 @@ pub mod artifact;
 /// Build stamps + install-mode discovery: what this agent is and how it got here.
 pub mod buildinfo;
 pub mod capacity;
+pub mod compat_tools;
 pub mod config;
 pub(crate) mod console_idle;
 mod container_ownership;
@@ -21,7 +22,7 @@ pub mod crash_report;
 pub mod cuda_runtime;
 pub mod ddc;
 /// Diagnostic registration (#256): what a host withholds while its startup cleanup is
-/// unresolved, and when it resumes. See `CONTEXT.md` "Diagnostic registration".
+/// unresolved, and when it resumes. See `GLOSSARY.md` "Diagnostic registration".
 pub mod diagnostic;
 mod encoder_compatibility;
 pub mod enrollment;
@@ -56,6 +57,7 @@ pub mod release;
 pub mod restart;
 pub mod session;
 pub mod vram;
+pub mod webtransport;
 
 pub mod runtime;
 pub mod runtime_dir_label;

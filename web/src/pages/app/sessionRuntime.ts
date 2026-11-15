@@ -36,6 +36,8 @@ import { mintSignalingToken } from "../../api/library";
 import { ApiError } from "../../api/client";
 import type { ICEServer } from "../../api/types";
 import { setupCapture, type GamepadIdentity } from "../../input/capture";
+import type { VirtualPadState } from "../../input/virtualPad";
+import { dataChannelSender } from "../../input/inputSender";
 import { NEUTRAL_MOUSE, type MouseSettings } from "../../input/mouseScale";
 import { QuasarSession, type RebindOutcome, type TakeoverRefusal } from "../../webrtc/session";
 import type { RecoveryState } from "../../webrtc/recovery";
@@ -43,6 +45,7 @@ import { PlayoutController, resolveInitialPlayoutMs } from "../../webrtc/playout
 import {
   SessionTelemetry,
   ABS_CAPTURE_TIME_URI,
+  type PostedCounters,
   type TelemetrySnapshot,
 } from "../../webrtc/telemetry";
 import { TraceEventEmitter } from "../../webrtc/traceEvents";
@@ -165,6 +168,9 @@ export interface SessionRuntimeCallbacks {
    *  fires this once per pad). Optional and informational: the page explains
    *  that its buttons may be mixed up; the pad is still forwarded. */
   onNonStandardGamepad?(pad: GamepadIdentity): void;
+  /** WebTransport moved off PyroWave to `codec` (`hello_ack.codec_switch_reason`,
+   *  codec-pyrowave.md §Switching codec). Optional and informational: the page says why. */
+  onCodecSwitched?(codec: string, reason: string): void;
   /** A disconnect signature was seen on the status channel. The host-lost poll
    *  stays on the page: hostLost is page state and the poller is page-owned. */
   onDisconnectSuspected(): void;
@@ -251,6 +257,7 @@ export interface TelemetryFactoryArgs {
   getCaptureMetrics: Parameters<typeof setupCapture> extends never ? never : () => unknown;
   tierFps?: number;
   hasAbsCaptureTime: () => boolean;
+  counters?: PostedCounters;
 }
 
 export interface TelemetryLike {
@@ -294,6 +301,7 @@ const productionDeps: SessionRuntimeDeps = {
       a.getCaptureMetrics as never,
       a.tierFps,
       a.hasAbsCaptureTime,
+      a.counters,
     ) as unknown as TelemetryLike,
   createTracer: (sessionId, authToken) =>
     new TraceEventEmitter(sessionId, authToken) as unknown as TracerLike,
@@ -320,6 +328,8 @@ export interface SessionRuntimeConfig {
   /** The launched profile's fps, for the client-health classifier's per-frame
    *  budget. Undefined when unknown. */
   tierFps?: number;
+  /** The page view's posted cumulative counters; each runtime it builds continues them. */
+  counters?: PostedCounters;
   callbacks: SessionRuntimeCallbacks;
   deps?: Partial<SessionRuntimeDeps>;
 }
@@ -341,6 +351,8 @@ export interface SessionRuntime {
   syncKeyboardLock(): void;
   /** Relative mouse speed; held for a channel that opens later. */
   setMouse(settings: MouseSettings): void;
+  /** On-screen controls' pad; null clears it (the host is left nothing held). */
+  setVirtualPad(pad: VirtualPadState | null): void;
   /** SYNCHRONOUS truth for gesture handlers, which must not read last-rendered
    *  state. This is why the runtime is an object and not a hook. */
   isCaptured(): boolean;
@@ -376,6 +388,7 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
   let captureEngage: ReturnType<typeof setupCapture>["engage"] | null = null;
   let captureRelease: (() => void) | null = null;
   let captureSetMouse: ((m: MouseSettings) => void) | null = null;
+  let captureSetVirtualPad: ((p: VirtualPadState | null) => void) | null = null;
   let mouse: MouseSettings = NEUTRAL_MOUSE;
   let audioCleanup: (() => void) | null = null;
   let audioEl: HTMLAudioElement | null = null;
@@ -472,6 +485,7 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
     captureEngage = null;
     captureRelease = null;
     captureSetMouse = null;
+    captureSetVirtualPad = null;
     // Bench stops before telemetry: its final flush reads the clock offset off
     // the telemetry instance. __qBench stays on window for the harness.
     bench?.stop();
@@ -488,9 +502,7 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
     if (destroyed) return;
     set({ channelOpen: true });
 
-    const sendInput = (msg: Record<string, unknown>) => {
-      if (ch.readyState === "open") ch.send(JSON.stringify(msg));
-    };
+    const { send: sendInput } = dataChannelSender(ch);
 
     const capture = deps.setupCapture({
       videoEl: cfg.videoEl,
@@ -509,6 +521,7 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
       mouse,
     });
     captureSetMouse = capture.setMouse;
+    captureSetVirtualPad = capture.setVirtualPad;
     captureCleanup = capture.cleanup;
     captureKbSync = capture.syncKeyboardLock;
     captureEngage = capture.engage;
@@ -525,6 +538,7 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
       getCaptureMetrics: capture.getMetrics as never,
       tierFps: cfg.tierFps,
       hasAbsCaptureTime: () => transport!.hasAbsCaptureTimeExtension(ABS_CAPTURE_TIME_URI),
+      counters: cfg.counters,
     });
     tm.onUpdate((snap) => sink.push(snap));
     tm.start();
@@ -952,6 +966,7 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
       mouse = m;
       captureSetMouse?.(m);
     },
+    setVirtualPad: (p) => captureSetVirtualPad?.(p),
     isCaptured: () => captured,
 
     cancelRecovery: () => transport?.cancelRecovery(),

@@ -18,6 +18,7 @@ const (
 	CodeForbidden              = "forbidden"                // 403
 	CodeNotFound               = "not_found"                // 404
 	CodeConflict               = "conflict"                 // 409
+	CodeHostNotRemovable       = "host_not_removable"       // 409, amendment 14
 	CodeRateLimited            = "rate_limited"             // 429
 	CodeNoHostAvailable        = "no_host_available"        // 503, retryable
 	CodeCapacityExhausted      = "capacity_exhausted"       // 503, retryable
@@ -56,6 +57,8 @@ const (
 	CodeCaptureKindUnsupported   = "capture_kind_unsupported"   // 422
 	CodeCaptureUnsupported       = "capture_unsupported"        // 501
 	CodeAgentNotConnected        = "agent_not_connected"        // 503
+	CodeSessionNotReconnectable  = "session_not_reconnectable"  // 409
+	CodeTransportUnavailable     = "transport_unavailable"      // 409
 	CodeJobDisabled              = "job_disabled"               // 409
 	CodeJobAlreadyRunning        = "job_already_running"        // 409
 	CodeJobUnmanaged             = "job_unmanaged"              // 409
@@ -87,6 +90,15 @@ type errorBody struct {
 // cause is that the caller's home is on a host that is offline or gone. Only an
 // admin clears it, so a client does not auto-retry it.
 const ReasonHomeHostUnavailable = "home_host_unavailable"
+
+// ReasonCompatToolMissing is the `reason` on a 503 no_host_available when the only thing
+// missing is the GE compatibility tool the launched game's mapping names.
+const ReasonCompatToolMissing = "compat_tool_missing"
+
+// ReasonSteamRestarting is the `reason` on a 503 capacity_exhausted while the
+// caller's parked Steam is stopping or its released runtime holds the home.
+// semantics: control-api.md §Warm Steam "Claim" (amendment 59)
+const ReasonSteamRestarting = "steam_restarting"
 
 // WriteJSON serializes v as JSON with the given status code.
 func WriteJSON(w http.ResponseWriter, status int, v any) {

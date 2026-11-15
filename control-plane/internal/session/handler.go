@@ -18,6 +18,7 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
 	"github.com/accreleus/quasar/control-plane/internal/ice"
 	"github.com/accreleus/quasar/control-plane/internal/profile"
+	"github.com/accreleus/quasar/control-plane/internal/wtendpoint"
 )
 
 // Handler serves the session endpoints: launch and lifecycle.
@@ -91,6 +92,7 @@ func (h *Handler) Register(mux httpx.Router, requireAuth func(http.Handler) http
 	mux.Handle("GET /v1/sessions", requireAuth(http.HandlerFunc(h.handleList)))
 	mux.Handle("GET /v1/sessions/{id}", requireAuth(http.HandlerFunc(h.handleGet)))
 	mux.Handle("POST /v1/sessions/{id}/signaling-token", requireAuth(http.HandlerFunc(h.handleSignalingToken)))
+	mux.Handle("POST /v1/sessions/{id}/transport-token", requireAuth(http.HandlerFunc(h.handleTransportToken)))
 	mux.Handle("DELETE /v1/sessions/{id}", requireAuth(http.HandlerFunc(h.handleStop)))
 	mux.Handle("POST /v1/sessions/{id}/swap", requireAuth(http.HandlerFunc(h.handleSwap)))
 	// Live render resolution / UI scale: a relay to the host agent. No state
@@ -258,10 +260,16 @@ type sessionResp struct {
 	HealthReason *string `json:"health_reason,omitempty"`
 	// The Steam parent whose library this session also mounts; always
 	// serialized. semantics: control-api.md §Storage
-	SharedHomeAppID *string    `json:"shared_home_app_id"`
-	CreatedAt       time.Time  `json:"created_at"`
-	StartedAt       *time.Time `json:"started_at"`
-	EndedAt         *time.Time `json:"ended_at"`
+	SharedHomeAppID *string `json:"shared_home_app_id"`
+	// Always serialized. semantics: control-api.md §Transport — WebRTC and WebTransport
+	Transport               string  `json:"transport"`
+	TransportReason         *string `json:"transport_reason"`
+	TransportFallbackReason *string `json:"transport_fallback_reason"`
+	// Always serialized, null before the stream plan wrote one. semantics: control-api.md §The session's pyrowave
+	PyroWave  *PyroWaveRecord `json:"pyrowave"`
+	CreatedAt time.Time       `json:"created_at"`
+	StartedAt *time.Time      `json:"started_at"`
+	EndedAt   *time.Time      `json:"ended_at"`
 }
 
 type signalingResp struct {
@@ -365,10 +373,15 @@ func sessionRespWithStream(s Session, stream streamResp) sessionResp {
 		HealthState:     string(s.HealthState),
 		HealthReason:    s.HealthReason,
 		SharedHomeAppID: s.SharedHomeAppID,
-		Stream:          stream,
-		CreatedAt:       s.CreatedAt,
-		StartedAt:       s.StartedAt,
-		EndedAt:         s.EndedAt,
+		Transport:       s.Transport,
+		TransportReason: s.TransportReason,
+
+		TransportFallbackReason: s.TransportFallbackReason,
+		PyroWave:                s.PyroWave,
+		Stream:                  stream,
+		CreatedAt:               s.CreatedAt,
+		StartedAt:               s.StartedAt,
+		EndedAt:                 s.EndedAt,
 	}
 }
 
@@ -401,8 +414,12 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		ClientType *string `json:"client_type"` // "native" | "browser"; absent ⇒ browser
 		// The launch REQUEST, absent ⇒ false. A plain bool, not a pointer: there
 		// is nothing to distinguish an absent value from an explicit false.
-		Mic    bool `json:"mic"`
-		Stream *struct {
+		Mic bool `json:"mic"`
+		// "webrtc" | "webtransport"; absent ⇒ the profile decides.
+		Transport *string `json:"transport"`
+		// Amendment 58: Ultra-low latency (PyroWave) picked; a wrong type is a 400 here.
+		PyroWave bool `json:"pyrowave"`
+		Stream   *struct {
 			Width       *int32  `json:"width"`
 			Height      *int32  `json:"height"`
 			FPS         *int32  `json:"fps"`
@@ -416,6 +433,12 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.AppID == "" {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "app_id is required")
+		return
+	}
+
+	if t := req.Transport; t != nil && *t != transportWebRTC && *t != transportWebTransport {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed,
+			"transport must be one of: webrtc, webtransport")
 		return
 	}
 
@@ -460,6 +483,10 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	// about the client, and is stamped on the session row for later reads.
 	lp.DeviceID, _ = auth.TokenDeviceIDFromContext(r.Context())
 	lp.Mic = req.Mic
+	if req.Transport != nil {
+		lp.Transport = *req.Transport
+	}
+	lp.PyroWave = req.PyroWave
 
 	res, err := h.coord.LaunchByProfile(r.Context(), user.ID, lp)
 	switch {
@@ -546,13 +573,16 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		// prevention; never shorten it to make this header smaller), so a relaunch
 		// right after a peer's DELETE bounces here for the ~15 s that teardown
 		// takes. Retry-After lets a polling client wait rather than error (#494).
-		retryAfter := capacityExhaustedRetryAfterSeconds
+		retryAfter, reason := capacityExhaustedRetryAfterSeconds, ""
 		var claim *ParkedClaimRefusedError
 		if errors.As(err, &claim) {
 			retryAfter = parkedClaimRetryAfterSeconds
+			if !claim.Warming {
+				reason = httpx.ReasonSteamRestarting
+			}
 		}
 		w.Header().Set("Retry-After", retryAfter)
-		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeCapacityExhausted,
+		httpx.WriteErrorReason(w, http.StatusServiceUnavailable, httpx.CodeCapacityExhausted, reason,
 			refusalMessage(err, "all capacity is in use; try again shortly",
 				"no free GPU can encode %s; try again shortly"))
 		return
@@ -573,6 +603,9 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	body := map[string]any{
 		"session":   h.sessionResp(res.Session),
 		"signaling": h.newSignalingResp(r, res.SignalingToken, res.TokenExpiresAt),
+	}
+	if res.Transport != nil {
+		body["transport_options"] = map[string]any{"webtransport": toWebTransportResp(res.Transport)}
 	}
 	// Omitted, never empty. semantics: control-api.md §Storage
 	if res.Notice != "" {
@@ -659,6 +692,78 @@ func (h *Handler) handleSignalingToken(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type webTransportResp struct {
+	URL       string    `json:"url"`
+	Token     string    `json:"token"`
+	ExpiresAt time.Time `json:"expires_at"`
+	// Always serialized: [] on an edge endpoint.
+	CertHashes []wtendpoint.Hash `json:"cert_hashes"`
+}
+
+func toWebTransportResp(o *TransportOptions) webTransportResp {
+	hashes := o.CertHashes
+	if hashes == nil {
+		hashes = []wtendpoint.Hash{}
+	}
+	return webTransportResp{URL: o.URL, Token: o.Token, ExpiresAt: o.ExpiresAt, CertHashes: hashes}
+}
+
+func (h *Handler) handleTransportToken(w http.ResponseWriter, r *http.Request) {
+	user, _ := auth.UserFromContext(r.Context())
+	id := r.PathValue("id")
+	sess, err := h.store.Get(r.Context(), id)
+	// Owner only, never admin: a token attaches to the live stream and input (#496).
+	if errors.Is(err, ErrNotFound) || (err == nil && (sess.UserID != user.ID || parkedHidden(user, sess, false))) {
+		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "session not found")
+		return
+	}
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not get session")
+		return
+	}
+	if h.statsLimiter != nil && !h.statsLimiter.allow(sess.ID+"/transport-token") {
+		httpx.WriteError(w, http.StatusTooManyRequests, httpx.CodeRateLimited, "too many transport token requests; slow down")
+		return
+	}
+	notReconnectable := func() {
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeSessionNotReconnectable, "session is not reconnectable")
+	}
+	// Stopping too, before any agent or endpoint check: the stream is being ended.
+	if sess.State.IsTerminal() || sess.State == StateStopping {
+		notReconnectable()
+		return
+	}
+	// A WebRTC session has no endpoint to reconnect to; the client uses the signaling token.
+	if sess.Transport != transportWebTransport {
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeTransportUnavailable,
+			"this session does not use WebTransport; use the signaling token")
+		return
+	}
+	// Retryable, as for the signaling token: the agent still holds the session while it reconnects.
+	if sess.HostID != nil && !h.coord.AgentConnected(*sess.HostID) {
+		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeAgentNotConnected,
+			"the host agent is reconnecting; retry shortly")
+		return
+	}
+	opts, err := h.coord.MintReconnectTransport(r.Context(), sess)
+	switch {
+	case errors.Is(err, ErrSessionTerminal):
+		notReconnectable()
+	case errors.Is(err, ErrTransportUnavailable):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeTransportUnavailable,
+			"the host has no usable WebTransport endpoint; use the signaling token")
+	case errors.Is(err, ErrAgentNoAck):
+		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeAgentNotConnected,
+			"the host agent did not acknowledge the token; retry shortly")
+	case err != nil:
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not mint transport token")
+	default:
+		httpx.WriteJSON(w, http.StatusCreated, map[string]any{
+			"transport_options": map[string]any{"webtransport": toWebTransportResp(opts)},
+		})
+	}
+}
+
 func (h *Handler) handleList(w http.ResponseWriter, r *http.Request) {
 	user, _ := auth.UserFromContext(r.Context())
 	cursor := r.URL.Query().Get("cursor")
@@ -704,7 +809,7 @@ func (h *Handler) handleStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if user.Role == auth.RoleAdmin {
-		h.recordActivity(r.Context(), user.ID, "session.stop", "session", id, map[string]any{"already_terminal": wasTerminal})
+		h.recordActivity(r.Context(), user.ID, "session.stop", "session", sess.ID, map[string]any{"already_terminal": wasTerminal})
 	}
 
 	// 202 Accepted while teardown proceeds; 200 if it was already terminal
@@ -773,6 +878,9 @@ func (h *Handler) handleSwap(w http.ResponseWriter, r *http.Request) {
 		return
 	case errors.Is(err, ErrHomeConflict):
 		h.writeHomeConflict(w, r.Context(), req.AppID)
+		return
+	case errors.As(err, new(*CompatToolRejection)):
+		writeNoHostAvailable(w, err)
 		return
 	case errors.Is(err, ErrNoHostAvailable):
 		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeNoHostAvailable,
@@ -898,6 +1006,18 @@ func writeHomeInUse(w http.ResponseWriter, err error, message string) {
 // clears it. Every other refusal omits the reason.
 // semantics: control-api.md §Admission control (amendment 40)
 func writeNoHostAvailable(w http.ResponseWriter, err error) {
+	var ct *CompatToolRejection
+	if errors.As(err, &ct) {
+		msg := fmt.Sprintf("no host can run the compatibility tool %s this game needs yet; hosts install it in the background, so try again shortly, and if it persists ask your administrator to check Library > Compatibility", ct.Tool)
+		if ct.Swap {
+			msg = fmt.Sprintf("this session started without the compatibility tool %s this game needs; launch the game on its own instead", ct.Tool)
+		}
+		if !ct.Usable {
+			msg = fmt.Sprintf("the compatibility tool %s this game needs is disabled or marked unusable; ask your administrator", ct.Tool)
+		}
+		httpx.WriteErrorReason(w, http.StatusServiceUnavailable, httpx.CodeNoHostAvailable, httpx.ReasonCompatToolMissing, msg)
+		return
+	}
 	var off *HomeHostOfflineRejection
 	if errors.As(err, &off) {
 		httpx.WriteErrorReason(w, http.StatusServiceUnavailable, httpx.CodeNoHostAvailable,

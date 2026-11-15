@@ -1,4 +1,4 @@
-//! Diagnostic registration (#256; CONTEXT.md "Diagnostic registration"): what the agent
+//! Diagnostic registration (#256; GLOSSARY.md "Diagnostic registration"): what the agent
 //! withholds while its startup cleanup is unresolved, and when it resumes. The decision
 //! is pure; `agent::run` owns the effects.
 
@@ -304,6 +304,9 @@ pub fn startup_cleanup(client: &RuntimeClient) -> CleanupAttempt {
     if let Some(swept) = crate::agent::post_application_retirement(
         retirement.is_ok(),
         || {
+            // Every session container of the previous process is retired, so no bind mount
+            // keeps a quarantined compatibility tool alive any more.
+            crate::compat_tools::sweep_quarantine();
             // Boot-only retirement, after acquiring the persistent owner lease.
             // Routine recovery never stops an active audio sibling.
             if let Err(error) = client.retire_audio_sidecars().wait() {
@@ -821,6 +824,7 @@ where
         | ControlMsg::SessionSwapApp { id, .. }
         | ControlMsg::SessionDisplayUpdate { id, .. }
         | ControlMsg::SessionCapture { id, .. }
+        | ControlMsg::SessionTransportToken { id, .. }
         | ControlMsg::ReleaseApply { id, .. }
         | ControlMsg::HostRemove { id, .. }
         | ControlMsg::ImageInventoryReconcile { id, .. }

@@ -93,10 +93,32 @@ func (c candidacy) pinGate(a *argset) string {
 	return pin
 }
 
-// placementGate is the canonical app's current host selection. All candidate
-// and explanation reads use it; the reservation then locks and rechecks the
+// placementGate is the canonical app's current host selection, then the compat-tool gate. All
+// candidate and explanation reads use it; the reservation then locks and rechecks the
 // row so a concurrent removal cannot admit a new session after it commits.
 func (c candidacy) placementGate(a *argset) string {
+	return c.appPlacementGate(a) + c.compatGate(a)
+}
+
+// compatGate keeps a launch whose game has a per-game GE mapping off hosts where the tool is not
+// usable (control-api.md §Compatibility tools, "Usable"). SQL twin of compat.Store.mountable; guarded by
+// TestPlacementWaitsForAHostThatHasTheMappedTool. The share locks of §Usable are not taken yet (C10).
+func (c candidacy) compatGate(a *argset) string {
+	if c.p.CompatGameID == "" {
+		return ""
+	}
+	i := a.add(c.p.CompatGameID)
+	return fmt.Sprintf(` AND (NOT EXISTS (
+		SELECT 1 FROM compat_tool_mappings m JOIN compat_tools t ON t.id = m.tool_id
+		WHERE m.provider = 'steam' AND m.external_id = $%[1]d::text AND t.family = 'ge')
+	OR EXISTS (
+		SELECT 1 FROM compat_tool_mappings m JOIN compat_tools t ON t.id = m.tool_id
+		JOIN host_compat_tools ht ON ht.host_id = h.id AND ht.sha512 = t.asset_sha512 AND ht.name = t.steam_name
+		WHERE m.provider = 'steam' AND m.external_id = $%[1]d::text AND t.family = 'ge'
+		  AND t.enabled AND NOT t.name_conflict AND NOT t.pin_conflict))`, i)
+}
+
+func (c candidacy) appPlacementGate(a *argset) string {
 	return fmt.Sprintf(` AND EXISTS (
 		SELECT 1 FROM app_placement ap
 		WHERE ap.app_id = $%d::uuid

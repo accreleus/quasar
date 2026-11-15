@@ -274,7 +274,7 @@ pub fn ice_stats(reply: &gstreamer::StructureRef) -> IceStats {
 }
 
 /// `(interface, address, prefix length)` for every configured address.
-fn interfaces() -> Vec<(String, IpAddr, u8)> {
+pub(crate) fn interfaces() -> Vec<(String, IpAddr, u8)> {
     let mut out = Vec::new();
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs allocates a list we only read and then free with freeifaddrs.

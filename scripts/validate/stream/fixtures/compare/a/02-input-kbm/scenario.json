@@ -1,0 +1,21 @@
+{
+  "id": "02-input-kbm",
+  "scenario": "input-kbm",
+  "params": {
+    "transport": "webrtc",
+    "codec": "h264",
+    "profile": "1080p60",
+    "hold_s": 60
+  },
+  "status": "pass",
+  "sessions": [],
+  "clock_offset_ms": null,
+  "criteria": [
+    {
+      "id": "pointer_lock_taken",
+      "pass": true,
+      "observed": true,
+      "expected": true
+    }
+  ]
+}

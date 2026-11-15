@@ -30,6 +30,26 @@ function randomUuidV4(): string {
     .join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10, 16).join("")}`;
 }
 
+/** Per-step bounds for {@link probeCapabilities}: a step that hangs (a stalled link, a background
+ *  tab that never draws a frame, a GPU adapter that never answers) is reported unknown, so the
+ *  record is still posted and stamped instead of re-probed at every launch. */
+const PROBE_BOUND_MS = { rtt: 4_000, bandwidth: 8_000, display: 2_000, codecs: 2_000 } as const;
+
+/** `p`'s value, or `fallback` once `ms` has passed. Never rejects. */
+export function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    p.catch(() => fallback),
+    new Promise<T>((resolve) => {
+      timer = setTimeout(() => resolve(fallback), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+/** Cancels a probe's request after `ms`; absent where the browser lacks `AbortSignal.timeout`. */
+const abortAfter = (ms: number): AbortSignal | undefined =>
+  typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(ms) : undefined;
+
 /** Returns the stable device key, creating and persisting it if absent. */
 export function getOrCreateDeviceKey(): string {
   let key = localStorage.getItem(DEVICE_KEY_STORAGE_KEY);
@@ -52,32 +72,44 @@ export function getOrCreateDeviceKey(): string {
  * H.264 verdict it posted: the server refuses H.264 rungs for a device whose record
  * says no, so a changed verdict (plugin installed) is posted at once, not tomorrow (#688).
  * It holds the zone and language too: launches read them from the record (amendment 49).
+ * v4 (amendment 54): a record posted before the WebCodecs and WebGPU keys existed makes the
+ * planner say `device_no_webcodecs`, so every stamp under v3 forces one post.
+ * And the WebGPU verdict: a probe that timed out or got a transient null posts `false`, and the
+ * next load's real answer differs from the stamp, so it re-posts instead of settling for a day
+ * (quasar-protocol#29 item 26).
+ * v5 (#1043): the WebCodecs verdict proves HEVC and AV1 at 4K too, so every v4 stamp posts once.
  */
-const DEVICE_POST_STORAGE_KEY = "quasar_device_posted_v2";
+const DEVICE_POST_STORAGE_KEY = "quasar_device_posted_v5";
 const DEVICE_POST_TTL_MS = 24 * 60 * 60 * 1000;
 
-export function deviceProbeIsFresh(userId: string, h264: boolean, now: number = Date.now()): boolean {
+export function deviceProbeIsFresh(userId: string, h264: boolean, webgpu: boolean, now: number = Date.now()): boolean {
   try {
     const raw = localStorage.getItem(DEVICE_POST_STORAGE_KEY);
     if (!raw) return false;
-    const { user, at, h264: posted, region } = JSON.parse(raw) as {
+    const { user, at, h264: posted, webgpu: postedGpu, region } = JSON.parse(raw) as {
       user?: string;
       at?: number;
       h264?: boolean;
+      webgpu?: boolean;
       region?: string;
     };
-    if (user !== userId || typeof at !== "number" || posted !== h264 || region !== regionStamp()) return false;
+    if (user !== userId || typeof at !== "number" || posted !== h264 || postedGpu !== webgpu || region !== regionStamp()) return false;
     return now - at >= 0 && now - at < DEVICE_POST_TTL_MS;
   } catch {
     return false;
   }
 }
 
-export function markDeviceProbePosted(userId: string, h264: boolean, now: number = Date.now()): void {
+/** An incomplete probe (a WebCodecs or WebGPU step timed out) is fresh for this long only. */
+export const INCOMPLETE_PROBE_RETRY_MS = 5 * 60 * 1000;
+
+/** `retryAfterMs` shortens the stamp's life: the record is posted, but read as stale after that. */
+export function markDeviceProbePosted(userId: string, h264: boolean, webgpu: boolean, now: number = Date.now(), retryAfterMs?: number): void {
+  const at = retryAfterMs === undefined ? now : now - DEVICE_POST_TTL_MS + retryAfterMs;
   try {
     localStorage.setItem(
       DEVICE_POST_STORAGE_KEY,
-      JSON.stringify({ user: userId, at: now, h264, region: regionStamp() }),
+      JSON.stringify({ user: userId, at, h264, webgpu, region: regionStamp() }),
     );
   } catch {
     /* Storage full or blocked: the only cost is posting again next load. */
@@ -192,6 +224,105 @@ export function probeH264Decodable(): Promise<boolean> {
   return h264Probe;
 }
 
+/** Amendment 54's `webtransport` probe key. */
+export function probeWebTransport(): { available: boolean; datagrams: boolean } {
+  const available = typeof WebTransport === "function";
+  return { available, datagrams: available && "datagrams" in WebTransport.prototype };
+}
+
+export interface WebCodecsProbe {
+  h264: boolean;
+  hevc: boolean;
+  av1: boolean;
+  opus_decode: boolean;
+  opus_encode: boolean;
+}
+
+/** The decoder strings the WebTransport path configures with (`decodeStage.ts`): what the agent's
+ *  descriptions yield for a Main-profile stream, at the top level each can carry. */
+const WEBCODECS_PROBES = {
+  h264: ["avc1.42e01f", [[1920, 1080]]],
+  hevc: ["hvc1.1.6.L153.B0", [[1920, 1080], [3840, 2160]]],
+  av1: ["av01.0.13M.08", [[1920, 1080], [3840, 2160]]],
+} as const;
+
+/** Amendment 54's `webcodecs` key, in the catalog codec spelling: `true` only when
+ *  `isConfigSupported` passes for every size the planner can pick for that codec, so a device
+ *  that decodes 1080p but not 4K stays on WebRTC for HEVC and AV1. Any throw or absent API is
+ *  `false`. */
+export async function probeWebCodecs(): Promise<WebCodecsProbe> {
+  const supported = async (check: () => Promise<{ supported?: boolean }> | undefined) => {
+    try {
+      return (await check())?.supported === true;
+    } catch {
+      return false;
+    }
+  };
+  const video = async (codec: keyof typeof WEBCODECS_PROBES) => {
+    const [string, sizes] = WEBCODECS_PROBES[codec];
+    const each = await Promise.all(
+      sizes.map(([codedWidth, codedHeight]) =>
+        supported(() =>
+          typeof VideoDecoder === "function"
+            ? VideoDecoder.isConfigSupported({ codec: string, codedWidth, codedHeight })
+            : undefined,
+        ),
+      ),
+    );
+    return each.every(Boolean);
+  };
+  const opus = { codec: "opus", sampleRate: 48000, numberOfChannels: 2 };
+  const [h264, hevc, av1, opus_decode, opus_encode] = await Promise.all([
+    video("h264"),
+    video("hevc"),
+    video("av1"),
+    supported(() => (typeof AudioDecoder === "function" ? AudioDecoder.isConfigSupported(opus) : undefined)),
+    supported(() => (typeof AudioEncoder === "function" ? AudioEncoder.isConfigSupported(opus) : undefined)),
+  ]);
+  return { h264, hevc, av1, opus_decode, opus_encode };
+}
+
+let webGpuProbe: Promise<{ available: boolean; features: string[] }> | undefined;
+
+// requestAdapter normally answers in milliseconds; this only bounds a browser that never does.
+const WEBGPU_ADAPTER_TIMEOUT_MS = 1500;
+
+/** The features the PyroWave decoder uses when present (`pyroWaveDeviceFeatures`); it needs neither. */
+const WEBGPU_REPORTED_FEATURES = ["subgroups", "shader-f16"];
+
+/**
+ * Amendment 54/55's `webgpu` key: `available` is true when `navigator.gpu.requestAdapter()`
+ * resolves to a hardware adapter, `features` lists which of the decoder's optional features it has.
+ * Never throws or hangs: no `navigator.gpu`, a null adapter, a rejection or a timeout all
+ * report `{available: false, features: []}`. Once per page, like the H.264 verdict.
+ */
+export function probeWebGpu(): Promise<{ available: boolean; features: string[] }> {
+  webGpuProbe ??= (async () => {
+    const none = { available: false, features: [] };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      if (typeof navigator === "undefined" || !navigator.gpu) return none;
+      const adapter = await Promise.race([
+        navigator.gpu.requestAdapter(),
+        new Promise<null>((resolve) => {
+          timer = setTimeout(() => resolve(null), WEBGPU_ADAPTER_TIMEOUT_MS);
+        }),
+      ]);
+      // A software rasteriser (SwiftShader) cannot decode PyroWave at a frame's deadline
+      // (quasar-protocol#29 item 26). `info.isFallbackAdapter` is current; older Chromium
+      // exposes `adapter.isFallbackAdapter`; neither present means a hardware adapter.
+      const a = adapter as (typeof adapter & { info?: { isFallbackAdapter?: boolean }; isFallbackAdapter?: boolean }) | null;
+      if (!a || (a.info?.isFallbackAdapter ?? a.isFallbackAdapter) === true) return none;
+      return { available: true, features: WEBGPU_REPORTED_FEATURES.filter((f) => a.features.has(f)) };
+    } catch {
+      return none;
+    } finally {
+      clearTimeout(timer);
+    }
+  })();
+  return webGpuProbe;
+}
+
 /**
  * Heuristic: the API doesn't directly expose a max decode resolution. Presence
  * of any sdpFmtpLine is treated as "negotiated at some level" -> assume 4K
@@ -220,11 +351,11 @@ function probeMaxDecodeHeight(): number {
  */
 async function probeRttMs(): Promise<number | null> {
   try {
-    await fetch("/health", { method: "HEAD", cache: "no-store" }); // warm the connection
+    await fetch("/health", { method: "HEAD", cache: "no-store", signal: abortAfter(PROBE_BOUND_MS.rtt) }); // warm the connection
     let best = Infinity;
     for (let i = 0; i < 3; i++) {
       const t0 = performance.now();
-      const res = await fetch("/health", { method: "HEAD", cache: "no-store" });
+      const res = await fetch("/health", { method: "HEAD", cache: "no-store", signal: abortAfter(PROBE_BOUND_MS.rtt) });
       const t1 = performance.now();
       if (!res.ok && res.status !== 404) return null;
       best = Math.min(best, t1 - t0);
@@ -316,7 +447,7 @@ async function probeBandwidthKbps(): Promise<number | null> {
     const target = scripts.find((s) => s.includes("/assets/")) ?? scripts[0];
     const url = `${target}${target.includes("?") ? "&" : "?"}probe=${Date.now()}`;
 
-    const res = await fetch(url, { cache: "no-store" });
+    const res = await fetch(url, { cache: "no-store", signal: abortAfter(PROBE_BOUND_MS.bandwidth) });
     await res.arrayBuffer(); // drain the body so responseEnd is stamped
     if (!res.ok) return null;
 
@@ -419,12 +550,12 @@ function probePlatform(): string {
   return navigator.platform || "unknown";
 }
 
+function displayGeometry(): DisplayInfo {
+  return { width: screen.width, height: screen.height, device_pixel_ratio: window.devicePixelRatio || 1 };
+}
+
 async function probeDisplay(): Promise<DisplayInfo> {
-  const info: DisplayInfo = {
-    width: screen.width,
-    height: screen.height,
-    device_pixel_ratio: window.devicePixelRatio || 1,
-  };
+  const info = displayGeometry();
   const hz = displayRefreshToReport(await sampleRefreshHz(), probeBrowser().name);
   if (hz != null) info.refresh_hz = hz;
   return info;
@@ -531,6 +662,11 @@ export interface DeviceCapabilities {
   /** Best-effort, not a real throughput test. */
   bandwidth_kbps: number | null;
   rtt_ms: number | null;
+  /** Amendment 54. */
+  webtransport?: { available: boolean; datagrams: boolean };
+  webcodecs?: WebCodecsProbe;
+  /** Amendment 55: `available` gates PyroWave. */
+  webgpu?: { available: boolean; features: string[] };
   /** Amendment 49: the browser's zone and language, read at launch. */
   timezone?: string;
   language?: string;
@@ -628,12 +764,15 @@ export interface NativeCapabilities extends Omit<DeviceCapabilities, "client_typ
 
 /** All measurements are best-effort; null values are valid (JSONB column). */
 export async function probeCapabilities(): Promise<DeviceCapabilities> {
-  const [h264Decodable, rttMs, bandwidthKbps, display, codecsDetail] = await Promise.all([
+  const [h264Decodable, rttMs, bandwidthKbps, display, codecsDetail, webcodecs, webgpu] = await Promise.all([
     probeH264Decodable(),
-    probeRttMs(),
-    probeBandwidthKbps(),
-    probeDisplay(),
-    probeCodecsDetail(),
+    withTimeout(probeRttMs(), PROBE_BOUND_MS.rtt + 1_000, null),
+    withTimeout(probeBandwidthKbps(), PROBE_BOUND_MS.bandwidth + 1_000, null),
+    // requestAnimationFrame never fires in a background tab: geometry without a refresh rate then.
+    withTimeout(probeDisplay(), PROBE_BOUND_MS.display, displayGeometry()),
+    withTimeout(probeCodecsDetail(), PROBE_BOUND_MS.codecs, {} as CodecsDetail),
+    withTimeout<WebCodecsProbe | undefined>(probeWebCodecs(), PROBE_BOUND_MS.codecs, undefined),
+    withTimeout<{ available: boolean; features: string[] } | undefined>(probeWebGpu(), PROBE_BOUND_MS.codecs, undefined),
   ]);
 
   return {
@@ -650,6 +789,9 @@ export async function probeCapabilities(): Promise<DeviceCapabilities> {
     profiles:          {}, // populated by the AS10-10 playback harness
     bandwidth_kbps:    bandwidthKbps,
     rtt_ms:            rttMs,
+    webtransport:      probeWebTransport(),
+    webcodecs,
+    webgpu,
     ...probeRegion(),
   };
 }

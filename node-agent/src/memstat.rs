@@ -62,15 +62,20 @@ pub fn maybe_trim() -> Option<(bool, Option<u64>)> {
     if !trim_enabled() {
         return None;
     }
+    Some((trim(), rss_kib()))
+}
+
+/// `malloc_trim(0)` unconditionally → whether anything was released (always `false` off
+/// glibc). Same cost rule as [`maybe_trim`].
+pub fn trim() -> bool {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         // SAFETY: no arguments to validate; malloc_trim is thread-safe.
-        let released = unsafe { malloc_trim(0) } != 0;
-        Some((released, rss_kib()))
+        unsafe { malloc_trim(0) != 0 }
     }
     #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
     {
-        Some((false, rss_kib()))
+        false
     }
 }
 

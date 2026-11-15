@@ -466,6 +466,7 @@ func TestScanReportBackfillEndToEndWithSwitchOff(t *testing.T) {
 
 	details := NewAppDetails(true, quietLogger()) // production wiring: always enabled here
 	details.endpoint = valve.URL
+	details.client = &http.Client{}                               // the stub is plain http on loopback, which the production client refuses
 	set := &fakeSettings{enabled: true, appDetailsEnabled: false} // the resolver-level switch: OFF
 	h := NewHandler(f.store, testStorageManager(f, set), set, details, newTestResolver(set), quietLogger())
 	mux := http.NewServeMux()
@@ -1973,6 +1974,7 @@ func TestAppDetailsDisabledMakesNoRequest(t *testing.T) {
 
 	off := NewAppDetails(false, quietLogger())
 	off.endpoint = srv.URL
+	off.client = &http.Client{} // the stub is plain http on loopback, which the production client refuses
 	if got := off.Classify(context.Background(), []string{"517710"}); got != nil {
 		t.Errorf("a disabled lookup returned %v, want nil", got)
 	}
@@ -1982,6 +1984,7 @@ func TestAppDetailsDisabledMakesNoRequest(t *testing.T) {
 
 	on := NewAppDetails(true, quietLogger())
 	on.endpoint = srv.URL
+	on.client = &http.Client{} // the stub is plain http on loopback, which the production client refuses
 	got := on.Classify(context.Background(), []string{"517710"})
 	if hits != 1 || !got["517710"] {
 		t.Errorf("enabled lookup: hits=%d result=%v; want 1 hit and a 'game' verdict", hits, got)

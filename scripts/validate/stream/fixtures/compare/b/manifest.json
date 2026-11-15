@@ -1,0 +1,53 @@
+{
+  "format": 1,
+  "suite_run_id": "compare-b-0001",
+  "plan": {
+    "name": "smoke",
+    "scenarios": [
+      {
+        "id": "01-stream-hold",
+        "scenario": "stream-hold",
+        "params": {
+          "transport": "webrtc",
+          "codec": "h264",
+          "profile": "1080p60",
+          "hold_s": 240
+        }
+      },
+      {
+        "id": "03-transport-fallback",
+        "scenario": "transport-fallback",
+        "params": {
+          "transport": "webtransport",
+          "codec": "h264",
+          "profile": "1080p60",
+          "when": "mid"
+        }
+      }
+    ]
+  },
+  "started_at_ms": 1786950000000,
+  "ended_at_ms": 1786950600000,
+  "runner": {
+    "commit": "1111111111111111111111111111111111111111",
+    "dirty": false
+  },
+  "halves": {
+    "client": true,
+    "host": true
+  },
+  "scenarios": [
+    "01-stream-hold",
+    "03-transport-fallback"
+  ],
+  "not_recorded": [
+    {
+      "fact": "audio_latency_ms",
+      "why": "nothing measures audio latency yet"
+    }
+  ],
+  "redacted": [
+    "addresses",
+    "tokens"
+  ]
+}

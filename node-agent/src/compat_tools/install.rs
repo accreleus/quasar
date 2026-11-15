@@ -1,0 +1,2165 @@
+//! The agent-owned tools directory, its install record and the `compat_tools.converge` runner.
+//! semantics: control-api.md §Compatibility tools, "Install job" and "Trust rules".
+//!
+//! Layout under the root (`QUASAR_COMPAT_TOOLS_ROOT`, self-mapped like the template root):
+//! `tools/<name>` is the tools directory sessions mount from, `staging/` holds a run's download
+//! and tree on the same filesystem, and `record.json` is the install record, outside every tool.
+
+use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::fs::File;
+use std::io;
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use quasar_runtime::DurableFile;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use tracing::{info, warn};
+
+use super::extract::{self, Extracted};
+use super::fetch::{self, Source};
+use super::{valid_name, Fail};
+use crate::jobs::{AbortFlag, JobOutcome, JobRunner};
+use crate::nofollow_dir::open_dir_at;
+
+pub const JOB_ID: &str = "compat_tools.converge";
+const GIB: u64 = 1 << 30;
+const MAX_ASSET: u64 = 2 * GIB;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryState {
+    Installing,
+    Installed,
+    Removing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordEntry {
+    pub name: String,
+    pub tag: String,
+    pub sha512: String,
+    pub bytes: u64,
+    pub state: EntryState,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct Record {
+    tools: Vec<RecordEntry>,
+}
+
+/// The tools root, its record and the tools live sessions hold mounted.
+pub struct ToolStore {
+    root: PathBuf,
+    record: Mutex<Record>,
+    /// session id -> (mounted names, parked, owner). A parked session never holds a removal back;
+    /// `owner` is the session manager that made the hold, whose sweep alone may drop it. Lock
+    /// order: `mounted`, then `record`; removal marks a tool Removing under `mounted`, so a mount
+    /// decision and a removal never interleave.
+    mounted: Mutex<HashMap<String, Hold>>,
+    #[cfg(test)]
+    trace: Mutex<Vec<&'static str>>,
+    #[cfg(test)]
+    fail_at: Mutex<Option<&'static str>>,
+    /// Holds `claim_for_adopt` between its check and its hold move (two waits).
+    #[cfg(test)]
+    adopt_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
+}
+
+/// A session's mount hold: the names, whether it is parked, and the manager that made it.
+type Hold = (Vec<String>, bool, u64);
+
+/// How deep a tree walk goes. Extraction allows 32 components (`extract::MAX_COMPONENTS`), so a
+/// tree this agent wrote never reaches it; a deeper one is refused, never recursed into.
+const MAX_DEPTH: usize = 64;
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn io_fail(what: &str, e: io::Error) -> Fail {
+    Fail::new("io_error", format!("{what}: {e}"))
+}
+
+/// Whether `path` or a proper ancestor other than `/` is a mount point in this process's
+/// namespace: the root must be a bind from the host, or a session's bind of a tool would name a
+/// directory the host does not have.
+fn is_mounted(path: &Path) -> bool {
+    let Ok(body) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    let points: Vec<&str> = body.lines().filter_map(|l| l.split(' ').nth(4)).collect();
+    path.ancestors()
+        .filter(|a| *a != Path::new("/"))
+        .any(|a| points.iter().any(|p| Path::new(p) == a))
+}
+
+fn mkdir_if_missing(p: &Path) -> io::Result<()> {
+    match std::fs::create_dir(p) {
+        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => Err(e),
+        _ => {
+            let m = std::fs::symlink_metadata(p)?;
+            if m.is_dir() {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "{} is not a directory",
+                    p.display()
+                )))
+            }
+        }
+    }
+}
+
+/// Walks `dir` without following links, setting directories to `dir_mode` and files to
+/// `file_mode(executable)`. Directories are opened `O_NOFOLLOW` one entry at a time, at most
+/// [`MAX_DEPTH`] deep.
+fn set_modes(dir: &File, dir_mode: u32, file_mode: &dyn Fn(bool) -> u32) -> io::Result<()> {
+    set_modes_at(dir, dir_mode, file_mode, 0)
+}
+
+fn set_modes_at(
+    dir: &File,
+    dir_mode: u32,
+    file_mode: &dyn Fn(bool) -> u32,
+    depth: usize,
+) -> io::Result<()> {
+    if depth > MAX_DEPTH {
+        return Err(io::Error::other(format!(
+            "a tree deeper than {MAX_DEPTH} directories"
+        )));
+    }
+    let names: Vec<Vec<u8>> = std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))?
+        .map(|e| e.map(|e| e.file_name().as_bytes().to_vec()))
+        .collect::<io::Result<_>>()?;
+    for n in names {
+        let name = OsStr::from_bytes(&n);
+        match open_dir_at(dir, name) {
+            Ok(sub) => set_modes_at(&sub, dir_mode, file_mode, depth + 1)?,
+            Err(e) if crate::nofollow_dir::is_symlink_or_not_dir(&e) => {
+                let c = std::ffi::CString::new(n.clone()).map_err(io::Error::other)?;
+                // SAFETY: `dir` is open and `c` NUL-terminated; the fd is closed below.
+                let fd = unsafe {
+                    libc::openat(
+                        dir.as_raw_fd(),
+                        c.as_ptr(),
+                        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                    )
+                };
+                if fd < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::ELOOP) {
+                        continue; // a symlink: its mode is never set
+                    }
+                    return Err(err);
+                }
+                // SAFETY: openat returned an fd we own.
+                let f = unsafe { <File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+                let meta = f.metadata()?;
+                use std::os::unix::fs::PermissionsExt;
+                let exec = meta.permissions().mode() & 0o111 != 0;
+                // SAFETY: `f` is open.
+                if unsafe { libc::fchmod(f.as_raw_fd(), file_mode(exec)) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    // SAFETY: `dir` is open.
+    if unsafe { libc::fchmod(dir.as_raw_fd(), dir_mode) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn make_read_only(dir: &File) -> io::Result<()> {
+    set_modes(dir, 0o555, &|x| if x { 0o555 } else { 0o444 })
+}
+
+/// Restores owner write on a read-only tree, then deletes it (neither follows a link). The mode
+/// walk refuses a tree deeper than [`MAX_DEPTH`] first, so `remove_dir_all` never sees one.
+fn delete_tree(path: &Path) -> io::Result<()> {
+    match crate::nofollow_dir::open_dir(path) {
+        Ok(d) => set_modes(&d, 0o755, &|x| if x { 0o755 } else { 0o644 })?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    }
+    std::fs::remove_dir_all(path)
+}
+
+/// `syncfs` on the filesystem `fd` is on: every file written there is on disk when it returns.
+fn sync_fs(fd: &File) -> io::Result<()> {
+    // SAFETY: `fd` is an open descriptor.
+    if unsafe { libc::syncfs(fd.as_raw_fd()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+/// Whether a directory moves from `from` to `to` by rename: false across filesystems (EXDEV),
+/// where every install would fail after its download.
+fn probe_rename(from: &Path, to: &Path) -> io::Result<()> {
+    let name = format!(".probe-{}-{}", std::process::id(), nanos());
+    std::fs::create_dir(from.join(&name))?;
+    let (f, t) = (
+        crate::nofollow_dir::open_dir(from)?,
+        crate::nofollow_dir::open_dir(to)?,
+    );
+    let moved = rename_noreplace(&f, name.as_bytes(), &t, name.as_bytes());
+    let _ = std::fs::remove_dir(from.join(&name));
+    let _ = std::fs::remove_dir(to.join(&name));
+    moved
+}
+
+/// `openat2` is missing (kernel before 5.6) or filtered (a seccomp profile): an environment
+/// fault, never a verdict on an archive.
+pub(crate) fn openat2_unavailable(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EPERM))
+}
+
+/// `renameat2(RENAME_NOREPLACE)`.
+fn rename_noreplace(from_dir: &File, from: &[u8], to_dir: &File, to: &[u8]) -> io::Result<()> {
+    let (f, t) = (
+        std::ffi::CString::new(from).map_err(io::Error::other)?,
+        std::ffi::CString::new(to).map_err(io::Error::other)?,
+    );
+    // SAFETY: both directories are open and both names NUL-terminated for the call.
+    let rc = unsafe {
+        libc::renameat2(
+            from_dir.as_raw_fd(),
+            f.as_ptr(),
+            to_dir.as_raw_fd(),
+            t.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+impl ToolStore {
+    /// Opens the root if it is usable (agent-api.md §register): an existing directory, outside the
+    /// managed-home and template roots, writable, and (when `require_mount`) a bind from the host.
+    /// Then finishes or rolls back what a killed run left (§Install job, "The install record").
+    pub fn open(root: &Path, others: &[&Path], require_mount: bool) -> Result<Self, String> {
+        if !root.is_absolute() {
+            return Err(format!("{} is not an absolute path", root.display()));
+        }
+        let meta =
+            std::fs::symlink_metadata(root).map_err(|e| format!("{}: {e}", root.display()))?;
+        if !meta.is_dir() {
+            return Err(format!("{} is not a directory", root.display()));
+        }
+        for other in others.iter().filter(|o| !o.as_os_str().is_empty()) {
+            if root.starts_with(other) || other.starts_with(root) {
+                return Err(format!(
+                    "{} overlaps {}, which sessions may mount",
+                    root.display(),
+                    other.display()
+                ));
+            }
+        }
+        if require_mount && !is_mounted(root) {
+            return Err(format!(
+                "{} is not bind-mounted into the agent container at the same path",
+                root.display()
+            ));
+        }
+        for sub in ["tools", "staging"] {
+            mkdir_if_missing(&root.join(sub))
+                .map_err(|e| format!("{}: {e}", root.join(sub).display()))?;
+        }
+        tempfile::tempdir_in(root.join("staging"))
+            .map_err(|e| format!("{} is not writable: {e}", root.display()))?;
+        probe_rename(&root.join("staging"), &root.join("tools")).map_err(|e| {
+            format!(
+                "{}/staging and tools must be on one filesystem: {e}",
+                root.display()
+            )
+        })?;
+        let rootfd =
+            crate::nofollow_dir::open_dir(root).map_err(|e| format!("{}: {e}", root.display()))?;
+        if let Err(e) = super::extract::resolve_beneath(&rootfd, b".") {
+            return Err(if openat2_unavailable(&e) {
+                format!("openat2(RESOLVE_BENEATH) is unavailable (it needs kernel 5.6+ and a seccomp profile that allows it): {e}")
+            } else {
+                format!("probing openat2 on {}: {e}", root.display())
+            });
+        }
+        let store = ToolStore {
+            root: root.to_path_buf(),
+            record: Mutex::new(Record::default()),
+            mounted: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            trace: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            fail_at: Mutex::new(None),
+            #[cfg(test)]
+            adopt_gate: Mutex::new(None),
+        };
+        store
+            .recover()
+            .map_err(|e| format!("recovering the install record: {e}"))?;
+        Ok(store)
+    }
+
+    pub fn tools_dir(&self) -> PathBuf {
+        self.root.join("tools")
+    }
+
+    fn record_file(&self) -> DurableFile<Record> {
+        DurableFile::new(self.root.join("record.json"), "json.tmp")
+    }
+
+    fn save(&self, rec: &Record) -> io::Result<()> {
+        self.record_file().store(rec)
+    }
+
+    /// Each leftover and each record entry is handled on its own: one that cannot be finished or
+    /// cleaned is quarantined and reported, and the rest carry on. Only an unreadable record fails.
+    fn recover(&self) -> io::Result<()> {
+        // A staged tree was never visible, so no container can mount it: delete it now.
+        for leftover in std::fs::read_dir(self.root.join("staging"))?.flatten() {
+            let path = leftover.path();
+            match delete_tree(&path) {
+                Ok(()) => info!(
+                    token = "compat-tools-staging-cleaned",
+                    "compat tools: removed the leftover {}",
+                    path.display()
+                ),
+                Err(e) => self.quarantine(&path, &e),
+            }
+        }
+        let mut rec = match self.record_file().load() {
+            Ok(r) => r.unwrap_or_default(),
+            // Heal: set the record aside and start empty; the sweep below quarantines every tool
+            // it no longer lists, and the control plane reinstalls by desired state.
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                let aside = self.root.join(format!("record.json.corrupt-{}", nanos()));
+                let moved = std::fs::rename(self.root.join("record.json"), &aside);
+                warn!(
+                    token = "compat-tools-record-corrupt",
+                    "compat tools: the install record does not parse ({e}); set aside as {} ({}), starting empty",
+                    aside.display(),
+                    moved.map_or_else(|e| format!("not moved: {e}"), |()| "moved".into())
+                );
+                Record::default()
+            }
+            Err(e) => return Err(e),
+        };
+        let tools = self.tools_dir();
+        let mut kept = Vec::new();
+        for mut e in std::mem::take(&mut rec.tools) {
+            let dir = tools.join(&e.name);
+            let present = std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir());
+            match (e.state, present) {
+                (EntryState::Installed, true) => kept.push(e),
+                // The rename happened: the tree was verified and synced, so finish it.
+                (EntryState::Installing, true) => {
+                    match crate::nofollow_dir::open_dir(&dir).and_then(|d| make_read_only(&d)) {
+                        Ok(()) => {
+                            e.state = EntryState::Installed;
+                            info!(
+                                token = "compat-tools-install-finished",
+                                "compat tools: finished installing {}", e.name
+                            );
+                            kept.push(e);
+                        }
+                        Err(err) => self.quarantine(&dir, &err),
+                    }
+                }
+                (EntryState::Removing, true) => match self.move_out_and_delete(&e.name) {
+                    Ok(()) => info!(
+                        token = "compat-tools-remove-finished",
+                        "compat tools: finished removing {}", e.name
+                    ),
+                    Err(err) => self.quarantine(&dir, &err),
+                },
+                (_, false) => info!(
+                    token = "compat-tools-record-dropped",
+                    "compat tools: dropped {} from the install record (its directory is missing)",
+                    e.name
+                ),
+            }
+        }
+        // tools/ holds exactly what the record lists: anything else would make every reinstall
+        // of that name fail name_conflict.
+        for entry in std::fs::read_dir(&tools)?.flatten() {
+            let name = entry.file_name();
+            if !kept.iter().any(|e| OsStr::new(&e.name) == name) {
+                self.quarantine(
+                    &entry.path(),
+                    &io::Error::other("not in the install record"),
+                );
+            }
+        }
+        rec.tools = kept;
+        self.save(&rec)?;
+        *lock(&self.record) = rec;
+        Ok(())
+    }
+
+    /// Deletes everything in `quarantine/`. Only after the boot's application retirement: a
+    /// container of the previous process may still bind-mount a tree moved there at open, and
+    /// moving it kept that mount alive where deleting it would not.
+    pub fn sweep_quarantine(&self) {
+        let Ok(entries) = std::fs::read_dir(self.root.join("quarantine")) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match delete_tree(&path) {
+                Ok(()) => info!(
+                    token = "compat-tools-quarantine-deleted",
+                    "compat tools: deleted the quarantined {}",
+                    path.display()
+                ),
+                Err(e) => warn!(
+                    token = "compat-tools-quarantine-kept",
+                    "compat tools: could not delete the quarantined {}: {e}",
+                    path.display()
+                ),
+            }
+        }
+    }
+
+    /// Whether every one of `names` is still Installed and present: a runtime holding any other is
+    /// never adopted.
+    pub fn all_installed(&self, names: &[String]) -> bool {
+        let installed = self.installed();
+        let tools = self.tools_dir();
+        names.iter().all(|n| {
+            installed.iter().any(|e| &e.name == n)
+                && std::fs::symlink_metadata(tools.join(n)).is_ok_and(|m| m.is_dir())
+        })
+    }
+
+    /// Moves `path` out of the way into `quarantine/` (same filesystem) and reports it; a tree
+    /// there is never mounted or listed, and the next start tries to delete it again.
+    fn quarantine(&self, path: &Path, why: &io::Error) {
+        let to = self.root.join("quarantine");
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // A read-only directory cannot move to another parent (its `..` changes) unless the
+        // agent runs as root, as in move_out_and_delete.
+        if let Ok(d) = crate::nofollow_dir::open_dir(path) {
+            // SAFETY: `d` is an open descriptor.
+            unsafe { libc::fchmod(d.as_raw_fd(), 0o755) };
+        }
+        let moved = mkdir_if_missing(&to)
+            .and_then(|()| std::fs::rename(path, to.join(format!("{}-{name}", nanos()))));
+        warn!(
+            token = "compat-tools-quarantined",
+            "compat tools: quarantined {} ({why}); moved aside: {}",
+            path.display(),
+            moved.map_or_else(|e| format!("no ({e})"), |()| "yes".into())
+        );
+    }
+
+    fn move_out_and_delete(&self, name: &str) -> io::Result<()> {
+        let tools = crate::nofollow_dir::open_dir(&self.tools_dir())?;
+        let staging_path = self.root.join("staging");
+        let staging = crate::nofollow_dir::open_dir(&staging_path)?;
+        let away = format!("removing-{name}-{}", nanos());
+        // Moving a directory to another parent rewrites its `..`, which needs write on the
+        // (read-only) directory itself unless the agent runs as root.
+        let top = open_dir_at(&tools, OsStr::new(name))?;
+        // SAFETY: `top` is an open descriptor.
+        if unsafe { libc::fchmod(top.as_raw_fd(), 0o755) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        rename_noreplace(&tools, name.as_bytes(), &staging, away.as_bytes())?;
+        let away = staging_path.join(away);
+        if let Err(e) = delete_tree(&away) {
+            // Out of the tools directory, so the removal holds; the disk comes back at a start.
+            self.quarantine(&away, &e);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn note(&self, ev: &'static str) {
+        lock(&self.trace).push(ev);
+    }
+
+    #[cfg(not(test))]
+    fn note(&self, _ev: &'static str) {}
+
+    /// A fault a test asked for at `point`.
+    #[cfg(test)]
+    fn fault(&self, point: &'static str) -> io::Result<()> {
+        match *lock(&self.fail_at) {
+            Some(p) if p == point => Err(io::Error::other(format!("injected at {point}"))),
+            _ => Ok(()),
+        }
+    }
+
+    #[cfg(not(test))]
+    fn fault(&self, _point: &'static str) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// The installed tools, for `capacity.compat_tools.tools`.
+    pub fn installed(&self) -> Vec<RecordEntry> {
+        lock(&self.record)
+            .tools
+            .iter()
+            .filter(|e| e.state == EntryState::Installed)
+            .cloned()
+            .collect()
+    }
+
+    pub fn free_bytes(&self) -> Option<u64> {
+        crate::artifact::free_bytes(&self.tools_dir())
+    }
+
+    /// The names in `wanted` this store can mount for `session_id`: installed (a tool marked
+    /// Removing is not) and present (agent-api.md §session_assign, "The mounts"). Others are
+    /// skipped and logged. The session holds what it got from here on, decided under the lock a
+    /// removal takes, so a removal can never start between this answer and the mount.
+    pub fn mountable(
+        &self,
+        session_id: &str,
+        wanted: &[String],
+        parked: bool,
+        owner: u64,
+    ) -> Vec<String> {
+        let mut held = lock(&self.mounted);
+        let installed = self.installed();
+        let tools = self.tools_dir();
+        let mut out = Vec::new();
+        for n in wanted {
+            let ok = valid_name(n)
+                && installed.iter().any(|e| &e.name == n)
+                && std::fs::symlink_metadata(tools.join(n)).is_ok_and(|m| m.is_dir())
+                && !out.contains(n);
+            if ok {
+                out.push(n.clone());
+            } else {
+                warn!(
+                    token = "compat-tools-mount-skipped",
+                    "compat tools: not mounting {n:?}: not installed here"
+                );
+            }
+        }
+        if !out.is_empty() {
+            held.insert(session_id.to_owned(), (out.clone(), parked, owner));
+        }
+        out
+    }
+
+    /// Claims `tools` for `to`, which adopts `from`'s runtime: under the `mounted` lock a removal
+    /// takes, every tool must still be Installed and present, and the hold moves to `to` (parked
+    /// only if `to` is) before the lock is released. A removal therefore either marked a tool
+    /// Removing first, and the claim fails, or sees `to`'s hold and defers `in_use`. The only
+    /// caller is the agent's `claim_runtime`, the gate every reuse of a runtime passes.
+    pub fn claim_for_adopt(
+        &self,
+        from: &str,
+        to: &str,
+        tools: &[String],
+        parked: bool,
+        owner: u64,
+    ) -> bool {
+        let mut held = lock(&self.mounted);
+        if !self.all_installed(tools) {
+            return false;
+        }
+        self.gate();
+        held.remove(from);
+        held.insert(to.to_owned(), (tools.to_vec(), parked, owner));
+        true
+    }
+
+    #[cfg(test)]
+    fn gate(&self) {
+        let gate = lock(&self.adopt_gate).clone();
+        if let Some(b) = gate {
+            b.wait();
+            b.wait();
+        }
+    }
+
+    #[cfg(not(test))]
+    fn gate(&self) {}
+
+    pub fn rehold(&self, session_id: &str, names: Vec<String>, parked: bool, owner: u64) {
+        let mut held = lock(&self.mounted);
+        if names.is_empty() {
+            held.remove(session_id);
+        } else {
+            held.insert(session_id.to_owned(), (names, parked, owner));
+        }
+    }
+
+    pub fn release(&self, session_id: &str) {
+        lock(&self.mounted).remove(session_id);
+    }
+
+    /// Drops every hold `owner` made for a session `live` no longer names (an assign refused or
+    /// expired); another manager's holds are not its to judge.
+    pub fn retain(&self, owner: u64, live: &dyn Fn(&str) -> bool) {
+        lock(&self.mounted).retain(|sid, h| h.2 != owner || live(sid));
+    }
+
+    fn in_use(held: &HashMap<String, Hold>, name: &str) -> bool {
+        held.values()
+            .any(|(names, parked, _)| !parked && names.iter().any(|n| n == name))
+    }
+
+    fn set_entry(&self, entry: Option<RecordEntry>, drop_name: &str) -> io::Result<()> {
+        let mut rec = lock(&self.record).clone();
+        rec.tools.retain(|e| e.name != drop_name);
+        rec.tools.extend(entry);
+        self.save(&rec)?;
+        *lock(&self.record) = rec;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct InstallParams {
+    tool_id: Value,
+    tag: String,
+    asset: String,
+    size: u64,
+    sha512: String,
+    expected_name: Option<String>,
+    reserve: u64,
+}
+
+fn hex128(s: &str) -> bool {
+    s.len() == 128 && s.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn invalid(detail: impl Into<String>) -> Fail {
+    Fail::new("invalid_params", detail)
+}
+
+fn parse_install(p: &Value) -> Result<InstallParams, Fail> {
+    let s = |k: &str| p.get(k).and_then(Value::as_str);
+    let tag = s("tag")
+        .filter(|t| fetch::valid_tag(t))
+        .ok_or_else(|| invalid("tag"))?;
+    let asset = s("asset")
+        .filter(|a| fetch::asset_name(tag, a).is_some())
+        .ok_or_else(|| invalid("asset"))?;
+    let size = p
+        .get("size_bytes")
+        .and_then(Value::as_u64)
+        .filter(|n| (1..=MAX_ASSET).contains(n))
+        .ok_or_else(|| invalid("size_bytes"))?;
+    let sha512 = s("sha512")
+        .filter(|h| hex128(h))
+        .ok_or_else(|| invalid("sha512"))?;
+    let expected_name = match p.get("expected_name") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(n)) if valid_name(n) => Some(n.clone()),
+        Some(_) => return Err(invalid("expected_name")),
+    };
+    let reserve = p
+        .get("reserve_bytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| invalid("reserve_bytes"))?;
+    Ok(InstallParams {
+        tool_id: p.get("tool_id").cloned().unwrap_or(Value::Null),
+        tag: tag.to_owned(),
+        asset: asset.to_owned(),
+        size,
+        sha512: sha512.to_owned(),
+        expected_name,
+        // T7: whatever the params say, at least 1 GiB.
+        reserve: reserve.max(GIB),
+    })
+}
+
+/// T6: the name checks after the grammar.
+fn check_name(name: &str, expected: Option<&str>) -> Result<(), Fail> {
+    if !valid_name(name) || name == "." || name == ".." {
+        return Err(Fail::new(
+            "vdf_invalid",
+            format!("tool name {name:?} is outside the grammar"),
+        ));
+    }
+    let lower = name.to_ascii_lowercase();
+    if !name.starts_with("GE-Proton")
+        || ["proton_", "steamlinuxruntime", "legacysteamruntime"]
+            .iter()
+            .any(|p| lower.starts_with(p))
+    {
+        return Err(Fail::new(
+            "name_reserved",
+            format!("tool name {name:?} is reserved"),
+        ));
+    }
+    if expected.is_some_and(|x| x != name) {
+        return Err(Fail::new(
+            "name_mismatch",
+            format!(
+                "the archive registers {name:?}, expected {:?}",
+                expected.unwrap_or_default()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+pub struct ConvergeRunner {
+    store: Arc<ToolStore>,
+    source: Arc<dyn Source>,
+    on_change: Arc<dyn Fn() + Send + Sync>,
+    limits: extract::Limits,
+}
+
+impl ConvergeRunner {
+    pub fn new(
+        store: Arc<ToolStore>,
+        source: Arc<dyn Source>,
+        on_change: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self {
+            store,
+            source,
+            on_change,
+            limits: extract::Limits::CONTRACT,
+        }
+    }
+
+    fn summary(
+        action: &str,
+        tool_id: &Value,
+        name: &str,
+        sha: &str,
+        bytes: u64,
+        already: bool,
+    ) -> Value {
+        json!({ "action": action, "tool_id": tool_id, "name": name, "sha512": sha,
+                "bytes": bytes, "already_installed": already })
+    }
+
+    fn install(&self, p: &Value, abort: &AbortFlag) -> Result<JobOutcome, Fail> {
+        let p = parse_install(p)?;
+        let store = &self.store;
+        if let Some(e) = store.installed().into_iter().find(|e| e.sha512 == p.sha512) {
+            check_name(&e.name, p.expected_name.as_deref())?;
+            if std::fs::symlink_metadata(store.tools_dir().join(&e.name)).is_ok_and(|m| m.is_dir())
+            {
+                return Ok(JobOutcome::Succeeded(Self::summary(
+                    "install", &p.tool_id, &e.name, &e.sha512, e.bytes, true,
+                )));
+            }
+        }
+        let need = p.size + extract::MAX_UNPACKED + p.reserve;
+        let free = store.free_bytes().unwrap_or(0);
+        if free < need {
+            info!(
+                token = "compat-tools-disk-short",
+                "compat tools: {free} bytes free, {need} needed"
+            );
+            return Ok(JobOutcome::Deferred("insufficient_disk".into()));
+        }
+        let run = tempfile::Builder::new()
+            .prefix("run-")
+            .tempdir_in(store.root.join("staging"))
+            .map_err(|e| io_fail("staging", e))?;
+        let asset = fetch::asset_name(&p.tag, &p.asset).expect("checked in parse_install");
+        let archive = run.path().join("asset");
+        let mut out = File::create(&archive).map_err(|e| io_fail("create download", e))?;
+        let sha = fetch::download(&*self.source, &p.tag, &asset, p.size, &mut out, &|| {
+            abort.is_aborted()
+        })?;
+        drop(out);
+        if sha != p.sha512 {
+            let mut f = Fail::new(
+                "checksum_mismatch",
+                "the download's SHA-512 is not the pinned one",
+            );
+            f.extra = Some(json!({ "expected_sha512": p.sha512, "actual_sha512": sha }));
+            return Err(f);
+        }
+        let tree_path = run.path().join("tree");
+        std::fs::create_dir(&tree_path).map_err(|e| io_fail("staging tree", e))?;
+        let tree =
+            crate::nofollow_dir::open_dir(&tree_path).map_err(|e| io_fail("staging tree", e))?;
+        let reserve = p.reserve;
+        let tools_dir = store.tools_dir();
+        let mut check = || {
+            if abort.is_aborted() {
+                return Err(Fail::new("io_error", "the run was aborted"));
+            }
+            match crate::artifact::free_bytes(&tools_dir) {
+                Some(f) if f >= reserve => Ok(()),
+                _ => Err(Fail::new(
+                    "io_error",
+                    "free space fell below the disk reserve while extracting",
+                )),
+            }
+        };
+        let Extracted { top, bytes } = extract::extract(
+            File::open(&archive).map_err(|e| io_fail("open download", e))?,
+            &tree,
+            &mut check,
+            self.limits,
+        )?;
+        let _ = std::fs::remove_file(&archive);
+        if abort.is_aborted() {
+            return Err(Fail::new("io_error", "the run was aborted"));
+        }
+        let topfd =
+            open_dir_at(&tree, OsStr::from_bytes(&top)).map_err(|e| io_fail("open tree", e))?;
+        let name = extract::read_vdf_name(&topfd)?;
+        check_name(&name, p.expected_name.as_deref())?;
+        let conflict = || {
+            Fail::new(
+                "name_conflict",
+                format!("{name} is already in the tools directory with other bytes"),
+            )
+        };
+        if std::fs::symlink_metadata(tools_dir.join(&name)).is_ok() {
+            return Err(conflict());
+        }
+        let entry = RecordEntry {
+            name: name.clone(),
+            tag: p.tag.clone(),
+            sha512: sha.clone(),
+            bytes,
+            state: EntryState::Installing,
+        };
+        store
+            .set_entry(Some(entry.clone()), &name)
+            .map_err(|e| io_fail("record", e))?;
+        // Every staged file is on disk before the tree becomes visible: after a power loss the
+        // rename is either absent or names complete, verified bytes.
+        sync_fs(&tree).map_err(|e| io_fail("sync staged tree", e))?;
+        store.note("synced-staged");
+        let tools =
+            crate::nofollow_dir::open_dir(&tools_dir).map_err(|e| io_fail("tools dir", e))?;
+        if let Err(e) = rename_noreplace(&tree, &top, &tools, name.as_bytes()) {
+            let _ = store.set_entry(None, &name);
+            return Err(if e.kind() == io::ErrorKind::AlreadyExists {
+                conflict()
+            } else {
+                io_fail("rename", e)
+            });
+        }
+        store.note("renamed");
+        let finish = || -> io::Result<()> {
+            store.fault("after-rename")?;
+            make_read_only(&open_dir_at(&tools, OsStr::new(&name))?)?;
+            // The rename and the modes are durable before the record says Installed.
+            sync_fs(&tools)?;
+            // SAFETY: `tools` is an open descriptor.
+            if unsafe { libc::fsync(tools.as_raw_fd()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            store.note("synced-tools");
+            store.set_entry(
+                Some(RecordEntry {
+                    state: EntryState::Installed,
+                    ..entry
+                }),
+                &name,
+            )?;
+            store.note("recorded-installed");
+            Ok(())
+        };
+        if let Err(e) = finish() {
+            // Never leave a half-finished tree behind a record that blocks the next run.
+            let undone = store
+                .move_out_and_delete(&name)
+                .and_then(|()| store.set_entry(None, &name));
+            if let Err(u) = undone {
+                warn!(
+                    token = "compat-tools-rollback-failed",
+                    "compat tools: rolling back {name}: {u}"
+                );
+            }
+            return Err(io_fail("finishing the install", e));
+        }
+        info!(
+            token = "compat-tools-installed",
+            "compat tools: installed {name} ({} bytes)", bytes
+        );
+        (self.on_change)();
+        Ok(JobOutcome::Succeeded(Self::summary(
+            "install", &p.tool_id, &name, &sha, bytes, false,
+        )))
+    }
+
+    fn remove(&self, p: &Value) -> Result<JobOutcome, Fail> {
+        let tool_id = p.get("tool_id").cloned().unwrap_or(Value::Null);
+        let name = p
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|n| valid_name(n) && *n != "." && *n != "..")
+            .ok_or_else(|| invalid("name"))?;
+        let sha = p
+            .get("sha512")
+            .and_then(Value::as_str)
+            .filter(|h| hex128(h))
+            .ok_or_else(|| invalid("sha512"))?;
+        let store = &self.store;
+        let Some(entry) = store
+            .installed()
+            .into_iter()
+            .find(|e| e.name == name && e.sha512 == sha)
+        else {
+            return Ok(JobOutcome::Succeeded(Self::summary(
+                "remove", &tool_id, name, sha, 0, false,
+            )));
+        };
+        {
+            // Under the lock `mountable` takes: no session can be handed this tool from here on.
+            let held = lock(&store.mounted);
+            if ToolStore::in_use(&held, name) {
+                return Ok(JobOutcome::Deferred("in_use".into()));
+            }
+            store
+                .set_entry(
+                    Some(RecordEntry {
+                        state: EntryState::Removing,
+                        ..entry.clone()
+                    }),
+                    name,
+                )
+                .map_err(|e| io_fail("record", e))?;
+        }
+        store
+            .move_out_and_delete(name)
+            .map_err(|e| io_fail("remove", e))?;
+        store
+            .set_entry(None, name)
+            .map_err(|e| io_fail("record", e))?;
+        info!(
+            token = "compat-tools-removed",
+            "compat tools: removed {name}"
+        );
+        (self.on_change)();
+        Ok(JobOutcome::Succeeded(Self::summary(
+            "remove",
+            &tool_id,
+            name,
+            sha,
+            entry.bytes,
+            false,
+        )))
+    }
+}
+
+impl JobRunner for ConvergeRunner {
+    fn job_id(&self) -> &'static str {
+        JOB_ID
+    }
+
+    fn run(&self, params: &Value, abort: &AbortFlag) -> JobOutcome {
+        let result = match params.get("action").and_then(Value::as_str) {
+            Some("install") => self.install(params, abort),
+            Some("remove") => self.remove(params),
+            _ => Err(invalid("action")),
+        };
+        match result {
+            Ok(o) => o,
+            Err(f) => {
+                warn!(
+                    token = "compat-tools-run-failed",
+                    "compat tools: {} ({})", f.reason, f.detail
+                );
+                f.into_outcome()
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compat_tools::fetch::{Hop, HopError};
+    use sha2::{Digest, Sha512};
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const TAG: &str = "GE-Proton11-12";
+    const NAME: &str = "GE-Proton11-12-x86_64";
+    const ASSET_URL: &str = "https://github.com/GloriousEggroll/proton-ge-custom/releases/download/GE-Proton11-12/GE-Proton11-12-x86_64.tar.gz";
+    /// A fake source's answer for a URL: `None` serves the default route.
+    type Route = Box<dyn Fn(&str) -> Option<Result<(u16, Option<String>), String>> + Send + Sync>;
+
+    const CDN: &str =
+        "https://release-assets.githubusercontent.com/github-production-release-asset/1?sig=x";
+
+    fn vdf(name: &str, extra: &str) -> Vec<u8> {
+        format!(
+            "\"compatibilitytools\"\n{{\n  \"compat_tools\"\n  {{\n    \"{name}\" // tool\n    {{\n      \"install_path\" \".\"\n      \"display_name\" \"{name}\"\n      \"from_oslist\" \"windows\"\n      \"to_oslist\" \"linux\"\n{extra}    }}\n  }}\n}}\n"
+        )
+        .into_bytes()
+    }
+
+    enum E<'a> {
+        Dir(&'a [u8]),
+        File(&'a [u8], &'a [u8], u32),
+        Link(&'a [u8], &'a [u8]),
+        Hard(&'a [u8], &'a [u8]),
+        Fifo(&'a [u8]),
+        Char(&'a [u8]),
+        Block(&'a [u8]),
+        /// A GNU sparse file (`S`) with an empty sparse map.
+        Sparse(&'a [u8]),
+        /// A pax extended header (`x`) for the next entry, with these records.
+        Pax(&'a [(&'a str, &'a str)]),
+        /// A header that claims `size` bytes but carries none.
+        Claims(&'a [u8], u64),
+        Global,
+    }
+
+    /// Writes headers byte for byte, so paths `tar::Builder` would refuse can be built.
+    fn tgz(entries: &[E]) -> Vec<u8> {
+        let mut b = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        for e in entries {
+            let mut h = tar::Header::new_gnu();
+            let (path, kind, link, data, mode): (&[u8], tar::EntryType, &[u8], &[u8], u32) = match e
+            {
+                E::Dir(p) => (p, tar::EntryType::Directory, b"", b"", 0o755),
+                E::File(p, d, m) => (p, tar::EntryType::Regular, b"", d, *m),
+                E::Link(p, t) => (p, tar::EntryType::Symlink, t, b"", 0o777),
+                E::Hard(p, t) => (p, tar::EntryType::Link, t, b"", 0o644),
+                E::Fifo(p) => (p, tar::EntryType::Fifo, b"", b"", 0o644),
+                E::Char(p) => (p, tar::EntryType::Char, b"", b"", 0o666),
+                E::Block(p) => (p, tar::EntryType::Block, b"", b"", 0o660),
+                E::Sparse(p) => (p, tar::EntryType::GNUSparse, b"", b"", 0o644),
+                E::Pax(records) => {
+                    let mut data = Vec::new();
+                    for (k, v) in *records {
+                        // A record is "<len> <key>=<value>\n", <len> counting itself.
+                        let body = format!(" {k}={v}\n");
+                        let mut len = body.len() + 1;
+                        while format!("{len}{body}").len() != len {
+                            len += 1;
+                        }
+                        data.extend(format!("{len}{body}").into_bytes());
+                    }
+                    let g = h.as_gnu_mut().unwrap();
+                    g.name[..13].copy_from_slice(b"PaxHeaders/x0");
+                    h.set_entry_type(tar::EntryType::XHeader);
+                    h.set_size(data.len() as u64);
+                    h.set_mode(0o644);
+                    h.set_cksum();
+                    b.append(&h, &data[..]).unwrap();
+                    continue;
+                }
+                E::Claims(p, n) => {
+                    let g = h.as_gnu_mut().unwrap();
+                    g.name[..p.len()].copy_from_slice(p);
+                    h.set_entry_type(tar::EntryType::Regular);
+                    h.set_size(*n);
+                    h.set_mode(0o644);
+                    h.set_cksum();
+                    b.append(&h, &[][..]).unwrap();
+                    continue;
+                }
+                E::Global => (
+                    b"pax_global_header",
+                    tar::EntryType::XGlobalHeader,
+                    b"",
+                    b"",
+                    0o644,
+                ),
+            };
+            let g = h.as_gnu_mut().unwrap();
+            g.name[..path.len()].copy_from_slice(path);
+            g.linkname[..link.len()].copy_from_slice(link);
+            h.set_entry_type(kind);
+            h.set_size(data.len() as u64);
+            h.set_mode(mode);
+            h.set_cksum();
+            b.append(&h, data).unwrap();
+        }
+        b.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn good_tool() -> Vec<u8> {
+        let v = vdf(NAME, "");
+        tgz(&[
+            E::Dir(b"GE-Proton11-12/"),
+            E::File(b"GE-Proton11-12/compatibilitytool.vdf", &v, 0o644),
+            E::File(b"GE-Proton11-12/proton", b"#!/bin/sh\n", 0o4755),
+            E::Dir(b"GE-Proton11-12/files/lib/"),
+            E::File(b"GE-Proton11-12/files/x", b"x", 0o644),
+            E::Link(b"GE-Proton11-12/files/lib/l", b"../x"),
+        ])
+    }
+
+    fn sha(b: &[u8]) -> String {
+        crate::artifact::hex(&Sha512::digest(b))
+    }
+
+    /// Serves `ASSET_URL` -> redirect -> `CDN` -> 200 `body`, unless `route` says otherwise.
+    struct Fake {
+        body: Vec<u8>,
+        route: Route,
+        calls: AtomicUsize,
+    }
+
+    impl Source for Fake {
+        fn get(&self, url: &str) -> Result<Hop, HopError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let (status, location) = match (self.route)(url) {
+                Some(Ok(r)) => r,
+                Some(Err(why)) => return Err(HopError::AddressRefused(why)),
+                None if url == ASSET_URL => (302, Some(CDN.to_string())),
+                None if url == CDN => (200, None),
+                None => (404, None),
+            };
+            Ok(Hop {
+                status,
+                location,
+                content_encoding: None,
+                body: Box::new(std::io::Cursor::new(if status == 200 {
+                    self.body.clone()
+                } else {
+                    vec![]
+                })),
+            })
+        }
+    }
+
+    struct Rig {
+        dir: tempfile::TempDir,
+        store: Arc<ToolStore>,
+        changes: Arc<AtomicUsize>,
+    }
+
+    impl Rig {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(ToolStore::open(dir.path(), &[], false).unwrap());
+            Rig {
+                dir,
+                store,
+                changes: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn reopen(&self) -> ToolStore {
+            ToolStore::open(self.dir.path(), &[], false).unwrap()
+        }
+
+        fn runner(&self, fake: Fake) -> (ConvergeRunner, Arc<Fake>) {
+            let fake = Arc::new(fake);
+            let changes = self.changes.clone();
+            let mut r = ConvergeRunner::new(
+                self.store.clone(),
+                fake.clone(),
+                Arc::new(move || {
+                    changes.fetch_add(1, Ordering::SeqCst);
+                }),
+            );
+            r.limits = extract::Limits {
+                entries: 50,
+                bytes: 1 << 20,
+                check_every: 64 << 20,
+            };
+            (r, fake)
+        }
+
+        fn run(&self, body: Vec<u8>, params: Value) -> (JobOutcome, Arc<Fake>) {
+            self.run_routed(body, params, Box::new(|_| None))
+        }
+
+        fn run_routed(
+            &self,
+            body: Vec<u8>,
+            params: Value,
+            route: Route,
+        ) -> (JobOutcome, Arc<Fake>) {
+            let (r, fake) = self.runner(Fake {
+                body,
+                route,
+                calls: AtomicUsize::new(0),
+            });
+            (r.run(&params, &AbortFlag::new()), fake)
+        }
+
+        fn leftovers(&self) -> usize {
+            std::fs::read_dir(self.dir.path().join("staging"))
+                .unwrap()
+                .count()
+        }
+
+        fn tools(&self) -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(self.store.tools_dir())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        }
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            // Installed trees are read-only; a non-root test run could not clean them up.
+            let _ = delete_tree(&self.store.tools_dir());
+        }
+    }
+
+    fn install(body: &[u8]) -> Value {
+        json!({ "action": "install", "tool_id": "6f1c", "tag": TAG, "asset": "x86_64",
+                "size_bytes": body.len(), "sha512": sha(body), "expected_name": NAME,
+                "reserve_bytes": 1 })
+    }
+
+    fn reason(o: &JobOutcome) -> String {
+        match o {
+            JobOutcome::FailedWith(s, _) => s["reason"].as_str().unwrap().to_owned(),
+            JobOutcome::Deferred(r) => r.clone(),
+            other => panic!("not refused: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_matching_download_installs_read_only_and_is_reported() {
+        let rig = Rig::new();
+        let body = good_tool();
+        let (out, fake) = rig.run(body.clone(), install(&body));
+        let JobOutcome::Succeeded(s) = &out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(s["name"], NAME);
+        assert_eq!(s["already_installed"], false);
+        assert_eq!(s["sha512"], sha(&body));
+        assert_eq!(
+            fake.calls.load(Ordering::SeqCst),
+            2,
+            "one redirect, then the asset host"
+        );
+        assert_eq!(rig.tools(), vec![NAME]);
+        assert_eq!(rig.leftovers(), 0, "the temporary directory is removed");
+        assert_eq!(rig.changes.load(Ordering::SeqCst), 1, "capacity is re-sent");
+        let tool = rig.store.tools_dir().join(NAME);
+        let mode = |p: &str| {
+            std::fs::symlink_metadata(tool.join(p))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        assert_eq!(mode(""), 0o555);
+        assert_eq!(mode("proton"), 0o555, "setuid cleared, still executable");
+        assert_eq!(mode("files/x"), 0o444);
+        assert_eq!(
+            std::fs::read_link(tool.join("files/lib/l")).unwrap(),
+            Path::new("../x")
+        );
+        let installed = rig.store.installed();
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].bytes, (vdf(NAME, "").len() + 11) as u64);
+    }
+
+    #[test]
+    fn a_re_run_is_idempotent_and_fetches_nothing() {
+        let rig = Rig::new();
+        let body = good_tool();
+        rig.run(body.clone(), install(&body));
+        let (out, fake) = rig.run(body.clone(), install(&body));
+        let JobOutcome::Succeeded(s) = &out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(s["already_installed"], true);
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn the_install_survives_a_restart_and_is_reported_after_reconnect() {
+        let rig = Rig::new();
+        let body = good_tool();
+        rig.run(body.clone(), install(&body));
+        let again = rig.reopen();
+        assert_eq!(again.installed(), rig.store.installed());
+        assert_eq!(
+            again.mountable("s", &[NAME.to_string(), "GE-Proton9-1".into()], false, 0),
+            vec![NAME.to_string()]
+        );
+    }
+
+    #[test]
+    fn a_checksum_mismatch_keeps_nothing_and_shows_both_digests() {
+        let rig = Rig::new();
+        let body = good_tool();
+        let mut params = install(&body);
+        params["sha512"] = json!("a".repeat(128));
+        let (out, _) = rig.run(body.clone(), params);
+        let JobOutcome::FailedWith(s, _) = &out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(s["reason"], "checksum_mismatch");
+        assert_eq!(s["expected_sha512"], "a".repeat(128));
+        assert_eq!(s["actual_sha512"], sha(&body));
+        assert!(rig.tools().is_empty());
+        assert_eq!(rig.leftovers(), 0);
+        assert!(rig.store.installed().is_empty());
+    }
+
+    #[test]
+    fn redirects_outside_the_allowlist_are_refused() {
+        let body = good_tool();
+        let cases: Vec<(&str, Route)> = vec![
+            (
+                "another host",
+                Box::new(|u: &str| {
+                    (u == ASSET_URL).then(|| Ok((302, Some("https://evil.example/x".into()))))
+                }),
+            ),
+            (
+                "plain http",
+                Box::new(|u: &str| {
+                    (u == ASSET_URL)
+                        .then(|| Ok((302, Some("http://objects.githubusercontent.com/x".into()))))
+                }),
+            ),
+            (
+                "another release",
+                Box::new(|u: &str| {
+                    (u == ASSET_URL).then(|| Ok((302, Some("https://github.com/GloriousEggroll/proton-ge-custom/releases/download/GE-Proton11-12/../GE-Proton1-1/x".into()))))
+                }),
+            ),
+            (
+                "no Location",
+                Box::new(|u: &str| (u == ASSET_URL).then_some(Ok((302, None)))),
+            ),
+            (
+                "a loop",
+                Box::new(|_: &str| Some(Ok((302, Some(ASSET_URL.into()))))),
+            ),
+            (
+                "a refused address",
+                Box::new(|_: &str| Some(Err("github.com resolves only to 10.0.0.1".into()))),
+            ),
+        ];
+        for (what, route) in cases {
+            let rig = Rig::new();
+            let (out, fake) = rig.run_routed(body.clone(), install(&body), route);
+            assert_eq!(reason(&out), "redirect_refused", "{what}");
+            assert!(
+                fake.calls.load(Ordering::SeqCst) <= 6,
+                "{what}: at most 5 redirects followed"
+            );
+            assert!(rig.tools().is_empty() && rig.leftovers() == 0, "{what}");
+        }
+    }
+
+    #[test]
+    fn five_redirects_are_followed_and_a_sixth_is_refused() {
+        let hops = |n: usize| -> Route {
+            Box::new(move |u: &str| {
+                let i: usize = u.rsplit_once("hop=").map_or(0, |(_, i)| i.parse().unwrap());
+                (u == ASSET_URL || u.contains("hop=")).then(|| {
+                    Ok(if i + 1 < n {
+                        (
+                            302,
+                            Some(format!(
+                                "https://objects.githubusercontent.com/a?hop={}",
+                                i + 1
+                            )),
+                        )
+                    } else {
+                        (302, Some(CDN.into()))
+                    })
+                })
+            })
+        };
+        let body = good_tool();
+        let rig = Rig::new();
+        assert!(matches!(
+            rig.run_routed(body.clone(), install(&body), hops(5)).0,
+            JobOutcome::Succeeded(_)
+        ));
+        let rig = Rig::new();
+        assert_eq!(
+            reason(&rig.run_routed(body.clone(), install(&body), hops(6)).0),
+            "redirect_refused"
+        );
+    }
+
+    #[test]
+    fn a_body_of_the_wrong_size_is_refused() {
+        let rig = Rig::new();
+        let body = good_tool();
+        let mut params = install(&body);
+        params["size_bytes"] = json!(body.len() - 1);
+        assert_eq!(reason(&rig.run(body.clone(), params).0), "size_mismatch");
+        let mut params = install(&body);
+        params["size_bytes"] = json!(body.len() + 1);
+        assert_eq!(reason(&rig.run(body, params).0), "size_mismatch");
+        assert_eq!(rig.leftovers(), 0);
+    }
+
+    #[test]
+    fn params_outside_the_rules_fetch_nothing() {
+        let body = good_tool();
+        let bad = [
+            ("tag", json!("GE-Proton11-12/../x")),
+            ("tag", json!("Proton-11")),
+            ("asset", json!("../x")),
+            ("size_bytes", json!(3u64 << 30)),
+            ("sha512", json!("ABC")),
+            ("expected_name", json!("../x")),
+            ("action", json!("exec")),
+        ];
+        for (k, v) in bad {
+            let rig = Rig::new();
+            let mut p = install(&body);
+            p[k] = v;
+            let (out, fake) = rig.run(body.clone(), p);
+            assert_eq!(reason(&out), "invalid_params", "{k}");
+            assert_eq!(fake.calls.load(Ordering::SeqCst), 0, "{k}");
+        }
+    }
+
+    #[test]
+    fn short_disk_defers_before_any_download() {
+        let rig = Rig::new();
+        let body = good_tool();
+        let mut p = install(&body);
+        p["reserve_bytes"] = json!(1u64 << 60);
+        let (out, fake) = rig.run(body, p);
+        assert_eq!(out, JobOutcome::Deferred("insufficient_disk".into()));
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+    }
+
+    fn vdf_entry_2(v: &[u8]) -> E<'_> {
+        E::File(b"t/compatibilitytool.vdf", v, 0o644)
+    }
+
+    fn refused_archive(entries: &[E]) -> String {
+        let rig = Rig::new();
+        let body = tgz(entries);
+        let mut p = install(&body);
+        p["expected_name"] = Value::Null;
+        let out = rig.run(body, p).0;
+        assert!(rig.tools().is_empty() && rig.leftovers() == 0);
+        reason(&out)
+    }
+
+    #[test]
+    fn unsafe_archives_are_refused() {
+        let v = vdf(NAME, "");
+        let f = |p: &'static [u8]| E::File(p, b"x", 0o644);
+        let vdf_entry = E::File(b"t/compatibilitytool.vdf", &v, 0o644);
+        let cases: Vec<(&str, Vec<E>)> = vec![
+            ("absolute path", vec![E::Dir(b"t/"), f(b"/etc/x")]),
+            ("dot-dot", vec![E::Dir(b"t/"), f(b"t/../x")]),
+            ("two top-level dirs", vec![E::Dir(b"t/"), E::Dir(b"u/")]),
+            ("a top-level file", vec![f(b"x")]),
+            ("duplicate", vec![E::Dir(b"t/"), f(b"t/a"), f(b"t/a")]),
+            (
+                "duplicate dir",
+                vec![E::Dir(b"t/"), E::Dir(b"t/d/"), E::Dir(b"t/d")],
+            ),
+            (
+                "hardlink",
+                vec![E::Dir(b"t/"), f(b"t/a"), E::Hard(b"t/b", b"t/a")],
+            ),
+            ("fifo", vec![E::Dir(b"t/"), E::Fifo(b"t/p")]),
+            ("char device", vec![E::Dir(b"t/"), E::Char(b"t/null")]),
+            ("block device", vec![E::Dir(b"t/"), E::Block(b"t/sda")]),
+            (
+                "GNU sparse file",
+                vec![E::Dir(b"t/"), E::Sparse(b"t/holes")],
+            ),
+            (
+                "absolute symlink",
+                vec![E::Dir(b"t/"), E::Link(b"t/l", b"/etc/passwd")],
+            ),
+            (
+                "escaping symlink",
+                vec![E::Dir(b"t/"), vdf_entry, E::Link(b"t/l", b"../../x")],
+            ),
+            (
+                "dir symlink escape",
+                vec![E::Dir(b"t/"), vdf_entry_2(&v), E::Link(b"t/up", b"..")],
+            ),
+            (
+                "looping symlink",
+                vec![E::Dir(b"t/"), E::Link(b"t/a", b"b"), E::Link(b"t/b", b"a")],
+            ),
+            (
+                "dangling symlink",
+                vec![E::Dir(b"t/"), E::Link(b"t/l", b"nothing")],
+            ),
+            (
+                "write through a link",
+                vec![
+                    E::Dir(b"t/"),
+                    E::Dir(b"t/d/"),
+                    E::Link(b"t/l", b"d"),
+                    f(b"t/l/x"),
+                ],
+            ),
+            (
+                "file over a link",
+                vec![E::Dir(b"t/"), f(b"t/x"), E::Link(b"t/l", b"x"), f(b"t/l")],
+            ),
+        ];
+        for (what, entries) in cases {
+            assert_eq!(refused_archive(&entries), "unsafe_archive", "{what}");
+        }
+    }
+
+    /// T5: owner, group and extended attributes are the agent's whatever the archive says, and a
+    /// mode never carries setuid, setgid or sticky: pax records that try to set them change nothing.
+    #[test]
+    fn pax_records_cannot_set_mode_ownership_or_xattrs() {
+        let v = vdf(NAME, "");
+        let rig = Rig::new();
+        let body = tgz(&[
+            E::Dir(b"t/"),
+            E::File(b"t/compatibilitytool.vdf", &v, 0o644),
+            E::Pax(&[
+                ("uid", "0"),
+                ("gid", "0"),
+                ("uname", "root"),
+                ("gname", "root"),
+                ("mode", "6755"),
+                ("SCHILY.xattr.security.capability", "x"),
+                ("SCHILY.xattr.user.quasar", "x"),
+            ]),
+            E::File(b"t/suid", b"#!/bin/sh\n", 0o7755),
+        ]);
+        let out = rig.run(body.clone(), install(&body)).0;
+        assert!(matches!(out, JobOutcome::Succeeded(_)), "{out:?}");
+        let file = rig.store.tools_dir().join(NAME).join("suid");
+        let meta = std::fs::symlink_metadata(&file).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            meta.mode() & 0o7777,
+            0o555,
+            "setuid, setgid and sticky cleared"
+        );
+        // SAFETY: getuid and getgid cannot fail.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        assert_eq!((meta.uid(), meta.gid()), (uid, gid), "owned by the agent");
+        let c = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path and a null buffer of size 0 (a size query).
+        let xattrs = unsafe { libc::llistxattr(c.as_ptr(), std::ptr::null_mut(), 0) };
+        assert!(
+            xattrs <= 0,
+            "no extended attribute was set ({xattrs} bytes of names)"
+        );
+    }
+
+    #[test]
+    fn a_link_that_climbs_but_stays_inside_is_accepted() {
+        let v = vdf(NAME, "");
+        let rig = Rig::new();
+        let body = tgz(&[
+            E::Dir(b"t/"),
+            E::File(b"t/compatibilitytool.vdf", &v, 0o644),
+            E::Dir(b"t/a/b/"),
+            E::File(b"t/x", b"x", 0o644),
+            E::Link(b"t/a/b/l", b"../../x"),
+            E::Link(b"t/self", b"."),
+            E::Global,
+        ]);
+        assert!(matches!(
+            rig.run(body.clone(), install(&body)).0,
+            JobOutcome::Succeeded(_)
+        ));
+    }
+
+    #[test]
+    fn caps_are_counted_while_extracting() {
+        let mut many = vec![E::Dir(b"t/")];
+        many.extend((0..60).map(|_| E::Global));
+        assert_eq!(refused_archive(&many), "archive_too_large", "entry count");
+        assert_eq!(
+            refused_archive(&[E::Dir(b"t/"), E::Claims(b"t/big", 5 << 30)]),
+            "archive_too_large",
+            "declared size"
+        );
+        let big = vec![7u8; (1 << 20) + 1];
+        assert_eq!(
+            refused_archive(&[E::Dir(b"t/"), E::File(b"t/big", &big, 0o644)]),
+            "archive_too_large",
+            "bytes"
+        );
+    }
+
+    #[test]
+    fn the_vdf_decides_the_name() {
+        let run = |vdf_body: Vec<u8>, expected: Value| {
+            let rig = Rig::new();
+            let body = tgz(&[
+                E::Dir(b"t/"),
+                E::File(b"t/compatibilitytool.vdf", &vdf_body, 0o644),
+            ]);
+            let mut p = install(&body);
+            p["expected_name"] = expected;
+            reason(&rig.run(body, p).0)
+        };
+        assert_eq!(
+            run(vdf(NAME, "      \"commandline\" \"x\"\n"), Value::Null),
+            "vdf_invalid"
+        );
+        assert_eq!(run(vdf("../evil", ""), Value::Null), "vdf_invalid");
+        assert_eq!(run(vdf("proton_9", ""), Value::Null), "name_reserved");
+        assert_eq!(run(vdf("Proton-GE", ""), Value::Null), "name_reserved");
+        assert_eq!(
+            run(vdf("GE-Proton11-13-x86_64", ""), json!(NAME)),
+            "name_mismatch"
+        );
+        let rig = Rig::new();
+        let body = tgz(&[E::Dir(b"t/"), E::File(b"t/other.txt", b"x", 0o644)]);
+        assert_eq!(
+            reason(&rig.run(body.clone(), install(&body)).0),
+            "vdf_invalid",
+            "missing vdf"
+        );
+        let rig = Rig::new();
+        let body = tgz(&[
+            E::Dir(b"t/"),
+            E::File(b"t/x", &vdf(NAME, ""), 0o644),
+            E::Link(b"t/compatibilitytool.vdf", b"x"),
+        ]);
+        assert_eq!(
+            reason(&rig.run(body.clone(), install(&body)).0),
+            "vdf_invalid",
+            "a linked vdf"
+        );
+    }
+
+    #[test]
+    fn a_name_already_in_the_tools_directory_is_a_conflict() {
+        let rig = Rig::new();
+        std::fs::create_dir(rig.store.tools_dir().join(NAME)).unwrap();
+        let body = good_tool();
+        assert_eq!(
+            reason(&rig.run(body.clone(), install(&body)).0),
+            "name_conflict"
+        );
+        assert!(rig.store.installed().is_empty());
+        assert_eq!(rig.leftovers(), 0);
+    }
+
+    fn remove() -> Value {
+        json!({ "action": "remove", "tool_id": "6f1c", "name": NAME, "sha512": sha(&good_tool()) })
+    }
+
+    #[test]
+    fn a_removal_waits_for_live_sessions_but_not_parked_ones() {
+        let rig = Rig::new();
+        let body = good_tool();
+        rig.run(body.clone(), install(&body));
+        let want = [NAME.to_string()];
+        assert_eq!(rig.store.mountable("parked", &want, true, 0), want.to_vec());
+        assert_eq!(rig.store.mountable("play", &want, false, 0), want.to_vec());
+        assert_eq!(
+            rig.run(vec![], remove()).0,
+            JobOutcome::Deferred("in_use".into())
+        );
+        rig.store.release("play");
+        assert!(rig
+            .store
+            .claim_for_adopt("parked", "adopted", &want, false, 0));
+        assert_eq!(
+            rig.run(vec![], remove()).0,
+            JobOutcome::Deferred("in_use".into()),
+            "adoption keeps the hold"
+        );
+        rig.store.release("adopted");
+        let (out, _) = rig.run(vec![], remove());
+        assert!(matches!(out, JobOutcome::Succeeded(_)), "{out:?}");
+        assert!(rig.tools().is_empty() && rig.leftovers() == 0);
+        assert!(rig.reopen().installed().is_empty());
+    }
+
+    #[test]
+    fn a_removal_touches_only_what_the_record_holds() {
+        let rig = Rig::new();
+        std::fs::create_dir(rig.store.tools_dir().join(NAME)).unwrap();
+        let (out, _) = rig.run(vec![], remove());
+        let JobOutcome::Succeeded(s) = &out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(s["bytes"], 0);
+        assert_eq!(
+            rig.tools(),
+            vec![NAME],
+            "a directory the record does not hold stays"
+        );
+        let mut p = remove();
+        p["name"] = json!("../tools");
+        assert_eq!(reason(&rig.run(vec![], p).0), "invalid_params");
+    }
+
+    #[test]
+    fn a_killed_run_is_finished_or_rolled_back_on_restart() {
+        let rig = Rig::new();
+        let body = good_tool();
+        rig.run(body.clone(), install(&body));
+        // A run killed mid-extract leaves its temporary tree.
+        let left = rig.dir.path().join("staging/run-killed/tree/t");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::File::create(left.join("half"))
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+        // One killed after the record said installing and before the rename, one after it.
+        let mut rec = rig.store.record_file().load().unwrap().unwrap();
+        let entry = |name: &str, state| RecordEntry {
+            name: name.into(),
+            tag: TAG.into(),
+            sha512: "b".repeat(128),
+            bytes: 1,
+            state,
+        };
+        rec.tools
+            .push(entry("GE-Proton9-1", EntryState::Installing));
+        rec.tools
+            .push(entry("GE-Proton9-2", EntryState::Installing));
+        std::fs::create_dir(rig.store.tools_dir().join("GE-Proton9-2")).unwrap();
+        // And a removal killed before its move.
+        rec.tools.retain(|e| e.name != NAME);
+        rec.tools.push(RecordEntry {
+            state: EntryState::Removing,
+            ..rig.store.installed()[0].clone()
+        });
+        rig.store.record_file().store(&rec).unwrap();
+
+        let again = rig.reopen();
+        assert_eq!(rig.leftovers(), 0, "the leftover tree is removed");
+        let names: Vec<String> = again.installed().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, vec!["GE-Proton9-2".to_string()]);
+        assert_eq!(rig.tools(), vec!["GE-Proton9-2".to_string()]);
+        let mode = std::fs::metadata(again.tools_dir().join("GE-Proton9-2"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o555, "the finished install is read-only");
+    }
+
+    /// The offline check a release passes before it goes on the recommended list (#1071):
+    /// `QUASAR_COMPAT_TARBALL=<path> QUASAR_COMPAT_TAG=<tag> QUASAR_COMPAT_SHA512=<pin>
+    /// QUASAR_COMPAT_NAME=<steam name> cargo test -- --ignored a_release_passes`.
+    #[test]
+    #[ignore]
+    fn a_release_passes_the_install_checks() {
+        struct FileSource(String, String);
+        impl Source for FileSource {
+            fn get(&self, url: &str) -> Result<Hop, HopError> {
+                if url == self.1 {
+                    return Ok(Hop {
+                        status: 302,
+                        location: Some(CDN.into()),
+                        content_encoding: None,
+                        body: Box::new(std::io::empty()),
+                    });
+                }
+                let f = std::fs::File::open(&self.0).map_err(|e| HopError::Other(e.to_string()))?;
+                Ok(Hop {
+                    status: 200,
+                    location: None,
+                    content_encoding: None,
+                    body: Box::new(f),
+                })
+            }
+        }
+        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("set {k}"));
+        let (path, tag, sha, name) = (
+            var("QUASAR_COMPAT_TARBALL"),
+            var("QUASAR_COMPAT_TAG"),
+            var("QUASAR_COMPAT_SHA512"),
+            var("QUASAR_COMPAT_NAME"),
+        );
+        let size = std::fs::metadata(&path).unwrap().len();
+        let asset = if path.ends_with("-x86_64.tar.gz") {
+            "x86_64"
+        } else {
+            "plain"
+        };
+        let url = fetch::asset_url(&tag, &fetch::asset_name(&tag, asset).unwrap());
+        let rig = Rig::new();
+        let r = ConvergeRunner::new(
+            rig.store.clone(),
+            Arc::new(FileSource(path, url)),
+            Arc::new(|| {}),
+        );
+        let p = json!({ "action": "install", "tool_id": null, "tag": tag, "asset": asset, "size_bytes": size,
+                        "sha512": sha, "expected_name": name, "reserve_bytes": 1 });
+        let out = r.run(&p, &AbortFlag::new());
+        let JobOutcome::Succeeded(s) = &out else {
+            panic!("{out:?}")
+        };
+        eprintln!(
+            "PASS {tag}: name {} sha512 {} size_bytes {size} unpacked {}",
+            s["name"], s["sha512"], s["bytes"]
+        );
+    }
+
+    #[test]
+    fn a_root_that_overlaps_the_homes_is_not_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let inside = dir.path().join("homes/compat");
+        std::fs::create_dir_all(&inside).unwrap();
+        assert!(ToolStore::open(&inside, &[&dir.path().join("homes")], false).is_err());
+        assert!(ToolStore::open(&dir.path().join("missing"), &[], false).is_err());
+        assert!(ToolStore::open(Path::new("relative"), &[], false).is_err());
+        assert!(
+            ToolStore::open(dir.path(), &[], true).is_err(),
+            "a temp dir is not a bind mount"
+        );
+    }
+
+    /// Item 1: the staged tree is on disk before it becomes visible, and the rename and modes are
+    /// before the record says Installed.
+    #[test]
+    fn an_install_is_durable_before_it_is_recorded() {
+        let rig = Rig::new();
+        let body = good_tool();
+        assert!(matches!(
+            rig.run(body.clone(), install(&body)).0,
+            JobOutcome::Succeeded(_)
+        ));
+        assert_eq!(
+            *lock(&rig.store.trace),
+            vec![
+                "synced-staged",
+                "renamed",
+                "synced-tools",
+                "recorded-installed"
+            ]
+        );
+    }
+
+    /// Item 2: a tool handed to a session is held from that moment, under the lock removal takes,
+    /// and a tool marked Removing is never handed out.
+    #[test]
+    fn a_tool_being_removed_is_never_mounted_and_a_mounted_one_never_removed() {
+        let rig = Rig::new();
+        let body = good_tool();
+        rig.run(body.clone(), install(&body));
+        let want = [NAME.to_string()];
+        assert_eq!(rig.store.mountable("s1", &want, false, 0), want.to_vec());
+        assert_eq!(
+            rig.run(vec![], remove()).0,
+            JobOutcome::Deferred("in_use".into())
+        );
+        // The assign was refused: the agent's session bookkeeping drops its hold.
+        rig.store.retain(0, &|sid| sid != "s1");
+        let mut rec = lock(&rig.store.record).clone();
+        rec.tools[0].state = EntryState::Removing;
+        *lock(&rig.store.record) = rec;
+        assert!(
+            rig.store.mountable("s2", &want, false, 0).is_empty(),
+            "Removing is not mountable"
+        );
+        assert!(
+            lock(&rig.store.mounted).is_empty(),
+            "nothing held for a tool not handed out"
+        );
+    }
+
+    /// Item 3: a path past the component or length cap is refused at extraction, and a deep tree
+    /// left in staging is quarantined at start without stopping the store or its other entries.
+    #[test]
+    fn deep_or_long_paths_are_refused_and_a_bad_leftover_is_quarantined() {
+        let deep = format!("t/{}/f", vec!["d"; extract::MAX_COMPONENTS].join("/"));
+        assert_eq!(
+            refused_archive(&[E::Dir(b"t/"), E::File(deep.as_bytes(), b"x", 0o644)]),
+            "unsafe_archive"
+        );
+        let rig = Rig::new();
+        let long = format!("t/{}", vec!["x".repeat(250); 17].join("/"));
+        let mut b = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        let mut h = tar::Header::new_gnu();
+        h.set_size(1);
+        h.set_mode(0o644);
+        h.set_entry_type(tar::EntryType::Regular);
+        b.append_data(&mut h, &long, &b"x"[..]).unwrap();
+        let body = b.into_inner().unwrap().finish().unwrap();
+        let mut p = install(&body);
+        p["expected_name"] = Value::Null;
+        assert_eq!(
+            reason(&rig.run(body, p).0),
+            "unsafe_archive",
+            "a path over 4096 bytes"
+        );
+
+        let rig = Rig::new();
+        let body = good_tool();
+        rig.run(body.clone(), install(&body));
+        let mut d = rig.dir.path().join("staging/run-deep");
+        for _ in 0..(MAX_DEPTH + 5) {
+            d.push("d");
+        }
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::create_dir_all(rig.dir.path().join("staging/run-ok/tree")).unwrap();
+        let again = rig.reopen();
+        assert_eq!(rig.leftovers(), 0, "both leftovers are out of staging");
+        assert_eq!(
+            std::fs::read_dir(rig.dir.path().join("quarantine"))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(again.installed().len(), 1, "the other entries carry on");
+    }
+
+    /// Item 4: staging and tools on two filesystems would fail every install after its download.
+    #[test]
+    fn a_rename_across_filesystems_is_found_when_the_store_opens() {
+        let here = tempfile::tempdir().unwrap();
+        let Ok(there) = tempfile::tempdir_in("/dev/shm") else {
+            return;
+        };
+        use std::os::unix::fs::MetadataExt;
+        if std::fs::metadata(here.path()).unwrap().dev()
+            == std::fs::metadata(there.path()).unwrap().dev()
+        {
+            return; // one filesystem here: nothing to prove
+        }
+        let e = probe_rename(here.path(), there.path()).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EXDEV));
+        let sub = here.path().join("t");
+        std::fs::create_dir(&sub).unwrap();
+        assert!(
+            probe_rename(here.path(), &sub).is_ok(),
+            "one filesystem passes"
+        );
+    }
+
+    /// Item 5: a failure after the rename rolls back, so the next run installs instead of hitting
+    /// name_conflict until a restart.
+    #[test]
+    fn a_failure_after_the_rename_rolls_back() {
+        let rig = Rig::new();
+        let body = good_tool();
+        *lock(&rig.store.fail_at) = Some("after-rename");
+        assert_eq!(reason(&rig.run(body.clone(), install(&body)).0), "io_error");
+        assert!(rig.tools().is_empty() && rig.leftovers() == 0);
+        assert!(
+            lock(&rig.store.record).tools.is_empty(),
+            "no Installing entry left"
+        );
+        *lock(&rig.store.fail_at) = None;
+        assert!(matches!(
+            rig.run(body.clone(), install(&body)).0,
+            JobOutcome::Succeeded(_)
+        ));
+    }
+
+    /// Item 6: openat2 missing or filtered is told apart from a bad archive.
+    #[test]
+    fn a_missing_openat2_is_an_environment_fault() {
+        assert!(openat2_unavailable(&io::Error::from_raw_os_error(
+            libc::ENOSYS
+        )));
+        assert!(openat2_unavailable(&io::Error::from_raw_os_error(
+            libc::EPERM
+        )));
+        assert!(!openat2_unavailable(&io::Error::from_raw_os_error(
+            libc::EXDEV
+        )));
+    }
+
+    /// Item 7: the check that runs while extracting (free space, the run's abort) stops it.
+    #[test]
+    fn the_extraction_check_stops_it() {
+        let v = vdf(NAME, "");
+        let big = vec![1u8; 4096];
+        let body = tgz(&[
+            E::Dir(b"t/"),
+            E::File(b"t/compatibilitytool.vdf", &v, 0o644),
+            E::File(b"t/a", &big, 0o644),
+            E::File(b"t/b", &big, 0o644),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let staging = crate::nofollow_dir::open_dir(dir.path()).unwrap();
+        let mut calls = 0;
+        let mut check = || {
+            calls += 1;
+            Err(Fail::new("io_error", "the run was aborted"))
+        };
+        let limits = extract::Limits {
+            entries: 50,
+            bytes: 1 << 20,
+            check_every: 1024,
+        };
+        let err = extract::extract(&body[..], &staging, &mut check, limits)
+            .err()
+            .unwrap();
+        assert_eq!((err.reason, calls), ("io_error", 1));
+        assert!(
+            !dir.path().join("t/b").exists(),
+            "nothing after the stop is written"
+        );
+    }
+
+    /// Round 3, item 1 (store half): only an Installed, present tool counts for an adoption.
+    #[test]
+    fn only_an_installed_tool_lets_a_runtime_be_adopted() {
+        let rig = Rig::new();
+        let body = good_tool();
+        rig.run(body.clone(), install(&body));
+        let want = [NAME.to_string()];
+        assert!(rig.store.all_installed(&want) && rig.store.all_installed(&[]));
+        let mut rec = lock(&rig.store.record).clone();
+        rec.tools[0].state = EntryState::Removing;
+        *lock(&rig.store.record) = rec;
+        assert!(!rig.store.all_installed(&want), "Removing");
+        let mut rec = lock(&rig.store.record).clone();
+        rec.tools[0].state = EntryState::Installed;
+        *lock(&rig.store.record) = rec;
+        assert!(matches!(
+            rig.run(vec![], remove()).0,
+            JobOutcome::Succeeded(_)
+        ));
+        assert!(!rig.store.all_installed(&want), "gone");
+    }
+
+    /// Round 3, item 2: a directory in tools/ the record does not list, read-only like a tool,
+    /// is quarantined at start, so the next install of that name is not name_conflict.
+    #[test]
+    fn an_unlisted_tool_directory_is_quarantined_at_start() {
+        let rig = Rig::new();
+        let stray = rig.store.tools_dir().join(NAME);
+        std::fs::create_dir_all(stray.join("files")).unwrap();
+        std::fs::set_permissions(&stray, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let again = Arc::new(rig.reopen());
+        assert!(
+            rig.tools().is_empty(),
+            "tools/ holds exactly what the record lists"
+        );
+        assert_eq!(
+            std::fs::read_dir(rig.dir.path().join("quarantine"))
+                .unwrap()
+                .count(),
+            1
+        );
+        let body = good_tool();
+        let r = ConvergeRunner::new(
+            again,
+            Arc::new(Fake {
+                body: body.clone(),
+                route: Box::new(|_| None),
+                calls: AtomicUsize::new(0),
+            }),
+            Arc::new(|| {}),
+        );
+        assert!(matches!(
+            r.run(&install(&body), &AbortFlag::new()),
+            JobOutcome::Succeeded(_)
+        ));
+    }
+
+    /// Round 3, item 3: a corrupt record is set aside, the store starts empty, every tool it no
+    /// longer lists is quarantined (kept until the boot's retirement sweep), and a reinstall works.
+    #[test]
+    fn a_corrupt_record_heals_itself() {
+        let rig = Rig::new();
+        let body = good_tool();
+        rig.run(body.clone(), install(&body));
+        std::fs::write(rig.dir.path().join("record.json"), b"{not json").unwrap();
+        let healed = Arc::new(rig.reopen());
+        assert!(healed.installed().is_empty());
+        assert!(rig.tools().is_empty());
+        let aside: Vec<String> = std::fs::read_dir(rig.dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("record.json.corrupt-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "the corrupt record is kept aside");
+        let quarantine = rig.dir.path().join("quarantine");
+        assert_eq!(
+            std::fs::read_dir(&quarantine).unwrap().count(),
+            1,
+            "not deleted at open"
+        );
+        healed.sweep_quarantine();
+        assert_eq!(
+            std::fs::read_dir(&quarantine).unwrap().count(),
+            0,
+            "deleted after retirement"
+        );
+        let r = ConvergeRunner::new(
+            healed.clone(),
+            Arc::new(Fake {
+                body: body.clone(),
+                route: Box::new(|_| None),
+                calls: AtomicUsize::new(0),
+            }),
+            Arc::new(|| {}),
+        );
+        let out = r.run(&install(&body), &AbortFlag::new());
+        let JobOutcome::Succeeded(s) = &out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(
+            s["already_installed"], false,
+            "reinstalled by desired state"
+        );
+        assert_eq!(healed.installed().len(), 1);
+    }
+
+    /// Round 4: a removal racing an adopt never leaves an adopted runtime on a removed tool. The
+    /// gate parks the claim between its check and its hold move while a removal runs.
+    #[test]
+    fn a_removal_racing_an_adopt_never_removes_the_adopted_tool() {
+        let rig = Rig::new();
+        let body = good_tool();
+        rig.run(body.clone(), install(&body));
+        let want = vec![NAME.to_string()];
+        assert_eq!(rig.store.mountable("parked", &want, true, 0), want);
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        *lock(&rig.store.adopt_gate) = Some(gate.clone());
+        let store = rig.store.clone();
+        let claim = std::thread::spawn({
+            let want = want.clone();
+            move || store.claim_for_adopt("parked", "play", &want, false, 0)
+        });
+        gate.wait(); // the claim has checked and not yet moved the hold
+        let (runner, _) = rig.runner(Fake {
+            body: vec![],
+            route: Box::new(|_| None),
+            calls: AtomicUsize::new(0),
+        });
+        let removal = std::thread::spawn(move || runner.run(&remove(), &AbortFlag::new()));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        gate.wait();
+        let claimed = claim.join().unwrap();
+        let removed = removal.join().unwrap();
+        *lock(&rig.store.adopt_gate) = None;
+        assert!(claimed, "the tool was Installed when the claim checked");
+        assert_eq!(
+            removed,
+            JobOutcome::Deferred("in_use".into()),
+            "the removal waited for the adopted runtime"
+        );
+        assert!(
+            rig.store.all_installed(&want),
+            "the adopted runtime's tool is still there"
+        );
+    }
+}

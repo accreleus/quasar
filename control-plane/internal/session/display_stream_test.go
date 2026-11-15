@@ -24,7 +24,7 @@ func bp(v bool) *bool { return &v }
 
 // TestValidateDisplayUpdateStream pins the stream-pair rules, and the
 // independent-axes rule (2026-08-16 amendment), against a session LAUNCHED at
-// 1920x1080 (rungs 1080/900/720). Render and stream are validated purely
+// 1920x1080 (rungs 1080/900/720/540/360). Render and stream are validated purely
 // against the LAUNCH size here — cached/current external state is a
 // coordinator-level concern (see TestDisplayRenderIndependentOfExternal),
 // validateDisplayUpdate itself never sees it.
@@ -455,7 +455,7 @@ func TestSessionRespRungsAndExternal(t *testing.T) {
 	}
 
 	st := get()
-	want := [][2]int32{{1920, 1080}, {1600, 900}, {1280, 720}}
+	want := [][2]int32{{1920, 1080}, {1600, 900}, {1280, 720}, {960, 540}, {640, 360}}
 	if len(st.Rungs) != len(want) {
 		t.Fatalf("rungs: got %v want %v", st.Rungs, want)
 	}

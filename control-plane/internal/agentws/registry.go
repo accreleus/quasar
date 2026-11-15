@@ -67,8 +67,11 @@ type conn struct {
 	hostID                    string
 	terminalHomeCleanupV1     bool
 	parkedSessionsV1          bool
+	adoptRestreamV1           bool
+	compatToolsV1             bool
 	policyTyped               bool
 	consoleReports            atomic.Int32 // capacity reports carrying console_capabilities
+	compatReports             atomic.Int32 // capacity reports on a compat_tools_v1 connection
 	policyIdle                bool
 	policyRecoveryRelease     bool // restart executor that takes config_policy_release
 	policyAccepted            []string
@@ -338,11 +341,21 @@ func (e *homeCommandEpoch) SupportsHomeCleanup() bool { return e.conn.terminalHo
 // SupportsParkedSessions is this exact connection's parked_sessions_v1.
 func (e *homeCommandEpoch) SupportsParkedSessions() bool { return e.conn.parkedSessionsV1 }
 
+// SupportsCompatTools is this exact connection's compat_tools_v1.
+func (e *homeCommandEpoch) SupportsCompatTools() bool { return e.conn.compatToolsV1 }
+
 // SupportsParkedSessions reports parked_sessions_v1 for the host's current
 // connection; a disconnected host has none.
 func (r *Registry) SupportsParkedSessions(hostID string) bool {
 	c, ok := r.get(hostID)
 	return ok && c.parkedSessionsV1
+}
+
+// SupportsAdoptRestream reports adopt_restream_v1 (amendment 59) beside
+// parked_sessions_v1 for the host's current connection.
+func (r *Registry) SupportsAdoptRestream(hostID string) bool {
+	c, ok := r.get(hostID)
+	return ok && c.parkedSessionsV1 && c.adoptRestreamV1
 }
 
 func (r *Registry) CurrentHomeCommandEpoch(hostID string) (HomeCommandEpoch, bool) {

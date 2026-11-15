@@ -403,6 +403,9 @@ type fakeDispatcher struct {
 	// lastCapture records the most recent session_capture (session-capture) so a
 	// test can assert the minted capture_id and the clamped budget/params.
 	lastCapture *agentws.SessionCaptureCmd
+	// lastSwap and lastStop record the most recent acked swap and stop commands.
+	lastSwap *agentws.SessionSwapAppCmd
+	lastStop *agentws.SessionStopCmd
 	// noAck records commands sent WITHOUT an ack. AgentHeartbeat's reverse
 	// reconcile must use Send, never SendWithAck: it runs inside the agent WS
 	// read loop, and that same loop is what would have to read the ack (#128).
@@ -417,6 +420,21 @@ type fakeDispatcher struct {
 	// same, and it is the ONLY way to reach it — the default fake never errors.
 	ackSendErr error
 	sawAssign  chan struct{}
+	// transportTokens records each session_transport_token, in order.
+	transportTokens []agentws.SessionTransportTokenCmd
+}
+
+// setAck changes the ack every later command gets.
+func (f *fakeDispatcher) setAck(ok bool, sendErr error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ackOK, f.ackSendErr = ok, sendErr
+}
+
+func (f *fakeDispatcher) transportTokenCmds() []agentws.SessionTransportTokenCmd {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]agentws.SessionTransportTokenCmd(nil), f.transportTokens...)
 }
 
 func newFakeDispatcher(ackOK bool) *fakeDispatcher {
@@ -458,10 +476,17 @@ func (f *fakeDispatcher) SendWithAck(_ context.Context, _ string, _ string, v an
 		f.lastAssign = &assign
 	case agentws.SessionStartCmd:
 		f.sent = append(f.sent, "start")
+	case agentws.SessionTransportTokenCmd:
+		f.sent = append(f.sent, "transport_token")
+		f.transportTokens = append(f.transportTokens, c)
 	case agentws.SessionStopCmd:
 		f.sent = append(f.sent, "stop")
+		stop := c
+		f.lastStop = &stop
 	case agentws.SessionSwapAppCmd:
 		f.sent = append(f.sent, "swap")
+		swap := c
+		f.lastSwap = &swap
 	case agentws.SessionDisplayUpdateCmd:
 		f.sent = append(f.sent, "display")
 		display := c
@@ -693,7 +718,7 @@ func TestHostDisconnectedKeepsHeldSessionRegistered(t *testing.T) {
 	coord.AgentState(ctx, s.hostID, agentws.SessionStateMsg{SessionID: res.Session.ID, State: "running"})
 
 	coord.health.mu.Lock()
-	coord.health.healthRuns[res.Session.ID] = time.Now()
+	coord.health.healthRuns[res.Session.ID] = belowFloorRun{since: time.Now()}
 	coord.health.mu.Unlock()
 
 	coord.HostDisconnected(ctx, s.hostID)

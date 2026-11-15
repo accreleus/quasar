@@ -126,7 +126,7 @@ Tickets with no console surface of their own:
 
 ## Copy and identifiers
 
-- The wording uses `CONTEXT.md` terms: Seed, Recovery actor, Service owner, External
+- The wording uses `GLOSSARY.md` terms: Seed, Recovery actor, Service owner, External
   manager, Combined host / GPU host / Control-only host, Enrollment, Attempt, Fleet run,
   Replacement, Platform release.
 - What the operator acts on appears in the copy: the commands they run (in copyable

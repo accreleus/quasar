@@ -31,9 +31,11 @@ import { elapsedWords, relativeTime } from "../../lib/format/relativeTime";
 import { useAdminAction } from "../../lib/resource/action";
 import { useResource } from "../../lib/resource/react";
 import { ImageCleanupModal } from "./library/ImageCleanupModal";
+import { CompatToolsCard } from "./fleet/hostDetail/CompatToolsCard";
 import { CapacityCard } from "./fleet/hostDetail/CapacityCard";
 import { FloorNote } from "./fleet/hostDetail/FloorNote";
 import { ServicesCard } from "./fleet/hostDetail/ServicesCard";
+import { WebTransportCard } from "./fleet/hostDetail/WebTransportCard";
 import { ApplyConfirmModal } from "./fleet/ApplyControls";
 import { hostFloorState } from "./fleet/hostFloor";
 import { SessionsCard } from "./fleet/hostDetail/SessionsCard";
@@ -186,6 +188,8 @@ export function HostDetail() {
   // The last report in which the recovery actor answered, kept for when it stops
   // answering (mock rh06/inv-error): the contract keeps no last report of its own.
   const lastReport = useRef<LastReport | null>(null);
+  /** The open Remove dialog was offered under a known identity (see `showRemove`). */
+  const removeOffered = useRef(false);
   useEffect(() => {
     if (host?.updater_present === true) lastReport.current = { host, at: Date.now() };
   }, [host]);
@@ -244,11 +248,20 @@ export function HostDetail() {
     floor,
   });
   const inFlight = removal.removal;
+  // An unknown control-plane identity (the release read failed) could be this very machine.
   const canRemove =
+    machine != null &&
     removable(host, machine) &&
     !conflict &&
     services != null &&
     (services.report === "reported" || services.report === "offline");
+  // Not left open for a later poll to show: the offer it confirmed is gone. Only on a definite
+  // answer: a poll whose release read failed (no `machine`) says nothing either way, so a dialog
+  // that was offered stays on screen through it instead of vanishing mid-confirm and coming back.
+  if (removeOpen && machine != null && !canRemove) setRemoveOpen(false);
+  if (!removeOpen) removeOffered.current = false;
+  else if (canRemove) removeOffered.current = true;
+  const showRemove = removeOpen && (canRemove || (machine == null && removeOffered.current));
   const servicesFoot =
     inFlight?.phase === "waiting" ? (
       <>
@@ -397,7 +410,9 @@ export function HostDetail() {
         />
       )}
 
-      {removeOpen && (
+      {/* `?remove=1` opens it too: never for a host this page would not offer removal of
+          (the control plane's own machine), whose Forget would drop its own row. */}
+      {showRemove && (
         <RemoveHostModal
           host={host}
           liveSessions={sessions.length}
@@ -408,8 +423,16 @@ export function HostDetail() {
             setRemoveOpen(false);
             removal.start(host, sessions.length);
           }}
+          onForget={() => {
+            setRemoveOpen(false);
+            void forget.run(host);
+          }}
         />
       )}
+
+      <CompatToolsCard hostId={host.id} />
+
+      <WebTransportCard hostId={host.id} now={now} />
 
       <CapacityCard host={host} gpus={gpus} now={now} />
 

@@ -12,6 +12,7 @@ import type {
   SessionResponse,
   SignalingCoords,
   SteamDialogs,
+  WebTransportCoords,
 } from "./types";
 
 export interface MySessionsResponse {
@@ -68,6 +69,10 @@ export interface LaunchRequest {
      *  for "Auto" and let the server resolve the codec. */
     codec?: "h264" | "h265" | "av1";
   };
+  /** Amendment 54: the client's transport preference; absent lets the profile decide. */
+  transport?: "webrtc" | "webtransport";
+  /** Amendment 58: the user picked Ultra-low latency (PyroWave). A wish: `session.pyrowave` says what the plan decided. */
+  pyrowave?: boolean;
 }
 
 /** Pass `appId` for the already-filtered launch menu; never filter client-side,
@@ -180,6 +185,14 @@ export function mintSignalingToken(
     method: "POST",
     token,
   });
+}
+
+/** A fresh WebTransport token for the same live session (amendment 54). */
+export function mintTransportToken(
+  token: string,
+  id: string,
+): Promise<{ transport_options: { webtransport: WebTransportCoords } }> {
+  return apiFetch(`/sessions/${id}/transport-token`, { method: "POST", token });
 }
 
 /** 202 (stopping) or 200 (already terminal), both with the session body. */

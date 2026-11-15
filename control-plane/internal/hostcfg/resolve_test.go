@@ -220,7 +220,7 @@ func TestCatalogHasEveryLadderKnob(t *testing.T) {
 		"abr_ladder_res_engage_dwell":  {TypeInt, float64(2), ClassLive, "QUASAR_ABR_LADDER_RES_ENGAGE_DWELL"},
 		"abr_ladder_res_recover_dwell": {TypeInt, float64(2), ClassLive, "QUASAR_ABR_LADDER_RES_RECOVER_DWELL"},
 		"abr_ladder_res_min_step_s":    {TypeInt, float64(10), ClassLive, "QUASAR_ABR_LADDER_RES_MIN_STEP_S"},
-		"abr_ladder_res_min_height":    {TypeInt, float64(720), ClassLive, "QUASAR_ABR_LADDER_RES_MIN_HEIGHT"},
+		"abr_ladder_res_min_height":    {TypeInt, float64(360), ClassLive, "QUASAR_ABR_LADDER_RES_MIN_HEIGHT"},
 		"abr_ladder_fps":               {TypeBool, false, ClassLive, "QUASAR_ABR_LADDER_FPS"},
 		// Amendment 5: default TRUE. It is inert unless a rung is actually engaged, and
 		// both rungs ship dark — so this is dark too, and turning a rung on gets the

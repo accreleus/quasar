@@ -159,6 +159,10 @@ func (h *Handler) handlePostStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Canonical spelling (#1100): the path id may differ in case from the row's, and
+	// every limiter and in-memory counter below must share one key per session.
+	id = sess.ID
+
 	if h.statsLimiter != nil && !h.statsLimiter.allow(id) {
 		httpx.WriteError(w, http.StatusTooManyRequests, httpx.CodeRateLimited,
 			"too many telemetry posts; slow down")

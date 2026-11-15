@@ -29,12 +29,13 @@
 // (matched by pointerId, so chrome taps are never seen here).
 
 import { EVDEV, MB_MAP } from "./evdev";
+import { type VirtualPadState } from "./virtualPad";
+import { detectPadEnv, isRemapped, remapGamepad, type PadEnv } from "./gamepadRemap";
 import { createMouseScaler, mouseGain, NEUTRAL_MOUSE, type MouseSettings } from "./mouseScale";
 import { isSendEscCombo, isSummonCombo, sendEscComboEnabled } from "./summonCombo";
 import { pointerLockSupported } from "./support";
 
-// InputMsg matches the JSON shapes in protocol/input.md.
-type InputMsg = Record<string, unknown>;
+import type { InputMsg } from "./inputSender";
 
 /** Whether per-`mm` send-side instrumentation is enabled (`?itrace=1`). */
 const INPUT_TRACE =
@@ -50,14 +51,33 @@ export interface GamepadIdentity {
   index: number;
   id: string;
   mapping: string;
+  /** Set when gamepadRemap.ts translates this pad into the standard layout. */
+  remapped?: boolean;
 }
 
 /** True when the browser recognised the pad and exposes it in the W3C
  *  Standard Gamepad layout. Anything else (`""` for an unrecognised pad) is the
  *  device's own HID order: buttons land on the wrong W3C indices and the d-pad
  *  is usually a hat on an axis (quasar#348). */
-export function isStandardMapping(pad: { mapping: string }): boolean {
-  return pad.mapping === "standard";
+export function isStandardMapping(pad: { mapping: string; remapped?: boolean }): boolean {
+  return pad.mapping === "standard" || pad.remapped === true;
+}
+
+/** Who the pad is, and whether the remap table translates it. Lengths only: builds no arrays. */
+function padIdentity(pad: Gamepad, env: PadEnv): GamepadIdentity {
+  const identity: GamepadIdentity = { index: pad.index, id: pad.id, mapping: pad.mapping };
+  if (pad.mapping !== "standard" && isRemapped(pad.id, pad.buttons.length, pad.axes.length, env)) identity.remapped = true;
+  return identity;
+}
+
+/** One pad's state as it goes on the wire, translated when the remap table knows it. */
+function readPad(pad: Gamepad, env: PadEnv) {
+  let buttons = Array.from(pad.buttons, (b) => b.value);
+  let axes = Array.from(pad.axes, (a) => Math.round(a * 1000) / 1000);
+  const identity = padIdentity(pad, env);
+  const mapped = identity.remapped ? remapGamepad(pad.id, buttons, axes, env) : null;
+  if (mapped) ({ buttons, axes } = mapped);
+  return { buttons, axes, identity };
 }
 
 /** AS10-13: snapshot of input-pipeline health, sampled each telemetry poll. */
@@ -110,7 +130,8 @@ export interface EngageResult {
 }
 
 export interface CaptureOptions {
-  videoEl: HTMLVideoElement;
+  /** The WebTransport path draws on a canvas, whose stream size is `data-stream-w/h`. */
+  videoEl: HTMLVideoElement | HTMLCanvasElement;
   /** Caller-built send fn; wire format is not inspected here (protocol/input.md). */
   sendInput: (msg: InputMsg) => void;
   /** Both booleans, every transition: `captured` drives the session chrome,
@@ -118,7 +139,7 @@ export interface CaptureOptions {
   onCaptureChange: (state: CaptureState) => void;
   /** Read only for bufferedAmount backpressure detection (AS10-13); never
    *  written from capture.ts. */
-  channel?: RTCDataChannel;
+  channel?: { readonly bufferedAmount: number };
   /** Live fullscreen state, read on every keyboard-lock re-evaluation (the API
    *  only grants Escape capture in fullscreen). Absent → Keyboard Lock never
    *  engaged. */
@@ -209,6 +230,8 @@ export function setupCapture({
   engage: () => Promise<EngageResult>;
   release: () => void;
   setMouse: (settings: MouseSettings) => void;
+  /** On-screen controls' pad (null = none). Sent as `gp` like a real pad, but never alongside one. */
+  setVirtualPad: (pad: VirtualPadState | null) => void;
 } {
   /** Gates `mm` and nothing else. */
   let pointerLocked = false;
@@ -259,8 +282,8 @@ export function setupCapture({
   let mouseSettings = mouse;
   const updateGain = () => {
     const [gx, gy] = mouseGain(mouseSettings, {
-      streamW: videoEl.videoWidth,
-      streamH: videoEl.videoHeight,
+      streamW: "videoWidth" in videoEl ? videoEl.videoWidth : Number(videoEl.dataset?.streamW),
+      streamH: "videoHeight" in videoEl ? videoEl.videoHeight : Number(videoEl.dataset?.streamH),
       boxW: videoEl.clientWidth,
       boxH: videoEl.clientHeight,
       fit: videoEl.dataset?.scalingMode,
@@ -281,10 +304,15 @@ export function setupCapture({
   // The compositor size (data-compositor-w/h, from the session page) is not a video property either.
   const modeObserver =
     videoEl instanceof Node && typeof MutationObserver === "function" ? new MutationObserver(updateGain) : null;
-  modeObserver?.observe(videoEl, { attributes: true, attributeFilter: ["data-scaling-mode", "data-compositor-w", "data-compositor-h"] });
+  modeObserver?.observe(videoEl, { attributes: true, attributeFilter: ["data-scaling-mode", "data-compositor-w", "data-compositor-h", "data-stream-w", "data-stream-h"] });
 
   // Gamepad state for delta-only sends.
   const gpPrev: Record<number, { buttons: number[]; axes: number[] }> = {};
+  const padEnv = detectPadEnv();
+  // The on-screen controls' pad. The host drives ONE virtual pad whatever `i` says, so it is only
+  // sent while no real pad is connected; `virtualSent` is what the host holds, for the release.
+  let virtualPad: VirtualPadState | null = null;
+  let virtualSent: VirtualPadState | null = null;
   // Pad ids already reported through onNonStandardGamepad (one notice each).
   const nonStandardReported = new Set<string>();
   let rafId: number;
@@ -394,6 +422,20 @@ export function setupCapture({
     }
   };
 
+  /** All-zero state for the on-screen pad if the host holds anything from it. */
+  const releaseVirtualPad = (sendFn: (msg: InputMsg) => void = send) => {
+    if (!virtualSent) return;
+    sendFn({ t: "gp", i: 0, buttons: virtualSent.buttons.map(() => 0), axes: virtualSent.axes.map(() => 0) });
+    virtualSent = null;
+    // the host's one pad is neutral now: a real pad's state must go out again
+    for (const key of Object.keys(gpPrev)) delete gpPrev[Number(key)];
+  };
+
+  const setVirtualPad = (pad: VirtualPadState | null) => {
+    virtualPad = pad;
+    if (!pad) releaseVirtualPad();
+  };
+
   /** Single writer for `captured`. The captured→released transition releases
    *  everything the host still thinks is held, covering every release path. */
   const setCaptured = (next: boolean) => {
@@ -407,6 +449,7 @@ export function setupCapture({
     if (was && !captured) {
       flushHeldKeys();
       resetGamepads();
+      releaseVirtualPad();
       // a mid-gesture finger must not leave a long-press right button held
       resetTouch();
     }
@@ -516,6 +559,26 @@ export function setupCapture({
     captureMode = "none";
     setCaptured(false);
   };
+
+  // A hidden page gets no rAF and may get no pointer events, so nothing would release what the
+  // host holds. Releases at once through the same path as any other release; the lock's own
+  // pointerlockchange arrives later and finds nothing left to do.
+  const onPageHidden = () => {
+    try {
+      release();
+      if (captured) {
+        captureMode = "none";
+        setCaptured(false);
+      }
+    } catch {
+      // channel closing: nothing more can be sent
+    }
+  };
+  const onVisibilityChange = () => {
+    if (document.hidden) onPageHidden();
+  };
+  document.addEventListener("visibilitychange", onVisibilityChange);
+  window.addEventListener("pagehide", onPageHidden);
 
   // ── Mouse ─────────────────────────────────────────────────────────────────
 
@@ -884,28 +947,45 @@ export function setupCapture({
     // release, so the first post-capture poll resends full state.
     if (captured) {
       const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+      const realPad = Array.prototype.some.call(pads, Boolean);
+      // Release before any real pad's state goes out: the host has one pad, so a later
+      // neutral would wipe it.
+      if (realPad) releaseVirtualPad();
       for (const pad of pads) {
         if (!pad) continue;
-        const buttons = Array.from(pad.buttons, (b) => b.value);
+        const { buttons, axes, identity } = readPad(pad, padEnv);
         // Standard layout only: on any other pad the indices are the device's own order.
-        if (mouseSettings.nintendo && buttons.length > 3 && isStandardMapping(pad)) {
+        if (mouseSettings.nintendo && buttons.length > 3 && isStandardMapping(identity)) {
           swapButtons(buttons, 0, 1); // A (bottom) with B (right)
           swapButtons(buttons, 2, 3); // X (left) with Y (top)
         }
-        const axes = Array.from(pad.axes, (a) => Math.round(a * 1000) / 1000);
         const prev = gpPrev[pad.index];
         const changed =
           !prev ||
+          buttons.length !== prev.buttons.length ||
+          axes.length !== prev.axes.length ||
           buttons.some((v, i) => v !== prev.buttons[i]) ||
           axes.some((v, i) => v !== prev.axes[i]);
         if (changed) {
-          if (!isStandardMapping(pad) && !nonStandardReported.has(pad.id)) {
+          if (!isStandardMapping(identity) && !nonStandardReported.has(pad.id)) {
             nonStandardReported.add(pad.id);
-            onNonStandardGamepad?.({ index: pad.index, id: pad.id, mapping: pad.mapping });
+            onNonStandardGamepad?.(identity);
           }
           send({ t: "gp", i: pad.index, buttons, axes });
           gpSendCount++;
           gpPrev[pad.index] = { buttons, axes };
+        }
+      }
+      if (virtualPad && !realPad) {
+        const { buttons, axes } = virtualPad;
+        if (
+          !virtualSent ||
+          buttons.some((v, i) => v !== virtualSent!.buttons[i]) ||
+          axes.some((v, i) => v !== virtualSent!.axes[i])
+        ) {
+          virtualSent = { buttons: buttons.slice(), axes: axes.slice() };
+          send({ t: "gp", i: 0, buttons: virtualSent.buttons.slice(), axes: virtualSent.axes.slice() });
+          gpSendCount++;
         }
       }
     }
@@ -933,7 +1013,7 @@ export function setupCapture({
     for (const p of rawPads) {
       if (!p) continue;
       gamepadCount++;
-      padIdentities.push({ index: p.index, id: p.id, mapping: p.mapping });
+      padIdentities.push(padIdentity(p, padEnv));
     }
 
     const snapshot: CaptureMetrics = {
@@ -971,6 +1051,7 @@ export function setupCapture({
     if (captured) {
       flushHeldKeys(sendBestEffort);
       resetGamepads(sendBestEffort);
+      releaseVirtualPad(sendBestEffort);
     }
     resetTouch(sendBestEffort);
     captured = false;
@@ -978,6 +1059,8 @@ export function setupCapture({
     cleanedUp = true;
     if (liveCapture.get(videoEl) === self) liveCapture.delete(videoEl);
     document.removeEventListener("pointerlockchange", onLockChange);
+    document.removeEventListener("visibilitychange", onVisibilityChange);
+    window.removeEventListener("pagehide", onPageHidden);
     document.removeEventListener("pointerdown", onPointerDown, true);
     document.removeEventListener("pointermove", onPointerMove);
     document.removeEventListener("mousedown", onMouseDown);
@@ -1011,5 +1094,5 @@ export function setupCapture({
     updateGain();
   };
 
-  return { cleanup, getMetrics, syncKeyboardLock: updateKeyboardLock, engage, release, setMouse };
+  return { cleanup, getMetrics, syncKeyboardLock: updateKeyboardLock, engage, release, setMouse, setVirtualPad };
 }

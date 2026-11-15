@@ -5,7 +5,7 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/semver"
 )
 
-// The floor (control-api.md amendment 14 §"below_floor"; CONTEXT.md "Floor"): the oldest
+// The floor (control-api.md amendment 14 §"below_floor"; GLOSSARY.md "Floor"): the oldest
 // node-agent and recovery-actor release the installed control plane still manages. It is
 // judged against THIS build's declared floor (buildinfo.DeclaredFloor), never against a
 // manifest, so it holds on edge and for a developer apply alike.

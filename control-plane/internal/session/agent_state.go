@@ -242,13 +242,13 @@ func (c *Coordinator) AgentMetrics(ctx context.Context, hostID string, m agentws
 		c.log.Warn("insert agent metric failed", "session_id", m.SessionID, "err", err)
 		return
 	}
-	// Stream health from the ABR setpoint against the session's profile floor. Own
+	// Stream health from the ABR setpoint against the current rung's floor. Own
 	// goroutine, failures logged not propagated: it must add no latency to the
 	// metrics hot path.
 	if hs.State == StateRunning && m.AbrSetpointKbps != nil {
 		setpoint := *m.AbrSetpointKbps
 		sid := m.SessionID
-		go c.health.evaluateHealth(context.Background(), sid, setpoint)
+		go c.health.evaluateHealth(context.Background(), sid, setpoint, m.AbrFloorKbps)
 	}
 
 	// Home usage, when the pre-terminal sample carries bytes_used. Best-effort
@@ -288,6 +288,18 @@ func (c *Coordinator) AgentTraceEvent(ctx context.Context, hostID string, m agen
 		c.log.Warn("insert agent trace event failed",
 			"session_id", m.SessionID, "event", m.Event, "err", err)
 		return
+	}
+	if m.Event == "codec.switched" {
+		var p struct {
+			To     string `json:"to"`
+			Reason string `json:"reason"`
+		}
+		if json.Unmarshal(m.Payload, &p) != nil || !fallbackReasonRE.MatchString(p.Reason) {
+			return
+		}
+		if err := c.store.ApplyPyroWaveSwitch(ctx, m.SessionID, p.To == wireCodecPyroWave, p.Reason); err != nil {
+			c.log.Warn("pyrowave: recording codec.switched failed", "session_id", m.SessionID, "err", err)
+		}
 	}
 }
 

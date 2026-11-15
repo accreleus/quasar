@@ -241,7 +241,7 @@ describe("DetailBand", () => {
     const { props } = renderBand();
     fireEvent.click(screen.getByRole("button", { name: /^Play$/ }));
     // Auto: no codec on the wire, the server still resolves it.
-    expect(props.onConfirmProfile).toHaveBeenCalledWith("p-1440", undefined);
+    expect(props.onConfirmProfile).toHaveBeenCalledWith("p-1440", undefined, false);
   });
 
   it("commits and launches in one press from the overlay", () => {
@@ -249,7 +249,7 @@ describe("DetailBand", () => {
     fireEvent.click(screen.getByRole("radio", { name: /H\.264/ }));
     fireEvent.click(screen.getByRole("button", { name: /Play now/ }));
     // The h264 rung is 1080p, so the draft healed to it on the way.
-    expect(props.onConfirmProfile).toHaveBeenCalledWith("p-1080", "h264");
+    expect(props.onConfirmProfile).toHaveBeenCalledWith("p-1080", "h264", false);
     // …and the band's own strip now reads back the committed selection.
     expect(document.querySelector(".d-specs")?.textContent).toContain("1920×1080");
   });
@@ -335,7 +335,7 @@ describe("DetailBand", () => {
     const { props } = renderBand({ codecCaps: caps, profiles: h264First, optionsOpen: true });
     fireEvent.click(screen.getByRole("radio", { name: /^AV1/ }));
     fireEvent.click(screen.getByRole("button", { name: /Play now/ }));
-    expect(props.onConfirmProfile).toHaveBeenCalledWith("p-1080", "av1");
+    expect(props.onConfirmProfile).toHaveBeenCalledWith("p-1080", "av1", false);
   });
 
   it("takes the ref the page scrolls the band into view with", () => {

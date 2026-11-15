@@ -411,8 +411,8 @@ export function AppHomeNext() {
           onCloseOptions={closeOptions}
           onRetryProfiles={() => void detail.fetchProfiles(openApp)}
           onClose={closeDetail}
-          onConfirmProfile={(profileId, streamCodec) =>
-            void launch.launchApp(openApp, profileId, streamCodec)
+          onConfirmProfile={(profileId, streamCodec, pyrowave) =>
+            void launch.launchApp(openApp, profileId, streamCodec, pyrowave)
           }
           onToggleFavourite={() => void toggleFavourite(openApp)}
           isBlocked={blockedIds.has(openApp.id)}

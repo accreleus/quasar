@@ -71,17 +71,20 @@ type Handler struct {
 	bootIncarnation     string
 	preparation         *preparation.Store
 	OnPreparationReport func(string)
-	store               *agentStore
-	log                 *slog.Logger
-	registry            *Registry
-	events              Events
-	relay               *RelayBus
-	cfgStore            *hostcfg.Store
-	consoleStore        *console.Store
-	consoleAuto         *consoleAutoState
-	failures            *ratelimit.FailureLimiter
-	diagnostics         *diagnosticQueue
-	vram                *vramQueue
+	// OnCompatTools runs after a compat_tools_v1 connection's first capacity report and after
+	// any report that changed the host's installed set (the converger's materialize triggers).
+	OnCompatTools func(ctx context.Context, hostID string)
+	store         *agentStore
+	log           *slog.Logger
+	registry      *Registry
+	events        Events
+	relay         *RelayBus
+	cfgStore      *hostcfg.Store
+	consoleStore  *console.Store
+	consoleAuto   *consoleAutoState
+	failures      *ratelimit.FailureLimiter
+	diagnostics   *diagnosticQueue
+	vram          *vramQueue
 	// Image-management P2 callback surface (images.go). Never nil — NewHandler
 	// installs a no-op — so dispatch needs no guard.
 	imageEvents   ImageEvents
@@ -933,6 +936,13 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	ac := newConn(hostID, conn)
 	ac.terminalHomeCleanupV1 = caps.TerminalHomeCleanupV1
 	ac.parkedSessionsV1 = caps.ParkedSessionsV1
+	ac.adoptRestreamV1 = caps.AdoptRestreamV1
+	ac.compatToolsV1 = caps.CompatToolsV1
+	if !caps.CompatToolsV1 {
+		if err := h.store.forgetHostCompatTools(bg, hostID); err != nil {
+			h.log.Warn("host compat tools clear failed", "host_id", hostID, "err", err)
+		}
+	}
 	ac.policyTyped = policyTyped
 	ac.policyAccepted = acceptedGroups
 	ac.policyIdle = slices.Contains(acceptedGroups, "hardware")
@@ -1068,6 +1078,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	}
 	reads := make(chan readResult, 1)
 	reading := false
+	owners := newSignalingOwners(h.store, h.log, hostID)
 	for {
 		// A lost initial map or acknowledgement must not leave an apparently
 		// connected host gated forever. Renegotiate after a bounded wait; the
@@ -1203,8 +1214,10 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			// effective_media and diag.* persist synchronously: queue saturation
 			// must not erase the admin's only record of what ran, and a diag.*
 			// result is being polled on right now — a coalescing-queue drop
-			// would turn that poll into a timeout.
-			if m.Event == "session.effective_media" || strings.HasPrefix(m.Event, diagEventPrefix) {
+			// would turn that poll into a timeout. codec.switched is state, not
+			// telemetry (it moves Session.pyrowave): the queue keeps only the newest
+			// per session, so an "off" would erase the "on" that set `used`.
+			if m.Event == "session.effective_media" || m.Event == "codec.switched" || strings.HasPrefix(m.Event, diagEventPrefix) {
 				h.events.AgentTraceEvent(bg, hostID, m)
 			} else {
 				h.diagnostics.enqueue(diagnosticEvent{hostID: hostID, trace: &m})
@@ -1550,11 +1563,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 				h.log.Warn("decode signaling envelope failed", "err", err)
 				continue
 			}
-			if err := h.relay.Deliver(env.SessionID, env.Msg); err != nil {
-				h.log.Error("reliable signaling relay failed", "host_id", hostID, "session_id", env.SessionID, "err", err)
-				msgType, _ := peekType(env.Msg)
-				h.events.AgentSignalingFailure(bg, hostID, env.SessionID, msgType == "bye", err.Error())
-			}
+			h.relayAgentSignaling(bg, owners, hostID, env)
 		default:
 			h.log.Warn("unknown agent message", "type", msgType, "host_id", hostID)
 		}
@@ -1566,6 +1575,8 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 type registerCaps struct {
 	TerminalHomeCleanupV1 bool
 	ParkedSessionsV1      bool
+	AdoptRestreamV1       bool
+	CompatToolsV1         bool
 	RecoveryRelease       bool // config_policy_versions.recovery_release (amendment 51)
 }
 
@@ -1730,7 +1741,8 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 		}
 	}
 	return result.HostID, result.RegisteredAt, reg.Images, identity.SourceCommit,
-		registerCaps{TerminalHomeCleanupV1: reg.TerminalHomeCleanupV1, ParkedSessionsV1: reg.ParkedSessionsV1,
+		registerCaps{TerminalHomeCleanupV1: reg.TerminalHomeCleanupV1, ParkedSessionsV1: reg.ParkedSessionsV1, CompatToolsV1: reg.CompatToolsV1,
+			AdoptRestreamV1: reg.AdoptRestreamV1,
 			RecoveryRelease: reg.ConfigPolicyVersions["recovery_release"] == 1},
 		policyTyped, acceptedGroups, connectionID, cleanupRegister, nil
 }
@@ -1852,6 +1864,18 @@ func (h *Handler) processCapacity(ctx context.Context, ac *conn, raw []byte) err
 	// nothing — a failure costs a tier decision, never a launch.
 	if err := h.store.upsertHostCodecPixelRates(ctx, hostID, cap.CodecThroughput); err != nil {
 		h.log.Warn("host codec throughput upsert failed", "host_id", hostID, "err", err)
+	}
+	if ac.compatToolsV1 {
+		changed, err := h.store.upsertHostCompatTools(ctx, hostID, cap.CompatTools)
+		if err != nil {
+			h.log.Warn("host compat tools upsert failed", "host_id", hostID, "err", err)
+		}
+		if first := ac.compatReports.Add(1) == 1; (first || changed) && h.OnCompatTools != nil {
+			go h.OnCompatTools(context.WithoutCancel(ctx), hostID)
+		}
+	}
+	if err := h.store.upsertHostWebTransport(ctx, hostID, webTransportReport(cap)); err != nil {
+		h.log.Warn("host webtransport upsert failed", "host_id", hostID, "err", err)
 	}
 	readinessErr := h.store.upsertHostReadiness(ctx, hostID, cap.Readiness)
 	if readinessErr != nil {
@@ -2442,4 +2466,17 @@ func (h *Handler) resolveAuth(ctx context.Context, reg RegisterMsg) (registerRes
 			tryReconnect.NodeSecret)
 	}
 	return registerResult{}, errors.New("auth must contain enrollment_token or node_secret")
+}
+
+// relayAgentSignaling relays an agent's signaling frame to the session's browser, only for a
+// session placed on hostID (#1116).
+func (h *Handler) relayAgentSignaling(ctx context.Context, owners *signalingOwners, hostID string, env SignalingEnvelope) {
+	if !owners.allows(ctx, env.SessionID) {
+		return
+	}
+	if err := h.relay.Deliver(env.SessionID, env.Msg); err != nil {
+		h.log.Error("reliable signaling relay failed", "host_id", hostID, "session_id", env.SessionID, "err", err)
+		msgType, _ := peekType(env.Msg)
+		h.events.AgentSignalingFailure(ctx, hostID, env.SessionID, msgType == "bye", err.Error())
+	}
 }

@@ -40,13 +40,24 @@ export const NO_HOST_RETRY_DELAY_MS = MIN_RETRY_DELAY_MS;
  *  a host that is offline or gone (amendment 40, #602). Only an admin clears it. */
 export const HOME_HOST_UNAVAILABLE = "home_host_unavailable";
 
+/** `error.reason` on a `no_host_available` when no host can run the GE compatibility tool the
+ *  game is mapped to yet (amendment 56, #1073). A host installs it in the background over
+ *  minutes, past the quiet-retry budget, so the user is told and tries again later. */
+export const COMPAT_TOOL_MISSING = "compat_tool_missing";
+
+/** `error.reason` on a `capacity_exhausted` while the caller's parked Steam is being stopped
+ *  for this launch (amendment 59, #1133). No slot is short, so the retry shows nothing (#1163). */
+export const STEAM_RESTARTING = "steam_restarting";
+
 /** Whether a launch refusal is worth the quiet retry: `capacity_exhausted` and
- *  `no_host_available`, except a home on a host that is offline or gone — no
- *  amount of waiting brings that host back. */
+ *  `no_host_available`, except a home on a host that is offline or gone (no
+ *  amount of waiting brings that host back) and a compatibility tool still missing. */
 export function isCapacityRetryable(err: { code: string; reason?: string }): boolean {
   return (
     err.code === "capacity_exhausted" ||
-    (err.code === "no_host_available" && err.reason !== HOME_HOST_UNAVAILABLE)
+    (err.code === "no_host_available" &&
+      err.reason !== HOME_HOST_UNAVAILABLE &&
+      err.reason !== COMPAT_TOOL_MISSING)
   );
 }
 

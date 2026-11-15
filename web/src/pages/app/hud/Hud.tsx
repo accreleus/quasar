@@ -43,6 +43,11 @@ export interface HudProps {
   appName: string;
   tier?: string;
   resolvedCodec?: string;
+  /** The session's transport: webrtc | webtransport. */
+  transport?: string;
+  /** Why the session fell back from WebTransport to WebRTC, when it did. */
+  transportFallbackReason?: string | null;
+  transportFallbackCause?: string | null;
   sessionId?: string;
 
   inputCaptured: boolean;
@@ -85,6 +90,12 @@ export interface HudProps {
 
   scalingMode: ScalingMode;
   onScalingChange: (m: ScalingMode) => void;
+  /** #1349: the upscale + sharpen pass, on unless this device turned it off. */
+  upscaleSharpen: boolean;
+  onUpscaleSharpenChange: (on: boolean) => void;
+  /** #1401: the touch pad switch in the Input pane. */
+  onScreenControls?: boolean;
+  onOnScreenControlsChange?: (on: boolean) => void;
   /** `session.started_at`, for the stats pane's elapsed row. */
   startedAt?: string | null;
 
@@ -396,6 +407,8 @@ export const Hud = forwardRef<HudHandle, HudProps>(function Hud(props, ref) {
             escCombo={props.escCombo}
             pointerLockAvailable={props.pointerLockAvailable}
             touchLook={props.touchLook}
+            onScreenControls={props.onScreenControls}
+            onOnScreenControlsChange={props.onOnScreenControlsChange}
             scalingMode={props.scalingMode}
             onScalingChange={props.onScalingChange}
           />
@@ -406,6 +419,9 @@ export const Hud = forwardRef<HudHandle, HudProps>(function Hud(props, ref) {
             register={props.register}
             tier={props.tier}
             resolvedCodec={props.resolvedCodec}
+            transport={props.transport}
+            transportFallbackReason={props.transportFallbackReason}
+            transportFallbackCause={props.transportFallbackCause}
             sessionId={props.sessionId}
             startedAt={props.startedAt}
           />
@@ -426,6 +442,8 @@ export const Hud = forwardRef<HudHandle, HudProps>(function Hud(props, ref) {
             onUiScaleChange={props.onUiScaleChange}
             displayBusy={props.displayBusy}
             showInterfaceSize={props.showInterfaceSize}
+            upscaleSharpen={props.upscaleSharpen}
+            onUpscaleSharpenChange={props.onUpscaleSharpenChange}
           />
         );
     }

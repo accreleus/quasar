@@ -6,8 +6,8 @@ describe("section tabs", () => {
     expect(FLEET_TABS.map((t) => t.id)).toEqual(["hosts", "storage", "jobs", "releases"]);
   });
 
-  it("library has apps, presets, images, sources", () => {
-    expect(LIBRARY_TABS.map((t) => t.id)).toEqual(["apps", "presets", "images", "sources"]);
+  it("library has apps, presets, images, sources, compatibility", () => {
+    expect(LIBRARY_TABS.map((t) => t.id)).toEqual(["apps", "presets", "images", "sources", "compatibility"]);
   });
 
   it("streaming has launch, profiles; people has users, invites", () => {

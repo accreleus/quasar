@@ -158,4 +158,29 @@ describe("SessionLoader — transport vs scheduling (#482)", () => {
     advance(TRANSPORT_STALL_MS + 5_000);
     expect(screen.queryByText(/video path/i)).not.toBeInTheDocument();
   });
+
+  // A fallback 12 s or more into a WebTransport launch must not meet a stall already past due.
+  it("gives the transport it switches to its own budget, and no stall card until that is spent", () => {
+    const props = { statusMsg: "Switching to WebRTC…", streaming: false, onExit: vi.fn(), hostAssigned: true, sessionRunning: true, wsOpen: false };
+    const { rerender } = render(<SessionLoader {...props} transport="webtransport" />);
+    advance(TRANSPORT_STALL_MS + 5_000);
+    expect(screen.getByText("WebTransport has not connected")).toBeInTheDocument();
+
+    rerender(<SessionLoader {...props} transport="webrtc" />);
+    advance(1_000);
+    expect(screen.queryByText("The signaling connection could not open")).not.toBeInTheDocument();
+    expect(screen.queryByText("WebTransport has not connected")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /cancel and go back/i })).not.toBeInTheDocument();
+    advance(TRANSPORT_STALL_MS - 3_000);
+    expect(screen.queryByText("The signaling connection could not open")).not.toBeInTheDocument();
+
+    // WebRTC's own budget, spent, is WebRTC's own verdict.
+    advance(4_000);
+    expect(screen.getByText("The signaling connection could not open")).toBeInTheDocument();
+  });
+
+  it("shows a notice in the status line under the title, in place of the boot line", () => {
+    render(<SessionLoader statusMsg="connecting" streaming={false} onExit={vi.fn()} notice="Switching to WebRTC…" />);
+    expect(screen.getByText("Switching to WebRTC…")).toBeInTheDocument();
+  });
 });

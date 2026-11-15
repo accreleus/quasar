@@ -20,7 +20,7 @@ import (
 // semantics: control-api.md amendment 14 §"Removing an owned GPU host"
 
 // CodeHostNotRemovable (409): not an owned GPU host, or its actor refused.
-const CodeHostNotRemovable = "host_not_removable"
+const CodeHostNotRemovable = httpx.CodeHostNotRemovable
 
 // RemoveHostRequest is the optional body.
 type RemoveHostRequest struct {
@@ -49,9 +49,10 @@ type RemoveDeps struct {
 	Store removeStore
 	// Connected is whether the host's agent is on the wire right now.
 	Connected func(hostID string) bool
-	// OwnNodeName is the node name of the agent that shares this control plane's
-	// machine, when it is a combined host; ok false when there is none or it is unknown.
-	OwnNodeName func(ctx context.Context) (string, bool)
+	// SharesOwnMachine is whether the named host is the agent on this control plane's
+	// own machine (MachineShape.SharesMachineWith); false when there is none or it is
+	// unknown. DELETE /v1/hosts/{id} asks the same function.
+	SharesOwnMachine func(nodeName string) bool
 	// Cordon takes the host out of scheduling and returns what puts its cordon
 	// back as it was found.
 	Cordon func(ctx context.Context, hostID string) (restore func(context.Context), err error)
@@ -76,6 +77,12 @@ type RemoveHandler struct {
 func NewRemoveHandler(deps RemoveDeps, auditor audit.Recorder, log logger) *RemoveHandler {
 	return &RemoveHandler{deps: deps, auditor: auditor, log: log, AckTimeout: DefaultAckTimeout, NewRequestID: newRequestID}
 }
+
+// SharesOwnMachineSet reports whether the own-machine guard was wired. Only the
+// composition-root wiring test reads it: RemoveDeps.SharesOwnMachine is a func
+// field, so a dropped injection makes the check skip silently (#1395), and no
+// route reaches that check without a connected owned host.
+func (h *RemoveHandler) SharesOwnMachineSet() bool { return h.deps.SharesOwnMachine != nil }
 
 // Register wires the route. admin must compose RequireAuth→RequireAdmin.
 func (h *RemoveHandler) Register(mux httpx.Router, admin func(http.Handler) http.Handler) {
@@ -144,12 +151,10 @@ func (h *RemoveHandler) handleRemove(w http.ResponseWriter, r *http.Request) {
 			"only a host whose recovery actor installed it can be removed from here; stop its agent on the machine, then forget the host once it is offline")
 		return
 	}
-	if h.deps.OwnNodeName != nil {
-		if own, ok := h.deps.OwnNodeName(ctx); ok && own == host.NodeName {
-			httpx.WriteError(w, http.StatusConflict, CodeHostNotRemovable,
-				"this host shares the control plane's machine; take that machine apart with the uninstall command on it")
-			return
-		}
+	if h.deps.SharesOwnMachine != nil && h.deps.SharesOwnMachine(host.NodeName) {
+		httpx.WriteError(w, http.StatusConflict, CodeHostNotRemovable,
+			"this host shares the control plane's machine; take that machine apart with the uninstall command on it")
+		return
 	}
 
 	// 2. Cordon, then 3. check sessions: none can be placed between the two.

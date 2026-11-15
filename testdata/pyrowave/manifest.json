@@ -1,0 +1,545 @@
+{
+  "format": 1,
+  "ticket": "accreleus/quasar#1053",
+  "pin": {
+    "pyrowave": "7fe0e2667cd3076b8b2bf04bcb80bc8d691b800b",
+    "granite": "53090429539bf3404250d18fe58db971f0907c04"
+  },
+  "bitstream": {
+    "spec": "bitstream v1 (bitstream/bitstream.md at the PyroWave pin; protocol/codec-pyrowave.md)",
+    "file_format": "PWV1: 24-byte PWV1Header, then one u32 frame size and that frame (SOF packet first, then 32x32 blocks)",
+    "chroma": "4:2:0",
+    "note": "Each frame is the library's own single packet (no datagram boundary). Datagram packing is codec-pyrowave.md \u00a7Packing and is not applied here."
+  },
+  "picture_format": {
+    "layout": "I420: Y (w*h bytes), Cb ((w/2)*(h/2)), Cr ((w/2)*(h/2)), 8-bit, planar, no header, no padding",
+    "colour": "YCbCr authored as BT.709 limited range (Y 16-235, C 16-240); every SOF says sRGB primaries, sRGB transfer, BT.709, LIMITED range, centre siting (the generator sets the range bit the library leaves at FULL); the codec itself is range-agnostic"
+  },
+  "generator": {
+    "image": "quasar-dev:20261106-1532",
+    "image_id": "sha256:edee72920be933b7cfa2e5c8a8d7086c0169f087461a2580bea6ea1018e92ec3",
+    "gcc": "gcc (GCC) 15.3.1 20260722 (Red Hat 15.3.1-1)",
+    "command": "scripts/dev/pyrowave-fixtures/gen.sh"
+  },
+  "decoder_bar": {
+    "min_psnr_db": 45,
+    "max_abs_err": 1,
+    "applies_to": "decoding the SAME .pwv1 and comparing with its .ref.yuv (every plane); the spike's bar for the WGSL decoder"
+  },
+  "encoder_bar": "per fixture, fixtures[].encoder_bar.min_psnr_db: decode an encoder's OWN output for the .src.yuv at the same budget and compare with the SOURCE; never compare its bytes with the .pwv1",
+  "reference_decode": "pyrowave_decoder_decode_cpu_buffer_synchronous, rounded to 8 bits by the library. The decode is NOT bit-exact across devices (bitstream.md): compare by PSNR/max error, never by hash, except to detect a changed fixture.",
+  "psnr_note": "PSNR of the reference decode against the source picture, per plane, 8-bit, 99.0 = identical.",
+  "encoder_device": {
+    "device_name": "NVIDIA GeForce RTX 5090",
+    "device_type": 2,
+    "vendor_id": 4318,
+    "api_version": "1.4.351",
+    "driver_name": "NVIDIA",
+    "driver_info": "615.78.08"
+  },
+  "encoder_note": "The encoder runs in Vulkan compute and needs a real GPU (subgroup-size control of wave16/32/64; lavapipe offers only 8). The files are canonical (alignment bytes zeroed, SOF range set), not raw encoder output, and are pinned as generated on this device; another GPU encodes different bytes, so verify by the decode bars, not by hash. See README.md.",
+  "pictures": {
+    "detail_200x114": {
+      "picture": "detail",
+      "width": 200,
+      "height": 114,
+      "src": {
+        "file": "detail_200x114.src.yuv",
+        "bytes": 34200,
+        "sha256": "99e463f4520363cfaf80199e7820722087ffacd00ed255d0deae6e1ea4534e65"
+      }
+    },
+    "detail_320x192": {
+      "picture": "detail",
+      "width": 320,
+      "height": 192,
+      "src": {
+        "file": "detail_320x192.src.yuv",
+        "bytes": 92160,
+        "sha256": "4e4a0b5e36f8dc32c4208ea1412a7de87d47faad7cafd0384c8b1b914afa9603"
+      }
+    },
+    "flat_200x114": {
+      "picture": "flat",
+      "width": 200,
+      "height": 114,
+      "src": {
+        "file": "flat_200x114.src.yuv",
+        "bytes": 34200,
+        "sha256": "cd781d1080cc589c1c7f4383dca4876cd29163b8e2bbe2c421b24d5ac9f3fcb2"
+      }
+    },
+    "flat_320x192": {
+      "picture": "flat",
+      "width": 320,
+      "height": 192,
+      "src": {
+        "file": "flat_320x192.src.yuv",
+        "bytes": 92160,
+        "sha256": "b674bbd5361a4ebfa1a0594fe484a7f6d43e4f5d1f9e43770b5d1a4b215a0f5d"
+      }
+    }
+  },
+  "fixtures": [
+    {
+      "name": "detail_200x114_hi",
+      "picture": "detail",
+      "width": 200,
+      "height": 114,
+      "rate": "hi",
+      "budget_bytes": 18240,
+      "frame_bytes": 18196,
+      "sof": {
+        "sequence": 1,
+        "total_blocks": 68,
+        "chroma_resolution": 0,
+        "color_primaries": 0,
+        "transfer_function": 0,
+        "ycbcr_transform": 0,
+        "ycbcr_range": 1,
+        "chroma_siting": 0
+      },
+      "blocks": 68,
+      "block_bytes_max": 956,
+      "blocks_over_1111": 0,
+      "pwv1": {
+        "file": "detail_200x114_hi.pwv1",
+        "bytes": 18224,
+        "sha256": "037a4a45733ae42280a4b23359ac99b6314b6b4a9a06499d0cdbf4ed6084df8b"
+      },
+      "ref": {
+        "file": "detail_200x114_hi.ref.yuv",
+        "bytes": 34200,
+        "sha256": "7cc5dad6b4def7e9717fe3627d2bf8df2c564fd63c154ea16e1b4b68587df1fc"
+      },
+      "src": "detail_200x114.src.yuv",
+      "psnr_ref_vs_src_db": {
+        "y": 42.31,
+        "cb": 50.17,
+        "cr": 50.21
+      },
+      "encoder_bar": {
+        "min_psnr_db": {
+          "y": 41.31,
+          "cb": 49.17,
+          "cr": 49.21
+        }
+      },
+      "budget_mbit_s_at_60fps": 8.8
+    },
+    {
+      "name": "detail_200x114_lo",
+      "picture": "detail",
+      "width": 200,
+      "height": 114,
+      "rate": "lo",
+      "budget_bytes": 4560,
+      "frame_bytes": 4528,
+      "sof": {
+        "sequence": 1,
+        "total_blocks": 52,
+        "chroma_resolution": 0,
+        "color_primaries": 0,
+        "transfer_function": 0,
+        "ycbcr_transform": 0,
+        "ycbcr_range": 1,
+        "chroma_siting": 0
+      },
+      "blocks": 52,
+      "block_bytes_max": 432,
+      "blocks_over_1111": 0,
+      "pwv1": {
+        "file": "detail_200x114_lo.pwv1",
+        "bytes": 4556,
+        "sha256": "cdc2cf843c1e6eecc0ace1f45c7031abbcfbf67b843620778338e193bd8eba84"
+      },
+      "ref": {
+        "file": "detail_200x114_lo.ref.yuv",
+        "bytes": 34200,
+        "sha256": "c063d7f6d06b3a294b0f1c8c5da67bc9bffc998b873b2065f06b3b49f6ff8c16"
+      },
+      "src": "detail_200x114.src.yuv",
+      "psnr_ref_vs_src_db": {
+        "y": 23.43,
+        "cb": 28.28,
+        "cr": 28.21
+      },
+      "encoder_bar": {
+        "min_psnr_db": {
+          "y": 22.43,
+          "cb": 27.28,
+          "cr": 27.21
+        }
+      },
+      "budget_mbit_s_at_60fps": 2.2
+    },
+    {
+      "name": "detail_200x114_xhi",
+      "picture": "detail",
+      "width": 200,
+      "height": 114,
+      "rate": "xhi",
+      "budget_bytes": 34200,
+      "frame_bytes": 30884,
+      "sof": {
+        "sequence": 1,
+        "total_blocks": 70,
+        "chroma_resolution": 0,
+        "color_primaries": 0,
+        "transfer_function": 0,
+        "ycbcr_transform": 0,
+        "ycbcr_range": 1,
+        "chroma_siting": 0
+      },
+      "blocks": 70,
+      "block_bytes_max": 1180,
+      "blocks_over_1111": 2,
+      "pwv1": {
+        "file": "detail_200x114_xhi.pwv1",
+        "bytes": 30912,
+        "sha256": "4d5db907767c469f9f461a1803aea2e3173e732666653fff43b8e35e3a62c1a3"
+      },
+      "ref": {
+        "file": "detail_200x114_xhi.ref.yuv",
+        "bytes": 34200,
+        "sha256": "fb9e55af402e0718bd6e93253df203289b08a677bdc98dcc1ff25e2cb0bfabfd"
+      },
+      "src": "detail_200x114.src.yuv",
+      "psnr_ref_vs_src_db": {
+        "y": 62.87,
+        "cb": 77.24,
+        "cr": 77.91
+      },
+      "encoder_bar": {
+        "min_psnr_db": {
+          "y": 59.0,
+          "cb": 59.0,
+          "cr": 59.0
+        }
+      },
+      "budget_mbit_s_at_60fps": 16.4
+    },
+    {
+      "name": "detail_320x192_hi",
+      "picture": "detail",
+      "width": 320,
+      "height": 192,
+      "rate": "hi",
+      "budget_bytes": 49152,
+      "frame_bytes": 49132,
+      "sof": {
+        "sequence": 1,
+        "total_blocks": 137,
+        "chroma_resolution": 0,
+        "color_primaries": 0,
+        "transfer_function": 0,
+        "ycbcr_transform": 0,
+        "ycbcr_range": 1,
+        "chroma_siting": 0
+      },
+      "blocks": 137,
+      "block_bytes_max": 904,
+      "blocks_over_1111": 0,
+      "pwv1": {
+        "file": "detail_320x192_hi.pwv1",
+        "bytes": 49160,
+        "sha256": "8c452b9d677abd5ca180aab64280c2ec9fce135ac52a8f1a2892d0b783f21ece"
+      },
+      "ref": {
+        "file": "detail_320x192_hi.ref.yuv",
+        "bytes": 92160,
+        "sha256": "915917de3c51716e009e074d5a0e6ded02add5fd0c935ed98db8fcc5575a81bd"
+      },
+      "src": "detail_320x192.src.yuv",
+      "psnr_ref_vs_src_db": {
+        "y": 48.95,
+        "cb": 59.11,
+        "cr": 59.65
+      },
+      "encoder_bar": {
+        "min_psnr_db": {
+          "y": 47.95,
+          "cb": 58.11,
+          "cr": 58.65
+        }
+      },
+      "budget_mbit_s_at_60fps": 23.6
+    },
+    {
+      "name": "detail_320x192_lo",
+      "picture": "detail",
+      "width": 320,
+      "height": 192,
+      "rate": "lo",
+      "budget_bytes": 12288,
+      "frame_bytes": 12252,
+      "sof": {
+        "sequence": 1,
+        "total_blocks": 97,
+        "chroma_resolution": 0,
+        "color_primaries": 0,
+        "transfer_function": 0,
+        "ycbcr_transform": 0,
+        "ycbcr_range": 1,
+        "chroma_siting": 0
+      },
+      "blocks": 97,
+      "block_bytes_max": 332,
+      "blocks_over_1111": 0,
+      "pwv1": {
+        "file": "detail_320x192_lo.pwv1",
+        "bytes": 12280,
+        "sha256": "33b995a81a58b3741e374ea72f14dcb6f84bc7fff7122e351065c39db0ca9ee5"
+      },
+      "ref": {
+        "file": "detail_320x192_lo.ref.yuv",
+        "bytes": 92160,
+        "sha256": "83db23ec81e92406a0a694d1ded85552c427e8983a73f5521cb1f25ca5c8fa50"
+      },
+      "src": "detail_320x192.src.yuv",
+      "psnr_ref_vs_src_db": {
+        "y": 26.45,
+        "cb": 29.24,
+        "cr": 31.41
+      },
+      "encoder_bar": {
+        "min_psnr_db": {
+          "y": 25.45,
+          "cb": 28.24,
+          "cr": 30.41
+        }
+      },
+      "budget_mbit_s_at_60fps": 5.9
+    },
+    {
+      "name": "detail_320x192_xhi",
+      "picture": "detail",
+      "width": 320,
+      "height": 192,
+      "rate": "xhi",
+      "budget_bytes": 92160,
+      "frame_bytes": 65988,
+      "sof": {
+        "sequence": 1,
+        "total_blocks": 138,
+        "chroma_resolution": 0,
+        "color_primaries": 0,
+        "transfer_function": 0,
+        "ycbcr_transform": 0,
+        "ycbcr_range": 1,
+        "chroma_siting": 0
+      },
+      "blocks": 138,
+      "block_bytes_max": 1164,
+      "blocks_over_1111": 15,
+      "pwv1": {
+        "file": "detail_320x192_xhi.pwv1",
+        "bytes": 66016,
+        "sha256": "3ca434daf2c213b0ecaae69271cc762a213890d7c7e19a3a10efea0aba1024ea"
+      },
+      "ref": {
+        "file": "detail_320x192_xhi.ref.yuv",
+        "bytes": 92160,
+        "sha256": "467579b228876dfa9e306237ec74f25eb6f230fddf8467048e8cf2ddec925141"
+      },
+      "src": "detail_320x192.src.yuv",
+      "psnr_ref_vs_src_db": {
+        "y": 83.46,
+        "cb": 79.2,
+        "cr": 82.21
+      },
+      "encoder_bar": {
+        "min_psnr_db": {
+          "y": 59.0,
+          "cb": 59.0,
+          "cr": 59.0
+        }
+      },
+      "budget_mbit_s_at_60fps": 44.2
+    },
+    {
+      "name": "flat_200x114_hi",
+      "picture": "flat",
+      "width": 200,
+      "height": 114,
+      "rate": "hi",
+      "budget_bytes": 18240,
+      "frame_bytes": 7800,
+      "sof": {
+        "sequence": 1,
+        "total_blocks": 57,
+        "chroma_resolution": 0,
+        "color_primaries": 0,
+        "transfer_function": 0,
+        "ycbcr_transform": 0,
+        "ycbcr_range": 1,
+        "chroma_siting": 0
+      },
+      "blocks": 57,
+      "block_bytes_max": 640,
+      "blocks_over_1111": 0,
+      "pwv1": {
+        "file": "flat_200x114_hi.pwv1",
+        "bytes": 7828,
+        "sha256": "945ab7b0894e70262e0e6113ca0ce94493ef03f7a436f4df95d1ce9fd2e55edc"
+      },
+      "ref": {
+        "file": "flat_200x114_hi.ref.yuv",
+        "bytes": 34200,
+        "sha256": "8d5cd62bb59ea302bf9bd1032dbb3c8db72d62f327169a29b6be0ed4ad976227"
+      },
+      "src": "flat_200x114.src.yuv",
+      "psnr_ref_vs_src_db": {
+        "y": 88.7,
+        "cb": 99.0,
+        "cr": 99.0
+      },
+      "encoder_bar": {
+        "min_psnr_db": {
+          "y": 59.0,
+          "cb": 59.0,
+          "cr": 59.0
+        }
+      },
+      "budget_mbit_s_at_60fps": 8.8
+    },
+    {
+      "name": "flat_200x114_lo",
+      "picture": "flat",
+      "width": 200,
+      "height": 114,
+      "rate": "lo",
+      "budget_bytes": 2280,
+      "frame_bytes": 2264,
+      "sof": {
+        "sequence": 1,
+        "total_blocks": 44,
+        "chroma_resolution": 0,
+        "color_primaries": 0,
+        "transfer_function": 0,
+        "ycbcr_transform": 0,
+        "ycbcr_range": 1,
+        "chroma_siting": 0
+      },
+      "blocks": 44,
+      "block_bytes_max": 276,
+      "blocks_over_1111": 0,
+      "pwv1": {
+        "file": "flat_200x114_lo.pwv1",
+        "bytes": 2292,
+        "sha256": "15ecb6779532dc34dbdac5897b924e849a002a6ddd90d1dc956189741254da08"
+      },
+      "ref": {
+        "file": "flat_200x114_lo.ref.yuv",
+        "bytes": 34200,
+        "sha256": "fd1bfa06b8d2dd9f4cf38aaf86871b3170e2826e4ff9c6b8a6473432a8d4f5d7"
+      },
+      "src": "flat_200x114.src.yuv",
+      "psnr_ref_vs_src_db": {
+        "y": 45.81,
+        "cb": 49.01,
+        "cr": 47.27
+      },
+      "encoder_bar": {
+        "min_psnr_db": {
+          "y": 44.81,
+          "cb": 48.01,
+          "cr": 46.27
+        }
+      },
+      "budget_mbit_s_at_60fps": 1.1
+    },
+    {
+      "name": "flat_320x192_hi",
+      "picture": "flat",
+      "width": 320,
+      "height": 192,
+      "rate": "hi",
+      "budget_bytes": 49152,
+      "frame_bytes": 11784,
+      "sof": {
+        "sequence": 1,
+        "total_blocks": 93,
+        "chroma_resolution": 0,
+        "color_primaries": 0,
+        "transfer_function": 0,
+        "ycbcr_transform": 0,
+        "ycbcr_range": 1,
+        "chroma_siting": 0
+      },
+      "blocks": 93,
+      "block_bytes_max": 604,
+      "blocks_over_1111": 0,
+      "pwv1": {
+        "file": "flat_320x192_hi.pwv1",
+        "bytes": 11812,
+        "sha256": "4ec8804b13d70c73eec813621163776bd0de22dc92e857775391db6bf25ac944"
+      },
+      "ref": {
+        "file": "flat_320x192_hi.ref.yuv",
+        "bytes": 92160,
+        "sha256": "87ddb9b8caaccd7c25c1ef743a93e959e22d976e9a84af4a5d487bf308db4ac9"
+      },
+      "src": "flat_320x192.src.yuv",
+      "psnr_ref_vs_src_db": {
+        "y": 89.03,
+        "cb": 99.0,
+        "cr": 89.99
+      },
+      "encoder_bar": {
+        "min_psnr_db": {
+          "y": 59.0,
+          "cb": 59.0,
+          "cr": 59.0
+        }
+      },
+      "budget_mbit_s_at_60fps": 23.6
+    },
+    {
+      "name": "flat_320x192_lo",
+      "picture": "flat",
+      "width": 320,
+      "height": 192,
+      "rate": "lo",
+      "budget_bytes": 6144,
+      "frame_bytes": 6128,
+      "sof": {
+        "sequence": 1,
+        "total_blocks": 73,
+        "chroma_resolution": 0,
+        "color_primaries": 0,
+        "transfer_function": 0,
+        "ycbcr_transform": 0,
+        "ycbcr_range": 1,
+        "chroma_siting": 0
+      },
+      "blocks": 73,
+      "block_bytes_max": 524,
+      "blocks_over_1111": 0,
+      "pwv1": {
+        "file": "flat_320x192_lo.pwv1",
+        "bytes": 6156,
+        "sha256": "3077b97d58a085ed78a8ea7bb21a3f4daa6cd59b3526e99f5e32fcbf2a25e0ac"
+      },
+      "ref": {
+        "file": "flat_320x192_lo.ref.yuv",
+        "bytes": 92160,
+        "sha256": "48019db309fb7aa2be4c4f0921b0e68bb3258ded7c82dd3e4f11ac8bddf43357"
+      },
+      "src": "flat_320x192.src.yuv",
+      "psnr_ref_vs_src_db": {
+        "y": 56.67,
+        "cb": 59.69,
+        "cr": 59.9
+      },
+      "encoder_bar": {
+        "min_psnr_db": {
+          "y": 55.67,
+          "cb": 58.69,
+          "cr": 58.9
+        }
+      },
+      "budget_mbit_s_at_60fps": 2.9
+    }
+  ]
+}

@@ -255,6 +255,33 @@ func TestInvalidTokenClose4401(t *testing.T) {
 	}
 }
 
+// TestTransportTokenAtSignalClose4401: a live, unexpired WebTransport token is not a signaling
+// token (schema.md session_tokens kind). /v1/signal closes it 4401 and leaves the row alone, and
+// the session's own signaling token still connects afterwards.
+func TestTransportTokenAtSignalClose4401(t *testing.T) {
+	pool := testDB(t)
+	srv := newTestServer(t, pool)
+	sess, signaling := seedAssignedSession(t, pool)
+	transport, err := session.NewStore(pool).MintTransportToken(context.Background(), sess.ID)
+	if err != nil {
+		t.Fatalf("mint transport token: %v", err)
+	}
+
+	if code := dialExpectClose(t, signalURL(srv, transport.Plaintext)); code != wsCloseTokenInvalid {
+		t.Fatalf("transport token at /v1/signal: close %d, want %d", code, wsCloseTokenInvalid)
+	}
+	var consumed bool
+	must(t, pool.QueryRow(context.Background(),
+		`SELECT consumed_at IS NOT NULL FROM session_tokens WHERE kind = 'transport' AND session_id = $1::uuid`,
+		sess.ID).Scan(&consumed))
+	if consumed {
+		t.Error("the refused attempt consumed the transport token")
+	}
+	if _, err := session.NewStore(pool).ConsumeSignalingToken(context.Background(), signaling); err != nil {
+		t.Errorf("the signaling token after the refused attempt: %v", err)
+	}
+}
+
 func TestInvalidSignalTokensAreRateLimitedPreUpgradeAndIgnoreXFF(t *testing.T) {
 	pool := testDB(t)
 	srv := newTestServer(t, pool)

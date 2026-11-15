@@ -28,7 +28,12 @@ fn probe_stream(request: &MediaProbeRequest) -> Result<StreamParams> {
         width: request.width,
         height: request.height,
         fps: request.fps,
-        codec: crate::session::Codec::parse(&request.codec)?,
+        // A PyroWave probe binds the GPU like any other; its stream codec goes unused.
+        codec: if request.codec == crate::session::probe_media::PYROWAVE {
+            crate::session::Codec::H264
+        } else {
+            crate::session::Codec::parse(&request.codec)?
+        },
         ..StreamParams::default()
     })
 }
@@ -86,7 +91,7 @@ pub fn child_spec(
     deadline: Duration,
 ) -> Result<ChildSpec> {
     let request = match codec {
-        Some(codec) => MediaProbeRequest::codec_probe(gpu_index, codec.codec()),
+        Some(codec) => MediaProbeRequest::codec_probe(gpu_index, codec.as_str()),
         None => MediaProbeRequest {
             gpu: gpu_index,
             ..MediaProbeRequest::default()

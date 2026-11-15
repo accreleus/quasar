@@ -107,6 +107,14 @@ func (h *Handler) SetRegistry(r RegistryChecker) {
 	h.registry = r
 }
 
+// SetOwnMachine gives DELETE /v1/hosts/{id} the control plane's own-machine
+// decision (platform.MachineShape.SharesMachineWith; internal/platform imports
+// this package's dependants, so it is passed in). Unset or unknown refuses nothing,
+// as Remove host does.
+func (h *Handler) SetOwnMachine(sharesMachineWith func(nodeName string) bool) {
+	h.store.sharesOwnMachine = sharesMachineWith
+}
+
 // Register wires the CRUD routes onto mux. requireAdmin enforces the admin role
 // server-side — the actual access gate, never UI route-hiding
 // (control-api.md §Authorization).
@@ -134,6 +142,9 @@ func (h *Handler) Register(mux httpx.Router, requireAuth, requireAdmin func(http
 	// registration, before check_id validation or any host lookup.
 	mux.Handle("PUT /v1/admin/hosts/{id}/readiness-overrides/{check_id}", admin(http.HandlerFunc(h.handleSetReadinessOverride)))
 	mux.Handle("DELETE /v1/admin/hosts/{id}/readiness-overrides/{check_id}", admin(http.HandlerFunc(h.handleClearReadinessOverride)))
+
+	mux.Handle("GET /v1/admin/hosts/{id}/webtransport", admin(http.HandlerFunc(h.handleGetHostWebTransport)))
+	mux.Handle("PATCH /v1/admin/hosts/{id}/webtransport", admin(http.HandlerFunc(h.handlePatchHostWebTransport)))
 
 	// Runtime presets (UI-P3). The admin UI's disabled Delete on an in-use preset
 	// is UX only; the 409 from DELETE is the enforcement (presets.go).
@@ -1267,6 +1278,9 @@ func (h *Handler) handleDeleteHost(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	case errors.Is(err, ErrNotFound):
 		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "host not found")
+	case errors.Is(err, ErrHostIsOwnMachine):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeHostNotRemovable,
+			"this host shares the control plane's machine; take that machine apart with the uninstall command on it")
 	case errors.Is(err, ErrHostHasActiveSessions):
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "host has active sessions — stop them first")
 	default:

@@ -6,14 +6,14 @@ Referenced from `CLAUDE.md` → "Agent skills". Layout: **single-context**.
 
 ## Before exploring, read these
 
-- **`CONTEXT.md`** at the repo root — the domain glossary (chain, rung, cert cap, stream plan, probe, envelope, entitlement, home, derived tile). It exists and is maintained; read it before naming things.
+- **`GLOSSARY.md`** at the repo root — the domain glossary (chain, rung, cert cap, stream plan, probe, envelope, entitlement, home, derived tile). It exists and is maintained; read it before naming things.
 - **`docs/adr/`** — architecture decision records. **This directory does not exist yet.** That is expected: `/domain-modeling` creates ADRs lazily, when a decision actually gets resolved. Proceed silently; don't flag its absence and don't scaffold it upfront.
 
-There is no `CONTEXT-MAP.md` and there should not be — this is a single-context repo despite having several language trees (`control-plane/`, `node-agent/`, `web/`). Those are deployment boundaries, not bounded contexts; they share one domain vocabulary, which is why there is one glossary.
+There is no `GLOSSARY-MAP.md` and there should not be — this is a single-context repo despite having several language trees (`control-plane/`, `node-agent/`, `web/`). Those are deployment boundaries, not bounded contexts; they share one domain vocabulary, which is why there is one glossary.
 
 ## These are the glossary, not the architecture
 
-`CONTEXT.md` defines *terms*. It does not supersede:
+`GLOSSARY.md` defines *terms*. It does not supersede:
 
 - **`docs/architecture-and-plan.md`** — the architecture of record.
 - **`protocol/`** — the frozen wire contracts (a submodule of `quasar-protocol`). Contract changes happen there, gated on Opus + explicit human sign-off, then the pin is bumped here.
@@ -25,7 +25,7 @@ If a glossary term and a frozen contract disagree, the contract wins and the glo
 
 ```
 /
-├── CONTEXT.md          ← the domain glossary (exists)
+├── GLOSSARY.md          ← the domain glossary (exists)
 ├── docs/adr/           ← created lazily by /domain-modeling (absent today)
 ├── docs/agents/        ← this directory: skill configuration
 ├── control-plane/      (Go)
@@ -35,7 +35,7 @@ If a glossary term and a frozen contract disagree, the contract wins and the glo
 
 ## Use the glossary's vocabulary
 
-When output names a domain concept — an issue title, a refactor proposal, a hypothesis, a test name — use the term as `CONTEXT.md` defines it, and don't drift to a synonym it explicitly avoids. `CLAUDE.md` makes this a standing rule: *"Read it before naming things; add a term when work resolves one, rather than coining a synonym."*
+When output names a domain concept — an issue title, a refactor proposal, a hypothesis, a test name — use the term as `GLOSSARY.md` defines it, and don't drift to a synonym it explicitly avoids. `CLAUDE.md` makes this a standing rule: *"Read it before naming things; add a term when work resolves one, rather than coining a synonym."*
 
 If the concept isn't in the glossary, that's a signal: either the language is being invented (reconsider) or there's a real gap (note it for `/domain-modeling`).
 

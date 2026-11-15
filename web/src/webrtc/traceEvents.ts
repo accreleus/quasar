@@ -12,6 +12,7 @@ export type BrowserTraceEventType =
   | "client.freeze_detected"
   | "client.visibility_changed"
   | "webrtc.state_changed"
+  | "transport.fallback"
   // Bench mode only (?bench=1). Never emitted by an ordinary user session.
   | "bench.window";
 
@@ -87,6 +88,12 @@ export class TraceEventEmitter {
 
   emitWebRtcStateChanged(kind: "ice" | "connection", from: string, to: string): void {
     this.push("webrtc.state_changed", { kind, from, to });
+  }
+
+  /** Flushes at once: the session is about to change transport. */
+  emitTransportFallback(reason: string): void {
+    this.push("transport.fallback", { from: "webtransport", to: "webrtc", reason });
+    void this.flush();
   }
 
   /**

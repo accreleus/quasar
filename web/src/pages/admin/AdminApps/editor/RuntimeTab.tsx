@@ -6,6 +6,7 @@
 // Read mergeRuntimePreset (control-plane/internal/session/runtime_preset.go)
 // before changing what layers over what.
 
+import type { ComponentProps } from "react";
 import { Link } from "react-router-dom";
 import type { AdminApp, RuntimePreset, StorageProvider } from "../../../../api/types";
 import { Button } from "../../../../components/Button";
@@ -13,6 +14,7 @@ import { IconClose, IconPlus } from "../../../../components/icons";
 import { SelectField, Switch, TextField } from "../../../../components/TextField";
 import { imageFieldPlaceholder } from "../imagePlaceholder";
 import { parseSpec } from "../runtimeSpec";
+import { CompatToolSection } from "./CompatToolSection";
 import { Fact, Section } from "./primitives";
 import type { AppDraft, DraftErrors } from "./appDraft";
 
@@ -34,6 +36,8 @@ interface RuntimeTabProps {
   presets: RuntimePreset[];
   /** Instance-wide, read-only here. Null when the settings read failed. */
   storageProvider: StorageProvider | null;
+  /** A derived Steam game's own tool; null for any other tile. */
+  compat?: ComponentProps<typeof CompatToolSection> | null;
 }
 
 export function RuntimeTab({
@@ -44,36 +48,40 @@ export function RuntimeTab({
   parent,
   presets,
   storageProvider,
+  compat,
 }: RuntimeTabProps) {
   if (parent && app) {
     const parentSpec = parseSpec(parent.runtime_spec);
     const parentPreset = presets.find((p) => p.id === parent.runtime_preset_id) ?? null;
     return (
-      <Section title="Runtime" desc="Merged from the parent tile at launch.">
-        <div className="note">
-          <div>
-            This tile is discovered under <strong>{parent.name}</strong> and contributes no runtime
-            of its own. Image, arguments, environment and mounts all come from the parent. Edit{" "}
-            <Link to={`/admin/library/apps/${parent.id}/runtime`}>{parent.name}</Link> to change
-            what it launches with.
+      <>
+        <Section title="Runtime" desc="Merged from the parent tile at launch.">
+          <div className="note">
+            <div>
+              This tile is discovered under <strong>{parent.name}</strong> and contributes no runtime
+              of its own. Image, arguments, environment and mounts all come from the parent. Edit{" "}
+              <Link to={`/admin/library/apps/${parent.id}/runtime`}>{parent.name}</Link> to change
+              what it launches with.
+            </div>
           </div>
-        </div>
-        <div className="ae-facts">
-          <Fact label="Image">
-            <span className="mono">{parentSpec.image || "inherited from the preset"}</span>
-          </Fact>
-          <Fact label="Runtime preset">
-            {parentPreset ? (
-              <Link to={`/admin/library/presets?preset=${parentPreset.id}`}>{parentPreset.name}</Link>
-            ) : (
-              <span className="muted">None</span>
-            )}
-          </Fact>
-          <Fact label="Own runtime spec">
-            <span className="mono">{JSON.stringify(app.runtime_spec ?? {})}</span>
-          </Fact>
-        </div>
-      </Section>
+          <div className="ae-facts">
+            <Fact label="Image">
+              <span className="mono">{parentSpec.image || "inherited from the preset"}</span>
+            </Fact>
+            <Fact label="Runtime preset">
+              {parentPreset ? (
+                <Link to={`/admin/library/presets?preset=${parentPreset.id}`}>{parentPreset.name}</Link>
+              ) : (
+                <span className="muted">None</span>
+              )}
+            </Fact>
+            <Fact label="Own runtime spec">
+              <span className="mono">{JSON.stringify(app.runtime_spec ?? {})}</span>
+            </Fact>
+          </div>
+        </Section>
+        {compat && <CompatToolSection {...compat} />}
+      </>
     );
   }
 
@@ -83,6 +91,12 @@ export function RuntimeTab({
   // stored false of a preset-linked app is not what runs.
   const presetHome = !!preset?.managed_home;
   const managedHome = draft.managedHome || presetHome;
+  // Same rule as the launch (mergeManagedHome): an app with no path of its own (empty or the schema
+  // default) takes the preset's. Shown as a hint only; the field stays on what the app stores.
+  const homePath =
+    preset?.home_container_path && (!draft.containerPath || draft.containerPath === "/home/quasar")
+      ? preset.home_container_path
+      : draft.containerPath;
   const overridden = draft.env.filter(([k]) => presetEnvKeys.includes(k.trim())).length;
 
   const setArgs = (args: string[]) => onChange({ ...draft, args });
@@ -241,10 +255,15 @@ export function RuntimeTab({
             value={draft.containerPath}
             onChange={(e) => onChange({ ...draft, containerPath: e.target.value })}
             placeholder="/home/quasar"
-            hint="Where the home appears inside the container, not where the data is stored."
+            hint={
+              homePath !== draft.containerPath
+                ? `The runtime preset mounts the home at ${homePath}. The app uses that path while this field is empty or /home/quasar.`
+                : "Where the home appears inside the container, not where the data is stored."
+            }
           />
         )}
-        {managedHome && (draft.kind === "desktop" || draft.shareSteamLibrary) && (
+        {managedHome &&
+          ((draft.kind === "desktop" && draft.libraryProvider === "") || draft.shareSteamLibrary) && (
           <>
             <Switch
               checked={draft.shareSteamLibrary}

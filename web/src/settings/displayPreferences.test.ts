@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   launchImmersive,
+  onScreenControls,
   loadDisplayPreferences,
   saveDisplayPreferences,
+  upscaleSharpen,
   type DisplayPreferences,
 } from "./displayPreferences";
 
@@ -91,6 +93,24 @@ describe("preferredMicDeviceId (microphone spec §3.4)", () => {
   });
 });
 
+describe("upscaleSharpen (#1349)", () => {
+  it("defaults off (opt-in), and reads back a stored on", () => {
+    expect(upscaleSharpen()).toBe(false);
+    saveDisplayPreferences({ upscaleSharpen: true });
+    expect(upscaleSharpen()).toBe(true);
+    saveDisplayPreferences({ upscaleSharpen: false });
+    expect(upscaleSharpen()).toBe(false);
+  });
+
+  it("survives a scaling-only save, and a scaling save survives it", () => {
+    saveDisplayPreferences({ upscaleSharpen: true });
+    saveDisplayPreferences({ scalingMode: "cover" });
+    expect(loadDisplayPreferences()).toEqual({ scalingMode: "cover", upscaleSharpen: true });
+    saveDisplayPreferences({ upscaleSharpen: false });
+    expect(loadDisplayPreferences().scalingMode).toBe("cover");
+  });
+});
+
 describe("saveDisplayPreferences", () => {
   it("persists to localStorage under the expected key", () => {
     saveDisplayPreferences({ scalingMode: "stretch" });
@@ -116,5 +136,16 @@ describe("launchImmersive (#647)", () => {
     expect(loadDisplayPreferences().scalingMode).toBe("contain");
     saveDisplayPreferences({ launchImmersive: true });
     expect(launchImmersive()).toBe(true);
+  });
+});
+
+describe("onScreenControls (#1401)", () => {
+  it("defaults off (opt-in), and reads back a stored on", () => {
+    localStorage.removeItem("quasar.display.preferences");
+    expect(onScreenControls()).toBe(false);
+    saveDisplayPreferences({ onScreenControls: true });
+    expect(onScreenControls()).toBe(true);
+    saveDisplayPreferences({ onScreenControls: false });
+    expect(onScreenControls()).toBe(false);
   });
 });

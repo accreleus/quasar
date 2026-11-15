@@ -179,6 +179,7 @@ impl WarmupHost for AgentWarmupHost {
             systempaths_unconfined: false,
             require_local_image: false,
             direct_display: false,
+            compat_tools: Vec::new(),
         };
 
         let mut cfg = SessionConfig::for_assignment_with(

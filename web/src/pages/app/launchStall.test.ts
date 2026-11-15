@@ -177,3 +177,23 @@ describe("resolveStall — the other phases keep their own copy", () => {
     }
   });
 });
+
+describe("resolveStall — a WebTransport session has no signaling socket", () => {
+  const wt = at({ transport: "webtransport", wsOpen: false, sessionRunning: true, hostAssigned: true, phase: "stream" });
+
+  it("names WebTransport, not signaling, WebSocket proxies or origins", () => {
+    const v = resolveStall({ ...wt, transportElapsedMs: TRANSPORT_STALL_MS });
+    expect(v?.kind).toBe("transport");
+    expect(v?.title).toBe("WebTransport has not connected");
+    expect(`${v?.title} ${v?.message}`).not.toMatch(/signaling|WebSocket|origin/i);
+  });
+
+  it("says nothing inside the transport budget", () => {
+    expect(resolveStall({ ...wt, transportElapsedMs: TRANSPORT_STALL_MS - 1 })).toBeNull();
+  });
+
+  it("still gives a WebRTC session with a closed socket the signaling verdict", () => {
+    const v = resolveStall({ ...wt, transport: "webrtc", transportElapsedMs: TRANSPORT_STALL_MS });
+    expect(v?.kind).toBe("signaling");
+  });
+});

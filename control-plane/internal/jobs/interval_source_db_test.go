@@ -307,6 +307,34 @@ func TestAPendingRunWithNoFinishedRunFollowsTheNewPeriod(t *testing.T) {
 	}
 }
 
+// ...and with the period and window unchanged, ticking does not move it: only a
+// change may re-date a pending run that has never finished one (#1003).
+func TestAPendingRunWithNoFinishedRunKeepsItsDate(t *testing.T) {
+	s := newSourcedJob(t, 7*24*time.Hour, func(d *Definition) { d.DailyOpensEveryDay = true })
+	// The same window as above, three days out, so the first pass is held and the
+	// pending run is the one under test.
+	now := time.Now().UTC()
+	open, shut := now.Add(6*time.Hour).Format("15:04"), now.Add(7*time.Hour).Format("15:04")
+	if _, err := s.store.pool.Exec(context.Background(),
+		`UPDATE jobs SET window_start = $1, window_end = $2, window_days = ARRAY[$3]::smallint[]
+		  WHERE id = 'library.discovery'`, open, shut, int(now.AddDate(0, 0, 3).Weekday())); err != nil {
+		t.Fatal(err)
+	}
+	s.tick(t)
+	before := s.next(t).ScheduledFor
+	if got := time.Until(before); got < 48*time.Hour {
+		t.Fatalf("pending run due in %s, want it held to the window day three days out", got)
+	}
+
+	s.tick(t)
+	if got := s.next(t).ScheduledFor; !got.Equal(before) {
+		t.Fatalf("scheduled_for %v -> %v with the period and window unchanged", before, got)
+	}
+	if got := s.execs.Load(); got != 0 {
+		t.Fatalf("the held pass ran %d times", got)
+	}
+}
+
 // Amendment 48: platform.release_detect's window opens every day while its setting
 // says daily, whatever window_days holds; an env-set period keeps the days.
 func TestDailyOpensTheWindowEveryDay(t *testing.T) {

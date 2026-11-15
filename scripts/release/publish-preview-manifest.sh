@@ -19,6 +19,8 @@
 #
 # --current REF prints the source_commit of the document at REF, or nothing when
 # the tag is not published (the Images gate diffs a develop push against it).
+# --component NAME (with --current) prints that component's image@digest instead
+# (the gate compares the base the published agent image was built on).
 #
 # Credentials come from REGISTRY_USER / REGISTRY_TOKEN (the workflow's
 # GITHUB_TOKEN); they go to curl through a mode-600 config file, never argv.
@@ -31,7 +33,7 @@ usage() {
   cat <<'EOF'
 usage: scripts/release/publish-preview-manifest.sh DOCUMENT REGISTRY/REPOSITORY:TAG \
          --source-url URL [--plain-http]
-       scripts/release/publish-preview-manifest.sh --current REGISTRY/REPOSITORY:TAG [--plain-http]
+       scripts/release/publish-preview-manifest.sh --current REGISTRY/REPOSITORY:TAG [--component NAME] [--plain-http]
 
 Pushes DOCUMENT (already validated with validate-platform-release-manifest.sh
 --preview) as the single layer of an OCI image manifest and points TAG at it,
@@ -41,22 +43,25 @@ links the package to its repository. --plain-http is for a local test registry.
 Prints the manifest digest on success.
 
 --current prints the source_commit TAG names now, or nothing if it is not published.
+--component NAME prints that component's image@digest instead (nothing if unpublished).
 EOF
 }
 
 rules="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/preview-rules.sh"
-doc="" ref="" source_url="" scheme=https current_only=0
+doc="" ref="" source_url="" scheme=https current_only=0 component=""
 while (($#)); do
   case "$1" in
     --source-url) source_url=${2:?--source-url needs a value}; shift 2 ;;
     --plain-http) scheme=http; shift ;;
     --current) current_only=1; shift ;;
+    --component) component=${2:?--component needs a value}; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     -*) usage >&2; exit 2 ;;
     *) if [[ -z "$doc" ]]; then doc=$1; elif [[ -z "$ref" ]]; then ref=$1; else usage >&2; exit 2; fi
        shift ;;
   esac
 done
+[[ -z "$component" ]] || ((current_only)) || { usage >&2; exit 2; }
 if ((current_only)); then
   [[ -n "$doc" && -z "$ref" ]] || { usage >&2; exit 2; }
   ref=$doc doc=""
@@ -120,10 +125,19 @@ current_commit() {
   req -L -o "$work/cur-layer" "$base/blobs/$layer"
   python3 -c '
 import json, re, sys
-c = json.load(open(sys.argv[1])).get("source_commit")
+d = json.load(open(sys.argv[1]))
+c = d.get("source_commit")
 if not isinstance(c, str) or not re.fullmatch(r"[0-9a-f]{40}", c):
     sys.exit(f"no source_commit in the document at {sys.argv[2]}")
-print(c)' "$work/cur-layer" "$ref" || fail "cannot read the document $ref names"
+if not sys.argv[3]:
+    print(c)
+else:
+    for comp in d.get("components", []):
+        if comp.get("name") == sys.argv[3] and comp.get("image") and comp.get("digest"):
+            print(comp["image"] + "@" + comp["digest"])
+            break
+    else:
+        sys.exit(f"no component {sys.argv[3]} in the document at {sys.argv[2]}")' "$work/cur-layer" "$ref" "$component" || fail "cannot read the document $ref names"
 }
 
 if ((current_only)); then

@@ -343,11 +343,22 @@ func (c *Coordinator) applyRegionInput(ctx context.Context, spec []byte, userID 
 	return setSpecEnvs(spec, values)
 }
 
-// swapSpec is a swap target's dispatch spec: its home, then its region values.
+// swapSpec is a swap target's dispatch spec: its own home, the shared Steam home
+// the swap guard claimed for it, then its region values. sess.SharedHomeAppID is
+// what Swap got back from GuardHomeForSwapWithHold, never the row's value, which
+// still names the old app's shared home.
 func (c *Coordinator) swapSpec(ctx context.Context, app LaunchApp, sess Session) ([]byte, error) {
 	spec, err := c.resolveHomeSpec(ctx, app, sess.UserID, *sess.HostID)
 	if err != nil {
 		return nil, err
+	}
+	// A mount dispatched without its hold, or a hold without its mount, is how
+	// two Steams end up on one library: the claim, the hold and this injection
+	// all follow the one answer.
+	if sess.SharedHomeAppID != nil {
+		if spec, err = c.injectSharedHomeMount(ctx, spec, app, sess.UserID, *sess.SharedHomeAppID, *sess.HostID); err != nil {
+			return nil, err
+		}
 	}
 	return c.applyRegionInput(ctx, spec, sess.UserID, sess.DeviceID)
 }

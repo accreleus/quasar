@@ -111,7 +111,8 @@ type RegistryResolver struct {
 // and bounds bodies like the production resolver, at each read site since its
 // bare client has no cap; it is never the catalog's.
 func NewPlainHTTPRegistryResolver(hosts map[string]struct{}, timeout time.Duration) *RegistryResolver {
-	client := &http.Client{Timeout: timeout, CheckRedirect: outbound.NoRedirect}
+	// Exception to internal/outbound: operator-named dev registries may be private or plain http; an empty Transport ignores proxy env.
+	client := &http.Client{Timeout: timeout, CheckRedirect: outbound.NoRedirect, Transport: &http.Transport{}}
 	return &RegistryResolver{client: client, allowHosts: hosts, plainHTTP: true}
 }
 

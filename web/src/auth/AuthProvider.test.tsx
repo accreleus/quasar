@@ -8,7 +8,7 @@
  */
 
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { AuthProvider } from "./AuthProvider";
 import { useAuth } from "./context";
 import { saveSession, type PersistedSession } from "./storage";
@@ -21,13 +21,18 @@ vi.mock("../api/auth", () => ({
 }));
 vi.mock("../webrtc/capability", () => ({
   getOrCreateDeviceKey: () => "dev-key",
-  probeCapabilities: vi.fn().mockResolvedValue({ codecs: { h264: true } }),
+  probeCapabilities: vi.fn().mockResolvedValue({ codecs: { h264: true }, webcodecs: {}, webgpu: {} }),
+  INCOMPLETE_PROBE_RETRY_MS: 300_000,
   probeH264Decodable: vi.fn().mockResolvedValue(true),
+  probeWebGpu: vi.fn().mockResolvedValue({ available: false, features: [] }),
   deviceProbeIsFresh: vi.fn(() => false),
   markDeviceProbePosted: vi.fn(),
 }));
 
+vi.mock("../api/setup", () => ({ claimSetup: vi.fn() }));
+
 import * as authApi from "../api/auth";
+import { claimSetup } from "../api/setup";
 import { deviceProbeIsFresh, markDeviceProbePosted, probeCapabilities, probeH264Decodable } from "../webrtc/capability";
 
 const TOKEN_KEY = "quasar.auth.token";
@@ -99,7 +104,7 @@ describe("AuthProvider device capability re-post", () => {
     );
 
     await waitFor(() => expect(authApi.postDevice).toHaveBeenCalledTimes(1));
-    expect(markDeviceProbePosted).toHaveBeenCalledWith("u1", true);
+    expect(markDeviceProbePosted).toHaveBeenCalledWith("u1", true, false, expect.any(Number), undefined);
   });
 
   it("skips the post while the stored probe is still fresh", async () => {
@@ -127,14 +132,14 @@ describe("AuthProvider device capability re-post", () => {
     });
 
     it("posts once when the last-posted verdict was false and the probe now says true", async () => {
-      actual.markDeviceProbePosted("u1", false);
+      actual.markDeviceProbePosted("u1", false, false);
       vi.mocked(probeH264Decodable).mockResolvedValue(true);
       render(<AuthProvider><Probe /></AuthProvider>);
       await waitFor(() => expect(authApi.postDevice).toHaveBeenCalledTimes(1));
     });
 
     it("does not post again when the verdict is the one last posted", async () => {
-      actual.markDeviceProbePosted("u1", true);
+      actual.markDeviceProbePosted("u1", true, false);
       vi.mocked(probeH264Decodable).mockResolvedValue(true);
       render(<AuthProvider><Probe /></AuthProvider>);
       await waitFor(() => expect(screen.getByText("hi ab-fresh")).toBeInTheDocument());
@@ -144,10 +149,47 @@ describe("AuthProvider device capability re-post", () => {
 
     it("stamps the verdict the posted record carries, so the next load does not post again", async () => {
       vi.mocked(probeH264Decodable).mockResolvedValue(false);
-      vi.mocked(probeCapabilities).mockResolvedValueOnce({ codecs: { h264: false } } as never);
+      vi.mocked(probeCapabilities).mockResolvedValueOnce({ codecs: { h264: false }, webcodecs: {}, webgpu: {} } as never);
       render(<AuthProvider><Probe /></AuthProvider>);
       await waitFor(() => expect(authApi.postDevice).toHaveBeenCalledTimes(1));
-      await waitFor(() => expect(actual.deviceProbeIsFresh("u1", false)).toBe(true));
+      await waitFor(() => expect(actual.deviceProbeIsFresh("u1", false, false)).toBe(true));
     });
+  });
+});
+
+/** Sign-in and the setup claim stamp the probe as rehydration does (deviceProbe.ts). */
+describe("AuthProvider device probe at sign-in", () => {
+  const signedIn = { access_token: "tok-2", expires_at: stored.expiresAt, user: stored.user };
+
+  function SignIn({ how }: { how: "login" | "claim" }) {
+    const { login, claim } = useAuth();
+    return (
+      <button onClick={() => void (how === "login" ? login("a@b.co", "pw") : claim("setup-token", "a@b.co", "ab", "pw"))}>
+        go
+      </button>
+    );
+  }
+
+  it.each(["login", "claim"] as const)("%s: a probe with a timed-out step is stamped to be asked again soon", async (how) => {
+    vi.mocked(authApi.login).mockResolvedValue(signedIn as never);
+    vi.mocked(claimSetup).mockResolvedValue(signedIn as never);
+    vi.mocked(markDeviceProbePosted).mockClear();
+    // The WebCodecs step timed out: its key is absent.
+    vi.mocked(probeCapabilities).mockResolvedValueOnce({ codecs: { h264: true }, webgpu: {} } as never);
+    render(<AuthProvider><SignIn how={how} /></AuthProvider>);
+    fireEvent.click(screen.getByRole("button", { name: "go" }));
+    await waitFor(() => expect(markDeviceProbePosted).toHaveBeenCalledWith("u1", true, false, expect.any(Number), 300_000));
+  });
+
+  // A revoked device signs in to a fresh device row with no capabilities (control-api.md
+  // §DELETE /v1/me/devices/{id}); this browser's stamp still says its last post is current.
+  it.each(["login", "claim"] as const)("%s: posts even when the local stamp is fresh", async (how) => {
+    vi.mocked(authApi.login).mockResolvedValue(signedIn as never);
+    vi.mocked(claimSetup).mockResolvedValue(signedIn as never);
+    vi.mocked(deviceProbeIsFresh).mockReturnValue(true);
+    render(<AuthProvider><SignIn how={how} /></AuthProvider>);
+    fireEvent.click(screen.getByRole("button", { name: "go" }));
+    await waitFor(() => expect(authApi.postDevice).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(authApi.postDevice).mock.calls[0][0]).toBe("tok-2");
   });
 });

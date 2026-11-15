@@ -23,9 +23,10 @@ name: Agent live tests
 # The nightly run is develop's. A schedule only fires from the default branch's copy
 # of this file, so that run checks develop out by name.
 on:
-  # Into develop only: the develop -> main release pull request has the push run below.
+  # Into develop or a release integration branch (`integration/<version>`) only: the
+  # develop -> main release pull request has the push run below.
   pull_request:
-    branches: [develop]
+    branches: [develop, 'integration/**']
     paths:
       - 'node-agent/**'
       - 'deploy/Dockerfile.vulkan'
@@ -37,7 +38,7 @@ on:
   # A landing on develop runs it too: those runs save the cargo cache every pull request
   # restores (#919). A schedule runs main's copy of this file, so it cannot be that source.
   push:
-    branches: [develop]
+    branches: [develop, 'integration/**']
     paths:
       - 'node-agent/**'
       - 'deploy/Dockerfile.vulkan'
@@ -59,10 +60,14 @@ permissions:
   contents: read
 
 jobs:
-  live:
-    name: node-agent (live WebRTC tests, toolchain image)
+  # Which toolchain image these pins name, and whether it is the GStreamer they pin. The
+  # jobs below pull it.
+  image:
+    name: toolchain image for these pins
     runs-on: ubuntu-26.04
-    timeout-minutes: 30
+    timeout-minutes: 10
+    outputs:
+      ref: ${{ steps.image.outputs.ref }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -87,7 +92,6 @@ jobs:
             echo "::error::No published toolchain image for these pins: $image (the registry said: ${said//$'\n'/ }). A pin, a patch, the toolchain stage or the base image changed. Run the Images workflow on this branch (its toolchain job builds and publishes that tag), then re-run this job."
             exit 1
           fi
-          docker pull --quiet "$image"
           echo "ref=$image" >> "$GITHUB_OUTPUT"
       - name: The image carries the pinned GStreamer
         env:
@@ -103,10 +107,27 @@ jobs:
             echo "::error::$IMAGE is not the GStreamer deploy/pins.env pins (GST_VERSION=$want): it links $links and loads $loads."
             exit 1
           fi
+
+  live:
+    name: node-agent (live WebRTC tests, toolchain image)
+    needs: image
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'develop' || '' }}
+          # The test step mounts this checkout into a container that runs the pull
+          # request's code, so the token must not be left in it.
+          persist-credentials: false
+      - name: Pull the toolchain image
+        env:
+          IMAGE: ${{ needs.image.outputs.ref }}
+        run: docker pull --quiet "$IMAGE"
       # The cargo registry and target dir, so a run compiles only what changed instead of
       # all ~250 crates (2.5 min, #919). Keyed on the toolchain image (its rustc and
       # GStreamer) and the lockfile; a lockfile change restores the newest build for the
-      # same image. Only a push to develop saves: a pull request's save is visible to that
+      # same image. Only a push (to develop or an integration branch) saves: a pull request's save is visible to that
       # pull request alone.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo
@@ -114,13 +135,13 @@ jobs:
           path: |
             ${{ runner.temp }}/cargo-registry
             node-agent/target
-          key: agent-live-${{ steps.image.outputs.ref }}-${{ hashFiles('node-agent/Cargo.lock') }}
-          restore-keys: agent-live-${{ steps.image.outputs.ref }}-
+          key: agent-live-${{ needs.image.outputs.ref }}-${{ hashFiles('node-agent/Cargo.lock') }}
+          restore-keys: agent-live-${{ needs.image.outputs.ref }}-
       # line-tables-only debug info keeps file:line in a test's backtrace at about a third
       # of the target dir's size, which is what keeps this cache small enough to keep.
       - name: Test
         env:
-          IMAGE: ${{ steps.image.outputs.ref }}
+          IMAGE: ${{ needs.image.outputs.ref }}
         run: |
           mkdir -p "$RUNNER_TEMP/cargo-registry"
           docker run --rm --ulimit core=0 -v "$PWD":/workspace -w /workspace/node-agent \
@@ -135,7 +156,7 @@ jobs:
       - name: Prune the cache to dependencies
         if: github.event_name == 'push' && steps.cargo.outputs.cache-hit != 'true'
         env:
-          IMAGE: ${{ steps.image.outputs.ref }}
+          IMAGE: ${{ needs.image.outputs.ref }}
         run: |
           du -sh node-agent/target 2>/dev/null || true
           docker run --rm -v "$PWD/node-agent":/n "$IMAGE" sh -c '
@@ -153,3 +174,54 @@ jobs:
             ${{ runner.temp }}/cargo-registry
             node-agent/target
           key: ${{ steps.cargo.outputs.cache-primary-key }}
+
+  # A real WebTransport session against the agent's listener and the production parser
+  # boundary: hello and hello_ack, video datagrams that reassemble into well-formed H.264
+  # access units, a clean close, input reaching the devices by datagram and by the control
+  # stream, and the agent's half of the fallback to WebRTC (#1044). The browser's half of the
+  # fallback is the web job's (web/src/webtransport/fallback.test.ts and the runtime's fallback
+  # tests). The client is the Rust WebTransport client the
+  # conformance suite uses: Playwright's Chromium has no H.264 decoder, and a browser that
+  # does needs a Chrome the lab runs (scripts/harness/run-takeover-peers.sh). Outcomes only,
+  # so other WebTransport work landing beside it does not move this job.
+  # Restores the live job's cargo cache and never saves one.
+  webtransport:
+    name: node-agent (live WebTransport session, toolchain image)
+    needs: image
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'develop' || '' }}
+          # The test step mounts this checkout into a container that runs the pull
+          # request's code, so the token must not be left in it.
+          persist-credentials: false
+      - name: Pull the toolchain image
+        env:
+          IMAGE: ${{ needs.image.outputs.ref }}
+        run: docker pull --quiet "$IMAGE"
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/cargo-registry
+            node-agent/target
+          key: agent-live-${{ needs.image.outputs.ref }}-${{ hashFiles('node-agent/Cargo.lock') }}
+          restore-keys: agent-live-${{ needs.image.outputs.ref }}-
+      - name: Test
+        env:
+          IMAGE: ${{ needs.image.outputs.ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cargo-registry"
+          docker run --rm --ulimit core=0 -v "$PWD":/workspace -w /workspace/node-agent \
+            -v "$RUNNER_TEMP/cargo-registry":/opt/cargo/registry \
+            -e CARGO_INCREMENTAL=0 -e CARGO_PROFILE_DEV_DEBUG=line-tables-only \
+            "$IMAGE" cargo test --lib webtransport:: -- --test-threads=4 2>&1 | tee "$RUNNER_TEMP/wt.log"
+          # A filter that matches nothing passes: insist the session, input and fallback tests ran.
+          for t in a_session_runs_from_hello_through_decodable_frames_to_a_clean_close \
+                   input_arrives_by_datagram_and_control_stream_only_after_hello_ack \
+                   a_client_that_falls_back_leaves_no_client_no_held_key_and_a_live_session; do
+            grep -qF "::$t ... ok" "$RUNNER_TEMP/wt.log" || { echo "missing or failed: $t"; exit 1; }
+          done
+          [ "$(grep -c '^test webtransport::.* ok$' "$RUNNER_TEMP/wt.log")" -ge 80 ]

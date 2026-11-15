@@ -126,7 +126,7 @@ func Evaluate(s HealthSample) HealthResult {
 		return HealthResult{
 			State:           HealthUnsustainable,
 			BelowFloorSince: since,
-			Reason:          "below ABR floor for over 3m — network cannot sustain this profile",
+			Reason:          "at or below the ABR floor for over 3m — network cannot sustain this profile",
 			ShouldFail:      true,
 		}
 	case belowFor >= healthABRAtFloorAfter:

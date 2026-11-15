@@ -65,7 +65,7 @@ case "$cmd" in
     "${COMPOSE[@]}" build devtools
     ;;
   versions)
-    "${COMPOSE[@]}" run --rm --no-deps ${GIT_MOUNT[@]+"${GIT_MOUNT[@]}"} devtools bash scripts/verify/versions.sh
+    "${COMPOSE[@]}" run --rm ${GIT_MOUNT[@]+"${GIT_MOUNT[@]}"} devtools-solo bash scripts/verify/versions.sh
     docker image inspect quasar-devtools:local --format 'image digest: {{.Id}}\nimage created: {{.Created}}\nimage size bytes: {{.Size}}'
     ;;
   reset-db)
@@ -85,7 +85,9 @@ case "$cmd" in
     "${COMPOSE[@]}" run --rm ${GIT_MOUNT[@]+"${GIT_MOUNT[@]}"} devtools bash "scripts/verify/$cmd.sh"
     ;;
   quick|web|control|agent|engine-suite-build)
-    "${COMPOSE[@]}" run --rm --no-deps ${GIT_MOUNT[@]+"${GIT_MOUNT[@]}"} devtools bash "scripts/verify/$cmd.sh"
+    # No Postgres: `devtools-solo` is on Docker's own bridge, so the run leaves no compose
+    # network behind (#1266).
+    "${COMPOSE[@]}" run --rm ${GIT_MOUNT[@]+"${GIT_MOUNT[@]}"} devtools-solo bash "scripts/verify/$cmd.sh"
     ;;
   uinput)
     # The node-agent's real-kernel uinput tests (#[ignore]d in `make test-rust`).
@@ -96,7 +98,7 @@ case "$cmd" in
       echo "FAIL — /dev/uinput is absent on this host: sudo modprobe uinput, or run on a host that has it" >&2
       exit 1
     fi
-    bin="$("${COMPOSE[@]}" run --rm --no-deps -T ${GIT_MOUNT[@]+"${GIT_MOUNT[@]}"} devtools bash scripts/verify/uinput.sh | tail -n1)"
+    bin="$("${COMPOSE[@]}" run --rm -T ${GIT_MOUNT[@]+"${GIT_MOUNT[@]}"} devtools-solo bash scripts/verify/uinput.sh | tail -n1)"
     case "$bin" in
       /cache/cargo-target/*) ;;
       *) echo "FAIL — could not build the node-agent test binary (got '$bin')" >&2; exit 1 ;;

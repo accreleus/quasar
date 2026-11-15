@@ -331,3 +331,12 @@ func TestFetchErrorsDoNotCarryTheURL(t *testing.T) {
 		}
 	}
 }
+
+// The artwork fetcher never routes through a proxy: its address guard would see the
+// proxy's address, not the target's (#1107).
+func TestFetcherHasNoProxy(t *testing.T) {
+	tr, ok := NewFetcher(time.Second, 0).client.Transport.(*http.Transport)
+	if !ok || tr.Proxy != nil {
+		t.Fatalf("transport = %#v, want an *http.Transport with Proxy == nil", NewFetcher(time.Second, 0).client.Transport)
+	}
+}

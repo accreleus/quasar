@@ -1,0 +1,6 @@
+{
+  "name": "input",
+  "scenarios": [
+    { "scenario": "input-kbm", "params": { "transport": "webrtc", "codec": "h264", "profile": "1080p60", "hold_s": 5 } }
+  ]
+}

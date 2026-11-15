@@ -218,3 +218,15 @@
   display: flex;
   flex-direction: column;
 }
+
+/* A Steam game's compatibility tool: the select and its Force checkbox share
+   a row, the checkbox on the select's baseline. */
+.ae-compat {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--s4);
+}
+
+.ae-compat .field {
+  flex: 0 1 320px;
+}

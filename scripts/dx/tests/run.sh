@@ -20,6 +20,9 @@ TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DX="$(cd "$TESTS_DIR/.." && pwd)"
 ROOT="$(cd "$DX/../.." && pwd)"
 FIXTURES="$TESTS_DIR/fixtures"
+# `qses` is the quasar-session skill's CLI, operator-local and not in this
+# repository; tests that assert its own behaviour SKIP by name without it (#1267).
+QSES="$ROOT/.claude/skills/quasar-session/scripts/qses"
 
 PASS_N=0; FAIL_N=0; WARN_N=0
 pass() { PASS_N=$((PASS_N + 1)); printf 'PASS %s — %s\n' "$1" "${2:-ok}"; }
@@ -28,9 +31,30 @@ fail() { FAIL_N=$((FAIL_N + 1)); printf 'FAIL %s — %s\n' "$1" "${2:-}" >&2; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/dx-tests.XXXXXX")"
 export WORK   # visible to PATH-shim subprocesses (e.g. the crontab stub's default state file)
-# shellcheck disable=SC2329  # invoked by the trap below, not by name
-cleanup() { rm -rf "$WORK"; }
-trap cleanup EXIT INT TERM
+# Every background child the suite starts (the fake control-plane and bench
+# servers) is recorded as it is launched, so the exit path stops it too. Only
+# removing $WORK was not enough: a run that never reached a test's own `kill` —
+# Ctrl-C, a `timeout`, a shell aborting mid-file — left a server listening with
+# its state file deleted from under it, and under `flock … make verify` that
+# orphan also keeps the lock's inherited descriptor open, which is how one held
+# the machine-wide gate for ten minutes.
+BG_PIDS=()
+start_bg() { BG_PIDS+=("$1"); }   # start_bg <pid> — remember a background child
+# shellcheck disable=SC2329  # invoked by the traps below, not by name
+cleanup() {
+  local pid
+  for pid in "${BG_PIDS[@]}"; do
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+# A signal runs the EXIT trap (so the servers stop) and then ENDS the run,
+# rather than letting it carry on with $WORK already gone.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # The operator's real bench server and key (BENCH_URL / BENCH_KEY, or qbench's
 # ~/.config/qbench/{url,key}) must never reach this suite: every bench script now
@@ -510,7 +534,7 @@ MK_BAD_TIGHT='--app=x;touch$IFS/tmp/PAYLOAD-MARKER'
 # fix, so this looks for the interpolation itself, quoted or not.
 # MAKEFILE_LIST belongs on this list: make maintains it, but a command-line
 # assignment still beats make's own, so it was settable exactly like a knob.
-MK_KNOBS='ARGS|SID|DIR|RUN|NAME|URL|ROUTES|KEY|BEFORE|AFTER|OUT|HOST|S|N|LEVEL|TARGET|KEEP|GREP|REF|IMAGE|PROFILE|CONFIRM|WINDOW|SINCE|JSON|KIND|MAKEFILE_LIST'
+MK_KNOBS='ARGS|SID|DIR|BUNDLE|RUN|NAME|URL|ROUTES|KEY|BEFORE|AFTER|OUT|HOST|S|N|LEVEL|TARGET|KEEP|GREP|REF|IMAGE|PROFILE|CONFIRM|WINDOW|SINCE|JSON|KIND|MAKEFILE_LIST'
 if grep -nE "^	.*\\\$\\(($MK_KNOBS)[,)]" "$ROOT/Makefile" > "$WORK/mk-interp.txt" 2>/dev/null; then
   fail "knob:no-interpolation" "a caller-settable variable is spliced into a recipe line: $(tr '\n' '|' < "$WORK/mk-interp.txt")"
 else
@@ -552,6 +576,7 @@ mk_dry_clean sid-session-soak  session-soak     SID="$MK_BAD_QUOTE"
 mk_dry_clean sid-display       session-display  SID="$MK_BAD_BACKTICK"
 mk_dry_clean sid-abr-ladder    abr-ladder       SID="$MK_BAD_CMDSUB"
 mk_dry_clean dir-bench-submit  bench-submit     DIR="$MK_BAD_QUOTE"
+mk_dry_clean bundle-e2e-review e2e-review       BUNDLE="$MK_BAD_QUOTE"
 mk_dry_clean run-bench-budget  bench-budget     RUN="$MK_BAD_BACKTICK"
 mk_dry_clean name-bench-base   bench-baseline   NAME="$MK_BAD_QUOTE" RUN=r1
 mk_dry_clean url-ui-audit      ui-audit         URL="$MK_BAD_QUOTE"
@@ -1026,6 +1051,32 @@ else
   fail "verify:cargo-target-per-instance" "docker-compose.devtools.yml no longer keys CARGO_TARGET_DIR off \$QUASAR_INSTANCE"
 fi
 
+# ── #1266: a stage that needs no Postgres runs on `devtools-solo`, which is on
+# Docker's own bridge and so creates no compose network. On the networked
+# `devtools` service every worktree that ran one gate left two networks behind,
+# until the daemon's address pools were full and no network could be created.
+VERIFY_NET_BAD=""
+for stage in quick web control agent engine-suite-build versions; do
+  VERIFY_LOG_S="$WORK/verify-docker-args-$stage.log"
+  : > "$VERIFY_LOG_S"
+  env PATH="$VERIFY_STUB:$PATH" VERIFY_DOCKER_LOG="$VERIFY_LOG_S" \
+    QUASAR_DX_ROOT=/fake/worktree-alpha \
+    bash "$ROOT/scripts/verify.sh" "$stage" >/dev/null 2>&1 || true
+  grep -E '^compose .* run ' "$VERIFY_LOG_S" | grep -q ' devtools-solo bash ' || VERIFY_NET_BAD="$VERIFY_NET_BAD $stage"
+done
+if [ -z "$VERIFY_NET_BAD" ]; then
+  pass "verify:no-postgres-stages-make-no-network" "quick, web, control, agent, engine-suite-build and versions run on devtools-solo"
+else
+  fail "verify:no-postgres-stages-make-no-network" "not run on devtools-solo:$VERIFY_NET_BAD"
+fi
+
+if awk '/^  devtools-solo:/{f=1;next} f&&/^  [^ ]/{f=0} f' "$ROOT/scripts/verify/docker-compose.devtools.yml" \
+    | grep -qE '^    network_mode: bridge$'; then
+  pass "verify:solo-on-the-bridge" "devtools-solo has network_mode: bridge"
+else
+  fail "verify:solo-on-the-bridge" "devtools-solo in docker-compose.devtools.yml is not on network_mode: bridge"
+fi
+
 printf '\n== degraded reporting ==\n'
 
 # ── doctor with an unreachable gpu-test role → degraded, rc 0 ────────────────
@@ -1128,10 +1179,10 @@ printf '\n== session soak ==\n'
 # fully offline (it never constructs an API client), and testdata/soak-* is a
 # synthetic run of a 1920x1080 ladder walk.
 soak_sched="$(bash "$DX/session_soak.sh" --dry-run --launch 1920x1080 --duration 180 2>&1 || true)"
-if printf '%s' "$soak_sched" | grep -qE '1280x720 +floor hold' \
+if printf '%s' "$soak_sched" | grep -qE '640x360 +floor hold' \
    && printf '%s' "$soak_sched" | grep -qE 'TOTAL +180\.0s' \
-   && printf '%s' "$soak_sched" | grep -qE '5 +1920x1080 +restore'; then
-  pass "soak:schedule" "ladder 1920x1080/180s: launch > 1600x900 > 1280x720 > back, fits the duration"
+   && printf '%s' "$soak_sched" | grep -qE '9 +1920x1080 +restore'; then
+  pass "soak:schedule" "ladder 1920x1080/180s: launch > 1600x900 > 1280x720 > 960x540 > 640x360 > back, fits the duration"
 else
   fail "soak:schedule" "$(printf '%s' "$soak_sched" | tail -n 5 | tr '\n' ' ')"
 fi
@@ -1320,8 +1371,15 @@ rc_of 2 "bench:run-pulse-without-bench" -- env -u HOST bash "$DX/bench_run.sh" -
 QSES_FIX_HOSTS="$WORK/qses-guard-hosts.json"
 printf '{"_schema":"quasar-skills/hosts@2","roles":{"aux-infra":"faked","gpu-test":"faked"},"hosts":{"faked":{"ssh_alias":"ignored","dir":"%s","api":"http://127.0.0.1:1","api_external":"http://127.0.0.1:1"}}}\n' \
   "$WORK" > "$QSES_FIX_HOSTS"
-rc_of 2 "bench:qses-bad-codec" -- env QUASAR_HOSTS_JSON="$QSES_FIX_HOSTS" bash "$ROOT/.claude/skills/quasar-session/scripts/qses" run --codec vp9
-rc_of 2 "bench:qses-pulse-without-bench" -- env QUASAR_HOSTS_JSON="$QSES_FIX_HOSTS" bash "$ROOT/.claude/skills/quasar-session/scripts/qses" run --input-pulse-every 5
+# These two assert qses's own argument handling: with no file there is nothing
+# to test, so they SKIP by name rather than fail or pass (#1267).
+if [ -f "$QSES" ]; then
+  rc_of 2 "bench:qses-bad-codec" -- env QUASAR_HOSTS_JSON="$QSES_FIX_HOSTS" bash "$QSES" run --codec vp9
+  rc_of 2 "bench:qses-pulse-without-bench" -- env QUASAR_HOSTS_JSON="$QSES_FIX_HOSTS" bash "$QSES" run --input-pulse-every 5
+else
+  warn "bench:qses-bad-codec" "the quasar-session skill's qses is not in this checkout (operator-local) — SKIPPED"
+  warn "bench:qses-pulse-without-bench" "the quasar-session skill's qses is not in this checkout (operator-local) — SKIPPED"
+fi
 
 # ── --peer (2026-08-19, docs/reports/2026-08-19-peer-path/REPORT.md) ─────────
 rc_of 2 "bench:run-peer-bogus" -- env -u HOST bash "$DX/bench_run.sh" --profile 1080p60-h264 --peer bogus
@@ -1416,12 +1474,17 @@ fi
 # qses itself must parse the flag without error: pair it with a KNOWN-bad
 # --codec so the run still exits 2, but the failure text must be the codec
 # guard, not "unknown arg --peer-unlock-fps" (which would mean the parser
-# never reached the --peer-unlock-fps case at all).
-qses_punlock_out="$(env -u HOST QUASAR_HOSTS_JSON="$QSES_FIX_HOSTS" bash "$ROOT/.claude/skills/quasar-session/scripts/qses" run --peer-unlock-fps --codec vp9 2>&1 || true)"
-if printf '%s' "$qses_punlock_out" | grep -q -- '--codec must be' && ! printf '%s' "$qses_punlock_out" | grep -q 'unknown arg --peer-unlock-fps'; then
-  pass "bench:qses-peer-unlock-fps-parses" "--peer-unlock-fps is recognized, parsing continues to the codec guard"
+# never reached the --peer-unlock-fps case at all). qses is operator-local and
+# not in this repository, so a worktree without it SKIPs by name (#1267).
+if [ -f "$QSES" ]; then
+  qses_punlock_out="$(env -u HOST QUASAR_HOSTS_JSON="$QSES_FIX_HOSTS" bash "$QSES" run --peer-unlock-fps --codec vp9 2>&1 || true)"
+  if printf '%s' "$qses_punlock_out" | grep -q -- '--codec must be' && ! printf '%s' "$qses_punlock_out" | grep -q 'unknown arg --peer-unlock-fps'; then
+    pass "bench:qses-peer-unlock-fps-parses" "--peer-unlock-fps is recognized, parsing continues to the codec guard"
+  else
+    fail "bench:qses-peer-unlock-fps-parses" "$qses_punlock_out"
+  fi
 else
-  fail "bench:qses-peer-unlock-fps-parses" "$qses_punlock_out"
+  warn "bench:qses-peer-unlock-fps-parses" "the quasar-session skill's qses is not in this checkout (operator-local) — SKIPPED"
 fi
 
 # bench_app_samples.py: frames.jsonl -> `app` samples, events.jsonl -> app.event,
@@ -1597,6 +1660,7 @@ PY
   python3 "$TESTS_DIR/fake_bench_server.py" --port "$KEY_BENCH_PORT" --log "$WORK/key-bench-server.log" \
     > "$WORK/key-bench-server.out" 2>&1 &
   KEY_BENCH_PID=$!
+  start_bg "$KEY_BENCH_PID"
   for _ in $(seq 1 40); do
     curl -fsS "http://127.0.0.1:$KEY_BENCH_PORT/v1/health" >/dev/null 2>&1 && break
     sleep 0.25
@@ -1673,6 +1737,7 @@ CP_STATE="$WORK/cp-overrides.json"
 python3 "$TESTS_DIR/fake_cp_server.py" --port "$CP_PORT" --state "$CP_STATE" \
   --seed '{"abr_mode":"smooth"}' > "$WORK/cp-server.out" 2>&1 &
 CP_PID=$!
+start_bg "$CP_PID"
 for _ in $(seq 1 40); do
   curl -fsS "http://127.0.0.1:$CP_PORT/v1/hosts" >/dev/null 2>&1 && break
   sleep 0.25
@@ -1750,6 +1815,7 @@ python3 "$TESTS_DIR/fake_cp_server.py" --port "$FP_PORT" --state "$FP_STATE" \
   --apps-seed '[{"id":"app-1","name":"Quasar Benchapp","profile_policy":"force","default_profile_id":"1080p60"}]' \
   > "$WORK/fp-server.out" 2>&1 &
 FP_PID=$!
+start_bg "$FP_PID"
 for _ in $(seq 1 40); do
   curl -fsS "http://127.0.0.1:$FP_PORT/v1/hosts" >/dev/null 2>&1 && break
   sleep 0.25
@@ -1845,6 +1911,7 @@ PY
   python3 "$TESTS_DIR/fake_bench_server.py" --port "$BENCH_PORT" --log "$BENCH_LOG" \
     > "$WORK/bench-server.out" 2>&1 &
   BENCH_PID=$!
+  start_bg "$BENCH_PID"
   for _ in $(seq 1 40); do
     curl -fsS "http://127.0.0.1:$BENCH_PORT/v1/health" >/dev/null 2>&1 && break
     sleep 0.25
@@ -2265,6 +2332,7 @@ PY
   python3 "$TESTS_DIR/fake_bench_server.py" --port "$BUD_BENCH_PORT" \
     --log "$WORK/bench-budget-server.log" > "$WORK/bench-budget-server.out" 2>&1 &
   BUD_BENCH_PID=$!
+  start_bg "$BUD_BENCH_PID"
   for _ in $(seq 1 40); do
     curl -fsS "http://127.0.0.1:$BUD_BENCH_PORT/v1/health" >/dev/null 2>&1 && break
     sleep 0.25
@@ -2318,6 +2386,7 @@ PY
     --log "$WORK/bench-budget-server2.log" --regressions-file "$BUD_FIXTURE" \
     > "$WORK/bench-budget-server2.out" 2>&1 &
   BUD_BENCH_PID=$!
+  start_bg "$BUD_BENCH_PID"
   for _ in $(seq 1 40); do
     curl -fsS "http://127.0.0.1:$BUD_BENCH_PORT/v1/health" >/dev/null 2>&1 && break
     sleep 0.25
@@ -2677,7 +2746,6 @@ printf '\n== qses stop ==\n'
 #
 # Driven against fake_cp_server.py through an `ssh` stub that runs the remote
 # command locally. Nothing leaves this machine.
-QSES="$ROOT/.claude/skills/quasar-session/scripts/qses"
 if [ -x "$QSES" ] || [ -f "$QSES" ]; then
   QSTUB="$WORK/qses-stubbin"
   mkdir -p "$QSTUB"
@@ -2700,6 +2768,7 @@ PY
     python3 "$TESTS_DIR/fake_cp_server.py" --port "$port" --state "$state" \
       --session-mode "$mode" > "$WORK/qses-$label.out" 2>&1 &
     local pid=$!
+    start_bg "$pid"
     for _ in $(seq 1 40); do
       curl -fsS "http://127.0.0.1:$port/v1/hosts" >/dev/null 2>&1 && break
       sleep 0.25
@@ -3029,9 +3098,9 @@ printf '\n== makefile ==\n'
 # ── every target must resolve to a script that exists ────────────────────────
 if command -v make >/dev/null 2>&1; then
   mk_missing=""
-  for t in help init doctor config-check verify test test-go test-rust test-uinput test-web \
+  for t in help init doctor config-check verify test test-go test-rust test-uinput test-web test-webgpu \
            test-db preflight up down restart rebuild redeploy-cp status health logs \
-           logs-follow dev-web dev-cp diagnose diagnose-bundle clean reset; do
+           logs-follow dev-web dev-cp diagnose diagnose-bundle clean reset e2e-review e2e-compare; do
     if ! make -C "$ROOT" -n "$t" >/dev/null 2>&1; then
       mk_missing="$mk_missing $t"
     fi
@@ -3173,6 +3242,7 @@ sess_server_up() { # sess_server_up [--verdict V] [--expect-token T] [--sessions
   python3 "$TESTS_DIR/fake_cp_server.py" --port "$SESS_PORT" --state "$SESS_DIR/state.json" \
     --sessions-seed "$SESS_SEED" "$@" > "$SESS_DIR/server.out" 2>&1 &
   SESS_PID=$!
+  start_bg "$SESS_PID"
   local _
   for _ in $(seq 1 40); do
     curl -fsS "http://127.0.0.1:$SESS_PORT/v1/hosts" >/dev/null 2>&1 && break
@@ -3687,6 +3757,43 @@ else
   fail "manifest:bench-keys-not-drifted" "$BENCH_KEYS_OUT"
 fi
 
+# The end-to-end suite's run bundle (#1272): the fixture is valid, each rule has a bundle that breaks it.
+if command -v node >/dev/null 2>&1; then
+  rc_of 0 "e2e:bundle-format" -- node --test "$ROOT/scripts/validate/stream/bundle.test.mjs"
+  rc_of 0 "e2e:runner" -- node --test "$ROOT/scripts/validate/stream/run.test.mjs"
+  # WEB_DIST (#1284): the route decision, the directory check and the digest, against a fake route.
+  rc_of 0 "e2e:web-dist" -- node --test "$ROOT/scripts/validate/stream/webdist.test.mjs"
+  # Its host half (#1274), driven against a fake API as an in-process fetch — no stack, no sockets.
+  rc_of 0 "e2e:collect" -- node --test "$ROOT/scripts/validate/stream/collect.test.mjs"
+  # Posting a run to quasar-bench (#1276): the spawn is recorded, and one dry run drives the real
+  # bench_submit.py with no server configured.
+  rc_of 0 "e2e:post" -- node --test "$ROOT/scripts/validate/stream/post.test.mjs"
+  # The client pack (#1280): its archive unpacked alone into an empty directory, its entry run against an in-process stack.
+  rc_of 0 "e2e:pack" -- node --test "$ROOT/scripts/validate/stream/pack.test.mjs"
+else
+  warn "e2e:bundle-format" "node not installed — SKIPPED"
+  warn "e2e:web-dist" "node not installed — SKIPPED"
+  warn "e2e:collect" "node not installed — SKIPPED"
+  warn "e2e:post" "node not installed — SKIPPED"
+  warn "e2e:pack" "node not installed — SKIPPED"
+fi
+
+# The review an agent reads first (#1275): golden bytes, the same bytes twice, a
+# failing scenario, an invalid bundle, and the 150-line budget.
+if command -v node >/dev/null 2>&1; then
+  rc_of 0 "e2e:review" -- node --test "$ROOT/scripts/validate/stream/review.test.mjs"
+else
+  warn "e2e:review" "node not installed — SKIPPED"
+fi
+
+# Two bundles compared (#1284): golden bytes, the same bytes twice, bundle text that cannot become
+# page structure, the review's warm-up, and a comparison that cannot be written.
+if command -v node >/dev/null 2>&1; then
+  rc_of 0 "e2e:compare" -- node --test "$ROOT/scripts/validate/stream/compare.test.mjs"
+else
+  warn "e2e:compare" "node not installed — SKIPPED"
+fi
+
 # Release publication must wait for every image its manifest names.
 rc_of 0 "release:publication-dependencies" -- bash "$ROOT/scripts/release/test-release-publication-gate.sh"
 
@@ -3695,6 +3802,15 @@ rc_of 0 "release:images-changed" -- bash "$ROOT/scripts/release/test-images-chan
 
 # The preview manifest's tag (#839): which runs write it, and that it only moves forward.
 rc_of 0 "release:preview-rules" -- bash "$ROOT/scripts/release/test-preview-rules.sh"
+
+# The nightly toolchain refresh builds only a tag the registry says is absent; a registry failure is an error (#1092).
+rc_of 0 "release:toolchain-missing" -- bash "$ROOT/scripts/release/test-toolchain-missing.sh"
+
+# A rebuilt base reaches the preview images: same digest skips, anything absent rebuilds, a registry error fails (#1092).
+rc_of 0 "release:base-changed" -- bash "$ROOT/scripts/release/test-base-changed.sh"
+
+# The refresh build refuses a checkout that no longer hashes to the tag it was asked for (#1092).
+rc_of 0 "release:toolchain-tag-check" -- bash "$ROOT/scripts/release/test-toolchain-tag-check.sh"
 
 # The detached release signature: the shell producer must write what the
 # shell verifier accepts, and refuse a tampered manifest or a wrong key.

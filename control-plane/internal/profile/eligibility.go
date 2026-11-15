@@ -87,6 +87,9 @@ type HostCaps struct {
 	// map is the union advertised by candidate hosts. Missing codecs then fail
 	// eligibility even when hardware-encoder telemetry itself is unknown.
 	Codecs map[Codec]bool
+	// NoPyroWave: the measured candidate union has no GPU listing pyrowave. Read by the
+	// session package's pyrowave block; eligibility ignores it. Zero is unknown.
+	NoPyroWave bool
 }
 
 // EvalInput bundles every input to Evaluate.
