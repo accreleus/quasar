@@ -566,31 +566,16 @@ impl Media {
         }
         drop(st);
         let audio = self.audio.attach(id);
-        let displaced = match hold.holder {
-            Holder::None => None,
-            Holder::Wt(_) => {
-                self.release(&mut hold);
-                None
-            }
+        match hold.holder {
+            Holder::None => {}
+            Holder::Wt(_) => self.release(&mut hold),
             Holder::WebRtc(t) => {
                 self.release(&mut hold);
-                Some(t)
+                hold.to_mute = Some(t);
             }
-        };
-        if let Some(t) = displaced {
-            hold.to_mute = Some(t);
         }
         hold.holder = Holder::Wt(id);
         drop(hold);
-        // #1294: a WebRTC peer's ABR loop had the encoder until this client's first
-        // estimate, which a client that sends no feedback never sends. Displace it here,
-        // before this client can have fed anything: the encoder goes back to its launch
-        // point and no loop owns it.
-        if displaced.is_some() {
-            if let Some(rate) = &self.rate {
-                (rate.displaced)();
-            }
-        }
         if config.codec != "pyrowave" {
             self.keyframe();
         }
@@ -606,6 +591,21 @@ impl Media {
 
     pub(crate) fn attached(&self) -> bool {
         self.lock().client.is_some()
+    }
+
+    /// A client has just taken the session (§Takeover): displace the ABR loop that still owns
+    /// the encoder, if any, at the takeover itself (#1294). Ownership, not the holder, is
+    /// what says a loop is still driving: a WebRTC peer whose PC failed leaves its hold
+    /// (`Holder::None`) and its loop owning the encoder, and a client that never sends
+    /// feedback would otherwise keep that dead link's rate for the session's life.
+    ///
+    /// Runs before this client can have fed anything and before its `hello_ack`, and OUTSIDE
+    /// the registry lock: `reset_to_launch` writes the encoder, and a rung restore restarts
+    /// its session on the Vulkan path.
+    pub(crate) fn displace_stale_abr(&self) {
+        if let Some(rate) = self.rate.as_ref().filter(|rate| (rate.owns)()) {
+            (rate.displaced)();
+        }
     }
 
     /// The peer of video `transport` had its first answer applied: it takes the session

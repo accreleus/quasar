@@ -1361,10 +1361,13 @@ pub(crate) fn feedback_abr(
     let floor_loop = abr_loop.clone();
     let report_loop = abr_loop.clone();
     let observed = latest.clone();
-    // #1294: what the takeover itself does to this session's encoder. The WebRTC peer's
-    // loop owns it until this client's first estimate arrives, and §Feedback lets a client
-    // send none at all: then nothing would ever take the encoder back from wherever the
-    // displaced link left it. So the displace happens here, at the handover.
+    // #1294: what the takeover itself does to this session's encoder. A loop — a WebRTC
+    // peer's, or this client's predecessor — can still own it when the next client takes
+    // the session, and §Feedback lets a client send no feedback at all: then nothing would
+    // ever take the encoder back from wherever the displaced link left it. So the displace
+    // happens at the handover, keyed on ownership (`Rate::owns`), not on whoever the holder
+    // still was — a WebRTC peer whose PC failed left its loop owning the encoder.
+    let owner = abr_loop.clone();
     let reset_loop = abr_loop.clone();
     let reset_cfg = plan.launch_cfg.clone();
     let reset_lever = plan.lever.clone();
@@ -1392,6 +1395,7 @@ pub(crate) fn feedback_abr(
         // Each client starts afresh: it takes the encoder over (a WebRTC peer that started
         // since owns it until then) and registers new hooks.
         start: Box::new(move || begin()),
+        owns: Box::new(move || owner.metrics.upgrade().is_some_and(|m| m.abr_owner() != 0)),
         displaced: Box::new(move || {
             if let Some(metrics) = reset_loop.metrics.upgrade() {
                 reset_to_launch(

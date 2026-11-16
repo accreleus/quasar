@@ -1544,6 +1544,7 @@ async fn governed_agent(stream: Stream) -> Agent {
                 floor_kbps: Box::new(|| 4000.0),
                 retargets: true,
                 start: Box::new(|| {}),
+                owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
                 observe: Box::new(|_| {}),
             })
@@ -2077,6 +2078,7 @@ async fn feedback_while_pyrowave_is_active_feeds_no_estimate() {
                 floor_kbps: Box::new(|| 500.0),
                 retargets: true,
                 start: Box::new(|| {}),
+                owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
                 observe: Box::new(move |_| {
                     count.fetch_add(1, Ordering::SeqCst);
@@ -2172,6 +2174,7 @@ async fn audio_alone_never_moves_the_video_estimate() {
             floor_kbps: Box::new(|| 500.0),
             retargets: true,
             start: Box::new(|| {}),
+            owns: Box::new(|| false),
             displaced: Box::new(|| {}),
             observe: Box::new(move |kbps| seen.lock().unwrap().push(kbps)),
         })
@@ -2215,6 +2218,7 @@ fn rate(retargets: bool) -> Rate {
         floor_kbps: Box::new(|| 4000.0),
         retargets,
         start: Box::new(|| {}),
+        owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         observe: Box::new(|_| {}),
     }
@@ -2300,6 +2304,7 @@ fn the_silence_decay_is_never_fed_to_the_collapse_as_a_measured_link() {
         floor_kbps: Box::new(|| 4000.0),
         retargets: true,
         start: Box::new(|| {}),
+        owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         observe: Box::new(move |_| {
             f.fetch_add(1, SeqCst);
@@ -2344,6 +2349,7 @@ fn a_report_gives_the_abr_its_reading_before_its_estimate() {
         floor_kbps: Box::new(|| 4000.0),
         retargets: true,
         start: Box::new(|| {}),
+        owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         observe: Box::new(move |_| o.lock().unwrap().push("observe")),
     };
@@ -2368,6 +2374,7 @@ fn a_client_that_is_gone_neither_starts_nor_feeds_the_abr() {
         start: Box::new(move || {
             started.fetch_add(1, SeqCst);
         }),
+        owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         observe: Box::new(move |_| {
             fed.fetch_add(1, SeqCst);
@@ -2427,6 +2434,7 @@ fn the_abr_is_fed_the_estimate_less_the_fec_share() {
         floor_kbps: Box::new(|| 500.0),
         retargets: true,
         start: Box::new(|| {}),
+        owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         observe: Box::new(move |kbps: f64| seen.lock().unwrap().push(kbps.round())),
     };
@@ -2454,6 +2462,7 @@ async fn lossy_session(retargets: bool) -> Agent {
                 floor_kbps: Box::new(|| 500.0),
                 retargets,
                 start: Box::new(|| {}),
+                owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
                 observe: Box::new(|_| {}),
             })
@@ -2617,6 +2626,7 @@ fn repairs_spend_only_what_the_estimate_leaves_above_the_abr_floor() {
         floor_kbps: Box::new(|| 2500.0),
         retargets: true,
         start: Box::new(|| {}),
+        owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         observe: Box::new(move |kbps: f64| seen.lock().unwrap().push(kbps.round())),
     };
@@ -2654,6 +2664,7 @@ fn governed(level: u8, estimate_kbps: f64, seconds: u64) -> Vec<(u32, f64)> {
         floor_kbps: Box::new(move || f64::from(floor.lock().unwrap().0.floor_kbps())),
         retargets: true,
         start: Box::new(|| {}),
+        owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         observe: Box::new(move |kbps| {
             let mut governor = observed.lock().unwrap();
@@ -2752,6 +2763,7 @@ fn a_pyrowave_frame_gets_no_repair_at_any_overhead() {
         floor_kbps: Box::new(|| 500.0),
         retargets: true,
         start: Box::new(|| {}),
+        owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         observe: Box::new(|_| {}),
     };
@@ -3468,13 +3480,13 @@ async fn a_webtransport_client_takes_over_the_webrtc_peer() {
     assert!(frames(&session, 1, true).await[0].keyframe);
 }
 
-/// #1294: the WebRTC peer's ABR loop had the encoder down when a WebTransport client took
-/// the session. The takeover itself puts the encoder back at its launch point and leaves it
-/// with no owner, so a client that sends no feedback (`transport-webtransport.md` §Feedback
-/// allows that) leaves it there. Taking it back only at the client's first estimate left it
-/// at whatever point the displaced peer's link had reached.
+/// #1294: a WebRTC peer's ABR loop owned the encoder, its link drove the encoder down, and
+/// then its PC failed — the peer's hold goes (`Holder::None`) and its loop keeps the encoder.
+/// A WebTransport client taking the session from that dead peer must get the launch point:
+/// ownership, not the holder, is what says a loop is still driving. The client sends no
+/// feedback at all, and the displaced loop's own tick (the drain hook) writes nothing.
 #[tokio::test]
-async fn a_webtransport_takeover_returns_the_encoder_to_launch_with_no_owner() {
+async fn a_webtransport_takeover_displaces_a_loop_its_peer_left_owning_the_encoder() {
     let metrics = Arc::new(crate::session::metrics::SessionMetrics::new("smooth", 30));
     let (trace_tx, _trace_rx) = tokio::sync::mpsc::channel(256);
     let trace_tx =
@@ -3522,8 +3534,9 @@ async fn a_webtransport_takeover_returns_the_encoder_to_launch_with_no_owner() {
     let pause = || std::thread::sleep(Duration::from_millis(20));
 
     // A second `AbrLoop` on the same encoder and metrics stands for the WebRTC peer's: the
-    // same owner slot, hooks and governor, only a different estimator. It drives the
-    // encoder down as a congested WebRTC link does.
+    // same owner slot, hooks and governor, only a different estimator. It drives the encoder
+    // down as a congested WebRTC link does — and, unlike a WebRTC loop, its `observe` would
+    // re-take an orphaned encoder, which is why the last step below drives the tick instead.
     let (peer_tx, _peer_rx) = tokio::sync::mpsc::channel(16);
     let peer_trace =
         crate::session::runner::DiagnosticEventTx::new(peer_tx, Arc::default(), Arc::default());
@@ -3545,20 +3558,31 @@ async fn a_webtransport_takeover_returns_the_encoder_to_launch_with_no_owner() {
         driven < 4000,
         "the peer's loop had it down ({driven} kbit/s)"
     );
-    assert_ne!(metrics.abr_owner(), 0, "and it owned the encoder");
+    let owned = metrics.abr_owner();
+    assert_ne!(owned, 0, "and it owned the encoder");
 
-    // A WebRTC peer holds the session, and the WebTransport client takes it from that peer.
+    // The peer's PC fails (`WebRtcSide::disconnected(gone)`): its hold goes, its loop's
+    // ownership does not. From here the session has no holder and a loop still driving.
     let media = agent.tap.as_ref().unwrap().media().clone();
     media.webrtc_attached(T1);
+    webrtc(&agent, T1).disconnected(true);
+    assert_eq!(
+        metrics.abr_owner(),
+        owned,
+        "the failed peer's loop still owns the encoder"
+    );
+
+    // A WebTransport client takes the session from that dead peer, and sends no feedback.
     let (_session, _send, _recv, ack) = agent.hello(TOKEN).await;
     assert_eq!(ack["type"], "hello_ack");
-
-    // Nothing sends feedback from here on: the takeover alone must have moved the encoder.
     assert_eq!(kbps(), 4000, "the takeover returned it to launch");
     assert_eq!(metrics.abr_owner(), 0, "and left it with no owner");
-    (peer.observe)(1500.0);
+
+    // Its tick (the drain hook) is what kept a frozen estimate writing: it was cleared.
+    metrics.drain_window(std::time::Instant::now());
     pause();
-    assert_eq!(kbps(), 4000, "the displaced loop drove nothing");
+    assert_eq!(kbps(), 4000, "the displaced loop's tick drove nothing");
+    assert_eq!(metrics.abr_owner(), 0, "and claimed nothing back");
 }
 
 /// #1193: the host missed the WebTransport close on a fallback. The WebRTC attach displaces the
@@ -4993,6 +5017,7 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
                 floor_kbps: Box::new(|| 500.0),
                 retargets: true,
                 start: Box::new(|| {}),
+                owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
                 observe: Box::new(move |kbps| observed.lock().unwrap().push(kbps)),
             })
