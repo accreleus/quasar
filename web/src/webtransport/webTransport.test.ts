@@ -191,8 +191,23 @@ describe("WebTransportMedia connect", () => {
     t.close();
   });
 
-  it("lets the session's own close outrank a datagram reader that failed first, as Safari's does", async () => {
+  it("a browser with no datagram API at all falls back as connect_failed, with a cause (#1412)", async () => {
+    // Some iOS builds ship WebTransport with no `datagrams` (WebKit bug 322201): media cannot
+    // travel in either direction, and the reader's bare TypeError used to be reported as
+    // `internal` with no cause the listener could read.
     const agent = new FakeAgent();
+    agent.noDatagrams = true;
+    await expect(transport(agent).connect(NO_SINK)).rejects.toMatchObject({
+      code: "connect_failed",
+      message: "datagrams: this browser's WebTransport has no datagram API",
+    });
+    expect(agent.last.closes[0]).toMatchObject({
+      closeCode: 4400,
+      reason: "datagrams: this browser's WebTransport has no datagram API",
+    });
+  });
+
+  it("lets the session's own close outrank a datagram reader that failed first, as Safari's does", async () => {    const agent = new FakeAgent();
     agent.hold = "answer";
     const up = transport(agent).connect(NO_SINK);
     await vi.waitFor(() => expect(agent.reached).toBe("answer"));
@@ -1626,11 +1641,35 @@ describe("createWebTransportRuntime fallback", () => {
         expect(s.agent.sent("hello")).toHaveLength(2);
         expect(s.callbacks.onFallback).not.toHaveBeenCalled();
         await feed(s, 8, 7);
-        expect(s.callbacks.onFallback).toHaveBeenCalledWith("decode_error", expect.stringContaining("no picture shown for 5 s"));
+        expect(s.callbacks.onFallback).toHaveBeenCalledWith("decode_error", expect.stringMatching(/^decode_error: no_picture: no picture shown for \d\.\d s, round trip 0 ms, limit 5\.0 s$/));
         const asked = s.agent.sent("keyframe_request").length;
         await vi.advanceTimersByTimeAsync(3_000);
         expect(s.agent.sent("keyframe_request")).toHaveLength(asked);
         expect(s.callbacks.onFallback).toHaveBeenCalledTimes(1);
+      });
+
+      it("waits the path-scaled bound for a picture, not a fixed 5 s, on a slow link (#1445)", async () => {
+        const s = await stuckDecoder();
+        // A 5 s round trip: the picture may trail the frames that arrived by 5 s plus four round trips.
+        for (let i = 0; i < 6; i++) {
+          pongWith(s.agent, 5_000);
+          await feed(s, 1, i);
+        }
+        expect(s.agent.sent("hello")).toHaveLength(1); // the fixed 5 s check would have ended the view here
+        for (let i = 6; i < 27; i++) {
+          pongWith(s.agent, 5_000);
+          await feed(s, 1, i);
+        }
+        expect(s.agent.sent("hello")).toHaveLength(2); // the path's own 25 s bound
+        s.rt.destroy();
+      });
+
+      it("records the no-picture check as the cause of the stream_lost that follows (#1445)", async () => {
+        const s = await stuckDecoder();
+        vi.mocked(mintTransportToken).mockRejectedValue(new Error("link saturated"));
+        await feed(s, 7);
+        expect(s.callbacks.onFallback).toHaveBeenCalledWith("stream_lost", expect.stringContaining("no_picture: no picture shown for"));
+        s.rt.destroy();
       });
 
       it("does not fire on a normal start", async () => {

@@ -204,6 +204,8 @@ export class FakeAgent {
   closeEndsDatagrams = true;
   /** Safari's datagram shape (the current spec): `createWritable()` and no `writable`. */
   safariDatagrams = false;
+  /** A browser with no `WebTransport.datagrams` at all (some iOS builds, WebKit bug 322201). */
+  noDatagrams = false;
   /** The await the client is parked at, once it gets there. */
   reached: string | null = null;
   private gate: { promise: Promise<void>; open: () => void } | null = null;
@@ -281,11 +283,13 @@ export class FakeAgent {
     const wt = {
       ready,
       closed,
-      datagrams: (() => {
-        const readable = new ReadableStream<Uint8Array>({ start: (c) => void (dgram = c) });
-        const writable = () => new WritableStream<Uint8Array>({ write: (chunk) => void agent.datagramsSent.push(chunk) });
-        return this.safariDatagrams ? { readable, createWritable: writable } : { readable, writable: writable() };
-      })(),
+      datagrams: this.noDatagrams
+        ? undefined
+        : (() => {
+            const readable = new ReadableStream<Uint8Array>({ start: (c) => void (dgram = c) });
+            const writable = () => new WritableStream<Uint8Array>({ write: (chunk) => void agent.datagramsSent.push(chunk) });
+            return this.safariDatagrams ? { readable, createWritable: writable } : { readable, writable: writable() };
+          })(),
       async createBidirectionalStream() {
         await agent.parked("stream");
         return {
