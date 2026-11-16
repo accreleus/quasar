@@ -376,10 +376,12 @@ function textureDevice(scene: { image: MarkerImageData }) {
   let mapFails = false;
   let scopeError: GPUError | null = null;
   let scopeDepth = 0;
+  let createThrows = false;
   const device = {
     pushErrorScope: () => void scopeDepth++,
     popErrorScope: () => (scopeDepth--, Promise.resolve(scopeError)),
     createBuffer: ({ size }: { size: number }) => {
+      if (createThrows) throw new Error("no buffer");
       created++;
       const mem = new Uint8Array(size);
       return {
@@ -405,7 +407,7 @@ function textureDevice(scene: { image: MarkerImageData }) {
     for (const r of maps.splice(0)) r();
     await new Promise((r) => setTimeout(r, 0));
   };
-  return { device: device as unknown as GPUDevice, copies, release, created: () => created, failMaps: () => (mapFails = true), failScope: (e: GPUError) => (scopeError = e), scopeDepth: () => scopeDepth };
+  return { device: device as unknown as GPUDevice, copies, release, created: () => created, failMaps: () => (mapFails = true), failScope: (e: GPUError | null) => (scopeError = e), scopeDepth: () => scopeDepth, throwOnCreate: () => (createThrows = true) };
 }
 
 describe("BenchController.onTexture (a PyroWave frame, #1344)", () => {
@@ -486,6 +488,13 @@ describe("BenchController.onTexture (a PyroWave frame, #1344)", () => {
     ctl.onTexture(gpu.device, { width: W, height: H } as GPUTexture);
     await gpu.release();
     expect(ctl.handle().stats()).toMatchObject({ frames: 0, no_image: 1 });
+    expect(gpu.scopeDepth()).toBe(0);
+    // A throw between push and pop must not leave the scopes on the presenter's device.
+    gpu.failScope(null);
+    gpu.throwOnCreate();
+    ctl.onTexture(gpu.device, { width: W, height: H } as GPUTexture);
+    await gpu.release();
+    expect(ctl.handle().stats()).toMatchObject({ frames: 0, no_image: 2 });
     expect(gpu.scopeDepth()).toBe(0);
     ctl.stop();
     warn.mockRestore();
