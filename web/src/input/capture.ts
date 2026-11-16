@@ -557,10 +557,17 @@ export function setupCapture({
     }
   };
 
-  /** Idempotent. Lock mode goes through exitPointerLock so browser state and
-   *  ours never diverge (pointerlockchange runs the release); fallback clears
-   *  directly. A lock this capture inherited (an older capture's) is exited too. */
-  const release = () => {
+  /** Whether the page hide released a capture the return can take back on its own (#1414). Only
+   *  a fallback capture qualifies: Pointer Lock needs a user gesture and coming back is not one,
+   *  so a lock session stays released and the picture's tap target does that re-take. Armed by
+   *  the hide only while it releases a capture, and cleared by any deliberate release, so a
+   *  session the app ended while the page was hidden is not taken back (#1465). */
+  let resumeOnVisible = false;
+
+  /** The release itself: idempotent; lock mode goes through exitPointerLock so browser state
+   *  and ours never diverge (pointerlockchange runs the release); fallback clears directly. A
+   *  lock this capture inherited (an older capture's) is exited too. */
+  const releaseCapture = () => {
     wanted = false;
     if ((captureMode === "lock" || document.pointerLockElement === videoEl) && document.exitPointerLock) {
       document.exitPointerLock();
@@ -573,22 +580,52 @@ export function setupCapture({
     setCaptured(false);
   };
 
+  /** A deliberate release — the app's own (SessionPage ends the session, a control is pressed)
+   *  or a capture key. It also disarms the page-return re-take: only a hide may arm it, so an
+   *  app release while the page is hidden is respected rather than undone (#1414). */
+  const release = () => {
+    resumeOnVisible = false;
+    releaseCapture();
+  };
+
+  /** End capture whatever the release path managed: a lock release leaves `captured` set until
+   *  its pointerlockchange arrives, and a hidden page may never get one. */
+  const endCapture = () => {
+    if (!captured) return;
+    captureMode = "none";
+    setCaptured(false);
+  };
+
   // A hidden page gets no rAF and may get no pointer events, so nothing would release what the
   // host holds. Releases at once through the same path as any other release; the lock's own
   // pointerlockchange arrives later and finds nothing left to do.
   const onPageHidden = () => {
+    // A page can report a hide twice (visibilitychange, then pagehide). The second report runs
+    // after the first released everything, and must leave the flag the first one set alone: set
+    // or clear it only while capture is held (#1465).
+    if (!captured) return;
+    const wasFallback = captureMode === "fallback";
     try {
-      release();
-      if (captured) {
-        captureMode = "none";
-        setCaptured(false);
-      }
+      releaseCapture();
+      endCapture();
     } catch {
-      // channel closing: nothing more can be sent
+      // channel closing: nothing more can be sent, and nothing to take back
+      return;
     }
+    // Armed AFTER the hide's own release, so only a release the hide did not cause can clear
+    // it — the hide must not disarm its own re-take.
+    resumeOnVisible = wasFallback;
   };
   const onVisibilityChange = () => {
-    if (document.hidden) onPageHidden();
+    if (document.hidden) {
+      onPageHidden();
+      return;
+    }
+    if (!resumeOnVisible) return;
+    resumeOnVisible = false;
+    // The same entry as a tap on the picture: a fallback capture needs no
+    // gesture, so a phone back from another app gets its input without a tap.
+    void engage();
   };
   document.addEventListener("visibilitychange", onVisibilityChange);
   window.addEventListener("pagehide", onPageHidden);
