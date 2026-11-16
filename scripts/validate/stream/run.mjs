@@ -465,6 +465,9 @@ export function configureTls(insecure, env = process.env) {
  */
 export async function openHost(browser, { attached, insecureTls, baseUrl = null, webDist = null }) {
   const context = await browser.newContext({ ignoreHTTPSErrors: insecureTls, viewport: null });
+  // A fresh context keeps no site permission, so Chrome would ask on every stream to reach the LAN media endpoint and
+  // the transport stalls while it waits. Best-effort: a Chrome without the permission simply never asks.
+  await context.grantPermissions?.(["local-network-access"]).catch(() => {});
   if (webDist) await serveWebDist(context, baseUrl, webDist); // this context only: the person's own tabs never see it
   return {
     host: { newPage: () => context.newPage(), closePage: (p) => p.close(), probeClient, browserNow: (p) => p.evaluate(() => Date.now()) },

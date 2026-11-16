@@ -423,17 +423,21 @@ test("the runner works in a browser context of its own and closes only that one"
   const made = [];
   const browser = {
     contexts: () => { throw new Error("the default context is the person's: not touched"); },
-    newContext: async (o) => { const c = { o, pages: 0, closed: false, newPage: async () => { c.pages += 1; return {}; }, close: async () => { c.closed = true; } }; made.push(c); return c; },
+    newContext: async (o) => { const c = { o, pages: 0, closed: false, granted: [], grantPermissions: async (p) => { c.granted.push(...p); }, newPage: async () => { c.pages += 1; return {}; }, close: async () => { c.closed = true; } }; made.push(c); return c; },
     close: async () => { throw new Error("an attached browser is not closed"); },
   };
   for (const insecure of [false, true]) {
     const { host, close } = await openHost(browser, { attached: true, insecureTls: insecure });
     await host.newPage();
     assert.deepEqual(made.at(-1).o, { ignoreHTTPSErrors: insecure, viewport: null });
+    assert.deepEqual(made.at(-1).granted, ["local-network-access"], "Chrome must not ask per stream to reach the LAN");
     assert.equal(made.at(-1).pages, 1);
     await close();
     assert.equal(made.at(-1).closed, true);
   }
+  // A Chrome that does not know the permission still gets its context.
+  const old = { newContext: async () => ({ grantPermissions: async () => { throw new Error("Unknown permission"); }, newPage: async () => ({}) }), close: async () => {} };
+  await (await openHost(old, { attached: false, insecureTls: false })).host.newPage();
   let shut = false;
   const own = { newContext: async () => ({ newPage: async () => ({}) }), close: async () => { shut = true; } };
   await (await openHost(own, { attached: false, insecureTls: false })).close();
