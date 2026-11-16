@@ -119,6 +119,14 @@ pub(crate) struct Rate {
     pub(crate) retargets: bool,
     /// A client's first estimate: its loop takes the encoder over (one writer per encoder).
     pub(crate) start: Box<dyn Fn() + Send + Sync>,
+    /// Some ABR loop owns the session's encoder right now (`SessionMetrics::abr_owner`).
+    /// Ownership outlives the transport that started the loop: a WebRTC peer whose PC fails
+    /// takes its hold with it (`Holder::None`) and leaves its loop owning the encoder.
+    pub(crate) owns: Box<dyn Fn() -> bool + Send + Sync>,
+    /// Displace a loop that still owns the encoder, at the takeover itself (#1294): the
+    /// encoder back at its launch point, no owner — not at this client's first estimate,
+    /// which a client that sends no feedback (§Feedback) never sends.
+    pub(crate) displaced: Box<dyn Fn() + Send + Sync>,
     pub(crate) observe: Box<dyn Fn(f64) + Send + Sync>,
     /// After `observe`, for every estimate that came from a receiver report, never for the
     /// silence decay: what the report showed the link carrying when the link held the
@@ -1412,6 +1420,10 @@ async fn authenticate(
             return;
         }
     };
+    // #1294: the takeover displaces a loop that still owns the encoder, here rather than
+    // under the registry lock `redeem` holds (the reset writes the encoder, and a rung
+    // restore restarts its session), and before this client's `hello_ack` lets it feed.
+    media.displace_stale_abr();
     // §FEC: repairs are paid for by lowering the encoder's rate, so only an ABR that
     // writes it sends them.
     let fec = media.rate().is_some_and(|rate| rate.retargets) && hello.decodes("xor");
