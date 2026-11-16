@@ -5,8 +5,10 @@
 // In the SPA because the CSP blocks injecting the decoder from a harness
 // (2026-08-18-benchapp-bringup.md §6) and the measurements need every frame.
 // Cost control: cached-location fast path + bbox-shrunk readback once located;
-// while unlocated, the pixels are read and searched at most four times a second
-// (the readback itself costs presentations, not just the search).
+// while unlocated, the video path reads and searches the pixels at most four times
+// a second (the readback itself costs presentations, not just the search); the
+// PyroWave texture path copies the crop every frame, off the presentation path,
+// and searches on the same four-a-second cadence.
 //
 // Nothing here runs unless bench mode is explicitly on (benchFlag.ts).
 
