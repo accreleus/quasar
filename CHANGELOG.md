@@ -25,6 +25,7 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Fixed
+- **On a slow link, WebTransport no longer gives up on the picture before the link can deliver it (#1445).** The check for a stream that sends frames but shows no picture now waits as long as the keyframe wait does while frames keep arriving — 5 s plus four of the link's round trips, at most 30 s — instead of a fixed 5 s, and the fallback row names the check that ended the view (`no_picture`, with the round trip and the limit it used).
 - **Bench mode (`?bench=1`) now measures a PyroWave session (#1344).** The marker is read off the decoded picture on the GPU, only its corner of the frame and without holding up the frame, so glass-to-glass, the marker counts and input-to-photon exist for PyroWave as for the other codecs. A browser that cannot read the picture back counts its frames as `no_image` instead of reporting none.
 - **The end-to-end suite's browser no longer stops at Chrome's "Allow access to other devices on your network" prompt.** Each scenario's fresh browser context is granted local network access, so a WebTransport stream no longer stalls into a WebRTC fallback while the prompt waits. A Chrome without that permission runs as before.
 - **`make e2e-run WEB_DIST=<dir>` no longer fails sign-in from the second scenario on.** The runner cleared the stored sign-in on an app page, where a build served from memory booted fast enough to restore it; it now clears it on `/health`, where the app never runs.
