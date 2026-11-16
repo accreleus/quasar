@@ -96,6 +96,9 @@ pub(crate) enum Gone {
     SessionEnded,
     /// The encoder never produced a keyframe this transport can carry.
     Unusable,
+    /// A rebuild replaced the session's encoder (`Media::hand_over`): closed as a lost
+    /// connection, so the client reconnects (§Reconnect) onto the new one.
+    Rebuilt,
 }
 
 struct Client {
@@ -737,6 +740,18 @@ impl Media {
             hold.holder = Holder::None;
         }
         self.audio.detach(id);
+    }
+
+    /// A rebuild's new encoder takes the session (amendment 59 (c), #1197). The old encode
+    /// chain is at `NULL`: a `hello` reads `session_not_ready` (token kept) until the new
+    /// tap registers, and the client goes with [`Gone::Rebuilt`] — this transport never
+    /// renegotiates the codec, so it reconnects onto the new one.
+    pub(crate) fn hand_over(&self) {
+        let mut st = self.lock();
+        st.config = None;
+        if let Some(old) = st.client.take() {
+            let _ = old.gone.set(Gone::Rebuilt);
+        }
     }
 
     pub(crate) fn end(&self) {
