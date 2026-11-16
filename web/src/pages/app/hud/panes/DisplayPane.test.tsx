@@ -13,6 +13,8 @@ const base = {
   uiScale: 1,
   onUiScaleChange: vi.fn(),
   displayBusy: false,
+  // #1409: the sharpen switch is a WebTransport-only control.
+  transport: "webtransport",
   upscaleSharpen: true,
   onUpscaleSharpenChange: vi.fn(),
 };
@@ -259,5 +261,54 @@ describe("DisplayPane upscale sharpen (#1349)", () => {
   ])("renders exactly once: %s", (_name, props) => {
     render(<DisplayPane {...props} />);
     expect(screen.getAllByRole("checkbox", { name: /sharpen an upscaled picture/i })).toHaveLength(1);
+  });
+
+  // #1409: the pass is the WebGPU presenter's, and only WebTransport draws
+  // through it. Anywhere else the switch stays visible but inert, with the
+  // reason under it (DESIGN.md: an unavailable toggle is disabled with its
+  // hint, never hidden).
+  it("is disabled, with the reason, on a WebRTC session", () => {
+    render(<DisplayPane {...streamBase} transport="webrtc" />);
+    const toggle = screen.getByRole("checkbox", {
+      name: /sharpen an upscaled picture/i,
+    }) as HTMLInputElement;
+    expect(toggle.disabled).toBe(true);
+    const describedBy = toggle.getAttribute("aria-describedby");
+    expect(describedBy).toBeTruthy();
+    expect(document.getElementById(describedBy!)?.textContent).toMatch(
+      /only a webtransport session uses this\. this session streams over webrtc\./i,
+    );
+  });
+
+  it("is disabled, with the reason, when the transport is unknown", () => {
+    render(<DisplayPane {...streamBase} transport={undefined} />);
+    const toggle = screen.getByRole("checkbox", {
+      name: /sharpen an upscaled picture/i,
+    }) as HTMLInputElement;
+    expect(toggle.disabled).toBe(true);
+    const describedBy = toggle.getAttribute("aria-describedby");
+    expect(describedBy).toBeTruthy();
+    expect(document.getElementById(describedBy!)?.textContent).toMatch(
+      /^only a webtransport session uses this\.$/i,
+    );
+  });
+
+  it("is enabled, with no hint, on a WebTransport session", () => {
+    render(<DisplayPane {...streamBase} />);
+    const toggle = screen.getByRole("checkbox", {
+      name: /sharpen an upscaled picture/i,
+    }) as HTMLInputElement;
+    expect(toggle.disabled).toBe(false);
+    expect(toggle.getAttribute("aria-describedby")).toBeNull();
+    expect(screen.queryByText(/only a webtransport session uses this/i)).toBeNull();
+  });
+
+  it("is still disabled, with the reason, without a reported stream size", () => {
+    render(<DisplayPane {...base} transport="webrtc" streamSize={null} />);
+    const toggle = screen.getByRole("checkbox", {
+      name: /sharpen an upscaled picture/i,
+    }) as HTMLInputElement;
+    expect(toggle.disabled).toBe(true);
+    expect(screen.getByText(/this session streams over webrtc/i)).toBeTruthy();
   });
 });
