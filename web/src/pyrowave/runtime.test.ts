@@ -62,7 +62,8 @@ function setup(opts: { offer?: boolean; warm?: boolean; deps?: Partial<WebTransp
   };
   const presenter: Presenter = {
     present: () => true,
-    device: {} as GPUDevice,
+    // The stage gates decodes on the device queue (#1416): an instantly completed submission.
+    device: { queue: { onSubmittedWorkDone: () => Promise.resolve() } } as unknown as GPUDevice,
     presentTexture: (t) => (textures.push(t), true),
     destroy: () => {},
   };
