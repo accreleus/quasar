@@ -122,7 +122,7 @@ export interface BenchWindowPayload {
   /** Image but no valid marker. Not `crc_fail`: also counts frames where the
    *  marker was simply absent (app not painting yet, marker off-crop). */
   undecoded: number;
-  /** RVFC callbacks where the <video> had no readable pixels; excluded from `n`. */
+  /** Frames with no readable pixels (an RVFC callback, or a PyroWave readback that failed or was skipped); excluded from `n`. */
   no_image: number;
 
   g2g_p50_ms: number | null;

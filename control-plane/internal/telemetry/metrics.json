@@ -1336,7 +1336,7 @@
       "n_key": null,
       "deprecated_for": null,
       "since": "bench-mode 2026-08-18",
-      "why": "RVFC callbacks where the <video> yielded no pixels. Excluded from n."
+      "why": "Frames that yielded no pixels: an RVFC callback with no readable <video>, or a PyroWave frame whose texture readback failed or was skipped because the in-flight readback limit was reached. Excluded from n."
     },
     {
       "key": "g2g_p50_ms",
