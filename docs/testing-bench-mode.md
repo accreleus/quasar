@@ -304,7 +304,8 @@ arrives as Shift+Space; the result's `idle_nudges` counts the taps that went out
 
 ## Cost, and the observer effect
 
-Bench mode reads back pixels every displayed frame. Steady state is cheap: once
+Bench mode reads back pixels on every displayed frame once the marker is located,
+and four times a second while it is not. Steady state is meant to be cheap: once
 the marker is located the decoder takes its cached-location path (570 cell-centre
 samples) and the readback shrinks to the marker's own bounding box (~500×320 px
 at 1080p). While the marker is **not** located the full search allocates a luma
