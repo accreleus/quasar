@@ -2399,11 +2399,12 @@ fn start_first_source<F: Fn(SessionEvent)>(
     if let Some(ctx) = va_ctx {
         source.apply_va_context(ctx);
     }
-    // Advertise the session's rung ladder as `wl_output` modes BEFORE the compositor
+    // Advertise the session's mode ladder as `wl_output` modes BEFORE the compositor
     // starts, so a guest that reads its mode list once at startup sees all of them. No-op
     // on a compositor image without the property. This is the internal half: what the app
-    // may pick from, independent of the external size.
-    source.set_mode_ladder(&super::rungs::available_rungs(
+    // may pick from, independent of the external size. It is the rung ladder less the
+    // sizes meant only for a starved link (#1418).
+    source.set_mode_ladder(&super::rungs::mode_ladder(
         cfg.stream.width,
         cfg.stream.height,
     ));
@@ -4646,7 +4647,7 @@ fn perform_swap(
     // replacement needs it too, with the same pre-boot reasoning as the render size.
     // Derived from the LAUNCH size, so it is identical for every generation and unaffected
     // by the current external size.
-    new_source.set_mode_ladder(&super::rungs::available_rungs(
+    new_source.set_mode_ladder(&super::rungs::mode_ladder(
         cfg.stream.width,
         cfg.stream.height,
     ));
