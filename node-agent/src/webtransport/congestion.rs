@@ -497,9 +497,13 @@ impl Estimator {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn estimate_kbps(&self) -> f64 {
         self.estimate_kbps
+    }
+
+    /// A delay or loss cut holds the estimate under the ceiling: it has found the link.
+    pub(crate) fn found_link(&self) -> bool {
+        self.bound != Bound::Ceiling
     }
 
     /// Start again from `kbps` (never above the ceiling): codec-pyrowave.md §Rate, the ABR
@@ -1393,6 +1397,190 @@ impl Backlog {
         } else {
             Admit::Skip
         }
+    }
+}
+
+/// Video QUIC may hold ahead of the next audio datagram, in time at the governed rate.
+const AUDIO_AHEAD_MS: u64 = 20;
+/// Video leaves at most this × the estimate once the estimate has found the link (#1433), so
+/// a keyframe waits here, where audio overtakes it, not in the link's queue: right after a
+/// delay cut this is 1.06 × what the link carried. quinn alone paces at 1.25 × window / RTT,
+/// 2.5 × the estimate or more. Must stay over 1 / (1 − the ABR's 0.15 deadband), the most
+/// video plus FEC is sent at, or held video never drains.
+const PACE_GAIN: f64 = 1.25;
+/// The pacer's burst: this long at the pace, at least two datagrams.
+const PACE_BURST_MS: f64 = 5.0;
+
+/// Video, FEC and `nack` answers waiting for room in QUIC's datagram queue, so audio, which
+/// goes straight to QUIC, never queues behind more than [`VideoQueue::room`] of video and
+/// is never the datagram QUIC drops to make space (#1321). `pkt_seq` is taken as a datagram
+/// is handed to QUIC, so it follows send order (§Channels) even when audio overtakes.
+#[derive(Default)]
+pub(crate) struct VideoQueue {
+    held: VecDeque<Held>,
+    bytes: usize,
+    /// The `pkt_seq` of the next datagram handed to QUIC.
+    wire: u32,
+    /// The rate the room was last sized at: held video drains at it after a release.
+    pace: Option<u64>,
+    /// Video datagrams dropped at the cap; they never take a `pkt_seq`, so no feedback
+    /// reports them lost.
+    pub(crate) dropped: u64,
+    /// The pacer: bytes video may still send now, and when they were counted.
+    tokens: f64,
+    counted: Option<Instant>,
+    /// The rate it last paced at: held video drains at it after the pace lets go.
+    paced: Option<u64>,
+    /// Video and resent datagrams over the path's datagram size, skipped.
+    pub(crate) too_large: u64,
+    pub(crate) resends_too_large: u64,
+}
+
+pub(crate) struct Held {
+    pub(crate) datagram: bytes::Bytes,
+    /// Goes in the send log, stamped `queued_at`: time held here is delay the estimate
+    /// must see, as it saw time in QUIC's queue.
+    pub(crate) logged: bool,
+    pub(crate) resend: bool,
+    pub(crate) queued_at: Instant,
+}
+
+/// What became of a datagram handed to QUIC.
+pub(crate) enum Handed {
+    Sent,
+    /// Not sent and its `pkt_seq` not used: a resend the fragment's budget no longer allows.
+    Skipped,
+    /// Over the path's datagram size: skipped like [`Handed::Skipped`], and counted.
+    TooLarge,
+    Gone,
+}
+
+impl VideoQueue {
+    /// Bytes of QUIC's datagram queue video may fill: [`AUDIO_AHEAD_MS`] at `kbps`, at
+    /// least two datagrams, at most half the queue so audio always fits beside it. With no
+    /// rate (`None`), video held from a governed spell still drains at that spell's last
+    /// rate; only an empty queue goes back to QUIC's whole buffer.
+    /// shortcut: a session never governed (no feedback, ABR off, PyroWave) gets the whole
+    /// buffer, so under congestion audio waits behind QUIC's queue as before #1321.
+    pub(crate) fn room(&mut self, kbps: Option<u64>, buffer: usize) -> usize {
+        let kbps = kbps.or(self.pace.filter(|_| !self.held.is_empty()));
+        self.pace = kbps;
+        kbps.map_or(buffer, |kbps| {
+            ((kbps * AUDIO_AHEAD_MS / 8) as usize)
+                .max(2 * super::media::MAX_DATAGRAM)
+                .min(buffer / 2)
+        })
+    }
+
+    /// Bytes the pacer lets go now: [`PACE_GAIN`] × `kbps`, in bursts of [`PACE_BURST_MS`].
+    /// `None` paces nothing, except video held from a paced spell, which drains at that pace.
+    pub(crate) fn pace(&mut self, kbps: Option<u64>, now: Instant) -> usize {
+        let Some(kbps) = kbps.or(self.paced.filter(|_| !self.held.is_empty())) else {
+            self.paced = None;
+            self.counted = None;
+            return usize::MAX;
+        };
+        self.paced = Some(kbps);
+        let per_s = kbps as f64 * PACE_GAIN * 1000.0 / 8.0;
+        let burst = (per_s * PACE_BURST_MS / 1000.0).max(2.0 * super::media::MAX_DATAGRAM as f64);
+        self.tokens = match self.counted {
+            Some(at) => self.tokens + per_s * now.saturating_duration_since(at).as_secs_f64(),
+            None => burst,
+        }
+        .min(burst);
+        self.counted = Some(now);
+        self.tokens as usize
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Drops everything held: datagrams of a configuration the client has left.
+    pub(crate) fn clear(&mut self) {
+        self.held.clear();
+        self.bytes = 0;
+        self.pace = None;
+        self.paced = None;
+        self.counted = None;
+    }
+
+    /// The `pkt_seq` new video is numbered from, a guess `feed` corrects: after everything
+    /// held.
+    pub(crate) fn next_seq(&self) -> u32 {
+        self.wire.wrapping_add(self.held.len() as u32)
+    }
+
+    /// The `pkt_seq` of a datagram handed to QUIC now, ahead of everything held.
+    pub(crate) fn take_seq(&mut self) -> u32 {
+        let seq = self.wire;
+        self.wire = seq.wrapping_add(1);
+        seq
+    }
+
+    /// Past `cap` held bytes the oldest are dropped, as QUIC's own queue drops them.
+    pub(crate) fn push(&mut self, held: Held, cap: usize) {
+        while self.bytes + held.datagram.len() > cap {
+            let Some(old) = self.held.pop_front() else {
+                break;
+            };
+            self.bytes -= old.datagram.len();
+            self.dropped += 1;
+        }
+        self.bytes += held.datagram.len();
+        self.held.push_back(held);
+    }
+
+    /// Hands `send` the oldest datagrams that fit in `room` bytes, each carrying the next
+    /// wire `pkt_seq`, and logs each sent one at the time it was queued. False when the
+    /// connection is gone.
+    pub(crate) fn feed(
+        &mut self,
+        mut room: usize,
+        mut log: Option<&mut SendLog>,
+        mut send: impl FnMut(Held) -> Handed,
+    ) -> bool {
+        while let Some(next) = self.held.front() {
+            let len = next.datagram.len();
+            if len > room {
+                break;
+            }
+            let mut held = self.held.pop_front().expect("front exists");
+            self.bytes -= len;
+            let seq = self.wire.to_le_bytes();
+            if held.datagram.get(1..5) != Some(&seq[..]) {
+                // Renumbered only after audio overtook it; a fragment the retransmit store
+                // shares is copied, a FEC repair or `nack` answer is not.
+                let mut d = held
+                    .datagram
+                    .try_into_mut()
+                    .unwrap_or_else(|d| bytes::BytesMut::from(&d[..]));
+                d[1..5].copy_from_slice(&seq);
+                held.datagram = d.freeze();
+            }
+            let (resend, queued_at) = (held.resend, held.queued_at);
+            let logged = log.as_deref_mut().filter(|_| held.logged);
+            let record = logged.map(|log| (log, held.datagram.clone()));
+            match send(held) {
+                Handed::Sent => {
+                    if let Some((log, d)) = record {
+                        log.record(&d, queued_at, resend);
+                    }
+                    room -= len;
+                    self.tokens -= len as f64;
+                    self.wire = self.wire.wrapping_add(1);
+                }
+                Handed::Skipped => {}
+                Handed::TooLarge if resend => self.resends_too_large += 1,
+                Handed::TooLarge => self.too_large += 1,
+                Handed::Gone => return false,
+            }
+        }
+        true
     }
 }
 

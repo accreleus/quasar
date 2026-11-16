@@ -5107,3 +5107,106 @@ fn releasing_the_tap_stops_its_pyrowave_encoder_and_keeps_the_tap() {
     let _ = main.set_state(gst::State::Null);
     let _ = pipeline.set_state(gst::State::Null);
 }
+
+/// #1321: an outage stops every ACK, so QUIC's queue stalls and video waits in the agent.
+/// Audio still goes to QUIC ahead of it, also after feedback silence has released the
+/// governor (held video then drains at the last governed rate, not into QUIC in one go):
+/// when the path returns, audio captured late in the outage arrives before video captured
+/// well before it. The relay holds the outage's datagrams rather than dropping them, so the
+/// order QUIC sent them in is what the client sees.
+#[tokio::test]
+async fn audio_overtakes_video_held_behind_a_stalled_path() {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let plan = audio::Plan {
+        audio: true,
+        mic: false,
+        pulse_server: None,
+        jitter_ms: 40,
+    };
+    let mut agent = agent_built(Stream::Av1Heavy, Limits::default(), plan, "snow", |_| {
+        Some(rate(true))
+    })
+    .await;
+    tap_session_audio(&mut agent);
+    let t0 = Instant::now();
+    let (outage, up_at, end) = (
+        t0 + Duration::from_secs(2),
+        t0 + Duration::from_millis(3500),
+        t0 + Duration::from_millis(5500),
+    );
+    let down = Arc::new(AtomicBool::new(false));
+    let cut = down.clone();
+    let (session, mut send, _recv) = through(&mut agent, move || {
+        Some(if cut.load(Relaxed) {
+            up_at.saturating_duration_since(Instant::now())
+        } else {
+            Duration::ZERO
+        })
+    })
+    .await;
+    let wall_us = || {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64
+    };
+    let mut path = Arrivals::default();
+    let mut report = tokio::time::interval(Duration::from_millis(50));
+    // Audio captured from here on was captured after the governor let go (silence: 500 ms).
+    let mut late = None::<u64>;
+    // (arrival order, capture µs) of every audio and video datagram from the outage on.
+    let (mut audio, mut video, mut n) = (Vec::new(), Vec::new(), 0);
+    loop {
+        let now = Instant::now();
+        if now >= end {
+            break;
+        }
+        down.store((outage..up_at).contains(&now), Relaxed);
+        if late.is_none() && now >= outage + Duration::from_millis(800) {
+            late = Some(wall_us());
+        }
+        tokio::select! {
+            d = session.read_datagram() => {
+                let d = d.unwrap();
+                if d.is_empty() { continue; }
+                path.receive(&d);
+                if now < outage { continue; }
+                n += 1;
+                let at = |r: std::ops::Range<usize>| u64::from_le_bytes(d[r].try_into().unwrap());
+                match d[0] {
+                    0x02 => audio.push((n, at(11..19))),
+                    0x01 => video.push((n, at(17..25))),
+                    _ => {}
+                }
+            }
+            _ = report.tick() => {
+                if let Some(fb) = path.feedback() {
+                    write_message(&mut send, &fb).await.unwrap();
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+    let late = late.unwrap();
+    let late_audio: Vec<_> = audio.iter().filter(|a| a.1 >= late).collect();
+    assert!(
+        !late_audio.is_empty(),
+        "no audio from late in the outage arrived"
+    );
+    // Video captured over 200 ms before an audio packet that arrived before it.
+    let overtaken: usize = late_audio
+        .iter()
+        .map(|&&(at, cap)| {
+            video
+                .iter()
+                .filter(|v| v.0 > at && v.1 + 200_000 < cap)
+                .count()
+        })
+        .max()
+        .unwrap();
+    eprintln!(
+        "{} late audio datagrams; the most video one overtook: {overtaken}",
+        late_audio.len()
+    );
+    assert!(overtaken > 0, "late audio waited behind older held video");
+}
