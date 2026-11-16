@@ -185,6 +185,11 @@ const (
 	// Amendment 14. Never a `targets` reason: only the revert and developer-apply
 	// refusals carry it (floor.go).
 	ReasonBelowFloor = "below_floor"
+
+	// Amendment 83. The only value `held_back.reason` takes: the release was
+	// withheld because its schema_version is below the installed control
+	// plane's (ADR 0002), and for no other reason.
+	ReasonSchemaBelowInstalled = "schema_below_installed"
 )
 
 // Target is one target's eligibility, evaluated against available[0] only.
@@ -229,6 +234,20 @@ func (i Installed) MarshalJSON() ([]byte, error) {
 	}{PlatformIdentity{i.ControlPlane, i.ControlPlaneMachine}, i.Hosts})
 }
 
+// HeldBack is `held_back` (amendment 83): why `available` is empty when ADR
+// 0002 emptied it. It names the newest release the channel selects that the
+// listing omits ONLY for being below the installed control plane's schema.
+// It gates nothing and offers nothing — a client may say that a release was
+// held back, never offer to apply it — so the type carries no identity or
+// manifest, only what says which release and why.
+type HeldBack struct {
+	// The held-back release's own channel (on beta, a stable row).
+	Channel       string `json:"channel"`
+	SchemaVersion int    `json:"schema_version"`
+	// ReasonSchemaBelowInstalled, the only value; an open string on the wire.
+	Reason string `json:"reason"`
+}
+
 // View is the whole `GET /v1/admin/platform/releases` body. `active_apply` is
 // ALWAYS serialized now that the apply half is served (#116): `null` is the
 // answer, not the absence of one.
@@ -244,8 +263,11 @@ type View struct {
 	LastError  *string   `json:"last_error"`
 	Installed  Installed `json:"installed"`
 	Available  []Release `json:"available"`
-	Targets    []Target  `json:"targets"`
-	Faults     []Fault   `json:"faults"`
+	// Why `available` is empty when ADR 0002 emptied it (amendment 83); null
+	// whenever available is non-empty or no release was detected. Gates nothing.
+	HeldBack *HeldBack `json:"held_back"`
+	Targets  []Target  `json:"targets"`
+	Faults   []Fault   `json:"faults"`
 	// Every open attempt on the instance, plus the active fleet run (#117).
 	// A client joins an attempt to a target by host_id.
 	ActiveApply *ActiveApply `json:"active_apply"`

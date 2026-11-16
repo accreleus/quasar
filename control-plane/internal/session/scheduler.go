@@ -751,7 +751,8 @@ type CompatToolRejection struct {
 	err    error
 	Tool   string
 	Usable bool
-	// Swap marks a swap's refusal: the session started without the tool, which no retry changes.
+	// Swap marks a swap's refusal: the session's carried table has no entry for the game, which no
+	// retry changes.
 	Swap bool
 }
 
