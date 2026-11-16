@@ -2399,11 +2399,12 @@ fn start_first_source<F: Fn(SessionEvent)>(
     if let Some(ctx) = va_ctx {
         source.apply_va_context(ctx);
     }
-    // Advertise the session's rung ladder as `wl_output` modes BEFORE the compositor
+    // Advertise the session's mode ladder as `wl_output` modes BEFORE the compositor
     // starts, so a guest that reads its mode list once at startup sees all of them. No-op
     // on a compositor image without the property. This is the internal half: what the app
-    // may pick from, independent of the external size.
-    source.set_mode_ladder(&super::rungs::available_rungs(
+    // may pick from, independent of the external size. It is the rung ladder less the
+    // sizes meant only for a starved link (#1418).
+    source.set_mode_ladder(&super::rungs::mode_ladder(
         cfg.stream.width,
         cfg.stream.height,
     ));
@@ -2558,26 +2559,18 @@ fn rebuild_config(
     next
 }
 
-/// The rebuilds amendment 59 (c) refuses before anything is touched.
+/// The rebuilds amendment 59 (c) refuses before anything is touched: what the compositor
+/// emits is fixed by the encoder family it was built for. A WebTransport tap is no longer a
+/// refusal: it is expected to survive the rebuild, its client reconnecting onto the new
+/// encoder (`webtransport::Tap`, `Media::hand_over`).
 fn rebuild_refused(
     current: super::EncoderChoice,
     next: super::EncoderChoice,
-    webtransport_tap: bool,
 ) -> Option<(&'static str, String)> {
-    // What the compositor emits is fixed by the encoder family it was built for.
-    if next != current {
-        return Some((
+    (next != current).then(|| {
+        (
             "encoder_family",
             format!("{current:?} would encode on {next:?}"),
-        ));
-    }
-    // A tap's end clears the session's WebTransport tokens for good (`Registry::end`), so a
-    // rebuild would leave that client nothing to reconnect with. Parked runtimes never have
-    // one (always `webrtc`).
-    webtransport_tap.then(|| {
-        (
-            "transport",
-            "a WebTransport session's encoder is not rebuilt warm".to_string(),
         )
     })
 }
@@ -2588,8 +2581,7 @@ fn rebuild_refused(
 /// (`cfg`, which the runner keeps at them); fps then moves by the lever and size by the
 /// display update. The old encoder is at NULL, its transports released first, before the
 /// new one is built. `Ok` only once the new encoder has put out a buffer. On `Err`
-/// (`encoder_family`, `transport` and `nvenc_drain` touch nothing) the caller takes the
-/// failure branch.
+/// (`encoder_family` and `nvenc_drain` touch nothing) the caller takes the failure branch.
 #[allow(clippy::too_many_arguments)]
 fn rebuild_encode(
     cfg: &SessionConfig,
@@ -2622,11 +2614,7 @@ fn rebuild_encode(
     let mut next = rebuild_config(cfg, to, old_pipe);
     let resolved = pipeline::resolve_effective_encoder(&mut next)
         .map_err(|e| RestreamFailure::hardware("encoder", format!("{e:#}")))?;
-    if let Some((step, why)) = rebuild_refused(
-        cfg.encoder,
-        next.encoder,
-        old_transports.webtransport.is_some(),
-    ) {
+    if let Some((step, why)) = rebuild_refused(cfg.encoder, next.encoder) {
         return Err(RestreamFailure::new(step, why));
     }
     let drain = || RestreamFailure::new("nvenc_drain", "another encoder is live on this host");
@@ -2636,6 +2624,11 @@ fn rebuild_encode(
     pipeline::Transport::release(old_transports);
     if !super::nvenc_defer::destroy_if_alone(old_pipe, defer) {
         return Err(drain());
+    }
+    // The old tap stays registered until the new one registers over it (`webtransport::Tap`),
+    // and its client is let go to reconnect onto the new encoder (#1197).
+    if let Some(tap) = &old_transports.webtransport {
+        tap.media().hand_over();
     }
     old_transports.audio_pipeline.finish();
     // The old ABR loop's hooks hold the old encoder.
@@ -4649,7 +4642,7 @@ fn perform_swap(
     // replacement needs it too, with the same pre-boot reasoning as the render size.
     // Derived from the LAUNCH size, so it is identical for every generation and unaffected
     // by the current external size.
-    new_source.set_mode_ladder(&super::rungs::available_rungs(
+    new_source.set_mode_ladder(&super::rungs::mode_ladder(
         cfg.stream.width,
         cfg.stream.height,
     ));
@@ -5141,18 +5134,15 @@ mod tests {
         assert_eq!(next.stream.codec, crate::session::Codec::H265);
     }
 
-    // Amendment 59 (c): what a rebuild refuses before it touches the old encoder.
+    // Amendment 59 (c): what a rebuild refuses before it touches the old encoder. A
+    // WebTransport tap is no longer one of them (#1197: the tap is kept across the rebuild).
     #[test]
-    fn a_rebuild_refuses_another_encoder_family_and_a_webtransport_tap() {
+    fn a_rebuild_refuses_another_encoder_family() {
         use crate::session::EncoderChoice::{Nvenc, Vulkan};
-        assert_eq!(super::rebuild_refused(Vulkan, Vulkan, false), None);
+        assert_eq!(super::rebuild_refused(Vulkan, Vulkan), None);
         assert_eq!(
-            super::rebuild_refused(Vulkan, Nvenc, false).map(|r| r.0),
+            super::rebuild_refused(Vulkan, Nvenc).map(|r| r.0),
             Some("encoder_family")
-        );
-        assert_eq!(
-            super::rebuild_refused(Vulkan, Vulkan, true).map(|r| r.0),
-            Some("transport")
         );
     }
     use std::sync::Arc;

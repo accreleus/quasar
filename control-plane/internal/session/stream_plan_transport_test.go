@@ -11,11 +11,13 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/wtendpoint"
 )
 
-// wtProbe is a fresh probe that proves everything the WebTransport path needs for h264 + opus.
+// wtProbe is a fresh probe that proves everything the WebTransport path needs for h264 + opus,
+// including amendment 78's WebGPU check.
 func wtProbe() *DeviceProbe {
 	return &DeviceProbe{
 		WebTransport: true,
 		WebCodecs:    map[string]bool{"h264": true, "hevc": true, "av1": true, "opus_decode": true},
+		WebGPU:       true,
 	}
 }
 
@@ -45,8 +47,16 @@ func TestPlanStreamTransport(t *testing.T) {
 	noH264.WebCodecs["h264"] = false
 	noWT := wtProbe()
 	noWT.WebTransport = false
+	noGPU := wtProbe()
+	noGPU.WebGPU = false
 	// A record posted before the WebCodecs keys existed: it proves WebTransport and nothing else.
 	beforeWebCodecs := &DeviceProbe{WebTransport: true}
+	// A record posted after the WebCodecs keys but before amendment 78's: it has no webgpu key,
+	// which reads as false and plans the session onto WebRTC.
+	beforeWebGPU := &DeviceProbe{WebTransport: true, WebCodecs: map[string]bool{"h264": true, "opus_decode": true}}
+	noGPUNoCodec := wtProbe()
+	noGPUNoCodec.WebGPU = false
+	noGPUNoCodec.WebCodecs["opus_decode"] = false
 
 	tests := []struct {
 		name       string
@@ -70,6 +80,9 @@ func TestPlanStreamTransport(t *testing.T) {
 		{"wanted but the device cannot decode the codec", wtInputs("webtransport", "", true, noH264), "webrtc", "device_no_webcodecs"},
 		{"wanted but the device cannot decode opus", wtInputs("webtransport", "", true, noOpus), "webrtc", "device_no_webcodecs"},
 		{"wanted but the probe predates the webcodecs keys", wtInputs("webtransport", "", true, beforeWebCodecs), "webrtc", "device_no_webcodecs"},
+		{"wanted but the device has no webgpu adapter", wtInputs("webtransport", "", true, noGPU), "webrtc", "device_no_webgpu"},
+		{"wanted but the probe predates the webgpu key", wtInputs("webtransport", "", true, beforeWebGPU), "webrtc", "device_no_webgpu"},
+		{"webcodecs is checked before webgpu", wtInputs("webtransport", "", true, noGPUNoCodec), "webrtc", "device_no_webcodecs"},
 		{"endpoint is checked before the device", wtInputs("webtransport", "", false, noWT), "webrtc", "host_no_endpoint"},
 		{"a refused request on a webrtc profile reports the profile, not the host", wtInputs("webrtc", "webtransport", false, nil), "webrtc", "profile_disallows"},
 	}
