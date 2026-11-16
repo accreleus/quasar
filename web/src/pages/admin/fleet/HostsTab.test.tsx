@@ -577,6 +577,9 @@ describe("HostsTab — owned hosts (#366)", () => {
 
   it("sends Remove host for an owned GPU host to its page, where its recovery actor removes it", async () => {
     setFleet([host({ ...owned })]);
+    mocked.getPlatformIdentity.mockResolvedValue({
+      identity: { machine_role: null, machine_node_name: null },
+    } as never);
     render(
       <MemoryRouter initialEntries={["/admin/fleet/hosts"]}>
         <SectionHeadProvider title="Fleet" tabs={FLEET_TABS}>
@@ -591,6 +594,35 @@ describe("HostsTab — owned hosts (#366)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Actions for quasar-node-1" }));
     fireEvent.click(screen.getByRole("menuitem", { name: "Remove host" }));
     expect(await screen.findByText("/admin/fleet/hosts/c2059601?remove=1")).toBeTruthy();
+    expect(mocked.deleteHost).not.toHaveBeenCalled();
+  });
+
+  // The page opens its Remove dialog on the same rule as this menu, so the menu must not
+  // promise one it will not show: the page explains instead (#1240).
+  it("takes an owned host it cannot remove to its page without the dialog", async () => {
+    setFleet([
+      host({
+        ...owned,
+        readiness: [{ id: "owner_conflict", status: "fail", summary: "x", remediation: "" }] as never,
+      }),
+    ]);
+    mocked.getPlatformIdentity.mockResolvedValue({
+      identity: { machine_role: null, machine_node_name: null },
+    } as never);
+    render(
+      <MemoryRouter initialEntries={["/admin/fleet/hosts"]}>
+        <SectionHeadProvider title="Fleet" tabs={FLEET_TABS}>
+          <Routes>
+            <Route path="/admin/fleet/hosts" element={<HostsTab />} />
+            <Route path="/admin/fleet/hosts/:id" element={<LocationProbe />} />
+          </Routes>
+        </SectionHeadProvider>
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText("quasar-node-1")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Actions for quasar-node-1" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Remove host" }));
+    expect(await screen.findByText("/admin/fleet/hosts/c2059601")).toBeTruthy();
     expect(mocked.deleteHost).not.toHaveBeenCalled();
   });
 });
