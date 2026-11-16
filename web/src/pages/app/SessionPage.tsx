@@ -33,7 +33,8 @@ import {
 } from "./sessionRuntime";
 import { createWebTransportRuntime } from "./webTransportRuntime";
 import { TraceEventEmitter } from "../../webrtc/traceEvents";
-import { rememberedFallback, rememberFallback } from "../../webtransport/fallback";
+// Aliased: `fallbackCause` is also this page's state for the overlay's row.
+import { fallbackCause as describeFallback, rememberedFallback, rememberFallback } from "../../webtransport/fallback";
 import { MicCapture, MicCaptureError, withUntrustedCertContext } from "../../webrtc/mic";
 import { probeCertificateTrust, type CertTrust } from "../../lib/certTrust";
 import { useToast } from "../../components/Toast";
@@ -108,6 +109,15 @@ const RECOVERY_BANNER_GRACE_MS = 500;
  * that with a worse, generic answer.
  */
 const RESUME_DEAD_STATES: ReadonlySet<string> = new Set(["stopping", "stopped"]);
+
+/**
+ * #1415/#1469: a resume's transport token may be refused with the contract's retryable
+ * `503 agent_not_connected` (control-api.md §transport-token — the host agent is reconnecting, or
+ * did not ack within 5 s), which is not "this session can no longer use WebTransport". Retried
+ * with these delays, about 15 s in all — the control plane's agent handshake window — before
+ * WebRTC becomes the floor.
+ */
+const TRANSPORT_MINT_RETRY_DELAYS_MS: readonly number[] = [500, 1_000, 2_000, 4_000, 8_000];
 
 interface SessionState {
   signalingUrl: string;
@@ -346,32 +356,56 @@ function SessionPageBody() {
         // WebRTC's token here silently moved every reloaded WebTransport session
         // (PyroWave included) onto WebRTC with nothing said about it.
         if (!remembered && session.transport === "webtransport") {
-          try {
-            const { transport_options } = await mintTransportToken(authToken, sessionId);
-            if (cancelled()) return;
-            const wt = transport_options?.webtransport;
-            if (wt) {
-              setCurrentApp((prev) => (prev.id ? prev : { id: session.app_id, name: prev.name }));
-              setResumedPyrowave(session.pyrowave?.wanted === true);
-              setWtCoords(wt);
-              return; // no signaling mint: this session is WebTransport's
+          /**
+           * The resume's transport token. The contract's `503 agent_not_connected` is retryable
+           * (control-api.md §transport-token: the host agent is reconnecting, or did not ack
+           * within 5 s), so it is retried with backoff; `spent` says the budget ran out with the
+           * agent still away. Any other refusal is thrown, for the page's own can't-resume path.
+           */
+          const mintResumeTransport = async (): Promise<
+            { coords: WebTransportCoords } | { refused: ApiError; spent: boolean }
+          > => {
+            for (let attempt = 0; ; attempt++) {
+              try {
+                const { transport_options } = await mintTransportToken(authToken, sessionId);
+                const wt = transport_options?.webtransport;
+                // A 201 with no coordinates is a broken server, not a session on another
+                // transport: the graceful answer is the same as `transport_unavailable`.
+                if (wt) return { coords: wt };
+                return { refused: new ApiError(409, "transport_unavailable", "the server did not return WebTransport coordinates"), spent: false };
+              } catch (err) {
+                const retryable = err instanceof ApiError && err.status === 503;
+                const waitMs = retryable ? TRANSPORT_MINT_RETRY_DELAYS_MS[attempt] : undefined;
+                if (waitMs === undefined) {
+                  // Every other API refusal is the caller's to judge; only a non-API failure
+                  // (the network) is thrown from here.
+                  if (err instanceof ApiError) return { refused: err, spent: retryable };
+                  throw err;
+                }
+                await new Promise((r) => setTimeout(r, waitMs));
+                if (cancelled()) throw err;
+              }
             }
-          } catch (err) {
-            if (cancelled()) return;
-            // The token route refuses when the session's transport is no longer
-            // WebTransport or its host's endpoint is gone, and when the session
-            // stopped meanwhile. Say which, and carry on over WebRTC: the
-            // signaling mint below is the floor and reports its own refusals.
-            const reason = err instanceof ApiError && err.code ? err.code : "transport_unavailable";
-            const cause = `${reason}: ${err instanceof Error ? err.message : String(err)}`;
-            setFallbackReason(reason);
-            setFallbackCause(cause);
-            addToast({
-              variant: "info",
-              title: "Streaming over WebRTC",
-              body: "This session can't use WebTransport any more, so it carries on over WebRTC.",
-            });
+          };
+          const mint = await mintResumeTransport();
+          if (cancelled()) return;
+          if ("coords" in mint) {
+            setCurrentApp((prev) => (prev.id ? prev : { id: session.app_id, name: prev.name }));
+            setResumedPyrowave(session.pyrowave?.wanted === true);
+            setWtCoords(mint.coords);
+            return; // no signaling mint: this session is WebTransport's
           }
+          // Only `409 transport_unavailable` — or a retryable 503 whose window is spent, the agent
+          // still away — means this session is not on WebTransport now. That is a fallback like
+          // any other, so the page's one fallback path records it (the `transport.fallback` trace
+          // and the reason a reload keeps) and mints WebRTC's coordinates. A 404, a
+          // `session_not_reconnectable` or a network failure was thrown above: the session cannot
+          // be resumed at all, so the page's own bounce says that and nothing claims a transport
+          // switch that did not happen.
+          const { refused, spent } = mint;
+          if (!spent && !(refused.status === 409 && refused.code === "transport_unavailable")) throw refused;
+          await fallBackToWebRtc("stream_lost", describeFallback(refused.code, refused));
+          return;
         }
         let res: Awaited<ReturnType<typeof mintSignalingToken>>;
         try {
@@ -651,7 +685,7 @@ function SessionPageBody() {
       runtimeRef.current = null;
       setRuntimeSnap(IDLE_SNAPSHOT);
     };
-  }, [signalCoords, webtransport]);
+  }, [signalCoords, webtransport, resumedPyrowave]);
 
   // Mic spec §3.4: release the device and reset to off on transport
   // rebuild/teardown — never carried across a reconnect.
