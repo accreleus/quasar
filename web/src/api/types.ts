@@ -224,6 +224,14 @@ export interface StreamParams {
   /** Hand-written ahead of the schema (quasar-protocol PR #15) — reconcile on the
    *  next pin bump. Present only when known AND the external size differs. */
   external_owner?: "auto" | "pinned";
+  /** Amendment 84 (#996): the session's CURRENT render size (the app-facing mode
+   *  inside the compositor) and UI scale. Present whenever the control plane
+   *  knows them — including at the launch size and 1.0, which is how a client
+   *  tells "known to be default" from "unknown"; ABSENT MEANS UNKNOWN. A second
+   *  tab or a takeover reads them instead of assuming the launch size. */
+  render_width?: number;
+  render_height?: number;
+  ui_scale?: number;
 }
 
 export type StreamProfile = Schemas["StreamProfile"];

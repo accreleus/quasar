@@ -99,6 +99,20 @@ impl Sim {
         }
     }
 
+    /// `secs` of the agent sending and nothing coming back, as an outage looks to the
+    /// estimator: every frame still goes out, no feedback arrives, and what was sent is lost
+    /// with the path rather than reported late.
+    fn outage(&mut self, secs: f64) {
+        let from = self.t;
+        for step in 1..=(secs * 10.0) as u64 {
+            self.t = from + step * 100_000;
+            self.frame();
+            let at = self.start + Duration::from_micros(self.t);
+            self.est.on_tick(at, &self.log, RTT);
+        }
+        self.pending.clear();
+    }
+
     fn frame(&mut self) {
         let kbps = self
             .send_kbps
@@ -376,6 +390,243 @@ fn feedback_silence_while_media_is_sent_decays_the_estimate() {
     assert!(
         (e - decayed).abs() < 0.05 * fed,
         "3 s of silence: {fed:.0} → {e:.0}"
+    );
+}
+
+/// #1417: a 10 s outage decays the estimate to the floor; a 20 Mbit/s session then needs
+/// about a minute of busy content to get it back at AIMD's 8 % a second. Regrown toward what
+/// the link carried before the outage, it is back in a few seconds. Twice: the estimator on
+/// its own (a sender fixed at 6 Mbit/s) and the real loop, where the encoder follows the
+/// estimate and the receive-rate cap paces the climb.
+#[test]
+fn an_outage_costs_the_estimate_seconds_not_a_minute() {
+    for send_kbps in [Some(6000.0), None] {
+        let mut s = Sim::new(20_000.0);
+        s.send_kbps = send_kbps;
+        s.run(5.0);
+        let carried = s.est.estimate_kbps();
+        assert!(
+            carried > 0.99 * CEILING,
+            "{send_kbps:?}: the link carried {carried:.0}"
+        );
+        s.outage(10.0);
+        let low = s.est.estimate_kbps();
+        assert!(
+            low < 0.05 * carried,
+            "{send_kbps:?}: the outage took it to {low:.0}"
+        );
+        s.run(10.0);
+        let e = s.est.estimate_kbps();
+        assert!(
+            e > 0.9 * carried,
+            "{send_kbps:?}: {carried:.0} → {low:.0} → {e:.0} in 10 s of feedback"
+        );
+    }
+}
+
+/// #1417: the regrow stops at the rate the link carried before the outage instead of crossing
+/// it, so the estimate is never driven above a rate that was proved. The rate is under the
+/// ceiling and the encoder follows the estimate, so neither the ceiling clamp nor the
+/// receive-rate cap is what stops it: only the memory's own bound is.
+#[test]
+fn the_regrow_stops_at_the_rate_the_link_carried() {
+    let mut s = Sim::new(4000.0);
+    s.send_kbps = None;
+    s.run(15.0);
+    let carried = s.est.estimate_kbps();
+    assert!(
+        (2000.0..0.95 * CEILING).contains(&carried),
+        "the link carried {carried:.0}, which the ceiling cannot hide"
+    );
+    s.outage(10.0);
+    let resumed = s.t;
+    // The same link comes back.
+    s.run(10.0);
+    let crossing = s
+        .trace
+        .iter()
+        .filter(|&&(t, _)| t >= resumed as f64 / 1e6)
+        .map(|&(_, e)| e)
+        .find(|&e| e >= carried)
+        .unwrap_or(f64::NAN);
+    assert!(
+        crossing.is_finite(),
+        "the estimate never got back to {carried:.0}"
+    );
+    assert!(
+        (crossing - carried).abs() < 1e-9 * carried,
+        "the regrow crossed to {crossing:.0} from a target of {carried:.0}"
+    );
+}
+
+/// #1417: the regrow ends the moment the link says it no longer carries the old rate. A link
+/// that came back a quarter as fast cuts the delay bound, and the memory goes with it; a
+/// still-held memory would keep the estimate racing at 2 %/50 ms toward a rate the link has
+/// already refused.
+#[test]
+fn a_delay_cut_ends_the_regrow() {
+    let mut s = Sim::new(6000.0);
+    s.send_kbps = None;
+    s.run(10.0);
+    let carried = s.est.estimate_kbps();
+    assert!(carried > 2000.0, "the link carried {carried:.0}");
+    s.outage(10.0);
+    assert!(s.est.recover_to.is_some(), "the outage left no memory");
+    // Back a quarter as fast, with the encoder following the estimate, on a buffer deep
+    // enough that it never drops: the delay signal is the only one this link gives.
+    s.cap_kbps = carried / 4.0;
+    s.queue_bytes = 4.0 * 1024.0 * 1024.0;
+    let lines = logged(|| s.run(15.0));
+    let labels: Vec<String> = cuts(&lines).into_iter().map(|c| c.0).collect();
+    assert!(
+        labels.iter().any(|l| l.contains("delay")),
+        "no delay cut: {labels:?}"
+    );
+    assert!(
+        s.est.recover_to.is_none(),
+        "the pre-outage rate outlived the delay cut: {labels:?}"
+    );
+    let e = s.est.estimate_kbps();
+    assert!(
+        e < carried / 2.0,
+        "{e:.0} still climbing toward {carried:.0}"
+    );
+}
+
+/// #1417: and a loss cut ends it too, on a link that only drops (a queue of two datagrams
+/// shows no delay), so the loss arm is the one that decides.
+#[test]
+fn a_loss_cut_ends_the_regrow() {
+    let mut s = Sim::new(12_000.0);
+    s.send_kbps = Some(6000.0);
+    s.run(10.0);
+    let carried = s.est.estimate_kbps();
+    assert!(carried > 2000.0, "the link carried {carried:.0}");
+    s.outage(10.0);
+    assert!(s.est.recover_to.is_some(), "the outage left no memory");
+    // Back an eighth as fast, with a two-datagram buffer that drops what overruns it and no
+    // delay to measure, and the encoder following the estimate.
+    s.cap_kbps = 1500.0;
+    s.queue_bytes = 2.0 * SIZE as f64;
+    s.send_kbps = None;
+    let lines = logged(|| s.run(15.0));
+    let labels: Vec<String> = cuts(&lines).into_iter().map(|c| c.0).collect();
+    let first = labels
+        .iter()
+        .find(|l| l.contains("delay") || l.contains("loss"));
+    assert!(
+        first.is_some_and(|l| l.contains("loss")),
+        "the first cut was not a loss cut: {labels:?}"
+    );
+    assert!(
+        s.est.recover_to.is_none(),
+        "the pre-outage rate outlived the loss cut: {labels:?}"
+    );
+    let e = s.est.estimate_kbps();
+    assert!(
+        e < 0.75 * carried,
+        "{e:.0} still climbing toward {carried:.0}"
+    );
+}
+
+/// #1417: the memory of the pre-outage rate is for the stretch after an outage, not for good.
+/// A still screen never gets back to it, and minutes later busy content must not race at 2x a
+/// second toward a rate measured before the outage.
+#[test]
+fn the_pre_outage_memory_expires_after_a_still_screen() {
+    let mut s = Sim::new(20_000.0);
+    s.send_kbps = None;
+    s.run(5.0);
+    let carried = s.est.estimate_kbps();
+    s.outage(10.0);
+    assert!(s.est.recover_to.is_some(), "the outage left no memory");
+    // A still screen: a datagram a frame, far under the estimate, so the link's rate is
+    // never measured and the regrow stalls under the receive-rate cap.
+    s.content_kbps = Box::new(|_| 50.0);
+    s.run(RECOVERY_HOLD.as_secs_f64() + 5.0);
+    assert!(
+        s.est.recover_to.is_none(),
+        "the memory outlived the still screen"
+    );
+    assert!(
+        s.est.estimate_kbps() < 0.25 * carried,
+        "the still screen carried it to {:.0} of {carried:.0}",
+        s.est.estimate_kbps()
+    );
+    // Busy content afterwards climbs at AIMD's 8 % a second: nowhere near the old rate.
+    s.content_kbps = Box::new(|_| f64::MAX);
+    s.run(5.0);
+    let e = s.est.estimate_kbps();
+    assert!(
+        e < 0.5 * carried,
+        "{e:.0} after 5 s of busy content, from a rate of {carried:.0}"
+    );
+}
+
+/// #1417 review A2/B1: the regrow's bound is on each bound, not only on the one the estimate
+/// happens to sit on. A short outage on a delay-bound session leaves the loss bound above the
+/// target and the delay bound under it: the delay bound may climb to the target, and the loss
+/// bound, already over it, must not grow at all.
+#[test]
+fn the_regrow_caps_each_bound_at_the_pre_outage_rate() {
+    let start = Instant::now();
+    let mut est = Estimator::new(CEILING, start);
+    est.delay_kbps = 2000.0;
+    est.loss_kbps = 5120.0;
+    est.settle();
+    est.recover_to = Some((3000.0, start + RECOVERY_HOLD));
+    // A second between messages would double a bound that is not held.
+    let m = Measured {
+        usage: Usage::Normal,
+        rate_kbps: Some(20_000.0),
+        sent_kbps: None,
+        fresh: true,
+        loss: None,
+    };
+    est.apply(m, start + Duration::from_secs(1), NO_QUIC);
+    assert_eq!(
+        est.delay_kbps, 3000.0,
+        "the delay bound climbed to {} past a target of 3000",
+        est.delay_kbps
+    );
+    assert_eq!(
+        est.loss_kbps, 5120.0,
+        "the loss bound grew to {} past a target of 3000",
+        est.loss_kbps
+    );
+}
+
+/// #1417 review A1: what the link delivers caps BOTH bounds, not only the delay one. With the
+/// loss bound the binding one and an application-limited sender, the loss bound holds at the
+/// receive-rate cap instead of climbing toward the pre-outage rate unmeasured.
+#[test]
+fn the_loss_bound_grows_within_the_receive_rate_cap() {
+    let start = Instant::now();
+    let mut est = Estimator::new(CEILING, start);
+    est.delay_kbps = 5000.0;
+    est.loss_kbps = 1000.0;
+    est.settle();
+    est.recover_to = Some((5000.0, start + RECOVERY_HOLD));
+    // A second later, 300 kbit/s arriving with no send rate: the sender is application
+    // limited, so 1.5 x 300 + 10 kbps is all the link is known to carry.
+    let m = Measured {
+        usage: Usage::Normal,
+        rate_kbps: Some(300.0),
+        sent_kbps: None,
+        fresh: true,
+        loss: None,
+    };
+    est.apply(m, start + Duration::from_secs(1), NO_QUIC);
+    let cap = RECV_CAP * 300.0 + RECV_CAP_ADD_KBPS;
+    assert!(
+        est.loss_kbps <= 1000.0 + 1e-9,
+        "the loss bound grew to {:.0} past a cap of {cap:.0}",
+        est.loss_kbps
+    );
+    assert_eq!(
+        est.recover_to.map(|(to, _)| to),
+        Some(5000.0),
+        "still recovering"
     );
 }
 
