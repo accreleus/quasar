@@ -109,7 +109,7 @@ ARG GST_VERSION=1.28.8
 ARG GST_PLUGINS_RS_REF=cee45224cb2d10e1523af4f256d0dd64c8b29491
 ARG GST_INTERPIPE_REF=0c454917
 ARG GST_WAYLAND_DISPLAY_REPO=https://github.com/salty2011/gst-wayland-display.git
-ARG GST_WAYLAND_DISPLAY_REF=05bc3c99c3e0f54ebebc021bd4ccc2c0a23418ea
+ARG GST_WAYLAND_DISPLAY_REF=492984b6ccaf906eb3083956e23e9d6d1f18674e
 ARG PYROWAVE_REF=7fe0e2667cd3076b8b2bf04bcb80bc8d691b800b
 ARG GRANITE_REF=53090429539bf3404250d18fe58db971f0907c04
 ARG VULKAN_LOADER_REF=363f465abadab0a8dcfc5c85d2c691e9b0b788d6
@@ -321,8 +321,8 @@ RUN cargo install cargo-c --version "${CARGO_C_VERSION}" --locked \
 
 # Patched GStreamer 1.28.8 -> /opt/gst. Thirteen vendored patches, applied in the order below; the
 # order is load-bearing (each was diffed against the tree with its predecessors applied) and is
-# documented per patch in deploy/patches/vulkan/README.md. The fifth is a diagnostic A/B arm for
-# Lab-host Xid 32: it serializes every GstVulkanQueue wrapper through one process-wide submit domain.
+# documented per patch in deploy/patches/vulkan/README.md. The fifth (gst-wayland-display's own)
+# shares one GstVulkanQueue per VkQueue, so every submitter on a queue takes one submit lock.
 # The ninth (issue #507) recycles the per-frame Vulkan bitstream buffer and must apply after the
 # eight before it, because it was diffed against gstvkencoder-private.c with them applied.
 # All of them must land after the clone and before Meson config/build.
@@ -351,7 +351,7 @@ RUN git clone --depth 1 --branch "${GST_VERSION}" \
     && git apply /tmp/vulkanh265enc.patch \
     && git apply /tmp/vkh264enc-rc-fix.patch \
     && git apply /tmp/vkh264enc-num-slices.patch \
-    && git apply /tmp/gstreamer-vulkan-global-submit-lock.patch \
+    && git apply /tmp/gstreamer-vulkan-shared-queue-lock.patch \
     && git apply /tmp/vkh264enc-intra-refresh.patch \
     && git apply /tmp/vulkanav1enc.patch \
     && git apply /tmp/vulkan-enc-output-state-on-resize.patch \

@@ -487,9 +487,8 @@ fn capture_encoder_props(active: &Active, ctx: &CaptureCtx<'_>) -> CaptureReport
         "scale_stage": ctx.stage,
         "ring": {
             // ONE named env var, never a bulk enumeration (tests.rs greps this
-            // file for that) — the host-wide Vulkan encode-src ring pin
-            // (`pipeline::source_branch::pin_vulkan_encode_ring`), a process-global
-            // the pipeline itself cannot report back.
+            // file for that): the operator's encode-src ring override
+            // (`pipeline::source_branch::source_ring_depth`).
             "wolf_vulkan_ring": std::env::var("WOLF_VULKAN_RING").ok(),
         },
     });

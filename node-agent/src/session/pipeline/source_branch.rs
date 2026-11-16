@@ -13,37 +13,37 @@ use crate::session::{EncoderChoice, SessionConfig};
 use super::caps::{dmabuf_zerocopy_format, source_caps, vulkan_image_transport};
 use super::encoders::va_device_element_prefix;
 
-/// Self-heal the compositor's Vulkan encode-src ring-slot tiling defect by pinning the
-/// ring to the depth [`super::encoders::required_source_ring_depth`] requires. WHICH codec
-/// is at risk and why that depth is correct live in that function, not here.
-///
-/// The pin is HOST-WIDE, not per-session, and must stay that way: the compositor caches
-/// the ring depth process-globally (`ring_used()` `OnceLock`, read at the first encode-src
-/// allocation), so per-session pinning is unreliable. It covers every Vulkan session for
-/// the process lifetime, H.264 and AV1 included; RING=2 costs neither any smoothness, and
-/// no other encoder reads it. An explicit operator `WOLF_VULKAN_RING` still wins.
-///
-/// Called from `session::prepare_gst_env`, before any thread exists: it used to run in
-/// the first Vulkan session's source build, a `setenv` beside every thread of a serving
-/// agent. The knobs it reads come from the environment, so they are the same there.
-pub(crate) fn pin_vulkan_encode_ring() {
-    let knobs = super::encoders::EncoderKnobs::from_env();
-    let Some(depth) = super::encoders::required_source_ring_depth(knobs) else {
-        return;
-    };
-    // An EMPTY value is unset, not an override: a compose passthrough
-    // (`WOLF_VULKAN_RING: ${WOLF_VULKAN_RING:-}`) lands an empty string when the operator
-    // exports nothing, and the compositor's `ring_used()` reads empty as "default".
-    if std::env::var("WOLF_VULKAN_RING").is_ok_and(|v| !v.is_empty()) {
-        return;
+/// The compositor's Vulkan encode-src ring depth (its `ring-depth` property) for this host:
+/// an operator's `WOLF_VULKAN_RING` if set and non-empty, else what
+/// [`super::encoders::required_source_ring_depth`] requires (the reason lives there).
+/// `None` keeps the element's default. Empty is unset: compose passes it through as
+/// `${WOLF_VULKAN_RING:-}`.
+pub(crate) fn source_ring_depth() -> Option<u32> {
+    match std::env::var("WOLF_VULKAN_RING") {
+        Ok(v) if !v.is_empty() => match v.trim().parse::<u32>() {
+            Ok(depth) => Some(depth),
+            Err(_) => {
+                tracing::warn!(
+                    token = "vulkan-ring-depth-unparsed",
+                    value = v,
+                    "WOLF_VULKAN_RING is not a number; using the codec default"
+                );
+                super::encoders::required_source_ring_depth(
+                    super::encoders::EncoderKnobs::from_env(),
+                )
+            }
+        },
+        _ => super::encoders::required_source_ring_depth(super::encoders::EncoderKnobs::from_env()),
     }
-    std::env::set_var("WOLF_VULKAN_RING", depth.to_string());
-    tracing::info!(
-        "vulkan encode-src ring pinned to {depth} slots (WOLF_VULKAN_RING={depth}) for ALL \
-         vulkan sessions on this host (the compositor caches the ring depth process-globally) \
-         — see encoders::required_source_ring_depth for why this depth is required. Set \
-         WOLF_VULKAN_RING explicitly to override."
-    );
+}
+
+/// `depth` clamped into the range `pspec` accepts (the compositor takes 1..=4 and raises
+/// anything below 2 to 2), so an operator value outside it cannot panic the setter.
+fn clamp_ring_depth(depth: u32, pspec: &gst::glib::ParamSpec) -> u32 {
+    match pspec.downcast_ref::<gst::glib::ParamSpecUInt>() {
+        Some(range) => depth.clamp(range.minimum(), range.maximum()),
+        None => depth,
+    }
 }
 
 /// Build the video-source sub-chain into `pipeline` and return its TAIL (the capsfilter
@@ -84,6 +84,18 @@ pub(crate) fn build_video_source(
             tracing::info!(
                 "VK-05: waylanddisplaysrc vulkan=true (emit memory:VulkanImage NV12 for vulkanh264enc)"
             );
+            // LINEAR first, OPTIMAL where the driver refuses it (NVIDIA): radv corrupts the
+            // tiled encode-src copy on RDNA2/RDNA4 (#281).
+            if el.find_property("linear-encode-src").is_some() {
+                el.set_property("linear-encode-src", true);
+            }
+            if let (Some(depth), Some(pspec)) =
+                (source_ring_depth(), el.find_property("ring-depth"))
+            {
+                let depth = clamp_ring_depth(depth, &pspec);
+                el.set_property("ring-depth", depth);
+                tracing::info!(depth, "vulkan encode-src ring depth");
+            }
         }
         // A swap builds its compositor from this same session cfg, not the new app's spec,
         // so the session keeps its keymap (amendment 49).

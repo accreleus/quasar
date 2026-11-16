@@ -72,9 +72,7 @@ mod source_branch;
 pub(crate) use source_branch::keyboard_layout;
 // Also the media host probe's source + convert stage (`session::probe_media`): the probe
 // must build the compositor arm production builds, not a stand-in.
-pub(crate) use source_branch::{
-    build_gpu_convert_stage, build_video_source, pin_vulkan_encode_ring,
-};
+pub(crate) use source_branch::{build_gpu_convert_stage, build_video_source};
 mod scale_stage;
 use scale_stage::build_scale_stage;
 pub use scale_stage::ScaleStage;

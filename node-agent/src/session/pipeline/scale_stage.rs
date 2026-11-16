@@ -463,7 +463,12 @@ pub(super) fn build_scale_stage(
         EncoderChoice::Vulkan => {
             if supported {
                 let f = tail_filter()?;
-                (tail_chain(vec![make("vulkanscale")?], f.clone()), Some(f))
+                let scale = make("vulkanscale")?;
+                // Its output images take the same LINEAR-first ladder as the compositor's.
+                if scale.find_property("linear-encode-src").is_some() {
+                    scale.set_property("linear-encode-src", true);
+                }
+                (tail_chain(vec![scale], f.clone()), Some(f))
             } else {
                 (vec![], None)
             }

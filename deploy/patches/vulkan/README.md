@@ -18,7 +18,7 @@
 > compositor, change it on `develop` and re-diff the file here so the two stay in step** — the
 > procedure is in `docs/third-party-pins.md`.
 >
-> The **GStreamer** patches here (`vkh264enc-*`, `vulkanh265enc`, `gstreamer-vulkan-global-submit-lock`)
+> The **GStreamer** patches here (`vkh264enc-*`, `vulkanh265enc`, `gstreamer-vulkan-shared-queue-lock`)
 > ARE still applied at build time. Only the `gst-wayland-display-*` ones moved into the branch.
 
 These patches split across **two upstreams**: thirteen apply to a from-source **GStreamer**
@@ -41,7 +41,7 @@ The remaining GStreamer patches are **Quasar-authored** (not from gst-wayland-di
 
 - `vkh264enc-rc-fix.patch`
 - `vkh264enc-num-slices.patch`
-- `gstreamer-vulkan-global-submit-lock.patch`
+- `gstreamer-vulkan-shared-queue-lock.patch` (from gst-wayland-display's `patches/`, see its section)
 - `vkh264enc-intra-refresh.patch`
 - `vulkanav1enc.patch`
 - `vulkan-enc-output-state-on-resize.patch`
@@ -56,10 +56,10 @@ They are applied — **in this order** — to a from-source GStreamer `1.28.8`
 checkout (see `deploy/Dockerfile.vulkan`); the rc-fix patch touches the same
 `new_sequence` region as the DPB patch, so it must apply **after** it, and the
 num-slices patch touches `new_sequence`, `_setup_slice`, `_setup_codec_pic`, and
-the property table on top of the rc-fix state, so it applies **fourth**. The global-submit-lock
-diagnostic applies **fifth**, and the intra-refresh patch applies **sixth**: it was diffed against the tree with all five earlier patches applied (it shares
+the property table on top of the rc-fix state, so it applies **fourth**. The shared-queue-lock
+patch applies **fifth**, and the intra-refresh patch applies **sixth**: it shares
 `new_sequence`, `_setup_codec_pic`, the frame struct, and the property table with num-slices, and
-`gstvkdevice.c` with the submit-lock diagnostic), so it applies **sixth**.
+`gstvkdevice.c` with the queue-lock patch.
 `vulkanav1enc.patch` applies **seventh**: it shares `ext/vulkan/meson.build` + `gstvulkan.c`
 registration context with `vulkanh265enc.patch`. (It was diffed with the six patches above and
 `gstreamer-vulkan-rc-retarget-no-reset.patch` applied. That patch, once seventh, was removed at
@@ -362,30 +362,20 @@ warning logged. See the `2026-07-05` multi-slice entry in
 `num-slices` property mirrors `vah264enc`/`nvh264enc` naming, so it is directly
 upstreamable.
 
-### `gstreamer-vulkan-global-submit-lock.patch`
+### `gstreamer-vulkan-shared-queue-lock.patch`
 
-**Diagnostic A/B arm; not an accepted production fix.** Stock GStreamer `1.28.4` stores the
-submission mutex in each `GstVulkanQueue` wrapper. Distinct wrappers can refer to the same raw
-`VkQueue`, so their mutexes would not satisfy Vulkan's external-synchronization rule for that
-handle. The lab host normally selects distinct graphics/compute and VIDEO_ENCODE queue families, however,
-so the converter and encoder are expected to use different raw queues. The lab host has produced
-stochastic Xid 32 failures during session pipeline bring-up, where both queues begin submitting.
+Taken verbatim from gst-wayland-display's `patches/` (upstream commit `b312362`), the patch its
+own tests run against. `gst_vulkan_device_get_queue()` returns the `GstVulkanQueue` still alive
+for a `VkQueue` instead of a new wrapper per call, so every element and pool submitting to one
+`VkQueue` takes the same submit lock (`vkQueueSubmit` needs the queue externally synchronised).
+Upstream measured it on an RTX 5080 with validation: no threading reports and no device loss in
+18 runs of two sources plus an encoder (2 to 5 losses in 10 before).
 
-This patch changes `gst_vulkan_queue_submit_lock()` / `_unlock()` to use one process-global GLib
-mutex for every wrapper and queue. This is deliberately broader than an eventual keyed-by-raw-
-queue production design: it tests whether suppressing cross-queue host submission concurrency or
-changing its timing removes the failure while preserving the public API and all existing call
-sites. The matching gst-wayland-display NVIDIA-sync patch routes both raw submits through that API
-when using the shared-device Vulkan encode path; `WOLF_VULKAN_DUMP` is diagnostic-only. Compare
-locked and stock builds under the same repeated-session matrix. Passing this arm alone does not
-prove a same-queue Vulkan violation, establish root cause, or satisfy Wave acceptance.
-
-The patch also emits one bounded `vulkandevice` INFO record whenever GStreamer creates a queue
-wrapper. Enable it with `GST_DEBUG=vulkandevice:6`; the record includes wrapper pointer, raw
-`VkDevice`, raw `VkQueue`, family/index, and `global-lock=enabled`. It does not log per frame.
-
-**Authored against:** GStreamer `1.28.4`, after the four encode feature/fix patches. LGPL-2.1+
-applies to the resulting modified GStreamer source.
+It replaces `gstreamer-vulkan-global-submit-lock.patch` (#1081), a diagnostic that made every
+submit lock in the process one global mutex while the lab host's session-start Xid 32 was
+isolated; this is the keyed-by-queue design that diagnostic stood in for. The two cannot both
+apply (both change `gst_vulkan_device_get_queue`). If the fork-bump live exercise shows Xid 32 at
+session start again, put the global lock back (git history) and say so on #1083.
 
 ### `vkh264enc-intra-refresh.patch`
 
@@ -1388,7 +1378,7 @@ The intra-refresh patch (Quasar-authored):
 | Field | Value |
 |---|---|
 | Origin | Quasar (this repo) — not vendored |
-| Authored against | GStreamer `1.28.4` (`gst-plugins-bad`), on top of DPB + h265 + rc-fix + num-slices + global-submit-lock (applies **sixth**) |
+| Authored against | GStreamer `1.28.4` (`gst-plugins-bad`), on top of DPB + h265 + rc-fix + num-slices + shared-queue-lock (applies **sixth**) |
 | Requires | Vulkan headers ≥ 1.4.321 (image ships 1.4.341) and a driver exposing `VK_KHR_video_encode_intra_refresh` (RADV Mesa ≥ 25.3, current NVIDIA) |
 | Upstream status | unreported as of 2026-07-20; issue to be filed with the rc-fix/num-slices batch |
 

@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Changed
+- **The compositor is rebuilt on the current upstream gst-wayland-display (#1081).** Quasar's compositor features are carried on top of upstream's latest release line, which brings its own fixes: bounded waits so a session stop never hangs on a frame, a clean failure when the compositor cannot start, HDR rework, input fixes and a newer Smithay. The Vulkan encoders now share one submit lock per GPU queue instead of one for the whole process. Streaming should look the same; this needs its hardware check before it ships (#1083).
+
 ### Fixed
 - **A mouse button held when input capture ends no longer stays down on the host (#1406).** Without Pointer Lock — a tablet with a trackpad, or a browser that refused the lock — a button held on the picture stayed pressed on the host after Esc, alt-tab or the page being hidden, until the player clicked again. Ending capture now lifts every held button, exactly as it already did for held keys and controller buttons.
 - **Bench mode (`?bench=1`) now measures a PyroWave session (#1344).** The marker is read off the decoded picture on the GPU, only its corner of the frame and without holding up the frame, so glass-to-glass, the marker counts and input-to-photon exist for PyroWave as for the other codecs. A browser that cannot read the picture back counts its frames as `no_image` instead of reporting none.
