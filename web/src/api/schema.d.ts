@@ -2680,7 +2680,7 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** A single host (admin). */
+        /** A single host (admin; response is wrapped in {host}, amendment 77). */
         get: {
             parameters: {
                 query?: never;
@@ -2698,7 +2698,9 @@ export interface paths {
                         [name: string]: unknown;
                     };
                     content: {
-                        "application/json": components["schemas"]["Host"];
+                        "application/json": {
+                            host: components["schemas"]["Host"];
+                        };
                     };
                 };
                 401: components["responses"]["Unauthorized"];
@@ -2749,7 +2751,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Cordon a host out of service. */
+        /** Cordon a host out of service (response is wrapped in {host}, amendment 77). */
         post: {
             parameters: {
                 query?: never;
@@ -2767,7 +2769,9 @@ export interface paths {
                         [name: string]: unknown;
                     };
                     content: {
-                        "application/json": components["schemas"]["Host"];
+                        "application/json": {
+                            host: components["schemas"]["Host"];
+                        };
                     };
                 };
                 401: components["responses"]["Unauthorized"];
@@ -2792,7 +2796,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Return a host to service. */
+        /** Return a host to service (response is wrapped in {host}, amendment 77). */
         post: {
             parameters: {
                 query?: never;
@@ -2810,7 +2814,9 @@ export interface paths {
                         [name: string]: unknown;
                     };
                     content: {
-                        "application/json": components["schemas"]["Host"];
+                        "application/json": {
+                            host: components["schemas"]["Host"];
+                        };
                     };
                 };
                 401: components["responses"]["Unauthorized"];
@@ -3446,7 +3452,7 @@ export interface paths {
                         "application/json": components["schemas"]["ErrorEnvelope"];
                     };
                 };
-                /** @description no_host_available (amendment 71, accreleus/quasar#1178) - the app is not selected for the session's host, or, with error.reason compat_tool_missing, the target is a derived Steam game whose mapped GE tool the session did not mount at launch. NOT retryable: a swap does not move hosts or wait for an install. */
+                /** @description no_host_available (amendment 71, accreleus/quasar#1178) - the app is not selected for the session's host, or, with error.reason compat_tool_missing, the target is a derived Steam game whose mapped GE tool the session did not mount at launch, or (amendment 87) whose mapping was written after the session was created. NOT retryable: a swap does not move hosts or wait for an install. */
                 503: {
                     headers: {
                         [name: string]: unknown;
@@ -3809,13 +3815,15 @@ export interface paths {
                 };
             };
             responses: {
-                /** @description Updated. */
+                /** @description Updated (wrapped in {user}, amendment 77). */
                 200: {
                     headers: {
                         [name: string]: unknown;
                     };
                     content: {
-                        "application/json": components["schemas"]["AdminUser"];
+                        "application/json": {
+                            user: components["schemas"]["AdminUser"];
+                        };
                     };
                 };
                 400: components["responses"]["ValidationFailed"];
@@ -6713,7 +6721,7 @@ export interface paths {
         put?: never;
         /**
          * Release an uncertain restart attempt and its recovery hold (amendment 51).
-         * @description The explicit repair of an uncertain restart attempt. The body must acknowledge that the host's configuration is unverified. The request is recorded, audited once and sent to the agent as config_policy_release once its journal is reconciled; it lifts nothing. The recovery hold, the group's uncertain status and the host's draining status end only when the agent reports the attempt released. Every 4xx writes nothing. Normative behavior: control-api.md section "Releasing a recovery hold".
+         * @description The explicit repair of an uncertain restart attempt. The body must acknowledge that the host's configuration is unverified. The request is recorded, audited once and sent to the agent as config_policy_release once its journal is reconciled; it lifts nothing. The recovery hold, the group's uncertain status and the host's draining status end only when the agent reports the attempt released. Amendment 86: an applied attempt that holds a recovery restriction (an applied replay without its verified active snapshot) is released by the control plane alone, at once, answering 200; nothing is sent to the agent. Every 4xx writes nothing. Normative behavior: control-api.md section "Releasing a recovery hold".
          */
         post: {
             parameters: {
@@ -6731,7 +6739,7 @@ export interface paths {
                 };
             };
             responses: {
-                /** @description Already released; nothing sent. */
+                /** @description Already released, or (amendment 86) an applied attempt's recovery hold released now; nothing sent. */
                 200: {
                     headers: {
                         [name: string]: unknown;
@@ -6755,7 +6763,7 @@ export interface paths {
                 403: components["responses"]["Forbidden"];
                 /** @description No restart attempt with this ID on this host. No write. */
                 404: components["responses"]["NotFound"];
-                /** @description attempt_not_uncertain: the attempt is neither uncertain nor released. No write. */
+                /** @description attempt_not_uncertain: the attempt is neither uncertain nor released, nor (amendment 86) applied with a recovery restriction or a recorded release. No write. */
                 409: components["responses"]["Conflict"];
             };
         };
@@ -9547,6 +9555,12 @@ export interface components {
             external_owner?: "auto" | "pinned";
             /** @description console-mode-switch (approved 2026-10-03, #445). The physical display mode a local console session runs at, as the agent last reported it (agent-api.md session_metrics.console_mode; refresh_millihz is the exact DRM timing). Present once a console sample has been seen; absent on every streamed session and before the first sample — absence means "not a known local console", never "at the launch mode". Moves when the app in the session picks another mode in its own display settings; width/height/fps stay the launch mode. In-memory cache, dropped on a control-plane restart like external_width. Read-only. */
             console_mode?: components["schemas"]["ConsoleModeSelection"];
+            /** @description Amendment 84 (accreleus/quasar#996), additive. The session's current RENDER width (the app-facing mode inside the compositor, set by PATCH /v1/sessions/{id}/display render_width) on session.stream; absent on an app's display_stream. Same presence rule as external_width: present whenever the control plane knows it, including at the pinned stream width; ABSENT MEANS UNKNOWN. Known from a 202 of that PATCH or a display-aware session_metrics sample (one with external_resize_supported), where an absent render_width means the pinned stream width (stream.width). In-memory cache, lost on a control-plane restart. Read-only. */
+            render_width?: number;
+            /** @description Amendment 84. Pairs with render_width; see its description. */
+            render_height?: number;
+            /** @description Amendment 84. The session's current UI scale (PATCH /v1/sessions/{id}/display ui_scale). Same presence rule and cache as render_width; a display-aware sample without ui_scale means 1.0. Read-only. */
+            ui_scale?: number;
             /** @description session-display-stream (approved 2026-08-16). The fixed, aspect-ratio-filtered table of [width,height] pairs this session's stream_width/stream_height may be set to via PATCH /v1/sessions/{id}/display (always <= the launch size, launch size always included). Always present on session.stream for a running session; absent on an app's display_stream. Not the admin-configured stream-profile "rungs" (AS10-01) — a separate, fixed table unrelated to the admin encode-rung catalog. 21:9 family membership is by a set of reduced ratios {43:18, 64:27, 7:3} — 3440x1440 reduces to 43:18, 2560x1080 to 64:27 — control-api.md's table is the reference, not a computed tolerance. */
             rungs?: number[][];
         };
@@ -9812,7 +9826,7 @@ export interface components {
             shared_home_app_id: string | null;
             /** @description Amendment 54: the transport the stream plan chose. Always serialized by a server implementing the amendment; absent from an older one, read as webrtc. */
             transport?: components["schemas"]["Transport"];
-            /** @description Amendment 54: why a wanted WebTransport was not chosen (profile_disallows, amendment 61's instance_default_disallows, host_no_endpoint, device_no_webtransport, device_no_webcodecs; an open string), else null. Absent from an older server. */
+            /** @description Amendment 54: why a wanted WebTransport was not chosen (profile_disallows, amendment 61's instance_default_disallows, host_no_endpoint, device_no_webtransport, device_no_webcodecs, and from amendment 78 codec_unsupported_on_transport and device_no_webgpu; an open string), else null. Absent from an older server. */
             transport_reason?: string | null;
             /** @description Amendment 54: the reason in the latest transport.fallback trace event the client posted, else null. Observability only. Absent from an older server. */
             transport_fallback_reason?: string | null;
@@ -10697,7 +10711,7 @@ export interface components {
             manifest: components["schemas"]["ReleaseManifest"] | components["schemas"]["ReleaseManifestV2"] | components["schemas"]["ReleaseManifestPreview"] | null;
             /** @description ADDITIVE, amendment 6 (#153). True when applying this release runs at least one migration on this instance - its schema_version is above the installed control plane's. THE ONE THING that decides whether a fleet apply's control-plane step drains the instance (see the apply section), so it is DERIVED AND SERVED rather than left to a client to re-derive, exactly as identity_known is: a client twin of the rule would keep naming the old policy after the rule moved. Always present. With no release to apply, read the cautious answer, true. */
             migrates: boolean;
-            /** @description ADDITIVE, amendment 48 (#840). On a preview release whose manifest carries commits, how many of its leading entries the installed control plane does not run: the entries before the one whose commit equals the installed control plane's source_commit, or all of them when none does. Null on every other release. A client shows the first new_commit_count entries of manifest.commits. DERIVED AND SERVED, like migrates. Always serialized by a server implementing amendment 48; a client reads absent as null. */
+            /** @description ADDITIVE, amendment 48 (#840). On a preview release whose manifest carries commits, how many of its leading entries the installed control plane does not run: the entries before the one whose commit equals the installed control plane's source_commit, or all of them when none does; 0 when the installed control plane is newer by the edge ordering rule (same schema_version, later built_at; amendment 83). Null on every other release. A client shows the first new_commit_count entries of manifest.commits. DERIVED AND SERVED, like migrates. Always serialized by a server implementing amendment 48; a client reads absent as null. */
             new_commit_count?: number | null;
             /**
              * Format: date-time
@@ -10791,6 +10805,14 @@ export interface components {
             };
             /** @description Releases the configured channel selects that are still offerable, NEWEST FIRST (schema_version DESC, then built_at DESC - the tiebreak matters because an edge channel produces many builds at one schema_version). On BETA, SemVer 2.0.0 precedence is inserted between those two keys, because that channel is the only one whose rows can arrive out of version order: 0.2.0-rc.2 orders below 0.2.0, which orders below 0.2.1-rc.1, whatever order they were built in. A release below the installed control plane's schema_version is NEVER here (ADR 0002); neither is one whose VERSION orders below an installed prerelease at the same schema_version, which is what stops a switch back to stable offering a downgrade (amendment 3); a prerelease is never here on stable; a stable or beta release with a missing or invalid manifest is never here either (and is not a fault - amendment 26). */
             available: components["schemas"]["PlatformRelease"][];
+            /** @description Amendment 83 (accreleus/quasar#1211), additive. Why `available` is empty when ADR 0002 emptied it: the newest release the channel selects that `available` omits ONLY because its schema_version is below the installed control plane's. null whenever available is non-empty or no such release was detected. Gates nothing; a client never offers it. Always serialized by a server implementing amendment 83; a client reads absent as null. */
+            held_back?: {
+                /** @description The held-back release's channel (on beta, stable). */
+                channel: string;
+                schema_version: number;
+                /** @description schema_below_installed, the only value; an open string. */
+                reason: string;
+            } | null;
             /** @description One entry per target - the control plane, then every registered host - each evaluated against available[0]. When available is empty every target is eligible:false with reason "no_release". */
             targets: components["schemas"]["PlatformReleaseTarget"][];
             faults: components["schemas"]["PlatformReleaseFault"][];
@@ -11431,6 +11453,10 @@ export interface components {
             managed_home: boolean;
             /** @description P5-01: container path where the home is mounted (default /home/quasar). */
             home_container_path: string;
+            /** @description Amendment 82 (accreleus/quasar#1201): whether a launch of this app gets a managed home now - the managed_home merge of the app's own value and its runtime preset's (for a derived tile, its parent's value and preset), by the launch path's rule (control-api.md Runtime presets, merge rules). Equals managed_home when there is no preset. Always serialized by an amendment-aware server; absent from an older one; ignored on write. */
+            readonly effective_managed_home?: boolean;
+            /** @description Amendment 82: the container path a managed home of this app would be mounted at now (nothing is mounted while effective_managed_home is false), by the same merge (an app still on the schema default takes the preset's path). Equals home_container_path when there is no preset. Same presence rule as effective_managed_home. */
+            readonly effective_home_container_path?: string;
             /** @description Amendment 53 (#1001): this app's sessions also mount the user's Steam data dir, on the same host, holding the Steam home's single-writer lock. Refused (400) on a derived tile and on a library provider app. See control-api.md §Storage. */
             share_steam_library: boolean;
             /**
@@ -11898,10 +11924,16 @@ export interface components {
             overlay_frames?: number;
             /** @description The governor's live floor, sent ONLY when the ladder has moved it off the launch floor. Absent means 'the floor the session launched with', never 'unknown'. Stream health judges the setpoint against it when present (amendment 75). Uncurated: readable via GET .../metrics, not in the diagnostic lens. */
             abr_floor_kbps?: number;
+            /** @description Amendment 85 (accreleus/quasar#1302), additive. FEC repair payload bytes the agent sent in the window as a percent of the video payload bytes sent in it. Present in every window of a WebTransport session whose hello_ack.fec named a scheme (0 when the window sent no repair); absent otherwise, meaning no FEC. Uncurated. */
+            wt_fec_overhead_pct?: number;
+            /** @description Amendment 85, additive. The same window's FEC repair payload as a rate, kbit/s. Same presence rule as wt_fec_overhead_pct. Uncurated. */
+            wt_fec_kbps?: number;
             /** @description The ABR mode this session is actually running ('smooth' | 'protective' | 'off'). Reported rather than inferred: deriving it from setpoint presence was wrong for 'off', where rtpgccbwe stays attached. Uncurated (a label, not a series). */
             abr_mode?: string;
             /** @description The in-session ABR governor's CURRENT CBR setpoint at drain time — a level, not a window average. Absent when ABR is disarmed. */
             abr_setpoint_kbps?: number;
+            /** @description Amendment 79: the ABR governor's unclamped link rate at drain time (what the link carries, before the floor clamps it into the setpoint). Present only on a WebTransport session in smooth (the per-report loop); absent means not measured. When present, stream health judges it against the floor (abr_floor_kbps, else the resolved rung's) instead of abr_setpoint_kbps, with the same at-or-below comparison. Uncurated: readable via GET .../metrics, not in the diagnostic lens. */
+            abr_link_rate_kbps?: number;
             /** @description The agent's own per-window bottleneck label ('healthy' | 'network_congested' | 'encoder_saturated' | 'unknown'). SIGNAL-ONLY — it changes no ABR behaviour, and it can never say 'client_presentation_limited' because the agent never sees browser data (invariant #1). */
             adaptation_state?: string;
             /** @description Frames emitted by waylanddisplaysrc per second, BEFORE caps normalisation and interpipe. The first stage where a rate can differ from what the app painted. */
@@ -11954,7 +11986,7 @@ export interface components {
             probe_send_desyncs?: number;
             /** @description The compositor's CURRENT app-facing wl_output logical height; see render_width. */
             render_height?: number;
-            /** @description The compositor's CURRENT app-facing wl_output logical width. Present only when it differs from the session's pinned stream size. With render_height and ui_scale this is the ONLY authoritative readback of live render resolution — the value lives nowhere else. */
+            /** @description The compositor's CURRENT app-facing wl_output logical width. Present only when it differs from the session's pinned stream size. With render_height and ui_scale this is the ONLY authoritative readback of live render resolution; the Session resource carries a cached copy (Session.stream.render_width, amendment 84). */
             render_width?: number;
             /** @description RTP packet bitrate before WebRTC transport overhead (SRTP, RTX, FEC). Always a little above bitrate_kbps; a large gap is retransmission. */
             rtp_bitrate_kbps?: number;
@@ -12025,6 +12057,8 @@ export interface components {
             wt_audio_target_ms?: number;
             /** @description Amendment 68 (accreleus/quasar#1346), additive. CUMULATIVE for the page view: times a WebTransport session's audio ring ran empty and played silence, however long each run lasted. The silence-run half of audio_concealment_events, so that count minus this one is the dropouts a lost packet's fade caused. Absent until audio has played, and never posted by a WebRTC session. */
             wt_audio_underruns?: number;
+            /** @description Amendment 85 (accreleus/quasar#1302), additive. CUMULATIVE for the page view, accumulated like packets_lost (each connection's count is added, so a reconnect never resets it): video fragments a WebTransport client rebuilt from FEC repair datagrams. A rebuilt fragment is never NACKed, so it is not in packets_lost; packets_lost + wt_fec_repaired is the video fragments the path lost. Posted only while FEC is negotiated; never posted by a WebRTC session. */
+            wt_fec_repaired?: number;
             /** @description Accepted by the browser ingest allow-list and declared here, but no client has ever posted it — the browser cannot observe host encode time. Kept declared so the ingest contract does not change. */
             encode_ms?: number;
             network_pacing_ms?: number;
