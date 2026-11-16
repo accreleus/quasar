@@ -1400,8 +1400,10 @@ impl Backlog {
     }
 }
 
-/// Video QUIC may hold ahead of the next audio datagram, in time at the governed rate.
-const AUDIO_AHEAD_MS: u64 = 20;
+/// Video QUIC may hold ahead of the next audio datagram, in time at the governed rate. Over
+/// two frames at 60 fps: at 20 ms a 1080p60 frame at 8 Mbit/s plus its FEC filled it, waited a
+/// drain tick, and a clean link presented 3 ms later at the median (#1433, lab host).
+const AUDIO_AHEAD_MS: u64 = 40;
 /// Video leaves at most this × the estimate once the estimate has found the link (#1433), so
 /// a keyframe waits here, where audio overtakes it, not in the link's queue: right after a
 /// delay cut this is 1.06 × what the link carried. quinn alone paces at 1.25 × window / RTT,
