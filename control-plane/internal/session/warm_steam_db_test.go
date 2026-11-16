@@ -702,7 +702,7 @@ func TestAWebTransportClaimOnAWebRTCParkLaunchesCold(t *testing.T) {
 	// The park is made with the device the launch probes from, so only the transport differs.
 	caps := `{"bandwidth_kbps":50000,"rtt_ms":5,"max_decode_height":2160,"measured_at":"` +
 		time.Now().UTC().Format(time.RFC3339) + `","codecs":{"h264":true},
-		"webtransport":{"available":true,"datagrams":true},
+		"webtransport":{"available":true,"datagrams":true},"webgpu":{"available":true},
 		"webcodecs":{"h264":true,"opus_decode":true,"opus_encode":true}}`
 	must(t, exec(t, f.pool, `UPDATE user_devices SET capabilities = $2::jsonb WHERE id = $1::uuid`, f.deviceID, caps))
 	k := f.park(t)
@@ -995,7 +995,7 @@ func (f *warmFixture) enableWebTransport(t *testing.T) {
 	t.Helper()
 	caps := `{"bandwidth_kbps":50000,"rtt_ms":5,"max_decode_height":2160,"measured_at":"` +
 		time.Now().UTC().Format(time.RFC3339) + `","codecs":{"h264":true},
-		"webtransport":{"available":true,"datagrams":true},
+		"webtransport":{"available":true,"datagrams":true},"webgpu":{"available":true},
 		"webcodecs":{"h264":true,"opus_decode":true,"opus_encode":true}}`
 	must(t, exec(t, f.pool, `UPDATE user_devices SET capabilities = $2::jsonb WHERE id = $1::uuid`, f.deviceID, caps))
 	must(t, exec(t, f.pool, `UPDATE launch_profiles SET transport = 'webtransport'`))

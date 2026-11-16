@@ -717,6 +717,106 @@ describe("SessionPage — Match cursor compositor size (#898)", () => {
     await reveal();
     expect(lastDrawerProps?.uiScale).toBe(1);
   });
+
+  // Amendment 84 (#996): the session resource carries the live render size and UI
+  // scale, so a page that is not the tab that set them (a second tab, a takeover)
+  // starts from them instead of the launch size.
+  const revealWithStream = async (stream: Record<string, unknown>) => {
+    currentSession = makeSession({ state: "running", state_detail: "app presented", stream });
+    renderPage();
+    await advance(1_000);
+    await act(async () => {
+      openChannel();
+    });
+    await advance(1_500);
+  };
+
+  it("a second tab starts from the render size and scale the session reports (#996)", async () => {
+    await revealWithStream({
+      width: 2560,
+      height: 1440,
+      fps: 60,
+      bitrate_kbps: 20000,
+      render_width: 1280,
+      render_height: 720,
+      ui_scale: 1.5,
+    });
+    expect(lastDrawerProps?.renderSize).toEqual({ w: 1280, h: 720 });
+    expect(lastDrawerProps?.uiScale).toBe(1.5);
+    expect(compositor()).toEqual(["1280", "720"]);
+    // Adopting is display-only: the page sends nothing.
+    await advance(1_000);
+    expect(updateSessionDisplay).not.toHaveBeenCalled();
+    // And it is what this tab now holds, so a reload keeps it even without the resource.
+    expect(sessionStorage.getItem("quasar.session.s1.render")).toBe(JSON.stringify({ w: 1280, h: 720 }));
+    expect(sessionStorage.getItem("quasar.session.s1.uiScale")).toBe("1.5");
+  });
+
+  it("a reported render size equal to the launch size reads as match-the-stream (#996)", async () => {
+    await revealWithStream({
+      width: 2560,
+      height: 1440,
+      fps: 60,
+      bitrate_kbps: 20000,
+      render_width: 2560,
+      render_height: 1440,
+      ui_scale: 1,
+    });
+    // The session default, not a pinned size: the next stream step must still move it.
+    expect(lastDrawerProps?.renderSize).toBeNull();
+    expect(lastDrawerProps?.uiScale).toBe(1);
+    expect(compositor()).toEqual(["2560", "1440"]);
+  });
+
+  it("what the session reports replaces this tab's stale stored ack (#996)", async () => {
+    sessionStorage.setItem("quasar.session.s1.render", JSON.stringify({ w: 960, h: 540 }));
+    sessionStorage.setItem("quasar.session.s1.uiScale", "2");
+    await revealWithStream({
+      width: 2560,
+      height: 1440,
+      fps: 60,
+      bitrate_kbps: 20000,
+      render_width: 1280,
+      render_height: 720,
+      ui_scale: 1.5,
+    });
+    expect(lastDrawerProps?.renderSize).toEqual({ w: 1280, h: 720 });
+    expect(lastDrawerProps?.uiScale).toBe(1.5);
+  });
+
+  it("a later poll does not undo a change this tab made (#996)", async () => {
+    // Adopted once on load: after that this tab's acked value is the newer truth,
+    // so another tab's move (or a poll in flight when this tab's PATCH landed) is
+    // not allowed to yank the controls.
+    await revealWithStream({
+      width: 2560,
+      height: 1440,
+      fps: 60,
+      bitrate_kbps: 20000,
+      render_width: 1280,
+      render_height: 720,
+      ui_scale: 1,
+    });
+    await act(async () => {
+      (lastDrawerProps?.onRenderSizeChange as (v: { w: number; h: number }) => void)({ w: 960, h: 540 });
+    });
+    await advance(500);
+    currentSession = makeSession({
+      state: "running",
+      state_detail: "app presented",
+      stream: {
+        width: 2560,
+        height: 1440,
+        fps: 60,
+        bitrate_kbps: 20000,
+        render_width: 1280,
+        render_height: 720,
+        ui_scale: 1,
+      },
+    });
+    await advance(6_000);
+    expect(lastDrawerProps?.renderSize).toEqual({ w: 960, h: 540 });
+  });
 });
 
 // Capture goes with a WebTransport connection: a reconnect or a fallback must ask for it again,
