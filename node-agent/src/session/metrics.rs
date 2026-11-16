@@ -206,6 +206,12 @@ pub struct MetricsWindow {
     /// it off the launch floor. Without it, a setpoint pinned at the floor is
     /// indistinguishable from a chosen one.
     pub abr_floor_kbps: Option<f64>,
+    /// Amendment 85: the FEC repair datagram payload sent in the window as a percent of
+    /// the video payload sent in it, and as a rate (kbit/s). Present in every window of a
+    /// WebTransport session whose `hello_ack.fec` named a scheme (`0` for a window that
+    /// sent no repair); absent otherwise, meaning "no FEC", never zero.
+    pub wt_fec_overhead_pct: Option<f64>,
+    pub wt_fec_kbps: Option<f64>,
     /// SPT-02: the active ABR mode. Always present, so the bundle reads it rather than
     /// deriving it from setpoint presence (wrong for `off`: rtpgccbwe stays attached, so
     /// setpoints can appear).
@@ -266,6 +272,13 @@ pub struct SessionMetrics {
     /// Amendment 5 (abr-ladder): the governor's floor in kbit/s once the ladder has moved
     /// it off the launch floor, else 0 (⇒ the drain reports `None`).
     abr_floor_kbps: AtomicU64,
+    /// Amendment 85: the live connection's `hello_ack.fec` named a scheme. Set per
+    /// connection, so the FEC keys are present in every window of a session whose current
+    /// client is sent repairs.
+    fec_negotiated: AtomicBool,
+    /// Amendment 85: lifetime video and repair datagram PAYLOAD bytes, diffed by the drain.
+    fec_video_bytes: AtomicU64,
+    fec_repair_bytes: AtomicU64,
     /// SPT-01: the raw rtpgccbwe estimate in kbit/s as `f64::to_bits` (0.0 ⇒ never
     /// received), stored on `notify::estimated-bitrate` before the governor sees it.
     gcc_estimate_kbps_bits: AtomicU64,
@@ -427,6 +440,8 @@ struct DrainSnapshot {
     rtp_frames: u64,
     rtp_bytes: u64,
     overflow_drops: u64,
+    fec_video_bytes: u64,
+    fec_repair_bytes: u64,
 }
 
 impl SessionMetrics {
@@ -439,6 +454,9 @@ impl SessionMetrics {
             start: now,
             abr_setpoint_kbps: AtomicU64::new(0),
             abr_floor_kbps: AtomicU64::new(0),
+            fec_negotiated: AtomicBool::new(false),
+            fec_video_bytes: AtomicU64::new(0),
+            fec_repair_bytes: AtomicU64::new(0),
             gcc_estimate_kbps_bits: AtomicU64::new(0),
             abr_mode,
             display: LiveEcho::default(),
@@ -471,6 +489,8 @@ impl SessionMetrics {
                 rtp_frames: 0,
                 rtp_bytes: 0,
                 overflow_drops: 0,
+                fec_video_bytes: 0,
+                fec_repair_bytes: 0,
             }),
         }
     }
@@ -791,6 +811,20 @@ impl SessionMetrics {
         self.abr_floor_kbps.store(kbps as u64, Ordering::Relaxed);
     }
 
+    /// Amendment 85: whether the live WebTransport connection's `hello_ack.fec` named a
+    /// scheme. Set once per connection, so a client that is sent no repairs turns the FEC
+    /// keys back off instead of reporting zeros for FEC it does not have.
+    pub fn set_fec_negotiated(&self, on: bool) {
+        self.fec_negotiated.store(on, Ordering::Relaxed);
+    }
+
+    /// Amendment 85: one protected frame's datagram PAYLOAD bytes — the video fragments and
+    /// the repair datagrams that follow them. Cumulative; the drain diffs it.
+    pub fn record_fec_bytes(&self, video: u64, repair: u64) {
+        self.fec_video_bytes.fetch_add(video, Ordering::Relaxed);
+        self.fec_repair_bytes.fetch_add(repair, Ordering::Relaxed);
+    }
+
     /// SPT-01: publish the raw `rtpgccbwe` estimate (kbit/s) BEFORE the governor acts
     /// on it. Called from the `notify::estimated-bitrate` fast path ahead of
     /// `observe()`; non-blocking, one relaxed store.
@@ -981,6 +1015,8 @@ impl SessionMetrics {
         let rtp_frames = self.rtp_frames.load(Ordering::Relaxed);
         let rtp_bytes = self.rtp_bytes.load(Ordering::Relaxed);
         let overflow = self.overflow_drops.load(Ordering::Relaxed);
+        let fec_video_bytes = self.fec_video_bytes.load(Ordering::Relaxed);
+        let fec_repair_bytes = self.fec_repair_bytes.load(Ordering::Relaxed);
 
         let mut last = self.last.lock().unwrap();
         let window_s = now.saturating_duration_since(last.at).as_secs_f64();
@@ -992,6 +1028,8 @@ impl SessionMetrics {
         let d_rtp_bytes = rtp_bytes.saturating_sub(last.rtp_bytes);
         // Drops discarded by the FIFO overflow resync this window (SO-08).
         let d_overflow = overflow.saturating_sub(last.overflow_drops);
+        let d_fec_video = fec_video_bytes.saturating_sub(last.fec_video_bytes);
+        let d_fec_repair = fec_repair_bytes.saturating_sub(last.fec_repair_bytes);
         *last = DrainSnapshot {
             at: now,
             frames_out,
@@ -1001,6 +1039,8 @@ impl SessionMetrics {
             rtp_frames,
             rtp_bytes,
             overflow_drops: overflow,
+            fec_video_bytes,
+            fec_repair_bytes,
         };
         drop(last);
 
@@ -1094,6 +1134,24 @@ impl SessionMetrics {
             v => Some(v as f64),
         };
 
+        // Amendment 85: present in every window of a session whose client is sent repairs,
+        // 0 for a window that sent none (a link that was clean all window).
+        let (wt_fec_overhead_pct, wt_fec_kbps) = if self.fec_negotiated.load(Ordering::Relaxed) {
+            let pct = if d_fec_video > 0 {
+                d_fec_repair as f64 * 100.0 / d_fec_video as f64
+            } else {
+                0.0
+            };
+            let kbps = if window_s > 0.0 {
+                (d_fec_repair as f64 * 8.0) / 1000.0 / window_s
+            } else {
+                0.0
+            };
+            (Some(pct), Some(kbps))
+        } else {
+            (None, None)
+        };
+
         // 0.0 bits ⇒ never received ⇒ None.
         let gcc_estimate_kbps = {
             let bits = self.gcc_estimate_kbps_bits.load(Ordering::Relaxed);
@@ -1182,6 +1240,8 @@ impl SessionMetrics {
             frames_dropped,
             abr_setpoint_kbps,
             abr_floor_kbps,
+            wt_fec_overhead_pct,
+            wt_fec_kbps,
             render_width: echo.render_width.reported(),
             render_height: echo.render_height.reported(),
             ui_scale: echo.ui_scale.reported(),
@@ -1266,6 +1326,34 @@ mod tests {
         assert!((s.mean - 50.5).abs() < 0.01);
         assert!((s.p50 - 50.0).abs() <= 1.0);
         assert!((s.p95 - 95.0).abs() <= 1.0);
+    }
+
+    // ── Amendment 85: FEC telemetry ───────────────────────────────────────────
+
+    /// The FEC keys are absent until a connection negotiates a scheme, present (0 when the
+    /// window sent no repair) once one has, and the share is repair over video payload.
+    #[test]
+    fn fec_keys_follow_the_negotiation_and_report_the_repair_share() {
+        let s = SessionMetrics::new("smooth", 60);
+        s.set_fec_negotiated(true);
+        s.record_fec_bytes(10_000, 500);
+        let first = s.last.lock().unwrap().at;
+        // Half a second later: 500 repair payload bytes of 10 000 video.
+        let w = s.drain_window(first + Duration::from_millis(500));
+        assert_eq!(w.wt_fec_overhead_pct, Some(5.0));
+        assert_eq!(w.wt_fec_kbps, Some(8.0), "500 bytes in 0.5 s");
+
+        // A clean window reports 0, never absent and never a stale share.
+        s.record_fec_bytes(12_000, 0);
+        let w = s.drain_window(first + Duration::from_secs(1));
+        assert_eq!(w.wt_fec_overhead_pct, Some(0.0));
+        assert_eq!(w.wt_fec_kbps, Some(0.0));
+
+        // A client that is sent no repairs turns them off: absence, not zeros.
+        s.set_fec_negotiated(false);
+        let w = s.drain_window(first + Duration::from_secs(2));
+        assert_eq!(w.wt_fec_overhead_pct, None);
+        assert_eq!(w.wt_fec_kbps, None);
     }
 
     // ── Host-stage latency probe (QUASAR_LATENCY_PROBE) ───────────────────────

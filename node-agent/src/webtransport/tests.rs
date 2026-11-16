@@ -1547,6 +1547,7 @@ async fn governed_agent(stream: Stream) -> Agent {
                 owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
                 observe: Box::new(|_| {}),
+                fec: Box::new(|_| {}),
             })
         },
     )
@@ -2083,6 +2084,7 @@ async fn feedback_while_pyrowave_is_active_feeds_no_estimate() {
                 observe: Box::new(move |_| {
                     count.fetch_add(1, Ordering::SeqCst);
                 }),
+                fec: Box::new(|_| {}),
             })
         },
     )
@@ -2177,6 +2179,7 @@ async fn audio_alone_never_moves_the_video_estimate() {
             owns: Box::new(|| false),
             displaced: Box::new(|| {}),
             observe: Box::new(move |kbps| seen.lock().unwrap().push(kbps)),
+            fec: Box::new(|_| {}),
         })
     })
     .await;
@@ -2221,6 +2224,7 @@ fn rate(retargets: bool) -> Rate {
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         observe: Box::new(|_| {}),
+        fec: Box::new(|_| {}),
     }
 }
 
@@ -2309,6 +2313,7 @@ fn the_silence_decay_is_never_fed_to_the_collapse_as_a_measured_link() {
         observe: Box::new(move |_| {
             f.fetch_add(1, SeqCst);
         }),
+        fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), false, Default::default());
     let t0 = std::time::Instant::now();
@@ -2352,6 +2357,7 @@ fn a_report_gives_the_abr_its_reading_before_its_estimate() {
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         observe: Box::new(move |_| o.lock().unwrap().push("observe")),
+        fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), false, Default::default());
     answered(&mut control, 0, std::time::Instant::now());
@@ -2379,6 +2385,7 @@ fn a_client_that_is_gone_neither_starts_nor_feeds_the_abr() {
         observe: Box::new(move |_| {
             fed.fetch_add(1, SeqCst);
         }),
+        fec: Box::new(|_| {}),
     };
     let gone = Arc::new(OnceLock::new());
     let mut control = Control::new(&rate, gone.clone(), false, Default::default());
@@ -2437,6 +2444,7 @@ fn the_abr_is_fed_the_estimate_less_the_fec_share() {
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         observe: Box::new(move |kbps: f64| seen.lock().unwrap().push(kbps.round())),
+        fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), true, Default::default());
     control.feed(4200.0, false);
@@ -2448,14 +2456,18 @@ fn the_abr_is_fed_the_estimate_less_the_fec_share() {
 }
 
 /// A session whose frames take several datagrams (snow does not compress), with an ABR
-/// that writes the encoder (`retargets`) or only tracks the estimate.
-async fn lossy_session(retargets: bool) -> Agent {
-    agent_built(
+/// that writes the encoder (`retargets`) or only tracks the estimate. The session's metrics
+/// come back with it, wired to the FEC telemetry as `feedback_abr` wires it (amendment 85).
+async fn lossy_session(retargets: bool) -> (Agent, Arc<crate::session::metrics::SessionMetrics>) {
+    let metrics = Arc::new(crate::session::metrics::SessionMetrics::new("smooth", 30));
+    let fec_metrics = metrics.clone();
+    let agent = agent_built(
         Stream::H264,
         Limits::default(),
         audio::Plan::default(),
         "snow",
         move |_| {
+            let m = fec_metrics.clone();
             Some(Rate {
                 measured: Box::new(|_| {}),
                 ceiling_kbps: 4000.0,
@@ -2465,10 +2477,17 @@ async fn lossy_session(retargets: bool) -> Agent {
                 owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
                 observe: Box::new(|_| {}),
+                fec: Box::new(move |event| match event {
+                    crate::webtransport::FecEvent::Negotiated(on) => m.set_fec_negotiated(on),
+                    crate::webtransport::FecEvent::Sent { video, repair } => {
+                        m.record_fec_bytes(video, repair);
+                    }
+                }),
             })
         },
     )
-    .await
+    .await;
+    (agent, metrics)
 }
 
 /// #1046, §FEC: a client that offered `xor` and reports loss is sent repair datagrams, and
@@ -2476,7 +2495,7 @@ async fn lossy_session(retargets: bool) -> Agent {
 /// retransmission.
 #[tokio::test]
 async fn a_client_that_offers_xor_and_reports_loss_rebuilds_a_fragment_without_a_nack() {
-    let agent = lossy_session(true).await;
+    let (agent, metrics) = lossy_session(true).await;
     let session = agent.connect().await;
     let (mut send, mut recv) = session.open_bi().await.unwrap();
     let hello = json!({"type": "hello", "wt_proto": 1, "token": TOKEN,
@@ -2545,13 +2564,24 @@ async fn a_client_that_offers_xor_and_reports_loss_rebuilds_a_fragment_without_a
         assert_eq!(payload, original[..], "fragment {k} of frame {frame_seq}");
         rebuilt += 1;
     }
+    // Amendment 85: the repairs are reported, as a share of the video and as a rate.
+    let w = metrics.drain_window(std::time::Instant::now());
+    let pct = w
+        .wt_fec_overhead_pct
+        .expect("FEC negotiated: the keys are present, never absent");
+    assert!(pct > 0.0, "repairs went out: {pct} %");
+    assert!(
+        w.wt_fec_kbps.is_some_and(|kbps| kbps > 0.0),
+        "a rate for the same bytes: {:?}",
+        w.wt_fec_kbps
+    );
 }
 
 /// §Hello: a client that offers no scheme is answered `fec: null` and sent no repair
 /// datagram, whatever loss it reports.
 #[tokio::test]
 async fn a_client_that_offers_no_fec_gets_none_whatever_it_loses() {
-    let agent = lossy_session(true).await;
+    let (agent, metrics) = lossy_session(true).await;
     let (session, mut send, _recv, ack) = agent.hello(TOKEN).await;
     assert_eq!(ack["fec"], Value::Null);
     let mut path = Lossy::new();
@@ -2560,6 +2590,11 @@ async fn a_client_that_offers_no_fec_gets_none_whatever_it_loses() {
         assert_eq!(d[0], 0x01, "only video is sent");
         path.receive(&d, &mut send).await;
     }
+    // Amendment 85: no scheme negotiated, so the FEC keys are ABSENT — not zero, which
+    // would read as "FEC on, a clean window".
+    let w = metrics.drain_window(std::time::Instant::now());
+    assert_eq!(w.wt_fec_overhead_pct, None);
+    assert_eq!(w.wt_fec_kbps, None);
 }
 
 /// §Hello ack: a session with no ABR reads no feedback, so it has no loss to size FEC by
@@ -2579,7 +2614,7 @@ async fn a_session_without_an_abr_names_no_fec_scheme() {
 /// nothing would pay for repairs: such a session names no scheme and sends none.
 #[tokio::test]
 async fn a_session_whose_abr_does_not_retarget_gets_no_fec_whatever_it_loses() {
-    let agent = lossy_session(false).await;
+    let (agent, _metrics) = lossy_session(false).await;
     let (session, mut send, _recv, ack) = agent.hello_with(TOKEN, json!({"fec": ["xor"]})).await;
     assert_eq!(ack["fec"], Value::Null);
     let mut path = Lossy::new();
@@ -2601,7 +2636,7 @@ async fn a_hello_that_names_no_known_fec_scheme_is_served_without_fec() {
         json!({"fec": ["fec2"]}),
         json!({"fec": "xor"}),
     ] {
-        let agent = lossy_session(true).await;
+        let (agent, _metrics) = lossy_session(true).await;
         let (session, _send, _recv, ack) = agent.hello_with(TOKEN, offer.clone()).await;
         assert_eq!(ack["type"], "hello_ack", "{offer}");
         assert_eq!(ack["fec"], Value::Null, "{offer}");
@@ -2629,6 +2664,7 @@ fn repairs_spend_only_what_the_estimate_leaves_above_the_abr_floor() {
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         observe: Box::new(move |kbps: f64| seen.lock().unwrap().push(kbps.round())),
+        fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), true, Default::default());
     let fec = control.fec.as_mut().unwrap();
@@ -2671,6 +2707,7 @@ fn governed(level: u8, estimate_kbps: f64, seconds: u64) -> Vec<(u32, f64)> {
             let now = governor.1;
             governor.0.observe(kbps, now);
         }),
+        fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), true, Default::default());
     let fec = control.fec.as_mut().unwrap();
@@ -2766,6 +2803,7 @@ fn a_pyrowave_frame_gets_no_repair_at_any_overhead() {
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         observe: Box::new(|_| {}),
+        fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), true, Default::default());
     let fec = control.fec.as_mut().unwrap();
@@ -2781,7 +2819,7 @@ fn a_pyrowave_frame_gets_no_repair_at_any_overhead() {
 /// the scheme: the connection may fall back to the standard codec.
 #[tokio::test]
 async fn a_pyrowave_client_that_offers_xor_is_sent_no_repair_whatever_it_loses() {
-    let agent = lossy_session(true).await;
+    let (agent, metrics) = lossy_session(true).await;
     let media = agent.listener.registry().lock()[SESSION]
         .media
         .clone()
@@ -2821,6 +2859,11 @@ async fn a_pyrowave_client_that_offers_xor_is_sent_no_repair_whatever_it_loses()
         }
     }
     assert!(video > 1000, "the frames arrived ({video} datagrams)");
+    // Amendment 85: the scheme is negotiated, so the keys are present — and 0, because a
+    // PyroWave frame is never protected.
+    let w = metrics.drain_window(std::time::Instant::now());
+    assert_eq!(w.wt_fec_overhead_pct, Some(0.0));
+    assert_eq!(w.wt_fec_kbps, Some(0.0));
 }
 
 #[tokio::test]
@@ -5042,6 +5085,7 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
                 owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
                 observe: Box::new(move |kbps| observed.lock().unwrap().push(kbps)),
+                fec: Box::new(|_| {}),
             })
         },
     )

@@ -227,6 +227,28 @@ describe("WtTelemetry", () => {
     expect(metrics[3]).toMatchObject({ wt_audio_underruns: 3 });
   });
 
+  it("posts the fragments FEC rebuilt, only while the connection is sent repairs (amendment 85)", async () => {
+    const h = harness();
+    h.frames(10, 8);
+    h.t.tick(); // before any scheme: no FEC, and the key must say nothing rather than 0
+    h.t.setFec(true);
+    h.t.addRepaired(2);
+    h.frames(10, 8);
+    h.t.tick();
+    h.t.addRepaired(1); // a reconnect's new connection adds to the page's total
+    h.frames(10, 8);
+    h.t.tick();
+    h.t.setFec(false); // the next connection is sent no repairs
+    h.frames(10, 8);
+    h.t.tick();
+    await h.t.flush();
+    const metrics = (h.posts[0].body.samples as { metrics: Record<string, number> }[]).map((s) => s.metrics);
+    expect(metrics[0]).not.toHaveProperty("wt_fec_repaired");
+    expect(metrics[1]).toMatchObject({ wt_fec_repaired: 2 });
+    expect(metrics[2]).toMatchObject({ wt_fec_repaired: 3 });
+    expect(metrics[3]).not.toHaveProperty("wt_fec_repaired");
+  });
+
   it("counts long frames and present rate by the one definition WebRTC uses", () => {
     const h = harness();
     h.t.presented(0);

@@ -137,6 +137,7 @@ export function videoConfigFrom(ack: Record<string, unknown>): VideoConfig {
         }
       : undefined,
     ...(typeof ack.codec_switch_reason === "string" ? { switchReason: ack.codec_switch_reason } : {}),
+    fec: typeof ack.fec === "string" ? ack.fec : null,
   };
 }
 
@@ -611,6 +612,12 @@ export class WebTransportMedia implements MediaTransport {
     /** What the PyroWave receivers already replaced counted lost. */
     let pyroLost = 0;
     let reported = 0;
+    /** Amendment 85: the fragments FEC has rebuilt so far, as last reported. */
+    let reportedRepaired = 0;
+    const reportRepaired = () => {
+      const n = assembler.repaired;
+      if (n !== reportedRepaired) sink.repaired?.((reportedRepaired = n));
+    };
     // PyroWave loss is never NACKed, so it is reported as its frames close.
     const reportLost = () => {
       const n = this.lostSoFar();
@@ -683,7 +690,10 @@ export class WebTransportMedia implements MediaTransport {
     const miss = (frameSeq: number, frags: [number, number][]) => this.recovered(assembler.miss(frameSeq, frags), sink);
     const tick = () => this.recovered(assembler.tick(), sink);
     // PyroWave frames never reach the assembler, so a repair for one finds no frame and is dropped.
-    const repair = (r: FecRepair) => this.recovered(assembler.repair(r), sink);
+    const repair = (r: FecRepair) => {
+      this.recovered(assembler.repair(r), sink);
+      reportRepaired();
+    };
     this.lostSoFar = () => assembler.lost + pyroLost + (pyro?.lost ?? 0);
     return { datagram, repair, config, miss, tick, stop };
   }
