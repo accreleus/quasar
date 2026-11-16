@@ -3622,6 +3622,8 @@ mod aux_senders;
 /// Amendment 39 (#759): parked, held, adopted and in-place-swapped runtimes.
 mod warm_steam;
 
+/// #1441: the first audio packet sent belongs to the stream that follows it.
+mod audio_opening;
 /// The transport seam (#1028) with a transport that is not WebRTC.
 mod fake_transport;
 /// #1134: packets shrink live on a path that drops the full-size ones.
