@@ -466,8 +466,10 @@ export function configureTls(insecure, env = process.env) {
 export async function openHost(browser, { attached, insecureTls, baseUrl = null, webDist = null }) {
   const context = await browser.newContext({ ignoreHTTPSErrors: insecureTls, viewport: null });
   // A fresh context keeps no site permission, so Chrome would ask on every stream to reach the LAN media endpoint and
-  // the transport stalls while it waits. Best-effort: a Chrome without the permission simply never asks.
-  await context.grantPermissions?.(["local-network-access"]).catch(() => {});
+  // the transport stalls while it waits. Context-wide on purpose: the permission belongs to the page's origin (baseUrl,
+  // or an alias it redirects to), the media endpoint is only a target, and the context is the runner's own, disposable.
+  // Best-effort: a Chrome without the permission never asks; the warning makes a grant that stops working visible.
+  await context.grantPermissions?.(["local-network-access"]).catch((e) => console.warn(`e2e: local network access not granted (${String(e?.message ?? e).split("\n")[0]}); Chrome may ask on each stream`));
   if (webDist) await serveWebDist(context, baseUrl, webDist); // this context only: the person's own tabs never see it
   return {
     host: { newPage: () => context.newPage(), closePage: (p) => p.close(), probeClient, browserNow: (p) => p.evaluate(() => Date.now()) },
