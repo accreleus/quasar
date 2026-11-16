@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+- **The platform release API says when a release was held back (#1211).** When the only releases the configured channel knows about are older than the installed control plane's database schema — so installing one would run the database backwards — the empty `available` list now carries `held_back`: that release's channel and schema version, and that this is why. It is an explanation only, never an offer: nothing can be applied from it, and it is `null` whenever a list was offered or nothing was found. A preview release whose commits are all already in the installed control plane now counts `0` new commits rather than all of them.
+
 ### Fixed
 - **The API reference now says that the single-row admin routes answer in an envelope (#1293).** `GET /v1/hosts/{id}`, the host drain and uncordon answers and `PATCH /v1/users/{id}` return `{"host": {...}}` / `{"user": {...}}` and always have; the published schema declared a bare object, so a client written from it found nothing at the top level, and the web client's generated types now match. A new control-plane test fails if a single-row response and the schema disagree again.
 - **Session audio no longer opens with one stale packet ahead of a gap (#1441).** When a client took longer than about 200 ms to connect, the host sent one audio packet captured at the start and then jumped a second or more ahead, which a receiver had to treat as a burst of loss. The host now sends no audio until the client has connected, so the first packet it sends begins the continuous stream.
