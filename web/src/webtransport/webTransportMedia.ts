@@ -170,6 +170,17 @@ const refused = (code: string, detail?: string): Answer => ({ kind: "refused", c
 const closeDetail = (code: number, reason?: string) => `close ${code}${reason ? ` ${reason}` : ""}`;
 const after = <T>(ms: number, value: T) => new Promise<T>((r) => setTimeout(() => r(value), ms));
 
+/** `WebTransport.datagrams` in both shapes: the current spec's `writable`, and Safari's older
+ *  `createWritable()` (#1403). Either direction missing means this browser cannot carry media. */
+interface Datagrams {
+  readable?: ReadableStream<Uint8Array>;
+  writable?: WritableStream<Uint8Array>;
+  createWritable?: () => WritableStream<Uint8Array>;
+}
+
+/** The cause a browser with no datagram API at all reports (#1412). */
+const NO_DATAGRAMS = "datagrams: this browser's WebTransport has no datagram API";
+
 export class WebTransportMedia implements MediaTransport {
   private wt: WebTransport | null = null;
   private writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
@@ -378,6 +389,15 @@ export class WebTransportMedia implements MediaTransport {
     }
     if (this.closed) return abandon(refused("closed"));
 
+    // Some iOS builds ship WebTransport with no datagram API at all (WebKit bug 322201). Media
+    // needs both directions, so no connection can be made here: say that at connect, before the
+    // reader is built. A bare TypeError from the reader was neither a fallback reason nor a cause
+    // the accept check could see (#1412).
+    const dg = (wt as { datagrams?: Datagrams }).datagrams;
+    if (!dg?.readable || !(dg.writable ?? dg.createWritable)) {
+      return abandon(refused("connect_failed", NO_DATAGRAMS), { closeCode: 4400, reason: NO_DATAGRAMS });
+    }
+
     let writer: WritableStreamDefaultWriter<Uint8Array>;
     let reader: ReadableStreamDefaultReader<Uint8Array>;
     try {
@@ -465,7 +485,6 @@ export class WebTransportMedia implements MediaTransport {
     this.router = router;
     // Safari ships the newer spec shape: `datagrams.createWritable()` and no `writable` (#1403).
     // `writable` first, so Chrome's path is the one it always took.
-    const dg = wt.datagrams as { writable?: WritableStream<Uint8Array>; createWritable?: () => WritableStream<Uint8Array> };
     this.datagramWriter = (dg.writable ?? dg.createWritable!()).getWriter();
     sink.streams?.(audioStreamsFrom(first));
     router.config(config);
@@ -530,7 +549,14 @@ export class WebTransportMedia implements MediaTransport {
     feedback: FeedbackRecorder,
     died: { death: string | null },
   ): Promise<void> {
-    const reader = wt.datagrams.readable.getReader();
+    let reader: ReadableStreamDefaultReader<Uint8Array>;
+    try {
+      reader = wt.datagrams.readable.getReader();
+    } catch (err) {
+      // No reader, so no media: record it for the accept check, as a failed read does (#1412).
+      died.death = `datagrams: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`;
+      throw new Error(died.death);
+    }
     for (;;) {
       let read: ReadableStreamReadResult<Uint8Array>;
       try {
