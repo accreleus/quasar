@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { AudioRing, MAX_QUEUED_FRAMES, STRETCH_DONE_FRAMES } from "./audioRing";
-import { AudioSync } from "./audioSync";
+import { AudioSync, MAX_TARGET_MS } from "./audioSync";
 
 /** Same 60 s packet and video arrivals for the old and new schedulers; no packet loss. */
 function jitterStream() {
@@ -71,9 +71,9 @@ describe("audio delay stability", () => {
     for (let t = 5_010; t < 9_999; t += 10) schedule(t, 70);
     expect(schedule(9_999, 70)).toBe(80);
     expect(schedule(10_000, 70)).toBe(70);
-    expect(schedule(10_010, 500)).toBe(150);
+    expect(schedule(10_010, 500)).toBe(MAX_TARGET_MS);
     sync.noteUnderrun(10_010);
-    expect(schedule(10_020, 70)).toBe(150);
+    expect(schedule(10_020, 70)).toBe(MAX_TARGET_MS);
     sync.reset();
     expect(schedule(10_030, 55)).toBe(55);
   });

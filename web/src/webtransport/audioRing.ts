@@ -55,8 +55,8 @@ export const STRETCH_RATE = 0.005;
  *  inside the slack: stopping there would leave the queue 5 ms ahead of the delay it was given,
  *  which is 5 ms of the jitter cover gone. */
 export const STRETCH_DONE_FRAMES = 48;
-/** The full 40–150 ms target range plus the previous correction's allowed remainder. */
-const MAX_TARGET_CHANGE_FRAMES = 5_280 + STRETCH_DONE_FRAMES;
+/** The full 40–250 ms target range (audioSync's MIN/MAX_TARGET_MS) plus the previous correction's allowed remainder. */
+const MAX_TARGET_CHANGE_FRAMES = 10_080 + STRETCH_DONE_FRAMES;
 
 export class AudioRing {
   private queue: Chunk[] = [];

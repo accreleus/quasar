@@ -11,8 +11,10 @@ const BUCKETS = 10;
 const VIDEO_SAMPLES = 120;
 /** Audio is never played sooner than this after capture: it must cover arrival jitter. */
 export const MIN_TARGET_MS = 40;
-/** A video latency this long is a stall, not a delay to match. */
-export const MAX_TARGET_MS = 150;
+/** A video latency this long is a stall, not a delay to match. Also bounds the jitter cover: under a
+ *  rate cap each keyframe's queue holds audio ~100 ms past the floor once a second, and 150 ms
+ *  left 45 ms for it after the device, posting and underrun margins (#1433). */
+export const MAX_TARGET_MS = 250;
 /** Audio packets behind the jitter estimate: ten seconds at the contract's one 10 ms packet per datagram. */
 const JITTER_SAMPLES = 1_000;
 /** One packet later than this past the floor is a stall, not jitter to cover: it is lost to
@@ -148,7 +150,7 @@ export class AudioSync {
     } else if (computed < scheduled - TARGET_DEADBAND_MS) {
       // Swings faster than the hold intentionally retain their peak: the link needed that
       // depth in the last 5 s and will again. Following them causes audible pitch wobble.
-      // The 150 ms cap bounds audio lag (up to 110 ms); it falls 5 s after swings stop.
+      // The cap bounds audio lag (up to 210 ms); it falls 5 s after swings stop.
       this.lowerSince ??= this.audioAt;
       if (this.audioAt - this.lowerSince >= TARGET_FALL_HOLD_MS) {
         this.scheduledTarget = computed;

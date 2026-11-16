@@ -173,6 +173,25 @@ describe("AudioSync", () => {
     expect(s.targetDelayMs(25)).toBe(25 + MAX_JITTER_MS);
   });
 
+  it("covers a keyframe's queue under a rate cap: audio up to 120 ms past the floor once a second (#1433)", () => {
+    // Measured on the NVIDIA lab host under a 5 Mbit/s cap: output latency 30 ms, the underrun
+    // margin at its 60 ms most, and each second's keyframe holding the audio behind it up to
+    // 120 ms past the floor while the queue drains.
+    const s = new AudioSync();
+    const minMs = 30 + 15 + MAX_UNDERRUN_MARGIN_MS;
+    const late = (i: number) => Math.max(0, 120 - 10 * (i % 100));
+    let worst = Infinity;
+    for (let i = 0; i < 1_000; i++) {
+      const capture = 1_000_000 + i * 10_000;
+      const arrival = capture / 1_000 + 100 + late(i);
+      s.noteAudio(capture, arrival);
+      const playAt = s.playAtMs(capture, minMs)!;
+      if (i >= 300) worst = Math.min(worst, playAt - arrival);
+    }
+    // Every packet is still ahead of the device's latency and the posting margin.
+    expect(worst).toBeGreaterThanOrEqual(30 + 15);
+  });
+
   it("forgets the floor and everything measured against it on reset", () => {
     const s = new AudioSync();
     s.noteAudio(1_000_000, 1_100);
