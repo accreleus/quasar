@@ -351,6 +351,16 @@ type SessionMetricsMsg struct {
 	// Governor's current floor (kbit/s), sent only when the ladder has moved it
 	// off the launch floor. Absent ⇒ the launch floor, never "unknown".
 	AbrFloorKbps *float64 `json:"abr_floor_kbps"`
+	// Amendment 79 (#1434): the governor's UNCLAMPED link rate at drain time, on
+	// a WebTransport session in smooth only. Absent ⇒ not measured; stream health
+	// judges it against the floor when present.
+	AbrLinkRateKbps *float64 `json:"abr_link_rate_kbps"`
+	// Amendment 85 (#1302): the window's FEC repair payload, as a percent of the
+	// video payload and as a rate. Sent in every window of a WebTransport session
+	// whose hello_ack.fec named a scheme (0 when it sent no repair); absent ⇒ no
+	// FEC.
+	WtFecOverheadPct *float64 `json:"wt_fec_overhead_pct"`
+	WtFecKbps        *float64 `json:"wt_fec_kbps"`
 	// Raw rtpgccbwe GCC estimate (kbit/s) before EWMA/deadband/step — distinct
 	// from AbrSetpointKbps (governor output).
 	GccEstimateKbps *float64 `json:"gcc_estimate_kbps"`

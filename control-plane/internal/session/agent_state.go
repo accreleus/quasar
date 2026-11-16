@@ -370,6 +370,17 @@ func buildAgentMetrics(m agentws.SessionMetricsMsg) json.RawMessage {
 	if m.AbrFloorKbps != nil {
 		obj["abr_floor_kbps"] = *m.AbrFloorKbps
 	}
+	// Amendments 79 and 85: present only where the agent measures them, never
+	// zero-filled (a zero FEC percent is the agent's own "sent no repair").
+	for key, value := range map[string]*float64{
+		"abr_link_rate_kbps":  m.AbrLinkRateKbps,
+		"wt_fec_overhead_pct": m.WtFecOverheadPct,
+		"wt_fec_kbps":         m.WtFecKbps,
+	} {
+		if value != nil {
+			obj[key] = *value
+		}
+	}
 	// The agent's reported ABR mode and adaptation-classifier label, stored
 	// verbatim so the diagnostic bundle needs no heuristic derivation. An older
 	// agent sends "" (omitted by its skip_if_empty convention), which stays absent
