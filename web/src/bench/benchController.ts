@@ -209,6 +209,7 @@ export class BenchController {
   private readsInFlight = 0;
   private readonly spareReads: GPUBuffer[] = [];
   private readFaulted = false;
+  private limitWarned = false;
 
   private totalDecoded = 0;
   private totalI2pMissed = 0;
@@ -354,7 +355,12 @@ export class BenchController {
   }
 
   private async readBack(device: GPUDevice, texture: GPUTexture): Promise<MarkerImageData | null> {
-    if (this.readsInFlight >= READBACKS_IN_FLIGHT) return null;
+    if (this.readsInFlight >= READBACKS_IN_FLIGHT) {
+      // The frame had pixels; the readbacks fell behind. Still no_image, but said once.
+      if (!this.limitWarned) console.warn(`bench: readbacks fell behind (${READBACKS_IN_FLIGHT} in flight), frames count as no_image`);
+      this.limitWarned = true;
+      return null;
+    }
     this.region(texture.width, texture.height);
     const w = this.cropW;
     const h = this.cropH;
@@ -363,12 +369,24 @@ export class BenchController {
     let buf: GPUBuffer | undefined;
     this.readsInFlight++;
     try {
-      const i = this.spareReads.findIndex((b) => b.size >= stride * h);
-      buf = i >= 0 ? this.spareReads.splice(i, 1)[0]! : device.createBuffer({ size: stride * h, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-      const enc = device.createCommandEncoder();
-      enc.copyTextureToBuffer({ texture }, { buffer: buf, bytesPerRow: stride }, [w, h]);
-      device.queue.submit([enc.finish()]);
-      await buf.mapAsync(GPUMapMode.READ, 0, stride * h);
+      // The device is the presenter's: an uncaptured error there ends the session, so the readback's errors stay in its own scopes.
+      device.pushErrorScope("out-of-memory");
+      device.pushErrorScope("validation");
+      let scopes: Promise<GPUError | null>[];
+      let mapped: Promise<void>;
+      try {
+        const i = this.spareReads.findIndex((b) => b.size >= stride * h);
+        buf = i >= 0 ? this.spareReads.splice(i, 1)[0]! : device.createBuffer({ size: stride * h, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        const enc = device.createCommandEncoder();
+        enc.copyTextureToBuffer({ texture }, { buffer: buf, bytesPerRow: stride }, [w, h]);
+        device.queue.submit([enc.finish()]);
+        mapped = buf.mapAsync(GPUMapMode.READ, 0, stride * h);
+      } finally {
+        // Popped even on a throw, or the scopes would swallow the presenter's own errors.
+        scopes = [device.popErrorScope(), device.popErrorScope()].map((p) => p.catch(() => null));
+      }
+      const [[invalid, oom]] = await Promise.all([Promise.all(scopes), mapped]);
+      if (invalid ?? oom) throw invalid ?? oom;
       const src = new Uint8Array(buf.getMappedRange(0, stride * h));
       const data = new Uint8ClampedArray(w * h * 4);
       for (let y = 0; y < h; y++) data.set(src.subarray(y * stride, y * stride + w * 4), y * w * 4);

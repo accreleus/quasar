@@ -374,7 +374,11 @@ function textureDevice(scene: { image: MarkerImageData }) {
   const maps: (() => void)[] = [];
   let created = 0;
   let mapFails = false;
+  let scopeError: GPUError | null = null;
+  let scopeDepth = 0;
   const device = {
+    pushErrorScope: () => void scopeDepth++,
+    popErrorScope: () => (scopeDepth--, Promise.resolve(scopeError)),
     createBuffer: ({ size }: { size: number }) => {
       created++;
       const mem = new Uint8Array(size);
@@ -401,7 +405,7 @@ function textureDevice(scene: { image: MarkerImageData }) {
     for (const r of maps.splice(0)) r();
     await new Promise((r) => setTimeout(r, 0));
   };
-  return { device: device as unknown as GPUDevice, copies, release, created: () => created, failMaps: () => (mapFails = true) };
+  return { device: device as unknown as GPUDevice, copies, release, created: () => created, failMaps: () => (mapFails = true), failScope: (e: GPUError) => (scopeError = e), scopeDepth: () => scopeDepth };
 }
 
 describe("BenchController.onTexture (a PyroWave frame, #1344)", () => {
@@ -468,6 +472,21 @@ describe("BenchController.onTexture (a PyroWave frame, #1344)", () => {
     await gpu.release();
     expect(ctl.handle().stats()).toMatchObject({ frames: READBACKS_IN_FLIGHT, no_image: 3 });
     expect(warn.mock.calls.filter((c) => c[0] === "bench: texture readback")).toHaveLength(1);
+    expect(warn.mock.calls.filter((c) => String(c[0]).startsWith("bench: readbacks fell behind"))).toHaveLength(1);
+    ctl.stop();
+    warn.mockRestore();
+  });
+
+  it("a GPU error from the readback stays in its own error scope and counts as no_image", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const ctl = new BenchController({ sendInput: () => {}, emitWindow: () => {}, getClockOffsetMs: () => 0 });
+    const gpu = textureDevice({ image: scene(1) });
+    gpu.failScope({ message: "bad copy" } as GPUError);
+    ctl.start();
+    ctl.onTexture(gpu.device, { width: W, height: H } as GPUTexture);
+    await gpu.release();
+    expect(ctl.handle().stats()).toMatchObject({ frames: 0, no_image: 1 });
+    expect(gpu.scopeDepth()).toBe(0);
     ctl.stop();
     warn.mockRestore();
   });
