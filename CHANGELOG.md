@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+- **The release view says when a release was held back (#1211).** When the only releases the configured channel knows about are older than the installed control plane's database schema — so installing one would run the database backwards — the empty `available` list now carries `held_back`: that release's channel and schema version, and that this is why. It is an explanation only, never an offer: nothing can be applied from it, and it is `null` whenever a list was offered or nothing was found. A preview release whose commits are all already in the installed control plane now counts `0` new commits rather than all of them.
+
 ### Fixed
 - **The API reference now says that the single-row admin routes answer in an envelope (#1293).** `GET /v1/hosts/{id}`, the host drain and uncordon answers and `PATCH /v1/users/{id}` return `{"host": {...}}` / `{"user": {...}}` and always have; the published schema declared a bare object, so a client written from it found nothing at the top level, and the web client's generated types now match. A new control-plane test fails if a single-row response and the schema disagree again.
 - **Input comes back by itself when a phone or tablet returns to the session page (#1414).** Hiding the page — switching apps, locking the screen — still releases everything the host holds, as before. On a device whose capture needs no Pointer Lock, the page now takes input back the moment it is visible again, so the next tap plays the game instead of opening the session menu. Where the session uses Pointer Lock the browser requires a tap to give it back, so input stays released until one, as it was before.
