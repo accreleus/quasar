@@ -1208,8 +1208,12 @@ fn feed(
         .as_ref()
         .filter(|c| !pyrowave && c.governor.governs())
         .map(|c| (c.governor.kbps() as f64).min(c.estimator.estimate_kbps()) as u64);
-    // Paced only once the estimate has found the link: at the ceiling a keyframe leaves at once.
-    let paced = governed.filter(|_| control.as_ref().is_some_and(|c| c.estimator.found_link()));
+    // Paced only once the estimate has found the link (at the ceiling a keyframe leaves at
+    // once), and never under the ABR floor the encoder is held to.
+    let paced = control
+        .as_ref()
+        .filter(|c| !pyrowave && c.governor.governs() && c.estimator.found_link())
+        .map(|c| c.governor.kbps());
     let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
     let room = video.room(governed, DATAGRAM_BUFFER).saturating_sub(queued);
     let room = room.min(video.pace(paced, std::time::Instant::now()));

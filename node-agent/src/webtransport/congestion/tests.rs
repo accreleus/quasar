@@ -2154,27 +2154,31 @@ fn a_keyframe_waits_in_the_agent_not_in_the_links_queue() {
     let max = waits[waits.len() - 1] / 1000;
     let estimate = s.mean_after(10.0);
     eprintln!("link queue after 10 s: p95 {p95} ms, max {max} ms; estimate {estimate:.0} kbps");
-    assert!(p95 <= 20 && max <= 40, "p95 {p95} ms, max {max} ms");
+    assert!(p95 <= 35 && max <= 45, "p95 {p95} ms, max {max} ms");
     assert!(estimate > 3500.0, "pacing kept the estimate: {estimate:.0}");
 }
 
 #[test]
-fn the_pacer_lets_video_go_at_its_rate_in_short_bursts_and_drains_after_a_release() {
-    let mut video = VideoQueue::default();
+fn the_pacer_lets_video_go_at_its_rate_in_short_bursts_and_never_holds_video_100_ms() {
     let t0 = Instant::now();
     let ms = |n: u64| t0 + Duration::from_millis(n);
-    assert_eq!(video.pace(None, t0), usize::MAX, "never paced: no limit");
-    let first = video.next_seq();
-    for i in 0..40 {
-        video.push(held(first + i), BUFFER);
-    }
-    let mut wire = Vec::new();
-    // 8 Mbit/s × 1.25 is 1250 bytes a millisecond; a burst is 5 ms of it.
-    let mut send = |video: &mut VideoQueue, kbps, at| {
+    // The datagrams the queue has handed QUIC after `pace(kbps, at)`.
+    let send = |video: &mut VideoQueue, kbps, at| {
         let room = video.pace(kbps, at);
+        let mut wire = Vec::new();
         assert!(video.feed(room, None, |h| quic(&mut wire, h)));
-        wire.len()
+        40 - video.bytes() / SIZE
     };
+    let keyframe = || {
+        let mut video = VideoQueue::default();
+        let first = video.next_seq();
+        for i in 0..40 {
+            video.push(held(first + i), BUFFER);
+        }
+        video
+    };
+    let mut video = keyframe();
+    // 8 Mbit/s × 1.25 is 1250 bytes a millisecond; a burst is 5 ms of it.
     assert_eq!(send(&mut video, Some(8000), ms(0)), 5, "one burst at once");
     assert_eq!(
         send(&mut video, Some(8000), ms(1)),
@@ -2187,15 +2191,17 @@ fn the_pacer_lets_video_go_at_its_rate_in_short_bursts_and_drains_after_a_releas
         13,
         "idle time saves one burst"
     );
-    // The pace lets go (the governor released, or the estimate back at its ceiling): held
-    // video drains at the last pace, not into QUIC at once.
-    assert_eq!(send(&mut video, None, ms(102)), 15);
-    assert_eq!(send(&mut video, None, ms(200)), 20);
-    assert!(video.feed(usize::MAX, None, |h| quic(&mut wire, h)));
-    assert!(video.is_empty());
     assert_eq!(
-        video.pace(None, ms(201)),
-        usize::MAX,
-        "nothing held: unpaced again"
+        send(&mut video, None, ms(101)),
+        40,
+        "not governed: not paced"
+    );
+
+    let mut video = keyframe();
+    assert_eq!(send(&mut video, Some(8000), ms(0)), 5);
+    assert_eq!(
+        send(&mut video, Some(8000), ms(101)),
+        40,
+        "video that waited 100 ms goes at once"
     );
 }

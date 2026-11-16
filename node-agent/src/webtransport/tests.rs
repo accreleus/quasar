@@ -5168,7 +5168,8 @@ async fn audio_overtakes_video_held_behind_a_stalled_path() {
         tokio::select! {
             d = session.read_datagram() => {
                 let d = d.unwrap();
-                if d.is_empty() { continue; }
+                // The starved-path probe (#1333) carries no `pkt_seq`.
+                if d.len() < 5 { continue; }
                 path.receive(&d);
                 if now < outage { continue; }
                 n += 1;
