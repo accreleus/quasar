@@ -20,7 +20,7 @@ fn record_sent_audio(host: &Host) -> Arc<Mutex<Vec<(u16, u32)>>> {
     let attach = {
         let (sent, probed) = (sent.clone(), probed.clone());
         move |element: &gst::Element| {
-            if !element.factory().is_some_and(|f| f.name() == "nicesink")
+            if element.factory().is_none_or(|f| f.name() != "nicesink")
                 || probed.swap(true, Ordering::SeqCst)
             {
                 return;
