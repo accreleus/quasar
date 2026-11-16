@@ -2834,7 +2834,10 @@ pub fn run_blocking(
     struct MetricsHookGuard(Arc<SessionMetrics>);
     impl Drop for MetricsHookGuard {
         fn drop(&mut self) {
-            self.0.clear_hooks();
+            // `end_hooks`, not `clear_hooks`: this is the session's end, so no ABR loop may
+            // register a hook afterwards (#1295). A replacement or a rebuild keeps
+            // `clear_hooks`, which a new loop may follow.
+            self.0.end_hooks();
         }
     }
     let _metrics_hook_guard = MetricsHookGuard(session_metrics.clone());
