@@ -24,6 +24,10 @@ export interface PyroWaveStageOptions {
 
 export const loadDecoder = (): Promise<DecoderModule> => import("./decoder");
 
+/** Decodes allowed to be outstanding at once (#1416). Two, not one: a completion callback can land
+ *  a frame late, and a gate of one would then halve the frame rate of a GPU that is keeping up. */
+export const MAX_IN_FLIGHT_DECODES = 2;
+
 /** Compiles the decoder's pipelines on `device` once, so a configuration later builds fast;
  *  false when this device cannot run either decoder path. */
 export async function warmPyroWave(device: GPUDevice, load: () => Promise<DecoderModule> = loadDecoder): Promise<boolean> {
@@ -43,6 +47,10 @@ export class PyroWaveStage {
   private configId: number | null = null;
   /** The newest frame that came while the decoder was being built; decoded once it is. */
   private waiting: PyroWaveFrame | null = null;
+  /** The newest frame that came while a decode was still running; older ones drop (#1416). */
+  private pending: PyroWaveFrame | null = null;
+  /** Decodes submitted whose GPU work has not completed yet. */
+  private inFlight = 0;
   /** Bumped per configuration, so a late create cannot install an old decoder. */
   private generation = 0;
   private fellBack = new Set<number>();
@@ -56,6 +64,8 @@ export class PyroWaveStage {
     this.decoder?.destroy();
     this.decoder = null;
     this.waiting = null;
+    this.pending = null;
+    this.inFlight = 0;
     this.configId = c.configId;
     const generation = ++this.generation;
     void (async () => {
@@ -87,6 +97,8 @@ export class PyroWaveStage {
     this.decoder = null;
     this.configId = null;
     this.waiting = null;
+    this.pending = null;
+    this.inFlight = 0;
   }
 
   frame(f: PyroWaveFrame): void {
@@ -97,9 +109,23 @@ export class PyroWaveStage {
       this.waiting = f;
       return;
     }
+    // A bounded number of decodes outstanding (#1416): a GPU slower than the frame rate would
+    // otherwise be handed every frame, its queue growing without end, and the picture shown would
+    // fall further and further behind. Every frame is intra, so a frame that arrives while the
+    // bound is full replaces the one already waiting rather than queueing behind it.
+    if (this.inFlight >= MAX_IN_FLIGHT_DECODES) {
+      this.pending = f;
+      return;
+    }
+    this.decodeNow(d, f);
+  }
+
+  private decodeNow(d: PyroWaveDecoder, f: PyroWaveFrame): void {
+    this.inFlight++;
     try {
       d.decode(f.packets, f.covered);
     } catch (err) {
+      this.inFlight--;
       // A malformed frame is dropped; anything else is this decoder's end.
       if ((err as { reason?: string }).reason === "bad_frame") return;
       console.warn("pyrowave: decode failed", err);
@@ -107,6 +133,23 @@ export class PyroWaveStage {
       return;
     }
     if (this.opts.present(d.texture)) this.opts.onPresented(f.captureUs);
+    // The submission's completion frees the slot. A lost device abandons its work: settle either
+    // way, or the gate would hold the last picture for the rest of the session.
+    void this.opts.device.queue.onSubmittedWorkDone().then(
+      () => this.decoded(d),
+      () => this.decoded(d),
+    );
+  }
+
+  /** A submitted decode finished: the newest frame that arrived meanwhile takes its place. */
+  private decoded(d: PyroWaveDecoder): void {
+    // A previous configuration's decode: `leave`/`config` already gave its slots back.
+    if (this.decoder !== d) return;
+    this.inFlight = Math.max(0, this.inFlight - 1);
+    const next = this.pending;
+    this.pending = null;
+    if (!next || this.stopped || next.configId !== this.configId) return;
+    this.decodeNow(d, next);
   }
 
   close(): void {
