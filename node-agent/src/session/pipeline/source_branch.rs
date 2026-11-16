@@ -325,6 +325,7 @@ mod tests {
         set_encode_src_properties, va_postproc_candidates,
     };
     use gstreamer as gst;
+    use gstreamer::prelude::*;
 
     #[test]
     fn keyboard_layout_needs_both_compositor_properties() {
