@@ -301,7 +301,7 @@ func TestSwapIntoAMappedGameNeedsTheToolTheSessionMounted(t *testing.T) {
 		rec := httptest.NewRecorder()
 		writeNoHostAvailable(rec, err)
 		if b := rec.Body.String(); !strings.Contains(b, `"reason":"compat_tool_missing"`) ||
-			!strings.Contains(b, "started without") || strings.Contains(b, "try again") {
+			!strings.Contains(b, "was not started with") || strings.Contains(b, "try again") {
 			t.Fatalf("%s: body %s", why, b)
 		}
 	}
@@ -354,5 +354,14 @@ func TestSwapIntoAMappingAddedAfterTheSessionStartedIsRefused(t *testing.T) {
 	}
 	if got := readRow(t, f.pool, sess); got.Detail == swapDetailInProgress {
 		t.Errorf("a refused swap left the session marked swapping")
+	}
+	// The refusal's message has to hold in this case too: the tool IS mounted, only
+	// the mapping is new, so nothing may say the session lacked the tool.
+	rec := httptest.NewRecorder()
+	writeNoHostAvailable(rec, err)
+	b := rec.Body.String()
+	if !strings.Contains(b, `"reason":"compat_tool_missing"`) || !strings.Contains(b, "was not started with") ||
+		strings.Contains(b, "started without") || strings.Contains(b, "try again") {
+		t.Fatalf("body %s", b)
 	}
 }
