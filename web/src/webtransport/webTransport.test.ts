@@ -1641,11 +1641,35 @@ describe("createWebTransportRuntime fallback", () => {
         expect(s.agent.sent("hello")).toHaveLength(2);
         expect(s.callbacks.onFallback).not.toHaveBeenCalled();
         await feed(s, 8, 7);
-        expect(s.callbacks.onFallback).toHaveBeenCalledWith("decode_error", expect.stringContaining("no picture shown for 5 s"));
+        expect(s.callbacks.onFallback).toHaveBeenCalledWith("decode_error", expect.stringMatching(/^decode_error: no_picture: no picture shown for \d\.\d s, round trip 0 ms, limit 5\.0 s$/));
         const asked = s.agent.sent("keyframe_request").length;
         await vi.advanceTimersByTimeAsync(3_000);
         expect(s.agent.sent("keyframe_request")).toHaveLength(asked);
         expect(s.callbacks.onFallback).toHaveBeenCalledTimes(1);
+      });
+
+      it("waits the path-scaled bound for a picture, not a fixed 5 s, on a slow link (#1445)", async () => {
+        const s = await stuckDecoder();
+        // A 5 s round trip: the picture may trail the frames that arrived by 5 s plus four round trips.
+        for (let i = 0; i < 6; i++) {
+          pongWith(s.agent, 5_000);
+          await feed(s, 1, i);
+        }
+        expect(s.agent.sent("hello")).toHaveLength(1); // the fixed 5 s check would have ended the view here
+        for (let i = 6; i < 27; i++) {
+          pongWith(s.agent, 5_000);
+          await feed(s, 1, i);
+        }
+        expect(s.agent.sent("hello")).toHaveLength(2); // the path's own 25 s bound
+        s.rt.destroy();
+      });
+
+      it("records the no-picture check as the cause of the stream_lost that follows (#1445)", async () => {
+        const s = await stuckDecoder();
+        vi.mocked(mintTransportToken).mockRejectedValue(new Error("link saturated"));
+        await feed(s, 7);
+        expect(s.callbacks.onFallback).toHaveBeenCalledWith("stream_lost", expect.stringContaining("no_picture: no picture shown for"));
+        s.rt.destroy();
       });
 
       it("does not fire on a normal start", async () => {
