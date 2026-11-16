@@ -1247,6 +1247,35 @@ describe("engage() without Pointer Lock — the send gate opens anyway", () => {
     video.remove();
   });
 
+  it("a held button is released when capture ends, exactly once (#1406)", async () => {
+    setPointerLockApi(null);
+    const video = mountVideo();
+    const send = vi.fn();
+    const { cleanup, engage, release } = setupCapture({
+      videoEl: video,
+      sendInput: send,
+      onCaptureChange: vi.fn(),
+      channel: makeChannel(),
+    });
+    await engage();
+
+    document.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerType: "mouse" }));
+    video.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 2 }));
+    send.mockClear();
+
+    // Esc / alt-tab / the page being hidden all end capture here.
+    release();
+    const buttonUps = send.mock.calls.filter(([m]) => m.t === "mb" && m.pressed === false);
+    expect(buttonUps).toEqual([[{ t: "mb", button: MB_MAP[2], pressed: false }]]);
+
+    // The finger or mouse coming up afterwards is not a second release.
+    document.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 2 }));
+    expect(send.mock.calls.filter(([m]) => m.t === "mb")).toHaveLength(1);
+
+    cleanup();
+    video.remove();
+  });
+
   it("Escape releases capture and flushes held keys + gamepads — the no-lock way out", async () => {
     setPointerLockApi(null);
     const rafHolder = withRaf();
@@ -1330,6 +1359,151 @@ describe("engage() without Pointer Lock — the send gate opens anyway", () => {
     expect(send).not.toHaveBeenCalledWith(
       expect.objectContaining({ code: EVDEV.KeyQ, pressed: true }),
     );
+
+    cleanup();
+  });
+});
+
+describe("a hidden page, and the return (#1414)", () => {
+  const setHidden = (hidden: boolean) => {
+    Object.defineProperty(document, "hidden", { value: hidden, configurable: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+  };
+  afterEach(() => delete (document as unknown as { hidden?: boolean }).hidden);
+
+  it("a fallback capture is taken back when the page comes back, with no tap", async () => {
+    setPointerLockApi(null);
+    const send = vi.fn();
+    const { cleanup, engage, getMetrics } = setupCapture({
+      videoEl: makeVideo(),
+      sendInput: send,
+      onCaptureChange: vi.fn(),
+      channel: makeChannel(),
+    });
+    await engage();
+
+    setHidden(true);
+    expect(getMetrics().captured).toBe(false);
+    setHidden(false);
+    expect(getMetrics().captured).toBe(true);
+    dispatchKeyDown("KeyW");
+    expect(send).toHaveBeenCalledWith({ t: "k", code: EVDEV.KeyW, pressed: true });
+
+    cleanup();
+  });
+
+  // M1 (seat A r1): the return must not undo a release the page did not cause.
+  it("a release the app makes while the page is hidden is respected on return (#1414)", async () => {
+    setPointerLockApi(null);
+    const send = vi.fn();
+    const { cleanup, engage, release, getMetrics } = setupCapture({
+      videoEl: makeVideo(),
+      sendInput: send,
+      onCaptureChange: vi.fn(),
+      channel: makeChannel(),
+    });
+    await engage();
+
+    setHidden(true);
+    // SessionPage's sessionOver effect releases exactly like this, and it can
+    // flip while the page is hidden (a phone whose session ended elsewhere).
+    release();
+    setHidden(false);
+    expect(getMetrics().captured).toBe(false);
+    // Nothing is forwarded into the ended session either.
+    dispatchKeyDown("KeyW");
+    expect(send).not.toHaveBeenCalled();
+
+    cleanup();
+  });
+
+  // S1: pagehide follows visibilitychange(hidden) on the way to the back/forward
+  // cache. The second report must not drop the flag the first one set (#1465).
+  it("takes input back after hidden -> pagehide -> visible (#1465)", async () => {
+    setPointerLockApi(null);
+    const send = vi.fn();
+    const { cleanup, engage, getMetrics } = setupCapture({
+      videoEl: makeVideo(),
+      sendInput: send,
+      onCaptureChange: vi.fn(),
+      channel: makeChannel(),
+    });
+    await engage();
+
+    setHidden(true);
+    window.dispatchEvent(new Event("pagehide"));
+    setHidden(false);
+    expect(getMetrics().captured).toBe(true);
+    dispatchKeyDown("KeyW");
+    expect(send).toHaveBeenCalledWith({ t: "k", code: EVDEV.KeyW, pressed: true });
+
+    cleanup();
+  });
+
+  // #1465: a hide report after everything was released says nothing about the
+  // capture that is gone, so it can neither arm nor disarm the return.
+  it("a later hide report does not re-arm a release the app made (#1465)", async () => {
+    setPointerLockApi(null);
+    const { cleanup, engage, release, getMetrics } = setupCapture({
+      videoEl: makeVideo(),
+      sendInput: vi.fn(),
+      onCaptureChange: vi.fn(),
+      channel: makeChannel(),
+    });
+    await engage();
+
+    setHidden(true);
+    release();
+    window.dispatchEvent(new Event("pagehide"));
+    setHidden(false);
+    expect(getMetrics().captured).toBe(false);
+
+    cleanup();
+  });
+
+  it("a Pointer Lock session stays released: coming back is not a user gesture", async () => {
+    const video = document.createElement("video");
+    const requestPointerLock = vi.fn(() => undefined);
+    const exitPointerLock = vi.fn();
+    setPointerLockApi(requestPointerLock);
+    Object.defineProperty(document, "exitPointerLock", { value: exitPointerLock, configurable: true });
+    const { cleanup, engage, getMetrics } = setupCapture({
+      videoEl: video,
+      sendInput: vi.fn(),
+      onCaptureChange: vi.fn(),
+      channel: makeChannel(),
+    });
+    expect((await engage()).mode).toBe("pointer-lock");
+    lockPointer(video);
+    expect(getMetrics().captured).toBe(true);
+
+    setHidden(true);
+    // The lock release leaves `captured` set until pointerlockchange, which a
+    // hidden page may never get — endCapture ends it on the spot.
+    expect(exitPointerLock).toHaveBeenCalledTimes(1);
+    expect(getMetrics().captured).toBe(false);
+    setHidden(false);
+    expect(getMetrics().captured).toBe(false);
+    // The browser would refuse a new lock without a gesture, so none is made.
+    expect(requestPointerLock).toHaveBeenCalledTimes(1);
+
+    cleanup();
+    delete (document as unknown as { exitPointerLock?: unknown }).exitPointerLock;
+  });
+
+  it("a capture the user released before hiding is not taken back", async () => {
+    setPointerLockApi(null);
+    const { cleanup, engage, release, getMetrics } = setupCapture({
+      videoEl: makeVideo(),
+      sendInput: vi.fn(),
+      onCaptureChange: vi.fn(),
+      channel: makeChannel(),
+    });
+    await engage();
+    release();
+    setHidden(true);
+    setHidden(false);
+    expect(getMetrics().captured).toBe(false);
 
     cleanup();
   });
@@ -2095,5 +2269,44 @@ describe("Firefox send-Esc combo, Ctrl+Alt+Shift+E (#647)", () => {
       { t: "k", code: 18, pressed: false },
     ]);
     cleanup();
+  });
+});
+
+describe("a page hide and the lock's own change release once (#1406)", () => {
+  it("visibilitychange then pointerlockchange sends one key-up and one button-up", async () => {
+    const video = document.createElement("video");
+    document.body.appendChild(video);
+    const requestPointerLock = vi.fn(() => undefined);
+    const exitPointerLock = vi.fn();
+    setPointerLockApi(requestPointerLock);
+    Object.defineProperty(document, "exitPointerLock", { value: exitPointerLock, configurable: true });
+    const send = vi.fn();
+    const { cleanup, engage } = setupCapture({
+      videoEl: video,
+      sendInput: send,
+      onCaptureChange: vi.fn(),
+      channel: makeChannel(),
+    });
+    expect((await engage()).mode).toBe("pointer-lock");
+    lockPointer(video);
+
+    dispatchKeyDown("KeyW");
+    video.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }));
+    send.mockClear();
+
+    // The hide releases through exitPointerLock; its pointerlockchange arrives
+    // afterwards and must not release everything a second time.
+    Object.defineProperty(document, "hidden", { value: true, configurable: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(exitPointerLock).toHaveBeenCalledTimes(1);
+    unlockPointer();
+
+    expect(send.mock.calls.filter(([m]) => m.t === "k" && m.pressed === false)).toHaveLength(1);
+    expect(send.mock.calls.filter(([m]) => m.t === "mb" && m.pressed === false)).toHaveLength(1);
+
+    cleanup();
+    delete (document as unknown as { hidden?: boolean }).hidden;
+    delete (document as unknown as { exitPointerLock?: unknown }).exitPointerLock;
+    video.remove();
   });
 });
