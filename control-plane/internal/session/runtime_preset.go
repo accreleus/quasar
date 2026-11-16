@@ -20,12 +20,13 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/accreleus/quasar/control-plane/internal/managedhome"
 	"github.com/accreleus/quasar/control-plane/internal/runtimeconfig"
 )
 
 // defaultHomeContainerPath is the schema default for apps.home_container_path
 // (migration 0008) and runtime_presets.home_container_path (migration 0035).
-const defaultHomeContainerPath = "/home/quasar"
+const defaultHomeContainerPath = managedhome.DefaultContainerPath
 
 // runtimePreset is a runtime_presets row as loaded at launch. Zero value = no
 // preset; callers must not call the merge with one.
@@ -129,27 +130,11 @@ func mergeRuntimePreset(appSpec json.RawMessage, p runtimePreset) (json.RawMessa
 }
 
 // mergeManagedHome is the storage half: the preset provides the default, the app
-// may override. apps.managed_home is NOT NULL DEFAULT false, so there is no
-// "unset" to tell from an explicit false — an app can turn a managed home ON
-// when its preset does not provide one, but cannot turn a preset's OFF, because
-// a preset that provisions a per-user home is a storage guarantee for every app
-// inheriting it.
-//
-// home_container_path matters only when managed_home is true; the app's path
-// wins unless it is the schema default, which expresses no preference.
+// may override. The rule itself lives in internal/managedhome, because the admin
+// app shape reports the same merged result (amendment 82) and crud and session
+// may not import each other.
 func mergeManagedHome(appManagedHome bool, appPath string, p runtimePreset) (bool, string) {
-	managed := appManagedHome || p.ManagedHome
-
-	path := appPath
-	if appPath == "" || appPath == defaultHomeContainerPath {
-		if p.HomeContainerPath != "" {
-			path = p.HomeContainerPath
-		}
-	}
-	if path == "" {
-		path = defaultHomeContainerPath
-	}
-	return managed, path
+	return managedhome.Merge(appManagedHome, appPath, p.ManagedHome, p.HomeContainerPath)
 }
 
 // validateRuntimeNetwork checks an app's own `runtime_spec.network` before it is

@@ -14,6 +14,7 @@ import (
 
 	"github.com/accreleus/quasar/control-plane/internal/admission"
 	"github.com/accreleus/quasar/control-plane/internal/images"
+	"github.com/accreleus/quasar/control-plane/internal/managedhome"
 	"github.com/accreleus/quasar/control-plane/internal/readinessgate"
 )
 
@@ -142,9 +143,19 @@ type App struct {
 	DisplayFPS         int32           `json:"display_fps"`
 	DisplayBitratekbps int32           `json:"display_bitrate_kbps"`
 	RuntimeSpec        json.RawMessage `json:"runtime_spec"`
-	// P5-01/02: managed per-(user, app) home opt-in.
+	// P5-01/02: managed per-(user, app) home opt-in. These are the app's OWN
+	// stored columns; what a launch actually gets is EffectiveManagedHome /
+	// EffectiveHomeContainerPath below.
 	ManagedHome       bool   `json:"managed_home"`
 	HomeContainerPath string `json:"home_container_path"`
+	// EffectiveManagedHome/EffectiveHomeContainerPath (amendment 82): the home a
+	// launch gets NOW — the merge of the app's own policy with its runtime preset
+	// (for a derived tile, its parent's values and preset), by the launch path's
+	// rule (internal/managedhome). Derived per read from the joined root and
+	// preset rows, so it can never go stale against an edited preset. Admin-only:
+	// never on App/AppListItem, never accepted on write.
+	EffectiveManagedHome       bool   `json:"-"`
+	EffectiveHomeContainerPath string `json:"-"`
 	// ShareSteamLibrary (#1001): mount the user's Steam data dir into this app's
 	// sessions. Semantics: control-api.md §Storage.
 	ShareSteamLibrary bool `json:"share_steam_library"`
@@ -1238,6 +1249,13 @@ func (s *store) listAllApps(ctx context.Context, callerID, cursor string, limit 
 		       default_width, default_height, default_fps, default_bitrate_kbps,
 		       enabled, default_profile_id, profile_policy, runtime_spec, managed_home, home_container_path, share_steam_library,
 		       apps.runtime_preset_id::text,
+		       -- amendment 82: the home a launch gets now. The launch path binds the
+		       -- CANONICAL root's policy and that root's preset (for a derived tile,
+		       -- its parent's), so the admin shape reads the same two rows the launch
+		       -- reads (internal/session/home_binding.go resolvedDispatchHome). A
+		       -- lateral row of its own keeps these names clear of the app columns
+		       -- (a bare join on apps makes every unqualified column ambiguous).
+		       home.managed, home.path, COALESCE(home.pmanaged, false), COALESCE(home.ppath, ''),
 		       -- UI-P5 allow-list. ARRAY(...) rather than a join + array_agg so the
 		       -- display_stream joins above keep their one-row-per-app shape.
 		       ARRAY(SELECT alp.launch_profile_id FROM app_launch_profiles alp
@@ -1269,6 +1287,13 @@ func (s *store) listAllApps(ctx context.Context, callerID, cursor string, limit 
 			ELSE spp.global_default_profile_id
 		END
 		LEFT JOIN stream_profiles dp ON dp.id = dpr.stream_profile_id
+		LEFT JOIN LATERAL (
+		    SELECT root.managed_home AS managed, root.home_container_path AS path,
+		           rp.managed_home AS pmanaged, rp.home_container_path AS ppath
+		    FROM apps root
+		    LEFT JOIN runtime_presets rp ON rp.id = root.runtime_preset_id
+		    WHERE root.id = COALESCE(apps.parent_app_id, apps.id)
+		) home ON true
 		LEFT JOIN user_app_favourites fav ON fav.app_id = apps.id AND fav.user_id = $3::uuid
 		-- sessions_30d, aggregated ONCE for the whole page rather than per row: a
 		-- correlated count re-scans the window for every app, which on a large
@@ -1290,6 +1315,8 @@ func (s *store) listAllApps(ctx context.Context, callerID, cursor string, limit 
 	var apps []App
 	for rows.Next() {
 		var a App
+		var rootManaged, presetManaged bool
+		var rootPath, presetPath string
 		if err := rows.Scan(&a.ID, &a.Name, &a.Description, &a.CoverURL, &a.HeroURL, &a.Kind,
 			&a.ExternalSource, &a.ExternalID,
 			&a.ParentAppID, &a.Origin, &a.LibraryProvider,
@@ -1297,13 +1324,14 @@ func (s *store) listAllApps(ctx context.Context, callerID, cursor string, limit 
 			&a.DefaultVramMB, &a.DefaultEncodeSlots,
 			&a.DefaultWidth, &a.DefaultHeight, &a.DefaultFPS, &a.DefaultBitratekbps,
 			&a.Enabled, &a.DefaultProfileID, &a.ProfilePolicy, &a.RuntimeSpec, &a.ManagedHome, &a.HomeContainerPath, &a.ShareSteamLibrary,
-			&a.RuntimePresetID, &a.LaunchableProfileIDs,
+			&a.RuntimePresetID, &rootManaged, &rootPath, &presetManaged, &presetPath, &a.LaunchableProfileIDs,
 			&a.DisplayWidth, &a.DisplayHeight, &a.DisplayFPS, &a.DisplayBitratekbps,
 			&a.CreatedAt, &a.UpdatedAt,
 			&a.Genres, &a.Developer, &a.Publisher, &a.ReleaseDate, &a.ControllerSupport, &a.LogoURL, &a.IconURL,
 			&a.Favourite, &a.Sessions30d); err != nil {
 			return nil, "", fmt.Errorf("scan app: %w", err)
 		}
+		a.resolveEffectiveHome(rootManaged, rootPath, presetManaged, presetPath)
 		apps = append(apps, a)
 	}
 	if err := rows.Err(); err != nil {
@@ -1323,6 +1351,8 @@ func (s *store) listAllApps(ctx context.Context, callerID, cursor string, limit 
 // `favourite` scoped to the acting caller's own favourites.
 func (s *store) getAppFull(ctx context.Context, callerID, id string) (App, error) {
 	var a App
+	var rootManaged, presetManaged bool
+	var rootPath, presetPath string
 	err := s.pool.QueryRow(ctx, `
 			SELECT apps.id::text, name, description, cover_url, hero_url, kind,
 		       external_source, external_id,
@@ -1335,6 +1365,13 @@ func (s *store) getAppFull(ctx context.Context, callerID, id string) (App, error
 		       default_width, default_height, default_fps, default_bitrate_kbps,
 		       enabled, default_profile_id, profile_policy, runtime_spec, managed_home, home_container_path, share_steam_library,
 		       apps.runtime_preset_id::text,
+		       -- amendment 82: the home a launch gets now. The launch path binds the
+		       -- CANONICAL root's policy and that root's preset (for a derived tile,
+		       -- its parent's), so the admin shape reads the same two rows the launch
+		       -- reads (internal/session/home_binding.go resolvedDispatchHome). A
+		       -- lateral row of its own keeps these names clear of the app columns
+		       -- (a bare join on apps makes every unqualified column ambiguous).
+		       home.managed, home.path, COALESCE(home.pmanaged, false), COALESCE(home.ppath, ''),
 		       -- UI-P5 allow-list; see listAllApps for why ARRAY(...) and not a join.
 		       ARRAY(SELECT alp.launch_profile_id FROM app_launch_profiles alp
 		             WHERE alp.app_id = apps.id ORDER BY alp.launch_profile_id),
@@ -1360,6 +1397,13 @@ func (s *store) getAppFull(ctx context.Context, callerID, id string) (App, error
 			ELSE spp.global_default_profile_id
 		END
 		LEFT JOIN stream_profiles dp ON dp.id = dpr.stream_profile_id
+		LEFT JOIN LATERAL (
+		    SELECT root.managed_home AS managed, root.home_container_path AS path,
+		           rp.managed_home AS pmanaged, rp.home_container_path AS ppath
+		    FROM apps root
+		    LEFT JOIN runtime_presets rp ON rp.id = root.runtime_preset_id
+		    WHERE root.id = COALESCE(apps.parent_app_id, apps.id)
+		) home ON true
 		LEFT JOIN user_app_favourites fav ON fav.app_id = apps.id AND fav.user_id = $2::uuid
 		WHERE apps.id::text = $1
 	`, id, callerID).Scan(&a.ID, &a.Name, &a.Description, &a.CoverURL, &a.HeroURL, &a.Kind,
@@ -1369,7 +1413,7 @@ func (s *store) getAppFull(ctx context.Context, callerID, id string) (App, error
 		&a.DefaultVramMB, &a.DefaultEncodeSlots,
 		&a.DefaultWidth, &a.DefaultHeight, &a.DefaultFPS, &a.DefaultBitratekbps,
 		&a.Enabled, &a.DefaultProfileID, &a.ProfilePolicy, &a.RuntimeSpec, &a.ManagedHome, &a.HomeContainerPath, &a.ShareSteamLibrary,
-		&a.RuntimePresetID, &a.LaunchableProfileIDs,
+		&a.RuntimePresetID, &rootManaged, &rootPath, &presetManaged, &presetPath, &a.LaunchableProfileIDs,
 		&a.DisplayWidth, &a.DisplayHeight, &a.DisplayFPS, &a.DisplayBitratekbps,
 		&a.CreatedAt, &a.UpdatedAt,
 		&a.Genres, &a.Developer, &a.Publisher, &a.ReleaseDate, &a.ControllerSupport, &a.LogoURL, &a.IconURL,
@@ -1380,7 +1424,16 @@ func (s *store) getAppFull(ctx context.Context, callerID, id string) (App, error
 	if err != nil {
 		return App{}, fmt.Errorf("query app: %w", err)
 	}
+	a.resolveEffectiveHome(rootManaged, rootPath, presetManaged, presetPath)
 	return a, nil
+}
+
+// resolveEffectiveHome applies the launch path's managed-home rule to the root
+// policy and preset the admin read joined in (amendment 82). rootManaged/rootPath
+// are the CANONICAL app's — for a derived tile its parent's — because that is the
+// pair the launch binds the home against.
+func (a *App) resolveEffectiveHome(rootManaged bool, rootPath string, presetManaged bool, presetPath string) {
+	a.EffectiveManagedHome, a.EffectiveHomeContainerPath = managedhome.Merge(rootManaged, rootPath, presetManaged, presetPath)
 }
 
 // listHosts returns all hosts with pagination.
