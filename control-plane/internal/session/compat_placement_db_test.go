@@ -301,7 +301,7 @@ func TestSwapIntoAMappedGameNeedsTheToolTheSessionMounted(t *testing.T) {
 		rec := httptest.NewRecorder()
 		writeNoHostAvailable(rec, err)
 		if b := rec.Body.String(); !strings.Contains(b, `"reason":"compat_tool_missing"`) ||
-			!strings.Contains(b, "started without") || strings.Contains(b, "try again") {
+			!strings.Contains(b, "was not started with") || strings.Contains(b, "try again") {
 			t.Fatalf("%s: body %s", why, b)
 		}
 	}
@@ -325,5 +325,43 @@ func TestSwapIntoAMappedGameNeedsTheToolTheSessionMounted(t *testing.T) {
 	hostHasTool(t, f.pool, f.hostID, false)
 	if _, err := f.coord.Swap(ctx, sess, mapped); err != nil {
 		t.Fatalf("swap with the tool mounted at launch: %v", err)
+	}
+}
+
+// #1427: a swap carries the table the session mounted at launch, so a mapping the admin added
+// after that launch is in no table the session carries — even when its tool is mounted for
+// another game, which is the case a check on tool names alone admits. The swap is refused and the
+// game is launched on its own instead, where the launch reads the mapping and carries it.
+func TestSwapIntoAMappingAddedAfterTheSessionStartedIsRefused(t *testing.T) {
+	f := newWarmFixture(t, 8)
+	desktop := seedDesktop(t, f, true)
+	must(t, exec(t, f.pool, `UPDATE apps SET default_encode_slots=2 WHERE id=$1::uuid`, desktop))
+	mapped := seedTile(t, f.pool, f.steam, "Hades", compatGameID)
+	toolID := seedGETool(t, f.pool)
+	// No mapping to the game yet, so no launch carried one. The session below mounts the
+	// tool all the same (for another game), which is what a name-only check would admit on.
+	must(t, exec(t, f.pool, `DELETE FROM compat_tool_mappings WHERE tool_id=$1::uuid`, toolID))
+	sess := f.startedLaunch(t, desktop)
+	must(t, exec(t, f.pool, `UPDATE sessions SET compat_tool_names = ARRAY[$2]::text[] WHERE id=$1::uuid`, sess, compatSteamNm))
+	// The admin adds the mapping mid-session.
+	must(t, exec(t, f.pool, `INSERT INTO compat_tool_mappings (provider, external_id, tool_id)
+		VALUES ('steam', $1, $2::uuid)`, compatGameID, toolID))
+
+	_, err := f.coord.Swap(context.Background(), sess, mapped)
+	var rej *CompatToolRejection
+	if !errors.Is(err, ErrNoHostAvailable) || !errors.As(err, &rej) || rej.Tool != compatTag || !rej.Swap {
+		t.Fatalf("swap into a mapping added mid-session: got %v, want ErrNoHostAvailable carrying a swap CompatToolRejection for %s", err, compatTag)
+	}
+	if got := readRow(t, f.pool, sess); got.Detail == swapDetailInProgress {
+		t.Errorf("a refused swap left the session marked swapping")
+	}
+	// The refusal's message has to hold in this case too: the tool IS mounted, only
+	// the mapping is new, so nothing may say the session lacked the tool.
+	rec := httptest.NewRecorder()
+	writeNoHostAvailable(rec, err)
+	b := rec.Body.String()
+	if !strings.Contains(b, `"reason":"compat_tool_missing"`) || !strings.Contains(b, "was not started with") ||
+		strings.Contains(b, "started without") || strings.Contains(b, "try again") {
+		t.Fatalf("body %s", b)
 	}
 }
