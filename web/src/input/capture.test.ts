@@ -1247,6 +1247,35 @@ describe("engage() without Pointer Lock — the send gate opens anyway", () => {
     video.remove();
   });
 
+  it("a held button is released when capture ends, exactly once (#1406)", async () => {
+    setPointerLockApi(null);
+    const video = mountVideo();
+    const send = vi.fn();
+    const { cleanup, engage, release } = setupCapture({
+      videoEl: video,
+      sendInput: send,
+      onCaptureChange: vi.fn(),
+      channel: makeChannel(),
+    });
+    await engage();
+
+    document.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerType: "mouse" }));
+    video.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 2 }));
+    send.mockClear();
+
+    // Esc / alt-tab / the page being hidden all end capture here.
+    release();
+    const buttonUps = send.mock.calls.filter(([m]) => m.t === "mb" && m.pressed === false);
+    expect(buttonUps).toEqual([[{ t: "mb", button: MB_MAP[2], pressed: false }]]);
+
+    // The finger or mouse coming up afterwards is not a second release.
+    document.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 2 }));
+    expect(send.mock.calls.filter(([m]) => m.t === "mb")).toHaveLength(1);
+
+    cleanup();
+    video.remove();
+  });
+
   it("Escape releases capture and flushes held keys + gamepads — the no-lock way out", async () => {
     setPointerLockApi(null);
     const rafHolder = withRaf();
@@ -2095,5 +2124,44 @@ describe("Firefox send-Esc combo, Ctrl+Alt+Shift+E (#647)", () => {
       { t: "k", code: 18, pressed: false },
     ]);
     cleanup();
+  });
+});
+
+describe("a page hide and the lock's own change release once (#1406)", () => {
+  it("visibilitychange then pointerlockchange sends one key-up and one button-up", async () => {
+    const video = document.createElement("video");
+    document.body.appendChild(video);
+    const requestPointerLock = vi.fn(() => undefined);
+    const exitPointerLock = vi.fn();
+    setPointerLockApi(requestPointerLock);
+    Object.defineProperty(document, "exitPointerLock", { value: exitPointerLock, configurable: true });
+    const send = vi.fn();
+    const { cleanup, engage } = setupCapture({
+      videoEl: video,
+      sendInput: send,
+      onCaptureChange: vi.fn(),
+      channel: makeChannel(),
+    });
+    expect((await engage()).mode).toBe("pointer-lock");
+    lockPointer(video);
+
+    dispatchKeyDown("KeyW");
+    video.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }));
+    send.mockClear();
+
+    // The hide releases through exitPointerLock; its pointerlockchange arrives
+    // afterwards and must not release everything a second time.
+    Object.defineProperty(document, "hidden", { value: true, configurable: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(exitPointerLock).toHaveBeenCalledTimes(1);
+    unlockPointer();
+
+    expect(send.mock.calls.filter(([m]) => m.t === "k" && m.pressed === false)).toHaveLength(1);
+    expect(send.mock.calls.filter(([m]) => m.t === "mb" && m.pressed === false)).toHaveLength(1);
+
+    cleanup();
+    delete (document as unknown as { hidden?: boolean }).hidden;
+    delete (document as unknown as { exitPointerLock?: unknown }).exitPointerLock;
+    video.remove();
   });
 });
