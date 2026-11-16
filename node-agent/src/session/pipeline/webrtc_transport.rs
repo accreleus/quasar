@@ -701,6 +701,26 @@ impl WebRtcSlot {
         audio_src_pad
             .link(&audio_sink_pad)
             .context("failed to link audio into audio webrtcbin")?;
+        // No audio reaches webrtcbin before its peer connects (#1441). Until then
+        // webrtcbin parks the send queue's push on one packet (its sink pad waits for the
+        // answer, its send bin for the DTLS key) while the leaky queue keeps only the
+        // newest 200 ms: that packet would go out first, ahead of a gap as long as the wait.
+        let gate = audio_src_pad.add_probe(
+            gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+            |_, _| gst::PadProbeReturn::Drop,
+        );
+        let gate = Mutex::new(gate);
+        let tail = audio_src_pad.downgrade();
+        audio_webrtc.connect_notify(Some("connection-state"), move |webrtc, _| {
+            if webrtc.property::<gstreamer_webrtc::WebRTCPeerConnectionState>("connection-state")
+                != gstreamer_webrtc::WebRTCPeerConnectionState::Connected
+            {
+                return;
+            }
+            if let (Some(gate), Some(tail)) = (gate.lock().unwrap().take(), tail.upgrade()) {
+                tail.remove_probe(gate);
+            }
+        });
         // Microphone capture (client → host): a second, recvonly Opus m-line on this same
         // audio PC, plus the decode bin that plays it into the sidecar's `quasar_mic`
         // sink. Position is load-bearing: after the send transceiver, so the sendonly
