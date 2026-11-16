@@ -191,15 +191,29 @@ describe("page hidden", () => {
     expect(sent).toEqual([]);
   });
 
-  it("a closing channel does not throw", async () => {
+  it("a closing channel does not throw, and the release still ends the capture", async () => {
     harness.cleanup();
     let closed = false;
-    harness = setupCapture({ videoEl: video, sendInput: () => { if (closed) throw new Error("closed"); }, onCaptureChange: () => {} });
+    let attempts = 0;
+    harness = setupCapture({
+      videoEl: video,
+      sendInput: () => {
+        attempts++;
+        if (closed) throw new Error("closed");
+      },
+      onCaptureChange: () => {},
+    });
     await harness.engage();
     harness.setVirtualPad(pressA());
     poll!();
     closed = true;
-    expect(() => hide("pagehide")).not.toThrow();
+    attempts = 0;
+    hide("pagehide");
+    // The throw is contained (it would otherwise abandon the rest of the
+    // release), the pad's neutral state was the one send it cost, and the
+    // capture did not stay engaged because of it.
+    expect(attempts).toBe(1);
+    expect(harness.getMetrics().captured).toBe(false);
   });
 });
 
