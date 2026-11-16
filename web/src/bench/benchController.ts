@@ -56,6 +56,8 @@ export const REACQUIRE_AFTER_FAILURES = 15;
  * is silently empty while the harness still reports green.
  */
 export const I2P_TIMEOUT_MS = 2000;
+/** onTexture copies in flight before a frame goes unread (no_image) rather than queueing more. */
+export const READBACKS_IN_FLIGHT = 3;
 /** How many windows to keep for `window.__qBench.windows()`. */
 const MAX_WINDOWS = 3600;
 
@@ -202,6 +204,13 @@ export class BenchController {
    *  than the round trip is queued, not refused; FIFO matches the input path. */
   private readonly pendingInputs: PendingInput[] = [];
 
+  /** onTexture's readbacks: measured in submission order; buffers reused. */
+  private readTail: Promise<void> = Promise.resolve();
+  private readsInFlight = 0;
+  private readonly spareReads: GPUBuffer[] = [];
+  private readFaulted = false;
+  private limitWarned = false;
+
   private totalDecoded = 0;
   private totalI2pMissed = 0;
   private totalNoImage = 0;
@@ -268,8 +277,9 @@ export class BenchController {
       clearInterval(this.windowTimer);
       this.windowTimer = null;
     }
-    // Flush the last partial window so its frames are not lost.
+    // Flush the last partial window so its frames are not lost; readbacks still in flight are not measured.
     this.closeWindow();
+    for (const b of this.spareReads.splice(0)) b.destroy();
   }
 
   /** The `window.__qBench` object. */
@@ -324,12 +334,79 @@ export class BenchController {
   /** Exposed for tests: process one displayed frame. */
   onFrame(metadata?: VideoFrameCallbackMetadata): void {
     if (!this.running) return;
-    const present = presentEpochMs(metadata, this.deps.nowEpochMs);
+    this.measure(presentEpochMs(metadata, this.deps.nowEpochMs), rvfcStageMetadata(metadata), this.grab());
+  }
+
+  /**
+   * A WebTransport PyroWave frame, just submitted to the presenter: its marker crop is copied off
+   * the decoded texture and measured when the copy is mapped, in submission order. Presentation
+   * never waits for it. present_ms is the submit, as on the WebCodecs path (#1035).
+   */
+  onTexture(device: GPUDevice, texture: GPUTexture): void {
+    if (!this.running) return;
+    const present = this.deps.nowEpochMs();
+    const pixels = this.readBack(device, texture);
+    this.readTail = this.readTail
+      .then(async () => {
+        const image = await pixels;
+        if (this.running) this.measure(present, {}, image);
+      })
+      .catch((err: unknown) => console.warn("bench:", err));
+  }
+
+  private async readBack(device: GPUDevice, texture: GPUTexture): Promise<MarkerImageData | null> {
+    if (this.readsInFlight >= READBACKS_IN_FLIGHT) {
+      // The frame had pixels; the readbacks fell behind. Still no_image, but said once.
+      if (!this.limitWarned) console.warn(`bench: readbacks fell behind (${READBACKS_IN_FLIGHT} in flight), frames count as no_image`);
+      this.limitWarned = true;
+      return null;
+    }
+    this.region(texture.width, texture.height);
+    const w = this.cropW;
+    const h = this.cropH;
+    // copyTextureToBuffer rows are 256-byte aligned.
+    const stride = Math.ceil((w * 4) / 256) * 256;
+    let buf: GPUBuffer | undefined;
+    this.readsInFlight++;
+    try {
+      // The device is the presenter's: an uncaptured error there ends the session, so the readback's errors stay in its own scopes.
+      device.pushErrorScope("out-of-memory");
+      device.pushErrorScope("validation");
+      let scopes: Promise<GPUError | null>[];
+      let mapped: Promise<void>;
+      try {
+        const i = this.spareReads.findIndex((b) => b.size >= stride * h);
+        buf = i >= 0 ? this.spareReads.splice(i, 1)[0]! : device.createBuffer({ size: stride * h, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        const enc = device.createCommandEncoder();
+        enc.copyTextureToBuffer({ texture }, { buffer: buf, bytesPerRow: stride }, [w, h]);
+        device.queue.submit([enc.finish()]);
+        mapped = buf.mapAsync(GPUMapMode.READ, 0, stride * h);
+      } finally {
+        // Popped even on a throw, or the scopes would swallow the presenter's own errors.
+        scopes = [device.popErrorScope(), device.popErrorScope()].map((p) => p.catch(() => null));
+      }
+      const [[invalid, oom]] = await Promise.all([Promise.all(scopes), mapped]);
+      if (invalid ?? oom) throw invalid ?? oom;
+      const src = new Uint8Array(buf.getMappedRange(0, stride * h));
+      const data = new Uint8ClampedArray(w * h * 4);
+      for (let y = 0; y < h; y++) data.set(src.subarray(y * stride, y * stride + w * 4), y * w * 4);
+      buf.unmap();
+      if (this.running && this.spareReads.length < READBACKS_IN_FLIGHT) this.spareReads.push(buf);
+      else buf.destroy();
+      return { width: w, height: h, data };
+    } catch (err) {
+      // No readback on this device: the frames count as no_image, never as silence.
+      if (!this.readFaulted) console.warn("bench: texture readback", err);
+      this.readFaulted = true;
+      buf?.destroy();
+      return null;
+    } finally {
+      this.readsInFlight--;
+    }
+  }
+
+  private measure(present: number, stageMeta: Partial<BenchFrame>, image: MarkerImageData | null): void {
     const offset = this.deps.getClockOffsetMs();
-
-    const stageMeta = rvfcStageMetadata(metadata);
-
-    const image = this.grab();
     if (!image) {
       // No readable pixels (pre-decode, tainted canvas, teardown) — counted
       // separately; must not inflate `n` or the undecoded count.
@@ -490,20 +567,7 @@ export class BenchController {
     if (!src) return null;
     const { width: vw, height: vh } = src;
     if (!vw || !vh) return null;
-
-    // ANY change in the received size invalidates the cached cell geometry —
-    // an increase as much as a decrease. Checking only "crop now bigger than the
-    // video" caught the downscale and missed the upscale.
-    if (vw !== this.geomW || vh !== this.geomH) {
-      this.resetGeometry();
-      this.geomW = vw;
-      this.geomH = vh;
-    }
-
-    if (this.cropW === 0 || this.cropH === 0) {
-      this.cropW = Math.min(vw, Math.max(SEARCH_MIN_PX, Math.round(vw * SEARCH_FRACTION)));
-      this.cropH = Math.min(vh, Math.max(SEARCH_MIN_PX, Math.round(vh * SEARCH_FRACTION)));
-    }
+    this.region(vw, vh);
 
     if (this.canvas.width !== this.cropW || this.canvas.height !== this.cropH) {
       this.canvas.width = this.cropW;
@@ -519,6 +583,23 @@ export class BenchController {
       return this.ctx.getImageData(0, 0, this.cropW, this.cropH);
     } catch {
       return null; // tainted canvas / not enough data yet
+    }
+  }
+
+  /** Sizes the top-left crop for a frame of vw x vh. */
+  private region(vw: number, vh: number): void {
+    // ANY change in the received size invalidates the cached cell geometry —
+    // an increase as much as a decrease. Checking only "crop now bigger than the
+    // video" caught the downscale and missed the upscale.
+    if (vw !== this.geomW || vh !== this.geomH) {
+      this.resetGeometry();
+      this.geomW = vw;
+      this.geomH = vh;
+    }
+
+    if (this.cropW === 0 || this.cropH === 0) {
+      this.cropW = Math.min(vw, Math.max(SEARCH_MIN_PX, Math.round(vw * SEARCH_FRACTION)));
+      this.cropH = Math.min(vh, Math.max(SEARCH_MIN_PX, Math.round(vh * SEARCH_FRACTION)));
     }
   }
 

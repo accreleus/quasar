@@ -424,7 +424,11 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     if (pyroOffer && device) {
       pyroStage = new PyroWaveStage({
         device,
-        present: (texture) => p.presentTexture?.(texture) ?? false,
+        present: (texture) => {
+          if (!p.presentTexture?.(texture)) return false;
+          bench?.onTexture(device, texture);
+          return true;
+        },
         onPresented: (captureUs) => presented(captureUs),
         fallback: (reason) => transport?.codecFallback(reason),
         load: deps.loadPyroWave,

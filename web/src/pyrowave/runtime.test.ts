@@ -10,7 +10,7 @@ import { blockLayout, parsePwv1 } from "./bitstream";
 import { PyroWaveError } from "./bitstream";
 import type { Presenter } from "../webtransport/presenter";
 import { WebTransportMedia } from "../webtransport/webTransportMedia";
-import { createWebTransportRuntime } from "../pages/app/webTransportRuntime";
+import { createWebTransportRuntime, type WebTransportRuntimeDeps } from "../pages/app/webTransportRuntime";
 import { avcC, b64, COORDS, FakeAgent, FakeChunk, FakeDecoder, helloAck, packPyroWave, pyroWaveDatagrams } from "../webtransport/testSupport";
 
 afterEach(() => {
@@ -39,7 +39,7 @@ const pyroAck = (configId: number, reason = "launch") => ({
   codec_switch_reason: reason,
 });
 
-function setup(opts: { offer?: boolean; warm?: boolean } = {}) {
+function setup(opts: { offer?: boolean; warm?: boolean; deps?: Partial<WebTransportRuntimeDeps> } = {}) {
   vi.stubGlobal("EncodedVideoChunk", FakeChunk);
   const agent = new FakeAgent();
   agent.replies = [[pyroAck(0)]];
@@ -90,10 +90,11 @@ function setup(opts: { offer?: boolean; warm?: boolean } = {}) {
         },
         isConfigSupported: async (c) => ({ supported: true, config: c }),
       },
+      ...opts.deps,
     },
   });
   const fail = (e: PyroWaveError) => (decodeError = e);
-  return { agent, rt, decodes, textures, h264, fail, clock };
+  return { agent, rt, decodes, textures, h264, fail, clock, texture, presenter };
 }
 
 const datagrams = (configId: number, frameSeq: number) => pyroWaveDatagrams({ configId, frameSeq }, packPyroWave(frames[0], N));
@@ -189,6 +190,52 @@ describe("a PyroWave session in the WebTransport runtime", () => {
     rt.start();
     await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
     expect(agent.sent("hello")[0].pyrowave).toBeUndefined();
+    rt.destroy();
+  });
+
+  it("in bench mode hands the instrument each presented frame's texture after it is drawn (#1344)", async () => {
+    const read: { device: unknown; texture: unknown; drawn: number }[] = [];
+    let drawn = 0;
+    class FakeBench {
+      start() {}
+      stop() {}
+      handle() {
+        return { enabled: true };
+      }
+      onTexture(device: unknown, texture: unknown) {
+        read.push({ device, texture, drawn });
+      }
+    }
+    const { agent, rt, textures, texture, presenter } = setup({
+      deps: {
+        isBenchModeEnabled: () => true,
+        loadBench: async () => ({ BenchController: FakeBench as never }),
+        createTracer: () => ({ start() {}, stop() {}, emitBenchWindow() {} }),
+      },
+    });
+    const draw = presenter.presentTexture!;
+    presenter.presentTexture = (t) => (drawn++, draw(t));
+    rt.start();
+    await vi.waitFor(() => expect((window as unknown as Record<string, unknown>).__qBench).toEqual({ enabled: true }));
+    agent.last.datagrams(datagrams(0, 1));
+    agent.last.datagrams(datagrams(0, 2));
+    await vi.waitFor(() => expect(textures).toHaveLength(2));
+    expect(read).toEqual([
+      { device: presenter.device, texture, drawn: 1 },
+      { device: presenter.device, texture, drawn: 2 },
+    ]);
+    rt.destroy();
+    delete (window as unknown as Record<string, unknown>).__qBench;
+  });
+
+  it("without bench mode loads no instrument and reads nothing back", async () => {
+    const loadBench = vi.fn();
+    const { agent, rt, textures } = setup({ deps: { isBenchModeEnabled: () => false, loadBench } });
+    rt.start();
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    agent.last.datagrams(datagrams(0, 1));
+    await vi.waitFor(() => expect(textures).toHaveLength(1));
+    expect(loadBench).not.toHaveBeenCalled();
     rt.destroy();
   });
 });
