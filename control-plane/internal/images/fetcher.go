@@ -181,11 +181,12 @@ func (f *HTTPFetcher) Fetch(ctx context.Context, ref string) ([]byte, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		// Names the URL, the two deploy-time knobs and the SQL that is the only
-		// thing that moves the ref: no API route or console control sets it.
+		// thing that moves the ref: no API route or console control sets it. The fetched
+		// ref is the resolved commit when Sync fetches, so it is not called the column.
 		return nil, fmt.Errorf(
-			"fetch manifest %s: unexpected status %d (check that ref %q, repo %q, and path %q are correct — "+
-				"repo/path are QUASAR_IMAGE_CATALOG_REPO/_PATH at deploy time; ref is instance_settings.image_catalog_ref, "+
-				"which no admin control sets: move it with UPDATE instance_settings SET image_catalog_ref = '<ref>' WHERE id = true)",
+			"fetch manifest %s: unexpected status %d (fetched ref %q, repo %q, path %q; "+
+				"repo/path are QUASAR_IMAGE_CATALOG_REPO/_PATH at deploy time. The configured ref is instance_settings.image_catalog_ref, "+
+				"which no admin control sets: UPDATE instance_settings SET image_catalog_ref = '<ref>' WHERE id = true)",
 			url, resp.StatusCode, ref, repo, path)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxManifestBytes)) // bounded: a misconfigured ref must not stream unbounded

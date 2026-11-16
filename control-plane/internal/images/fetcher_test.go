@@ -29,7 +29,7 @@ func TestFailedFetchMessageNamesHowTheRefMoves(t *testing.T) {
 		t.Fatalf("message still calls the ref admin-editable: %v", err)
 	}
 	for _, want := range []string{
-		`ref "nightly"`,
+		`fetched ref "nightly"`,
 		"QUASAR_IMAGE_CATALOG_REPO/_PATH",
 		"UPDATE instance_settings SET image_catalog_ref = '<ref>' WHERE id = true",
 	} {

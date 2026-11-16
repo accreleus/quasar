@@ -965,6 +965,35 @@ func TestSyncResolvesRefBeforeFetch(t *testing.T) {
 	}
 }
 
+// TestSyncFailureNamesTheFetchedRefNotTheColumn — #999: Sync fetches the commit the
+// configured branch resolved to, so a non-200 quotes a sha. The stored sync_error must
+// not call that sha the instance_settings.image_catalog_ref column (setting the column
+// to it would pin the same commit and keep the 404).
+func TestSyncFailureNamesTheFetchedRefNotTheColumn(t *testing.T) {
+	pool := testDB(t)
+	gh := newFakeGitHub(t) // resolves any ref to testSHA
+	s := NewStoreWithFetcher(pool, &HTTPFetcher{Client: statusDoer(http.StatusNotFound)})
+	s.SetLogger(testLog())
+	s.SetContextResolver(gh.resolver())
+
+	env, err := s.Sync(context.Background())
+	mustT(t, err)
+	if env.SyncError == nil {
+		t.Fatal("a 404 must record sync_error")
+	}
+	msg := *env.SyncError
+	// image_sync_error is cut at maxSyncErrorLen, so a wording that grows must still end with the UPDATE hint.
+	for _, want := range []string{
+		`fetched ref "` + testSHA + `"`,
+		"The configured ref is instance_settings.image_catalog_ref",
+		"UPDATE instance_settings SET image_catalog_ref = '<ref>' WHERE id = true",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("sync_error does not say %q: %s", want, msg)
+		}
+	}
+}
+
 // TestBuildUsesFrozenInputsNotMovedCatalog — P4 CRITICAL #1 (the fleet-split
 // twin): after a template is adopted, a later catalog sync that moves
 // context_sha / dockerfile / build_args must NOT change what an already-adopted
