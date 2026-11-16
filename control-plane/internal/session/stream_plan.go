@@ -111,6 +111,8 @@ const (
 	reasonDeviceNoWebTransport = "device_no_webtransport"
 	reasonDeviceNoWebCodecs    = "device_no_webcodecs"
 	reasonCodecUnsupported     = "codec_unsupported_on_transport"
+	// reasonDeviceNoWebGPU (amendment 78) is declared once for the package, in
+	// pyrowave_plan.go: PyroWave's refusal carries the same wire string.
 )
 
 // webTransportCodecs are the codecs this build's WebTransport media path carries. A codec the
@@ -309,6 +311,11 @@ func (in StreamInputs) planTransport(codec profile.Codec, wantsPyroWave bool) (t
 		return transportWebRTC, reasonCodecUnsupported
 	case !in.Probe.WebCodecs[string(codec)] || !in.Probe.WebCodecs["opus_decode"]:
 		return transportWebRTC, reasonDeviceNoWebCodecs
+	case !in.Probe.WebGPU:
+		// Amendment 78: the client draws every WebTransport frame with WebGPU, so a
+		// device without a hardware adapter would fall back on every launch. Last, so
+		// an earlier failure keeps its reason; a missing key reads false and fails here.
+		return transportWebRTC, reasonDeviceNoWebGPU
 	}
 	return transportWebTransport, ""
 }
