@@ -25,6 +25,7 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Fixed
+- **Two rare races when a WebTransport client re-takes a session's encoder are closed.** A WebRTC viewer that had just started could lose its adaptive bitrate for the rest of the session, and a session ending in that same instant could keep the encoder (and its GPU memory) allocated.
 - **Bench mode (`?bench=1`) now measures a PyroWave session (#1344).** The marker is read off the decoded picture on the GPU, only its corner of the frame and without holding up the frame, so glass-to-glass, the marker counts and input-to-photon exist for PyroWave as for the other codecs. A browser that cannot read the picture back counts its frames as `no_image` instead of reporting none.
 - **The end-to-end suite's browser no longer stops at Chrome's "Allow access to other devices on your network" prompt.** Each scenario's fresh browser context is granted local network access, so a WebTransport stream no longer stalls into a WebRTC fallback while the prompt waits. A Chrome without that permission runs as before.
 - **`make e2e-run WEB_DIST=<dir>` no longer fails sign-in from the second scenario on.** The runner cleared the stored sign-in on an app page, where a build served from memory booted fast enough to restore it; it now clears it on `/health`, where the app never runs.
