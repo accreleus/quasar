@@ -366,6 +366,15 @@ func buildAgentMetrics(m agentws.SessionMetricsMsg) json.RawMessage {
 	if m.GccEstimateKbps != nil {
 		obj["gcc_estimate_kbps"] = *m.GccEstimateKbps
 	}
+	if m.AbrLinkRateKbps != nil {
+		obj["abr_link_rate_kbps"] = *m.AbrLinkRateKbps
+	}
+	if m.WTFecOverheadPct != nil {
+		obj["wt_fec_overhead_pct"] = *m.WTFecOverheadPct
+	}
+	if m.WTFecKbps != nil {
+		obj["wt_fec_kbps"] = *m.WTFecKbps
+	}
 	// The ladder-followed ABR floor, present only off the launch floor.
 	if m.AbrFloorKbps != nil {
 		obj["abr_floor_kbps"] = *m.AbrFloorKbps
