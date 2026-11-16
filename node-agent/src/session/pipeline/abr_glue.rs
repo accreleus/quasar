@@ -1031,7 +1031,9 @@ fn arm(
 /// teardown lands in the middle of it (#1295). The two windows are too narrow to hit by
 /// timing: `BeforeClaim` is the gap between a re-take's `orphaned()` read and its claim, and
 /// `BeforeHooks` the one between the claim and the hooks that hold the encoder. Armed for
-/// one session id only, so the other tests in this binary never reach it.
+/// one session id only, so the other tests in this binary never reach it. Armings are kept
+/// per (step, session): tests run in parallel, and a single slot let one test's `arm`
+/// overwrite another's before its `start` reached the step.
 #[cfg(test)]
 pub(crate) mod start_pause {
     use std::sync::Mutex;
@@ -1044,22 +1046,22 @@ pub(crate) mod start_pause {
 
     type Hook = Box<dyn Fn() + Send + Sync>;
 
-    static ARMED: Mutex<Option<(Step, String, Hook)>> = Mutex::new(None);
+    static ARMED: Mutex<Vec<(Step, String, Hook)>> = Mutex::new(Vec::new());
 
     /// Run `hook` once, when [`super::start`] for `session_id` reaches `step`.
     pub(crate) fn arm(session_id: &str, step: Step, hook: impl Fn() + Send + Sync + 'static) {
-        *ARMED.lock().unwrap() = Some((step, session_id.to_string(), Box::new(hook)));
+        let mut armed = ARMED.lock().unwrap();
+        armed.retain(|(at, for_session, _)| !(*at == step && for_session == session_id));
+        armed.push((step, session_id.to_string(), Box::new(hook)));
     }
 
     pub(super) fn run(session_id: &str, step: Step) {
         let hook = {
             let mut armed = ARMED.lock().unwrap();
-            match armed.as_ref() {
-                Some((at, for_session, _)) if *at == step && for_session == session_id => {
-                    armed.take().map(|(_, _, hook)| hook)
-                }
-                _ => None,
-            }
+            armed
+                .iter()
+                .position(|(at, for_session, _)| *at == step && for_session == session_id)
+                .map(|i| armed.remove(i).2)
         };
         if let Some(hook) = hook {
             hook();
