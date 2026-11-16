@@ -320,6 +320,10 @@ export function setupCapture({
   // Held keys already forwarded (evdev codes), flushed as key-ups on release —
   // otherwise a key held when capture drops sticks down on the host.
   const heldKeys = new Set<number>();
+  // Mouse buttons already forwarded, flushed as button-ups the same way (#1406).
+  // Only onMouseDown adds: a touch tap is a complete press+release in one go and
+  // the long-press right button has its own `rightHeld` release.
+  const heldButtons = new Set<number>();
 
   // Idempotency guard so repeated syncs don't re-lock/re-unlock.
   let keyboardLocked = false;
@@ -406,6 +410,14 @@ export function setupCapture({
     heldKeys.clear();
   };
 
+  /** Button-up for every mouse button the host has down, then clear (#1406).
+   *  Same reason as the keys: a button held when capture drops would stay down
+   *  on the host — in fallback mode nothing else ever lifts it. */
+  const flushHeldButtons = (sendFn: (msg: InputMsg) => void = send) => {
+    for (const button of heldButtons) sendFn({ t: "mb", button, pressed: false });
+    heldButtons.clear();
+  };
+
   /** All-zero state per forwarded pad (host must not keep a button held), then
    *  clear gpPrev so re-capture resends full state. Frozen `gp` shape only. */
   const resetGamepads = (sendFn: (msg: InputMsg) => void = send) => {
@@ -448,6 +460,7 @@ export function setupCapture({
     onCaptureChange({ captured, pointerLocked });
     if (was && !captured) {
       flushHeldKeys();
+      flushHeldButtons();
       resetGamepads();
       releaseVirtualPad();
       // a mid-gesture finger must not leave a long-press right button held
@@ -642,13 +655,19 @@ export function setupCapture({
   const onMouseDown = (e: MouseEvent) => {
     if (!captured || !aimedAtGame(e)) return;
     const button = MB_MAP[e.button];
-    if (button !== undefined) send({ t: "mb", button, pressed: true });
+    if (button !== undefined) {
+      send({ t: "mb", button, pressed: true });
+      heldButtons.add(button);
+    }
   };
 
   const onMouseUp = (e: MouseEvent) => {
     if (!captured || !aimedAtGame(e)) return;
     const button = MB_MAP[e.button];
-    if (button !== undefined) send({ t: "mb", button, pressed: false });
+    if (button !== undefined) {
+      send({ t: "mb", button, pressed: false });
+      heldButtons.delete(button);
+    }
   };
 
   const onWheel = (e: WheelEvent) => {
@@ -1050,6 +1069,7 @@ export function setupCapture({
     // captured doesn't leave the host with stuck keys or gamepad buttons.
     if (captured) {
       flushHeldKeys(sendBestEffort);
+      flushHeldButtons(sendBestEffort);
       resetGamepads(sendBestEffort);
       releaseVirtualPad(sendBestEffort);
     }
