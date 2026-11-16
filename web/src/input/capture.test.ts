@@ -1335,6 +1335,82 @@ describe("engage() without Pointer Lock — the send gate opens anyway", () => {
   });
 });
 
+describe("a hidden page, and the return (#1414)", () => {
+  const setHidden = (hidden: boolean) => {
+    Object.defineProperty(document, "hidden", { value: hidden, configurable: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+  };
+  afterEach(() => delete (document as unknown as { hidden?: boolean }).hidden);
+
+  it("a fallback capture is taken back when the page comes back, with no tap", async () => {
+    setPointerLockApi(null);
+    const send = vi.fn();
+    const { cleanup, engage, getMetrics } = setupCapture({
+      videoEl: makeVideo(),
+      sendInput: send,
+      onCaptureChange: vi.fn(),
+      channel: makeChannel(),
+    });
+    await engage();
+
+    setHidden(true);
+    expect(getMetrics().captured).toBe(false);
+    setHidden(false);
+    expect(getMetrics().captured).toBe(true);
+    dispatchKeyDown("KeyW");
+    expect(send).toHaveBeenCalledWith({ t: "k", code: EVDEV.KeyW, pressed: true });
+
+    cleanup();
+  });
+
+  it("a Pointer Lock session stays released: coming back is not a user gesture", async () => {
+    const video = document.createElement("video");
+    const requestPointerLock = vi.fn(() => undefined);
+    const exitPointerLock = vi.fn();
+    setPointerLockApi(requestPointerLock);
+    Object.defineProperty(document, "exitPointerLock", { value: exitPointerLock, configurable: true });
+    const { cleanup, engage, getMetrics } = setupCapture({
+      videoEl: video,
+      sendInput: vi.fn(),
+      onCaptureChange: vi.fn(),
+      channel: makeChannel(),
+    });
+    expect((await engage()).mode).toBe("pointer-lock");
+    lockPointer(video);
+    expect(getMetrics().captured).toBe(true);
+
+    setHidden(true);
+    // The lock release leaves `captured` set until pointerlockchange, which a
+    // hidden page may never get — endCapture ends it on the spot.
+    expect(exitPointerLock).toHaveBeenCalledTimes(1);
+    expect(getMetrics().captured).toBe(false);
+    setHidden(false);
+    expect(getMetrics().captured).toBe(false);
+    // The browser would refuse a new lock without a gesture, so none is made.
+    expect(requestPointerLock).toHaveBeenCalledTimes(1);
+
+    cleanup();
+    delete (document as unknown as { exitPointerLock?: unknown }).exitPointerLock;
+  });
+
+  it("a capture the user released before hiding is not taken back", async () => {
+    setPointerLockApi(null);
+    const { cleanup, engage, release, getMetrics } = setupCapture({
+      videoEl: makeVideo(),
+      sendInput: vi.fn(),
+      onCaptureChange: vi.fn(),
+      channel: makeChannel(),
+    });
+    await engage();
+    release();
+    setHidden(true);
+    setHidden(false);
+    expect(getMetrics().captured).toBe(false);
+
+    cleanup();
+  });
+});
+
 describe("gamepad — Nintendo layout (control-api.md §Region and Input settings)", () => {
   const NIN = { match: false, sensitivity: 1, raw: false, flip: false, nintendo: true };
   const OFF = { ...NIN, nintendo: false };
