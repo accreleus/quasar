@@ -332,6 +332,9 @@ describe("HostDetail — remove host (#366)", () => {
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByText("gpu-host-4 is not connected")).toBeTruthy();
     expect(within(dialog).getByText(/last seen 3 days ago/)).toBeTruthy();
+    // The cost is stated, and re-adding is not promised under the same name without a forget (#634).
+    expect(within(dialog).getByText(/each home claim then needs\s+releasing by hand in Storage/)).toBeTruthy();
+    expect(dialog.textContent).not.toContain("you can leave it");
     expect(within(dialog).queryByRole("button", { name: /Remove host/ })).toBeNull();
     fireEvent.click(within(dialog).getByRole("button", { name: /Forget host/ }));
     await waitFor(() => expect(mocked.deleteHost).toHaveBeenCalledWith("tok", ID));
