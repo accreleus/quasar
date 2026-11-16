@@ -79,10 +79,10 @@ func TestARecoveryReleaseLiftsNothingUntilTheAgentReportsIt(t *testing.T) {
 	boot, offer := uncertainRecoveryHold(t, pool, store, hostID)
 	advertiseRecoveryRelease(t, pool, hostID, true)
 
-	if first, err := store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID); err != nil || !first {
+	if first, _, err := store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID, releaseActor); err != nil || !first {
 		t.Fatalf("request: first=%v err=%v", first, err)
 	}
-	if first, err := store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID); err != nil || first {
+	if first, _, err := store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID, releaseActor); err != nil || first {
 		t.Fatalf("repeat: first=%v err=%v, want an idempotent repeat", first, err)
 	}
 	if got := holdKinds(t, pool, hostID); got != "recovery" {
@@ -139,7 +139,7 @@ func TestARecoveryReleaseLiftsNothingUntilTheAgentReportsIt(t *testing.T) {
 	if ids, _ := store.PendingRecoveryReleases(ctx, hostID, offerConnection); len(ids) != 0 {
 		t.Fatalf("still pending after released: %v", ids)
 	}
-	if first, err := store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID); err != nil || first {
+	if first, _, err := store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID, releaseActor); err != nil || first {
 		t.Fatalf("request after released: first=%v err=%v", first, err)
 	}
 	if preview, err := store.PreviewIdleApply(ctx, hostID, "hardware"); err != nil || preview == nil {
@@ -174,6 +174,20 @@ func unprovenAppliedHold(t *testing.T, pool *pgxpool.Pool, store *Store) (string
 
 const appliedHolderConnection = "00000000-0000-4000-8000-000000000339"
 
+// releaseActor is the administrator every store-level release test acts as.
+const releaseActor = "00000000-0000-4000-8000-0000000003aa"
+
+// auditRowCount is the host.recovery.release rows this host's releases wrote.
+func auditRowCount(t *testing.T, pool *pgxpool.Pool, hostID string) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM admin_activity
+		WHERE action='host.recovery.release' AND target_id=$1`, hostID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
 // An applied replay without its proof (amendment 86): the hold becomes a recovery
 // hold, the release route ends it on the control plane alone, a repeat writes
 // nothing, and a later inventory carrying the proof behaves as before.
@@ -195,7 +209,7 @@ func TestAnAppliedReplayWithoutItsProofTakesTheReleaseRoute(t *testing.T) {
 	}
 	groupBefore := hardwareGroupStatus(t, pool, hostID)
 
-	first, err := store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID)
+	first, _, err := store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID, releaseActor)
 	if err != nil || !first {
 		t.Fatalf("release: first=%v err=%v", first, err)
 	}
@@ -220,7 +234,7 @@ func TestAnAppliedReplayWithoutItsProofTakesTheReleaseRoute(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT release_requested_at FROM host_config_attempts WHERE id=$1::uuid`, offer.AttemptID).Scan(&recordedAt); err != nil {
 		t.Fatal(err)
 	}
-	first, err = store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID)
+	first, _, err = store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID, releaseActor)
 	if err != nil || first {
 		t.Fatalf("repeat: first=%v err=%v, want an idempotent repeat", first, err)
 	}
@@ -270,7 +284,7 @@ func TestAnAppliedAttemptWithNoRecoveryHoldTakesNoRelease(t *testing.T) {
 	if got := holdKinds(t, pool, hostID); got != "" {
 		t.Fatalf("a live applied report left %q", got)
 	}
-	if _, err := store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID); !errors.Is(err, ErrAttemptNotUncertain) {
+	if _, _, err := store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID, releaseActor); !errors.Is(err, ErrAttemptNotUncertain) {
 		t.Fatalf("proven applied attempt: %v, want ErrAttemptNotUncertain", err)
 	}
 	var marked bool
@@ -299,7 +313,7 @@ func TestAReleasedReportRecomputesTheHostLikeAdmissionRelease(t *testing.T) {
 			hostID := seedHost(t, pool)
 			ctx := context.Background()
 			boot, offer := uncertainRecoveryHold(t, pool, store, hostID)
-			if _, err := store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID); err != nil {
+			if _, _, err := store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID, releaseActor); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := pool.Exec(ctx, tc.setup, hostID); err != nil {
@@ -326,7 +340,7 @@ func TestAReconnectKeepsThePendingReleaseAndTakesTheReleasedEntry(t *testing.T) 
 	hostID := seedHost(t, pool)
 	ctx := context.Background()
 	boot, offer := uncertainRecoveryHold(t, pool, store, hostID)
-	if _, err := store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID); err != nil {
+	if _, _, err := store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID, releaseActor); err != nil {
 		t.Fatal(err)
 	}
 	entry := func(phase, seq string) JournalInventoryEntry {
@@ -395,13 +409,13 @@ func TestOnlyAnUncertainAttemptTakesARelease(t *testing.T) {
 	if _, err := store.ObserveIdleState(ctx, hostID, offerConnection, liveReport(boot, offer, "accepted", "1")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID); !errors.Is(err, ErrAttemptNotUncertain) {
+	if _, _, err := store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID, releaseActor); !errors.Is(err, ErrAttemptNotUncertain) {
 		t.Fatalf("accepted attempt: %v, want ErrAttemptNotUncertain", err)
 	}
-	if _, err := store.RequestRecoveryRelease(ctx, hostID, "00000000-0000-4000-8000-0000000003ff"); !errors.Is(err, ErrIdleAttemptNotFound) {
+	if _, _, err := store.RequestRecoveryRelease(ctx, hostID, "00000000-0000-4000-8000-0000000003ff", releaseActor); !errors.Is(err, ErrIdleAttemptNotFound) {
 		t.Fatalf("unknown attempt: %v", err)
 	}
-	if _, err := store.RequestRecoveryRelease(ctx, "00000000-0000-4000-8000-0000000003fe", offer.AttemptID); !errors.Is(err, ErrIdleAttemptNotFound) {
+	if _, _, err := store.RequestRecoveryRelease(ctx, "00000000-0000-4000-8000-0000000003fe", offer.AttemptID, releaseActor); !errors.Is(err, ErrIdleAttemptNotFound) {
 		t.Fatalf("another host: %v", err)
 	}
 	// An uncertain attempt nobody asked to release has nothing to send.
@@ -455,7 +469,7 @@ func TestAPendingReleaseSaysWhatItWaitsFor(t *testing.T) {
 	hostID := seedHost(t, pool)
 	ctx := context.Background()
 	_, offer := uncertainRecoveryHold(t, pool, store, hostID)
-	if _, err := store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID); err != nil {
+	if _, _, err := store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID, releaseActor); err != nil {
 		t.Fatal(err)
 	}
 	waiting := func() string {
@@ -627,8 +641,12 @@ func TestReleaseRecoveryHoldEndpointEndsAnAppliedAttemptsHold(t *testing.T) {
 	if len(dispatcher.sent) != 0 {
 		t.Fatalf("an applied release went to the agent: %v", dispatcher.sent)
 	}
-	if len(auditor.rows) != 1 || auditor.rows[0] != (recordedActivity{"host.recovery.release", "host", hostID}) {
-		t.Fatalf("audit %v", auditor.rows)
+	// The audit row is written in the release transaction, not by the handler.
+	if len(auditor.rows) != 0 {
+		t.Fatalf("the handler audited outside the transaction: %v", auditor.rows)
+	}
+	if got := auditRowCount(t, pool, hostID); got != 1 {
+		t.Fatalf("audit rows after the release: %d, want 1", got)
 	}
 	if got := holdKinds(t, pool, hostID); got != "" {
 		t.Fatalf("holds %q after the release, want none", got)
@@ -636,7 +654,92 @@ func TestReleaseRecoveryHoldEndpointEndsAnAppliedAttemptsHold(t *testing.T) {
 	if w := post(); w.Code != http.StatusOK {
 		t.Fatalf("repeat: %d %s, want 200", w.Code, w.Body.String())
 	}
-	if len(auditor.rows) != 1 || len(dispatcher.sent) != 0 {
-		t.Fatalf("a repeat wrote: audit=%v sent=%v", auditor.rows, dispatcher.sent)
+	if len(auditor.rows) != 0 || len(dispatcher.sent) != 0 || auditRowCount(t, pool, hostID) != 1 {
+		t.Fatalf("a repeat wrote: audit=%v sent=%v rows=%d", auditor.rows, dispatcher.sent, auditRowCount(t, pool, hostID))
+	}
+}
+
+// Every other writer in this package takes the host row before what it owns
+// (idle_tokens.go, idle_inventory.go). A release that locked its attempt row first
+// deadlocked against a reconnect's inventory replay (40P01, seat A r1).
+func TestAReleaseDoesNotDeadlockAReconnectReplay(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	ctx := context.Background()
+	hostID, _, offer := unprovenAppliedHold(t, pool, store)
+
+	// The replay's own order: the host row, then the attempt row it replays.
+	replay, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replay.Rollback(ctx) //nolint:errcheck
+	if _, err := replay.Exec(ctx, `SELECT id FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	released := make(chan error, 1)
+	go func() {
+		_, _, err := store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID, releaseActor)
+		released <- err
+	}()
+	time.Sleep(300 * time.Millisecond) // the release is now waiting on one of the two rows
+	if _, err := replay.Exec(ctx, `SELECT id FROM host_config_attempts WHERE id=$1::uuid FOR UPDATE`, offer.AttemptID); err != nil {
+		t.Fatalf("the inventory replay was aborted: %v", err)
+	}
+	if err := replay.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-released:
+		if err != nil {
+			t.Fatalf("the release was aborted: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the release did not finish")
+	}
+	if got := holdKinds(t, pool, hostID); got != "" {
+		t.Fatalf("holds %q after the release, want none", got)
+	}
+}
+
+// The audit row and the lift commit together (amendment 86): a failed audit write
+// leaves the hold, the request and the host exactly where they were.
+func TestAnAppliedReleaseAuditsInTheReleaseTransaction(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	ctx := context.Background()
+	hostID, _, offer := unprovenAppliedHold(t, pool, store)
+	if got := auditRowCount(t, pool, hostID); got != 0 {
+		t.Fatalf("audit rows before the release: %d", got)
+	}
+	// An actor the audit insert cannot store fails the whole transaction.
+	if _, _, err := store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID, "not-a-uuid"); err == nil {
+		t.Fatal("a failed audit write was ignored")
+	}
+	if got := holdKinds(t, pool, hostID); got != "recovery" {
+		t.Fatalf("holds %q after a failed audit, want recovery", got)
+	}
+	if got := hostStatus(t, pool, hostID); got != "draining" {
+		t.Fatalf("host %s after a failed audit, want draining", got)
+	}
+	var marked bool
+	if err := pool.QueryRow(ctx, `SELECT release_requested_at IS NOT NULL FROM host_config_attempts WHERE id=$1::uuid`, offer.AttemptID).Scan(&marked); err != nil || marked {
+		t.Fatalf("a failed audit recorded the request: marked=%v err=%v", marked, err)
+	}
+	if got := auditRowCount(t, pool, hostID); got != 0 {
+		t.Fatalf("audit rows after a failed audit: %d", got)
+	}
+
+	if _, _, err := store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID, releaseActor); err != nil {
+		t.Fatal(err)
+	}
+	if got := auditRowCount(t, pool, hostID); got != 1 {
+		t.Fatalf("audit rows after the release: %d, want 1", got)
+	}
+	if _, _, err := store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID, releaseActor); err != nil {
+		t.Fatal(err)
+	}
+	if got := auditRowCount(t, pool, hostID); got != 1 {
+		t.Fatalf("a repeat audited again: %d", got)
 	}
 }

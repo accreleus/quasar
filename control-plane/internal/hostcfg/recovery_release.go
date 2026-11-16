@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/accreleus/quasar/control-plane/internal/audit"
 )
 
 var ErrAttemptNotUncertain = errors.New("attempt is not uncertain")
@@ -43,52 +45,59 @@ const projectHostStatusSQL = `UPDATE hosts SET status=CASE
 // uncertain restart attempt. It lifts nothing: the hold, the group and the host
 // status move only when the agent reports the attempt `released`. first is true
 // only for the request that set the marker. A released attempt answers as done.
-// An applied attempt's recovery hold (amendment 86) is ended here instead.
-func (s *Store) RequestRecoveryRelease(ctx context.Context, hostID, attemptID string) (first bool, err error) {
+// An applied attempt's recovery hold (amendment 86) is ended here instead, and
+// its audit event is written in the same transaction, which auditedInTx reports.
+func (s *Store) RequestRecoveryRelease(ctx context.Context, hostID, attemptID, actor string) (first, auditedInTx bool, err error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	// Lock order: the host row first, as every other writer in this package takes
+	// it (idle_tokens.go, idle_inventory.go). A release that locked its attempt row
+	// first deadlocked a reconnect's inventory replay (40P01).
+	if _, err := tx.Exec(ctx, `SELECT id FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID); err != nil {
+		return false, false, err
+	}
 	var phase string
 	err = tx.QueryRow(ctx, `SELECT phase FROM host_config_attempts
 		WHERE host_id=$1::uuid AND id=$2::uuid AND scope='restart' FOR UPDATE`, hostID, attemptID).Scan(&phase)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, ErrIdleAttemptNotFound
+		return false, false, ErrIdleAttemptNotFound
 	}
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	switch phase {
 	case "released":
-		return false, nil
+		return false, false, nil
 	case "uncertain":
 	case "applied":
-		first, err := releaseAppliedRecoveryHold(ctx, tx, hostID, attemptID)
+		first, err := releaseAppliedRecoveryHold(ctx, tx, hostID, attemptID, actor)
 		if err != nil {
-			return false, err
+			return false, false, err
 		}
-		return first, tx.Commit(ctx)
+		return first, true, tx.Commit(ctx)
 	default:
-		return false, ErrAttemptNotUncertain
+		return false, false, ErrAttemptNotUncertain
 	}
 	set, err := tx.Exec(ctx, `UPDATE host_config_attempts SET release_requested_at=now()
 		WHERE host_id=$1::uuid AND id=$2::uuid AND release_requested_at IS NULL`, hostID, attemptID)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
-	return set.RowsAffected() == 1, tx.Commit(ctx)
+	return set.RowsAffected() == 1, false, tx.Commit(ctx)
 }
 
 // releaseAppliedRecoveryHold ends an applied attempt's recovery hold on the
 // control plane alone (control-api.md, amendment 86): the agent's journal holds a
 // final `applied` record that holds nothing, so nothing is sent to it. It accepts
 // a recovery restriction or an already recorded release, and writes nothing on a
-// repeat.
-func releaseAppliedRecoveryHold(ctx context.Context, tx pgx.Tx, hostID, attemptID string) (bool, error) {
+// repeat. The caller holds the host and attempt rows.
+func releaseAppliedRecoveryHold(ctx context.Context, tx pgx.Tx, hostID, attemptID, actor string) (bool, error) {
 	var requestedAt *time.Time
 	if err := tx.QueryRow(ctx, `SELECT release_requested_at FROM host_config_attempts
-		WHERE host_id=$1::uuid AND id=$2::uuid FOR UPDATE`, hostID, attemptID).Scan(&requestedAt); err != nil {
+		WHERE host_id=$1::uuid AND id=$2::uuid`, hostID, attemptID).Scan(&requestedAt); err != nil {
 		return false, err
 	}
 	var held bool
@@ -108,6 +117,15 @@ func releaseAppliedRecoveryHold(ctx context.Context, tx pgx.Tx, hostID, attemptI
 	}
 	if !held {
 		return first, nil
+	}
+
+	// The audit row lands in this transaction, for the first request only: the lift
+	// and its record commit together or not at all.
+	if first {
+		if err := audit.RecordTx(ctx, tx, actor, "host.recovery.release", "host", hostID,
+			map[string]any{"attempt_id": attemptID, "acknowledge": "unverified"}); err != nil {
+			return false, err
+		}
 	}
 	// Steps 3 and 4 of the section: the resolved hold recomputes the host and
 	// opens new approvals under fresh review IDs. The attempt stays applied.
