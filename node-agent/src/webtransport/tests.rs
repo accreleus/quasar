@@ -3456,6 +3456,28 @@ async fn a_webtransport_client_takes_over_the_webrtc_peer() {
     assert!(frames(&session, 1, true).await[0].keyframe);
 }
 
+/// #1197: a rebuild hands the session over to its new encoder (`Media::hand_over`). The old
+/// client's control stream must end as a LOST CONNECTION — no `bye`, close code `0` — because
+/// that is what makes it mint a fresh token and reconnect onto the new encoder (§Reconnect).
+/// Any other exit here ends the view for good: `bye session_ended` + `4404` is a session that
+/// is over, which is exactly what a rebuild is not.
+#[tokio::test]
+async fn a_handover_ends_the_client_stream_with_no_bye_and_close_zero() {
+    let agent = agent().await;
+    let (session, _send, mut recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+    agent.tap.as_ref().unwrap().media().hand_over();
+    assert!(
+        matches!(read_message(&mut recv).await, Err(Violation::Gone)),
+        "a message here (a `bye`) tells the client the session is over, not to reconnect"
+    );
+    assert_eq!(
+        close_code(&session).await,
+        Some(CLOSE_NORMAL),
+        "a normal close is a lost connection; 4404 would end the view"
+    );
+}
+
 /// #1193: the host missed the WebTransport close on a fallback. The WebRTC attach displaces the
 /// client then, so its control-stream silence 10 s later lifts nothing the WebRTC peer holds.
 #[tokio::test]

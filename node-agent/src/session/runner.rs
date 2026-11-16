@@ -2559,7 +2559,9 @@ fn rebuild_config(
 }
 
 /// The rebuilds amendment 59 (c) refuses before anything is touched: what the compositor
-/// emits is fixed by the encoder family it was built for.
+/// emits is fixed by the encoder family it was built for. A WebTransport tap is no longer a
+/// refusal: it is expected to survive the rebuild, its client reconnecting onto the new
+/// encoder (`webtransport::Tap`, `Media::hand_over`).
 fn rebuild_refused(
     current: super::EncoderChoice,
     next: super::EncoderChoice,

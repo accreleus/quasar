@@ -1714,7 +1714,8 @@ async fn stream(
                 }
                 None => break match client.gone.get() {
                     // A rebuild replaced the encoder: a lost connection, not an end, so the
-                    // client reconnects onto the new one with the token it keeps (#1197).
+                    // client mints a fresh token and reconnects onto the new encoder
+                    // (§Reconnect, #1197). No `bye` and code 0 is what says "lost link".
                     Some(Gone::Rebuilt) => QUIET,
                     Some(Gone::TakenOver) => (Some(json!({"type": "bye", "reason": "taken_over"})), CLOSE_TAKEN_OVER, ""),
                     Some(Gone::Unusable) => (
