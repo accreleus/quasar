@@ -1364,6 +1364,151 @@ describe("engage() without Pointer Lock — the send gate opens anyway", () => {
   });
 });
 
+describe("a hidden page, and the return (#1414)", () => {
+  const setHidden = (hidden: boolean) => {
+    Object.defineProperty(document, "hidden", { value: hidden, configurable: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+  };
+  afterEach(() => delete (document as unknown as { hidden?: boolean }).hidden);
+
+  it("a fallback capture is taken back when the page comes back, with no tap", async () => {
+    setPointerLockApi(null);
+    const send = vi.fn();
+    const { cleanup, engage, getMetrics } = setupCapture({
+      videoEl: makeVideo(),
+      sendInput: send,
+      onCaptureChange: vi.fn(),
+      channel: makeChannel(),
+    });
+    await engage();
+
+    setHidden(true);
+    expect(getMetrics().captured).toBe(false);
+    setHidden(false);
+    expect(getMetrics().captured).toBe(true);
+    dispatchKeyDown("KeyW");
+    expect(send).toHaveBeenCalledWith({ t: "k", code: EVDEV.KeyW, pressed: true });
+
+    cleanup();
+  });
+
+  // M1 (seat A r1): the return must not undo a release the page did not cause.
+  it("a release the app makes while the page is hidden is respected on return (#1414)", async () => {
+    setPointerLockApi(null);
+    const send = vi.fn();
+    const { cleanup, engage, release, getMetrics } = setupCapture({
+      videoEl: makeVideo(),
+      sendInput: send,
+      onCaptureChange: vi.fn(),
+      channel: makeChannel(),
+    });
+    await engage();
+
+    setHidden(true);
+    // SessionPage's sessionOver effect releases exactly like this, and it can
+    // flip while the page is hidden (a phone whose session ended elsewhere).
+    release();
+    setHidden(false);
+    expect(getMetrics().captured).toBe(false);
+    // Nothing is forwarded into the ended session either.
+    dispatchKeyDown("KeyW");
+    expect(send).not.toHaveBeenCalled();
+
+    cleanup();
+  });
+
+  // S1: pagehide follows visibilitychange(hidden) on the way to the back/forward
+  // cache. The second report must not drop the flag the first one set (#1465).
+  it("takes input back after hidden -> pagehide -> visible (#1465)", async () => {
+    setPointerLockApi(null);
+    const send = vi.fn();
+    const { cleanup, engage, getMetrics } = setupCapture({
+      videoEl: makeVideo(),
+      sendInput: send,
+      onCaptureChange: vi.fn(),
+      channel: makeChannel(),
+    });
+    await engage();
+
+    setHidden(true);
+    window.dispatchEvent(new Event("pagehide"));
+    setHidden(false);
+    expect(getMetrics().captured).toBe(true);
+    dispatchKeyDown("KeyW");
+    expect(send).toHaveBeenCalledWith({ t: "k", code: EVDEV.KeyW, pressed: true });
+
+    cleanup();
+  });
+
+  // #1465: a hide report after everything was released says nothing about the
+  // capture that is gone, so it can neither arm nor disarm the return.
+  it("a later hide report does not re-arm a release the app made (#1465)", async () => {
+    setPointerLockApi(null);
+    const { cleanup, engage, release, getMetrics } = setupCapture({
+      videoEl: makeVideo(),
+      sendInput: vi.fn(),
+      onCaptureChange: vi.fn(),
+      channel: makeChannel(),
+    });
+    await engage();
+
+    setHidden(true);
+    release();
+    window.dispatchEvent(new Event("pagehide"));
+    setHidden(false);
+    expect(getMetrics().captured).toBe(false);
+
+    cleanup();
+  });
+
+  it("a Pointer Lock session stays released: coming back is not a user gesture", async () => {
+    const video = document.createElement("video");
+    const requestPointerLock = vi.fn(() => undefined);
+    const exitPointerLock = vi.fn();
+    setPointerLockApi(requestPointerLock);
+    Object.defineProperty(document, "exitPointerLock", { value: exitPointerLock, configurable: true });
+    const { cleanup, engage, getMetrics } = setupCapture({
+      videoEl: video,
+      sendInput: vi.fn(),
+      onCaptureChange: vi.fn(),
+      channel: makeChannel(),
+    });
+    expect((await engage()).mode).toBe("pointer-lock");
+    lockPointer(video);
+    expect(getMetrics().captured).toBe(true);
+
+    setHidden(true);
+    // The lock release leaves `captured` set until pointerlockchange, which a
+    // hidden page may never get — endCapture ends it on the spot.
+    expect(exitPointerLock).toHaveBeenCalledTimes(1);
+    expect(getMetrics().captured).toBe(false);
+    setHidden(false);
+    expect(getMetrics().captured).toBe(false);
+    // The browser would refuse a new lock without a gesture, so none is made.
+    expect(requestPointerLock).toHaveBeenCalledTimes(1);
+
+    cleanup();
+    delete (document as unknown as { exitPointerLock?: unknown }).exitPointerLock;
+  });
+
+  it("a capture the user released before hiding is not taken back", async () => {
+    setPointerLockApi(null);
+    const { cleanup, engage, release, getMetrics } = setupCapture({
+      videoEl: makeVideo(),
+      sendInput: vi.fn(),
+      onCaptureChange: vi.fn(),
+      channel: makeChannel(),
+    });
+    await engage();
+    release();
+    setHidden(true);
+    setHidden(false);
+    expect(getMetrics().captured).toBe(false);
+
+    cleanup();
+  });
+});
+
 describe("gamepad — Nintendo layout (control-api.md §Region and Input settings)", () => {
   const NIN = { match: false, sensitivity: 1, raw: false, flip: false, nintendo: true };
   const OFF = { ...NIN, nintendo: false };
