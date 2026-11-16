@@ -218,6 +218,9 @@ test("a catalog name with CSS in it is never made into a selector", async () => 
   const { scenario } = await run(w, PLAN({ app: nasty }));
   assert.equal(scenario().status, "pass");
   assert.ok(w.gotos.every((u) => !u.includes("aria-label")));
+  // The stored sign-in is cleared where the app does not run, then the login page is opened.
+  const login = w.gotos.indexOf(`${BASE}/login`);
+  assert.equal(w.gotos[login - 1], `${BASE}/health`);
   assert.ok(w.clicks.every((c) => !c.includes("aria-label") && !c.includes("Steam")));
 });
 

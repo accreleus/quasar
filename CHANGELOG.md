@@ -26,6 +26,7 @@ own; the two do not move together, and that is deliberate.
 
 ### Fixed
 - **The end-to-end suite's browser no longer stops at Chrome's "Allow access to other devices on your network" prompt.** Each scenario's fresh browser context is granted local network access, so a WebTransport stream no longer stalls into a WebRTC fallback while the prompt waits. A Chrome without that permission runs as before.
+- **`make e2e-run WEB_DIST=<dir>` no longer fails sign-in from the second scenario on.** The runner cleared the stored sign-in on an app page, where a build served from memory booted fast enough to restore it; it now clears it on `/health`, where the app never runs.
 
 ## 0.6.0 — 2026-11-15
 
