@@ -1501,6 +1501,9 @@ fn write_launch_point(
     lever: Option<&EncodeResolutionLever>,
     metrics: &SessionMetrics,
 ) -> String {
+    // Amendment 79: the link rate belongs to the per-report loop that published it, so a
+    // transport that replaces it must not leave that rate for health to judge.
+    metrics.set_abr_link_rate(0.0);
     if cfg.abr_mode == AbrMode::Off || !encoder_abr_writable(encoder, cfg.encoder) {
         return "nothing (nothing ever moved it)".into();
     }
@@ -2654,8 +2657,18 @@ mod tests {
         metrics.set_on_drain(Box::new(move || {
             let _ = &held;
         }));
+        metrics.set_abr_link_rate(400.0);
 
         reset_to_launch(&encoder, &cfg, Some(&lever), &metrics);
+
+        // Amendment 79: another transport took the encoder; the old loop's rate is gone.
+        assert!(
+            metrics
+                .drain_window(std::time::Instant::now())
+                .abr_link_rate_kbps
+                .is_none(),
+            "a taken-over session carries no link rate"
+        );
 
         assert_eq!(encoder.property::<u32>("bitrate"), launch_bps);
         assert_eq!(

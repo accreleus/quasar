@@ -366,11 +366,6 @@ func buildAgentMetrics(m agentws.SessionMetricsMsg) json.RawMessage {
 	if m.AbrSetpointKbps != nil {
 		obj["abr_setpoint_kbps"] = *m.AbrSetpointKbps
 	}
-	// Amendment 79: the governor's unclamped link rate, verbatim — the value stream
-	// health judges against the floor when it is present. Absent means not measured.
-	if m.AbrLinkRateKbps != nil {
-		obj["abr_link_rate_kbps"] = *m.AbrLinkRateKbps
-	}
 	if m.GccEstimateKbps != nil {
 		obj["gcc_estimate_kbps"] = *m.GccEstimateKbps
 	}
@@ -386,14 +381,6 @@ func buildAgentMetrics(m agentws.SessionMetricsMsg) json.RawMessage {
 	// The ladder-followed ABR floor, present only off the launch floor.
 	if m.AbrFloorKbps != nil {
 		obj["abr_floor_kbps"] = *m.AbrFloorKbps
-	}
-	// Amendment 85: the WebTransport FEC repair sent in the window, verbatim. Present
-	// only while FEC is negotiated, so absence means "no FEC", never zero.
-	if m.WtFecOverheadPct != nil {
-		obj["wt_fec_overhead_pct"] = *m.WtFecOverheadPct
-	}
-	if m.WtFecKbps != nil {
-		obj["wt_fec_kbps"] = *m.WtFecKbps
 	}
 	// The agent's reported ABR mode and adaptation-classifier label, stored
 	// verbatim so the diagnostic bundle needs no heuristic derivation. An older
