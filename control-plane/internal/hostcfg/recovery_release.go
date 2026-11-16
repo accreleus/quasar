@@ -43,6 +43,7 @@ const projectHostStatusSQL = `UPDATE hosts SET status=CASE
 // uncertain restart attempt. It lifts nothing: the hold, the group and the host
 // status move only when the agent reports the attempt `released`. first is true
 // only for the request that set the marker. A released attempt answers as done.
+// An applied attempt's recovery hold (amendment 86) is ended here instead.
 func (s *Store) RequestRecoveryRelease(ctx context.Context, hostID, attemptID string) (first bool, err error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -62,6 +63,12 @@ func (s *Store) RequestRecoveryRelease(ctx context.Context, hostID, attemptID st
 	case "released":
 		return false, nil
 	case "uncertain":
+	case "applied":
+		first, err := releaseAppliedRecoveryHold(ctx, tx, hostID, attemptID)
+		if err != nil {
+			return false, err
+		}
+		return first, tx.Commit(ctx)
 	default:
 		return false, ErrAttemptNotUncertain
 	}
@@ -71,6 +78,50 @@ func (s *Store) RequestRecoveryRelease(ctx context.Context, hostID, attemptID st
 		return false, err
 	}
 	return set.RowsAffected() == 1, tx.Commit(ctx)
+}
+
+// releaseAppliedRecoveryHold ends an applied attempt's recovery hold on the
+// control plane alone (control-api.md, amendment 86): the agent's journal holds a
+// final `applied` record that holds nothing, so nothing is sent to it. It accepts
+// a recovery restriction or an already recorded release, and writes nothing on a
+// repeat.
+func releaseAppliedRecoveryHold(ctx context.Context, tx pgx.Tx, hostID, attemptID string) (bool, error) {
+	var requestedAt *time.Time
+	if err := tx.QueryRow(ctx, `SELECT release_requested_at FROM host_config_attempts
+		WHERE host_id=$1::uuid AND id=$2::uuid FOR UPDATE`, hostID, attemptID).Scan(&requestedAt); err != nil {
+		return false, err
+	}
+	var held bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM host_admission_restrictions
+		WHERE host_id=$1::uuid AND owner_kind='recovery' AND owner_id=$2::uuid)`, hostID, attemptID).Scan(&held); err != nil {
+		return false, err
+	}
+	if requestedAt == nil && !held {
+		return false, ErrAttemptNotUncertain
+	}
+	first := requestedAt == nil
+	if first {
+		if _, err := tx.Exec(ctx, `UPDATE host_config_attempts SET release_requested_at=now()
+			WHERE host_id=$1::uuid AND id=$2::uuid`, hostID, attemptID); err != nil {
+			return false, err
+		}
+	}
+	if !held {
+		return first, nil
+	}
+	// Steps 3 and 4 of the section: the resolved hold recomputes the host and
+	// opens new approvals under fresh review IDs. The attempt stays applied.
+	if _, err := tx.Exec(ctx, `DELETE FROM host_admission_restrictions
+		WHERE host_id=$1::uuid AND owner_kind='recovery' AND owner_id=$2::uuid`, hostID, attemptID); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx, projectHostStatusSQL, hostID); err != nil {
+		return false, err
+	}
+	if err := rotateHostReviewTokens(ctx, tx, hostID); err != nil {
+		return false, err
+	}
+	return first, nil
 }
 
 // PendingRecoveryReleases lists the requested releases still uncertain, and only
@@ -87,7 +138,10 @@ func (s *Store) PendingRecoveryReleases(ctx context.Context, hostID, connectionI
 }
 
 func (s *Store) recoveryRelease(ctx context.Context, hostID, phase string, requestedAt *time.Time) (*RecoveryRelease, error) {
-	if phase == "released" {
+	// An applied attempt's hold is ended by the control plane alone (amendment
+	// 86), so a recorded request is already a release: nothing is ever sent to
+	// the agent for it.
+	if phase == "released" || (phase == "applied" && requestedAt != nil) {
 		return &RecoveryRelease{State: "released", RequestedAt: requestedAt}, nil
 	}
 	if phase != "uncertain" || requestedAt == nil {

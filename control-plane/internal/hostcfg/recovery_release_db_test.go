@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -143,6 +144,138 @@ func TestARecoveryReleaseLiftsNothingUntilTheAgentReportsIt(t *testing.T) {
 	}
 	if preview, err := store.PreviewIdleApply(ctx, hostID, "hardware"); err != nil || preview == nil {
 		t.Fatalf("a released host offers no fresh review: %+v %v", preview, err)
+	}
+}
+
+// unprovenAppliedHold seeds a host with one offered hardware attempt, then
+// replays that attempt applied on a fresh connection without the matching
+// verified active snapshot: the attempt keeps its hold, as a recovery one
+// (amendment 86).
+func unprovenAppliedHold(t *testing.T, pool *pgxpool.Pool, store *Store) (string, string, *PolicyOffer) {
+	t.Helper()
+	ctx := context.Background()
+	hostID, boot, offer := offeredHardwareAttempt(t, pool, store)
+	now := time.Now().UTC()
+	entry := restartInventoryEntry(hostID, boot, offer, "applied", "4")
+	entry.VerifiedAt = &now
+	if err := store.BeginJournalReconciliation(ctx, hostID, appliedHolderConnection); err != nil {
+		t.Fatal(err)
+	}
+	active := map[string]PolicySnapshot{"hardware": {Kind: "verified", Digest: strings.Repeat("a", 64)}}
+	if active["hardware"].Digest == offer.ContentSHA256 {
+		t.Fatal("fixture must differ from the candidate")
+	}
+	if err := store.CompleteJournalReconciliation(ctx, hostID, appliedHolderConnection,
+		[]JournalInventoryEntry{entry}, active); err != nil {
+		t.Fatal(err)
+	}
+	return hostID, boot, offer
+}
+
+const appliedHolderConnection = "00000000-0000-4000-8000-000000000339"
+
+// An applied replay without its proof (amendment 86): the hold becomes a recovery
+// hold, the release route ends it on the control plane alone, a repeat writes
+// nothing, and a later inventory carrying the proof behaves as before.
+func TestAnAppliedReplayWithoutItsProofTakesTheReleaseRoute(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	ctx := context.Background()
+	hostID, boot, offer := unprovenAppliedHold(t, pool, store)
+
+	if got := holdKinds(t, pool, hostID); got != "recovery" {
+		t.Fatalf("holds %q after an unproven applied replay, want recovery", got)
+	}
+	if got := hostStatus(t, pool, hostID); got != "draining" {
+		t.Fatalf("host %s, want draining", got)
+	}
+	view, err := store.GetIdleApply(ctx, hostID, offer.AttemptID)
+	if err != nil || view.Phase != "applied" || !view.AdmissionRestricted || view.RecoveryRelease != nil {
+		t.Fatalf("held applied view: %+v %+v %v", view, view.RecoveryRelease, err)
+	}
+	groupBefore := hardwareGroupStatus(t, pool, hostID)
+
+	first, err := store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID)
+	if err != nil || !first {
+		t.Fatalf("release: first=%v err=%v", first, err)
+	}
+	if got := holdKinds(t, pool, hostID); got != "" {
+		t.Fatalf("holds %q after the release, want none", got)
+	}
+	if got := hostStatus(t, pool, hostID); got != "online" {
+		t.Fatalf("host %s after the release, want online", got)
+	}
+	if got := hardwareGroupStatus(t, pool, hostID); got != groupBefore {
+		t.Fatalf("group %s -> %s; the release changes no group", groupBefore, got)
+	}
+	view, err = store.GetIdleApply(ctx, hostID, offer.AttemptID)
+	if err != nil || view.Phase != "applied" || view.AdmissionRestricted || view.RecoveryRelease == nil ||
+		view.RecoveryRelease.State != "released" || view.RecoveryRelease.RequestedAt == nil || view.RecoveryRelease.WaitingFor != nil {
+		t.Fatalf("released applied view: %+v %+v %v", view, view.RecoveryRelease, err)
+	}
+	if ids, err := store.PendingRecoveryReleases(ctx, hostID, appliedHolderConnection); err != nil || len(ids) != 0 {
+		t.Fatalf("an applied release is sent to the agent: %v (%v)", ids, err)
+	}
+	var recordedAt time.Time
+	if err := pool.QueryRow(ctx, `SELECT release_requested_at FROM host_config_attempts WHERE id=$1::uuid`, offer.AttemptID).Scan(&recordedAt); err != nil {
+		t.Fatal(err)
+	}
+	first, err = store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID)
+	if err != nil || first {
+		t.Fatalf("repeat: first=%v err=%v, want an idempotent repeat", first, err)
+	}
+	var againAt time.Time
+	if err := pool.QueryRow(ctx, `SELECT release_requested_at FROM host_config_attempts WHERE id=$1::uuid`, offer.AttemptID).Scan(&againAt); err != nil || !againAt.Equal(recordedAt) {
+		t.Fatalf("a repeat rewrote the request: %v -> %v (%v)", recordedAt, againAt, err)
+	}
+
+	// The proof arriving later still applies the group; there is no hold left to delete.
+	third := "00000000-0000-4000-8000-000000000340"
+	if err := store.BeginJournalReconciliation(ctx, hostID, third); err != nil {
+		t.Fatal(err)
+	}
+	entry := restartInventoryEntry(hostID, boot, offer, "applied", "4")
+	verifiedAt := time.Now().UTC()
+	entry.VerifiedAt = &verifiedAt
+	if err := store.CompleteJournalReconciliation(ctx, hostID, third, []JournalInventoryEntry{entry},
+		map[string]PolicySnapshot{"hardware": {Kind: "verified", Digest: offer.ContentSHA256}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := holdKinds(t, pool, hostID); got != "" {
+		t.Fatalf("the proven replay planted %q", got)
+	}
+	if got := hardwareGroupStatus(t, pool, hostID); got != "applied" {
+		t.Fatalf("group %s after the proven replay, want applied", got)
+	}
+}
+
+// An applied attempt that already has its proof holds nothing: the route refuses
+// it and writes nothing (amendment 86 keeps this a 409).
+func TestAnAppliedAttemptWithNoRecoveryHoldTakesNoRelease(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	ctx := context.Background()
+	boot, offer := offerRestartAttempt(t, pool, store, hostID)
+	if _, err := store.ObserveIdleState(ctx, hostID, offerConnection, liveReport(boot, offer, "accepted", "1")); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	applied := liveReport(boot, offer, "applied", "4")
+	applied.VerifiedAt = &now
+	// A live applied report is itself the verification: the hold is released.
+	if fresh, err := store.ObserveIdleState(ctx, hostID, offerConnection, applied); err != nil || !fresh {
+		t.Fatalf("applied report: fresh=%v err=%v", fresh, err)
+	}
+	if got := holdKinds(t, pool, hostID); got != "" {
+		t.Fatalf("a live applied report left %q", got)
+	}
+	if _, err := store.RequestRecoveryRelease(ctx, hostID, offer.AttemptID); !errors.Is(err, ErrAttemptNotUncertain) {
+		t.Fatalf("proven applied attempt: %v, want ErrAttemptNotUncertain", err)
+	}
+	var marked bool
+	if err := pool.QueryRow(ctx, `SELECT release_requested_at IS NOT NULL FROM host_config_attempts WHERE id=$1::uuid`, offer.AttemptID).Scan(&marked); err != nil || marked {
+		t.Fatalf("the refused route wrote a request: marked=%v err=%v", marked, err)
 	}
 }
 
@@ -464,5 +597,46 @@ func TestReleaseRecoveryHoldEndpointRefusesANonUncertainAttempt(t *testing.T) {
 		strings.NewReader(`{"acknowledge":"unverified"}`)))
 	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "attempt_not_uncertain") {
 		t.Fatalf("accepted attempt: %d %s, want 409", w.Code, w.Body.String())
+	}
+}
+
+// Amendment 86: an applied attempt's recovery hold is released by the control
+// plane alone — 200 at once, audited once, nothing sent to the agent.
+func TestReleaseRecoveryHoldEndpointEndsAnAppliedAttemptsHold(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID, _, offer := unprovenAppliedHold(t, pool, store)
+	auditor := &fakeAuditor{}
+	dispatcher := &releaseDispatcher{capable: true}
+	mux := http.NewServeMux()
+	pass := func(next http.Handler) http.Handler { return next }
+	NewHandler(store, dispatcher, nil, auditor).Register(mux, pass, pass)
+	post := func() *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/admin/hosts/"+hostID+"/idle-apply/"+offer.AttemptID+"/release-recovery",
+			strings.NewReader(`{"acknowledge":"unverified"}`)))
+		return w
+	}
+	w := post()
+	var view IdleApplyAttempt
+	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &view) != nil || view.Phase != "applied" ||
+		view.AdmissionRestricted || view.RecoveryRelease == nil || view.RecoveryRelease.State != "released" ||
+		view.RecoveryRelease.RequestedAt == nil || view.RecoveryRelease.WaitingFor != nil {
+		t.Fatalf("release: %d %s, want 200 released", w.Code, w.Body.String())
+	}
+	if len(dispatcher.sent) != 0 {
+		t.Fatalf("an applied release went to the agent: %v", dispatcher.sent)
+	}
+	if len(auditor.rows) != 1 || auditor.rows[0] != (recordedActivity{"host.recovery.release", "host", hostID}) {
+		t.Fatalf("audit %v", auditor.rows)
+	}
+	if got := holdKinds(t, pool, hostID); got != "" {
+		t.Fatalf("holds %q after the release, want none", got)
+	}
+	if w := post(); w.Code != http.StatusOK {
+		t.Fatalf("repeat: %d %s, want 200", w.Code, w.Body.String())
+	}
+	if len(auditor.rows) != 1 || len(dispatcher.sent) != 0 {
+		t.Fatalf("a repeat wrote: audit=%v sent=%v", auditor.rows, dispatcher.sent)
 	}
 }

@@ -123,7 +123,7 @@ func (h *Handler) handleReleaseRecoveryHold(w http.ResponseWriter, r *http.Reque
 		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "idle apply attempt not found")
 		return
 	case errors.Is(err, ErrAttemptNotUncertain):
-		httpx.WriteError(w, http.StatusConflict, "attempt_not_uncertain", "Only an uncertain restart attempt has a recovery hold to release.")
+		httpx.WriteError(w, http.StatusConflict, "attempt_not_uncertain", "Only an uncertain restart attempt, or an applied attempt held for recovery, has a recovery hold to release.")
 		return
 	case err != nil:
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not record the release")
@@ -142,7 +142,9 @@ func (h *Handler) handleReleaseRecoveryHold(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	status := http.StatusAccepted
-	if attempt.Phase == "released" {
+	// Released already, or (amendment 86) an applied attempt's hold ended here:
+	// both answer 200 with what the attempt view projects.
+	if attempt.RecoveryRelease != nil && attempt.RecoveryRelease.State == "released" {
 		status = http.StatusOK
 	}
 	httpx.WriteJSON(w, status, attempt)
