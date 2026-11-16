@@ -13,10 +13,17 @@ import (
 // "may this reporter write this session's telemetry at all?".
 
 // SessionHostState is the minimal session view the ingestion trust boundary and
-// the trace relay need: who owns it (host), and whether it is live.
+// the trace relay need: who owns it (host), whether it is live, and the launch
+// size a display-aware metrics sample's absent render keys stand for
+// (amendment 84, accreleus/quasar#996).
 type SessionHostState struct {
 	HostID *string
 	State  State
+	// Width/Height are the session's pinned LAUNCH size (sessions.width/height),
+	// read in the same row as the trust boundary because the render cache needs
+	// them on the metrics path and a second query there would be a wasted round
+	// trip.
+	Width, Height int32
 }
 
 // GetSessionHostState is the trust boundary for agent metric ingestion (agent
@@ -29,8 +36,8 @@ func (s *Store) GetSessionHostState(ctx context.Context, sessionID string) (Sess
 	var st SessionHostState
 	var state string
 	err := s.pool.QueryRow(ctx, `
-		SELECT host_id::text, state FROM sessions WHERE id = $1::uuid
-	`, sessionID).Scan(&st.HostID, &state)
+		SELECT host_id::text, state, width, height FROM sessions WHERE id = $1::uuid
+	`, sessionID).Scan(&st.HostID, &state, &st.Width, &st.Height)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return SessionHostState{}, ErrNotFound
 	}

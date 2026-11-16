@@ -143,6 +143,9 @@ func (c *Coordinator) UpdateDisplay(ctx context.Context, sessionID string, upd D
 	if upd.StreamWidth != nil && upd.StreamHeight != nil {
 		c.display.setSize(sessionID, *upd.StreamWidth, *upd.StreamHeight, sess.Width, sess.Height)
 	}
+	// Amendment 84: the render size and UI scale are served on the Session
+	// resource, so a 202 must make them known to every reader at once.
+	c.display.setRender(sessionID, upd.RenderWidth, upd.RenderHeight, upd.UIScale)
 	c.log.Info("display update accepted by agent", "session_id", sessionID)
 	return sess, nil
 }
