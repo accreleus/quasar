@@ -287,7 +287,10 @@ pub(crate) fn keyboard_layout(container: Option<&ContainerSpec>) -> Option<(&str
 
 #[cfg(test)]
 mod tests {
-    use super::{keyboard_layout, keyboard_properties_present, va_postproc_candidates};
+    use super::{
+        clamp_ring_depth, keyboard_layout, keyboard_properties_present, va_postproc_candidates,
+    };
+    use gstreamer as gst;
 
     #[test]
     fn keyboard_layout_needs_both_compositor_properties() {
@@ -337,5 +340,19 @@ mod tests {
             va_postproc_candidates("software"),
             vec!["vapostproc".to_string()]
         );
+    }
+
+    // An operator WOLF_VULKAN_RING outside the compositor's ring-depth range must not panic
+    // the setter: it lands on the nearest bound.
+    #[test]
+    fn ring_depth_is_clamped_into_the_property_range() {
+        let pspec = gst::glib::ParamSpecUInt::builder("ring-depth")
+            .minimum(1)
+            .maximum(4)
+            .default_value(4)
+            .build();
+        assert_eq!(clamp_ring_depth(8, &pspec), 4);
+        assert_eq!(clamp_ring_depth(0, &pspec), 1);
+        assert_eq!(clamp_ring_depth(2, &pspec), 2);
     }
 }
