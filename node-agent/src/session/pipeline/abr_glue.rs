@@ -1368,6 +1368,16 @@ pub(crate) fn feedback_abr(
     let floor_loop = abr_loop.clone();
     let report_loop = abr_loop.clone();
     let observed = latest.clone();
+    // #1294: what the takeover itself does to this session's encoder. A loop — a WebRTC
+    // peer's, or this client's predecessor — can still own it when the next client takes
+    // the session, and §Feedback lets a client send no feedback at all: then nothing would
+    // ever take the encoder back from wherever the displaced link left it. So the displace
+    // happens at the handover, keyed on ownership (`Rate::owns`), not on whoever the holder
+    // still was — a WebRTC peer whose PC failed left its loop owning the encoder.
+    let owner = abr_loop.clone();
+    let reset_loop = abr_loop.clone();
+    let reset_cfg = plan.launch_cfg.clone();
+    let reset_lever = plan.lever.clone();
     let begin: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         let latest = latest.clone();
         start(
@@ -1392,6 +1402,17 @@ pub(crate) fn feedback_abr(
         // Each client starts afresh: it takes the encoder over (a WebRTC peer that started
         // since owns it until then) and registers new hooks.
         start: Box::new(move || begin()),
+        owns: Box::new(move || owner.metrics.upgrade().is_some_and(|m| m.abr_owner() != 0)),
+        displaced: Box::new(move || {
+            if let Some(metrics) = reset_loop.metrics.upgrade() {
+                reset_to_launch(
+                    &reset_loop.encoder,
+                    &reset_cfg,
+                    reset_lever.as_deref(),
+                    &metrics,
+                );
+            }
+        }),
         observe: Box::new(move |kbps| {
             observed.store(kbps.to_bits(), std::sync::atomic::Ordering::Relaxed);
             // One ABR owner per encoder; an owner that lost the encoder re-takes it from
@@ -1435,6 +1456,9 @@ fn take_over(abr_loop: &AbrLoop, plan: &Plan, metrics: &SessionMetrics) {
 /// its ladder at rung 0; without this the encoder keeps the last peer's degraded bitrate,
 /// speed bias and rungs until GCC's estimate moves, which on a clean path is never.
 ///
+/// Also the WebTransport handover (#1294): a client taking the session from a WebRTC peer
+/// displaces that peer's loop here, at the takeover, rather than at its own first estimate.
+///
 /// The encoder element and its pipeline stay; these property and caps writes are all a
 /// replacement does to it, and the log line names each. A size change is an encoder
 /// session restart on the Vulkan path, as any rung step is.
@@ -1443,11 +1467,11 @@ fn take_over(abr_loop: &AbrLoop, plan: &Plan, metrics: &SessionMetrics) {
 pub(super) fn reset_to_launch(
     encoder: &gst::Element,
     cfg: &SessionConfig,
-    lever: &EncodeResolutionLever,
+    lever: Option<&EncodeResolutionLever>,
     metrics: &SessionMetrics,
 ) {
     metrics.clear_hooks();
-    let written = write_launch_point(encoder, cfg, Some(lever), metrics);
+    let written = write_launch_point(encoder, cfg, lever, metrics);
     tracing::info!(
         token = "transport-replaced-encoder-kept",
         "encoder {} kept across the transport replacement; written: {written}",
@@ -1967,7 +1991,7 @@ mod tests {
             "the client's loop drove the encoder down"
         );
 
-        reset_to_launch(&encoder, &cfg, &lever, &metrics);
+        reset_to_launch(&encoder, &cfg, Some(&lever), &metrics);
         assert_eq!(bitrate(), 11_500, "the replacement put it back at launch");
 
         // Its governor starts again too: the old one would sit out its down dwell here.
@@ -2575,8 +2599,9 @@ mod tests {
         EncodeResolutionLever::new(stage, encoder, |_| {})
     }
 
-    // The lever's rungs are the session's rung family — the same table the compositor's
-    // mode-ladder and the control plane's validator use.
+    // The lever's rungs are the session's rung family — the same table the control plane's
+    // validator steps along; the compositor's mode-ladder advertises it less the sizes meant
+    // only for a starved link (`rungs::mode_ladder`).
     #[test]
     fn lever_exposes_the_sessions_rungs() {
         let lever = software_lever((1920, 1080));
@@ -2630,7 +2655,7 @@ mod tests {
             let _ = &held;
         }));
 
-        reset_to_launch(&encoder, &cfg, &lever, &metrics);
+        reset_to_launch(&encoder, &cfg, Some(&lever), &metrics);
 
         assert_eq!(encoder.property::<u32>("bitrate"), launch_bps);
         assert_eq!(
@@ -2654,7 +2679,7 @@ mod tests {
         lever.set_pinned(true);
         let metrics = SessionMetrics::new("smooth", cfg.stream.fps as u32);
 
-        reset_to_launch(&encoder, &cfg, &lever, &metrics);
+        reset_to_launch(&encoder, &cfg, Some(&lever), &metrics);
 
         assert_eq!(lever.stage().requested(), (1280, 720));
     }

@@ -13,8 +13,9 @@
 //! The control plane is the validator (`PATCH /v1/sessions/{id}/display` rejects an
 //! off-ladder pair before it reaches a host). The agent needs the same table to (1)
 //! advertise the ladder to the guest app as `wl_output` modes (compositor `mode-ladder`
-//! property), and (2) a defensive second wire check, so a CP/agent skew surfaces as
-//! `ack{ok:false}` rather than a silently wrong frame size.
+//! property, [`mode_ladder`] — a subset, see [`LADDER_ONLY`]), and (2) a defensive second
+//! wire check, so a CP/agent skew surfaces as `ack{ok:false}` rather than a silently wrong
+//! frame size.
 //!
 //! [`tests::table_matches_the_control_plane`] pins the exact values against the CP's
 //! `rungs_test.go` cases. If you change one table, change both.
@@ -55,6 +56,12 @@ pub const RUNGS_16X10: &[Rung] = &[
 ];
 pub const RUNGS_21X9: &[Rung] = &[(3440, 1440), (2560, 1080)];
 pub const RUNGS_4X3: &[Rung] = &[(1600, 1200), (1280, 960), (1024, 768)];
+
+/// Rungs a session may be STEPPED to but must never offer the guest app as a display mode:
+/// 540p and 360p were added so a starved link can step down (#1397), and a game that starts
+/// at the lowest listed mode would start there instead of at its own size (#1418). They stay
+/// legal stream sizes; only the `wl_output` list leaves them out.
+const LADDER_ONLY: &[Rung] = &[(960, 540), (640, 360)];
 
 /// An aspect ratio in lowest terms.
 type Ratio = (i32, i32);
@@ -114,6 +121,18 @@ pub fn available_rungs(w: i32, h: i32) -> Vec<Rung> {
 /// `launch_w` x `launch_h`.
 pub fn is_rung(w: i32, h: i32, launch_w: i32, launch_h: i32) -> bool {
     available_rungs(launch_w, launch_h).contains(&(w, h))
+}
+
+/// The modes to advertise to the guest app for a session launched at `w` x `h`:
+/// [`available_rungs`] less the [`LADDER_ONLY`] sizes. This is what the compositor gets as
+/// its `mode-ladder`; the stream ladder, and so every size a session may be stepped to, is
+/// unchanged. The launch size is always kept, even when it is itself a ladder-only size: it
+/// is the mode the session really started at, and dropping it would leave no mode at all.
+pub fn mode_ladder(w: i32, h: i32) -> Vec<Rung> {
+    available_rungs(w, h)
+        .into_iter()
+        .filter(|&rung| rung == (w, h) || !LADDER_ONLY.contains(&rung))
+        .collect()
 }
 
 /// The compositor's `mode-ladder` wire form: `"1920x1080,1600x900,1280x720,960x540,640x360"`.
@@ -264,6 +283,59 @@ mod tests {
         ] {
             assert_eq!(is_rung(w, h, lw, lh), want, "is_rung({w},{h},{lw},{lh})");
         }
+    }
+
+    /// #1418: what the guest app is offered is the rung ladder less the sizes only a
+    /// starved link needs, so no game's resolution menu can start at 540p or 360p instead of
+    /// at its own size. The stream ladder is untouched: both are still rungs a session may be
+    /// stepped to, and the launch size is never dropped from the offer.
+    #[test]
+    fn the_mode_ladder_offers_the_rungs_less_the_ladder_only_sizes() {
+        for (launch, want) in [
+            ((1920, 1080), vec![(1920, 1080), (1600, 900), (1280, 720)]),
+            (
+                (2560, 1440),
+                vec![(2560, 1440), (1920, 1080), (1600, 900), (1280, 720)],
+            ),
+            // 720p is then the smallest mode an app can see.
+            ((1280, 720), vec![(1280, 720)]),
+            // A launch at a ladder-only size keeps it, or the app sees no mode at all.
+            ((640, 360), vec![(640, 360)]),
+            // Other families never had these sizes, and are offered in full.
+            (
+                (1920, 1200),
+                vec![(1920, 1200), (1680, 1050), (1440, 900), (1280, 800)],
+            ),
+            ((1024, 768), vec![(1024, 768)]),
+        ] {
+            let (w, h) = launch;
+            assert_eq!(mode_ladder(w, h), want, "mode_ladder({w},{h})");
+        }
+        // The stream ladder itself is unchanged: 540p and 360p are still legal steps.
+        let rungs = available_rungs(1920, 1080);
+        for rung in LADDER_ONLY {
+            assert!(rungs.contains(rung), "{rung:?} left the stream ladder");
+            assert!(is_rung(rung.0, rung.1, 1920, 1080), "{rung:?} is no rung");
+            assert!(
+                !mode_ladder(1920, 1080).contains(rung),
+                "{rung:?} was offered to the guest app"
+            );
+        }
+        // Every mode offered is a rung, in descending order, and the launch size first.
+        for (w, h) in [(3840, 2160), (1920, 1080), (2000, 1125), (640, 360)] {
+            let modes = mode_ladder(w, h);
+            assert_eq!(modes[0], (w, h), "mode_ladder({w},{h})");
+            for (i, &mode) in modes.iter().enumerate() {
+                assert!(is_rung(mode.0, mode.1, w, h), "mode {mode:?}");
+                if i > 0 {
+                    assert!(mode.0 < modes[i - 1].0, "not descending: {modes:?}");
+                }
+            }
+        }
+        assert_eq!(
+            format_ladder(&mode_ladder(1920, 1080)),
+            "1920x1080,1600x900,1280x720"
+        );
     }
 
     #[test]

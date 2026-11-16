@@ -333,8 +333,8 @@
       "estimator": "last",
       "n_key": null,
       "deprecated_for": null,
-      "since": "amendment 79",
-      "why": "The ABR governor's UNCLAMPED link rate at drain time: what the reports say the link carries, before the floor clamps it into the setpoint. Present only while the per-report loop runs (a WebTransport session in smooth). Stream health judges it against the floor instead of abr_setpoint_kbps when present, because the setpoint cannot go under its floor and a session pinned there was always at or below it. Uncurated: readable via GET .../metrics, not in the diagnostic lens."
+      "since": "0.6.1 amendment 79 (#1434)",
+      "why": "The governor's UNCLAMPED link rate at drain time, what the link carries before the floor clamps it into the setpoint. Present only on a WebTransport session in smooth (the per-report loop); absent means not measured. When present, stream health judges it against the floor (abr_floor_kbps, else the resolved rung's) instead of abr_setpoint_kbps, with the same at-or-below comparison. Uncurated: readable via GET .../metrics, not in the diagnostic lens."
     },
     {
       "key": "wt_fec_overhead_pct",
@@ -346,8 +346,8 @@
       "estimator": "last",
       "n_key": null,
       "deprecated_for": null,
-      "since": "amendment 85",
-      "why": "The FEC repair payload the agent sent in the window as a percent of the video payload bytes it sent in the same window. Present in every window of a WebTransport session whose hello_ack.fec named a scheme, 0 for a window that sent no repair; absent otherwise (WebRTC, FEC not negotiated, an older agent), meaning 'no FEC', never zero. Signal-only for the control plane. Uncurated."
+      "since": "0.6.1 amendment 85 (#1302)",
+      "why": "FEC repair payload bytes the agent sent in the window as a percentage of the video payload bytes it sent in it \u2014 a percentage number (0-100), which is why the unit reads 'fraction': the unit vocabulary has no percent member. Present in every window of a WebTransport session whose hello_ack.fec named a scheme (0 when the window sent no repair); absent otherwise, meaning no FEC. Uncurated."
     },
     {
       "key": "wt_fec_kbps",
@@ -359,8 +359,8 @@
       "estimator": "last",
       "n_key": null,
       "deprecated_for": null,
-      "since": "amendment 85",
-      "why": "The same window's FEC repair payload as a rate, kbit/s. Same presence rule as wt_fec_overhead_pct: absent means no FEC, never zero. Uncurated."
+      "since": "0.6.1 amendment 85 (#1302)",
+      "why": "The same window's FEC repair payload as a rate, kbit/s. Same presence rule as wt_fec_overhead_pct. Uncurated."
     },
     {
       "key": "gcc_estimate_kbps",
@@ -1123,15 +1123,15 @@
     {
       "key": "wt_fec_repaired",
       "source": "browser",
-      "taxonomy": "client.wt_fec_repaired",
+      "taxonomy": null,
       "unit": "count",
       "clock": "none",
       "window": "cumulative",
       "estimator": "raw",
       "n_key": null,
       "deprecated_for": null,
-      "since": "amendment 85",
-      "why": "CUMULATIVE for the page view, accumulated like packets_lost (each connection's own count is added, so a reconnect never resets it): video FRAGMENTS a WebTransport client rebuilt from FEC repair datagrams. A rebuilt fragment is never NACKed, so it is not in packets_lost: on that transport packets_lost is the fragments FEC did not repair, and packets_lost + wt_fec_repaired is the fragments the path lost. Posted only while the connection's hello_ack.fec names a scheme; never posted by a WebRTC session."
+      "since": "0.6.1 amendment 85 (#1302)",
+      "why": "CUMULATIVE for the page view, accumulated like packets_lost (each connection's count is added, so a reconnect never resets it): video FRAGMENTS a WebTransport client rebuilt from FEC repair datagrams. A rebuilt fragment is never NACKed, so it is not in packets_lost; packets_lost + wt_fec_repaired is the video fragments the path lost. Posted only while FEC is negotiated; never posted by a WebRTC session. Uncurated."
     },
     {
       "key": "network_pacing_ms",
