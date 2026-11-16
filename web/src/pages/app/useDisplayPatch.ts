@@ -8,10 +8,12 @@
 // doesn't carry them back — so this hook keeps the last server-ACKED value
 // and treats its own state as optimistic until then.
 //
-// The render size and interface size are on no read the player has (the session row
-// never carries them; session_metrics is admin-only), so the last-acked values are kept
-// per session in sessionStorage and a reload starts from them instead of from "match the
-// stream" / 1×.
+// The session resource DOES carry them since amendment 84 (#996): `serverDisplay` is
+// what the control plane last knew, adopted once on load so a second tab or a takeover
+// starts from the session's real values instead of the launch size. The last-acked values
+// are still kept per session in sessionStorage, as the fallback for a control plane that
+// does not know them yet (an older server, or the first seconds after a restart), so a
+// reload never drops back to "match the stream" / 1× in that window.
 //
 // `externalSize`/`externalResizeSupported` are owned by useSessionStatus (its
 // 5s poll also updates them); this hook is handed their raw setters and calls
@@ -62,10 +64,23 @@ export interface UseDisplayPatchParams {
   authToken: string | null | undefined;
   sessionId: string | undefined;
   addToast: (item: Omit<ToastItem, "id">) => void;
+  /** Amendment 84 (#996): what the session resource reports about the display
+   *  state the control plane last knew. Omitted or empty while it knows nothing.
+   *  `render: null` is a VALUE — the session default, modelled here as "match
+   *  the stream". */
+  serverDisplay?: ServerDisplay;
   /** Raw setter from useSessionStatus — called on ack/revert (see module header). */
   setExternalSize: Dispatch<SetStateAction<{ w: number; h: number } | null>>;
   /** Raw setter from useSessionStatus — latched false on a 409 external_resize_unsupported. */
   setExternalResizeSupported: Dispatch<SetStateAction<boolean | undefined>>;
+}
+
+/** What the session resource reports about its live display state (amendment 84,
+ *  #996). A field is ABSENT when the control plane does not know it — absence is
+ *  never "the launch size". */
+export interface ServerDisplay {
+  render?: { w: number; h: number } | null;
+  uiScale?: number;
 }
 
 export interface UseDisplayPatchResult {
@@ -81,7 +96,7 @@ export interface UseDisplayPatchResult {
 }
 
 export function useDisplayPatch(params: UseDisplayPatchParams): UseDisplayPatchResult {
-  const { authToken, sessionId, addToast, setExternalSize, setExternalResizeSupported } = params;
+  const { authToken, sessionId, addToast, serverDisplay, setExternalSize, setExternalResizeSupported } = params;
 
   // null means "match the stream": staying null rather than eagerly copying
   // the stream size means a revert lands on default without knowing it.
@@ -257,6 +272,31 @@ export function useDisplayPatch(params: UseDisplayPatchParams): UseDisplayPatchR
       if (displayTimerRef.current) clearTimeout(displayTimerRef.current);
     };
   }, []);
+
+  // Amendment 84 (#996): adopt the session's OWN render size and UI scale the first
+  // time the resource reports them, so a second tab, a reload or a takeover starts
+  // from where the session actually is instead of this tab's stored ack or the launch
+  // size. ONCE, not on every poll: a poll already in flight when the user makes a
+  // change would otherwise fight the ack, and after the first adoption this tab's own
+  // acked value is the newer truth. A change this tab has pending or in flight always
+  // wins, and the adoption is then skipped for good (that value is the truth from here).
+  const adoptedServerDisplayRef = useRef(false);
+  useEffect(() => {
+    if (!sessionId || adoptedServerDisplayRef.current || serverDisplay == null) return;
+    if (serverDisplay.render === undefined && serverDisplay.uiScale === undefined) return;
+    if (displayInFlightRef.current || Object.keys(pendingDisplayRef.current).length > 0) return;
+    adoptedServerDisplayRef.current = true;
+    if (serverDisplay.render !== undefined) {
+      ackedDisplayRef.current.render = serverDisplay.render;
+      saveAcked(sessionId, "render", serverDisplay.render);
+      setRenderSize(serverDisplay.render);
+    }
+    if (serverDisplay.uiScale !== undefined) {
+      ackedDisplayRef.current.uiScale = serverDisplay.uiScale;
+      saveAcked(sessionId, "uiScale", serverDisplay.uiScale);
+      setUiScale(serverDisplay.uiScale);
+    }
+  }, [sessionId, serverDisplay]);
 
   return {
     renderSize,
