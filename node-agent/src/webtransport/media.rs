@@ -96,6 +96,9 @@ pub(crate) enum Gone {
     SessionEnded,
     /// The encoder never produced a keyframe this transport can carry.
     Unusable,
+    /// A rebuild replaced the session's encoder (`Media::hand_over`): closed as a lost
+    /// connection, so the client reconnects (§Reconnect) onto the new one.
+    Rebuilt,
 }
 
 struct Client {
@@ -136,6 +139,9 @@ struct State {
     session_id: String,
     /// Set by `end`: no client attaches after it.
     ended: bool,
+    /// Set by `hand_over`: an encode chain's caps callback still in flight must not
+    /// re-populate `config`, or a `hello` in that instant would attach to the dead chain.
+    handed_over: bool,
     last_forced: Option<Instant>,
     /// A request was coalesced into the last: the next unit past the spacing sends it.
     pending_key: bool,
@@ -754,6 +760,19 @@ impl Media {
         self.audio.detach(id);
     }
 
+    /// A rebuild's new encoder takes the session (amendment 59 (c), #1197). The old encode
+    /// chain is at `NULL`: a `hello` reads `session_not_ready` (token kept) until the new
+    /// tap registers, and the client goes with [`Gone::Rebuilt`] — this transport never
+    /// renegotiates the codec, so it reconnects onto the new one.
+    pub(crate) fn hand_over(&self) {
+        let mut st = self.lock();
+        st.handed_over = true;
+        st.config = None;
+        if let Some(old) = st.client.take() {
+            let _ = old.gone.set(Gone::Rebuilt);
+        }
+    }
+
     pub(crate) fn end(&self) {
         let mut st = self.lock();
         st.ended = true;
@@ -793,6 +812,11 @@ impl Media {
 
     pub(super) fn on_caps(&self, caps: &gst::CapsRef, session_id: &str) {
         let mut st = self.lock();
+        // A `hand_over`'d chain is at NULL and this media is on its way out (a rebuild's old
+        // tap): a caps event still in flight must not make it servable again (#1197 review).
+        if st.handed_over {
+            return;
+        }
         if st.session_id.is_empty() {
             st.session_id = session_id.to_string();
         }

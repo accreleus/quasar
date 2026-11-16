@@ -3585,6 +3585,28 @@ async fn a_webtransport_takeover_displaces_a_loop_its_peer_left_owning_the_encod
     assert_eq!(metrics.abr_owner(), 0, "and claimed nothing back");
 }
 
+/// #1197: a rebuild hands the session over to its new encoder (`Media::hand_over`). The old
+/// client's control stream must end as a LOST CONNECTION — no `bye`, close code `0` — because
+/// that is what makes it mint a fresh token and reconnect onto the new encoder (§Reconnect).
+/// Any other exit here ends the view for good: `bye session_ended` + `4404` is a session that
+/// is over, which is exactly what a rebuild is not.
+#[tokio::test]
+async fn a_handover_ends_the_client_stream_with_no_bye_and_close_zero() {
+    let agent = agent().await;
+    let (session, _send, mut recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+    agent.tap.as_ref().unwrap().media().hand_over();
+    assert!(
+        matches!(read_message(&mut recv).await, Err(Violation::Gone)),
+        "a message here (a `bye`) tells the client the session is over, not to reconnect"
+    );
+    assert_eq!(
+        close_code(&session).await,
+        Some(CLOSE_NORMAL),
+        "a normal close is a lost connection; 4404 would end the view"
+    );
+}
+
 /// #1193: the host missed the WebTransport close on a fallback. The WebRTC attach displaces the
 /// client then, so its control-stream silence 10 s later lifts nothing the WebRTC peer holds.
 #[tokio::test]
@@ -5128,7 +5150,7 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
 
 /// A session id assigned again while its tap runs gets a fresh registry entry, which no longer
 /// names that tap's media: the tap still ends its own when it drops, so the client on it is
-/// told the session ended.
+/// told the session ended, and the fresh entry is left alone.
 #[test]
 fn a_tap_dropped_after_its_session_was_assigned_again_ends_its_own_media() {
     gst::init().unwrap();
@@ -5157,6 +5179,74 @@ fn a_tap_dropped_after_its_session_was_assigned_again_ends_its_own_media() {
     assign();
     drop(tap);
     assert_eq!(client.gone.get(), Some(&Gone::SessionEnded));
+    assert!(
+        registry.add_token(SESSION, &token_hash("next"), SystemTime::now() + TOKEN_TTL),
+        "the tap that dropped ended the entry it no longer named"
+    );
+}
+
+/// #1197: a rebuild's tap registers over the old one under the same session id. The old tap's
+/// client is let go to reconnect, a `hello` in between waits with its token kept, the
+/// reconnect attaches to the new tap, and the old tap dropped after it leaves the entry alone.
+#[test]
+fn a_rebuilds_tap_takes_over_the_session_id_and_the_old_taps_drop_leaves_it() {
+    gst::init().unwrap();
+    let registry = Arc::new(Registry::default());
+    let expires = SystemTime::now() + TOKEN_TTL;
+    registry.assign(SESSION, &token_hash(TOKEN), expires);
+    let tap = |pipeline: &gst::Pipeline| {
+        let tap = Tap::attach(
+            &registry,
+            &pipeline
+                .by_name("parse")
+                .unwrap()
+                .static_pad("src")
+                .unwrap(),
+            &pipeline.by_name("enc").unwrap(),
+            SESSION,
+            no_input(),
+            audio::Plan::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        tap.media().on_caps(&streams::av1_caps(640), SESSION);
+        tap
+    };
+    let (first, second) = (synthetic(Stream::Av1), synthetic(Stream::Av1));
+    let old = tap(&first);
+    let before = old.media().attach(false, Duration::ZERO).unwrap();
+
+    // The rebuild: the old encode chain goes to NULL and its client is let go to reconnect.
+    old.media().hand_over();
+    assert_eq!(before.gone.get(), Some(&Gone::Rebuilt));
+    assert!(
+        registry.add_token(SESSION, &token_hash("reconnect"), expires),
+        "the handover ended the session's WebTransport entry"
+    );
+    assert_eq!(
+        old.media().attach(false, Duration::ZERO).err(),
+        Some(Refused::NotReady),
+        "a hello before the new tap registered waits, keeping its token"
+    );
+
+    // The new tap registers over the same id, and the old tap is dropped after it.
+    let new = tap(&second);
+    drop(old);
+    assert!(
+        registry.add_token(SESSION, &token_hash("late"), expires),
+        "the old tap's drop ended the entry of the tap that replaced it"
+    );
+    let after = new
+        .media()
+        .attach(false, Duration::ZERO)
+        .expect("the reconnect attaches to the new tap");
+    assert_eq!(after.gone.get(), None);
+
+    // A real session end still ends it.
+    drop(new);
+    assert_eq!(after.gone.get(), Some(&Gone::SessionEnded));
+    assert!(!registry.add_token(SESSION, &token_hash("later"), expires));
 }
 
 /// #1228: a session stop releases the tap's PyroWave encoder before the source goes (it shares
