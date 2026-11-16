@@ -32,6 +32,7 @@ own; the two do not move together, and that is deliberate.
 
 ### Changed
 - **A game is no longer offered 960x540 and 640x360 as screen modes (#1418).** The two sizes exist so a slow link can step the stream down, and they were also advertised to the app as display modes on every 16:9 session, so a game that starts at the smallest mode it is offered starts at 360p. The stream still steps down to them; the smallest mode a 16:9 game now sees is 1280x720 (or the size the session launched at, if that is smaller).
+- **CI checkouts no longer leave the job token in the workspace (#877).** Every workflow checkout now sets `persist-credentials: false` (the one release-gate step that fetches afterwards keeps it), and a CI check fails a new checkout that does not.
 
 ### Fixed
 - **Two rare races when a WebTransport client re-takes a session's encoder are closed.** A WebRTC viewer that had just started could lose its adaptive bitrate for the rest of the session, and a session ending in that same instant could keep the encoder (and its GPU memory) allocated.
