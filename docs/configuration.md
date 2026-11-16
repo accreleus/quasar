@@ -2966,9 +2966,11 @@ an undersized image.
 The compositor also advertises a **mode ladder** on the `wl_output` (one
 mode per rung ≤ the session's current external size, in the profile's
 aspect family), so in-app resolution menus and desktop display settings can
-list real choices instead of one fixed mode. On a 16:9 session that now
-includes 960x540 and 640x360, so a game's resolution menu gains those two
-entries.
+list real choices instead of one fixed mode. The 960x540 and 640x360 rungs
+exist so a starved link can step the stream down; they are deliberately
+**not** in that list, because a game that opens at the smallest mode it is
+offered would open at 360p. The smallest mode a 16:9 game is offered is
+therefore 1280x720 (or the size the session launched at, if it is smaller).
 
 **KDE Display Settings** lists the ladder and applies a chosen mode only
 with the **patched KWin shipped in the KDE image** (`quasar-images`); a
