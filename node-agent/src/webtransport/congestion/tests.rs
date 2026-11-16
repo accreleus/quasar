@@ -2413,8 +2413,8 @@ const BUFFER: usize = 1 << 20;
 #[test]
 fn audio_leaves_ahead_of_video_over_the_send_budget_and_video_waits() {
     let mut video = VideoQueue::default();
-    // 2 Mbit/s: 20 ms of it is 5000 bytes, four video datagrams.
-    let room = video.room(Some(2000), BUFFER);
+    // 1 Mbit/s: 40 ms of it is 5000 bytes, four video datagrams.
+    let room = video.room(Some(1000), BUFFER);
     assert_eq!(room, 5000);
     let mut wire = Vec::new();
     // A keyframe of 40 datagrams lands on a path that has not drained.
@@ -2482,7 +2482,7 @@ fn the_room_is_two_datagrams_at_least_and_half_the_buffer_at_most() {
 #[test]
 fn video_held_when_the_governor_lets_go_drains_at_the_last_governed_rate() {
     let mut video = VideoQueue::default();
-    assert_eq!(video.room(Some(2000), BUFFER), 5000);
+    assert_eq!(video.room(Some(1000), BUFFER), 5000);
     for i in 0..40 {
         video.push(held(i), BUFFER);
     }
@@ -2501,7 +2501,7 @@ fn video_held_when_the_governor_lets_go_drains_at_the_last_governed_rate() {
 #[test]
 fn a_cleared_queue_holds_nothing_and_keeps_its_numbering() {
     let mut video = VideoQueue::default();
-    video.room(Some(2000), BUFFER);
+    video.room(Some(1000), BUFFER);
     for i in 0..4 {
         video.push(held(i), BUFFER);
     }
