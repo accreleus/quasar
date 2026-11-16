@@ -464,10 +464,7 @@ pub(super) fn build_scale_stage(
             if supported {
                 let f = tail_filter()?;
                 let scale = make("vulkanscale")?;
-                // Its output images take the same LINEAR-first ladder as the compositor's.
-                if scale.find_property("linear-encode-src").is_some() {
-                    scale.set_property("linear-encode-src", true);
-                }
+                super::source_branch::set_encode_src_properties(&scale, None);
                 (tail_chain(vec![scale], f.clone()), Some(f))
             } else {
                 (vec![], None)
@@ -656,6 +653,11 @@ mod tests {
             .map(|e| e.factory().unwrap().name().to_string())
             .collect();
         assert_eq!(names, vec!["vulkanscale", "capsfilter"]);
+        // LINEAR-first output images (#281), where the scaler has the property.
+        let scale = &stage.elements[0];
+        if scale.find_property("linear-encode-src").is_some() {
+            assert!(scale.property::<bool>("linear-encode-src"));
+        }
         assert_eq!(stage.launch, (1920, 1080));
         assert_eq!(stage.current(), (1920, 1080));
     }

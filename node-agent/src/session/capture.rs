@@ -487,8 +487,8 @@ fn capture_encoder_props(active: &Active, ctx: &CaptureCtx<'_>) -> CaptureReport
         "scale_stage": ctx.stage,
         "ring": {
             // ONE named env var, never a bulk enumeration (tests.rs greps this
-            // file for that): the operator's encode-src ring override
-            // (`pipeline::source_branch::source_ring_depth`).
+            // file for that): the operator's encode-src ring override. The depth the
+            // compositor got is `scale_stage.encode_src_ring_depth`.
             "wolf_vulkan_ring": std::env::var("WOLF_VULKAN_RING").ok(),
         },
     });

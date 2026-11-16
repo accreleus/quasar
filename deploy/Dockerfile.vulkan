@@ -574,8 +574,8 @@ RUN git clone --branch 0.15 \
 # wl_display explicitly at compositor teardown (kills the back-to-back AlreadyBound race),
 # and bridges GPU client-buffer import failures to a `quasar-renderer-degraded` gst bus
 # WARNING the node-agent fails-closed on.
-# gst-wayland-display-linear-encsrc-fallback.patch implements the tiled fallback that
-# WOLF_VULKAN_LINEAR_ENCSRC's own comment promises: a failed LINEAR encode-src alloc (NVIDIA
+# gst-wayland-display-linear-encsrc-fallback.patch implements the tiled fallback the
+# LINEAR encode-src option promises (now the `linear-encode-src` property, set by the agent): a failed LINEAR encode-src alloc (NVIDIA
 # Vulkan-Video rejects LINEAR encode-src images — verified live on the RTX 5090, 2026-07-24)
 # retries with OPTIMAL + a warning instead of hard-failing the session's Vulkan output.
 # gst-wayland-display-per-element-vulkan-device.patch (8th gwd patch) moves the owned
@@ -591,8 +591,8 @@ RUN git clone --branch 0.15 \
 # buffer-reuse gate (spec 2c): VulkanNv12::to_gst_buffer hands the encode path a CHILD header
 # carrying GstParentBufferMeta over the cached encode-src slot (not a bare clone the encoder's
 # BaseSrc COW can silently free), and convert() drops-and-re-emits rather than reuse a slot the
-# encoder still references — making the auto-pinned ring depth (WOLF_VULKAN_RING=2,
-# double-buffered — RING=1's single slot starves under this same gate) safe and closing a
+# encoder still references — making the HEVC ring pin (then WOLF_VULKAN_RING=2, now the
+# ring-depth property) safe and closing a
 # candidate green-bars artifact. Touches only vulkan_nv12.rs; applies on top of the pts patch
 # (which touches the same to_gst_buffer). RADV path unchanged (encode_src-only).
 # gst-wayland-display-cuda-pool-config-leak.patch (10th gwd patch, applied last) fixes TWO

@@ -628,11 +628,10 @@ fn build_source_interpipe_sink(sink_name: &str) -> Result<gst::Element> {
         .property("async", false)
         // GstInterPipeSink subclasses GstAppSink, which by default holds a ref to the last
         // GstSample forever. On the Vulkan path that sample also pins the compositor's
-        // ParentBufferMeta child (G1 gate) and so an encode-src ring slot, alive after
-        // every real consumer reaches NULL. Under WOLF_VULKAN_RING=2 (auto-pinned for
-        // HEVC; RING=1 starves under the same gate, source_branch.rs) that permanently
-        // takes one of the two slots, halving convert()'s double-buffering headroom.
-        // Quasar never reads `last-sample`. Also unblocks safe teardown.
+        // ParentBufferMeta child and so an encode-src ring slot, alive after every real
+        // consumer reaches NULL: one slot of the HEVC pin's ring-depth=2 lost for good, so
+        // the compositor grows its ring instead. Quasar never reads `last-sample`. Also
+        // unblocks safe teardown.
         .property("enable-last-sample", false)
         // Never forward EOS to listeners: tearing this source down on a swap must not
         // end the live encode pipeline that is (or was) listening.
@@ -915,8 +914,8 @@ mod source_interpipe_tests {
     use gstreamer::prelude::*;
 
     /// The source interpipesink must NOT retain the last GstSample: on the Vulkan path a
-    /// retained sample pins the compositor's ParentBufferMeta child (G1 gate) and so an
-    /// encode-src ring slot, permanently taking one of the two under WOLF_VULKAN_RING=2.
+    /// retained sample pins the compositor's ParentBufferMeta child and so an encode-src
+    /// ring slot for good.
     /// `drop=true` is also load-bearing: a not-yet-switched source must never block.
     #[test]
     fn source_sink_does_not_retain_last_sample() {

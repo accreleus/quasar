@@ -867,6 +867,14 @@ impl AppSource {
         query.context_owned()
     }
 
+    /// The compositor's encode-src `ring-depth` (its starting ring; it may grow under
+    /// back-pressure), `None` on a build without the property.
+    pub fn ring_depth(&self) -> Option<u32> {
+        let source = self.pipeline.by_name("video-source")?;
+        source.find_property("ring-depth")?;
+        Some(source.property::<u32>("ring-depth"))
+    }
+
     /// Set this generation's compositor app-facing presentation: the `wl_output` logical
     /// mode (`render`, `None` ⇒ follow the encode size) and the `wp_fractional_scale_v1`
     /// `preferred_scale`. Returns whether the compositor took them.
