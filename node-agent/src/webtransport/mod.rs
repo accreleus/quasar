@@ -119,6 +119,11 @@ pub(crate) struct Rate {
     pub(crate) retargets: bool,
     /// A client's first estimate: its loop takes the encoder over (one writer per encoder).
     pub(crate) start: Box<dyn Fn() + Send + Sync>,
+    /// A WebTransport client took the session from a WebRTC peer (#1294): that peer's loop
+    /// is displaced NOW — the encoder back at its launch point, no owner — not at this
+    /// client's first estimate, which a client that sends no feedback (§Feedback) never
+    /// sends.
+    pub(crate) displaced: Box<dyn Fn() + Send + Sync>,
     pub(crate) observe: Box<dyn Fn(f64) + Send + Sync>,
     /// After `observe`, for every estimate that came from a receiver report, never for the
     /// silence decay: what the report showed the link carrying when the link held the

@@ -566,16 +566,31 @@ impl Media {
         }
         drop(st);
         let audio = self.audio.attach(id);
-        match hold.holder {
-            Holder::None => {}
-            Holder::Wt(_) => self.release(&mut hold),
+        let displaced = match hold.holder {
+            Holder::None => None,
+            Holder::Wt(_) => {
+                self.release(&mut hold);
+                None
+            }
             Holder::WebRtc(t) => {
                 self.release(&mut hold);
-                hold.to_mute = Some(t);
+                Some(t)
             }
+        };
+        if let Some(t) = displaced {
+            hold.to_mute = Some(t);
         }
         hold.holder = Holder::Wt(id);
         drop(hold);
+        // #1294: a WebRTC peer's ABR loop had the encoder until this client's first
+        // estimate, which a client that sends no feedback never sends. Displace it here,
+        // before this client can have fed anything: the encoder goes back to its launch
+        // point and no loop owns it.
+        if displaced.is_some() {
+            if let Some(rate) = &self.rate {
+                (rate.displaced)();
+            }
+        }
         if config.codec != "pyrowave" {
             self.keyframe();
         }
