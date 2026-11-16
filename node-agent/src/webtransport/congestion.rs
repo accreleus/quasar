@@ -1549,6 +1549,10 @@ const AUDIO_AHEAD_MS: u64 = 20;
 const PACE_GAIN: f64 = 1.25;
 /// The pacer's burst: this long at the pace, at least two datagrams.
 const PACE_BURST_MS: f64 = 5.0;
+/// Video that has waited this long is not paced: a paced keyframe of five frames' bytes waits
+/// at most 5 / (60 fps × `PACE_GAIN`), 67 ms, so this is a path back from an outage, or a
+/// source over the pace, and it drains at QUIC's own pace as before #1433.
+const PACE_MAX_WAIT: Duration = Duration::from_millis(100);
 
 /// Video, FEC and `nack` answers waiting for room in QUIC's datagram queue, so audio, which
 /// goes straight to QUIC, never queues behind more than [`VideoQueue::room`] of video and
@@ -1568,8 +1572,6 @@ pub(crate) struct VideoQueue {
     /// The pacer: bytes video may still send now, and when they were counted.
     tokens: f64,
     counted: Option<Instant>,
-    /// The rate it last paced at: held video drains at it after the pace lets go.
-    paced: Option<u64>,
     /// Video and resent datagrams over the path's datagram size, skipped.
     pub(crate) too_large: u64,
     pub(crate) resends_too_large: u64,
@@ -1611,15 +1613,17 @@ impl VideoQueue {
         })
     }
 
-    /// Bytes the pacer lets go now: [`PACE_GAIN`] × `kbps`, in bursts of [`PACE_BURST_MS`].
-    /// `None` paces nothing, except video held from a paced spell, which drains at that pace.
+    /// Bytes the pacer lets go now: [`PACE_GAIN`] × `kbps`, in bursts of [`PACE_BURST_MS`];
+    /// `None` paces nothing.
     pub(crate) fn pace(&mut self, kbps: Option<u64>, now: Instant) -> usize {
-        let Some(kbps) = kbps.or(self.paced.filter(|_| !self.held.is_empty())) else {
-            self.paced = None;
+        let stale = self
+            .held
+            .front()
+            .is_some_and(|h| now.saturating_duration_since(h.queued_at) >= PACE_MAX_WAIT);
+        let Some(kbps) = kbps.filter(|_| !stale) else {
             self.counted = None;
             return usize::MAX;
         };
-        self.paced = Some(kbps);
         let per_s = kbps as f64 * PACE_GAIN * 1000.0 / 8.0;
         let burst = (per_s * PACE_BURST_MS / 1000.0).max(2.0 * super::media::MAX_DATAGRAM as f64);
         self.tokens = match self.counted {
@@ -1644,7 +1648,6 @@ impl VideoQueue {
         self.held.clear();
         self.bytes = 0;
         self.pace = None;
-        self.paced = None;
         self.counted = None;
     }
 
