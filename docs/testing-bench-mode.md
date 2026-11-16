@@ -96,6 +96,11 @@ value means the UA supplied no `expectedDisplayTime` and `present_ms` fell back
 to `Date.now()`, so the stage table is describing a different quantity than the
 g2g beside it.
 
+On a WebTransport session (WebCodecs or PyroWave) `present_ms` is the moment the
+frame is submitted to the presenter, not `expectedDisplayTime`. Its `g2g_ms` is
+therefore shorter than a WebRTC session's by the submit-to-display time; keep
+that in mind when comparing the two transports.
+
 | key | stage | kind |
 |---|---|---|
 | `stage_host_to_receive_p50_ms` / `_p95_ms` | app submit → the frame's last packet arrives at the browser: app render, the compositor repaint wait, the whole agent chain, and the wire | measured (the only stage needing the ST-05 offset) |
@@ -185,7 +190,9 @@ A frameless second is emitted as a window with `n: 0`, so a three-second freeze
 reads as three windows rather than a hole. `undecoded` counts frames that had an
 image but no valid marker (including "no marker present at all", not only a CRC
 failure); a callback whose readback yielded nothing at all is counted separately
-as `no_image` and never inflates `n`.
+as `no_image` and never inflates `n`. On a PyroWave session `no_image` also
+counts frames skipped because three texture readbacks were still in flight; the
+console says so once.
 
 This is a **trace event**, deliberately not a persisted stats key: the browser
 stats series is allow-listed per `schema.md` and bench mode must not extend that

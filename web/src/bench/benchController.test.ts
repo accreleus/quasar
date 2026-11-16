@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { BenchController, presentEpochMs } from "./benchController";
+import { BenchController, READBACKS_IN_FLIGHT, presentEpochMs } from "./benchController";
 import { syntheticFrame, type MarkerFields } from "./syntheticMarker";
 import type { MarkerImageData } from "./marker_decode.js";
 import type { BenchWindowPayload } from "./aggregate";
@@ -400,5 +400,139 @@ describe("BenchController — recovery paths the review found (I2/I3/I4)", () =>
     ctl.start();
     ctl.onFrame();
     ctl.stop();
+  });
+});
+
+/** A device whose texture holds `scene.image`: each copy reads the scene as it is at submit, and
+ *  each map waits until the test releases it (a GPU that has not finished yet). */
+function textureDevice(scene: { image: MarkerImageData }) {
+  const copies: { w: number; h: number; bytesPerRow: number }[] = [];
+  const maps: (() => void)[] = [];
+  let created = 0;
+  let mapFails = false;
+  let scopeError: GPUError | null = null;
+  let scopeDepth = 0;
+  let createThrows = false;
+  const device = {
+    pushErrorScope: () => void scopeDepth++,
+    popErrorScope: () => (scopeDepth--, Promise.resolve(scopeError)),
+    createBuffer: ({ size }: { size: number }) => {
+      if (createThrows) throw new Error("no buffer");
+      created++;
+      const mem = new Uint8Array(size);
+      return {
+        size,
+        mem,
+        mapAsync: () => (mapFails ? Promise.reject(new Error("no readback")) : new Promise<void>((r) => maps.push(r))),
+        getMappedRange: (o: number, n: number) => mem.buffer.slice(o, o + n),
+        unmap: () => {},
+        destroy: () => {},
+      };
+    },
+    createCommandEncoder: () => ({
+      copyTextureToBuffer: (_src: unknown, dst: { buffer: { mem: Uint8Array }; bytesPerRow: number }, [w, h]: number[]) => {
+        copies.push({ w: w!, h: h!, bytesPerRow: dst.bytesPerRow });
+        const { image } = scene;
+        for (let y = 0; y < h!; y++) dst.buffer.mem.set(image.data.subarray(y * image.width * 4, (y * image.width + w!) * 4), y * dst.bytesPerRow);
+      },
+      finish: () => ({}),
+    }),
+    queue: { submit: () => {} },
+  };
+  const release = async () => {
+    for (const r of maps.splice(0)) r();
+    await new Promise((r) => setTimeout(r, 0));
+  };
+  return { device: device as unknown as GPUDevice, copies, release, created: () => created, failMaps: () => (mapFails = true), failScope: (e: GPUError | null) => (scopeError = e), scopeDepth: () => scopeDepth, throwOnCreate: () => (createThrows = true) };
+}
+
+describe("BenchController.onTexture (a PyroWave frame, #1344)", () => {
+  beforeEach(() => {
+    vi.stubGlobal("GPUBufferUsage", { MAP_READ: 1, COPY_DST: 8 });
+    vi.stubGlobal("GPUMapMode", { READ: 1 });
+    return () => vi.unstubAllGlobals();
+  });
+
+  const W = 1280;
+  const H = 720;
+  const scene = (frame_index: number) =>
+    syntheticFrame({ ...BASE, frame_index, render_w: W, render_h: H }, { width: W, height: H, ox: 8, oy: 8, cell: 16 });
+
+  it("reads back only the marker's crop, never stalls the caller, and measures each frame in order at its submit time", async () => {
+    let now = BASE.host_time_ms + 50;
+    const windows: BenchWindowPayload[] = [];
+    const ctl = new BenchController({ sendInput: () => {}, emitWindow: (p) => windows.push(p), getClockOffsetMs: () => 0, nowEpochMs: () => now });
+    const s = { image: scene(1) };
+    const gpu = textureDevice(s);
+    const texture = { width: W, height: H } as GPUTexture;
+    ctl.start();
+
+    ctl.onTexture(gpu.device, texture);
+    // Returns before the copy is mapped: nothing measured yet.
+    expect(ctl.handle().stats().frames).toBe(0);
+    s.image = scene(2);
+    now += 16;
+    ctl.onTexture(gpu.device, texture);
+    now += 100; // measured later, but stamped at its submit
+    await gpu.release();
+
+    const { frames } = ctl.handle().dump();
+    expect(frames.map((f) => [f.frame_index, f.g2g_ms])).toEqual([[1, 50], [2, 66]]);
+    // The first copy is the search crop (45 % of the frame, at least 512 px), rows padded to 256 bytes.
+    expect(gpu.copies[0]).toEqual({ w: 576, h: 512, bytesPerRow: 2304 });
+    s.image = scene(3);
+    ctl.onTexture(gpu.device, texture);
+    await gpu.release();
+    // Once located, the marker's bounding box and a cell: about 8 + 31 x 16 by 8 + 20 x 16.
+    const { w, h } = gpu.copies[2]!;
+    expect([w > 480 && w <= 504, h > 304 && h <= 328]).toEqual([true, true]);
+    expect(ctl.handle().stats()).toMatchObject({ frames: 3, decoded: 3, located: true, no_image: 0 });
+    // The buffers come back for the next frames.
+    expect(gpu.created()).toBe(2);
+    ctl.stop();
+    expect(windows[0]).toMatchObject({ n: 3, decoded: 3 });
+  });
+
+  it("a frame past the readbacks in flight, or one the device cannot read back, is no_image, never silence", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const ctl = new BenchController({ sendInput: () => {}, emitWindow: () => {}, getClockOffsetMs: () => 0 });
+    const gpu = textureDevice({ image: scene(1) });
+    const texture = { width: W, height: H } as GPUTexture;
+    ctl.start();
+    for (let i = 0; i < READBACKS_IN_FLIGHT + 1; i++) ctl.onTexture(gpu.device, texture);
+    expect(gpu.copies).toHaveLength(READBACKS_IN_FLIGHT);
+    await gpu.release();
+    expect(ctl.handle().stats()).toMatchObject({ frames: READBACKS_IN_FLIGHT, no_image: 1 });
+
+    gpu.failMaps();
+    ctl.onTexture(gpu.device, texture);
+    ctl.onTexture(gpu.device, texture);
+    await gpu.release();
+    expect(ctl.handle().stats()).toMatchObject({ frames: READBACKS_IN_FLIGHT, no_image: 3 });
+    expect(warn.mock.calls.filter((c) => c[0] === "bench: texture readback")).toHaveLength(1);
+    expect(warn.mock.calls.filter((c) => String(c[0]).startsWith("bench: readbacks fell behind"))).toHaveLength(1);
+    ctl.stop();
+    warn.mockRestore();
+  });
+
+  it("a GPU error from the readback stays in its own error scope and counts as no_image", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const ctl = new BenchController({ sendInput: () => {}, emitWindow: () => {}, getClockOffsetMs: () => 0 });
+    const gpu = textureDevice({ image: scene(1) });
+    gpu.failScope({ message: "bad copy" } as GPUError);
+    ctl.start();
+    ctl.onTexture(gpu.device, { width: W, height: H } as GPUTexture);
+    await gpu.release();
+    expect(ctl.handle().stats()).toMatchObject({ frames: 0, no_image: 1 });
+    expect(gpu.scopeDepth()).toBe(0);
+    // A throw between push and pop must not leave the scopes on the presenter's device.
+    gpu.failScope(null);
+    gpu.throwOnCreate();
+    ctl.onTexture(gpu.device, { width: W, height: H } as GPUTexture);
+    await gpu.release();
+    expect(ctl.handle().stats()).toMatchObject({ frames: 0, no_image: 2 });
+    expect(gpu.scopeDepth()).toBe(0);
+    ctl.stop();
+    warn.mockRestore();
   });
 });
