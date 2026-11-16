@@ -15,7 +15,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import "../../styles/session.css";
 import "../../styles/hud.css";
-import { getSession, listApps, mintSignalingToken, stopSession } from "../../api/library";
+import { getSession, listApps, mintSignalingToken, mintTransportToken, stopSession } from "../../api/library";
 import { ApiError } from "../../api/client";
 import type { ICEServer, WebTransportCoords } from "../../api/types";
 import { useAuth } from "../../auth/context";
@@ -172,7 +172,14 @@ function SessionPageBody() {
   const [fallbackCause, setFallbackCause] = useState<string | null>(null);
   // The status line from the moment WebTransport gives up until WebRTC's signaling is open.
   const [switching, setSwitching] = useState(false);
-  const webtransport = fallbackReason ? undefined : state?.webtransport;
+  // The launch's WebTransport coordinates arrive in router state; a resume (#1415)
+  // mints its own into here, so a session planned on WebTransport comes back on it.
+  const [wtCoords, setWtCoords] = useState<WebTransportCoords | undefined>(state?.webtransport);
+  const webtransport = fallbackReason ? undefined : wtCoords;
+  // A resumed WebTransport session keeps its launch's PyroWave want (#1415): the
+  // server records it, and a `hello` that does not offer PyroWave steps the
+  // session down to the standard codec for good.
+  const [resumedPyrowave, setResumedPyrowave] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   // The HUD owns whether it is open and on which section; this page only asks
   // it to open (summon chord, stage click, touch button) and to collapse.
@@ -335,6 +342,37 @@ function SessionPageBody() {
         // A `failed` session is left to the poller's launch-failure verdict
         // (see RESUME_DEAD_STATES) — no mint, no bounce, no toast.
         if (session.state === "failed") return;
+        // #1415: a session whose plan is WebTransport resumes on it. Minting only
+        // WebRTC's token here silently moved every reloaded WebTransport session
+        // (PyroWave included) onto WebRTC with nothing said about it.
+        if (!remembered && session.transport === "webtransport") {
+          try {
+            const { transport_options } = await mintTransportToken(authToken, sessionId);
+            if (cancelled()) return;
+            const wt = transport_options?.webtransport;
+            if (wt) {
+              setCurrentApp((prev) => (prev.id ? prev : { id: session.app_id, name: prev.name }));
+              setResumedPyrowave(session.pyrowave?.wanted === true);
+              setWtCoords(wt);
+              return; // no signaling mint: this session is WebTransport's
+            }
+          } catch (err) {
+            if (cancelled()) return;
+            // The token route refuses when the session's transport is no longer
+            // WebTransport or its host's endpoint is gone, and when the session
+            // stopped meanwhile. Say which, and carry on over WebRTC: the
+            // signaling mint below is the floor and reports its own refusals.
+            const reason = err instanceof ApiError && err.code ? err.code : "transport_unavailable";
+            const cause = `${reason}: ${err instanceof Error ? err.message : String(err)}`;
+            setFallbackReason(reason);
+            setFallbackCause(cause);
+            addToast({
+              variant: "info",
+              title: "Streaming over WebRTC",
+              body: "This session can't use WebTransport any more, so it carries on over WebRTC.",
+            });
+          }
+        }
         let res: Awaited<ReturnType<typeof mintSignalingToken>>;
         try {
           res = await mintSignalingToken(authToken, sessionId);
@@ -495,7 +533,10 @@ function SessionPageBody() {
   };
 
   useEffect(() => {
-    if (!signalCoords.url || !signalCoords.token || !videoRef.current) return;
+    // A WebTransport view needs no signaling coordinates: a resume (#1415) seats
+    // only the transport token, and the <video> stays empty until a fallback mints one.
+    if (!webtransport && (!signalCoords.url || !signalCoords.token)) return;
+    if (!videoRef.current) return;
 
     const inputCallbacks: Pick<
       SessionRuntimeCallbacks,
@@ -548,7 +589,7 @@ function SessionPageBody() {
           authToken: authToken ?? "",
           coords: webtransport,
           canvas: canvasRef.current,
-          pyrowave: state?.pyrowave === true,
+          pyrowave: state?.pyrowave === true || resumedPyrowave,
           tierFps: state?.tier ? parseInt(state.tier.split("@")[1] ?? "", 10) || undefined : undefined,
           counters: postedCountersRef.current,
           callbacks: {
@@ -610,7 +651,7 @@ function SessionPageBody() {
       runtimeRef.current = null;
       setRuntimeSnap(IDLE_SNAPSHOT);
     };
-  }, [signalCoords]);
+  }, [signalCoords, webtransport]);
 
   // Mic spec §3.4: release the device and reset to off on transport
   // rebuild/teardown — never carried across a reconnect.

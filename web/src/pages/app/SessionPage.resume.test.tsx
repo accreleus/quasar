@@ -28,14 +28,47 @@ import { ThemeProvider } from "../../settings/ThemeContext";
 const getSession = vi.fn();
 const stopSession = vi.fn();
 const mintSignalingToken = vi.fn();
+const mintTransportToken = vi.fn();
 const updateSessionDisplay = vi.fn();
 vi.mock("../../api/library", () => ({
   getSession: (...a: unknown[]) => getSession(...a),
   listApps: () => Promise.resolve({ items: [] }),
   stopSession: (...a: unknown[]) => stopSession(...a),
   mintSignalingToken: (...a: unknown[]) => mintSignalingToken(...a),
+  mintTransportToken: (...a: unknown[]) => mintTransportToken(...a),
   updateSessionDisplay: (...a: unknown[]) => updateSessionDisplay(...a),
 }));
+
+/** The WebTransport runtimes the page built, so a resume's transport is observable. */
+const wtRuntimes: Array<{ coords: unknown; pyrowave?: boolean }> = [];
+vi.mock("./webTransportRuntime", async () => {
+  const { IDLE_SNAPSHOT } = await import("./sessionRuntime");
+  return {
+    createWebTransportRuntime: (cfg: { coords: unknown; pyrowave?: boolean }) => {
+      wtRuntimes.push({ coords: cfg.coords, pyrowave: cfg.pyrowave });
+      return {
+        getSnapshot: () => IDLE_SNAPSHOT,
+        subscribe: () => () => {},
+        start() {},
+        destroy() {},
+        engage: () => null,
+        release() {},
+        syncKeyboardLock() {},
+        setMouse() {},
+        setVirtualPad() {},
+        isCaptured: () => false,
+        cancelRecovery() {},
+        hasMicSlot: () => false,
+        attachMicTrack: () => Promise.resolve(),
+        detachMicTrack: () => Promise.resolve(),
+        registerTelemetry: () => () => {},
+        summary: () => ({ elapsedMs: 0, fps: [], latency: [] }),
+        releaseAudio() {},
+        holdAudio() {},
+      };
+    },
+  };
+});
 
 vi.mock("../../auth/context", () => ({ useAuth: () => ({ token: "t" }) }));
 
@@ -185,9 +218,15 @@ function renderResumed(strict = false) {
 
 const settle = () => act(async () => void (await Promise.resolve()));
 
+/** The coordinates `POST /v1/sessions/{id}/transport-token` mints for a WebTransport session. */
+const WT = { url: "https://agent/wt", token: "wt-token", expires_at: "2026-11-16T12:01:00Z", cert_hashes: [] };
+
 beforeEach(() => {
   transports.length = 0;
+  wtRuntimes.length = 0;
+  sessionStorage.clear();
   getSession.mockResolvedValue({ session: makeSession() });
+  mintTransportToken.mockResolvedValue({ transport_options: { webtransport: WT } });
   mintSignalingToken.mockResolvedValue({
     signaling: { url: "wss://host/v1/signal", token: "fresh-token" },
   });
@@ -335,5 +374,62 @@ describe("resuming a session with no router state (#524)", () => {
     reject(new ApiError(404, "not_found", "session not found"));
     await settle();
     expect(screen.queryByText(/no longer exists/i)).not.toBeInTheDocument();
+  });
+});
+
+// #1415 — a reloaded session whose stream plan chose WebTransport came back over
+// WebRTC with nothing said about it, which also dropped a PyroWave session to its
+// standard codec for the rest of its life. The resume asks the session's own
+// transport token route first; only when that is refused does it fall back, and
+// then it says so.
+describe("resuming a WebTransport session (#1415)", () => {
+  it("resumes over WebTransport from the transport token, not WebRTC", async () => {
+    getSession.mockResolvedValue({ session: makeSession({ transport: "webtransport" }) });
+    renderResumed();
+
+    await waitFor(() => expect(wtRuntimes).toHaveLength(1));
+    expect(mintTransportToken).toHaveBeenCalledWith("t", "s1");
+    expect(mintSignalingToken).not.toHaveBeenCalled();
+    expect(wtRuntimes[0].coords).toEqual(WT);
+    expect(transports).toHaveLength(0);
+    expect(screen.getByTestId("path").textContent).toBe("/app/session/s1");
+    expect(screen.queryByText(/over WebRTC/i)).not.toBeInTheDocument();
+  });
+
+  it("carries the session's PyroWave want across the resume", async () => {
+    getSession.mockResolvedValue({
+      session: makeSession({
+        transport: "webtransport",
+        pyrowave: { allowed: true, reason: null, wanted: true, active: true, used: true, target_kbps: 200_000, switch_reason: null },
+      }),
+    });
+    renderResumed();
+
+    await waitFor(() => expect(wtRuntimes).toHaveLength(1));
+    expect(wtRuntimes[0].pyrowave).toBe(true);
+  });
+
+  it("says so and carries on over WebRTC when the session can no longer use WebTransport", async () => {
+    getSession.mockResolvedValue({ session: makeSession({ transport: "webtransport" }) });
+    mintTransportToken.mockRejectedValue(
+      new ApiError(409, "transport_unavailable", "the session's transport is webrtc"),
+    );
+    renderResumed();
+
+    await waitFor(() => expect(transports).toHaveLength(1));
+    expect(wtRuntimes).toHaveLength(0);
+    expect(mintSignalingToken).toHaveBeenCalledWith("t", "s1");
+    expect(transports[0].requestOfferOnOpen).toBe(true);
+    expect(await screen.findByText(/carries on over WebRTC/i)).toBeInTheDocument();
+  });
+
+  it("goes straight to WebRTC on a reload after a remembered fallback, asking for no transport token", async () => {
+    sessionStorage.setItem("quasar.wt-fallback.s1", "connect_timeout");
+    getSession.mockResolvedValue({ session: makeSession({ transport: "webtransport" }) });
+    renderResumed();
+
+    await waitFor(() => expect(transports).toHaveLength(1));
+    expect(mintTransportToken).not.toHaveBeenCalled();
+    expect(wtRuntimes).toHaveLength(0);
   });
 });
