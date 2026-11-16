@@ -267,12 +267,27 @@ describe("Hud shelf", () => {
     expect(screen.getByRole("tablist", { name: /session menu sections/i })).toBeTruthy();
   });
 
-  it("renders the three display controls on the Display section", () => {
+  it("renders the render-resolution and interface-size controls on the Display section", () => {
     renderHud();
     fireEvent.click(tabBtn(/^Display$/));
     expect(screen.getByRole("combobox", { name: /render resolution/i })).toBeTruthy();
     expect(screen.getByRole("combobox", { name: /interface size/i })).toBeTruthy();
     expect(screen.getByText("Render resolution")).toBeTruthy();
+  });
+
+  it("gives the Display pane the session's transport, so the sharpen switch is inert off WebTransport (#1409)", () => {
+    const { unmount } = renderHud({ transport: "webrtc" });
+    fireEvent.click(tabBtn(/^Display$/));
+    const onWebrtc = screen.getByRole("checkbox", { name: /sharpen an upscaled picture/i }) as HTMLInputElement;
+    expect(onWebrtc.disabled).toBe(true);
+    expect(screen.getByText(/only a webtransport session uses this/i)).toBeTruthy();
+    unmount();
+
+    renderHud({ transport: "webtransport" });
+    fireEvent.click(tabBtn(/^Display$/));
+    const onWebtransport = screen.getByRole("checkbox", { name: /sharpen an upscaled picture/i }) as HTMLInputElement;
+    expect(onWebtransport.disabled).toBe(false);
+    expect(screen.queryByText(/only a webtransport session uses this/i)).toBeNull();
   });
 });
 

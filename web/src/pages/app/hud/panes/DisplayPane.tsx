@@ -62,6 +62,11 @@ export interface DisplayPaneProps {
   /** True while a display PATCH is in flight — the rows go inert together,
    *  because they share one debounced request. */
   displayBusy: boolean;
+  /** The session's transport (`webrtc` | `webtransport`). #1409: the sharpen
+   *  pass lives in the WebGPU presenter, which only WebTransport uses, so the
+   *  switch is inert (with the reason) on any other transport. Absent (unknown)
+   *  reads as "not WebTransport". */
+  transport?: string;
   /** #1349: the upscale + sharpen pass, on unless this device turned it off. */
   upscaleSharpen: boolean;
   onUpscaleSharpenChange: (on: boolean) => void;
@@ -83,15 +88,33 @@ export function DisplayPane(props: DisplayPaneProps) {
 
   // #1349: this device's own setting, so it shows whatever the session reported.
   // The presenter skips the pass at 1:1 whatever this says.
+  // #1409: only WebTransport draws through the WebGPU presenter the pass lives
+  // in. On any other transport the switch stays visible but inert, with the
+  // reason under it (DESIGN.md: an unavailable toggle is disabled with its
+  // hint, never hidden), so the stored value the next WebTransport session
+  // will use is still readable here.
+  const webTransport = props.transport === "webtransport";
+  const sharpenHintId = "hud-upscale-sharpen-hint";
   const sharpen = (
-    <div className="ctl-row">
-      <Switch
-        label="Sharpen an upscaled picture"
-        id="hud-upscale-sharpen"
-        checked={props.upscaleSharpen}
-        onChange={props.onUpscaleSharpenChange}
-      />
-    </div>
+    <>
+      <div className="ctl-row">
+        <Switch
+          label="Sharpen an upscaled picture"
+          id="hud-upscale-sharpen"
+          checked={props.upscaleSharpen}
+          onChange={props.onUpscaleSharpenChange}
+          disabled={!webTransport}
+          aria-describedby={webTransport ? undefined : sharpenHintId}
+        />
+      </div>
+      {!webTransport && (
+        <p className="col-note" id={sharpenHintId}>
+          {props.transport === "webrtc"
+            ? "Only a WebTransport session uses this. This session streams over WebRTC."
+            : "Only a WebTransport session uses this."}
+        </p>
+      )}
+    </>
   );
 
   return (
@@ -99,8 +122,8 @@ export function DisplayPane(props: DisplayPaneProps) {
       <div className="pane-head">
         <h3>Display</h3>
         <p>
-          Changes apply to the running session. The stream keeps playing while the host
-          answers.
+          Stream, render and interface-size changes apply to the running session. The
+          stream keeps playing while the host answers.
         </p>
       </div>
       <div className="cols">

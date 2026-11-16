@@ -442,6 +442,7 @@ export const Hud = forwardRef<HudHandle, HudProps>(function Hud(props, ref) {
             onUiScaleChange={props.onUiScaleChange}
             displayBusy={props.displayBusy}
             showInterfaceSize={props.showInterfaceSize}
+            transport={props.transport}
             upscaleSharpen={props.upscaleSharpen}
             onUpscaleSharpenChange={props.onUpscaleSharpenChange}
           />
