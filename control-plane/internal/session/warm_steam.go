@@ -1117,17 +1117,32 @@ func markReleased(ctx context.Context, tx pgx.Tx, sessionID string) error {
 // The hold is still on the runtime it was to adopt, which only that runtime's
 // own cleanup proof clears; the stop here is a best-effort hurry, and the
 // heartbeat and ReconcilePendingHomes repeat it once no live row adopts it.
+//
+// A stop in its grace owns the session's outcome (amendment 88, #1451): a
+// command the agent refused then — an assign refused for an id the stop already
+// retired, or for its own reason while the stop was in flight — ends the session
+// as that stop, never as a failure (no error_message, no `session failed`, no
+// session.failed audit). The dispatch is abandoned here, so the row is ended
+// here too where the agent cannot report it (#940).
 func (c *Coordinator) failBeforeAgent(sessionID, adoptID string, hostID *string, reason string) {
-	c.failSession(sessionID, reason)
+	stopped := c.stopInGrace(sessionID)
+	if stopped {
+		c.log.Info("launch abandoned during a stop; not failing the session",
+			"session_id", sessionID, "reason", reason)
+	} else {
+		c.failSession(sessionID, reason)
+	}
 	if err := c.store.releaseUnusedSharedClaim(context.Background(), sessionID); err != nil {
 		c.log.Warn("releasing an unused shared home claim failed", "session_id", sessionID, "err", err)
 	}
-	if adoptID == "" || hostID == nil {
-		return
+	if adoptID != "" && hostID != nil {
+		cmd := agentws.SessionStopCmd{Type: "session_stop", ID: newCmdID(), SessionID: adoptID, Reason: "error"}
+		if err := c.dispatcher.Send(*hostID, cmd); err != nil {
+			c.log.Warn("stopping an unadopted runtime failed", "session_id", adoptID, "err", err)
+		}
 	}
-	cmd := agentws.SessionStopCmd{Type: "session_stop", ID: newCmdID(), SessionID: adoptID, Reason: "error"}
-	if err := c.dispatcher.Send(*hostID, cmd); err != nil {
-		c.log.Warn("stopping an unadopted runtime failed", "session_id", adoptID, "err", err)
+	if stopped {
+		c.endUnsentStopOnHost(sessionID, hostID)
 	}
 }
 
