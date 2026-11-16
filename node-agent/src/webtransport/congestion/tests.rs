@@ -379,6 +379,77 @@ fn feedback_silence_while_media_is_sent_decays_the_estimate() {
     );
 }
 
+/// #1417: a 10 s outage decays the estimate to the floor; a 20 Mbit/s session then needs
+/// about a minute of busy content to get it back at AIMD's 8 % a second. Regrown toward what
+/// the link carried before the outage, it is back in a few seconds.
+#[test]
+fn an_outage_costs_the_estimate_seconds_not_a_minute() {
+    let mut s = Sim::new(20_000.0);
+    s.send_kbps = Some(6000.0);
+    s.run(5.0);
+    let carried = s.est.estimate_kbps();
+    assert!(carried > 0.99 * CEILING, "the link carried {carried:.0}");
+    // 10 s of the agent sending and nothing coming back.
+    let outage = s.t;
+    for step in 1..=100u64 {
+        s.t = outage + step * 100_000;
+        s.frame();
+        let at = s.start + Duration::from_micros(s.t);
+        s.est.on_tick(at, &s.log, RTT);
+    }
+    let low = s.est.estimate_kbps();
+    assert!(low < 0.05 * carried, "the outage took it to {low:.0}");
+    // Everything sent during the outage was lost with it; then feedback returns on the
+    // same link.
+    s.pending.clear();
+    s.run(10.0);
+    let e = s.est.estimate_kbps();
+    assert!(
+        e > 0.9 * carried,
+        "{carried:.0} → {low:.0} → {e:.0} in 10 s of feedback"
+    );
+}
+
+/// #1417: the regrow is toward the rate the link carried, not a probe past it. On a link
+/// that came back a tenth as fast, the estimate settles at the new rate and never runs to
+/// the old one.
+#[test]
+fn the_regrow_never_passes_what_the_link_carried() {
+    let mut s = Sim::new(20_000.0);
+    s.send_kbps = Some(6000.0);
+    s.run(5.0);
+    let carried = s.est.estimate_kbps();
+    let outage = s.t;
+    for step in 1..=100u64 {
+        s.t = outage + step * 100_000;
+        s.frame();
+        let at = s.start + Duration::from_micros(s.t);
+        s.est.on_tick(at, &s.log, RTT);
+    }
+    s.pending.clear();
+    // The link is now a twentieth of what it was, and the encoder follows the estimate as
+    // the ABR makes it.
+    s.cap_kbps = 1000.0;
+    s.send_kbps = None;
+    s.run(20.0);
+    let resumed = (outage + 10_000_000) as f64 / 1e6;
+    let peak = s
+        .trace
+        .iter()
+        .filter(|&&(t, _)| t >= resumed)
+        .map(|&(_, e)| e)
+        .fold(0.0, f64::max);
+    assert!(
+        peak < carried,
+        "the regrow peaked at {peak:.0} on a 1000 kbps link that carried {carried:.0}"
+    );
+    let e = s.est.estimate_kbps();
+    assert!(
+        (500.0..2500.0).contains(&e),
+        "settled at {e:.0} on a 1000 kbps link"
+    );
+}
+
 #[test]
 fn a_frame_after_a_still_screen_is_not_judged_before_its_feedback_can_return() {
     let mut s = Sim::new(50_000.0);

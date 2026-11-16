@@ -15,6 +15,9 @@
 //!   arrivals, measures the content or the stall, not the link (#1316). Overuse that
 //!   outlasts a spike with no such window cuts from the receive rate, so a quiet sender
 //!   still follows a link that carries less.
+//! - **Outage regrow.** An estimate a silence decay took under what the link carried before
+//!   it grows back at `RECOVERY_GROWTH_PER_S`, and never past that rate: AIMD's 8 % a second
+//!   costs about a minute to regain a 20 Mbit/s session from the floor (#1417).
 //! - **Loss.** Over 10 % scales by (1 − loss/2); under 2 % lets it grow.
 //! - The estimate is the least of the two and of the ceiling. QUIC's own window follows it
 //!   (`Window`), so it is no bound here.
@@ -64,6 +67,11 @@ const THRESHOLD_MAX_MS: f64 = 600.0;
 // AIMD (libwebrtc `AimdRateControl`).
 const BETA: f64 = 0.85;
 const GROWTH_PER_S: f64 = 1.08;
+/// Growth while the estimate climbs back to what the link carried before a silence decay
+/// (#1417). AIMD's 8 % a second needs about a minute to regain a 20 Mbit/s session from the
+/// floor after a 10 s outage; this reaches the same rate in a few seconds, and never goes
+/// past it.
+const RECOVERY_GROWTH_PER_S: f64 = 2.0;
 const RECV_CAP: f64 = 1.5;
 const RECV_CAP_ADD_KBPS: f64 = 10.0;
 const REDUCE_MIN: Duration = Duration::from_millis(10);
@@ -448,6 +456,10 @@ pub(crate) struct Estimator {
     last_decay: Option<Instant>,
     loss: Option<f64>,
     bound: Bound,
+    /// What the link carried when the current silence decay began: the estimate grows back
+    /// toward it faster than AIMD, and never past it. Cleared once it is reached, or when
+    /// the link disagrees with a delay or loss cut (#1417).
+    recover_to: Option<f64>,
     /// The bound the log last named, and when.
     logged: (Bound, Option<Instant>),
     /// The estimate before a silence decay not logged yet; delay and loss cuts always log.
@@ -491,6 +503,7 @@ impl Estimator {
             last_decay: None,
             loss: None,
             bound: Bound::Ceiling,
+            recover_to: None,
             logged: (Bound::Ceiling, None),
             unlogged: None,
             measured: None,
@@ -507,6 +520,7 @@ impl Estimator {
     pub(crate) fn resume_at(&mut self, kbps: f64) {
         self.delay_kbps = kbps;
         self.loss_kbps = kbps;
+        self.recover_to = None;
         self.settle();
     }
 
@@ -549,6 +563,15 @@ impl Estimator {
             .as_secs_f64()
             .min(1.0);
         self.last_update = now;
+        // Under what the link carried before a silence decay: grow back toward it at
+        // `RECOVERY_GROWTH_PER_S`, and never past it (#1417).
+        let recover = self.recover_to.filter(|&to| to > self.estimate_kbps);
+        let growth = if recover.is_some() {
+            RECOVERY_GROWTH_PER_S
+        } else {
+            GROWTH_PER_S
+        }
+        .powf(dt);
         let app_limited = m
             .sent_kbps
             .is_none_or(|s| s < APP_LIMITED * self.estimate_kbps);
@@ -596,13 +619,18 @@ impl Estimator {
                     if cut < self.delay_kbps {
                         self.delay_kbps = cut;
                         cut_by.push("delay");
+                        // The link no longer carries what it did before the outage.
+                        self.recover_to = None;
                     }
                     self.last_decrease = Some(now);
                 }
             }
             Usage::Underusing => {}
             Usage::Normal => {
-                let mut grown = self.delay_kbps * GROWTH_PER_S.powf(dt);
+                let mut grown = self.delay_kbps * growth;
+                if let Some(to) = recover {
+                    grown = grown.min(to.max(self.delay_kbps));
+                }
                 if let Some(cap) = m.rate_kbps.map(|r| RECV_CAP * r + RECV_CAP_ADD_KBPS) {
                     if grown > cap {
                         grown = self.delay_kbps.max(cap);
@@ -622,16 +650,27 @@ impl Estimator {
                     self.loss_kbps = self.estimate_kbps * (1.0 - 0.5 * loss);
                     self.last_loss_decrease = Some(now);
                     cut_by.push("loss");
+                    // The link no longer carries what it did before the outage.
+                    self.recover_to = None;
                     // These losses are spent; the next decision reads new ones.
                     self.losses.clear();
                 }
             }
             Some(loss) if loss >= LOSS_LOW => {}
-            _ => self.loss_kbps *= GROWTH_PER_S.powf(dt),
+            _ => {
+                let mut grown = self.loss_kbps * growth;
+                if let Some(to) = recover {
+                    grown = grown.min(to.max(self.loss_kbps));
+                }
+                self.loss_kbps = grown;
+            }
         }
 
         let was = self.estimate_kbps;
         self.settle();
+        if self.recover_to.is_some_and(|to| self.estimate_kbps >= to) {
+            self.recover_to = None;
+        }
         self.measured = m
             .rate_kbps
             .zip(m.sent_kbps)
@@ -689,6 +728,9 @@ impl Estimator {
         let from = self.last_decay.unwrap_or(sent + timeout);
         let steps = now.saturating_duration_since(from).as_secs_f64() / SILENCE_STEP.as_secs_f64();
         let factor = SILENCE_DECAY.powf(steps);
+        // The first decay of an episode remembers what the link carried, for the regrow to
+        // return to once feedback comes back (#1417).
+        self.recover_to.get_or_insert(self.estimate_kbps);
         self.delay_kbps *= factor;
         self.loss_kbps *= factor;
         let was = self.estimate_kbps;
