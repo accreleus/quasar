@@ -13,6 +13,8 @@ const base = {
   uiScale: 1,
   onUiScaleChange: vi.fn(),
   displayBusy: false,
+  // #1409: the sharpen switch is a WebTransport-only control.
+  transport: "webtransport",
   upscaleSharpen: true,
   onUpscaleSharpenChange: vi.fn(),
 };
@@ -259,5 +261,20 @@ describe("DisplayPane upscale sharpen (#1349)", () => {
   ])("renders exactly once: %s", (_name, props) => {
     render(<DisplayPane {...props} />);
     expect(screen.getAllByRole("checkbox", { name: /sharpen an upscaled picture/i })).toHaveLength(1);
+  });
+
+  // #1409: the pass is the WebGPU presenter's, and only WebTransport draws
+  // through it. On WebRTC the switch must not be offered at all.
+  it.each([
+    ["webrtc", "webrtc"],
+    ["unknown", undefined],
+  ])("is not offered on a %s session", (_name, transport) => {
+    render(<DisplayPane {...streamBase} transport={transport} />);
+    expect(screen.queryByRole("checkbox", { name: /sharpen an upscaled picture/i })).toBeNull();
+  });
+
+  it("is not offered on a WebRTC session without a reported stream size either", () => {
+    render(<DisplayPane {...base} transport="webrtc" streamSize={null} />);
+    expect(screen.queryByRole("checkbox", { name: /sharpen an upscaled picture/i })).toBeNull();
   });
 });

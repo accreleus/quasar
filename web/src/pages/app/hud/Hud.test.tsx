@@ -274,6 +274,17 @@ describe("Hud shelf", () => {
     expect(screen.getByRole("combobox", { name: /interface size/i })).toBeTruthy();
     expect(screen.getByText("Render resolution")).toBeTruthy();
   });
+
+  it("offers the sharpen switch on a WebTransport session only (#1409)", () => {
+    const { unmount } = renderHud({ transport: "webrtc" });
+    fireEvent.click(tabBtn(/^Display$/));
+    expect(screen.queryByRole("checkbox", { name: /sharpen an upscaled picture/i })).toBeNull();
+    unmount();
+
+    renderHud({ transport: "webtransport" });
+    fireEvent.click(tabBtn(/^Display$/));
+    expect(screen.getByRole("checkbox", { name: /sharpen an upscaled picture/i })).toBeTruthy();
+  });
 });
 
 describe("Hud capture", () => {

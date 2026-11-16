@@ -62,6 +62,10 @@ export interface DisplayPaneProps {
   /** True while a display PATCH is in flight — the rows go inert together,
    *  because they share one debounced request. */
   displayBusy: boolean;
+  /** The session's transport (`webrtc` | `webtransport`). #1409: the sharpen
+   *  pass lives in the WebGPU presenter, which only WebTransport uses, so the
+   *  switch is shown on that transport alone. Absent (unknown) shows nothing. */
+  transport?: string;
   /** #1349: the upscale + sharpen pass, on unless this device turned it off. */
   upscaleSharpen: boolean;
   onUpscaleSharpenChange: (on: boolean) => void;
@@ -83,16 +87,19 @@ export function DisplayPane(props: DisplayPaneProps) {
 
   // #1349: this device's own setting, so it shows whatever the session reported.
   // The presenter skips the pass at 1:1 whatever this says.
-  const sharpen = (
-    <div className="ctl-row">
-      <Switch
-        label="Sharpen an upscaled picture"
-        id="hud-upscale-sharpen"
-        checked={props.upscaleSharpen}
-        onChange={props.onUpscaleSharpenChange}
-      />
-    </div>
-  );
+  // #1409: only WebTransport draws through the WebGPU presenter, so on a WebRTC
+  // session the switch would do nothing — it is not offered there.
+  const sharpen =
+    props.transport === "webtransport" ? (
+      <div className="ctl-row">
+        <Switch
+          label="Sharpen an upscaled picture"
+          id="hud-upscale-sharpen"
+          checked={props.upscaleSharpen}
+          onChange={props.onUpscaleSharpenChange}
+        />
+      </div>
+    ) : null;
 
   return (
     <>
@@ -110,7 +117,7 @@ export function DisplayPane(props: DisplayPaneProps) {
               This session did not report a stream size, so its display controls are
               unavailable. Relaunch from the library to get them back.
             </div>
-            <div>{sharpen}</div>
+            {sharpen && <div>{sharpen}</div>}
           </>
         ) : (
           <>
