@@ -28,14 +28,47 @@ import { ThemeProvider } from "../../settings/ThemeContext";
 const getSession = vi.fn();
 const stopSession = vi.fn();
 const mintSignalingToken = vi.fn();
+const mintTransportToken = vi.fn();
 const updateSessionDisplay = vi.fn();
 vi.mock("../../api/library", () => ({
   getSession: (...a: unknown[]) => getSession(...a),
   listApps: () => Promise.resolve({ items: [] }),
   stopSession: (...a: unknown[]) => stopSession(...a),
   mintSignalingToken: (...a: unknown[]) => mintSignalingToken(...a),
+  mintTransportToken: (...a: unknown[]) => mintTransportToken(...a),
   updateSessionDisplay: (...a: unknown[]) => updateSessionDisplay(...a),
 }));
+
+/** The WebTransport runtimes the page built, so a resume's transport is observable. */
+const wtRuntimes: Array<{ coords: unknown; pyrowave?: boolean }> = [];
+vi.mock("./webTransportRuntime", async () => {
+  const { IDLE_SNAPSHOT } = await import("./sessionRuntime");
+  return {
+    createWebTransportRuntime: (cfg: { coords: unknown; pyrowave?: boolean }) => {
+      wtRuntimes.push({ coords: cfg.coords, pyrowave: cfg.pyrowave });
+      return {
+        getSnapshot: () => IDLE_SNAPSHOT,
+        subscribe: () => () => {},
+        start() {},
+        destroy() {},
+        engage: () => null,
+        release() {},
+        syncKeyboardLock() {},
+        setMouse() {},
+        setVirtualPad() {},
+        isCaptured: () => false,
+        cancelRecovery() {},
+        hasMicSlot: () => false,
+        attachMicTrack: () => Promise.resolve(),
+        detachMicTrack: () => Promise.resolve(),
+        registerTelemetry: () => () => {},
+        summary: () => ({ elapsedMs: 0, fps: [], latency: [] }),
+        releaseAudio() {},
+        holdAudio() {},
+      };
+    },
+  };
+});
 
 vi.mock("../../auth/context", () => ({ useAuth: () => ({ token: "t" }) }));
 
@@ -80,6 +113,8 @@ vi.mock("../../webrtc/telemetry", async (importOriginal) => {
   };
 });
 
+/** Every `transport.fallback` reason this page reported, in order. */
+const fallbackTraces: string[] = [];
 vi.mock("../../webrtc/traceEvents", () => ({
   TraceEventEmitter: class {
     start() {}
@@ -87,6 +122,9 @@ vi.mock("../../webrtc/traceEvents", () => ({
     emitPlayoutChanged() {}
     emitWebRtcStateChanged() {}
     emitFreezeDetected() {}
+    emitTransportFallback(reason: string) {
+      fallbackTraces.push(reason);
+    }
   },
 }));
 
@@ -185,9 +223,16 @@ function renderResumed(strict = false) {
 
 const settle = () => act(async () => void (await Promise.resolve()));
 
+/** The coordinates `POST /v1/sessions/{id}/transport-token` mints for a WebTransport session. */
+const WT = { url: "https://agent/wt", token: "wt-token", expires_at: "2026-11-16T12:01:00Z", cert_hashes: [] };
+
 beforeEach(() => {
   transports.length = 0;
+  wtRuntimes.length = 0;
+  fallbackTraces.length = 0;
+  sessionStorage.clear();
   getSession.mockResolvedValue({ session: makeSession() });
+  mintTransportToken.mockResolvedValue({ transport_options: { webtransport: WT } });
   mintSignalingToken.mockResolvedValue({
     signaling: { url: "wss://host/v1/signal", token: "fresh-token" },
   });
@@ -196,6 +241,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.clearAllMocks();
 });
 
@@ -335,5 +381,173 @@ describe("resuming a session with no router state (#524)", () => {
     reject(new ApiError(404, "not_found", "session not found"));
     await settle();
     expect(screen.queryByText(/no longer exists/i)).not.toBeInTheDocument();
+  });
+});
+
+// #1415 — a reloaded session whose stream plan chose WebTransport came back over
+// WebRTC with nothing said about it, which also dropped a PyroWave session to its
+// standard codec for the rest of its life. The resume asks the session's own
+// transport token route first; only when that is refused does it fall back, and
+// then it says so.
+describe("resuming a WebTransport session (#1415)", () => {
+  it("resumes over WebTransport from the transport token, not WebRTC", async () => {
+    getSession.mockResolvedValue({ session: makeSession({ transport: "webtransport" }) });
+    renderResumed();
+
+    await waitFor(() => expect(wtRuntimes).toHaveLength(1));
+    expect(mintTransportToken).toHaveBeenCalledWith("t", "s1");
+    expect(mintSignalingToken).not.toHaveBeenCalled();
+    expect(wtRuntimes[0].coords).toEqual(WT);
+    expect(transports).toHaveLength(0);
+    expect(screen.getByTestId("path").textContent).toBe("/app/session/s1");
+    expect(screen.queryByText(/over WebRTC/i)).not.toBeInTheDocument();
+  });
+
+  it("carries the session's PyroWave want across the resume", async () => {
+    getSession.mockResolvedValue({
+      session: makeSession({
+        transport: "webtransport",
+        pyrowave: { allowed: true, reason: null, wanted: true, active: true, used: true, target_kbps: 200_000, switch_reason: null },
+      }),
+    });
+    renderResumed();
+
+    await waitFor(() => expect(wtRuntimes).toHaveLength(1));
+    expect(wtRuntimes[0].pyrowave).toBe(true);
+  });
+
+  it("a 409 transport_unavailable is a fallback like any other: recorded, said, and carried on over WebRTC", async () => {
+    // control-api.md §transport-token: only this refusal means the session is no longer on
+    // WebTransport. It must be recorded the way the runtime records a fallback (#1469 M1): the
+    // `transport.fallback` trace, the reason a reload keeps, and the row the stats overlay shows.
+    getSession.mockResolvedValue({ session: makeSession({ transport: "webtransport" }) });
+    mintTransportToken.mockRejectedValue(
+      new ApiError(409, "transport_unavailable", "the session's transport is webrtc"),
+    );
+    renderResumed();
+
+    await waitFor(() => expect(transports).toHaveLength(1));
+    expect(wtRuntimes).toHaveLength(0);
+    expect(mintSignalingToken).toHaveBeenCalledWith("t", "s1");
+    expect(transports[0].requestOfferOnOpen).toBe(true);
+    // It says so the way every other fallback does, on the launch screen's own notice.
+    expect(screen.getAllByText("Switching to WebRTC…").length).toBeGreaterThan(0);
+    // `stream_lost` is §Transport fallback's reason for "a fresh transport token did not restore
+    // it"; the API's own code travels in the cause instead, where the overlay's row shows it.
+    expect(fallbackTraces).toEqual(["stream_lost"]);
+    expect(sessionStorage.getItem("quasar.wt-fallback.s1")).toBe("stream_lost");
+    expect(mintTransportToken).toHaveBeenCalledTimes(1); // not retryable: the answer is final
+  });
+
+  it("retries the contract's retryable 503 and stays on WebTransport when the agent comes back", async () => {
+    // `503 agent_not_connected` is retryable "exactly as for the signaling token" (a host agent
+    // reconnecting, or one that did not ack within 5 s). Treating it as a fallback would move a
+    // WebTransport — or PyroWave — session onto WebRTC for good over a five-second delay.
+    getSession.mockResolvedValue({
+      session: makeSession({
+        transport: "webtransport",
+        pyrowave: { allowed: true, reason: null, wanted: true, active: true, used: true, target_kbps: 200_000, switch_reason: null },
+      }),
+    });
+    mintTransportToken
+      .mockRejectedValueOnce(new ApiError(503, "agent_not_connected", "the host agent did not acknowledge the token; retry shortly"))
+      .mockResolvedValueOnce({ transport_options: { webtransport: WT } });
+    renderResumed();
+
+    await waitFor(() => expect(wtRuntimes).toHaveLength(1), { timeout: 5_000 });
+    expect(mintTransportToken).toHaveBeenCalledTimes(2);
+    expect(mintSignalingToken).not.toHaveBeenCalled();
+    expect(transports).toHaveLength(0);
+    expect(wtRuntimes[0]).toMatchObject({ coords: WT, pyrowave: true });
+    expect(fallbackTraces).toEqual([]);
+    expect(sessionStorage.getItem("quasar.wt-fallback.s1")).toBeNull();
+    expect(screen.queryByText(/carries on over WebRTC/i)).not.toBeInTheDocument();
+  });
+
+  it("does not switch transports on the first 503: nothing is said or recorded while it retries", async () => {
+    getSession.mockResolvedValue({ session: makeSession({ transport: "webtransport" }) });
+    mintTransportToken.mockRejectedValue(new ApiError(503, "agent_not_connected", "retry shortly"));
+    renderResumed();
+
+    await waitFor(() => expect(mintTransportToken).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 1_200)); // two retries into the budget
+    expect(mintTransportToken.mock.calls.length).toBeGreaterThan(1);
+    expect(mintSignalingToken).not.toHaveBeenCalled();
+    expect(fallbackTraces).toEqual([]);
+    expect(screen.queryByText(/carries on over WebRTC/i)).not.toBeInTheDocument();
+  });
+
+  it("gives up on WebRTC only after the retries are spent", async () => {
+    // The retry budget is the control plane's agent handshake window: the first mint plus five
+    // retries over about 15 s, then WebRTC is the floor — with the same recorded, said fallback
+    // as a 409.
+    vi.useFakeTimers();
+    getSession.mockResolvedValue({ session: makeSession({ transport: "webtransport" }) });
+    mintTransportToken.mockRejectedValue(new ApiError(503, "agent_not_connected", "retry shortly"));
+    renderResumed();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(16_000);
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    // The budget is spent: the last refusal is the answer, and the page records the fallback and
+    // mints WebRTC's coordinates exactly as it does for a 409.
+    expect(mintTransportToken).toHaveBeenCalledTimes(6);
+    expect(mintSignalingToken).toHaveBeenCalledWith("t", "s1");
+    expect(transports).toHaveLength(1);
+    expect(fallbackTraces).toEqual(["stream_lost"]);
+  }, 20_000);
+
+  it("a 404 takes the page's own can't-resume path, and claims no transport switch", async () => {
+    getSession.mockResolvedValue({ session: makeSession({ transport: "webtransport" }) });
+    mintTransportToken.mockRejectedValue(new ApiError(404, "not_found", "session not found"));
+    renderResumed();
+
+    await waitFor(() => expect(screen.getByTestId("path").textContent).toBe("/app"));
+    expect(await screen.findByText(/no longer exists/i)).toBeInTheDocument();
+    expect(screen.queryByText(/carries on over WebRTC/i)).not.toBeInTheDocument();
+    expect(fallbackTraces).toEqual([]);
+    expect(sessionStorage.getItem("quasar.wt-fallback.s1")).toBeNull();
+    expect(transports).toHaveLength(0);
+  });
+
+  it("a session that stopped meanwhile takes the can't-resume path, not a transport switch", async () => {
+    getSession.mockResolvedValue({ session: makeSession({ transport: "webtransport" }) });
+    mintTransportToken.mockRejectedValue(
+      new ApiError(409, "session_not_reconnectable", "session is not reconnectable"),
+    );
+    renderResumed();
+
+    await waitFor(() => expect(screen.getByTestId("path").textContent).toBe("/app"));
+    expect(await screen.findByText(/session is not reconnectable/i)).toBeInTheDocument();
+    expect(screen.queryByText(/carries on over WebRTC/i)).not.toBeInTheDocument();
+    expect(fallbackTraces).toEqual([]);
+  });
+
+  it("a network failure says the server could not be reached, and never claims a switch", async () => {
+    // The WebRTC path needs a mint too, so with the server unreachable it cannot succeed either:
+    // switching transports would be a story about a connection that was never made. The page's
+    // ordinary "could not reach the server" bounce is the honest answer, and it is what the
+    // signaling-token resume already does for the same failure.
+    getSession.mockResolvedValue({ session: makeSession({ transport: "webtransport" }) });
+    mintTransportToken.mockRejectedValue(new TypeError("Failed to fetch"));
+    renderResumed();
+
+    await waitFor(() => expect(screen.getByTestId("path").textContent).toBe("/app"));
+    expect(await screen.findByText(/Could not reach the server/i)).toBeInTheDocument();
+    expect(screen.queryByText(/carries on over WebRTC/i)).not.toBeInTheDocument();
+    expect(fallbackTraces).toEqual([]);
+    expect(mintSignalingToken).not.toHaveBeenCalled();
+    expect(transports).toHaveLength(0);
+  });
+
+  it("goes straight to WebRTC on a reload after a remembered fallback, asking for no transport token", async () => {
+    sessionStorage.setItem("quasar.wt-fallback.s1", "connect_timeout");
+    getSession.mockResolvedValue({ session: makeSession({ transport: "webtransport" }) });
+    renderResumed();
+
+    await waitFor(() => expect(transports).toHaveLength(1));
+    expect(mintTransportToken).not.toHaveBeenCalled();
+    expect(wtRuntimes).toHaveLength(0);
   });
 });
