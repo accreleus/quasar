@@ -3452,7 +3452,7 @@ export interface paths {
                         "application/json": components["schemas"]["ErrorEnvelope"];
                     };
                 };
-                /** @description no_host_available (amendment 71, accreleus/quasar#1178) - the app is not selected for the session's host, or, with error.reason compat_tool_missing, the target is a derived Steam game whose mapped GE tool the session did not mount at launch. NOT retryable: a swap does not move hosts or wait for an install. */
+                /** @description no_host_available (amendment 71, accreleus/quasar#1178) - the app is not selected for the session's host, or, with error.reason compat_tool_missing, the target is a derived Steam game whose mapped GE tool the session did not mount at launch, or (amendment 87) whose mapping was written after the session was created. NOT retryable: a swap does not move hosts or wait for an install. */
                 503: {
                     headers: {
                         [name: string]: unknown;
@@ -6721,7 +6721,7 @@ export interface paths {
         put?: never;
         /**
          * Release an uncertain restart attempt and its recovery hold (amendment 51).
-         * @description The explicit repair of an uncertain restart attempt. The body must acknowledge that the host's configuration is unverified. The request is recorded, audited once and sent to the agent as config_policy_release once its journal is reconciled; it lifts nothing. The recovery hold, the group's uncertain status and the host's draining status end only when the agent reports the attempt released. Every 4xx writes nothing. Normative behavior: control-api.md section "Releasing a recovery hold".
+         * @description The explicit repair of an uncertain restart attempt. The body must acknowledge that the host's configuration is unverified. The request is recorded, audited once and sent to the agent as config_policy_release once its journal is reconciled; it lifts nothing. The recovery hold, the group's uncertain status and the host's draining status end only when the agent reports the attempt released. Amendment 86: an applied attempt that holds a recovery restriction (an applied replay without its verified active snapshot) is released by the control plane alone, at once, answering 200; nothing is sent to the agent. Every 4xx writes nothing. Normative behavior: control-api.md section "Releasing a recovery hold".
          */
         post: {
             parameters: {
@@ -6739,7 +6739,7 @@ export interface paths {
                 };
             };
             responses: {
-                /** @description Already released; nothing sent. */
+                /** @description Already released, or (amendment 86) an applied attempt's recovery hold released now; nothing sent. */
                 200: {
                     headers: {
                         [name: string]: unknown;
@@ -6763,7 +6763,7 @@ export interface paths {
                 403: components["responses"]["Forbidden"];
                 /** @description No restart attempt with this ID on this host. No write. */
                 404: components["responses"]["NotFound"];
-                /** @description attempt_not_uncertain: the attempt is neither uncertain nor released. No write. */
+                /** @description attempt_not_uncertain: the attempt is neither uncertain nor released, nor (amendment 86) applied with a recovery restriction or a recorded release. No write. */
                 409: components["responses"]["Conflict"];
             };
         };

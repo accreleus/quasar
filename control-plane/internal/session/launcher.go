@@ -1098,8 +1098,40 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 		return
 	}
 
+	// A stop can take the row between the assign ack and here. The agent drops a
+	// pending-only assignment when that stop arrives, so a start now would be
+	// refused ("no assignment") for a session its user already stopped (#1451).
+	// Nothing will ever start that assignment, so this abandonment ends the row
+	// itself where the agent cannot report it (endUnsentStop, #940): no-op for an
+	// agent with the home-cleanup ledger, which reports `stopped` from it.
+	if c.stopInGrace(sess.ID) {
+		c.log.Info("session start withheld: a stop took the session after the assign",
+			"session_id", sess.ID)
+		c.endUnsentStopOnHost(sess.ID, &hostID)
+		return
+	}
+
 	start := agentws.SessionStartCmd{Type: "session_start", ID: newCmdID(), SessionID: sess.ID}
-	if !c.commandOK(hostID, start.ID, start, startAckTimeout, sess.ID, "start") {
+	actx, cancel := context.WithTimeout(context.Background(), startAckTimeout)
+	res, err := c.dispatcher.SendWithAck(actx, hostID, start.ID, start)
+	cancel()
+	if err != nil {
+		// A lost ack leaves open whether the agent took the start, so the watchdog
+		// and the heartbeat own the row from here: only a refusal proves it did not
+		// start the session. Never end it on this path.
+		c.failCommand(sess.ID, fmt.Sprintf("start dispatch failed: %v", err))
+		return
+	}
+	if !res.OK {
+		if c.stopInGrace(sess.ID) {
+			// The stop dropped the pending assignment and the agent refused the
+			// start for an id it no longer has: nothing will ever start it.
+			c.log.Info("session start refused during a stop; ending the launch",
+				"session_id", sess.ID, "err", res.Error)
+			c.endUnsentStopOnHost(sess.ID, &hostID)
+			return
+		}
+		c.failCommand(sess.ID, fmt.Sprintf("agent rejected start: %s", res.Error))
 		return
 	}
 	c.log.Info("session start dispatched", "session_id", sess.ID)

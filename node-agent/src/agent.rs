@@ -4269,18 +4269,28 @@ impl SessionManager {
                     match ledger.record_active(&session_id) {
                         Ok(true) => {}
                         Ok(false) => {
+                            warn!(
+                                token = "session-assign-already-recorded",
+                                "session {session_id} assignment refused: the home-cleanup \
+                                 ledger already holds an active record for this id"
+                            );
                             return Some(ack(
                                 id,
                                 false,
                                 Some("session id already recorded".to_string()),
-                            ))
+                            ));
                         }
-                        Err(_) => {
+                        Err(error) => {
+                            warn!(
+                                token = "session-assign-admission-unavailable",
+                                "session {session_id} assignment refused: durable session \
+                                 admission unavailable: {error:#}"
+                            );
                             return Some(ack(
                                 id,
                                 false,
                                 Some("durable session admission unavailable".to_string()),
-                            ))
+                            ));
                         }
                     }
                 }
@@ -4292,6 +4302,11 @@ impl SessionManager {
                             Some(runtime.ensure_image(spec.image, Duration::from_secs(600)))
                         }
                         Err(error) => {
+                            warn!(
+                                token = "session-assign-runtime-unavailable",
+                                "session {session_id} assignment refused: the runtime \
+                                 configuration is unavailable: {error:#}"
+                            );
                             self.note_session_count();
                             return Some(ack(id, false, Some(error.to_string())));
                         }
@@ -4633,6 +4648,10 @@ impl SessionManager {
                             }
                         };
                         if self.pending.remove(&session_id).is_some() {
+                            info!(
+                                token = "session-stop-dropped-assignment",
+                                "session {session_id}: stop dropped a pending assignment that had not started"
+                            );
                             self.note_session_count();
                         }
                         self.home_cleanup_reports
@@ -4641,6 +4660,10 @@ impl SessionManager {
                     }
                 }
                 if self.pending.remove(&session_id).is_some() {
+                    info!(
+                        token = "session-stop-dropped-assignment",
+                        "session {session_id}: stop dropped a pending assignment that had not started"
+                    );
                     self.note_session_count();
                 }
                 if let Some(h) = self.running.get_mut(&session_id) {
@@ -12485,6 +12508,111 @@ mod tests {
                 )
                 .is_empty());
         });
+    }
+
+    /// Writes captured tracing output where a test can read it back.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+        fn make_writer(&'a self) -> CapturedLog {
+            self.clone()
+        }
+    }
+
+    /// #1451: a stop that lands between the assign and the start drops the
+    /// pending-only assignment, so the launch the control plane is about to start
+    /// no longer exists. Without a line for it, that launch reads as a start the
+    /// agent refused for no reason.
+    ///
+    /// Both arms are exercised, because both are real: an agent with the
+    /// home-cleanup ledger retires the id and reports the stopped row itself, and
+    /// one that registered without it (an unverified identity directory) can only
+    /// log — the control plane ends that row on the refusal (#940).
+    #[test]
+    fn a_stop_that_drops_a_pending_assignment_says_so() {
+        for ledger in [false, true] {
+            let (mut mgr, warm) = warm_manager();
+            let dir = tempfile::tempdir().unwrap();
+            if ledger {
+                mgr.home_cleanup = Some(
+                    crate::home_cleanup::HomeCleanupLedger::open_after_startup_cleanup(
+                        dir.path().join("ledger"),
+                    )
+                    .unwrap(),
+                );
+            }
+            mgr.pending.insert(
+                "p0".to_string(),
+                PendingAssignment {
+                    cfg: steam_cfg(SessionKind::Play, "-applaunch 620", (1920, 1080)),
+                    assigned_at: Instant::now(),
+                    preparation: None,
+                    gpu_index: 0,
+                    adopt: None,
+                },
+            );
+            let captured = CapturedLog::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_ansi(false)
+                .with_writer(captured.clone())
+                .finish();
+            let reply = tracing::subscriber::with_default(subscriber, || {
+                tracing::callsite::rebuild_interest_cache();
+                mgr.handle_control(
+                    ControlMsg::SessionStop {
+                        id: "stop".into(),
+                        session_id: "p0".into(),
+                        reason: "user_requested".into(),
+                    },
+                    &warm.evt_tx,
+                    &diagnostic_sender(),
+                )
+            });
+            assert!(acked(reply));
+            assert!(
+                mgr.pending.is_empty(),
+                "ledger={ledger}: the assignment is gone"
+            );
+            let text = captured.text();
+            assert!(
+                text.contains("stop dropped a pending assignment"),
+                "ledger={ledger}: the drop is not logged: {text}"
+            );
+            let reports: Vec<serde_json::Value> = mgr
+                .home_cleanup_reports
+                .drain(..)
+                .map(|m| serde_json::to_value(m).unwrap())
+                .collect();
+            if ledger {
+                assert_eq!(reports.len(), 1, "{reports:?}");
+                assert_eq!(reports[0]["session_id"], "p0");
+                assert_eq!(reports[0]["state"], "stopped");
+            } else {
+                assert!(
+                    reports.is_empty(),
+                    "a ledger-less agent reports nothing for the dropped id: {reports:?}"
+                );
+            }
+        }
     }
 
     #[test]
