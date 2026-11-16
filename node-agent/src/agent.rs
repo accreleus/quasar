@@ -12541,44 +12541,78 @@ mod tests {
     /// pending-only assignment, so the launch the control plane is about to start
     /// no longer exists. Without a line for it, that launch reads as a start the
     /// agent refused for no reason.
+    ///
+    /// Both arms are exercised, because both are real: an agent with the
+    /// home-cleanup ledger retires the id and reports the stopped row itself, and
+    /// one that registered without it (an unverified identity directory) can only
+    /// log — the control plane ends that row on the refusal (#940).
     #[test]
     fn a_stop_that_drops_a_pending_assignment_says_so() {
-        let (mut mgr, warm) = warm_manager();
-        mgr.pending.insert(
-            "p0".to_string(),
-            PendingAssignment {
-                cfg: steam_cfg(SessionKind::Play, "-applaunch 620", (1920, 1080)),
-                assigned_at: Instant::now(),
-                preparation: None,
-                gpu_index: 0,
-                adopt: None,
-            },
-        );
-        let captured = CapturedLog::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .with_writer(captured.clone())
-            .finish();
-        let reply = tracing::subscriber::with_default(subscriber, || {
-            tracing::callsite::rebuild_interest_cache();
-            mgr.handle_control(
-                ControlMsg::SessionStop {
-                    id: "stop".into(),
-                    session_id: "p0".into(),
-                    reason: "user_requested".into(),
+        for ledger in [false, true] {
+            let (mut mgr, warm) = warm_manager();
+            let dir = tempfile::tempdir().unwrap();
+            if ledger {
+                mgr.home_cleanup = Some(
+                    crate::home_cleanup::HomeCleanupLedger::open_after_startup_cleanup(
+                        dir.path().join("ledger"),
+                    )
+                    .unwrap(),
+                );
+            }
+            mgr.pending.insert(
+                "p0".to_string(),
+                PendingAssignment {
+                    cfg: steam_cfg(SessionKind::Play, "-applaunch 620", (1920, 1080)),
+                    assigned_at: Instant::now(),
+                    preparation: None,
+                    gpu_index: 0,
+                    adopt: None,
                 },
-                &warm.evt_tx,
-                &diagnostic_sender(),
-            )
-        });
-        assert!(acked(reply));
-        assert!(mgr.pending.is_empty(), "the assignment is gone");
-        let text = captured.text();
-        assert!(
-            text.contains("stop dropped a pending assignment"),
-            "the drop is not logged: {text}"
-        );
+            );
+            let captured = CapturedLog::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_ansi(false)
+                .with_writer(captured.clone())
+                .finish();
+            let reply = tracing::subscriber::with_default(subscriber, || {
+                tracing::callsite::rebuild_interest_cache();
+                mgr.handle_control(
+                    ControlMsg::SessionStop {
+                        id: "stop".into(),
+                        session_id: "p0".into(),
+                        reason: "user_requested".into(),
+                    },
+                    &warm.evt_tx,
+                    &diagnostic_sender(),
+                )
+            });
+            assert!(acked(reply));
+            assert!(
+                mgr.pending.is_empty(),
+                "ledger={ledger}: the assignment is gone"
+            );
+            let text = captured.text();
+            assert!(
+                text.contains("stop dropped a pending assignment"),
+                "ledger={ledger}: the drop is not logged: {text}"
+            );
+            let reports: Vec<serde_json::Value> = mgr
+                .home_cleanup_reports
+                .drain(..)
+                .map(|m| serde_json::to_value(m).unwrap())
+                .collect();
+            if ledger {
+                assert_eq!(reports.len(), 1, "{reports:?}");
+                assert_eq!(reports[0]["session_id"], "p0");
+                assert_eq!(reports[0]["state"], "stopped");
+            } else {
+                assert!(
+                    reports.is_empty(),
+                    "a ledger-less agent reports nothing for the dropped id: {reports:?}"
+                );
+            }
+        }
     }
 
     #[test]
