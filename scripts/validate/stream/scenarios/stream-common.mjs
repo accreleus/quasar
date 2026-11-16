@@ -97,7 +97,9 @@ export async function waitFirstFrame(page, ctx, tClick) {
 }
 
 export async function signIn(page, ctx) {
-  await page.goto(ctx.baseUrl, { waitUntil: "domcontentloaded" });
+  // Cleared on /health, a stack route where the app never runs: on an app page a fast-loading app (a WEB_DIST build
+  // answered from memory) restores its sign-in after the clear, and /login then sends an already signed-in page on.
+  await page.goto(`${ctx.baseUrl}/health`, { waitUntil: "domcontentloaded" });
   await page.evaluate((bench) => {
     for (const k of Object.keys(localStorage)) if (k.startsWith("quasar.auth.")) localStorage.removeItem(k);
     if (bench) localStorage.setItem("quasar.bench", "1");
