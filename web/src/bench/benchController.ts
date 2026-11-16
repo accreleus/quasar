@@ -5,13 +5,15 @@
 // In the SPA because the CSP blocks injecting the decoder from a harness
 // (2026-08-18-benchapp-bringup.md §6) and the measurements need every frame.
 // Cost control: cached-location fast path + bbox-shrunk readback once located;
-// while unlocated, the full search (~3.4 MB of allocations, synchronous in the
-// RVFC callback) is throttled to four attempts/second.
+// while unlocated, the video path reads and searches the pixels at most four times
+// a second (the readback itself costs presentations, not just the search); the
+// PyroWave texture path copies the crop every frame, off the presentation path,
+// and searches on the same four-a-second cadence.
 //
 // Nothing here runs unless bench mode is explicitly on (benchFlag.ts).
 
 import { decodeMarker } from "./marker_decode.js";
-import type { MarkerImageData, MarkerLocation } from "./marker_decode.js";
+import type { MarkerDecodeResult, MarkerImageData, MarkerLocation } from "./marker_decode.js";
 import { EVDEV } from "../input/evdev";
 import {
   FLAG_INPUT_ECHO,
@@ -60,6 +62,8 @@ export const I2P_TIMEOUT_MS = 2000;
 export const READBACKS_IN_FLIGHT = 3;
 /** How many windows to keep for `window.__qBench.windows()`. */
 const MAX_WINDOWS = 3600;
+
+const NOT_READ: MarkerDecodeResult = { decoded: false, confidence: 0, error: "not read" };
 
 /** Everything the controller needs from the session, injected for testability. */
 export interface BenchDeps {
@@ -113,6 +117,10 @@ export interface BenchHandle {
     located: boolean;
     i2p_missed: number;
     no_image: number;
+    skipped_reads: number;
+    missed_presentations: number;
+    callback_ms_mean: number | null;
+    callback_ms_max: number;
   };
 }
 
@@ -214,6 +222,14 @@ export class BenchController {
   private totalDecoded = 0;
   private totalI2pMissed = 0;
   private totalNoImage = 0;
+  /** Frames whose pixels were not read because a full search was not due. */
+  private totalSkippedReads = 0;
+  /** Presentations RVFC coalesced away before the callback ran (presentedFrames gaps). */
+  private totalMissedPresentations = 0;
+  private prevPresented: number | null = null;
+  private totalCallbacks = 0;
+  private totalCallbackMs = 0;
+  private maxCallbackMs = 0;
 
   /** Time origin used to lift RVFC high-res stamps into the epoch (stages.ts). */
   private readonly timeOriginMs: number;
@@ -295,6 +311,10 @@ export class BenchController {
         located: this.location !== null,
         i2p_missed: this.totalI2pMissed,
         no_image: this.totalNoImage,
+        skipped_reads: this.totalSkippedReads,
+        missed_presentations: this.totalMissedPresentations,
+        callback_ms_mean: this.totalCallbacks > 0 ? this.totalCallbackMs / this.totalCallbacks : null,
+        callback_ms_max: this.maxCallbackMs,
       }),
     };
   }
@@ -334,7 +354,20 @@ export class BenchController {
   /** Exposed for tests: process one displayed frame. */
   onFrame(metadata?: VideoFrameCallbackMetadata): void {
     if (!this.running) return;
-    this.measure(presentEpochMs(metadata, this.deps.nowEpochMs), rvfcStageMetadata(metadata), this.grab());
+    const started = performance.now();
+    const stageMeta = rvfcStageMetadata(metadata);
+    const presented = stageMeta.presented_frames;
+    if (presented !== undefined && this.prevPresented !== null && presented - this.prevPresented > 1) {
+      this.totalMissedPresentations += presented - this.prevPresented - 1;
+    }
+    if (presented !== undefined) this.prevPresented = presented;
+    // Between full searches nothing reads pixels: the readback, not the decode, is what costs presentations.
+    const searchDue = this.location !== null || this.deps.nowEpochMs() - this.lastFullSearchMs >= FULL_SEARCH_MIN_INTERVAL_MS;
+    this.measure(presentEpochMs(metadata, this.deps.nowEpochMs), stageMeta, searchDue ? this.grab() : undefined);
+    const took = performance.now() - started;
+    this.totalCallbackMs += took;
+    this.maxCallbackMs = Math.max(this.maxCallbackMs, took);
+    this.totalCallbacks += 1;
   }
 
   /**
@@ -405,9 +438,10 @@ export class BenchController {
     }
   }
 
-  private measure(present: number, stageMeta: Partial<BenchFrame>, image: MarkerImageData | null): void {
+  /** `image` is null when the readback yielded nothing, undefined when this frame's pixels were not read (no search due). */
+  private measure(present: number, stageMeta: Partial<BenchFrame>, image: MarkerImageData | null | undefined): void {
     const offset = this.deps.getClockOffsetMs();
-    if (!image) {
+    if (image === null) {
       // No readable pixels (pre-decode, tainted canvas, teardown) — counted
       // separately; must not inflate `n` or the undecoded count.
       this.windowNoImage += 1;
@@ -416,7 +450,9 @@ export class BenchController {
       return;
     }
 
-    const result = decodeMarker(image, this.decodeOptions());
+    let result: MarkerDecodeResult = NOT_READ;
+    if (image) result = decodeMarker(image, this.decodeOptions());
+    else this.totalSkippedReads += 1;
     let frame: BenchFrame = {
       present_ms: present, decoded: false, confidence: 0, offset_ms: offset, ...stageMeta,
     };
@@ -444,7 +480,7 @@ export class BenchController {
         offset_ms: offset,
         ...stageMeta,
       };
-    } else {
+    } else if (image) {
       this.failStreak += 1;
       if (this.location !== null && this.failStreak >= REACQUIRE_AFTER_FAILURES) {
         // Re-acquire from scratch: the geometry we cached no longer describes
@@ -481,15 +517,6 @@ export class BenchController {
     if (this.ring.length > RING_CAPACITY) this.ring.splice(0, this.ring.length - RING_CAPACITY);
   }
 
-  /** Abandon sends whose echo never arrived, so the queue can never wedge. */
-  private expireStaleInputs(nowMs: number): void {
-    while (this.pendingInputs.length > 0 && nowMs - this.pendingInputs[0]!.sentMs > I2P_TIMEOUT_MS) {
-      this.pendingInputs.shift();
-      this.windowI2pMissed += 1;
-      this.totalI2pMissed += 1;
-    }
-  }
-
   /**
    * Decode options for this frame: the cached-location fast path when we have
    * one, otherwise a THROTTLED full search (see the cost note in the header).
@@ -506,6 +533,15 @@ export class BenchController {
     }
     this.lastFullSearchMs = now;
     return undefined;
+  }
+
+  /** Abandon sends whose echo never arrived, so the queue can never wedge. */
+  private expireStaleInputs(nowMs: number): void {
+    while (this.pendingInputs.length > 0 && nowMs - this.pendingInputs[0]!.sentMs > I2P_TIMEOUT_MS) {
+      this.pendingInputs.shift();
+      this.windowI2pMissed += 1;
+      this.totalI2pMissed += 1;
+    }
   }
 
   /** Test seam: close the current window as the 1 s timer would. */

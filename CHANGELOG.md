@@ -28,6 +28,7 @@ own; the two do not move together, and that is deliberate.
 - **Bench mode (`?bench=1`) now measures a PyroWave session (#1344).** The marker is read off the decoded picture on the GPU, only its corner of the frame and without holding up the frame, so glass-to-glass, the marker counts and input-to-photon exist for PyroWave as for the other codecs. A browser that cannot read the picture back counts its frames as `no_image` instead of reporting none.
 - **The end-to-end suite's browser no longer stops at Chrome's "Allow access to other devices on your network" prompt.** Each scenario's fresh browser context is granted local network access, so a WebTransport stream no longer stalls into a WebRTC fallback while the prompt waits. A Chrome without that permission runs as before.
 - **`make e2e-run WEB_DIST=<dir>` no longer fails sign-in from the second scenario on.** The runner cleared the stored sign-in on an app page, where a build served from memory booted fast enough to restore it; it now clears it on `/health`, where the app never runs.
+- Bench mode no longer reads the video's pixels on every frame while no marker is located (only on the four-a-second search), which cost WebRTC presentations on an app with no marker; `__qBench.stats()` now reports `skipped_reads`, `missed_presentations` and the callback's own time. A bench-mode page also no longer posts a client-health class, so a bench hold cannot make its user ineligible for the next launch (Refs #1304).
 
 ## 0.6.0 — 2026-11-15
 
