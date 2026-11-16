@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Fixed
+- Bench mode no longer reads the video's pixels on every frame while no marker is located (only on the four-a-second search), which cost WebRTC presentations on an app with no marker; `__qBench.stats()` now reports `skipped_reads`, `missed_presentations` and the callback's own time. A bench-mode page also no longer posts a client-health class, so a bench hold cannot make its user ineligible for the next launch (Refs #1304).
+
 ## 0.6.0 — 2026-11-15
 
 ### Upgrading

@@ -3,6 +3,7 @@
 // transport has the facts: the display frames the presenter's pictures land in, the bytes and
 // frames the runtime handles, and the control stream's ping/pong. There is no RTCPeerConnection to ask.
 
+import { isBenchModeEnabled } from "../bench/benchFlag";
 import { median, percentile } from "../lib/stats";
 import type { CaptureMetrics } from "../input/capture";
 import { getOrCreateDeviceKey } from "../webrtc/capability";
@@ -317,11 +318,12 @@ export class WtTelemetry {
     put("wt_audio_target_ms", this.audioTargetMs);
     put("wt_audio_underruns", this.counters.audioUnderruns);
     // A thin window has no σ: "smooth" there is unmeasured, and posting it would record a pass.
+    // Bench mode never posts a class: its readback costs presentations (see the WebRTC twin).
     const unmeasured = health.health === "smooth" && cadence.n < PRESENT_MIN_SAMPLES;
     this.pending.push({
       ts_unix_ms: this.nowEpochMs(),
       metrics: m,
-      ...(unmeasured ? {} : { client_health: health.health, client_health_reason: health.reason }),
+      ...(unmeasured || isBenchModeEnabled() ? {} : { client_health: health.health, client_health_reason: health.reason }),
       device_key: this.deviceKey,
       ...(this.codec ? { codec_mime_type: this.codec } : {}),
     });

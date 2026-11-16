@@ -157,7 +157,7 @@ near a whole one), whereas a fixed feedback or driver cost has p50 ≈ p95.
 | `__qBench.pressKey('Space')` | sends one key down+up and arms an input-to-photon measurement. `false` if the key is unknown or an echo is already outstanding. |
 | `__qBench.windows()` | every completed one-second window so far. |
 | `__qBench.dump()` | `{frames, windows}` — the last 5000 per-frame records plus the windows. |
-| `__qBench.stats()` | `{frames, decoded, located}`. |
+| `__qBench.stats()` | `{frames, decoded, located, i2p_missed, no_image, skipped_reads, missed_presentations, callback_ms_mean, callback_ms_max}`. |
 
 Each window is also posted as a `bench.window` trace event
 (`POST /v1/sessions/{id}/trace/events`), payload:
@@ -309,9 +309,15 @@ the marker is located the decoder takes its cached-location path (570 cell-centr
 samples) and the readback shrinks to the marker's own bounding box (~500×320 px
 at 1080p). While the marker is **not** located the full search allocates a luma
 buffer plus a Float64 integral image (~3.4 MB at the default search crop), so it
-is throttled to four attempts a second — a cold app start can take tens of
-seconds to first paint, and 60 fps of full searches through that is hundreds of
-MB/s of GC churn for no information.
+is throttled to four attempts a second, and between attempts the pixels are not
+read at all (the readback alone costs presentations; those frames still count
+in `n`, undecoded). A cold app start can take tens of seconds to first paint,
+and 60 fps of full searches through that is hundreds of MB/s of GC churn for no
+information. `__qBench.stats()` reports the cost: `skipped_reads`,
+`missed_presentations` (RVFC `presentedFrames` gaps: presentations the
+callback never saw) and `callback_ms_mean` / `callback_ms_max`. A bench-mode
+page posts no client-health class, so a bench hold never records a pass or a
+failure against the user's launch eligibility.
 
 **Bench numbers are not directly comparable to a non-bench cell.** The
 `drawImage` + `getImageData` runs synchronously in the RVFC callback, on top of

@@ -153,6 +153,20 @@ describe("WtTelemetry", () => {
     expect(h.posts.filter((p) => p.url.endsWith("/stats"))).toHaveLength(1);
   });
 
+  it("posts no client_health from a page in bench mode", async () => {
+    localStorage.setItem("quasar.bench", "1");
+    try {
+      const h = harness();
+      h.frames(60, 1000 / 60, 12);
+      h.t.tick();
+      await h.t.flush();
+      const [sample] = h.posts[0].body.samples as { client_health?: string }[];
+      expect(sample).not.toHaveProperty("client_health");
+    } finally {
+      localStorage.removeItem("quasar.bench");
+    }
+  });
+
   it("posts the display cushion as playout_target_ms and the arrival jitter behind it", async () => {
     const h = harness();
     h.frames(10, 8);

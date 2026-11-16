@@ -334,6 +334,42 @@ describe("BenchController — recovery paths the review found (I2/I3/I4)", () =>
     expect(ctl.handle().stats().decoded).toBe(2);
   });
 
+  it("reads no pixels between full searches, and counts the frames it did not read", () => {
+    const now = 1_000;
+    let grabs = 0;
+    const blank: MarkerImageData = {
+      width: 600, height: 400, data: new Uint8ClampedArray(600 * 400 * 4).fill(90),
+    };
+    const ctl = new BenchController({
+      video: { videoWidth: 1920, videoHeight: 1080 } as HTMLVideoElement,
+      sendInput: () => {},
+      emitWindow: () => {},
+      getClockOffsetMs: () => 0,
+      nowEpochMs: () => now,
+      grabFrame: () => { grabs += 1; return blank; },
+    });
+    ctl.start();
+    for (let i = 0; i < 120; i++) ctl.onFrame();
+    const stats = ctl.handle().stats();
+    ctl.stop();
+    expect(grabs).toBe(1);
+    expect(stats.skipped_reads).toBe(119);
+    expect(stats.callback_ms_mean).not.toBeNull();
+    // Every presented frame is still a frame of the window, undecoded.
+    expect(ctl.handle().windows()[0]!.n).toBe(120);
+  });
+
+  it("counts presentations the callback never saw from the presentedFrames gap", () => {
+    const { ctl, setFrame } = harness();
+    setFrame(markerImage({ frame_index: 1 }));
+    ctl.start();
+    for (const presentedFrames of [10, 11, 14]) {
+      ctl.onFrame({ presentedFrames } as VideoFrameCallbackMetadata);
+    }
+    ctl.stop();
+    expect(ctl.handle().stats().missed_presentations).toBe(2);
+  });
+
   it("throttles the expensive full search while the marker is absent (I4)", () => {
     let now = 1_000;
     const blank: MarkerImageData = {
