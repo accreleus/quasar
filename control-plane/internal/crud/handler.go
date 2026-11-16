@@ -319,7 +319,15 @@ type adminAppResp struct {
 	RuntimeSpec        json.RawMessage `json:"runtime_spec"`
 	ManagedHome        bool            `json:"managed_home"`
 	HomeContainerPath  string          `json:"home_container_path"`
-	ShareSteamLibrary  bool            `json:"share_steam_library"`
+	// EffectiveManagedHome/EffectiveHomeContainerPath (amendment 82): the home a
+	// launch of this app gets NOW, by the launch path's own merge rule
+	// (internal/managedhome) — a preset's managed home applies, an app still on
+	// the schema default takes the preset's path, and a derived tile reads its
+	// parent's values and preset. Always serialized; ignored on write. The stored
+	// columns above keep their meaning.
+	EffectiveManagedHome       bool   `json:"effective_managed_home"`
+	EffectiveHomeContainerPath string `json:"effective_home_container_path"`
+	ShareSteamLibrary          bool   `json:"share_steam_library"`
 	// RuntimePresetID (UI-P3): the app's OWN stored preset, null = none. Not the
 	// merged effective value — that's a launch-time concern.
 	RuntimePresetID *string `json:"runtime_preset_id"`
@@ -353,17 +361,20 @@ func appToAdminResp(a App) adminAppResp {
 		allowList = []string{}
 	}
 	return adminAppResp{
-		appResp:              appToResp(a),
-		DefaultVramMB:        a.DefaultVramMB,
-		DefaultEncodeSlots:   a.DefaultEncodeSlots,
-		RuntimeSpec:          spec,
-		ManagedHome:          a.ManagedHome,
-		HomeContainerPath:    a.HomeContainerPath,
-		ShareSteamLibrary:    a.ShareSteamLibrary,
-		RuntimePresetID:      a.RuntimePresetID,
-		LaunchableProfileIDs: allowList,
-		Origin:               a.Origin,
-		LibraryProvider:      a.LibraryProvider,
+		appResp:            appToResp(a),
+		DefaultVramMB:      a.DefaultVramMB,
+		DefaultEncodeSlots: a.DefaultEncodeSlots,
+		RuntimeSpec:        spec,
+		ManagedHome:        a.ManagedHome,
+		HomeContainerPath:  a.HomeContainerPath,
+
+		EffectiveManagedHome:       a.EffectiveManagedHome,
+		EffectiveHomeContainerPath: a.EffectiveHomeContainerPath,
+		ShareSteamLibrary:          a.ShareSteamLibrary,
+		RuntimePresetID:            a.RuntimePresetID,
+		LaunchableProfileIDs:       allowList,
+		Origin:                     a.Origin,
+		LibraryProvider:            a.LibraryProvider,
 
 		LibraryDiscoverySuspended: a.LibraryDiscoverySuspended,
 		Sessions30d:               a.Sessions30d,
