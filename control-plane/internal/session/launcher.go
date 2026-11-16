@@ -1098,6 +1098,15 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 		return
 	}
 
+	// A stop can take the row between the assign ack and here. The agent drops a
+	// pending-only assignment when that stop arrives, so a start now would be
+	// refused ("no assignment") for a session its user already stopped (#1451).
+	if c.stopInGrace(sess.ID) {
+		c.log.Info("session start withheld: a stop took the session after the assign",
+			"session_id", sess.ID)
+		return
+	}
+
 	start := agentws.SessionStartCmd{Type: "session_start", ID: newCmdID(), SessionID: sess.ID}
 	if !c.commandOK(hostID, start.ID, start, startAckTimeout, sess.ID, "start") {
 		return

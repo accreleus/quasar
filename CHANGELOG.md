@@ -25,6 +25,7 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Fixed
+- **A launch the player cancels within a moment of starting no longer ends `failed` with "agent rejected start: no assignment".** The control plane stops short of sending the start once the session is stopping, and does not record a refusal the stop caused as a launch failure. The node agent now says why it refused an assignment, and says so when a stop drops an assignment that had not started (#1451).
 - **Bench mode (`?bench=1`) now measures a PyroWave session (#1344).** The marker is read off the decoded picture on the GPU, only its corner of the frame and without holding up the frame, so glass-to-glass, the marker counts and input-to-photon exist for PyroWave as for the other codecs. A browser that cannot read the picture back counts its frames as `no_image` instead of reporting none.
 - **The end-to-end suite's browser no longer stops at Chrome's "Allow access to other devices on your network" prompt.** Each scenario's fresh browser context is granted local network access, so a WebTransport stream no longer stalls into a WebRTC fallback while the prompt waits. A Chrome without that permission runs as before.
 - **`make e2e-run WEB_DIST=<dir>` no longer fails sign-in from the second scenario on.** The runner cleared the stored sign-in on an app page, where a build served from memory booted fast enough to restore it; it now clears it on `/health`, where the app never runs.
