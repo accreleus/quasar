@@ -16,8 +16,12 @@
 //!   outlasts a spike with no such window cuts from the receive rate, so a quiet sender
 //!   still follows a link that carries less.
 //! - **Outage regrow.** An estimate a silence decay took under what the link carried before
-//!   it grows back at `RECOVERY_GROWTH_PER_S`, and never past that rate: AIMD's 8 % a second
-//!   costs about a minute to regain a 20 Mbit/s session from the floor (#1417).
+//!   it grows back toward that rate at `RECOVERY_GROWTH_PER_S`, so a session that lost ten
+//!   seconds of feedback gets its bitrate back in seconds rather than AIMD's minute. The
+//!   memory is the stretch after an outage only: it is dropped when the rate is reached,
+//!   `RECOVERY_HOLD` after the last decay, on a codec switch, and at the first delay or loss
+//!   cut — the link has the last word, and the estimate is already above what it delivers by
+//!   the time that cut comes.
 //! - **Loss.** Over 10 % scales by (1 − loss/2); under 2 % lets it grow.
 //! - The estimate is the least of the two and of the ceiling. QUIC's own window follows it
 //!   (`Window`), so it is no bound here.
@@ -67,11 +71,14 @@ const THRESHOLD_MAX_MS: f64 = 600.0;
 // AIMD (libwebrtc `AimdRateControl`).
 const BETA: f64 = 0.85;
 const GROWTH_PER_S: f64 = 1.08;
-/// Growth while the estimate climbs back to what the link carried before a silence decay
+/// Growth while the estimate climbs back toward what the link carried before a silence decay
 /// (#1417). AIMD's 8 % a second needs about a minute to regain a 20 Mbit/s session from the
-/// floor after a 10 s outage; this reaches the same rate in a few seconds, and never goes
-/// past it.
+/// floor after a 10 s outage; this reaches the same rate in a few seconds.
 const RECOVERY_GROWTH_PER_S: f64 = 2.0;
+/// How long the pre-outage rate is remembered after the last silence decay of an episode.
+/// It is a memory of the stretch right after an outage, not a standing target: a still screen
+/// that never gets back to it leaves nothing behind for busy content minutes later (#1417).
+const RECOVERY_HOLD: Duration = Duration::from_secs(20);
 const RECV_CAP: f64 = 1.5;
 const RECV_CAP_ADD_KBPS: f64 = 10.0;
 const REDUCE_MIN: Duration = Duration::from_millis(10);
@@ -456,10 +463,11 @@ pub(crate) struct Estimator {
     last_decay: Option<Instant>,
     loss: Option<f64>,
     bound: Bound,
-    /// What the link carried when the current silence decay began: the estimate grows back
-    /// toward it faster than AIMD, and never past it. Cleared once it is reached, or when
-    /// the link disagrees with a delay or loss cut (#1417).
-    recover_to: Option<f64>,
+    /// What the link carried when the current silence decay began, and when that memory stops
+    /// being used (`RECOVERY_HOLD` after the last decay): the estimate grows back toward it
+    /// faster than AIMD. Dropped when it is reached, when it expires, when the link disagrees
+    /// with a delay or loss cut, and on a codec switch (#1417).
+    recover_to: Option<(f64, Instant)>,
     /// The bound the log last named, and when.
     logged: (Bound, Option<Instant>),
     /// The estimate before a silence decay not logged yet; delay and loss cuts always log.
@@ -520,7 +528,7 @@ impl Estimator {
     pub(crate) fn resume_at(&mut self, kbps: f64) {
         self.delay_kbps = kbps;
         self.loss_kbps = kbps;
-        self.recover_to = None;
+        self.stop_regrow("codec switch");
         self.settle();
     }
 
@@ -563,15 +571,25 @@ impl Estimator {
             .as_secs_f64()
             .min(1.0);
         self.last_update = now;
+        if self.recover_to.is_some_and(|(_, until)| now > until) {
+            self.stop_regrow("expired");
+        }
         // Under what the link carried before a silence decay: grow back toward it at
-        // `RECOVERY_GROWTH_PER_S`, and never past it (#1417).
-        let recover = self.recover_to.filter(|&to| to > self.estimate_kbps);
+        // `RECOVERY_GROWTH_PER_S`, and no further than it (#1417).
+        let recover = self
+            .recover_to
+            .filter(|&(to, _)| to > self.estimate_kbps)
+            .map(|(to, _)| to);
         let growth = if recover.is_some() {
             RECOVERY_GROWTH_PER_S
         } else {
             GROWTH_PER_S
         }
         .powf(dt);
+        // What the link is delivering bounds the growth of BOTH bounds, as it does AIMD's
+        // (libwebrtc's 1.5 x the receive rate): a link that came back slower holds the bound
+        // that is not binding it as well as the one that is.
+        let cap = m.rate_kbps.map(|r| RECV_CAP * r + RECV_CAP_ADD_KBPS);
         let app_limited = m
             .sent_kbps
             .is_none_or(|s| s < APP_LIMITED * self.estimate_kbps);
@@ -620,7 +638,7 @@ impl Estimator {
                         self.delay_kbps = cut;
                         cut_by.push("delay");
                         // The link no longer carries what it did before the outage.
-                        self.recover_to = None;
+                        self.stop_regrow("delay cut");
                     }
                     self.last_decrease = Some(now);
                 }
@@ -631,7 +649,7 @@ impl Estimator {
                 if let Some(to) = recover {
                     grown = grown.min(to.max(self.delay_kbps));
                 }
-                if let Some(cap) = m.rate_kbps.map(|r| RECV_CAP * r + RECV_CAP_ADD_KBPS) {
+                if let Some(cap) = cap {
                     if grown > cap {
                         grown = self.delay_kbps.max(cap);
                     }
@@ -651,7 +669,7 @@ impl Estimator {
                     self.last_loss_decrease = Some(now);
                     cut_by.push("loss");
                     // The link no longer carries what it did before the outage.
-                    self.recover_to = None;
+                    self.stop_regrow("loss cut");
                     // These losses are spent; the next decision reads new ones.
                     self.losses.clear();
                 }
@@ -662,14 +680,22 @@ impl Estimator {
                 if let Some(to) = recover {
                     grown = grown.min(to.max(self.loss_kbps));
                 }
+                if let Some(cap) = cap {
+                    if grown > cap {
+                        grown = self.loss_kbps.max(cap);
+                    }
+                }
                 self.loss_kbps = grown;
             }
         }
 
         let was = self.estimate_kbps;
         self.settle();
-        if self.recover_to.is_some_and(|to| self.estimate_kbps >= to) {
-            self.recover_to = None;
+        if self
+            .recover_to
+            .is_some_and(|(to, _)| self.estimate_kbps >= to)
+        {
+            self.stop_regrow("reached");
         }
         self.measured = m
             .rate_kbps
@@ -728,9 +754,22 @@ impl Estimator {
         let from = self.last_decay.unwrap_or(sent + timeout);
         let steps = now.saturating_duration_since(from).as_secs_f64() / SILENCE_STEP.as_secs_f64();
         let factor = SILENCE_DECAY.powf(steps);
-        // The first decay of an episode remembers what the link carried, for the regrow to
-        // return to once feedback comes back (#1417).
-        self.recover_to.get_or_insert(self.estimate_kbps);
+        // The first decay of an episode remembers what the link carried; the memory is good
+        // for `RECOVERY_HOLD` after the last decay, so an outage of any length keeps it and
+        // a still screen afterwards lets it go (#1417).
+        let to = match self.recover_to {
+            Some((to, _)) => to,
+            None => {
+                let to = self.estimate_kbps;
+                tracing::info!(
+                    token = "webtransport-cc-regrow",
+                    to_kbps = to as u64,
+                    "WebTransport estimate will regrow toward {to:.0} kbps once feedback returns"
+                );
+                to
+            }
+        };
+        self.recover_to = Some((to, now + RECOVERY_HOLD));
         self.delay_kbps *= factor;
         self.loss_kbps *= factor;
         let was = self.estimate_kbps;
@@ -753,6 +792,20 @@ impl Estimator {
             );
         }
         self.due(now)
+    }
+
+    /// Drop the pre-outage memory, with the one log line that closes the fast regrow: it was
+    /// reached, it expired, a codec switch replaced it, or the link said it no longer carries
+    /// that rate.
+    fn stop_regrow(&mut self, reason: &'static str) {
+        if let Some((to, _)) = self.recover_to.take() {
+            tracing::info!(
+                token = "webtransport-cc-regrow",
+                to_kbps = to as u64,
+                reason,
+                "WebTransport estimate regrow toward {to:.0} kbps ended: {reason}"
+            );
+        }
     }
 
     fn log_due(&self, now: Instant) -> bool {
