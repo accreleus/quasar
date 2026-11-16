@@ -11,7 +11,7 @@
 // snapshot, so the video/input subtree re-renders only on status/channelOpen/
 // pointerLocked/stopping/hostLost/health, never per telemetry tick.
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import "../../styles/session.css";
 import "../../styles/hud.css";
@@ -63,7 +63,7 @@ import { useMouseSettings } from "./useMouseSettings";
 import { OnScreenControls } from "./OnScreenControls";
 import type { VirtualPadState } from "../../input/virtualPad";
 import { useSessionStatus } from "./useSessionStatus";
-import { useDisplayPatch } from "./useDisplayPatch";
+import { useDisplayPatch, type ServerDisplay } from "./useDisplayPatch";
 import { enterLaunchFullscreen, leaveLaunchFullscreen } from "../../input/launchFullscreen";
 import { sendEscComboEnabled } from "../../input/summonCombo";
 import {
@@ -404,6 +404,8 @@ function SessionPageBody() {
     externalResizeSupported,
     setExternalResizeSupported,
     externalOwner,
+    polledRenderSize,
+    polledUiScale,
     launchDetail,
     shaderPercent,
     launchFailure,
@@ -913,6 +915,26 @@ function SessionPageBody() {
   // lives in useDisplayPatch.ts. `externalSize`/`externalResizeSupported` live
   // in useSessionStatus above (the 5s poll can also change them); this hook
   // gets their raw setters and writes them on ack/revert.
+  // Amendment 84 (#996): what the SESSION reports about its render size and UI
+  // scale, so a second tab, a reload or a takeover starts from the session's real
+  // values instead of this tab's stored ack or the launch size. A render size equal
+  // to the pinned stream size is the session default, which this page models as
+  // "match the stream" (null) — passing it as a concrete size would stop it
+  // following the stream.
+  const serverDisplay = useMemo<ServerDisplay | undefined>(() => {
+    const d: ServerDisplay = {};
+    if (polledRenderSize) {
+      d.render =
+        polledStreamSize &&
+        polledRenderSize.w === polledStreamSize.w &&
+        polledRenderSize.h === polledStreamSize.h
+          ? null
+          : polledRenderSize;
+    }
+    if (polledUiScale != null) d.uiScale = polledUiScale;
+    return d.render !== undefined || d.uiScale !== undefined ? d : undefined;
+  }, [polledRenderSize, polledUiScale, polledStreamSize]);
+
   const {
     renderSize,
     uiScale,
@@ -925,6 +947,7 @@ function SessionPageBody() {
     authToken,
     sessionId,
     addToast,
+    serverDisplay,
     setExternalSize,
     setExternalResizeSupported,
   });

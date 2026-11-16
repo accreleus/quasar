@@ -35,6 +35,19 @@ type externalState struct {
 	// session has no encoder, and a mode the app picked moves the monitor, not
 	// the wire.
 	ConsoleMode *console.ModeSelection
+	// RenderW/RenderH and UIScale are the last-known app-facing render mode and UI
+	// scale (amendment 84, accreleus/quasar#996): what PATCH /display set the
+	// compositor to. The pair is known from a 202 of that PATCH or from a
+	// display-aware sample — in which an absent render width/height means the
+	// launch size and an absent ui_scale means 1.0, because the agent sends them
+	// only when non-default (agent-api.md §session_metrics). RenderKnown and
+	// UIScaleKnown say the control plane knows the value at all: absent on the
+	// Session resource means UNKNOWN, never "the launch size". Ephemeral like
+	// Width/Height above — dropped on restart and refilled by the next sample.
+	RenderW, RenderH int32
+	RenderKnown      bool
+	UIScale          float64
+	UIScaleKnown     bool
 }
 
 // displayState holds the per-session external-resolution cache. Like swapper and
@@ -82,7 +95,14 @@ func (d *displayState) setSize(sessionID string, w, h, launchW, launchH int32) {
 //
 // owner follows the same window and is cleared in lockstep with the size, never
 // left stale from a prior sample.
-func (d *displayState) observe(sessionID string, w, h *int32, supported *bool, owner string) {
+//
+// The render size and UI scale (amendment 84) follow the same window and the
+// same omit-when-default convention: on a display-aware sample an absent
+// render_width/render_height means the LAUNCH size and an absent ui_scale means
+// 1.0, so both become known even when the sample carries neither. launchW/launchH
+// are the session's pinned launch size (the caller reads them in the same row as
+// the trust check).
+func (d *displayState) observe(sessionID string, w, h *int32, supported *bool, owner string, renderW, renderH *int32, uiScale *float64, launchW, launchH int32) {
 	if w == nil && h == nil && supported == nil && owner == "" {
 		return
 	}
@@ -98,6 +118,32 @@ func (d *displayState) observe(sessionID string, w, h *int32, supported *bool, o
 	}
 	if supported != nil {
 		st.Supported = supported
+	}
+	st.RenderW, st.RenderH, st.RenderKnown = launchW, launchH, true
+	if renderW != nil && renderH != nil {
+		st.RenderW, st.RenderH = *renderW, *renderH
+	}
+	st.UIScale, st.UIScaleKnown = 1.0, true
+	if uiScale != nil {
+		st.UIScale = *uiScale
+	}
+	d.m[sessionID] = st
+}
+
+// setRender records the render size and UI scale a display PATCH was ACKED with
+// (amendment 84), the optimistic counterpart of observe: only the fields the
+// request carried are known from it, and the next display-aware sample
+// overwrites both. Like setSize, it exists so a second read (a reload, another
+// tab) sees the change before the next sample lands.
+func (d *displayState) setRender(sessionID string, w, h *int32, uiScale *float64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	st := d.m[sessionID]
+	if w != nil && h != nil {
+		st.RenderW, st.RenderH, st.RenderKnown = *w, *h, true
+	}
+	if uiScale != nil {
+		st.UIScale, st.UIScaleKnown = *uiScale, true
 	}
 	d.m[sessionID] = st
 }

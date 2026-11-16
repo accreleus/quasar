@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+- **A second tab, a reload or a takeover starts from the session's real render size and interface size (#996).** The session resource now reports the render resolution (the size the app draws at inside the compositor) and the interface size in use, alongside the streamed size it already reported, so a client that did not make the change — another tab, another device, a page reload — no longer assumes the launch size. The reported values follow the session: an interface size change made in one tab is what the other tabs show within a few seconds, and a render size that is the session default keeps following the stream. Absent means the control plane does not know it yet, never that the size is the launch size. The control plane learns them from the display change's own reply or from the host's next telemetry sample.
+
 ### Fixed
 - **Session audio no longer opens with one stale packet ahead of a gap (#1441).** When a client took longer than about 200 ms to connect, the host sent one audio packet captured at the start and then jumped a second or more ahead, which a receiver had to treat as a burst of loss. The host now sends no audio until the client has connected, so the first packet it sends begins the continuous stream.
 - **Ultra-low latency (PyroWave) now skips frames instead of falling behind on a GPU that cannot keep up (#1416).** The client holds at most two decodes in flight and keeps only the newest frame that arrived meanwhile, so a slow GPU drops frames rather than growing a queue of work that would show ever-older pictures; a GPU that keeps up decodes every frame as before.
