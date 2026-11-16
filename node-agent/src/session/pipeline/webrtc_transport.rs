@@ -397,6 +397,7 @@ impl WebRtcSlot {
                 &self.payloader,
                 &self.encoder,
                 self.session_id.clone(),
+                self.trace_tx.clone(),
             );
         }
         if self.observe {

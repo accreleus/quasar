@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+- **A session's live packet-size steps are in its trace, not only its log (#1152, amendment 81).** When the agent shrinks its video packets because the client's path drops the full-size ones, it now records a `transport.rtp_mtu_shrunk` event with the size before and after and the loss counts that decided it, alongside the existing log line. The events are on the droppable diagnostics lane, so a missing one means nothing on its own; a step whose event was dropped shows as the next step's `from` not being the previous step's `to`.
+
 ### Fixed
 - **A WebTransport session held at the lowest picture size's bitrate is no longer ended while its link carries it (#1434, amendment 79).** The control plane ends a session whose bitrate has been at or under its floor for 3 minutes. At the lowest size the bitrate sits exactly on that floor and cannot go lower, so a floor-pinned session was ended even when the link carried more than the floor. The agent now reports the rate its reports say the link carries, beside the bitrate (`abr_link_rate_kbps` in `session_metrics`), and the 3 minutes are counted on that rate, which is above the floor whenever the link carries more. A link that really cannot carry the floor ends the session as before. Readable in the session's metrics; an agent from an earlier release reports none and is judged as before.
 - **Input comes back by itself when a phone or tablet returns to the session page (#1414).** Hiding the page — switching apps, locking the screen — still releases everything the host holds, as before. On a device whose capture needs no Pointer Lock, the page now takes input back the moment it is visible again, so the next tap plays the game instead of opening the session menu. Where the session uses Pointer Lock the browser requires a tap to give it back, so input stays released until one, as it was before.
