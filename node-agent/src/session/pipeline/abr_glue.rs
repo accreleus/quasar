@@ -265,11 +265,18 @@ impl AbrLoop {
             let st = r.state.lock().unwrap();
             st.in_flight || st.planner.settling(now)
         });
-        let (prev, cut) = {
+        let (prev, cut, rate) = {
             let mut gov = self.governor.lock().unwrap();
             let prev = gov.setpoint_kbps();
-            (prev, gov.observe_report(reading.filter(|_| !settling), now))
+            let cut = gov.observe_report(reading.filter(|_| !settling), now);
+            (prev, cut, gov.rate_kbps())
         };
+        // Amendment 79: what the reports say the link carries, unclamped by the floor —
+        // the only value that can tell a floor-pinned session on a good link (this rate
+        // above the floor) from one whose link carries less.
+        if let Some(m) = self.metrics.upgrade() {
+            m.set_abr_link_rate(rate);
+        }
         if let Some(kbps) = cut {
             self.retarget(prev, kbps, reading.unwrap_or_default());
         }
@@ -2098,6 +2105,8 @@ mod tests {
         seen: Vec<TraceEvent>,
         est: f64,
         t0: std::time::Instant,
+        /// The session's telemetry, held here as the runner holds it.
+        metrics: Arc<SessionMetrics>,
     }
 
     impl Wt {
@@ -2139,8 +2148,6 @@ mod tests {
             )
             .expect("openh264enc takes live writes");
             start(&abr_loop, &plan, Box::new(|| 10_000.0));
-            // The loop holds the metrics weakly; they live as long as the session.
-            std::mem::forget(metrics);
             Self {
                 abr_loop,
                 lever,
@@ -2149,6 +2156,7 @@ mod tests {
                 seen: Vec::new(),
                 est: 10_000.0,
                 t0: std::time::Instant::now(),
+                metrics,
             }
         }
 
@@ -2393,6 +2401,43 @@ mod tests {
             }
         });
         assert_eq!(wt.rung_steps(), vec![(0, 3)]);
+    }
+
+    /// Amendment 79 (#1434): the per-report loop publishes the governor's UNCLAMPED link
+    /// rate, which is the value stream health judges against the floor: a session pinned
+    /// there on a link that carries more keeps its rate above the floor, and one whose
+    /// link carries the floor or less does not. Deleting the `set_abr_link_rate` call in
+    /// `AbrLoop::report` leaves every drain reporting `None`.
+    #[test]
+    fn the_per_report_loop_publishes_the_unclamped_link_rate() {
+        let mut wt = Wt::new(true);
+        let t0 = wt.t0;
+        assert!(
+            wt.metrics.drain_window(t0).abr_link_rate_kbps.is_none(),
+            "no report yet: not measured, never zero"
+        );
+        // A link that carries the ceiling: the rate is there and no floor binds.
+        wt.link(0, 3000, |_| 20_000.0);
+        let w = wt
+            .metrics
+            .drain_window(t0 + std::time::Duration::from_secs(3));
+        let rate = wt.abr_loop.governor.lock().unwrap().rate_kbps();
+        assert_eq!(w.abr_link_rate_kbps, Some(rate));
+        assert_eq!(rate, 10_000.0, "the rate at the ceiling: {rate}");
+
+        // A link carrying a tenth of it: the setpoint stops at a rung's floor, the rate
+        // goes under it, and only the rate says so.
+        wt.link(3000, 20_000, |_| 1000.0);
+        let w = wt
+            .metrics
+            .drain_window(t0 + std::time::Duration::from_secs(20));
+        let rate = wt.abr_loop.governor.lock().unwrap().rate_kbps();
+        assert_eq!(w.abr_link_rate_kbps, Some(rate), "this report's rate");
+        let setpoint = wt.setpoint() as f64;
+        assert!(
+            rate < setpoint,
+            "the floor holds the setpoint at {setpoint} kbps, the link carries {rate}"
+        );
     }
 
     /// #1376 review A1/R1, seat A's replay on the owner's profile: at 900p a link

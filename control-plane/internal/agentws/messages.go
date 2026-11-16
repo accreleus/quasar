@@ -348,12 +348,21 @@ type SessionMetricsMsg struct {
 	ProbePTSUnmatched                 *float64 `json:"probe_pts_unmatched"`
 	// ABR governor CBR setpoint (kbit/s); absent ⇒ static CBR.
 	AbrSetpointKbps *float64 `json:"abr_setpoint_kbps"`
+	// Amendment 79: the governor's UNCLAMPED link rate (kbit/s); present only while the
+	// per-report loop runs (a WebTransport session in smooth). When a sample carries it,
+	// stream health judges THIS rate against the floor instead of AbrSetpointKbps.
+	AbrLinkRateKbps *float64 `json:"abr_link_rate_kbps"`
 	// Governor's current floor (kbit/s), sent only when the ladder has moved it
 	// off the launch floor. Absent ⇒ the launch floor, never "unknown".
 	AbrFloorKbps *float64 `json:"abr_floor_kbps"`
 	// Raw rtpgccbwe GCC estimate (kbit/s) before EWMA/deadband/step — distinct
 	// from AbrSetpointKbps (governor output).
 	GccEstimateKbps *float64 `json:"gcc_estimate_kbps"`
+	// Amendment 85: the FEC repair the agent sent in the window (repair payload bytes as
+	// a percent of the video payload sent, and as a rate). Present in every window of a
+	// WebTransport session whose hello_ack named a scheme; absent means no FEC.
+	WtFecOverheadPct *float64 `json:"wt_fec_overhead_pct"`
+	WtFecKbps        *float64 `json:"wt_fec_kbps"`
 	// "protective" | "off"; empty from old agents, for which the diagnostic
 	// bundle falls back to the setpoint-presence heuristic.
 	AbrMode string `json:"abr_mode"`
