@@ -113,9 +113,10 @@ type HTTPFetcher struct {
 // NewHTTPFetcher builds the production fetcher against
 // accreleus/quasar-images's raw.githubusercontent.com content, or an
 // operator override (QUASAR_IMAGE_CATALOG_REPO/_PATH, docs/configuration.md).
-// instance_settings.image_catalog_ref (the branch/tag/commit) stays a
-// separate DB-side admin-editable knob — these two env vars are the
-// deploy-time "which repo/file" it resolves against.
+// instance_settings.image_catalog_ref (the branch/tag/commit) is a separate
+// DB-side value that only the documented SQL moves — no API route or console
+// control sets it — and these two env vars are the deploy-time "which
+// repo/file" it resolves against.
 func NewHTTPFetcher() *HTTPFetcher {
 	repo := os.Getenv("QUASAR_IMAGE_CATALOG_REPO")
 	if repo == "" {
@@ -179,11 +180,12 @@ func (f *HTTPFetcher) Fetch(ctx context.Context, ref string) ([]byte, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		// Names the URL and the two operator knobs, not a bare status code.
+		// Names the URL, the two deploy-time knobs and the SQL that is the only
+		// thing that moves the ref: no API route or console control sets it.
 		return nil, fmt.Errorf(
 			"fetch manifest %s: unexpected status %d (check that ref %q, repo %q, and path %q are correct — "+
-				"repo/path are QUASAR_IMAGE_CATALOG_REPO/_PATH at deploy time, ref is the admin-editable "+
-				"instance_settings.image_catalog_ref)",
+				"repo/path are QUASAR_IMAGE_CATALOG_REPO/_PATH at deploy time; ref is instance_settings.image_catalog_ref, "+
+				"which no admin control sets: move it with UPDATE instance_settings SET image_catalog_ref = '<ref>' WHERE id = true)",
 			url, resp.StatusCode, ref, repo, path)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxManifestBytes)) // bounded: a misconfigured ref must not stream unbounded
