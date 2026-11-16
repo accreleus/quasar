@@ -44,7 +44,7 @@ import { RemovalNote } from "./fleet/hostDetail/RemovalNote";
 import { RemoveHostModal } from "./fleet/RemoveHostModal";
 import { agentOlderThanControlPlane, hostServices, type LastReport } from "./fleet/hostServices";
 import { ownerConflict } from "./fleet/hostWarnings";
-import { removable, setRemoval, useHostRemoval } from "./fleet/removeHost";
+import { canRemoveHost, removalBlockedReason, setRemoval, useHostRemoval } from "./fleet/removeHost";
 import { IconTrash } from "../../components/icons";
 import { clockTime } from "../../lib/format/clockTime";
 import { AdmissionReasons, admissionActionLabel, canChangeOperatorDrain, hasOperatorDrain } from "./fleet/AdmissionReasons";
@@ -248,13 +248,10 @@ export function HostDetail() {
     floor,
   });
   const inFlight = removal.removal;
-  // An unknown control-plane identity (the release read failed) could be this very machine.
-  const canRemove =
-    machine != null &&
-    removable(host, machine) &&
-    !conflict &&
-    services != null &&
-    (services.report === "reported" || services.report === "offline");
+  // One rule with the Fleet row menu (`canRemoveHost`), so the menu never sends an admin
+  // to a Remove dialog this page will not open (#1240).
+  const canRemove = canRemoveHost(host, machine);
+  const removalBlocked = removalBlockedReason(host, machine);
   // Not left open for a later poll to show: the offer it confirmed is gone. Only on a definite
   // answer: a poll whose release read failed (no `machine`) says nothing either way, so a dialog
   // that was offered stays on screen through it instead of vanishing mid-confirm and coming back.
@@ -284,6 +281,8 @@ export function HostDetail() {
           Remove host
         </Button>
       </>
+    ) : !inFlight && removalBlocked ? (
+      <p className="hint">{removalBlocked}</p>
     ) : null;
 
   return (
