@@ -2530,8 +2530,9 @@ mod tests {
         EncodeResolutionLever::new(stage, encoder, |_| {})
     }
 
-    // The lever's rungs are the session's rung family — the same table the compositor's
-    // mode-ladder and the control plane's validator use.
+    // The lever's rungs are the session's rung family — the same table the control plane's
+    // validator steps along; the compositor's mode-ladder advertises it less the sizes meant
+    // only for a starved link (`rungs::mode_ladder`).
     #[test]
     fn lever_exposes_the_sessions_rungs() {
         let lever = software_lever((1920, 1080));
