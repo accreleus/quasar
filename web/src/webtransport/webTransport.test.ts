@@ -191,8 +191,23 @@ describe("WebTransportMedia connect", () => {
     t.close();
   });
 
-  it("lets the session's own close outrank a datagram reader that failed first, as Safari's does", async () => {
+  it("a browser with no datagram API at all falls back as connect_failed, with a cause (#1412)", async () => {
+    // Some iOS builds ship WebTransport with no `datagrams` (WebKit bug 322201): media cannot
+    // travel in either direction, and the reader's bare TypeError used to be reported as
+    // `internal` with no cause the listener could read.
     const agent = new FakeAgent();
+    agent.noDatagrams = true;
+    await expect(transport(agent).connect(NO_SINK)).rejects.toMatchObject({
+      code: "connect_failed",
+      message: "datagrams: this browser's WebTransport has no datagram API",
+    });
+    expect(agent.last.closes[0]).toMatchObject({
+      closeCode: 4400,
+      reason: "datagrams: this browser's WebTransport has no datagram API",
+    });
+  });
+
+  it("lets the session's own close outrank a datagram reader that failed first, as Safari's does", async () => {    const agent = new FakeAgent();
     agent.hold = "answer";
     const up = transport(agent).connect(NO_SINK);
     await vi.waitFor(() => expect(agent.reached).toBe("answer"));
