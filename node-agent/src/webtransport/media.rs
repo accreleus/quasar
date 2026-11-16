@@ -599,6 +599,21 @@ impl Media {
         self.lock().client.is_some()
     }
 
+    /// A client has just taken the session (§Takeover): displace the ABR loop that still owns
+    /// the encoder, if any, at the takeover itself (#1294). Ownership, not the holder, is
+    /// what says a loop is still driving: a WebRTC peer whose PC failed leaves its hold
+    /// (`Holder::None`) and its loop owning the encoder, and a client that never sends
+    /// feedback would otherwise keep that dead link's rate for the session's life.
+    ///
+    /// Runs before this client can have fed anything and before its `hello_ack`, and OUTSIDE
+    /// the registry lock: `reset_to_launch` writes the encoder, and a rung restore restarts
+    /// its session on the Vulkan path.
+    pub(crate) fn displace_stale_abr(&self) {
+        if let Some(rate) = self.rate.as_ref().filter(|rate| (rate.owns)()) {
+            (rate.displaced)();
+        }
+    }
+
     /// The peer of video `transport` had its first answer applied: it takes the session
     /// (§Takeover), counted and never refused (erratum 28: it displaces a WebTransport client
     /// or nobody, a fallback among them). A WebTransport client is closed at once and what it

@@ -45,6 +45,13 @@ export interface SessionStatus {
   setExternalResizeSupported: Dispatch<SetStateAction<boolean | undefined>>;
   /** ABR resolution ladder (T6b): who owns the external size right now. */
   externalOwner: "auto" | "pinned" | undefined;
+  /** Amendment 84 (#996): the session's live render size, as the control plane
+   *  caches it. Null until it knows one; a render size EQUAL to the pinned stream
+   *  size is the session default ("match the stream"). */
+  polledRenderSize: { w: number; h: number } | null;
+  /** Amendment 84: the session's live UI scale, null until the control plane
+   *  knows it. 1 is the session default. */
+  polledUiScale: number | null;
   /** UX assessment §2.2: the loader's substage copy while a launch is still in progress. */
   launchDetail: string | null;
   /** Steam's shader progress (0-100) while the app boots; null when the read carries none. */
@@ -98,6 +105,11 @@ export function useSessionStatus(
   // streamRungs is null until first poll answers (client 16:9 fallback covers
   // a pre-amendment control plane in the meantime).
   const [externalSize, setExternalSize] = useState<{ w: number; h: number } | null>(null);
+  // Amendment 84 (#996): what the control plane knows about the render size and
+  // UI scale. Presence-based like externalSize — the fields are absent while it
+  // does not know them, so absence must not be read as "the launch size".
+  const [polledRenderSize, setPolledRenderSize] = useState<{ w: number; h: number } | null>(null);
+  const [polledUiScale, setPolledUiScale] = useState<number | null>(null);
   const [streamRungs, setStreamRungs] = useState<[number, number][] | null>(null);
   const [externalResizeSupported, setExternalResizeSupported] = useState<boolean | undefined>(
     undefined,
@@ -199,6 +211,9 @@ export function useSessionStatus(
               rungs?: [number, number][];
               external_resize_supported?: boolean;
               external_owner?: "auto" | "pinned";
+              render_width?: number;
+              render_height?: number;
+              ui_scale?: number;
             }
           | undefined;
         if (s?.width && s.height) setPolledStreamSize({ w: s.width, h: s.height });
@@ -212,6 +227,13 @@ export function useSessionStatus(
         if (s?.external_width && s.external_height) {
           setExternalSize({ w: s.external_width, h: s.external_height });
         }
+        // Amendment 84 (#996): the live render size and UI scale, which a second
+        // tab (or a takeover) reads instead of assuming the launch size. Same
+        // presence rule as externalSize: absent means the control plane does not
+        // know, so the last known value stands rather than flapping the control
+        // back to its default.
+        if (s?.render_width && s.render_height) setPolledRenderSize({ w: s.render_width, h: s.render_height });
+        if (s?.ui_scale != null) setPolledUiScale(s.ui_scale);
         // Unconditional: absent = "no known owner", so the drawer must stop
         // rendering the "Auto ·" chip immediately.
         setExternalOwner(s?.external_owner);
@@ -310,6 +332,8 @@ export function useSessionStatus(
     externalResizeSupported,
     setExternalResizeSupported,
     externalOwner,
+    polledRenderSize,
+    polledUiScale,
     launchDetail,
     shaderPercent,
     launchFailure,
