@@ -361,7 +361,7 @@ impl ConsoleAccessManager {
         let (tx, rx) = std::sync::mpsc::channel::<bool>();
         let weak = Arc::downgrade(self);
         std::thread::Builder::new()
-            .name("quasar-console-access".into())
+            .name(WORKER_THREAD_NAME.into())
             .spawn(move || worker(weak, rx))
             .expect("failed to spawn the console access worker");
         *slot = Some(tx.clone());
@@ -623,6 +623,9 @@ impl ConsoleAccessManager {
     }
 }
 
+/// The kernel cuts a thread name to 15 bytes, and the crash report prints it.
+const WORKER_THREAD_NAME: &str = "qsr-con-access";
+
 /// Runs requests in order, and polls the actor while an attempt is applying.
 fn worker(mgr: Weak<ConsoleAccessManager>, rx: std::sync::mpsc::Receiver<bool>) {
     loop {
@@ -842,6 +845,11 @@ fn derive(marker: bool, _rootless: bool, actor: &ActorConsole) -> ConsoleAccess 
 #[cfg(test)]
 mod tests_derive {
     use super::*;
+
+    #[test]
+    fn the_worker_thread_name_fits_the_kernels_15_bytes() {
+        assert!(WORKER_THREAD_NAME.len() <= 15, "{WORKER_THREAD_NAME}");
+    }
 
     fn last(target: bool, settled: &str, reason: Option<&str>) -> ActorConsoleLast {
         ActorConsoleLast {
