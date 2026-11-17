@@ -92,6 +92,16 @@ func TestDefaultAppCheck(t *testing.T) {
 	}
 }
 
+// #583: an image from before direct_display leaves the picker empty, so the
+// remedy for a default app that cannot run direct names the image update.
+func TestDefaultAppCheckNotDirectSaysToUpdateTheImage(t *testing.T) {
+	name := "app"
+	got := DefaultAppCheck(&name, DefaultAppFacts{Found: true, Enabled: true, Kind: "desktop", Name: "Steam"})
+	if got.Status != "fail" || !strings.Contains(got.Remediation, "update the default app's image") {
+		t.Fatalf("remediation %q does not tell the operator to update the image", got.Remediation)
+	}
+}
+
 func TestRuntimeSpecDirect(t *testing.T) {
 	for _, tc := range []struct {
 		spec string
