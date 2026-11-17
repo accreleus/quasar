@@ -561,6 +561,8 @@ mk_dry_clean() { # mk_dry_clean <label> <target> <VAR=value>...
   out="$(cd "$ROOT" && make -n "$target" "$@" 2>&1)"; rc=$?
   if printf '%s' "$out" | grep -qF 'PAYLOAD-MARKER'; then
     fail "knob:dryrun-$label" "the payload reached the recipe make would run: $(printf '%s' "$out" | tr '\n' '|')"
+  elif [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF 'is refused'; then
+    pass "knob:dryrun-$label" "make refused the value before any recipe"
   elif [ "$rc" -ne 0 ]; then
     fail "knob:dryrun-$label" "make -n $target failed (rc=$rc): $(printf '%s' "$out" | tail -n 2 | tr '\n' ' ')"
   else
@@ -589,6 +591,30 @@ mk_dry_clean host-admin-token  admin-token      HOST="$MK_BAD_QUOTE"
 # The repo constants are not knobs any more; `override` wins over the command line.
 mk_dry_clean web-clean         clean            WEB='x; touch /tmp/PAYLOAD-MARKER'
 mk_dry_clean makefile-list     help             MAKEFILE_LIST='Makefile; touch /tmp/PAYLOAD-MARKER'
+
+# ── a make function in a knob, on a REAL run (#1296): `make -n` cannot show it,
+# because make expands the value itself when it exports it, before any recipe. Every
+# knob in the list above must be refused with its name, and nothing may have run.
+mk_real_refused() { # mk_real_refused <KNOB> <opener> <closer>
+  local knob="$1" open="$2" close="$3" marker="$WORK/mk-real-$1" out rc
+  out="$(cd "$ROOT" && make help "$knob=${open}shell touch $marker${close}" 2>&1)"; rc=$?
+  if [ -e "$marker" ]; then
+    fail "knob:real-$knob" "make ran the command held in $knob before any recipe"
+  elif [ "$rc" -eq 0 ] || ! printf '%s' "$out" | grep -qF "$knob: a command-line value"; then
+    fail "knob:real-$knob" "not refused by name (rc=$rc): $(printf '%s' "$out" | head -n 2 | tr '\n' ' ')"
+  else
+    pass "knob:real-$knob" "a make function in $knob is refused and nothing ran"
+  fi
+}
+IFS='|' read -ra MK_REAL_KNOBS <<< "$MK_KNOBS"
+for _k in "${MK_REAL_KNOBS[@]}"; do mk_real_refused "$_k" '$(' ')'; done
+mk_real_refused DIR '${' '}'
+# An ordinary value, `$` and all, is still taken literally.
+if mk_out="$(cd "$ROOT" && make help ARGS='--price $5 --role admin' 2>&1)" && printf '%s' "$mk_out" | grep -q 'Quasar make targets'; then
+  pass "knob:real-ordinary-value" "a value with no make function still runs"
+else
+  fail "knob:real-ordinary-value" "an ordinary knob value was refused: $(printf '%s' "$mk_out" | head -n 2 | tr '\n' ' ')"
+fi
 
 # ── per-knob: hostile refused, legitimate still works ────────────────────────
 # dx_env_argv is the receiving end for the two LIST knobs (ARGS, SID). It splits

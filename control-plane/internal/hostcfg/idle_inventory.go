@@ -637,9 +637,19 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 			VALUES($1::uuid,'recovery',$2::uuid,'configuration_recovery') ON CONFLICT DO NOTHING`, hostID, entry.AttemptID); err != nil {
 			return err
 		}
+	} else if entry.Phase == "applied" && !active {
+		// Amendment 86: a historical applied entry proves nothing about what runs
+		// now, so the hold stays as a recovery hold that the one explicit repair
+		// path ends, or a later inventory carrying the proof. An existing row is
+		// converted, never inserted.
+		if _, err := tx.Exec(ctx, `UPDATE host_admission_restrictions SET owner_kind='recovery',reason='configuration_recovery'
+			WHERE host_id=$1::uuid AND owner_kind='idle_apply' AND owner_id=$2::uuid`, hostID, entry.AttemptID); err != nil {
+			return err
+		}
 	} else if terminal && (entry.Phase != "applied" || active) {
 		// An applied entry releases its hold only with the matching verified active
-		// snapshot. A recovery row exists only for an uncertain attempt; a release ends it.
+		// snapshot. A recovery row exists only for an uncertain or an unproven
+		// applied attempt; a release ends it.
 		if _, err := tx.Exec(ctx, `DELETE FROM host_admission_restrictions WHERE host_id=$1::uuid AND owner_kind IN ('idle_apply','recovery') AND owner_id=$2::uuid`, hostID, entry.AttemptID); err != nil {
 			return err
 		}

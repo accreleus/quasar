@@ -655,6 +655,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	cfgHandler := hostcfg.NewHandler(cfgStore, agentRegistry, sessionStore, auditStore)
 	settingsHandler := settings.NewHandler(settingsStore, auditStore)
 	settingsHandler.OnAllowedOriginsChanged = originResolver.Invalidate
+	settingsHandler.WebhookHostAllowed = platform.WebhookHostAllowed
 	invitesHandler := invites.NewHandler(invites.NewStore(pool), cfg.PublicBaseURL, auditStore)
 	compatStore := compat.NewStore(pool)
 	compatStore.Auditor = auditStore
