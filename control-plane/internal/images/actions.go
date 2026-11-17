@@ -171,7 +171,7 @@ func (s *Store) Install(ctx context.Context, id string, lazy bool) (CatalogImage
 		}
 	}
 	// A reinstall reuses the managed preset, so apps may already link it.
-	if err := stampDirectDisplay(ctx, tx, id); err != nil {
+	if err := stampDirectDisplay(ctx, tx, s.log, id); err != nil {
 		return CatalogImage{}, err
 	}
 
@@ -375,7 +375,7 @@ func (s *Store) Update(ctx context.Context, id string) (applied bool, img Catalo
 		}
 	}
 	// After the provider app is re-linked, so a preset gained here is seen.
-	if err := stampDirectDisplay(ctx, tx, id); err != nil {
+	if err := stampDirectDisplay(ctx, tx, s.log, id); err != nil {
 		return false, CatalogImage{}, err
 	}
 
