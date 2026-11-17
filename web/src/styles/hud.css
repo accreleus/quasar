@@ -788,6 +788,7 @@
 @media (max-width: 900px) {
   .stat-card svg { min-height: 26px; }
   .cols { grid-template-columns: 1fr 1fr; }
+  .diag-grid { grid-template-columns: 1fr 1fr; }
 }
 
 /* ============================================================
@@ -1014,6 +1015,7 @@
   }
   .banner .ba { justify-content: flex-end; }
   .cols { grid-template-columns: 1fr; }
+  .diag-grid { grid-template-columns: 1fr; }
 }
 
 @media (prefers-reduced-motion: reduce) {
