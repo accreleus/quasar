@@ -1071,6 +1071,28 @@ fn register_prep_over_budget(elapsed: Duration) -> bool {
     elapsed > REGISTER_PREP_BUDGET
 }
 
+/// #192: how long a register preparation may be reused by the next attempt.
+const REGISTER_PREP_TTL: Duration = Duration::from_secs(60);
+
+/// What register preparation gathered from the container runtime. An attempt that
+/// dies at the dial (control plane down) leaves it behind and the next one reuses
+/// it for [`REGISTER_PREP_TTL`]: a refused connection cannot have changed the image
+/// records or the install facts, and re-probing a slow runtime on every retry ate
+/// the held-session grace (#128). An attempt that gets past the dial drops it, so
+/// the reconnect after a registration re-verifies images (agent-api.md §register).
+struct RegisterPrep {
+    at: Instant,
+    images: Vec<crate::messages::RegisterImageEntry>,
+    install: crate::buildinfo::InstallFacts,
+    actor_dark: bool,
+}
+
+impl RegisterPrep {
+    fn fresh(&self) -> bool {
+        self.at.elapsed() < REGISTER_PREP_TTL
+    }
+}
+
 /// #531: run one synchronous host probe on the blocking pool, never on the runtime
 /// worker polling the agent's control future.
 ///
@@ -2064,14 +2086,19 @@ async fn connect_and_run(
     // the same probes into the same wall.
     let prep_started = Instant::now();
     image_mgr.begin_connection();
+    // #192: the last attempt died at the dial, so what it learned still holds.
+    let reused = sessions.register_prep.take().filter(RegisterPrep::fresh);
 
     // agent-api.md: recorded images are verified against the docker daemon on startup
     // AND reconnect — an image `docker rmi`'d out from under a long-lived agent must
     // not keep reporting `ready`. Runs before the upstream attaches, so the
     // attach-time flush reports post-reconciliation states.
-    let images = {
-        let mgr = image_mgr.clone();
-        tokio::task::spawn_blocking(move || mgr.refresh_register_images()).await?
+    let images = match &reused {
+        Some(prep) => prep.images.clone(),
+        None => {
+            let mgr = image_mgr.clone();
+            tokio::task::spawn_blocking(move || mgr.refresh_register_images()).await?
+        }
     };
 
     // Re-discovered per connection, not once at boot: an updater that starts
@@ -2081,15 +2108,20 @@ async fn connect_and_run(
     // never holds the dial, and the readiness refresh reports it once it answers.
     let actor_deadline = Instant::now() + crate::buildinfo::ACTOR_REGISTER_BUDGET;
     let actor_socket = release_mgr.actor_socket().map(std::path::Path::to_path_buf);
-    let (install, actor_dark) = offload_probe(move || {
-        let runtime = ContainerRuntime::from_env();
-        crate::buildinfo::discover_observed(
-            &runtime,
-            actor_socket.as_deref(),
-            crate::buildinfo::ACTOR_REGISTER_BUDGET,
-        )
-    })
-    .await;
+    let (install, actor_dark) = match &reused {
+        Some(prep) => (prep.install.clone(), prep.actor_dark),
+        None => {
+            offload_probe(move || {
+                let runtime = ContainerRuntime::from_env();
+                crate::buildinfo::discover_observed(
+                    &runtime,
+                    actor_socket.as_deref(),
+                    crate::buildinfo::ACTOR_REGISTER_BUDGET,
+                )
+            })
+            .await
+        }
+    };
     crate::buildinfo::set_install_facts(install.clone());
     // Before the first `capacity`, which carries `console_capabilities.access`.
     let console_access = sessions.mgr.console_access.clone();
@@ -2098,7 +2130,7 @@ async fn connect_and_run(
     let mut console_access_rx = console_access.owned().then(|| console_access.subscribe());
     // A read that outlasts the budget finishes on its own thread; its change wakes
     // `console_access_rx`, which re-sends `capacity`.
-    let console_read = {
+    let console_read = reused.is_none().then(|| {
         let ca = console_access.clone();
         tokio::spawn(async move {
             let read = tokio::task::spawn_blocking(move || {
@@ -2112,17 +2144,19 @@ async fn connect_and_run(
                 );
             }
         })
-    };
-    if tokio::time::timeout_at(actor_deadline.into(), console_read)
-        .await
-        .is_err()
-    {
-        // `capacity` carries `access`, and an absent one clears the control plane's stored
-        // state (agent-api.md): say what is known until the read lands.
-        console_access.publish_known();
+    });
+    if let Some(console_read) = console_read {
+        if tokio::time::timeout_at(actor_deadline.into(), console_read)
+            .await
+            .is_err()
+        {
+            // `capacity` carries `access`, and an absent one clears the control plane's stored
+            // state (agent-api.md): say what is known until the read lands.
+            console_access.publish_known();
+        }
     }
 
-    if actor_dark {
+    if actor_dark && reused.is_none() {
         warn!(
             token = "register-actor-dark",
             "the recovery actor gave no usable status within {:?}: registering without \
@@ -2130,6 +2164,14 @@ async fn connect_and_run(
             crate::buildinfo::ACTOR_REGISTER_BUDGET
         );
     }
+    // Kept until the dial succeeds; a reused prep keeps its own age, so reuse cannot
+    // stretch the TTL.
+    sessions.register_prep = Some(RegisterPrep {
+        at: reused.as_ref().map_or(prep_started, |p| p.at),
+        images: images.clone(),
+        install: install.clone(),
+        actor_dark,
+    });
     let prep = prep_started.elapsed();
     // Only a dark actor's share is taken out: one that answers `/v1/status` but is slow on
     // `/v1/console` leaves up to the budget of its wait in here, so `register-prep-slow` can
@@ -2150,6 +2192,7 @@ async fn connect_and_run(
     }
 
     let (mut tx, mut rx) = dial(cfg).await?;
+    sessions.register_prep = None;
 
     // Attach this connection's upstream channel to the process-wide ImageManager.
     // Attaching also flushes every op-free record's current state (terminal states
@@ -2402,6 +2445,7 @@ async fn connect_and_run(
         probe_updates,
         registered_this_connection: _,
         grace_timer: _,
+        register_prep: _,
     } = sessions;
     mgr.begin_connection(gpu_inventory, vram_targets);
     // #175: home refs mounted by live sessions. The GC reaper consults it so it
@@ -3178,6 +3222,9 @@ struct HostSessions {
     /// it — a result produced while disconnected is applied when the next
     /// connection's loop runs.
     probe_updates: mpsc::UnboundedReceiver<crate::host_probe::orchestrator::ReportUpdate>,
+    /// The last register preparation, kept only while the attempt that made it died
+    /// at the dial (#192). See [`RegisterPrep`].
+    register_prep: Option<RegisterPrep>,
 }
 
 impl HostSessions {
@@ -3222,6 +3269,7 @@ impl HostSessions {
             probe_updates,
             registered_this_connection: false,
             grace_timer: None,
+            register_prep: None,
         }
     }
 
@@ -8693,6 +8741,131 @@ mod tests {
         assert!(register.contains(r#""install_mode":"owned""#), "{register}");
         assert!(
             register.contains(r#""updater_present":false"#),
+            "{register}"
+        );
+    }
+
+    /// #192: an attempt that dies at the dial leaves its register preparation for the next
+    /// one (an `owned` install is the marker: no probe in this test can report it), a
+    /// stale one is re-run, and getting past the dial drops it, so the reconnect after a
+    /// registration re-verifies the images.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_dial_leaves_the_register_prep_for_the_next_attempt() {
+        let _facts = crate::buildinfo::INSTALL_FACTS_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        let marked = |at: Instant| RegisterPrep {
+            at,
+            images: Vec::new(),
+            install: crate::buildinfo::InstallFacts {
+                install_mode: Some(crate::buildinfo::InstallMode::Owned),
+                ..Default::default()
+            },
+            actor_dark: false,
+        };
+        let health = HealthState::new();
+        let image_mgr = test_image_mgr();
+        let release_mgr = test_release_mgr();
+        let mut sessions = HostSessions::new(
+            LiveRefs::default(),
+            health.clone(),
+            String::new(),
+            image_mgr.clone(),
+            release_mgr.clone(),
+        );
+        let cp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let live_url = format!("ws://{}", cp.local_addr().unwrap());
+        let dead_url = {
+            let gone = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("ws://{}", gone.local_addr().unwrap())
+        };
+        // Reads each connection's `register`, then hangs up.
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = cp.accept() {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
+                let mut ws = tungstenite::accept(stream).unwrap();
+                while let Ok(m) = ws.read() {
+                    if let Message::Text(t) = m {
+                        let _ = seen_tx.send(t.to_string());
+                        break;
+                    }
+                }
+            }
+        });
+        async fn attempt(
+            url: &str,
+            secret: &std::path::Path,
+            sessions: &mut HostSessions,
+            image_mgr: &Arc<ImageManager>,
+            release_mgr: &Arc<ReleaseManager>,
+            health: &Arc<HealthState>,
+        ) {
+            let cfg = Config {
+                control_plane_url: url.to_string(),
+                ..test_cfg(secret.to_str().unwrap(), Some("enrollment-token"))
+            };
+            let _ = tokio::time::timeout(
+                Duration::from_secs(60),
+                connect_and_run(
+                    &cfg,
+                    health,
+                    "",
+                    "test",
+                    image_mgr,
+                    release_mgr,
+                    sessions,
+                    false,
+                ),
+            )
+            .await;
+        }
+
+        // 1. Fresh prep, dial refused: kept, and not re-stamped.
+        let seeded = Instant::now();
+        sessions.register_prep = Some(marked(seeded));
+        attempt(
+            &dead_url,
+            &secret,
+            &mut sessions,
+            &image_mgr,
+            &release_mgr,
+            &health,
+        )
+        .await;
+        assert_eq!(sessions.register_prep.as_ref().map(|p| p.at), Some(seeded));
+
+        // 2. Dial succeeds: the attempt registers with the kept facts, then drops them.
+        attempt(
+            &live_url,
+            &secret,
+            &mut sessions,
+            &image_mgr,
+            &release_mgr,
+            &health,
+        )
+        .await;
+        let register = seen_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(register.contains(r#""install_mode":"owned""#), "{register}");
+        assert!(sessions.register_prep.is_none());
+
+        // 3. A prep past the TTL is not reused.
+        let stale = Instant::now() - REGISTER_PREP_TTL - Duration::from_secs(1);
+        sessions.register_prep = Some(marked(stale));
+        attempt(
+            &live_url,
+            &secret,
+            &mut sessions,
+            &image_mgr,
+            &release_mgr,
+            &health,
+        )
+        .await;
+        let register = seen_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            !register.contains(r#""install_mode":"owned""#),
             "{register}"
         );
     }
