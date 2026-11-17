@@ -5080,6 +5080,13 @@ async fn a_pyrowave_client_gets_frames_that_rejoin_byte_for_byte_and_can_fall_ba
 async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
     let fed = Arc::new(Mutex::new(Vec::<f64>::new()));
     let observed = fed.clone();
+    // What was fed while PyroWave was still the client's codec. A feedback the client wrote
+    // before it read the step-down's `hello_ack` reaches the agent after the switch, as H.264
+    // feedback, and feeds the ABR then: that is the standard codec's, not PyroWave's, and
+    // whether one lands before the assert depends on timing (#1440).
+    let session_media = Arc::new(std::sync::OnceLock::<Arc<Media>>::new());
+    let fed_by_pyrowave = Arc::new(Mutex::new(Vec::<f64>::new()));
+    let (pyro_fed, active) = (fed_by_pyrowave.clone(), session_media.clone());
     let agent = agent_built(
         Stream::H264,
         Limits::default(),
@@ -5094,7 +5101,12 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
-                observe: Box::new(move |kbps| observed.lock().unwrap().push(kbps)),
+                observe: Box::new(move |kbps| {
+                    if active.get().is_some_and(|m| m.pyrowave_active()) {
+                        pyro_fed.lock().unwrap().push(kbps);
+                    }
+                    observed.lock().unwrap().push(kbps)
+                }),
                 fec: Box::new(|_| {}),
             })
         },
@@ -5104,6 +5116,7 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
         .media
         .clone()
         .unwrap();
+    session_media.set(media.clone()).ok();
     // The element only: its `bitrate` is what the stream loop writes. No device is opened.
     let _ = gstpyrowave::plugin_register_static();
     let encoder = gst::ElementFactory::make("pyrowaveenc").build().unwrap();
@@ -5178,7 +5191,10 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
         written < floor_budget,
         "the encoder's live bitrate followed the estimate under the floor: {written} kbit/s"
     );
-    assert!(fed.lock().unwrap().is_empty(), "PyroWave fed the ABR");
+    assert!(
+        fed_by_pyrowave.lock().unwrap().is_empty(),
+        "PyroWave fed the ABR"
+    );
 
     // H.264 on a clean path: the ABR's first estimate starts from PyroWave's, under the floor,
     // not from its 1 000 000 kbit/s ceiling.
