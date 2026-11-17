@@ -547,9 +547,11 @@ impl Estimator {
         self.estimate_kbps
     }
 
-    /// A delay or loss cut, or a silence decay, holds the estimate under the ceiling.
+    /// The link set the estimate: a delay or loss cut holds it under the ceiling. A silence
+    /// decay does not count while its regrow memory is held (#1417): the link has not said it
+    /// carries less, and pacing a recovery keyframe at a decayed rate only delays it.
     pub(crate) fn found_link(&self) -> bool {
-        self.bound != Bound::Ceiling
+        self.bound != Bound::Ceiling && self.recover_to.is_none()
     }
 
     /// Start again from `kbps` (never above the ceiling): codec-pyrowave.md §Rate, the ABR

@@ -2755,20 +2755,28 @@ fn after_a_cap_lifts_the_estimate_climbs_back_to_the_ceiling_promptly() {
     );
 }
 
-/// #1417 × #1433: a silence decay leaves the estimate under the ceiling, so the pacer is on
-/// while the outage regrow runs. A paced keyframe on resume must not read as a delay cut, which
-/// ends the regrow.
+/// #1417 × #1433: a silence decay leaves the estimate under the ceiling, but the link has not
+/// said it carries less, so the pacer stays off while the outage regrow runs: a recovery
+/// keyframe paced at the decayed rate came late (and, logged at its queue time, read as a
+/// delay cut that ended the regrow).
 #[test]
-fn a_paced_keyframe_after_an_outage_does_not_end_the_regrow() {
+fn the_pacer_stays_off_while_the_outage_regrow_runs() {
     let mut s = Sim::new(50_000.0);
     s.quic = Some(Quic::default());
     s.keyframe_every = 60;
     s.run(10.0);
     assert_eq!(s.est.estimate_kbps(), CEILING);
     s.outage(10.0);
-    assert!(s.est.found_link() && s.est.recover_to.is_some());
+    assert!(s.est.estimate_kbps() < CEILING && s.est.recover_to.is_some());
     let resumed = s.t as f64 / 1e6;
-    let lines = logged(|| s.run(15.0));
+    let lines = logged(|| s.run(0.5));
+    assert!(s.governor.governs(), "feedback governs again");
+    assert_eq!(
+        video_rates(&s.governor, &s.est, false).1,
+        None,
+        "paced during the regrow"
+    );
+    let lines = [lines, logged(|| s.run(14.5))].concat();
     let back = s
         .trace
         .iter()
