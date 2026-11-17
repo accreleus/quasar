@@ -64,6 +64,7 @@ own; the two do not move together, and that is deliberate.
 - **The end-to-end suite's browser no longer stops at Chrome's "Allow access to other devices on your network" prompt.** Each scenario's fresh browser context is granted local network access, so a WebTransport stream no longer stalls into a WebRTC fallback while the prompt waits. A Chrome without that permission runs as before.
 - **`make e2e-run WEB_DIST=<dir>` no longer fails sign-in from the second scenario on.** The runner cleared the stored sign-in on an app page, where a build served from memory booted fast enough to restore it; it now clears it on `/health`, where the app never runs.
 - Bench mode no longer reads the video's pixels on every frame while no marker is located (only on the four-a-second search), which cost WebRTC presentations on an app with no marker; `__qBench.stats()` now reports `skipped_reads`, `missed_presentations` and the callback's own time. A bench-mode page also no longer posts a client-health class, so a bench hold cannot make its user ineligible for the next launch (Refs #1304).
+- **`make validate` journeys no longer stall on Chrome's local-network prompt (#1456).** The journeys runner now grants `local-network-access` to the browser context it opens, as the end-to-end suite already does, so a session page that reaches a LAN media address is not left waiting on a per-site question.
 
 ## 0.6.0 — 2026-11-15
 
