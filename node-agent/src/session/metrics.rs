@@ -328,17 +328,25 @@ pub struct SessionMetrics {
     /// sustained loss and at `max-bitrate`, so a purely notification-driven governor
     /// stalls mid-descent (overdriving the pipe) or mid-recovery. Riding the heartbeat
     /// avoids a per-session thread and dies with this struct.
+    ///
+    /// Last registration wins, but only while the registering loop owns the encoder and the
+    /// session has not ended: see [`SessionMetrics::set_on_drain`].
     on_drain: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// SPT-04: post-classification hook, invoked at the END of `drain_window` with the
     /// window's [`AdaptationState`] and encode-time p95 (ms), from which the smooth
     /// governor derives its [`AdaptationHint`](crate::session::abr::AdaptationHint) for
     /// the next observe. Runs after classification (unlike `on_drain`) so it sees this
-    /// window's label. Registered only in `Smooth` mode; dies with this struct.
+    /// window's label. Registered only in `Smooth` mode; refused like `on_drain` when the
+    /// loop is not the encoder's owner or the session has ended.
     #[allow(clippy::type_complexity)]
     on_window: Mutex<Option<Box<dyn Fn(AdaptationState, Option<f64>) + Send + Sync>>>,
     /// The ABR loop that writes this session's encoder (`abr_glue::AbrLoop::id`), 0 for
     /// none: one writer per encoder, the transport that started last.
     abr_owner: AtomicU64,
+    /// The session's teardown ran ([`SessionMetrics::end_hooks`]). Sticky, unlike the
+    /// owner: that is zeroed by a transport replacement and a rebuild too, which are not
+    /// ends and may be followed by a new loop's registration.
+    hooks_ended: AtomicBool,
     /// Drain bookkeeping: the counter snapshot + instant of the last drain.
     last: Mutex<DrainSnapshot>,
 }
@@ -462,6 +470,7 @@ impl SessionMetrics {
             on_drain: Mutex::new(None),
             on_window: Mutex::new(None),
             abr_owner: AtomicU64::new(0),
+            hooks_ended: AtomicBool::new(false),
             last: Mutex::new(DrainSnapshot {
                 at: now,
                 frames_out: 0,
@@ -799,24 +808,49 @@ impl SessionMetrics {
             .store(kbps.to_bits(), Ordering::Relaxed);
     }
 
-    /// Make ABR loop `id` the one writer of this session's encoder.
+    /// Make ABR loop `id` the one writer of this session's encoder. A session that has ended
+    /// takes no writer: the encode chain is being torn down, and the claim would only leave a
+    /// nonzero owner whose loop can never be armed (`set_on_drain` refuses).
     pub fn claim_abr(&self, id: u64) {
-        self.abr_owner.store(id, Ordering::Relaxed);
+        if self.hooks_ended.load(Ordering::Acquire) {
+            return;
+        }
+        self.abr_owner.store(id, Ordering::Release);
+    }
+
+    /// Claim the encoder only if no loop owns it: true when this loop now does. The
+    /// WebTransport loop re-takes an encoder nobody drives (#1040); a loop that started in
+    /// the meantime owns it now and must not be taken from (#1295), and an ended session
+    /// takes no owner at all.
+    pub fn claim_abr_if_free(&self, id: u64) -> bool {
+        if self.hooks_ended.load(Ordering::Acquire) {
+            return false;
+        }
+        self.abr_owner
+            .compare_exchange(0, id, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
     }
 
     pub fn abr_owner(&self) -> u64 {
-        self.abr_owner.load(Ordering::Relaxed)
+        self.abr_owner.load(Ordering::Acquire)
     }
 
     /// AS-03: register the per-drain hook (see the `on_drain` field doc). Last
-    /// registration wins; dropped with the session's `SessionMetrics`.
-    pub fn set_on_drain(&self, hook: Box<dyn Fn() + Send + Sync>) {
-        *self.on_drain.lock().unwrap() = Some(hook);
+    /// registration wins; refused — and `false` — when `owner` is no longer the encoder's
+    /// owner, since a teardown that ran in between cleared the hooks and a hook installed
+    /// after it would keep the encoder alive for good (#1295).
+    pub fn set_on_drain(&self, owner: u64, hook: Box<dyn Fn() + Send + Sync>) -> bool {
+        let mut slot = self.on_drain.lock().unwrap();
+        // Both read under the slot's lock, which `clear_hooks`/`end_hooks` take to zero the
+        // owner and to set the ended flag: a registration either lands before that and is
+        // dropped there, or sees the result here.
+        if self.hooks_ended.load(Ordering::Acquire) || self.abr_owner() != owner {
+            return false;
+        }
+        *slot = Some(hook);
+        true
     }
 
-    /// SPT-04: register the post-classification hook (see the `on_window` field doc).
-    /// Last registration wins; dropped with the session's `SessionMetrics`.
-    #[allow(clippy::type_complexity)]
     /// Drop both ABR hooks. The runner MUST call this at session teardown: the hooks hold
     /// strong element refs (encoder + rtpgccbwe, `abr_glue`) while the encoder's pad
     /// probes hold this struct's Arc — a cross ref cycle (encoder → probe → metrics →
@@ -829,17 +863,68 @@ impl SessionMetrics {
     /// `on_window` also holds (`abr_glue::resolution_lever_with_echo`): the runner and
     /// the webrtcbin `request-aux-sender` closure hold it too, so it is pipeline-scoped.
     pub fn clear_hooks(&self) {
-        let had_drain = self.on_drain.lock().unwrap().take().is_some();
-        let had_window = self.on_window.lock().unwrap().take().is_some();
+        self.drop_hooks(false);
+    }
+
+    /// The session is ending: drop the hooks and refuse every later registration. The
+    /// runner's teardown guard calls this instead of [`Self::clear_hooks`], because the
+    /// owner alone cannot say "ended": a transport replacement and a rebuild zero it too,
+    /// and a loop that claims after that zero would pass an owner-only check and install a
+    /// hook after the teardown — rebuilding the cycle it broke, for good (#1295).
+    pub fn end_hooks(&self) {
+        self.drop_hooks(true);
+    }
+
+    fn drop_hooks(&self, ended: bool) {
+        let mut drain = self.on_drain.lock().unwrap();
+        let mut window = self.on_window.lock().unwrap();
         // No owner either: a replacement transport already put the encoder back at launch
         // (`abr_glue::reset_to_launch`), so its loop's start is no takeover to repeat. A
         // WebTransport client still streaming takes it back (`abr_glue::feedback_abr`).
-        self.abr_owner.store(0, Ordering::Relaxed);
-        tracing::debug!(had_drain, had_window, "session metrics ABR hooks cleared");
+        //
+        // Written HERE, under both slots' locks: a loop's registration checks them while
+        // holding one of them, so it either lands before this and is dropped below, or sees
+        // the result and installs nothing.
+        if ended {
+            self.hooks_ended.store(true, Ordering::Release);
+        }
+        self.abr_owner.store(0, Ordering::Release);
+        let had_drain = drain.take().is_some();
+        let had_window = window.take().is_some();
+        tracing::debug!(
+            had_drain,
+            had_window,
+            ended,
+            "session metrics ABR hooks dropped"
+        );
     }
 
-    pub fn set_on_window(&self, hook: Box<dyn Fn(AdaptationState, Option<f64>) + Send + Sync>) {
-        *self.on_window.lock().unwrap() = Some(hook);
+    /// SPT-04: register the post-classification hook (see the `on_window` field doc).
+    /// Last registration wins; refused — and `false` — when `owner` is no longer the
+    /// encoder's owner, exactly as [`Self::set_on_drain`] is (#1295).
+    #[allow(clippy::type_complexity)]
+    pub fn set_on_window(
+        &self,
+        owner: u64,
+        hook: Box<dyn Fn(AdaptationState, Option<f64>) + Send + Sync>,
+    ) -> bool {
+        let mut slot = self.on_window.lock().unwrap();
+        // As `set_on_drain`: the ended flag and the owner are read under the slot's own lock.
+        if self.hooks_ended.load(Ordering::Acquire) || self.abr_owner() != owner {
+            return false;
+        }
+        *slot = Some(hook);
+        true
+    }
+
+    /// Which ABR hooks are installed, for the test that a registration racing a teardown
+    /// leaves none behind (#1295).
+    #[cfg(test)]
+    pub(crate) fn hooks_armed(&self) -> (bool, bool) {
+        (
+            self.on_drain.lock().unwrap().is_some(),
+            self.on_window.lock().unwrap().is_some(),
+        )
     }
 
     /// Record the compositor's live app-facing render size / UI scale for the echo.
