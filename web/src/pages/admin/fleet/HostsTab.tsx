@@ -29,7 +29,7 @@ import { ApplyConfirmModal } from "./ApplyControls";
 import { hostFloorState } from "./hostFloor";
 import { HostRow } from "./HostRow";
 import { hostFlag } from "./hostWarnings";
-import { notConnected, removable } from "./removeHost";
+import { canRemoveHost, notConnected, removable } from "./removeHost";
 import "../../../styles/admin/fleet.css";
 
 // `Host.capacity` carries the roll-up but no GPU model names, so one resource
@@ -327,8 +327,11 @@ export function HostsTab() {
                       }
                       onForget={() => {
                         // An owned GPU host is removed by its recovery actor, on its page.
+                        // The page opens the dialog on the same rule as this menu, and says
+                        // why when it cannot (#1240).
                         if (removable(host, controlPlane)) {
-                          navigate(`/admin/fleet/hosts/${host.id}?remove=1`);
+                          const dialog = canRemoveHost(host, controlPlane) ? "?remove=1" : "";
+                          navigate(`/admin/fleet/hosts/${host.id}${dialog}`);
                           return;
                         }
                         setForgetError(null);
