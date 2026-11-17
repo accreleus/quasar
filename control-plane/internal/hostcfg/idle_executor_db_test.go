@@ -793,12 +793,12 @@ func TestRecoveredReplayKeepsALaterAppliedGroup(t *testing.T) {
 // second must not move holds after the first has made the row terminal.
 func TestJournalInventoryWithTwoPhasesForOneAttemptQuarantines(t *testing.T) {
 	for _, tc := range []struct {
-		name, second string
-		proven       bool
-		heldByFirst  int
+		name, second           string
+		proven                 bool
+		wantIdle, wantRecovery int
 	}{
-		{name: "recovered after unproven applied", second: "recovered", proven: false, heldByFirst: 1},
-		{name: "uncertain after proven applied", second: "uncertain", proven: true, heldByFirst: 0},
+		{name: "recovered after unproven applied", second: "recovered", proven: false, wantIdle: 0, wantRecovery: 1},
+		{name: "uncertain after proven applied", second: "uncertain", proven: true, wantIdle: 0, wantRecovery: 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pool := testPool(t)
@@ -846,7 +846,7 @@ func TestJournalInventoryWithTwoPhasesForOneAttemptQuarantines(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if idle, recovery := holds(tx); idle != tc.heldByFirst || recovery != 0 {
+			if idle, recovery := holds(tx); idle != tc.wantIdle || recovery != tc.wantRecovery {
 				t.Fatalf("entry that did not land moved holds: idle_apply=%d recovery=%d", idle, recovery)
 			}
 		})
