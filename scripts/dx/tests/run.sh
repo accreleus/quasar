@@ -43,7 +43,9 @@ start_bg() { BG_PIDS+=("$1"); }   # start_bg <pid> — remember a background chi
 # shellcheck disable=SC2329  # invoked by the traps below, not by name
 cleanup() {
   local pid
-  for pid in "${BG_PIDS[@]}"; do
+  # ${BG_PIDS[@]+"${BG_PIDS[@]}"}: bash < 4.4 (macOS ships 3.2) reads an empty
+  # array's expansion as an unbound variable under `set -u` and dies (#1411).
+  for pid in ${BG_PIDS[@]+"${BG_PIDS[@]}"}; do
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   done
@@ -4345,6 +4347,18 @@ if [ -z "$rf_copy_bad" ]; then
   pass "readiness-faults:no-image-copies-scripts" "no deploy/Dockerfile* COPY or ADD source can include scripts/"
 else
   fail "readiness-faults:no-image-copies-scripts" "$rf_copy_bad"
+fi
+
+# ── suite hygiene ────────────────────────────────────────────────────────────
+# The suite's own cleanup loop expands BG_PIDS. Bash < 4.4 (macOS ships 3.2) reads
+# an empty array's expansion as an unbound variable under `set -u` and dies before
+# the trap can stop anything; the guarded `${BG_PIDS[@]+"${BG_PIDS[@]}"}` form is
+# what keeps a macOS run alive (#1411).
+cleanup_body="$(sed -n '/^cleanup() {/,/^}/p' "$TESTS_DIR/run.sh")"
+if printf '%s' "$cleanup_body" | grep -qF 'for pid in ${BG_PIDS[@]+"${BG_PIDS[@]}"}; do'; then
+  pass "suite:bg-pids-guarded" "the cleanup loop expands an empty BG_PIDS safely under set -u (bash 3.2)"
+else
+  fail "suite:bg-pids-guarded" "the cleanup loop expands BG_PIDS with \"\${BG_PIDS[@]}\", which dies on an empty array under set -u on bash 3.2 (#1411)"
 fi
 
 # ── summary ──────────────────────────────────────────────────────────────────

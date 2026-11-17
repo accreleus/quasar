@@ -39,6 +39,7 @@ own; the two do not move together, and that is deliberate.
 - **The e2e compare test now pins the decode-support read (#1410).** A client that reports a codec named like something every object has (`constructor`) is read as absent on the other side, never as an inherited value; the test fails if the guard is removed.
 
 ### Fixed
+- **The test suite no longer leaves fake timers on for a later test, and the DX self-tests no longer die on an empty background-pid array under `set -u` on bash older than 4.4 (#1411).** Test and tooling only.
 - **The fake-transport takeover test accepts openh264 repeating the keyframe's PTS on the second access unit (#1520).** It failed once in CI when the second unit carried the keyframe's PTS rather than no PTS at all; the strict rise is still held from the third unit on, and the check is unit-tested with that exact sequence. Test-only.
 - **Warning rows in the session overlay's Detailed stats are amber (#1136).** A codec mismatch, a failed check, a stalled audio buffer and similar warnings were drawn in the same grey as every other row; they now use the warning colour.
 - **The Detailed stats in the session overlay no longer scroll sideways on a phone (#1413).** Its four tables now drop to two columns on a narrow screen and one column on a portrait phone.
