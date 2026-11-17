@@ -601,7 +601,7 @@ impl WebRtcSlot {
             }
         }
         let cfg = self.cfg.lock().unwrap().clone();
-        abr_glue::reset_to_launch(&self.encoder, &cfg, &self.lever, &self.metrics);
+        abr_glue::reset_to_launch(&self.encoder, &cfg, Some(&self.lever), &self.metrics);
         *video = self.attach_video(true, gate)?;
         // The pipeline handed its latency to the first transport on the way to PLAYING;
         // one added later has to be told.

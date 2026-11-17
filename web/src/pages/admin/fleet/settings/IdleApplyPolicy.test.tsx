@@ -2,7 +2,8 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../../../../auth/context", () => ({ useAuth: () => ({ token: "admin-token" }) }));
-vi.mock("../../../../components/Toast", () => ({ useToast: () => ({ addToast: vi.fn(), removeToast: vi.fn() }) }));
+const toast = vi.hoisted(() => ({ addToast: vi.fn() }));
+vi.mock("../../../../components/Toast", () => ({ useToast: () => ({ addToast: toast.addToast, removeToast: vi.fn() }) }));
 vi.mock("../../../../api/admin", () => ({
   getHostPolicy: vi.fn(), getHostIdleApply: vi.fn(),
   approveHostIdleApply: vi.fn(), cancelHostIdleApply: vi.fn(), releaseHostRecoveryHold: vi.fn(),
@@ -75,6 +76,27 @@ describe("idle apply policy", () => {
     expect(await screen.findByText(/Approval: uncertain/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Release recovery hold" })).toBeNull();
     expect(screen.queryByText(/An administrator released/)).toBeNull();
+  });
+
+  it("offers an applied attempt's recovery hold and says the control plane ends it", async () => {
+    const applied = { ...uncertain, phase: "applied", started: true, admission_restricted: true, recovery_release: null };
+    const releasedNow = { ...applied, admission_restricted: false,
+      recovery_release: { state: "released", requested_at: "2026-10-30T12:00:00Z", waiting_for: null } };
+    vi.mocked(api.getHostPolicy).mockResolvedValue(view(waiting.attempt_id) as never);
+    vi.mocked(api.getHostIdleApply).mockResolvedValue(applied as never);
+    vi.mocked(api.releaseHostRecoveryHold).mockResolvedValue(releasedNow as never);
+    render(<IdleApplyPolicy hostId="host-1" />);
+    expect(await screen.findByText(/Admission remains protected/)).toBeTruthy();
+    fireEvent.click(await screen.findByRole("button", { name: "Release recovery hold" }));
+    expect(screen.getByText(/without asking the host's agent/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("checkbox", { name: /configuration is unverified/ }));
+    vi.mocked(api.getHostIdleApply).mockResolvedValue(releasedNow as never);
+    fireEvent.click(screen.getByRole("button", { name: "Release hold" }));
+    await waitFor(() => expect(api.releaseHostRecoveryHold).toHaveBeenCalledWith("admin-token", "host-1", waiting.attempt_id));
+    await waitFor(() => expect(toast.addToast).toHaveBeenCalledWith({
+      variant: "success", title: "Recovery hold released. The host takes new sessions again, unless another hold remains." }));
+    expect(await screen.findByText(/The attempt stays applied and its group is unchanged/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Release recovery hold" })).toBeNull();
   });
 
   it("releases the attempt the dialog opened on, even if a refresh swaps the attempt", async () => {

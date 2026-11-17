@@ -121,6 +121,14 @@ pub(crate) struct Rate {
     pub(crate) retargets: bool,
     /// A client's first estimate: its loop takes the encoder over (one writer per encoder).
     pub(crate) start: Box<dyn Fn() + Send + Sync>,
+    /// Some ABR loop owns the session's encoder right now (`SessionMetrics::abr_owner`).
+    /// Ownership outlives the transport that started the loop: a WebRTC peer whose PC fails
+    /// takes its hold with it (`Holder::None`) and leaves its loop owning the encoder.
+    pub(crate) owns: Box<dyn Fn() -> bool + Send + Sync>,
+    /// Displace a loop that still owns the encoder, at the takeover itself (#1294): the
+    /// encoder back at its launch point, no owner — not at this client's first estimate,
+    /// which a client that sends no feedback (§Feedback) never sends.
+    pub(crate) displaced: Box<dyn Fn() + Send + Sync>,
     pub(crate) observe: Box<dyn Fn(f64) + Send + Sync>,
     /// After `observe`, for every estimate that came from a receiver report, never for the
     /// silence decay: what the report showed the link carrying when the link held the
@@ -439,11 +447,22 @@ impl Registry {
 
     /// The session is stopping: its tokens go, and its client gets `bye session_ended`.
     pub fn end(&self, session_id: &str) {
-        let media = self.lock().get_mut(session_id).and_then(|entry| {
-            entry.tokens.clear();
-            entry.ended_at.get_or_insert_with(SystemTime::now);
-            entry.media.take()
-        });
+        self.end_if(session_id, |_| true);
+    }
+
+    /// `end`, only when `names` holds for the entry's media, checked under the same lock: a
+    /// tap dropped after its successor registered under the same id (#1197) must leave that
+    /// successor's entry alone.
+    fn end_if(&self, session_id: &str, names: impl FnOnce(Option<&Arc<Media>>) -> bool) {
+        let media = self
+            .lock()
+            .get_mut(session_id)
+            .filter(|entry| names(entry.media.as_ref()))
+            .and_then(|entry| {
+                entry.tokens.clear();
+                entry.ended_at.get_or_insert_with(SystemTime::now);
+                entry.media.take()
+            });
         if let Some(media) = media {
             media.end();
         }
@@ -507,6 +526,11 @@ pub(crate) fn registry() -> Option<Arc<Registry>> {
 
 /// Takes the session's video off the encoded-frame boundary for its WebTransport
 /// client, and forgets the session when dropped with the transport.
+///
+/// One live tap per session id (#1197): `attach` registers its media over any earlier tap's
+/// (`set_media`, under the registry lock), and a drop ends the entry only while it still
+/// names that tap's media. A rebuild's old tap is dropped after its successor attached, so
+/// it never ends the successor's entry; nor does a tap whose id was assigned again.
 pub(crate) struct Tap {
     registry: Arc<Registry>,
     session_id: String,
@@ -644,8 +668,10 @@ impl Tap {
 
 impl Drop for Tap {
     fn drop(&mut self) {
-        self.registry.end(&self.session_id);
-        // Its own media too: an id assigned again got a fresh entry that no longer names it.
+        let own = &self.media;
+        self.registry
+            .end_if(&self.session_id, |m| m.is_some_and(|m| Arc::ptr_eq(m, own)));
+        // Its own media too, which the entry may no longer name.
         self.media.end();
         self.release();
     }
@@ -1441,6 +1467,10 @@ async fn authenticate(
             return;
         }
     };
+    // #1294: the takeover displaces a loop that still owns the encoder, here rather than
+    // under the registry lock `redeem` holds (the reset writes the encoder, and a rung
+    // restore restarts its session), and before this client's `hello_ack` lets it feed.
+    media.displace_stale_abr();
     // §FEC: repairs are paid for by lowering the encoder's rate, so only an ABR that
     // writes it sends them.
     let fec = media.rate().is_some_and(|rate| rate.retargets) && hello.decodes("xor");
@@ -1749,6 +1779,10 @@ async fn stream(
                     }
                 }
                 None => break match client.gone.get() {
+                    // A rebuild replaced the encoder: a lost connection, not an end, so the
+                    // client mints a fresh token and reconnects onto the new encoder
+                    // (§Reconnect, #1197). No `bye` and code 0 is what says "lost link".
+                    Some(Gone::Rebuilt) => QUIET,
                     Some(Gone::TakenOver) => (Some(json!({"type": "bye", "reason": "taken_over"})), CLOSE_TAKEN_OVER, ""),
                     Some(Gone::Unusable) => (
                         Some(json!({"type": "error", "code": "internal", "message": "the encoder sent no usable keyframe"})),

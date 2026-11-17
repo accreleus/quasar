@@ -909,13 +909,14 @@ impl AppSource {
         true
     }
 
-    /// Advertise the session's rung ladder (`session::rungs::available_rungs` of the
-    /// launch size) as this compositor's `wl_output` modes. The internal half of adaptive
-    /// external resolution, independent of the encoded size. Must be set once per source
-    /// generation BEFORE the compositor starts: an app that reads its output's mode list
-    /// once at startup has to see the full ladder. Guarded on `find_property` for the
-    /// same panic reason as [`Self::set_display_properties`]; an older image debug-logs
-    /// and no-ops. Returns whether it was taken.
+    /// Advertise the modes the guest app may pick (`session::rungs::mode_ladder` of the
+    /// launch size, the rung ladder less the sizes meant only for a starved link) as this
+    /// compositor's `wl_output` modes. The internal half of adaptive external resolution,
+    /// independent of the encoded size. Must be set once per source generation BEFORE the
+    /// compositor starts: an app that reads its output's mode list once at startup has to
+    /// see the full list. Guarded on `find_property` for the same panic reason as
+    /// [`Self::set_display_properties`]; an older image debug-logs and no-ops. Returns
+    /// whether it was taken.
     pub fn set_mode_ladder(&self, rungs: &[(i32, i32)]) -> bool {
         let Some(source) = self.pipeline.by_name("video-source") else {
             tracing::warn!(

@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"testing"
+	"time"
+
+	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
 )
 
 // previewRel is a preview row whose manifest lists the given commits, newest first.
@@ -75,6 +78,43 @@ func TestNewCommitCount(t *testing.T) {
 }
 
 func intp(n int) *int { return &n }
+
+// Amendment 83: an installed control plane NEWER than the release by the edge
+// ordering rule (same schema_version, later built_at) runs every commit the
+// release carries, so new_commit_count is 0 — not the whole list, which is what
+// "installed commit is not on the list" would answer.
+func TestNewCommitCountIsZeroWhenInstalledIsNewer(t *testing.T) {
+	// The preview row was built at(5); installed commit is mid-list, so the
+	// ordinary answer would be 1.
+	row := previewRel(commitA, commitB, commitC)
+	installedNewer := cp(commitB, 76)
+	installedNewer.BuiltAt = str(at(6).Format(time.RFC3339))
+	installedOlder := cp(commitB, 76)
+	installedOlder.BuiltAt = str(at(4).Format(time.RFC3339))
+
+	for _, tc := range []struct {
+		name     string
+		cp       buildinfo.Identity
+		wantZero bool
+	}{
+		{"installed built later at the same schema", installedNewer, true},
+		{"installed built earlier", installedOlder, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			view := PlanRelease(PlanInputs{Channel: ChannelPreview, ControlPlane: tc.cp, Releases: []Release{row}})
+			if len(view.Available) != 1 {
+				t.Fatalf("available = %v, want the one row", ids(view.Available))
+			}
+			got := view.Available[0].NewCommitCount
+			if got == nil {
+				t.Fatal("new_commit_count = null, want a count on a preview row with a commit list")
+			}
+			if (got != nil && *got == 0) != tc.wantZero {
+				t.Fatalf("new_commit_count = %d, want zero=%v", *got, tc.wantZero)
+			}
+		})
+	}
+}
 
 func derefInt(p *int) any {
 	if p == nil {

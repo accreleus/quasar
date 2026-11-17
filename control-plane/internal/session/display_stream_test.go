@@ -132,13 +132,13 @@ func TestDisplayStateCache(t *testing.T) {
 
 	// An old agent's sample (nothing display-aware in it) must not clobber the
 	// optimistic value.
-	d.observe("s1", nil, nil, nil, "")
+	d.observe("s1", nil, nil, nil, "", nil, nil, nil, 1920, 1080)
 	if w, h := d.externalSizeOf("s1", 1920, 1080); w != 1280 || h != 720 {
 		t.Fatalf("non-display-aware sample clobbered the cache: %dx%d", w, h)
 	}
 
 	// The authoritative readback wins, even when it disagrees.
-	d.observe("s1", i32(1600), i32(900), bp(true), "auto")
+	d.observe("s1", i32(1600), i32(900), bp(true), "auto", nil, nil, nil, 1920, 1080)
 	if w, h := d.externalSizeOf("s1", 1920, 1080); w != 1600 || h != 900 {
 		t.Fatalf("metrics did not override the optimistic value: %dx%d", w, h)
 	}
@@ -151,7 +151,7 @@ func TestDisplayStateCache(t *testing.T) {
 	}
 
 	// A later sample can flip owner to "pinned" (a manual PATCH took over).
-	d.observe("s1", i32(1600), i32(900), bp(true), "pinned")
+	d.observe("s1", i32(1600), i32(900), bp(true), "pinned", nil, nil, nil, 1920, 1080)
 	if st, _ := d.get("s1"); st.Owner != "pinned" {
 		t.Fatalf("owner did not flip to pinned: got %q", st.Owner)
 	}
@@ -159,7 +159,7 @@ func TestDisplayStateCache(t *testing.T) {
 	// Display-aware sample WITHOUT the pair ⇒ back at launch size. Without this
 	// a session stepped 1080 → 720 → 1080 would report 720 forever. Owner clears
 	// in lockstep — there is no meaningful owner of the launch size.
-	d.observe("s1", nil, nil, bp(true), "")
+	d.observe("s1", nil, nil, bp(true), "", nil, nil, nil, 1920, 1080)
 	if w, h := d.externalSizeOf("s1", 1920, 1080); w != 1920 || h != 1080 {
 		t.Fatalf("absent pair did not reset to launch: %dx%d", w, h)
 	}
@@ -173,6 +173,77 @@ func TestDisplayStateCache(t *testing.T) {
 	d.forget("s1")
 	if _, ok := d.get("s1"); ok {
 		t.Fatal("forget left an entry behind")
+	}
+}
+
+// TestDisplayStateRenderSize pins amendment 84 (#996): the render size and UI
+// scale are known from a 202 of the display PATCH or from a display-aware
+// sample, in which an absent pair means the launch size and an absent scale
+// means 1.0; a non-display-aware sample changes neither; and the Session
+// resource omits them until something knows them, including when the known value
+// IS the launch size/1.0.
+func TestDisplayStateRenderSize(t *testing.T) {
+	d := newDisplayState()
+
+	// Before anything knows them the resource omits all three: absence means
+	// UNKNOWN, never "the launch size".
+	if got := toSessionRespExt(Session{Width: 1920, Height: 1080}, externalState{}, true).Stream; got.RenderWidth != nil || got.RenderHeight != nil || got.UIScale != nil {
+		t.Fatalf("unknown render state serialized: %+v", got)
+	}
+
+	// A 202 makes the fields the request carried known, and only those: the
+	// next display-aware sample fills the rest.
+	d.setRender("s1", i32(1600), i32(900), nil)
+	if st, _ := d.get("s1"); !st.RenderKnown || st.RenderW != 1600 || st.RenderH != 900 || st.UIScaleKnown {
+		t.Fatalf("render pair from a 202: %+v", st)
+	}
+	d.setRender("s1", nil, nil, f64(1.5))
+	if st, _ := d.get("s1"); !st.UIScaleKnown || st.UIScale != 1.5 || st.RenderW != 1600 {
+		t.Fatalf("ui scale from a 202: %+v", st)
+	}
+
+	// A display-aware sample that carries neither pair means the launch size and
+	// 1.0 — the agent only sends them when non-default.
+	d.observe("s1", nil, nil, bp(true), "", nil, nil, nil, 1920, 1080)
+	st, _ := d.get("s1")
+	if !st.RenderKnown || st.RenderW != 1920 || st.RenderH != 1080 {
+		t.Fatalf("absent render pair did not read as the launch size: %+v", st)
+	}
+	if !st.UIScaleKnown || st.UIScale != 1.0 {
+		t.Fatalf("absent ui scale did not read as 1.0: %+v", st)
+	}
+
+	// A sample carrying them is the authority.
+	d.observe("s1", nil, nil, bp(true), "", i32(1280), i32(720), f64(2), 1920, 1080)
+	st, _ = d.get("s1")
+	if st.RenderW != 1280 || st.RenderH != 720 || st.UIScale != 2 {
+		t.Fatalf("sample values not recorded: %+v", st)
+	}
+	stream := toSessionRespExt(Session{Width: 1920, Height: 1080}, st, true).Stream
+	if stream.RenderWidth == nil || *stream.RenderWidth != 1280 ||
+		stream.RenderHeight == nil || *stream.RenderHeight != 720 ||
+		stream.UIScale == nil || *stream.UIScale != 2 {
+		t.Fatalf("known render state not serialized: %+v", stream)
+	}
+
+	// A sample with nothing display-aware in it (an older agent) must not
+	// overwrite what is known, even though it carries render keys.
+	d.observe("s1", nil, nil, nil, "", i32(640), i32(360), nil, 1920, 1080)
+	if st, _ := d.get("s1"); st.RenderW != 1280 || st.UIScale != 2 {
+		t.Fatalf("a non-display-aware sample changed the render state: %+v", st)
+	}
+
+	// Known-and-default is still PRESENT, which is how a client tells it from
+	// unknown.
+	d.setRender("s1", i32(1920), i32(1080), f64(1))
+	stream = toSessionRespExt(Session{Width: 1920, Height: 1080}, func() externalState { s, _ := d.get("s1"); return s }(), true).Stream
+	if stream.RenderWidth == nil || *stream.RenderWidth != 1920 || stream.UIScale == nil || *stream.UIScale != 1 {
+		t.Fatalf("known default render state was omitted: %+v", stream)
+	}
+
+	d.forget("s1")
+	if _, ok := d.get("s1"); ok {
+		t.Fatal("forget left the render state behind")
 	}
 }
 
@@ -199,7 +270,7 @@ func TestDisplayStateConsoleMode(t *testing.T) {
 
 	// A streamed-style sample (no console mode) leaves it in place...
 	d.observeConsoleMode("s1", nil)
-	d.observe("s1", nil, nil, bp(false), "")
+	d.observe("s1", nil, nil, bp(false), "", nil, nil, nil, 1920, 1080)
 	if st, _ := d.get("s1"); st.ConsoleMode == nil || *st.ConsoleMode != first {
 		t.Fatalf("console mode clobbered by a sample without one: %+v", st)
 	}
@@ -224,7 +295,7 @@ func TestDisplayStateCacheSetSizeOwnership(t *testing.T) {
 	d := newDisplayState()
 
 	// The ladder had already stepped this session down and reported it.
-	d.observe("s1", i32(1600), i32(900), bp(true), "auto")
+	d.observe("s1", i32(1600), i32(900), bp(true), "auto", nil, nil, nil, 1920, 1080)
 	if st, _ := d.get("s1"); st.Owner != "auto" {
 		t.Fatalf("setup: want auto, got %q", st.Owner)
 	}
@@ -549,6 +620,86 @@ func TestSessionRespRungsAndExternal(t *testing.T) {
 	}
 	if st.Width != 1920 || st.Height != 1080 {
 		t.Fatalf("launch width/height moved with the console mode: %dx%d", st.Width, st.Height)
+	}
+}
+
+// TestSessionRespRenderSizeAndScale pins amendment 84 (#996) end to end: GET
+// omits the render size and UI scale until the control plane knows them, a
+// display-aware sample makes both known (absent keys reading as the launch size
+// and 1.0), a 202 of the display PATCH is visible on the very next GET, and a
+// later sample moves them again. This is what lets a second tab or a takeover
+// start from the session's real render size instead of assuming the launch one.
+func TestSessionRespRenderSizeAndScale(t *testing.T) {
+	pool := testDB(t)
+	srv, authSvc, store, _, coord := newStreamDisplayServer(t, pool, true)
+	ctx := context.Background()
+
+	_ = seed(t, pool, 4)
+	owner, err := authSvc.Register(ctx, "render@test.local", "renderuser", "unrelated-pw-07")
+	if err != nil {
+		t.Fatalf("register owner: %v", err)
+	}
+	tok := loginTok(t, authSvc, "render@test.local", "unrelated-pw-07")
+	sid := session1080ForUser(t, store, currentSeed(t, pool), owner.ID)
+	host := hostOf(t, store, sid)
+
+	get := func() streamResp {
+		resp := doJSON(t, http.MethodGet, srv.URL+"/v1/sessions/"+sid, tok, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET session: %d", resp.StatusCode)
+		}
+		return decodeSessionResp(t, resp).Stream
+	}
+
+	// Nothing has said anything yet: UNKNOWN, so all three are absent.
+	if st := get(); st.RenderWidth != nil || st.RenderHeight != nil || st.UIScale != nil {
+		t.Fatalf("render size/scale present before any readback: %+v", st)
+	}
+
+	// A display-aware sample without the render keys means "launch size, 1.0".
+	coord.AgentMetrics(ctx, host, agentws.SessionMetricsMsg{
+		Type: "session_metrics", SessionID: sid, TsUnixMs: time.Now().UnixMilli(),
+		ExternalResizeSupported: bp(true),
+	})
+	st := get()
+	if st.RenderWidth == nil || *st.RenderWidth != 1920 ||
+		st.RenderHeight == nil || *st.RenderHeight != 1080 ||
+		st.UIScale == nil || *st.UIScale != 1.0 {
+		t.Fatalf("known defaults not served: %+v", st)
+	}
+
+	// The sample is the authority for a non-default mode.
+	coord.AgentMetrics(ctx, host, agentws.SessionMetricsMsg{
+		Type: "session_metrics", SessionID: sid, TsUnixMs: time.Now().UnixMilli(),
+		ExternalResizeSupported: bp(true),
+		RenderWidth:             i32(1600), RenderHeight: i32(900), UIScale: f64(1.5),
+	})
+	st = get()
+	if st.RenderWidth == nil || *st.RenderWidth != 1600 || st.RenderHeight == nil || *st.RenderHeight != 900 ||
+		st.UIScale == nil || *st.UIScale != 1.5 {
+		t.Fatalf("sample's render size/scale not served: %+v", st)
+	}
+
+	// A 202 makes the change visible at once, before the next sample, which is
+	// the whole point for a reader that is not the tab that asked.
+	resp := doJSON(t, http.MethodPatch, srv.URL+"/v1/sessions/"+sid+"/display", tok,
+		map[string]any{"render_width": 1280, "render_height": 720, "ui_scale": 2})
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("PATCH display: got %d want 202 (code=%s)", resp.StatusCode, errCode(t, resp))
+	}
+	resp.Body.Close()
+	st = get()
+	if st.RenderWidth == nil || *st.RenderWidth != 1280 || st.RenderHeight == nil || *st.RenderHeight != 720 ||
+		st.UIScale == nil || *st.UIScale != 2 {
+		t.Fatalf("202 not served at once: %+v", st)
+	}
+	// The launch size and the encoded size are untouched by a render change: the
+	// encoded size is known (a display-aware sample reported it) and still at launch.
+	if st.Width != 1920 || st.Height != 1080 {
+		t.Fatalf("launch size moved with the render size: %dx%d", st.Width, st.Height)
+	}
+	if st.ExternalWidth == nil || *st.ExternalWidth != 1920 || st.ExternalHeight == nil || *st.ExternalHeight != 1080 {
+		t.Fatalf("render change moved the encoded size: %+v", st)
 	}
 }
 
