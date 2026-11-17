@@ -6,13 +6,13 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { spawn, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { checkName, crc32, tarGz, zip } from "./archive.mjs";
 import { validateBundle } from "./bundle.mjs";
-import { closure, packMembers, playwrightFiles } from "./pack.mjs";
-import { doctor, findChrome, parseCli, sendBack, withoutSignIn, zipBundle } from "./pack-run.mjs";
+import { closure, packMembers, playwrightFiles, requireTracked } from "./pack.mjs";
+import { doctor, dropSignIn, findChrome, parseCli, sendBack, withoutSignIn, zipBundle } from "./pack-run.mjs";
 import { headless, runnerState } from "./run.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -284,6 +284,38 @@ test("a scenario or plan git does not track stops the pack", () => {
   fs.writeFileSync(stray, '{"name":"zz","scenarios":[]}\n');
   try { assert.throws(() => packMembers(), /zz-untracked-test\.json is not tracked by git/); } finally { fs.rmSync(stray, { force: true }); }
   assert.ok(packMembers().length > 10);
+});
+
+test("the pack holds only tracked files: an untracked or ignored one, a launcher, or a git that cannot answer stops it (#1408)", () => {
+  const dir = tmp();
+  const git = (...a) => execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "user.name=t", "-c", "user.email=t@example.invalid", ...a], { cwd: dir, stdio: "ignore" });
+  try {
+    // A copy of what the pack reads, as its own repository.
+    const tracked = execFileSync("git", ["ls-files", "-z", "scripts/validate", "docs/session-trace"], { cwd: ROOT, encoding: "utf8" }).split("\0").filter(Boolean);
+    for (const f of tracked) { fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true }); fs.copyFileSync(path.join(ROOT, f), path.join(dir, f)); }
+    git("init", "-q");
+    git("add", "-A");
+    git("commit", "-q", "-m", "x");
+    assert.ok(packMembers(dir).length > 10, "a clean copy packs");
+    const plans = path.join(dir, "scripts/validate/stream/plans");
+    // ignored: --exclude-standard used to wave it through
+    fs.writeFileSync(path.join(dir, ".gitignore"), "zz-*.json\n");
+    fs.writeFileSync(path.join(plans, "zz-ignored.json"), '{"name":"zz","scenarios":[]}\n');
+    assert.throws(() => packMembers(dir), /zz-ignored\.json is not tracked by git/);
+    fs.rmSync(path.join(plans, "zz-ignored.json"));
+    // a launcher that is not tracked rides in under a clean VERSION otherwise
+    git("rm", "-q", "--cached", "scripts/validate/stream/pack/run.cmd");
+    assert.throws(() => packMembers(dir), /pack\/run\.cmd is not tracked by git/);
+    // no git answer is no guard
+    fs.rmSync(path.join(dir, ".git"), { recursive: true });
+    assert.throws(() => packMembers(dir), /cannot tell which files git tracks/);
+    assert.throws(() => requireTracked(dir, ["a"]), /cannot tell which files git tracks/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("the sign-in is dropped from this process's environment but the TLS switch stays for its own checks (#1408)", () => {
+  const env = { PATH: "/bin", QUASAR_E2E_EMAIL: "a", QUASAR_E2E_PASSWORD: "b", QUASAR_E2E_CRED_FILE: "c", NODE_TLS_REJECT_UNAUTHORIZED: "0" };
+  assert.deepEqual(dropSignIn(env), { PATH: "/bin", NODE_TLS_REJECT_UNAUTHORIZED: "0" });
 });
 
 test("a symlink in a bundle is not zipped", () => {

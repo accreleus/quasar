@@ -18,7 +18,8 @@ import { cannotRun } from "./scenarios/stream-common.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "../../..");
-const STRIP = ["QUASAR_E2E_EMAIL", "QUASAR_E2E_PASSWORD", "QUASAR_E2E_CRED_FILE", "NODE_TLS_REJECT_UNAUTHORIZED"];
+const SIGN_IN = ["QUASAR_E2E_EMAIL", "QUASAR_E2E_PASSWORD", "QUASAR_E2E_CRED_FILE"];
+const STRIP = [...SIGN_IN, "NODE_TLS_REJECT_UNAUTHORIZED"];
 const USAGE = "usage: pack-run.mjs [doctor] <stack url> [<plan: smoke|fallback|input>] [--insecure]\nsign-in: signin.txt in this folder (QUASAR_E2E_EMAIL=... and QUASAR_E2E_PASSWORD=... lines), or those two variables";
 
 export function parseCli(argv) {
@@ -42,6 +43,12 @@ export function withoutSignIn(env) {
   const out = { ...env };
   for (const k of STRIP) delete out[k];
   return out;
+}
+
+/** Removes the sign-in from `env` itself. NODE_TLS_REJECT_UNAUTHORIZED stays: this process's own checks need it, and the runner's child gets it removed separately. */
+export function dropSignIn(env) {
+  for (const k of SIGN_IN) delete env[k];
+  return env;
 }
 
 /** The pack carries no node_modules: the first run installs playwright-core from the lockfile. The sign-in is not in this process' environment. */
@@ -156,7 +163,7 @@ async function main() {
   if (failed) { console.error(failed); result("failed", "zip= reason=install"); return 1; }
   // The sign-in lives in this process and the runner's child only: Chrome and npm never see it.
   const creds = readCreds(process.env);
-  for (const k of STRIP.slice(0, 3)) delete process.env[k];
+  dropSignIn(process.env);
 
   const chrome = findChrome();
   const d = await doctor({ target: cli.target, plan: cli.plan, creds, chrome, insecure });
