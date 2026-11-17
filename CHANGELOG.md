@@ -38,6 +38,7 @@ own; the two do not move together, and that is deliberate.
 - **A test now fails if the release-webhook host check is left unwired (#156).** The save-time refusal reaches the settings route through one line at startup, and deleting that line used to leave every test green; no change for operators.
 - **CI checkouts no longer leave the job token in the workspace (#877).** Every workflow checkout now sets `persist-credentials: false` (the one release-gate step that fetches afterwards keeps it), and a CI check fails a new checkout that does not.
 - **The e2e compare test now pins the decode-support read (#1410).** A client that reports a codec named like something every object has (`constructor`) is read as absent on the other side, never as an inherited value; the test fails if the guard is removed.
+- **A test now covers a preset gained in the same image update (#583).** The provider app that the update re-links onto a preset materialized by that same update gains `direct_display` without a second pass; it fails if the stamp runs before the re-link. Test-only.
 
 ### Fixed
 - **The test suite no longer leaves fake timers on for a later test, and the DX self-tests no longer die on an empty background-pid array under `set -u` on bash older than 4.4 (#1411).** Test and tooling only.
