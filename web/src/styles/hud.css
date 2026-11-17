@@ -716,6 +716,9 @@
   font-variant-numeric: tabular-nums;
 }
 .diag-extra .diag-table td[colspan="2"] { text-align: left; }
+/* A warning row is amber (#1136). A bare .diag-warn loses to the cell rules above, so this sits after them. */
+.diag-grid td.diag-warn,
+.diag-extra .diag-table td.diag-warn { color: var(--warning-text); }
 
 /* The Advanced disclosure inside the stats pane: input-pipeline and cadence
    instrumentation that "mostly don't provide value" to a player reading it
