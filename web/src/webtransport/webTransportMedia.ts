@@ -676,6 +676,8 @@ export class WebTransportMedia implements MediaTransport {
         return;
       }
       this.recovered(assembler.push(f), sink);
+      // A held repair a video fragment completes is rebuilt here, not on a repair datagram.
+      reportRepaired();
     };
     const config = (c: VideoConfig) => {
       configs.delete(c.configId);

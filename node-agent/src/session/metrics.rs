@@ -35,6 +35,8 @@ const PROBE_SEND_FIFO_CAP: usize = 8;
 /// acceptable only here, because `probe_pay_to_send_*` measures the same span keyed on
 /// RTP timestamp (cannot desync) and still reports the untruncated tail.
 const PROBE_SEND_MAX_AGE_FRAMES: f64 = 1.0;
+/// `fec_client` when no attached connection is sent repairs (a real client id is a counter).
+const NO_FEC_CLIENT: u64 = u64::MAX;
 /// Consecutive unmatched encoder-input PTS, after at least one match, that mean the
 /// S1 correlation key has stopped surviving to the encoder mid-session.
 const PROBE_UNMATCHED_STREAK_WARN: u64 = 120;
@@ -272,10 +274,10 @@ pub struct SessionMetrics {
     /// Amendment 5 (abr-ladder): the governor's floor in kbit/s once the ladder has moved
     /// it off the launch floor, else 0 (⇒ the drain reports `None`).
     abr_floor_kbps: AtomicU64,
-    /// Amendment 85: the live connection's `hello_ack.fec` named a scheme. Set per
-    /// connection, so the FEC keys are present in every window of a session whose current
-    /// client is sent repairs.
-    fec_negotiated: AtomicBool,
+    /// Amendment 85: the id of the attached connection whose `hello_ack.fec` named a scheme
+    /// (`NO_FEC_CLIENT` for none), so the FEC keys are present in every window of a session
+    /// whose current client is sent repairs. Only the attached connection changes it.
+    fec_client: AtomicU64,
     /// Amendment 85: lifetime video and repair datagram PAYLOAD bytes, diffed by the drain.
     fec_video_bytes: AtomicU64,
     fec_repair_bytes: AtomicU64,
@@ -462,7 +464,7 @@ impl SessionMetrics {
             start: now,
             abr_setpoint_kbps: AtomicU64::new(0),
             abr_floor_kbps: AtomicU64::new(0),
-            fec_negotiated: AtomicBool::new(false),
+            fec_client: AtomicU64::new(NO_FEC_CLIENT),
             fec_video_bytes: AtomicU64::new(0),
             fec_repair_bytes: AtomicU64::new(0),
             gcc_estimate_kbps_bits: AtomicU64::new(0),
@@ -820,15 +822,35 @@ impl SessionMetrics {
         self.abr_floor_kbps.store(kbps as u64, Ordering::Relaxed);
     }
 
-    /// Amendment 85: whether the live WebTransport connection's `hello_ack.fec` named a
-    /// scheme. Set once per connection, so a client that is sent no repairs turns the FEC
-    /// keys back off instead of reporting zeros for FEC it does not have.
-    pub fn set_fec_negotiated(&self, on: bool) {
-        self.fec_negotiated.store(on, Ordering::Relaxed);
+    /// Amendment 85: client `client` is now the session's attached WebTransport connection;
+    /// `fec` is whether its `hello_ack.fec` named a scheme. It replaces whatever the previous
+    /// connection said, so a client that is sent no repairs turns the FEC keys back off
+    /// instead of reporting zeros for FEC it does not have.
+    pub fn attach_fec(&self, client: u64, fec: bool) {
+        let owner = if fec { client } else { NO_FEC_CLIENT };
+        self.fec_client.store(owner, Ordering::Relaxed);
     }
 
-    /// Amendment 85: one protected frame's datagram PAYLOAD bytes — the video fragments and
-    /// the repair datagrams that follow them. Cumulative; the drain diffs it.
+    /// Amendment 85: connection `client` ended. Clears the FEC keys only if it still owns
+    /// them: a displaced connection's teardown runs after its successor attached, and must
+    /// not turn the successor's telemetry off.
+    pub fn detach_fec(&self, client: u64) {
+        let _ = self.fec_client.compare_exchange(
+            client,
+            NO_FEC_CLIENT,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Test read of the lifetime video payload bytes `record_fec_bytes` has been given.
+    #[cfg(test)]
+    pub(crate) fn fec_video_total(&self) -> u64 {
+        self.fec_video_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Amendment 85: video datagram PAYLOAD bytes sent (a frame, or a retransmit) and the
+    /// repair datagram payload that followed them. Cumulative; the drain diffs it.
     pub fn record_fec_bytes(&self, video: u64, repair: u64) {
         self.fec_video_bytes.fetch_add(video, Ordering::Relaxed);
         self.fec_repair_bytes.fetch_add(repair, Ordering::Relaxed);
@@ -1221,21 +1243,22 @@ impl SessionMetrics {
 
         // Amendment 85: present in every window of a session whose client is sent repairs,
         // 0 for a window that sent none (a link that was clean all window).
-        let (wt_fec_overhead_pct, wt_fec_kbps) = if self.fec_negotiated.load(Ordering::Relaxed) {
-            let pct = if d_fec_video > 0 {
-                d_fec_repair as f64 * 100.0 / d_fec_video as f64
+        let (wt_fec_overhead_pct, wt_fec_kbps) =
+            if self.fec_client.load(Ordering::Relaxed) != NO_FEC_CLIENT {
+                let pct = if d_fec_video > 0 {
+                    d_fec_repair as f64 * 100.0 / d_fec_video as f64
+                } else {
+                    0.0
+                };
+                let kbps = if window_s > 0.0 {
+                    (d_fec_repair as f64 * 8.0) / 1000.0 / window_s
+                } else {
+                    0.0
+                };
+                (Some(pct), Some(kbps))
             } else {
-                0.0
+                (None, None)
             };
-            let kbps = if window_s > 0.0 {
-                (d_fec_repair as f64 * 8.0) / 1000.0 / window_s
-            } else {
-                0.0
-            };
-            (Some(pct), Some(kbps))
-        } else {
-            (None, None)
-        };
 
         // 0.0 bits ⇒ never received ⇒ None.
         let gcc_estimate_kbps = {
@@ -1420,7 +1443,7 @@ mod tests {
     #[test]
     fn fec_keys_follow_the_negotiation_and_report_the_repair_share() {
         let s = SessionMetrics::new("smooth", 60);
-        s.set_fec_negotiated(true);
+        s.attach_fec(1, true);
         s.record_fec_bytes(10_000, 500);
         let first = s.last.lock().unwrap().at;
         // Half a second later: 500 repair payload bytes of 10 000 video.
@@ -1435,10 +1458,54 @@ mod tests {
         assert_eq!(w.wt_fec_kbps, Some(0.0));
 
         // A client that is sent no repairs turns them off: absence, not zeros.
-        s.set_fec_negotiated(false);
+        s.attach_fec(2, false);
         let w = s.drain_window(first + Duration::from_secs(2));
         assert_eq!(w.wt_fec_overhead_pct, None);
         assert_eq!(w.wt_fec_kbps, None);
+    }
+
+    /// The share is repair over ALL the video sent in the window: frames that got no repair
+    /// (a small frame banks its budget) and retransmits are in the denominator too.
+    #[test]
+    fn the_fec_share_counts_frames_that_got_no_repair() {
+        let s = SessionMetrics::new("smooth", 60);
+        s.attach_fec(1, true);
+        s.record_fec_bytes(10_000, 500); // a frame that paid for a repair
+        s.record_fec_bytes(10_000, 0); // a frame that banked its budget
+        s.record_fec_bytes(5_000, 0); // a retransmit
+        let first = s.last.lock().unwrap().at;
+        let w = s.drain_window(first + Duration::from_secs(1));
+        assert_eq!(
+            w.wt_fec_overhead_pct,
+            Some(2.0),
+            "500 of 25 000, not of 10 000"
+        );
+    }
+
+    /// A displaced connection's teardown, run after its successor attached, leaves the
+    /// successor's keys on; only the attached connection's own end turns them off.
+    #[test]
+    fn only_the_attached_connection_changes_the_fec_state() {
+        let s = SessionMetrics::new("smooth", 60);
+        let at = s.last.lock().unwrap().at;
+        let present = |s: &SessionMetrics, secs| {
+            s.drain_window(at + Duration::from_secs(secs))
+                .wt_fec_kbps
+                .is_some()
+        };
+        s.attach_fec(1, true);
+        s.attach_fec(2, true); // a takeover or reload: B attaches while A is still tearing down
+        s.detach_fec(1); // A's stream notices and ends
+        assert!(present(&s, 1), "B still reports FEC after A ended");
+        s.detach_fec(2); // B ends with nobody attaching after
+        assert!(!present(&s, 2));
+        // A successor that is sent no repairs takes the keys off at once, before the
+        // displaced connection's teardown.
+        s.attach_fec(3, true);
+        s.attach_fec(4, false);
+        assert!(!present(&s, 3));
+        s.detach_fec(3);
+        assert!(!present(&s, 4));
     }
 
     // ── Host-stage latency probe (QUASAR_LATENCY_PROBE) ───────────────────────

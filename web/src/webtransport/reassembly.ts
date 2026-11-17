@@ -273,7 +273,8 @@ export class FrameAssembler {
           for (let b = 0; b < n; b++) out[b] ^= part[b];
         }
         p.repairs.splice(p.repairs.indexOf(r), 1);
-        this.repaired += 1;
+        // A fragment already NACKed is in `lost`; the two never overlap (amendment 85).
+        if (p.asks[missing[0]] === 0) this.repaired += 1;
         if (!this.store(seq, p, missing[0], out, at)) return;
         progress = true;
       }

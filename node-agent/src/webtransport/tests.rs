@@ -2478,7 +2478,10 @@ async fn lossy_session(retargets: bool) -> (Agent, Arc<crate::session::metrics::
                 displaced: Box::new(|| {}),
                 observe: Box::new(|_| {}),
                 fec: Box::new(move |event| match event {
-                    crate::webtransport::FecEvent::Negotiated(on) => m.set_fec_negotiated(on),
+                    crate::webtransport::FecEvent::Attached { client, fec } => {
+                        m.attach_fec(client, fec);
+                    }
+                    crate::webtransport::FecEvent::Detached { client } => m.detach_fec(client),
                     crate::webtransport::FecEvent::Sent { video, repair } => {
                         m.record_fec_bytes(video, repair);
                     }
@@ -2864,6 +2867,9 @@ async fn a_pyrowave_client_that_offers_xor_is_sent_no_repair_whatever_it_loses()
     let w = metrics.drain_window(std::time::Instant::now());
     assert_eq!(w.wt_fec_overhead_pct, Some(0.0));
     assert_eq!(w.wt_fec_kbps, Some(0.0));
+    // ...and the frames that got no repair are still video sent in the window: the share's
+    // denominator is all the video, not only the frames that were repaired.
+    assert!(metrics.fec_video_total() > 1000, "{}", metrics.fec_video_total());
 }
 
 #[tokio::test]

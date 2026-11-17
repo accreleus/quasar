@@ -115,6 +115,18 @@ describe("FrameAssembler", () => {
       expect(a.repaired).toBe(1);
     });
 
+    it("does not count a fragment already NACKed as repaired: it is in lost, and the two never overlap (amendment 85)", () => {
+      const f = five();
+      const a = new FrameAssembler(() => 0);
+      // Fragments 0 and 2 never arrive: both are NACKed (lost) as the later ones show the gap.
+      for (const i of [1, 3, 4]) a.push(f[i]);
+      expect(a.lost).toBe(2);
+      // The group over 0, 2 and 4 is held with two missing; the resend of 0 lets it rebuild 2.
+      a.repair(parseFecDatagram(repairOf(f, 0, 3, 2))!);
+      a.push(f[0]);
+      expect([a.lost, a.repaired]).toEqual([2, 0]);
+    });
+
     it("rebuilds the last, shorter fragment at its own length", () => {
       const f = five();
       const a = new FrameAssembler(() => 0);

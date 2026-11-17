@@ -700,6 +700,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     lostCause = e.code === 4400 && e.reason.startsWith("datagrams:") ? e.reason : undefined;
     stableVideoSince = null;
     transport = null; // the closed one's own `end` is then not this view's
+    telemetry.setFec(false); // no connection is sent repairs until the next hello_ack says so
     teardownInput();
     closing = t.close();
     // The active recovery loop notices that its replacement ended and tries again.

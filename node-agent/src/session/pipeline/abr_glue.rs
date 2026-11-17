@@ -1537,7 +1537,10 @@ pub(crate) fn feedback_abr(
         }),
         measured: Box::new(move |reading| report_loop.report(reading, std::time::Instant::now())),
         fec: Box::new(move |event| match event {
-            crate::webtransport::FecEvent::Negotiated(on) => fec_metrics.set_fec_negotiated(on),
+            crate::webtransport::FecEvent::Attached { client, fec } => {
+                fec_metrics.attach_fec(client, fec);
+            }
+            crate::webtransport::FecEvent::Detached { client } => fec_metrics.detach_fec(client),
             crate::webtransport::FecEvent::Sent { video, repair } => {
                 fec_metrics.record_fec_bytes(video, repair);
             }
