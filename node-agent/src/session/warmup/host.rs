@@ -222,7 +222,7 @@ impl WarmupHost for AgentWarmupHost {
         let thread_stop = stop.clone();
         let thread_id = session_id.clone();
         let thread = std::thread::Builder::new()
-            .name("quasar-warmup-session".to_string())
+            .name("quasar-warmup".to_string())
             .spawn(move || {
                 // Contained the same way the agent contains a user session's
                 // panic (#409): must end the warm-up, not the agent process.

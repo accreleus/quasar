@@ -8,6 +8,8 @@ import (
 	"math"
 	"sync"
 	"time"
+
+	"github.com/accreleus/quasar/control-plane/internal/agentws"
 )
 
 // healthEvaluator owns the server- and client-health run tracking and the
@@ -59,13 +61,44 @@ type ClientHealthSample struct {
 	IsHidden bool
 }
 
-// evaluateHealth computes stream health from the latest ABR setpoint against the
-// floor of the rung the session is on now, persists a change, and fails a session
-// unsustainable too long. reportedFloorKbps is the sample's abr_floor_kbps (nil ⇒
-// the launch floor, agent-api.md §session_metrics). The state machine is Evaluate;
-// this does the I/O, in its own goroutine off the metrics hot path, logging errors
-// rather than propagating them.
-func (h *healthEvaluator) evaluateHealth(ctx context.Context, sessionID string, setpointKbps float64, reportedFloorKbps *float64) {
+// healthSignal is the rate one session_metrics sample is judged on, and which of the two
+// the agent reported: its ABR setpoint, or — when the sample carries one — the governor's
+// unclamped link rate (amendment 79). The two differ exactly where it matters: a session
+// pinned at the lowest rung's floor has a setpoint that can never rise above that floor,
+// while its link rate is above it whenever the link carries more.
+type healthSignal struct {
+	kbps     float64
+	linkRate bool
+}
+
+// String names the judged value as an operator reads it in a log line or a failure detail.
+func (s healthSignal) String() string {
+	if s.linkRate {
+		return "link rate"
+	}
+	return "setpoint"
+}
+
+// streamHealthRate is the signal a sample carries: the unclamped link rate when the agent
+// reported one (a WebTransport session in smooth, amendment 79), else its CBR setpoint. ok
+// is false when the sample measured neither — ABR disarmed, or an older agent — which is
+// not an observation of the floor at all.
+func streamHealthRate(m agentws.SessionMetricsMsg) (sig healthSignal, ok bool) {
+	if m.AbrLinkRateKbps != nil && *m.AbrLinkRateKbps > 0 {
+		return healthSignal{kbps: *m.AbrLinkRateKbps, linkRate: true}, true
+	}
+	if m.AbrSetpointKbps != nil {
+		return healthSignal{kbps: *m.AbrSetpointKbps}, true
+	}
+	return healthSignal{}, false
+}
+
+// evaluateHealth computes stream health from the latest ABR rate against the floor of the
+// rung the session is on now, persists a change, and fails a session unsustainable too
+// long. reportedFloorKbps is the sample's abr_floor_kbps (nil ⇒ the launch floor,
+// agent-api.md §session_metrics). The state machine is Evaluate; this does the I/O, in its
+// own goroutine off the metrics hot path, logging errors rather than propagating them.
+func (h *healthEvaluator) evaluateHealth(ctx context.Context, sessionID string, sig healthSignal, reportedFloorKbps *float64) {
 	sess, err := h.store.Get(ctx, sessionID)
 	if err != nil {
 		return
@@ -98,7 +131,7 @@ func (h *healthEvaluator) evaluateHealth(ctx context.Context, sessionID string, 
 	res := Evaluate(HealthSample{
 		Current:         sess.HealthState,
 		BelowFloorSince: run.since,
-		SetpointKbps:    setpointKbps,
+		SetpointKbps:    sig.kbps,
 		HasSetpoint:     true,
 		FloorKbps:       floorKbps,
 		Now:             time.Now(),
@@ -132,7 +165,7 @@ func (h *healthEvaluator) evaluateHealth(ctx context.Context, sessionID string, 
 		} else {
 			h.log.Info("session health changed",
 				"session_id", sessionID, "health_state", res.State, "reason", res.Reason,
-				"setpoint_kbps", setpointKbps, "floor_kbps", floorKbps)
+				"judged", sig.String(), "judged_kbps", sig.kbps, "floor_kbps", floorKbps)
 		}
 	}
 
@@ -145,7 +178,7 @@ func (h *healthEvaluator) evaluateHealth(ctx context.Context, sessionID string, 
 		h.mu.Unlock()
 		// state_detail carries the reason too (mirroring host_lost) so the client
 		// banner can read it, not just error_message.
-		reason := fmt.Sprintf("unsustainable: %s (setpoint %.0f kbps, floor %d kbps)", res.Reason, setpointKbps, floorKbps)
+		reason := fmt.Sprintf("unsustainable: %s (%s %.0f kbps, floor %d kbps)", res.Reason, sig.String(), sig.kbps, floorKbps)
 		h.failSession(sessionID, reason, &reason)
 	}
 }
