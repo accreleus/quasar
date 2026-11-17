@@ -368,6 +368,14 @@ test("a member named like something every object has is not read as a bundle val
   const row = cmp.runs.fields.find((f) => f.field === "builds.constructor.version");
   assert.deepEqual([row.a, row.b, row.same], [null, "1.0.0", false]);
   assert.doesNotMatch(renderCompare(cmp, 0), /native code/);
+  // The same for client.decode: B decodes a codec called `constructor`; on A it is absent, never Object's own constructor (#1410).
+  edit(b, "client.json", (x) => ({ ...x, decode: { ...x.decode, constructor: { supported: true, hardware: false } } }));
+  // Nothing inherited is called `supported`, so the guard shows only when something is: put them on Object.prototype for this one compare.
+  Object.prototype.supported = "inherited"; Object.prototype.hardware = "inherited";
+  let dec;
+  try { dec = compare(a, b).runs.fields.filter((f) => f.field.startsWith("client.decode.constructor.")); } finally { delete Object.prototype.supported; delete Object.prototype.hardware; }
+  assert.deepEqual(dec.map((f) => [f.field, f.a, f.b, f.same]), [["client.decode.constructor.supported", null, true, false], ["client.decode.constructor.hardware", null, false, false]]);
+  assert.doesNotMatch(renderCompare(compare(a, b), 0), /native code/);
   // A number too large to average or scale is no sample; a percent that overflows is absent. Every number written is finite.
   const rows = (fps, max) => Array.from({ length: 30 }, (_, i) => ({ kind: "metric", source: "browser", ts_unix_ms: 1786940000000 + i * 1000, metrics: { fps, present_interval_max_ms: max } }));
   const write = (dir, r) => fs.writeFileSync(path.join(dir, "01-stream-hold", "metrics.jsonl"), r.map((x) => JSON.stringify(x) + "\n").join(""));
