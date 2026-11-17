@@ -306,8 +306,13 @@ export function setupCapture({
     videoEl instanceof Node && typeof MutationObserver === "function" ? new MutationObserver(updateGain) : null;
   modeObserver?.observe(videoEl, { attributes: true, attributeFilter: ["data-scaling-mode", "data-compositor-w", "data-compositor-h", "data-stream-w", "data-stream-h"] });
 
-  // Gamepad state for delta-only sends.
+  // Gamepad state for delta-only sends, keyed by the controller NUMBER (amendment 80), not by
+  // the browser's sparse `Gamepad.index`.
   const gpPrev: Record<number, { buttons: number[]; axes: number[] }> = {};
+  // Amendment 80: `Gamepad.index` -> controller number. Numbers are dense: a controller takes
+  // the lowest free one (the first connected is 0) and frees it when it disconnects.
+  const padNumbers = new Map<number, number>();
+  const MAX_PADS = 4;
   const padEnv = detectPadEnv();
   // The on-screen controls' pad. The host drives ONE virtual pad whatever `i` says, so it is only
   // sent while no real pad is connected; `virtualSent` is what the host holds, for the release.
@@ -421,18 +426,16 @@ export function setupCapture({
   /** All-zero state per forwarded pad (host must not keep a button held), then
    *  clear gpPrev so re-capture resends full state. Frozen `gp` shape only. */
   const resetGamepads = (sendFn: (msg: InputMsg) => void = send) => {
-    for (const key of Object.keys(gpPrev)) {
-      const idx = Number(key);
-      const prev = gpPrev[idx];
-      sendFn({
-        t: "gp",
-        i: idx,
-        buttons: prev.buttons.map(() => 0),
-        axes: prev.axes.map(() => 0),
-      });
-      delete gpPrev[idx];
-    }
+    for (const key of Object.keys(gpPrev)) restPad(Number(key), sendFn);
   };
+
+  /** One all-zero `gp` for controller `num` if the host holds state for it, then forget it. */
+  function restPad(num: number, sendFn: (msg: InputMsg) => void = send) {
+    const prev = gpPrev[num];
+    if (!prev) return;
+    sendFn({ t: "gp", i: num, buttons: prev.buttons.map(() => 0), axes: prev.axes.map(() => 0) });
+    delete gpPrev[num];
+  }
 
   /** All-zero state for the on-screen pad if the host holds anything from it. */
   const releaseVirtualPad = (sendFn: (msg: InputMsg) => void = send) => {
@@ -1007,15 +1010,31 @@ export function setupCapture({
       // Release before any real pad's state goes out: the host has one pad, so a later
       // neutral would wipe it.
       if (realPad) releaseVirtualPad();
+      // Amendment 80: a controller that went away rests, then frees its number for the next.
+      const live = new Set<number>();
+      for (const pad of pads) if (pad) live.add(pad.index);
+      for (const [index, num] of padNumbers) {
+        if (live.has(index)) continue;
+        restPad(num);
+        padNumbers.delete(index);
+      }
       for (const pad of pads) {
         if (!pad) continue;
+        let num = padNumbers.get(pad.index);
+        if (num === undefined) {
+          const taken = new Set(padNumbers.values());
+          num = 0;
+          while (taken.has(num)) num++;
+          if (num >= MAX_PADS) continue; // the contract numbers 0 to 3
+          padNumbers.set(pad.index, num);
+        }
         const { buttons, axes, identity } = readPad(pad, padEnv);
         // Standard layout only: on any other pad the indices are the device's own order.
         if (mouseSettings.nintendo && buttons.length > 3 && isStandardMapping(identity)) {
           swapButtons(buttons, 0, 1); // A (bottom) with B (right)
           swapButtons(buttons, 2, 3); // X (left) with Y (top)
         }
-        const prev = gpPrev[pad.index];
+        const prev = gpPrev[num];
         const changed =
           !prev ||
           buttons.length !== prev.buttons.length ||
@@ -1027,9 +1046,9 @@ export function setupCapture({
             nonStandardReported.add(pad.id);
             onNonStandardGamepad?.(identity);
           }
-          send({ t: "gp", i: pad.index, buttons, axes });
+          send({ t: "gp", i: num, buttons, axes });
           gpSendCount++;
-          gpPrev[pad.index] = { buttons, axes };
+          gpPrev[num] = { buttons, axes };
         }
       }
       if (virtualPad && !realPad) {
