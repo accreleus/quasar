@@ -1076,13 +1076,15 @@ const REGISTER_PREP_TTL: Duration = Duration::from_secs(60);
 
 /// What register preparation gathered from the container runtime. An attempt that
 /// dies at the dial (control plane down) leaves it behind and the next one reuses
-/// it for [`REGISTER_PREP_TTL`]: a refused connection cannot have changed the image
-/// records or the install facts, and re-probing a slow runtime on every retry ate
-/// the held-session grace (#128). An attempt that gets past the dial drops it, so
-/// the reconnect after a registration re-verifies images (agent-api.md §register).
+/// it for [`REGISTER_PREP_TTL`]: a refused connection cannot have changed the install
+/// facts, and re-probing a slow runtime on every retry ate the held-session grace
+/// (#128). The image records are NOT kept: an image op can finish while the agent is
+/// disconnected, so a reused attempt sends the manager's current records rather than
+/// the list from the failed dial (#192, review of PR #1519). An attempt that gets past
+/// the dial drops the prep, so the reconnect after a registration re-verifies images
+/// (agent-api.md §register).
 struct RegisterPrep {
     at: Instant,
-    images: Vec<crate::messages::RegisterImageEntry>,
     install: crate::buildinfo::InstallFacts,
     actor_dark: bool,
 }
@@ -2094,7 +2096,11 @@ async fn connect_and_run(
     // not keep reporting `ready`. Runs before the upstream attaches, so the
     // attach-time flush reports post-reconciliation states.
     let images = match &reused {
-        Some(prep) => prep.images.clone(),
+        // #192 (review of PR #1519): not the prep's cached list — an image op that
+        // finished while the agent was disconnected would register with its old
+        // state until the attach flush corrected it. The in-memory records are
+        // current, and reading them skips the reconcile a fresh attempt runs.
+        Some(_) => image_mgr.register_images(),
         None => {
             let mgr = image_mgr.clone();
             tokio::task::spawn_blocking(move || mgr.refresh_register_images()).await?
@@ -2168,7 +2174,6 @@ async fn connect_and_run(
     // stretch the TTL.
     sessions.register_prep = Some(RegisterPrep {
         at: reused.as_ref().map_or(prep_started, |p| p.at),
-        images: images.clone(),
         install: install.clone(),
         actor_dark,
     });
@@ -8756,7 +8761,6 @@ mod tests {
         let secret = dir.path().join("secret");
         let marked = |at: Instant| RegisterPrep {
             at,
-            images: Vec::new(),
             install: crate::buildinfo::InstallFacts {
                 install_mode: Some(crate::buildinfo::InstallMode::Owned),
                 ..Default::default()
@@ -8867,6 +8871,119 @@ mod tests {
         assert!(
             !register.contains(r#""install_mode":"owned""#),
             "{register}"
+        );
+    }
+
+    /// #192 (review of PR #1519): a reused register preparation sends the image
+    /// manager's CURRENT records, not the list the failed dial cached. An image op
+    /// that finishes while the agent is disconnected is otherwise registered with
+    /// its old state, until the attach-time `flush_op_free_states` corrects it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reused_register_prep_sends_the_current_image_records() {
+        let _facts = crate::buildinfo::INSTALL_FACTS_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        let health = HealthState::new();
+        let image_mgr = ImageManager::empty_for_test();
+        image_mgr.set_ready_for_test("image-before-the-outage", "registry.invalid/before:1", "1");
+        let release_mgr = test_release_mgr();
+        let mut sessions = HostSessions::new(
+            LiveRefs::default(),
+            health.clone(),
+            String::new(),
+            image_mgr.clone(),
+            release_mgr.clone(),
+        );
+        let cp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let live_url = format!("ws://{}", cp.local_addr().unwrap());
+        let dead_url = {
+            let gone = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("ws://{}", gone.local_addr().unwrap())
+        };
+        // Reads each connection's `register`, then hangs up.
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = cp.accept() {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
+                let mut ws = tungstenite::accept(stream).unwrap();
+                while let Ok(m) = ws.read() {
+                    if let Message::Text(t) = m {
+                        let _ = seen_tx.send(t.to_string());
+                        break;
+                    }
+                }
+            }
+        });
+        async fn attempt(
+            url: &str,
+            secret: &std::path::Path,
+            sessions: &mut HostSessions,
+            image_mgr: &Arc<ImageManager>,
+            release_mgr: &Arc<ReleaseManager>,
+            health: &Arc<HealthState>,
+        ) {
+            let cfg = Config {
+                control_plane_url: url.to_string(),
+                ..test_cfg(secret.to_str().unwrap(), Some("enrollment-token"))
+            };
+            let _ = tokio::time::timeout(
+                Duration::from_secs(60),
+                connect_and_run(
+                    &cfg,
+                    health,
+                    "",
+                    "test",
+                    image_mgr,
+                    release_mgr,
+                    sessions,
+                    false,
+                ),
+            )
+            .await;
+        }
+
+        // 1. The attempt dies at the dial, so its preparation is kept for reuse.
+        attempt(
+            &dead_url,
+            &secret,
+            &mut sessions,
+            &image_mgr,
+            &release_mgr,
+            &health,
+        )
+        .await;
+        assert!(
+            sessions.register_prep.is_some(),
+            "no prep left by a failed dial"
+        );
+
+        // 2. An image operation finishes while the agent is disconnected (the
+        // control plane it would report to is down); the next attempt reuses the
+        // prep and must carry this record, not the list from step 1.
+        image_mgr.set_ready_for_test(
+            "image-finished-during-the-outage",
+            "registry.invalid/during:1",
+            "1",
+        );
+        attempt(
+            &live_url,
+            &secret,
+            &mut sessions,
+            &image_mgr,
+            &release_mgr,
+            &health,
+        )
+        .await;
+        let register = seen_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            register.contains(r#""image_id":"image-before-the-outage""#),
+            "the reused register lost its pre-outage record: {register}"
+        );
+        assert!(
+            register.contains(r#""image_id":"image-finished-during-the-outage""#),
+            "the reused register sent a cached image list: {register}"
         );
     }
 
