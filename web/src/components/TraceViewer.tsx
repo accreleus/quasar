@@ -70,6 +70,10 @@ const EVENT_COLORS: Record<string, string> = {
   "abr.ladder.step": "var(--warning-text)",
   "playout.changed": "var(--lavender)",
   "pipeline.source_swapped": "var(--info)",
+  // Amendment 81: a live RTP packet-size step — the path dropping the full-size
+  // packets. A known cause of a mid-session quality cliff, so it reads as itself
+  // in the legend rather than as "other event".
+  "transport.rtp_mtu_shrunk": "var(--warning-text)",
   "webrtc.state_changed": "var(--text-3)",
 };
 

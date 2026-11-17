@@ -224,6 +224,27 @@ describe("TraceViewer", () => {
     });
   });
 
+  // Amendment 81 (#1152): an RTP packet-size step is a named legend entry, not
+  // bucketed into "other event" — it is a known cause of a mid-session cliff.
+  it("names a transport.rtp_mtu_shrunk event in the legend", async () => {
+    mockGetDiagnosticBundle.mockResolvedValue({
+      ...BASE_BUNDLE,
+      events: [
+        ...BASE_BUNDLE.events,
+        {
+          source: "agent",
+          ts_unix_ms: Date.now() - 12_000,
+          type: "transport.rtp_mtu_shrunk",
+          payload: { from: 1200, to: 1100 },
+        },
+      ],
+    });
+    render(<TraceViewer sessionId="sess-abc" token="tok" />);
+    await waitFor(() => {
+      expect(screen.getByText("transport.rtp_mtu_shrunk")).toBeTruthy();
+    });
+  });
+
   it("calls getDiagnosticBundle with the correct session id and token", async () => {
     mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
     render(<TraceViewer sessionId="sess-xyz" token="admin-tok" />);

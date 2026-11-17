@@ -1415,13 +1415,15 @@ mod tests {
         agent.connect();
         agent.send(Report::LaunchState(LaunchState::ClientOnly));
         let (first, _) = listener.accept().unwrap();
+        // Held past the `drop` by a forked child, as above (#1110).
+        let held = first.try_clone().unwrap();
         drop(first);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(held);
+        });
         assert_eq!(agent.commands(), vec![]);
-        listener.set_nonblocking(true).unwrap();
-        let (second, _) = listener
-            .accept()
-            .expect("reconnected on the read that saw the close");
-        second.set_nonblocking(false).unwrap();
+        let second = reconnected(&mut agent, &listener);
         drop(agent);
         let lines: Vec<String> = BufReader::new(second).lines().map(Result::unwrap).collect();
         assert_eq!(
@@ -2418,14 +2420,18 @@ mod tests {
         agent.send(Report::LaunchState(LaunchState::Starting));
         // The agent drops a connection that goes quiet.
         let (first, _) = listener.accept().unwrap();
+        // A forked child (another test's fake `steam`) holds the accepted socket past the
+        // `drop` until it execs, so the writes below succeed into a live peer (#1110).
+        let held = first.try_clone().unwrap();
         drop(first);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(held);
+        });
         agent.send(Report::LaunchState(LaunchState::ClientOnly));
         agent.send(Report::GameWindow { on_screen: true });
+        let second = reconnected(&mut agent, &listener);
         drop(agent);
-        // Already queued, or the helper never reconnected: fail, do not hang.
-        listener.set_nonblocking(true).unwrap();
-        let (second, _) = listener.accept().expect("the helper reconnected");
-        second.set_nonblocking(false).unwrap();
         let mut lines: Vec<String> = BufReader::new(second).lines().map(Result::unwrap).collect();
         lines.dedup();
         assert_eq!(
@@ -2435,6 +2441,42 @@ mod tests {
                 r#"{"type":"game_window","v":1,"on_screen":true}"#,
             ]
         );
+    }
+
+    /// The next connection the helper makes, waited for the way its pass loop waits.
+    ///
+    /// The helper replaces a dropped connection when it next writes, and a connect that did
+    /// not land is tried again on the next pass (`RECONNECT` is only the backoff after a
+    /// failed connect). A test that accepts once assumes both landed before the accept, which
+    /// is not what the helper promises — it failed on a loaded runner with `WouldBlock`
+    /// (#1110). The likely cause: another test thread forks (these tests spawn a fake
+    /// `steam`) while the accepted socket is open, and the child holds it past the
+    /// `drop`, so the helper's writes succeed into a peer nobody reads and it still thinks
+    /// it is connected. It learns the peer is gone by READING, so this waits the way the
+    /// pass loop does: `commands()` then `connect()`. Nothing else runs while this waits, so
+    /// a helper that never reconnects still fails, at the deadline, and says so.
+    fn reconnected(agent: &mut Agent, listener: &UnixListener) -> UnixStream {
+        let deadline = Instant::now() + RECONNECT + Duration::from_secs(5);
+        listener.set_nonblocking(true).unwrap();
+        loop {
+            let _ = agent.commands();
+            agent.connect();
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    return stream;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "no replacement connection within {:?}: the helper never reconnected",
+                        RECONNECT + Duration::from_secs(5)
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("waiting for the helper's connection: {e}"),
+            }
+        }
     }
 
     /// A `content_log.txt` line for a helper whose logs are in `dir`.

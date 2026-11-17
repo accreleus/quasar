@@ -60,8 +60,9 @@ export function RemoveHostModal({
           </div>
           <p className="rm-host-copy">
             Reconnect it and try again. If the machine is gone for good, forget it: Quasar drops
-            its record, its GPUs, its finished sessions and its homes, and touches nothing on the
-            machine. A machine added under the same node name later starts fresh.
+            its record, its GPUs, its finished sessions and its homes — each home claim then needs
+            releasing by hand in Storage — and touches nothing on the machine. A machine added
+            under the same node name later starts fresh.
           </p>
         </>
       ) : (
