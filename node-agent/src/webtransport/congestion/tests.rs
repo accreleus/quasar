@@ -58,6 +58,12 @@ struct Sim {
     frames: u32,
     /// (seconds, µs a datagram entering the bottleneck now would wait), each queued-mode tick.
     waits: Vec<(f64, u64)>,
+    /// As production's `Control`: feedback governs at the estimate, never under the ABR floor
+    /// (which the encoder never goes under either); silence releases it.
+    governor: Governor,
+    floor_kbps: f64,
+    /// (seconds, µs the oldest held video had waited), each queued-mode tick.
+    held_waits: Vec<(f64, u64)>,
 }
 
 /// The agent's [`VideoQueue`] and QUIC behind it: a datagram leaves QUIC's queue once the
@@ -106,6 +112,9 @@ impl Sim {
             keyframe_every: 0,
             frames: 0,
             waits: Vec::new(),
+            governor: Governor::default(),
+            floor_kbps: 0.0,
+            held_waits: Vec::new(),
         }
     }
 
@@ -141,7 +150,9 @@ impl Sim {
             self.t = from + step * 100_000;
             self.frame();
             let at = self.start + Duration::from_micros(self.t);
-            self.est.on_tick(at, &self.log, RTT);
+            if self.est.on_tick(at, &self.log, RTT).is_some() {
+                self.governor.release();
+            }
         }
         // The packets sent during the outage stay pending as lost, as a real client's first
         // report after it names them NOT_RECEIVED (#1557). Earlier packets keep their arrival.
@@ -155,7 +166,7 @@ impl Sim {
     fn frame(&mut self) {
         let kbps = self
             .send_kbps
-            .unwrap_or(self.est.estimate_kbps())
+            .unwrap_or(self.est.estimate_kbps().max(self.floor_kbps))
             .min((self.content_kbps)(self.t));
         let key = self.keyframe_every > 0 && self.frames.is_multiple_of(self.keyframe_every);
         self.frames += 1;
@@ -209,14 +220,18 @@ impl Sim {
     /// production `feed` gives it, and QUIC sends again.
     fn drain(&mut self) {
         let mut quic = self.quic.take().expect("queued mode");
-        let est = self.est.estimate_kbps();
+        let est = if self.governor.governs() {
+            self.governor.kbps() as f64
+        } else {
+            self.est.estimate_kbps()
+        };
         self.send_window(&mut quic, est);
+        // The production `feed`'s rates.
+        let (governed, paced) = video_rates(&self.governor, &self.est, false);
         let room = quic
             .video
-            .room(Some(est as u64), BUFFER)
+            .room(governed, BUFFER)
             .saturating_sub(quic.queued);
-        // As the production `feed`: paced once the estimate has found the link.
-        let paced = Some(est as u64).filter(|_| self.est.found_link());
         let at = self.start + Duration::from_micros(self.t);
         let room = room.min(quic.video.pace(paced, at));
         let (queue, queued) = (&mut quic.queue, &mut quic.queued);
@@ -231,6 +246,11 @@ impl Sim {
         self.send_window(&mut quic, est);
         self.waits
             .push((self.t as f64 / 1e6, self.free_at.saturating_sub(self.t)));
+        let oldest = quic
+            .video
+            .oldest()
+            .map_or(0, |q| at.saturating_duration_since(q).as_micros() as u64);
+        self.held_waits.push((self.t as f64 / 1e6, oldest));
         self.quic = Some(quic);
     }
 
@@ -318,7 +338,9 @@ impl Sim {
             arrivals,
         };
         let at = self.start + Duration::from_micros(now);
-        self.est.on_feedback(&fb, &mut self.log, at, NO_QUIC);
+        if let Some(kbps) = self.est.on_feedback(&fb, &mut self.log, at, NO_QUIC) {
+            self.governor.govern(kbps.max(self.floor_kbps));
+        }
         self.trace
             .push((now as f64 / 1e6, self.est.estimate_kbps()));
     }
@@ -2607,11 +2629,18 @@ fn the_pacer_lets_video_go_at_its_rate_in_short_bursts_and_never_holds_video_100
         assert!(video.feed(room, None, |h| quic(&mut wire, h)));
         40 - video.bytes() / SIZE
     };
+    // 40 datagrams queued at `t0` exactly.
     let keyframe = || {
         let mut video = VideoQueue::default();
         let first = video.next_seq();
         for i in 0..40 {
-            video.push(held(first + i), BUFFER);
+            video.push(
+                Held {
+                    queued_at: t0,
+                    ..held(first + i)
+                },
+                BUFFER,
+            );
         }
         video
     };
@@ -2625,12 +2654,12 @@ fn the_pacer_lets_video_go_at_its_rate_in_short_bursts_and_never_holds_video_100
     );
     assert_eq!(send(&mut video, Some(8000), ms(3)), 8);
     assert_eq!(
-        send(&mut video, Some(8000), ms(100)),
+        send(&mut video, Some(8000), ms(99)),
         13,
         "idle time saves one burst"
     );
     assert_eq!(
-        send(&mut video, None, ms(101)),
+        send(&mut video, None, ms(99)),
         40,
         "not governed: not paced"
     );
@@ -2638,8 +2667,118 @@ fn the_pacer_lets_video_go_at_its_rate_in_short_bursts_and_never_holds_video_100
     let mut video = keyframe();
     assert_eq!(send(&mut video, Some(8000), ms(0)), 5);
     assert_eq!(
-        send(&mut video, Some(8000), ms(101)),
-        40,
-        "video that waited 100 ms goes at once"
+        send(&mut video, Some(8000), ms(99)),
+        10,
+        "waited 99 ms: still paced"
     );
+    assert_eq!(
+        send(&mut video, Some(8000), ms(100)),
+        40,
+        "waited 100 ms: goes at once"
+    );
+}
+
+/// #1496 review A M1: the rates `feed` uses. The pacer holds video to the governed rate, never
+/// under the ABR floor the encoder is held to: an outage that decayed the estimate to 500 under
+/// a 2500 floor still leaves the encoder at 2500, and pacing that at 1.25 × 500 held it until
+/// it was stale.
+#[test]
+fn video_is_paced_at_the_governed_rate_not_at_an_estimate_under_the_floor() {
+    let mut est = Estimator::new(CEILING, Instant::now());
+    let governor = Governor::default();
+    assert_eq!(
+        video_rates(&governor, &est, false),
+        (None, None),
+        "not governed"
+    );
+    governor.govern(CEILING);
+    assert_eq!(
+        video_rates(&governor, &est, false),
+        (Some(8000), None),
+        "at the ceiling: not paced"
+    );
+    est.resume_at(500.0);
+    governor.govern(2500.0);
+    assert_eq!(video_rates(&governor, &est, false), (Some(500), Some(2500)));
+    assert_eq!(video_rates(&governor, &est, true), (None, None), "PyroWave");
+}
+
+/// The same in the sim: an outage decays the estimate under the ABR floor and the encoder keeps
+/// sending the floor. Paced at the governed rate, held video never waits long.
+#[test]
+fn after_an_outage_under_the_floor_held_video_does_not_go_stale() {
+    let mut s = Sim::new(6000.0);
+    s.quic = Some(Quic::default());
+    s.floor_kbps = 4000.0;
+    s.run(10.0);
+    s.outage(5.0);
+    let resumed = s.t as f64 / 1e6;
+    s.run(5.0);
+    let worst = s
+        .held_waits
+        .iter()
+        .filter(|&&(t, _)| t >= resumed)
+        .map(|&(_, w)| w)
+        .max()
+        .unwrap()
+        / 1000;
+    eprintln!("after the outage: oldest held video waited at most {worst} ms");
+    assert!(worst < 50, "held video waited {worst} ms");
+}
+
+/// #1496 review B M1: a cap that lifts. The pacer's wait is not path delay; logged as it, each
+/// paced keyframe read as overuse on the faster link and cut the estimate, which took about
+/// 45 s and 32 delay cuts to get back to the ceiling instead of about 10 s.
+#[test]
+fn after_a_cap_lifts_the_estimate_climbs_back_to_the_ceiling_promptly() {
+    let mut s = Sim::new(5000.0);
+    s.quic = Some(Quic::default());
+    s.keyframe_every = 60;
+    s.run(30.0);
+    assert!(s.est.found_link(), "the 5 Mbit/s cap was found");
+    s.cap_kbps = 50_000.0;
+    let lifted = s.t as f64 / 1e6;
+    let lines = logged(|| s.run(30.0));
+    let back = s
+        .trace
+        .iter()
+        .find(|&&(t, e)| t >= lifted && e >= CEILING)
+        .map(|&(t, _)| t - lifted);
+    let delay_cuts = cuts(&lines)
+        .iter()
+        .filter(|c| c.0.contains("delay"))
+        .count();
+    eprintln!("cap lifted: back at the ceiling after {back:?} s, {delay_cuts} delay cuts");
+    assert!(
+        back.is_some_and(|b| b <= 15.0),
+        "{back:?} s, {delay_cuts} delay cuts"
+    );
+}
+
+/// #1417 × #1433: a silence decay leaves the estimate under the ceiling, so the pacer is on
+/// while the outage regrow runs. A paced keyframe on resume must not read as a delay cut, which
+/// ends the regrow.
+#[test]
+fn a_paced_keyframe_after_an_outage_does_not_end_the_regrow() {
+    let mut s = Sim::new(50_000.0);
+    s.quic = Some(Quic::default());
+    s.keyframe_every = 60;
+    s.run(10.0);
+    assert_eq!(s.est.estimate_kbps(), CEILING);
+    s.outage(10.0);
+    assert!(s.est.found_link() && s.est.recover_to.is_some());
+    let resumed = s.t as f64 / 1e6;
+    let lines = logged(|| s.run(15.0));
+    let back = s
+        .trace
+        .iter()
+        .find(|&&(t, e)| t >= resumed && e >= CEILING)
+        .map(|&(t, _)| t - resumed);
+    let ended: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("regrow") && l.contains("ended"))
+        .collect();
+    eprintln!("after the outage: back at the ceiling after {back:?} s; {ended:?}");
+    assert!(ended.iter().all(|l| l.contains("reached")), "{ended:?}");
+    assert!(back.is_some_and(|b| b <= 10.0), "{back:?} s");
 }

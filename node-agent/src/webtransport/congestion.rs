@@ -536,7 +536,7 @@ impl Estimator {
         self.estimate_kbps
     }
 
-    /// A delay or loss cut holds the estimate under the ceiling: it has found the link.
+    /// A delay or loss cut, or a silence decay, holds the estimate under the ceiling.
     pub(crate) fn found_link(&self) -> bool {
         self.bound != Bound::Ceiling
     }
@@ -1235,6 +1235,22 @@ impl Governor {
     }
 }
 
+/// The rates `VideoQueue` holds video to, kbit/s: QUIC's room ([`VideoQueue::room`]) at the
+/// governed rate or the estimate if lower, and the pacer ([`VideoQueue::pace`]) at the
+/// governed rate, never under the ABR floor the encoder is held to, once the estimate is under
+/// the ceiling. `None`: the session is not governed (or PyroWave), or nothing to pace.
+pub(crate) fn video_rates(
+    governor: &Governor,
+    estimator: &Estimator,
+    pyrowave: bool,
+) -> (Option<u64>, Option<u64>) {
+    if pyrowave || !governor.governs() {
+        return (None, None);
+    }
+    let room = (governor.kbps() as f64).min(estimator.estimate_kbps()) as u64;
+    (Some(room), estimator.found_link().then(|| governor.kbps()))
+}
+
 fn cubic(window: u64, now: Instant, mtu: u16) -> Box<dyn Controller> {
     let mut config = CubicConfig::default();
     config.initial_window(window);
@@ -1542,12 +1558,15 @@ impl Backlog {
 /// Video QUIC may hold ahead of the next audio datagram, in time at the governed rate. Over
 /// two frames at 60 fps: at 20 ms a 1080p60 frame at 8 Mbit/s plus its FEC filled it, waited a
 /// drain tick, and a clean link presented 3 ms later at the median (#1433, lab host).
+/// shortcut: at 30 fps a frame is 33 ms of rate, so one over this with its FEC still waits a
+/// tick; make it frame-relative if a 30 fps session shows that cost.
 const AUDIO_AHEAD_MS: u64 = 40;
-/// Video leaves at most this × the estimate once the estimate has found the link (#1433), so
-/// a keyframe waits here, where audio overtakes it, not in the link's queue: right after a
-/// delay cut this is 1.06 × what the link carried. quinn alone paces at 1.25 × window / RTT,
-/// 2.5 × the estimate or more. Must stay over 1 / (1 − the ABR's 0.15 deadband), the most
-/// video plus FEC is sent at, or held video never drains.
+/// Video leaves at most this × the governed rate (the estimate, never under the ABR floor)
+/// once the estimate is under the ceiling (#1433), so a keyframe waits here, where audio
+/// overtakes it, not in the link's queue: right after a delay cut this is 1.06 × what the
+/// link carried. quinn alone paces at 1.25 × window / RTT, 2.5 × the rate or more. Must stay
+/// over 1 / (1 − the ABR's 0.15 deadband), the most video plus FEC is sent at, or held video
+/// never drains.
 const PACE_GAIN: f64 = 1.25;
 /// The pacer's burst: this long at the pace, at least two datagrams.
 const PACE_BURST_MS: f64 = 5.0;
@@ -1641,6 +1660,11 @@ impl VideoQueue {
         self.held.is_empty()
     }
 
+    #[cfg(test)]
+    pub(crate) fn oldest(&self) -> Option<Instant> {
+        self.held.front().map(|h| h.queued_at)
+    }
+
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }
@@ -1706,7 +1730,11 @@ impl VideoQueue {
                 d[1..5].copy_from_slice(&seq);
                 held.datagram = d.freeze();
             }
-            let (resend, queued_at) = (held.resend, held.queued_at);
+            // A paced datagram is logged as sent when the pacer let it go: its wait here is
+            // the pacer's, not the path's, and read as delay it cut the estimate at each
+            // keyframe on a link faster than the pace. A wait for room in QUIC's queue stays
+            // in, as it was in QUIC's queue before #1321.
+            let (resend, queued_at) = (held.resend, self.counted.unwrap_or(held.queued_at));
             let logged = log.as_deref_mut().filter(|_| held.logged);
             let record = logged.map(|log| (log, held.datagram.clone()));
             match send(held) {
