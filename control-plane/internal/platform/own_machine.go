@@ -93,6 +93,31 @@ func (s MachineShape) SharesMachineWith(nodeName string) bool {
 	return ok && own == nodeName
 }
 
+// RefusesHostRemoval is the own-machine guard Forget and Remove host use. It
+// answers a stricter question than SharesMachineWith: must this host be left
+// alone because it is, or cannot be told apart from, the agent on this control
+// plane's own machine? It fails closed, because losing the own host row is worse
+// than refusing a legitimate one. A shape the configuration cannot produce is
+// not evidence that no host shares this machine, so it refuses every host
+// (#1395 part 2). The zero shape means no machine shape at all — an agentless
+// control plane — which is not an identity to protect; the composition root's
+// guard (ownMachineGuard) decides whether an owned install can still be its own
+// machine with no shape to name it.
+func (s MachineShape) RefusesHostRemoval(nodeName string) bool {
+	if s == (MachineShape{}) {
+		return false
+	}
+	switch s.Role {
+	case MachineRoleCombined:
+		return s.NodeName == "" || s.NodeName == nodeName
+	case MachineRoleControlOnly:
+		// A control-only machine runs no agent, so no host is on it. One without
+		// a node name is not a shape the configuration accepts.
+		return s.NodeName == ""
+	}
+	return true
+}
+
 // PlatformIdentity is the wire `PlatformIdentity`: the binary's own stamps,
 // plus the machine it runs on.
 type PlatformIdentity struct {

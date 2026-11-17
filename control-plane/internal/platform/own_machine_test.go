@@ -354,3 +354,37 @@ func TestIdentityServesTheMachineShapeWhetherOrNotTheActorAnswers(t *testing.T) 
 		t.Errorf("a role without a node name was served: %+v", got)
 	}
 }
+
+// TestRefusesHostRemovalFailsClosed: forgetting a host destroys its row, so the
+// guard must refuse when it cannot tell this machine apart rather than assume it
+// is not ours. Only the shapes the configuration accepts, and the zero shape of
+// an unowned control plane, may let a host through (#1395 part 2).
+func TestRefusesHostRemovalFailsClosed(t *testing.T) {
+	const own, other = "gpu-01", "gpu-02"
+	for _, tc := range []struct {
+		name  string
+		shape MachineShape
+		node  string
+		want  bool
+	}{
+		{"the combined host itself", MachineShape{Role: MachineRoleCombined, NodeName: own}, own, true},
+		{"another machine's host", MachineShape{Role: MachineRoleCombined, NodeName: own}, other, false},
+		{"a control-only machine", MachineShape{Role: MachineRoleControlOnly, NodeName: own}, other, false},
+		{"an unowned control plane", MachineShape{}, other, false},
+		{"a combined machine with no node name, any host", MachineShape{Role: MachineRoleCombined}, other, true},
+		{"a control-only machine with no node name", MachineShape{Role: MachineRoleControlOnly}, other, true},
+		{"an unrecognised role", MachineShape{Role: "control-only", NodeName: own}, other, true},
+		{"a node name with no role", MachineShape{NodeName: own}, own, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.shape.RefusesHostRemoval(tc.node); got != tc.want {
+				t.Errorf("RefusesHostRemoval(%q) with %+v = %v, want %v", tc.node, tc.shape, got, tc.want)
+			}
+		})
+	}
+	// The apply paths keep SharesMachineWith: an unknown shape must not make every
+	// host look like this machine's and drop node-agent from a fleet apply.
+	if (MachineShape{Role: MachineRoleCombined}).SharesMachineWith(other) {
+		t.Error("SharesMachineWith changed; an apply would now drop node-agent from every host")
+	}
+}
