@@ -57,6 +57,7 @@ own; the two do not move together, and that is deliberate.
 - **The end-to-end suite's browser no longer stops at Chrome's "Allow access to other devices on your network" prompt.** Each scenario's fresh browser context is granted local network access, so a WebTransport stream no longer stalls into a WebRTC fallback while the prompt waits. A Chrome without that permission runs as before.
 - **`make e2e-run WEB_DIST=<dir>` no longer fails sign-in from the second scenario on.** The runner cleared the stored sign-in on an app page, where a build served from memory booted fast enough to restore it; it now clears it on `/health`, where the app never runs.
 - Bench mode no longer reads the video's pixels on every frame while no marker is located (only on the four-a-second search), which cost WebRTC presentations on an app with no marker; `__qBench.stats()` now reports `skipped_reads`, `missed_presentations` and the callback's own time. A bench-mode page also no longer posts a client-health class, so a bench hold cannot make its user ineligible for the next launch (Refs #1304).
+- **The bench submit script no longer trusts the files in a run directory (#1407).** A `conditions.json`, caps or verdict file with an over-long value, control or bidi characters, odd keys or deep nesting, or a suite or scenario name that is not a plain identifier, is now refused instead of being sent to the bench. Scenario names made by `bench-run` and `bench-suite` now include the app, so two apps on one profile no longer share one.
 
 ## 0.6.0 — 2026-11-15
 

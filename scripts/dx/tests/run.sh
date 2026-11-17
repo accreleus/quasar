@@ -1487,6 +1487,30 @@ else
   warn "bench:qses-peer-unlock-fps-parses" "the quasar-session skill's qses is not in this checkout (operator-local) — SKIPPED"
 fi
 
+# #1407: bench_submit.py refuses a run directory whose conditions.json / caps / verdict carry a
+# value the bench must not be sent, and a suite or scenario name that is not a plain identifier.
+submit_trust="$(python3 "$TESTS_DIR/check_submit_inputs.py" "$FIXTURES/bench-run" 2>&1 | tail -n 1)"
+if [ "$submit_trust" = OK ]; then
+  pass "bench:submit-trust-boundary" "bad conditions, caps, verdict and names are refused; the fixture still passes"
+else
+  fail "bench:submit-trust-boundary" "$submit_trust"
+fi
+
+# #1407: the app is part of the scenario name (bench_run default, bench_suite per cell), so two
+# apps on one profile do not share a scenario; characters outside [A-Za-z0-9._-] become `_`.
+app_scn_run="$(env -u HOST bash "$DX/bench_run.sh" --profile 1080p60-h264 --app 'my app' --dry-run 2>&1 || true)"
+app_scn_suite="$(env -u HOST bash "$DX/bench_suite.sh" --profiles 720p60-h264 --abr-modes smooth \
+                   --ladder off --netem none --iterations 1 --app 'my app' --dry-run 2>&1 || true)"
+noapp_scn_suite="$(env -u HOST bash "$DX/bench_suite.sh" --profiles 720p60-h264 --abr-modes smooth \
+                   --ladder off --netem none --iterations 1 --dry-run 2>&1 || true)"
+if printf '%s' "$app_scn_run" | grep -q 'scenario  1080p60-h264-clean-my_app$' \
+   && printf '%s' "$app_scn_suite" | grep -q 'scenario 720p60-h264-abr-smooth-ladder-off-netem-none-my_app$' \
+   && printf '%s' "$noapp_scn_suite" | grep -q 'scenario 720p60-h264-abr-smooth-ladder-off-netem-none$'; then
+  pass "bench:scenario-name-has-app" "bench_run and bench_suite names carry the app; no app, no suffix"
+else
+  fail "bench:scenario-name-has-app" "$(printf '%s\n%s' "$app_scn_run" "$app_scn_suite" | grep 'scenario' | tr '\n' ' ')"
+fi
+
 # bench_app_samples.py: frames.jsonl -> `app` samples, events.jsonl -> app.event,
 # bench windows -> `browser` samples, all folded into the two files
 # bench_submit.py actually reads. Run TWICE: the fold must be idempotent and must
