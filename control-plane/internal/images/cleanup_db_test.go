@@ -127,6 +127,20 @@ func waitCleanupTriggersIdle(t *testing.T, svc *CleanupService, host string) {
 	}
 }
 
+func waitCleanupDispatchesIdle(t *testing.T, svc *CleanupService) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		svc.dispatchWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cleanup dispatch still running")
+	}
+}
+
 func TestCleanupHTTPPreviewAndExactAttemptAreCurrentConnectionBound(t *testing.T) {
 	env, hosts := newActionsEnv(t, "cleanup-http-host")
 	host := hosts[0]
@@ -453,9 +467,7 @@ func TestCleanupDuplicateUnresolvedAttemptRequestsRecoveryWithoutSecondDelete(t 
 	install(t, env.pool, false)
 	env.cleanupWire.cleanup = make(chan agentws.ImageCleanupCmd, 2)
 	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 3)
-	// Journal requests can be emitted by overlapping cleanup/reconcile callbacks;
-	// leave room for the burst so this fake does not make the test timing-dependent.
-	env.cleanupWire.journalRequests = make(chan agentws.ImageCleanupJournalRequestCmd, 32)
+	env.cleanupWire.journalRequests = make(chan agentws.ImageCleanupJournalRequestCmd, 1)
 	entry := agentws.ImageVersionEntry{ImageID: imgID, Version: imgVer2, ImageRef: imgDigest2, RuntimeImageID: "sha256:lost-dispatch", State: "present"}
 	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "current", Capable: true, Complete: true,
 		ReconciledRevision: 1, Versions: []agentws.ImageVersionEntry{entry}})
@@ -479,6 +491,15 @@ func TestCleanupDuplicateUnresolvedAttemptRequestsRecoveryWithoutSecondDelete(t 
 	case firstReconcile = <-env.cleanupWire.inventoryRequests:
 	case <-time.After(5 * time.Second):
 		t.Fatal("initial post-dispatch reconcile missing")
+	}
+	// Receiving the reconcile command does not mean dispatch has finished its
+	// synchronous journal check. Wait before advancing the snapshot, or that
+	// check can observe the new revision and race the explicit journal request.
+	waitCleanupDispatchesIdle(t, env.cleanup)
+	select {
+	case stale := <-env.cleanupWire.journalRequests:
+		t.Fatalf("dispatch requested journal before a fresh reconcile: %+v", stale)
+	default:
 	}
 	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "current", Capable: true, Complete: true,
 		ReconciledRevision: 2, ReconciledRequestID: firstReconcile.ID, Versions: []agentws.ImageVersionEntry{entry}})

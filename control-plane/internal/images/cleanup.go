@@ -39,6 +39,7 @@ type CleanupService struct {
 	}
 	auditor            audit.Recorder
 	mu                 sync.Mutex
+	dispatchWG         sync.WaitGroup
 	journalRequests    map[string]pendingCleanupJournal
 	inventorySnapshots map[string]trackedCleanupInventory
 	freshReconcile     map[string]cleanupReconcileGate
@@ -528,7 +529,11 @@ func (s *CleanupService) Request(ctx context.Context, hostID string, req Cleanup
 		ImageRef: req.ImageRef, RuntimeImageID: req.RuntimeImageID, Generation: strconv.FormatInt(newGeneration, 10), State: "removing"}
 	// A lost dispatch is recovered from this durable attempt after reconnect.
 	// No database lock is held during the agent call.
-	go s.dispatch(attempt, hostID)
+	s.dispatchWG.Add(1)
+	go func() {
+		defer s.dispatchWG.Done()
+		s.dispatch(attempt, hostID)
+	}()
 	return attempt, 202, nil, nil
 }
 
