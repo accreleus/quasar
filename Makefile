@@ -30,6 +30,15 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
+# A knob's command-line value is taken literally or refused. Make expands such a
+# value itself when it exports it to a recipe, so a value holding a make function
+# ran before any recipe or script could look at it (#1296). `$(value ...)` reads the
+# text unexpanded; the two openers sit in variables so this line's own parentheses
+# balance. Every variable is checked, not a list that a new knob could miss.
+override _MK_FN_PAREN := $$(
+override _MK_FN_BRACE := $${
+$(foreach v,$(.VARIABLES),$(if $(filter command line,$(origin $v)),$(if $(or $(findstring $(_MK_FN_PAREN),$(value $v)),$(findstring $(_MK_FN_BRACE),$(value $v))),$(error $v: a command-line value holding a make function is refused, since make would run it before any recipe))))
+
 # Repo constants, not knobs. `override` so `make clean WEB='x; rm -rf /'` cannot
 # turn one of them into a command — they are the only variables still spliced
 # into a recipe line (see the passthrough note below).
