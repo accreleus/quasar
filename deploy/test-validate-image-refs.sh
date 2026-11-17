@@ -36,7 +36,16 @@ printf '%s\n' "$*" >>"${MOCK_DOCKER_LOG:?}"
 case "$1" in
   pull)   [ "${MOCK_PULL_OK:-1}" = 1 ] || { echo 'mock: pull refused' >&2; exit 1; }; exit 0 ;;
   volume) exit 0 ;;
-  run)    exit 0 ;;   # no RESULT lines: every in-image assertion is simply absent
+  run)    # No RESULT lines by default: every in-image assertion is simply absent. With
+          # MOCK_RUN_LOCAL=1 the in-image runner executes here, on the mock PATH (#1000).
+          if [ "${MOCK_RUN_LOCAL:-0}" = 1 ]; then
+            for a in "$@"; do
+              case "$a" in QV_PROGRAM_B64=*) export "$a" ;; esac
+              script="$a"
+            done
+            exec /bin/sh -c "$script"
+          fi
+          exit 0 ;;
   image)
     [ "$2" = inspect ] || exit 99
     [ "${MOCK_IMAGE_PRESENT:-1}" = 1 ] || exit 1
@@ -127,5 +136,26 @@ floor() { # floor <gst label value> <PASS|FAIL>
 }
 floor 1.28.6 PASS; floor 1.28.8 PASS; floor 1.30.0 PASS
 for v in 1.28.5 1.9 dev 1.28.6-rc1 gst1.28.8 ''; do floor "$v" FAIL; done
+
+# ── 8. agent_no_unresolved fails closed when ldd cannot list the libraries (#1000) ──
+# The in-image runner executes locally against a one-assertion contract and a fake ldd.
+mkdir -p "$tmp/ldd"
+printf '#!/bin/sh\n' >"$tmp/ldd/agent"; chmod +x "$tmp/ldd/agent"
+cat >"$tmp/ldd/contract.json" <<EOF
+{"schema_version":1,"roles":{"t":{"agent_binary":{"path":"$tmp/ldd/agent","no_unresolved_libs":true}}}}
+EOF
+unresolved() { # unresolved <fake ldd body> <PASS|FAIL>
+  printf '#!/bin/sh\n%s\n' "$1" >"$tmp/bin/ldd"; chmod +x "$tmp/bin/ldd"
+  local out; out="$(PATH="$tmp/bin:$PATH" MOCK_RUN_LOCAL=1 MOCK_DOCKER_LOG="$tmp/ldd.log" \
+    bash "$script" --image "$image" --role t --contract "$tmp/ldd/contract.json" --no-gpu 2>&1 || true)"
+  printf '%s\n' "$out" | grep -Eq "^ *$2 +agent\.no-unresolved-libs( |$)" \
+    || fail "ldd '$1': expected $2: $(printf '%s\n' "$out" | grep 'no-unresolved' || echo '<no line>')"
+}
+unresolved 'echo "	libc.so.6 => /lib/libc.so.6 (0x1)"' PASS
+unresolved 'echo "	libgone.so.1 => not found"' FAIL
+unresolved 'exit 0' FAIL                                   # prints nothing
+unresolved 'echo "ldd: cannot execute" >&2; exit 127' FAIL # fails to run
+unresolved 'echo "	libgone.so.1 => not found"; exit 1' FAIL
+rm -f "$tmp/bin/ldd"
 
 echo 'validate-image.sh reference handling: PASS'
