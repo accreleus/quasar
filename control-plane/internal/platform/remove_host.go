@@ -49,9 +49,10 @@ type RemoveDeps struct {
 	Store removeStore
 	// Connected is whether the host's agent is on the wire right now.
 	Connected func(hostID string) bool
-	// SharesOwnMachine is whether the named host is the agent on this control plane's
-	// own machine (MachineShape.SharesMachineWith); false when there is none or it is
-	// unknown. DELETE /v1/hosts/{id} asks the same function.
+	// SharesOwnMachine is whether the named host is, or cannot be told apart from,
+	// the agent on this control plane's own machine
+	// (MachineShape.RefusesHostRemoval); false only when there is none. DELETE
+	// /v1/hosts/{id} asks the same function.
 	SharesOwnMachine func(nodeName string) bool
 	// Cordon takes the host out of scheduling and returns what puts its cordon
 	// back as it was found.
@@ -78,11 +79,17 @@ func NewRemoveHandler(deps RemoveDeps, auditor audit.Recorder, log logger) *Remo
 	return &RemoveHandler{deps: deps, auditor: auditor, log: log, AckTimeout: DefaultAckTimeout, NewRequestID: newRequestID}
 }
 
-// SharesOwnMachineSet reports whether the own-machine guard was wired. Only the
-// composition-root wiring test reads it: RemoveDeps.SharesOwnMachine is a func
-// field, so a dropped injection makes the check skip silently (#1395), and no
-// route reaches that check without a connected owned host.
-func (h *RemoveHandler) SharesOwnMachineSet() bool { return h.deps.SharesOwnMachine != nil }
+// OwnMachineRefuses is what the injected own-machine guard answers for a host,
+// and whether it was wired at all. Only the composition-root wiring test reads
+// it: RemoveDeps.SharesOwnMachine is a func field, so a dropped injection makes
+// the check skip silently (#1395), and no route reaches that check without a
+// connected owned host.
+func (h *RemoveHandler) OwnMachineRefuses(nodeName string) (refuses, wired bool) {
+	if h.deps.SharesOwnMachine == nil {
+		return false, false
+	}
+	return h.deps.SharesOwnMachine(nodeName), true
+}
 
 // Register wires the route. admin must compose RequireAuth→RequireAdmin.
 func (h *RemoveHandler) Register(mux httpx.Router, admin func(http.Handler) http.Handler) {
@@ -153,7 +160,7 @@ func (h *RemoveHandler) handleRemove(w http.ResponseWriter, r *http.Request) {
 	}
 	if h.deps.SharesOwnMachine != nil && h.deps.SharesOwnMachine(host.NodeName) {
 		httpx.WriteError(w, http.StatusConflict, CodeHostNotRemovable,
-			"this host shares the control plane's machine; take that machine apart with the uninstall command on it")
+			"this host is, or may be, the agent on the control plane's own machine; take that machine apart with the uninstall command on it, or set QUASAR_MACHINE_ROLE and QUASAR_MACHINE_NODE_NAME on the control plane and retry")
 		return
 	}
 

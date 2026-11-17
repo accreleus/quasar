@@ -48,11 +48,14 @@ func (f *fakeRemoveAgent) sentCount() int {
 }
 
 type removeHarness struct {
-	pool       *pgxpool.Pool
-	store      *Store
-	hostID     string
-	agent      *fakeRemoveAgent
-	ownNode    string
+	pool    *pgxpool.Pool
+	store   *Store
+	hostID  string
+	agent   *fakeRemoveAgent
+	ownNode string
+	// shape overrides the machine shape the guard reads; nil means combined
+	// with ownNode as the node name, or no shape at all when ownNode is empty.
+	shape      *MachineShape
 	base       string
 	adminToken string
 	userToken  string
@@ -93,7 +96,7 @@ func newRemoveHarness(t *testing.T) *removeHarness {
 		Store:     store,
 		Connected: func(string) bool { return h.agent.connected },
 		SharesOwnMachine: func(node string) bool {
-			return MachineShape{Role: MachineRoleCombined, NodeName: h.ownNode}.SharesMachineWith(node)
+			return h.machineShape().RefusesHostRemoval(node)
 		},
 		Cordon: func(ctx context.Context, hostID string) (func(context.Context), error) {
 			held, err := adm.List(ctx, hostID)
@@ -137,6 +140,18 @@ func newRemoveHarness(t *testing.T) *removeHarness {
 	t.Cleanup(srv.Close)
 	h.base = srv.URL
 	return h
+}
+
+// machineShape is the configured shape this harness's guard reads: a combined
+// host named ownNode, no shape at all when it names no node, or the case's own.
+func (h *removeHarness) machineShape() MachineShape {
+	if h.shape != nil {
+		return *h.shape
+	}
+	if h.ownNode == "" {
+		return MachineShape{}
+	}
+	return MachineShape{Role: MachineRoleCombined, NodeName: h.ownNode}
 }
 
 func (h *removeHarness) remove(t *testing.T, token string, body any) (int, []byte) {
@@ -250,6 +265,11 @@ func TestRemoveHostRefusesInTheContractsOrderChangingNothing(t *testing.T) {
 		}, http.StatusConflict, CodeHostNotRemovable, ""},
 		{"the control plane's own machine", func(h *removeHarness, _ *testing.T) { h.ownNode = "gpu-host-4" },
 			http.StatusConflict, CodeHostNotRemovable, ""},
+		// A shape the configuration cannot produce cannot tell any host apart
+		// from the control plane's own machine, so the removal is refused (#1395).
+		{"an identity that cannot be told apart", func(h *removeHarness, _ *testing.T) {
+			h.shape = &MachineShape{Role: MachineRoleCombined}
+		}, http.StatusConflict, CodeHostNotRemovable, ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

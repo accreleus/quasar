@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"strings"
 
 	"github.com/accreleus/quasar/control-plane/internal/audit"
 	"github.com/accreleus/quasar/control-plane/internal/auth"
@@ -41,6 +43,12 @@ type Handler struct {
 	// suspended, never deleted (#456), and the image is not uninstalled (that
 	// stays an explicit admin action). Same non-blocking contract.
 	DisableLibraryProviders func()
+
+	// WebhookHostAllowed is whether QUASAR_PLATFORM_WEBHOOK_HOSTS lets a release
+	// webhook go to this host (#156). A plain func field because internal/platform
+	// sits above this package; nil means no narrowing. The delivery-time refusal
+	// stays as it was — this is the earlier, friendlier no.
+	WebhookHostAllowed func(host string) bool
 
 	auditor audit.Recorder
 }
@@ -214,6 +222,14 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed,
 			"release_webhook_url must be an absolute https URL with no credentials, at most 2048 characters")
 		return
+	}
+	if req.ReleaseWebhookURL != nil && *req.ReleaseWebhookURL != "" && h.WebhookHostAllowed != nil {
+		// ValidReleaseWebhookURL passed, so the URL parses and has a host.
+		if u, err := url.Parse(*req.ReleaseWebhookURL); err == nil && !h.WebhookHostAllowed(strings.ToLower(u.Hostname())) {
+			httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed,
+				"release_webhook_url's host is not in this control plane's QUASAR_PLATFORM_WEBHOOK_HOSTS list")
+			return
+		}
 	}
 	// Enabling with no URL to send to would be a setting that silently does
 	// nothing, so it is refused. The URL this request LEAVES BEHIND decides:

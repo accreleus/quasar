@@ -113,9 +113,10 @@ type HTTPFetcher struct {
 // NewHTTPFetcher builds the production fetcher against
 // accreleus/quasar-images's raw.githubusercontent.com content, or an
 // operator override (QUASAR_IMAGE_CATALOG_REPO/_PATH, docs/configuration.md).
-// instance_settings.image_catalog_ref (the branch/tag/commit) stays a
-// separate DB-side admin-editable knob — these two env vars are the
-// deploy-time "which repo/file" it resolves against.
+// instance_settings.image_catalog_ref (the branch/tag/commit) is a separate
+// DB-side value that only the documented SQL moves — no API route or console
+// control sets it — and these two env vars are the deploy-time "which
+// repo/file" it resolves against.
 func NewHTTPFetcher() *HTTPFetcher {
 	repo := os.Getenv("QUASAR_IMAGE_CATALOG_REPO")
 	if repo == "" {
@@ -179,12 +180,16 @@ func (f *HTTPFetcher) Fetch(ctx context.Context, ref string) ([]byte, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		// Names the URL and the two operator knobs, not a bare status code.
+		// The fixed operator hint comes FIRST: Sync clamps sync_error to maxSyncErrorLen from the
+		// front, so a long repo, path or ref only ever cuts the variable tail. No API route or console
+		// control sets the ref, and the fetched ref is the resolved commit when Sync fetches, so it is
+		// not called the column.
 		return nil, fmt.Errorf(
-			"fetch manifest %s: unexpected status %d (check that ref %q, repo %q, and path %q are correct — "+
-				"repo/path are QUASAR_IMAGE_CATALOG_REPO/_PATH at deploy time, ref is the admin-editable "+
-				"instance_settings.image_catalog_ref)",
-			url, resp.StatusCode, ref, repo, path)
+			"The configured ref is instance_settings.image_catalog_ref, which no admin control sets: "+
+				"UPDATE instance_settings SET image_catalog_ref = '<ref>' WHERE id = true. "+
+				"Fetch manifest failed: unexpected status %d (fetched ref %q, repo %q, path %q, url %s; "+
+				"repo/path are QUASAR_IMAGE_CATALOG_REPO/_PATH at deploy time)",
+			resp.StatusCode, ref, repo, path, url)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxManifestBytes)) // bounded: a misconfigured ref must not stream unbounded
 	if err != nil {
