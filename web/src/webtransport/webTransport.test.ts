@@ -426,10 +426,11 @@ describe("WebTransportMedia loss recovery", () => {
     const reported: number[] = [];
     await t.connect({ ...NO_SINK, repaired: (n) => void reported.push(n) });
     const pkt = { n: 0 };
-    // Five fragments; the third never arrives and the frame's repair rebuilds it.
+    // Five fragments; the last never arrives (no later datagram shows a gap to NACK) and the
+    // frame's repair rebuilds it.
     const five = packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(5000, 0) }, pkt);
     const f = five.map((d) => parseVideoDatagram(d)!);
-    agent.last.datagrams(five.filter((_, i) => i !== 2));
+    agent.last.datagrams(five.filter((_, i) => i !== 4));
     agent.last.datagrams([repairOf(f, 0, 5)]);
     await vi.waitFor(() => expect(reported).toEqual([1]));
     t.close();
@@ -444,11 +445,11 @@ describe("WebTransportMedia loss recovery", () => {
     const pkt = { n: 0 };
     const five = packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(5000, 0) }, pkt);
     const f = five.map((d) => parseVideoDatagram(d)!);
-    // Two of the group are missing, so its repair is held; the next video fragment rebuilds one.
-    agent.last.datagrams([five[0], five[3], five[4]]);
+    // The last two are missing, so the repair is held; the next video fragment rebuilds the other.
+    agent.last.datagrams([five[0], five[1], five[2]]);
     agent.last.datagrams([repairOf(f, 0, 5)]);
     expect(reported).toEqual([]);
-    agent.last.datagrams([five[1]]);
+    agent.last.datagrams([five[3]]);
     await vi.waitFor(() => expect(reported).toEqual([1]));
     t.close();
   });

@@ -106,13 +106,12 @@ describe("FrameAssembler", () => {
       const f = five();
       expect(f).toHaveLength(5);
       const a = new FrameAssembler(() => 0);
-      for (const i of [0, 1, 3]) a.push(f[i]);
-      // Fragment 2 was NACKed when fragment 3 showed the gap (the repair comes after the
-      // fragments it protects); once rebuilt, nothing is asked again.
-      const r = a.repair(parseFecDatagram(repairOf(f, 0, 4))!);
+      // The last fragment is the one that never arrives, so no later datagram shows a gap to NACK.
+      for (const i of [0, 1, 2, 3]) a.push(f[i]);
+      const r = a.repair(parseFecDatagram(repairOf(f, 0, 5))!);
       expect(r.nacks).toEqual([]);
-      expect(whole(a.push(f[4]))).toBe(true);
-      expect(a.repaired).toBe(1);
+      expect(whole(r)).toBe(true);
+      expect([a.lost, a.repaired]).toEqual([0, 1]);
     });
 
     it("does not count a fragment already NACKed as repaired: it is in lost, and the two never overlap (amendment 85)", () => {
@@ -137,19 +136,19 @@ describe("FrameAssembler", () => {
     it("holds a repair that arrives while two of its group are missing, and uses it when one of them arrives", () => {
       const f = five();
       const a = new FrameAssembler(() => 0);
-      for (const i of [0, 3, 4]) a.push(f[i]);
-      expect(a.repair(parseFecDatagram(repairOf(f, 0, 4))!).units).toEqual([]);
+      for (const i of [0, 1, 2]) a.push(f[i]);
+      expect(a.repair(parseFecDatagram(repairOf(f, 0, 5))!).units).toEqual([]);
       expect(a.repaired).toBe(0);
-      expect(whole(a.push(f[1]))).toBe(true); // fragment 2 comes from the held repair
+      expect(whole(a.push(f[3]))).toBe(true); // fragment 4 comes from the held repair
       expect(a.repaired).toBe(1);
     });
 
     it("repairs a burst of two adjacent fragments with two interleaved groups", () => {
       const f = five();
       const a = new FrameAssembler(() => 0);
-      for (const i of [0, 3, 4]) a.push(f[i]);
-      a.repair(parseFecDatagram(repairOf(f, 0, 2, 2))!); // protects 0 and 2
-      expect(whole(a.repair(parseFecDatagram(repairOf(f, 1, 2, 2))!))).toBe(true); // 1 and 3
+      for (const i of [0, 1, 2]) a.push(f[i]);
+      a.repair(parseFecDatagram(repairOf(f, 0, 3, 2))!); // protects 0, 2 and 4: rebuilds 4
+      expect(whole(a.repair(parseFecDatagram(repairOf(f, 1, 2, 2))!))).toBe(true); // 1 and 3: rebuilds 3
       expect(a.repaired).toBe(2);
     });
 
