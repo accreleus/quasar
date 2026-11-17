@@ -55,6 +55,14 @@ const (
 // any public https host, which is the default for an admin-chosen URL.
 const WebhookHostsEnv = "QUASAR_PLATFORM_WEBHOOK_HOSTS"
 
+// WebhookHostAllowed is whether WebhookHostsEnv lets a webhook go to host
+// (case-insensitive); true when the variable is unset. The settings PATCH asks it
+// so an admin hears "no" at save time instead of at the first delivery.
+func WebhookHostAllowed(host string) bool {
+	narrow := parseWebhookHosts()
+	return narrow == nil || outbound.HostAllowed(narrow, strings.ToLower(host))
+}
+
 // SendWebhook POSTs one event. It never returns an error: every failure is a
 // Delivery with OK=false, so a webhook problem cannot become a detection one.
 func SendWebhook(ctx context.Context, cfg WebhookConfig, ev Event) Delivery {
@@ -73,7 +81,7 @@ func SendWebhook(ctx context.Context, cfg WebhookConfig, ev Event) Delivery {
 		return done(Delivery{Error: "the configured webhook URL is not an absolute https URL without credentials"})
 	}
 	host := strings.ToLower(u.Hostname())
-	if narrow := parseWebhookHosts(); narrow != nil && !outbound.HostAllowed(narrow, host) {
+	if !WebhookHostAllowed(host) {
 		return done(Delivery{Error: fmt.Sprintf("host %q is not in %s", host, WebhookHostsEnv)})
 	}
 
