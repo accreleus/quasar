@@ -21,6 +21,9 @@ export interface VideoConfig {
   colorSpace?: VideoColorSpaceInit;
   /** `hello_ack.codec_switch_reason` (codec-pyrowave.md §Switching codec). */
   switchReason?: string;
+  /** `hello_ack.fec`: the scheme the agent will send (amendment 85's presence rule for the
+   *  client's FEC telemetry), or null/absent when it sends no repairs. */
+  fec?: string | null;
 }
 
 /** A `hello_ack.audio` or `.mic` (§Hello ack): 10 ms Opus packets. */
@@ -82,6 +85,9 @@ export interface MediaSink {
    *  when it is first NACKed, whether or not the resend then arrives. PyroWave: the datagrams
    *  missing from each frame closed or dropped incomplete. */
   lost?(fragments: number): void;
+  /** Video fragments REBUILT from FEC repair datagrams since connect, cumulative (amendment
+   *  85). A repaired fragment is never NACKed, so it is never in `lost`. */
+  repaired?(fragments: number): void;
 }
 
 export interface MediaTransport {

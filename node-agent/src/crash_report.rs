@@ -78,7 +78,8 @@
 //!   and only for a report of something other than SIGSEGV, on a Rust-spawned thread,
 //!   whose unwinding then faults. The other reported signals are left unblocked in
 //!   `sa_mask` for this: blocked, the kernel would always kill with the report's own
-//!   fault.
+//!   fault. Every other signal is blocked there, so an unrelated handler cannot nest
+//!   inside the report on that small stack.
 
 use std::cell::UnsafeCell;
 use std::ffi::c_void;
@@ -177,9 +178,25 @@ pub fn install(role: &str) {
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = handler as *const () as usize;
             action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-            libc::sigemptyset(&mut action.sa_mask);
+            action.sa_mask = handler_mask();
             libc::sigaction(signal, &action, std::ptr::null_mut());
         }
+    }
+}
+
+/// The signals blocked while the handler runs: all of them but the reported ones. An
+/// unrelated handler nesting inside a report on Rust's 8 KiB alternate stack cut 50 of
+/// 80 reports in a debug build, and a full report needs 5632 bytes of it there. The
+/// reported signals stay unblocked for the re-entry rules in the module docs.
+fn handler_mask() -> libc::sigset_t {
+    // SAFETY: a zeroed `sigset_t` is a valid value, and each call edits only it.
+    unsafe {
+        let mut mask: libc::sigset_t = std::mem::zeroed();
+        libc::sigfillset(&mut mask);
+        for (signal, _) in SIGNALS {
+            libc::sigdelset(&mut mask, signal);
+        }
+        mask
     }
 }
 
@@ -344,14 +361,21 @@ unsafe fn wait_for_the_report() {
     }
 }
 
-/// A `read`-like call, made again for as long as a signal interrupts it: `sa_mask` is
-/// empty, so an unrelated handler can run in the middle of a report.
+/// The most times [`uninterrupted`] makes a call again. `sa_mask` blocks every signal
+/// but the reported ones, so an interruption is rare; a cap keeps a flood of them from
+/// holding the report open for ever.
+const MAX_EINTR_RETRIES: u32 = 16;
+
+/// A `read`-like call, made again for as long as a signal interrupts it, at most
+/// [`MAX_EINTR_RETRIES`] times.
 unsafe fn uninterrupted(mut call: impl FnMut() -> isize) -> isize {
+    let mut retries = 0;
     loop {
         let got = call();
-        if got >= 0 || *libc::__errno_location() != libc::EINTR {
+        if got >= 0 || *libc::__errno_location() != libc::EINTR || retries == MAX_EINTR_RETRIES {
             return got;
         }
+        retries += 1;
     }
 }
 
@@ -615,7 +639,37 @@ extern "C" fn handler(signal: libc::c_int, info: *mut libc::siginfo_t, context: 
 
 #[cfg(test)]
 mod tests {
-    use super::parse_map;
+    use super::{handler_mask, parse_map, uninterrupted, MAX_EINTR_RETRIES, SIGNALS};
+
+    #[test]
+    fn the_handler_blocks_every_signal_but_the_reported_ones() {
+        let mask = handler_mask();
+        for (signal, name) in SIGNALS {
+            // SAFETY: `mask` is a valid set.
+            assert_eq!(unsafe { libc::sigismember(&mask, signal) }, 0, "{name}");
+        }
+        for signal in [libc::SIGTERM, libc::SIGALRM, libc::SIGUSR1, libc::SIGCHLD] {
+            // SAFETY: as above.
+            assert_eq!(unsafe { libc::sigismember(&mask, signal) }, 1, "{signal}");
+        }
+    }
+
+    #[test]
+    fn an_interrupted_call_is_made_again_only_a_bounded_number_of_times() {
+        let mut calls = 0u32;
+        // SAFETY: the closure only sets errno on this thread.
+        let got = unsafe {
+            uninterrupted(|| {
+                calls += 1;
+                // Past the cap a loop with no limit would still be going: end it with
+                // another errno so the test fails instead of hanging.
+                *libc::__errno_location() = if calls > 1000 { libc::EIO } else { libc::EINTR };
+                -1
+            })
+        };
+        assert_eq!(got, -1);
+        assert_eq!(calls, MAX_EINTR_RETRIES + 1);
+    }
 
     #[test]
     fn a_maps_line_gives_its_range_and_whether_it_is_code_or_a_load_base() {
