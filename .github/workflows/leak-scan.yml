@@ -47,6 +47,7 @@ jobs:
       # needs a real repository rather than an export.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
       # The operator's own patterns are not committed (a public file listing them
       # publishes what they guard); they come from this repository secret. It is

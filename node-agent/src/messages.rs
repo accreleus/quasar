@@ -344,6 +344,10 @@ pub enum AgentMsg {
         wt_fec_overhead_pct: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         wt_fec_kbps: Option<f64>,
+        /// Amendment 79: the governor's UNCLAMPED link rate (kbit/s), present only while
+        /// the per-report loop runs (WebTransport in `smooth`). Absent ⇒ not measured.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        abr_link_rate_kbps: Option<f64>,
         /// Raw rtpgccbwe GCC estimate (kbit/s) BEFORE governor smoothing.
         /// Present only once ABR is armed and has received an estimate.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -519,6 +523,7 @@ impl AgentMsg {
             abr_floor_kbps: w.abr_floor_kbps,
             wt_fec_overhead_pct: w.wt_fec_overhead_pct,
             wt_fec_kbps: w.wt_fec_kbps,
+            abr_link_rate_kbps: w.abr_link_rate_kbps,
             gcc_estimate_kbps: w.gcc_estimate_kbps,
             abr_mode: w.abr_mode,
             adaptation_state: w.adaptation_state,
@@ -1536,6 +1541,7 @@ mod tests {
             abr_floor_kbps: None,
             wt_fec_overhead_pct: None,
             wt_fec_kbps: None,
+            abr_link_rate_kbps: None,
             gcc_estimate_kbps: None,
             abr_mode: "off",
             adaptation_state: "healthy",
@@ -2536,6 +2542,7 @@ mod tests {
             abr_floor_kbps: Some(3000.0),
             wt_fec_overhead_pct: Some(5.0),
             wt_fec_kbps: Some(320.0),
+            abr_link_rate_kbps: Some(2400.0),
             gcc_estimate_kbps: Some(11800.0),
             render_width: Some(1280),
             render_height: Some(720),
@@ -2565,6 +2572,7 @@ mod tests {
             keys(&full),
             [
                 "abr_floor_kbps",
+                "abr_link_rate_kbps",
                 "abr_mode",
                 "abr_setpoint_kbps",
                 "adaptation_state",
