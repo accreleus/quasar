@@ -309,9 +309,10 @@ export function setupCapture({
   // Gamepad state for delta-only sends, keyed by the controller NUMBER (amendment 80), not by
   // the browser's sparse `Gamepad.index`.
   const gpPrev: Record<number, { buttons: number[]; axes: number[] }> = {};
-  // Amendment 80: `Gamepad.index` -> controller number. Numbers are dense: a controller takes
-  // the lowest free one (the first connected is 0) and frees it when it disconnects.
-  const padNumbers = new Map<number, number>();
+  // Amendment 80: the `Gamepad.index` of each controller, by controller NUMBER. Numbers stay
+  // dense: a controller takes the next one (the first connected is 0), and when one
+  // disconnects every controller above it moves down by one, so a lone controller is 0.
+  const padOrder: number[] = [];
   const MAX_PADS = 4;
   const padEnv = detectPadEnv();
   // The on-screen controls' pad. The host drives ONE virtual pad whatever `i` says, so it is only
@@ -1010,23 +1011,22 @@ export function setupCapture({
       // Release before any real pad's state goes out: the host has one pad, so a later
       // neutral would wipe it.
       if (realPad) releaseVirtualPad();
-      // Amendment 80: a controller that went away rests, then frees its number for the next.
+      // Amendment 80: when a controller went away, its number and every number above it rest
+      // (the host holds nothing from them), then each controller still here is sent again
+      // under its new, lower number.
       const live = new Set<number>();
       for (const pad of pads) if (pad) live.add(pad.index);
-      for (const [index, num] of padNumbers) {
-        if (live.has(index)) continue;
-        restPad(num);
-        padNumbers.delete(index);
+      const gone = padOrder.findIndex((index) => !live.has(index));
+      if (gone >= 0) {
+        for (let n = gone; n < padOrder.length; n++) restPad(n);
+        padOrder.splice(0, padOrder.length, ...padOrder.filter((index) => live.has(index)));
       }
       for (const pad of pads) {
         if (!pad) continue;
-        let num = padNumbers.get(pad.index);
-        if (num === undefined) {
-          const taken = new Set(padNumbers.values());
-          num = 0;
-          while (taken.has(num)) num++;
-          if (num >= MAX_PADS) continue; // the contract numbers 0 to 3
-          padNumbers.set(pad.index, num);
+        let num = padOrder.indexOf(pad.index);
+        if (num < 0) {
+          if (padOrder.length >= MAX_PADS) continue; // the contract numbers 0 to 3
+          num = padOrder.push(pad.index) - 1;
         }
         const { buttons, axes, identity } = readPad(pad, padEnv);
         // Standard layout only: on any other pad the indices are the device's own order.

@@ -148,6 +148,9 @@ pub struct InputState {
     /// per number. Per session, so `reset` (an app swap) leaves it alone.
     // shortcut: numbers above 63 share bit 63, so a hostile client costs one line, not one each.
     dropped_pads: AtomicU64,
+    /// Messages that got past the pad filter into a sink (tests assert a dropped `gp` is not one).
+    #[cfg(test)]
+    delivered: AtomicU64,
 }
 
 impl InputState {
@@ -252,6 +255,8 @@ pub fn handle(json: &str, sink: &InputSink, state: &InputState, width: i32, heig
         }
         return;
     }
+    #[cfg(test)]
+    state.delivered.fetch_add(1, Ordering::Relaxed);
 
     match sink {
         InputSink::Virtual(devices) => {
@@ -599,6 +604,22 @@ mod tests {
         // A `gp` with no `i` is number 0 (serde default).
         let no_i = InputMsg::parse(r#"{"t":"gp","buttons":[],"axes":[]}"#).unwrap();
         assert_eq!(st.drop_pad(&no_i), None);
+    }
+
+    /// The drop is wired into `handle`: a `gp` for another number never reaches a sink (where
+    /// it would nudge the pointer or be diffed against pad 0), pad 0's and other input does.
+    #[test]
+    fn handle_drops_other_pad_numbers_before_the_sink() {
+        let st = InputState::new();
+        let go = |json: &str| handle(json, &InputSink::None, &st, 320, 240);
+        go(r#"{"t":"gp","i":1,"buttons":[1],"axes":[0]}"#);
+        go(r#"{"t":"gp","i":3,"buttons":[1],"axes":[0]}"#);
+        assert_eq!(st.delivered.load(Ordering::Relaxed), 0);
+        assert_eq!(st.dropped_pads.load(Ordering::Relaxed), 0b1010);
+        go(r#"{"t":"gp","i":0,"buttons":[1],"axes":[0]}"#);
+        go(r#"{"t":"gp","buttons":[1],"axes":[0]}"#);
+        go(r#"{"t":"k","code":30,"pressed":true}"#);
+        assert_eq!(st.delivered.load(Ordering::Relaxed), 3);
     }
 
     fn mm() -> InputMsg {

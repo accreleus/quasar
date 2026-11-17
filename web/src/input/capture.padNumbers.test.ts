@@ -60,17 +60,41 @@ describe("controller numbers", () => {
     expect(gps().at(-1)).toEqual({ t: "gp", i: 1, buttons: [0], axes: [0] });
   });
 
-  it("rests a disconnected controller's number first, then gives the freed number to the next", () => {
+  it("rests a disconnected controller's number, moves the one above it down, and hands the freed top number to the next", () => {
     pads = [pad(0), pad(1)];
     tick(); // slot 0 = 0, slot 1 = 1
     sent.length = 0;
-    pads = [null, pad(1)]; // number 0 leaves
+    pads = [null, pad(1)]; // number 0 leaves: the survivor is a lone controller, so it is 0
     tick();
-    expect(gps()).toEqual([{ t: "gp", i: 0, buttons: [0], axes: [0] }]);
+    expect(gps()).toEqual([
+      { t: "gp", i: 0, buttons: [0], axes: [0] }, // 0 rests
+      { t: "gp", i: 1, buttons: [0], axes: [0] }, // the mover rests its old number
+      { t: "gp", i: 0, buttons: [1], axes: [0] }, // then it is sent as 0
+    ]);
     sent.length = 0;
-    pads = [null, pad(1), pad(2)]; // a new controller takes the freed 0, not 2
+    pads = [null, pad(1), pad(2)]; // a new controller is number 1
     tick();
-    expect(gps()).toEqual([{ t: "gp", i: 0, buttons: [1], axes: [0] }]);
+    expect(gps()).toEqual([{ t: "gp", i: 1, buttons: [1], axes: [0] }]);
+  });
+
+  it("keeps three controllers dense when the middle one is unplugged", () => {
+    pads = [pad(0), pad(1), pad(2)];
+    tick();
+    sent.length = 0;
+    pads = [pad(0), null, pad(2)];
+    tick();
+    // The middle number and the one above rest; the third controller becomes 1; the first,
+    // below the gap, is untouched.
+    expect(gps()).toEqual([
+      { t: "gp", i: 1, buttons: [0], axes: [0] },
+      { t: "gp", i: 2, buttons: [0], axes: [0] },
+      { t: "gp", i: 1, buttons: [1], axes: [0] },
+    ]);
+    sent.length = 0;
+    pads = [null, null, pad(2)]; // the first leaves too: the last one standing is 0
+    tick();
+    expect(gps().at(-1)).toEqual({ t: "gp", i: 0, buttons: [1], axes: [0] });
+    expect(gps().map((m) => m.i)).toEqual([0, 1, 0]);
   });
 
   it("sends no controller past number 3", () => {
