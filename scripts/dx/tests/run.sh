@@ -3822,12 +3822,15 @@ if command -v node >/dev/null 2>&1; then
   rc_of 0 "e2e:post" -- node --test "$ROOT/scripts/validate/stream/post.test.mjs"
   # The client pack (#1280): its archive unpacked alone into an empty directory, its entry run against an in-process stack.
   rc_of 0 "e2e:pack" -- node --test "$ROOT/scripts/validate/stream/pack.test.mjs"
+  # The journeys runner grants local network access to its contexts, as the e2e runner does (#1456).
+  rc_of 0 "validate:local-network" -- node --test "$ROOT/scripts/validate/lib/localNetwork.test.mjs"
 else
   warn "e2e:bundle-format" "node not installed — SKIPPED"
   warn "e2e:web-dist" "node not installed — SKIPPED"
   warn "e2e:collect" "node not installed — SKIPPED"
   warn "e2e:post" "node not installed — SKIPPED"
   warn "e2e:pack" "node not installed — SKIPPED"
+  warn "validate:local-network" "node not installed — SKIPPED"
 fi
 
 # The review an agent reads first (#1275): golden bytes, the same bytes twice, a

@@ -144,7 +144,7 @@ fn spawn_rel_flush_thread(
 ) -> std::thread::JoinHandle<()> {
     let log_span = tracing::Span::current();
     std::thread::Builder::new()
-        .name("quasar-rel-flush".into())
+        .name("quasar-relflush".into())
         .spawn(move || {
             // Re-enter the session span so this thread's lines carry session=<id>.
             let _log_span = log_span.enter();

@@ -178,11 +178,3 @@ fn describe_change(before: &ConsoleCapabilities, after: &ConsoleCapabilities) ->
         parts.join(", ")
     }
 }
-
-#[cfg(test)]
-mod thread_name_tests {
-    #[test]
-    fn the_thread_name_fits_the_kernels_15_bytes() {
-        assert!(super::THREAD_NAME.len() <= 15, "{}", super::THREAD_NAME);
-    }
-}

@@ -440,7 +440,7 @@ fn lock_body() -> String {
 /// the body (rather than a `utimensat`) keeps this dependency-free and self-describing.
 fn spawn_heartbeat(mut file: std::fs::File, what: String, stop: Arc<AtomicBool>) {
     let _ = std::thread::Builder::new()
-        .name("quasar-provision-hb".into())
+        .name("quasar-prov-hb".into())
         .spawn(move || {
             while !stop.load(Ordering::SeqCst) {
                 std::thread::sleep(HEARTBEAT_INTERVAL);

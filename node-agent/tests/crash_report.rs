@@ -116,8 +116,27 @@ fn prepare(how: &str) {
     }
 }
 
+/// Exits 0 when `install` left the handler a mask that blocks the unreported signals and
+/// not the reported one. `handler_mask` alone cannot show that: `install` must use it.
+fn exit_by_handler_mask() {
+    // SAFETY: a zeroed `sigaction` is valid; the call reads one disposition into it.
+    let old = unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut old);
+        old
+    };
+    // SAFETY: `sa_mask` is a valid set.
+    let right = unsafe {
+        libc::sigismember(&old.sa_mask, libc::SIGTERM) == 1
+            && libc::sigismember(&old.sa_mask, libc::SIGUSR1) == 1
+            && libc::sigismember(&old.sa_mask, libc::SIGSEGV) == 0
+    };
+    std::process::exit(if right { 0 } else { 3 });
+}
+
 fn die(how: &str) {
     match how {
+        "mask" => exit_by_handler_mask(),
         "abort" => std::process::abort(),
         // SAFETY: raises a signal at this process.
         "raised-trap" => unsafe {
@@ -314,6 +333,12 @@ fn child_sent_segvs(kills: usize, how: &str) -> Ended {
 
 fn banner(signal: &str) -> String {
     format!("]: fatal signal {signal} code ")
+}
+
+#[test]
+fn install_gives_the_handler_the_mask_that_blocks_unreported_signals() {
+    let end = child("mask");
+    assert_eq!(end.code, Some(0), "{}", end.stderr);
 }
 
 #[test]
