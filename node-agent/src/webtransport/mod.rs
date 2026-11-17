@@ -1230,16 +1230,9 @@ fn feed(
     media: &Media,
     handed: &mut u64,
 ) -> bool {
-    let governed = control
-        .as_ref()
-        .filter(|c| !pyrowave && c.governor.governs())
-        .map(|c| (c.governor.kbps() as f64).min(c.estimator.estimate_kbps()) as u64);
-    // Paced only once the estimate has found the link (at the ceiling a keyframe leaves at
-    // once), and never under the ABR floor the encoder is held to.
-    let paced = control
-        .as_ref()
-        .filter(|c| !pyrowave && c.governor.governs() && c.estimator.found_link())
-        .map(|c| c.governor.kbps());
+    let (governed, paced) = control.as_ref().map_or((None, None), |c| {
+        congestion::video_rates(&c.governor, &c.estimator, pyrowave)
+    });
     let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
     let room = video.room(governed, DATAGRAM_BUFFER).saturating_sub(queued);
     let room = room.min(video.pace(paced, std::time::Instant::now()));
