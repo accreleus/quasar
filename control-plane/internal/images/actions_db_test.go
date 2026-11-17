@@ -994,6 +994,40 @@ func TestSyncFailureNamesTheFetchedRefNotTheColumn(t *testing.T) {
 	}
 }
 
+// TestSyncFailureKeepsTheUpdateHintWhateverTheRepoOrPath — #999: image_sync_error is cut
+// at maxSyncErrorLen from the front, and the repo, path and ref are all operator-set, so the
+// fixed UPDATE hint must survive a long one (it sat after them and was cut at 22+ char paths).
+func TestSyncFailureKeepsTheUpdateHintWhateverTheRepoOrPath(t *testing.T) {
+	for name, f := range map[string]HTTPFetcher{
+		"long path": {Path: "deploy/quasar-manifest.json"},
+		"long repo": {Repo: "some-organisation/some-long-repository-name"},
+		"both":      {Repo: "some-organisation/some-long-repository-name", Path: "deploy/quasar-manifest.json"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			pool := testDB(t)
+			gh := newFakeGitHub(t)
+			f.Client = statusDoer(http.StatusNotFound)
+			s := NewStoreWithFetcher(pool, &f)
+			s.SetLogger(testLog())
+			s.SetContextResolver(gh.resolver())
+
+			env, err := s.Sync(context.Background())
+			mustT(t, err)
+			if env.SyncError == nil {
+				t.Fatal("a 404 must record sync_error")
+			}
+			for _, want := range []string{
+				"The configured ref is instance_settings.image_catalog_ref",
+				"UPDATE instance_settings SET image_catalog_ref = '<ref>' WHERE id = true",
+			} {
+				if !strings.Contains(*env.SyncError, want) {
+					t.Fatalf("sync_error lost %q to the %d-byte clamp: %s", want, maxSyncErrorLen, *env.SyncError)
+				}
+			}
+		})
+	}
+}
+
 // TestBuildUsesFrozenInputsNotMovedCatalog — P4 CRITICAL #1 (the fleet-split
 // twin): after a template is adopted, a later catalog sync that moves
 // context_sha / dockerfile / build_args must NOT change what an already-adopted
