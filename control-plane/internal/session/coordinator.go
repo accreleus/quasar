@@ -283,14 +283,28 @@ func (c *Coordinator) commandOK(hostID, id string, cmd any, timeout time.Duratio
 	defer cancel()
 	res, err := c.dispatcher.SendWithAck(ctx, hostID, id, cmd)
 	if err != nil {
-		c.failSession(sessionID, fmt.Sprintf("%s dispatch failed: %v", what, err))
+		c.failCommand(sessionID, fmt.Sprintf("%s dispatch failed: %v", what, err))
 		return false
 	}
 	if !res.OK {
-		c.failSession(sessionID, fmt.Sprintf("agent rejected %s: %s", what, res.Error))
+		c.failCommand(sessionID, fmt.Sprintf("agent rejected %s: %s", what, res.Error))
 		return false
 	}
 	return true
+}
+
+// failCommand records a refused command as the session's failure, unless a stop
+// owns the row. A stop that lands while the ack is in flight makes the agent
+// drop the pending assignment and refuse the command for an id it no longer
+// has (#1451); that refusal is the stop's outcome, and failing the session
+// would report the user's own stop as a launch error.
+func (c *Coordinator) failCommand(sessionID, reason string) {
+	if c.stopInGrace(sessionID) {
+		c.log.Info("command refused during a stop; not failing the session",
+			"session_id", sessionID, "reason", reason)
+		return
+	}
+	c.failSession(sessionID, reason)
 }
 
 // failSession records reason as error_message, leaving state_detail unchanged.

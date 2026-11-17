@@ -424,6 +424,37 @@ describe("HostsTab — the row menu", () => {
     await waitFor(() => expect(mocked.deleteHost).toHaveBeenCalledWith("tok", "c2059601"));
   });
 
+  // After a control-plane restart a host whose agent never comes back stays
+  // `draining` for good (#596), and the server's rule for the delete is the live
+  // connection, not the status — so this host has to be forgettable (#634).
+  it("forgets a draining host whose agent has stopped heartbeating", async () => {
+    setFleet([
+      host({ status: "draining", last_heartbeat_at: new Date(NOW - 120_000).toISOString() }),
+    ]);
+    renderTab();
+    await openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Remove host" }));
+
+    expect(screen.getByText(/permanently removes/)).toBeTruthy();
+    // The cost is stated before the delete: history, and homes that then need a release.
+    expect(screen.getByText(/its managed homes are tombstoned/)).toBeTruthy();
+    expect(screen.getByText(/needs releasing by hand in Storage/)).toBeTruthy();
+    expect(mocked.deleteHost).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove host" }));
+    await waitFor(() => expect(mocked.deleteHost).toHaveBeenCalledWith("tok", "c2059601"));
+  });
+
+  it("still explains a draining host whose agent is answering", async () => {
+    setFleet([host({ status: "draining" })]);
+    renderTab();
+    await openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Remove host" }));
+
+    expect(screen.getByText(/is still connected/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Remove host" })).toBeNull();
+  });
+
   it("keeps the remove dialog open and shows the server's message on a 409", async () => {
     setFleet([host({ status: "offline" })]);
     mocked.deleteHost.mockRejectedValue(
@@ -577,6 +608,9 @@ describe("HostsTab — owned hosts (#366)", () => {
 
   it("sends Remove host for an owned GPU host to its page, where its recovery actor removes it", async () => {
     setFleet([host({ ...owned })]);
+    mocked.getPlatformIdentity.mockResolvedValue({
+      identity: { machine_role: null, machine_node_name: null },
+    } as never);
     render(
       <MemoryRouter initialEntries={["/admin/fleet/hosts"]}>
         <SectionHeadProvider title="Fleet" tabs={FLEET_TABS}>
@@ -591,6 +625,35 @@ describe("HostsTab — owned hosts (#366)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Actions for quasar-node-1" }));
     fireEvent.click(screen.getByRole("menuitem", { name: "Remove host" }));
     expect(await screen.findByText("/admin/fleet/hosts/c2059601?remove=1")).toBeTruthy();
+    expect(mocked.deleteHost).not.toHaveBeenCalled();
+  });
+
+  // The page opens its Remove dialog on the same rule as this menu, so the menu must not
+  // promise one it will not show: the page explains instead (#1240).
+  it("takes an owned host it cannot remove to its page without the dialog", async () => {
+    setFleet([
+      host({
+        ...owned,
+        readiness: [{ id: "owner_conflict", status: "fail", summary: "x", remediation: "" }] as never,
+      }),
+    ]);
+    mocked.getPlatformIdentity.mockResolvedValue({
+      identity: { machine_role: null, machine_node_name: null },
+    } as never);
+    render(
+      <MemoryRouter initialEntries={["/admin/fleet/hosts"]}>
+        <SectionHeadProvider title="Fleet" tabs={FLEET_TABS}>
+          <Routes>
+            <Route path="/admin/fleet/hosts" element={<HostsTab />} />
+            <Route path="/admin/fleet/hosts/:id" element={<LocationProbe />} />
+          </Routes>
+        </SectionHeadProvider>
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText("quasar-node-1")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Actions for quasar-node-1" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Remove host" }));
+    expect(await screen.findByText("/admin/fleet/hosts/c2059601")).toBeTruthy();
     expect(mocked.deleteHost).not.toHaveBeenCalled();
   });
 });

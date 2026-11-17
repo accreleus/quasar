@@ -116,7 +116,10 @@ func PlanRelease(in PlanInputs) View {
 			ControlPlaneMachine: in.ControlPlaneMachine,
 		},
 		Available: available,
-		Targets:   targets(available, in.ControlPlane, hosts, open, fleet, cpFacts, image),
+		// Amendment 83: an empty list says why when the ONLY thing that emptied
+		// it is ADR 0002's schema rule.
+		HeldBack: heldBack(in.Releases, channel, in.ControlPlane, available),
+		Targets:  targets(available, in.ControlPlane, hosts, open, fleet, cpFacts, image),
 		// Faults are read off the rows the channel SELECTS, which on beta are
 		// the stable channel's (rowChannel), and ordered the way `available`
 		// orders them on that channel.
@@ -180,6 +183,45 @@ func ReleaseRunsAMigration(r Release, schemaVersion int) bool {
 	return r.SchemaVersion > schemaVersion
 }
 
+// listing verdict: why the channel's listing does or does not offer a row.
+// Both `offerable` and `heldBack` read this one function, so a rule added here
+// cannot empty `available` without also naming the release it held back.
+type listing int
+
+const (
+	listed listing = iota
+	// heldBackForSchema: the ONLY rule that refuses the row is ADR 0002's — its
+	// schema_version is below the installed control plane's, a downgrade.
+	heldBackForSchema
+	// notListed: refused for another reason, so it is not an offer withheld
+	// from this operator and must never be explained as one.
+	notListed
+)
+
+func listingVerdict(r Release, channel string, cp buildinfo.Identity) listing {
+	if r.Channel != rowChannel(channel) {
+		return notListed
+	}
+	// Every rule BUT ADR 0002's, first: `heldBackForSchema` has to mean "nothing
+	// else refuses this row", so a row a second rule also refuses is never
+	// explained as a downgrade withheld.
+	//
+	// Prereleases exist to be exercised; stable ignores them. Beta is the
+	// channel that does not, and nothing to pin it by (ADR 0001) is never
+	// offered — edge is exempt because it publishes no manifest at all and
+	// resolves its digests at apply time.
+	if belowInstalledVersion(r, cp) ||
+		(channel == ChannelStable && r.Prerelease) ||
+		(channel != ChannelEdge && len(r.Manifest) == 0) {
+		return notListed
+	}
+	// ADR 0002: a downgrade must be unrepresentable, not merely discouraged.
+	if r.SchemaVersion < cp.SchemaVersion {
+		return heldBackForSchema
+	}
+	return listed
+}
+
 // offerable applies the listing rules and the ordering: schema_version then
 // built_at, both DESC (ADR 0002). The built_at tiebreak matters because edge
 // produces many builds at one schema_version; id keeps a list stable across
@@ -191,27 +233,9 @@ func ReleaseRunsAMigration(r Release, schemaVersion int) bool {
 // built before the 0.2.5 that orders below it. Edge builds have no version at
 // all.
 func offerable(rows []Release, channel string, cp buildinfo.Identity) []Release {
-	source := rowChannel(channel)
 	out := make([]Release, 0, len(rows))
 	for _, r := range rows {
-		if r.Channel != source {
-			continue
-		}
-		// ADR 0002: a downgrade must be unrepresentable, not merely discouraged.
-		if r.SchemaVersion < cp.SchemaVersion {
-			continue
-		}
-		if belowInstalledVersion(r, cp) {
-			continue
-		}
-		// Prereleases exist to be exercised; stable ignores them. Beta is the
-		// channel that does not.
-		if channel == ChannelStable && r.Prerelease {
-			continue
-		}
-		// Nothing to pin it by (ADR 0001). Edge is exempt because it publishes
-		// no manifest at all and resolves its digests at apply time.
-		if channel != ChannelEdge && len(r.Manifest) == 0 {
+		if listingVerdict(r, channel, cp) != listed {
 			continue
 		}
 		// Derived here because this is where the control plane's own schema
@@ -223,10 +247,40 @@ func offerable(rows []Release, channel string, cp buildinfo.Identity) []Release 
 	return sortOfferable(out, channel)
 }
 
+// heldBack is amendment 83's `held_back`: the newest release the channel selects
+// that `available` omits ONLY for being below the installed control plane's
+// schema, so an empty list can say why instead of looking like "nothing was
+// detected". nil whenever `available` is non-empty, and whenever no row was
+// refused for that reason alone — a release refused for any other rule is not an
+// offer withheld from this operator, and a client must never offer it.
+func heldBack(rows []Release, channel string, cp buildinfo.Identity, available []Release) *HeldBack {
+	if len(available) > 0 {
+		return nil
+	}
+	var candidates []Release
+	for _, r := range rows {
+		if listingVerdict(r, channel, cp) == heldBackForSchema {
+			candidates = append(candidates, r)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	newest := sortOfferable(candidates, channel)[0]
+	return &HeldBack{
+		Channel:       newest.Channel,
+		SchemaVersion: newest.SchemaVersion,
+		Reason:        ReasonSchemaBelowInstalled,
+	}
+}
+
 // newCommitCount is amendment 48's `new_commit_count`: the entries of a preview
 // manifest's `commits` before the one that is the installed control plane's
 // source_commit, or all of them when none is (a stable, edge, unstamped or older
 // install). nil when the row is not a preview or its manifest carries no list.
+// 0 — not the whole list — when the installed control plane is newer than the
+// release by the edge ordering rule (amendment 83): it runs every commit the
+// release carries, so none of them is news.
 func newCommitCount(r Release, cp buildinfo.Identity) *int {
 	if r.Channel != ChannelPreview || len(r.Manifest) == 0 {
 		return nil
@@ -240,6 +294,10 @@ func newCommitCount(r Release, cp buildinfo.Identity) *int {
 	// decodes has no list to count.
 	if json.Unmarshal(r.Manifest, &doc) != nil || doc.Commits == nil {
 		return nil
+	}
+	if edgeOlderThanInstalled(r, cp) {
+		zero := 0
+		return &zero
 	}
 	n := len(*doc.Commits)
 	for i, c := range *doc.Commits {
