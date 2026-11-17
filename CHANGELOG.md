@@ -25,7 +25,7 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Changed
-- **The compositor is rebuilt on the current upstream gst-wayland-display (#1081).** Quasar's compositor features are carried on top of upstream's latest release line, which brings its own fixes: bounded waits so a session stop never hangs on a frame, a clean failure when the compositor cannot start, HDR rework, input fixes and a newer Smithay. The Vulkan encoders now share one submit lock per GPU queue instead of one for the whole process. Streaming should look the same; this needs its hardware check before it ships (#1083).
+- **The compositor is rebuilt on the current upstream gst-wayland-display (#1081).** Quasar's compositor features are carried on top of upstream's latest release line, which brings its own fixes: bounded waits so a session stop never hangs on a frame, a clean failure when the compositor cannot start, HDR rework, input fixes and a newer Smithay. The Vulkan encoders now share one submit lock per GPU queue instead of one for the whole process. Streaming should look the same; this needs its hardware check before it ships (#1083). The HEVC encode-ring override is now `QUASAR_VULKAN_RING`, so an owned install can set it with the recovery actor; `WOLF_VULKAN_RING` still works.
 
 ### Fixed
 - **Session audio no longer opens with one stale packet ahead of a gap (#1441).** When a client took longer than about 200 ms to connect, the host sent one audio packet captured at the start and then jumped a second or more ahead, which a receiver had to treat as a burst of loss. The host now sends no audio until the client has connected, so the first packet it sends begins the continuous stream.

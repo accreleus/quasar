@@ -464,7 +464,10 @@ pub(super) fn build_scale_stage(
             if supported {
                 let f = tail_filter()?;
                 let scale = make("vulkanscale")?;
-                super::source_branch::set_encode_src_properties(&scale, None);
+                let linear = super::source_branch::linear_encode_src_for(
+                    super::source_branch::session_gpu_vendor(cfg),
+                );
+                super::source_branch::set_encode_src_properties(&scale, linear, None);
                 (tail_chain(vec![scale], f.clone()), Some(f))
             } else {
                 (vec![], None)
@@ -653,10 +656,15 @@ mod tests {
             .map(|e| e.factory().unwrap().name().to_string())
             .collect();
         assert_eq!(names, vec!["vulkanscale", "capsfilter"]);
-        // LINEAR-first output images (#281), where the scaler has the property.
+        // The scaler gets the compositor's LINEAR choice for this host's vendor, where it has
+        // the property.
         let scale = &stage.elements[0];
         if scale.find_property("linear-encode-src").is_some() {
-            assert!(scale.property::<bool>("linear-encode-src"));
+            let cfg = cfg_for(EncoderChoice::Vulkan, 1920, 1080);
+            let want = super::super::source_branch::linear_encode_src_for(
+                super::super::source_branch::session_gpu_vendor(&cfg),
+            );
+            assert_eq!(scale.property::<bool>("linear-encode-src"), want);
         }
         assert_eq!(stage.launch, (1920, 1080));
         assert_eq!(stage.current(), (1920, 1080));

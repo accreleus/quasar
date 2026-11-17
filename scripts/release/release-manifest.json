@@ -69,7 +69,7 @@
   "upstream_pins": [
     {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "GST_INTERPIPE_REF", "value": "0c454917"},
     {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "GST_PLUGINS_RS_REF", "value": "cee45224cb2d10e1523af4f256d0dd64c8b29491"},
-    {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "GST_WAYLAND_DISPLAY_REF", "value": "492984b6ccaf906eb3083956e23e9d6d1f18674e"},
+    {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "GST_WAYLAND_DISPLAY_REF", "value": "3964d5260ba53e3292185368b92943d51df25f43"},
     {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "PYROWAVE_REF", "value": "7fe0e2667cd3076b8b2bf04bcb80bc8d691b800b"},
     {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "GRANITE_REF", "value": "53090429539bf3404250d18fe58db971f0907c04"},
     {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "VULKAN_LOADER_REF", "value": "363f465abadab0a8dcfc5c85d2c691e9b0b788d6"},

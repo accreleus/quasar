@@ -6,6 +6,7 @@ use anyhow::{anyhow, Context, Result};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 
+use crate::gpu_vendor::GpuVendor;
 use crate::session::container::ContainerSpec;
 use crate::session::virtual_input::VirtualDevices;
 use crate::session::{EncoderChoice, SessionConfig};
@@ -14,16 +15,25 @@ use super::caps::{dmabuf_zerocopy_format, source_caps, vulkan_image_transport};
 use super::encoders::va_device_element_prefix;
 
 /// The compositor's Vulkan encode-src ring depth (its `ring-depth` property) for this host:
-/// an operator's `WOLF_VULKAN_RING`, else what [`super::encoders::required_source_ring_depth`]
-/// requires (the reason lives there). `None` keeps the element's default.
+/// an operator's `QUASAR_VULKAN_RING` (or the older `WOLF_VULKAN_RING`), else what
+/// [`super::encoders::required_source_ring_depth`] requires (the reason lives there). `None`
+/// keeps the element's default.
 pub(crate) fn source_ring_depth() -> Option<u32> {
+    let quasar = std::env::var("QUASAR_VULKAN_RING").ok();
+    let wolf = std::env::var("WOLF_VULKAN_RING").ok();
     ring_depth_from(
-        std::env::var("WOLF_VULKAN_RING").ok().as_deref(),
+        ring_override(quasar.as_deref(), wolf.as_deref()),
         super::encoders::required_source_ring_depth(super::encoders::EncoderKnobs::from_env()),
     )
 }
 
-/// `raw` (the `WOLF_VULKAN_RING` value) if it is a number, else `default`. Empty is unset:
+/// The operator's ring override: `QUASAR_VULKAN_RING` (the name a recovery-actor
+/// `reconfigure` can set) wins over `WOLF_VULKAN_RING`; empty is unset.
+fn ring_override<'a>(quasar: Option<&'a str>, wolf: Option<&'a str>) -> Option<&'a str> {
+    quasar.filter(|v| !v.trim().is_empty()).or(wolf)
+}
+
+/// `raw` (the operator's ring override) if it is a number, else `default`. Empty is unset:
 /// compose passes it through as `${WOLF_VULKAN_RING:-}`.
 fn ring_depth_from(raw: Option<&str>, default: Option<u32>) -> Option<u32> {
     match raw.map(str::trim) {
@@ -32,7 +42,7 @@ fn ring_depth_from(raw: Option<&str>, default: Option<u32>) -> Option<u32> {
             tracing::warn!(
                 token = "vulkan-ring-depth-unparsed",
                 value = v,
-                "WOLF_VULKAN_RING is not a number; using the codec default"
+                "QUASAR_VULKAN_RING / WOLF_VULKAN_RING is not a number; using the codec default"
             );
             default
         }),
@@ -48,13 +58,27 @@ fn clamp_ring_depth(depth: u32, pspec: &gst::glib::ParamSpec) -> u32 {
     }
 }
 
+/// The GPU vendor behind this session's render node (sysfs), else the host's.
+pub(crate) fn session_gpu_vendor(cfg: &SessionConfig) -> Option<GpuVendor> {
+    crate::gpu_vendor::detect_with(&|k| {
+        (k == "QUASAR_RENDER_NODE").then(|| cfg.render_node.clone())
+    })
+    .map(|(vendor, _)| vendor)
+}
+
+/// Whether encode-src images should be LINEAR first: AMD only. radv corrupts the tiled
+/// encode-src copy on RDNA2/RDNA4 (#272/#281). On NVIDIA a LINEAR encode-src image yields
+/// no encoded frame at all (#1083), so it keeps the element default, OPTIMAL.
+pub(crate) fn linear_encode_src_for(vendor: Option<GpuVendor>) -> bool {
+    vendor == Some(GpuVendor::Amd)
+}
+
 /// The encode-src settings the agent relies on, for `waylanddisplaysrc` and `vulkanscale`:
-/// `linear-encode-src=true` (radv corrupts the tiled encode-src copy on RDNA2/RDNA4, #281;
-/// a driver that refuses LINEAR, NVIDIA, gets OPTIMAL) and, when given, `ring-depth`. An
+/// `linear-encode-src` (see [`linear_encode_src_for`]) and, when given, `ring-depth`. An
 /// element without one keeps its default and warns once per process.
-pub(crate) fn set_encode_src_properties(el: &gst::Element, ring_depth: Option<u32>) {
+pub(crate) fn set_encode_src_properties(el: &gst::Element, linear: bool, ring_depth: Option<u32>) {
     if el.find_property("linear-encode-src").is_some() {
-        el.set_property("linear-encode-src", true);
+        el.set_property("linear-encode-src", linear);
     } else {
         warn_property_missing(el, "linear-encode-src");
     }
@@ -128,7 +152,8 @@ pub(crate) fn build_video_source(
             tracing::info!(
                 "VK-05: waylanddisplaysrc vulkan=true (emit memory:VulkanImage NV12 for vulkanh264enc)"
             );
-            set_encode_src_properties(&el, source_ring_depth());
+            let linear = linear_encode_src_for(session_gpu_vendor(cfg));
+            set_encode_src_properties(&el, linear, source_ring_depth());
         }
         // A swap builds its compositor from this same session cfg, not the new app's spec,
         // so the session keeps its keymap (amendment 49).
@@ -321,9 +346,10 @@ pub(crate) fn keyboard_layout(container: Option<&ContainerSpec>) -> Option<(&str
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_ring_depth, keyboard_layout, keyboard_properties_present, ring_depth_from,
-        set_encode_src_properties, va_postproc_candidates,
+        clamp_ring_depth, keyboard_layout, keyboard_properties_present, linear_encode_src_for,
+        ring_depth_from, ring_override, set_encode_src_properties, va_postproc_candidates,
     };
+    use crate::gpu_vendor::GpuVendor;
     use gstreamer as gst;
     use gstreamer::prelude::*;
 
@@ -418,8 +444,29 @@ mod tests {
             eprintln!("skipped: this waylanddisplaysrc predates ring-depth / linear-encode-src");
             return;
         }
-        set_encode_src_properties(&el, Some(2));
+        set_encode_src_properties(&el, linear_encode_src_for(Some(GpuVendor::Amd)), Some(2));
         assert!(el.property::<bool>("linear-encode-src"));
         assert_eq!(el.property::<u32>("ring-depth"), 2);
+        set_encode_src_properties(&el, linear_encode_src_for(Some(GpuVendor::Nvidia)), Some(4));
+        assert!(!el.property::<bool>("linear-encode-src"));
+        assert_eq!(el.property::<u32>("ring-depth"), 4);
+    }
+
+    // QUASAR_VULKAN_RING wins over WOLF_VULKAN_RING; an empty one is unset.
+    #[test]
+    fn quasar_ring_override_wins_over_wolf() {
+        assert_eq!(ring_override(Some("4"), Some("2")), Some("4"));
+        assert_eq!(ring_override(Some(""), Some("2")), Some("2"));
+        assert_eq!(ring_override(None, Some("3")), Some("3"));
+        assert_eq!(ring_override(None, None), None);
+    }
+
+    // LINEAR encode-src is AMD's fix; NVIDIA encodes nothing from a LINEAR image (#1083).
+    #[test]
+    fn linear_encode_src_is_amd_only() {
+        assert!(linear_encode_src_for(Some(GpuVendor::Amd)));
+        assert!(!linear_encode_src_for(Some(GpuVendor::Nvidia)));
+        assert!(!linear_encode_src_for(Some(GpuVendor::Intel)));
+        assert!(!linear_encode_src_for(None));
     }
 }
