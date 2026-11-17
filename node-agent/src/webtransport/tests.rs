@@ -2869,7 +2869,11 @@ async fn a_pyrowave_client_that_offers_xor_is_sent_no_repair_whatever_it_loses()
     assert_eq!(w.wt_fec_kbps, Some(0.0));
     // ...and the frames that got no repair are still video sent in the window: the share's
     // denominator is all the video, not only the frames that were repaired.
-    assert!(metrics.fec_video_total() > 1000, "{}", metrics.fec_video_total());
+    assert!(
+        metrics.fec_video_total() > 1000,
+        "{}",
+        metrics.fec_video_total()
+    );
 }
 
 #[tokio::test]
