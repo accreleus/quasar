@@ -33,6 +33,7 @@ own; the two do not move together, and that is deliberate.
 ### Changed
 - **Two launch-helper tests no longer read a dropped connection as a lost one (#1110).** They waited for the helper's replacement connection only once and failed on a loaded machine when that connection was not there yet; they now wait for it the way the helper's own loop does, and still fail at the deadline if it never comes.
 - **A game is no longer offered 960x540 and 640x360 as screen modes (#1418).** The two sizes exist so a slow link can step the stream down, and they were also advertised to the app as display modes on every 16:9 session, so a game that starts at the smallest mode it is offered starts at 360p. The stream still steps down to them; the smallest mode a 16:9 game now sees is 1280x720 (or the size the session launched at, if that is smaller).
+- **The e2e compare test now pins the decode-support read (#1410).** A client that reports a codec named like something every object has (`constructor`) is read as absent on the other side, never as an inherited value; the test fails if the guard is removed.
 
 ### Fixed
 - **A host whose agent is gone can be forgotten from the console, whatever its status reads (#634).** After a control-plane restart a host whose agent never came back stays `draining`, and the Hosts tab only offered the delete for `offline`; it now offers it once the host's heartbeats have stopped. The dialog says the host's GPU records and session history are deleted and that each managed home claim then needs releasing by hand in Storage.
