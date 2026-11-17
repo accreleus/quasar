@@ -561,6 +561,8 @@ mk_dry_clean() { # mk_dry_clean <label> <target> <VAR=value>...
   out="$(cd "$ROOT" && make -n "$target" "$@" 2>&1)"; rc=$?
   if printf '%s' "$out" | grep -qF 'PAYLOAD-MARKER'; then
     fail "knob:dryrun-$label" "the payload reached the recipe make would run: $(printf '%s' "$out" | tr '\n' '|')"
+  elif [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF 'is refused'; then
+    pass "knob:dryrun-$label" "make refused the value before any recipe"
   elif [ "$rc" -ne 0 ]; then
     fail "knob:dryrun-$label" "make -n $target failed (rc=$rc): $(printf '%s' "$out" | tail -n 2 | tr '\n' ' ')"
   else
@@ -589,6 +591,30 @@ mk_dry_clean host-admin-token  admin-token      HOST="$MK_BAD_QUOTE"
 # The repo constants are not knobs any more; `override` wins over the command line.
 mk_dry_clean web-clean         clean            WEB='x; touch /tmp/PAYLOAD-MARKER'
 mk_dry_clean makefile-list     help             MAKEFILE_LIST='Makefile; touch /tmp/PAYLOAD-MARKER'
+
+# ── a make function in a knob, on a REAL run (#1296): `make -n` cannot show it,
+# because make expands the value itself when it exports it, before any recipe. Every
+# knob in the list above must be refused with its name, and nothing may have run.
+mk_real_refused() { # mk_real_refused <KNOB> <opener> <closer>
+  local knob="$1" open="$2" close="$3" marker="$WORK/mk-real-$1" out rc
+  out="$(cd "$ROOT" && make help "$knob=${open}shell touch $marker${close}" 2>&1)"; rc=$?
+  if [ -e "$marker" ]; then
+    fail "knob:real-$knob" "make ran the command held in $knob before any recipe"
+  elif [ "$rc" -eq 0 ] || ! printf '%s' "$out" | grep -qF "$knob: a command-line value"; then
+    fail "knob:real-$knob" "not refused by name (rc=$rc): $(printf '%s' "$out" | head -n 2 | tr '\n' ' ')"
+  else
+    pass "knob:real-$knob" "a make function in $knob is refused and nothing ran"
+  fi
+}
+IFS='|' read -ra MK_REAL_KNOBS <<< "$MK_KNOBS"
+for _k in "${MK_REAL_KNOBS[@]}"; do mk_real_refused "$_k" '$(' ')'; done
+mk_real_refused DIR '${' '}'
+# An ordinary value, `$` and all, is still taken literally.
+if mk_out="$(cd "$ROOT" && make help ARGS='--price $5 --role admin' 2>&1)" && printf '%s' "$mk_out" | grep -q 'Quasar make targets'; then
+  pass "knob:real-ordinary-value" "a value with no make function still runs"
+else
+  fail "knob:real-ordinary-value" "an ordinary knob value was refused: $(printf '%s' "$mk_out" | head -n 2 | tr '\n' ' ')"
+fi
 
 # ── per-knob: hostile refused, legitimate still works ────────────────────────
 # dx_env_argv is the receiving end for the two LIST knobs (ARGS, SID). It splits
@@ -1485,6 +1511,30 @@ if [ -f "$QSES" ]; then
   fi
 else
   warn "bench:qses-peer-unlock-fps-parses" "the quasar-session skill's qses is not in this checkout (operator-local) — SKIPPED"
+fi
+
+# #1407: bench_submit.py refuses a run directory whose conditions.json / caps / verdict carry a
+# value the bench must not be sent, and a suite or scenario name that is not a plain identifier.
+submit_trust="$(python3 "$TESTS_DIR/check_submit_inputs.py" "$FIXTURES/bench-run" 2>&1 | tail -n 1)"
+if [ "$submit_trust" = OK ]; then
+  pass "bench:submit-trust-boundary" "bad conditions, caps, verdict and names are refused; the fixture still passes"
+else
+  fail "bench:submit-trust-boundary" "$submit_trust"
+fi
+
+# #1407: the app is part of the scenario name (bench_run default, bench_suite per cell), so two
+# apps on one profile do not share a scenario; characters outside [A-Za-z0-9._-] become `_`.
+app_scn_run="$(env -u HOST bash "$DX/bench_run.sh" --profile 1080p60-h264 --app 'my app' --dry-run 2>&1 || true)"
+app_scn_suite="$(env -u HOST bash "$DX/bench_suite.sh" --profiles 720p60-h264 --abr-modes smooth \
+                   --ladder off --netem none --iterations 1 --app 'my app' --dry-run 2>&1 || true)"
+noapp_scn_suite="$(env -u HOST bash "$DX/bench_suite.sh" --profiles 720p60-h264 --abr-modes smooth \
+                   --ladder off --netem none --iterations 1 --dry-run 2>&1 || true)"
+if printf '%s' "$app_scn_run" | grep -q 'scenario  1080p60-h264-clean-my_app$' \
+   && printf '%s' "$app_scn_suite" | grep -q 'scenario 720p60-h264-abr-smooth-ladder-off-netem-none-my_app$' \
+   && printf '%s' "$noapp_scn_suite" | grep -q 'scenario 720p60-h264-abr-smooth-ladder-off-netem-none$'; then
+  pass "bench:scenario-name-has-app" "bench_run and bench_suite names carry the app; no app, no suffix"
+else
+  fail "bench:scenario-name-has-app" "$(printf '%s\n%s' "$app_scn_run" "$app_scn_suite" | grep 'scenario' | tr '\n' ' ')"
 fi
 
 # bench_app_samples.py: frames.jsonl -> `app` samples, events.jsonl -> app.event,
@@ -3770,12 +3820,15 @@ if command -v node >/dev/null 2>&1; then
   rc_of 0 "e2e:post" -- node --test "$ROOT/scripts/validate/stream/post.test.mjs"
   # The client pack (#1280): its archive unpacked alone into an empty directory, its entry run against an in-process stack.
   rc_of 0 "e2e:pack" -- node --test "$ROOT/scripts/validate/stream/pack.test.mjs"
+  # The journeys runner grants local network access to its contexts, as the e2e runner does (#1456).
+  rc_of 0 "validate:local-network" -- node --test "$ROOT/scripts/validate/lib/localNetwork.test.mjs"
 else
   warn "e2e:bundle-format" "node not installed — SKIPPED"
   warn "e2e:web-dist" "node not installed — SKIPPED"
   warn "e2e:collect" "node not installed — SKIPPED"
   warn "e2e:post" "node not installed — SKIPPED"
   warn "e2e:pack" "node not installed — SKIPPED"
+  warn "validate:local-network" "node not installed — SKIPPED"
 fi
 
 # The review an agent reads first (#1275): golden bytes, the same bytes twice, a

@@ -72,10 +72,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          sparse-checkout: scripts/verify
+          sparse-checkout: |
+            scripts/verify
+            .github/workflows
           persist-credentials: false
       - name: Table test the area map
         run: bash scripts/verify/test-ci-changed-areas.sh
+      - name: Every checkout drops its token
+        run: bash scripts/verify/test-workflow-checkout.sh
       - name: Decide
         id: areas
         env:
@@ -141,6 +145,7 @@ jobs:
         # TestOpenAPIDrift and TestMetricsManifestDrift read protocol/openapi.yaml,
         # which is a submodule. Without this they fail on a missing file, not on drift.
         with:
+          persist-credentials: false
           submodules: true
       # go-version (not go-version-file): pin the same Go the project builds
       # with, explicitly — a mismatched gofmt formats differently and produces
@@ -236,6 +241,8 @@ jobs:
         working-directory: web
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
@@ -265,6 +272,8 @@ jobs:
         working-directory: web
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
@@ -358,6 +367,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: true
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -387,6 +397,8 @@ jobs:
         working-directory: node-agent
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # The .deb set is cached on the package list and the runner image, so a runner upgrade
       # never installs debs the new image's mirror pins have moved past. Only a push to
       # develop saves it (a pull request's save is visible to that pull request alone, and
@@ -464,6 +476,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # The suite links the agent crate, which needs the same headers as the rust job.
       - name: Runner image
         id: image

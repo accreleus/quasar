@@ -47,6 +47,25 @@ impl Transport for FakeTransport {
     }
 }
 
+/// Whether every pair of access units from the third on rises strictly, allowing the
+/// second unit to carry no PTS or the keyframe's own PTS. openh264 repeats the keyframe's
+/// PTS on the second unit in some runs (#1520), so the first pair is not a rise to hold
+/// the encoder to; the strict check starts at the third unit.
+fn pts_rises_after_the_second_unit(units: &[(Option<gst::ClockTime>, bool)]) -> bool {
+    let pts: Vec<Option<gst::ClockTime>> = units.iter().map(|u| u.0).collect();
+    if pts.len() < 3 || pts[0].is_none() {
+        return false;
+    }
+    if let Some(second) = pts[1] {
+        if second != pts[0].unwrap() {
+            return false;
+        }
+    }
+    pts[2..].iter().all(|p| p.is_some())
+        && pts[2..].windows(2).all(|w| w[0] < w[1])
+        && (pts[1].is_none() || pts[1].unwrap() < pts[2].unwrap())
+}
+
 fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !done() {
@@ -131,13 +150,12 @@ fn a_second_transport_takes_access_units_without_rtp_or_webrtc() {
         assert!(units[0].1, "the first access unit is a keyframe");
         assert!(units[1..].iter().any(|u| !u.1), "later units are deltas");
         assert!(units[0].0.is_some(), "the keyframe has a PTS");
-        // openh264's second unit carries none; the rest do.
-        let pts: Vec<_> = units.iter().filter_map(|u| u.0).collect();
+        // openh264's second unit carries none, or repeats the keyframe's PTS (#1520);
+        // from the third unit on every pair rises.
         assert!(
-            pts.len() + 1 >= units.len(),
-            "units without a PTS: {units:?}"
+            pts_rises_after_the_second_unit(&units),
+            "PTS rises after the second unit: {units:?}"
         );
-        assert!(pts.windows(2).all(|w| w[0] < w[1]), "PTS rises: {pts:?}");
     }
 
     // The keyframe request is the encoder's, whatever the transport.
@@ -151,4 +169,36 @@ fn a_second_transport_takes_access_units_without_rtp_or_webrtc() {
     assert!(transport.released.load(Ordering::SeqCst));
     let _ = pipeline.set_state(gst::State::Null);
     let _ = source.set_state(gst::State::Null);
+}
+
+/// The exact sequence #1520 failed on: the keyframe's PTS, the same PTS again on the
+/// second unit, then a rise. The predicate accepts it; a strict first pair would not.
+#[test]
+fn the_second_unit_may_repeat_the_keyframes_pts() {
+    let keyframe = gst::ClockTime::from_mseconds(1);
+    let later = gst::ClockTime::from_mseconds(35);
+    // The second unit repeats the keyframe's PTS: the sequence from the issue.
+    assert!(pts_rises_after_the_second_unit(&[
+        (Some(keyframe), true),
+        (Some(keyframe), false),
+        (Some(later), false),
+    ]));
+    // A missing PTS on the second unit stays accepted.
+    assert!(pts_rises_after_the_second_unit(&[
+        (Some(keyframe), true),
+        (None, false),
+        (Some(later), false),
+    ]));
+    // The third unit's PTS must still rise over the keyframe it repeated.
+    assert!(!pts_rises_after_the_second_unit(&[
+        (Some(keyframe), true),
+        (Some(keyframe), false),
+        (Some(keyframe), false),
+    ]));
+    // A second PTS that neither repeats the keyframe nor is absent is still refused.
+    assert!(!pts_rises_after_the_second_unit(&[
+        (Some(keyframe), true),
+        (Some(gst::ClockTime::from_mseconds(2)), false),
+        (Some(later), false),
+    ]));
 }
