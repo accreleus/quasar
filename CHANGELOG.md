@@ -33,6 +33,7 @@ own; the two do not move together, and that is deliberate.
 ### Changed
 - **Two launch-helper tests no longer read a dropped connection as a lost one (#1110).** They waited for the helper's replacement connection only once and failed on a loaded machine when that connection was not there yet; they now wait for it the way the helper's own loop does, and still fail at the deadline if it never comes.
 - **A game is no longer offered 960x540 and 640x360 as screen modes (#1418).** The two sizes exist so a slow link can step the stream down, and they were also advertised to the app as display modes on every 16:9 session, so a game that starts at the smallest mode it is offered starts at 360p. The stream still steps down to them; the smallest mode a 16:9 game now sees is 1280x720 (or the size the session launched at, if that is smaller).
+- **A test now fails if the release-webhook host check is left unwired (#156).** The save-time refusal reaches the settings route through one line at startup, and deleting that line used to leave every test green; no change for operators.
 
 ### Fixed
 - **A release webhook outside `QUASAR_PLATFORM_WEBHOOK_HOSTS` is refused when you save it (#156).** Saving a URL whose host the control plane's own allowlist excludes used to succeed and only fail at Send test or the next weekly check. The settings save now answers `400 validation_failed` and says why; delivery is unchanged.
