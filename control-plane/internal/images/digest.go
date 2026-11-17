@@ -429,7 +429,10 @@ func (r *RegistryResolver) fetchToken(ctx context.Context, realm, service, scope
 		return "", fmt.Errorf("fetch registry token: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+	// Only a refusal means "denied" (GHCR answers a missing package this way). A 429, 408 or 400
+	// is a failed lookup, never "not published": the preview check must fail, not stay green.
+	switch resp.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
 		return "", fmt.Errorf("fetch registry token: status %d: %w", resp.StatusCode, ErrRegistryDenied)
 	}
 	if resp.StatusCode != http.StatusOK {

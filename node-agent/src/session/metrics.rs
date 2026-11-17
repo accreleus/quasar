@@ -206,6 +206,11 @@ pub struct MetricsWindow {
     /// it off the launch floor. Without it, a setpoint pinned at the floor is
     /// indistinguishable from a chosen one.
     pub abr_floor_kbps: Option<f64>,
+    /// Amendment 79: the governor's unclamped link rate (kbit/s) — what the reports say
+    /// the link carries, before the floor clamps it into the setpoint. Present only while
+    /// the per-report loop runs (a WebTransport session in `smooth`); absent means "not
+    /// measured", never zero.
+    pub abr_link_rate_kbps: Option<f64>,
     /// SPT-02: the active ABR mode. Always present, so the bundle reads it rather than
     /// deriving it from setpoint presence (wrong for `off`: rtpgccbwe stays attached, so
     /// setpoints can appear).
@@ -266,6 +271,13 @@ pub struct SessionMetrics {
     /// Amendment 5 (abr-ladder): the governor's floor in kbit/s once the ladder has moved
     /// it off the launch floor, else 0 (⇒ the drain reports `None`).
     abr_floor_kbps: AtomicU64,
+    /// Amendment 79: the governor's unclamped link rate in kbit/s, published once per
+    /// receiver report, with the id of the ABR loop that wrote it (`(0, 0.0)` ⇒ none).
+    /// The rate belongs to that loop: the drain reports it only while that loop still owns
+    /// the encoder, so a report in flight when another transport took over cannot leave a
+    /// stale rate behind, whatever the interleaving. A cell (owner and rate change together
+    /// or not at all), held for the one store or load, never across an owner check.
+    abr_link_rate: Mutex<(u64, f64)>,
     /// SPT-01: the raw rtpgccbwe estimate in kbit/s as `f64::to_bits` (0.0 ⇒ never
     /// received), stored on `notify::estimated-bitrate` before the governor sees it.
     gcc_estimate_kbps_bits: AtomicU64,
@@ -447,6 +459,7 @@ impl SessionMetrics {
             start: now,
             abr_setpoint_kbps: AtomicU64::new(0),
             abr_floor_kbps: AtomicU64::new(0),
+            abr_link_rate: Mutex::new((0, 0.0)),
             gcc_estimate_kbps_bits: AtomicU64::new(0),
             abr_mode,
             display: LiveEcho::default(),
@@ -798,6 +811,18 @@ impl SessionMetrics {
     /// `abr_floor_kbps` without needing to know the launch value.
     pub fn set_abr_floor(&self, kbps: u32) {
         self.abr_floor_kbps.store(kbps as u64, Ordering::Relaxed);
+    }
+
+    /// Amendment 79: publish the unclamped link rate (kbit/s) of ABR loop `owner`, from
+    /// its per-report loop. Never called on a WebRTC session, so the drain omits the key
+    /// there; the drain also omits it once `owner` no longer owns the encoder.
+    pub fn set_abr_link_rate(&self, owner: u64, kbps: f64) {
+        *self.abr_link_rate.lock().unwrap() = (owner, kbps);
+    }
+
+    /// Forget the published link rate: the encoder went back to its launch point.
+    pub fn clear_abr_link_rate(&self) {
+        *self.abr_link_rate.lock().unwrap() = (0, 0.0);
     }
 
     /// SPT-01: publish the raw `rtpgccbwe` estimate (kbit/s) BEFORE the governor acts
@@ -1179,6 +1204,13 @@ impl SessionMetrics {
             v => Some(v as f64),
         };
 
+        // Amendment 79: only the rate of the loop that owns the encoder now; another's
+        // (displaced, or none ran) reads as absent.
+        let abr_link_rate_kbps = {
+            let (owner, v) = *self.abr_link_rate.lock().unwrap();
+            (owner != 0 && owner == self.abr_owner() && v > 0.0).then_some(v)
+        };
+
         // 0.0 bits ⇒ never received ⇒ None.
         let gcc_estimate_kbps = {
             let bits = self.gcc_estimate_kbps_bits.load(Ordering::Relaxed);
@@ -1267,6 +1299,7 @@ impl SessionMetrics {
             frames_dropped,
             abr_setpoint_kbps,
             abr_floor_kbps,
+            abr_link_rate_kbps,
             render_width: echo.render_width.reported(),
             render_height: echo.render_height.reported(),
             ui_scale: echo.ui_scale.reported(),
