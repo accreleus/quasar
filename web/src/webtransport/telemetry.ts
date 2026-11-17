@@ -73,6 +73,10 @@ export class WtTelemetry {
   private bytesTotal = 0;
   private lastTickMs: number;
   private keyframeRequests = 0;
+  /** Amendment 85: fragments FEC rebuilt, for the page view (cumulative across reconnects). */
+  private fecRepaired = 0;
+  /** Amendment 85: the live connection's `hello_ack.fec` named a scheme. */
+  private fecOn = false;
   private readonly counters: PostedCounters;
   private lostAtTick: number;
   /** The last window's median interval: what a thin window's freezes are judged against. */
@@ -157,6 +161,19 @@ export class WtTelemetry {
    *  count into additions. */
   addLost(fragments: number): void {
     if (fragments > 0) this.counters.packetsLost += fragments;
+  }
+
+  /** Amendment 85: whether the live connection's `hello_ack.fec` named a scheme. The FEC
+   *  keys are posted only while it does, so absence means "no FEC", never zero. */
+  setFec(on: boolean): void {
+    this.fecOn = on;
+  }
+
+  /** More video fragments rebuilt from FEC repair datagrams (amendment 85). Cumulative for
+   *  the page view, accumulated like `packets_lost`: the caller turns each connection's own
+   *  count into additions, so a reconnect never resets it. */
+  addRepaired(fragments: number): void {
+    if (fragments > 0) this.fecRepaired += fragments;
   }
 
   /** A unit handed to the decoder, keyed by its capture time (the frame's timestamp). */
@@ -317,6 +334,8 @@ export class WtTelemetry {
     put("wt_audio_buffer_ms", this.audioBufferMs);
     put("wt_audio_target_ms", this.audioTargetMs);
     put("wt_audio_underruns", this.counters.audioUnderruns);
+    // Amendment 85: only while this connection is sent repairs (0 until the first rebuild).
+    put("wt_fec_repaired", this.fecOn ? this.fecRepaired : null);
     // A thin window has no σ: "smooth" there is unmeasured, and posting it would record a pass.
     // Bench mode never posts a class: its readback costs presentations (see the WebRTC twin).
     const unmeasured = health.health === "smooth" && cadence.n < PRESENT_MIN_SAMPLES;
