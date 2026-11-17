@@ -77,6 +77,30 @@ func TestPatchReleaseWebhookValidationFailures(t *testing.T) {
 	}
 }
 
+// QUASAR_PLATFORM_WEBHOOK_HOSTS is checked when the URL is saved (#156), not
+// only when a delivery is attempted.
+func TestPatchReleaseWebhookRefusesAHostOutsideTheNarrowing(t *testing.T) {
+	pool := testDB(t)
+	patch, get := newSettingsHarnessWith(t, pool, func(h *Handler) {
+		h.WebhookHostAllowed = func(host string) bool { return host == "hooks.example.com" }
+	})
+
+	code, _ := patch(t, `{"release_webhook_url":"https://other.example.net/a","release_webhook_enabled":true}`)
+	if code != 400 {
+		t.Fatalf("a host outside the narrowing: status = %d, want 400 validation_failed", code)
+	}
+	if st := get(t).Settings; st.ReleaseWebhookURL != "" || st.ReleaseWebhookEnabled {
+		t.Fatalf("a rejected PATCH still wrote: %+v", st)
+	}
+	if code, _ = patch(t, `{"release_webhook_url":"https://HOOKS.example.com/a"}`); code != 200 {
+		t.Fatalf("a host inside the narrowing (any case): status = %d, want 200", code)
+	}
+	// Clearing is never a host question.
+	if code, _ = patch(t, `{"release_webhook_url":""}`); code != 200 {
+		t.Fatalf("clearing the URL: status = %d, want 200", code)
+	}
+}
+
 func TestReleaseWebhookKeysAreAudited(t *testing.T) {
 	enabled, url := true, "https://hooks.example.com/a"
 	p := Patch{ReleaseWebhookEnabled: &enabled, ReleaseWebhookURL: &url}
