@@ -211,6 +211,9 @@ STAMP="$(dx_timestamp)"
 [ -n "$STATE" ] || STATE="$OUT/state.tsv"
 
 # ── the cell plan ────────────────────────────────────────────────────────────
+# The bench scenario of a cell. The app is part of the name: two apps on one profile, arm and
+# netem level are different scenarios, not one (#1407).
+cell_scenario() { printf '%s' "$1-abr-$2-ladder-$3-netem-$4${APP:+-${APP//[^A-Za-z0-9._-]/_}}"; }
 CELLS=()
 for p in "${PROFILE_LIST[@]}"; do
   for a in "${ABR_LIST[@]}"; do
@@ -232,7 +235,10 @@ dx_info "suite=$SUITE app=${APP:-<host bench_app>} secs=$SECS host=$DX_HOST peer
 # to die with "CELLS[@]: unbound variable" and no RESULT line at all instead of
 # the intended refusal.
 [ "${#CELLS[@]}" -gt 0 ] || dx_guard "$TARGET" "--only '$ONLY' matched no cell"
-for c in "${CELLS[@]}"; do dx_info "  cell ${c%%|*}"; done
+for c in "${CELLS[@]}"; do
+  IFS='|' read -r _id _p _a _l _n _i <<<"$c"
+  dx_info "  cell $_id  scenario $(cell_scenario "$_p" "$_a" "$_l" "$_n")"
+done
 
 if [ "$DRY" = 1 ]; then
   dx_pass plan "printed above; no session launched, no host setting changed, nothing posted"
@@ -465,7 +471,7 @@ for c in "${CELLS[@]}"; do
     continue
   fi
 
-  SCEN="$prof-abr-$abr-ladder-$lad-netem-$net"
+  SCEN="$(cell_scenario "$prof" "$abr" "$lad" "$net")"
   case "$abr" in off) ABR_ENABLED=off ;; *) ABR_ENABLED=on ;; esac
   RUN_ARGS=(--profile "$prof" --secs "$SECS" --suite "$SUITE"
             --scenario "$SCEN"
