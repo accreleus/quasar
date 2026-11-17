@@ -96,6 +96,7 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
 import urllib.request
 
 DX_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -245,6 +246,82 @@ def read_json(path: str):
         return None
 
 
+# ── trust boundary: scenario files are read, never believed (#1407) ─────────
+# conditions.json, caps-negotiated.json and verdict.json come from a run directory (a
+# harness run, or one copied from elsewhere) and go to the bench server verbatim. They are
+# checked once, where they are read, and REFUSED when wrong — never cleaned up, because a
+# cleaned-up value is a different claim than the one the run made.
+
+class UntrustedInput(Exception):
+    """A run-directory file carries a value the bench must not be sent."""
+
+
+_KEY_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_.:+/@=-]{1,128}")
+_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:/=+-]{0,199}")  # no leading `-`; `/` and `=` are real (stream-hold/transport=webrtc/..)
+_BAD_CATEGORIES = {"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"}  # control, format (bidi), line/para sep
+_TEXT_MAX = 512
+_TREE_DEPTH, _TREE_ITEMS = 4, 256  # conditions.effective is ~42 keys and grows with every setting
+
+
+def check_text(v, what: str):
+    """Free text: a str of bounded length with no control, format or separator characters."""
+    if not isinstance(v, str) or len(v) > _TEXT_MAX:
+        raise UntrustedInput("%s: want a string of at most %d characters" % (what, _TEXT_MAX))
+    if any(unicodedata.category(c) in _BAD_CATEGORIES for c in v):
+        raise UntrustedInput("%s: control, format or line-separator characters are not allowed" % what)
+    return v
+
+
+def check_token(v, what: str):
+    """An identifier-shaped value (codec, encoder factory, verdict)."""
+    if not isinstance(v, str) or not _TOKEN_RE.fullmatch(v):
+        raise UntrustedInput("%s: want 1-128 characters of [A-Za-z0-9_.:+/@=-]" % what)
+    return v
+
+
+def check_name(v: str, what: str) -> str:
+    """A suite or scenario name: it becomes a path-like identifier, so it cannot start with `-`."""
+    if not isinstance(v, str) or not _NAME_RE.fullmatch(v):
+        raise UntrustedInput("%s %r: want 1-200 characters of [A-Za-z0-9_.:/=+-], starting with a letter, digit or '_'" % (what, v))
+    return v
+
+
+def check_tree(v, what: str, depth: int = 0):
+    """JSON of scalars, bounded dicts and lists; keys identifier-shaped, strings free text."""
+    if v is None or isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        if isinstance(v, float) and v != v or v in (float("inf"), float("-inf")):
+            raise UntrustedInput("%s: not a finite number" % what)
+        return v
+    if isinstance(v, str):
+        return check_text(v, what)
+    if depth >= _TREE_DEPTH or not isinstance(v, (dict, list)) or len(v) > _TREE_ITEMS:
+        raise UntrustedInput("%s: too deep, too large or not JSON data" % what)
+    if isinstance(v, list):
+        for i, x in enumerate(v):
+            check_tree(x, "%s[%d]" % (what, i), depth + 1)
+        return v
+    for k, x in v.items():
+        if not isinstance(k, str) or not _KEY_RE.fullmatch(k):
+            raise UntrustedInput("%s: key %r is not 1-64 characters of [A-Za-z0-9_.:-]" % (what, k))
+        check_tree(x, "%s.%s" % (what, k), depth + 1)
+    return v
+
+
+def read_verdict(rundir: str):
+    """(verdict, evidence) from verdict.json, validated; (None, []) when absent."""
+    d = read_json(os.path.join(rundir, "verdict.json"))
+    if not isinstance(d, dict) or not d.get("verdict"):
+        return None, []
+    ev = d.get("evidence") or []
+    if not isinstance(ev, list) or len(ev) > 16:
+        raise UntrustedInput("verdict.json evidence: want a list of at most 16 strings")
+    return check_token(d["verdict"], "verdict.json verdict"), \
+        [check_text(x, "verdict.json evidence") for x in ev]
+
+
 def read_jsonl(path: str) -> list:
     rows = []
     if not os.path.exists(path):
@@ -286,7 +363,12 @@ def read_caps_negotiated(rundir: str) -> dict | None:
     # is what the encode branch was doing when the run ended.
     last = items[-1]
     payload = last.get("payload") if isinstance(last, dict) else None
-    return payload if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    for k in ("codec", "profile", "encoder_factory"):
+        if payload.get(k):
+            check_token(payload[k], "caps-negotiated.json " + k)
+    return payload
 
 
 def _pct(values: list, q: float) -> float:
@@ -521,7 +603,7 @@ def build_conditions(rundir: str, session: dict, marks: list, tags: dict,
         cond = read_json(os.path.join(rundir, "conditions.json")) or {}
     if not isinstance(cond, dict):
         cond = {}
-    cond = dict(cond)
+    cond = dict(check_tree(cond, "conditions.json"))
 
     launch = session.get("launch") or []
     negotiated = {}
@@ -563,7 +645,7 @@ def build_conditions(rundir: str, session: dict, marks: list, tags: dict,
             cond["effective"].setdefault("codec_pin", caps["codec"])
 
     if negotiated:
-        cond.setdefault("negotiated", negotiated)
+        cond.setdefault("negotiated", check_tree(negotiated, "negotiated (session.json)"))
 
     cond.setdefault("netem", netem_conditions(marks))
     cond.setdefault("git", {k: v for k, v in (
@@ -577,9 +659,9 @@ def build_conditions(rundir: str, session: dict, marks: list, tags: dict,
     # Posted as a CONDITION (what the host actually did), not a tag (what was
     # asked for) — absent on an older control plane with no /verdict route, or
     # a session with too little data to classify yet; either way, optional.
-    verdict_doc = read_json(os.path.join(rundir, "verdict.json"))
-    if isinstance(verdict_doc, dict) and verdict_doc.get("verdict"):
-        cond.setdefault("verdict", str(verdict_doc["verdict"]))
+    verdict, _ = read_verdict(rundir)
+    if verdict:
+        cond.setdefault("verdict", verdict)
     return cond
 
 
@@ -815,12 +897,7 @@ def build_payload(rundir: str, root: str, args) -> dict:
     # Session verdict (C11 #2), read back for the validity decision in main().
     # build_conditions already folded the same file into conditions["verdict"];
     # this is a second, cheap read rather than a threaded-through return value.
-    verdict_doc = read_json(os.path.join(rundir, "verdict.json"))
-    session_verdict = None
-    session_verdict_evidence: list = []
-    if isinstance(verdict_doc, dict) and verdict_doc.get("verdict"):
-        session_verdict = str(verdict_doc["verdict"])
-        session_verdict_evidence = verdict_doc.get("evidence") or []
+    session_verdict, session_verdict_evidence = read_verdict(rundir)
 
     verdict = args.verdict or summary.get("overall")
     if verdict not in ("PASS", "FAIL", "INFO"):
@@ -1075,7 +1152,12 @@ def main(argv=None) -> int:
         die("no such run directory: %s" % rundir, 2)
 
     root = os.path.abspath(os.path.join(DX_DIR, "..", ".."))
-    plan = build_payload(rundir, root, args)
+    try:
+        check_name(args.suite, "--suite")
+        check_name(args.scenario, "--scenario")
+        plan = build_payload(rundir, root, args)
+    except UntrustedInput as exc:
+        die("refusing to submit: %s" % exc, 2)
 
     print("     dir       %s" % rundir)
     print("     suite     %s" % args.suite)

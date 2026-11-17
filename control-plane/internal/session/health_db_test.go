@@ -48,7 +48,7 @@ func TestEvaluateHealthFailStampsUnsustainableDetail(t *testing.T) {
 	coord.health.mu.Lock()
 	coord.health.healthRuns[sess.ID] = belowFloorRun{since: time.Now().Add(-5 * time.Minute), floorKbps: 4000}
 	coord.health.mu.Unlock()
-	coord.health.evaluateHealth(ctx, sess.ID, 3000, nil) // below the 4000 kbps floor
+	coord.health.evaluateHealth(ctx, sess.ID, healthSignal{kbps: 3000}, nil) // below the 4000 kbps floor
 
 	got, err := store.Get(ctx, sess.ID)
 	if err != nil {
@@ -117,7 +117,7 @@ func TestEvaluateHealthJudgesTheCurrentRungFloor(t *testing.T) {
 
 	// 360p above its own floor after 10 min under the 4000 kbps launch floor: healthy.
 	healthy := running(launch)
-	coord.health.evaluateHealth(ctx, healthy, 1468, &floor360)
+	coord.health.evaluateHealth(ctx, healthy, healthSignal{kbps: 1468}, &floor360)
 	if got := state(healthy); got.State != StateRunning || got.HealthState != HealthHealthy {
 		t.Fatalf("360p above its floor: got state %s health %q, want running/healthy", got.State, got.HealthState)
 	}
@@ -128,7 +128,7 @@ func TestEvaluateHealthJudgesTheCurrentRungFloor(t *testing.T) {
 	// A step to 360p, landing at its floor: the run opened against 4000 ends and the
 	// clock starts again against 577.
 	stepped := running(launch)
-	coord.health.evaluateHealth(ctx, stepped, floor360, &floor360)
+	coord.health.evaluateHealth(ctx, stepped, healthSignal{kbps: floor360}, &floor360)
 	if got := state(stepped); got.State != StateRunning {
 		t.Fatalf("a run opened against the launch floor carried across the step: got state %s", got.State)
 	}
@@ -142,7 +142,7 @@ func TestEvaluateHealthJudgesTheCurrentRungFloor(t *testing.T) {
 	// At or under the lowest rung's floor for over 3 min against that same floor: failed,
 	// and the detail names the setpoint and the floor.
 	pinned := running(belowFloorRun{since: time.Now().Add(-5 * time.Minute), floorKbps: 577})
-	coord.health.evaluateHealth(ctx, pinned, floor360, &floor360)
+	coord.health.evaluateHealth(ctx, pinned, healthSignal{kbps: floor360}, &floor360)
 	got := state(pinned)
 	if got.State != StateFailed || got.HealthState != HealthUnsustainable {
 		t.Fatalf("pinned at the lowest rung floor: got state %s health %q, want failed/unsustainable", got.State, got.HealthState)
@@ -154,7 +154,7 @@ func TestEvaluateHealthJudgesTheCurrentRungFloor(t *testing.T) {
 	// An out-of-range reported floor falls back to the launch rung's.
 	huge := 1e12
 	wild := running(belowFloorRun{since: time.Now().Add(-5 * time.Minute), floorKbps: 4000})
-	coord.health.evaluateHealth(ctx, wild, 3000, &huge)
+	coord.health.evaluateHealth(ctx, wild, healthSignal{kbps: 3000}, &huge)
 	if got := state(wild); got.State != StateFailed {
 		t.Fatalf("out-of-range floor: got state %s, want failed against the 4000 launch floor", got.State)
 	}
@@ -234,7 +234,7 @@ func TestEvaluateHealthYieldsToClientState(t *testing.T) {
 	}
 
 	// (1) A healthy (above-floor) agent sample must NOT clobber the client_* state.
-	coord.health.evaluateHealth(ctx, sess.ID, 5000, nil) // above the 4000 kbps floor
+	coord.health.evaluateHealth(ctx, sess.ID, healthSignal{kbps: 5000}, nil) // above the 4000 kbps floor
 	got, err := store.Get(ctx, sess.ID)
 	if err != nil {
 		t.Fatalf("get after healthy sample: %v", err)
@@ -249,7 +249,7 @@ func TestEvaluateHealthYieldsToClientState(t *testing.T) {
 	coord.health.mu.Lock()
 	coord.health.healthRuns[sess.ID] = belowFloorRun{since: time.Now().Add(-5 * time.Minute), floorKbps: 4000}
 	coord.health.mu.Unlock()
-	coord.health.evaluateHealth(ctx, sess.ID, 3000, nil) // below the 4000 kbps floor
+	coord.health.evaluateHealth(ctx, sess.ID, healthSignal{kbps: 3000}, nil) // below the 4000 kbps floor
 
 	got, err = store.Get(ctx, sess.ID)
 	if err != nil {
@@ -408,5 +408,73 @@ func TestHealthMapLeak_AgentStateTerminalForgets(t *testing.T) {
 	}
 	if inHR, inCR := healthMapsContain(coord, sess.ID); inHR || inCR {
 		t.Fatalf("leak: session %s still tracked after agent-reported stop: healthRuns=%v clientRuns=%v", sess.ID, inHR, inCR)
+	}
+}
+
+// Amendment 79 (#1434): the ingest hands the sample's abr_link_rate_kbps to the evaluator,
+// which judges it instead of the setpoint. A session pinned at the lowest rung's floor (577
+// kbps) for 5 minutes is NOT ended while the link carries more than the floor, and one whose
+// link carries the floor or less is. Judging the setpoint (both samples carry 577) would fail
+// the first — the exact bug the amendment closes.
+func TestAgentMetricsJudgesTheReportedLinkRate(t *testing.T) {
+	pool := testDB(t)
+	store, coord, _ := newCoord(t, pool)
+	s := seed(t, pool, 4)
+	ctx := context.Background()
+
+	running := func() string {
+		sess, err := store.ScheduleAndCreate(ctx, launchParams(s))
+		if err != nil {
+			t.Fatalf("launch: %v", err)
+		}
+		if _, err := pool.Exec(ctx,
+			`UPDATE sessions SET profile_id = '1080p60', stream_profile_id = '1080p60-h264' WHERE id::text = $1`,
+			sess.ID); err != nil {
+			t.Fatalf("set profile ids: %v", err)
+		}
+		for _, st := range []State{StateStarting, StateRunning} {
+			if _, err := store.Transition(ctx, sess.ID, st, nil, nil); err != nil {
+				t.Fatalf("→ %s: %v", st, err)
+			}
+		}
+		coord.health.mu.Lock()
+		coord.health.healthRuns[sess.ID] = belowFloorRun{since: time.Now().Add(-5 * time.Minute), floorKbps: 577}
+		coord.health.mu.Unlock()
+		return sess.ID
+	}
+	sample := func(id string, linkRate float64) {
+		setpoint, floor := 577.0, 577.0
+		coord.AgentMetrics(ctx, s.hostID, agentws.SessionMetricsMsg{
+			Type: "session_metrics", SessionID: id, TsUnixMs: time.Now().UnixMilli(),
+			AbrSetpointKbps: &setpoint, AbrFloorKbps: &floor, AbrLinkRateKbps: &linkRate,
+		})
+	}
+
+	// The link carries more than the floor: the rate is above it, so the run clears and the
+	// session lives on.
+	held := running()
+	sample(held, 2400)
+	waitFor(t, func() bool {
+		if in, _ := healthMapsContain(coord, held); in {
+			return false
+		}
+		got, err := store.Get(ctx, held)
+		return err == nil && got.HealthState == HealthHealthy
+	})
+
+	// The link carries less than the floor: the rate is at or below it, so the same pinned
+	// setpoint now ends the session.
+	short := running()
+	sample(short, 400)
+	waitFor(t, func() bool {
+		got, err := store.Get(ctx, short)
+		return err == nil && got.State == StateFailed
+	})
+	got, err := store.Get(ctx, short)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.StateDetail == nil || !strings.Contains(*got.StateDetail, "link rate 400 kbps, floor 577 kbps") {
+		t.Fatalf("state_detail does not name the judged link rate and the floor: %v", got.StateDetail)
 	}
 }
