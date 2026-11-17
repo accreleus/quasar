@@ -4,8 +4,11 @@
 package images
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
+	"strings"
 	"testing"
 )
 
@@ -46,7 +49,7 @@ func directDisplay(t *testing.T, env *actionsEnv, appID string) any {
 // provider app and an operator's app on the managed preset, plus the three
 // rows the stamp must leave alone.
 type directFixture struct {
-	provider, onPreset, refused, repointed, ownImage string
+	provider, onPreset, refused, repointed, ownImage, ownImageOnPreset string
 }
 
 func seedDirectFixture(t *testing.T, env *actionsEnv) directFixture {
@@ -73,6 +76,8 @@ func seedDirectFixture(t *testing.T, env *actionsEnv) directFixture {
 		refused:   seedApp(t, env, "Operator said no", *app.PresetID, `{"gpu":true,"direct_display":false}`),
 		repointed: seedApp(t, env, "Operator preset", ownPreset, `{"gpu":true}`),
 		ownImage:  seedApp(t, env, "Own image", "", `{"image":"ghcr.io/operator/steam:own"}`),
+		// Linked to the managed preset, but it launches its own image (#583).
+		ownImageOnPreset: seedApp(t, env, "Own image on the managed preset", *app.PresetID, `{"image":"ghcr.io/operator/steam:own"}`),
 	}
 	for name, id := range map[string]string{"provider": f.provider, "on preset": f.onPreset} {
 		if got := directDisplay(t, env, id); got != nil {
@@ -93,6 +98,7 @@ func (f directFixture) assertStamped(t *testing.T, env *actionsEnv) {
 		{"an app whose operator set false", f.refused, false},
 		{"an app on the operator's own preset", f.repointed, nil},
 		{"an app on its own image", f.ownImage, nil},
+		{"an app on the managed preset that sets its own image", f.ownImageOnPreset, nil},
 	} {
 		if got := directDisplay(t, env, tt.id); got != tt.want {
 			t.Errorf("%s: direct_display = %v, want %v", tt.name, got, tt.want)
@@ -106,7 +112,7 @@ func TestUpdateStampsDirectDisplayOnAppsOfTheManagedPreset(t *testing.T) {
 
 	seedCatalogRuntime(t, env, imgVer2, imgDigest2, "steam", directSteamRuntime)
 	// The catalog is ahead of the adoption: nothing runs the declaring image yet.
-	if err := stampDirectDisplay(context.Background(), env.pool, imgID); err != nil {
+	if err := stampDirectDisplay(context.Background(), env.pool, testLog(), imgID); err != nil {
 		t.Fatalf("stampDirectDisplay: %v", err)
 	}
 	if got := directDisplay(t, env, f.provider); got != nil {
@@ -146,4 +152,25 @@ func TestReinstallStampsDirectDisplay(t *testing.T) {
 		t.Fatalf("install: %v", err)
 	}
 	f.assertStamped(t, env)
+}
+
+// #583: a state that converged without an adoption move is stamped by the sync
+// itself, once for the whole catalog, and the rewrite leaves one log line with
+// the row count. The runtime block is unchanged across the sync, so
+// reconcileRuntimeDrift stamps nothing: only the unscoped pass can.
+func TestSyncStampsDirectDisplayWithoutAnAdoptionMove(t *testing.T) {
+	env, _ := newActionsEnv(t)
+	f := seedDirectFixture(t, env)
+	seedCatalogRuntime(t, env, imgVer, imgDigest, "steam", directSteamRuntime)
+
+	var buf bytes.Buffer
+	syncStore := NewStoreWithFetcher(env.pool, fixtureFetcher{data: []byte(steamManifestAtVersion(imgVer, directSteamRuntime))})
+	syncStore.SetLogger(slog.New(slog.NewTextHandler(&buf, nil)))
+	if res, err := syncStore.Sync(context.Background()); err != nil || res.SyncError != nil {
+		t.Fatalf("sync: err=%v sync_error=%v", err, res.SyncError)
+	}
+	f.assertStamped(t, env)
+	if log := buf.String(); !strings.Contains(log, "stamped direct_display") || !strings.Contains(log, "apps=2") {
+		t.Errorf("want one log line counting the 2 stamped apps, got:\n%s", log)
+	}
 }

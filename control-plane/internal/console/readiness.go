@@ -60,6 +60,10 @@ type DefaultApp struct {
 
 const pickDirectApp = "Pick a default app from the console page's list; it offers only apps that declare direct_display in their runtime spec."
 
+// updateDirectApp is the remedy when the list may be empty: an image too old to
+// declare direct_display leaves nothing to pick (#583).
+const updateDirectApp = pickDirectApp + " If the list is empty, update the default app's image on the Images page (an image from before direct_display does not declare it), then pick the app."
+
 // DefaultAppCheck evaluates console_default_app. Pure: the store gathers facts.
 // Anything but `pass` means the control plane does not auto-start a console
 // session (no launch is attempted); this check is the explanation.
@@ -84,7 +88,7 @@ func DefaultAppCheck(defaultApp *string, facts DefaultAppFacts) ReadinessCheck {
 	case !facts.Direct:
 		c.Status = "fail"
 		c.Summary = fmt.Sprintf("The console's default app %s cannot run direct: its runtime spec does not declare direct_display, so console mode will not launch it.", facts.Name)
-		c.Remediation = pickDirectApp
+		c.Remediation = updateDirectApp
 	default:
 		c.Status = "pass"
 		c.Summary = fmt.Sprintf("%s can run direct on this host's display.", facts.Name)

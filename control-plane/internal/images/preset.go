@@ -348,7 +348,7 @@ func reconcileRuntimeDrift(ctx context.Context, tx dbExecutor, log *slog.Logger,
 			return err
 		}
 	}
-	return stampDirectDisplay(ctx, tx, imageID)
+	return stampDirectDisplay(ctx, tx, log, imageID)
 }
 
 // runtimeBlocksEqual compares semantically, not by bytes: old comes back as

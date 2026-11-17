@@ -664,6 +664,12 @@ func (s *Store) upsert(ctx context.Context, m *Manifest, prov ManifestProvenance
 		return prov, fmt.Errorf("reconcile image_catalog deletions: %w", err)
 	}
 
+	// A state that converged without an adoption move (an app linked back to the
+	// managed preset) is stamped here, once for the whole catalog (#583).
+	if err := stampDirectDisplay(ctx, tx, s.log, ""); err != nil {
+		return prov, err
+	}
+
 	// Sync state (error cleared, time stamped) and the #548 provenance are
 	// written in the SAME transaction as the catalog they describe: a separate
 	// post-commit write could fail independently and leave a successful sync

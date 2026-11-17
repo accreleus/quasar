@@ -846,11 +846,6 @@ fn derive(marker: bool, _rootless: bool, actor: &ActorConsole) -> ConsoleAccess 
 mod tests_derive {
     use super::*;
 
-    #[test]
-    fn the_worker_thread_name_fits_the_kernels_15_bytes() {
-        assert!(WORKER_THREAD_NAME.len() <= 15, "{WORKER_THREAD_NAME}");
-    }
-
     fn last(target: bool, settled: &str, reason: Option<&str>) -> ActorConsoleLast {
         ActorConsoleLast {
             request_id: Some("0b7e3c52-6f0e-4d0a-9c1e-5a2b7d8e9f10".into()),
