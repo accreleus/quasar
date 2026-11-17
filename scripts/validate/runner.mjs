@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 import { parseArgs, requireArg } from "./lib/args.mjs";
 import { attachEvidenceListeners } from "./lib/listeners.mjs";
+import { grantLocalNetwork } from "./lib/localNetwork.mjs";
 import { renderReport } from "./report.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -81,6 +82,7 @@ async function runJourney(browser, journey, args) {
       storageState: storageStateFor(journey.role, args),
       ignoreHTTPSErrors: true, // target stacks use self-signed certs
     });
+    await grantLocalNetwork(context);
     const page = await context.newPage();
     const evidence = { consoleErrors, networkFailures };
     attachEvidenceListeners(page, args["base-url"], evidence);

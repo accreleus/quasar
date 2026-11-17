@@ -321,7 +321,8 @@ if [ -z "$PEER_UNLOCK_FPS" ]; then
 fi
 
 [ -n "$SUITE" ] || { if [ -n "$NETEM" ]; then SUITE=abr-ladder; else SUITE=baseline; fi; }
-[ -n "$SCENARIO" ] || SCENARIO="$PROFILE-${NETEM:-clean}"
+# The app is part of the name: two apps on one profile and netem level are different scenarios (#1407).
+[ -n "$SCENARIO" ] || SCENARIO="$PROFILE-${NETEM:-clean}${APP:+-${APP//[^A-Za-z0-9._-]/_}}"
 
 # --netem delegates to abr_ladder_netem.sh, which spends BASELINE(30) + dwell + RECOVERY(120)
 # on top of the level itself. Keep the peer alive for all of it.

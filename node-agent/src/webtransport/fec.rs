@@ -10,7 +10,7 @@ use super::media::{HEADER as VIDEO_HEADER, MAX_DATAGRAM};
 
 const CHANNEL_FEC: u8 = 0x04;
 const SCHEME_XOR: u8 = 0x01;
-const HEADER: usize = 14;
+pub(super) const HEADER: usize = 14;
 /// §FEC: one repair datagram protects 2 … 48 fragments.
 const MAX_COUNT: usize = 48;
 

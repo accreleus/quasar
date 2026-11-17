@@ -1137,6 +1137,19 @@ mod tests {
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
         );
+        // What PyroWave holds at once, by frame: a pts is in the set from the feed's probe,
+        // which hands the frame over, until the encoder's src probe sees it come out — the
+        // same two moments the product's own `InFlight` gate uses. Subtracting the probes'
+        // totals reads 0 under load instead: the feed's probe only counts a frame it finds
+        // another reference to, while the encoder's counts every frame, so one frame's
+        // accounting can outrun the other's (#1269). The second set holds a pts the encoder
+        // output before the feed's probe got to record it (a stalled thread), so it is never
+        // counted as held after the fact.
+        type Frames = (
+            std::collections::HashSet<gst::ClockTime>,
+            std::collections::HashSet<gst::ClockTime>,
+        );
+        let held: Arc<Mutex<Frames>> = Arc::default();
         let identity = |sleep_us: u32| {
             gst::ElementFactory::make("identity")
                 .property("sleep-time", sleep_us)
@@ -1151,20 +1164,39 @@ mod tests {
         // Added before `start_with`'s own probe on this pad, so a frame is counted out before
         // the next can be admitted.
         let e = encoded.clone();
+        let out = held.clone();
         enc.static_pad("src")
             .unwrap()
-            .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
                 e.fetch_add(1, Ordering::SeqCst);
+                if let Some(buffer) = info.buffer() {
+                    if let Some(pts) = buffer.pts() {
+                        let (held, gone) = &mut *out.lock().unwrap();
+                        if !held.remove(&pts) {
+                            gone.insert(pts);
+                        }
+                    }
+                }
                 gst::PadProbeReturn::Ok
             });
         let side = start_with(feed, download, &enc, || true, |_| {}, |_| {}).unwrap();
         // After the feed's probe: a frame it admitted is referenced by the PyroWave pipeline
         // too (a 40 ms stage is ahead of it, so it is still held here).
-        let (a, e, w) = (admitted.clone(), encoded.clone(), worst.clone());
+        let (a, h, w) = (admitted.clone(), held.clone(), worst.clone());
         queue_src.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
-            if info.buffer().is_some_and(|b| !b.is_writable()) {
-                let held =
-                    (a.fetch_add(1, Ordering::SeqCst) + 1).saturating_sub(e.load(Ordering::SeqCst));
+            let Some(buffer) = info.buffer() else {
+                return gst::PadProbeReturn::Ok;
+            };
+            if !buffer.is_writable() {
+                a.fetch_add(1, Ordering::SeqCst);
+                let pts = buffer.pts().expect("every frame of the feed has a PTS");
+                let held = {
+                    let (held, gone) = &mut *h.lock().unwrap();
+                    if !gone.remove(&pts) {
+                        held.insert(pts);
+                    }
+                    held.len()
+                };
                 w.fetch_max(held, Ordering::SeqCst);
             }
             gst::PadProbeReturn::Ok
