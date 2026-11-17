@@ -424,6 +424,37 @@ describe("HostsTab — the row menu", () => {
     await waitFor(() => expect(mocked.deleteHost).toHaveBeenCalledWith("tok", "c2059601"));
   });
 
+  // After a control-plane restart a host whose agent never comes back stays
+  // `draining` for good (#596), and the server's rule for the delete is the live
+  // connection, not the status — so this host has to be forgettable (#634).
+  it("forgets a draining host whose agent has stopped heartbeating", async () => {
+    setFleet([
+      host({ status: "draining", last_heartbeat_at: new Date(NOW - 120_000).toISOString() }),
+    ]);
+    renderTab();
+    await openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Remove host" }));
+
+    expect(screen.getByText(/permanently removes/)).toBeTruthy();
+    // The cost is stated before the delete: history, and homes that then need a release.
+    expect(screen.getByText(/its managed homes are tombstoned/)).toBeTruthy();
+    expect(screen.getByText(/needs releasing by hand in Storage/)).toBeTruthy();
+    expect(mocked.deleteHost).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove host" }));
+    await waitFor(() => expect(mocked.deleteHost).toHaveBeenCalledWith("tok", "c2059601"));
+  });
+
+  it("still explains a draining host whose agent is answering", async () => {
+    setFleet([host({ status: "draining" })]);
+    renderTab();
+    await openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Remove host" }));
+
+    expect(screen.getByText(/is still connected/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Remove host" })).toBeNull();
+  });
+
   it("keeps the remove dialog open and shows the server's message on a 409", async () => {
     setFleet([host({ status: "offline" })]);
     mocked.deleteHost.mockRejectedValue(
