@@ -395,8 +395,11 @@ while IFS="$(printf '\t')" read -r check id arg; do
       else emit PASS "$id" "no $tok in the agent's libraries"; fi ;;
     agent_no_unresolved)
       if [ ! -e "$arg" ]; then emit FAIL "$id" "agent binary missing at $arg"
+      # An ldd that cannot run or prints nothing is a FAIL, never "nothing unresolved" (#1000).
+      elif ! deps=$(ldd "$arg" 2>&1) || [ -z "$deps" ]; then
+        emit FAIL "$id" "cannot list the agent's libraries with ldd: $(printf '%s' "$deps" | head -1)"
       else
-        miss=$(ldd "$arg" 2>/dev/null | grep 'not found' || true)
+        miss=$(printf '%s\n' "$deps" | grep 'not found' || true)
         if [ -n "$miss" ]; then emit FAIL "$id" "unresolved: $(echo "$miss" | tr '\n' ' ')"
         else emit PASS "$id" "all libraries resolve"; fi
       fi ;;

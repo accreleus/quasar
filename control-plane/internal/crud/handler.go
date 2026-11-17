@@ -108,9 +108,9 @@ func (h *Handler) SetRegistry(r RegistryChecker) {
 }
 
 // SetOwnMachine gives DELETE /v1/hosts/{id} the control plane's own-machine
-// decision (platform.MachineShape.SharesMachineWith; internal/platform imports
-// this package's dependants, so it is passed in). Unset or unknown refuses nothing,
-// as Remove host does.
+// decision (platform.MachineShape.RefusesHostRemoval; internal/platform imports
+// this package's dependants, so it is passed in). Unset refuses nothing; a
+// decision that cannot tell this machine apart refuses every host.
 func (h *Handler) SetOwnMachine(sharesMachineWith func(nodeName string) bool) {
 	h.store.sharesOwnMachine = sharesMachineWith
 }
@@ -1291,7 +1291,7 @@ func (h *Handler) handleDeleteHost(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "host not found")
 	case errors.Is(err, ErrHostIsOwnMachine):
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeHostNotRemovable,
-			"this host shares the control plane's machine; take that machine apart with the uninstall command on it")
+			"this host is, or may be, the agent on the control plane's own machine; take that machine apart with the uninstall command on it, or set QUASAR_MACHINE_ROLE and QUASAR_MACHINE_NODE_NAME on the control plane and retry")
 	case errors.Is(err, ErrHostHasActiveSessions):
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "host has active sessions — stop them first")
 	default:
