@@ -77,6 +77,16 @@ func TestSendRefusesAnUnusableURLBeforeAnyRequest(t *testing.T) {
 	}
 }
 
+func TestWebhookHostAllowed(t *testing.T) {
+	if !WebhookHostAllowed("anywhere.example.net") {
+		t.Fatal("with the variable unset every host is allowed")
+	}
+	t.Setenv(WebhookHostsEnv, "hooks.example.com")
+	if !WebhookHostAllowed("HOOKS.example.com") || WebhookHostAllowed("elsewhere.example.net") {
+		t.Fatal("a listed host (any case) is allowed and an unlisted one is not")
+	}
+}
+
 // TestSendRefusesAHostOutsideTheNarrowingAllowlist — QUASAR_PLATFORM_WEBHOOK_HOSTS
 // is the operator's pin, checked before any client is built.
 func TestSendRefusesAHostOutsideTheNarrowingAllowlist(t *testing.T) {

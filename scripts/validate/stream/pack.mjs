@@ -19,6 +19,7 @@ const TOP = "quasar-e2e-pack";
 const ALLOWED = [`${STREAM}/`, "scripts/validate/lib/", "docs/session-trace/"];
 const ENTRY = `${STREAM}/pack-run.mjs`;
 const DATA = ["docs/session-trace/thresholds.json", "docs/session-trace/metrics.json"];
+const LOCKFILE = "scripts/validate/package-lock.json";
 const LAUNCHERS = { "run.sh": 0o755, "run.cmd": 0o644, "README.txt": 0o644 };
 
 /** The repo-relative files `file` imports, statically or with a literal import(); node: and bare specifiers are not files. */
@@ -47,7 +48,7 @@ export function closure(entries, root = ROOT) {
 
 /** package.json and package-lock.json for playwright-core alone, the one dependency: the lockfile is the repo's own, cut down, so versions and hashes are the ones already reviewed. */
 export function playwrightFiles(root = ROOT) {
-  const lock = JSON.parse(fs.readFileSync(path.join(root, "scripts/validate/package-lock.json"), "utf8"));
+  const lock = JSON.parse(fs.readFileSync(path.join(root, LOCKFILE), "utf8"));
   const core = lock.packages["node_modules/playwright-core"];
   if (!core) throw new Error("scripts/validate/package-lock.json has no playwright-core entry");
   const name = "quasar-e2e-pack";
@@ -62,14 +63,20 @@ export function versionOf(root = ROOT) {
   try { return git("rev-parse", "HEAD") + (git("status", "--porcelain", "--untracked-files=no") ? " dirty" : "") + "\n"; } catch { return "unknown\n"; }
 }
 
+/** The pack holds only files git tracks. VERSION names the commit, so a file git does not list (untracked, or ignored) would ride along under a clean one. Git that cannot answer stops the pack too. */
+export function requireTracked(root, files) {
+  let tracked;
+  try { tracked = new Set(execFileSync("git", ["--literal-pathspecs", "ls-files", "-z", "--", ...files], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).split("\0")); } catch (e) { throw new Error(`cannot tell which files git tracks, so cannot pack (${String(e.stderr || e.message).trim().split("\n")[0]}): pack from a git checkout`); }
+  const stray = files.find((f) => !tracked.has(f));
+  if (stray) throw new Error(`${stray} is not tracked by git: commit it or remove it before packing`);
+}
+
 export function packMembers(root = ROOT, version = versionOf(root)) {
   const scenarios = fs.readdirSync(path.join(root, STREAM, "scenarios")).filter((f) => f.endsWith(".mjs")).map((f) => `${STREAM}/scenarios/${f}`);
   const plans = fs.readdirSync(path.join(root, STREAM, "plans")).filter((f) => f.endsWith(".json")).map((f) => `${STREAM}/plans/${f}`);
   const files = [...closure([ENTRY, ...scenarios], root), ...plans.sort(), ...DATA];
-  // VERSION says "dirty" for changed tracked files only: a file git does not know would ride along under a clean commit.
-  let untracked = [];
-  try { untracked = execFileSync("git", ["ls-files", "--others", "--exclude-standard", "--", ...ALLOWED], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).split("\n").filter((f) => files.includes(f)); } catch { /* not a git checkout: nothing to compare with */ }
-  if (untracked.length) throw new Error(`${untracked[0]} is not tracked by git: commit it or remove it before packing`);
+  const launchers = Object.keys(LAUNCHERS).map((f) => `${STREAM}/pack/${f}`);
+  requireTracked(root, [...files, ...launchers, LOCKFILE]);
   for (const f of files) if (!fs.lstatSync(path.join(root, f)).isFile()) throw new Error(`${f} is not a plain file`);
   const members = files.map((f) => ({ name: `${TOP}/${f}`, data: fs.readFileSync(path.join(root, f)), mode: 0o644 }));
   for (const [f, mode] of Object.entries(LAUNCHERS)) members.push({ name: `${TOP}/${f}`, data: fs.readFileSync(path.join(root, STREAM, "pack", f)), mode });
