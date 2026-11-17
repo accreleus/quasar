@@ -2040,6 +2040,22 @@
       "why": "The DataChannel's SCTP association died while nobody asked us to stop. The session ends on the CLEAN teardown path with a state_detail and no error_message \u2014 the peer went away, the agent did not fault."
     },
     {
+      "type": "transport.rtp_mtu_shrunk",
+      "source": "agent",
+      "lane": "diagnostic",
+      "payload_keys": [
+        "from",
+        "to",
+        "nacked_large",
+        "lost_large",
+        "sent_large",
+        "nacked_small",
+        "sent_small"
+      ],
+      "clock": "host_wall",
+      "why": "A live RTP packet-size step down, 100 bytes at a time to the 900-byte floor and never back up, taken because the client's path drops the full-size packets and not the small ones. `from` and `to` are the size in bytes before and after; the counts are the deciding window's, of the stream the peer NACKed most (the media stream, never RTX): `sent_large` and `nacked_large` packets larger than from - 100 bytes, `lost_large` those NACKed a third time (lost to the path), `sent_small` and `nacked_small` packets under the 900-byte floor, packets in between in neither. One event per step, so a copy dropped on the diagnostic lane shows as the next step's `from` not being this one's `to`. Pairs with the agent's rtp-mtu-shrunk log line; a step also forces a keyframe."
+    },
+    {
       "type": "app.launch_state",
       "source": "agent",
       "lane": "diagnostic",

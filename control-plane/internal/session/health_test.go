@@ -3,6 +3,8 @@ package session
 import (
 	"testing"
 	"time"
+
+	"github.com/accreleus/quasar/control-plane/internal/agentws"
 )
 
 // base is a fixed evaluation epoch for deterministic durations.
@@ -192,5 +194,49 @@ func TestValidHealthState(t *testing.T) {
 	}
 	if ValidHealthState("bogus") {
 		t.Fatal("ValidHealthState(bogus) = true, want false")
+	}
+}
+
+// Amendment 79 (#1434): a sample is judged on the governor's unclamped link rate when it
+// carries one, and on the setpoint only when it does not — the setpoint cannot fall under
+// its floor, so a floor-pinned session is always "at or below" on it however much the link
+// carries. A zero is not a measurement (the agent omits the key instead), so it falls back.
+func TestStreamHealthRate(t *testing.T) {
+	v := func(f float64) *float64 { return &f }
+	table := []struct {
+		what   string
+		sample agentws.SessionMetricsMsg
+		want   healthSignal
+		wantOk bool
+	}{
+		{
+			what:   "the per-report loop's rate wins over the setpoint",
+			sample: agentws.SessionMetricsMsg{AbrSetpointKbps: v(577), AbrLinkRateKbps: v(2400)},
+			want:   healthSignal{kbps: 2400, linkRate: true},
+			wantOk: true,
+		},
+		{
+			what:   "no link rate: the setpoint, as before the amendment",
+			sample: agentws.SessionMetricsMsg{AbrSetpointKbps: v(577)},
+			want:   healthSignal{kbps: 577},
+			wantOk: true,
+		},
+		{
+			what:   "a zero link rate is not a measurement",
+			sample: agentws.SessionMetricsMsg{AbrSetpointKbps: v(4000), AbrLinkRateKbps: v(0)},
+			want:   healthSignal{kbps: 4000},
+			wantOk: true,
+		},
+		{
+			what:   "neither: not an observation of the floor",
+			sample: agentws.SessionMetricsMsg{},
+			wantOk: false,
+		},
+	}
+	for _, tc := range table {
+		got, ok := streamHealthRate(tc.sample)
+		if ok != tc.wantOk || got != tc.want {
+			t.Errorf("%s: got %+v ok=%v, want %+v ok=%v", tc.what, got, ok, tc.want, tc.wantOk)
+		}
 	}
 }
