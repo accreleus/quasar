@@ -419,6 +419,41 @@ describe("WebTransportMedia loss recovery", () => {
     t.close();
   });
 
+  it("reports the fragments FEC rebuilt, cumulatively, to the sink (amendment 85)", async () => {
+    const agent = new FakeAgent();
+    agent.replies = [[{ ...helloAck(0, avcC()), fec: "xor" }]];
+    const t = transport(agent);
+    const reported: number[] = [];
+    await t.connect({ ...NO_SINK, repaired: (n) => void reported.push(n) });
+    const pkt = { n: 0 };
+    // Five fragments; the last never arrives (no later datagram shows a gap to NACK) and the
+    // frame's repair rebuilds it.
+    const five = packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(5000, 0) }, pkt);
+    const f = five.map((d) => parseVideoDatagram(d)!);
+    agent.last.datagrams(five.filter((_, i) => i !== 4));
+    agent.last.datagrams([repairOf(f, 0, 5)]);
+    await vi.waitFor(() => expect(reported).toEqual([1]));
+    t.close();
+  });
+
+  it("reports a fragment a held repair rebuilds when the video fragment that completes it arrives (amendment 85)", async () => {
+    const agent = new FakeAgent();
+    agent.replies = [[{ ...helloAck(0, avcC()), fec: "xor" }]];
+    const t = transport(agent);
+    const reported: number[] = [];
+    await t.connect({ ...NO_SINK, repaired: (n) => void reported.push(n) });
+    const pkt = { n: 0 };
+    const five = packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(5000, 0) }, pkt);
+    const f = five.map((d) => parseVideoDatagram(d)!);
+    // The last two are missing, so the repair is held; the next video fragment rebuilds the other.
+    agent.last.datagrams([five[0], five[1], five[2]]);
+    agent.last.datagrams([repairOf(f, 0, 5)]);
+    expect(reported).toEqual([]);
+    agent.last.datagrams([five[3]]);
+    await vi.waitFor(() => expect(reported).toEqual([1]));
+    t.close();
+  });
+
   it(`sends a NACK held for FEC ${FEC_HOLD_MS} ms after the gap showed, with no datagram to carry it`, async () => {
     const agent = new FakeAgent();
     agent.replies = [[helloAck(0, avcC())]];

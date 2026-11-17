@@ -16,7 +16,7 @@
 //! compositor-path check (names/fields authoritative from the element's imp.rs)
 //! but are no longer on the live input path.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -144,11 +144,31 @@ pub struct InputState {
     mouse_seen: AtomicBool,
     /// The one-shot nudge has fired (or been claimed).
     nudge_sent: AtomicBool,
+    /// Controller numbers other than 0 already logged as dropped (amendment 80), one bit
+    /// per number. Per session, so `reset` (an app swap) leaves it alone.
+    // shortcut: numbers above 63 share bit 63, so a hostile client costs one line, not one each.
+    dropped_pads: AtomicU64,
+    /// Messages that got past the pad filter into a sink (tests assert a dropped `gp` is not one).
+    #[cfg(test)]
+    delivered: AtomicU64,
 }
 
 impl InputState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Amendment 80: the node agent presents one pad, `0`. `Some(first)` for a `gp` with any
+    /// other number (to be dropped; `first` when this number has not been logged yet in this
+    /// session), `None` for pad `0`.
+    fn drop_pad(&self, msg: &InputMsg) -> Option<bool> {
+        match msg {
+            InputMsg::Gamepad { i, .. } if *i != 0 => {
+                let bit = 1u64 << (*i).min(63);
+                Some(self.dropped_pads.fetch_or(bit, Ordering::Relaxed) & bit == 0)
+            }
+            _ => None,
+        }
     }
 
     /// Re-arm the one-shot on launcher<->game swap completion: the DataChannel and
@@ -222,6 +242,21 @@ pub fn handle(json: &str, sink: &InputSink, state: &InputState, width: i32, heig
     } else {
         None
     };
+
+    // Amendment 80: one virtual pad, `0`. Another number is dropped before it can be diffed
+    // against pad 0's last state or nudge the pointer.
+    if let Some(first) = state.drop_pad(&msg) {
+        if first {
+            if let InputMsg::Gamepad { i, .. } = &msg {
+                tracing::info!(
+                    "dropping gamepad {i}: this host presents one virtual pad (number 0)"
+                );
+            }
+        }
+        return;
+    }
+    #[cfg(test)]
+    state.delivered.fetch_add(1, Ordering::Relaxed);
 
     match sink {
         InputSink::Virtual(devices) => {
@@ -539,6 +574,52 @@ mod tests {
             buttons: vec![0.0],
             axes: vec![0.0, 0.0],
         }
+    }
+
+    fn pad(i: u32) -> InputMsg {
+        InputMsg::Gamepad {
+            i,
+            buttons: vec![1.0],
+            axes: vec![0.0, 0.0],
+        }
+    }
+
+    /// Amendment 80: pad 0 is the only pad; any other number is dropped, and logged once per
+    /// number per session (an app swap does not make it log again).
+    #[test]
+    fn only_pad_zero_is_driven_and_each_other_number_logs_once() {
+        let st = InputState::new();
+        assert_eq!(st.drop_pad(&pad(0)), None);
+        assert_eq!(st.drop_pad(&pad(1)), Some(true), "first drop of 1 logs");
+        assert_eq!(st.drop_pad(&pad(1)), Some(false), "then silent");
+        assert_eq!(st.drop_pad(&pad(2)), Some(true), "2 is its own number");
+        st.reset();
+        assert_eq!(
+            st.drop_pad(&pad(1)),
+            Some(false),
+            "a swap is not a new session"
+        );
+        assert_eq!(st.drop_pad(&pad(0)), None);
+        assert_eq!(st.drop_pad(&mm()), None, "other messages are never dropped");
+        // A `gp` with no `i` is number 0 (serde default).
+        let no_i = InputMsg::parse(r#"{"t":"gp","buttons":[],"axes":[]}"#).unwrap();
+        assert_eq!(st.drop_pad(&no_i), None);
+    }
+
+    /// The drop is wired into `handle`: a `gp` for another number never reaches a sink (where
+    /// it would nudge the pointer or be diffed against pad 0), pad 0's and other input does.
+    #[test]
+    fn handle_drops_other_pad_numbers_before_the_sink() {
+        let st = InputState::new();
+        let go = |json: &str| handle(json, &InputSink::None, &st, 320, 240);
+        go(r#"{"t":"gp","i":1,"buttons":[1],"axes":[0]}"#);
+        go(r#"{"t":"gp","i":3,"buttons":[1],"axes":[0]}"#);
+        assert_eq!(st.delivered.load(Ordering::Relaxed), 0);
+        assert_eq!(st.dropped_pads.load(Ordering::Relaxed), 0b1010);
+        go(r#"{"t":"gp","i":0,"buttons":[1],"axes":[0]}"#);
+        go(r#"{"t":"gp","buttons":[1],"axes":[0]}"#);
+        go(r#"{"t":"k","code":30,"pressed":true}"#);
+        assert_eq!(st.delivered.load(Ordering::Relaxed), 3);
     }
 
     fn mm() -> InputMsg {

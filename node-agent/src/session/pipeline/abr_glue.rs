@@ -1458,6 +1458,8 @@ pub(crate) fn feedback_abr(
     session_id: String,
     lever: Option<Arc<EncodeResolutionLever>>,
 ) -> Option<crate::webtransport::Rate> {
+    // Amendment 85: the FEC counters live on the same metrics the ABR publishes.
+    let fec_metrics = session_metrics.clone();
     // The WebRTC fallback's `enable_abr` already said any `ladder_gate_warning`.
     let (abr_loop, plan) = arm(
         encoder,
@@ -1547,6 +1549,15 @@ pub(crate) fn feedback_abr(
             observe_loop.observe(kbps, true, std::time::Instant::now());
         }),
         measured: Box::new(move |reading| report_loop.report(reading, std::time::Instant::now())),
+        fec: Box::new(move |event| match event {
+            crate::webtransport::FecEvent::Attached { client, fec } => {
+                fec_metrics.attach_fec(client, fec);
+            }
+            crate::webtransport::FecEvent::Detached { client } => fec_metrics.detach_fec(client),
+            crate::webtransport::FecEvent::Sent { video, repair } => {
+                fec_metrics.record_fec_bytes(video, repair);
+            }
+        }),
     })
 }
 
