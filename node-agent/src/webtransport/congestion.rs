@@ -208,6 +208,10 @@ pub(crate) struct SendLog {
     /// The first send since the last feedback: the silence clock starts here, not at the
     /// feedback, or a frame after a still screen would be judged before its answer can come.
     unanswered_since: Option<Instant>,
+    /// The last stamp, µs: stamps never go back in `pkt_seq` (send) order, whatever stamped
+    /// them (a paced release, a queue time, a resend), or the delay detector reads a send
+    /// that went back in time.
+    last_us: u64,
 }
 
 impl SendLog {
@@ -216,6 +220,7 @@ impl SendLog {
             start,
             slots: vec![Slot::default(); LOG],
             unanswered_since: None,
+            last_us: 0,
         }
     }
 
@@ -226,9 +231,12 @@ impl SendLog {
             return;
         };
         let seq = u32::from_le_bytes([seq[0], seq[1], seq[2], seq[3]]);
+        self.last_us = self
+            .last_us
+            .max(at.saturating_duration_since(self.start).as_micros() as u64);
         self.slots[seq as usize % LOG] = Slot {
             seq,
-            sent_us: at.saturating_duration_since(self.start).as_micros() as u64,
+            sent_us: self.last_us,
             bytes: datagram.len().min(u16::MAX as usize) as u16,
             resend,
             status: Status::Unreported,
@@ -309,10 +317,13 @@ impl InterArrival {
             return None;
         }
         let done = *cur;
+        // A group sent before the one before it is no delay sample. An equal send is one: a
+        // frame's datagrams share a stamp, and a delay spike can split them across groups.
         let out = self.previous.and_then(|prev| {
+            let send_d = done.last_send.checked_sub(prev.last_send)?;
             (done.last_arrival >= prev.last_arrival).then(|| {
                 (
-                    (done.last_send - prev.last_send) as f64 / 1000.0,
+                    send_d as f64 / 1000.0,
                     (done.last_arrival - prev.last_arrival) as f64 / 1000.0,
                     done.last_arrival as f64 / 1000.0,
                 )
@@ -1700,7 +1711,14 @@ impl VideoQueue {
             self.dropped += 1;
         }
         self.bytes += held.datagram.len();
-        self.held.push_back(held);
+        // A resend goes ahead of held video (after earlier resends): the client gives a frame
+        // up about 2 × (sRTT + 10 ms) after its first NACK, sooner than a paced keyframe drains.
+        let at = if held.resend {
+            self.held.iter().take_while(|h| h.resend).count()
+        } else {
+            self.held.len()
+        };
+        self.held.insert(at, held);
     }
 
     /// Hands `send` the oldest datagrams that fit in `room` bytes, each carrying the next
@@ -1730,10 +1748,10 @@ impl VideoQueue {
                 d[1..5].copy_from_slice(&seq);
                 held.datagram = d.freeze();
             }
-            // A paced datagram is logged as sent when the pacer let it go: its wait here is
-            // the pacer's, not the path's, and read as delay it cut the estimate at each
-            // keyframe on a link faster than the pace. A wait for room in QUIC's queue stays
-            // in, as it was in QUIC's queue before #1321.
+            // While paced, a datagram is logged as sent when the pacer let it go: its wait here
+            // is the pacer's, not the path's, and read as delay it cut the estimate at each
+            // keyframe on a link faster than the pace. Unpaced, its queue time is logged, as
+            // it was in QUIC's queue before #1321. `SendLog::record` keeps the mix monotone.
             let (resend, queued_at) = (held.resend, self.counted.unwrap_or(held.queued_at));
             let logged = log.as_deref_mut().filter(|_| held.logged);
             let record = logged.map(|log| (log, held.datagram.clone()));

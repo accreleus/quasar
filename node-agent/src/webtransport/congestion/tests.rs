@@ -2782,3 +2782,70 @@ fn a_paced_keyframe_after_an_outage_does_not_end_the_regrow() {
     assert!(ended.iter().all(|l| l.contains("reached")), "{ended:?}");
     assert!(back.is_some_and(|b| b <= 10.0), "{back:?} s");
 }
+
+/// #1496 r2 M1: a second step down while the pacer is on (5 Mbit/s with a keyframe each
+/// second, then 2 Mbit/s). Paced datagrams are logged at their release and unpaced ones at
+/// their queue time; the send log keeps every stamp at or after the one before it in
+/// `pkt_seq` order, or the delay detector reads a send that went back in time.
+#[test]
+fn send_stamps_never_go_back_through_a_second_step_down_while_paced() {
+    let mut s = Sim::new(5000.0);
+    s.quic = Some(Quic::default());
+    s.keyframe_every = 60;
+    s.run(30.0);
+    assert!(s.est.found_link(), "paced before the second step");
+    s.cap_kbps = 2000.0;
+    s.run(30.0);
+    let mut slots: Vec<&Slot> = s.log.slots.iter().filter(|s| s.bytes > 0).collect();
+    slots.sort_by_key(|s| s.seq);
+    let back = slots
+        .windows(2)
+        .filter(|w| w[1].sent_us < w[0].sent_us)
+        .count();
+    assert_eq!(back, 0, "{back} stamps went back in pkt_seq order");
+    assert!(
+        s.est.estimate_kbps() < 2000.0,
+        "{:.0}",
+        s.est.estimate_kbps()
+    );
+}
+
+/// A group sent no later than the one before it gives no delay sample, and no panic.
+#[test]
+fn a_send_group_that_went_back_in_time_is_no_delay_sample() {
+    // A group whose last send is before the previous group's.
+    let mut ia = InterArrival::default();
+    ia.push(100_000, 110_000);
+    ia.push(200_000, 210_000);
+    ia.current.as_mut().unwrap().last_send = 50_000;
+    assert_eq!(ia.push(300_000, 310_000), None);
+}
+
+/// #1496 r2 S2: a `nack` answer goes ahead of held video, after earlier answers, and keeps
+/// the wire `pkt_seq` +1 per datagram.
+#[test]
+fn a_resend_goes_ahead_of_held_video() {
+    let mut video = VideoQueue::default();
+    let first = video.next_seq();
+    for i in 0..40 {
+        video.push(held(first + i), BUFFER);
+    }
+    let resend = |seq| Held {
+        resend: true,
+        ..held(seq)
+    };
+    video.push(resend(100), BUFFER);
+    video.push(resend(101), BUFFER);
+    let mut wire = Vec::new();
+    let mut order = Vec::new();
+    assert!(video.feed(3 * SIZE, None, |h| {
+        order.push(h.resend);
+        quic(&mut wire, h)
+    }));
+    assert_eq!(
+        order,
+        [true, true, false],
+        "the two answers first, then video"
+    );
+    assert_eq!(wire, [0, 1, 2]);
+}
