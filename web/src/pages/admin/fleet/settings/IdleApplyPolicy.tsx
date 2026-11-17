@@ -142,7 +142,11 @@ export function IdleApplyPolicy({ hostId }: { hostId: string | undefined }) {
     ),
     {
       success: (result) => result.phase === "released" ? "Recovery hold released."
-        : "Release requested. The host stays held until its agent confirms.",
+        // An applied attempt stays applied when its hold is released (amendment 86):
+        // the control plane lifts it itself, so no agent confirmation follows.
+        : result.recovery_release?.state === "released"
+          ? "Recovery hold released. The host takes new sessions again, unless another hold remains."
+          : "Release requested. The host stays held until its agent confirms.",
       failure: "Could not request the release.",
       onSuccess: () => { setActionError(null); setReleasing(null); void resource.refresh(); },
       onFailure: (error) => {
@@ -154,7 +158,10 @@ export function IdleApplyPolicy({ hostId }: { hostId: string | undefined }) {
   if (!hostId || (resource.data && (!group || group.scope !== "restart"))) return null;
   const busy = approve.pending !== null || cancel.pending !== null || release.pending !== null;
   const pendingRelease = attempt?.phase === "uncertain" ? attempt.recovery_release ?? null : null;
-  const recoveryHeld = attempt?.phase === "uncertain" && attempt.admission_restricted;
+  // An applied attempt can hold nothing but a recovery row of its own (amendment 86:
+  // a replay keeps the hold, an administrator ends it), so it takes the same repair.
+  const recoveryHeld = attempt?.admission_restricted === true &&
+    (attempt.phase === "uncertain" || attempt.phase === "applied");
 
   // The dialog sits outside the card: a .card's backdrop-filter traps position: fixed.
   return <><KnobPanel title="Idle apply" hint="Approve a reviewed host configuration for an idle window. Saving settings alone does not apply them.">
@@ -169,6 +176,8 @@ export function IdleApplyPolicy({ hostId }: { hostId: string | undefined }) {
           {recoveryHeld && <p className="form-error" role="alert">Recovery could not be verified. Admission remains protected until an operator repairs this host.</p>}
           {pendingRelease && <p className="hint">Release requested. {WAITING_FOR[pendingRelease.waiting_for ?? "agent_report"]}</p>}
           {attempt?.phase === "released" && <p className="hint">An administrator released the recovery hold. This host's configuration was never verified.</p>}
+          {attempt?.phase === "applied" && attempt.recovery_release?.state === "released" &&
+            <p className="hint">An administrator released this attempt's recovery hold. The attempt stays applied and its group is unchanged.</p>}
           {attempt?.remedy && <p className="hint">{attempt.remedy}</p>}
           {preview?.remedy && !waiting && <p className="hint">{preview.remedy}</p>}
           {!preview && group.remedy && !waiting && <p className="hint">{group.remedy}</p>}
@@ -204,8 +213,9 @@ export function IdleApplyPolicy({ hostId }: { hostId: string | undefined }) {
   >
     <div className="note warn">
       <strong>This host's state is unverified.</strong> The agent restarted to apply a configuration and could not
-      prove which configuration it is running now. Quasar tells the host's agent to set this attempt aside. Once the
-      agent confirms, the host takes new sessions again, unless another hold remains.
+      prove which configuration it is running now. {attempt?.phase === "applied"
+        ? "Quasar releases this attempt's hold itself, without asking the host's agent, and the host takes new sessions again unless another hold remains."
+        : "Quasar tells the host's agent to set this attempt aside. Once the agent confirms, the host takes new sessions again, unless another hold remains."}
     </div>
     <p>Nothing on the host is repaired. Check its readiness and media probe first, then review and approve the configuration again.</p>
     <label className="rowflex">
