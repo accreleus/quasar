@@ -265,11 +265,20 @@ impl AbrLoop {
             let st = r.state.lock().unwrap();
             st.in_flight || st.planner.settling(now)
         });
-        let (prev, cut) = {
+        let (prev, cut, rate) = {
             let mut gov = self.governor.lock().unwrap();
             let prev = gov.setpoint_kbps();
-            (prev, gov.observe_report(reading.filter(|_| !settling), now))
+            let cut = gov.observe_report(reading.filter(|_| !settling), now);
+            (prev, cut, gov.rate_kbps())
         };
+        // Amendment 79: what the reports say the link carries, unclamped by the floor —
+        // the only value that can tell a floor-pinned session on a good link (this rate
+        // above the floor) from one whose link carries less.
+        if let Some(m) = self.metrics.upgrade() {
+            #[cfg(test)]
+            start_pause::run(&self.session_id, start_pause::Step::BeforeRateStore);
+            m.set_abr_link_rate(self.id, rate);
+        }
         if let Some(kbps) = cut {
             self.retarget(prev, kbps, reading.unwrap_or_default());
         }
@@ -1039,9 +1048,13 @@ pub(crate) mod start_pause {
     use std::sync::Mutex;
 
     #[derive(Clone, Copy, PartialEq, Eq)]
+    // Each step is named for the point it pauses before.
+    #[allow(clippy::enum_variant_names)]
     pub(crate) enum Step {
         BeforeClaim,
         BeforeHooks,
+        /// [`super::AbrLoop::report`], after its owner check and before it stores the link rate.
+        BeforeRateStore,
     }
 
     type Hook = Box<dyn Fn() + Send + Sync>;
@@ -1610,6 +1623,9 @@ fn write_launch_point(
     lever: Option<&EncodeResolutionLever>,
     metrics: &SessionMetrics,
 ) -> String {
+    // Amendment 79: the link rate belongs to the per-report loop that published it, so a
+    // transport that replaces it must not leave that rate for health to judge.
+    metrics.clear_abr_link_rate();
     if cfg.abr_mode == AbrMode::Off || !encoder_abr_writable(encoder, cfg.encoder) {
         return "nothing (nothing ever moved it)".into();
     }
@@ -2403,10 +2419,17 @@ mod tests {
         seen: Vec<TraceEvent>,
         est: f64,
         t0: std::time::Instant,
+        /// The session's telemetry, held here as the runner holds it.
+        metrics: Arc<SessionMetrics>,
     }
 
     impl Wt {
         fn new(floor_follows_rung: bool) -> Self {
+            Self::named(floor_follows_rung, "s")
+        }
+
+        /// As [`Wt::new`] with its own session id, for a test that arms a [`start_pause`].
+        fn named(floor_follows_rung: bool, session_id: &str) -> Self {
             init();
             let metrics = Arc::new(SessionMetrics::new("smooth", 120));
             let (tx, traces) = tokio::sync::mpsc::channel(4096);
@@ -2438,14 +2461,12 @@ mod tests {
                 &cfg,
                 metrics.clone(),
                 trace,
-                "s".into(),
+                session_id.into(),
                 Some(lever.clone()),
                 "webtransport feedback",
             )
             .expect("openh264enc takes live writes");
             start(&abr_loop, &plan, Box::new(|| 10_000.0), Claim::Take);
-            // The loop holds the metrics weakly; they live as long as the session.
-            std::mem::forget(metrics);
             Self {
                 abr_loop,
                 lever,
@@ -2454,6 +2475,7 @@ mod tests {
                 seen: Vec::new(),
                 est: 10_000.0,
                 t0: std::time::Instant::now(),
+                metrics,
             }
         }
 
@@ -2700,6 +2722,77 @@ mod tests {
         assert_eq!(wt.rung_steps(), vec![(0, 3)]);
     }
 
+    /// Amendment 79 (#1434): the per-report loop publishes the governor's UNCLAMPED link
+    /// rate, which is the value stream health judges against the floor: a session pinned
+    /// there on a link that carries more keeps its rate above the floor, and one whose
+    /// link carries the floor or less does not. Deleting the `set_abr_link_rate` call in
+    /// `AbrLoop::report` leaves every drain reporting `None`.
+    #[test]
+    fn the_per_report_loop_publishes_the_unclamped_link_rate() {
+        let mut wt = Wt::new(true);
+        let t0 = wt.t0;
+        assert!(
+            wt.metrics.drain_window(t0).abr_link_rate_kbps.is_none(),
+            "no report yet: not measured, never zero"
+        );
+        // A link that carries the ceiling: the rate is there and no floor binds.
+        wt.link(0, 3000, |_| 20_000.0);
+        let w = wt
+            .metrics
+            .drain_window(t0 + std::time::Duration::from_secs(3));
+        let rate = wt.abr_loop.governor.lock().unwrap().rate_kbps();
+        assert_eq!(w.abr_link_rate_kbps, Some(rate));
+        assert_eq!(rate, 10_000.0, "the rate at the ceiling: {rate}");
+
+        // A link carrying a tenth of it: the setpoint stops at a rung's floor, the rate
+        // goes under it, and only the rate says so.
+        wt.link(3000, 20_000, |_| 1000.0);
+        let w = wt
+            .metrics
+            .drain_window(t0 + std::time::Duration::from_secs(20));
+        let rate = wt.abr_loop.governor.lock().unwrap().rate_kbps();
+        assert_eq!(w.abr_link_rate_kbps, Some(rate), "this report's rate");
+        let setpoint = wt.setpoint() as f64;
+        assert!(
+            rate < setpoint,
+            "the floor holds the setpoint at {setpoint} kbps, the link carries {rate}"
+        );
+    }
+
+    /// Amendment 79 (#1434) round 3: a report already past its owner check when another
+    /// transport takes the encoder stores its rate AFTER the takeover's clear, and a WebRTC
+    /// successor never writes one to replace it. The rate is tagged with the loop that wrote
+    /// it and the drain reports it only for the current owner, so that late store is
+    /// invisible. Without the tag the drain reports the displaced loop's frozen rate.
+    #[test]
+    fn a_report_in_flight_at_a_takeover_leaves_no_link_rate() {
+        use start_pause::{arm, Step};
+        const SESSION: &str = "link-rate-race";
+        let mut wt = Wt::named(true, SESSION);
+        let t0 = wt.t0;
+        wt.link(0, 3000, |_| 20_000.0);
+        assert!(
+            wt.metrics.drain_window(t0).abr_link_rate_kbps.is_some(),
+            "the WebTransport loop publishes its rate while it owns the encoder"
+        );
+        // A WebRTC peer takes over between the loop's owner check and its store: the owner
+        // changes, the launch point is written (the clear), then the old loop stores.
+        let metrics = wt.metrics.clone();
+        arm(SESSION, Step::BeforeRateStore, move || {
+            metrics.claim_abr(u64::MAX);
+            metrics.clear_abr_link_rate();
+        });
+        wt.report(3000, 20_000.0);
+        assert_eq!(wt.metrics.abr_owner(), u64::MAX);
+        assert!(
+            wt.metrics
+                .drain_window(t0 + std::time::Duration::from_secs(4))
+                .abr_link_rate_kbps
+                .is_none(),
+            "the displaced loop's late store must not read as the new owner's rate"
+        );
+    }
+
     /// #1376 review A1/R1, seat A's replay on the owner's profile: at 900p a link
     /// alternating 2900 and 4200 kbit/s every 6 s crosses 900p's engage line (2965) in its
     /// low phase and 720p's recover line (3953) in its high one. Old code (24ad172a): down
@@ -2894,8 +2987,18 @@ mod tests {
                 let _ = &held;
             })
         ));
+        metrics.set_abr_link_rate(7, 400.0);
 
         reset_to_launch(&encoder, &cfg, Some(&lever), &metrics);
+
+        // Amendment 79: another transport took the encoder; the old loop's rate is gone.
+        assert!(
+            metrics
+                .drain_window(std::time::Instant::now())
+                .abr_link_rate_kbps
+                .is_none(),
+            "a taken-over session carries no link rate"
+        );
 
         assert_eq!(encoder.property::<u32>("bitrate"), launch_bps);
         assert_eq!(
