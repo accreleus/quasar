@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/admission"
 	"github.com/accreleus/quasar/control-plane/internal/audit"
 	"github.com/accreleus/quasar/control-plane/internal/auth"
+	"github.com/accreleus/quasar/control-plane/internal/httpx"
 )
 
 const removeRequestID = "3c0a6f2e-8d1b-4f7e-9a55-2b8e1c0d9f41"
@@ -278,6 +280,11 @@ func TestRemoveHostRefusesInTheContractsOrderChangingNothing(t *testing.T) {
 			code, body := h.remove(t, h.adminToken, nil)
 			if code != c.code || errCode(t, body) != c.errc || reasonOf(t, body) != c.reason {
 				t.Fatalf("= %d %s, want %d %s reason=%q", code, body, c.code, c.errc, c.reason)
+			}
+			if strings.HasPrefix(c.name, "the control plane's own") || strings.HasPrefix(c.name, "an identity") {
+				if !bytes.Contains(body, []byte(httpx.HostIsOwnMachineMessage)) {
+					t.Errorf("%s: body %s, want the shared own-machine message", c.name, body)
+				}
 			}
 			if c.reason != "" && (bytes.Contains(body, []byte("release")) || !bytes.Contains(body, []byte("nothing was removed"))) {
 				t.Errorf("a removal refusal speaks of a release, or not of the removal: %s", body)

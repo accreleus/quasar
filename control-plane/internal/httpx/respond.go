@@ -73,6 +73,14 @@ const (
 	CodeInvalidState = "invalid_state" // 400
 )
 
+// HostIsOwnMachineMessage is the 409 host_not_removable text for a host that is, or
+// may be, the agent on the control plane's own machine (Forget host and Remove host
+// share it, #1395). It is true on that machine's own host and when the control plane
+// cannot tell: the machine's identity is written by the recovery actor's recipe, never
+// typed by an operator, so the remedy is the actor's reconfigure, not a variable to set.
+const HostIsOwnMachineMessage = "this host is, or may be, the agent on the control plane's own machine, so it is not removed from here: take that machine apart with the uninstall command on it. " +
+	"If it is another machine's host, the control plane has not recorded which machine it runs on; run `quasar-recovery reconfigure` on the control plane's machine (docs/upgrading.md) and retry"
+
 // errorEnvelope is the wire shape: { "error": { "code", "message" } }.
 type errorEnvelope struct {
 	Error errorBody `json:"error"`
