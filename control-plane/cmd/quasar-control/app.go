@@ -612,7 +612,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	crudHandler := crud.NewHandler(pool, auditStore)
 	crudHandler.SetRegistry(agentRegistry) // lets DELETE /v1/hosts/{id} check live connectivity
 	// The same own-machine decision Remove host makes: Forget host must not drop this machine's row.
-	crudHandler.SetOwnMachine(applyMachineShape(cfg).SharesMachineWith)
+	crudHandler.SetOwnMachine(ownMachineGuard(cfg))
 	crudHandler.SetReadinessStaleSecs(int(cfg.ReadinessStaleSecs))
 	crudHandler.SetSessionRevoker(coordinator.StopUnentitledSessions)
 	sessionHandler := session.NewHandler(coordinator, sessionStore, auditStore).
@@ -1255,7 +1255,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		Connected: agentRegistry.IsConnected,
 		// The shape the recovery actor wrote into this control plane's configuration,
 		// known whether or not the actor answers (control-api.md, machine_node_name).
-		SharesOwnMachine: applyMachineShape(cfg).SharesMachineWith,
+		SharesOwnMachine: ownMachineGuard(cfg),
 		Cordon: func(ctx context.Context, hostID string) (func(context.Context), error) {
 			held, err := admissionStore.List(ctx, hostID)
 			if err != nil {
@@ -1618,6 +1618,22 @@ func applyMachineShape(cfg *config.Config) platform.MachineShape {
 		return platform.MachineShape{Role: platform.MachineRoleCombined, NodeName: cfg.LocalEnrollmentNodeName}
 	}
 	return machineShape(cfg)
+}
+
+// ownMachineGuard is the own-machine decision Forget and Remove host share
+// (#1288, #1395). It adds one case to the shape's own fail-closed rule: an
+// install with a recovery actor on its own machine (a control socket) but no
+// machine shape to name that machine. The actor proves an agent may be on this
+// machine — the recipe writes both, so this is an older or a hand-edited
+// configuration — and nothing says which host it is, so no host can be told
+// apart from it. Refusing them all beats dropping the row of the control plane's
+// own machine, and the operator can fix the configuration and retry.
+func ownMachineGuard(cfg *config.Config) func(nodeName string) bool {
+	shape := applyMachineShape(cfg)
+	if cfg.RecoveryControlSocket != "" && shape.Role == "" {
+		return func(string) bool { return true }
+	}
+	return shape.RefusesHostRemoval
 }
 
 // detectIntervalEnv is platform.release_detect's EnvOverride (docs/configuration.md).
