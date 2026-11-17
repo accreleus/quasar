@@ -324,6 +324,45 @@
       "why": "The governor's live floor, sent ONLY when the ladder has moved it off the launch floor. Absent means 'the floor the session launched with', never 'unknown'. Uncurated: readable via GET .../metrics, not in the diagnostic lens."
     },
     {
+      "key": "abr_link_rate_kbps",
+      "source": "agent",
+      "taxonomy": null,
+      "unit": "kbps",
+      "clock": "none",
+      "window": "heartbeat(~5s)",
+      "estimator": "last",
+      "n_key": null,
+      "deprecated_for": null,
+      "since": "0.6.1 amendment 79 (#1434)",
+      "why": "The governor's UNCLAMPED link rate at drain time, what the link carries before the floor clamps it into the setpoint. Present only on a WebTransport session in smooth (the per-report loop); absent means not measured. When present, stream health judges it against the floor (abr_floor_kbps, else the resolved rung's) instead of abr_setpoint_kbps, with the same at-or-below comparison. Uncurated: readable via GET .../metrics, not in the diagnostic lens."
+    },
+    {
+      "key": "wt_fec_overhead_pct",
+      "source": "agent",
+      "taxonomy": null,
+      "unit": "fraction",
+      "clock": "none",
+      "window": "heartbeat(~5s)",
+      "estimator": "last",
+      "n_key": null,
+      "deprecated_for": null,
+      "since": "0.6.1 amendment 85 (#1302)",
+      "why": "FEC repair payload bytes the agent sent in the window as a percentage of the video payload bytes it sent in it \u2014 a percentage number (0-100), which is why the unit reads 'fraction': the unit vocabulary has no percent member. Present in every window of a WebTransport session whose hello_ack.fec named a scheme (0 when the window sent no repair); absent otherwise, meaning no FEC. Uncurated."
+    },
+    {
+      "key": "wt_fec_kbps",
+      "source": "agent",
+      "taxonomy": null,
+      "unit": "kbps",
+      "clock": "none",
+      "window": "heartbeat(~5s)",
+      "estimator": "last",
+      "n_key": null,
+      "deprecated_for": null,
+      "since": "0.6.1 amendment 85 (#1302)",
+      "why": "The same window's FEC repair payload as a rate, kbit/s. Same presence rule as wt_fec_overhead_pct. Uncurated."
+    },
+    {
       "key": "gcc_estimate_kbps",
       "source": "agent",
       "taxonomy": "transport.gcc_estimate_kbps",
@@ -1080,6 +1119,19 @@
       "deprecated_for": null,
       "since": "0.6 (#1346)",
       "why": "CUMULATIVE for the page view: times the WebTransport audio ring ran empty and played silence, however long each run lasted. It is the silence-run half of audio_concealment_events, so that count minus this one is the dropouts a lost packet's fade caused: a burst of events with underruns flat is packet loss, one with underruns rising is the buffer running dry. Absent until audio has played, and never posted by a WebRTC session."
+    },
+    {
+      "key": "wt_fec_repaired",
+      "source": "browser",
+      "taxonomy": null,
+      "unit": "count",
+      "clock": "none",
+      "window": "cumulative",
+      "estimator": "raw",
+      "n_key": null,
+      "deprecated_for": null,
+      "since": "0.6.1 amendment 85 (#1302)",
+      "why": "CUMULATIVE for the page view, accumulated like packets_lost (each connection's count is added, so a reconnect never resets it): video FRAGMENTS a WebTransport client rebuilt from FEC repair datagrams. A rebuilt fragment is never NACKed, so it is not in packets_lost; packets_lost + wt_fec_repaired is the video fragments the path lost. Posted only while FEC is negotiated; never posted by a WebRTC session. Uncurated."
     },
     {
       "key": "network_pacing_ms",

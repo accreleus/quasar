@@ -230,7 +230,8 @@ func (c *Coordinator) AgentMetrics(ctx context.Context, hostID string, m agentws
 	// Fold the external-resolution readback into the cache BEFORE the fallible
 	// insert: the cache validates the next display request and is what the Session
 	// resource serializes, so it must not be hostage to a metrics write.
-	c.display.observe(m.SessionID, m.StreamWidth, m.StreamHeight, m.ExternalResizeSupported, m.ExternalOwner)
+	c.display.observe(m.SessionID, m.StreamWidth, m.StreamHeight, m.ExternalResizeSupported, m.ExternalOwner,
+		m.RenderWidth, m.RenderHeight, m.UIScale, hs.Width, hs.Height)
 	c.display.observeConsoleMode(m.SessionID, m.ConsoleMode)
 
 	metrics := buildAgentMetrics(m)
@@ -365,6 +366,15 @@ func buildAgentMetrics(m agentws.SessionMetricsMsg) json.RawMessage {
 	}
 	if m.GccEstimateKbps != nil {
 		obj["gcc_estimate_kbps"] = *m.GccEstimateKbps
+	}
+	if m.AbrLinkRateKbps != nil {
+		obj["abr_link_rate_kbps"] = *m.AbrLinkRateKbps
+	}
+	if m.WTFecOverheadPct != nil {
+		obj["wt_fec_overhead_pct"] = *m.WTFecOverheadPct
+	}
+	if m.WTFecKbps != nil {
+		obj["wt_fec_kbps"] = *m.WTFecKbps
 	}
 	// The ladder-followed ABR floor, present only off the launch floor.
 	if m.AbrFloorKbps != nil {

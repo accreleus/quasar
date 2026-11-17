@@ -203,7 +203,8 @@ func (s *Store) ObserveIdleState(ctx context.Context, hostID, connectionID strin
 			}
 		}
 	} else if terminal {
-		// A recovery row exists only for an uncertain attempt; a release ends it.
+		// A recovery row exists for an uncertain attempt and for an applied one whose
+		// proof never arrived (amendment 86); a release or the proof ends it.
 		if _, err := tx.Exec(ctx, `DELETE FROM host_admission_restrictions WHERE host_id=$1::uuid AND owner_kind IN ('idle_apply','recovery') AND owner_id=$2::uuid`, hostID, state.AttemptID); err != nil {
 			return false, err
 		}

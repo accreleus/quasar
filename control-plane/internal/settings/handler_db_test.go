@@ -36,6 +36,16 @@ func newSettingsHarness(t *testing.T, pool *pgxpool.Pool) (
 	get func(t *testing.T) settingsEnvelope,
 ) {
 	t.Helper()
+	return newSettingsHarnessWith(t, pool, nil)
+}
+
+// newSettingsHarnessWith is newSettingsHarness with a hook on the handler before
+// it serves, for the injected seams.
+func newSettingsHarnessWith(t *testing.T, pool *pgxpool.Pool, tune func(*Handler)) (
+	patch func(t *testing.T, body string) (int, settingsEnvelope),
+	get func(t *testing.T) settingsEnvelope,
+) {
+	t.Helper()
 	ctx := context.Background()
 
 	store := NewStore(pool)
@@ -51,6 +61,9 @@ func newSettingsHarness(t *testing.T, pool *pgxpool.Pool) (
 	must(t, err)
 
 	h := NewHandler(store)
+	if tune != nil {
+		tune(h)
+	}
 	mux := http.NewServeMux()
 	h.Register(mux, func(next http.Handler) http.Handler {
 		return authHandler.RequireAuth(authHandler.RequireAdmin(next))

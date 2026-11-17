@@ -934,9 +934,13 @@ mod tests {
         let metrics = Arc::new(SessionMetrics::new("off", 60));
         attach_encode_probes(&encoder, metrics.clone(), true);
         let hook_encoder = encoder.clone();
-        metrics.set_on_window(Box::new(move |_, _| {
-            let _keepalive = &hook_encoder;
-        }));
+        metrics.claim_abr(1);
+        assert!(metrics.set_on_window(
+            1,
+            Box::new(move |_, _| {
+                let _keepalive = &hook_encoder;
+            })
+        ));
         let weak_encoder = encoder.downgrade();
         drop(encoder);
         assert!(

@@ -14,12 +14,18 @@ type scriptedHomeEpoch struct {
 	queued  bool
 	err     error
 	sends   int
+	// after runs once the ack has been produced, for a test that needs something
+	// to happen between this ack and the command that follows it.
+	after func()
 }
 
 func (e *scriptedHomeEpoch) SupportsHomeCleanup() bool { return e.capable }
 func (*scriptedHomeEpoch) Send(any) (bool, error)      { return true, nil }
 func (e *scriptedHomeEpoch) SendWithAck(context.Context, string, any) (agentws.AckResult, bool, error) {
 	e.sends++
+	if e.after != nil {
+		e.after()
+	}
 	return e.result, e.queued, e.err
 }
 

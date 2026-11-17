@@ -354,6 +354,14 @@ type SessionMetricsMsg struct {
 	// Raw rtpgccbwe GCC estimate (kbit/s) before EWMA/deadband/step — distinct
 	// from AbrSetpointKbps (governor output).
 	GccEstimateKbps *float64 `json:"gcc_estimate_kbps"`
+	// Governor's UNCLAMPED link rate (kbit/s), the per-report loop's rate before
+	// the floor clamps it into the setpoint (amendment 79). WebTransport in smooth
+	// only; absent ⇒ not measured.
+	AbrLinkRateKbps *float64 `json:"abr_link_rate_kbps"`
+	// FEC repair payload for the window, as a percent of the video payload sent
+	// and as a rate (amendment 85). Present only while FEC is negotiated.
+	WTFecOverheadPct *float64 `json:"wt_fec_overhead_pct"`
+	WTFecKbps        *float64 `json:"wt_fec_kbps"`
 	// "protective" | "off"; empty from old agents, for which the diagnostic
 	// bundle falls back to the setpoint-presence heuristic.
 	AbrMode string `json:"abr_mode"`

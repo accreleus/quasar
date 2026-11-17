@@ -91,6 +91,71 @@ func TestFreshV2SeedRequiresReconnectBeforeAdmission(t *testing.T) {
 	}
 }
 
+// Migration 0087 stored a pre-policy override as an explicit choice with no
+// host_setting_groups row, and the legacy map withholds an owned group's keys,
+// so that choice was never offered (#1444).
+func TestConfirmOffersAnExplicitChoiceWithNoGroupRow(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO host_setting_choices(host_id,key,source,explicit_value,revision) VALUES
+		($1::uuid,'abr_ladder_resolution','explicit','false',0),
+		($1::uuid,'abr_ladder_order','explicit','"hybrid"',0)`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	connection := "00000000-0000-4000-8000-000000000141"
+	groups := []string{"abr_ladder_resolution", "abr_ladder_order", "idle_timeout_secs"}
+	if _, err := store.BeginPolicyConnection(ctx, hostID, connection, map[string]int{"typed_settings": 2}, groups, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ConfirmPolicyGroups(ctx, hostID, connection, groups); err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.GetPolicy(ctx, hostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, group := range groups[:2] {
+		if view.Groups[group].Status != "pending" {
+			t.Fatalf("%s = %+v", group, view.Groups[group])
+		}
+	}
+	if view.Groups["idle_timeout_secs"].Saved {
+		t.Fatalf("group without a choice got a row: %+v", view.Groups["idle_timeout_secs"])
+	}
+	var obligations int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM host_reconcile_obligations WHERE host_id=$1::uuid AND kind='setting'`, hostID).Scan(&obligations); err != nil {
+		t.Fatal(err)
+	}
+	if obligations != 2 {
+		t.Fatalf("obligations = %d", obligations)
+	}
+	id := "00000000-0000-4000-8000-000000000142"
+	if _, ok, err := store.PrepareLegacyDelivery(ctx, hostID, connection, id, groups); err != nil || !ok {
+		t.Fatalf("delivery: %v %v", ok, err)
+	}
+	if ok, err := store.AcknowledgeInitialDelivery(ctx, hostID, connection, id); err != nil || !ok {
+		t.Fatalf("ack: %v %v", ok, err)
+	}
+	digest := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	offers, err := store.NextSessionOffers(ctx, hostID, "00000000-0000-4000-8000-000000000143", connection,
+		map[string]PolicySnapshot{
+			"abr_ladder_resolution": {Kind: "seeded", Digest: digest},
+			"abr_ladder_order":      {Kind: "seeded", Digest: digest},
+		}, func() string { return "00000000-0000-4000-8000-000000000144" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	offered := map[string]any{}
+	for _, offer := range offers {
+		offered[offer.Group] = offer.ResolvedSettings[offer.Group]
+	}
+	if len(offers) != 2 || offered["abr_ladder_resolution"] != false || offered["abr_ladder_order"] != "hybrid" {
+		t.Fatalf("offers = %+v", offers)
+	}
+}
+
 func TestUpgradeRequiredRemedyDistinguishesLegacyWriterFromStickyOwnership(t *testing.T) {
 	pool := testPool(t)
 	store := NewStore(pool)
