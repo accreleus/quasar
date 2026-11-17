@@ -29,7 +29,7 @@ import { ApplyConfirmModal } from "./ApplyControls";
 import { hostFloorState } from "./hostFloor";
 import { HostRow } from "./HostRow";
 import { hostFlag } from "./hostWarnings";
-import { canRemoveHost, removable } from "./removeHost";
+import { canRemoveHost, notConnected, removable } from "./removeHost";
 import "../../../styles/admin/fleet.css";
 
 // `Host.capacity` carries the roll-up but no GPU model names, so one resource
@@ -374,13 +374,17 @@ export function HostsTab() {
       {forgetTarget &&
         (() => {
           // The server refuses (409) while the agent is reachable or has
-          // active sessions, checked live rather than off `status` — so an
-          // offline row still gets the real confirm, everything else gets
+          // active sessions, checked live rather than off `status` — so a host
+          // whose agent is gone still gets the real confirm, everything else gets
           // the explanation + a way to get there (#101).
           // Read the LIVE row, not the snapshot taken when the dialog opened:
           // Drain from inside the dialog changes the status it is explaining.
           const live = hosts.find((h) => h.id === forgetTarget.id) ?? forgetTarget;
-          const removable = live.status === "offline";
+          // The server's rule is the live connection, not `status`, so this is the
+          // connection too: a host whose agent never came back after a restart stays
+          // `draining` for good, and that is exactly the host an admin has to be able
+          // to forget (#634).
+          const forgettable = notConnected(live, now);
           const draining = live.status === "draining" || actionPendingId === live.id;
           return (
             <Modal
@@ -388,7 +392,7 @@ export function HostsTab() {
               onClose={() => setForgetTarget(null)}
               title="Remove host"
               footer={
-                removable ? (
+                forgettable ? (
                   <>
                     <Button variant="ghost" onClick={() => setForgetTarget(null)}>
                       Cancel
@@ -413,12 +417,15 @@ export function HostsTab() {
                 )
               }
             >
-              {removable ? (
+              {forgettable ? (
                 <>
                   <p className="sec">
                     This permanently removes <strong>{forgetTarget.node_name}</strong> from the
-                    host registry. Its GPU records and session history are deleted. If the host
-                    comes back online it re-enrolls automatically. This cannot be undone.
+                    host registry. Its GPU records and its session history are deleted, and its
+                    managed homes are tombstoned, so each claim then needs releasing by hand in
+                    Storage before that user can launch the app again. Nothing on the machine is
+                    touched. To bring the machine back, add a host with the same node name. This
+                    cannot be undone.
                   </p>
                   {forgetError && (
                     <p className="note warn" role="alert">
@@ -435,8 +442,8 @@ export function HostsTab() {
                   <p className="note">
                     Drain it, then stop the agent on that machine — for a host enrolled with the
                     installer, <span className="mono">docker compose --project-directory
-                    /opt/quasar-agent down</span>. The row turns offline within a heartbeat
-                    window; remove it from here once it does.
+                    /opt/quasar-agent down</span>. It can be removed from here once its heartbeats
+                    stop, whether it reads draining or offline.
                   </p>
                 </>
               )}

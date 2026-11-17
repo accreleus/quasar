@@ -14,6 +14,8 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 
 use super::codec_chain::{rtp_mtu_of, set_rtp_mtu};
+use super::TraceTx;
+use crate::session::runner::TraceEvent;
 use crate::session::RTP_MTU_RANGE;
 
 /// One step, in bytes of `QUASAR_RTP_MTU`.
@@ -310,6 +312,7 @@ pub(super) fn attach(
     payloader: &gst::Element,
     encoder: &gst::Element,
     session_id: String,
+    trace: TraceTx,
 ) {
     let Some(rtp_mtu) = rtp_mtu_of(payloader).filter(|&m| next_step(m).is_some()) else {
         return;
@@ -361,6 +364,7 @@ pub(super) fn attach(
         });
         let (shrink, payloader, encoder) = (shrink.clone(), payloader.clone(), encoder.clone());
         let session_id = session_id.clone();
+        let trace = trace.clone();
         pad.add_probe(
             gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
             move |_, info| {
@@ -382,7 +386,7 @@ pub(super) fn attach(
                     }
                 }
                 if let Some(step) = step {
-                    take_step(&step, &payloader, &encoder, &session_id);
+                    take_step(&step, &payloader, &encoder, &session_id, &trace);
                 }
                 gst::PadProbeReturn::Ok
             },
@@ -395,6 +399,7 @@ fn take_step(
     payloader: &glib::WeakRef<gst::Element>,
     encoder: &glib::WeakRef<gst::Element>,
     session_id: &str,
+    trace: &TraceTx,
 ) {
     let Some(payloader) = payloader.upgrade() else {
         return;
@@ -418,6 +423,29 @@ fn take_step(
         "the path drops full-size video packets: RTP packets shrunk from {} to {} bytes",
         step.from,
         step.to
+    );
+    // Amendment 81: the same step on the diagnostics lane, so a live MTU step is in
+    // session telemetry and not only in a log line. One event per step; a dropped copy
+    // shows as the next step's `from` not being this one's `to`.
+    let ts_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    trace.try_emit(
+        session_id.to_string(),
+        TraceEvent {
+            ts_unix_ms,
+            event: "transport.rtp_mtu_shrunk",
+            payload: serde_json::json!({
+                "from": step.from,
+                "to": step.to,
+                "nacked_large": w.nacked_large,
+                "lost_large": w.lost_large,
+                "sent_large": w.sent_large,
+                "nacked_small": w.nacked_small,
+                "sent_small": w.sent_small,
+            }),
+        },
     );
     // The peer is missing frames: a keyframe at the new size now, not at its next PLI.
     if let Some(encoder) = encoder.upgrade() {
@@ -558,8 +586,59 @@ mod tests {
             to: 1100,
             window: Window::default(),
         };
-        take_step(&stale, &pay.downgrade(), &glib::WeakRef::new(), "stale");
+        take_step(
+            &stale,
+            &pay.downgrade(),
+            &glib::WeakRef::new(),
+            "stale",
+            &quiet_trace(),
+        );
         assert_eq!(rtp_mtu_of(&pay), Some(1000));
+    }
+
+    /// A diagnostics lane nobody reads, for steps a test does not assert on.
+    fn quiet_trace() -> TraceTx {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        // The receiver is dropped so nothing back-pressures; `try_emit` never blocks.
+        drop(rx);
+        TraceTx::new(tx, Arc::default(), Arc::default())
+    }
+
+    /// Amendment 81 (#1152): each live RTP MTU step is a `transport.rtp_mtu_shrunk` event
+    /// carrying the sizes and the NACK counts of the deciding window, so a step is in
+    /// session telemetry and not only in a log line. Deleting the `try_emit` in
+    /// `take_step` leaves the lane empty.
+    #[test]
+    fn a_step_emits_the_rtp_mtu_shrunk_event() {
+        gst::init().unwrap();
+        let pay = gst::ElementFactory::make("rtph264pay").build().unwrap();
+        set_rtp_mtu(&pay, 1200);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let trace = TraceTx::new(tx, Arc::default(), Arc::default());
+        let step = Step {
+            from: 1200,
+            to: 1100,
+            window: wl(200, 190, 120, 60, 4),
+        };
+        take_step(&step, &pay.downgrade(), &glib::WeakRef::new(), "s1", &trace);
+        let (sid, event) = rx.try_recv().expect("one event per step");
+        assert_eq!(sid, "s1");
+        assert_eq!(event.event, "transport.rtp_mtu_shrunk");
+        assert_eq!(
+            event.payload,
+            serde_json::json!({
+                "from": 1200,
+                "to": 1100,
+                "nacked_large": 190,
+                "lost_large": 120,
+                "sent_large": 200,
+                "nacked_small": 4,
+                "sent_small": 60,
+            })
+        );
+        // A step the payloader is already under changes nothing and says nothing.
+        take_step(&step, &pay.downgrade(), &glib::WeakRef::new(), "s1", &trace);
+        assert!(rx.try_recv().is_err(), "a stale step emits no event");
     }
 
     #[test]

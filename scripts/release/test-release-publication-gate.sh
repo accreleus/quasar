@@ -67,7 +67,8 @@ assert inputs.index('id: preview') < inputs.index('id: gate'), 'the gate needs t
 assert 'publish-preview-manifest.sh --current' in inputs and 'preview-rules.sh forward "$current" HEAD' in inputs, \
     'a develop push no longer refuses a run older than the published preview'
 assert 'prev="$current"' in inputs, 'a develop push no longer diffs against the published preview'
-assert re.search(r'actions/checkout@\S+.*\n\s+with:\n(?:\s+#.*\n)*\s+fetch-depth: 0', blocks['preview']), \
+# Other `with:` keys (persist-credentials, #877) may sit before fetch-depth.
+assert re.search(r'actions/checkout@\S+.*\n\s+with:\n(?:[ \t]+(?:#.*|[\w-]+: .*)\n)*[ \t]+fetch-depth: 0', blocks['preview']), \
     'the preview job needs history for the forward check'
 print('PASS the workflow decides the preview tag and its diff base by preview-rules.sh')
 
