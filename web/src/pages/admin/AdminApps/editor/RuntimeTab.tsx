@@ -16,7 +16,7 @@ import { imageFieldPlaceholder } from "../imagePlaceholder";
 import { parseSpec } from "../runtimeSpec";
 import { CompatToolSection } from "./CompatToolSection";
 import { Fact, Section } from "./primitives";
-import type { AppDraft, DraftErrors } from "./appDraft";
+import { specFlag, withSpecFlag, type AppDraft, type DraftErrors } from "./appDraft";
 
 // The control is per host (Fleet › Hosts); this is the read-only explanation.
 // "volume" is unreachable (#473, migration 0068) but stays because the frozen
@@ -231,6 +231,40 @@ export function RuntimeTab({
           </div>
         </div>
       </Section>
+
+      {/* The server stamps an image-managed preset's flags onto the app on every write (#171), so the
+          controls would write nowhere. The preset DTO does not say which presets are managed, so any
+          preset hides the group (a contract field would let admin-authored presets keep it). */}
+      {!draft.runtimePresetId && (
+        <Section title="Container" desc="Flags for an app that brings its own image.">
+          <Switch
+            checked={draft.gpu}
+            onChange={(gpu) => onChange({ ...draft, gpu })}
+            label="GPU access"
+            id="container-gpu"
+          />
+          <span className="hint">Passes the host's GPU into the container. Off, the app cannot use it.</span>
+          <Switch
+            checked={specFlag(draft, "no_new_privileges")}
+            onChange={(on) => onChange(withSpecFlag(draft, "no_new_privileges", on))}
+            label="Block privilege escalation"
+            id="container-no-new-privileges"
+          />
+          <span className="hint">
+            On by default. Turn it off only for an image whose startup scripts run sudo; the session
+            otherwise streams a black screen. A host can refuse the opt-out.
+          </span>
+          <Switch
+            checked={specFlag(draft, "systempaths_unconfined")}
+            onChange={(on) => onChange(withSpecFlag(draft, "systempaths_unconfined", on))}
+            label="Unmask /proc and /sys"
+            id="container-systempaths-unconfined"
+          />
+          <span className="hint">
+            Off by default. Turn it on for desktop images that run Flatpak. A host can refuse it.
+          </span>
+        </Section>
+      )}
 
       <Section
         title="Storage"
