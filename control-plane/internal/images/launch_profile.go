@@ -30,6 +30,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 )
 
 // ApplyLaunchProfile returns spec with the manifest runtime block's launch
@@ -87,22 +88,31 @@ func applyLaunchProfile(spec map[string]any, rt providerRuntimeExtras) {
 // stampDirectDisplay gives the apps that launch imageID through its managed
 // preset the `direct_display: true` its manifest declares, once the adoption is
 // at the catalog's version (#580). Called wherever an adoption moves, in that
-// transaction. Never overwrites: an app that already has the key keeps it (an
-// explicit false is the operator's), and an app on another preset or its own
-// image matches nothing. SQL twin: migration 0103, for rows that predate this.
-func stampDirectDisplay(ctx context.Context, tx dbExecutor, imageID string) error {
-	if _, err := tx.Exec(ctx, `
+// transaction, and unscoped (imageID "") at the end of the catalog upsert, so a
+// state that converged without an adoption move (an app linked back to the
+// managed preset) is stamped too (#583). Never overwrites: an app that already
+// has the key keeps it (an explicit false is the operator's), and an app on
+// another preset or on its own runtime_spec.image matches nothing. Migrations
+// 0103 and 0117 are the SQL twins, for rows that predate this. A rewrite leaves
+// one log line with the row count: nobody asked for it.
+func stampDirectDisplay(ctx context.Context, tx dbExecutor, log *slog.Logger, imageID string) error {
+	tag, err := tx.Exec(ctx, `
 		UPDATE apps
 		   SET runtime_spec = apps.runtime_spec || '{"direct_display": true}'::jsonb
 		  FROM installed_images ii
 		  JOIN image_catalog ic ON ic.id = ii.image_id
-		 WHERE ii.image_id = $1
+		 WHERE ($1 = '' OR ii.image_id = $1)
 		   AND apps.runtime_preset_id = ii.runtime_preset_id
 		   AND ii.version = ic.version
 		   AND ic.runtime -> 'direct_display' = 'true'::jsonb
 		   AND NOT apps.runtime_spec ? 'direct_display'
-	`, imageID); err != nil {
+		   AND COALESCE(apps.runtime_spec->>'image', '') = ''
+	`, imageID)
+	if err != nil {
 		return fmt.Errorf("stamp direct_display for image %q: %w", imageID, err)
+	}
+	if n := tag.RowsAffected(); n > 0 {
+		log.Info("stamped direct_display on apps of the managed preset", "image_id", imageID, "apps", n)
 	}
 	return nil
 }
