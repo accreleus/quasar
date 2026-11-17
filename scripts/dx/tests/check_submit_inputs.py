@@ -58,7 +58,7 @@ bad_cond = {
     "control character in a value": {"effective": {"abr_mode": "a\nb"}},
     "key with a space": {"effective": {"abr mode": "smooth"}},
     "nested too deep": {"effective": {"a": {"b": {"c": {"d": {"e": 1}}}}}},
-    "too many items": {"effective": {"k%d" % i: i for i in range(100)}},
+    "too many items": {"effective": {"k%d" % i: i for i in range(300)}},
     "not finite": {"effective": {"x": float("inf")}},
 }
 for label, doc in bad_cond.items():

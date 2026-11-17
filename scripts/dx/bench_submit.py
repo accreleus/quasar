@@ -261,7 +261,7 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9_.:+/@=-]{1,128}")
 _NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:/=+-]{0,199}")  # no leading `-`; `/` and `=` are real (stream-hold/transport=webrtc/..)
 _BAD_CATEGORIES = {"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"}  # control, format (bidi), line/para sep
 _TEXT_MAX = 512
-_TREE_DEPTH, _TREE_ITEMS = 4, 64
+_TREE_DEPTH, _TREE_ITEMS = 4, 256  # conditions.effective is ~42 keys and grows with every setting
 
 
 def check_text(v, what: str):
