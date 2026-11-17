@@ -38,6 +38,9 @@ const STORAGE_DELTA_MB: i64 = 1024;
 /// Minimum delta (fraction of total) on any volume field worth a re-send.
 const STORAGE_DELTA_FRACTION: f64 = 0.01;
 
+/// The kernel cuts a thread name to 15 bytes, and the crash report prints it.
+const THREAD_NAME: &str = "qsr-con-hotplug";
+
 /// RAII handle for the background poll thread: dropping it (on connection
 /// teardown) sets the stop flag and joins the thread, so no watcher outlives
 /// the WebSocket connection it reports changes for.
@@ -57,7 +60,7 @@ impl ConsoleHotplugWatcher {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let handle = std::thread::Builder::new()
-            .name("quasar-console-hotplug".to_string())
+            .name(THREAD_NAME.to_string())
             .spawn(move || run(stop2, tx))
             .expect("failed to spawn console-hotplug watcher thread");
         ConsoleHotplugWatcher { stop, handle }
@@ -173,5 +176,13 @@ fn describe_change(before: &ConsoleCapabilities, after: &ConsoleCapabilities) ->
         "console capabilities changed".to_string()
     } else {
         parts.join(", ")
+    }
+}
+
+#[cfg(test)]
+mod thread_name_tests {
+    #[test]
+    fn the_thread_name_fits_the_kernels_15_bytes() {
+        assert!(super::THREAD_NAME.len() <= 15, "{}", super::THREAD_NAME);
     }
 }
