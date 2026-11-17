@@ -422,7 +422,7 @@ pub(crate) fn learn_input(connector: &str) {
     }
     // Over a second of i2c per read: not on the 2 s hotplug poll's thread.
     let spawned = std::thread::Builder::new()
-        .name("console-input-learn".into())
+        .name("console-learn".into())
         .spawn(move || learn_from(&LEARNED, due, read_vcp_sl));
     if let Err(err) = spawned {
         tracing::warn!(token = "console-input-learn-spawn-failed", %err, "console: could not start the monitor input read");
