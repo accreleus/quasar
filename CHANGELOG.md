@@ -43,6 +43,7 @@ own; the two do not move together, and that is deliberate.
 - **CI checkouts no longer leave the job token in the workspace (#877).** Every workflow checkout now sets `persist-credentials: false` (the one release-gate step that fetches afterwards keeps it), and a CI check fails a new checkout that does not.
 - **The e2e compare test now pins the decode-support read (#1410).** A client that reports a codec named like something every object has (`constructor`) is read as absent on the other side, never as an inherited value; the test fails if the guard is removed.
 - **A test now covers a preset gained in the same image update (#583).** The provider app that the update re-links onto a preset materialized by that same update gains `direct_display` without a second pass; it fails if the stamp runs before the re-link. Test-only.
+- **Two node-agent tests pin the codec-advertisement reconnect follow-ups (#309).** The first asserts `begin_connection` keeps the agent's current runtime settings, so a reconnect re-advertises the codecs the live stack proved instead of dropping back to the Openh264 baseline; the second drives a codec probe through the real scheduler to the advertised set and pins the scheduler running on exactly the inputs the manager notified. A test-only change: the advertisement behaviour is unchanged, and each test fails if its invariant is broken.
 
 ### Fixed
 - **Audio code comments describe the send path as it is since #1441 (#1479).** Comment only; no behaviour change.
