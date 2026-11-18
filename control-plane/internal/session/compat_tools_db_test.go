@@ -392,3 +392,28 @@ func TestALaunchMappedToAnUnusableToolFailsBeforeTheAgent(t *testing.T) {
 		}
 	}
 }
+
+// A replaced mapping takes a new revision, so the swap guard's commit-order comparison sees the
+// replacement (#1555).
+func TestSetMappingBumpsTheRevisionOnReplace(t *testing.T) {
+	f := compatFixture(t, true)
+	ctx := context.Background()
+	var admin, hotfix string
+	must(t, f.pool.QueryRow(ctx, `SELECT id::text FROM users LIMIT 1`).Scan(&admin))
+	must(t, f.pool.QueryRow(ctx, `SELECT id::text FROM compat_tools WHERE steam_name = 'proton_hotfix'`).Scan(&hotfix))
+	rev := func() int64 {
+		t.Helper()
+		var r int64
+		must(t, f.pool.QueryRow(ctx, `SELECT revision FROM compat_tool_mappings
+			WHERE provider = 'steam' AND external_id = '480'`).Scan(&r))
+		return r
+	}
+	_, _, _, _, err := compat.NewStore(f.pool).SetMapping(ctx, "480", hotfix, false, admin)
+	must(t, err)
+	first := rev()
+	_, _, _, _, err = compat.NewStore(f.pool).SetMapping(ctx, "480", hotfix, true, admin)
+	must(t, err)
+	if second := rev(); second <= first {
+		t.Errorf("replaced mapping keeps revision %d (was %d), want a later one", second, first)
+	}
+}
