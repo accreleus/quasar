@@ -9018,8 +9018,26 @@ mod tests {
             sessions.register_prep.is_some(),
             "no prep left by a failed dial"
         );
+        let kept_at = sessions.register_prep.as_ref().unwrap().at;
 
-        // 2. An image operation finishes while the agent is disconnected (the
+        // 2. The next attempt REUSES it, not re-prepares: its timestamp still holds
+        // the first attempt's, so a broken reuse cannot pass this test (#1533).
+        attempt(
+            &dead_url,
+            &secret,
+            &mut sessions,
+            &image_mgr,
+            &release_mgr,
+            &health,
+        )
+        .await;
+        assert_eq!(
+            sessions.register_prep.as_ref().map(|p| p.at),
+            Some(kept_at),
+            "the second attempt did not reuse the register preparation"
+        );
+
+        // 3. An image operation finishes while the agent is disconnected (the
         // control plane it would report to is down); the next attempt reuses the
         // prep and must carry this record, not the list from step 1.
         image_mgr.set_ready_for_test(

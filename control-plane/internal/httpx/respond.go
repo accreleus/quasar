@@ -77,11 +77,12 @@ const (
 // may be, the agent on the control plane's own machine (Forget host and Remove host
 // share it, #1395). It is true on that machine's own host and when the control plane
 // cannot tell: the machine's identity is written by the recovery actor's recipe when
-// it creates the control plane, never typed by an operator, so the remedy is a
-// platform update from Fleet ▸ Releases that re-creates the control plane with a
-// recipe naming its machine, not a variable to set.
+// it creates the control plane, never typed by an operator, so the remedy is to
+// apply the next platform update from Fleet ▸ Releases (an install already on the
+// latest release has none to apply until one ships, #1521), which re-creates the
+// control plane with a recipe naming its machine, not a variable to set.
 const HostIsOwnMachineMessage = "this host is, or may be, the agent on the control plane's own machine, so it is not removed from here: take that machine apart with the uninstall command on it. " +
-	"If it is another machine's host, the control plane's configuration does not name its machine (it was created by an older recovery actor or edited by hand): apply the platform update from Admin › Fleet › Releases › Apply so its recovery actor re-creates the control plane with a recipe that names its machine, then retry"
+	"If it is another machine's host, the control plane's configuration does not name its machine (it was created by an older recovery actor or edited by hand): apply the next platform update from Admin › Fleet › Releases › Apply so its recovery actor re-creates the control plane with a recipe that names its machine, then retry"
 
 // errorEnvelope is the wire shape: { "error": { "code", "message" } }.
 type errorEnvelope struct {
