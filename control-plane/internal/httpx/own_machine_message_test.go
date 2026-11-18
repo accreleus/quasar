@@ -9,15 +9,17 @@ import (
 // input can change the answer (docs/configuration.md: the machine shape is "not an
 // operator input"), and where the identity is unknown. It must not tell the operator to
 // set those variables or to run a bare reconfigure (neither changes the shape), and
-// must name the real remedy: a platform update from Fleet ▸ Releases (#1395).
+// must name the real remedy: the NEXT platform update from Fleet ▸ Releases
+// (#1395, #1521 — an install already on the latest release has no release to
+// apply until the next one ships, so "the platform update" is wrong).
 func TestHostIsOwnMachineMessageIsTrueOnTheOwnMachineAndWhenIdentityIsUnknown(t *testing.T) {
 	m := HostIsOwnMachineMessage
-	for _, bad := range []string{"set QUASAR_MACHINE", "QUASAR_MACHINE_ROLE", "QUASAR_MACHINE_NODE_NAME", "quasar-recovery reconfigure"} {
+	for _, bad := range []string{"set QUASAR_MACHINE", "QUASAR_MACHINE_ROLE", "QUASAR_MACHINE_NODE_NAME", "quasar-recovery reconfigure", "apply the platform update"} {
 		if strings.Contains(m, bad) {
-			t.Errorf("message tells the operator about %q, which cannot change the machine's shape: %s", bad, m)
+			t.Errorf("message tells the operator about %q, which cannot change the machine's shape or the remedy: %s", bad, m)
 		}
 	}
-	for _, want := range []string{"own machine", "uninstall", "Fleet › Releases › Apply", "recovery actor"} {
+	for _, want := range []string{"own machine", "uninstall", "apply the next platform update", "Fleet › Releases › Apply", "recovery actor"} {
 		if !strings.Contains(m, want) {
 			t.Errorf("message lacks %q: %s", want, m)
 		}
