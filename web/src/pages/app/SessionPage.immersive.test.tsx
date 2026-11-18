@@ -784,10 +784,10 @@ describe("SessionPage — Match cursor compositor size (#898)", () => {
     expect(lastDrawerProps?.uiScale).toBe(1.5);
   });
 
-  it("a later poll does not undo a change this tab made (#996)", async () => {
-    // Adopted once on load: after that this tab's acked value is the newer truth,
-    // so another tab's move (or a poll in flight when this tab's PATCH landed) is
-    // not allowed to yank the controls.
+  it("a later poll does not undo a change this tab made (#996, adopt-then-edit)", async () => {
+    // Adopted on load first, then this tab's own change acked: that acked value is
+    // the newer truth from then on, so a poll carrying another tab's move (or a
+    // sample taken before this tab's PATCH landed) cannot yank the controls.
     await revealWithStream({
       width: 2560,
       height: 1440,
@@ -816,6 +816,96 @@ describe("SessionPage — Match cursor compositor size (#898)", () => {
     });
     await advance(6_000);
     expect(lastDrawerProps?.renderSize).toEqual({ w: 960, h: 540 });
+    expect(compositor()).toEqual(["960", "540"]);
+    expect(sessionStorage.getItem("quasar.session.s1.render")).toBe(JSON.stringify({ w: 960, h: 540 }));
+  });
+
+  it("adoption continues across polls until this tab changes something, so a stale first sample is corrected (#1491)", async () => {
+    // The ~1 s window where a pre-PATCH metrics sample overwrote the 202 leaves the
+    // first poll with a stale value. A tab that latched it once kept it for good.
+    await revealWithStream({
+      width: 2560,
+      height: 1440,
+      fps: 60,
+      bitrate_kbps: 20000,
+      render_width: 1280,
+      render_height: 720,
+      ui_scale: 1.5,
+    });
+    expect(lastDrawerProps?.renderSize).toEqual({ w: 1280, h: 720 });
+    expect(lastDrawerProps?.uiScale).toBe(1.5);
+
+    // Nothing was acked by this tab, so the next poll adopts the corrected value.
+    currentSession = makeSession({
+      state: "running",
+      state_detail: "app presented",
+      stream: {
+        width: 2560,
+        height: 1440,
+        fps: 60,
+        bitrate_kbps: 20000,
+        render_width: 960,
+        render_height: 540,
+        ui_scale: 2,
+      },
+    });
+    await advance(6_000);
+    expect(lastDrawerProps?.renderSize).toEqual({ w: 960, h: 540 });
+    expect(lastDrawerProps?.uiScale).toBe(2);
+    expect(compositor()).toEqual(["960", "540"]);
+    expect(sessionStorage.getItem("quasar.session.s1.render")).toBe(JSON.stringify({ w: 960, h: 540 }));
+  });
+
+  it("a change this tab acked before its first adoption survives a delayed stale poll (#1491, edit-then-stale-poll)", async () => {
+    // No render/scale fields yet: the control plane does not know them, so nothing
+    // was adopted and this tab edits FIRST, getting the ACK.
+    await revealWithStream({ width: 2560, height: 1440, fps: 60, bitrate_kbps: 20000 });
+    expect(lastDrawerProps?.renderSize).toBeNull();
+    await act(async () => {
+      (lastDrawerProps?.onRenderSizeChange as (v: { w: number; h: number }) => void)({ w: 960, h: 540 });
+    });
+    await advance(500);
+    expect(updateSessionDisplay).toHaveBeenLastCalledWith("t", "s1", { render_width: 960, render_height: 540 });
+    expect(lastDrawerProps?.renderSize).toEqual({ w: 960, h: 540 });
+
+    // A delayed poll carries the older size (sampled before the PATCH landed). The
+    // acked local change must end adoption permanently, not only while the PATCH ran.
+    currentSession = makeSession({
+      state: "running",
+      state_detail: "app presented",
+      stream: {
+        width: 2560,
+        height: 1440,
+        fps: 60,
+        bitrate_kbps: 20000,
+        render_width: 1280,
+        render_height: 720,
+        ui_scale: 1,
+      },
+    });
+    await advance(6_000);
+    expect(lastDrawerProps?.renderSize).toEqual({ w: 960, h: 540 });
+    expect(compositor()).toEqual(["960", "540"]);
+    expect(sessionStorage.getItem("quasar.session.s1.render")).toBe(JSON.stringify({ w: 960, h: 540 }));
+  });
+
+  it("a reported display value the PATCH contract rejects is not adopted (#1491)", async () => {
+    sessionStorage.setItem("quasar.session.s1.render", JSON.stringify({ w: 960, h: 540 }));
+    sessionStorage.setItem("quasar.session.s1.uiScale", "2");
+    await revealWithStream({
+      width: 2560,
+      height: 1440,
+      fps: 60,
+      bitrate_kbps: 20000,
+      render_width: 1281,
+      render_height: 721,
+      ui_scale: 3.5,
+    });
+    // Adoption goes through parseRender/parseUiScale: odd dims and a scale above 3
+    // are shapes the PATCH contract rejects, so this tab's stored ack stands.
+    expect(lastDrawerProps?.renderSize).toEqual({ w: 960, h: 540 });
+    expect(lastDrawerProps?.uiScale).toBe(2);
+    expect(compositor()).toEqual(["960", "540"]);
   });
 });
 
