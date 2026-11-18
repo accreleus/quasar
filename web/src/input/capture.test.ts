@@ -1247,6 +1247,43 @@ describe("engage() without Pointer Lock — the send gate opens anyway", () => {
     video.remove();
   });
 
+  it("a button pressed on the picture is released over the HUD (#1464)", async () => {
+    setPointerLockApi(null);
+    const video = mountVideo();
+    const hud = document.createElement("div");
+    document.body.appendChild(hud);
+    const send = vi.fn();
+    const { cleanup, engage } = setupCapture({
+      videoEl: video,
+      sendInput: send,
+      onCaptureChange: vi.fn(),
+      channel: makeChannel(),
+    });
+    await engage();
+
+    // Press in the stream: the host gets the press.
+    document.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerType: "mouse" }));
+    video.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }));
+    expect(send).toHaveBeenCalledWith({ t: "mb", button: MB_MAP[0], pressed: true });
+
+    // Release over the HUD overlay: the page sees the mouseup only on the HUD
+    // element, so `aimedAtGame` rejects it — and the host used to keep the button
+    // down until capture ended. A press this capture sent must lift anyway.
+    send.mockClear();
+    hud.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 0 }));
+    expect(send.mock.calls).toEqual([[{ t: "mb", button: MB_MAP[0], pressed: false }]]);
+
+    // A HUD-only click (no press on the picture) still sends nothing, press or
+    // release: chrome clicks stay chrome's.
+    hud.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }));
+    hud.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 0 }));
+    expect(send.mock.calls).toHaveLength(1);
+
+    cleanup();
+    hud.remove();
+    video.remove();
+  });
+
   it("a held button is released when capture ends, exactly once (#1406)", async () => {
     setPointerLockApi(null);
     const video = mountVideo();
