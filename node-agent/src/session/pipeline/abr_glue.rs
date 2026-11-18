@@ -1642,6 +1642,11 @@ fn write_launch_point(
     }
     let fps = cfg.stream.fps.max(1) as u32;
     write_encoder_bitrate(encoder, cfg.encoder, cfg.stream.bitrate_kbps, fps);
+    // #1462: publish the launch setpoint beside the bitrate. With the link rate cleared
+    // above, health falls back to the setpoint; leaving the old loop's (possibly
+    // floor-pinned) value published lets the control plane end a healthy stream whose new
+    // client sends no ABR feedback.
+    metrics.set_abr_setpoint(cfg.stream.bitrate_kbps);
     let bias = encoder_speed_bias_writable(encoder, cfg.encoder);
     if bias {
         write_encoder_speed_bias(encoder, cfg.encoder, 0, cfg.target_usage);
@@ -2999,16 +3004,23 @@ mod tests {
             })
         ));
         metrics.set_abr_link_rate(7, 400.0);
+        // #1462: the old loop stepped its governor down before its transport went away.
+        metrics.set_abr_setpoint(400);
 
         reset_to_launch(&encoder, &cfg, Some(&lever), &metrics);
 
+        let window = metrics.drain_window(std::time::Instant::now());
         // Amendment 79: another transport took the encoder; the old loop's rate is gone.
         assert!(
-            metrics
-                .drain_window(std::time::Instant::now())
-                .abr_link_rate_kbps
-                .is_none(),
+            window.abr_link_rate_kbps.is_none(),
             "a taken-over session carries no link rate"
+        );
+        // #1462: neither is the old loop's setpoint — the encoder runs at launch, so that
+        // is what health must read until the new loop retargets.
+        assert_eq!(
+            window.abr_setpoint_kbps,
+            Some(cfg.stream.bitrate_kbps as f64),
+            "a taken-over session publishes the launch setpoint, not the old loop's"
         );
 
         assert_eq!(encoder.property::<u32>("bitrate"), launch_bps);
