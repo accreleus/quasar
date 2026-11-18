@@ -218,6 +218,28 @@ describe("WebTransportMedia connect", () => {
     expect(agent.last.closes.every((c) => c?.closeCode !== 4400)).toBe(true);
   });
 
+  it.each<[number, string]>([
+    [4404, "session_ended"],
+    [4410, "taken_over"],
+  ])(
+    "reports the session's own close (%i) racing a hello_ack on a dead reader instead of internal (#1478)",
+    async (code, expected) => {
+      const agent = new FakeAgent();
+      agent.hold = "answer";
+      const t = transport(agent);
+      const up = t.connect(NO_SINK);
+      await vi.waitFor(() => expect(agent.reached).toBe("answer"));
+      agent.last.failDatagrams(NETWORK_ERROR());
+      await flush();
+      agent.last.control(helloAck(0, avcC()));
+      // The session's own close resolves in the same instant as the hello_ack on the dead reader.
+      agent.last.closeWith(code);
+      await expect(up).rejects.toMatchObject({ code: expected });
+      expect(agent.last.closes.every((c) => c?.closeCode !== 4400)).toBe(true);
+      t.close();
+    },
+  );
+
   it("names the datagram reader in its 4400 when the session stays up without it", async () => {
     const agent = new FakeAgent();
     agent.hold = "answer";
