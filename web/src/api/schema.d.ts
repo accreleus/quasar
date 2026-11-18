@@ -3452,7 +3452,7 @@ export interface paths {
                         "application/json": components["schemas"]["ErrorEnvelope"];
                     };
                 };
-                /** @description no_host_available (amendment 71, accreleus/quasar#1178) - the app is not selected for the session's host, or, with error.reason compat_tool_missing, the target is a derived Steam game whose mapped GE tool the session did not mount at launch, or (amendment 87) whose mapping was written after the session was created. NOT retryable: a swap does not move hosts or wait for an install. */
+                /** @description no_host_available (amendment 71, accreleus/quasar#1178) - the app is not selected for the session's host, or, with error.reason compat_tool_missing, the target is a derived Steam game whose mapped GE tool the session did not mount at launch, or (amendments 87 and 90) whose mapping was committed after the launch read it. NOT retryable: a swap does not move hosts or wait for an install. */
                 503: {
                     headers: {
                         [name: string]: unknown;
@@ -4960,7 +4960,7 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
-                /** @description PRE-SEND, in this order, each changing nothing: run_active; attempt_in_flight (both as for apply); host_not_eligible (the body carries `reason`: host_offline or updater_absent); host_not_removable (the host is not owned, or its agent is the one on the control plane's own machine - refused before any cordon or session stop); conflict (after the cordon, non-terminal sessions remain and force is false; the cordon is restored). ACK OUTCOME: host_not_removable (the ack carried a rejection - invalid, busy, updater_absent or updater_unreachable - which the message names; the cordon is restored, and sessions a force request already stopped stay stopped). */
+                /** @description PRE-SEND, in this order, each changing nothing: run_active; attempt_in_flight (both as for apply); host_not_eligible (the body carries `reason`: host_offline or updater_absent); host_not_removable (the host is not owned, or its agent is the one on the control plane's own machine - refused before any cordon or session stop. Amendment 89: When an owned control plane (one with a recovery actor) can name neither a machine role nor its own enrollment node, it cannot tell which host is its own and refuses every host; when it knows its own node, it refuses only that host, as before.); conflict (after the cordon, non-terminal sessions remain and force is false; the cordon is restored). ACK OUTCOME: host_not_removable (the ack carried a rejection - invalid, busy, updater_absent or updater_unreachable - which the message names; the cordon is restored, and sessions a force request already stopped stay stopped). */
                 409: {
                     headers: {
                         [name: string]: unknown;
