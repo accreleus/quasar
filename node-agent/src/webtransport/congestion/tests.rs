@@ -453,6 +453,90 @@ fn the_first_report_after_an_outage_counts_no_outage_loss() {
     );
 }
 
+/// #1557 review A2: the exemption ends at the send time of the first packet the report
+/// shows received after the outage's mark. A burst sent after the link came back is
+/// congestion, even when it falls in the feedback interval before the first report: it
+/// must cut, and the exemption must not swallow it for the whole report.
+#[test]
+fn a_congestion_burst_right_after_recovery_still_cuts() {
+    let mut s = Sim::new(20_000.0);
+    s.send_kbps = Some(6000.0);
+    s.run(5.0);
+    s.outage(10.0);
+    assert!(s.est.recover_to.is_some(), "the outage left no memory");
+    // The link is back, but the first frames after it lose a burst: the report shows a
+    // received packet behind the gap, so the mark ends before those losses.
+    s.drop_every = 4;
+    let lines = logged(|| s.run(0.05));
+    let labels: Vec<String> = cuts(&lines).into_iter().map(|c| c.0).collect();
+    assert!(
+        labels.iter().any(|l| l.contains("loss")),
+        "the burst right after recovery was exempted: {labels:?}"
+    );
+    assert!(
+        s.est.recover_to.is_none(),
+        "the pre-outage rate outlived the loss cut: {labels:?}"
+    );
+}
+
+/// #1557 review A1: a packet exempted as the outage's own loss was never counted, so its
+/// late arrival must not undo a counted loss. It used to pass through the late-loss path
+/// and subtract one it never added.
+#[test]
+fn a_late_exempted_outage_loss_does_not_undo_a_counted_loss() {
+    let start = Instant::now();
+    let mut log = SendLog::new(start);
+    let mut est = Estimator::new(CEILING, start);
+    // seq 0 sent before the mark (counted when lost), seq 1..20 after it (the outage's
+    // own), seq 21..40 received after the mark: the first of those ends the exemption.
+    let sent_us = |seq: u32| u64::from(seq) * 10_000;
+    let arrived = |seq: u32| ((sent_us(seq) + 5_000) / UNIT_US) as u16;
+    for seq in 0..41u32 {
+        let mut d = vec![0u8; SIZE];
+        d[1..5].copy_from_slice(&seq.to_le_bytes());
+        let at = start + Duration::from_micros(sent_us(seq));
+        log.record(&d, at, false);
+    }
+    est.outage_from_us = Some(10_000);
+    let first: Vec<u16> = (0..41u32)
+        .map(|seq| {
+            if seq <= 20 {
+                NOT_RECEIVED
+            } else {
+                arrived(seq)
+            }
+        })
+        .collect();
+    let fb = Feedback {
+        first_pkt_seq: 0,
+        ref_us: 0,
+        arrivals: first,
+    };
+    est.on_feedback(&fb, &mut log, start + Duration::from_millis(1_000), NO_QUIC);
+    assert_eq!(
+        est.loss(),
+        Some(1.0 / 21.0),
+        "the one counted loss was measured, the outage's own twenty were not"
+    );
+    // seq 1, exempted, arrives late in a later report.
+    let late = Feedback {
+        first_pkt_seq: 1,
+        ref_us: 0,
+        arrivals: vec![arrived(1)],
+    };
+    est.on_feedback(
+        &late,
+        &mut log,
+        start + Duration::from_millis(1_050),
+        NO_QUIC,
+    );
+    let loss = est.loss();
+    assert!(
+        loss.is_some_and(|l| (l - 1.0 / 22.0).abs() < 1e-12),
+        "the exempted packet's late arrival subtracted a loss never counted: {loss:?}"
+    );
+}
+
 /// #1417: the regrow stops at the rate the link carried before the outage instead of crossing
 /// it, so the estimate is never driven above a rate that was proved. The rate is under the
 /// ceiling and the encoder follows the estimate, so neither the ceiling clamp nor the

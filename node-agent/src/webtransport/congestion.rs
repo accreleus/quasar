@@ -178,6 +178,9 @@ enum Status {
     #[default]
     Unreported,
     Lost,
+    /// Reported not received while an outage's own losses were exempt: no loss was counted,
+    /// so a late arrival of it has none to undo (#1557).
+    Outage,
     Received,
 }
 
@@ -469,8 +472,9 @@ pub(crate) struct Estimator {
     /// with a delay or loss cut, and on a codec switch (#1417).
     recover_to: Option<(f64, Instant)>,
     /// The first send after the last feedback, in the log's µs clock, while a detected silence
-    /// is an outage: the report after it counts packets sent from here as the outage's losses,
-    /// not congestion (#1557). Read by `measure`, which clears it.
+    /// is an outage: the report after it counts packets sent from here, up to the first it
+    /// shows received after it, as the outage's losses rather than congestion (#1557). Read by
+    /// `measure`, which clears it.
     outage_from_us: Option<u64>,
     /// The bound the log last named, and when.
     logged: (Bound, Option<Instant>),
@@ -858,8 +862,11 @@ impl Estimator {
     pub(crate) fn measure(&mut self, fb: &Feedback, log: &mut SendLog, now: Instant) -> Measured {
         let (mut received, mut lost) = (0i64, 0i64);
         // A loss sent during the detected outage belongs to the outage, not congestion: the
-        // first report after it must not cut the loss bound (#1557).
+        // first report after it must not cut the loss bound (#1557). The exemption ends at
+        // the send time of the first packet this report shows as received after the mark:
+        // from then the link answered, so a loss sent after it is congestion.
         let outage = self.outage_from_us;
+        let mut answered_from: Option<u64> = None;
         let mut newest_fresh = None;
         for (i, &arrival) in fb.arrivals.iter().enumerate() {
             let seq = fb.first_pkt_seq.wrapping_add(i as u32);
@@ -870,10 +877,21 @@ impl Estimator {
                 .then(|| fb.ref_us.checked_add(u64::from(arrival) * UNIT_US))
                 .flatten();
             match (slot.status, at_us) {
-                (Status::Received, _) | (Status::Lost, None) => continue,
+                (Status::Received, _) | (Status::Lost, None) | (Status::Outage, None) => continue,
+                (Status::Outage, Some(_)) => {
+                    // Late: no loss was counted for it, so there is none to undo; it is no
+                    // delay sample either.
+                    slot.status = Status::Received;
+                    received += 1;
+                }
                 (Status::Unreported, None) => {
-                    slot.status = Status::Lost;
-                    if outage.is_none_or(|from| slot.sent_us < from) {
+                    let exempt = outage.is_some_and(|from| {
+                        slot.sent_us >= from && answered_from.is_none_or(|at| slot.sent_us < at)
+                    });
+                    if exempt {
+                        slot.status = Status::Outage;
+                    } else {
+                        slot.status = Status::Lost;
                         lost += 1;
                     }
                     continue;
@@ -887,6 +905,11 @@ impl Estimator {
                 (Status::Unreported, Some(at)) => {
                     slot.status = Status::Received;
                     received += 1;
+                    // The first packet this report shows received after the mark: the
+                    // outage's exemption ends at its send time (#1557).
+                    if outage.is_some_and(|from| slot.sent_us >= from) {
+                        answered_from.get_or_insert(slot.sent_us);
+                    }
                     if let Some((send_d, arrival_d, arrival_ms)) =
                         self.inter_arrival.push(slot.sent_us, at)
                     {
