@@ -45,6 +45,7 @@ own; the two do not move together, and that is deliberate.
 - **A test now covers a preset gained in the same image update (#583).** The provider app that the update re-links onto a preset materialized by that same update gains `direct_display` without a second pass; it fails if the stamp runs before the re-link. Test-only.
 
 ### Fixed
+- **Audio code comments describe the send path as it is since #1441 (#1479).** Comment only; no behaviour change.
 - **The platform apply suite's setup truncate no longer races a live apply attempt (#1329).** `TestDeveloperApplyRefusals` accepted a developer apply, which left the apply runner driving an attempt against the same database, and then built a second harness whose `TRUNCATE ... CASCADE` raced those writes into a 40P01 deadlock under load; the test now stops the runner and fails if anything is still driving before the truncate. Test-only.
 - **A WebTransport takeover no longer leaves the old peer's low ABR setpoint published (#1462).** When a new client takes a session, the agent returns the encoder to its launch bitrate but had kept reporting whatever setpoint the displaced loop had last published. With no ABR feedback from the new client, the control plane judged that stale (possibly floor-pinned) setpoint and could end a healthy stream. The agent now publishes the launch setpoint at the same moment it writes the launch bitrate.
 - **A source comment named a lab machine instead of its role.** Comment only; no behaviour change.
