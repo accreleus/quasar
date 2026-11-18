@@ -67,6 +67,8 @@ swap_sources() { # swap_sources <target-mirror> -> regenerated sources under $wo
     [ -f "$f" ] && files+=("$f")
   done
   [ "${#files[@]}" -gt 0 ] || return 1
+  # GitHub's runners name their mirror through a mirror list (`URIs: mirror+file:/etc/apt/
+  # apt-mirrors.txt`), so that URI is replaced by the target too, or apt keeps the stalled host.
   # One output file per input, keeping its name and so its format: a deb822 .sources file must
   # stay a .sources file (apt reads the one-line format only from .list files and sourcelist).
   rm -rf "$work/parts"; mkdir -p "$work/parts"
@@ -77,6 +79,7 @@ swap_sources() { # swap_sources <target-mirror> -> regenerated sources under $wo
     sed -E \
       -e "s#(://)[a-z0-9.-]*archive\.ubuntu\.com#\1$host#g" \
       -e "s#(://)security\.ubuntu\.com#\1$host#g" \
+      -e "s#mirror\+file:[^[:space:]]*#$target/ubuntu/#g" \
       "$f" > "$out"
   done
 }

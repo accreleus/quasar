@@ -76,7 +76,9 @@ for a in "$@"; do case "$a" in
     for f in "$d"/*.list; do [ -f "$f" ] && grep -q '^Types:' "$f" && printf 'argv BAD deb822 in a .list part\n' >> "$log"; done
     cat "$d"/* 2>/dev/null > "$log.parts" || true
     grep -q 'azure\.archive\.ubuntu\.com' "$log.parts" && mirror="azure.archive.ubuntu.com"
-    [ "$mirror" = DEFAULT ] && grep -q '://archive\.ubuntu\.com' "$log.parts" && mirror="archive.ubuntu.com" ;;
+    [ "$mirror" = DEFAULT ] && grep -q '://archive\.ubuntu\.com' "$log.parts" && mirror="archive.ubuntu.com"
+    # The runner's mirror list keeps the stalled host: a switched mirror must replace it.
+    grep -q 'mirror+file:' "$log.parts" && printf 'argv BAD mirror+file URI left in switched sources\n' >> "$log" ;;
 esac; done
 for a in "$@"; do [ "$a" = --download-only ] && dl=download; done
 printf '%s %s %s\n' "${sub:-?}" "$mirror" "$dl" >> "$log"
@@ -99,7 +101,7 @@ run_scenario() { # run_scenario <stall 0|1> <stall_all 0|1> — returns the scri
   printf 'deb http://ae.archive.ubuntu.com/ubuntu/ noble main\n' > "$CONF/sources.list"
   # The runner's real layout (#1580): a deb822 ubuntu.sources next to the one-line sources.list.
   mkdir -p "$CONF/sources.list.d"
-  printf 'Types: deb\nURIs: http://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: noble\nComponents: main\n' > "$CONF/sources.list.d/ubuntu.sources"
+  printf 'Types: deb\nURIs: mirror+file:/etc/apt/apt-mirrors.txt\nSuites: noble\nComponents: main\n' > "$CONF/sources.list.d/ubuntu.sources"
   sudo_exec; write_stub
   local td="$WORK/tmp"; mkdir -p "$td" && echo keep > "$td/decoy.txt"   # beside the script's $work
   local rc=0
