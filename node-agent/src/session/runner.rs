@@ -734,6 +734,7 @@ fn capture_stage_snapshot(
     encode_size: (i32, i32),
     current_render: Option<(i32, i32)>,
     current_ui_scale: Option<f64>,
+    ring_depth: Option<u32>,
 ) -> serde_json::Value {
     let stage = lever.stage();
     let (req_w, req_h) = stage.requested();
@@ -750,6 +751,8 @@ fn capture_stage_snapshot(
         "encode_size": { "width": encode_size.0, "height": encode_size.1 },
         "render": current_render.map(|(w, h)| serde_json::json!({ "width": w, "height": h })),
         "ui_scale": current_ui_scale,
+        // The ring-depth the compositor was given (WOLF_VULKAN_RING or the HEVC pin).
+        "encode_src_ring_depth": ring_depth,
     })
 }
 
@@ -3603,6 +3606,7 @@ pub fn run_blocking(
                     encode_size,
                     current_render,
                     Some(current_ui_scale),
+                    current_source.ring_depth(),
                 ),
             };
             if let Some(report) = capture.poll(&ctx) {
