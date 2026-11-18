@@ -24,6 +24,10 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Upgrading
+- **This release changes the database (migration 0118), so there is no going back below it.** Once applied, an older control plane will not start. For Quasar's own database the way back is a restore of the dump the update takes first (`docs/upgrading.md`, "The one-way migration rule"); on your own database, back up first. Fleet ▸ Releases ▸ Update Quasar waits for live sessions to end before it replaces the control plane (or tick "Update now" to end them), and automatic updates never install a release that changes the database.
+- **It worked when** Fleet ▸ Releases shows this release everywhere and the run ends `succeeded`.
+
 ### Changed
 - **Two node-agent tests pin the codec-advertisement reconnect follow-ups (#309).** The first asserts `begin_connection` keeps the agent's current runtime settings, so a reconnect re-advertises the codecs the live stack proved instead of dropping back to the Openh264 baseline; the second drives a codec probe through the real scheduler to the advertised set and pins the scheduler running on exactly the inputs the manager notified. A test-only change: the advertisement behaviour is unchanged, and each test fails if its invariant is broken.
 
