@@ -453,7 +453,15 @@ func TestCleanupDuplicateUnresolvedAttemptRequestsRecoveryWithoutSecondDelete(t 
 	install(t, env.pool, false)
 	env.cleanupWire.cleanup = make(chan agentws.ImageCleanupCmd, 2)
 	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 3)
-	env.cleanupWire.journalRequests = make(chan agentws.ImageCleanupJournalRequestCmd, 1)
+	// Two requests can legitimately be queued before this test reads one: the
+	// manual request below, and the first POST's own post-dispatch journal
+	// request — the dispatch goroutine (dispatch's deferred ImageCleanupRegistered)
+	// asks for the journal under the same completed-scan gate as soon as the
+	// scheduler lets it observe the scan recorded complete, which on a loaded
+	// machine can be after the test's own request is queued (#1354). Both
+	// target the same unresolved attempt; the duplicate's new scan retires
+	// either one.
+	env.cleanupWire.journalRequests = make(chan agentws.ImageCleanupJournalRequestCmd, 2)
 	entry := agentws.ImageVersionEntry{ImageID: imgID, Version: imgVer2, ImageRef: imgDigest2, RuntimeImageID: "sha256:lost-dispatch", State: "present"}
 	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "current", Capable: true, Complete: true,
 		ReconciledRevision: 1, Versions: []agentws.ImageVersionEntry{entry}})
@@ -534,6 +542,16 @@ func TestCleanupDuplicateUnresolvedAttemptRequestsRecoveryWithoutSecondDelete(t 
 	if state != "removing" {
 		t.Fatalf("old journal settled attempt before fresh scan: %s", state)
 	}
+	// The old scan's async journal request (see the queue capacity at the
+	// top) may still surface right up to the duplicate's reconcile
+	// invalidate, and a moment later if the scheduler parked the sender
+	// just after that. It is retired — the duplicate's scan dropped its
+	// pending entry — so drain it rather than misread it as the check
+	// below firing. Nothing else can produce a request at this point.
+	select {
+	case <-env.cleanupWire.journalRequests:
+	case <-time.After(100 * time.Millisecond):
+	}
 	select {
 	case journal := <-env.cleanupWire.journalRequests:
 		t.Fatalf("journal requested before fresh reconcile revision: %+v", journal)
@@ -543,16 +561,30 @@ func TestCleanupDuplicateUnresolvedAttemptRequestsRecoveryWithoutSecondDelete(t 
 	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "current", Capable: true, Complete: true,
 		ReconciledRevision: 3, ReconciledRequestID: duplicateReconcile.ID, Versions: []agentws.ImageVersionEntry{entry}})
 	env.cleanup.ImageVersionsChanged(context.Background(), host)
-	select {
-	case journal := <-env.cleanupWire.journalRequests:
+	// Answer journal requests until one settles the attempt. A request the
+	// service no longer has pending — the old scan's, retired by the
+	// duplicate (see the queue capacity at the top) — is ignored by the
+	// service, so keep reading until the fresh scan's request arrives and
+	// the durable state moves.
+	for {
+		var journal agentws.ImageCleanupJournalRequestCmd
+		select {
+		case journal = <-env.cleanupWire.journalRequests:
+		case <-time.After(5 * time.Second):
+			t.Fatal("duplicate did not request attempt journal")
+		}
 		if len(journal.AttemptIDs) != 1 || journal.AttemptIDs[0] != first.AttemptID {
 			t.Fatalf("duplicate requested wrong journal: %+v", journal)
 		}
 		env.cleanup.ImageCleanupJournal(context.Background(), host, agentws.ImageCleanupJournalMsg{
 			RequestID: journal.ID, RetiredAttemptIDs: []string{first.AttemptID},
 		})
-	case <-time.After(5 * time.Second):
-		t.Fatal("duplicate did not request attempt journal")
+		if err := env.pool.QueryRow(context.Background(), `SELECT state FROM host_image_cleanup_attempts WHERE id=$1::uuid`, first.AttemptID).Scan(&state); err != nil {
+			t.Fatal(err)
+		}
+		if state == "removed" {
+			break
+		}
 	}
 	if err := env.pool.QueryRow(context.Background(), `SELECT state FROM host_image_cleanup_attempts WHERE id=$1::uuid`, first.AttemptID).Scan(&state); err != nil {
 		t.Fatal(err)
