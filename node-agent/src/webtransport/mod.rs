@@ -1583,12 +1583,17 @@ async fn stream(
     let (mut nacks_capped, mut resends_too_large) = (0u64, 0u64);
     let mut warned_oversized = false;
     // Amendment 85: whether this connection is sent repairs, so the session's windows carry
-    // the FEC keys (0 repair) exactly while it is.
-    if let Some(rate) = media.rate() {
-        (rate.fec)(FecEvent::Attached {
-            client: client.id,
-            fec,
-        });
+    // the FEC keys (0 repair) exactly while it is. A client displaced while its `hello_ack`
+    // write stalled (a takeover) is no longer the session's current connection: its attach
+    // lands after the successor's, so it must not overwrite the successor's telemetry
+    // (#1554).
+    if client.gone.get().is_none() {
+        if let Some(rate) = media.rate() {
+            (rate.fec)(FecEvent::Attached {
+                client: client.id,
+                fec,
+            });
+        }
     }
     let mut control = media
         .rate()

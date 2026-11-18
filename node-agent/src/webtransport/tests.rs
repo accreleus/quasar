@@ -2580,6 +2580,67 @@ async fn a_client_that_offers_xor_and_reports_loss_rebuilds_a_fragment_without_a
     );
 }
 
+/// #1554: client A's `hello_ack` write stalls (its control stream grants 8 bytes of credit
+/// and reads none). Client B takes the session over and negotiates FEC. When A's write
+/// finally completes, its attach lands after B's, and its stream ends at once. Neither A's
+/// late attach nor its teardown may turn B's FEC telemetry off while B still sends repairs.
+#[tokio::test]
+async fn a_displaced_clients_late_attach_does_not_turn_the_successors_fec_off() {
+    let (agent, metrics) = lossy_session(true).await;
+    let expires = SystemTime::now() + TOKEN_TTL;
+
+    // A's control stream grants 8 bytes for every write, and it reads none: the hello_ack
+    // cannot be written past that. A still attaches — redeem and attach come first.
+    assert!(agent
+        .listener
+        .registry()
+        .add_token(SESSION, &token_hash("stalled-ack"), expires));
+    let stalled = stalling_client().connect(agent.url.clone()).await.unwrap();
+    let (mut send_a, mut recv_a) = stalled.open_bi().await.unwrap();
+    write_message(
+        &mut send_a,
+        &json!({"type": "hello", "wt_proto": 1, "token": "stalled-ack",
+                "session_id": SESSION, "client": "browser", "fec": ["xor"]}),
+    )
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !agent.tap.as_ref().unwrap().attached() {
+        assert!(Instant::now() < deadline, "A never attached");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // B takes over A and negotiates FEC while A's write is stalled.
+    assert!(agent
+        .listener
+        .registry()
+        .add_token(SESSION, &token_hash("successor"), expires));
+    let (_b, _send_b, _recv_b, ack_b) =
+        agent.hello_with("successor", json!({"fec": ["xor"]})).await;
+    assert_eq!(ack_b["fec"], "xor");
+    let present = |m: &crate::session::metrics::SessionMetrics| {
+        m.drain_window(std::time::Instant::now())
+            .wt_fec_kbps
+            .is_some()
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !present(&metrics) {
+        assert!(Instant::now() < deadline, "B's attach never reported FEC");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // A's stalled write completes now: its attach lands after B's, then its stream ends.
+    let ack_a = read_message(&mut recv_a).await.unwrap();
+    assert_eq!(ack_a["fec"], "xor");
+    // Read what follows, so A's teardown is not behind the same tiny window.
+    tokio::spawn(async move { while read_message(&mut recv_a).await.is_ok() {} });
+    assert_eq!(close_code(&stalled).await, Some(CLOSE_TAKEN_OVER));
+    assert!(
+        present(&metrics),
+        "A's late attach and teardown turned B's FEC telemetry off"
+    );
+}
+
 /// §Hello: a client that offers no scheme is answered `fec: null` and sent no repair
 /// datagram, whatever loss it reports.
 #[tokio::test]
