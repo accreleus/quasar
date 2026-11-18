@@ -17,8 +17,9 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -68,9 +69,13 @@ pub fn pulse_socket_dir(runtime_dir: &str, session_id: &str) -> PathBuf {
     PathBuf::from(runtime_dir).join(format!("pulse-{session_id}"))
 }
 
-/// How long to wait for the socket file to appear before giving up.
+/// How long readiness may take: the sidecar's socket and the baked profile's three
+/// devices (`quasar_output`, `quasar_mic`, `quasar_mic_src`).
 pub(crate) const PULSE_WAIT_TOTAL: Duration = Duration::from_secs(2);
 const PULSE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// A single `pactl` query's bound, so a server that accepts the socket and then stops
+/// answering cannot spend the readiness budget (and with it the silent-audio fallback).
+const PACTL_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// A per-session audio sidecar container owning a Unix socket (`{dir}/native`) that
 /// the app container connects to and `pulsesrc` captures from. Drop requests cleanup.
@@ -155,7 +160,7 @@ impl PulseSidecar {
                 return Err(anyhow!(error).context("audio sidecar start failed"));
             }
         };
-        if !wait_for_socket(&sidecar.socket_dir.join("native")) {
+        if !wait_for_audio_readiness(&sidecar.socket_dir.join("native")) {
             // #411: say why. The daemon's own words, once it is stopped, are the reason.
             let why = match sidecar.runtime.stop_audio_sidecar(id.clone()).wait() {
                 Ok(()) => match sidecar.runtime.observe_audio_sidecar(id).wait() {
@@ -171,14 +176,14 @@ impl PulseSidecar {
                     error.kind
                 ),
             };
-            tracing::warn!(token = "audio-pulse-socket-timeout",
-                "audio sidecar socket '{}' did not become ready within {}s — falling back to silent audio; the sidecar: {why}",
+            tracing::warn!(token = "audio-pulse-readiness-timeout",
+                "audio sidecar '{}' did not become ready within {}s — falling back to silent audio; the sidecar: {why}",
                 sidecar.socket_dir.join("native").display(), PULSE_WAIT_TOTAL.as_secs());
             sidecar.stop();
             return Ok(None);
         }
         tracing::info!(
-            "audio sidecar ready: socket={}",
+            "audio sidecar ready: socket={} (quasar_output, quasar_mic, quasar_mic_src)",
             sidecar.socket_dir.join("native").display()
         );
         Ok(Some(sidecar))
@@ -321,7 +326,10 @@ fn socket_accepts_connection(path: &Path) -> bool {
     }
 }
 
-/// Poll for a connectable socket at 100 ms intervals up to `PULSE_WAIT_TOTAL`.
+/// Test-only: poll for a connectable socket at 100 ms intervals up to
+/// `PULSE_WAIT_TOTAL`, pinning `connect(2)`'s bounded behaviour on a full listener backlog.
+/// Production readiness is [`wait_for_audio_readiness`] (#479: socket AND devices).
+#[cfg(test)]
 pub(crate) fn wait_for_socket(path: &Path) -> bool {
     let steps = (PULSE_WAIT_TOTAL.as_millis() / PULSE_POLL_INTERVAL.as_millis()) as u32;
     for _ in 0..steps {
@@ -331,6 +339,92 @@ pub(crate) fn wait_for_socket(path: &Path) -> bool {
         thread::sleep(PULSE_POLL_INTERVAL);
     }
     socket_accepts_connection(path)
+}
+
+/// #479: readiness is the socket AND the baked profile's three devices, not the socket
+/// alone. With PipeWire, `pipewire-pulse` binds the socket before `pulse.cmd` creates
+/// `quasar_output` / `quasar_mic` / `quasar_mic_src`, and a stream naming a device only
+/// completes once WirePlumber links it. A socket-only check let `pulsesrc` / `pulsesink`
+/// block in `prepare` past the 2 s silent-audio fallback, and passed the host probe for a
+/// profile that never loads. Bounded by the same [`PULSE_WAIT_TOTAL`] budget.
+pub(crate) fn wait_for_audio_readiness(socket: &Path) -> bool {
+    wait_for_readiness(socket, audio_devices_ready)
+}
+
+/// Poll `probe` until it reports every device, or the readiness budget ends. The probe is
+/// only asked once the socket accepts, so a daemon that is not up yet is not queried.
+fn wait_for_readiness(socket: &Path, probe: impl Fn(&str, Instant) -> bool) -> bool {
+    let deadline = Instant::now() + PULSE_WAIT_TOTAL;
+    loop {
+        if socket_accepts_connection(socket) && probe(&server_uri(socket), deadline) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(PULSE_POLL_INTERVAL);
+    }
+}
+
+fn server_uri(socket: &Path) -> String {
+    format!("unix:{}", socket.display())
+}
+
+/// The three devices the baked profile creates. Read back through `pactl` (shipped by the
+/// agent image, alongside PipeWire; no new dependency) as `name` on `list short sinks` /
+/// `list short sources`.
+fn audio_devices_ready(server_uri: &str, deadline: Instant) -> bool {
+    let sinks = pactl_list(server_uri, "sinks", deadline);
+    let sources = pactl_list(server_uri, "sources", deadline);
+    match (sinks, sources) {
+        (Some(sinks), Some(sources)) => devices_listed(&sinks, &sources),
+        _ => false,
+    }
+}
+
+fn devices_listed(sinks: &str, sources: &str) -> bool {
+    let has = |text: &str, name: &str| {
+        text.lines()
+            .any(|line| line.split('\t').nth(1) == Some(name))
+    };
+    has(sinks, QUASAR_SINK_NAME)
+        && has(sinks, QUASAR_MIC_SINK_NAME)
+        && has(sources, QUASAR_MIC_SOURCE_NAME)
+}
+
+/// `pactl --server unix:… list short <category>`, bounded by the readiness deadline and a
+/// per-query cap. `None` on a spawn failure, a non-zero exit, or no answer in time.
+fn pactl_list(server_uri: &str, category: &str, deadline: Instant) -> Option<String> {
+    let deadline = deadline.min(Instant::now() + PACTL_PROBE_TIMEOUT);
+    if Instant::now() >= deadline {
+        return None;
+    }
+    let mut child = Command::new("pactl")
+        .args(["--server", server_uri, "list", "short", category])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut text = String::new();
+                stdout.read_to_string(&mut text).ok()?;
+                return status.success().then_some(text);
+            }
+            Ok(None) => {}
+            Err(_) => break,
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
 }
 
 /// The last lines a daemon wrote, bounded for one log line.
@@ -380,6 +474,53 @@ mod tests {
     }
 
     use super::*;
+
+    /// #479: the readiness must not pass on a connectable socket alone — with PipeWire the
+    /// socket appears first, and only `pulse.cmd` creates the devices. Reverting the probe
+    /// (socket-only readiness) makes this assertion fail.
+    #[test]
+    fn readiness_needs_the_sidecar_devices_and_not_only_a_connectable_socket() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("native");
+        let _listener = UnixListener::bind(&path).unwrap();
+        assert!(!super::wait_for_readiness(&path, |_uri, _deadline| false));
+    }
+
+    #[test]
+    fn readiness_passes_once_the_devices_appear() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("native");
+        let _listener = UnixListener::bind(&path).unwrap();
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let ready = super::wait_for_readiness(&path, |_uri, _deadline| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 1
+        });
+        assert!(ready);
+        assert!(calls.load(std::sync::atomic::Ordering::Relaxed) >= 2);
+    }
+
+    /// The baked profile creates two sinks and one remapped source; one missing device is
+    /// not readiness (a half-loaded `pulse.cmd` would let `pulsesrc` block in `prepare`).
+    #[test]
+    fn all_three_devices_must_be_listed() {
+        let sinks = "0\tquasar_output\tfloat32 2ch\n1\tquasar_mic\tfloat32 2ch\n";
+        let sources = "0\tquasar_output.monitor\tfloat32 2ch\n\
+                       1\tquasar_mic.monitor\tfloat32 2ch\n\
+                       2\tquasar_mic_src\tfloat32 2ch\n";
+        assert!(super::devices_listed(sinks, sources));
+        assert!(!super::devices_listed(
+            "0\tquasar_output\tfloat32 2ch\n",
+            sources
+        ));
+        assert!(!super::devices_listed(
+            sinks,
+            "0\tquasar_mic.monitor\tfloat32 2ch\n"
+        ));
+        assert!(!super::devices_listed(
+            "0\tquasar_output\tfloat32 2ch\n",
+            "2\tquasar_mic_src\tfloat32 2ch\n"
+        ));
+    }
 
     /// A config the image installs under `/etc/pipewire/`.
     fn baked_config(name: &str) -> String {
