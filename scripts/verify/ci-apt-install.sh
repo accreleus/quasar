@@ -58,7 +58,7 @@ offline_install() {
 # still name the stalled host). swap_sources rewrites only the mirror host on each deb/deb-src and
 # deb822 URIs line, preserving suite, components and format; it reads the active sources under
 # $aptconf so the self-test can point it at a fake one.
-swap_sources() { # swap_sources <target-mirror> -> writes regenerated sources to $work/src
+swap_sources() { # swap_sources <target-mirror> -> regenerated sources under $work/parts
   local target="$1"
   local host="${target#*://}" f
   local -a files=()
@@ -67,25 +67,37 @@ swap_sources() { # swap_sources <target-mirror> -> writes regenerated sources to
     [ -f "$f" ] && files+=("$f")
   done
   [ "${#files[@]}" -gt 0 ] || return 1
-  sed -E \
-    -e "s#(://)[a-z0-9.-]*archive\.ubuntu\.com#\1$host#g" \
-    -e "s#(://)security\.ubuntu\.com#\1$host#g" \
-    "${files[@]}" > "$work/src"
+  # GitHub's runners name their mirror through a mirror list (`URIs: mirror+file:/etc/apt/
+  # apt-mirrors.txt`), so that URI is replaced by the target too, or apt keeps the stalled host.
+  # One output file per input, keeping its name and so its format: a deb822 .sources file must
+  # stay a .sources file (apt reads the one-line format only from .list files and sourcelist).
+  rm -rf "$work/parts"; mkdir -p "$work/parts"
+  for f in "${files[@]}"; do
+    local out
+    out="$work/parts/$(basename "$f")"
+    [ "$f" = "$aptconf/sources.list" ] && out="$work/parts/00-sources.list"
+    sed -E \
+      -e "s#(://)[a-z0-9.-]*archive\.ubuntu\.com#\1$host#g" \
+      -e "s#(://)security\.ubuntu\.com#\1$host#g" \
+      -e "s#mirror\+file:[^[:space:]]*#$target/ubuntu/#g" \
+      "$f" > "$out"
+  done
 }
 # apt_get <mirror> <timeout> <apt-args...>: run apt with the system sources, or with a regenerated
 # sources at <mirror> (an empty mirror means the runner's default). Global -o options go before the
 # subcommand, so apt parses them. Each -o takes its directive as the NEXT argument (-o key=value),
 # never glued to it ("-o key=value" as one arg is an unknown option apt ignores, so the override
-# would silently not apply): emit them as separate argv entries. Dir::Etc::sourceparts points apt
-# at an empty sources.list.d so the regenerated sourcelist is the only source; the sourceparts-
-# form is the read-only default and cannot be set, so it is not used.
+# would silently not apply): emit them as separate argv entries. The regenerated sources live in
+# $work/parts (Dir::Etc::sourceparts), one file per original so deb822 .sources keep their format
+# (#1580: concatenating them into the one-line sourcelist made apt reject 'Types:'); sourcelist
+# points at an empty file so the runner's own sources are not read as well.
 apt_get() { # apt_get <mirror> <timeout> <apt-args...>
   local mirror="$1" timeout="$2"; shift 2
   local -a opts=()
   if [ -n "$mirror" ]; then
     swap_sources "$mirror" || return 1
-    mkdir -p "$work/empty"
-    opts=(-o "Dir::Etc::sourcelist=$work/src" -o "Dir::Etc::sourceparts=$work/empty")
+    : > "$work/empty.list"
+    opts=(-o "Dir::Etc::sourcelist=$work/empty.list" -o "Dir::Etc::sourceparts=$work/parts")
   fi
   sudo timeout "$timeout" apt-get "${opts[@]+"${opts[@]}"}" "$@"
 }
