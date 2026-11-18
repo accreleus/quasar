@@ -104,13 +104,20 @@ impl Sim {
     /// with the path rather than reported late.
     fn outage(&mut self, secs: f64) {
         let from = self.t;
+        let first = self.seq;
         for step in 1..=(secs * 10.0) as u64 {
             self.t = from + step * 100_000;
             self.frame();
             let at = self.start + Duration::from_micros(self.t);
             self.est.on_tick(at, &self.log, RTT);
         }
-        self.pending.clear();
+        // The packets sent during the outage stay pending as lost, as a real client's first
+        // report after it names them NOT_RECEIVED (#1557). Earlier packets keep their arrival.
+        for (seq, arrival) in self.pending.iter_mut() {
+            if *seq >= first {
+                *arrival = None;
+            }
+        }
     }
 
     fn frame(&mut self) {
@@ -422,6 +429,28 @@ fn an_outage_costs_the_estimate_seconds_not_a_minute() {
             "{send_kbps:?}: {carried:.0} → {low:.0} → {e:.0} in 10 s of feedback"
         );
     }
+}
+
+/// #1557: the first report after a long outage names the packets sent during it lost. Those
+/// losses are the outage, not congestion: they must not cut the loss bound, and the memory of
+/// what the link carried before the outage must survive so the estimate can regrow fast.
+#[test]
+fn the_first_report_after_an_outage_counts_no_outage_loss() {
+    let mut s = Sim::new(20_000.0);
+    s.send_kbps = Some(6000.0);
+    s.run(5.0);
+    s.outage(10.0);
+    assert!(s.est.recover_to.is_some(), "the outage left no memory");
+    s.run(0.05);
+    let loss = s.est.loss();
+    assert!(
+        loss.is_none_or(|l| l < LOSS_LOW),
+        "the outage's own losses measured {loss:?}"
+    );
+    assert!(
+        s.est.recover_to.is_some(),
+        "the outage's own losses ended the regrow"
+    );
 }
 
 /// #1417: the regrow stops at the rate the link carried before the outage instead of crossing
