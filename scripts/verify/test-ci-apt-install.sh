@@ -68,9 +68,18 @@ for ((i=0; i<n; i++)); do
 done
 [ "$ok" = 1 ] || printf 'argv BAD %s\n' "$bad" >> "$log"
 prev=""; for a in "$@"; do [ "$prev" = -o ] && { prev=""; continue; }; case "$a" in -o) prev=-o ;; -*) ;; *) sub="$a"; break ;; esac; done
-for a in "$@"; do case "$a" in Dir::Etc::sourcelist=*) f="${a#*=}"; [ -r "$f" ] || continue
-  grep -q 'azure\.archive\.ubuntu\.com' "$f" && mirror="azure.archive.ubuntu.com"
-  [ "$mirror" = DEFAULT ] && grep -q 'archive\.ubuntu\.com' "$f" && mirror="archive.ubuntu.com" ;; esac; done
+for a in "$@"; do case "$a" in
+  Dir::Etc::sourcelist=*) f="${a#*=}"
+    # apt reads sourcelist in the one-line format only: a deb822 stanza there is the #1580 CI failure.
+    [ -r "$f" ] && grep -q '^Types:' "$f" && printf 'argv BAD deb822 in one-line sourcelist\n' >> "$log" ;;
+  Dir::Etc::sourceparts=*) d="${a#*=}"; [ -d "$d" ] || continue
+    for f in "$d"/*.list; do [ -f "$f" ] && grep -q '^Types:' "$f" && printf 'argv BAD deb822 in a .list part\n' >> "$log"; done
+    cat "$d"/* 2>/dev/null > "$log.parts" || true
+    grep -q 'azure\.archive\.ubuntu\.com' "$log.parts" && mirror="azure.archive.ubuntu.com"
+    [ "$mirror" = DEFAULT ] && grep -q '://archive\.ubuntu\.com' "$log.parts" && mirror="archive.ubuntu.com"
+    # The runner's mirror list keeps the stalled host: a switched mirror must replace it.
+    grep -q 'mirror+file:' "$log.parts" && printf 'argv BAD mirror+file URI left in switched sources\n' >> "$log" ;;
+esac; done
 for a in "$@"; do [ "$a" = --download-only ] && dl=download; done
 printf '%s %s %s\n' "${sub:-?}" "$mirror" "$dl" >> "$log"
 # A --download-only install is the step the issue stalls on.
@@ -90,6 +99,9 @@ final_install_mirror() { awk '$1=="install" && $3=="" {m=$2} END{printf "%s", m}
 run_scenario() { # run_scenario <stall 0|1> <stall_all 0|1> — returns the script's exit status
   : > "$LOG"
   printf 'deb http://ae.archive.ubuntu.com/ubuntu/ noble main\n' > "$CONF/sources.list"
+  # The runner's real layout (#1580): a deb822 ubuntu.sources next to the one-line sources.list.
+  mkdir -p "$CONF/sources.list.d"
+  printf 'Types: deb\nURIs: mirror+file:/etc/apt/apt-mirrors.txt\nSuites: noble\nComponents: main\n' > "$CONF/sources.list.d/ubuntu.sources"
   sudo_exec; write_stub
   local td="$WORK/tmp"; mkdir -p "$td" && echo keep > "$td/decoy.txt"   # beside the script's $work
   local rc=0
