@@ -33,8 +33,9 @@ export interface SessionSwapControllerProps {
    *  start a swap) nor the overlay (it must not cover the banner). The hook
    *  keeps running, so a swap in flight survives a verdict that clears. */
   sessionOver?: boolean;
-  /** Tells the page whether the switching screen is up (`switching` or `booting`),
-   *  so it can hold the session's sound under it. False on every other exit. */
+  /** Tells the page whether the switching screen is up — any phase that renders
+   *  it opaque over the stream (`switching`, `booting`, `error`, `timeout`) — so
+   *  it can hold the session's sound under it. False on every other exit. */
   onScreenChange?: (up: boolean) => void;
   /** Render prop: caller gets only the two derived values its children need
    *  (the Games pane, the bar's swappingTo). The transition screen is rendered here,
@@ -60,7 +61,18 @@ export function SessionSwapController({
     onToast,
   });
 
-  const screenUp = transition?.phase === "switching" || transition?.phase === "booting";
+  // The switching screen is "up" across every phase that renders it opaque over
+  // the stream: switching/booting (the live swap) AND error/timeout (the
+  // 3.5s terminal screen that auto-clears). Sound must be held under all of them
+  // — a terminal screen still covers the stream, so releasing the old game's
+  // sound the instant it appears would leak audio behind an opaque overlay.
+  // Auto-capture after a failed or timed-out swap now waits for that screen to
+  // clear (about 3.5 s) instead of engaging under it; nothing releases capture.
+  const screenUp =
+    transition?.phase === "switching" ||
+    transition?.phase === "booting" ||
+    transition?.phase === "error" ||
+    transition?.phase === "timeout";
   useEffect(() => {
     onScreenChange?.(screenUp);
     return () => onScreenChange?.(false);
