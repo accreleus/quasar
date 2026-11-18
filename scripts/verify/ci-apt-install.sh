@@ -74,14 +74,18 @@ swap_sources() { # swap_sources <target-mirror> -> writes regenerated sources to
 }
 # apt_get <mirror> <timeout> <apt-args...>: run apt with the system sources, or with a regenerated
 # sources at <mirror> (an empty mirror means the runner's default). Global -o options go before the
-# subcommand, so apt parses them.
+# subcommand, so apt parses them. Each -o takes its directive as the NEXT argument (-o key=value),
+# never glued to it ("-o key=value" as one arg is an unknown option apt ignores, so the override
+# would silently not apply): emit them as separate argv entries. Dir::Etc::sourceparts points apt
+# at an empty sources.list.d so the regenerated sourcelist is the only source; the sourceparts-
+# form is the read-only default and cannot be set, so it is not used.
 apt_get() { # apt_get <mirror> <timeout> <apt-args...>
   local mirror="$1" timeout="$2"; shift 2
   local -a opts=()
   if [ -n "$mirror" ]; then
     swap_sources "$mirror" || return 1
     mkdir -p "$work/empty"
-    opts=(-o "Dir::Etc::sourcelist=$work/src" "-o Dir::Etc::sourceparts=$work/empty" "-o Dir::Etc::sourceparts-=$work/empty")
+    opts=(-o "Dir::Etc::sourcelist=$work/src" -o "Dir::Etc::sourceparts=$work/empty")
   fi
   sudo timeout "$timeout" apt-get "${opts[@]+"${opts[@]}"}" "$@"
 }
@@ -112,7 +116,10 @@ for attempt in 1 2 3; do
   [ "$attempt" -lt 3 ] || { echo "ci-apt-install: download still stalled after $attempt attempts" >&2; exit 1; }
   echo "ci-apt-install: attempt $attempt stalled, switching mirror; resuming"
 done
-apt_get "" 300 install -y --no-install-recommends "${packages[@]}"
+# The successful download left this mirror's indices in apt's lists directory (update drops the
+# lists not named by the active sources). Install against the SAME mirror, or the default sources
+# name the runner's host while its lists are gone and apt reports "Unable to locate package".
+apt_get "$mirror" 300 install -y --no-install-recommends "${packages[@]}"
 
 find "$archives" -maxdepth 1 -name '*.deb' -exec cp --update=none -t "$debs" {} +
 echo "debs to cache: $(find "$debs" -maxdepth 1 -name '*.deb' | wc -l)"
