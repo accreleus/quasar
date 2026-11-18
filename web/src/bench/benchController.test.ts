@@ -493,6 +493,57 @@ describe("BenchController.onTexture (a PyroWave frame, #1344)", () => {
     expect(windows[0]).toMatchObject({ n: 3, decoded: 3 });
   });
 
+  it("measures a texture frame in the window it was submitted, not when its map resolves (#1454)", async () => {
+    let now = BASE.host_time_ms + 50;
+    const windows: BenchWindowPayload[] = [];
+    const ctl = new BenchController({ sendInput: () => {}, emitWindow: (p) => windows.push(p), getClockOffsetMs: () => 0, nowEpochMs: () => now });
+    const s = { image: scene(1) };
+    const gpu = textureDevice(s);
+    const texture = { width: W, height: H } as GPUTexture;
+    ctl.start();
+
+    // Frame 1 submitted at T0 (window 0); its map is not released yet.
+    ctl.onTexture(gpu.device, texture);
+    // The window boundary moves into the next second before the map settles.
+    now += 1200;
+    // Start the tick while the readback is still in flight, then let the device
+    // finish it during the tick's bounded wait.
+    const tickP = ctl.tickForTest();
+    await gpu.release();
+    await tickP;
+    ctl.stop();
+
+    // The frame stamped at T0 is measured before window 0 closes, so it lands
+    // in window 0 (whose bounds start at T0), not in the next window. Without
+    // the fix closeWindow ran before the map resolved and the frame landed in
+    // window 1, outside its own [t_start_ms, t_end_ms].
+    expect(windows.map((w) => w.t_start_ms)).toEqual([BASE.host_time_ms + 50, BASE.host_time_ms + 1250]);
+    expect(windows.map((w) => w.n)).toEqual([1, 0]);
+    expect(windows[0]!).toMatchObject({ decoded: 1 });
+  });
+
+  it("a device whose map never settles still closes its windows on time (#1454)", async () => {
+    let now = BASE.host_time_ms + 50;
+    const windows: BenchWindowPayload[] = [];
+    const ctl = new BenchController({ sendInput: () => {}, emitWindow: (p) => windows.push(p), getClockOffsetMs: () => 0, nowEpochMs: () => now });
+    const s = { image: scene(1) };
+    const gpu = textureDevice(s);
+    const texture = { width: W, height: H } as GPUTexture;
+    ctl.start();
+    ctl.onTexture(gpu.device, texture); // map never released
+
+    const t0 = performance.now();
+    const tickP = ctl.tickForTest(); // must not hang forever
+    await tickP;
+    const elapsed = performance.now() - t0;
+    ctl.stop();
+
+    // The tick waited for the readback only up to the bound, then closed.
+    expect(elapsed).toBeLessThan(1000);
+    expect(windows[0]!).toMatchObject({ n: 0, no_image: 0 });
+    expect(windows[0]!.t_start_ms).toBe(BASE.host_time_ms + 50);
+  });
+
   it("a frame past the readbacks in flight, or one the device cannot read back, is no_image, never silence", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const ctl = new BenchController({ sendInput: () => {}, emitWindow: () => {}, getClockOffsetMs: () => 0 });

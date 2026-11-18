@@ -62,6 +62,13 @@ export const I2P_TIMEOUT_MS = 2000;
 export const READBACKS_IN_FLIGHT = 3;
 /** How many windows to keep for `window.__qBench.windows()`. */
 const MAX_WINDOWS = 3600;
+/**
+ * How long tick() waits for in-flight texture readbacks before closing the
+ * window, so a device whose maps never settle cannot stop the windows. Frames
+ * are stamped at submit, so measuring them here (before closeWindow) keeps them
+ * in the window their submit falls in.
+ */
+export const READBACK_SETTLE_MS = 250;
 
 const NOT_READ: MarkerDecodeResult = { decoded: false, confidence: 0, error: "not read" };
 
@@ -257,13 +264,29 @@ export class BenchController {
   }
 
   /**
-   * Refresh the inbound-rtp counters, then close the window — in that order,
-   * or the counter delta describes a window up to a second away from the
-   * frames it is quoted beside.
+   * Refresh the inbound-rtp counters, wait for in-flight texture readbacks,
+   * then close the window — in that order.
+   *
+   * refreshInbound first, or the counter delta describes a window up to a
+   * second away from the frames it is quoted beside. The readback chain first,
+   * or a texture frame stamped at its submit could land in the next window
+   * (#1454): onTexture measures when its map resolves, so a slow map would put
+   * the frame in whatever window is open then. Frames are stamped at submit, so
+   * measuring them here keeps them in the window their submit falls in. The
+   * wait is bounded (#1454): a device whose maps never settle must not stop the
+   * windows.
    */
   private async tick(): Promise<void> {
     await this.refreshInbound();
+    await Promise.race([this.readTail, this.settleDelay(READBACK_SETTLE_MS)]);
     this.closeWindow();
+  }
+
+  /** Resolves after `ms`; bounds how long tick() waits for the readback chain. */
+  private settleDelay(ms: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      setTimeout(resolve, ms);
+    });
   }
 
   /** Test seam: run one window boundary exactly as the interval timer would. */
