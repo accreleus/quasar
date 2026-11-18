@@ -9744,6 +9744,50 @@ mod tests {
         );
     }
 
+    /// #309 item 1: a reconnect must re-advertise the codecs for the agent's *current*
+    /// runtime settings, not a stale baseline. `begin_connection` is the reconnect entry
+    /// point the loop calls on every dial — it drops pending assignments and adopts the
+    /// fresh inventory, but it must not reset `runtime_settings` to `baseline()`. Doing so
+    /// would (a) re-plan from the Openh264 baseline, dropping every codec a live
+    /// `config_update` overlay had chosen, and (b) change the evidence stamp, which reads
+    /// the same settings, withdrawing every proven codec; the registration capacity then
+    /// falls back to `["h264"]` until the next send. Pin that `begin_connection` leaves
+    /// `runtime_settings` — and therefore the advertised set — untouched.
+    #[test]
+    fn begin_connection_keeps_runtime_settings_so_reconnect_readvertises_the_live_stack() {
+        let gpu = || gpu(0, "nvidia", Some("/dev/dri/renderD128"));
+        // A plan that separates the encoders: the Openh264 baseline plans only H.264; a
+        // Vulkan overlay plans H.265 + AV1 as well.
+        let mut mgr = codec_mgr(vec![gpu()], |encoder, _node| match encoder {
+            EncoderChoice::Openh264 => BTreeSet::from([Codec::H264]),
+            _ => BTreeSet::from([Codec::H264, Codec::H265, Codec::Av1]),
+        });
+        // The effective settings the control plane last sent carry a live overlay: Vulkan.
+        mgr.runtime_settings.encoder = EncoderChoice::Vulkan;
+        // A codec proven under that overlay is advertised on the live stack.
+        prove(&mut mgr, 0, crate::host_probe::ProbeCodec::H265);
+        prove(&mut mgr, 0, crate::host_probe::ProbeCodec::Av1);
+        assert_eq!(
+            mgr.advertised_codecs(),
+            wire(&["h264", "h265", "av1"]),
+            "the live stack advertises its proven codecs"
+        );
+
+        // The reconnect: `begin_connection` is exactly what the loop calls on every dial.
+        mgr.begin_connection(vec![gpu()], Vec::new());
+
+        assert_eq!(
+            mgr.runtime_settings.encoder,
+            EncoderChoice::Vulkan,
+            "begin_connection must not reset runtime_settings to the baseline"
+        );
+        assert_eq!(
+            mgr.advertised_codecs(),
+            wire(&["h264", "h265", "av1"]),
+            "a reconnect re-advertises the live stack, not a baseline h264-only set"
+        );
+    }
+
     /// #1056: with `pyrowaveenc` registered every GPU gets a PyroWave codec probe, and a
     /// pass puts `pyrowave` on that GPU's wire set and the host union, never in the
     /// session-codec sets the assign belt reads.
@@ -11757,6 +11801,105 @@ mod tests {
         assert_eq!(
             after_encoder_change, after_unrelated_change,
             "home_root does not select the media path and must not trigger a re-probe"
+        );
+    }
+
+    /// #309 item 3: end-to-end liveness — a codec probe driven through the *real*
+    /// scheduler, then applied to the manager's evidence, makes the codec appear in the
+    /// advertised set. Safety proves no unproven codec is advertised; this proves the
+    /// opposite seam works: a pass recorded on the stack the manager last notified does
+    /// reach the wire. It also pins the invariant the issue flags — the scheduler runs on
+    /// exactly the inputs the manager sent (`mgr.notified_probe_inputs`): drive
+    /// `registered` with an AV1 target, and only that target's pass makes AV1 appear.
+    #[tokio::test]
+    async fn a_codec_pass_driven_through_the_scheduler_is_advertised() {
+        use crate::host_probe::orchestrator::{apply, BoxFuture, ProbeRunner, RunEnd};
+        use crate::host_probe::outcome::ProbeOutcome;
+        use crate::host_probe::{ProbeKind, ProbeTarget};
+        use tokio::sync::watch;
+
+        /// A probe runner that concludes every probe with a pass, so a single `registered`
+        /// drives the whole ladder (input → audio → media → application → codec) to
+        /// completion with no GPU, container or child in sight.
+        struct PassAllRunner;
+        impl ProbeRunner for PassAllRunner {
+            fn run(&self, _: ProbeTarget, _: watch::Receiver<bool>) -> BoxFuture<RunEnd> {
+                Box::pin(async move {
+                    RunEnd::Concluded {
+                        outcome: ProbeOutcome::Pass {
+                            summary: "ok".into(),
+                        },
+                        reconciled: true,
+                    }
+                })
+            }
+            fn reconcile(&self, _: ProbeKind) -> BoxFuture<bool> {
+                Box::pin(async { true })
+            }
+        }
+
+        let (handle, mut updates) = crate::host_probe::orchestrator::spawn(Arc::new(PassAllRunner));
+        let (mut mgr, _live_refs) = manager_with_runner(default_runner());
+        mgr.gpu_inventory = vec![gpu(0, "nvidia", Some("/dev/dri/renderD128"))];
+        mgr.agent_image_identity = "sha256:agent".into();
+        mgr.codec_layers = CodecLayers {
+            plan: |_, _| BTreeSet::from([Codec::H264, Codec::H265, Codec::Av1]),
+            excluded: exclude_none,
+            pyrowave: || false,
+        };
+        mgr.host_codec_report = Some(HostCodecReport::default());
+        mgr.probe_handle = Some(handle.clone());
+
+        // The manager's view of what to probe, sent once on `registered`: the value the
+        // invariant `scheduler.inputs == mgr.notified_probe_inputs` compares the scheduler
+        // against. It must select the AV1 probe under test.
+        let inputs = probe_inputs(&mgr);
+        assert!(
+            inputs
+                .codecs
+                .get(&0)
+                .is_some_and(|c| c.contains(&crate::host_probe::ProbeCodec::Av1)),
+            "the inputs the manager notifies must select the AV1 probe under test"
+        );
+        mgr.notified_probe_inputs = Some(inputs.clone());
+        handle.registered(inputs.clone());
+
+        // The scheduler runs the whole ladder and then goes quiet: drain updates until
+        // none arrives for two short windows, applying each as the loop would. A codec
+        // pass only advertises under the stamp the run started with, which — the stack
+        // being unchanged — is the same stamp `advertised_codecs` checks.
+        let mut saw_codec = false;
+        let mut quiet = 0;
+        while quiet < 2 {
+            match tokio::time::timeout(Duration::from_millis(300), updates.recv()).await {
+                Ok(Some(update)) => {
+                    quiet = 0;
+                    if let crate::host_probe::orchestrator::ReportUpdate::Record {
+                        target, ..
+                    } = &update
+                    {
+                        saw_codec |= target.codec.is_some();
+                    }
+                    apply(&mut mgr.readiness, &mut mgr.codec_evidence, update);
+                }
+                Ok(None) => panic!("the update channel closed before the scheduler finished"),
+                Err(_) => quiet += 1,
+            }
+        }
+
+        assert!(
+            saw_codec,
+            "the scheduler must have started at least one codec probe"
+        );
+        assert_eq!(
+            mgr.advertised_codecs(),
+            wire(&["h264", "h265", "av1"]),
+            "a codec pass applied on the notified stack is advertised"
+        );
+        assert_eq!(
+            mgr.notified_probe_inputs,
+            Some(inputs),
+            "the scheduler ran on exactly the inputs the manager notified"
         );
     }
 

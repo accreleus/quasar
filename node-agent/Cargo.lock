@@ -1917,6 +1917,7 @@ dependencies = [
  "gst-plugin-pyrowave",
  "gstreamer",
  "gstreamer-app",
+ "gstreamer-base",
  "gstreamer-rtp",
  "gstreamer-sdp",
  "gstreamer-video",

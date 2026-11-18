@@ -19,6 +19,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as sessionRuntime from "./sessionRuntime";
 import { SessionPage, parseTierSize } from "./SessionPage";
 import { ApiError } from "../../api/client";
 import { ToastProvider } from "../../components/Toast";
@@ -193,22 +194,27 @@ vi.mock("../../webrtc/session", () => ({
 
 /** The page's callback for the swap screen going up or down, so a test can play the controller. */
 let lastScreenChange: ((up: boolean) => void) | undefined;
+/** The page's callback for the swap starting, so a test can drive the swap-start hook. */
+let lastOnSwapStart: (() => void) | undefined;
 let lastCurrentApp: { id?: string; name: string } | undefined;
 let lastOnCommitted: ((appId: string, appName: string) => void) | undefined;
 vi.mock("./SessionSwapController", () => ({
   SessionSwapController: ({
     children,
     onScreenChange,
+    onSwapStart,
     currentApp,
     onCommitted,
   }: {
     children: (p: { quickSwitch: null; swappingTo: null }) => React.ReactNode;
     onScreenChange?: (up: boolean) => void;
+    onSwapStart?: () => void;
     currentApp: { id?: string; name: string };
     onCommitted: (appId: string, appName: string) => void;
   }) => {
     lastOnCommitted = onCommitted;
     lastScreenChange = onScreenChange;
+    lastOnSwapStart = onSwapStart;
     lastCurrentApp = currentApp;
     return children({ quickSwitch: null, swappingTo: null });
   },
@@ -1435,6 +1441,33 @@ describe("SessionPage — WebTransport falls back to WebRTC (A11)", () => {
     const hud = lastDrawerProps as Record<string, unknown>;
     expect(hud.transport).toBe("webrtc");
     expect(hud.transportFallbackReason).toBe("connect_timeout");
+  });
+});
+
+describe("SessionPage — quick-switch holds sound at swap start (#768)", () => {
+  it("holds the old game's sound the instant onSwapStart runs, before the screen is up", async () => {
+    // The runtime is minted in a post-mount effect (once the signal + video exist),
+    // so spy before mount and read back the instance the page created.
+    const createSpy = vi.spyOn(sessionRuntime, "createSessionRuntime");
+    currentSession = makeSession({ state: "running", state_detail: "app presented" });
+    renderPage();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+
+    const minted = createSpy.mock.results;
+    expect(minted.length).toBeGreaterThanOrEqual(1);
+    const rt = minted[minted.length - 1].value as { holdAudio: () => void };
+    const holdAudio = vi.spyOn(rt, "holdAudio");
+
+    // Driving the swap-start hook the mocked controller exposes must hold the
+    // sound SYNCHRONOUSLY — before the switching screen is up — not one render
+    // later via the sound-hold effect. That is the #768 fix.
+    expect(lastOnSwapStart).toBeTruthy();
+    await act(async () => {
+      lastOnSwapStart?.();
+    });
+    expect(holdAudio).toHaveBeenCalled();
   });
 });
 
