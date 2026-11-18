@@ -285,7 +285,8 @@ export function useDisplayPatch(params: UseDisplayPatchParams): UseDisplayPatchR
 
   // Amendment 84 (#996, #1491): adopt the session's OWN render size and UI scale on
   // EVERY poll, so a second tab, a reload or a takeover starts from where the session
-  // is AND a change another tab makes is picked up. Adoption ends for good once THIS
+  // is AND a change another tab makes is picked up, until this tab acks one of its own.
+  // Adoption ends for good once THIS
   // tab has acked a change of its own (`ackedLocallyRef`): from then this tab's acked
   // value is the truth, so a poll sampled before that PATCH landed — a delayed poll,
   // the stale metrics sample in the ~1 s window after a change — cannot overwrite the
