@@ -9,6 +9,11 @@
 #   build=true|false        true only when the registry ANSWERED "no such tag".
 # Run it from the repo root. Needs REGISTRY_NS (e.g. ghcr.io/accreleus/quasar).
 #
+# QUASAR_BASE_DIGEST pins the base digest the tag is worked out for, instead of asking the
+# registry what `quasar-base:latest` is now. The refresh's recheck passes the digest its
+# `check` job recorded, so a base rebuild between the two jobs cannot make it ask about a
+# tag this run will not build (#1092).
+#
 # A registry that cannot be read is an ERROR (exit 1), never "missing": a hiccup must not
 # read as "absent" and cost a 40-minute build. Only the registry's own "manifest unknown"
 # / "name unknown" / "<ref>: not found" counts as missing.
@@ -18,9 +23,13 @@ set -euo pipefail
 base="$(grep -E '^QUASAR_BASE_IMAGE=' deploy/pins.env | head -1 | cut -d= -f2-)"
 [ -n "$base" ] || { echo "deploy/pins.env declares no QUASAR_BASE_IMAGE" >&2; exit 1; }
 
-if ! digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$base")"; then
-  echo "::error::could not read the base image $base from the registry, so the toolchain tag cannot be worked out (the error is above). Re-run if the registry was unreachable." >&2
-  exit 1
+digest="${QUASAR_BASE_DIGEST:-}"
+digest="${digest#*@}"
+if [ -z "$digest" ]; then
+  if ! digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$base")"; then
+    echo "::error::could not read the base image $base from the registry, so the toolchain tag cannot be worked out (the error is above). Re-run if the registry was unreachable." >&2
+    exit 1
+  fi
 fi
 case "$digest" in sha256:*) ;; *) echo "::error::unexpected digest for $base: $digest" >&2; exit 1 ;; esac
 
