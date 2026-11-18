@@ -66,8 +66,8 @@ export function SessionSwapController({
   // 3.5s terminal screen that auto-clears). Sound must be held under all of them
   // — a terminal screen still covers the stream, so releasing the old game's
   // sound the instant it appears would leak audio behind an opaque overlay.
-  // Capture is unaffected in effect: during error/timeout no swap committed, so
-  // there is nothing new to gate and the gate re-evaluates when the screen clears.
+  // Auto-capture after a failed or timed-out swap now waits for that screen to
+  // clear (about 3.5 s) instead of engaging under it; nothing releases capture.
   const screenUp =
     transition?.phase === "switching" ||
     transition?.phase === "booting" ||

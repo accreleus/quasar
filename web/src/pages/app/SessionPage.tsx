@@ -1462,7 +1462,7 @@ function SessionPageBody() {
         onSwapStart={() => {
           // Hold the old game's sound THE INSTANT the swap starts — before the
           // switching screen is up — so it cannot leak through the one-render gap
-          // between the click and the sound-hold effect (SessionPage ~1010). The
+          // between the click and the sound-hold effect. The
           // effect still releases it when the screen clears; holdAudio is idempotent.
           runtimeRef.current?.holdAudio();
           hudRef.current?.close();
