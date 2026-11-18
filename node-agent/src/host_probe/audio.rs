@@ -7,7 +7,7 @@ use super::container::{ContainerProbeEnd, Observed};
 use super::outcome::{remediation, wording, ProbeOutcome};
 use super::{ProbeKind, ProbeTarget};
 
-/// Run one probe sidecar to a socket-ready/timeout verdict, always stopping and
+/// Run one probe sidecar to a readiness/timeout verdict, always stopping and
 /// cleaning up whatever it created. Recovery of a stale prior sidecar runs inside this
 /// same single flight, before any new create.
 pub fn run(
@@ -16,6 +16,27 @@ pub fn run(
     runtime_dir: &str,
     nonce: &str,
     preempted: &(dyn Fn() -> bool + Sync),
+) -> ContainerProbeEnd {
+    run_with_readiness(
+        api,
+        image,
+        runtime_dir,
+        nonce,
+        preempted,
+        crate::session::audio::wait_for_audio_readiness,
+    )
+}
+
+/// [`run`] with the readiness predicate injected: the same probe proves the production
+/// readiness (#479: the socket AND the baked profile's three devices), while tests can
+/// hold a bare socket ready without a Pulse daemon behind it.
+pub(crate) fn run_with_readiness(
+    api: &RuntimeClient,
+    image: &str,
+    runtime_dir: &str,
+    nonce: &str,
+    preempted: &(dyn Fn() -> bool + Sync),
+    readiness: impl Fn(&std::path::Path) -> bool,
 ) -> ContainerProbeEnd {
     if let Err(error) = api.recover_audio_sidecars().wait() {
         return ContainerProbeEnd {
@@ -62,7 +83,7 @@ pub fn run(
 
     // The wait is not itself pre-emptible (≤2 s is an accepted delay); a launch that
     // arrived during it is honoured right after.
-    let ready = crate::session::audio::wait_for_socket(&socket_dir.join("native"));
+    let ready = readiness(&socket_dir.join("native"));
     let observed = if ready {
         Observed::SocketReady
     } else if preempted() {
@@ -88,11 +109,11 @@ pub fn outcome(end: &ContainerProbeEnd) -> ProbeOutcome {
     let (passed, failed, exercising) = wording(ProbeTarget::host(ProbeKind::Audio));
     match &end.observed {
         Observed::SocketReady => ProbeOutcome::Pass {
-            summary: format!("{passed}: its socket appeared"),
+            summary: format!("{passed}: its socket and audio devices appeared"),
         },
         Observed::SocketTimeout => ProbeOutcome::Fail {
             summary: format!(
-                "{failed}: its socket did not appear within {} s",
+                "{failed}: its socket and audio devices were not ready within {} s",
                 crate::session::audio::PULSE_WAIT_TOTAL.as_secs()
             ),
             remediation: remediation(ProbeKind::Audio),
