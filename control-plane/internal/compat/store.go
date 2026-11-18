@@ -460,6 +460,8 @@ func (s *Store) Entries(ctx context.Context, hostID string) ([]Entry, []string, 
 // before the read, and the tool is left out, or waits until the session's compat_tool_names
 // holds the name, and force-remove's stop step finds the session (control-api.md §Usable).
 // shortcut: locks the whole catalogue (a few dozen rows) instead of only the rows it reads.
+// The watermark is read before the mappings so a mapping committed between the two reads makes the
+// swap guard refuse conservatively, never admit a table this launch did not carry (#1555).
 func (s *Store) Assign(ctx context.Context, sessionID, hostID string) ([]Entry, []string, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -468,6 +470,10 @@ func (s *Store) Assign(ctx context.Context, sessionID, hostID string) ([]Entry, 
 	defer tx.Rollback(ctx) //nolint:errcheck
 	if _, err := tx.Exec(ctx, `SELECT id FROM compat_tools ORDER BY id FOR SHARE`); err != nil {
 		return nil, nil, fmt.Errorf("lock compat tools: %w", err)
+	}
+	var revision int64
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(revision), 0) FROM compat_tool_mappings`).Scan(&revision); err != nil {
+		return nil, nil, fmt.Errorf("read mapping revision: %w", err)
 	}
 	out, mount, err := entries(ctx, tx, hostID)
 	if err != nil {
@@ -490,7 +496,8 @@ func (s *Store) Assign(ctx context.Context, sessionID, hostID string) ([]Entry, 
 	case name == nil || !slices.Contains(mount, *name):
 		return nil, nil, &ToolMissingError{Tag: tag}
 	}
-	if _, err := tx.Exec(ctx, `UPDATE sessions SET compat_tool_names = $2::text[] WHERE id = $1::uuid`, sessionID, mount); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE sessions SET compat_tool_names = $2::text[], compat_mapping_revision = $3
+		WHERE id = $1::uuid`, sessionID, mount, revision); err != nil {
 		return nil, nil, fmt.Errorf("record mounted compat tools: %w", err)
 	}
 	return out, mount, tx.Commit(ctx)
@@ -580,6 +587,7 @@ func (s *Store) Mappings(ctx context.Context) ([]Mapping, error) {
 
 // SetMapping replaces the Steam game's mapping and returns it with the one it replaced (nil if none).
 // It takes FOR SHARE on the tool row first and checks usable after the lock (control-api.md §Usable).
+// mappingCapLock is held from before the insert until commit, so mapping revisions order by commit.
 func (s *Store) SetMapping(ctx context.Context, appID, toolID string, forced bool, actorID string) (m Mapping, prev *Mapping, tool, prevTool ToolRef, err error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -631,7 +639,8 @@ func (s *Store) SetMapping(ctx context.Context, appID, toolID string, forced boo
 		INSERT INTO compat_tool_mappings (provider, external_id, tool_id, forced, updated_by)
 		VALUES ('steam', $1, $2::uuid, $3, $4::uuid)
 		ON CONFLICT (provider, external_id) DO UPDATE
-		   SET tool_id = EXCLUDED.tool_id, forced = EXCLUDED.forced, updated_by = EXCLUDED.updated_by, updated_at = now()
+		   SET tool_id = EXCLUDED.tool_id, forced = EXCLUDED.forced, updated_by = EXCLUDED.updated_by,
+		       updated_at = now(), revision = nextval('compat_tool_mappings_revision_seq')
 		RETURNING provider, external_id, tool_id::text, forced, updated_at`, appID, toolID, forced, actorID).
 		Scan(&m.Provider, &m.ExternalID, &m.ToolID, &m.Forced, &m.UpdatedAt); err != nil {
 		return

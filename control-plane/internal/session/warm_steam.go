@@ -672,7 +672,7 @@ func (s *Store) adoptedByLive(ctx context.Context, id string) bool {
 func adoptRuntime(ctx context.Context, tx pgx.Tx, from, to string) error {
 	if _, err := tx.Exec(ctx, `UPDATE sessions t SET adopt_session_id = f.id,
 		    managed_home_id = f.managed_home_id, managed_home_mount_sha256 = f.managed_home_mount_sha256,
-		    compat_tool_names = f.compat_tool_names
+		    compat_tool_names = f.compat_tool_names, compat_mapping_revision = f.compat_mapping_revision
 		FROM sessions f WHERE f.id = $1::uuid AND t.id = $2::uuid`, from, to); err != nil {
 		return fmt.Errorf("record adoption: %w", err)
 	}
