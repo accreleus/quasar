@@ -294,6 +294,17 @@ describe("SessionTelemetry posted client_health on a Firefox-shaped report (#610
     expect(sample).not.toHaveProperty("client_health_reason");
   });
 
+  it("posts no client_health from a page in bench mode, even for a degraded window", async () => {
+    localStorage.setItem("quasar.bench", "1");
+    try {
+      const sample = await queuedSample(10);
+      expect(sample).not.toHaveProperty("client_health");
+      expect(sample).not.toHaveProperty("client_health_reason");
+    } finally {
+      localStorage.removeItem("quasar.bench");
+    }
+  });
+
   it("still posts decode_degrading when decode is over budget", async () => {
     const sample = await queuedSample(10);
     expect(sample["client_health"]).toBe("decode_degrading");

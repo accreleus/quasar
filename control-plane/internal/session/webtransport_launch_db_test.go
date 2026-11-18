@@ -35,7 +35,8 @@ type wtFixture struct {
 }
 
 // newWTFixture seeds a host that reports a WebTransport endpoint, a device that proves
-// WebTransport + WebCodecs for h264 and opus, and sets the 1080p60 profile's transport.
+// WebTransport + WebCodecs for h264 and opus + amendment 78's WebGPU, and sets the 1080p60
+// profile's transport.
 func newWTFixture(t *testing.T, profileTransport string) *wtFixture {
 	t.Helper()
 	pool := testDB(t)
@@ -65,7 +66,7 @@ func newWTFixture(t *testing.T, profileTransport string) *wtFixture {
 		WHERE id = $1::uuid`, hostID, wtCertA))
 	caps := `{"bandwidth_kbps":50000,"rtt_ms":5,"max_decode_height":2160,"measured_at":"` +
 		time.Now().UTC().Format(time.RFC3339) + `","codecs":{"h264":true},
-		"webtransport":{"available":true,"datagrams":true},
+		"webtransport":{"available":true,"datagrams":true},"webgpu":{"available":true},
 		"webcodecs":{"h264":true,"hevc":true,"av1":true,"opus_decode":true,"opus_encode":true}}`
 
 	authSvc, err := auth.NewService(pool, auth.DefaultParams(), time.Hour)
@@ -263,6 +264,12 @@ func TestLaunchFallsBackToWebRTCWithAReason(t *testing.T) {
 		{"device cannot decode h264 in webcodecs", "webtransport", map[string]any{}, func(t *testing.T, f *wtFixture) {
 			must(t, exec(t, f.pool, `UPDATE user_devices SET capabilities = jsonb_set(capabilities, '{webcodecs,h264}', 'false')`))
 		}, "device_no_webcodecs"},
+		{"device has no webgpu adapter", "webtransport", map[string]any{}, func(t *testing.T, f *wtFixture) {
+			must(t, exec(t, f.pool, `UPDATE user_devices SET capabilities = capabilities - 'webgpu'`))
+		}, "device_no_webgpu"},
+		{"device reports a software webgpu adapter", "webtransport", map[string]any{}, func(t *testing.T, f *wtFixture) {
+			must(t, exec(t, f.pool, `UPDATE user_devices SET capabilities = jsonb_set(capabilities, '{webgpu,available}', 'false')`))
+		}, "device_no_webgpu"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

@@ -4,6 +4,7 @@ package images
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -29,6 +30,8 @@ type fakeRegistry struct {
 	notFound bool
 	// stall delays the manifest HEAD (used to trip the resolver's timeout).
 	stall time.Duration
+	// tokenStatus, when set, makes the token endpoint answer that status with no token.
+	tokenStatus int
 	// missingDigestHeader answers 200 with no Docker-Content-Digest.
 	missingDigestHeader bool
 	// realmHost overrides the host in the WWW-Authenticate realm (default
@@ -51,6 +54,10 @@ func newFakeRegistry(t *testing.T) *fakeRegistry {
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
 		f.tokenScope = r.URL.Query().Get("scope")
 		f.tokenIssued++
+		if f.tokenStatus != 0 {
+			w.WriteHeader(f.tokenStatus)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, `{"token":"fake-anonymous-token"}`)
 	})
@@ -381,5 +388,30 @@ func TestFetchTokenRefusesAnOversizedBodyOnABareClient(t *testing.T) {
 
 	if _, err := r.fetchToken(context.Background(), "https://ghcr.io/token", "ghcr.io", "scope"); err == nil {
 		t.Fatal("an over-limit token response was accepted")
+	}
+}
+
+// TestResolveTokenStatusClassification (#886) — a refusing token endpoint (401/403/404) reads as
+// denied; a throttled or otherwise failed one (429, 408, 400, 500) is a plain failure, never denied.
+func TestResolveTokenStatusClassification(t *testing.T) {
+	for _, c := range []struct {
+		status int
+		denied bool
+	}{
+		{http.StatusUnauthorized, true}, {http.StatusForbidden, true}, {http.StatusNotFound, true},
+		{http.StatusTooManyRequests, false}, {http.StatusRequestTimeout, false},
+		{http.StatusBadRequest, false}, {http.StatusInternalServerError, false},
+	} {
+		t.Run(fmt.Sprint(c.status), func(t *testing.T) {
+			reg := newFakeRegistry(t)
+			reg.requireToken, reg.tokenStatus = true, c.status
+			_, err := reg.resolver().Resolve(context.Background(), "registry.example.com/acme/app:1")
+			if err == nil {
+				t.Fatal("Resolve with a failing token endpoint: got nil error")
+			}
+			if got := errors.Is(err, ErrRegistryDenied); got != c.denied {
+				t.Fatalf("status %d: errors.Is(ErrRegistryDenied) = %v, want %v (err: %v)", c.status, got, c.denied, err)
+			}
+		})
 	}
 }

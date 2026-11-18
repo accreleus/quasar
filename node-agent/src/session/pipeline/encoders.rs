@@ -79,7 +79,7 @@ impl CodecKnob {
 /// `QUASAR_VULKAN_AV1`), read from env once per ambient edge via
 /// [`EncoderKnobs::from_env`] and threaded as data from there. The ambient edges:
 /// `agent::probe_host_codecs`, `pipeline::resolve_effective_encoder` (once per
-/// session), and `source_branch::pin_vulkan_encode_ring` (via
+/// session), and `source_branch::source_ring_depth` (via
 /// [`required_source_ring_depth`]).
 ///
 /// All three default ON. Disabling one makes [`effective_encoder`] borrow the vendor
@@ -1147,15 +1147,13 @@ pub(crate) fn rearm_vulkan_rc(enc: &gst::Element, bitrate_kbps: u32) {
 }
 
 /// The Vulkan compositor encode-src ring depth `knobs` requires, `None` if the
-/// default ring is fine — the WHY half of `source_branch::pin_vulkan_encode_ring`,
-/// which only applies it.
+/// default ring is fine — the WHY half of `source_branch::source_ring_depth`,
+/// which applies it as the compositor's `ring-depth`.
 ///
-/// `Some(2)` iff HEVC is enabled on the Vulkan encoder. The 5090's Vulkan H.265
-/// encode-src pool gives one of the default `RING=4` slots an incompatible
-/// tiling/swizzle, so the RGBA→NV12 compute shader writes it black — exactly 1-in-4
-/// encoded frames (`docs/design/plans/2026-07-24-vulkanh265enc-conformance-resolution-spec.md`
-/// §7 item 4). `RING=2` eliminates it (0 black frames measured); not `RING=1`, see
-/// `source_branch::pin_vulkan_encode_ring` for the starvation finding.
+/// `Some(2)` iff HEVC is enabled on the Vulkan encoder. At the old compositor pin a ring of
+/// 4 blacked exactly 1-in-4 H.265 frames on the RTX 5090 and 2 showed none. The rebuilt
+/// compositor grows a fully-held ring (up to 12), so 2 is a starting depth, and upstream
+/// #88 traces the black frame to a repeated import; #1083 measures whether this still matters.
 ///
 /// AV1 must NOT arm the pin on its own: proven live on the RTX 5090 with zero black
 /// frames at the stock `RING=4` once the input-buffer-release fix removed the

@@ -10,6 +10,7 @@ import {
   markDeviceProbePosted,
   probeCapabilities,
   probeRegion,
+  probeWebTransport,
   probeWebCodecs,
   probeFeatures,
   type DeviceCapabilities,
@@ -460,5 +461,26 @@ describe("probeCapabilities on a link or browser where a step hangs", () => {
     expect(caps.webgpu).toEqual({ available: false, features: [] });
     expect(caps.display.refresh_hz).toBeUndefined();
     expect(caps.display.width).toBe(screen.width);
+  });
+});
+
+describe("probeWebTransport (#1412)", () => {
+  it("reports datagrams false for a browser whose WebTransport has no datagram API", () => {
+    // Some iOS builds ship WebTransport without `datagrams` (WebKit bug 322201): the plan must
+    // put that browser on WebRTC from the start rather than onto a transport it cannot use.
+    vi.stubGlobal("WebTransport", function WebTransport() {} as unknown);
+    expect(probeWebTransport()).toEqual({ available: true, datagrams: false });
+  });
+
+  it("reports datagrams true where the datagram API is there", () => {
+    const ctor = function WebTransport() {} as unknown as { prototype: object };
+    ctor.prototype = { datagrams: null };
+    vi.stubGlobal("WebTransport", ctor);
+    expect(probeWebTransport()).toEqual({ available: true, datagrams: true });
+  });
+
+  it("reports unavailable, and no datagrams, in a browser with no WebTransport at all", () => {
+    vi.stubGlobal("WebTransport", undefined);
+    expect(probeWebTransport()).toEqual({ available: false, datagrams: false });
   });
 });

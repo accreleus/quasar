@@ -137,6 +137,7 @@ export function videoConfigFrom(ack: Record<string, unknown>): VideoConfig {
         }
       : undefined,
     ...(typeof ack.codec_switch_reason === "string" ? { switchReason: ack.codec_switch_reason } : {}),
+    fec: typeof ack.fec === "string" ? ack.fec : null,
   };
 }
 
@@ -169,6 +170,17 @@ interface Router {
 const refused = (code: string, detail?: string): Answer => ({ kind: "refused", code, detail });
 const closeDetail = (code: number, reason?: string) => `close ${code}${reason ? ` ${reason}` : ""}`;
 const after = <T>(ms: number, value: T) => new Promise<T>((r) => setTimeout(() => r(value), ms));
+
+/** `WebTransport.datagrams` in both shapes: the current spec's `writable`, and Safari's older
+ *  `createWritable()` (#1403). Either direction missing means this browser cannot carry media. */
+interface Datagrams {
+  readable?: ReadableStream<Uint8Array>;
+  writable?: WritableStream<Uint8Array>;
+  createWritable?: () => WritableStream<Uint8Array>;
+}
+
+/** The cause a browser with no datagram API at all reports (#1412). */
+const NO_DATAGRAMS = "datagrams: this browser's WebTransport has no datagram API";
 
 export class WebTransportMedia implements MediaTransport {
   private wt: WebTransport | null = null;
@@ -378,6 +390,15 @@ export class WebTransportMedia implements MediaTransport {
     }
     if (this.closed) return abandon(refused("closed"));
 
+    // Some iOS builds ship WebTransport with no datagram API at all (WebKit bug 322201). Media
+    // needs both directions, so no connection can be made here: say that at connect, before the
+    // reader is built. A bare TypeError from the reader was neither a fallback reason nor a cause
+    // the accept check could see (#1412).
+    const dg = (wt as { datagrams?: Datagrams }).datagrams;
+    if (!dg?.readable || !(dg.writable ?? dg.createWritable)) {
+      return abandon(refused("connect_failed", NO_DATAGRAMS), { closeCode: 4400, reason: NO_DATAGRAMS });
+    }
+
     let writer: WritableStreamDefaultWriter<Uint8Array>;
     let reader: ReadableStreamDefaultReader<Uint8Array>;
     try {
@@ -465,7 +486,6 @@ export class WebTransportMedia implements MediaTransport {
     this.router = router;
     // Safari ships the newer spec shape: `datagrams.createWritable()` and no `writable` (#1403).
     // `writable` first, so Chrome's path is the one it always took.
-    const dg = wt.datagrams as { writable?: WritableStream<Uint8Array>; createWritable?: () => WritableStream<Uint8Array> };
     this.datagramWriter = (dg.writable ?? dg.createWritable!()).getWriter();
     sink.streams?.(audioStreamsFrom(first));
     router.config(config);
@@ -530,7 +550,14 @@ export class WebTransportMedia implements MediaTransport {
     feedback: FeedbackRecorder,
     died: { death: string | null },
   ): Promise<void> {
-    const reader = wt.datagrams.readable.getReader();
+    let reader: ReadableStreamDefaultReader<Uint8Array>;
+    try {
+      reader = wt.datagrams.readable.getReader();
+    } catch (err) {
+      // No reader, so no media: record it for the accept check, as a failed read does (#1412).
+      died.death = `datagrams: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`;
+      throw new Error(died.death);
+    }
     for (;;) {
       let read: ReadableStreamReadResult<Uint8Array>;
       try {
@@ -585,6 +612,12 @@ export class WebTransportMedia implements MediaTransport {
     /** What the PyroWave receivers already replaced counted lost. */
     let pyroLost = 0;
     let reported = 0;
+    /** Amendment 85: the fragments FEC has rebuilt so far, as last reported. */
+    let reportedRepaired = 0;
+    const reportRepaired = () => {
+      const n = assembler.repaired;
+      if (n !== reportedRepaired) sink.repaired?.((reportedRepaired = n));
+    };
     // PyroWave loss is never NACKed, so it is reported as its frames close.
     const reportLost = () => {
       const n = this.lostSoFar();
@@ -643,6 +676,8 @@ export class WebTransportMedia implements MediaTransport {
         return;
       }
       this.recovered(assembler.push(f), sink);
+      // A held repair a video fragment completes is rebuilt here, not on a repair datagram.
+      reportRepaired();
     };
     const config = (c: VideoConfig) => {
       configs.delete(c.configId);
@@ -657,7 +692,10 @@ export class WebTransportMedia implements MediaTransport {
     const miss = (frameSeq: number, frags: [number, number][]) => this.recovered(assembler.miss(frameSeq, frags), sink);
     const tick = () => this.recovered(assembler.tick(), sink);
     // PyroWave frames never reach the assembler, so a repair for one finds no frame and is dropped.
-    const repair = (r: FecRepair) => this.recovered(assembler.repair(r), sink);
+    const repair = (r: FecRepair) => {
+      this.recovered(assembler.repair(r), sink);
+      reportRepaired();
+    };
     this.lostSoFar = () => assembler.lost + pyroLost + (pyro?.lost ?? 0);
     return { datagram, repair, config, miss, tick, stop };
   }

@@ -24,7 +24,6 @@ const WRITES: &[(&str, usize)] = &[
     ("main.rs", 2),
     ("nvidia_volume.rs", 1),
     ("session/mod.rs", 3),
-    ("session/pipeline/source_branch.rs", 1),
 ];
 
 fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {

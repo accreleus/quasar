@@ -265,11 +265,20 @@ impl AbrLoop {
             let st = r.state.lock().unwrap();
             st.in_flight || st.planner.settling(now)
         });
-        let (prev, cut) = {
+        let (prev, cut, rate) = {
             let mut gov = self.governor.lock().unwrap();
             let prev = gov.setpoint_kbps();
-            (prev, gov.observe_report(reading.filter(|_| !settling), now))
+            let cut = gov.observe_report(reading.filter(|_| !settling), now);
+            (prev, cut, gov.rate_kbps())
         };
+        // Amendment 79: what the reports say the link carries, unclamped by the floor —
+        // the only value that can tell a floor-pinned session on a good link (this rate
+        // above the floor) from one whose link carries less.
+        if let Some(m) = self.metrics.upgrade() {
+            #[cfg(test)]
+            start_pause::run(&self.session_id, start_pause::Step::BeforeRateStore);
+            m.set_abr_link_rate(self.id, rate);
+        }
         if let Some(kbps) = cut {
             self.retarget(prev, kbps, reading.unwrap_or_default());
         }
@@ -826,20 +835,25 @@ pub(super) fn enable_abr(
             notify_loop.observe(est_bps as f64 / 1000.0, true, std::time::Instant::now());
         });
         let tick_bwe = bwe.clone();
-        start(
+        let armed = start(
             &abr_loop,
             &plan,
             Box::new(move || tick_bwe.property::<u32>("estimated-bitrate") as f64 / 1000.0),
+            Claim::Take,
         );
-        tracing::info!(
-            "AS-03 ABR armed (mode={}): rtpgccbwe → {:?} encoder, codec={}, bounds [{}, {}] kbps @ {} fps",
-            mode.as_str(),
-            choice,
-            codec.as_str(),
-            floor_bps / 1000,
-            ceiling_bps / 1000,
-            fps
-        );
+        // Only when it really took the encoder and registered its hooks: a start can be
+        // refused (a teardown won the race), and then no ABR exists to claim.
+        if armed {
+            tracing::info!(
+                "AS-03 ABR armed (mode={}): rtpgccbwe → {:?} encoder, codec={}, bounds [{}, {}] kbps @ {} fps",
+                mode.as_str(),
+                choice,
+                codec.as_str(),
+                floor_bps / 1000,
+                ceiling_bps / 1000,
+                fps
+            );
+        }
         Some(bwe.to_value())
     });
 }
@@ -1022,6 +1036,64 @@ fn arm(
     Some((abr_loop, plan))
 }
 
+/// A step inside [`start`] a test can hold the thread at, once, so that a second owner or a
+/// teardown lands in the middle of it (#1295). The two windows are too narrow to hit by
+/// timing: `BeforeClaim` is the gap between a re-take's `orphaned()` read and its claim, and
+/// `BeforeHooks` the one between the claim and the hooks that hold the encoder. Armed for
+/// one session id only, so the other tests in this binary never reach it. Armings are kept
+/// per (step, session): tests run in parallel, and a single slot let one test's `arm`
+/// overwrite another's before its `start` reached the step.
+#[cfg(test)]
+pub(crate) mod start_pause {
+    use std::sync::Mutex;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    // Each step is named for the point it pauses before.
+    #[allow(clippy::enum_variant_names)]
+    pub(crate) enum Step {
+        BeforeClaim,
+        BeforeHooks,
+        /// [`super::AbrLoop::report`], after its owner check and before it stores the link rate.
+        BeforeRateStore,
+    }
+
+    type Hook = Box<dyn Fn() + Send + Sync>;
+
+    static ARMED: Mutex<Vec<(Step, String, Hook)>> = Mutex::new(Vec::new());
+
+    /// Run `hook` once, when [`super::start`] for `session_id` reaches `step`.
+    pub(crate) fn arm(session_id: &str, step: Step, hook: impl Fn() + Send + Sync + 'static) {
+        let mut armed = ARMED.lock().unwrap();
+        armed.retain(|(at, for_session, _)| !(*at == step && for_session == session_id));
+        armed.push((step, session_id.to_string(), Box::new(hook)));
+    }
+
+    pub(super) fn run(session_id: &str, step: Step) {
+        let hook = {
+            let mut armed = ARMED.lock().unwrap();
+            armed
+                .iter()
+                .position(|(at, for_session, _)| *at == step && for_session == session_id)
+                .map(|i| armed.remove(i).2)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+/// How a [`start`] takes the encoder.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Claim {
+    /// An explicit start — a transport's first estimate, or a client's: the last one to
+    /// start drives the encoder.
+    Take,
+    /// The re-take of an encoder nobody owns ([`AbrLoop::orphaned`]). A loop that started
+    /// in the window between that read and this claim owns it now, and this one must let
+    /// it be (#1295).
+    IfFree,
+}
+
 /// Register the loop's per-window hooks: the stall-rescue tick, which re-observes
 /// `estimate()`, and in Smooth mode the adaptation hint and the ladder; and make this loop
 /// the encoder's one writer. Hooks and owner are both single on `SessionMetrics`, so the
@@ -1030,17 +1102,42 @@ fn arm(
 /// Its governor must match the encoder when it starts. It does not after another loop
 /// owned the encoder, or when this loop drove it and then lost it to nobody (a transport
 /// replacement put the encoder back at launch): both start from the launch point.
-fn start(abr_loop: &Arc<AbrLoop>, plan: &Plan, estimate: Box<dyn Fn() -> f64 + Send + Sync>) {
-    if let Some(m) = abr_loop.metrics.upgrade() {
-        let previous = m.abr_owner();
-        m.claim_abr(abr_loop.id);
-        let drove = abr_loop
-            .first_estimate
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if previous != abr_loop.id && (previous != 0 || drove) {
-            take_over(abr_loop, plan, &m);
+fn start(
+    abr_loop: &Arc<AbrLoop>,
+    plan: &Plan,
+    estimate: Box<dyn Fn() -> f64 + Send + Sync>,
+    claim: Claim,
+) -> bool {
+    let Some(m) = abr_loop.metrics.upgrade() else {
+        return false;
+    };
+    #[cfg(test)]
+    start_pause::run(&abr_loop.session_id, start_pause::Step::BeforeClaim);
+    let previous = match claim {
+        Claim::Take => {
+            let previous = m.abr_owner();
+            m.claim_abr(abr_loop.id);
+            previous
         }
+        // #1295: a loop that started in the window between the `orphaned()` read that sent
+        // us here and this claim owns the encoder now, and must keep it. Losing is not an
+        // error: nothing is registered, nothing is written.
+        Claim::IfFree => {
+            if !m.claim_abr_if_free(abr_loop.id) {
+                return false;
+            }
+            // Won from 0: nobody owned it, so there is no other loop's write to undo.
+            0
+        }
+    };
+    let drove = abr_loop
+        .first_estimate
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if previous != abr_loop.id && (previous != 0 || drove) {
+        take_over(abr_loop, plan, &m);
     }
+    #[cfg(test)]
+    start_pause::run(&abr_loop.session_id, start_pause::Step::BeforeHooks);
     let Plan {
         mode,
         choice,
@@ -1063,10 +1160,17 @@ fn start(abr_loop: &Arc<AbrLoop>, plan: &Plan, estimate: Box<dyn Fn() -> f64 + S
     // heartbeat-drain (~5 s); the hook dies with `SessionMetrics`, so there is no
     // per-session thread and no teardown plumbing.
     let tick_loop = abr_loop.clone();
-    if let Some(m) = tick_loop.metrics.upgrade() {
-        m.set_on_drain(Box::new(move || {
-            tick_loop.observe(estimate(), false, std::time::Instant::now())
-        }));
+    if !m.set_on_drain(
+        abr_loop.id,
+        Box::new(move || tick_loop.observe(estimate(), false, std::time::Instant::now())),
+    ) {
+        // Refused only when a teardown (or another loop) took the encoder while this one was
+        // claiming it: the hooks were already cleared, and one installed now would rebuild
+        // the encoder → probe → metrics → hook → encoder cycle the teardown broke, keeping
+        // the encoder alive for good (#1295). Nothing is left to register or drive.
+        //
+        // Deliberately no window hook either from here on: the caller reports "not armed".
+        return false;
     }
 
     // SPT-04: in Smooth mode derive the governor's per-window AdaptationHint from the
@@ -1171,7 +1275,8 @@ fn start(abr_loop: &Arc<AbrLoop>, plan: &Plan, estimate: Box<dyn Fn() -> f64 + S
             // The outer request-aux-sender closure is `Fn` and must keep its own
             // `ladder_encoder`.
             let window_encoder = ladder_encoder.clone();
-            m.set_on_window(Box::new(move |state, encode_p95| {
+            let owner = hint_loop.id;
+            let window_hook = Box::new(move |state, encode_p95| {
                 use crate::session::adaptation::AdaptationState;
                 let saturated = matches!(state, AdaptationState::EncoderSaturated);
                 let fresh = {
@@ -1326,9 +1431,18 @@ fn start(abr_loop: &Arc<AbrLoop>, plan: &Plan, estimate: Box<dyn Fn() -> f64 + S
                         None => {}
                     }
                 }
-            }));
+            });
+            // As the drain hook above: refused only when a teardown won the race, and then no
+            // hook may hold the encoder it cleared (#1295). Nothing follows this
+            // registration, so a refusal and a return are the same thing.
+            // A refused window registration leaves the drain hook from above installed
+            // (owner gone, so it no longer drives, but it holds the encoder until the
+            // session's `end_hooks`). Harmless today, and why `start` reports whether it
+            // really armed.
+            let _ = m.set_on_window(owner, window_hook);
         }
     }
+    true
 }
 
 /// The ABR a WebTransport client's receiver feedback drives
@@ -1344,6 +1458,8 @@ pub(crate) fn feedback_abr(
     session_id: String,
     lever: Option<Arc<EncodeResolutionLever>>,
 ) -> Option<crate::webtransport::Rate> {
+    // Amendment 85: the FEC counters live on the same metrics the ABR publishes.
+    let fec_metrics = session_metrics.clone();
     // The WebRTC fallback's `enable_abr` already said any `ladder_gate_warning`.
     let (abr_loop, plan) = arm(
         encoder,
@@ -1361,22 +1477,47 @@ pub(crate) fn feedback_abr(
     let floor_loop = abr_loop.clone();
     let report_loop = abr_loop.clone();
     let observed = latest.clone();
-    let begin: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+    // #1294: what the takeover itself does to this session's encoder. A loop — a WebRTC
+    // peer's, or this client's predecessor — can still own it when the next client takes
+    // the session, and §Feedback lets a client send no feedback at all: then nothing would
+    // ever take the encoder back from wherever the displaced link left it. So the displace
+    // happens at the handover, keyed on ownership (`Rate::owns`), not on whoever the holder
+    // still was — a WebRTC peer whose PC failed left its loop owning the encoder.
+    let owner = abr_loop.clone();
+    let reset_loop = abr_loop.clone();
+    let reset_cfg = plan.launch_cfg.clone();
+    let reset_lever = plan.lever.clone();
+    // Two ways in: the client's own start (`Claim::Take` — it holds the session now, so it
+    // takes the encoder from a WebRTC loop that started since) and the re-take of one nobody
+    // owns, which must not take it from a loop that started meanwhile (#1295).
+    let starter = |claim: Claim| -> Arc<dyn Fn() + Send + Sync> {
+        let abr_loop = abr_loop.clone();
+        let plan = plan.clone();
         let latest = latest.clone();
-        start(
-            &abr_loop,
-            &plan,
-            Box::new(move || f64::from_bits(latest.load(std::sync::atomic::Ordering::Relaxed))),
-        );
-        tracing::info!(
-            "AS-03 ABR armed (mode={}): WebTransport receiver feedback → encoder, \
-             bounds [{}, {}] kbps",
-            mode.as_str(),
-            plan.launch_floor_kbps,
-            plan.ceiling_kbps
-        );
-    });
-    let retake = begin.clone();
+        Arc::new(move || {
+            let latest = latest.clone();
+            let armed = start(
+                &abr_loop,
+                &plan,
+                Box::new(move || f64::from_bits(latest.load(std::sync::atomic::Ordering::Relaxed))),
+                claim,
+            );
+            // An `IfFree` re-take can lose to a loop that started meanwhile, and a session
+            // that ended refuses the hooks: neither armed anything, and saying it did would
+            // be a lie in exactly the log line an operator reads.
+            if armed {
+                tracing::info!(
+                    "AS-03 ABR armed (mode={}): WebTransport receiver feedback → encoder, \
+                     bounds [{}, {}] kbps",
+                    mode.as_str(),
+                    plan.launch_floor_kbps,
+                    plan.ceiling_kbps
+                );
+            }
+        })
+    };
+    let begin = starter(Claim::Take);
+    let retake = starter(Claim::IfFree);
     Some(crate::webtransport::Rate {
         ceiling_kbps,
         // The governor's lock, alone and released: `observe` takes it again after.
@@ -1385,6 +1526,17 @@ pub(crate) fn feedback_abr(
         // Each client starts afresh: it takes the encoder over (a WebRTC peer that started
         // since owns it until then) and registers new hooks.
         start: Box::new(move || begin()),
+        owns: Box::new(move || owner.metrics.upgrade().is_some_and(|m| m.abr_owner() != 0)),
+        displaced: Box::new(move || {
+            if let Some(metrics) = reset_loop.metrics.upgrade() {
+                reset_to_launch(
+                    &reset_loop.encoder,
+                    &reset_cfg,
+                    reset_lever.as_deref(),
+                    &metrics,
+                );
+            }
+        }),
         observe: Box::new(move |kbps| {
             observed.store(kbps.to_bits(), std::sync::atomic::Ordering::Relaxed);
             // One ABR owner per encoder; an owner that lost the encoder re-takes it from
@@ -1397,6 +1549,15 @@ pub(crate) fn feedback_abr(
             observe_loop.observe(kbps, true, std::time::Instant::now());
         }),
         measured: Box::new(move |reading| report_loop.report(reading, std::time::Instant::now())),
+        fec: Box::new(move |event| match event {
+            crate::webtransport::FecEvent::Attached { client, fec } => {
+                fec_metrics.attach_fec(client, fec);
+            }
+            crate::webtransport::FecEvent::Detached { client } => fec_metrics.detach_fec(client),
+            crate::webtransport::FecEvent::Sent { video, repair } => {
+                fec_metrics.record_fec_bytes(video, repair);
+            }
+        }),
     })
 }
 
@@ -1428,6 +1589,9 @@ fn take_over(abr_loop: &AbrLoop, plan: &Plan, metrics: &SessionMetrics) {
 /// its ladder at rung 0; without this the encoder keeps the last peer's degraded bitrate,
 /// speed bias and rungs until GCC's estimate moves, which on a clean path is never.
 ///
+/// Also the WebTransport handover (#1294): a client taking the session from a WebRTC peer
+/// displaces that peer's loop here, at the takeover, rather than at its own first estimate.
+///
 /// The encoder element and its pipeline stay; these property and caps writes are all a
 /// replacement does to it, and the log line names each. A size change is an encoder
 /// session restart on the Vulkan path, as any rung step is.
@@ -1436,11 +1600,11 @@ fn take_over(abr_loop: &AbrLoop, plan: &Plan, metrics: &SessionMetrics) {
 pub(super) fn reset_to_launch(
     encoder: &gst::Element,
     cfg: &SessionConfig,
-    lever: &EncodeResolutionLever,
+    lever: Option<&EncodeResolutionLever>,
     metrics: &SessionMetrics,
 ) {
     metrics.clear_hooks();
-    let written = write_launch_point(encoder, cfg, Some(lever), metrics);
+    let written = write_launch_point(encoder, cfg, lever, metrics);
     tracing::info!(
         token = "transport-replaced-encoder-kept",
         "encoder {} kept across the transport replacement; written: {written}",
@@ -1470,11 +1634,19 @@ fn write_launch_point(
     lever: Option<&EncodeResolutionLever>,
     metrics: &SessionMetrics,
 ) -> String {
+    // Amendment 79: the link rate belongs to the per-report loop that published it, so a
+    // transport that replaces it must not leave that rate for health to judge.
+    metrics.clear_abr_link_rate();
     if cfg.abr_mode == AbrMode::Off || !encoder_abr_writable(encoder, cfg.encoder) {
         return "nothing (nothing ever moved it)".into();
     }
     let fps = cfg.stream.fps.max(1) as u32;
     write_encoder_bitrate(encoder, cfg.encoder, cfg.stream.bitrate_kbps, fps);
+    // #1462: publish the launch setpoint beside the bitrate. With the link rate cleared
+    // above, health falls back to the setpoint; leaving the old loop's (possibly
+    // floor-pinned) value published lets the control plane end a healthy stream whose new
+    // client sends no ABR feedback.
+    metrics.set_abr_setpoint(cfg.stream.bitrate_kbps);
     let bias = encoder_speed_bias_writable(encoder, cfg.encoder);
     if bias {
         write_encoder_speed_bias(encoder, cfg.encoder, 0, cfg.target_usage);
@@ -1960,7 +2132,7 @@ mod tests {
             "the client's loop drove the encoder down"
         );
 
-        reset_to_launch(&encoder, &cfg, &lever, &metrics);
+        reset_to_launch(&encoder, &cfg, Some(&lever), &metrics);
         assert_eq!(bitrate(), 11_500, "the replacement put it back at launch");
 
         // Its governor starts again too: the old one would sit out its down dwell here.
@@ -1972,6 +2144,171 @@ mod tests {
             driven < 11_500,
             "the abandoned takeover left the client with no ABR ({driven} kbit/s)"
         );
+    }
+
+    // ---- the re-take's two windows (#1295) ----
+
+    /// #1295 (1), check-then-claim: `observe` finds the encoder orphaned, and a replacement
+    /// transport's WebRTC loop starts in the window before this loop claims it. The claim is
+    /// a compare-exchange, so the loop that started keeps the encoder; a plain store took it
+    /// from that loop, and its viewer was left with no ABR for the rest of the session.
+    #[test]
+    fn a_retake_that_lost_the_encoder_meanwhile_does_not_take_it_from_its_new_loop() {
+        use start_pause::{arm, Step};
+        init();
+        const SESSION: &str = "retake-races-1";
+        const OTHER: u64 = u64::MAX;
+        let metrics = Arc::new(SessionMetrics::new("smooth", 60));
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let trace =
+            crate::session::runner::DiagnosticEventTx::new(tx, Arc::default(), Arc::default());
+        let mut cfg = cfg_with_floors(0, Some(500));
+        cfg.abr_governor.min_interval_ms = 1;
+        let Ok(encoder) = gst::ElementFactory::make("openh264enc").build() else {
+            return; // openh264 unavailable: skip
+        };
+        let choice = cfg.encoder;
+        let client = feedback_abr(&encoder, &cfg, metrics.clone(), trace, SESSION.into(), None)
+            .expect("this encoder takes live writes");
+        let bitrate = || encoder.property::<u32>("bitrate") / 1000;
+        let pause = || std::thread::sleep(std::time::Duration::from_millis(5));
+        (client.start)();
+        pause();
+        (client.observe)(2000.0);
+        pause();
+        assert!(
+            bitrate() < 11_500,
+            "the client's loop drove the encoder down"
+        );
+
+        // A transport replacement put the encoder back at launch, owned by nobody (#1040).
+        let lever = software_lever((1920, 1080));
+        reset_to_launch(&encoder, &cfg, Some(&lever), &metrics);
+        assert_eq!(bitrate(), 11_500, "back at launch");
+        assert_eq!(metrics.abr_owner(), 0);
+
+        // …and another transport's loop starts inside the client's next re-take: between its
+        // `orphaned()` read and its claim.
+        let (hook_metrics, hook_encoder) = (metrics.clone(), encoder.clone());
+        arm(SESSION, Step::BeforeClaim, move || {
+            hook_metrics.claim_abr(OTHER);
+            write_encoder_bitrate(&hook_encoder, choice, 3000, 60);
+        });
+        (client.observe)(2000.0);
+        pause();
+
+        assert_eq!(
+            metrics.abr_owner(),
+            OTHER,
+            "the loop that started in the window kept the encoder"
+        );
+        assert_eq!(
+            bitrate(),
+            3000,
+            "and the re-take wrote nothing over what that loop set"
+        );
+    }
+
+    /// #1295 (2), start-then-teardown: a *reset* (a transport replacement or a rebuild,
+    /// `clear_hooks`) lands inside `start`, after the claim and before the hooks. The owner
+    /// check refuses them: registering them then rebuilt the encoder → probe → metrics →
+    /// hook → encoder cycle the reset had just broken, and the encoder was never released.
+    /// (A session *end* is covered by the two tests below, which the owner alone cannot see.)
+    #[test]
+    fn a_reset_that_lands_between_the_claim_and_the_hooks_installs_none() {
+        use start_pause::{arm, Step};
+        init();
+        const SESSION: &str = "retake-races-2";
+        let metrics = Arc::new(SessionMetrics::new("smooth", 60));
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let trace =
+            crate::session::runner::DiagnosticEventTx::new(tx, Arc::default(), Arc::default());
+        let cfg = cfg_with_floors(0, Some(500));
+        let Ok(encoder) = gst::ElementFactory::make("openh264enc").build() else {
+            return; // openh264 unavailable: skip
+        };
+        let client = feedback_abr(&encoder, &cfg, metrics.clone(), trace, SESSION.into(), None)
+            .expect("this encoder takes live writes");
+
+        let reset = metrics.clone();
+        arm(SESSION, Step::BeforeHooks, move || reset.clear_hooks());
+        (client.start)();
+
+        assert_eq!(
+            metrics.hooks_armed(),
+            (false, false),
+            "a hook registered after the reset keeps the encoder alive for good"
+        );
+        assert_eq!(metrics.abr_owner(), 0, "and no loop owns it any more");
+    }
+
+    /// #1295 (review, seat B): the teardown can land BEFORE the claim, not only after it. A
+    /// `Take` claim then stores a nonzero owner over the 0 the teardown left, and an
+    /// owner-only check installs both hooks — the encoder → probe → metrics → hook → encoder
+    /// cycle is rebuilt for good. `Control::feed`'s client-gone check is one instruction
+    /// earlier, so this is the same window from the other side.
+    #[test]
+    fn a_start_after_the_sessions_teardown_installs_no_hooks() {
+        use start_pause::{arm, Step};
+        init();
+        const SESSION: &str = "retake-races-3";
+        let metrics = Arc::new(SessionMetrics::new("smooth", 60));
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let trace =
+            crate::session::runner::DiagnosticEventTx::new(tx, Arc::default(), Arc::default());
+        let cfg = cfg_with_floors(0, Some(500));
+        let Ok(encoder) = gst::ElementFactory::make("openh264enc").build() else {
+            return; // openh264 unavailable: skip
+        };
+        let client = feedback_abr(&encoder, &cfg, metrics.clone(), trace, SESSION.into(), None)
+            .expect("this encoder takes live writes");
+
+        // The runner's teardown (its `MetricsHookGuard`), before this loop claims at all.
+        let teardown = metrics.clone();
+        arm(SESSION, Step::BeforeClaim, move || teardown.end_hooks());
+        (client.start)();
+
+        assert_eq!(
+            metrics.hooks_armed(),
+            (false, false),
+            "a session that ended admits no ABR hook, whatever the owner says"
+        );
+        assert_eq!(metrics.abr_owner(), 0, "and no loop owns it");
+    }
+
+    /// #1295 (review, seat B): the same window on the re-take path. An already-started
+    /// client's next estimate finds the encoder orphaned (the teardown's 0), wins the
+    /// compare-exchange on it, and installs both hooks — unless registration knows the
+    /// session ended. No pause hook is needed: the teardown simply lands in between.
+    #[test]
+    fn a_retake_after_the_sessions_teardown_installs_no_hooks() {
+        init();
+        const SESSION: &str = "retake-races-4";
+        let metrics = Arc::new(SessionMetrics::new("smooth", 60));
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let trace =
+            crate::session::runner::DiagnosticEventTx::new(tx, Arc::default(), Arc::default());
+        let mut cfg = cfg_with_floors(0, Some(500));
+        cfg.abr_governor.min_interval_ms = 1;
+        let Ok(encoder) = gst::ElementFactory::make("openh264enc").build() else {
+            return; // openh264 unavailable: skip
+        };
+        let client = feedback_abr(&encoder, &cfg, metrics.clone(), trace, SESSION.into(), None)
+            .expect("this encoder takes live writes");
+        // A client that has started once, as `Control::feed` leaves it.
+        (client.start)();
+        assert_eq!(metrics.hooks_armed(), (true, true), "both ways in armed it");
+
+        // The session ends, then the client's in-flight estimate arrives.
+        metrics.end_hooks();
+        (client.observe)(5000.0);
+
+        assert_eq!(
+            metrics.hooks_armed(),
+            (false, false),
+            "the re-take re-armed a hook on an ended session"
+        );
+        assert_eq!(metrics.abr_owner(), 0, "and it kept no owner");
     }
 
     // ---- the ladder on a WebTransport session (#1320) ----
@@ -2098,10 +2435,17 @@ mod tests {
         seen: Vec<TraceEvent>,
         est: f64,
         t0: std::time::Instant,
+        /// The session's telemetry, held here as the runner holds it.
+        metrics: Arc<SessionMetrics>,
     }
 
     impl Wt {
         fn new(floor_follows_rung: bool) -> Self {
+            Self::named(floor_follows_rung, "s")
+        }
+
+        /// As [`Wt::new`] with its own session id, for a test that arms a [`start_pause`].
+        fn named(floor_follows_rung: bool, session_id: &str) -> Self {
             init();
             let metrics = Arc::new(SessionMetrics::new("smooth", 120));
             let (tx, traces) = tokio::sync::mpsc::channel(4096);
@@ -2133,14 +2477,12 @@ mod tests {
                 &cfg,
                 metrics.clone(),
                 trace,
-                "s".into(),
+                session_id.into(),
                 Some(lever.clone()),
                 "webtransport feedback",
             )
             .expect("openh264enc takes live writes");
-            start(&abr_loop, &plan, Box::new(|| 10_000.0));
-            // The loop holds the metrics weakly; they live as long as the session.
-            std::mem::forget(metrics);
+            start(&abr_loop, &plan, Box::new(|| 10_000.0), Claim::Take);
             Self {
                 abr_loop,
                 lever,
@@ -2149,6 +2491,7 @@ mod tests {
                 seen: Vec::new(),
                 est: 10_000.0,
                 t0: std::time::Instant::now(),
+                metrics,
             }
         }
 
@@ -2395,6 +2738,77 @@ mod tests {
         assert_eq!(wt.rung_steps(), vec![(0, 3)]);
     }
 
+    /// Amendment 79 (#1434): the per-report loop publishes the governor's UNCLAMPED link
+    /// rate, which is the value stream health judges against the floor: a session pinned
+    /// there on a link that carries more keeps its rate above the floor, and one whose
+    /// link carries the floor or less does not. Deleting the `set_abr_link_rate` call in
+    /// `AbrLoop::report` leaves every drain reporting `None`.
+    #[test]
+    fn the_per_report_loop_publishes_the_unclamped_link_rate() {
+        let mut wt = Wt::new(true);
+        let t0 = wt.t0;
+        assert!(
+            wt.metrics.drain_window(t0).abr_link_rate_kbps.is_none(),
+            "no report yet: not measured, never zero"
+        );
+        // A link that carries the ceiling: the rate is there and no floor binds.
+        wt.link(0, 3000, |_| 20_000.0);
+        let w = wt
+            .metrics
+            .drain_window(t0 + std::time::Duration::from_secs(3));
+        let rate = wt.abr_loop.governor.lock().unwrap().rate_kbps();
+        assert_eq!(w.abr_link_rate_kbps, Some(rate));
+        assert_eq!(rate, 10_000.0, "the rate at the ceiling: {rate}");
+
+        // A link carrying a tenth of it: the setpoint stops at a rung's floor, the rate
+        // goes under it, and only the rate says so.
+        wt.link(3000, 20_000, |_| 1000.0);
+        let w = wt
+            .metrics
+            .drain_window(t0 + std::time::Duration::from_secs(20));
+        let rate = wt.abr_loop.governor.lock().unwrap().rate_kbps();
+        assert_eq!(w.abr_link_rate_kbps, Some(rate), "this report's rate");
+        let setpoint = wt.setpoint() as f64;
+        assert!(
+            rate < setpoint,
+            "the floor holds the setpoint at {setpoint} kbps, the link carries {rate}"
+        );
+    }
+
+    /// Amendment 79 (#1434) round 3: a report already past its owner check when another
+    /// transport takes the encoder stores its rate AFTER the takeover's clear, and a WebRTC
+    /// successor never writes one to replace it. The rate is tagged with the loop that wrote
+    /// it and the drain reports it only for the current owner, so that late store is
+    /// invisible. Without the tag the drain reports the displaced loop's frozen rate.
+    #[test]
+    fn a_report_in_flight_at_a_takeover_leaves_no_link_rate() {
+        use start_pause::{arm, Step};
+        const SESSION: &str = "link-rate-race";
+        let mut wt = Wt::named(true, SESSION);
+        let t0 = wt.t0;
+        wt.link(0, 3000, |_| 20_000.0);
+        assert!(
+            wt.metrics.drain_window(t0).abr_link_rate_kbps.is_some(),
+            "the WebTransport loop publishes its rate while it owns the encoder"
+        );
+        // A WebRTC peer takes over between the loop's owner check and its store: the owner
+        // changes, the launch point is written (the clear), then the old loop stores.
+        let metrics = wt.metrics.clone();
+        arm(SESSION, Step::BeforeRateStore, move || {
+            metrics.claim_abr(u64::MAX);
+            metrics.clear_abr_link_rate();
+        });
+        wt.report(3000, 20_000.0);
+        assert_eq!(wt.metrics.abr_owner(), u64::MAX);
+        assert!(
+            wt.metrics
+                .drain_window(t0 + std::time::Duration::from_secs(4))
+                .abr_link_rate_kbps
+                .is_none(),
+            "the displaced loop's late store must not read as the new owner's rate"
+        );
+    }
+
     /// #1376 review A1/R1, seat A's replay on the owner's profile: at 900p a link
     /// alternating 2900 and 4200 kbit/s every 6 s crosses 900p's engage line (2965) in its
     /// low phase and 720p's recover line (3953) in its high one. Old code (24ad172a): down
@@ -2530,8 +2944,9 @@ mod tests {
         EncodeResolutionLever::new(stage, encoder, |_| {})
     }
 
-    // The lever's rungs are the session's rung family — the same table the compositor's
-    // mode-ladder and the control plane's validator use.
+    // The lever's rungs are the session's rung family — the same table the control plane's
+    // validator steps along; the compositor's mode-ladder advertises it less the sizes meant
+    // only for a starved link (`rungs::mode_ladder`).
     #[test]
     fn lever_exposes_the_sessions_rungs() {
         let lever = software_lever((1920, 1080));
@@ -2581,11 +2996,32 @@ mod tests {
         let metrics = SessionMetrics::new("smooth", cfg.stream.fps as u32);
         let held_by_hook = Arc::new(());
         let held = held_by_hook.clone();
-        metrics.set_on_drain(Box::new(move || {
-            let _ = &held;
-        }));
+        metrics.claim_abr(7);
+        assert!(metrics.set_on_drain(
+            7,
+            Box::new(move || {
+                let _ = &held;
+            })
+        ));
+        metrics.set_abr_link_rate(7, 400.0);
+        // #1462: the old loop stepped its governor down before its transport went away.
+        metrics.set_abr_setpoint(400);
 
-        reset_to_launch(&encoder, &cfg, &lever, &metrics);
+        reset_to_launch(&encoder, &cfg, Some(&lever), &metrics);
+
+        let window = metrics.drain_window(std::time::Instant::now());
+        // Amendment 79: another transport took the encoder; the old loop's rate is gone.
+        assert!(
+            window.abr_link_rate_kbps.is_none(),
+            "a taken-over session carries no link rate"
+        );
+        // #1462: neither is the old loop's setpoint — the encoder runs at launch, so that
+        // is what health must read until the new loop retargets.
+        assert_eq!(
+            window.abr_setpoint_kbps,
+            Some(cfg.stream.bitrate_kbps as f64),
+            "a taken-over session publishes the launch setpoint, not the old loop's"
+        );
 
         assert_eq!(encoder.property::<u32>("bitrate"), launch_bps);
         assert_eq!(
@@ -2609,7 +3045,7 @@ mod tests {
         lever.set_pinned(true);
         let metrics = SessionMetrics::new("smooth", cfg.stream.fps as u32);
 
-        reset_to_launch(&encoder, &cfg, &lever, &metrics);
+        reset_to_launch(&encoder, &cfg, Some(&lever), &metrics);
 
         assert_eq!(lever.stage().requested(), (1280, 720));
     }

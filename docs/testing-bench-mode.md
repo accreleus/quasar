@@ -96,6 +96,11 @@ value means the UA supplied no `expectedDisplayTime` and `present_ms` fell back
 to `Date.now()`, so the stage table is describing a different quantity than the
 g2g beside it.
 
+On a WebTransport session (WebCodecs or PyroWave) `present_ms` is the moment the
+frame is submitted to the presenter, not `expectedDisplayTime`. Its `g2g_ms` is
+therefore shorter than a WebRTC session's by the submit-to-display time; keep
+that in mind when comparing the two transports.
+
 | key | stage | kind |
 |---|---|---|
 | `stage_host_to_receive_p50_ms` / `_p95_ms` | app submit → the frame's last packet arrives at the browser: app render, the compositor repaint wait, the whole agent chain, and the wire | measured (the only stage needing the ST-05 offset) |
@@ -157,7 +162,7 @@ near a whole one), whereas a fixed feedback or driver cost has p50 ≈ p95.
 | `__qBench.pressKey('Space')` | sends one key down+up and arms an input-to-photon measurement. `false` if the key is unknown or an echo is already outstanding. |
 | `__qBench.windows()` | every completed one-second window so far. |
 | `__qBench.dump()` | `{frames, windows}` — the last 5000 per-frame records plus the windows. |
-| `__qBench.stats()` | `{frames, decoded, located}`. |
+| `__qBench.stats()` | `{frames, decoded, located, i2p_missed, no_image, skipped_reads, missed_presentations, callback_ms_mean, callback_ms_max}`. |
 
 Each window is also posted as a `bench.window` trace event
 (`POST /v1/sessions/{id}/trace/events`), payload:
@@ -185,7 +190,9 @@ A frameless second is emitted as a window with `n: 0`, so a three-second freeze
 reads as three windows rather than a hole. `undecoded` counts frames that had an
 image but no valid marker (including "no marker present at all", not only a CRC
 failure); a callback whose readback yielded nothing at all is counted separately
-as `no_image` and never inflates `n`.
+as `no_image` and never inflates `n`. On a PyroWave session `no_image` also
+counts frames skipped because three texture readbacks were still in flight; the
+console says so once.
 
 This is a **trace event**, deliberately not a persisted stats key: the browser
 stats series is allow-listed per `schema.md` and bench mode must not extend that
@@ -304,14 +311,23 @@ arrives as Shift+Space; the result's `idle_nudges` counts the taps that went out
 
 ## Cost, and the observer effect
 
-Bench mode reads back pixels every displayed frame. Steady state is cheap: once
+Bench mode reads back pixels on every displayed frame once the marker is located.
+While it is not, a WebRTC session reads and searches four times a second; a
+PyroWave session still copies the marker's crop off every frame (on the GPU, off
+the presentation path) but searches on the same four-a-second cadence. Steady state is meant to be cheap: once
 the marker is located the decoder takes its cached-location path (570 cell-centre
 samples) and the readback shrinks to the marker's own bounding box (~500×320 px
 at 1080p). While the marker is **not** located the full search allocates a luma
 buffer plus a Float64 integral image (~3.4 MB at the default search crop), so it
-is throttled to four attempts a second — a cold app start can take tens of
-seconds to first paint, and 60 fps of full searches through that is hundreds of
-MB/s of GC churn for no information.
+is throttled to four attempts a second, and between attempts the pixels are not
+read at all (the readback alone costs presentations; those frames still count
+in `n`, undecoded). A cold app start can take tens of seconds to first paint,
+and 60 fps of full searches through that is hundreds of MB/s of GC churn for no
+information. `__qBench.stats()` reports the cost: `skipped_reads`,
+`missed_presentations` (RVFC `presentedFrames` gaps: presentations the
+callback never saw) and `callback_ms_mean` / `callback_ms_max`. A bench-mode
+page posts no client-health class, so a bench hold never records a pass or a
+failure against the user's launch eligibility.
 
 **Bench numbers are not directly comparable to a non-bench cell.** The
 `drawImage` + `getImageData` runs synchronously in the RVFC callback, on top of

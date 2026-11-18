@@ -306,8 +306,14 @@ export function setupCapture({
     videoEl instanceof Node && typeof MutationObserver === "function" ? new MutationObserver(updateGain) : null;
   modeObserver?.observe(videoEl, { attributes: true, attributeFilter: ["data-scaling-mode", "data-compositor-w", "data-compositor-h", "data-stream-w", "data-stream-h"] });
 
-  // Gamepad state for delta-only sends.
+  // Gamepad state for delta-only sends, keyed by the controller NUMBER (amendment 80), not by
+  // the browser's sparse `Gamepad.index`.
   const gpPrev: Record<number, { buttons: number[]; axes: number[] }> = {};
+  // Amendment 80: the `Gamepad.index` of each controller, by controller NUMBER. Numbers stay
+  // dense: a controller takes the next one (the first connected is 0), and when one
+  // disconnects every controller above it moves down by one, so a lone controller is 0.
+  const padOrder: number[] = [];
+  const MAX_PADS = 4;
   const padEnv = detectPadEnv();
   // The on-screen controls' pad. The host drives ONE virtual pad whatever `i` says, so it is only
   // sent while no real pad is connected; `virtualSent` is what the host holds, for the release.
@@ -320,6 +326,10 @@ export function setupCapture({
   // Held keys already forwarded (evdev codes), flushed as key-ups on release —
   // otherwise a key held when capture drops sticks down on the host.
   const heldKeys = new Set<number>();
+  // Mouse buttons already forwarded, flushed as button-ups the same way (#1406).
+  // Only onMouseDown adds: a touch tap is a complete press+release in one go and
+  // the long-press right button has its own `rightHeld` release.
+  const heldButtons = new Set<number>();
 
   // Idempotency guard so repeated syncs don't re-lock/re-unlock.
   let keyboardLocked = false;
@@ -406,21 +416,27 @@ export function setupCapture({
     heldKeys.clear();
   };
 
+  /** Button-up for every mouse button the host has down, then clear (#1406).
+   *  Same reason as the keys: a button held when capture drops would stay down
+   *  on the host — in fallback mode nothing else ever lifts it. */
+  const flushHeldButtons = (sendFn: (msg: InputMsg) => void = send) => {
+    for (const button of heldButtons) sendFn({ t: "mb", button, pressed: false });
+    heldButtons.clear();
+  };
+
   /** All-zero state per forwarded pad (host must not keep a button held), then
    *  clear gpPrev so re-capture resends full state. Frozen `gp` shape only. */
   const resetGamepads = (sendFn: (msg: InputMsg) => void = send) => {
-    for (const key of Object.keys(gpPrev)) {
-      const idx = Number(key);
-      const prev = gpPrev[idx];
-      sendFn({
-        t: "gp",
-        i: idx,
-        buttons: prev.buttons.map(() => 0),
-        axes: prev.axes.map(() => 0),
-      });
-      delete gpPrev[idx];
-    }
+    for (const key of Object.keys(gpPrev)) restPad(Number(key), sendFn);
   };
+
+  /** One all-zero `gp` for controller `num` if the host holds state for it, then forget it. */
+  function restPad(num: number, sendFn: (msg: InputMsg) => void = send) {
+    const prev = gpPrev[num];
+    if (!prev) return;
+    sendFn({ t: "gp", i: num, buttons: prev.buttons.map(() => 0), axes: prev.axes.map(() => 0) });
+    delete gpPrev[num];
+  }
 
   /** All-zero state for the on-screen pad if the host holds anything from it. */
   const releaseVirtualPad = (sendFn: (msg: InputMsg) => void = send) => {
@@ -448,6 +464,7 @@ export function setupCapture({
     onCaptureChange({ captured, pointerLocked });
     if (was && !captured) {
       flushHeldKeys();
+      flushHeldButtons();
       resetGamepads();
       releaseVirtualPad();
       // a mid-gesture finger must not leave a long-press right button held
@@ -544,10 +561,17 @@ export function setupCapture({
     }
   };
 
-  /** Idempotent. Lock mode goes through exitPointerLock so browser state and
-   *  ours never diverge (pointerlockchange runs the release); fallback clears
-   *  directly. A lock this capture inherited (an older capture's) is exited too. */
-  const release = () => {
+  /** Whether the page hide released a capture the return can take back on its own (#1414). Only
+   *  a fallback capture qualifies: Pointer Lock needs a user gesture and coming back is not one,
+   *  so a lock session stays released and the picture's tap target does that re-take. Armed by
+   *  the hide only while it releases a capture, and cleared by any deliberate release, so a
+   *  session the app ended while the page was hidden is not taken back (#1465). */
+  let resumeOnVisible = false;
+
+  /** The release itself: idempotent; lock mode goes through exitPointerLock so browser state
+   *  and ours never diverge (pointerlockchange runs the release); fallback clears directly. A
+   *  lock this capture inherited (an older capture's) is exited too. */
+  const releaseCapture = () => {
     wanted = false;
     if ((captureMode === "lock" || document.pointerLockElement === videoEl) && document.exitPointerLock) {
       document.exitPointerLock();
@@ -560,22 +584,52 @@ export function setupCapture({
     setCaptured(false);
   };
 
+  /** A deliberate release — the app's own (SessionPage ends the session, a control is pressed)
+   *  or a capture key. It also disarms the page-return re-take: only a hide may arm it, so an
+   *  app release while the page is hidden is respected rather than undone (#1414). */
+  const release = () => {
+    resumeOnVisible = false;
+    releaseCapture();
+  };
+
+  /** End capture whatever the release path managed: a lock release leaves `captured` set until
+   *  its pointerlockchange arrives, and a hidden page may never get one. */
+  const endCapture = () => {
+    if (!captured) return;
+    captureMode = "none";
+    setCaptured(false);
+  };
+
   // A hidden page gets no rAF and may get no pointer events, so nothing would release what the
   // host holds. Releases at once through the same path as any other release; the lock's own
   // pointerlockchange arrives later and finds nothing left to do.
   const onPageHidden = () => {
+    // A page can report a hide twice (visibilitychange, then pagehide). The second report runs
+    // after the first released everything, and must leave the flag the first one set alone: set
+    // or clear it only while capture is held (#1465).
+    if (!captured) return;
+    const wasFallback = captureMode === "fallback";
     try {
-      release();
-      if (captured) {
-        captureMode = "none";
-        setCaptured(false);
-      }
+      releaseCapture();
+      endCapture();
     } catch {
-      // channel closing: nothing more can be sent
+      // channel closing: nothing more can be sent, and nothing to take back
+      return;
     }
+    // Armed AFTER the hide's own release, so only a release the hide did not cause can clear
+    // it — the hide must not disarm its own re-take.
+    resumeOnVisible = wasFallback;
   };
   const onVisibilityChange = () => {
-    if (document.hidden) onPageHidden();
+    if (document.hidden) {
+      onPageHidden();
+      return;
+    }
+    if (!resumeOnVisible) return;
+    resumeOnVisible = false;
+    // The same entry as a tap on the picture: a fallback capture needs no
+    // gesture, so a phone back from another app gets its input without a tap.
+    void engage();
   };
   document.addEventListener("visibilitychange", onVisibilityChange);
   window.addEventListener("pagehide", onPageHidden);
@@ -642,13 +696,19 @@ export function setupCapture({
   const onMouseDown = (e: MouseEvent) => {
     if (!captured || !aimedAtGame(e)) return;
     const button = MB_MAP[e.button];
-    if (button !== undefined) send({ t: "mb", button, pressed: true });
+    if (button !== undefined) {
+      send({ t: "mb", button, pressed: true });
+      heldButtons.add(button);
+    }
   };
 
   const onMouseUp = (e: MouseEvent) => {
     if (!captured || !aimedAtGame(e)) return;
     const button = MB_MAP[e.button];
-    if (button !== undefined) send({ t: "mb", button, pressed: false });
+    if (button !== undefined) {
+      send({ t: "mb", button, pressed: false });
+      heldButtons.delete(button);
+    }
   };
 
   const onWheel = (e: WheelEvent) => {
@@ -951,15 +1011,30 @@ export function setupCapture({
       // Release before any real pad's state goes out: the host has one pad, so a later
       // neutral would wipe it.
       if (realPad) releaseVirtualPad();
+      // Amendment 80: when a controller went away, its number and every number above it rest
+      // (the host holds nothing from them), then each controller still here is sent again
+      // under its new, lower number.
+      const live = new Set<number>();
+      for (const pad of pads) if (pad) live.add(pad.index);
+      const gone = padOrder.findIndex((index) => !live.has(index));
+      if (gone >= 0) {
+        for (let n = gone; n < padOrder.length; n++) restPad(n);
+        padOrder.splice(0, padOrder.length, ...padOrder.filter((index) => live.has(index)));
+      }
       for (const pad of pads) {
         if (!pad) continue;
+        let num = padOrder.indexOf(pad.index);
+        if (num < 0) {
+          if (padOrder.length >= MAX_PADS) continue; // the contract numbers 0 to 3
+          num = padOrder.push(pad.index) - 1;
+        }
         const { buttons, axes, identity } = readPad(pad, padEnv);
         // Standard layout only: on any other pad the indices are the device's own order.
         if (mouseSettings.nintendo && buttons.length > 3 && isStandardMapping(identity)) {
           swapButtons(buttons, 0, 1); // A (bottom) with B (right)
           swapButtons(buttons, 2, 3); // X (left) with Y (top)
         }
-        const prev = gpPrev[pad.index];
+        const prev = gpPrev[num];
         const changed =
           !prev ||
           buttons.length !== prev.buttons.length ||
@@ -971,9 +1046,9 @@ export function setupCapture({
             nonStandardReported.add(pad.id);
             onNonStandardGamepad?.(identity);
           }
-          send({ t: "gp", i: pad.index, buttons, axes });
+          send({ t: "gp", i: num, buttons, axes });
           gpSendCount++;
-          gpPrev[pad.index] = { buttons, axes };
+          gpPrev[num] = { buttons, axes };
         }
       }
       if (virtualPad && !realPad) {
@@ -1050,6 +1125,7 @@ export function setupCapture({
     // captured doesn't leave the host with stuck keys or gamepad buttons.
     if (captured) {
       flushHeldKeys(sendBestEffort);
+      flushHeldButtons(sendBestEffort);
       resetGamepads(sendBestEffort);
       releaseVirtualPad(sendBestEffort);
     }

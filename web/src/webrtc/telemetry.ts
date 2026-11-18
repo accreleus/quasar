@@ -6,6 +6,7 @@
 import { DEFAULT_PLAYOUT_MS, resolvePlayoutMs } from "./playout";
 import type { CaptureMetrics } from "../input/capture";
 import { measureDisplayRefreshHz, type MeasurementHandle } from "./displayRefreshEstimator";
+import { isBenchModeEnabled } from "../bench/benchFlag";
 import { classifyClientHealth, type ClientHealth } from "./clientHealth";
 import { getOrCreateDeviceKey } from "./capability";
 import type { ClockEstimate, PostedClock } from "./clockOffset";
@@ -637,6 +638,8 @@ export class SessionTelemetry {
 
     // Firefox reports no freezeCount, and a thin present window has no σ: "smooth" there
     // is unmeasured, and a posted one would record a pass. An absent class is a server no-op.
+    // Bench mode is the same: its readback costs presentations, and a class posted from it would
+    // record a failure against the user's launch eligibility.
     const unmeasured =
       ch.health === "smooth" &&
       typeof rtp["freezeCount"] !== "number" &&
@@ -644,7 +647,7 @@ export class SessionTelemetry {
     const sample: StatSample = {
       ts_unix_ms: Date.now(),
       metrics: { ...this.buildMetrics(), is_hidden: isHidden ? 1 : 0 },
-      ...(unmeasured ? {} : { client_health: ch.health, client_health_reason: ch.reason }),
+      ...(unmeasured || isBenchModeEnabled() ? {} : { client_health: ch.health, client_health_reason: ch.reason }),
       device_key: this.deviceKey,
       ...(this.negotiatedCodec ? { codec_mime_type: this.negotiatedCodec } : {}),
     };

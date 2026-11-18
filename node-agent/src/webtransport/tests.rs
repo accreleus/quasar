@@ -1544,7 +1544,10 @@ async fn governed_agent(stream: Stream) -> Agent {
                 floor_kbps: Box::new(|| 4000.0),
                 retargets: true,
                 start: Box::new(|| {}),
+                owns: Box::new(|| false),
+                displaced: Box::new(|| {}),
                 observe: Box::new(|_| {}),
+                fec: Box::new(|_| {}),
             })
         },
     )
@@ -2076,9 +2079,12 @@ async fn feedback_while_pyrowave_is_active_feeds_no_estimate() {
                 floor_kbps: Box::new(|| 500.0),
                 retargets: true,
                 start: Box::new(|| {}),
+                owns: Box::new(|| false),
+                displaced: Box::new(|| {}),
                 observe: Box::new(move |_| {
                     count.fetch_add(1, Ordering::SeqCst);
                 }),
+                fec: Box::new(|_| {}),
             })
         },
     )
@@ -2170,7 +2176,10 @@ async fn audio_alone_never_moves_the_video_estimate() {
             floor_kbps: Box::new(|| 500.0),
             retargets: true,
             start: Box::new(|| {}),
+            owns: Box::new(|| false),
+            displaced: Box::new(|| {}),
             observe: Box::new(move |kbps| seen.lock().unwrap().push(kbps)),
+            fec: Box::new(|_| {}),
         })
     })
     .await;
@@ -2212,7 +2221,10 @@ fn rate(retargets: bool) -> Rate {
         floor_kbps: Box::new(|| 4000.0),
         retargets,
         start: Box::new(|| {}),
+        owns: Box::new(|| false),
+        displaced: Box::new(|| {}),
         observe: Box::new(|_| {}),
+        fec: Box::new(|_| {}),
     }
 }
 
@@ -2296,9 +2308,12 @@ fn the_silence_decay_is_never_fed_to_the_collapse_as_a_measured_link() {
         floor_kbps: Box::new(|| 4000.0),
         retargets: true,
         start: Box::new(|| {}),
+        owns: Box::new(|| false),
+        displaced: Box::new(|| {}),
         observe: Box::new(move |_| {
             f.fetch_add(1, SeqCst);
         }),
+        fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), false, Default::default());
     let t0 = std::time::Instant::now();
@@ -2339,7 +2354,10 @@ fn a_report_gives_the_abr_its_reading_before_its_estimate() {
         floor_kbps: Box::new(|| 4000.0),
         retargets: true,
         start: Box::new(|| {}),
+        owns: Box::new(|| false),
+        displaced: Box::new(|| {}),
         observe: Box::new(move |_| o.lock().unwrap().push("observe")),
+        fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), false, Default::default());
     answered(&mut control, 0, std::time::Instant::now());
@@ -2362,9 +2380,12 @@ fn a_client_that_is_gone_neither_starts_nor_feeds_the_abr() {
         start: Box::new(move || {
             started.fetch_add(1, SeqCst);
         }),
+        owns: Box::new(|| false),
+        displaced: Box::new(|| {}),
         observe: Box::new(move |_| {
             fed.fetch_add(1, SeqCst);
         }),
+        fec: Box::new(|_| {}),
     };
     let gone = Arc::new(OnceLock::new());
     let mut control = Control::new(&rate, gone.clone(), false, Default::default());
@@ -2420,7 +2441,10 @@ fn the_abr_is_fed_the_estimate_less_the_fec_share() {
         floor_kbps: Box::new(|| 500.0),
         retargets: true,
         start: Box::new(|| {}),
+        owns: Box::new(|| false),
+        displaced: Box::new(|| {}),
         observe: Box::new(move |kbps: f64| seen.lock().unwrap().push(kbps.round())),
+        fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), true, Default::default());
     control.feed(4200.0, false);
@@ -2432,25 +2456,41 @@ fn the_abr_is_fed_the_estimate_less_the_fec_share() {
 }
 
 /// A session whose frames take several datagrams (snow does not compress), with an ABR
-/// that writes the encoder (`retargets`) or only tracks the estimate.
-async fn lossy_session(retargets: bool) -> Agent {
-    agent_built(
+/// that writes the encoder (`retargets`) or only tracks the estimate. The session's metrics
+/// come back with it, wired to the FEC telemetry as `feedback_abr` wires it (amendment 85).
+async fn lossy_session(retargets: bool) -> (Agent, Arc<crate::session::metrics::SessionMetrics>) {
+    let metrics = Arc::new(crate::session::metrics::SessionMetrics::new("smooth", 30));
+    let fec_metrics = metrics.clone();
+    let agent = agent_built(
         Stream::H264,
         Limits::default(),
         audio::Plan::default(),
         "snow",
         move |_| {
+            let m = fec_metrics.clone();
             Some(Rate {
                 measured: Box::new(|_| {}),
                 ceiling_kbps: 4000.0,
                 floor_kbps: Box::new(|| 500.0),
                 retargets,
                 start: Box::new(|| {}),
+                owns: Box::new(|| false),
+                displaced: Box::new(|| {}),
                 observe: Box::new(|_| {}),
+                fec: Box::new(move |event| match event {
+                    crate::webtransport::FecEvent::Attached { client, fec } => {
+                        m.attach_fec(client, fec);
+                    }
+                    crate::webtransport::FecEvent::Detached { client } => m.detach_fec(client),
+                    crate::webtransport::FecEvent::Sent { video, repair } => {
+                        m.record_fec_bytes(video, repair);
+                    }
+                }),
             })
         },
     )
-    .await
+    .await;
+    (agent, metrics)
 }
 
 /// #1046, §FEC: a client that offered `xor` and reports loss is sent repair datagrams, and
@@ -2458,7 +2498,7 @@ async fn lossy_session(retargets: bool) -> Agent {
 /// retransmission.
 #[tokio::test]
 async fn a_client_that_offers_xor_and_reports_loss_rebuilds_a_fragment_without_a_nack() {
-    let agent = lossy_session(true).await;
+    let (agent, metrics) = lossy_session(true).await;
     let session = agent.connect().await;
     let (mut send, mut recv) = session.open_bi().await.unwrap();
     let hello = json!({"type": "hello", "wt_proto": 1, "token": TOKEN,
@@ -2527,13 +2567,24 @@ async fn a_client_that_offers_xor_and_reports_loss_rebuilds_a_fragment_without_a
         assert_eq!(payload, original[..], "fragment {k} of frame {frame_seq}");
         rebuilt += 1;
     }
+    // Amendment 85: the repairs are reported, as a share of the video and as a rate.
+    let w = metrics.drain_window(std::time::Instant::now());
+    let pct = w
+        .wt_fec_overhead_pct
+        .expect("FEC negotiated: the keys are present, never absent");
+    assert!(pct > 0.0, "repairs went out: {pct} %");
+    assert!(
+        w.wt_fec_kbps.is_some_and(|kbps| kbps > 0.0),
+        "a rate for the same bytes: {:?}",
+        w.wt_fec_kbps
+    );
 }
 
 /// §Hello: a client that offers no scheme is answered `fec: null` and sent no repair
 /// datagram, whatever loss it reports.
 #[tokio::test]
 async fn a_client_that_offers_no_fec_gets_none_whatever_it_loses() {
-    let agent = lossy_session(true).await;
+    let (agent, metrics) = lossy_session(true).await;
     let (session, mut send, _recv, ack) = agent.hello(TOKEN).await;
     assert_eq!(ack["fec"], Value::Null);
     let mut path = Lossy::new();
@@ -2542,6 +2593,11 @@ async fn a_client_that_offers_no_fec_gets_none_whatever_it_loses() {
         assert_eq!(d[0], 0x01, "only video is sent");
         path.receive(&d, &mut send).await;
     }
+    // Amendment 85: no scheme negotiated, so the FEC keys are ABSENT — not zero, which
+    // would read as "FEC on, a clean window".
+    let w = metrics.drain_window(std::time::Instant::now());
+    assert_eq!(w.wt_fec_overhead_pct, None);
+    assert_eq!(w.wt_fec_kbps, None);
 }
 
 /// §Hello ack: a session with no ABR reads no feedback, so it has no loss to size FEC by
@@ -2561,7 +2617,7 @@ async fn a_session_without_an_abr_names_no_fec_scheme() {
 /// nothing would pay for repairs: such a session names no scheme and sends none.
 #[tokio::test]
 async fn a_session_whose_abr_does_not_retarget_gets_no_fec_whatever_it_loses() {
-    let agent = lossy_session(false).await;
+    let (agent, _metrics) = lossy_session(false).await;
     let (session, mut send, _recv, ack) = agent.hello_with(TOKEN, json!({"fec": ["xor"]})).await;
     assert_eq!(ack["fec"], Value::Null);
     let mut path = Lossy::new();
@@ -2583,7 +2639,7 @@ async fn a_hello_that_names_no_known_fec_scheme_is_served_without_fec() {
         json!({"fec": ["fec2"]}),
         json!({"fec": "xor"}),
     ] {
-        let agent = lossy_session(true).await;
+        let (agent, _metrics) = lossy_session(true).await;
         let (session, _send, _recv, ack) = agent.hello_with(TOKEN, offer.clone()).await;
         assert_eq!(ack["type"], "hello_ack", "{offer}");
         assert_eq!(ack["fec"], Value::Null, "{offer}");
@@ -2608,7 +2664,10 @@ fn repairs_spend_only_what_the_estimate_leaves_above_the_abr_floor() {
         floor_kbps: Box::new(|| 2500.0),
         retargets: true,
         start: Box::new(|| {}),
+        owns: Box::new(|| false),
+        displaced: Box::new(|| {}),
         observe: Box::new(move |kbps: f64| seen.lock().unwrap().push(kbps.round())),
+        fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), true, Default::default());
     let fec = control.fec.as_mut().unwrap();
@@ -2644,11 +2703,14 @@ fn governed(level: u8, estimate_kbps: f64, seconds: u64) -> Vec<(u32, f64)> {
         floor_kbps: Box::new(move || f64::from(floor.lock().unwrap().0.floor_kbps())),
         retargets: true,
         start: Box::new(|| {}),
+        owns: Box::new(|| false),
+        displaced: Box::new(|| {}),
         observe: Box::new(move |kbps| {
             let mut governor = observed.lock().unwrap();
             let now = governor.1;
             governor.0.observe(kbps, now);
         }),
+        fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), true, Default::default());
     let fec = control.fec.as_mut().unwrap();
@@ -2741,7 +2803,10 @@ fn a_pyrowave_frame_gets_no_repair_at_any_overhead() {
         floor_kbps: Box::new(|| 500.0),
         retargets: true,
         start: Box::new(|| {}),
+        owns: Box::new(|| false),
+        displaced: Box::new(|| {}),
         observe: Box::new(|_| {}),
+        fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), true, Default::default());
     let fec = control.fec.as_mut().unwrap();
@@ -2757,7 +2822,7 @@ fn a_pyrowave_frame_gets_no_repair_at_any_overhead() {
 /// the scheme: the connection may fall back to the standard codec.
 #[tokio::test]
 async fn a_pyrowave_client_that_offers_xor_is_sent_no_repair_whatever_it_loses() {
-    let agent = lossy_session(true).await;
+    let (agent, metrics) = lossy_session(true).await;
     let media = agent.listener.registry().lock()[SESSION]
         .media
         .clone()
@@ -2797,6 +2862,18 @@ async fn a_pyrowave_client_that_offers_xor_is_sent_no_repair_whatever_it_loses()
         }
     }
     assert!(video > 1000, "the frames arrived ({video} datagrams)");
+    // Amendment 85: the scheme is negotiated, so the keys are present — and 0, because a
+    // PyroWave frame is never protected.
+    let w = metrics.drain_window(std::time::Instant::now());
+    assert_eq!(w.wt_fec_overhead_pct, Some(0.0));
+    assert_eq!(w.wt_fec_kbps, Some(0.0));
+    // ...and the frames that got no repair are still video sent in the window: the share's
+    // denominator is all the video, not only the frames that were repaired.
+    assert!(
+        metrics.fec_video_total() > 1000,
+        "{}",
+        metrics.fec_video_total()
+    );
 }
 
 #[tokio::test]
@@ -3454,6 +3531,133 @@ async fn a_webtransport_client_takes_over_the_webrtc_peer() {
         "the peer's disconnect lifted the client's key"
     );
     assert!(frames(&session, 1, true).await[0].keyframe);
+}
+
+/// #1294: a WebRTC peer's ABR loop owned the encoder, its link drove the encoder down, and
+/// then its PC failed — the peer's hold goes (`Holder::None`) and its loop keeps the encoder.
+/// A WebTransport client taking the session from that dead peer must get the launch point:
+/// ownership, not the holder, is what says a loop is still driving. The client sends no
+/// feedback at all, and the displaced loop's own tick (the drain hook) writes nothing.
+#[tokio::test]
+async fn a_webtransport_takeover_displaces_a_loop_its_peer_left_owning_the_encoder() {
+    let metrics = Arc::new(crate::session::metrics::SessionMetrics::new("smooth", 30));
+    let (trace_tx, _trace_rx) = tokio::sync::mpsc::channel(256);
+    let trace_tx =
+        crate::session::runner::DiagnosticEventTx::new(trace_tx, Arc::default(), Arc::default());
+    let mut cfg = {
+        let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
+        settings.encoder = crate::session::EncoderChoice::Openh264;
+        settings.abr_mode = crate::session::AbrMode::Smooth;
+        let stream = crate::session::StreamParams {
+            width: 640,
+            height: 360,
+            fps: 30,
+            bitrate_kbps: 4000,
+            h264_profile: "constrained-baseline".to_string(),
+            codec: crate::session::Codec::H264,
+            abr_floor_kbps: 0,
+            mic: false,
+        };
+        crate::session::SessionConfig::for_assignment_with(&settings, stream, None)
+    };
+    // One estimate is one write: the governor's debounce is what paces it otherwise.
+    cfg.abr_governor.min_interval_ms = 1;
+    let session_cfg = cfg.clone();
+    let rate_metrics = metrics.clone();
+    let agent = agent_built(
+        Stream::H264,
+        Limits::default(),
+        audio::Plan::default(),
+        "ball",
+        move |encoder| {
+            crate::session::pipeline::feedback_abr(
+                encoder,
+                &session_cfg,
+                rate_metrics,
+                trace_tx,
+                SESSION.to_string(),
+                None,
+            )
+        },
+    )
+    .await;
+    let encoder = agent.pipeline.by_name("enc").unwrap();
+    let kbps = || encoder.property::<u32>("bitrate") / 1000;
+    assert_eq!(kbps(), 4000, "the encoder starts at the launch point");
+    let pause = || std::thread::sleep(Duration::from_millis(20));
+
+    // A second `AbrLoop` on the same encoder and metrics stands for the WebRTC peer's: the
+    // same owner slot, hooks and governor, only a different estimator. It drives the encoder
+    // down as a congested WebRTC link does — and, unlike a WebRTC loop, its `observe` would
+    // re-take an orphaned encoder, which is why the last step below drives the tick instead.
+    let (peer_tx, _peer_rx) = tokio::sync::mpsc::channel(16);
+    let peer_trace =
+        crate::session::runner::DiagnosticEventTx::new(peer_tx, Arc::default(), Arc::default());
+    let peer = crate::session::pipeline::feedback_abr(
+        &encoder,
+        &cfg,
+        metrics.clone(),
+        peer_trace,
+        SESSION.to_string(),
+        None,
+    )
+    .expect("this encoder takes live writes");
+    (peer.start)();
+    pause();
+    (peer.observe)(2000.0);
+    pause();
+    let driven = kbps();
+    assert!(
+        driven < 4000,
+        "the peer's loop had it down ({driven} kbit/s)"
+    );
+    let owned = metrics.abr_owner();
+    assert_ne!(owned, 0, "and it owned the encoder");
+
+    // The peer's PC fails (`WebRtcSide::disconnected(gone)`): its hold goes, its loop's
+    // ownership does not. From here the session has no holder and a loop still driving.
+    let media = agent.tap.as_ref().unwrap().media().clone();
+    media.webrtc_attached(T1);
+    webrtc(&agent, T1).disconnected(true);
+    assert_eq!(
+        metrics.abr_owner(),
+        owned,
+        "the failed peer's loop still owns the encoder"
+    );
+
+    // A WebTransport client takes the session from that dead peer, and sends no feedback.
+    let (_session, _send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+    assert_eq!(kbps(), 4000, "the takeover returned it to launch");
+    assert_eq!(metrics.abr_owner(), 0, "and left it with no owner");
+
+    // Its tick (the drain hook) is what kept a frozen estimate writing: it was cleared.
+    metrics.drain_window(std::time::Instant::now());
+    pause();
+    assert_eq!(kbps(), 4000, "the displaced loop's tick drove nothing");
+    assert_eq!(metrics.abr_owner(), 0, "and claimed nothing back");
+}
+
+/// #1197: a rebuild hands the session over to its new encoder (`Media::hand_over`). The old
+/// client's control stream must end as a LOST CONNECTION — no `bye`, close code `0` — because
+/// that is what makes it mint a fresh token and reconnect onto the new encoder (§Reconnect).
+/// Any other exit here ends the view for good: `bye session_ended` + `4404` is a session that
+/// is over, which is exactly what a rebuild is not.
+#[tokio::test]
+async fn a_handover_ends_the_client_stream_with_no_bye_and_close_zero() {
+    let agent = agent().await;
+    let (session, _send, mut recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+    agent.tap.as_ref().unwrap().media().hand_over();
+    assert!(
+        matches!(read_message(&mut recv).await, Err(Violation::Gone)),
+        "a message here (a `bye`) tells the client the session is over, not to reconnect"
+    );
+    assert_eq!(
+        close_code(&session).await,
+        Some(CLOSE_NORMAL),
+        "a normal close is a lost connection; 4404 would end the view"
+    );
 }
 
 /// #1193: the host missed the WebTransport close on a fallback. The WebRTC attach displaces the
@@ -4876,6 +5080,13 @@ async fn a_pyrowave_client_gets_frames_that_rejoin_byte_for_byte_and_can_fall_ba
 async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
     let fed = Arc::new(Mutex::new(Vec::<f64>::new()));
     let observed = fed.clone();
+    // What was fed while PyroWave was still the client's codec. A feedback the client wrote
+    // before it read the step-down's `hello_ack` reaches the agent after the switch, as H.264
+    // feedback, and feeds the ABR then: that is the standard codec's, not PyroWave's, and
+    // whether one lands before the assert depends on timing (#1440).
+    let session_media = Arc::new(std::sync::OnceLock::<Arc<Media>>::new());
+    let fed_by_pyrowave = Arc::new(Mutex::new(Vec::<f64>::new()));
+    let (pyro_fed, active) = (fed_by_pyrowave.clone(), session_media.clone());
     let agent = agent_built(
         Stream::H264,
         Limits::default(),
@@ -4888,7 +5099,15 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
                 floor_kbps: Box::new(|| 500.0),
                 retargets: true,
                 start: Box::new(|| {}),
-                observe: Box::new(move |kbps| observed.lock().unwrap().push(kbps)),
+                owns: Box::new(|| false),
+                displaced: Box::new(|| {}),
+                observe: Box::new(move |kbps| {
+                    if active.get().is_some_and(|m| m.pyrowave_active()) {
+                        pyro_fed.lock().unwrap().push(kbps);
+                    }
+                    observed.lock().unwrap().push(kbps)
+                }),
+                fec: Box::new(|_| {}),
             })
         },
     )
@@ -4897,6 +5116,7 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
         .media
         .clone()
         .unwrap();
+    session_media.set(media.clone()).ok();
     // The element only: its `bitrate` is what the stream loop writes. No device is opened.
     let _ = gstpyrowave::plugin_register_static();
     let encoder = gst::ElementFactory::make("pyrowaveenc").build().unwrap();
@@ -4971,7 +5191,10 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
         written < floor_budget,
         "the encoder's live bitrate followed the estimate under the floor: {written} kbit/s"
     );
-    assert!(fed.lock().unwrap().is_empty(), "PyroWave fed the ABR");
+    assert!(
+        fed_by_pyrowave.lock().unwrap().is_empty(),
+        "PyroWave fed the ABR"
+    );
 
     // H.264 on a clean path: the ABR's first estimate starts from PyroWave's, under the floor,
     // not from its 1 000 000 kbit/s ceiling.
@@ -4997,7 +5220,7 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
 
 /// A session id assigned again while its tap runs gets a fresh registry entry, which no longer
 /// names that tap's media: the tap still ends its own when it drops, so the client on it is
-/// told the session ended.
+/// told the session ended, and the fresh entry is left alone.
 #[test]
 fn a_tap_dropped_after_its_session_was_assigned_again_ends_its_own_media() {
     gst::init().unwrap();
@@ -5026,6 +5249,74 @@ fn a_tap_dropped_after_its_session_was_assigned_again_ends_its_own_media() {
     assign();
     drop(tap);
     assert_eq!(client.gone.get(), Some(&Gone::SessionEnded));
+    assert!(
+        registry.add_token(SESSION, &token_hash("next"), SystemTime::now() + TOKEN_TTL),
+        "the tap that dropped ended the entry it no longer named"
+    );
+}
+
+/// #1197: a rebuild's tap registers over the old one under the same session id. The old tap's
+/// client is let go to reconnect, a `hello` in between waits with its token kept, the
+/// reconnect attaches to the new tap, and the old tap dropped after it leaves the entry alone.
+#[test]
+fn a_rebuilds_tap_takes_over_the_session_id_and_the_old_taps_drop_leaves_it() {
+    gst::init().unwrap();
+    let registry = Arc::new(Registry::default());
+    let expires = SystemTime::now() + TOKEN_TTL;
+    registry.assign(SESSION, &token_hash(TOKEN), expires);
+    let tap = |pipeline: &gst::Pipeline| {
+        let tap = Tap::attach(
+            &registry,
+            &pipeline
+                .by_name("parse")
+                .unwrap()
+                .static_pad("src")
+                .unwrap(),
+            &pipeline.by_name("enc").unwrap(),
+            SESSION,
+            no_input(),
+            audio::Plan::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        tap.media().on_caps(&streams::av1_caps(640), SESSION);
+        tap
+    };
+    let (first, second) = (synthetic(Stream::Av1), synthetic(Stream::Av1));
+    let old = tap(&first);
+    let before = old.media().attach(false, Duration::ZERO).unwrap();
+
+    // The rebuild: the old encode chain goes to NULL and its client is let go to reconnect.
+    old.media().hand_over();
+    assert_eq!(before.gone.get(), Some(&Gone::Rebuilt));
+    assert!(
+        registry.add_token(SESSION, &token_hash("reconnect"), expires),
+        "the handover ended the session's WebTransport entry"
+    );
+    assert_eq!(
+        old.media().attach(false, Duration::ZERO).err(),
+        Some(Refused::NotReady),
+        "a hello before the new tap registered waits, keeping its token"
+    );
+
+    // The new tap registers over the same id, and the old tap is dropped after it.
+    let new = tap(&second);
+    drop(old);
+    assert!(
+        registry.add_token(SESSION, &token_hash("late"), expires),
+        "the old tap's drop ended the entry of the tap that replaced it"
+    );
+    let after = new
+        .media()
+        .attach(false, Duration::ZERO)
+        .expect("the reconnect attaches to the new tap");
+    assert_eq!(after.gone.get(), None);
+
+    // A real session end still ends it.
+    drop(new);
+    assert_eq!(after.gone.get(), Some(&Gone::SessionEnded));
+    assert!(!registry.add_token(SESSION, &token_hash("later"), expires));
 }
 
 /// #1228: a session stop releases the tap's PyroWave encoder before the source goes (it shares

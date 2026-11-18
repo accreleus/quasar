@@ -153,6 +153,20 @@ describe("WtTelemetry", () => {
     expect(h.posts.filter((p) => p.url.endsWith("/stats"))).toHaveLength(1);
   });
 
+  it("posts no client_health from a page in bench mode", async () => {
+    localStorage.setItem("quasar.bench", "1");
+    try {
+      const h = harness();
+      h.frames(60, 1000 / 60, 12);
+      h.t.tick();
+      await h.t.flush();
+      const [sample] = h.posts[0].body.samples as { client_health?: string }[];
+      expect(sample).not.toHaveProperty("client_health");
+    } finally {
+      localStorage.removeItem("quasar.bench");
+    }
+  });
+
   it("posts the display cushion as playout_target_ms and the arrival jitter behind it", async () => {
     const h = harness();
     h.frames(10, 8);
@@ -211,6 +225,28 @@ describe("WtTelemetry", () => {
     expect(metrics[3]).not.toHaveProperty("wt_audio_buffer_ms");
     expect(metrics[3]).not.toHaveProperty("wt_audio_target_ms");
     expect(metrics[3]).toMatchObject({ wt_audio_underruns: 3 });
+  });
+
+  it("posts the fragments FEC rebuilt, only while the connection is sent repairs (amendment 85)", async () => {
+    const h = harness();
+    h.frames(10, 8);
+    h.t.tick(); // before any scheme: no FEC, and the key must say nothing rather than 0
+    h.t.setFec(true);
+    h.t.addRepaired(2);
+    h.frames(10, 8);
+    h.t.tick();
+    h.t.addRepaired(1); // a reconnect's new connection adds to the page's total
+    h.frames(10, 8);
+    h.t.tick();
+    h.t.setFec(false); // the next connection is sent no repairs
+    h.frames(10, 8);
+    h.t.tick();
+    await h.t.flush();
+    const metrics = (h.posts[0].body.samples as { metrics: Record<string, number> }[]).map((s) => s.metrics);
+    expect(metrics[0]).not.toHaveProperty("wt_fec_repaired");
+    expect(metrics[1]).toMatchObject({ wt_fec_repaired: 2 });
+    expect(metrics[2]).toMatchObject({ wt_fec_repaired: 3 });
+    expect(metrics[3]).not.toHaveProperty("wt_fec_repaired");
   });
 
   it("counts long frames and present rate by the one definition WebRTC uses", () => {

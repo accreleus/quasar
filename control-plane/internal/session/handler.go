@@ -213,6 +213,15 @@ type streamResp struct {
 	// sample. Moves when the app picks another mode; width/height/fps above stay
 	// the launch mode.
 	ConsoleMode *console.ModeSelection `json:"console_mode,omitempty"`
+	// Amendment 84: the session's CURRENT render size (the app-facing mode inside
+	// the compositor) and UI scale, as PATCH /display set them. Present whenever
+	// the control plane knows them — including at the launch size and 1.0, which
+	// is how a client tells "known to be default" from "unknown". Absent means
+	// unknown, the external_width rule. A client opening a running session (a
+	// second tab, a takeover) reads them instead of assuming the launch size.
+	RenderWidth  *int32   `json:"render_width,omitempty"`
+	RenderHeight *int32   `json:"render_height,omitempty"`
+	UIScale      *float64 `json:"ui_scale,omitempty"`
 }
 
 type sessionResp struct {
@@ -337,6 +346,14 @@ func toSessionRespExt(s Session, ext externalState, haveExt bool) sessionResp {
 		stream.ExternalResizeSupported = ext.Supported
 		stream.ExternalOwner = ext.Owner
 		stream.ConsoleMode = ext.ConsoleMode
+		if ext.RenderKnown {
+			rw, rh := ext.RenderW, ext.RenderH
+			stream.RenderWidth, stream.RenderHeight = &rw, &rh
+		}
+		if ext.UIScaleKnown {
+			scale := ext.UIScale
+			stream.UIScale = &scale
+		}
 	}
 	return sessionRespWithStream(s, stream)
 }
@@ -1010,7 +1027,10 @@ func writeNoHostAvailable(w http.ResponseWriter, err error) {
 	if errors.As(err, &ct) {
 		msg := fmt.Sprintf("no host can run the compatibility tool %s this game needs yet; hosts install it in the background, so try again shortly, and if it persists ask your administrator to check Library > Compatibility", ct.Tool)
 		if ct.Swap {
-			msg = fmt.Sprintf("this session started without the compatibility tool %s this game needs; launch the game on its own instead", ct.Tool)
+			// True whether the session never mounted the tool or its mapping was
+			// written after the session started (#1427): in both cases the table
+			// the running container carries has no entry for this game.
+			msg = fmt.Sprintf("this session was not started with the compatibility tool %s set for this game; launch the game on its own instead", ct.Tool)
 		}
 		if !ct.Usable {
 			msg = fmt.Sprintf("the compatibility tool %s this game needs is disabled or marked unusable; ask your administrator", ct.Tool)

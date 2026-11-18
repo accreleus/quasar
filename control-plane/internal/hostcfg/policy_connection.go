@@ -124,6 +124,27 @@ func (s *Store) ConfirmPolicyGroups(ctx context.Context, hostID, connectionID st
 				return false, err
 			}
 		}
+		// Migration 0087 backfilled a pre-policy override as an explicit choice
+		// and wrote no group row, and the legacy map withholds an owned group's
+		// keys, so nothing ever offered that choice (#1444). Confirm is where a
+		// group becomes typed-owned: a confirmed next-session group that holds an
+		// explicit choice and has no row gets a pending one.
+		if scope, known := PolicyGroupScope(group); known && scope == "next_session" {
+			created, err := tx.Exec(ctx, `INSERT INTO host_setting_groups(host_id,group_key,desired_revision,scope,status)
+				SELECT $1::uuid,$2,revision,'next_session','pending' FROM host_policy_revisions WHERE host_id=$1::uuid
+				AND EXISTS (SELECT 1 FROM host_setting_choices c WHERE c.host_id=$1::uuid AND c.source='explicit' AND c.key=ANY($3::text[]))
+				ON CONFLICT(host_id,group_key) DO NOTHING`, hostID, group, PolicyGroupKeys(group))
+			if err != nil {
+				return false, err
+			}
+			if created.RowsAffected() > 0 {
+				if _, err := tx.Exec(ctx, `INSERT INTO host_reconcile_obligations(host_id,kind,resource_key,revision,next_attempt_at)
+					SELECT $1::uuid,'setting',group_key,desired_revision,now() FROM host_setting_groups WHERE host_id=$1::uuid AND group_key=$2
+					ON CONFLICT(host_id,kind,resource_key) DO UPDATE SET revision=excluded.revision,next_attempt_at=now(),retry_count=0`, hostID, group); err != nil {
+					return false, err
+				}
+			}
+		}
 	}
 	return true, tx.Commit(ctx)
 }

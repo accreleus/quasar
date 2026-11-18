@@ -111,8 +111,9 @@ the run does not have (a negative first-frame time, a bench window whose `n` or 
 negative or not finite) is `null`, never a clean zero. `params.bench: false` leaves bench mode off.
 **Use a fresh test user for each run.** A client that cannot keep up at a profile is refused it
 afterwards (`historical_client_performance_failed`; the scenario ends `error: the launch was
-refused: 409 ...`), and on the Mac test client one bench-armed 60 s hold at 1080p60 was enough (a
-hold with `bench: false` was not). A scenario the client cannot run (no WebTransport, a codec it
+refused: 409 ...`). A bench-armed hold no longer counts against the user (a bench-mode page
+posts no client-health class, #1304), but a fresh user per run keeps one run's real failures out of
+the next. A scenario the client cannot run (no WebTransport, a codec it
 cannot decode, the app not in the catalog) is `skipped` with the reason.
 
 ### Hooks

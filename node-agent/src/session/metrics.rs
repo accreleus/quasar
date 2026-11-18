@@ -35,6 +35,8 @@ const PROBE_SEND_FIFO_CAP: usize = 8;
 /// acceptable only here, because `probe_pay_to_send_*` measures the same span keyed on
 /// RTP timestamp (cannot desync) and still reports the untruncated tail.
 const PROBE_SEND_MAX_AGE_FRAMES: f64 = 1.0;
+/// `fec_client` when no attached connection is sent repairs (a real client id is a counter).
+const NO_FEC_CLIENT: u64 = u64::MAX;
 /// Consecutive unmatched encoder-input PTS, after at least one match, that mean the
 /// S1 correlation key has stopped surviving to the encoder mid-session.
 const PROBE_UNMATCHED_STREAK_WARN: u64 = 120;
@@ -206,6 +208,17 @@ pub struct MetricsWindow {
     /// it off the launch floor. Without it, a setpoint pinned at the floor is
     /// indistinguishable from a chosen one.
     pub abr_floor_kbps: Option<f64>,
+    /// Amendment 85: the FEC repair datagram payload sent in the window as a percent of
+    /// the video payload sent in it, and as a rate (kbit/s). Present in every window of a
+    /// WebTransport session whose `hello_ack.fec` named a scheme (`0` for a window that
+    /// sent no repair); absent otherwise, meaning "no FEC", never zero.
+    pub wt_fec_overhead_pct: Option<f64>,
+    pub wt_fec_kbps: Option<f64>,
+    /// Amendment 79: the governor's unclamped link rate (kbit/s) — what the reports say
+    /// the link carries, before the floor clamps it into the setpoint. Present only while
+    /// the per-report loop runs (a WebTransport session in `smooth`); absent means "not
+    /// measured", never zero.
+    pub abr_link_rate_kbps: Option<f64>,
     /// SPT-02: the active ABR mode. Always present, so the bundle reads it rather than
     /// deriving it from setpoint presence (wrong for `off`: rtpgccbwe stays attached, so
     /// setpoints can appear).
@@ -266,6 +279,20 @@ pub struct SessionMetrics {
     /// Amendment 5 (abr-ladder): the governor's floor in kbit/s once the ladder has moved
     /// it off the launch floor, else 0 (⇒ the drain reports `None`).
     abr_floor_kbps: AtomicU64,
+    /// Amendment 85: the id of the attached connection whose `hello_ack.fec` named a scheme
+    /// (`NO_FEC_CLIENT` for none), so the FEC keys are present in every window of a session
+    /// whose current client is sent repairs. Only the attached connection changes it.
+    fec_client: AtomicU64,
+    /// Amendment 85: lifetime video and repair datagram PAYLOAD bytes, diffed by the drain.
+    fec_video_bytes: AtomicU64,
+    fec_repair_bytes: AtomicU64,
+    /// Amendment 79: the governor's unclamped link rate in kbit/s, published once per
+    /// receiver report, with the id of the ABR loop that wrote it (`(0, 0.0)` ⇒ none).
+    /// The rate belongs to that loop: the drain reports it only while that loop still owns
+    /// the encoder, so a report in flight when another transport took over cannot leave a
+    /// stale rate behind, whatever the interleaving. A cell (owner and rate change together
+    /// or not at all), held for the one store or load, never across an owner check.
+    abr_link_rate: Mutex<(u64, f64)>,
     /// SPT-01: the raw rtpgccbwe estimate in kbit/s as `f64::to_bits` (0.0 ⇒ never
     /// received), stored on `notify::estimated-bitrate` before the governor sees it.
     gcc_estimate_kbps_bits: AtomicU64,
@@ -328,17 +355,25 @@ pub struct SessionMetrics {
     /// sustained loss and at `max-bitrate`, so a purely notification-driven governor
     /// stalls mid-descent (overdriving the pipe) or mid-recovery. Riding the heartbeat
     /// avoids a per-session thread and dies with this struct.
+    ///
+    /// Last registration wins, but only while the registering loop owns the encoder and the
+    /// session has not ended: see [`SessionMetrics::set_on_drain`].
     on_drain: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// SPT-04: post-classification hook, invoked at the END of `drain_window` with the
     /// window's [`AdaptationState`] and encode-time p95 (ms), from which the smooth
     /// governor derives its [`AdaptationHint`](crate::session::abr::AdaptationHint) for
     /// the next observe. Runs after classification (unlike `on_drain`) so it sees this
-    /// window's label. Registered only in `Smooth` mode; dies with this struct.
+    /// window's label. Registered only in `Smooth` mode; refused like `on_drain` when the
+    /// loop is not the encoder's owner or the session has ended.
     #[allow(clippy::type_complexity)]
     on_window: Mutex<Option<Box<dyn Fn(AdaptationState, Option<f64>) + Send + Sync>>>,
     /// The ABR loop that writes this session's encoder (`abr_glue::AbrLoop::id`), 0 for
     /// none: one writer per encoder, the transport that started last.
     abr_owner: AtomicU64,
+    /// The session's teardown ran ([`SessionMetrics::end_hooks`]). Sticky, unlike the
+    /// owner: that is zeroed by a transport replacement and a rebuild too, which are not
+    /// ends and may be followed by a new loop's registration.
+    hooks_ended: AtomicBool,
     /// Drain bookkeeping: the counter snapshot + instant of the last drain.
     last: Mutex<DrainSnapshot>,
 }
@@ -427,6 +462,8 @@ struct DrainSnapshot {
     rtp_frames: u64,
     rtp_bytes: u64,
     overflow_drops: u64,
+    fec_video_bytes: u64,
+    fec_repair_bytes: u64,
 }
 
 impl SessionMetrics {
@@ -439,6 +476,10 @@ impl SessionMetrics {
             start: now,
             abr_setpoint_kbps: AtomicU64::new(0),
             abr_floor_kbps: AtomicU64::new(0),
+            fec_client: AtomicU64::new(NO_FEC_CLIENT),
+            fec_video_bytes: AtomicU64::new(0),
+            fec_repair_bytes: AtomicU64::new(0),
+            abr_link_rate: Mutex::new((0, 0.0)),
             gcc_estimate_kbps_bits: AtomicU64::new(0),
             abr_mode,
             display: LiveEcho::default(),
@@ -462,6 +503,7 @@ impl SessionMetrics {
             on_drain: Mutex::new(None),
             on_window: Mutex::new(None),
             abr_owner: AtomicU64::new(0),
+            hooks_ended: AtomicBool::new(false),
             last: Mutex::new(DrainSnapshot {
                 at: now,
                 frames_out: 0,
@@ -471,6 +513,8 @@ impl SessionMetrics {
                 rtp_frames: 0,
                 rtp_bytes: 0,
                 overflow_drops: 0,
+                fec_video_bytes: 0,
+                fec_repair_bytes: 0,
             }),
         }
     }
@@ -791,6 +835,52 @@ impl SessionMetrics {
         self.abr_floor_kbps.store(kbps as u64, Ordering::Relaxed);
     }
 
+    /// Amendment 85: client `client` is now the session's attached WebTransport connection;
+    /// `fec` is whether its `hello_ack.fec` named a scheme. It replaces whatever the previous
+    /// connection said, so a client that is sent no repairs turns the FEC keys back off
+    /// instead of reporting zeros for FEC it does not have.
+    pub fn attach_fec(&self, client: u64, fec: bool) {
+        let owner = if fec { client } else { NO_FEC_CLIENT };
+        self.fec_client.store(owner, Ordering::Relaxed);
+    }
+
+    /// Amendment 85: connection `client` ended. Clears the FEC keys only if it still owns
+    /// them: a displaced connection's teardown runs after its successor attached, and must
+    /// not turn the successor's telemetry off.
+    pub fn detach_fec(&self, client: u64) {
+        let _ = self.fec_client.compare_exchange(
+            client,
+            NO_FEC_CLIENT,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Test read of the lifetime video payload bytes `record_fec_bytes` has been given.
+    #[cfg(test)]
+    pub(crate) fn fec_video_total(&self) -> u64 {
+        self.fec_video_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Amendment 85: video datagram PAYLOAD bytes sent (a frame, or a retransmit) and the
+    /// repair datagram payload that followed them. Cumulative; the drain diffs it.
+    pub fn record_fec_bytes(&self, video: u64, repair: u64) {
+        self.fec_video_bytes.fetch_add(video, Ordering::Relaxed);
+        self.fec_repair_bytes.fetch_add(repair, Ordering::Relaxed);
+    }
+
+    /// Amendment 79: publish the unclamped link rate (kbit/s) of ABR loop `owner`, from
+    /// its per-report loop. Never called on a WebRTC session, so the drain omits the key
+    /// there; the drain also omits it once `owner` no longer owns the encoder.
+    pub fn set_abr_link_rate(&self, owner: u64, kbps: f64) {
+        *self.abr_link_rate.lock().unwrap() = (owner, kbps);
+    }
+
+    /// Forget the published link rate: the encoder went back to its launch point.
+    pub fn clear_abr_link_rate(&self) {
+        *self.abr_link_rate.lock().unwrap() = (0, 0.0);
+    }
+
     /// SPT-01: publish the raw `rtpgccbwe` estimate (kbit/s) BEFORE the governor acts
     /// on it. Called from the `notify::estimated-bitrate` fast path ahead of
     /// `observe()`; non-blocking, one relaxed store.
@@ -799,24 +889,49 @@ impl SessionMetrics {
             .store(kbps.to_bits(), Ordering::Relaxed);
     }
 
-    /// Make ABR loop `id` the one writer of this session's encoder.
+    /// Make ABR loop `id` the one writer of this session's encoder. A session that has ended
+    /// takes no writer: the encode chain is being torn down, and the claim would only leave a
+    /// nonzero owner whose loop can never be armed (`set_on_drain` refuses).
     pub fn claim_abr(&self, id: u64) {
-        self.abr_owner.store(id, Ordering::Relaxed);
+        if self.hooks_ended.load(Ordering::Acquire) {
+            return;
+        }
+        self.abr_owner.store(id, Ordering::Release);
+    }
+
+    /// Claim the encoder only if no loop owns it: true when this loop now does. The
+    /// WebTransport loop re-takes an encoder nobody drives (#1040); a loop that started in
+    /// the meantime owns it now and must not be taken from (#1295), and an ended session
+    /// takes no owner at all.
+    pub fn claim_abr_if_free(&self, id: u64) -> bool {
+        if self.hooks_ended.load(Ordering::Acquire) {
+            return false;
+        }
+        self.abr_owner
+            .compare_exchange(0, id, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
     }
 
     pub fn abr_owner(&self) -> u64 {
-        self.abr_owner.load(Ordering::Relaxed)
+        self.abr_owner.load(Ordering::Acquire)
     }
 
     /// AS-03: register the per-drain hook (see the `on_drain` field doc). Last
-    /// registration wins; dropped with the session's `SessionMetrics`.
-    pub fn set_on_drain(&self, hook: Box<dyn Fn() + Send + Sync>) {
-        *self.on_drain.lock().unwrap() = Some(hook);
+    /// registration wins; refused — and `false` — when `owner` is no longer the encoder's
+    /// owner, since a teardown that ran in between cleared the hooks and a hook installed
+    /// after it would keep the encoder alive for good (#1295).
+    pub fn set_on_drain(&self, owner: u64, hook: Box<dyn Fn() + Send + Sync>) -> bool {
+        let mut slot = self.on_drain.lock().unwrap();
+        // Both read under the slot's lock, which `clear_hooks`/`end_hooks` take to zero the
+        // owner and to set the ended flag: a registration either lands before that and is
+        // dropped there, or sees the result here.
+        if self.hooks_ended.load(Ordering::Acquire) || self.abr_owner() != owner {
+            return false;
+        }
+        *slot = Some(hook);
+        true
     }
 
-    /// SPT-04: register the post-classification hook (see the `on_window` field doc).
-    /// Last registration wins; dropped with the session's `SessionMetrics`.
-    #[allow(clippy::type_complexity)]
     /// Drop both ABR hooks. The runner MUST call this at session teardown: the hooks hold
     /// strong element refs (encoder + rtpgccbwe, `abr_glue`) while the encoder's pad
     /// probes hold this struct's Arc — a cross ref cycle (encoder → probe → metrics →
@@ -829,17 +944,68 @@ impl SessionMetrics {
     /// `on_window` also holds (`abr_glue::resolution_lever_with_echo`): the runner and
     /// the webrtcbin `request-aux-sender` closure hold it too, so it is pipeline-scoped.
     pub fn clear_hooks(&self) {
-        let had_drain = self.on_drain.lock().unwrap().take().is_some();
-        let had_window = self.on_window.lock().unwrap().take().is_some();
+        self.drop_hooks(false);
+    }
+
+    /// The session is ending: drop the hooks and refuse every later registration. The
+    /// runner's teardown guard calls this instead of [`Self::clear_hooks`], because the
+    /// owner alone cannot say "ended": a transport replacement and a rebuild zero it too,
+    /// and a loop that claims after that zero would pass an owner-only check and install a
+    /// hook after the teardown — rebuilding the cycle it broke, for good (#1295).
+    pub fn end_hooks(&self) {
+        self.drop_hooks(true);
+    }
+
+    fn drop_hooks(&self, ended: bool) {
+        let mut drain = self.on_drain.lock().unwrap();
+        let mut window = self.on_window.lock().unwrap();
         // No owner either: a replacement transport already put the encoder back at launch
         // (`abr_glue::reset_to_launch`), so its loop's start is no takeover to repeat. A
         // WebTransport client still streaming takes it back (`abr_glue::feedback_abr`).
-        self.abr_owner.store(0, Ordering::Relaxed);
-        tracing::debug!(had_drain, had_window, "session metrics ABR hooks cleared");
+        //
+        // Written HERE, under both slots' locks: a loop's registration checks them while
+        // holding one of them, so it either lands before this and is dropped below, or sees
+        // the result and installs nothing.
+        if ended {
+            self.hooks_ended.store(true, Ordering::Release);
+        }
+        self.abr_owner.store(0, Ordering::Release);
+        let had_drain = drain.take().is_some();
+        let had_window = window.take().is_some();
+        tracing::debug!(
+            had_drain,
+            had_window,
+            ended,
+            "session metrics ABR hooks dropped"
+        );
     }
 
-    pub fn set_on_window(&self, hook: Box<dyn Fn(AdaptationState, Option<f64>) + Send + Sync>) {
-        *self.on_window.lock().unwrap() = Some(hook);
+    /// SPT-04: register the post-classification hook (see the `on_window` field doc).
+    /// Last registration wins; refused — and `false` — when `owner` is no longer the
+    /// encoder's owner, exactly as [`Self::set_on_drain`] is (#1295).
+    #[allow(clippy::type_complexity)]
+    pub fn set_on_window(
+        &self,
+        owner: u64,
+        hook: Box<dyn Fn(AdaptationState, Option<f64>) + Send + Sync>,
+    ) -> bool {
+        let mut slot = self.on_window.lock().unwrap();
+        // As `set_on_drain`: the ended flag and the owner are read under the slot's own lock.
+        if self.hooks_ended.load(Ordering::Acquire) || self.abr_owner() != owner {
+            return false;
+        }
+        *slot = Some(hook);
+        true
+    }
+
+    /// Which ABR hooks are installed, for the test that a registration racing a teardown
+    /// leaves none behind (#1295).
+    #[cfg(test)]
+    pub(crate) fn hooks_armed(&self) -> (bool, bool) {
+        (
+            self.on_drain.lock().unwrap().is_some(),
+            self.on_window.lock().unwrap().is_some(),
+        )
     }
 
     /// Record the compositor's live app-facing render size / UI scale for the echo.
@@ -981,6 +1147,8 @@ impl SessionMetrics {
         let rtp_frames = self.rtp_frames.load(Ordering::Relaxed);
         let rtp_bytes = self.rtp_bytes.load(Ordering::Relaxed);
         let overflow = self.overflow_drops.load(Ordering::Relaxed);
+        let fec_video_bytes = self.fec_video_bytes.load(Ordering::Relaxed);
+        let fec_repair_bytes = self.fec_repair_bytes.load(Ordering::Relaxed);
 
         let mut last = self.last.lock().unwrap();
         let window_s = now.saturating_duration_since(last.at).as_secs_f64();
@@ -992,6 +1160,8 @@ impl SessionMetrics {
         let d_rtp_bytes = rtp_bytes.saturating_sub(last.rtp_bytes);
         // Drops discarded by the FIFO overflow resync this window (SO-08).
         let d_overflow = overflow.saturating_sub(last.overflow_drops);
+        let d_fec_video = fec_video_bytes.saturating_sub(last.fec_video_bytes);
+        let d_fec_repair = fec_repair_bytes.saturating_sub(last.fec_repair_bytes);
         *last = DrainSnapshot {
             at: now,
             frames_out,
@@ -1001,6 +1171,8 @@ impl SessionMetrics {
             rtp_frames,
             rtp_bytes,
             overflow_drops: overflow,
+            fec_video_bytes,
+            fec_repair_bytes,
         };
         drop(last);
 
@@ -1094,6 +1266,31 @@ impl SessionMetrics {
             v => Some(v as f64),
         };
 
+        // Amendment 85: present in every window of a session whose client is sent repairs,
+        // 0 for a window that sent none (a link that was clean all window).
+        let (wt_fec_overhead_pct, wt_fec_kbps) =
+            if self.fec_client.load(Ordering::Relaxed) != NO_FEC_CLIENT {
+                let pct = if d_fec_video > 0 {
+                    d_fec_repair as f64 * 100.0 / d_fec_video as f64
+                } else {
+                    0.0
+                };
+                let kbps = if window_s > 0.0 {
+                    (d_fec_repair as f64 * 8.0) / 1000.0 / window_s
+                } else {
+                    0.0
+                };
+                (Some(pct), Some(kbps))
+            } else {
+                (None, None)
+            };
+        // Amendment 79: only the rate of the loop that owns the encoder now; another's
+        // (displaced, or none ran) reads as absent.
+        let abr_link_rate_kbps = {
+            let (owner, v) = *self.abr_link_rate.lock().unwrap();
+            (owner != 0 && owner == self.abr_owner() && v > 0.0).then_some(v)
+        };
+
         // 0.0 bits ⇒ never received ⇒ None.
         let gcc_estimate_kbps = {
             let bits = self.gcc_estimate_kbps_bits.load(Ordering::Relaxed);
@@ -1182,6 +1379,9 @@ impl SessionMetrics {
             frames_dropped,
             abr_setpoint_kbps,
             abr_floor_kbps,
+            wt_fec_overhead_pct,
+            wt_fec_kbps,
+            abr_link_rate_kbps,
             render_width: echo.render_width.reported(),
             render_height: echo.render_height.reported(),
             ui_scale: echo.ui_scale.reported(),
@@ -1266,6 +1466,78 @@ mod tests {
         assert!((s.mean - 50.5).abs() < 0.01);
         assert!((s.p50 - 50.0).abs() <= 1.0);
         assert!((s.p95 - 95.0).abs() <= 1.0);
+    }
+
+    // ── Amendment 85: FEC telemetry ───────────────────────────────────────────
+
+    /// The FEC keys are absent until a connection negotiates a scheme, present (0 when the
+    /// window sent no repair) once one has, and the share is repair over video payload.
+    #[test]
+    fn fec_keys_follow_the_negotiation_and_report_the_repair_share() {
+        let s = SessionMetrics::new("smooth", 60);
+        s.attach_fec(1, true);
+        s.record_fec_bytes(10_000, 500);
+        let first = s.last.lock().unwrap().at;
+        // Half a second later: 500 repair payload bytes of 10 000 video.
+        let w = s.drain_window(first + Duration::from_millis(500));
+        assert_eq!(w.wt_fec_overhead_pct, Some(5.0));
+        assert_eq!(w.wt_fec_kbps, Some(8.0), "500 bytes in 0.5 s");
+
+        // A clean window reports 0, never absent and never a stale share.
+        s.record_fec_bytes(12_000, 0);
+        let w = s.drain_window(first + Duration::from_secs(1));
+        assert_eq!(w.wt_fec_overhead_pct, Some(0.0));
+        assert_eq!(w.wt_fec_kbps, Some(0.0));
+
+        // A client that is sent no repairs turns them off: absence, not zeros.
+        s.attach_fec(2, false);
+        let w = s.drain_window(first + Duration::from_secs(2));
+        assert_eq!(w.wt_fec_overhead_pct, None);
+        assert_eq!(w.wt_fec_kbps, None);
+    }
+
+    /// The share is repair over ALL the video sent in the window: frames that got no repair
+    /// (a small frame banks its budget) and retransmits are in the denominator too.
+    #[test]
+    fn the_fec_share_counts_frames_that_got_no_repair() {
+        let s = SessionMetrics::new("smooth", 60);
+        s.attach_fec(1, true);
+        s.record_fec_bytes(10_000, 500); // a frame that paid for a repair
+        s.record_fec_bytes(10_000, 0); // a frame that banked its budget
+        s.record_fec_bytes(5_000, 0); // a retransmit
+        let first = s.last.lock().unwrap().at;
+        let w = s.drain_window(first + Duration::from_secs(1));
+        assert_eq!(
+            w.wt_fec_overhead_pct,
+            Some(2.0),
+            "500 of 25 000, not of 10 000"
+        );
+    }
+
+    /// A displaced connection's teardown, run after its successor attached, leaves the
+    /// successor's keys on; only the attached connection's own end turns them off.
+    #[test]
+    fn only_the_attached_connection_changes_the_fec_state() {
+        let s = SessionMetrics::new("smooth", 60);
+        let at = s.last.lock().unwrap().at;
+        let present = |s: &SessionMetrics, secs| {
+            s.drain_window(at + Duration::from_secs(secs))
+                .wt_fec_kbps
+                .is_some()
+        };
+        s.attach_fec(1, true);
+        s.attach_fec(2, true); // a takeover or reload: B attaches while A is still tearing down
+        s.detach_fec(1); // A's stream notices and ends
+        assert!(present(&s, 1), "B still reports FEC after A ended");
+        s.detach_fec(2); // B ends with nobody attaching after
+        assert!(!present(&s, 2));
+        // A successor that is sent no repairs takes the keys off at once, before the
+        // displaced connection's teardown.
+        s.attach_fec(3, true);
+        s.attach_fec(4, false);
+        assert!(!present(&s, 3));
+        s.detach_fec(3);
+        assert!(!present(&s, 4));
     }
 
     // ── Host-stage latency probe (QUASAR_LATENCY_PROBE) ───────────────────────

@@ -119,11 +119,36 @@ pub(crate) struct Rate {
     pub(crate) retargets: bool,
     /// A client's first estimate: its loop takes the encoder over (one writer per encoder).
     pub(crate) start: Box<dyn Fn() + Send + Sync>,
+    /// Some ABR loop owns the session's encoder right now (`SessionMetrics::abr_owner`).
+    /// Ownership outlives the transport that started the loop: a WebRTC peer whose PC fails
+    /// takes its hold with it (`Holder::None`) and leaves its loop owning the encoder.
+    pub(crate) owns: Box<dyn Fn() -> bool + Send + Sync>,
+    /// Displace a loop that still owns the encoder, at the takeover itself (#1294): the
+    /// encoder back at its launch point, no owner — not at this client's first estimate,
+    /// which a client that sends no feedback (§Feedback) never sends.
+    pub(crate) displaced: Box<dyn Fn() + Send + Sync>,
     pub(crate) observe: Box<dyn Fn(f64) + Send + Sync>,
     /// After `observe`, for every estimate that came from a receiver report, never for the
     /// silence decay: what the report showed the link carrying when the link held the
     /// sender back (`congestion::Estimator::measured`), `None` when it did not.
     pub(crate) measured: Box<dyn Fn(Option<f64>) + Send + Sync>,
+    /// Amendment 85: FEC telemetry — whether this connection's `hello_ack.fec` named a
+    /// scheme, and per protected frame the video and repair datagram payload bytes sent.
+    /// FEC exists only where this estimate writes the encoder, so it is reported here.
+    pub(crate) fec: Box<dyn Fn(FecEvent) + Send + Sync>,
+}
+
+/// What the FEC telemetry sink is told (`Rate::fec`).
+pub(crate) enum FecEvent {
+    /// Client `client` is now the session's attached connection, and its `hello_ack.fec`
+    /// named a scheme (`true`) or did not (`false`). Replaces whatever the last one said.
+    Attached { client: u64, fec: bool },
+    /// Client `client`'s connection ended. A no-op unless it is still the attached one: a
+    /// displaced connection's teardown must not clear its successor's telemetry.
+    Detached { client: u64 },
+    /// Video datagram payload bytes sent (a frame, or a retransmit) and the repair datagram
+    /// payload bytes that followed them (0 for a frame or retransmit with none).
+    Sent { video: u64, repair: u64 },
 }
 
 /// One client's congestion control: its feedback and the agent's silence clock into an
@@ -437,11 +462,22 @@ impl Registry {
 
     /// The session is stopping: its tokens go, and its client gets `bye session_ended`.
     pub fn end(&self, session_id: &str) {
-        let media = self.lock().get_mut(session_id).and_then(|entry| {
-            entry.tokens.clear();
-            entry.ended_at.get_or_insert_with(SystemTime::now);
-            entry.media.take()
-        });
+        self.end_if(session_id, |_| true);
+    }
+
+    /// `end`, only when `names` holds for the entry's media, checked under the same lock: a
+    /// tap dropped after its successor registered under the same id (#1197) must leave that
+    /// successor's entry alone.
+    fn end_if(&self, session_id: &str, names: impl FnOnce(Option<&Arc<Media>>) -> bool) {
+        let media = self
+            .lock()
+            .get_mut(session_id)
+            .filter(|entry| names(entry.media.as_ref()))
+            .and_then(|entry| {
+                entry.tokens.clear();
+                entry.ended_at.get_or_insert_with(SystemTime::now);
+                entry.media.take()
+            });
         if let Some(media) = media {
             media.end();
         }
@@ -505,6 +541,11 @@ pub(crate) fn registry() -> Option<Arc<Registry>> {
 
 /// Takes the session's video off the encoded-frame boundary for its WebTransport
 /// client, and forgets the session when dropped with the transport.
+///
+/// One live tap per session id (#1197): `attach` registers its media over any earlier tap's
+/// (`set_media`, under the registry lock), and a drop ends the entry only while it still
+/// names that tap's media. A rebuild's old tap is dropped after its successor attached, so
+/// it never ends the successor's entry; nor does a tap whose id was assigned again.
 pub(crate) struct Tap {
     registry: Arc<Registry>,
     session_id: String,
@@ -642,8 +683,10 @@ impl Tap {
 
 impl Drop for Tap {
     fn drop(&mut self) {
-        self.registry.end(&self.session_id);
-        // Its own media too: an id assigned again got a fresh entry that no longer names it.
+        let own = &self.media;
+        self.registry
+            .end_if(&self.session_id, |m| m.is_some_and(|m| Arc::ptr_eq(m, own)));
+        // Its own media too, which the entry may no longer name.
         self.media.end();
         self.release();
     }
@@ -1185,6 +1228,14 @@ fn stalled() -> (Option<Value>, u32, &'static str) {
     )
 }
 
+/// The payload bytes of video datagrams: what amendment 85's FEC share is measured against.
+fn video_payload(datagrams: &[bytes::Bytes]) -> u64 {
+    datagrams
+        .iter()
+        .map(|d| d.len().saturating_sub(media::HEADER) as u64)
+        .sum()
+}
+
 /// Send `nack` answers; false when the connection is gone. A resend the path's maximum
 /// datagram size has shrunk below is dropped and counted: the client gives that frame up.
 fn resend(
@@ -1394,6 +1445,10 @@ async fn authenticate(
             return;
         }
     };
+    // #1294: the takeover displaces a loop that still owns the encoder, here rather than
+    // under the registry lock `redeem` holds (the reset writes the encoder, and a rung
+    // restore restarts its session), and before this client's `hello_ack` lets it feed.
+    media.displace_stale_abr();
     // §FEC: repairs are paid for by lowering the encoder's rate, so only an ABR that
     // writes it sends them.
     let fec = media.rate().is_some_and(|rate| rate.retargets) && hello.decodes("xor");
@@ -1527,6 +1582,14 @@ async fn stream(
     let mut nack_budget = retransmit::NackBudget::new(std::time::Instant::now());
     let (mut nacks_capped, mut resends_too_large) = (0u64, 0u64);
     let mut warned_oversized = false;
+    // Amendment 85: whether this connection is sent repairs, so the session's windows carry
+    // the FEC keys (0 repair) exactly while it is.
+    if let Some(rate) = media.rate() {
+        (rate.fec)(FecEvent::Attached {
+            client: client.id,
+            fec,
+        });
+    }
     let mut control = media
         .rate()
         .map(|rate| Control::new(rate, client.gone.clone(), fec, governor.clone()));
@@ -1663,6 +1726,18 @@ async fn stream(
                     // loss shows in the bench.
                     if let Some(control) = control.as_mut() {
                         let repairs = control.protect(unit.pyrowave, &datagrams, &mut pkt_seq);
+                        // Every video frame while a scheme is on, one that got no repair too
+                        // (a small frame banks its budget; a PyroWave frame gets none): the
+                        // share is repair over ALL the video sent (amendment 85).
+                        if let Some(rate) = media.rate().filter(|_| fec) {
+                            // Payload, not datagram bytes: the header is per-datagram overhead
+                            // on both sides and would dilute the ratio differently.
+                            let repair: u64 = repairs
+                                .iter()
+                                .map(|d| d.len().saturating_sub(fec::HEADER) as u64)
+                                .sum();
+                            (rate.fec)(FecEvent::Sent { video: video_payload(&datagrams), repair });
+                        }
                         datagrams.extend(repairs);
                     }
                     // shortcut: a PyroWave frame (~380 datagrams at 1080p/200) goes as one burst;
@@ -1695,6 +1770,10 @@ async fn stream(
                     }
                 }
                 None => break match client.gone.get() {
+                    // A rebuild replaced the encoder: a lost connection, not an end, so the
+                    // client mints a fresh token and reconnects onto the new encoder
+                    // (§Reconnect, #1197). No `bye` and code 0 is what says "lost link".
+                    Some(Gone::Rebuilt) => QUIET,
                     Some(Gone::TakenOver) => (Some(json!({"type": "bye", "reason": "taken_over"})), CLOSE_TAKEN_OVER, ""),
                     Some(Gone::Unusable) => (
                         Some(json!({"type": "error", "code": "internal", "message": "the encoder sent no usable keyframe"})),
@@ -1728,6 +1807,13 @@ async fn stream(
                                 if let Some((frame_seq, answer)) = answer {
                                     let log = control.as_mut().map(|c| &mut c.log);
                                     handed += answer.resend.len() as u64;
+                                    // A retransmit is video sent in the window too (amendment 85).
+                                    if let Some(rate) = media.rate().filter(|_| fec) {
+                                        (rate.fec)(FecEvent::Sent {
+                                            video: video_payload(&answer.resend),
+                                            repair: 0,
+                                        });
+                                    }
                                     if !resend(session, answer.resend, log, &mut resends_too_large) {
                                         break QUIET;
                                     }
@@ -1787,6 +1873,11 @@ async fn stream(
     };
     reader.abort();
     media.detach(client.id);
+    // Amendment 85: this connection is over, so the session's windows stop claiming FEC until
+    // another client negotiates it (a WebRTC peer's windows never carry the keys).
+    if let Some(rate) = media.rate() {
+        (rate.fec)(FecEvent::Detached { client: client.id });
+    }
     let quic = quinn::Connection::stats(session);
     tracing::info!(
         token = "webtransport-client-quic-stats",

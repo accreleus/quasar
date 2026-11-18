@@ -18,6 +18,7 @@ import { ApiError } from "../../../api/client";
 import type { Host, PlatformIdentity } from "../../../api/types";
 import { useAuth } from "../../../auth/context";
 import { useAdminAction } from "../../../lib/resource/action";
+import { ownerConflict } from "./hostWarnings";
 import { isControlPlaneMachine, isOwned } from "./hostServices";
 
 export type RemovalPhase = "waiting" | "sent" | "failed" | "removed";
@@ -72,6 +73,47 @@ export function useRemoval(hostId: string): Removal | null {
 /** Whether this host is removed from here: an owned GPU host, never the control plane's own. */
 export function removable(host: Host, machine: PlatformIdentity | null | undefined): boolean {
   return isOwned(host) && !isControlPlaneMachine(host, machine);
+}
+
+/**
+ * Whether the console offers removal of this host: an owned GPU host, never the control
+ * plane's own, and #1240's other conditions — see `removalBlockedReason`. The Fleet row
+ * menu sends an admin to the page's Remove dialog only on this answer, and the host page
+ * opens that dialog on the same one, so the menu can never land on a page that offers
+ * nothing. One rule, both callers.
+ */
+export function canRemoveHost(
+  host: Host,
+  machine: PlatformIdentity | null | undefined,
+): boolean {
+  return removable(host, machine) && removalBlockedReason(host, machine) == null;
+}
+
+/**
+ * Why an owned GPU host's removal is not offered, as the sentence its page shows where the
+ * Remove button would be — null when it is offered, and for a host this rule says nothing
+ * about (not owned, or the control plane's own machine, whose menu opens the Forget dialog
+ * instead). These are the conditions the row menu used to promise a dialog for and the page
+ * then showed nothing at all (#1240): an unknown machine identity (`machine` null: the
+ * release read failed, and it could be this very machine), an owner conflict, and a
+ * recovery actor that has not reported — that actor is what performs the removal.
+ */
+export function removalBlockedReason(
+  host: Host,
+  machine: PlatformIdentity | null | undefined,
+): string | null {
+  if (!isOwned(host)) return null;
+  if (machine == null) {
+    return "The control plane could not say which machine it runs on, so removal is not offered. Reload the page to try again.";
+  }
+  if (isControlPlaneMachine(host, machine)) return null;
+  if (ownerConflict(host)) {
+    return "Another owner’s container is in the way on this machine, so removal is not offered. Quasar never acts on that container; clear it on the machine first.";
+  }
+  if (host.updater_present !== true) {
+    return "Its recovery actor has not reported, and that actor is what performs a removal. Removal is offered again once the host reports.";
+  }
+  return null;
 }
 
 /** Six missed heartbeats (agent-api.md `heartbeat_interval_ms`, 5 s), with room for skew

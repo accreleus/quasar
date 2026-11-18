@@ -867,6 +867,14 @@ impl AppSource {
         query.context_owned()
     }
 
+    /// The compositor's encode-src `ring-depth` (its starting ring; it may grow under
+    /// back-pressure), `None` on a build without the property.
+    pub fn ring_depth(&self) -> Option<u32> {
+        let source = self.pipeline.by_name("video-source")?;
+        source.find_property("ring-depth")?;
+        Some(source.property::<u32>("ring-depth"))
+    }
+
     /// Set this generation's compositor app-facing presentation: the `wl_output` logical
     /// mode (`render`, `None` ⇒ follow the encode size) and the `wp_fractional_scale_v1`
     /// `preferred_scale`. Returns whether the compositor took them.
@@ -909,13 +917,14 @@ impl AppSource {
         true
     }
 
-    /// Advertise the session's rung ladder (`session::rungs::available_rungs` of the
-    /// launch size) as this compositor's `wl_output` modes. The internal half of adaptive
-    /// external resolution, independent of the encoded size. Must be set once per source
-    /// generation BEFORE the compositor starts: an app that reads its output's mode list
-    /// once at startup has to see the full ladder. Guarded on `find_property` for the
-    /// same panic reason as [`Self::set_display_properties`]; an older image debug-logs
-    /// and no-ops. Returns whether it was taken.
+    /// Advertise the modes the guest app may pick (`session::rungs::mode_ladder` of the
+    /// launch size, the rung ladder less the sizes meant only for a starved link) as this
+    /// compositor's `wl_output` modes. The internal half of adaptive external resolution,
+    /// independent of the encoded size. Must be set once per source generation BEFORE the
+    /// compositor starts: an app that reads its output's mode list once at startup has to
+    /// see the full list. Guarded on `find_property` for the same panic reason as
+    /// [`Self::set_display_properties`]; an older image debug-logs and no-ops. Returns
+    /// whether it was taken.
     pub fn set_mode_ladder(&self, rungs: &[(i32, i32)]) -> bool {
         let Some(source) = self.pipeline.by_name("video-source") else {
             tracing::warn!(

@@ -181,8 +181,12 @@ describe("HostDetail — owner conflict (#366)", () => {
     const row = within(await card()).getByText("Another owner’s container").closest("tr") as HTMLElement;
     expect(within(row).getByText("Another owner")).toBeTruthy();
     expect(within(row).getByText("in the way")).toBeTruthy();
-    // Not removed from here while another owner's container is in the way.
+    // Not removed from here while another owner's container is in the way, and the page
+    // says so where the button would be (#1240).
     expect(screen.queryByRole("button", { name: /Remove host/ })).toBeNull();
+    expect(
+      screen.getByText(/Another owner’s container is in the way on this machine, so removal is not offered/),
+    ).toBeTruthy();
   });
 
   it("checks again, and says it is still in the way when a newer report still has it", async () => {
@@ -235,6 +239,16 @@ describe("HostDetail — the last report (#366)", () => {
 });
 
 describe("HostDetail — remove host (#366)", () => {
+  // The Fleet row menu sends an admin here on the same rule; when it says no, the page
+  // has to say why (#1240).
+  it("says why removal is not offered while its recovery actor has not reported", async () => {
+    mocked.getHost.mockResolvedValue({ host: host({ updater_present: false }) } as never);
+    renderDetail();
+    const c = await card();
+    expect(within(c).queryByRole("button", { name: /Remove host/ })).toBeNull();
+    expect(within(c).getByText(/Its recovery actor has not reported/)).toBeTruthy();
+  });
+
   it("confirms, drains, waits for the host's sessions, then asks the recovery actor", async () => {
     setFleet([session()]);
     renderDetail();
@@ -332,6 +346,9 @@ describe("HostDetail — remove host (#366)", () => {
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByText("gpu-host-4 is not connected")).toBeTruthy();
     expect(within(dialog).getByText(/last seen 3 days ago/)).toBeTruthy();
+    // The cost is stated, and re-adding is not promised under the same name without a forget (#634).
+    expect(within(dialog).getByText(/each home claim then needs\s+releasing by hand in Storage/)).toBeTruthy();
+    expect(dialog.textContent).not.toContain("you can leave it");
     expect(within(dialog).queryByRole("button", { name: /Remove host/ })).toBeNull();
     fireEvent.click(within(dialog).getByRole("button", { name: /Forget host/ }));
     await waitFor(() => expect(mocked.deleteHost).toHaveBeenCalledWith("tok", ID));

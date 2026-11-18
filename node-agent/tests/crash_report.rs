@@ -116,8 +116,27 @@ fn prepare(how: &str) {
     }
 }
 
+/// Exits 0 when `install` left the handler a mask that blocks the unreported signals and
+/// not the reported one. `handler_mask` alone cannot show that: `install` must use it.
+fn exit_by_handler_mask() {
+    // SAFETY: a zeroed `sigaction` is valid; the call reads one disposition into it.
+    let old = unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut old);
+        old
+    };
+    // SAFETY: `sa_mask` is a valid set.
+    let right = unsafe {
+        libc::sigismember(&old.sa_mask, libc::SIGTERM) == 1
+            && libc::sigismember(&old.sa_mask, libc::SIGUSR1) == 1
+            && libc::sigismember(&old.sa_mask, libc::SIGSEGV) == 0
+    };
+    std::process::exit(if right { 0 } else { 3 });
+}
+
 fn die(how: &str) {
     match how {
+        "mask" => exit_by_handler_mask(),
         "abort" => std::process::abort(),
         // SAFETY: raises a signal at this process.
         "raised-trap" => unsafe {
@@ -317,6 +336,12 @@ fn banner(signal: &str) -> String {
 }
 
 #[test]
+fn install_gives_the_handler_the_mask_that_blocks_unreported_signals() {
+    let end = child("mask");
+    assert_eq!(end.code, Some(0), "{}", end.stderr);
+}
+
+#[test]
 fn a_fault_reports_its_thread_stack_maps_and_frames_and_dies_of_the_signal() {
     let end = child("segv");
     let stderr = &end.stderr;
@@ -431,6 +456,35 @@ fn a_real_trap_is_reported_and_dies_of_the_trap() {
     assert!(end.complete(), "{stderr}");
 }
 
+/// Whether `unshare` can make the namespaces, asked with a deadline: a probe that hangs
+/// must not hang the suite, and `--kill-child` takes the inner process with it.
+fn namespace_probe(unshare: &[&str]) -> bool {
+    let Ok(mut probe) = Command::new(unshare[0])
+        .args(&unshare[1..])
+        .arg("true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let started = Instant::now();
+    loop {
+        match probe.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if started.elapsed() < Duration::from_secs(10) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = probe.kill();
+                let _ = probe.wait();
+                return false;
+            }
+        }
+    }
+}
+
 /// As the init of a PID namespace (a pod, a bare `docker run`) the kernel drops a raised
 /// default-fatal signal, so after a trap the process ran on past the breakpoint. It must
 /// exit instead. Needs a user and PID namespace, which a container's seccomp profile
@@ -445,11 +499,7 @@ fn as_a_namespace_init_a_trap_still_ends_the_process() {
         "--fork",
         "--kill-child",
     ];
-    let allowed = Command::new(unshare[0])
-        .args(&unshare[1..])
-        .arg("true")
-        .output()
-        .is_ok_and(|probe| probe.status.success());
+    let allowed = namespace_probe(&unshare);
     if !allowed {
         eprintln!("SKIP: no user and PID namespace here, so no process can be made PID 1");
         return;

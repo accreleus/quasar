@@ -305,6 +305,11 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     const pathMs = pong ? Math.max(pong.rttMs, now - pong.at - PING_MS) : 0;
     const keyWaitMs = Math.min(KEY_WAIT_MAX_MS, MEDIA_SILENCE_MS + 4 * pathMs);
     const arriving = lastDatagramAt !== null && now - lastDatagramAt <= MEDIA_SILENCE_MS;
+    // How long no video — or, with video arriving, no picture — may go on: the keyframe wait's
+    // path-scaled bound while frames still arrive, the plain 5 s otherwise. On a slow link the
+    // picture trails the frames that arrived by many seconds, and a fixed 5 s ended the view
+    // before the keyframe wait's own bound was spent (#1445).
+    const silenceMs = arriving ? keyWaitMs : MEDIA_SILENCE_MS;
     const keyWaitEnd = (t: MediaTransport, reason: string, waitedMs: number) => {
       onEnd(t, { code: null, reason });
       lostCause = `keyframe_wait: none for ${(waitedMs / 1000).toFixed(1)} s, round trip ${Math.round(pathMs)} ms, limit ${(keyWaitMs / 1000).toFixed(1)} s`;
@@ -318,7 +323,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       snapshot.channelOpen &&
       lastVideoAt !== null &&
       document.visibilityState === "visible" &&
-      now - lastVideoAt > (arriving ? keyWaitMs : MEDIA_SILENCE_MS)
+      now - lastVideoAt > silenceMs
     ) {
       if (arriving) keyWaitEnd(transport, "media_silent", now - lastVideoAt);
       else onEnd(transport, { code: null, reason: "media_silent" });
@@ -350,14 +355,21 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       snapshot.channelOpen &&
       presentRefAt !== null &&
       document.visibilityState === "visible" &&
-      now - presentRefAt > MEDIA_SILENCE_MS
+      now - presentRefAt > silenceMs
     ) {
+      // The cause names the check that fired and the bound it used, so a fallback that follows it
+      // says which check ended the view (#1445).
+      const waitedMs = now - presentRefAt;
+      const cause = `no_picture: no picture shown for ${(waitedMs / 1000).toFixed(1)} s, round trip ${Math.round(pathMs)} ms, limit ${(silenceMs / 1000).toFixed(1)} s`;
       // The first trip gets the one media reconnect media_silent gets; a second one is a decoder that cannot show.
       if (noPictureTrips++ === 0 && !reconnected) {
         onEnd(transport, { code: null, reason: "no_picture" });
         if (failed) return;
+        // A reconnect that cannot be made reports `stream_lost`, whose cause is this one.
+        lostCause = cause;
+        console.warn("webtransport:", lostCause);
       } else {
-        fail("decode_error", false, undefined, `no picture shown for ${MEDIA_SILENCE_MS / 1000} s while video kept arriving`);
+        fail("decode_error", false, undefined, cause);
         return;
       }
     }
@@ -424,7 +436,11 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     if (pyroOffer && device) {
       pyroStage = new PyroWaveStage({
         device,
-        present: (texture) => p.presentTexture?.(texture) ?? false,
+        present: (texture) => {
+          if (!p.presentTexture?.(texture)) return false;
+          bench?.onTexture(device, texture);
+          return true;
+        },
         onPresented: (captureUs) => presented(captureUs),
         fallback: (reason) => transport?.codecFallback(reason),
         load: deps.loadPyroWave,
@@ -500,6 +516,9 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       playout?.reset();
     }
     let lostOnThisConnection = 0;
+    // Amendment 85: the fragments FEC rebuilt on THIS connection, so a reconnect sums instead
+    // of replacing the page's total (as `lostOnThisConnection` does for packets_lost).
+    let repairedOnThisConnection = 0;
     try {
       await t.connect({
         streams: (streams) => {
@@ -519,6 +538,8 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
         config: (c) => {
           if (destroyed || failed || t !== transport) return;
           telemetry.setCodec(CODEC_MIME[c.codec] ?? c.codec);
+          // Amendment 85: the FEC keys are posted only while this connection is sent repairs.
+          telemetry.setFec(typeof c.fec === "string");
           if (c.switchReason) console.info(`WebTransport codec ${c.codec}: ${c.switchReason}`);
           if (c.switchReason && c.codec !== "pyrowave") cfg.callbacks.onCodecSwitched?.(c.codec, c.switchReason);
           // capture.ts scales the mouse by the stream size, which a canvas does not know.
@@ -562,6 +583,11 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
           // The count is this connection's own, from 0: a reconnect's must add, not replace.
           if (t === transport) telemetry.addLost(fragments - lostOnThisConnection);
           lostOnThisConnection = fragments;
+        },
+        repaired: (fragments) => {
+          // Same rule for the FEC repairs: this connection's own count, added to the page's.
+          if (t === transport) telemetry.addRepaired(fragments - repairedOnThisConnection);
+          repairedOnThisConnection = fragments;
         },
         rtt: (ms, agentWallMs) => {
           if (t !== transport) return;
@@ -674,6 +700,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     lostCause = e.code === 4400 && e.reason.startsWith("datagrams:") ? e.reason : undefined;
     stableVideoSince = null;
     transport = null; // the closed one's own `end` is then not this view's
+    telemetry.setFec(false); // no connection is sent repairs until the next hello_ack says so
     teardownInput();
     closing = t.close();
     // The active recovery loop notices that its replacement ended and tries again.
