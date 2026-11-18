@@ -477,26 +477,141 @@ describe("resuming a WebTransport session (#1415)", () => {
     expect(screen.queryByText(/carries on over WebRTC/i)).not.toBeInTheDocument();
   });
 
-  it("gives up on WebRTC only after the retries are spent", async () => {
-    // The retry budget is the control plane's agent handshake window: the first mint plus five
-    // retries over about 15 s, then WebRTC is the floor — with the same recorded, said fallback
-    // as a 409.
+  it("gives up on WebRTC at a ~15 s wall-clock deadline, whatever each attempt also waited", async () => {
+    // #1490: each attempt can also wait the server's 5 s agent-ack timeout, so the five
+    // backoff delays alone ("about 15 s") kept the loader for ~45 s against a silent
+    // agent. The budget is a deadline that this wait spends like a delay does.
     vi.useFakeTimers();
     getSession.mockResolvedValue({ session: makeSession({ transport: "webtransport" }) });
-    mintTransportToken.mockRejectedValue(new ApiError(503, "agent_not_connected", "retry shortly"));
+    // Every attempt refuses after the server's own 5 s agent-ack wait.
+    mintTransportToken.mockImplementation(async () => {
+      await new Promise((r) => setTimeout(r, 5_000));
+      throw new ApiError(503, "agent_not_connected", "retry shortly");
+    });
     renderResumed();
 
+    // A tick for the GET, then the first mint.
+    await settle();
+    await settle();
+    expect(mintTransportToken).toHaveBeenCalled();
+
+    // Still inside the deadline: nothing said, recorded or switched.
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(16_000);
-      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(14_000);
     });
-    // The budget is spent: the last refusal is the answer, and the page records the fallback and
-    // mints WebRTC's coordinates exactly as it does for a 409.
-    expect(mintTransportToken).toHaveBeenCalledTimes(6);
+    expect(mintSignalingToken).not.toHaveBeenCalled();
+    expect(fallbackTraces).toEqual([]);
+
+    // By ~15 s of wall clock the budget is spent and the fallback happens — one
+    // in-flight attempt may land past the deadline by its own 5 s ack wait (~20 s
+    // worst case). The old code's five delays plus six 5 s acks was ~45 s, and the
+    // replacement mint's 120 s budget was longer still, so this fails on both.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_000);
+    });
+    expect(mintTransportToken.mock.calls.length).toBeLessThanOrEqual(4);
     expect(mintSignalingToken).toHaveBeenCalledWith("t", "s1");
     expect(transports).toHaveLength(1);
     expect(fallbackTraces).toEqual(["stream_lost"]);
   }, 20_000);
+
+  it("a spent budget re-reads the session: one that ended meanwhile says so, not a switch", async () => {
+    // #1490: a spent 503 budget can mean the session ended while the agent was away, and
+    // the last refusal does not say which. Claiming a fallback would then promise a WebRTC
+    // connect whose own mint gets the same 503 — the "cannot reach the server" answer.
+    vi.useFakeTimers();
+    let ended = false;
+    getSession.mockImplementation(async () => ({
+      session: makeSession({
+        transport: "webtransport",
+        state: ended ? "stopped" : "running",
+      }),
+    }));
+    mintTransportToken.mockRejectedValue(new ApiError(503, "agent_not_connected", "retry shortly"));
+    // The WebRTC mint that the old fallback would try gets the same 503, which is what
+    // made the page's "unreachable" verdict stand in for "already ended".
+    mintSignalingToken.mockRejectedValue(new ApiError(503, "agent_not_connected", "retry shortly"));
+    renderResumed();
+
+    // A tick for the GET then the first mint; fake timers make `waitFor` unusable here.
+    await settle();
+    await settle();
+    expect(mintTransportToken).toHaveBeenCalled();
+    ended = true;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(125_000);
+    });
+
+    expect(screen.getByTestId("path").textContent).toBe("/app");
+    expect(screen.queryByText(/already ended/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Could not reach the stream/i)).not.toBeInTheDocument();
+    expect(mintSignalingToken).not.toHaveBeenCalled();
+    expect(fallbackTraces).toEqual([]);
+    expect(sessionStorage.getItem("quasar.wt-fallback.s1")).toBeNull();
+  }, 20_000);
+
+  it("503 then 409: the agent comes back and answers that the transport really is gone", async () => {
+    // Exactly one retry is spent on the 503, then the contract's final answer arrives.
+    getSession.mockResolvedValue({ session: makeSession({ transport: "webtransport" }) });
+    mintTransportToken
+      .mockRejectedValueOnce(new ApiError(503, "agent_not_connected", "retry shortly"))
+      .mockRejectedValueOnce(new ApiError(409, "transport_unavailable", "the session's transport is webrtc"));
+    renderResumed();
+
+    await waitFor(() => expect(transports).toHaveLength(1));
+    expect(mintTransportToken).toHaveBeenCalledTimes(2);
+    expect(mintSignalingToken).toHaveBeenCalledWith("t", "s1");
+    expect(fallbackTraces).toEqual(["stream_lost"]);
+    expect(wtRuntimes).toHaveLength(0);
+  }, 10_000);
+
+  it("503 then 404: a session that disappeared takes can't-resume, never a claimed switch", async () => {
+    getSession.mockResolvedValue({ session: makeSession({ transport: "webtransport" }) });
+    mintTransportToken
+      .mockRejectedValueOnce(new ApiError(503, "agent_not_connected", "retry shortly"))
+      .mockRejectedValueOnce(new ApiError(404, "not_found", "session not found"));
+    renderResumed();
+
+    await waitFor(() => expect(screen.getByTestId("path").textContent).toBe("/app"), { timeout: 5_000 });
+    expect(await screen.findByText(/no longer exists/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Could not reach the server/i)).not.toBeInTheDocument();
+    expect(mintSignalingToken).not.toHaveBeenCalled();
+    expect(transports).toHaveLength(0);
+    expect(fallbackTraces).toEqual([]);
+    expect(sessionStorage.getItem("quasar.wt-fallback.s1")).toBeNull();
+  }, 10_000);
+
+  it("unmounting during the retry says and records nothing", async () => {
+    vi.useFakeTimers();
+    getSession.mockResolvedValue({ session: makeSession({ transport: "webtransport" }) });
+    mintTransportToken.mockRejectedValue(new ApiError(503, "agent_not_connected", "retry shortly"));
+    const { unmount } = renderResumed();
+
+    await settle();
+    await settle();
+    expect(mintTransportToken).toHaveBeenCalled();
+    unmount();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(125_000);
+    });
+    expect(mintSignalingToken).not.toHaveBeenCalled();
+    expect(transports).toHaveLength(0);
+    expect(fallbackTraces).toEqual([]);
+  }, 20_000);
+
+  it("a 201 with no WebTransport coordinates is a synthetic 409: fallback, not a hang", async () => {
+    // #1490: a broken server (or a plan with no WebTransport) must answer like
+    // `transport_unavailable`, not leave the loader spinning on an empty object.
+    getSession.mockResolvedValue({ session: makeSession({ transport: "webtransport" }) });
+    mintTransportToken.mockResolvedValue({ transport_options: {} });
+    renderResumed();
+
+    await waitFor(() => expect(transports).toHaveLength(1));
+    expect(mintTransportToken).toHaveBeenCalledTimes(1);
+    expect(wtRuntimes).toHaveLength(0);
+    expect(mintSignalingToken).toHaveBeenCalledWith("t", "s1");
+    expect(fallbackTraces).toEqual(["stream_lost"]);
+  }, 10_000);
 
   it("a 404 takes the page's own can't-resume path, and claims no transport switch", async () => {
     getSession.mockResolvedValue({ session: makeSession({ transport: "webtransport" }) });

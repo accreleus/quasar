@@ -11,10 +11,17 @@ set -euo pipefail
 
 list=$1
 debs=$2
-archives=/var/cache/apt/archives
+# Overridable so the self-test can point at a fake apt config and archives dir and run with a
+# stubbed apt and no network. In CI these are unset and the real paths are used unchanged.
+aptconf=${CI_APT_CONF_DIR:-/etc/apt}
+archives=${CI_APT_ARCHIVES:-/var/cache/apt/archives}
 
-mkdir -p "$debs"
-sudo tee /etc/apt/apt.conf.d/80-ci-bounded >/dev/null <<'CONF'
+work="$(mktemp -d "${TMPDIR:-/tmp}/ci-apt-install.XXXXXX")"
+cleanup() { rm -rf "$work"; }
+trap cleanup EXIT
+
+mkdir -p "$debs" "$archives"
+sudo tee "$aptconf/apt.conf.d/80-ci-bounded" >/dev/null <<'CONF'
 Acquire::http::Timeout "20";
 Acquire::https::Timeout "20";
 Acquire::Retries "3";
@@ -46,17 +53,73 @@ offline_install() {
       { echo "ci-apt-install: the cached set lacks $p" >&2; return 1; }
   done
 }
-if ! sudo timeout 120 apt-get update; then
+# apt chooses the mirror from sources.list, so switching one means regenerating the sources with
+# the next host and refreshing its indices before downloading (the .deb URLs in the old indices
+# still name the stalled host). swap_sources rewrites only the mirror host on each deb/deb-src and
+# deb822 URIs line, preserving suite, components and format; it reads the active sources under
+# $aptconf so the self-test can point it at a fake one.
+swap_sources() { # swap_sources <target-mirror> -> writes regenerated sources to $work/src
+  local target="$1"
+  local host="${target#*://}" f
+  local -a files=()
+  [ -f "$aptconf/sources.list" ] && files+=("$aptconf/sources.list")
+  for f in "$aptconf"/sources.list.d/*.sources "$aptconf"/sources.list.d/*.list; do
+    [ -f "$f" ] && files+=("$f")
+  done
+  [ "${#files[@]}" -gt 0 ] || return 1
+  sed -E \
+    -e "s#(://)[a-z0-9.-]*archive\.ubuntu\.com#\1$host#g" \
+    -e "s#(://)security\.ubuntu\.com#\1$host#g" \
+    "${files[@]}" > "$work/src"
+}
+# apt_get <mirror> <timeout> <apt-args...>: run apt with the system sources, or with a regenerated
+# sources at <mirror> (an empty mirror means the runner's default). Global -o options go before the
+# subcommand, so apt parses them. Each -o takes its directive as the NEXT argument (-o key=value),
+# never glued to it ("-o key=value" as one arg is an unknown option apt ignores, so the override
+# would silently not apply): emit them as separate argv entries. Dir::Etc::sourceparts points apt
+# at an empty sources.list.d so the regenerated sourcelist is the only source; the sourceparts-
+# form is the read-only default and cannot be set, so it is not used.
+apt_get() { # apt_get <mirror> <timeout> <apt-args...>
+  local mirror="$1" timeout="$2"; shift 2
+  local -a opts=()
+  if [ -n "$mirror" ]; then
+    swap_sources "$mirror" || return 1
+    mkdir -p "$work/empty"
+    opts=(-o "Dir::Etc::sourcelist=$work/src" -o "Dir::Etc::sourceparts=$work/empty")
+  fi
+  sudo timeout "$timeout" apt-get "${opts[@]+"${opts[@]}"}" "$@"
+}
+if ! apt_get "" 120 update; then
   offline_install && exit 0
   echo "ci-apt-install: apt-get update did not finish and no cached .deb set installs" >&2
   exit 1
 fi
+# On a stall advance to the next mirror instead of retrying the same one (#1580): the runner's
+# regional mirror (e.g. us-east-2.ec2.archive.ubuntu.com) can hang on the large ROCm/HIP packages
+# while another archive host answers. The first attempt keeps the runner's default mirror; the
+# next two switch to archive.ubuntu.com then azure.archive.ubuntu.com.
+mirrors=( "" "https://archive.ubuntu.com" "https://azure.archive.ubuntu.com" )
 for attempt in 1 2 3; do
-  sudo timeout 180 apt-get install -y --no-install-recommends --download-only "${packages[@]}" && break
+  mirror="${mirrors[$((attempt - 1))]}"
+  download_ok=1
+  if [ -n "$mirror" ]; then
+    # Switched mirror: its .deb URLs live in its own indices, so refresh those before downloading
+    # (the download URL is taken from the index, not the sources.list host).
+    if ! apt_get "$mirror" 120 update; then
+      download_ok=0
+    fi
+  fi
+  if [ "$download_ok" -eq 1 ] && ! apt_get "$mirror" 180 install -y --no-install-recommends --download-only "${packages[@]}"; then
+    download_ok=0
+  fi
+  [ "$download_ok" -eq 1 ] && break
   [ "$attempt" -lt 3 ] || { echo "ci-apt-install: download still stalled after $attempt attempts" >&2; exit 1; }
-  echo "ci-apt-install: attempt $attempt did not finish in 3 minutes, resuming"
+  echo "ci-apt-install: attempt $attempt stalled, switching mirror; resuming"
 done
-sudo timeout 300 apt-get install -y --no-install-recommends "${packages[@]}"
+# The successful download left this mirror's indices in apt's lists directory (update drops the
+# lists not named by the active sources). Install against the SAME mirror, or the default sources
+# name the runner's host while its lists are gone and apt reports "Unable to locate package".
+apt_get "$mirror" 300 install -y --no-install-recommends "${packages[@]}"
 
 find "$archives" -maxdepth 1 -name '*.deb' -exec cp --update=none -t "$debs" {} +
 echo "debs to cache: $(find "$debs" -maxdepth 1 -name '*.deb' | wc -l)"
