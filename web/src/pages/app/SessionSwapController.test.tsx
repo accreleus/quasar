@@ -352,7 +352,11 @@ describe("SessionSwapController — onScreenChange", () => {
     await waitFor(() => expect(onScreenChange).toHaveBeenLastCalledWith(false), { timeout: 5000 });
   });
 
-  it("reports it down when the swap fails", async () => {
+  // A rejected swap lands in the terminal `error` phase, whose 3.5s screen is as
+  // opaque over the stream as the switching screen. Before the #768 fix `screenUp`
+  // was `switching||booting` only, so this asserted `false` — sound released behind
+  // an opaque screen. The corrected behaviour holds it until the screen clears.
+  it("holds the sound while the failure screen is up, releasing only when it auto-clears", async () => {
     swapSession.mockResolvedValue({ session: { id: "s1", app_id: "a1" } });
     getSession.mockResolvedValue(session("running", "swapping"));
     const onScreenChange = vi.fn();
@@ -361,6 +365,42 @@ describe("SessionSwapController — onScreenChange", () => {
     swapSession.mockRejectedValue(new Error("no"));
 
     fireEvent.click(screen.getByRole("button", { name: /Redout: Enhanced Edition/ }));
-    await waitFor(() => expect(onScreenChange).toHaveBeenLastCalledWith(false));
+    // The failure screen is opaque — sound stays HELD, not released the instant
+    // it appears.
+    await waitFor(() => expect(screen.getByText("Could not switch apps.")).toBeTruthy());
+    expect(onScreenChange).toHaveBeenLastCalledWith(true);
+    // Once the terminal screen auto-clears, sound releases.
+    await waitFor(() => expect(onScreenChange).toHaveBeenLastCalledWith(false), { timeout: 5000 });
+  });
+});
+
+describe("SessionSwapController — onScreenChange holds across a timeout", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("holds the sound while a timeout screen is up, releasing once it clears", async () => {
+    const onScreenChange = vi.fn();
+    // The server never progresses, so the client give-up fires at
+    // CLIENT_SWAP_TIMEOUT_MS (110s) rather than a commit.
+    getSession.mockResolvedValue(session("running", "swapping"));
+
+    renderController({ onScreenChange });
+    await waitFor(() => expect(screen.getByText("Redout: Enhanced Edition")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: /Redout: Enhanced Edition/ }));
+    // No commit: the timeout lands at the 110s give-up bound.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(110_000);
+    });
+    expect(onScreenChange).toHaveBeenLastCalledWith(true);
+    // The terminal screen auto-clears, and sound releases.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4_000);
+    });
+    expect(onScreenChange).toHaveBeenLastCalledWith(false);
   });
 });
