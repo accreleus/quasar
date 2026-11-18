@@ -64,4 +64,23 @@ grep -Eq "^base_ref=.*@$recorded$" <<<"$out" || fail "the base_ref line must car
 rc=0; out="$(run QUASAR_BASE_DIGEST="$recorded" FAKE_BASE=fail FAKE_PRESENT_REF="$image")" || rc=$?
 [ "$rc" -eq 0 ] || fail "a recorded digest must not need the live base ($rc): $out"
 grep -qx "image=$image" <<<"$out" || fail "recorded digest with an unreadable live base: $out"
+
+# #1092: the digest must be a whole sha256:<64 lowercase hex>; a shortened, prefixed or
+# upper-case one is an error, never a tag.
+short=sha256:0123456789abcdef
+upper=sha256:0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+for bad in "$short" "$upper" sha256: md5:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef; do
+  rc=0; out="$(run QUASAR_BASE_DIGEST="$bad")" || rc=$?
+  [ "$rc" -ne 0 ] || fail "a malformed digest must be an error, got: $bad ($out)"
+  grep -q '^image=' <<<"$out" && fail "a malformed digest still worked out a tag: $bad ($out)"
+done
+
+# #1092: a recheck whose `check` output went missing (empty base_ref) must FAIL, not fall
+# back to asking the live base: that would ask about a tag this run is not about to build.
+# The fake docker would answer a valid digest if the script asked it.
+rc=0; out="$(run QUASAR_BASE_DIGEST="" FAKE_BASE=ok)" || rc=$?
+[ "$rc" -ne 0 ] || fail "an empty recorded digest must be an error, not a live lookup: $out"
+grep -q '^image=' <<<"$out" && fail "an empty recorded digest still worked out a tag: $out"
+grep -q '::error::QUASAR_BASE_DIGEST is set but empty' <<<"$out" || fail "the empty-digest error was not named: $out"
+
 echo "PASS toolchain-missing: absent builds, present reuses, a registry failure is an error"
