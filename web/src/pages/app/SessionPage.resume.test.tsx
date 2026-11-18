@@ -477,28 +477,39 @@ describe("resuming a WebTransport session (#1415)", () => {
     expect(screen.queryByText(/carries on over WebRTC/i)).not.toBeInTheDocument();
   });
 
-  it("gives up on WebRTC only once the wall-clock budget is spent, not after a delay count", async () => {
-    // #1490: the budget must outlast the agent's grace window (90 s default), and each
-    // attempt can also wait the server's 5 s agent-ack timeout — so five delays are not
-    // ~15 s of loader. The deadline is the same 120 s the runtime's replacement mint uses.
+  it("gives up on WebRTC at a ~15 s wall-clock deadline, whatever each attempt also waited", async () => {
+    // #1490: each attempt can also wait the server's 5 s agent-ack timeout, so the five
+    // backoff delays alone ("about 15 s") kept the loader for ~45 s against a silent
+    // agent. The budget is a deadline that this wait spends like a delay does.
     vi.useFakeTimers();
     getSession.mockResolvedValue({ session: makeSession({ transport: "webtransport" }) });
-    mintTransportToken.mockRejectedValue(new ApiError(503, "agent_not_connected", "retry shortly"));
+    // Every attempt refuses after the server's own 5 s agent-ack wait.
+    mintTransportToken.mockImplementation(async () => {
+      await new Promise((r) => setTimeout(r, 5_000));
+      throw new ApiError(503, "agent_not_connected", "retry shortly");
+    });
     renderResumed();
 
-    // Still well inside the window at 95 s: nothing said, recorded or switched.
+    // A tick for the GET, then the first mint.
+    await settle();
+    await settle();
+    expect(mintTransportToken).toHaveBeenCalled();
+
+    // Still inside the deadline: nothing said, recorded or switched.
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(95_000);
+      await vi.advanceTimersByTimeAsync(14_000);
     });
     expect(mintSignalingToken).not.toHaveBeenCalled();
     expect(fallbackTraces).toEqual([]);
 
-    // Past the deadline the budget is spent: the page records the fallback and mints
-    // WebRTC's coordinates exactly as it does for a 409.
+    // By ~15 s of wall clock the budget is spent and the fallback happens — one
+    // in-flight attempt may land past the deadline by its own 5 s ack wait (~20 s
+    // worst case). The old code's five delays plus six 5 s acks was ~45 s, and the
+    // replacement mint's 120 s budget was longer still, so this fails on both.
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(30_000);
+      await vi.advanceTimersByTimeAsync(3_000);
     });
-    expect(mintTransportToken.mock.calls.length).toBeGreaterThan(6); // not five delays
+    expect(mintTransportToken.mock.calls.length).toBeLessThanOrEqual(4);
     expect(mintSignalingToken).toHaveBeenCalledWith("t", "s1");
     expect(transports).toHaveLength(1);
     expect(fallbackTraces).toEqual(["stream_lost"]);

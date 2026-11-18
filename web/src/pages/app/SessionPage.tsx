@@ -27,7 +27,6 @@ import {
 import {
   createSessionRuntime,
   IDLE_SNAPSHOT,
-  MINT_RETRY_BUDGET_MS,
   type SessionRuntime,
   type SessionRuntimeCallbacks,
   type SessionRuntimeSnapshot,
@@ -115,16 +114,18 @@ const RESUME_DEAD_STATES: ReadonlySet<string> = new Set(["stopping", "stopped"])
  * #1490: a resume's transport token may be refused with the contract's retryable
  * `503 agent_not_connected` (control-api.md §transport-token — the host agent is
  * reconnecting, or did not ack within 5 s), which is not "this session can no longer
- * use WebTransport". It is retried against a WALL-CLOCK deadline, not a count of
- * backoff delays: each attempt can also wait the server's own 5 s agent-ack timeout,
- * so five delays were ~45 s of loader in the worst case, not 15 s. The deadline is
- * the budget `sessionRuntime.ts`'s replacement mint already uses (#128), sized to
- * outlast the agent's grace window (90 s default) — the moment the host decides
- * whether the session survived.
+ * use WebTransport". It is retried against a WALL-CLOCK deadline of about 15 s, not a
+ * count of backoff delays: each attempt can also wait the server's own 5 s agent-ack
+ * timeout, so five delays ("about 15 s") were ~45 s of loader in the worst case. An
+ * attempt's own wait spends the deadline like a delay does, and each delay is clamped
+ * to the time left, so the fallback lands at about 15 s of wall clock (an in-flight
+ * attempt can carry past the deadline by its own server wait; ~20 s worst case, not
+ * ~45 s). Deliberately NOT the replacement mint's 120 s (#128): that budget outlasts
+ * the agent's 90 s grace window and made the resume's loader LONGER than before.
  */
-const TRANSPORT_MINT_BUDGET_MS = MINT_RETRY_BUDGET_MS;
-const TRANSPORT_MINT_RETRY_BASE_DELAY_MS = 500;
-const TRANSPORT_MINT_RETRY_MAX_DELAY_MS = 8_000;
+const TRANSPORT_RESUME_RETRY_BUDGET_MS = 15_000;
+const TRANSPORT_RESUME_RETRY_BASE_DELAY_MS = 500;
+const TRANSPORT_RESUME_RETRY_MAX_DELAY_MS = 8_000;
 
 interface SessionState {
   signalingUrl: string;
@@ -375,7 +376,7 @@ function SessionPageBody() {
             // #1490: the budget is a deadline, not a delay list — an attempt's own
             // server-side wait (the agent's 5 s ack) counts against it like a retry
             // delay does. `attempt` only drives the backoff's growth.
-            const deadline = Date.now() + TRANSPORT_MINT_BUDGET_MS;
+            const deadline = Date.now() + TRANSPORT_RESUME_RETRY_BUDGET_MS;
             for (let attempt = 0; ; attempt++) {
               try {
                 const { transport_options } = await mintTransportToken(authToken, sessionId);
@@ -395,7 +396,7 @@ function SessionPageBody() {
                 const remaining = deadline - Date.now();
                 if (remaining <= 0) return { refused: err, spent: true };
                 const waitMs = Math.min(
-                  Math.min(TRANSPORT_MINT_RETRY_BASE_DELAY_MS * 2 ** attempt, TRANSPORT_MINT_RETRY_MAX_DELAY_MS),
+                  Math.min(TRANSPORT_RESUME_RETRY_BASE_DELAY_MS * 2 ** attempt, TRANSPORT_RESUME_RETRY_MAX_DELAY_MS),
                   remaining,
                 );
                 await new Promise((r) => setTimeout(r, waitMs));
