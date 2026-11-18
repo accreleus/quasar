@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/accreleus/quasar/control-plane/internal/httpx"
 	"github.com/accreleus/quasar/control-plane/internal/migrate"
 	"github.com/accreleus/quasar/control-plane/migrations"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -287,6 +288,9 @@ func TestDeleteHostHTTP_RefusesOwnMachine(t *testing.T) {
 	rec := del(ids.hostID)
 	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), `"host_not_removable"`) {
 		t.Fatalf("own machine: got %d %s, want 409 host_not_removable", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), httpx.HostIsOwnMachineMessage) {
+		t.Fatalf("own machine: body %s, want the shared own-machine message", rec.Body)
 	}
 	var n int
 	_ = pool.QueryRow(context.Background(), `SELECT count(*) FROM hosts WHERE id::text=$1`, ids.hostID).Scan(&n)

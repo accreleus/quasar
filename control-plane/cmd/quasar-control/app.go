@@ -1627,7 +1627,8 @@ func applyMachineShape(cfg *config.Config) platform.MachineShape {
 // machine — the recipe writes both, so this is an older or a hand-edited
 // configuration — and nothing says which host it is, so no host can be told
 // apart from it. Refusing them all beats dropping the row of the control plane's
-// own machine, and the operator can fix the configuration and retry.
+// own machine, and the operator corrects it by re-creating the control plane
+// with a platform update from Fleet ▸ Releases, then retries.
 func ownMachineGuard(cfg *config.Config) func(nodeName string) bool {
 	shape := applyMachineShape(cfg)
 	if cfg.RecoveryControlSocket != "" && shape.Role == "" {
