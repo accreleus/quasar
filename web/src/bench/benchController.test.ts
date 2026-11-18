@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { BenchController, READBACKS_IN_FLIGHT, presentEpochMs } from "./benchController";
+import { BenchController, READBACK_SETTLE_MS, READBACKS_IN_FLIGHT, presentEpochMs } from "./benchController";
 import { syntheticFrame, type MarkerFields } from "./syntheticMarker";
 import type { MarkerImageData } from "./marker_decode.js";
 import type { BenchWindowPayload } from "./aggregate";
@@ -522,7 +522,7 @@ describe("BenchController.onTexture (a PyroWave frame, #1344)", () => {
     expect(windows[0]!).toMatchObject({ decoded: 1 });
   });
 
-  it("a device whose map never settles still closes its windows on time (#1454)", async () => {
+  it("a device whose map never settles counts the frame no_image and keeps the chain moving (#1454)", async () => {
     let now = BASE.host_time_ms + 50;
     const windows: BenchWindowPayload[] = [];
     const ctl = new BenchController({ sendInput: () => {}, emitWindow: (p) => windows.push(p), getClockOffsetMs: () => 0, nowEpochMs: () => now });
@@ -530,18 +530,29 @@ describe("BenchController.onTexture (a PyroWave frame, #1344)", () => {
     const gpu = textureDevice(s);
     const texture = { width: W, height: H } as GPUTexture;
     ctl.start();
-    ctl.onTexture(gpu.device, texture); // map never released
 
+    // Frame 1 submitted; its map never releases — a device whose maps never settle.
+    ctl.onTexture(gpu.device, texture);
+
+    // The tick must not hang on such a device: its bounded settle wait returns and
+    // closes the window on time.
     const t0 = performance.now();
-    const tickP = ctl.tickForTest(); // must not hang forever
-    await tickP;
-    const elapsed = performance.now() - t0;
-    ctl.stop();
+    await ctl.tickForTest();
+    expect(performance.now() - t0).toBeLessThan(1000);
 
-    // The tick waited for the readback only up to the bound, then closed.
-    expect(elapsed).toBeLessThan(1000);
-    expect(windows[0]!).toMatchObject({ n: 0, no_image: 0 });
-    expect(windows[0]!.t_start_ms).toBe(BASE.host_time_ms + 50);
+    // Its own bound fires: the stuck frame counts as no_image and its in-flight slot
+    // is released. The old code held the slot and the readTail link forever, so the
+    // frame vanished — never counted, not even as no_image (silence).
+    await new Promise((r) => setTimeout(r, READBACK_SETTLE_MS + 20));
+    expect(ctl.handle().stats()).toMatchObject({ no_image: 1, frames: 0 });
+
+    // A later frame whose map does resolve is still measured — the chain moved on.
+    now += 16;
+    s.image = scene(2);
+    ctl.onTexture(gpu.device, texture);
+    await gpu.release();
+    expect(ctl.handle().stats()).toMatchObject({ no_image: 1, frames: 1 });
+    ctl.stop();
   });
 
   it("a frame past the readbacks in flight, or one the device cannot read back, is no_image, never silence", async () => {
