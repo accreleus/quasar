@@ -201,6 +201,16 @@ else
   fail "validate-image:refs" "$(printf '%s' "$vi_out" | grep '^FAIL' | head -n 5)"
 fi
 
+printf '\n== ci-apt-install mirror fallback (#1580) ==\n'
+# Offline: a stubbed apt-get + a fake apt config prove the install script switches to a
+# different mirror on a stall instead of retrying the same one. It runs with no network and no
+# root (CI_APT_CONF_DIR / CI_APT_ARCHIVES point the script at temp dirs).
+if apt_out="$(bash "$ROOT/scripts/verify/test-ci-apt-install.sh" 2>&1)"; then
+  pass "ci-apt-install:mirror-fallback" "$(printf '%s\n' "$apt_out" | grep '^PASS' | sed 's/^PASS /  /' | tr '\n' ' ')"
+else
+  fail "ci-apt-install:mirror-fallback" "$(printf '%s' "$apt_out" | grep '^FAIL' | head -n 5)"
+fi
+
 printf '\n== guards ==\n'
 
 # Guard tests point resolution at the fixture, never the real operator config
