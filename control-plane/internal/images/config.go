@@ -95,7 +95,7 @@ func (r *RegistryResolver) InspectConfig(ctx context.Context, ref string) (Image
 
 	ctx, cancel := context.WithTimeout(ctx, inspectTimeout)
 	defer cancel()
-	token := r.anonymousToken(ctx, p)
+	token, tokenErr := r.anonymousToken(ctx, p)
 
 	reference := p.Tag
 	if p.Digest != "" {
@@ -103,6 +103,11 @@ func (r *RegistryResolver) InspectConfig(ctx context.Context, ref string) (Image
 	}
 	body, digest, err := r.getManifest(ctx, p, reference, &token)
 	if err != nil {
+		// A denied GET is the token request's own failure too when that was
+		// throttled or broken: report it, never as a denial.
+		if tokenErr != nil && errors.Is(err, ErrRegistryDenied) {
+			return ImageConfig{}, tokenErr
+		}
 		return ImageConfig{}, err
 	}
 	// Content addressing is the whole trust: each document must hash to the digest
@@ -176,12 +181,18 @@ func (r *RegistryResolver) allowedRef(ref string) (parsedRef, error) {
 }
 
 // anonymousToken is GHCR's anonymous pull token, "" elsewhere (a challenge then asks).
-func (r *RegistryResolver) anonymousToken(ctx context.Context, p parsedRef) string {
+// A denied token is nil (GHCR denies the token of a package that is not public),
+// but a throttled or failed one is kept: a GET that follows it and is denied too
+// must not read as "not published".
+func (r *RegistryResolver) anonymousToken(ctx context.Context, p parsedRef) (string, error) {
 	if p.apiHost() != "ghcr.io" {
-		return ""
+		return "", nil
 	}
-	token, _ := r.fetchToken(ctx, "https://ghcr.io/token", "ghcr.io", p.scope())
-	return token
+	token, err := r.fetchToken(ctx, "https://ghcr.io/token", "ghcr.io", p.scope())
+	if errors.Is(err, ErrRegistryDenied) {
+		return "", nil
+	}
+	return token, err
 }
 
 const ociImageManifest = "application/vnd.oci.image.manifest.v1+json"
@@ -200,7 +211,7 @@ func (r *RegistryResolver) FetchArtifact(ctx context.Context, ref string) ([]byt
 	}
 	ctx, cancel := context.WithTimeout(ctx, inspectTimeout)
 	defer cancel()
-	token := r.anonymousToken(ctx, p)
+	token, tokenErr := r.anonymousToken(ctx, p)
 
 	reference := p.Tag
 	if p.Digest != "" {
@@ -208,6 +219,11 @@ func (r *RegistryResolver) FetchArtifact(ctx context.Context, ref string) ([]byt
 	}
 	body, digest, err := r.getManifest(ctx, p, reference, &token)
 	if errors.Is(err, ErrRegistryDenied) {
+		// A throttled or broken token request is a registry failure to retry,
+		// not an unpublished package.
+		if tokenErr != nil {
+			return nil, tokenErr
+		}
 		// Anonymously GHCR cannot tell an unpublished package from a private one.
 		return nil, fmt.Errorf("%w: %s is not published, or the package is not public: %v", ErrRegistryNotFound, ref, err)
 	}
