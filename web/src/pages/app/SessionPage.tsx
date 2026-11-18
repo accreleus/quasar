@@ -27,6 +27,7 @@ import {
 import {
   createSessionRuntime,
   IDLE_SNAPSHOT,
+  MINT_RETRY_BUDGET_MS,
   type SessionRuntime,
   type SessionRuntimeCallbacks,
   type SessionRuntimeSnapshot,
@@ -111,13 +112,19 @@ const RECOVERY_BANNER_GRACE_MS = 500;
 const RESUME_DEAD_STATES: ReadonlySet<string> = new Set(["stopping", "stopped"]);
 
 /**
- * #1415/#1469: a resume's transport token may be refused with the contract's retryable
- * `503 agent_not_connected` (control-api.md §transport-token — the host agent is reconnecting, or
- * did not ack within 5 s), which is not "this session can no longer use WebTransport". Retried
- * with these delays, about 15 s in all — the control plane's agent handshake window — before
- * WebRTC becomes the floor.
+ * #1490: a resume's transport token may be refused with the contract's retryable
+ * `503 agent_not_connected` (control-api.md §transport-token — the host agent is
+ * reconnecting, or did not ack within 5 s), which is not "this session can no longer
+ * use WebTransport". It is retried against a WALL-CLOCK deadline, not a count of
+ * backoff delays: each attempt can also wait the server's own 5 s agent-ack timeout,
+ * so five delays were ~45 s of loader in the worst case, not 15 s. The deadline is
+ * the budget `sessionRuntime.ts`'s replacement mint already uses (#128), sized to
+ * outlast the agent's grace window (90 s default) — the moment the host decides
+ * whether the session survived.
  */
-const TRANSPORT_MINT_RETRY_DELAYS_MS: readonly number[] = [500, 1_000, 2_000, 4_000, 8_000];
+const TRANSPORT_MINT_BUDGET_MS = MINT_RETRY_BUDGET_MS;
+const TRANSPORT_MINT_RETRY_BASE_DELAY_MS = 500;
+const TRANSPORT_MINT_RETRY_MAX_DELAY_MS = 8_000;
 
 interface SessionState {
   signalingUrl: string;
@@ -365,6 +372,10 @@ function SessionPageBody() {
           const mintResumeTransport = async (): Promise<
             { coords: WebTransportCoords } | { refused: ApiError; spent: boolean }
           > => {
+            // #1490: the budget is a deadline, not a delay list — an attempt's own
+            // server-side wait (the agent's 5 s ack) counts against it like a retry
+            // delay does. `attempt` only drives the backoff's growth.
+            const deadline = Date.now() + TRANSPORT_MINT_BUDGET_MS;
             for (let attempt = 0; ; attempt++) {
               try {
                 const { transport_options } = await mintTransportToken(authToken, sessionId);
@@ -375,13 +386,18 @@ function SessionPageBody() {
                 return { refused: new ApiError(409, "transport_unavailable", "the server did not return WebTransport coordinates"), spent: false };
               } catch (err) {
                 const retryable = err instanceof ApiError && err.status === 503;
-                const waitMs = retryable ? TRANSPORT_MINT_RETRY_DELAYS_MS[attempt] : undefined;
-                if (waitMs === undefined) {
-                  // Every other API refusal is the caller's to judge; only a non-API failure
-                  // (the network) is thrown from here.
-                  if (err instanceof ApiError) return { refused: err, spent: retryable };
+                if (!retryable) {
+                  // Every other API refusal is the caller's to judge; only a non-API
+                  // failure (the network) is thrown from here.
+                  if (err instanceof ApiError) return { refused: err, spent: false };
                   throw err;
                 }
+                const remaining = deadline - Date.now();
+                if (remaining <= 0) return { refused: err, spent: true };
+                const waitMs = Math.min(
+                  Math.min(TRANSPORT_MINT_RETRY_BASE_DELAY_MS * 2 ** attempt, TRANSPORT_MINT_RETRY_MAX_DELAY_MS),
+                  remaining,
+                );
                 await new Promise((r) => setTimeout(r, waitMs));
                 if (cancelled()) throw err;
               }
@@ -395,15 +411,29 @@ function SessionPageBody() {
             setWtCoords(mint.coords);
             return; // no signaling mint: this session is WebTransport's
           }
-          // Only `409 transport_unavailable` — or a retryable 503 whose window is spent, the agent
-          // still away — means this session is not on WebTransport now. That is a fallback like
-          // any other, so the page's one fallback path records it (the `transport.fallback` trace
-          // and the reason a reload keeps) and mints WebRTC's coordinates. A 404, a
-          // `session_not_reconnectable` or a network failure was thrown above: the session cannot
-          // be resumed at all, so the page's own bounce says that and nothing claims a transport
-          // switch that did not happen.
+          // Only `409 transport_unavailable` — or a retryable 503 whose budget is spent, the
+          // agent still away — means this session is not on WebTransport now. That is a
+          // fallback like any other, so the page's one fallback path records it (the
+          // `transport.fallback` trace and the reason a reload keeps) and mints WebRTC's
+          // coordinates. A 404, a `session_not_reconnectable` or a network failure was thrown
+          // above: the session cannot be resumed at all, so the page's own bounce says that
+          // and nothing claims a transport switch that did not happen.
           const { refused, spent } = mint;
           if (!spent && !(refused.status === 409 && refused.code === "transport_unavailable")) throw refused;
+          // #1490: a spent budget can mean the session ended while the agent was away, and
+          // the last 503 does not say which. Re-read the session before claiming a switch,
+          // as the signaling-token path does for its refusal: "already ended" (or the
+          // revoke's own words) is the honest answer, and a fallback would promise a WebRTC
+          // connect that cannot happen.
+          if (spent) {
+            const again = await getSession(authToken, sessionId);
+            if (cancelled()) return;
+            if (bounceIfRevoked(again.session)) return;
+            if (RESUME_DEAD_STATES.has(again.session.state)) {
+              bounce("That session has already ended. Launch it again from your library.");
+              return;
+            }
+          }
           await fallBackToWebRtc("stream_lost", describeFallback(refused.code, refused));
           return;
         }

@@ -120,7 +120,9 @@ const ICE_UP: readonly string[] = ["connected", "completed"];
 // holding it. 120 s puts the last attempt at 111 s, past the host's decision
 // point. Once the grace HAS expired the host answers 409, which fails fast, so
 // the larger budget costs nothing in the genuinely-dead case.
-const MINT_RETRY_BUDGET_MS = 120_000;
+// Exported so the resume path's transport-token mint (#1490) spends the same
+// wall-clock budget this one is sized to: one agent grace window, not two.
+export const MINT_RETRY_BUDGET_MS = 120_000;
 const MINT_RETRY_BASE_DELAY_MS = 1_000;
 const MINT_RETRY_MAX_DELAY_MS = 16_000;
 
