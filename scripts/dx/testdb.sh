@@ -214,6 +214,10 @@ if ! docker network create --label "quasar.testdb.owner=$TESTDB_OWNER" "$PG_NET"
   dx_result "$TARGET"
 fi
 
+# The database is thrown away with the run, so crash safety buys nothing, and every
+# suite's setup `TRUNCATE ... CASCADE` rewrites ~80 relations: with fsync on that is ~300 ms
+# on an idle machine and past a suite's 10 s timeout when other gates share the disk (#1121).
+# CI's Postgres has the same three settings off (.github/workflows/ci.yml).
 # Pick a port and start the container, retrying with the next port on
 # failure (#466): dx_free_port's bind-check happens before `docker run`
 # publishes the port, so two concurrent invocations can both see a port as
@@ -235,7 +239,8 @@ while [ "$PG_START_ATTEMPTS" -lt "$PG_START_MAX" ]; do
        -e POSTGRES_USER="$PG_USER" \
        -e POSTGRES_DB="$PG_DB" \
        -p "127.0.0.1:${CANDIDATE_PORT}:5432" \
-       "$PG_IMAGE" >/dev/null 2>&1; then
+       "$PG_IMAGE" -c fsync=off -c synchronous_commit=off -c full_page_writes=off \
+       >/dev/null 2>&1; then
     PORT="$CANDIDATE_PORT"
     PG_STARTED=1
     break

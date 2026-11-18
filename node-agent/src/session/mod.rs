@@ -943,7 +943,6 @@ fn gst_registry_path() -> String {
 pub fn prepare_gst_env() {
     std::env::set_var("GST_REGISTRY", gst_registry_path());
     apply_intel_vulkan_video_knob();
-    pipeline::pin_vulkan_encode_ring();
 }
 
 /// Initialise GStreamer. Must run before any other GStreamer API, and after

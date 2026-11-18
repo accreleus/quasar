@@ -662,6 +662,17 @@ fn the_webtransport_port_and_per_source_cap_are_agent_variables_a_reconfigure_se
 }
 
 #[test]
+fn the_vulkan_encode_ring_is_an_agent_variable_a_reconfigure_sets() {
+    let m = Machine::install(combined_env());
+    assert!(env(&m.agent(), "QUASAR_VULKAN_RING").is_empty());
+    let actor = m.actor();
+    let (_, result) = run(&actor, changes(&[("QUASAR_VULKAN_RING", "4")]));
+    assert_eq!(result.state, State::Succeeded, "{}", result.output);
+    assert_eq!(env(&m.agent(), "QUASAR_VULKAN_RING"), "4");
+    m.never_a_migration("agent variables");
+}
+
+#[test]
 fn a_setting_the_install_owns_or_a_misspelt_one_is_not_an_agent_variable() {
     let m = Machine::install(combined_env());
     let actor = m.actor();
