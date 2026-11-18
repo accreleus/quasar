@@ -370,6 +370,10 @@ pub struct SessionMetrics {
     /// The ABR loop that writes this session's encoder (`abr_glue::AbrLoop::id`), 0 for
     /// none: one writer per encoder, the transport that started last.
     abr_owner: AtomicU64,
+    /// Serialises an ABR owner check with the encoder write it authorises, and a
+    /// takeover's `abr_glue::reset_to_launch` / `take_over` launch-point write, so an
+    /// observe that passed its early check can never write after the reset (#1489).
+    abr_write: Mutex<()>,
     /// The session's teardown ran ([`SessionMetrics::end_hooks`]). Sticky, unlike the
     /// owner: that is zeroed by a transport replacement and a rebuild too, which are not
     /// ends and may be followed by a new loop's registration.
@@ -503,6 +507,7 @@ impl SessionMetrics {
             on_drain: Mutex::new(None),
             on_window: Mutex::new(None),
             abr_owner: AtomicU64::new(0),
+            abr_write: Mutex::new(()),
             hooks_ended: AtomicBool::new(false),
             last: Mutex::new(DrainSnapshot {
                 at: now,
@@ -914,6 +919,18 @@ impl SessionMetrics {
 
     pub fn abr_owner(&self) -> u64 {
         self.abr_owner.load(Ordering::Acquire)
+    }
+
+    /// Held across an ABR owner check and the encoder write it authorises. A takeover
+    /// takes it after clearing the owner and around its launch-point write, so the two
+    /// cannot interleave: whoever holds it, writes alone (#1489).
+    pub fn lock_abr_write(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.abr_write.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The last raw estimate published, `0.0` before the first observation.
+    pub fn gcc_estimate_kbps(&self) -> f64 {
+        f64::from_bits(self.gcc_estimate_kbps_bits.load(Ordering::Relaxed))
     }
 
     /// AS-03: register the per-drain hook (see the `on_drain` field doc). Last

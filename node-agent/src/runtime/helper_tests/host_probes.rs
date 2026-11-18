@@ -231,12 +231,15 @@ fn audio_probe_identity_and_a_ready_socket_pass_then_removes() {
         crate::session::audio::pulse_socket_dir(&runtime_dir.to_string_lossy(), "probe-ready");
     let socket_thread = bind_socket_once_ready(socket_dir);
 
-    let end = audio_probe::run(
+    let end = audio_probe::run_with_readiness(
         &client,
         IMAGE,
         &runtime_dir.to_string_lossy(),
         "ready",
         &never(),
+        // Injection keeps this identity/cleanup test independent of the devices: the
+        // bare-socket-is-not-ready case is `audio_probe_a_bare_socket_without_devices...`.
+        crate::session::audio::wait_for_socket,
     );
     let _listener = socket_thread.join().unwrap();
 
@@ -263,6 +266,35 @@ fn audio_probe_socket_timeout_is_still_stopped_and_removed() {
         "timeout",
         &never(),
     );
+    assert_eq!(end.observed, Observed::SocketTimeout);
+    assert!(end.reconciled);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 1);
+    assert_eq!(engine.requests("DELETE /containers/"), 1);
+}
+
+/// #479: a connectable socket alone is not readiness. With PipeWire the socket is bound
+/// before `pulse.cmd` creates the three devices, and a stream naming one blocks in
+/// `prepare` until WirePlumber links it. The real readiness must fail into the timeout
+/// verdict here; reverting the device check turns this into a SocketReady pass.
+#[test]
+fn audio_probe_a_bare_socket_without_devices_is_a_timeout() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let client = engine.client();
+    let runtime_dir = probe_runtime_dir(&engine);
+    let socket_dir =
+        crate::session::audio::pulse_socket_dir(&runtime_dir.to_string_lossy(), "no-devices");
+    let socket_thread = bind_socket_once_ready(socket_dir);
+
+    let end = audio_probe::run(
+        &client,
+        IMAGE,
+        &runtime_dir.to_string_lossy(),
+        "no-devices",
+        &never(),
+    );
+    let _listener = socket_thread.join().unwrap();
+
     assert_eq!(end.observed, Observed::SocketTimeout);
     assert!(end.reconciled);
     assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 1);
