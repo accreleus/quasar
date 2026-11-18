@@ -333,9 +333,14 @@ pub(super) fn attach(
         gst::PadProbeReturn::Ok
     });
 
-    // The queue's first push blocks until the audio PeerConnection is negotiated, so it
-    // fills and leaks at every session start. Count drops only once a second packet has
-    // left it, which means the first push returned.
+    // #1441: `webrtc_transport::build_audio` gates this same pad and drops every buffer
+    // until the audio PeerConnection connects, so the queue no longer parks its first push
+    // and leaks at every session start (the demo single-webrtcbin path in `pipeline.rs`
+    // links audio with no gate). Count drops only once a second packet has left the queue.
+    // This probe runs BEFORE that gate, so the gate's drops count as sent — and it has to
+    // stay in front of it: once a pad probe returns Drop, GStreamer calls no later probe on
+    // that pad, so a `sent` count taken below the gate would never reach 2 while it is
+    // closed.
     let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
     if let Some(queue_src) = send_queue.static_pad("src") {
         let sent = sent.clone();

@@ -38,10 +38,13 @@ pub(super) fn add_audio_chain(
         .property("caps", &audio_rtp_caps)
         .build()
         .context("capsfilter not found")?;
-    // Hands packets to `webrtcbin` on its own thread, so a stall on the send side (the
-    // wait for the peer's answer at every session start, or any later block) can never
-    // stop the capture thread and overrun the capture ring buffer (#351). Leaky, and
-    // bounded in time, so a stall costs the oldest packets rather than growing latency.
+    // Hands packets to `webrtcbin` on its own thread, so a block on the send side can
+    // never stop the capture thread and overrun the capture ring buffer (#351). Leaky,
+    // and bounded in time, so a block costs the oldest packets rather than growing
+    // latency. Since #1441 the wait for the peer's answer at session start is not such a
+    // block on the split audio path: `webrtc_transport::build_audio` gates this queue's
+    // src pad and drops every packet until the audio PeerConnection is connected, so the
+    // queue drains while it waits.
     let audio_send_queue = gst::ElementFactory::make("queue")
         .name("audio_send_queue")
         .property_from_str("leaky", "downstream")

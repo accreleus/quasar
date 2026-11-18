@@ -2171,9 +2171,12 @@ async fn connect_and_run(
         );
     }
     // Kept until the dial succeeds; a reused prep keeps its own age, so reuse cannot
-    // stretch the TTL.
+    // stretch the TTL. #1558: a freshly prepared one is stamped when it FINISHES, not
+    // when it starts — a preparation slower than REGISTER_PREP_TTL would otherwise be
+    // born stale and never reused by the next attempt.
+    let prep_finished = Instant::now();
     sessions.register_prep = Some(RegisterPrep {
-        at: reused.as_ref().map_or(prep_started, |p| p.at),
+        at: reused.as_ref().map_or(prep_finished, |p| p.at),
         install: install.clone(),
         actor_dark,
     });
@@ -8871,6 +8874,63 @@ mod tests {
         assert!(
             !register.contains(r#""install_mode":"owned""#),
             "{register}"
+        );
+    }
+
+    /// #1558: the preparation's timestamp is taken when it FINISHES. A preparation
+    /// slower than REGISTER_PREP_TTL (here, a dark recovery actor costing it the whole
+    /// register budget) must not arrive already stale: the next attempt can still reuse
+    /// it. The assertion fails if the stamp is taken at the preparation's start.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_register_prep_is_stamped_when_it_finishes() {
+        let _facts = crate::buildinfo::INSTALL_FACTS_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        let socket = dir.path().join("dark.sock");
+        // A paused actor accepts the connection and never answers: discovery gives up
+        // at ACTOR_REGISTER_BUDGET, which is a slow preparation.
+        let _dark = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let health = HealthState::new();
+        let image_mgr = test_image_mgr();
+        let release_mgr = crate::release::ReleaseManager::owned(socket.clone());
+        let mut sessions = HostSessions::new(
+            LiveRefs::default(),
+            health.clone(),
+            String::new(),
+            image_mgr.clone(),
+            release_mgr.clone(),
+        );
+        let dead_url = {
+            let gone = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("ws://{}", gone.local_addr().unwrap())
+        };
+        let cfg = Config {
+            control_plane_url: dead_url.clone(),
+            ..test_cfg(secret.to_str().unwrap(), Some("enrollment-token"))
+        };
+        let started = Instant::now();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(60),
+            connect_and_run(
+                &cfg,
+                &health,
+                "",
+                "test",
+                &image_mgr,
+                &release_mgr,
+                &mut sessions,
+                false,
+            ),
+        )
+        .await;
+        let prep = sessions
+            .register_prep
+            .as_ref()
+            .expect("a failed dial keeps the preparation");
+        let age = prep.at.duration_since(started);
+        assert!(
+            age > crate::buildinfo::ACTOR_REGISTER_BUDGET / 2,
+            "the preparation's timestamp was taken before it ran: {age:?}"
         );
     }
 
