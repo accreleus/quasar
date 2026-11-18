@@ -1460,6 +1460,11 @@ function SessionPageBody() {
         onCommitted={(appId, appName) => setCurrentApp({ id: appId, name: appName })}
         onToast={pushToast}
         onSwapStart={() => {
+          // Hold the old game's sound THE INSTANT the swap starts — before the
+          // switching screen is up — so it cannot leak through the one-render gap
+          // between the click and the sound-hold effect (SessionPage ~1010). The
+          // effect still releases it when the screen clears; holdAudio is idempotent.
+          runtimeRef.current?.holdAudio();
           hudRef.current?.close();
           // #647: the tile click is a gesture; spend it like Play does.
           if (immersive && enterLaunchFullscreen()) autoArmedRef.current = "reveal";
