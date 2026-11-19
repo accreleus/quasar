@@ -691,6 +691,10 @@ func TestSwapBackIntoASharingDesktopReleasesItsNewSteamHold(t *testing.T) {
 			}
 			f.disp.waitFor(t, "swap")
 			f.waitSteamHold(t, "") // released on the dispatch goroutine
+			// The goroutine writes the rejected detail after the hold release: wait for that last write.
+			for deadline := time.Now().Add(5 * time.Second); readRow(t, f.pool, sess).Detail != swapDetailRejected && time.Now().Before(deadline); {
+				time.Sleep(20 * time.Millisecond)
+			}
 		}},
 		{"target spec failure", func(t *testing.T, f *warmFixture, sess, desktop string) {
 			must(t, exec(t, f.pool, `UPDATE apps SET home_container_path='home' WHERE id=$1::uuid`, desktop))
