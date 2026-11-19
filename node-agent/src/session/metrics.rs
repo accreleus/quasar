@@ -964,6 +964,15 @@ impl SessionMetrics {
         self.drop_hooks(false);
     }
 
+    /// Drop ONLY the `on_window` hook, leaving the owner and the drain hook alone: a
+    /// takeover has already claimed the encoder, and the previous loop's window hook can
+    /// otherwise step a rung between the launch-point write in `abr_glue::take_over` and
+    /// the new loop's `set_on_window` (#1582). [`Self::clear_hooks`] cannot be used there:
+    /// it also zeroes the owner the claiming loop still needs.
+    pub fn drop_window_hook(&self) {
+        self.on_window.lock().unwrap().take();
+    }
+
     /// The session is ending: drop the hooks and refuse every later registration. The
     /// runner's teardown guard calls this instead of [`Self::clear_hooks`], because the
     /// owner alone cannot say "ended": a transport replacement and a rebuild zero it too,
