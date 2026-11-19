@@ -129,6 +129,9 @@ func TestDisplayStateCache(t *testing.T) {
 	if st, _ := d.get("s1"); st.Owner != "pinned" {
 		t.Fatalf("optimistic set to a non-launch size did not pin: got %q", st.Owner)
 	}
+	if st, _ := d.get("s1"); !st.SizeKnown {
+		t.Fatal("a stream 202 did not mark the external size known")
+	}
 
 	// An old agent's sample (nothing display-aware in it) must not clobber the
 	// optimistic value.
@@ -165,6 +168,9 @@ func TestDisplayStateCache(t *testing.T) {
 	}
 	if st, _ := d.get("s1"); st.HasSize {
 		t.Fatal("HasSize still set after an absent pair")
+	}
+	if st, _ := d.get("s1"); !st.SizeKnown {
+		t.Fatal("a display-aware sample with an absent pair left the external size UNKNOWN")
 	}
 	if st, _ := d.get("s1"); st.Owner != "" {
 		t.Fatalf("owner not cleared at launch size: got %q", st.Owner)
@@ -244,6 +250,43 @@ func TestDisplayStateRenderSize(t *testing.T) {
 	d.forget("s1")
 	if _, ok := d.get("s1"); ok {
 		t.Fatal("forget left the render state behind")
+	}
+}
+
+// TestDisplayStateRenderOnlyPatchSizeUnknown (#1587): a render-only PATCH makes
+// the RENDER size known but says nothing about the external size. The state must
+// record that distinction (SizeKnown false while HasSize false), or the Session
+// resource reports the launch size as the external size — a value no ack or
+// sample ever reported. A display-aware sample then makes it known at launch.
+func TestDisplayStateRenderOnlyPatchSizeUnknown(t *testing.T) {
+	d := newDisplayState()
+
+	d.setRender("s1", i32(1280), i32(720), nil)
+	if st, ok := d.get("s1"); !ok || st.SizeKnown || st.HasSize {
+		t.Fatalf("a render-only ack claimed an external size: %+v ok=%v", st, ok)
+	}
+	stream := toSessionRespExt(Session{Width: 1920, Height: 1080}, func() externalState {
+		s, _ := d.get("s1")
+		return s
+	}(), true).Stream
+	if stream.ExternalWidth != nil || stream.ExternalHeight != nil {
+		t.Fatalf("render-only state serialized an external size: %+v want external_* absent (unknown)", stream)
+	}
+	if stream.RenderWidth == nil || *stream.RenderWidth != 1280 ||
+		stream.RenderHeight == nil || *stream.RenderHeight != 720 {
+		t.Fatalf("render size not served: %+v", stream)
+	}
+
+	// The first display-aware sample reports the external size (absent pair =
+	// launch size): now the pair is PRESENT at the launch size.
+	d.observe("s1", nil, nil, bp(true), "", nil, nil, nil, 1920, 1080)
+	stream = toSessionRespExt(Session{Width: 1920, Height: 1080}, func() externalState {
+		s, _ := d.get("s1")
+		return s
+	}(), true).Stream
+	if stream.ExternalWidth == nil || *stream.ExternalWidth != 1920 ||
+		stream.ExternalHeight == nil || *stream.ExternalHeight != 1080 {
+		t.Fatalf("a sample reporting the launch size was not served: %+v", stream)
 	}
 }
 
@@ -700,6 +743,77 @@ func TestSessionRespRenderSizeAndScale(t *testing.T) {
 	}
 	if st.ExternalWidth == nil || *st.ExternalWidth != 1920 || st.ExternalHeight == nil || *st.ExternalHeight != 1080 {
 		t.Fatalf("render change moved the encoded size: %+v", st)
+	}
+}
+
+// TestSessionRespRenderOnlyPatchFirstOmitsExternalSize (#1587): a render-only
+// display PATCH sent BEFORE the first metrics sample makes only the render size
+// known. The 202 body and the next GET must omit external_width/height — the
+// external size is UNKNOWN, not "the launch size" — and a display-aware sample
+// then makes it known (at launch) so the pair appears. Before the fix the PATCH
+// created a cache entry whose HasSize=false made the resource report the launch
+// size as the external size.
+func TestSessionRespRenderOnlyPatchFirstOmitsExternalSize(t *testing.T) {
+	pool := testDB(t)
+	srv, authSvc, store, _, coord := newStreamDisplayServer(t, pool, true)
+	ctx := context.Background()
+
+	_ = seed(t, pool, 4)
+	owner, err := authSvc.Register(ctx, "renderfirst@test.local", "renderfirst", "unrelated-pw-08")
+	if err != nil {
+		t.Fatalf("register owner: %v", err)
+	}
+	tok := loginTok(t, authSvc, "renderfirst@test.local", "unrelated-pw-08")
+	sid := session1080ForUser(t, store, currentSeed(t, pool), owner.ID)
+	host := hostOf(t, store, sid)
+
+	get := func() streamResp {
+		resp := doJSON(t, http.MethodGet, srv.URL+"/v1/sessions/"+sid, tok, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET session: %d", resp.StatusCode)
+		}
+		return decodeSessionResp(t, resp).Stream
+	}
+
+	// Nothing has reported the external size yet.
+	if st := get(); st.ExternalWidth != nil || st.ExternalHeight != nil {
+		t.Fatalf("external_* present before any readback: %+v", st)
+	}
+
+	// The real order: a render-only PATCH lands first, with NO metrics sample.
+	resp := doJSON(t, http.MethodPatch, srv.URL+"/v1/sessions/"+sid+"/display", tok,
+		map[string]any{"render_width": 1280, "render_height": 720})
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("PATCH display: got %d want 202 (code=%s)", resp.StatusCode, errCode(t, resp))
+	}
+	acked := decodeSessionResp(t, resp).Stream
+	if acked.RenderWidth == nil || *acked.RenderWidth != 1280 ||
+		acked.RenderHeight == nil || *acked.RenderHeight != 720 {
+		t.Fatalf("render size not served by the 202: %+v", acked)
+	}
+	if acked.ExternalWidth != nil || acked.ExternalHeight != nil {
+		t.Fatalf("render-only 202 claimed an external size: %+v want external_* absent (unknown)", acked)
+	}
+
+	st := get()
+	if st.ExternalWidth != nil || st.ExternalHeight != nil {
+		t.Fatalf("render-only PATCH invented an external size: %+v want external_* absent (unknown)", st)
+	}
+	if st.RenderWidth == nil || *st.RenderWidth != 1280 ||
+		st.RenderHeight == nil || *st.RenderHeight != 720 {
+		t.Fatalf("render size not served by the GET: %+v", st)
+	}
+
+	// The first display-aware sample reports the external size — the absent pair
+	// reads as the launch size, and NOW the pair is present.
+	coord.AgentMetrics(ctx, host, agentws.SessionMetricsMsg{
+		Type: "session_metrics", SessionID: sid, TsUnixMs: time.Now().UnixMilli(),
+		ExternalResizeSupported: bp(true),
+	})
+	st = get()
+	if st.ExternalWidth == nil || *st.ExternalWidth != 1920 ||
+		st.ExternalHeight == nil || *st.ExternalHeight != 1080 {
+		t.Fatalf("sample did not make the launch-size external known: %+v", st)
 	}
 }
 
