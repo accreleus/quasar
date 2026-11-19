@@ -4157,23 +4157,24 @@ async fn raw_connections(
 
 #[tokio::test]
 async fn peers_that_never_send_connect_hold_a_slot_until_the_deadline_and_never_pass_the_cap() {
+    // A cap of 4, not 64: every peer completes a QUIC handshake and a loaded runner can
+    // spread 200 (or even 64) of them past HELLO_DEADLINE, freeing a slot for the next and
+    // making the count meaningless. A burst this small fits inside one deadline. The
+    // documented 64 is pinned by `the_unauthenticated_cap_is_the_documented_64`.
+    const CAP: usize = 4;
     let agent = agent_with(Limits {
+        unauthenticated: CAP,
         per_source: 0,
-        ..Limits::default()
     })
     .await;
     let endpoint = raw_endpoint();
     let started = Instant::now();
-    let held = raw_connections(&agent, &endpoint, 200).await;
+    let held = raw_connections(&agent, &endpoint, CAP * 2).await;
     assert!(
         started.elapsed() < HELLO_DEADLINE,
         "the burst must fit inside one deadline for the count to mean anything"
     );
-    assert_eq!(
-        held.len(),
-        MAX_UNAUTHENTICATED,
-        "exactly the cap got through"
-    );
+    assert_eq!(held.len(), CAP, "exactly the cap got through");
     assert!(
         ClientBuilder::new()
             .with_server_certificate_hashes(vec![agent.hash.clone()])
