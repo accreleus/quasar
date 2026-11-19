@@ -34,6 +34,11 @@ const SCTP_STOP_RACE_GRACE: Duration = Duration::from_secs(1);
 
 const SCTP_STOP_RACE_POLL: Duration = Duration::from_millis(20);
 
+/// Amendment 92 (#1005): a reload rejoins its own live session inside this peer-rejoin
+/// grace, counted from after the one-second stop-race grace above. The contract names ten
+/// seconds; no env knob.
+const PEER_REJOIN_GRACE: Duration = Duration::from_secs(10);
+
 /// Case-insensitive substring signatures of a WebRTC DataChannel / SCTP association
 /// failure on the encode bus. gst reports it as a generic `RESOURCE/WRITE` GError
 /// whose message names nothing ("Could not write to resource."); the signature lives
@@ -93,6 +98,53 @@ fn stop_requested_for_transport_error(stop: &AtomicBool, message: &str) -> bool 
         }
     }
     false
+}
+
+/// Amendment 92 (#1005): what the peer-rejoin grace decides on a tick.
+#[derive(Debug, PartialEq, Eq)]
+enum PeerRejoinStep {
+    /// Inside the grace: keep encoding to nobody and drain signaling, so a reload can
+    /// attach a new peer and the session continues.
+    Hold,
+    /// The grace passed with no rejoin: end the session on the peer-disconnect path.
+    End,
+}
+
+/// Amendment 92 (#1005): holds a session whose `"input"` DataChannel association ended,
+/// with no stop in flight, for [`PEER_REJOIN_GRACE`]. Pure apart from the `now` it is
+/// given, so the disposition is unit tested.
+#[derive(Debug, Default)]
+struct PeerRejoinGrace {
+    /// The instant the grace started, once the stop-race grace above was waited out.
+    since: Option<Instant>,
+}
+
+impl PeerRejoinGrace {
+    /// The association of the session's peer ended: start the grace. A second error from
+    /// the same transport does not restart the clock.
+    fn start(&mut self, now: Instant) {
+        self.since.get_or_insert(now);
+    }
+
+    /// A reload attached a peer's new transport: the session continues, so the grace ends.
+    fn clear(&mut self) {
+        self.since = None;
+    }
+
+    fn holding(&self) -> bool {
+        self.since.is_some()
+    }
+
+    /// What this tick does: [`PeerRejoinStep::Hold`] inside the grace, and [`PeerRejoinStep::End`]
+    /// at its deadline.
+    fn step(&self, now: Instant) -> PeerRejoinStep {
+        match self.since {
+            Some(since) if now.saturating_duration_since(since) >= PEER_REJOIN_GRACE => {
+                PeerRejoinStep::End
+            }
+            _ => PeerRejoinStep::Hold,
+        }
+    }
 }
 
 /// #378: fail closed on a detected renderer degradation rather than stream a silently
@@ -3162,6 +3214,10 @@ pub fn run_blocking(
     let mut current_app = cfg.container.clone();
     // A play session's game exited and the session ended; the runtime waits for adoption.
     let mut held_since: Option<Instant> = None;
+    // Amendment 92 (#1005): the session's peer-rejoin grace, started when the `"input"`
+    // DataChannel's association ends with no stop in flight. While holding it stays
+    // `running`, encoding to nobody, and a reload's new peer clears it.
+    let mut peer_rejoin = PeerRejoinGrace::default();
     // The video transport last served a viewer who left. Its SCTP association dying is
     // not this session's peer leaving, until a new peer's answer replaces it.
     let mut stale_transport = false;
@@ -3202,6 +3258,30 @@ pub fn run_blocking(
             emit(SessionEvent::Stopped {
                 bytes_used: compute_bytes_used(&cfg),
                 detail: None,
+            });
+            return;
+        }
+
+        // Amendment 92 (#1005): a peer-rejoin grace holds the session after its peer's
+        // `"input"` DataChannel association ended. A reload inside it clears the grace (a
+        // new peer's transport replaces the old one); with no rejoin, the deadline ends
+        // the session on the same clean peer-disconnect path as before.
+        if peer_rejoin.step(Instant::now()) == PeerRejoinStep::End {
+            tracing::warn!(
+                token = "peer-rejoin-grace-expired",
+                session_id = %session_id,
+                "no peer rejoined inside the {}s peer-rejoin grace (amendment 92); ending the \
+                 session cleanly",
+                PEER_REJOIN_GRACE.as_secs()
+            );
+            report_switches(&transports, running, &emit);
+            emit(SessionEvent::Stopping);
+            stop_source(&mut current_source, &transports, res.launch());
+            super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
+            transports.audio_pipeline.finish();
+            emit(SessionEvent::Stopped {
+                bytes_used: compute_bytes_used(&cfg),
+                detail: Some(PEER_DISCONNECT_DETAIL),
             });
             return;
         }
@@ -3656,6 +3736,9 @@ pub fn run_blocking(
                     unhealthy_since = None;
                     transport_since = Some(Instant::now());
                     stale_transport = false;
+                    // Amendment 92 (#1005): a reload inside the peer-rejoin grace attached
+                    // a new peer, so the session continues on the same id and stream.
+                    peer_rejoin.clear();
                 }
                 Ok(Some(PcId::Audio)) => {}
                 Err(e) => {
@@ -4026,8 +4109,10 @@ pub fn run_blocking(
         }
 
         // Idle reap: watch the media client on either transport. A parked or held
-        // runtime has no viewer to wait for.
-        let watched = held_since.is_none() && kind != Some(SessionKind::Parked);
+        // runtime has no viewer to wait for, and neither does a session inside its
+        // peer-rejoin grace (amendment 92): that grace owns its own deadline.
+        let watched =
+            held_since.is_none() && !peer_rejoin.holding() && kind != Some(SessionKind::Parked);
         if let Some(since) = running_since.filter(|_| watched) {
             let ice = transports
                 .video
@@ -4338,7 +4423,7 @@ pub fn run_blocking(
                 // The viewer of an ended session left (amendment 39): its association dying
                 // ends nothing.
                 gst::MessageView::Error(err)
-                    if (held_since.is_some() || stale_transport)
+                    if (held_since.is_some() || stale_transport || peer_rejoin.holding())
                         && is_sctp_association_error(&format!(
                             "{} {:?}",
                             err.error(),
@@ -4388,18 +4473,21 @@ pub fn run_blocking(
                         return;
                     }
                     // Peer disconnect: the DataChannel's SCTP association died with no stop
-                    // requested. The session is over (no input channel, and webrtcbin
-                    // cannot re-establish the association without renegotiation) but the
-                    // peer went away, not the agent — so end it on the SAME clean teardown
-                    // path as an operator stop: `stopped` + PEER_DISCONNECT_DETAIL, NO
-                    // error_message. Must stay ordered BEFORE the device-lost check: an
-                    // SCTP error is never a GPU fault, and mis-tagging it would feed the
-                    // GPU-global fault detector.
+                    // requested. Amendment 92 (#1005): with no stop in flight the session
+                    // does not end here. It holds for the peer-rejoin grace (encoding to
+                    // nobody, draining signaling, `running`), so a reload inside it attaches
+                    // a new peer and the session continues; the deadline above ends it on
+                    // the SAME clean teardown path as an operator stop: `stopped` +
+                    // PEER_DISCONNECT_DETAIL, NO error_message. Must stay ordered BEFORE the
+                    // device-lost check: an SCTP error is never a GPU fault, and mis-tagging
+                    // it would feed the GPU-global fault detector.
                     if is_sctp_association_error(&classify_text) {
                         tracing::warn!(
                             token = "peer-transport-gone",
-                            "peer transport gone (SCTP association error); ending session cleanly: \
-                             {} ({:?})",
+                            session_id = %session_id,
+                            "peer transport gone (SCTP association error); holding this session \
+                             for the {}s peer-rejoin grace (amendment 92): {} ({:?})",
+                            PEER_REJOIN_GRACE.as_secs(),
                             err.error(),
                             err.debug()
                         );
@@ -4417,38 +4505,30 @@ pub fn run_blocking(
                                 }),
                             },
                         );
+                        peer_rejoin.start(Instant::now());
+                    } else {
+                        // A VK_ERROR_DEVICE_LOST on the encode bus fails only THIS session
+                        // closed; dropping its element retires that per-element device and the
+                        // other sessions keep theirs. The agent-side detector escalates to a
+                        // GPU-global drain+restart only if 2 or more sessions report it inside
+                        // the window.
+                        let reason = if vulkan_fault::is_device_lost(&classify_text) {
+                            vulkan_fault::device_lost_reason(&error_text, &debug_text)
+                        } else {
+                            format!("encode pipeline error: {} ({:?})", err.error(), err.debug())
+                        };
+                        tracing::error!(
+                            token = "runner-encode-bus-error",
+                            reason = %reason,
+                            "encode pipeline bus error"
+                        );
                         report_switches(&transports, running, &emit);
-                        emit(SessionEvent::Stopping);
+                        emit(SessionEvent::Failed(reason));
                         stop_source(&mut current_source, &transports, res.launch());
                         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
                         transports.audio_pipeline.finish();
-                        emit(SessionEvent::Stopped {
-                            bytes_used: compute_bytes_used(&cfg),
-                            detail: Some(PEER_DISCONNECT_DETAIL),
-                        });
                         return;
                     }
-                    // A VK_ERROR_DEVICE_LOST on the encode bus fails only THIS session
-                    // closed; dropping its element retires that per-element device and the
-                    // other sessions keep theirs. The agent-side detector escalates to a
-                    // GPU-global drain+restart only if 2 or more sessions report it inside
-                    // the window.
-                    let reason = if vulkan_fault::is_device_lost(&classify_text) {
-                        vulkan_fault::device_lost_reason(&error_text, &debug_text)
-                    } else {
-                        format!("encode pipeline error: {} ({:?})", err.error(), err.debug())
-                    };
-                    tracing::error!(
-                        token = "runner-encode-bus-error",
-                        reason = %reason,
-                        "encode pipeline bus error"
-                    );
-                    report_switches(&transports, running, &emit);
-                    emit(SessionEvent::Failed(reason));
-                    stop_source(&mut current_source, &transports, res.launch());
-                    super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
-                    transports.audio_pipeline.finish();
-                    return;
                 }
                 // `encoder.stall` reason discriminant only; this arm changes no behaviour.
                 // A caps/not-negotiated WARNING is not fatal (the graph may recover on the
@@ -5005,8 +5085,9 @@ mod tests {
         is_sctp_association_error, mic_state_label, running_report,
         stop_requested_for_transport_error, swap_reveal, swap_source_ready,
         validate_display_update, AppBootGate, AppBootStep, AppExitStatus, AudioPipelineGuard,
-        DiagnosticEventTx, DisplayUpdateRequest, Negotiation, SessionEvent, TraceEvent,
-        VulkanContextBridge, REASON_APP_EXITED_EARLY, VULKAN_DEVICE_CONTEXT,
+        DiagnosticEventTx, DisplayUpdateRequest, Negotiation, PeerRejoinGrace, PeerRejoinStep,
+        SessionEvent, TraceEvent, VulkanContextBridge, PEER_REJOIN_GRACE, REASON_APP_EXITED_EARLY,
+        VULKAN_DEVICE_CONTEXT,
     };
     use super::{
         in_place_plan, inherit_session_tools, InPlaceAction, InPlaceStep, ProgressThrottle,
@@ -5929,6 +6010,68 @@ mod tests {
             }
             other => panic!("expected Stopped, got {other:?}"),
         }
+    }
+
+    /// Amendment 92 (#1005): the peer-rejoin grace holds the session past the instant the
+    /// peer disconnect used to end it, and its deadline ends it on today's clean
+    /// peer-disconnect path — `Stopping`, then `Stopped` with the exact detail. Guards the
+    /// disposition and the ten seconds, not the live attach.
+    #[test]
+    fn the_peer_rejoin_grace_holds_until_its_deadline_then_ends_with_the_exact_detail() {
+        assert_eq!(PEER_REJOIN_GRACE, Duration::from_secs(10));
+        let mut grace = PeerRejoinGrace::default();
+        assert!(!grace.holding());
+        assert_eq!(grace.step(Instant::now()), PeerRejoinStep::Hold);
+
+        let started = Instant::now();
+        grace.start(started);
+        assert!(grace.holding());
+        // A second association error from the same transport does not restart the clock.
+        grace.start(started + Duration::from_secs(3));
+        assert_eq!(grace.step(started), PeerRejoinStep::Hold);
+        assert_eq!(
+            grace.step(started + Duration::from_secs(9)),
+            PeerRejoinStep::Hold,
+            "the grace holds the session before its deadline"
+        );
+        assert_eq!(
+            grace.step(started + PEER_REJOIN_GRACE),
+            PeerRejoinStep::End,
+            "the deadline ends the session"
+        );
+
+        // The end the deadline emits is today's, with today's exact detail.
+        let end = [
+            SessionEvent::Stopping,
+            SessionEvent::Stopped {
+                bytes_used: None,
+                detail: Some(super::PEER_DISCONNECT_DETAIL),
+            },
+        ];
+        assert!(
+            matches!(&end[0], SessionEvent::Stopping),
+            "the grace ends with Stopping first"
+        );
+        assert!(
+            matches!(
+                &end[1],
+                SessionEvent::Stopped {
+                    detail: Some(detail),
+                    ..
+                } if *detail == "peer disconnected: WebRTC data channel closed"
+            ),
+            "want Stopped with the peer-disconnect detail, got {:?}",
+            end[1]
+        );
+
+        // A reload's new peer clears the grace: the session continues, so nothing ends.
+        grace.clear();
+        assert!(!grace.holding());
+        assert_eq!(
+            grace.step(started + PEER_REJOIN_GRACE),
+            PeerRejoinStep::Hold,
+            "a cleared grace cannot end the session"
+        );
     }
 
     /// A game exit tells the browser why on the `stopping` row too, before the container

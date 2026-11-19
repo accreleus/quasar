@@ -858,6 +858,17 @@ fn threads() -> usize {
     std::fs::read_dir("/proc/self/task").map_or(0, |d| d.count())
 }
 
+/// `pc.close()` in a browser: an SCTP ABORT, then the peer connections go — what a page does
+/// on a reload (amendment 92: `runner::PeerRejoinGrace` holds the session for the rejoin).
+fn close_as_a_browser(session: &mut Session, peer: &mut Peer) {
+    let sent = peer.video.abort_sctp();
+    let left = session.pump(peer, Duration::from_secs(2), |_, _| {
+        sent.load(Ordering::SeqCst)
+    });
+    assert!(left, "the ABORT never left the peer");
+    peer.stop();
+}
+
 /// The issue: a second page opens a session a first page is streaming.
 #[test]
 fn a_takeover_mid_stream_moves_the_stream_to_the_new_peer() {
@@ -3186,6 +3197,119 @@ fn a_session_nobody_answered_stops() {
     assert!(
         matches!(ended, Some(SessionEvent::Stopped { .. })),
         "the session did not stop: {ended:?}"
+    );
+}
+
+/// Amendment 92 (#1005): a reload inside the peer-rejoin grace rejoins its own live session.
+/// The page's peer connections close, the reloaded page recreates them and sends `restart_ice`
+/// for each, and the same session continues with media and input on the new peer's transports.
+#[test]
+fn a_reload_inside_the_peer_rejoin_grace_rejoins_the_same_session() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut session = Session::start("rejoin-attach", Duration::from_secs(600));
+    let mut a = Peer::new();
+    assert!(
+        session.pump(&mut a, Duration::from_secs(20), |_, p| streaming(p)),
+        "the first peer never streamed: {}",
+        describe(&a)
+    );
+    // The page reloads: its peer connections close, so the host sees the `"input"`
+    // DataChannel's association end.
+    close_as_a_browser(&mut session, &mut a);
+    // The reloaded page mints a token for the same session, opens a new socket and recreates
+    // its peer connections, sending one `restart_ice` for each inside the grace.
+    let mut b = Peer::new();
+    for pc in [PcId::Video, PcId::Audio] {
+        let _ = session.to_host.send(SignalMsg::RestartIce { pc: Some(pc) });
+    }
+    let up = session.pump(&mut b, Duration::from_secs(20), |_, p| streaming(p));
+    assert!(
+        up,
+        "the reloaded peer never received media: {} (offers {:?})",
+        describe(&b),
+        session.offers
+    );
+    assert!(
+        session.ended.is_none(),
+        "the session ended instead of rejoining: {:?}",
+        session.ended
+    );
+    // The same session: input reaches the host on the rejoined transport...
+    let pongs = b.video.pongs.load(Ordering::Relaxed);
+    b.video.ping();
+    assert!(
+        session.pump(&mut b, Duration::from_secs(2), |_, p| {
+            p.video.pongs.load(Ordering::Relaxed) > pongs
+        }),
+        "input never reached the host on the rejoined transport"
+    );
+    // ...and media resumes.
+    let before = rtp(&b.video);
+    session.pump(&mut b, Duration::from_millis(400), |_, _| false);
+    assert!(
+        rtp(&b.video) > before + 10,
+        "media stopped after the rejoin: video rtp {before} -> {}",
+        rtp(&b.video)
+    );
+
+    session.stop.store(true, Ordering::SeqCst);
+    let ended = session.pump(&mut b, Duration::from_secs(20), |s, _| s.ended.is_some());
+    assert!(ended, "the rejoined session never stopped");
+    assert!(
+        matches!(session.ended, Some(SessionEvent::Stopped { .. })),
+        "the rejoined session did not stop cleanly: {:?}",
+        session.ended
+    );
+    session.thread.take().unwrap().join().unwrap();
+}
+
+/// Amendment 92 (#1005): a reload that never comes holds the session for the peer-rejoin
+/// grace (ten seconds after the one-second stop-race grace) and only then ends it on today's
+/// clean peer-disconnect path, with the exact detail.
+#[test]
+fn a_reload_that_never_comes_ends_the_session_after_the_peer_rejoin_grace() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut session = Session::start("rejoin-expire", Duration::from_secs(600));
+    let mut a = Peer::new();
+    assert!(
+        session.pump(&mut a, Duration::from_secs(20), |_, p| streaming(p)),
+        "the first peer never streamed: {}",
+        describe(&a)
+    );
+    close_as_a_browser(&mut session, &mut a);
+    // Nobody rejoins. Today's end used to arrive about a second after the association died;
+    // amendment 92 holds the session for ten more seconds first.
+    let mut nobody = Peer::new();
+    assert!(
+        !session.pump(&mut nobody, Duration::from_secs(3), |s, _| s
+            .ended
+            .is_some()),
+        "the session ended without the peer-rejoin grace: {:?}",
+        session.ended
+    );
+    let ended = session.ends_within(Duration::from_secs(20));
+    assert!(ended.is_some(), "the session never ended after the grace");
+    assert!(
+        session
+            .log
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Stopping)),
+        "the grace ends with Stopping first"
+    );
+    assert!(
+        matches!(
+            session.ended,
+            Some(SessionEvent::Stopped { detail: Some(d), .. })
+                if d == "peer disconnected: WebRTC data channel closed"
+        ),
+        "want stopped with the peer-disconnect detail: {:?}",
+        session.ended
     );
 }
 
