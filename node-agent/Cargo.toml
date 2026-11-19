@@ -153,6 +153,9 @@ tokio = { version = "1", features = ["test-util"] }
 rcgen = "0.14"
 # The WebTransport conformance client's URL (`webtransport::tests`).
 url = "2"
+# The CPU-path hand-off test registers a `BaseTransform` stand-in for `vulkandownload`
+# (that element needs a Vulkan device, which the test image has not).
+gstreamer-base = "0.25"
 
 [[bench]]
 name = "encode_metrics"

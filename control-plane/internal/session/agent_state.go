@@ -243,13 +243,15 @@ func (c *Coordinator) AgentMetrics(ctx context.Context, hostID string, m agentws
 		c.log.Warn("insert agent metric failed", "session_id", m.SessionID, "err", err)
 		return
 	}
-	// Stream health from the ABR setpoint against the current rung's floor. Own
+	// Stream health from the ABR setpoint against the current rung's floor, or from the
+	// governor's unclamped link rate when the sample carries one (amendment 79). Own
 	// goroutine, failures logged not propagated: it must add no latency to the
 	// metrics hot path.
-	if hs.State == StateRunning && m.AbrSetpointKbps != nil {
-		setpoint := *m.AbrSetpointKbps
-		sid := m.SessionID
-		go c.health.evaluateHealth(context.Background(), sid, setpoint, m.AbrFloorKbps)
+	if hs.State == StateRunning {
+		if sig, ok := streamHealthRate(m); ok {
+			sid := m.SessionID
+			go c.health.evaluateHealth(context.Background(), sid, sig, m.AbrFloorKbps)
+		}
 	}
 
 	// Home usage, when the pre-terminal sample carries bytes_used. Best-effort

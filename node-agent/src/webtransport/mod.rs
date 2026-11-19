@@ -132,6 +132,23 @@ pub(crate) struct Rate {
     /// silence decay: what the report showed the link carrying when the link held the
     /// sender back (`congestion::Estimator::measured`), `None` when it did not.
     pub(crate) measured: Box<dyn Fn(Option<f64>) + Send + Sync>,
+    /// Amendment 85: FEC telemetry — whether this connection's `hello_ack.fec` named a
+    /// scheme, and per protected frame the video and repair datagram payload bytes sent.
+    /// FEC exists only where this estimate writes the encoder, so it is reported here.
+    pub(crate) fec: Box<dyn Fn(FecEvent) + Send + Sync>,
+}
+
+/// What the FEC telemetry sink is told (`Rate::fec`).
+pub(crate) enum FecEvent {
+    /// Client `client` is now the session's attached connection, and its `hello_ack.fec`
+    /// named a scheme (`true`) or did not (`false`). Replaces whatever the last one said.
+    Attached { client: u64, fec: bool },
+    /// Client `client`'s connection ended. A no-op unless it is still the attached one: a
+    /// displaced connection's teardown must not clear its successor's telemetry.
+    Detached { client: u64 },
+    /// Video datagram payload bytes sent (a frame, or a retransmit) and the repair datagram
+    /// payload bytes that followed them (0 for a frame or retransmit with none).
+    Sent { video: u64, repair: u64 },
 }
 
 /// One client's congestion control: its feedback and the agent's silence clock into an
@@ -1211,6 +1228,14 @@ fn stalled() -> (Option<Value>, u32, &'static str) {
     )
 }
 
+/// The payload bytes of video datagrams: what amendment 85's FEC share is measured against.
+fn video_payload(datagrams: &[bytes::Bytes]) -> u64 {
+    datagrams
+        .iter()
+        .map(|d| d.len().saturating_sub(media::HEADER) as u64)
+        .sum()
+}
+
 /// Send `nack` answers; false when the connection is gone. A resend the path's maximum
 /// datagram size has shrunk below is dropped and counted: the client gives that frame up.
 fn resend(
@@ -1557,6 +1582,13 @@ async fn stream(
     let mut nack_budget = retransmit::NackBudget::new(std::time::Instant::now());
     let (mut nacks_capped, mut resends_too_large) = (0u64, 0u64);
     let mut warned_oversized = false;
+    // Amendment 85: whether this connection is sent repairs, so the session's windows carry
+    // the FEC keys (0 repair) exactly while it is. The publish refuses a client the session
+    // no longer has, under the lock that replaces it: a displaced connection's attach lands
+    // after the successor's, whether it arrived before the successor's takeover (#1554) or
+    // between that check and its publish (#1569), so it must not overwrite the successor's
+    // telemetry.
+    media.fec_attach(client.id, fec);
     let mut control = media
         .rate()
         .map(|rate| Control::new(rate, client.gone.clone(), fec, governor.clone()));
@@ -1693,6 +1725,18 @@ async fn stream(
                     // loss shows in the bench.
                     if let Some(control) = control.as_mut() {
                         let repairs = control.protect(unit.pyrowave, &datagrams, &mut pkt_seq);
+                        // Every video frame while a scheme is on, one that got no repair too
+                        // (a small frame banks its budget; a PyroWave frame gets none): the
+                        // share is repair over ALL the video sent (amendment 85).
+                        if let Some(rate) = media.rate().filter(|_| fec) {
+                            // Payload, not datagram bytes: the header is per-datagram overhead
+                            // on both sides and would dilute the ratio differently.
+                            let repair: u64 = repairs
+                                .iter()
+                                .map(|d| d.len().saturating_sub(fec::HEADER) as u64)
+                                .sum();
+                            (rate.fec)(FecEvent::Sent { video: video_payload(&datagrams), repair });
+                        }
                         datagrams.extend(repairs);
                     }
                     // shortcut: a PyroWave frame (~380 datagrams at 1080p/200) goes as one burst;
@@ -1762,6 +1806,13 @@ async fn stream(
                                 if let Some((frame_seq, answer)) = answer {
                                     let log = control.as_mut().map(|c| &mut c.log);
                                     handed += answer.resend.len() as u64;
+                                    // A retransmit is video sent in the window too (amendment 85).
+                                    if let Some(rate) = media.rate().filter(|_| fec) {
+                                        (rate.fec)(FecEvent::Sent {
+                                            video: video_payload(&answer.resend),
+                                            repair: 0,
+                                        });
+                                    }
                                     if !resend(session, answer.resend, log, &mut resends_too_large) {
                                         break QUIET;
                                     }
@@ -1821,6 +1872,11 @@ async fn stream(
     };
     reader.abort();
     media.detach(client.id);
+    // Amendment 85: this connection is over, so the session's windows stop claiming FEC until
+    // another client negotiates it (a WebRTC peer's windows never carry the keys).
+    if let Some(rate) = media.rate() {
+        (rate.fec)(FecEvent::Detached { client: client.id });
+    }
     let quic = quinn::Connection::stats(session);
     tracing::info!(
         token = "webtransport-client-quic-stats",

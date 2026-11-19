@@ -34,8 +34,8 @@
 #
 # All three codecs run on the Vulkan encoder by default (2026-08-22):
 # QUASAR_VULKAN_H264 / _HEVC / _AV1 are ON unless an operator sets one to 0. While
-# HEVC is enabled the agent auto-pins WOLF_VULKAN_RING=2 (5090 ring-slot tiling
-# defect at RING=4). h265 is still admin-opt-in per profile, so a default
+# HEVC is enabled the agent sets the compositor's ring-depth=2 (the 5090's 1-in-4
+# black HEVC frame at depth 4); WOLF_VULKAN_RING overrides that depth. h265 is still admin-opt-in per profile, so a default
 # deployment streams h264 regardless.
 #
 # NVENC is NOT gone — it is the per-session fallback and the explicit opt-out:

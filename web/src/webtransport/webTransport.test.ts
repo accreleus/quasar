@@ -218,6 +218,28 @@ describe("WebTransportMedia connect", () => {
     expect(agent.last.closes.every((c) => c?.closeCode !== 4400)).toBe(true);
   });
 
+  it.each<[number, string]>([
+    [4404, "session_ended"],
+    [4410, "taken_over"],
+  ])(
+    "reports the session's own close (%i) racing a hello_ack on a dead reader instead of internal (#1478)",
+    async (code, expected) => {
+      const agent = new FakeAgent();
+      agent.hold = "answer";
+      const t = transport(agent);
+      const up = t.connect(NO_SINK);
+      await vi.waitFor(() => expect(agent.reached).toBe("answer"));
+      agent.last.failDatagrams(NETWORK_ERROR());
+      await flush();
+      agent.last.control(helloAck(0, avcC()));
+      // The session's own close resolves in the same instant as the hello_ack on the dead reader.
+      agent.last.closeWith(code);
+      await expect(up).rejects.toMatchObject({ code: expected });
+      expect(agent.last.closes.every((c) => c?.closeCode !== 4400)).toBe(true);
+      t.close();
+    },
+  );
+
   it("names the datagram reader in its 4400 when the session stays up without it", async () => {
     const agent = new FakeAgent();
     agent.hold = "answer";
@@ -416,6 +438,41 @@ describe("WebTransportMedia loss recovery", () => {
     // Nothing more arrives: a still picture. The repeat and the lateness come off the timer.
     await vi.waitFor(() => expect(agent.sent("nack")).toHaveLength(2));
     await vi.waitFor(() => expect(agent.sent("keyframe_request")).toEqual([{ type: "keyframe_request", reason: "late" }]));
+    t.close();
+  });
+
+  it("reports the fragments FEC rebuilt, cumulatively, to the sink (amendment 85)", async () => {
+    const agent = new FakeAgent();
+    agent.replies = [[{ ...helloAck(0, avcC()), fec: "xor" }]];
+    const t = transport(agent);
+    const reported: number[] = [];
+    await t.connect({ ...NO_SINK, repaired: (n) => void reported.push(n) });
+    const pkt = { n: 0 };
+    // Five fragments; the last never arrives (no later datagram shows a gap to NACK) and the
+    // frame's repair rebuilds it.
+    const five = packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(5000, 0) }, pkt);
+    const f = five.map((d) => parseVideoDatagram(d)!);
+    agent.last.datagrams(five.filter((_, i) => i !== 4));
+    agent.last.datagrams([repairOf(f, 0, 5)]);
+    await vi.waitFor(() => expect(reported).toEqual([1]));
+    t.close();
+  });
+
+  it("reports a fragment a held repair rebuilds when the video fragment that completes it arrives (amendment 85)", async () => {
+    const agent = new FakeAgent();
+    agent.replies = [[{ ...helloAck(0, avcC()), fec: "xor" }]];
+    const t = transport(agent);
+    const reported: number[] = [];
+    await t.connect({ ...NO_SINK, repaired: (n) => void reported.push(n) });
+    const pkt = { n: 0 };
+    const five = packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(5000, 0) }, pkt);
+    const f = five.map((d) => parseVideoDatagram(d)!);
+    // The last two are missing, so the repair is held; the next video fragment rebuilds the other.
+    agent.last.datagrams([five[0], five[1], five[2]]);
+    agent.last.datagrams([repairOf(f, 0, 5)]);
+    expect(reported).toEqual([]);
+    agent.last.datagrams([five[3]]);
+    await vi.waitFor(() => expect(reported).toEqual([1]));
     t.close();
   });
 
@@ -732,8 +789,14 @@ describe("createWebTransportRuntime", () => {
     ];
     const pkt = { n: 0 };
     // Fragments of a frame arrive reversed: datagrams are unordered.
-    for (const u of units) agent.last.datagrams(packetize(u, pkt).reverse());
-    await vi.waitFor(() => expect(presented).toHaveLength(3), { timeout: 8_000 });
+    // Feed and present each frame before the next: the display cushion holds a frame behind a
+    // timer, so two frames due under one late timer make the playout show the newer and drop
+    // the older (#1531) — which a loaded machine makes likely. Waiting for each presentation
+    // leaves at most one frame behind that timer.
+    for (let i = 0; i < units.length; i++) {
+      agent.last.datagrams(packetize(units[i], pkt).reverse());
+      await vi.waitFor(() => expect(presented).toHaveLength(i + 1), { timeout: 8_000 });
+    }
 
     expect(decoders[0].configs[0]).toMatchObject({ codec: "avc1.42e01f", codedWidth: 1920, codedHeight: 1080 });
     expect(decoders[0].chunks.map((c) => c.type)).toEqual(["key", "delta", "delta"]);

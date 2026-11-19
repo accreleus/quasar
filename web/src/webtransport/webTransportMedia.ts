@@ -137,6 +137,7 @@ export function videoConfigFrom(ack: Record<string, unknown>): VideoConfig {
         }
       : undefined,
     ...(typeof ack.codec_switch_reason === "string" ? { switchReason: ack.codec_switch_reason } : {}),
+    fec: typeof ack.fec === "string" ? ack.fec : null,
   };
 }
 
@@ -349,9 +350,17 @@ export class WebTransportMedia implements MediaTransport {
     } catch {
       return refused("connect_failed");
     }
-    // Read here or below; a failed connect must not leave it unhandled.
+    // Read here or below; a failed connect must not leave it unhandled. `settled.close` keeps the
+    // close a connection that already ended gave, so the accept check can read it without waiting
+    // out {@link CLOSE_CODE_WAIT_MS} for a session whose close raced the `hello_ack` (#1478). The
+    // holder object, not a `let`, because TypeScript narrows a `let` assigned in a callback to its
+    // initializer's `null`.
+    const settled: { close: WebTransportCloseInfo | null } = { close: null };
     const closeInfo = wt.closed.then(
-      (info) => info,
+      (info) => {
+        settled.close = info;
+        return info;
+      },
       () => null,
     );
     const abandon = (answer: Answer, sent?: WebTransportCloseInfo): Answer => {
@@ -476,7 +485,16 @@ export class WebTransportMedia implements MediaTransport {
 
     if (this.closed) return abandon(refused("closed"));
     // Accepted, but no video can arrive on this connection: never call it connected (#1403).
-    if (datagramReader.death) return abandon(refused("internal", datagramReader.death), { closeCode: 4400, reason: datagramReader.death.slice(0, 100) });
+    if (datagramReader.death) {
+      // The session's own close outranks the reader's death even here: a takeover (4410) or a
+      // session end (4404) that resolved in the same instant as the `hello_ack` is that
+      // refusal, not `internal` (#1478).
+      const code = settled.close?.closeCode ?? null;
+      if (code !== null && code !== 0 && CLOSE_REFUSALS[code]) {
+        return abandon(refused(CLOSE_REFUSALS[code], closeDetail(code, settled.close?.reason)));
+      }
+      return abandon(refused("internal", datagramReader.death), { closeCode: 4400, reason: datagramReader.death.slice(0, 100) });
+    }
     this.abortAttempt = null;
     this.wt = wt;
     this.writer = writer;
@@ -611,6 +629,12 @@ export class WebTransportMedia implements MediaTransport {
     /** What the PyroWave receivers already replaced counted lost. */
     let pyroLost = 0;
     let reported = 0;
+    /** Amendment 85: the fragments FEC has rebuilt so far, as last reported. */
+    let reportedRepaired = 0;
+    const reportRepaired = () => {
+      const n = assembler.repaired;
+      if (n !== reportedRepaired) sink.repaired?.((reportedRepaired = n));
+    };
     // PyroWave loss is never NACKed, so it is reported as its frames close.
     const reportLost = () => {
       const n = this.lostSoFar();
@@ -669,6 +693,8 @@ export class WebTransportMedia implements MediaTransport {
         return;
       }
       this.recovered(assembler.push(f), sink);
+      // A held repair a video fragment completes is rebuilt here, not on a repair datagram.
+      reportRepaired();
     };
     const config = (c: VideoConfig) => {
       configs.delete(c.configId);
@@ -683,7 +709,10 @@ export class WebTransportMedia implements MediaTransport {
     const miss = (frameSeq: number, frags: [number, number][]) => this.recovered(assembler.miss(frameSeq, frags), sink);
     const tick = () => this.recovered(assembler.tick(), sink);
     // PyroWave frames never reach the assembler, so a repair for one finds no frame and is dropped.
-    const repair = (r: FecRepair) => this.recovered(assembler.repair(r), sink);
+    const repair = (r: FecRepair) => {
+      this.recovered(assembler.repair(r), sink);
+      reportRepaired();
+    };
     this.lostSoFar = () => assembler.lost + pyroLost + (pyro?.lost ?? 0);
     return { datagram, repair, config, miss, tick, stop };
   }

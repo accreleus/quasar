@@ -75,10 +75,13 @@ func (s *Store) GuardPlacementForSwap(ctx context.Context, sessionID string, app
 // compat block and the agent carries the running container's launch-time table
 // (compat_tools::carry), so what decides whether the tool applies is sessions.compat_tool_names,
 // never the host's report now (the same question claimToolMissing asks of a parked Steam). A
-// mapping written after the session started is in no table that session carries, even when its
-// tool is mounted for another game (#1427), so the swap is refused and the game is launched on its
-// own instead. A running session with NULL names mounts nothing. Runs in the guard
-// transaction after its placement and home checks and before any claim, hold or write.
+// mapping committed after the launch is in no table that session carries, even when its tool is
+// mounted for another game (#1427), so the swap is refused and the game is launched on its own
+// instead. The comparison is commit order (mapping revision against the revision the launch read),
+// never updated_at, which is now() at the mapping transaction's START and can predate the session
+// when that transaction waits on mappingCapLock (#1555). A running session with NULL names mounts
+// nothing, and one with no recorded revision carries no mapping. Runs in the guard transaction
+// after its placement and home checks and before any claim, hold or write.
 // semantics: control-api.md §Compatibility tools, "Placement".
 func compatToolNotMounted(ctx context.Context, q rowQuerier, sessionID string, app LaunchApp) error {
 	if !app.IsDerived() || app.ExternalSource != "steam" {
@@ -89,7 +92,7 @@ func compatToolNotMounted(ctx context.Context, q rowQuerier, sessionID string, a
 	err := q.QueryRow(ctx, `
 		SELECT t.tag, t.enabled AND NOT t.name_conflict AND NOT t.pin_conflict,
 		       COALESCE(t.steam_name = ANY(k.compat_tool_names), false),
-		       m.updated_at <= k.created_at
+		       COALESCE(m.revision <= k.compat_mapping_revision, false)
 		FROM sessions k, compat_tool_mappings m JOIN compat_tools t ON t.id = m.tool_id
 		WHERE k.id = $1::uuid AND m.provider = 'steam' AND m.external_id = $2 AND t.family = 'ge'`,
 		sessionID, app.ExternalID).Scan(&tag, &usable, &mounted, &carried)
