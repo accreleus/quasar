@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BenchController, READBACK_SETTLE_MS, READBACKS_IN_FLIGHT, presentEpochMs } from "./benchController";
 import { syntheticFrame, type MarkerFields } from "./syntheticMarker";
 import type { MarkerImageData } from "./marker_decode.js";
@@ -596,5 +596,132 @@ describe("BenchController.onTexture (a PyroWave frame, #1344)", () => {
     expect(gpu.scopeDepth()).toBe(0);
     ctl.stop();
     warn.mockRestore();
+  });
+});
+
+/** A device whose readback maps resolve one at a time, in submission order. A frame whose map is
+ *  never released stays in flight ("a GPU that has not finished yet"), so a stuck frame is one we
+ *  simply never call release on. */
+function orderedReadbackDevice() {
+  const resolvers: (() => void)[] = [];
+  const device = {
+    pushErrorScope: () => {},
+    popErrorScope: () => Promise.resolve(null),
+    createBuffer: ({ size }: { size: number }) => {
+      const mem = new Uint8Array(size);
+      return {
+        size, mem,
+        mapAsync: () => new Promise<void>((r) => resolvers.push(r)),
+        getMappedRange: (o: number, n: number) => mem.buffer.slice(o, o + n),
+        unmap: () => {}, destroy: () => {},
+      };
+    },
+    createCommandEncoder: () => ({ copyTextureToBuffer: () => {}, finish: () => ({}) }),
+    queue: { submit: () => {} },
+  } as unknown as GPUDevice;
+  /** Settle the oldest in-flight map (one readback completes). */
+  const releaseOne = () => { resolvers.shift()?.(); };
+  return { device: device as unknown as GPUDevice, releaseOne };
+}
+
+describe("BenchController — settle deadline (#1575)", () => {
+  const W = 1280;
+  const H = 720;
+  const scene = (frame_index: number) =>
+    syntheticFrame({ ...BASE, frame_index, render_w: W, render_h: H }, { width: W, height: H, ox: 8, oy: 8, cell: 16 });
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(BASE.host_time_ms);
+    vi.stubGlobal("GPUBufferUsage", { MAP_READ: 1, COPY_DST: 8 });
+    vi.stubGlobal("GPUMapMode", { READ: 1 });
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  /**
+   * The bug: the loop raced a FRESH `settleDelay(READBACK_SETTLE_MS)` each pass and checked the
+   * deadline only afterwards, so a frame that settled just before the deadline forced a second
+   * full 250 ms wait past it — ~500 ms total on a clock the deadline never saw. The fix passes the
+   * remaining time to one `settleDelay`, so the whole wait is bounded by READBACK_SETTLE_MS.
+   */
+  it("bounds the settle wait to one READBACK_SETTLE_MS even as a frame races the deadline", async () => {
+    const windows: BenchWindowPayload[] = [];
+    const ctl = new BenchController({ sendInput: () => {}, emitWindow: (p) => windows.push(p), getClockOffsetMs: () => 0, nowEpochMs: () => Date.now() });
+    const s = { image: scene(1) };
+    const gpu = orderedReadbackDevice();
+    const texture = { width: W, height: H } as GPUTexture;
+    ctl.start();
+
+    ctl.onTexture(gpu.device, texture); // frame 1 at T0, map pending -> settle loop starts, deadline T0 + 250
+    const start = Date.now();
+    let settled = -1;
+    ctl.tickForTest().then(() => { settled = Date.now() - start; });
+    // Race frame 1's map to just before the deadline, then submit a second frame whose map is stuck.
+    await vi.advanceTimersByTimeAsync(READBACK_SETTLE_MS - 1); // T0 + 249
+    gpu.releaseOne(); // frame 1 settles at T0 + 249
+    s.image = scene(2);
+    ctl.onTexture(gpu.device, texture); // frame 2 at T0 + 249, map never released
+    await vi.advanceTimersByTimeAsync(READBACK_SETTLE_MS + 50); // let the settle loop run out
+    // Bounded to one deadline on one clock (~250), never a second full delay (~500).
+    expect(settled).toBeGreaterThanOrEqual(READBACK_SETTLE_MS - 40);
+    expect(settled).toBeLessThan(READBACK_SETTLE_MS + 60);
+    ctl.stop();
+  });
+
+  /**
+   * The loop waits while a new frame keeps swapping `readTail`. A frame submitted during the wait
+   * must be waited for and measured before the window closes, so it lands in the current window,
+   * not the next. A single wait (no loop) returns as soon as the first readback settles and pushes
+   * the later frame into the next window (#1454).
+   */
+  it("waits for a frame submitted during the settle wait so it lands in the current window", async () => {
+    const windows: BenchWindowPayload[] = [];
+    const ctl = new BenchController({ sendInput: () => {}, emitWindow: (p) => windows.push(p), getClockOffsetMs: () => 0, nowEpochMs: () => Date.now() });
+    const s = { image: scene(1) };
+    const gpu = orderedReadbackDevice();
+    const texture = { width: W, height: H } as GPUTexture;
+    ctl.start();
+
+    ctl.onTexture(gpu.device, texture); // frame 1 at T0, map pending -> loop tail = chain1
+    const tickP = ctl.tickForTest();
+    await vi.advanceTimersByTimeAsync(100); // T0 + 100, inside the settle wait
+    s.image = scene(2);
+    ctl.onTexture(gpu.device, texture); // frame 2 at T0 + 100, map pending -> readTail = chain2
+    await vi.advanceTimersByTimeAsync(20); // T0 + 120
+    gpu.releaseOne(); // frame 1 settles -> loop sees readTail change, advances to chain2, keeps waiting
+    await vi.advanceTimersByTimeAsync(20); // T0 + 140, loop now waiting on chain2
+    gpu.releaseOne(); // frame 2 settles -> readTail stable -> settle completes
+    await tickP;
+    ctl.stop(); // stop() closes the (now-empty) window a final time -> [2, 0]
+    // Both frames are measured before the first window closes, so they share window 0 (n = 2).
+    // A single wait would return after frame 1 and push frame 2 into the next window -> [1, 1, 0].
+    expect(windows.map((w) => w.n)).toEqual([2, 0]);
+    expect(ctl.handle().stats().frames).toBe(2);
+  });
+
+  /**
+   * `stop()` sets running=false and closes the window. If it runs during the settle wait, tick()
+   * must return on the `if (!this.running)` guard rather than falling through to a second
+   * closeWindow(). Removing the guard emits an extra empty window after stop().
+   */
+  it("returns without closing the window again if stop() ran during the settle wait", async () => {
+    const windows: BenchWindowPayload[] = [];
+    const ctl = new BenchController({ sendInput: () => {}, emitWindow: (p) => windows.push(p), getClockOffsetMs: () => 0, nowEpochMs: () => Date.now() });
+    const gpu = orderedReadbackDevice();
+    const texture = { width: W, height: H } as GPUTexture;
+    ctl.start();
+
+    ctl.onTexture(gpu.device, texture); // frame 1 at T0, map stuck -> settle loop waits up to the deadline
+    const tickP = ctl.tickForTest();
+    await vi.advanceTimersByTimeAsync(50); // T0 + 50, inside the settle wait
+    ctl.stop(); // running=false, closes the window once
+    const afterStop = windows.length;
+    await vi.advanceTimersByTimeAsync(READBACK_SETTLE_MS + 50); // let the settle loop finish
+    await tickP; // tick() must return on the running guard, not close the window a second time
+    expect(windows.length).toBe(afterStop);
+    ctl.stop(); // idempotent
   });
 });

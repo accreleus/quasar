@@ -300,7 +300,7 @@ export class BenchController {
     const deadline = this.deps.nowEpochMs() + READBACK_SETTLE_MS;
     let tail = this.readTail;
     for (;;) {
-      await Promise.race([tail, this.settleDelay(READBACK_SETTLE_MS)]);
+      await Promise.race([tail, this.settleDelay(deadline - this.deps.nowEpochMs())]);
       if (this.readTail === tail) return;
       tail = this.readTail;
       if (this.deps.nowEpochMs() >= deadline) return;
