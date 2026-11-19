@@ -1797,6 +1797,11 @@ td.cell-actions > * + * {
   color: var(--danger-text);
 }
 
+/* After .danger: a disabled danger item reads disabled, not red (issue 1499). */
+.row-menu-item.danger:disabled {
+  color: var(--text-4);
+}
+
 .menu button.danger:hover,
 .row-menu-item.danger:hover:not(:disabled) {
   background: var(--danger-bg);
