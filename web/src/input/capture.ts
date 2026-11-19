@@ -703,9 +703,15 @@ export function setupCapture({
   };
 
   const onMouseUp = (e: MouseEvent) => {
-    if (!captured || !aimedAtGame(e)) return;
+    if (!captured) return;
     const button = MB_MAP[e.button];
-    if (button !== undefined) {
+    if (button === undefined) return;
+    // A button THIS capture pressed on the picture is released wherever the pointer
+    // comes up — over the HUD overlay, or off the video — because the host is
+    // holding it and no later event will lift it (#1464). A HUD-only click never
+    // pressed anything, so `heldButtons` (not `aimedAtGame`) is what lets its
+    // release through without leaking the click to the game as a press.
+    if (aimedAtGame(e) || heldButtons.has(button)) {
       send({ t: "mb", button, pressed: false });
       heldButtons.delete(button);
     }

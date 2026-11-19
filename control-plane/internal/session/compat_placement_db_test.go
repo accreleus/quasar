@@ -320,8 +320,11 @@ func TestSwapIntoAMappedGameNeedsTheToolTheSessionMounted(t *testing.T) {
 		f.commitSwap(t, sess)
 	}
 
-	// Mounted at launch is admitted even if the host's report has since dropped the tool.
-	must(t, exec(t, f.pool, `UPDATE sessions SET compat_tool_names = ARRAY[$2]::text[] WHERE id=$1::uuid`, sess, compatSteamNm))
+	// Mounted at launch is admitted even if the host's report has since dropped the tool. The
+	// mapping predates the launch, so its revision is what the launch read.
+	must(t, exec(t, f.pool, `UPDATE sessions SET compat_tool_names = ARRAY[$2]::text[],
+		compat_mapping_revision = (SELECT revision FROM compat_tool_mappings WHERE external_id = $3)
+		WHERE id=$1::uuid`, sess, compatSteamNm, compatGameID))
 	hostHasTool(t, f.pool, f.hostID, false)
 	if _, err := f.coord.Swap(ctx, sess, mapped); err != nil {
 		t.Fatalf("swap with the tool mounted at launch: %v", err)
@@ -363,5 +366,45 @@ func TestSwapIntoAMappingAddedAfterTheSessionStartedIsRefused(t *testing.T) {
 	if !strings.Contains(b, `"reason":"compat_tool_missing"`) || !strings.Contains(b, "was not started with") ||
 		strings.Contains(b, "started without") || strings.Contains(b, "try again") {
 		t.Fatalf("body %s", b)
+	}
+}
+
+// #1555: SetMapping stamps updated_at with now(), the mapping transaction's START. A mapping
+// transaction that starts before the launch and commits after it therefore carries a time before
+// the session's created_at, and comparing the two admitted a mapping in no table the session
+// carries. The guard compares mapping revisions (commit order) instead, so the swap is refused.
+func TestAMappingCommittedAfterTheLaunchIsRefusedThoughItsTransactionStartedBefore(t *testing.T) {
+	f := newWarmFixture(t, 8)
+	f.disp.compat = true
+	steam := f.steam // the Steam parent: a launch of it reads and records compat tools
+	tile := seedTile(t, f.pool, f.steam, "Hades", "4342")
+	toolID := seedGETool(t, f.pool) // maps compatGameID; the host holds it, so the launch mounts it
+	hostHasTool(t, f.pool, f.hostID, true)
+	ctx := context.Background()
+
+	// The admin's mapping transaction starts here...
+	conn, err := f.pool.Acquire(ctx)
+	must(t, err)
+	defer conn.Release()
+	tx, err := conn.Begin(ctx)
+	must(t, err)
+
+	// ... the launch happens, records the mounted tool and the revision it read ...
+	sess := f.startedLaunch(t, steam)
+
+	// ... and only then is the game's mapping inserted and committed, with now() from the
+	// transaction start (before the session's created_at).
+	_, err = tx.Exec(ctx, `INSERT INTO compat_tool_mappings (provider, external_id, tool_id)
+		VALUES ('steam', $1, $2::uuid)`, "4342", toolID)
+	must(t, err)
+	must(t, tx.Commit(ctx))
+
+	_, err = f.coord.Swap(ctx, sess, tile)
+	var rej *CompatToolRejection
+	if !errors.Is(err, ErrNoHostAvailable) || !errors.As(err, &rej) || rej.Tool != compatTag || !rej.Swap {
+		t.Fatalf("swap into a mapping committed after the launch: got %v, want ErrNoHostAvailable carrying a swap CompatToolRejection for %s", err, compatTag)
+	}
+	if got := readRow(t, f.pool, sess); got.Detail == swapDetailInProgress {
+		t.Errorf("a refused swap left the session marked swapping")
 	}
 }

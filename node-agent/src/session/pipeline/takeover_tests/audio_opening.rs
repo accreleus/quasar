@@ -6,7 +6,9 @@ use super::*;
 const MAX_STEP: u32 = 4_800;
 
 /// `(seq, timestamp)` of each audio RTP packet the host's ICE sink sends. SRTP leaves the
-/// RTP header in the clear; RTCP (`byte 1 & 0x7f` is 72..=76) is skipped by its type.
+/// RTP header in the clear, and the filter below keeps RTP (version 2) carrying the audio
+/// payload type 111: everything else on the pad, RTCP included (its byte 1 is the RTCP
+/// packet type, 200 and up, never 111), is never recorded.
 fn record_sent_audio(host: &Host) -> Arc<Mutex<Vec<(u16, u32)>>> {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let webrtc = host

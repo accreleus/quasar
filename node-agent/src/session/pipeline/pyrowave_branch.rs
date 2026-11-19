@@ -723,6 +723,176 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::{Duration, Instant};
 
+    /// A `vulkandownload` stand-in for the CPU path: its sink takes whatever comes in (the
+    /// template is ANY) and its src hands on plain NV12, which is the caps change the real
+    /// download makes and needs a Vulkan device for. The frames themselves are system memory in
+    /// the test, so a plain `BaseTransform` copy stands in for the download.
+    mod cpu_download {
+        use gstreamer as gst;
+        use gstreamer::glib;
+        use gstreamer::prelude::*;
+        use gstreamer::subclass::prelude::*;
+        use gstreamer_base::subclass::prelude::*;
+        use gstreamer_base::subclass::BaseTransformMode;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::{LazyLock, Once};
+
+        #[glib::object_subclass]
+        impl ObjectSubclass for Inner {
+            const NAME: &'static str = "GstTestCpuDownload";
+            type Type = Download;
+            type ParentType = gstreamer_base::BaseTransform;
+        }
+
+        glib::wrapper! {
+            pub(super) struct Download(ObjectSubclass<Inner>)
+                @extends gstreamer_base::BaseTransform, gst::Element, gst::Object;
+        }
+
+        #[derive(Default)]
+        pub(super) struct Inner {
+            /// How long the copy takes, per frame (µs); 0 when the test runs it at once.
+            sleep_us: AtomicU32,
+        }
+
+        impl ObjectImpl for Inner {
+            fn properties() -> &'static [glib::ParamSpec] {
+                static PROPS: LazyLock<Vec<glib::ParamSpec>> = LazyLock::new(|| {
+                    vec![glib::ParamSpecUInt::builder("sleep-us")
+                        .nick("Sleep")
+                        .blurb("How long the copy takes, per frame (µs)")
+                        .default_value(0)
+                        .build()]
+                });
+                PROPS.as_ref()
+            }
+
+            fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
+                match pspec.name() {
+                    "sleep-us" => self.sleep_us.store(value.get().unwrap(), Ordering::Relaxed),
+                    _ => unreachable!(),
+                }
+            }
+
+            fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
+                match pspec.name() {
+                    "sleep-us" => self.sleep_us.load(Ordering::Relaxed).to_value(),
+                    _ => unreachable!(),
+                }
+            }
+        }
+
+        impl GstObjectImpl for Inner {}
+
+        /// The plain NV12 caps the download's src hands on.
+        fn plain_caps() -> gst::Caps {
+            gst::Caps::builder("video/x-raw")
+                .field("format", "NV12")
+                .field("width", 64)
+                .field("height", 48)
+                .field("framerate", gst::Fraction::new(60, 1))
+                .field("colorimetry", "bt601")
+                .build()
+        }
+
+        impl ElementImpl for Inner {
+            fn metadata() -> Option<&'static gst::subclass::ElementMetadata> {
+                static META: LazyLock<gst::subclass::ElementMetadata> = LazyLock::new(|| {
+                    gst::subclass::ElementMetadata::new(
+                        "CPU download stand-in",
+                        "Test",
+                        "Vulkan-image caps to plain caps, for the CPU-path hand-off tests",
+                        "Quasar",
+                    )
+                });
+                Some(&*META)
+            }
+
+            fn pad_templates() -> &'static [gst::PadTemplate] {
+                static TEMPLATES: LazyLock<Vec<gst::PadTemplate>> = LazyLock::new(|| {
+                    let plain = plain_caps();
+                    vec![
+                        gst::PadTemplate::new(
+                            "sink",
+                            gst::PadDirection::Sink,
+                            gst::PadPresence::Always,
+                            &gst::Caps::new_any(),
+                        )
+                        .unwrap(),
+                        gst::PadTemplate::new(
+                            "src",
+                            gst::PadDirection::Src,
+                            gst::PadPresence::Always,
+                            &plain,
+                        )
+                        .unwrap(),
+                    ]
+                });
+                &TEMPLATES
+            }
+        }
+
+        impl BaseTransformImpl for Inner {
+            const MODE: BaseTransformMode = BaseTransformMode::NeverInPlace;
+            const PASSTHROUGH_ON_SAME_CAPS: bool = false;
+            const TRANSFORM_IP_ON_PASSTHROUGH: bool = false;
+
+            /// The stand-in copies the frame through; only the caps change.
+            fn transform(
+                &self,
+                inbuf: &gst::Buffer,
+                outbuf: &mut gst::BufferRef,
+            ) -> Result<gst::FlowSuccess, gst::FlowError> {
+                let sleep_us = self.sleep_us.load(Ordering::Relaxed);
+                if sleep_us > 0 {
+                    std::thread::sleep(std::time::Duration::from_micros(sleep_us as u64));
+                }
+                inbuf
+                    .copy_into(outbuf, gst::BUFFER_COPY_ALL, ..)
+                    .map_err(|_| gst::FlowError::Error)?;
+                Ok(gst::FlowSuccess::Ok)
+            }
+
+            /// Whatever memory the frame came in, the download hands on plain caps: the
+            /// base transform's identity mapping would keep the Vulkan feature and find no
+            /// intersection with the src template.
+            fn transform_caps(
+                &self,
+                direction: gst::PadDirection,
+                _caps: &gst::Caps,
+                filter: Option<&gst::Caps>,
+            ) -> Option<gst::Caps> {
+                let out = match direction {
+                    gst::PadDirection::Sink => plain_caps(),
+                    _ => gst::Caps::new_any(),
+                };
+                match filter {
+                    Some(f) => {
+                        let filtered = out.intersect(f);
+                        (!filtered.is_empty()).then_some(filtered)
+                    }
+                    None => Some(out),
+                }
+            }
+        }
+
+        /// The element, registered once per test binary.
+        pub(super) fn make() -> gst::Element {
+            static REGISTER: Once = Once::new();
+            REGISTER.call_once(|| {
+                let _ = gst::Element::register(
+                    None,
+                    "test-cpu-download",
+                    gst::Rank::NONE,
+                    Download::static_type(),
+                );
+            });
+            gst::ElementFactory::make("test-cpu-download")
+                .build()
+                .unwrap()
+        }
+    }
+
     #[test]
     fn the_feed_learns_the_colorimetry_the_source_negotiated() {
         gst::init().unwrap();
@@ -905,6 +1075,117 @@ mod tests {
             after.clone().all(|g| *g < Duration::from_millis(200)),
             "{gaps:?}"
         );
+    }
+
+    /// The CPU path's frames: BT.601 Vulkan images (the compositor's default), the download
+    /// stand-in copying them to plain memory, and optionally a slow encoder. Returns the
+    /// PyroWave pipeline's state and the messages its errors carried, once the standard
+    /// stream saw every frame. `copy_us` is the download's cost per frame; `slow_encoder`
+    /// turns the encoder slow (500 ms a frame) after its first frame.
+    fn cpu_path(
+        copy_us: u32,
+        slow_encoder: bool,
+        expect_give_up: bool,
+    ) -> (gst::State, Vec<String>) {
+        gst::init().unwrap();
+        let caps = gst::Caps::builder("video/x-raw")
+            .features(["memory:VulkanImage"])
+            .field("format", "NV12")
+            .field("width", 64)
+            .field("height", 48)
+            .field("framerate", gst::Fraction::new(60, 1))
+            .field("colorimetry", "bt601")
+            .build();
+        let main = gst::Pipeline::new();
+        let src = gst_app::AppSrc::builder()
+            .caps(&caps)
+            .format(gst::Format::Time)
+            .build();
+        let queue = gst::ElementFactory::make("queue").build().unwrap();
+        let sink = gst::ElementFactory::make("fakesink")
+            .property("sync", false)
+            .build()
+            .unwrap();
+        main.add_many([src.upcast_ref(), &queue, &sink]).unwrap();
+        gst::Element::link_many([src.upcast_ref(), &queue, &sink]).unwrap();
+        let arrivals = Arc::new(Mutex::new(Vec::<Instant>::new()));
+        let seen = arrivals.clone();
+        sink.static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                seen.lock().unwrap().push(Instant::now());
+                gst::PadProbeReturn::Ok
+            });
+        let feed = feed_at(queue.static_pad("src").unwrap(), &caps).unwrap();
+        // `vulkandownload` needs a Vulkan device the test image has not: this stand-in takes
+        // the Vulkan caps and hands on plain ones through the same src-pad release.
+        let download = cpu_download::make();
+        if copy_us > 0 {
+            download.set_property("sleep-us", copy_us);
+        }
+        let enc = gst::ElementFactory::make("identity").build().unwrap();
+        let slow = enc.clone();
+        let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+        let errs = errors.clone();
+        let side = start_with(
+            feed,
+            Some(download),
+            &enc,
+            || true,
+            move |_| {
+                if slow_encoder {
+                    slow.set_property("sleep-time", 500_000u32);
+                }
+            },
+            move |e| errs.lock().unwrap().push(e),
+        )
+        .unwrap();
+        main.set_state(gst::State::Playing).unwrap();
+        for i in 0..20u64 {
+            let mut buf = gst::Buffer::with_size(64 * 48 * 3 / 2).unwrap();
+            buf.get_mut()
+                .unwrap()
+                .set_pts(gst::ClockTime::from_mseconds(i * 50));
+            src.push_buffer(buf).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        wait_until("every frame on the standard side", || {
+            arrivals.lock().unwrap().len() == 20
+        });
+        if expect_give_up {
+            wait_until("PyroWave gives the frame up", || {
+                !errors.lock().unwrap().is_empty()
+            });
+            wait_until("PyroWave stops", || {
+                side.pipeline.current_state() == gst::State::Null
+            });
+        }
+        let state = side.pipeline.current_state();
+        drop(side);
+        main.set_state(gst::State::Null).unwrap();
+        let errors = errors.lock().unwrap().clone();
+        (state, errors)
+    }
+
+    /// A download whose copy outlasts the hand-off's bound switches PyroWave off: the frame
+    /// is not handed on in time, and the standard stream goes on. The copy is the CPU path's
+    /// own cost, which is what the hand-off bounds (see the next test for the encoder).
+    #[test]
+    fn a_stalled_download_switches_pyrowave_off_on_the_cpu_path() {
+        let (state, errors) = cpu_path(300_000, false, true);
+        assert_eq!(state, gst::State::Null, "PyroWave stopped");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("held a frame"), "{}", errors[0]);
+    }
+
+    /// A slow encoder alone does not switch PyroWave off on the CPU path: the download hands
+    /// the copied frame on at its src pad, ahead of the encoder, so the hand-off never waits on
+    /// the encoder (only the copy can hold it past its bound).
+    #[test]
+    fn a_slow_encoder_does_not_switch_pyrowave_off_on_the_cpu_path() {
+        let (state, errors) = cpu_path(0, true, false);
+        assert_eq!(state, gst::State::Playing, "PyroWave stayed on");
+        assert_eq!(errors, Vec::<String>::new(), "it never gave a frame up");
     }
 
     #[test]

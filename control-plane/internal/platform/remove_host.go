@@ -160,7 +160,7 @@ func (h *RemoveHandler) handleRemove(w http.ResponseWriter, r *http.Request) {
 	}
 	if h.deps.SharesOwnMachine != nil && h.deps.SharesOwnMachine(host.NodeName) {
 		httpx.WriteError(w, http.StatusConflict, CodeHostNotRemovable,
-			"this host is, or may be, the agent on the control plane's own machine; take that machine apart with the uninstall command on it, or set QUASAR_MACHINE_ROLE and QUASAR_MACHINE_NODE_NAME on the control plane and retry")
+			httpx.HostIsOwnMachineMessage)
 		return
 	}
 

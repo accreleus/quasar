@@ -62,6 +62,13 @@ export const I2P_TIMEOUT_MS = 2000;
 export const READBACKS_IN_FLIGHT = 3;
 /** How many windows to keep for `window.__qBench.windows()`. */
 const MAX_WINDOWS = 3600;
+/**
+ * How long tick() waits for in-flight texture readbacks before closing the
+ * window, so a device whose maps never settle cannot stop the windows. Frames
+ * are stamped at submit, so measuring them here (before closeWindow) keeps them
+ * in the window their submit falls in.
+ */
+export const READBACK_SETTLE_MS = 250;
 
 const NOT_READ: MarkerDecodeResult = { decoded: false, confidence: 0, error: "not read" };
 
@@ -218,6 +225,7 @@ export class BenchController {
   private readonly spareReads: GPUBuffer[] = [];
   private readFaulted = false;
   private limitWarned = false;
+  private readTailWarned = false;
 
   private totalDecoded = 0;
   private totalI2pMissed = 0;
@@ -257,13 +265,53 @@ export class BenchController {
   }
 
   /**
-   * Refresh the inbound-rtp counters, then close the window — in that order,
-   * or the counter delta describes a window up to a second away from the
-   * frames it is quoted beside.
+   * Refresh the inbound-rtp counters, wait for in-flight texture readbacks,
+   * then close the window — in that order.
+   *
+   * refreshInbound first, or the counter delta describes a window up to a
+   * second away from the frames it is quoted beside. The readback chain first,
+   * or a texture frame stamped at its submit could land in the next window
+   * (#1454): onTexture measures when its map resolves, so a slow map would put
+   * the frame in whatever window is open then. Frames are stamped at submit, so
+   * measuring them here keeps them in the window their submit falls in. The
+   * wait is bounded (#1454): a device whose maps never settle must not stop the
+   * windows.
    */
   private async tick(): Promise<void> {
     await this.refreshInbound();
+    await this.settleReadbacks();
+    // stop() may have run during the settle wait and already closed the window.
+    if (!this.running) return;
     this.closeWindow();
+  }
+
+  /**
+   * Wait for in-flight texture readbacks to settle before closing the window, so
+   * a frame stamped at its submit lands in the window its submit falls in, not
+   * the next (#1454). Bounded by READBACK_SETTLE_MS: a device whose maps never
+   * settle cannot stop the windows, because each readback carries its own bound
+   * (#1454) and the chain always moves on.
+   *
+   * The race holds on one `readTail` snapshot and loops while a new frame keeps
+   * swapping it out, so frames submitted during the wait are not pushed into the
+   * next window.
+   */
+  private async settleReadbacks(): Promise<void> {
+    const deadline = this.deps.nowEpochMs() + READBACK_SETTLE_MS;
+    let tail = this.readTail;
+    for (;;) {
+      await Promise.race([tail, this.settleDelay(READBACK_SETTLE_MS)]);
+      if (this.readTail === tail) return;
+      tail = this.readTail;
+      if (this.deps.nowEpochMs() >= deadline) return;
+    }
+  }
+
+  /** Resolves after `ms`; bounds how long tick() waits for the readback chain. */
+  private settleDelay(ms: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      setTimeout(resolve, ms);
+    });
   }
 
   /** Test seam: run one window boundary exactly as the interval timer would. */
@@ -384,7 +432,12 @@ export class BenchController {
         const image = await pixels;
         if (this.running) this.measure(present, {}, image);
       })
-      .catch((err: unknown) => console.warn("bench:", err));
+      .catch((err: unknown) => {
+        if (!this.readTailWarned) {
+          this.readTailWarned = true;
+          console.warn("bench:", err);
+        }
+      });
   }
 
   private async readBack(device: GPUDevice, texture: GPUTexture): Promise<MarkerImageData | null> {
@@ -418,7 +471,20 @@ export class BenchController {
         // Popped even on a throw, or the scopes would swallow the presenter's own errors.
         scopes = [device.popErrorScope(), device.popErrorScope()].map((p) => p.catch(() => null));
       }
-      const [[invalid, oom]] = await Promise.all([Promise.all(scopes), mapped]);
+      // Bound the map wait so a device whose map never settles cannot wedge the
+      // readback chain (#1454): on timeout the frame still counts as no_image and
+      // its in-flight slot is released (the finally below), and the chain moves on.
+      // A map that rejects before it settles falls through to the read-fault path.
+      const mappedValue = await Promise.race([
+        mapped,
+        this.settleDelay(READBACK_SETTLE_MS).then(() => "timeout" as const),
+      ]);
+      if (mappedValue === "timeout") {
+        buf.destroy();
+        mapped.catch(() => {}); // a late map resolve must not surface unhandled
+        return null;
+      }
+      const [invalid, oom] = await Promise.all(scopes);
       if (invalid ?? oom) throw invalid ?? oom;
       const src = new Uint8Array(buf.getMappedRange(0, stride * h));
       const data = new Uint8ClampedArray(w * h * 4);

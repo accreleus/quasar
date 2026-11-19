@@ -69,7 +69,7 @@
   "upstream_pins": [
     {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "GST_INTERPIPE_REF", "value": "0c454917"},
     {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "GST_PLUGINS_RS_REF", "value": "cee45224cb2d10e1523af4f256d0dd64c8b29491"},
-    {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "GST_WAYLAND_DISPLAY_REF", "value": "05bc3c99c3e0f54ebebc021bd4ccc2c0a23418ea"},
+    {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "GST_WAYLAND_DISPLAY_REF", "value": "2cef04c5bb7c33337025db64d05cba0efbfa734b"},
     {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "PYROWAVE_REF", "value": "7fe0e2667cd3076b8b2bf04bcb80bc8d691b800b"},
     {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "GRANITE_REF", "value": "53090429539bf3404250d18fe58db971f0907c04"},
     {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "VULKAN_LOADER_REF", "value": "363f465abadab0a8dcfc5c85d2c691e9b0b788d6"},
@@ -82,7 +82,7 @@
     "deploy/patches/vulkan/vulkanh265enc.patch",
     "deploy/patches/vulkan/vkh264enc-rc-fix.patch",
     "deploy/patches/vulkan/vkh264enc-num-slices.patch",
-    "deploy/patches/vulkan/gstreamer-vulkan-global-submit-lock.patch",
+    "deploy/patches/vulkan/gstreamer-vulkan-shared-queue-lock.patch",
     "deploy/patches/vulkan/vkh264enc-intra-refresh.patch",
     "deploy/patches/vulkan/vulkanav1enc.patch",
     "deploy/patches/vulkan/vulkan-enc-output-state-on-resize.patch",

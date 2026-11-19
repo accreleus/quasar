@@ -201,6 +201,16 @@ else
   fail "validate-image:refs" "$(printf '%s' "$vi_out" | grep '^FAIL' | head -n 5)"
 fi
 
+printf '\n== ci-apt-install mirror fallback (#1580) ==\n'
+# Offline: a stubbed apt-get + a fake apt config prove the install script switches to a
+# different mirror on a stall instead of retrying the same one. It runs with no network and no
+# root (CI_APT_CONF_DIR / CI_APT_ARCHIVES point the script at temp dirs).
+if apt_out="$(bash "$ROOT/scripts/verify/test-ci-apt-install.sh" 2>&1)"; then
+  pass "ci-apt-install:mirror-fallback" "$(printf '%s\n' "$apt_out" | grep '^PASS' | sed 's/^PASS /  /' | tr '\n' ' ')"
+else
+  fail "ci-apt-install:mirror-fallback" "$(printf '%s' "$apt_out" | grep '^FAIL' | head -n 5)"
+fi
+
 printf '\n== guards ==\n'
 
 # Guard tests point resolution at the fixture, never the real operator config
@@ -4035,6 +4045,14 @@ if [ -n "$rm_c1_line" ] && [ -n "$netrm_n1_line" ] && [ "$rm_c1_line" -lt "$netr
   pass "testdb:sweep-containers-before-networks" "rm(c1) line $rm_c1_line precedes netrm(n1) line $netrm_n1_line"
 else
   fail "testdb:sweep-containers-before-networks" "rm c1 at ${rm_c1_line:-?}, netrm n1 at ${netrm_n1_line:-?}"
+fi
+
+# The throwaway Postgres runs without durability, as CI's does: with fsync on, every suite's
+# setup TRUNCATE ... CASCADE took ~300 ms idle and timed out under shared disk load (#1121).
+if grep -qE '"\$PG_IMAGE" -c fsync=off -c synchronous_commit=off -c full_page_writes=off' "$DX/testdb.sh"; then
+  pass "testdb:pg-without-durability" "the ephemeral Postgres starts with fsync, synchronous_commit and full_page_writes off"
+else
+  fail "testdb:pg-without-durability" "testdb.sh starts Postgres with durability on: setup truncates stall under disk load (#1121)"
 fi
 
 # Unlabelled resources never reach the sweep: the listing filters by label

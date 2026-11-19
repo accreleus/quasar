@@ -145,6 +145,7 @@ impl Sim {
     /// with the path rather than reported late.
     fn outage(&mut self, secs: f64) {
         let from = self.t;
+        let first = self.seq;
         for step in 1..=(secs * 10.0) as u64 {
             self.t = from + step * 100_000;
             self.frame();
@@ -153,7 +154,13 @@ impl Sim {
                 self.governor.release();
             }
         }
-        self.pending.clear();
+        // The packets sent during the outage stay pending as lost, as a real client's first
+        // report after it names them NOT_RECEIVED (#1557). Earlier packets keep their arrival.
+        for (seq, arrival) in self.pending.iter_mut() {
+            if *seq >= first {
+                *arrival = None;
+            }
+        }
     }
 
     fn frame(&mut self) {
@@ -563,6 +570,112 @@ fn an_outage_costs_the_estimate_seconds_not_a_minute() {
             "{send_kbps:?}: {carried:.0} → {low:.0} → {e:.0} in 10 s of feedback"
         );
     }
+}
+
+/// #1557: the first report after a long outage names the packets sent during it lost. Those
+/// losses are the outage, not congestion: they must not cut the loss bound, and the memory of
+/// what the link carried before the outage must survive so the estimate can regrow fast.
+#[test]
+fn the_first_report_after_an_outage_counts_no_outage_loss() {
+    let mut s = Sim::new(20_000.0);
+    s.send_kbps = Some(6000.0);
+    s.run(5.0);
+    s.outage(10.0);
+    assert!(s.est.recover_to.is_some(), "the outage left no memory");
+    s.run(0.05);
+    let loss = s.est.loss();
+    assert!(
+        loss.is_none_or(|l| l < LOSS_LOW),
+        "the outage's own losses measured {loss:?}"
+    );
+    assert!(
+        s.est.recover_to.is_some(),
+        "the outage's own losses ended the regrow"
+    );
+}
+
+/// #1557 review A2: the exemption ends at the send time of the first packet the report
+/// shows received after the outage's mark. A burst sent after the link came back is
+/// congestion, even when it falls in the feedback interval before the first report: it
+/// must cut, and the exemption must not swallow it for the whole report.
+#[test]
+fn a_congestion_burst_right_after_recovery_still_cuts() {
+    let mut s = Sim::new(20_000.0);
+    s.send_kbps = Some(6000.0);
+    s.run(5.0);
+    s.outage(10.0);
+    assert!(s.est.recover_to.is_some(), "the outage left no memory");
+    // The link is back, but the first frames after it lose a burst: the report shows a
+    // received packet behind the gap, so the mark ends before those losses.
+    s.drop_every = 4;
+    let lines = logged(|| s.run(0.05));
+    let labels: Vec<String> = cuts(&lines).into_iter().map(|c| c.0).collect();
+    assert!(
+        labels.iter().any(|l| l.contains("loss")),
+        "the burst right after recovery was exempted: {labels:?}"
+    );
+    assert!(
+        s.est.recover_to.is_none(),
+        "the pre-outage rate outlived the loss cut: {labels:?}"
+    );
+}
+
+/// #1557 review A1: a packet exempted as the outage's own loss was never counted, so its
+/// late arrival must not undo a counted loss. It used to pass through the late-loss path
+/// and subtract one it never added.
+#[test]
+fn a_late_exempted_outage_loss_does_not_undo_a_counted_loss() {
+    let start = Instant::now();
+    let mut log = SendLog::new(start);
+    let mut est = Estimator::new(CEILING, start);
+    // seq 0 sent before the mark (counted when lost), seq 1..20 after it (the outage's
+    // own), seq 21..40 received after the mark: the first of those ends the exemption.
+    let sent_us = |seq: u32| u64::from(seq) * 10_000;
+    let arrived = |seq: u32| ((sent_us(seq) + 5_000) / UNIT_US) as u16;
+    for seq in 0..41u32 {
+        let mut d = vec![0u8; SIZE];
+        d[1..5].copy_from_slice(&seq.to_le_bytes());
+        let at = start + Duration::from_micros(sent_us(seq));
+        log.record(&d, at, false);
+    }
+    est.outage_from_us = Some(10_000);
+    let first: Vec<u16> = (0..41u32)
+        .map(|seq| {
+            if seq <= 20 {
+                NOT_RECEIVED
+            } else {
+                arrived(seq)
+            }
+        })
+        .collect();
+    let fb = Feedback {
+        first_pkt_seq: 0,
+        ref_us: 0,
+        arrivals: first,
+    };
+    est.on_feedback(&fb, &mut log, start + Duration::from_millis(1_000), NO_QUIC);
+    assert_eq!(
+        est.loss(),
+        Some(1.0 / 21.0),
+        "the one counted loss was measured, the outage's own twenty were not"
+    );
+    // seq 1, exempted, arrives late in a later report.
+    let late = Feedback {
+        first_pkt_seq: 1,
+        ref_us: 0,
+        arrivals: vec![arrived(1)],
+    };
+    est.on_feedback(
+        &late,
+        &mut log,
+        start + Duration::from_millis(1_050),
+        NO_QUIC,
+    );
+    let loss = est.loss();
+    assert!(
+        loss.is_some_and(|l| (l - 1.0 / 22.0).abs() < 1e-12),
+        "the exempted packet's late arrival subtracted a loss never counted: {loss:?}"
+    );
 }
 
 /// #1417: the regrow stops at the rate the link carried before the outage instead of crossing
