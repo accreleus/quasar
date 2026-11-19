@@ -376,13 +376,21 @@ impl AbrLoop {
             self.retarget(prev, kbps, rate);
         }
         let setpoint = self.governor.lock().unwrap().setpoint_kbps();
+        // #1599: a takeover that claimed the encoder between the rung write (as_owner, above)
+        // and here would otherwise receive this step's floor/rung echo over the launch point
+        // it just wrote. Re-check ownership before publishing; the echo is two atomic stores,
+        // so it stays out of the ABR write lock.
+        #[cfg(test)]
+        start_pause::run(&self.session_id, start_pause::Step::BeforeEchoPublish);
         if let Some(m) = self.metrics.upgrade() {
-            m.set_abr_floor(if floor_now == rungs.launch_floor_kbps {
-                0
-            } else {
-                floor_now
-            });
-            m.set_ladder_res_rung(d.to);
+            if m.abr_owner() == self.id {
+                m.set_abr_floor(if floor_now == rungs.launch_floor_kbps {
+                    0
+                } else {
+                    floor_now
+                });
+                m.set_ladder_res_rung(d.to);
+            }
         }
         tracing::info!(
             "SPT-08 ladder step: resolution rung {} → {} ({}), {w}x{h}, rate {rate:.0} kbps; \
@@ -1078,11 +1086,12 @@ fn arm(
 }
 
 /// A step inside [`start`] (and [`AbrLoop::step_rung`]) a test can hold the thread at, once,
-/// so that a second owner or a teardown lands in the middle of it (#1295, #1582). The windows
-/// are too narrow to hit by timing: `BeforeClaim` is the gap between a re-take's `orphaned()`
-/// read and its claim, `BeforeHooks` the one between the claim and the hooks that hold the
-/// encoder, `BeforeRungWrite` the one between the rung planner's decision and the lever
-/// write, and `BeforeLaunchWrite` the one in [`take_over`] after it dropped the previous
+/// so that a second owner or a teardown lands in the middle of it (#1295, #1582, #1599). The
+/// windows are too narrow to hit by timing: `BeforeClaim` is the gap between a re-take's
+/// `orphaned()` read and its claim, `BeforeHooks` the one between the claim and the hooks that
+/// hold the encoder, `BeforeRungWrite` the one between the rung planner's decision and the
+/// lever write, `BeforeEchoPublish` the one between that write and the step's floor/rung echo
+/// publish, and `BeforeLaunchWrite` the one in [`take_over`] after it dropped the previous
 /// loop's window hook and before it writes the launch point. Armed for one session id only,
 /// so the other tests in this binary never reach it. Armings are kept per (step, session):
 /// tests run in parallel, and a single slot let one test's `arm` overwrite another's before
@@ -1102,6 +1111,9 @@ pub(crate) mod start_pause {
         /// [`super::AbrLoop::step_rung`], after the planner planned a rung step and before
         /// the lever write (#1582).
         BeforeRungWrite,
+        /// [`super::AbrLoop::step_rung`], after the rung write and the floor move but before
+        /// it publishes the floor/rung echo to the metrics (#1599).
+        BeforeEchoPublish,
         /// [`super::take_over`], after dropping the previous loop's window hook and before
         /// writing the launch point (#1582).
         BeforeLaunchWrite,
@@ -2430,6 +2442,87 @@ mod tests {
             metrics.hooks_armed(),
             (true, true),
             "and the new loop owns both hooks"
+        );
+        assert_ne!(metrics.abr_owner(), 0, "the new loop owns the encoder");
+    }
+
+    /// #1599: a rung step that passed `as_owner` must not publish its floor/rung echo after a
+    /// takeover claimed the encoder and wrote the launch point back. Deterministic: the pause
+    /// is `BeforeEchoPublish`, exactly between the rung write and the echo publish. Without the
+    /// fix the echo still lands at the rung step's floor/rung, over the launch point the
+    /// takeover just wrote.
+    #[test]
+    fn a_takeover_between_the_rung_write_and_its_echo_keeps_the_launch_echo() {
+        use start_pause::{arm, Step};
+        init();
+        const SESSION: &str = "rung-echo-takeover-1";
+        let metrics = Arc::new(SessionMetrics::new("smooth", 60));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let trace =
+            crate::session::runner::DiagnosticEventTx::new(tx, Arc::default(), Arc::default());
+        let cfg = smooth_rung_cfg(8000);
+        let Ok(encoder) = gst::ElementFactory::make("openh264enc").build() else {
+            return; // openh264 unavailable: skip
+        };
+        let stage = super::super::scale_stage::build_scale_stage(&cfg, None).unwrap();
+        assert!(stage.supported, "the software arm always carries the lever");
+        let lever = Arc::new(EncodeResolutionLever::new(stage, encoder.clone(), |_| {}));
+
+        let (client_a, abr) = feedback_abr_armed(
+            &encoder,
+            &cfg,
+            metrics.clone(),
+            trace.clone(),
+            SESSION.into(),
+            Some(lever.clone()),
+        )
+        .expect("openh264enc takes live writes");
+        let client_b = feedback_abr(
+            &encoder,
+            &cfg,
+            metrics.clone(),
+            trace,
+            SESSION.into(),
+            Some(lever.clone()),
+        )
+        .expect("openh264enc takes live writes");
+        (client_a.start)();
+        assert_eq!(
+            metrics.hooks_armed(),
+            (true, true),
+            "the first loop owns both hooks"
+        );
+
+        // Two readings in a row under the rate take the governor's rate (not just the
+        // setpoint) to what the link carries: 1000 kbit/kb fits no engage line, so the
+        // planner wants a size step.
+        let t0 = std::time::Instant::now();
+        abr.report(Some(1000.0), t0); // the first reading: under, not yet a move
+        abr.report(Some(1000.0), t0 + std::time::Duration::from_millis(100)); // rate moves
+        let rate = abr.governor.lock().unwrap().rate_kbps();
+        assert!(rate <= 1000.0, "the governor's rate stayed at {rate}");
+
+        // The pause: the takeover (the second transport's `start`) lands exactly between the
+        // rung write (as_owner) and the echo publish.
+        let b = client_b;
+        arm(SESSION, Step::BeforeEchoPublish, move || (b.start)());
+        // The rate has been under the band for more than `RATE_CONFIRM`: this report's
+        // `step_rung` plans the step, passes as_owner (Loop A still owns), writes the rung,
+        // then reaches the pause. No sleeps: the clock is supplied.
+        abr.report(Some(1000.0), t0 + std::time::Duration::from_millis(1500));
+
+        // The takeover now owns the encoder, so step_rung's echo publish is skipped: the
+        // echoed floor and ladder rung stay at the launch values the takeover wrote.
+        let now = std::time::Instant::now();
+        assert_eq!(
+            metrics.drain_window(now).abr_floor_kbps,
+            None,
+            "the echoed floor must stay at launch, not the rung step's floor"
+        );
+        assert_eq!(
+            metrics.drain_window(now).ladder_res_rung,
+            None,
+            "the echoed ladder rung must stay at launch, not the rung step's rung"
         );
         assert_ne!(metrics.abr_owner(), 0, "the new loop owns the encoder");
     }
