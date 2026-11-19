@@ -446,11 +446,12 @@ export class WebTransportMedia implements MediaTransport {
     // Datagrams can overtake the hello_ack; the decode stage holds units by config_id, the
     // router PyroWave fragments.
     const feedback = new FeedbackRecorder(this.now());
-    /** `hello_ack.retransmit_window_ms`, and the path's round trip from the latest pong; until
-     *  both are known, no gap is held. */
+    /** `hello_ack.retransmit_window_ms`, and the path's round trip from the pongs; until both are
+     *  known, no gap is held. The round trip is smoothed as the assembler's own is: one ping spike
+     *  is not the path, and its cap must not fall to 0 for a second (#1436). */
     let retransmitWindowMs = 0;
-    let pathRttMs = Infinity;
-    const router = this.makeRouter(sink, live, feedback, () => retransmitWindowMs - pathRttMs);
+    let pathRttMs: number | null = null;
+    const router = this.makeRouter(sink, live, feedback, () => retransmitWindowMs - (pathRttMs ?? Infinity));
     /** Set once this attempt's datagram reader has failed: `datagrams: <name>: <message>`. */
     const datagramReader = { death: null as string | null };
     void this.readDatagrams(wt, sink, router, live, feedback, datagramReader).catch((err: unknown) => {
@@ -528,8 +529,11 @@ export class WebTransportMedia implements MediaTransport {
           else if (m.type === "nack_miss" && typeof m.frame_seq === "number" && Array.isArray(m.frags)) {
             router.miss(m.frame_seq, m.frags as [number, number][]);
           } else if (m.type === "pong" && typeof m.tc === "number") {
-            pathRttMs = Math.max(0, this.now() - m.tc);
-            sink.rtt?.(pathRttMs, typeof m.tw === "number" ? m.tw : undefined);
+            const rtt = Math.max(0, this.now() - m.tc);
+            // A longer sample at most doubles the estimate and a shorter one is averaged in at 1/8,
+            // as the assembler's round trip is: a spike from one ping does not shrink the window.
+            pathRttMs = pathRttMs === null ? rtt : rtt > pathRttMs ? Math.min(rtt, 2 * pathRttMs) : (7 * pathRttMs + rtt) / 8;
+            sink.rtt?.(rtt, typeof m.tw === "number" ? m.tw : undefined);
           }
           else if (m.type === "ping") {
             this.send({ type: "pong", id: m.id, ts: m.ts, tw: m.tw, tc: this.now() });

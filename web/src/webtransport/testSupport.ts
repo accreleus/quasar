@@ -362,18 +362,28 @@ export class FakeDecoder {
   chunks: FakeChunk[] = [];
   /** configure() throws, as a browser does for a configuration it cannot take. */
   refuseConfigure = false;
+  /** WebCodecs rejects a delta fed before any keyframe since configure() with a DataError: model
+   *  that (a test flips this on; the standard path always feeds a keyframe first). */
+  keyRequired = false;
   /** Decoded frames wait for `emit()`: a decoder that has not caught up. */
   holdOutput = false;
   /** `decodeQueueSize` follows the frames waiting, as a real decoder's does; off, a test sets it. */
   queueFollowsWaiting = false;
   private waiting: FakeChunk[] = [];
+  /** No keyframe decoded since the last configure(): a browser would reject a delta. */
+  private keySeen = false;
   constructor(readonly init: VideoDecoderInit) {}
   configure(c: VideoDecoderConfig) {
     if (this.refuseConfigure) throw new DOMException("Unsupported configuration", "NotSupportedError");
     this.configs.push(c);
     this.state = "configured";
+    this.keySeen = false;
   }
   decode(chunk: FakeChunk) {
+    if (this.keyRequired && chunk.type === "delta" && !this.keySeen) {
+      throw new DOMException("A delta needs a preceding keyframe", "DataError");
+    }
+    if (chunk.type === "key") this.keySeen = true;
     this.chunks.push(chunk);
     if (this.holdOutput) {
       this.waiting.push(chunk);
