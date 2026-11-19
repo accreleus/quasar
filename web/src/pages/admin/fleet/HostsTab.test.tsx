@@ -7,7 +7,7 @@
  * reaching it and every assertion here fails.
  */
 
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -23,7 +23,7 @@ vi.mock("../../../lib/fleet/FleetContext", () => ({
 
 import * as adminApi from "../../../api/admin";
 import { ApiError } from "../../../api/client";
-import type { AdminSession, GPUAvailability, Host } from "../../../api/types";
+import type { AdminSession, GPUAvailability, Host, PlatformIdentity } from "../../../api/types";
 import type { FleetContextValue } from "../../../lib/fleet/FleetContext";
 import { SectionHeadProvider } from "../../../components/shell/sectionHead";
 import { FLEET_TABS } from "../../../components/shell/sectionTabs";
@@ -654,6 +654,98 @@ describe("HostsTab — owned hosts (#366)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Actions for quasar-node-1" }));
     fireEvent.click(screen.getByRole("menuitem", { name: "Remove host" }));
     expect(await screen.findByText("/admin/fleet/hosts/c2059601")).toBeTruthy();
+    expect(mocked.deleteHost).not.toHaveBeenCalled();
+  });
+});
+
+describe("HostsTab — remove host before the identity loads (#1499)", () => {
+  const ownedGPU = { install_mode: "owned", updater_present: true } as Partial<Host>;
+
+  // A deferred identity read: the row holds "Remove host" until it settles. The
+  // identity is partial — only the machine shape the row branches on — and cast out
+  // of the full PlatformIdentity type the way the owned-host tests cast theirs.
+  function pendingIdentity() {
+    let resolveIdentity: (value: { identity: Partial<PlatformIdentity> }) => void = () => {};
+    const identity = new Promise<{ identity: Partial<PlatformIdentity> }>((resolve) => {
+      resolveIdentity = resolve;
+    });
+    return { identity: identity as never, resolveIdentity };
+  }
+
+  it("holds 'Remove host' for a removable host until the identity resolves, then opens its dialog", async () => {
+    setFleet([host({ ...ownedGPU })]);
+    const { identity, resolveIdentity } = pendingIdentity();
+    mocked.getPlatformIdentity.mockReturnValue(identity as never);
+    render(
+      <MemoryRouter initialEntries={["/admin/fleet/hosts"]}>
+        <SectionHeadProvider title="Fleet" tabs={FLEET_TABS}>
+          <Routes>
+            <Route path="/admin/fleet/hosts" element={<HostsTab />} />
+            <Route path="/admin/fleet/hosts/:id" element={<LocationProbe />} />
+          </Routes>
+        </SectionHeadProvider>
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText("quasar-node-1")).toBeTruthy());
+
+    // While the identity is in flight the row cannot tell a removable host from the control
+    // plane's own machine, so the item is held (disabled) rather than landing on the page
+    // with no dialog and needing a second click.
+    fireEvent.click(screen.getByRole("button", { name: "Actions for quasar-node-1" }));
+    expect(screen.getByRole("menuitem", { name: "Remove host" }).hasAttribute("disabled")).toBe(
+      true,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Actions for quasar-node-1" }));
+
+    await act(async () => {
+      resolveIdentity({ identity: { machine_role: null, machine_node_name: null } });
+    });
+    await waitFor(() => expect(screen.getByText("quasar-node-1")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "Actions for quasar-node-1" }));
+    expect(screen.getByRole("menuitem", { name: "Remove host" }).hasAttribute("disabled")).toBe(
+      false,
+    );
+    fireEvent.click(screen.getByRole("menuitem", { name: "Remove host" }));
+    expect(await screen.findByText("/admin/fleet/hosts/c2059601?remove=1")).toBeTruthy();
+    expect(mocked.deleteHost).not.toHaveBeenCalled();
+  });
+
+  it("holds the own machine's 'Remove host' until the identity resolves, then opens the still-connected dialog", async () => {
+    setFleet([host({ ...ownedGPU, node_name: "living-room-pc", id: "own1" })]);
+    const { identity, resolveIdentity } = pendingIdentity();
+    mocked.getPlatformIdentity.mockReturnValue(identity as never);
+    render(
+      <MemoryRouter initialEntries={["/admin/fleet/hosts"]}>
+        <SectionHeadProvider title="Fleet" tabs={FLEET_TABS}>
+          <Routes>
+            <Route path="/admin/fleet/hosts" element={<HostsTab />} />
+            <Route path="/admin/fleet/hosts/:id" element={<LocationProbe />} />
+          </Routes>
+        </SectionHeadProvider>
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText("living-room-pc")).toBeTruthy());
+
+    // Before the identity resolves the row thinks the own machine is removable and would
+    // navigate to its page; the held item prevents that.
+    fireEvent.click(screen.getByRole("button", { name: "Actions for living-room-pc" }));
+    expect(screen.getByRole("menuitem", { name: "Remove host" }).hasAttribute("disabled")).toBe(
+      true,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Actions for living-room-pc" }));
+
+    await act(async () => {
+      resolveIdentity({
+        identity: { machine_role: "combined", machine_node_name: "living-room-pc" },
+      });
+    });
+    await waitFor(() => expect(screen.getByText("living-room-pc")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "Actions for living-room-pc" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Remove host" }));
+    // The own machine is the control plane's own, still connected: the Forget dialog, not the page.
+    expect(await screen.findByText(/is still connected/)).toBeTruthy();
     expect(mocked.deleteHost).not.toHaveBeenCalled();
   });
 });
