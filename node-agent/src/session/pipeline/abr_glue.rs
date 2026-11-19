@@ -378,11 +378,12 @@ impl AbrLoop {
         let setpoint = self.governor.lock().unwrap().setpoint_kbps();
         // #1599: a takeover that claimed the encoder between the rung write (as_owner, above)
         // and here would otherwise receive this step's floor/rung echo over the launch point
-        // it just wrote. Re-check ownership before publishing; the echo is two atomic stores,
-        // so it stays out of the ABR write lock.
+        // it just wrote. Check and publish under the same write lock take_over writes the
+        // launch point under, so the check cannot go stale before the two atomic stores.
         #[cfg(test)]
         start_pause::run(&self.session_id, start_pause::Step::BeforeEchoPublish);
         if let Some(m) = self.metrics.upgrade() {
+            let _guard = m.lock_abr_write();
             if m.abr_owner() == self.id {
                 m.set_abr_floor(if floor_now == rungs.launch_floor_kbps {
                     0
