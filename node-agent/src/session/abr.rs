@@ -399,6 +399,13 @@ fn parse_validated_ms(
 /// the silence decay's.
 const REPORT_GAP: Duration = Duration::from_millis(500);
 
+/// Per-report loop: for this long after a reading sets the rate, the up path takes at most one
+/// deadband step over it. The estimate need not be near the link (a shallow buffer cuts it on
+/// loss only, a queue that grows a little fires no delay cut), and at the 25 %/s slew the
+/// setpoint was back over the link 0.6 s after each reading, so the link's queue or loss
+/// never stopped (#1496 r4). One step over a reading (`BETA` × the link) stays under the link.
+const READING_HOLD: Duration = Duration::from_secs(10);
+
 /// A receiver report's evidence that the link held the sender back
 /// (`webtransport::congestion::Estimator::measured`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -438,6 +445,12 @@ pub struct Governor {
     last_report: Option<Instant>,
     /// Per-report loop: the first reading of a run under the line.
     under: Option<f64>,
+    /// Per-report loop: the rate the last reading set, and when ([`READING_HOLD`]).
+    read: Option<(f64, Instant)>,
+    /// Per-report loop: the last report showed the link holding the sender back, even on
+    /// video sent before the last write: no up move on it, or each up move made the evidence
+    /// against it stale and the setpoint climbed three steps over the link (#1496 r5).
+    holding: bool,
 }
 
 impl Governor {
@@ -455,6 +468,8 @@ impl Governor {
             fed: None,
             last_report: None,
             under: None,
+            read: None,
+            holding: false,
         }
     }
 
@@ -571,8 +586,15 @@ impl Governor {
                 .min(self.rate * (1.0 + slew * dt))
                 .min(self.cfg.ceiling_kbps as f64);
         }
+        if let Some((read, _)) = self
+            .read
+            .filter(|&(_, at)| now.saturating_duration_since(at) < READING_HOLD)
+        {
+            self.rate = self.rate.min(read * (1.0 + self.cfg.deadband));
+        }
         let target = self.clamp(self.rate.min(estimate).floor());
-        let up = target > self.setpoint
+        let up = !self.holding
+            && target > self.setpoint
             && (target as f64 >= sp * (1.0 + self.cfg.deadband) || target == self.cfg.ceiling_kbps);
         if !up || !self.write_due(now) {
             return None;
@@ -591,6 +613,7 @@ impl Governor {
     pub fn observe_report(&mut self, held: Option<Held>, now: Instant) -> Option<u32> {
         self.cfg.per_report?;
         self.last_report = Some(now);
+        self.holding = held.is_some();
         let Some(reading) = held
             .filter(|h| h.since >= self.last_retarget)
             .map(|h| h.share * f64::from(self.setpoint))
@@ -606,6 +629,7 @@ impl Governor {
         }
         self.under = None;
         self.rate = target;
+        self.read = Some((target, now));
         let sp = self.clamp(target);
         if sp >= self.setpoint {
             return None;
@@ -1285,6 +1309,39 @@ mod tests {
             "the setpoint stops at the floor"
         );
         assert_eq!(g.rate_kbps(), 800.0, "the rate does not");
+    }
+
+    /// #1496 r5: for 10 s after a reading, the up path takes at most one deadband step over
+    /// it (`BETA` × the link, one step up, is still under the link); then it climbs again, but
+    /// not on a report that shows the link holding the sender back, even on video sent before
+    /// the last write.
+    #[test]
+    fn per_report_a_reading_holds_the_up_path_one_step_over_it() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        g.observe(10_000.0, ms(base, 0));
+        g.observe_report(held(&g, 4000.0, ms(base, 0)), ms(base, 0));
+        assert_eq!(
+            g.observe_report(held(&g, 4000.0, ms(base, 100)), ms(base, 100)),
+            Some(4000)
+        );
+        let mut most = 0;
+        for i in 2..100 {
+            let at = ms(base, i * 100);
+            g.observe_report(None, at);
+            g.observe(10_000.0, at);
+            most = most.max(g.setpoint_kbps());
+        }
+        assert_eq!(most, 4600, "one 15 % step in the hold");
+        let at = ms(base, 10_500);
+        g.observe_report(held(&g, 4000.0, ms(base, 0)), at);
+        assert_eq!(g.observe(10_000.0, at), None, "a stale reading still holds");
+        g.observe_report(None, ms(base, 10_600));
+        assert!(
+            g.observe(10_000.0, ms(base, 10_600))
+                .is_some_and(|sp| sp > 5290),
+            "the next clean report climbs past one step"
+        );
     }
 
     /// A report with no reading between two low ones breaks the run, and video sent before

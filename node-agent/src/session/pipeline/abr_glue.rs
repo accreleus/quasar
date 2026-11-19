@@ -3287,7 +3287,8 @@ mod tests {
     /// and back up every cycle. Now the first up after a down waits until the down is
     /// `min_step_s` (10 s) old, so every down comes at least `min_step_s + STEP_SETTLE +
     /// RATE_CONFIRM` (14 s) after the one before. A down stays prompt: 1 s after the first
-    /// low phase begins.
+    /// low phase begins. Since #1496 r5 a reading holds the rate under one deadband step over
+    /// it for 10 s, so a link back under it within 10 s keeps the session down.
     #[test]
     fn a_slow_oscillation_across_the_band_is_bounded() {
         let mut wt = Wt::new(true);
@@ -3311,7 +3312,7 @@ mod tests {
         );
         assert!(downs[0] <= 21_200, "down at {downs:?}");
         assert!(
-            downs.len() >= 2 && downs.windows(2).all(|d| d[1] - d[0] >= 14_000),
+            !downs.is_empty() && downs.windows(2).all(|d| d[1] - d[0] >= 14_000),
             "{downs:?} {steps:?}"
         );
     }

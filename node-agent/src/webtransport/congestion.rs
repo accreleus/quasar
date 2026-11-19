@@ -118,17 +118,22 @@ const OVERUSE_GAP: Duration = Duration::from_millis(250);
 const APP_LIMITED: f64 = 0.8;
 /// The least one-way delay in the rate window this far over the least of the last
 /// [`FLOOR_WINDOW_US`] is a standing queue: the link holds the sender back
-/// ([`Estimator::measured`]). A rate gate cannot tell a link a wire 1 % over fills from a
-/// clean one, which measures within 1 %, and that queue grows for good (#1496); a queue
-/// that keeps growing crosses any line.
+/// ([`Estimator::measured`]) if it is still growing. A rate gate cannot tell a link a wire
+/// 1 % over fills from a clean one, which measures within 1 %, and that queue grows for good
+/// (#1496); a queue that keeps growing crosses any line.
 const QUEUE_HELD_US: i64 = 30_000;
+/// A queue grows when the least delay of each of the last two whole [`FLOOR_STEP_US`] of send
+/// time is this much over the step before it: a wire 0.4 % over the link. A least delay over
+/// half a second is the path's floor plus the queue, whatever the jitter on each datagram, so a
+/// path whose delay steps up (a roam) rises once and stays: no growth (#1496 r4 B M2).
+const QUEUE_GROWTH_US: i64 = 2_000;
 /// The delay floor is the least one-way delay over this much send time, in steps of
 /// [`FLOOR_STEP_US`]: long enough that a wire 0.4 % over the link crosses
 /// [`QUEUE_HELD_US`] before its queue ages into the floor, short enough that a path whose
 /// delay rose (a roam) stops reading as a queue.
 /// shortcut: a wire under 0.4 % over the link is never seen; raise this if one shows.
 const FLOOR_WINDOW_US: u64 = 10_000_000;
-const FLOOR_STEP_US: u64 = 1_000_000;
+const FLOOR_STEP_US: u64 = 500_000;
 /// Arrivals kept for the rate window, by receive order, one per datagram: the same 0.5 s at a
 /// 400 Mbit/s grant, ~21 800 of them (#1430).
 const MAX_ARRIVALS: usize = 1 << 15;
@@ -528,11 +533,13 @@ pub(crate) struct Measured {
     /// The rate every video datagram sent over the same span was sent at, lost ones
     /// included, on the agent's clock; `None` when the message added no fresh arrival.
     pub(crate) sent_kbps: Option<f64>,
-    /// The received datagrams' arrival rate over the rate they were sent at: under 1, the link
-    /// queued them; loss does not lower it.
-    pub(crate) delivery: Option<f64>,
+    /// The share of the video bytes sent over the rate window that arrived: loss lowers it.
+    pub(crate) delivered: Option<f64>,
     /// How far the least one-way delay in the rate window is over the delay floor, µs.
     pub(crate) queue_us: Option<i64>,
+    /// How much the least delay rose each [`FLOOR_STEP_US`] of send time, the lesser of the
+    /// last two whole steps, µs.
+    pub(crate) growth_us: Option<i64>,
     /// When the window's first datagram was sent.
     pub(crate) since: Option<Instant>,
     /// A video datagram (not a resend) first reported here is in the rate window.
@@ -611,13 +618,17 @@ impl Estimator {
         self.loss
     }
 
-    /// What the last message showed, when the link held the sender back (a standing queue,
-    /// [`QUEUE_HELD_US`], and datagrams arriving slower than they were sent): `BETA` (the
-    /// delay cut's own drain margin) × that share of the send rate, of the video sent from
-    /// `since`. `None` on a clean link, whatever the delay detector says (#68), under random
-    /// loss, which leaves the share at 1, and when no rate was measured. A sender under its
-    /// estimate counts: a wire 1 % over the link fires no delay cut, so the estimate stays at
-    /// the ceiling while the queue grows (#1496). The ABR's down path reads only this (#1376).
+    /// What the last message showed, when the link held the sender back, of the video sent
+    /// from `since`: `BETA` (the delay cut's own drain margin) × the share of the send rate the
+    /// link carried. Either a standing queue ([`QUEUE_HELD_US`]) that still grows
+    /// ([`QUEUE_GROWTH_US`]), the share being the send time over the time the queue took, or
+    /// over GCC's own [`LOSS_HIGH`] of the bytes sent lost, the share being what arrived: a
+    /// full drop-tail buffer too shallow to hold 30 ms delivers at the link what it was sent at
+    /// the link, so it shows no queue, only the loss of the wire's excess (#1496 r4 B M1).
+    /// `None` on a clean link, whatever the delay detector says (#68), under random loss under
+    /// `LOSS_HIGH`, and when no rate was measured. A sender under its estimate counts: a wire
+    /// 1 % over the link fires no delay cut, so the estimate stays at the ceiling while the
+    /// queue grows (#1496). The ABR's down path reads only this (#1376).
     pub(crate) fn measured(&self) -> Option<abr::Held> {
         self.measured
     }
@@ -772,15 +783,21 @@ impl Estimator {
         {
             self.stop_regrow("reached");
         }
-        self.measured = m
-            .delivery
-            .zip(m.queue_us)
+        let queue = m
+            .queue_us
+            .zip(m.growth_us)
+            .filter(|&(q, g)| q > QUEUE_HELD_US && g >= QUEUE_GROWTH_US)
+            .map(|(_, g)| BETA * FLOOR_STEP_US as f64 / (FLOOR_STEP_US as f64 + g as f64));
+        let lost = m
+            .delivered
+            .filter(|&d| d < 1.0 - LOSS_HIGH)
+            .map(|d| BETA * d);
+        self.measured = queue
+            .into_iter()
+            .chain(lost)
+            .reduce(f64::min)
             .zip(m.since)
-            .filter(|&((d, q), _)| d < 1.0 && q > QUEUE_HELD_US)
-            .map(|((d, _), since)| abr::Held {
-                share: BETA * d,
-                since,
-            });
+            .map(|(share, since)| abr::Held { share, since });
         let due = self.log_due(now) && (self.unlogged.is_some() || self.bound != self.logged.0);
         if !cut_by.is_empty() || due {
             // A silence fall not logged yet is part of this line's "from → to".
@@ -1025,8 +1042,22 @@ impl Estimator {
                 .then(|| (bytes - u64::from(first.1)) as f64 * 8.0 * 1000.0 / span as f64)
         };
         let rate_kbps = rate(|a| a.0, MIN_RATE_SPAN_US);
-        let delivery = rate_kbps.zip(rate(|a| a.2, 1)).map(|(r, s)| r / s);
         let floor = self.floor.iter().map(|&(_, d)| d).min();
+        // The back step is still filling.
+        let growth_us = match self
+            .floor
+            .len()
+            .checked_sub(4)
+            .map(|i| self.floor.range(i..i + 3))
+        {
+            Some(mut steps) => {
+                let (a, b, c) = (steps.next(), steps.next(), steps.next());
+                a.zip(b)
+                    .zip(c)
+                    .map(|((a, b), c)| (b.1 - a.1).min(c.1 - b.1))
+            }
+            None => None,
+        };
         let queue_us = self
             .arrivals
             .iter()
@@ -1039,7 +1070,7 @@ impl Estimator {
         let first_sent = self.arrivals.iter().map(|a| a.2).min();
         let since = first_sent.map(|us| log.start + Duration::from_micros(us));
         let last_sent = self.arrivals.iter().map(|a| a.2).max();
-        let sent_kbps = match (fresh, rate_kbps, first_sent, last_sent) {
+        let (sent_kbps, delivered) = match (fresh, rate_kbps, first_sent, last_sent) {
             (true, Some(_), Some(lo), Some(hi)) if hi > lo => {
                 let sent: u64 = log
                     .slots
@@ -1047,9 +1078,18 @@ impl Estimator {
                     .filter(|s| s.bytes > 0 && !s.resend && s.sent_us > lo && s.sent_us <= hi)
                     .map(|s| u64::from(s.bytes))
                     .sum();
-                Some(sent as f64 * 8.0 * 1000.0 / (hi - lo) as f64)
+                let got: u64 = self
+                    .arrivals
+                    .iter()
+                    .filter(|a| a.2 > lo)
+                    .map(|a| u64::from(a.1))
+                    .sum();
+                (
+                    Some(sent as f64 * 8.0 * 1000.0 / (hi - lo) as f64),
+                    (sent > 0).then(|| (got as f64 / sent as f64).min(1.0)),
+                )
             }
-            _ => None,
+            _ => (None, None),
         };
 
         if received != 0 || lost != 0 {
@@ -1076,8 +1116,9 @@ impl Estimator {
             usage: self.trendline.usage,
             rate_kbps,
             sent_kbps,
-            delivery,
+            delivered,
             queue_us,
+            growth_us,
             since,
             fresh,
             loss,

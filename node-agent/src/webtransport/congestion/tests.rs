@@ -1124,8 +1124,9 @@ fn the_regrow_caps_each_bound_at_the_pre_outage_rate() {
         usage: Usage::Normal,
         rate_kbps: Some(20_000.0),
         sent_kbps: None,
-        delivery: None,
+        delivered: None,
         queue_us: None,
+        growth_us: None,
         since: None,
         fresh: true,
         loss: None,
@@ -1160,8 +1161,9 @@ fn the_loss_bound_grows_within_the_receive_rate_cap() {
         usage: Usage::Normal,
         rate_kbps: Some(300.0),
         sent_kbps: None,
-        delivery: None,
+        delivered: None,
         queue_us: None,
+        growth_us: None,
         since: None,
         fresh: true,
         loss: None,
@@ -1940,8 +1942,9 @@ fn a_bound_flipping_at_the_feedback_rate_is_logged_at_most_once_a_second() {
                 },
                 rate_kbps: None,
                 sent_kbps: None,
-                delivery: None,
+                delivered: None,
                 queue_us: None,
+                growth_us: None,
                 since: None,
                 fresh: false,
                 loss: delay_grows.then_some(0.05),
@@ -2018,8 +2021,9 @@ fn each_line_names_every_cause_of_the_fall_it_covers() {
             usage: Usage::Normal,
             rate_kbps: None,
             sent_kbps: None,
-            delivery: None,
+            delivered: None,
             queue_us: None,
+            growth_us: None,
             since: None,
             fresh: false,
             loss: Some(0.5),
@@ -2037,45 +2041,65 @@ fn each_line_names_every_cause_of_the_fall_it_covers() {
 }
 
 /// #1376, #1496: a report is evidence of the link (`measured`) only when the link holds the
-/// sender back: a standing queue and datagrams arriving slower than they were sent. It is then
-/// `BETA` × that share, of the video sent from the window's start. A queue that drains, a
-/// clean link (whatever it delivers) and a report with no rate give none.
+/// sender back: a standing queue that still grows, or over `LOSS_HIGH` of the bytes sent lost.
+/// It is then `BETA` × the share of the send rate the link carried, of the video sent from the
+/// window's start. A queue that drains or stays put, random loss, and a report with no
+/// growth give none.
 #[test]
 fn a_report_is_evidence_only_when_the_link_held_the_sender_back() {
     let start = Instant::now();
     let at = |ms| start + Duration::from_millis(ms);
-    let report = |delivery, queue_ms: i64| Measured {
+    let report = |delivered, queue_ms: i64, growth_ms: i64| Measured {
         usage: Usage::Normal,
         rate_kbps: Some(7000.0),
         sent_kbps: Some(8000.0),
-        delivery: Some(delivery),
+        delivered: Some(delivered),
         queue_us: Some(queue_ms * 1000),
+        growth_us: Some(growth_ms * 1000),
         since: Some(at(50)),
         fresh: true,
         loss: None,
     };
     let mut est = Estimator::new(CEILING, start);
-    est.apply(report(0.9, 5), at(100), NO_QUIC);
-    assert_eq!(est.measured(), None, "no standing queue: a burst, or loss");
-    est.apply(report(1.05, 200), at(200), NO_QUIC);
-    assert_eq!(est.measured(), None, "a queue that drains");
-    est.apply(
-        Measured {
-            delivery: None,
-            ..report(0.9, 200)
-        },
-        at(400),
-        NO_QUIC,
-    );
-    assert_eq!(est.measured(), None, "no rate");
-    est.apply(report(0.99, 200), at(500), NO_QUIC);
+    for (m, why) in [
+        (report(1.0, 5, 10), "no standing queue: a burst"),
+        (
+            report(1.0, 200, 0),
+            "a queue that stays put: a delay step, or a full buffer",
+        ),
+        (report(1.0, 200, -10), "a queue that drains"),
+        (report(0.95, 0, 0), "loss under LOSS_HIGH: random"),
+        (
+            Measured {
+                growth_us: None,
+                ..report(1.0, 200, 10)
+            },
+            "no whole steps yet",
+        ),
+    ] {
+        est.apply(m, at(100), NO_QUIC);
+        assert_eq!(est.measured(), None, "{why}");
+    }
+    let held = |share| {
+        Some(abr::Held {
+            share,
+            since: at(50),
+        })
+    };
+    est.apply(report(1.0, 200, 10), at(500), NO_QUIC);
     assert_eq!(
         est.measured(),
-        Some(abr::Held {
-            share: BETA * 0.99,
-            since: at(50)
-        })
+        held(BETA * FLOOR_STEP_US as f64 / (FLOOR_STEP_US + 10_000) as f64),
+        "a queue growing 10 ms a step"
     );
+    est.apply(report(0.8, 0, 0), at(600), NO_QUIC);
+    assert_eq!(
+        est.measured(),
+        held(BETA * 0.8),
+        "a fifth of the bytes lost"
+    );
+    est.apply(report(0.8, 200, 10), at(700), NO_QUIC);
+    assert_eq!(est.measured(), held(BETA * 0.8), "both: the lower");
 }
 
 /// A sender whose ABR is at `setpoint` with no room over it, the wire `WIRE` × that, into a
@@ -2107,21 +2131,25 @@ fn every_setpoint_over_the_link_is_taken_under_it() {
     for over in [0.005, 0.01, 0.014, 0.023, 0.03, 0.04, 0.05] {
         let setpoint = (LINK / WIRE * (1.0 + over)).round() as u32;
         let mut s = abr_at(LINK, setpoint);
+        s.keyframe_every = 60;
+        s.extra_us = jitter(110);
         let mut under = None;
-        let mut wait_max: u64 = 0;
+        let (mut wait_max, mut under_late): (u64, u32) = (0, 0);
         for tenth in 1..=600 {
             s.run(0.1);
-            let wire = WIRE * f64::from(s.abr.as_ref().unwrap().0.setpoint_kbps());
-            if wire < LINK {
+            if wire(&s) < LINK {
                 under.get_or_insert(f64::from(tenth) / 10.0);
+                under_late += u32::from(tenth > 300);
             }
             if tenth > 300 {
                 wait_max = wait_max.max(s.free_at.saturating_sub(s.t));
             }
         }
-        table.push((setpoint, under, wait_max / 1000, s.readings));
+        table.push((setpoint, under, under_late, wait_max / 1000, s.readings));
     }
-    for &(setpoint, under, wait_ms, _) in &table {
+    eprintln!("(setpoint, first under s, tenths under of the last 300, wait max ms, readings)");
+    eprintln!("{table:?}");
+    for &(setpoint, under, under_late, wait_ms, _) in &table {
         let under =
             under.unwrap_or_else(|| panic!("setpoint {setpoint} stayed over the link: {table:?}"));
         assert!(
@@ -2129,9 +2157,67 @@ fn every_setpoint_over_the_link_is_taken_under_it() {
             "setpoint {setpoint} went under the link only at {under} s: {table:?}"
         );
         assert!(
+            under_late >= 240,
+            "setpoint {setpoint}: under the link {under_late}/300 of the last 30 s: {table:?}"
+        );
+        assert!(
             wait_ms < 500,
             "setpoint {setpoint}: the queue reached {wait_ms} ms: {table:?}"
         );
+    }
+}
+
+/// The wire the sim's sender puts on the path, kbit/s: `WIRE` × the setpoint, plus the
+/// keyframes' four extra frames.
+fn wire(s: &Sim) -> f64 {
+    let keys = if s.keyframe_every > 0 {
+        4.0 / f64::from(s.keyframe_every)
+    } else {
+        0.0
+    };
+    WIRE * f64::from(s.abr.as_ref().unwrap().0.setpoint_kbps()) * (1.0 + keys)
+}
+
+/// #1496 r4 B M1: a drop-tail buffer too shallow to hold the 30 ms a standing queue is read at
+/// (a shallow router, a policer). Full, it delivers at the link what it was sent at the link,
+/// so it shows no queue, only loss of the wire's excess: 1 − link / wire, 20–50 % here, which
+/// held the setpoint over the link for good (1348–5464 drops each 30 s). That loss takes the
+/// wire under the link, and from then only the probe after each hold loses anything.
+#[test]
+fn a_full_shallow_buffer_takes_the_wire_under_the_link() {
+    const LINK: f64 = 1688.0;
+    let mut table = Vec::new();
+    for (buffer_ms, setpoint) in [(22.0, 2000), (44.0, 2400), (22.0, 3200), (44.0, 3200)] {
+        let mut s = abr_at(LINK, setpoint);
+        s.queue_bytes = LINK * buffer_ms / 8.0;
+        s.run(30.0);
+        let early = s.queue_drops;
+        let (mut under_late, mut least) = (0u32, u32::MAX);
+        for _ in 0..300 {
+            s.run(0.1);
+            under_late += u32::from(wire(&s) < LINK);
+            least = least.min(s.abr.as_ref().unwrap().0.setpoint_kbps());
+        }
+        let late = s.queue_drops - early;
+        let end = s.abr.as_ref().unwrap().0.setpoint_kbps();
+        table.push((
+            buffer_ms, setpoint, early, late, under_late, least, end, s.readings,
+        ));
+    }
+    eprintln!("(buffer ms, setpoint, drops 0-30 s, drops 30-60 s, tenths under of the last 300, least setpoint 30-60 s, setpoint at 60 s, readings)");
+    eprintln!("{table:?}");
+    for &(buffer_ms, setpoint, _, late, under_late, _, end, _) in &table {
+        let row = format!("{buffer_ms} ms / {setpoint}: {table:?}");
+        assert!(
+            WIRE * f64::from(end) < LINK,
+            "the wire ends over the link, {row}"
+        );
+        assert!(
+            under_late >= 240,
+            "under the link {under_late}/300 of the last 30 s, {row}"
+        );
+        // Only the probe after each 10 s hold loses anything: one step over the link.
+        assert!(late < 150, "{late} drops in the last 30 s, {row}");
     }
 }
 
@@ -2141,9 +2227,19 @@ fn every_setpoint_over_the_link_is_taken_under_it() {
 fn a_clean_jittery_link_gives_no_reading() {
     let mut s = abr_at(20_000.0, 8000);
     s.extra_us = jitter(110);
-    s.run(30.0);
-    assert_eq!(s.readings, 0);
-    assert_eq!(s.abr.as_ref().unwrap().0.setpoint_kbps(), 8000);
+    s.keyframe_every = 60;
+    let least = least_setpoint(&mut s, 30.0);
+    assert_eq!((s.readings, least), (0, 8000));
+}
+
+/// The least setpoint over `secs` of the sim, read each 0.1 s.
+fn least_setpoint(s: &mut Sim, secs: f64) -> u32 {
+    let mut least = u32::MAX;
+    for _ in 0..(secs * 10.0) as u32 {
+        s.run(0.1);
+        least = least.min(s.abr.as_ref().unwrap().0.setpoint_kbps());
+    }
+    least
 }
 
 /// Random loss is not congestion: 2 % of datagrams lost on a link with room leave the
@@ -2152,7 +2248,8 @@ fn a_clean_jittery_link_gives_no_reading() {
 fn random_loss_leaves_the_delivered_share_at_one() {
     let mut s = abr_at(20_000.0, 8000);
     s.drop_every = 50;
-    s.run(30.0);
+    let least = least_setpoint(&mut s, 30.0);
+    assert_eq!(least, 8000);
     let span = |key: fn(&(u64, u32, u64)) -> u64| {
         let keys = s.est.arrivals.iter().map(key);
         (keys.clone().max().unwrap() - keys.min().unwrap()) as f64
@@ -3323,13 +3420,18 @@ fn held_video_over_the_cap_is_dropped_before_a_resend() {
     assert_eq!(held, [(true, 9), (false, 1), (false, 2), (false, 3)]);
 }
 
-/// A path whose delay rises 60 ms and stays there (a roam) reads as a queue until the floor
-/// ages it out, but a queue that does not grow delivers what is sent: it costs no cut.
+/// A path whose delay rises 60 ms and stays there (a roam) reads as a standing queue until the
+/// floor ages it out, but one that does not grow is no evidence: it costs no reading and never
+/// moves the setpoint, through 2 ms of noise on each datagram and a keyframe each second
+/// (#1496 r4 B M2: span-based delivery hovered near 1 and gave 42 readings).
 #[test]
 fn a_path_whose_delay_rises_costs_no_cut() {
     let mut s = abr_at(20_000.0, 8000);
     let j = jitter(0);
     s.extra_us = Box::new(move |t| j(t) + if t >= 5_000_000 { 60_000 } else { 0 });
-    s.run(30.0);
-    assert_eq!(s.abr.as_ref().unwrap().0.setpoint_kbps(), 8000);
+    s.reorder_us = Box::new(|seq| u64::from(seq.wrapping_mul(2_654_435_761) % 2000));
+    s.hold_us = 5000;
+    s.keyframe_every = 60;
+    let least = least_setpoint(&mut s, 30.0);
+    assert_eq!((s.readings, least), (0, 8000));
 }
