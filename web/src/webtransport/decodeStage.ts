@@ -82,6 +82,10 @@ export class DecodeStage {
   /** Deltas are useless until a keyframe: after a (re)configure, a decoder restart or a skip. */
   private needKey = true;
   private askedKey = false;
+  /** Set by leave(): the picture has left for PyroWave, so units and the keyframe wait are inert
+   *  until the next config() re-arms the stage. Without this a stale delta of the old configuration
+   *  reaches a decoder that rejects it and ends the connection as a lost stream (#1436). */
+  private left = false;
   /** Set once the stage can do nothing more: closed, or a fatal error reported. */
   private stopped = false;
   /** Bumped per configure, so a late support check cannot apply an old config. */
@@ -104,6 +108,8 @@ export class DecodeStage {
     // A re-sent hello_ack for the live configuration (the agent's resync) changes nothing.
     if (this.current?.configId === config.configId) return;
     this.current = config;
+    // A genuine new configuration re-arms the stage, clearing the leave() drop-units state.
+    this.left = false;
     // Null until configure() finishes: units for this config wait in `held` meanwhile.
     const decoder = this.decoder?.state === "closed" ? null : this.decoder;
     this.decoder = null;
@@ -127,14 +133,16 @@ export class DecodeStage {
    *  arriving meanwhile are dropped, so no picture is expected. Not so for a decoder that stopped
    *  taking units (its queue is at the hard cap), whose keyframe wait never ends. */
   needsKey(): boolean {
-    return this.needKey && this.current !== null && (this.decoder?.decodeQueueSize ?? 0) < MAX_DECODE_QUEUE_HARD;
+    return !this.left && this.needKey && this.current !== null && (this.decoder?.decodeQueueSize ?? 0) < MAX_DECODE_QUEUE_HARD;
   }
 
   /** The picture leaves this stage: PyroWave takes it over mid-session, so the keyframe wait here
    *  is not this connection's and must not end it (#1436). Units held for the old configuration
-   *  cannot follow either. */
+   *  cannot follow either, and neither may a stale one arrive: the stage drops units and reports no
+   *  keyframe wait until the next config() re-arms it. */
   leave(): void {
     if (this.stopped) return;
+    this.left = true;
     this.needKey = false;
     this.askedKey = false;
     this.held = [];
@@ -143,6 +151,10 @@ export class DecodeStage {
 
   unit(unit: AccessUnit): void {
     if (this.stopped) return;
+    // After leave() the stage is inert until the next config(): a stale unit of the old
+    // configuration would otherwise reach a decoder that rejects it (a delta with no keyframe) and
+    // end the connection as a lost stream (#1436).
+    if (this.left) return;
     const cur = this.current;
     if (cur && unit.configId !== cur.configId && !serialAfter(unit.configId, cur.configId, 8)) {
       return; // older than the current configuration
