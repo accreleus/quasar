@@ -7,7 +7,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { RuntimeTab } from "./RuntimeTab";
 import { draftFromApp } from "./appDraft";
-import type { RuntimePreset } from "../../../../api/types";
+import type { AdminApp, RuntimePreset } from "../../../../api/types";
 
 type Draft = ReturnType<typeof draftFromApp>;
 
@@ -159,5 +159,96 @@ describe("RuntimeTab container flags (#179)", () => {
     renderTab(false);
     expect(screen.queryByLabelText("GPU access")).toBeNull();
     expect(screen.queryByLabelText("Block privilege escalation")).toBeNull();
+  });
+});
+
+// A derived tile has no runtime of its own, so the editor must not derive its
+// managed home client-side from the parent: it reads effective_managed_home /
+// effective_home_container_path off the app the API returned (amendment 82).
+describe("RuntimeTab derived tile", () => {
+  function renderDerived(opts: { parent: Partial<AdminApp>; app: Partial<AdminApp> }) {
+    const preset = {
+      id: "preset-1",
+      name: "KDE Desktop",
+      managed_home: true,
+      home_container_path: "/home/kde",
+      env: {},
+    } as unknown as RuntimePreset;
+    function Harness() {
+      const [draft, setDraft] = useState<Draft>(draftFromApp(null));
+      return (
+        <RuntimeTab
+          draft={draft}
+          onChange={setDraft}
+          errors={{}}
+          app={{ id: "app-1", ...opts.app } as unknown as AdminApp}
+          parent={{ id: "parent-1", ...opts.parent } as unknown as AdminApp}
+          presets={[preset]}
+          storageProvider={null}
+        />
+      );
+    }
+    render(
+      <MemoryRouter>
+        <Harness />
+      </MemoryRouter>,
+    );
+  }
+
+  it("shows the app's effective managed home and its path for a derived tile", () => {
+    renderDerived({
+      parent: {
+        id: "parent-1",
+        name: "KDE Desktop",
+        runtime_spec: {},
+        runtime_preset_id: "preset-1",
+      },
+      app: {
+        id: "app-1",
+        runtime_spec: {},
+        effective_managed_home: true,
+        effective_home_container_path: "/home/kde",
+      },
+    });
+    expect(screen.getByText("Managed home")).toBeInTheDocument();
+    expect(screen.getByText(/\/home\/kde/)).toBeInTheDocument();
+  });
+
+  it("reads the home from the API, not a client-side merge of the parent", () => {
+    renderDerived({
+      parent: {
+        id: "parent-1",
+        name: "KDE Desktop",
+        runtime_spec: {},
+        runtime_preset_id: "preset-1",
+      },
+      app: {
+        id: "app-1",
+        runtime_spec: {},
+        // The parent's preset provides no managed home, so a client-side merge
+        // of parent + preset would show none; the API says otherwise.
+        effective_managed_home: true,
+        effective_home_container_path: "/srv/effective",
+      },
+    });
+    expect(screen.getByText("/srv/effective")).toBeInTheDocument();
+  });
+
+  it("shows None when the app's effective managed home is off", () => {
+    renderDerived({
+      parent: {
+        id: "parent-1",
+        name: "KDE Desktop",
+        runtime_spec: {},
+        runtime_preset_id: "preset-1",
+      },
+      app: {
+        id: "app-1",
+        runtime_spec: {},
+        effective_managed_home: false,
+      },
+    });
+    expect(screen.getByText("Managed home")).toBeInTheDocument();
+    expect(screen.getByText("None")).toBeInTheDocument();
   });
 });

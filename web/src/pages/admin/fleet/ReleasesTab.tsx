@@ -455,11 +455,23 @@ function ReleaseFeed({ view }: { view: PlatformReleaseView }) {
   return (
     <>
       {view.available.length === 0 ? (
-        <Card className="card-pad mb4">
-          <p className="muted">
-            Nothing newer than this control plane has been detected on the {view.channel} channel.
-          </p>
-        </Card>
+        view.held_back ? (
+          <Card className="card-pad mb4">
+            <p className="muted">
+              The newest release on the {view.held_back.channel} channel is held back: its schema{" "}
+              <span className="mono">{view.held_back.schema_version}</span> is below the installed
+              control plane&rsquo;s schema{" "}
+              <span className="mono">{view.installed.control_plane.schema_version}</span>, so it is
+              not offered.
+            </p>
+          </Card>
+        ) : (
+          <Card className="card-pad mb4">
+            <p className="muted">
+              Nothing newer than this control plane has been detected on the {view.channel} channel.
+            </p>
+          </Card>
+        )
       ) : (
         view.available.map((release, i) => (
           <ReleaseCard
