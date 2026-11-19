@@ -256,4 +256,12 @@ describe("a path that holds each datagram on its own (#1330)", () => {
     expect(burst.reorderMs(1200)).toBeGreaterThan(90);
     expect(burst.reorderMs(1110 + REORDER_HISTORY_MS)).toBe(0);
   });
+
+  it("never holds a gap longer than 150 ms, however late the datagrams come (#1330, #1436)", () => {
+    const rec = new FeedbackRecorder(0);
+    // A window far wider than the bound: only the 150 ms clamp decides.
+    rec.capMs = () => 10_000;
+    stream(rec, 3_000, (s) => s + spread(400)(s), 3_000);
+    expect(rec.reorderMs(3_000)).toBe(150);
+  });
 });

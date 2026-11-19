@@ -2,9 +2,13 @@ import { describe, expect, it } from "vitest";
 import { summarizePresentWindow } from "./presentCadence";
 import {
   feedPresentedFrame,
+  feedPresentedFrames,
+  presentedDisplayMs,
   presentedFrameKey,
   INITIAL_FRAME_DEDUP_STATE,
+  INITIAL_PRESENT_FRAME_METADATA_STATE,
   type FrameDedupState,
+  type PresentFrameMetadataState,
 } from "./presentFrameDedup";
 
 /**
@@ -210,5 +214,104 @@ describe("presentedFrameKey", () => {
     expect(presentedFrameKey({ mediaTime: 0 })).toBe(0);
     expect(presentedFrameKey({ mediaTime: 0.5, rtpTimestamp: 9 })).toBe(0.5);
     expect(presentedFrameKey(undefined)).toBeUndefined();
+  });
+});
+
+// #552: presentation pacing from RVFC frame metadata. A callback the UA coalesced
+// over several presentations must count every presented frame and contribute one
+// per-frame interval, never one callback-to-callback span read as a long frame.
+describe("feedPresentedFrames (RVFC metadata, #552)", () => {
+  type Frame = { presentedFrames: number; displayMs: number };
+  const run = (frames: Frame[]) => {
+    let state: PresentFrameMetadataState = INITIAL_PRESENT_FRAME_METADATA_STATE;
+    const out: { frames: number; intervalMs: number | null }[] = [];
+    for (const f of frames) {
+      const r = feedPresentedFrames(state, f.presentedFrames, f.displayMs);
+      state = r.nextState;
+      out.push({ frames: r.frames, intervalMs: r.intervalMs });
+    }
+    return out;
+  };
+
+  it("a presentedFrames delta of 2 in one callback counts 2 frames and one 16.67 ms interval", () => {
+    // Seeded at presentedFrames 10 / display 1000; the next callback coalesced
+    // two presentations, 33.34 ms apart on the display clock.
+    const r = run([
+      { presentedFrames: 10, displayMs: 1000 },
+      { presentedFrames: 12, displayMs: 1033.34 },
+    ]);
+    expect(r[0]).toEqual({ frames: 0, intervalMs: null });
+    expect(r[1]!.frames).toBe(2);
+    expect(r[1]!.intervalMs).toBeCloseTo(16.67, 6);
+    // NOT 33.34: the two presented frames share the span; one long frame was the
+    // callback-cadence bug #552.
+    expect(r[1]!.intervalMs).not.toBeCloseTo(33.34, 6);
+  });
+
+  it("counts a deeper coalesce as its presented-frame delta with a per-frame interval", () => {
+    const r = run([
+      { presentedFrames: 0, displayMs: 0 },
+      { presentedFrames: 3, displayMs: 50 },
+    ]);
+    expect(r[1]).toEqual({ frames: 3, intervalMs: 50 / 3 });
+  });
+
+  it("a duplicate tick (presentedFrames delta 0) yields no sample and preserves state", () => {
+    const r = run([
+      { presentedFrames: 5, displayMs: 0 },
+      { presentedFrames: 5, displayMs: 10 }, // tick for the same presented frame
+      { presentedFrames: 6, displayMs: 33.34 }, // next new frame: full gap, not 10 ms
+    ]);
+    expect(r[1]).toEqual({ frames: 0, intervalMs: null });
+    expect(r[2]).toEqual({ frames: 1, intervalMs: 33.34 });
+  });
+
+  it("reseeds rather than suppressing samples when the UA counter restarts", () => {
+    const r = run([
+      { presentedFrames: 500, displayMs: 0 },
+      { presentedFrames: 2, displayMs: 100 }, // counter restarted (new element/run)
+      { presentedFrames: 3, displayMs: 116.67 },
+    ]);
+    expect(r[1]).toEqual({ frames: 0, intervalMs: null });
+    expect(r[2]!.frames).toBe(1);
+    expect(r[2]!.intervalMs).toBeCloseTo(16.67, 6);
+  });
+
+  it("a real dropped frame still reads as one long interval (delta 1)", () => {
+    const r = run([
+      { presentedFrames: 0, displayMs: 0 },
+      { presentedFrames: 1, displayMs: 33.34 },
+    ]);
+    expect(r[1]).toEqual({ frames: 1, intervalMs: 33.34 });
+  });
+
+  it("the interval is the elapsed display time per frame, independent of callback run time", () => {
+    // The interval is displayToDisplay / delta; nothing in this function reads a
+    // callback clock, so a delayed callback cannot move it.
+    const r = run([
+      { presentedFrames: 0, displayMs: 1000 },
+      { presentedFrames: 1, displayMs: 1016.67 },
+      { presentedFrames: 2, displayMs: 1033.34 },
+    ]);
+    expect(r[1]!.intervalMs).toBeCloseTo(16.67, 6);
+    expect(r[2]!.intervalMs).toBeCloseTo(16.67, 6);
+  });
+});
+
+describe("presentedDisplayMs (#552)", () => {
+  it("prefers expectedDisplayTime", () => {
+    expect(presentedDisplayMs({ expectedDisplayTime: 500, presentationTime: 480 }))
+      .toBe(500);
+  });
+
+  it("falls back to presentationTime when expectedDisplayTime is absent", () => {
+    expect(presentedDisplayMs({ presentationTime: 480 })).toBe(480);
+    expect(presentedDisplayMs({ expectedDisplayTime: Number.NaN, presentationTime: 480 }))
+      .toBe(480);
+  });
+
+  it("is null when the UA supplied no display time", () => {
+    expect(presentedDisplayMs({})).toBeNull();
+    expect(presentedDisplayMs(undefined)).toBeNull();
   });
 });

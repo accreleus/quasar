@@ -2499,6 +2499,80 @@ fn pyrowave_an_application_limited_sender_with_a_small_window_never_steps_down()
     assert_eq!(rate.budget, budget_of(f64::from(PYRO_TARGET)));
 }
 
+/// #1430: the send log is sized for PyroWave's grant: the estimator reads the sent rate over
+/// its 0.5 s window, and at 400 Mbit/s that is 25 MB, ~21 800 datagrams, more than a log
+/// sized for the standard codec's 100 Mbit/s. A window the log cannot cover reads as
+/// application-limited, so the log holds it all.
+#[test]
+fn pyrowave_send_log_spans_the_rate_window_at_a_400_mbit_grant() {
+    let on = Instant::now();
+    let mut log = SendLog::new(on);
+    // 400 Mbit/s is 50 000 B/ms; a whole datagram is 1 148 B, so 21 778 of them in 0.5 s.
+    let count = 21_778usize;
+    for seq in 0..count {
+        let mut d = vec![0u8; SIZE];
+        d[1..5].copy_from_slice(&(seq as u32).to_le_bytes());
+        log.record(&d, on + Duration::from_micros(seq as u64 * 23), false);
+    }
+    assert!(
+        LOG >= count,
+        "the {count} datagrams of 0.5 s at 400 Mbit/s outgrow the log"
+    );
+    assert!(
+        MAX_ARRIVALS >= count,
+        "the rate window's {count} arrivals outgrow the arrivals deque"
+    );
+    assert_eq!(log.slots.len(), LOG);
+    // The whole window is held: the first record was never overwritten by a later one.
+    assert!(
+        log.slot(0).is_some(),
+        "the oldest record of the rate window was overwritten"
+    );
+}
+
+/// #1430 review: a whole frame arrives as a burst over a window smaller than it, and the
+/// 100 ms tick lands on the burst every time. The queue waits at each tick, but the report
+/// between ticks shows the window drained it, so it is not the standing queue that caps:
+/// the budget must not be cut and the session must not step down.
+#[test]
+fn pyrowave_a_burst_phase_locked_to_the_tick_is_not_a_standing_queue() {
+    let on = Instant::now();
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
+    // Quinn's first window at a 1 ms RTT: 12 000 B, 96 Mbit/s, 1/35 of one whole frame at
+    // the target. The report 50 ms after a tick sees it drained; the tick sees the next burst.
+    let small = quic_at(96_000.0);
+    let burst = QuicPath {
+        queued_bytes: 407_000, // one whole 60 fps frame at the 200 Mbit/s target
+        ..small
+    };
+    for step in 0..40u64 {
+        let at = on + Duration::from_millis(50 + step * 100);
+        fill(&mut rate, 50);
+        let report = rate.on_feedback(
+            &Feedback {
+                first_pkt_seq: u32::MAX / 2, // names nothing the log holds: no rate sample
+                ref_us: 0,
+                arrivals: vec![0],
+            },
+            at,
+            small,
+        );
+        assert!(
+            !matches!(report, PyroVerdict::StepDown { .. }),
+            "stepped down from an oscillating queue at step {step}: {report:?}"
+        );
+        fill(&mut rate, 50);
+        // The tick is phase-locked to the burst (a whole frame every 100 ms): waiting now, but
+        // the report between ticks showed the queue drained, so this is one burst in flight.
+        let tick = rate.on_tick(at + Duration::from_millis(100), burst);
+        assert!(
+            !matches!(tick, PyroVerdict::StepDown { .. }),
+            "the burst at the tick capped and stepped down at step {step}: {tick:?}"
+        );
+    }
+    assert_eq!(rate.budget, budget_of(f64::from(PYRO_TARGET)));
+}
+
 #[test]
 fn pyrowave_clean_feedback_at_the_target_for_10_s_never_steps_down() {
     let on = Instant::now();
