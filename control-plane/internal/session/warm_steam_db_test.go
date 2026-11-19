@@ -1051,6 +1051,26 @@ func TestHeartbeatSkipsAUserWhoseLaunchWouldBeWebTransport(t *testing.T) {
 	}
 }
 
+// #1224: on a mixed-GPU host (GPU 0 PyroWave-capable, GPU 1 not) the launch plans WebTransport
+// on GPU 0 and WebRTC on GPU 1, so the park must land on GPU 1, where a WebRTC launch adopts it.
+// GPU 1 has fewer free slots, so an unpinned park would take GPU 0.
+func TestHeartbeatPinsTheParkToAWebRTCPlanningGPU(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	f.enableWebTransport(t)
+	f.enablePyroWavePrefer(t)
+	must(t, exec(t, f.pool, `INSERT INTO gpus (host_id, index, vram_mb_total, encode_slots_total)
+		VALUES ($1::uuid, 1, 16384, 3)`, f.hostID))
+	must(t, exec(t, f.pool, `UPDATE gpus SET codecs = '["h264"]' WHERE host_id = $1::uuid AND index = 1`, f.hostID))
+
+	f.coord.SteamWarmHeartbeat(context.Background(), f.userID, false, f.deviceID)
+
+	var idx int32
+	if err := f.pool.QueryRow(context.Background(), `SELECT g.index FROM sessions s JOIN gpus g ON g.id = s.gpu_id
+		WHERE s.kind = 'parked'`).Scan(&idx); err != nil || idx != 1 {
+		t.Fatalf("parked on gpu %v (err %v), want the WebRTC-planning GPU 1", idx, err)
+	}
+}
+
 // enablePyroWavePrefer makes an Auto launch pick PyroWave, hence WebTransport, with no request
 // switch: an opt-in profile on prefer, a GPU that passed its probe, a WebGPU device with a fresh
 // fast link.
