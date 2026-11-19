@@ -6,7 +6,7 @@
 //! puts the previous agent back), and the text lands in `ConsoleLast.detail`, which
 //! `release::console::derive` puts in front of the generic restored-summary reason.
 //!
-//! Kernel facts driving this (Linux ≥5.8, `drm_auth.c`; live-proven on nvidia-test
+//! Kernel facts driving this (Linux ≥5.8, `drm_auth.c`; live-proven on the NVIDIA lab host
 //! 2026-09-29, issue #407 comments): the first opener of a card node with no current
 //! master becomes master with no capability check. Re-asserting master over an
 //! already-held display needs `CAP_SYS_ADMIN`, checked against the host's initial user

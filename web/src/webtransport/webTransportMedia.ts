@@ -350,9 +350,17 @@ export class WebTransportMedia implements MediaTransport {
     } catch {
       return refused("connect_failed");
     }
-    // Read here or below; a failed connect must not leave it unhandled.
+    // Read here or below; a failed connect must not leave it unhandled. `settled.close` keeps the
+    // close a connection that already ended gave, so the accept check can read it without waiting
+    // out {@link CLOSE_CODE_WAIT_MS} for a session whose close raced the `hello_ack` (#1478). The
+    // holder object, not a `let`, because TypeScript narrows a `let` assigned in a callback to its
+    // initializer's `null`.
+    const settled: { close: WebTransportCloseInfo | null } = { close: null };
     const closeInfo = wt.closed.then(
-      (info) => info,
+      (info) => {
+        settled.close = info;
+        return info;
+      },
       () => null,
     );
     const abandon = (answer: Answer, sent?: WebTransportCloseInfo): Answer => {
@@ -477,7 +485,16 @@ export class WebTransportMedia implements MediaTransport {
 
     if (this.closed) return abandon(refused("closed"));
     // Accepted, but no video can arrive on this connection: never call it connected (#1403).
-    if (datagramReader.death) return abandon(refused("internal", datagramReader.death), { closeCode: 4400, reason: datagramReader.death.slice(0, 100) });
+    if (datagramReader.death) {
+      // The session's own close outranks the reader's death even here: a takeover (4410) or a
+      // session end (4404) that resolved in the same instant as the `hello_ack` is that
+      // refusal, not `internal` (#1478).
+      const code = settled.close?.closeCode ?? null;
+      if (code !== null && code !== 0 && CLOSE_REFUSALS[code]) {
+        return abandon(refused(CLOSE_REFUSALS[code], closeDetail(code, settled.close?.reason)));
+      }
+      return abandon(refused("internal", datagramReader.death), { closeCode: 4400, reason: datagramReader.death.slice(0, 100) });
+    }
     this.abortAttempt = null;
     this.wt = wt;
     this.writer = writer;

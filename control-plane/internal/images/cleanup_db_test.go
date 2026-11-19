@@ -23,7 +23,7 @@ type fakeCleanupWire struct {
 	inventoryRequests chan agentws.ImageInventoryReconcileCmd
 	journalRequests   chan agentws.ImageCleanupJournalRequestCmd
 	snapshotHook      func()
-	inventorySendHook func()
+	inventorySendHook func(agentws.ImageInventoryReconcileCmd)
 	inventorySendErr  error
 }
 
@@ -52,7 +52,7 @@ func (f *fakeCleanupWire) SendImageInventoryReconcile(_ string, c agentws.ImageI
 	sendErr := f.inventorySendErr
 	f.mu.Unlock()
 	if hook != nil {
-		hook()
+		hook(c)
 	}
 	if sendErr != nil {
 		return sendErr
@@ -453,12 +453,33 @@ func TestCleanupDuplicateUnresolvedAttemptRequestsRecoveryWithoutSecondDelete(t 
 	install(t, env.pool, false)
 	env.cleanupWire.cleanup = make(chan agentws.ImageCleanupCmd, 2)
 	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 3)
+	// Capacity 1 on purpose: this test reads every journal request explicitly
+	// where it is produced (see the send park below), so an unexpected extra
+	// one — including a premature one the negative checks must never swallow —
+	// panics the fake by name instead of racing past a blind drain (#1354).
 	env.cleanupWire.journalRequests = make(chan agentws.ImageCleanupJournalRequestCmd, 1)
 	entry := agentws.ImageVersionEntry{ImageID: imgID, Version: imgVer2, ImageRef: imgDigest2, RuntimeImageID: "sha256:lost-dispatch", State: "present"}
 	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "current", Capable: true, Complete: true,
 		ReconciledRevision: 1, Versions: []agentws.ImageVersionEntry{entry}})
 	path := "/v1/admin/hosts/" + host + "/images/cleanup"
 	request := `{"image_id":"` + imgID + `","version":"` + imgVer2 + `","image_ref":"` + imgDigest2 + `","runtime_image_id":"sha256:lost-dispatch","expected_generation":"0"}`
+	// The first POST's dispatch goroutine asks for the attempt journal under
+	// the completed-scan gate as soon as it can observe its post-dispatch
+	// scan recorded complete, and on a loaded machine that moment can land
+	// anywhere in this test's window (#1354). Park the goroutine inside the
+	// fake's reconcile send — it holds no fake lock there — so the test can
+	// record the scan's completion while the goroutine cannot yet observe it,
+	// then release it and read its journal request explicitly.
+	parked, release := make(chan agentws.ImageInventoryReconcileCmd, 1), make(chan struct{})
+	var parkedOnce atomic.Bool
+	env.cleanupWire.mu.Lock()
+	env.cleanupWire.inventorySendHook = func(cmd agentws.ImageInventoryReconcileCmd) {
+		if parkedOnce.CompareAndSwap(false, true) {
+			parked <- cmd
+			<-release
+		}
+	}
+	env.cleanupWire.mu.Unlock()
 	code, body := env.do(t, http.MethodPost, path, request)
 	if code != 202 {
 		t.Fatalf("initial cleanup = %d %s", code, body)
@@ -474,12 +495,25 @@ func TestCleanupDuplicateUnresolvedAttemptRequestsRecoveryWithoutSecondDelete(t 
 	}
 	var firstReconcile agentws.ImageInventoryReconcileCmd
 	select {
-	case firstReconcile = <-env.cleanupWire.inventoryRequests:
+	case firstReconcile = <-parked:
 	case <-time.After(5 * time.Second):
-		t.Fatal("initial post-dispatch reconcile missing")
+		t.Fatal("initial post-dispatch reconcile never reached the agent send")
 	}
+	// The agent reports the scan recorded complete while the send is parked,
+	// so the goroutine's deferred journal request (dispatch's deferred
+	// ImageCleanupRegistered → requestCleanupJournal in cleanup.go) is
+	// guaranteed to observe the recorded scan once released.
 	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "current", Capable: true, Complete: true,
 		ReconciledRevision: 2, ReconciledRequestID: firstReconcile.ID, Versions: []agentws.ImageVersionEntry{entry}})
+	close(release)
+	select {
+	case sent := <-env.cleanupWire.inventoryRequests:
+		if sent.ID != firstReconcile.ID {
+			t.Fatalf("parked reconcile sent a different command: parked=%s sent=%+v", firstReconcile.ID, sent)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial post-dispatch reconcile not sent")
+	}
 	// Catalog/adoption may disappear while the attempt remains durable. The
 	// duplicate still needs to reconcile that exact managed identity.
 	if _, err := env.pool.Exec(context.Background(), `DELETE FROM installed_images`); err != nil {
@@ -488,14 +522,19 @@ func TestCleanupDuplicateUnresolvedAttemptRequestsRecoveryWithoutSecondDelete(t 
 	if _, err := env.pool.Exec(context.Background(), `DELETE FROM image_catalog`); err != nil {
 		t.Fatal(err)
 	}
-	// An older journal response may still be in flight when the duplicate
-	// begins a new daemon scan. It cannot settle against the old inventory.
-	env.cleanup.requestCleanupJournal(context.Background(), host)
+	// The released goroutine's post-dispatch journal request is the older
+	// journal response still in flight when the duplicate begins a new daemon
+	// scan. It cannot settle against the old inventory. Read it explicitly:
+	// from here on no request may arrive unaccounted for, so the negative
+	// checks below stay strict.
 	var oldJournal agentws.ImageCleanupJournalRequestCmd
 	select {
 	case oldJournal = <-env.cleanupWire.journalRequests:
 	case <-time.After(5 * time.Second):
-		t.Fatal("old journal request missing")
+		t.Fatal("post-dispatch journal request missing")
+	}
+	if len(oldJournal.AttemptIDs) != 1 || oldJournal.AttemptIDs[0] != first.AttemptID {
+		t.Fatalf("post-dispatch requested wrong journal: %+v", oldJournal)
 	}
 	code, body = env.do(t, http.MethodPost, path, request)
 	if code != 202 {
@@ -534,6 +573,11 @@ func TestCleanupDuplicateUnresolvedAttemptRequestsRecoveryWithoutSecondDelete(t 
 	if state != "removing" {
 		t.Fatalf("old journal settled attempt before fresh scan: %s", state)
 	}
+	// The first POST's post-dispatch request was read explicitly above, and
+	// the duplicate's reconcile invalidate retired it; the duplicate's own
+	// trigger is gated on its new scan, which is not recorded complete yet.
+	// So nothing may ask for a journal until ReconciledRevision: 3 lands —
+	// any request here, of any content, is premature.
 	select {
 	case journal := <-env.cleanupWire.journalRequests:
 		t.Fatalf("journal requested before fresh reconcile revision: %+v", journal)
@@ -766,7 +810,7 @@ func TestCleanupGateAndReconcileSendStayOrderedAcrossNewAttempt(t *testing.T) {
 	entered, release, registered := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	var paused atomic.Bool
 	env.cleanupWire.mu.Lock()
-	env.cleanupWire.inventorySendHook = func() {
+	env.cleanupWire.inventorySendHook = func(agentws.ImageInventoryReconcileCmd) {
 		if paused.CompareAndSwap(false, true) {
 			close(entered)
 			<-release
@@ -1181,7 +1225,7 @@ func TestCleanupManagedIdentityTriggerRetriesFailedSend(t *testing.T) {
 	env.cleanupWire.inventorySendErr = errors.New("temporary send failure")
 	env.cleanupWire.mu.Unlock()
 	failed := make(chan struct{}, 1)
-	env.cleanupWire.inventorySendHook = func() {
+	env.cleanupWire.inventorySendHook = func(agentws.ImageInventoryReconcileCmd) {
 		select {
 		case failed <- struct{}{}:
 		default:
@@ -1242,7 +1286,7 @@ func TestCleanupHostTriggerStopsOnServiceCancel(t *testing.T) {
 	firstSend := make(chan struct{}, 1)
 	env.cleanupWire.mu.Lock()
 	env.cleanupWire.inventorySendErr = errors.New("persistent send failure")
-	env.cleanupWire.inventorySendHook = func() {
+	env.cleanupWire.inventorySendHook = func(agentws.ImageInventoryReconcileCmd) {
 		select {
 		case firstSend <- struct{}{}:
 		default:
@@ -1497,7 +1541,7 @@ func TestCleanupReconcileSendFailureKeepsProofClosedUntilRetry(t *testing.T) {
 	var once sync.Once
 	env.cleanupWire.mu.Lock()
 	env.cleanupWire.inventorySendErr = errors.New("queue unavailable")
-	env.cleanupWire.inventorySendHook = func() { once.Do(func() { close(failedSend) }) }
+	env.cleanupWire.inventorySendHook = func(agentws.ImageInventoryReconcileCmd) { once.Do(func() { close(failedSend) }) }
 	env.cleanupWire.mu.Unlock()
 	path := "/v1/admin/hosts/" + host + "/images/cleanup"
 	request := `{"image_id":"` + imgID + `","version":"` + imgVer2 + `","image_ref":"` + imgDigest2 + `","runtime_image_id":"sha256:send-failure","expected_generation":"0"}`

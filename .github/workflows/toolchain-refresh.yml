@@ -95,11 +95,17 @@ jobs:
       # Hours can pass between `check` and here, and an Images run on develop may have published
       # this tag meanwhile. A second build would overwrite it with a different digest (BUILT_AT
       # differs), so look again and stand down if it exists. An unreadable registry fails.
+      # Ask about the base digest `check` recorded, never the one quasar-base:latest has now:
+      # the build publishes `check`'s image from `check`'s base, so a base rebuilt between the
+      # jobs must not make this run ask about a tag it is not about to build (and rebuild a tag
+      # an Images run published meanwhile).
       - name: Is the tag still missing?
         id: recheck
+        env:
+          BASE_REF: ${{ needs.check.outputs.base_ref }}
         run: |
           set -euo pipefail
-          out="$(bash scripts/release/toolchain-missing.sh)"
+          out="$(QUASAR_BASE_DIGEST="${BASE_REF##*@}" bash scripts/release/toolchain-missing.sh)"
           echo "$out"
           if grep -qx 'build=false' <<<"$out"; then
             echo "The toolchain tag was published while this run waited; nothing to build."

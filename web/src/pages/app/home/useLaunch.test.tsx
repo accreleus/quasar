@@ -367,6 +367,8 @@ describe("useLaunch full screen on Play (#647)", () => {
     });
   });
   afterEach(() => {
+    // One test here switches to fake timers; a neighbour must not inherit them (#1411).
+    vi.useRealTimers();
     vi.resetAllMocks();
     localStorage.removeItem(PREFS);
   });
@@ -587,6 +589,10 @@ describe("useLaunch carries the URL switches from the library to a game page (#1
   afterEach(() => {
     vi.resetAllMocks();
     window.history.replaceState({}, "", "/");
+  });
+
+  it("starts on real timers, not the full-screen describe's fake ones (#1411)", () => {
+    expect(vi.isFakeTimers()).toBe(false);
   });
 
   it("keeps ?codec=pyrowave set on the library page for a launch from the game page", async () => {

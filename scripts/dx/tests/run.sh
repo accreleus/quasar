@@ -43,7 +43,9 @@ start_bg() { BG_PIDS+=("$1"); }   # start_bg <pid> — remember a background chi
 # shellcheck disable=SC2329  # invoked by the traps below, not by name
 cleanup() {
   local pid
-  for pid in "${BG_PIDS[@]}"; do
+  # ${BG_PIDS[@]+"${BG_PIDS[@]}"}: bash < 4.4 (macOS ships 3.2) reads an empty
+  # array's expansion as an unbound variable under `set -u` and dies (#1411).
+  for pid in ${BG_PIDS[@]+"${BG_PIDS[@]}"}; do
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   done
@@ -197,6 +199,16 @@ if vi_out="$(bash "$ROOT/deploy/test-validate-image-refs.sh" 2>&1)"; then
   pass "validate-image:refs" "$(printf '%s' "$vi_out" | tail -n 1)"
 else
   fail "validate-image:refs" "$(printf '%s' "$vi_out" | grep '^FAIL' | head -n 5)"
+fi
+
+printf '\n== ci-apt-install mirror fallback (#1580) ==\n'
+# Offline: a stubbed apt-get + a fake apt config prove the install script switches to a
+# different mirror on a stall instead of retrying the same one. It runs with no network and no
+# root (CI_APT_CONF_DIR / CI_APT_ARCHIVES point the script at temp dirs).
+if apt_out="$(bash "$ROOT/scripts/verify/test-ci-apt-install.sh" 2>&1)"; then
+  pass "ci-apt-install:mirror-fallback" "$(printf '%s\n' "$apt_out" | grep '^PASS' | sed 's/^PASS /  /' | tr '\n' ' ')"
+else
+  fail "ci-apt-install:mirror-fallback" "$(printf '%s' "$apt_out" | grep '^FAIL' | head -n 5)"
 fi
 
 printf '\n== guards ==\n'
@@ -4035,6 +4047,14 @@ else
   fail "testdb:sweep-containers-before-networks" "rm c1 at ${rm_c1_line:-?}, netrm n1 at ${netrm_n1_line:-?}"
 fi
 
+# The throwaway Postgres runs without durability, as CI's does: with fsync on, every suite's
+# setup TRUNCATE ... CASCADE took ~300 ms idle and timed out under shared disk load (#1121).
+if grep -qE '"\$PG_IMAGE" -c fsync=off -c synchronous_commit=off -c full_page_writes=off' "$DX/testdb.sh"; then
+  pass "testdb:pg-without-durability" "the ephemeral Postgres starts with fsync, synchronous_commit and full_page_writes off"
+else
+  fail "testdb:pg-without-durability" "testdb.sh starts Postgres with durability on: setup truncates stall under disk load (#1121)"
+fi
+
 # Unlabelled resources never reach the sweep: the listing filters by label
 # KEY. Pin that the selection itself is label-filtered, so a name-based
 # path cannot sneak back.
@@ -4348,6 +4368,18 @@ if [ -z "$rf_copy_bad" ]; then
   pass "readiness-faults:no-image-copies-scripts" "no deploy/Dockerfile* COPY or ADD source can include scripts/"
 else
   fail "readiness-faults:no-image-copies-scripts" "$rf_copy_bad"
+fi
+
+# ── suite hygiene ────────────────────────────────────────────────────────────
+# The suite's own cleanup loop expands BG_PIDS. Bash < 4.4 (macOS ships 3.2) reads
+# an empty array's expansion as an unbound variable under `set -u` and dies before
+# the trap can stop anything; the guarded `${BG_PIDS[@]+"${BG_PIDS[@]}"}` form is
+# what keeps a macOS run alive (#1411).
+cleanup_body="$(sed -n '/^cleanup() {/,/^}/p' "$TESTS_DIR/run.sh")"
+if printf '%s' "$cleanup_body" | grep -qF 'for pid in ${BG_PIDS[@]+"${BG_PIDS[@]}"}; do'; then
+  pass "suite:bg-pids-guarded" "the cleanup loop expands an empty BG_PIDS safely under set -u (bash 3.2)"
+else
+  fail "suite:bg-pids-guarded" "the cleanup loop expands BG_PIDS with \"\${BG_PIDS[@]}\", which dies on an empty array under set -u on bash 3.2 (#1411)"
 fi
 
 # ── summary ──────────────────────────────────────────────────────────────────

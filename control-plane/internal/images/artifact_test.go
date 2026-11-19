@@ -114,6 +114,46 @@ func TestFetchArtifactGHCRUnpublishedPackage(t *testing.T) {
 	}
 }
 
+// A throttled (429) or failed (5xx) anonymous token request is kept: when the
+// unauthenticated manifest read is denied too, that is a registry failure to
+// retry, never "not published" (#1556).
+func TestGHCRThrottledTokenThenDeniedManifest(t *testing.T) {
+	ctx := context.Background()
+	ref := "ghcr.io/acme/app/quasar-release-manifest:preview"
+	for name, tokenStatus := range map[string]int{
+		"throttled":    http.StatusTooManyRequests,
+		"server error": http.StatusServiceUnavailable,
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/token" {
+					w.WriteHeader(tokenStatus)
+					return
+				}
+				w.WriteHeader(http.StatusForbidden)
+			}))
+			t.Cleanup(srv.Close)
+			r := newTestResolver(&http.Client{}, srv.URL)
+			calls := []struct {
+				name string
+				fn   func() error
+			}{
+				{"FetchArtifact", func() error { _, err := r.FetchArtifact(ctx, ref); return err }},
+				{"InspectConfig", func() error { _, err := r.InspectConfig(ctx, ref); return err }},
+			}
+			for _, call := range calls {
+				err := call.fn()
+				if err == nil || errors.Is(err, ErrRegistryNotFound) {
+					t.Fatalf("%s: err = %v, want a failure that is not ErrRegistryNotFound", call.name, err)
+				}
+				if want := fmt.Sprintf("status %d", tokenStatus); !strings.Contains(err.Error(), want) {
+					t.Fatalf("%s: err = %v, want the token request's own %q kept", call.name, err, want)
+				}
+			}
+		})
+	}
+}
+
 // The contract names an OCI image manifest; a Docker v2 one is the wrong document.
 func TestFetchArtifactRefusesADockerManifest(t *testing.T) {
 	const doc = `{"format_version":2}`

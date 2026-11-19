@@ -81,6 +81,20 @@ impl AbrLoop {
         self.metrics.upgrade().is_some_and(|m| m.abr_owner() == 0)
     }
 
+    /// Take the ABR write lock and re-check ownership inside it: the check and the
+    /// encoder write are one critical section against a takeover (#1489).
+    fn write_as_owner(&self, write: impl FnOnce()) -> bool {
+        let Some(m) = self.metrics.upgrade() else {
+            return false;
+        };
+        let _guard = m.lock_abr_write();
+        if m.abr_owner() != self.id {
+            return false;
+        }
+        write();
+        true
+    }
+
     fn fps(&self) -> u32 {
         self.fps.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -95,16 +109,19 @@ impl AbrLoop {
     fn retune_for_fps(&self, fps: u32) {
         self.fps
             .store(fps.max(1), std::sync::atomic::Ordering::Relaxed);
-        if self.mode == AbrMode::Off || !self.owns_encoder() {
+        if self.mode == AbrMode::Off {
             return;
         }
         let kbps = self.governor.lock().unwrap().setpoint_kbps();
-        write_encoder_bitrate(&self.encoder, self.choice, kbps, self.fps());
+        let fps = self.fps();
+        if !self.write_as_owner(|| write_encoder_bitrate(&self.encoder, self.choice, kbps, fps)) {
+            return;
+        }
         tracing::info!(
             "SPT-08 fps rung: CPB re-derived for {} fps at {} kbps (cpb {} kbit)",
-            self.fps(),
+            fps,
             kbps,
-            cpb_size_kbits(kbps, self.fps())
+            cpb_size_kbits(kbps, fps)
         );
     }
 
@@ -130,15 +147,18 @@ impl AbrLoop {
             );
         }
         if let Some(setpoint) = raised {
-            write_encoder_bitrate(&self.encoder, self.choice, setpoint, self.fps());
-            if let Some(m) = self.metrics.upgrade() {
-                m.set_abr_setpoint(setpoint);
+            if self.write_as_owner(|| {
+                write_encoder_bitrate(&self.encoder, self.choice, setpoint, self.fps())
+            }) {
+                if let Some(m) = self.metrics.upgrade() {
+                    m.set_abr_setpoint(setpoint);
+                }
+                tracing::info!(
+                    "SPT-08 ladder: the setpoint was below the restored floor — raised to \
+                     {setpoint} kbps (cpb {} kbit)",
+                    cpb_size_kbits(setpoint, self.fps())
+                );
             }
-            tracing::info!(
-                "SPT-08 ladder: the setpoint was below the restored floor — raised to \
-                 {setpoint} kbps (cpb {} kbit)",
-                cpb_size_kbits(setpoint, self.fps())
-            );
         }
         // …and move the ESTIMATOR's own lower bound with it: the governor can only be as
         // free as the estimate it is fed. Run D (2026-08-17) without this walked the
@@ -212,9 +232,19 @@ impl AbrLoop {
     }
 
     /// Write a new setpoint to the encoder and publish it (log, metric, `abr.retarget`).
+    /// Writes only while this loop still owns the encoder, with the check inside the ABR
+    /// write lock: an observe that passed `owns_encoder` before a takeover cleared it must
+    /// not write after the reset put launch back (#1489).
     fn retarget(&self, prev_setpoint: u32, new_kbps: u32, est_kbps: f64) {
-        write_encoder_bitrate(&self.encoder, self.choice, new_kbps, self.fps());
-        if let Some(m) = self.metrics.upgrade() {
+        let Some(m) = self.metrics.upgrade() else {
+            return;
+        };
+        {
+            let _guard = m.lock_abr_write();
+            if m.abr_owner() != self.id {
+                return;
+            }
+            write_encoder_bitrate(&self.encoder, self.choice, new_kbps, self.fps());
             m.set_abr_setpoint(new_kbps);
         }
         tracing::info!(
@@ -1299,23 +1329,33 @@ fn start(
                 // a network dip.
                 if let Some(ref lad) = ladder_state {
                     if let Some(bias) = lad.lock().unwrap().observe(state) {
-                        write_encoder_speed_bias(&window_encoder, choice, bias, base_target_usage);
-                        if let Some(m) = hint_loop.metrics.upgrade() {
-                            m.set_ladder_bias(bias);
+                        let wrote = hint_loop.write_as_owner(|| {
+                            write_encoder_speed_bias(
+                                &window_encoder,
+                                choice,
+                                bias,
+                                base_target_usage,
+                            )
+                        });
+                        if wrote {
+                            if let Some(m) = hint_loop.metrics.upgrade() {
+                                m.set_ladder_bias(bias);
+                            }
+                            let prev = last_bias.swap(bias, std::sync::atomic::Ordering::Relaxed);
+                            emit_ladder_step(
+                                &res_trace_tx,
+                                &res_session_id,
+                                "bias",
+                                prev as i64,
+                                bias as i64,
+                                if bias > prev { "engage" } else { "recover" },
+                                StepRates {
+                                    setpoint_kbps: setpoint,
+                                    floor_kbps: hint_loop.governor.lock().unwrap().floor_kbps()
+                                        as f64,
+                                },
+                            );
                         }
-                        let prev = last_bias.swap(bias, std::sync::atomic::Ordering::Relaxed);
-                        emit_ladder_step(
-                            &res_trace_tx,
-                            &res_session_id,
-                            "bias",
-                            prev as i64,
-                            bias as i64,
-                            if bias > prev { "engage" } else { "recover" },
-                            StepRates {
-                                setpoint_kbps: setpoint,
-                                floor_kbps: hint_loop.governor.lock().unwrap().floor_kbps() as f64,
-                            },
-                        );
                     }
                 }
 
@@ -1458,6 +1498,20 @@ pub(crate) fn feedback_abr(
     session_id: String,
     lever: Option<Arc<EncodeResolutionLever>>,
 ) -> Option<crate::webtransport::Rate> {
+    feedback_abr_armed(encoder, cfg, session_metrics, trace_tx, session_id, lever)
+        .map(|(rate, _)| rate)
+}
+
+/// [`feedback_abr`] and the loop behind it, for tests that interleave the loop's own
+/// writes with a takeover (#1489).
+fn feedback_abr_armed(
+    encoder: &gst::Element,
+    cfg: &SessionConfig,
+    session_metrics: Arc<SessionMetrics>,
+    trace_tx: TraceTx,
+    session_id: String,
+    lever: Option<Arc<EncodeResolutionLever>>,
+) -> Option<(crate::webtransport::Rate, Arc<AbrLoop>)> {
     // Amendment 85: the FEC counters live on the same metrics the ABR publishes.
     let fec_metrics = session_metrics.clone();
     // The WebRTC fallback's `enable_abr` already said any `ladder_gate_warning`.
@@ -1476,6 +1530,7 @@ pub(crate) fn feedback_abr(
     let observe_loop = abr_loop.clone();
     let floor_loop = abr_loop.clone();
     let report_loop = abr_loop.clone();
+    let handle = abr_loop.clone();
     let observed = latest.clone();
     // #1294: what the takeover itself does to this session's encoder. A loop — a WebRTC
     // peer's, or this client's predecessor — can still own it when the next client takes
@@ -1518,47 +1573,56 @@ pub(crate) fn feedback_abr(
     };
     let begin = starter(Claim::Take);
     let retake = starter(Claim::IfFree);
-    Some(crate::webtransport::Rate {
-        ceiling_kbps,
-        // The governor's lock, alone and released: `observe` takes it again after.
-        floor_kbps: Box::new(move || f64::from(floor_loop.governor.lock().unwrap().floor_kbps())),
-        retargets: mode != AbrMode::Off,
-        // Each client starts afresh: it takes the encoder over (a WebRTC peer that started
-        // since owns it until then) and registers new hooks.
-        start: Box::new(move || begin()),
-        owns: Box::new(move || owner.metrics.upgrade().is_some_and(|m| m.abr_owner() != 0)),
-        displaced: Box::new(move || {
-            if let Some(metrics) = reset_loop.metrics.upgrade() {
-                reset_to_launch(
-                    &reset_loop.encoder,
-                    &reset_cfg,
-                    reset_lever.as_deref(),
-                    &metrics,
-                );
-            }
-        }),
-        observe: Box::new(move |kbps| {
-            observed.store(kbps.to_bits(), std::sync::atomic::Ordering::Relaxed);
-            // One ABR owner per encoder; an owner that lost the encoder re-takes it from
-            // the launch point on its next estimate. Lost to nobody, that is: a WebRTC
-            // answer replaced the video transport (`reset_to_launch`) and that peer never
-            // connected. A live owner is never taken from here, only by a client's `start`.
-            if observe_loop.orphaned() {
-                retake();
-            }
-            observe_loop.observe(kbps, true, std::time::Instant::now());
-        }),
-        measured: Box::new(move |reading| report_loop.report(reading, std::time::Instant::now())),
-        fec: Box::new(move |event| match event {
-            crate::webtransport::FecEvent::Attached { client, fec } => {
-                fec_metrics.attach_fec(client, fec);
-            }
-            crate::webtransport::FecEvent::Detached { client } => fec_metrics.detach_fec(client),
-            crate::webtransport::FecEvent::Sent { video, repair } => {
-                fec_metrics.record_fec_bytes(video, repair);
-            }
-        }),
-    })
+    Some((
+        crate::webtransport::Rate {
+            ceiling_kbps,
+            // The governor's lock, alone and released: `observe` takes it again after.
+            floor_kbps: Box::new(move || {
+                f64::from(floor_loop.governor.lock().unwrap().floor_kbps())
+            }),
+            retargets: mode != AbrMode::Off,
+            // Each client starts afresh: it takes the encoder over (a WebRTC peer that started
+            // since owns it until then) and registers new hooks.
+            start: Box::new(move || begin()),
+            owns: Box::new(move || owner.metrics.upgrade().is_some_and(|m| m.abr_owner() != 0)),
+            displaced: Box::new(move || {
+                if let Some(metrics) = reset_loop.metrics.upgrade() {
+                    reset_to_launch(
+                        &reset_loop.encoder,
+                        &reset_cfg,
+                        reset_lever.as_deref(),
+                        &metrics,
+                    );
+                }
+            }),
+            observe: Box::new(move |kbps| {
+                observed.store(kbps.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                // One ABR owner per encoder; an owner that lost the encoder re-takes it from
+                // the launch point on its next estimate. Lost to nobody, that is: a WebRTC
+                // answer replaced the video transport (`reset_to_launch`) and that peer never
+                // connected. A live owner is never taken from here, only by a client's `start`.
+                if observe_loop.orphaned() {
+                    retake();
+                }
+                observe_loop.observe(kbps, true, std::time::Instant::now());
+            }),
+            measured: Box::new(move |reading| {
+                report_loop.report(reading, std::time::Instant::now())
+            }),
+            fec: Box::new(move |event| match event {
+                crate::webtransport::FecEvent::Attached { client, fec } => {
+                    fec_metrics.attach_fec(client, fec);
+                }
+                crate::webtransport::FecEvent::Detached { client } => {
+                    fec_metrics.detach_fec(client)
+                }
+                crate::webtransport::FecEvent::Sent { video, repair } => {
+                    fec_metrics.record_fec_bytes(video, repair);
+                }
+            }),
+        },
+        handle,
+    ))
 }
 
 /// Another transport's loop owned the encoder and left its bitrate, bias and rungs on it,
@@ -1571,12 +1635,15 @@ fn take_over(abr_loop: &AbrLoop, plan: &Plan, metrics: &SessionMetrics) {
         .fps
         .store(plan.abr_cfg.fps, std::sync::atomic::Ordering::Relaxed);
     metrics.set_abr_setpoint(plan.abr_cfg.ceiling_kbps);
-    let written = write_launch_point(
-        &abr_loop.encoder,
-        &plan.launch_cfg,
-        plan.lever.as_deref(),
-        metrics,
-    );
+    let written = {
+        let _guard = metrics.lock_abr_write();
+        write_launch_point(
+            &abr_loop.encoder,
+            &plan.launch_cfg,
+            plan.lever.as_deref(),
+            metrics,
+        )
+    };
     tracing::info!(
         token = "abr-encoder-taken-over",
         "{} took the encoder over from another transport's ABR; written: {written}",
@@ -1603,8 +1670,13 @@ pub(super) fn reset_to_launch(
     lever: Option<&EncodeResolutionLever>,
     metrics: &SessionMetrics,
 ) {
+    // Clear the owner first: every write re-checks it under `lock_abr_write`, so a
+    // retarget that started before this cannot land after the launch point below.
     metrics.clear_hooks();
-    let written = write_launch_point(encoder, cfg, lever, metrics);
+    let written = {
+        let _guard = metrics.lock_abr_write();
+        write_launch_point(encoder, cfg, lever, metrics)
+    };
     tracing::info!(
         token = "transport-replaced-encoder-kept",
         "encoder {} kept across the transport replacement; written: {written}",
@@ -1642,6 +1714,11 @@ fn write_launch_point(
     }
     let fps = cfg.stream.fps.max(1) as u32;
     write_encoder_bitrate(encoder, cfg.encoder, cfg.stream.bitrate_kbps, fps);
+    // #1462: publish the launch setpoint beside the bitrate. With the link rate cleared
+    // above, health falls back to the setpoint; leaving the old loop's (possibly
+    // floor-pinned) value published lets the control plane end a healthy stream whose new
+    // client sends no ABR feedback.
+    metrics.set_abr_setpoint(cfg.stream.bitrate_kbps);
     let bias = encoder_speed_bias_writable(encoder, cfg.encoder);
     if bias {
         write_encoder_speed_bias(encoder, cfg.encoder, 0, cfg.target_usage);
@@ -2098,6 +2175,65 @@ mod tests {
         assert_eq!(bitrate(), 11_500, "back at launch under its new owner");
         (b.observe)(11_500.0);
         assert_eq!(bitrate(), 11_500);
+    }
+
+    /// #1489: an observe that passed its ownership check before a takeover must not write
+    /// after the reset put the launch point back. The governor lock is the pause: the
+    /// check runs before it and the retarget write after it, so holding it across the
+    /// reset reproduces the window deterministically. Reverting the fix (a retarget that
+    /// does not re-check the owner under `lock_abr_write`) leaves the stale setpoint.
+    #[test]
+    fn a_takeover_between_the_owner_check_and_the_write_keeps_the_launch_point() {
+        init();
+        let metrics = Arc::new(SessionMetrics::new("smooth", 60));
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let trace =
+            crate::session::runner::DiagnosticEventTx::new(tx, Arc::default(), Arc::default());
+        let mut cfg = cfg_with_floors(0, Some(500));
+        cfg.abr_governor.min_interval_ms = 1;
+        let encoder = gst::ElementFactory::make("openh264enc").build().unwrap();
+        let lever = Arc::new(software_lever((cfg.stream.width, cfg.stream.height)));
+        let (client, abr) = feedback_abr_armed(
+            &encoder,
+            &cfg,
+            metrics.clone(),
+            trace,
+            "s".into(),
+            Some(lever.clone()),
+        )
+        .unwrap();
+        let bitrate = || encoder.property::<u32>("bitrate") / 1000;
+        let pause = || std::thread::sleep(std::time::Duration::from_millis(5));
+        (client.start)();
+        pause();
+
+        // Hold the governor: the observe passes `owns_encoder`, publishes its estimate
+        // (which is after the check), then blocks here — before the retarget write.
+        let governor = abr.governor.lock().unwrap();
+        let seen = metrics.clone();
+        let observe = std::thread::spawn(move || (client.observe)(2000.0));
+        let mut reached = false;
+        for _ in 0..2000 {
+            if seen.gcc_estimate_kbps() == 2000.0 {
+                reached = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            reached,
+            "the in-flight observe never published its estimate"
+        );
+
+        reset_to_launch(&encoder, &cfg, Some(lever.as_ref()), &metrics);
+        assert_eq!(bitrate(), 11_500, "the takeover put launch back");
+        drop(governor);
+        observe.join().unwrap();
+        assert_eq!(
+            bitrate(),
+            11_500,
+            "the retarget must not write after the takeover put launch back"
+        );
     }
 
     /// #1040: a WebRTC answer replaced the video transport under a streaming WebTransport
@@ -2999,16 +3135,23 @@ mod tests {
             })
         ));
         metrics.set_abr_link_rate(7, 400.0);
+        // #1462: the old loop stepped its governor down before its transport went away.
+        metrics.set_abr_setpoint(400);
 
         reset_to_launch(&encoder, &cfg, Some(&lever), &metrics);
 
+        let window = metrics.drain_window(std::time::Instant::now());
         // Amendment 79: another transport took the encoder; the old loop's rate is gone.
         assert!(
-            metrics
-                .drain_window(std::time::Instant::now())
-                .abr_link_rate_kbps
-                .is_none(),
+            window.abr_link_rate_kbps.is_none(),
             "a taken-over session carries no link rate"
+        );
+        // #1462: neither is the old loop's setpoint — the encoder runs at launch, so that
+        // is what health must read until the new loop retargets.
+        assert_eq!(
+            window.abr_setpoint_kbps,
+            Some(cfg.stream.bitrate_kbps as f64),
+            "a taken-over session publishes the launch setpoint, not the old loop's"
         );
 
         assert_eq!(encoder.property::<u32>("bitrate"), launch_bps);

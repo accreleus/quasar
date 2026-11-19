@@ -231,7 +231,18 @@ fn adopt_as(session: &mut Session, flags: &str, kind: Option<SessionKind>) -> us
 /// One `app booting` (the adopting session's `running`: a `running` report without it would
 /// let a client reveal a stream the game has not drawn on, #749) and one `effective_media`
 /// for the adopting session, the restart offers notwithstanding.
+///
+/// The window starts at the adopting session's `Starting`, not at the log's length taken
+/// before the adopt: the parked session's `running` and `effective_media` are two separate
+/// reports, and a pump that stops on the first leaves the second in the event channel.
+/// Drained later, it lands behind that length and reads as a second report for the adopter
+/// (#1549). The channel's order puts every event the parked session emitted before the
+/// adoption, so the adopting session's own `Starting` is the deterministic boundary.
 fn assert_one_session_start(log: &[SessionEvent], from: usize) {
+    let from = log[from..]
+        .iter()
+        .position(|e| matches!(e, SessionEvent::Starting))
+        .map_or(from, |i| from + i);
     let count = |what: fn(&SessionEvent) -> bool| log.iter().skip(from).filter(|e| what(e)).count();
     assert_eq!(
         count(|e| matches!(e, SessionEvent::Starting)),
