@@ -43,11 +43,11 @@ export interface AppDraft {
   containerPath: string;
   shareSteamLibrary: boolean;
   /**
-   * runtime_spec.gpu must round-trip; no control offers it. It is NOT inert: the
-   * agent passes the GPU into the container only when it is true. For an app on
-   * a managed preset the server stamps the image's declared value on every
-   * write (#171), so what the form sends for it does not matter there; for a
-   * custom-image app the stored value is what launches.
+   * runtime_spec.gpu is NOT inert: the agent passes the GPU into the container
+   * only when it is true. For an app on a managed preset the server stamps the
+   * image's declared value on every write (#171), so what the form sends for it
+   * does not matter there; for a custom-image app the stored value is what
+   * launches, so the Runtime tab's Container group edits it (#179).
    */
   gpu: boolean;
   /** runtime_spec keys the form does not edit. Dropping `no_new_privileges`
@@ -116,6 +116,23 @@ export function withProfilePolicy(
   const next = { ...draft, profilePolicy: policy };
   if (next.defaultProfileId || profiles.length === 0) return next;
   return withLaunchProfile(next, profiles[0]);
+}
+
+/** The two container flags that ride runtime_spec's extras. Absent means the default. */
+export type SpecFlag = "no_new_privileges" | "systempaths_unconfined";
+const SPEC_FLAG_DEFAULT: Record<SpecFlag, boolean> = { no_new_privileges: true, systempaths_unconfined: false };
+
+export function specFlag(draft: AppDraft, key: SpecFlag): boolean {
+  const v = draft.specExtras[key];
+  return typeof v === "boolean" ? v : SPEC_FLAG_DEFAULT[key];
+}
+
+/** Setting a flag back to its default drops the key, so an untouched spec is not rewritten. */
+export function withSpecFlag(draft: AppDraft, key: SpecFlag, on: boolean): AppDraft {
+  const specExtras = { ...draft.specExtras };
+  delete specExtras[key];
+  if (on !== SPEC_FLAG_DEFAULT[key]) specExtras[key] = on;
+  return { ...draft, specExtras };
 }
 
 export type DraftErrors = Record<string, string>;

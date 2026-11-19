@@ -103,3 +103,61 @@ describe("RuntimeTab managed home", () => {
     expect(screen.getByLabelText("Share the user's Steam library")).toBeTruthy();
   });
 });
+
+describe("RuntimeTab container flags (#179)", () => {
+  let latest: Draft;
+  function renderFlags(draftOver: Partial<Draft> = {}) {
+    function Harness() {
+      const [draft, setDraft] = useState<Draft>({ ...draftFromApp(null), ...draftOver });
+      latest = draft;
+      return (
+        <RuntimeTab
+          draft={draft}
+          onChange={setDraft}
+          errors={{}}
+          app={null}
+          parent={null}
+          presets={[]}
+          storageProvider={null}
+        />
+      );
+    }
+    render(
+      <MemoryRouter>
+        <Harness />
+      </MemoryRouter>,
+    );
+  }
+  const flag = (name: string) => screen.getByLabelText(name) as HTMLInputElement;
+
+  it("offers the three flags with their defaults on an app with no preset", () => {
+    renderFlags();
+    expect(flag("GPU access").checked).toBe(false);
+    expect(flag("Block privilege escalation").checked).toBe(true);
+    expect(flag("Unmask /proc and /sys").checked).toBe(false);
+  });
+
+  it("writes each flag to the draft, and drops a key that goes back to its default", () => {
+    renderFlags();
+    fireEvent.click(flag("GPU access"));
+    expect(latest.gpu).toBe(true);
+    fireEvent.click(flag("Block privilege escalation"));
+    expect(latest.specExtras).toEqual({ no_new_privileges: false });
+    fireEvent.click(flag("Unmask /proc and /sys"));
+    expect(latest.specExtras).toEqual({ no_new_privileges: false, systempaths_unconfined: true });
+    fireEvent.click(flag("Block privilege escalation"));
+    expect(latest.specExtras).toEqual({ systempaths_unconfined: true });
+  });
+
+  it("shows a stored opt-out as it is", () => {
+    renderFlags({ gpu: true, specExtras: { no_new_privileges: false } });
+    expect(flag("GPU access").checked).toBe(true);
+    expect(flag("Block privilege escalation").checked).toBe(false);
+  });
+
+  it("is absent when a runtime preset supplies the runtime", () => {
+    renderTab(false);
+    expect(screen.queryByLabelText("GPU access")).toBeNull();
+    expect(screen.queryByLabelText("Block privilege escalation")).toBeNull();
+  });
+});
