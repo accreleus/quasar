@@ -1130,7 +1130,7 @@ describe("createWebTransportRuntime fallback", () => {
     const agent = new FakeAgent();
     agent.replies = [[helloAck(0, avcC())]];
     const presenter: Presenter = { present: (f) => (f.close(), true), destroy: vi.fn() };
-    const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn(), onFallback: vi.fn() };
+    const callbacks = { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn(), onFallback: vi.fn(), onCodecSwitched: vi.fn() };
     const rt = createWebTransportRuntime({
       sessionId: "s1",
       authToken: "auth",
@@ -1614,6 +1614,26 @@ describe("createWebTransportRuntime fallback", () => {
       await vi.advanceTimersByTimeAsync(3 * SILENT);
       expect(idle.agent.sent("hello")).toHaveLength(1);
       idle.rt.destroy();
+    });
+
+    it("tells the player a step-down once per session, not on every connect (#1430)", async () => {
+      vi.useFakeTimers();
+      const { agent, callbacks, rt } = setup();
+      const ack = (configId: number) => ({ ...helloAck(configId, avcC()), codec_switch_reason: "client_no_decoder" });
+      agent.replies = [[ack(1)]];
+      rt.start();
+      await vi.advanceTimersByTimeAsync(10);
+      expect(rt.getSnapshot().channelOpen).toBe(true);
+      expect(callbacks.onCodecSwitched).toHaveBeenCalledTimes(1);
+      expect(callbacks.onCodecSwitched).toHaveBeenCalledWith("h264", "client_no_decoder");
+      // A picture, then silence: the watchdog reconnects, and its hello_ack repeats the session's
+      // step-down record. The player is not told twice.
+      agent.last.datagrams(packetize({ configId: 1, frameSeq: 0, keyframe: true, data: bytes(10, 0) }));
+      await vi.advanceTimersByTimeAsync(10);
+      await vi.advanceTimersByTimeAsync(SILENT);
+      expect(agent.sent("hello")).toHaveLength(2);
+      expect(callbacks.onCodecSwitched).toHaveBeenCalledTimes(1);
+      rt.destroy();
     });
 
     it("does not fire on a tick that ran late: a stalled page has its datagrams still queued", async () => {

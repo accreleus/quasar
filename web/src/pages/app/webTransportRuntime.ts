@@ -135,6 +135,9 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   let recovering = false;
   /** Our own 4400 for a dead datagram reader (#1403): its reason is the cause of a later stream_lost. */
   let lostCause: string | undefined;
+  /** The step-down reasons the player was told: a resync's `hello_ack` repeats the session's
+   *  record, and the notice is shown at most once per session (#1430). */
+  const announcedSwitches = new Set<string>();
   let recoveryDeadline: ReturnType<typeof setTimeout> | null = null;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   let wakeRetry: (() => void) | null = null;
@@ -541,7 +544,12 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
           // Amendment 85: the FEC keys are posted only while this connection is sent repairs.
           telemetry.setFec(typeof c.fec === "string");
           if (c.switchReason) console.info(`WebTransport codec ${c.codec}: ${c.switchReason}`);
-          if (c.switchReason && c.codec !== "pyrowave") cfg.callbacks.onCodecSwitched?.(c.codec, c.switchReason);
+          // A resync's hello_ack repeats the step-down the session already recorded, and the player
+          // is told once per reason rather than once per connect (#1430).
+          if (c.switchReason && c.codec !== "pyrowave" && !announcedSwitches.has(c.switchReason)) {
+            announcedSwitches.add(c.switchReason);
+            cfg.callbacks.onCodecSwitched?.(c.codec, c.switchReason);
+          }
           // capture.ts scales the mouse by the stream size, which a canvas does not know.
           cfg.canvas.dataset.streamW = String(c.width);
           cfg.canvas.dataset.streamH = String(c.height);
