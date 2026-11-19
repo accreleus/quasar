@@ -826,7 +826,7 @@ describe("HostDetail — services on this machine (#357)", () => {
     expect(within(c).getByText(/has not reported its services yet/)).toBeTruthy();
   });
 
-  it("says the recovery actor did not answer when the agent reports it absent", async () => {
+  it("says the recovery actor has not answered when the agent reports it absent", async () => {
     mocked.getHost.mockResolvedValue({
       host: host({ ...owned, updater_present: false, recovery_actor_version: null }),
     } as never);
