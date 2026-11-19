@@ -340,6 +340,7 @@ export function HostsTab() {
                       actionPending={actionPendingId === host.id}
                       actionError={actionErrors[host.id]}
                       controlPlane={controlPlane}
+                      identityLoading={identityRes.loading}
                       floor={hostFloorState(host, releaseRes.data)}
                       onUpdate={() => setUpdateTarget(host)}
                       now={now}
