@@ -182,15 +182,17 @@ func (c *Coordinator) SteamWarmHeartbeat(ctx context.Context, userID string, isA
 // it runs the launch's own stream plan (gatherStreamInputs + planStream, so planTransport and the
 // PyroWave intent) as a play on the home's host, once per GPU. A WebRTC-only park is useless to a
 // launch that plans WebTransport (#1163), so the second result (withhold) is true only when every
-// GPU plans WebTransport; otherwise the first result is the first GPU that plans WebRTC, which the
-// park is pinned to, so a mixed-GPU host never parks where a WebTransport launch cannot adopt it
-// (#1224). Anything that
-// fails to read or plan is "no" (park, unpinned), so a park is only ever withheld on a positive
-// answer. The PyroWave slot is assumed free, as for a claim (claimCandidate).
+// GPU plans WebTransport. The first result is a GPU pin, returned only on a truly mixed host —
+// at least one GPU plans WebTransport AND at least one plans WebRTC — where the park is pinned to
+// the first GPU a WebRTC launch plans, so it never parks where a WebTransport launch cannot adopt
+// it (#1224). On a host where every GPU plans WebRTC there is no pin, exactly as before the pin:
+// the park is unpinned and the scheduler places it on a GPU with room. Anything that fails to read
+// or plan is "no" (park, unpinned), so a park is only ever withheld on a positive answer. The
+// PyroWave slot is assumed free, as for a claim (claimCandidate).
 // shortcut: the profile resolved is the Steam parent's default; a tile pinned to another profile
-// is not seen, and a WebTransport-planned user still gets no warm; the pinned GPU may be full or
-// blocked, in which case the park is simply not placed. The real fix is #1214 (transport-neutral
-// parks).
+// is not seen, and a WebTransport-planned user still gets no warm; on a mixed host with two or more
+// WebRTC GPUs the single PinGPUIndex takes the first even if it is full or blocked, so the park is
+// then not placed. The real fix is #1214 (transport-neutral parks).
 func (c *Coordinator) launchWouldPlanWebTransport(ctx context.Context, p CreateParams, hostID string,
 	chain profile.LaunchProfile, lp LaunchParams, ov StreamOverride, env ProbeEnvelope, source string,
 ) (*int32, bool) {
@@ -217,6 +219,15 @@ func (c *Coordinator) launchWouldPlanWebTransport(ctx context.Context, p CreateP
 		return nil, false
 	}
 	lp.parked = false
+	// Plan every GPU, then decide from the whole set: pin only on a truly mixed
+	// host (at least one GPU plans WebTransport AND at least one plans WebRTC),
+	// so a host where every GPU plans WebRTC parks unpinned, as before the pin,
+	// and a host where every GPU plans WebTransport still withholds the park.
+	var (
+		hasWebTransport bool
+		webRTCIdx       int32
+		haveWebRTC      bool
+	)
 	for _, idx := range gpus {
 		prov := Session{
 			UserID: p.UserID, AppID: p.AppID, HostID: &hostID, GPUIndex: &idx,
@@ -231,11 +242,23 @@ func (c *Coordinator) launchWouldPlanWebTransport(ctx context.Context, p CreateP
 		if err != nil {
 			return nil, false
 		}
-		if plan.Update.Transport != transportWebTransport {
-			return &idx, false
+		if plan.Update.Transport == transportWebTransport {
+			hasWebTransport = true
+			continue
+		}
+		if !haveWebRTC {
+			webRTCIdx = idx
+			haveWebRTC = true
 		}
 	}
-	return nil, true
+	switch {
+	case haveWebRTC && hasWebTransport:
+		return &webRTCIdx, false
+	case haveWebRTC:
+		return nil, false
+	default:
+		return nil, true
+	}
 }
 
 // warmSteamApp is the Steam parent app a heartbeat would warm for this user,
