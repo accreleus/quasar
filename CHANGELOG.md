@@ -25,6 +25,7 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **CI now scans pull requests for credentials (#595).** A new gitleaks job in `.github/workflows/leak-scan.yml` runs on the pinned `ghcr.io/gitleaks/gitleaks:v8.30.1` image (pinned by version and digest) with no repository secret, so a fork pull request scans too; it scans the pull request's own commits, and a credential-shaped string fails the check before merge. Test fixtures and known false positives are allow-listed in the committed `.gitleaks.toml`.
 - **The app editor can set GPU access and the two container opt-outs for an app that brings its own image (#179).** A new Container group on the Runtime tab has switches for GPU access, privilege-escalation blocking and unmasking /proc and /sys. It is hidden when the app uses a runtime preset, which supplies them.
 
 ### Upgrading
