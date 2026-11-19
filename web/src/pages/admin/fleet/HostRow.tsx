@@ -49,6 +49,8 @@ export interface HostRowProps {
   actionError?: string;
   /** The control plane's own identity: which host shares its machine. */
   controlPlane?: PlatformIdentity | null;
+  /** The identity read is still in flight: hold "Remove host" until it resolves. */
+  identityLoading?: boolean;
   /** Below the floor, the row offers only an update (hostFloor.ts). */
   floor?: FloorState | null;
   onUpdate?: () => void;
@@ -282,12 +284,18 @@ function menuItems(props: HostRowProps): ActionsMenuEntry[] {
     });
   }
 
-  // Always enabled: the offline precondition (server 409s otherwise) is
-  // explained and actioned in the confirm modal, not gated here (#101).
+  // Held until the control plane's identity read returns (#1499): without it the row
+  // cannot tell a removable host from the control plane's own machine, so a click would
+  // land on the page with no dialog, or the own machine on the wrong dialog. Once the
+  // identity resolves the answer is stable for the row's life, so the item stays enabled.
   items.push({
     key: "forget",
     label: "Remove host",
     variant: "danger",
+    disabled: props.identityLoading,
+    title: props.identityLoading
+      ? "Waiting for the control plane to identify this machine"
+      : undefined,
     onClick: props.onForget,
   });
 

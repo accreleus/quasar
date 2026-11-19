@@ -76,7 +76,7 @@ export function ServicesCard({
       {report === "not_answering" && services.lastReportAt == null && (
         <div className="host-services-note">
           <p className="note warn">
-            <b>Could not read this machine’s services.</b> Its recovery actor did not answer when
+            <b>Could not read this machine’s services.</b> Its recovery actor has not answered since
             the node agent {since ? `connected ${since} ago` : "last connected"}. The node agent is
             connected; sessions are unaffected.
           </p>

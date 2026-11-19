@@ -161,16 +161,16 @@ export function DisplayPane(props: DisplayPaneProps) {
                       }
                     />
                   </div>
-                  {sharpen}
+                  <p className="col-note">{STREAM_RESOLUTION_NOTE}</p>
+                  {props.externalResizeSupported === false && (
+                    <p className="col-note">{STREAM_RESIZE_UNSUPPORTED_NOTE}</p>
+                  )}
                   {props.streamAdapting && (
                     <p className="col-note" role="status">
                       Adapting…
                     </p>
                   )}
-                  <p className="col-note">{STREAM_RESOLUTION_NOTE}</p>
-                  {props.externalResizeSupported === false && (
-                    <p className="col-note">{STREAM_RESIZE_UNSUPPORTED_NOTE}</p>
-                  )}
+                  {sharpen}
                 </>
               ) : (
                 <>
