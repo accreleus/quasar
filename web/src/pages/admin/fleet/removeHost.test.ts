@@ -58,12 +58,16 @@ describe("canRemoveHost", () => {
     );
 
     // `updater_present` is whether the recovery actor answered; only `true` is an answer.
-    for (const answered of [false, null] as const) {
-      expect(canRemoveHost(host({ updater_present: answered }), MACHINE)).toBe(false);
-      expect(removalBlockedReason(host({ updater_present: answered }), MACHINE)).toMatch(
-        /recovery actor has not reported/,
-      );
-    }
+    // #1499: the wording follows the services banner — "has not answered" once it went
+    // silent (`false`), "has not reported" while it never answered (`null`).
+    expect(canRemoveHost(host({ updater_present: false }), MACHINE)).toBe(false);
+    expect(removalBlockedReason(host({ updater_present: false }), MACHINE)).toMatch(
+      /recovery actor has not answered/,
+    );
+    expect(canRemoveHost(host({ updater_present: null }), MACHINE)).toBe(false);
+    expect(removalBlockedReason(host({ updater_present: null }), MACHINE)).toMatch(
+      /recovery actor has not reported/,
+    );
   });
 
   it("leaves the control plane's own machine to the row menu's Forget dialog", () => {
