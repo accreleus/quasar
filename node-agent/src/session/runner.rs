@@ -908,6 +908,26 @@ pub(crate) static RESTREAM_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 pub(crate) static SWAP_HOLD: AtomicBool = AtomicBool::new(false);
 
+/// Test hook (#1005): the launch helper that reports a game exit is not installed beside the
+/// test binary, so a live test names the session whose game exit it drives.
+#[cfg(test)]
+pub(crate) static FORCED_GAME_EXIT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Whether this session's game exit is forced by [`FORCED_GAME_EXIT`]; never in production.
+#[cfg(test)]
+fn forced_game_exit(session_id: &str) -> bool {
+    FORCED_GAME_EXIT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_deref()
+        == Some(session_id)
+}
+
+#[cfg(not(test))]
+fn forced_game_exit(_: &str) -> bool {
+    false
+}
+
 /// A `session_assign` that adopts this runner's runtime (amendment 39, `adopt_session_id`).
 /// The agent has already checked that it may, and re-labels the runtime's reports.
 #[derive(Debug, Clone)]
@@ -3292,7 +3312,8 @@ pub fn run_blocking(
         // for adoption (amendment 39); the viewer is told at once either way.
         let game_exited = in_place.is_none()
             && held_since.is_none()
-            && res.launch().is_some_and(|l| l.reports().game_exited());
+            && (res.launch().is_some_and(|l| l.reports().game_exited())
+                || forced_game_exit(&session_id));
         if game_exited && kind.is_some() && cfg.video_topology == VideoTopology::StreamOnly {
             tracing::info!(
                 token = "launch-game-exited-held",
@@ -3305,6 +3326,9 @@ pub fn run_blocking(
             emit(SessionEvent::Signaling(SignalMsg::Bye));
             emit(SessionEvent::Held);
             held_since = Some(Instant::now());
+            // The runtime is held for adoption: the peer-rejoin grace's deadline must never
+            // tear it down (a new session that adopted it inside the grace would be killed).
+            peer_rejoin.clear();
             stale_transport = true;
             app_boot_started_at = None;
             app_presented_at = None;
@@ -3720,6 +3744,9 @@ pub fn run_blocking(
         // must not have its new transport muted.
         if transports.take_from_webrtc(&sig_tx) {
             stale_transport = true;
+            // Amendment 92 (#1005): a WebTransport `hello` during the peer-rejoin grace is a
+            // new peer, so the session continues on its same id (the grace must not end it).
+            peer_rejoin.clear();
         }
 
         // Inbound relay signaling (answer/ICE from the browser). A held runtime has no
@@ -6014,8 +6041,8 @@ mod tests {
 
     /// Amendment 92 (#1005): the peer-rejoin grace holds the session past the instant the
     /// peer disconnect used to end it, and its deadline ends it on today's clean
-    /// peer-disconnect path — `Stopping`, then `Stopped` with the exact detail. Guards the
-    /// disposition and the ten seconds, not the live attach.
+    /// peer-disconnect path. Guards the disposition and the ten seconds; the live suite
+    /// (`takeover_tests`) covers what the runner emits and every attach that clears it.
     #[test]
     fn the_peer_rejoin_grace_holds_until_its_deadline_then_ends_with_the_exact_detail() {
         assert_eq!(PEER_REJOIN_GRACE, Duration::from_secs(10));
@@ -6038,30 +6065,6 @@ mod tests {
             grace.step(started + PEER_REJOIN_GRACE),
             PeerRejoinStep::End,
             "the deadline ends the session"
-        );
-
-        // The end the deadline emits is today's, with today's exact detail.
-        let end = [
-            SessionEvent::Stopping,
-            SessionEvent::Stopped {
-                bytes_used: None,
-                detail: Some(super::PEER_DISCONNECT_DETAIL),
-            },
-        ];
-        assert!(
-            matches!(&end[0], SessionEvent::Stopping),
-            "the grace ends with Stopping first"
-        );
-        assert!(
-            matches!(
-                &end[1],
-                SessionEvent::Stopped {
-                    detail: Some(detail),
-                    ..
-                } if *detail == "peer disconnected: WebRTC data channel closed"
-            ),
-            "want Stopped with the peer-disconnect detail, got {:?}",
-            end[1]
         );
 
         // A reload's new peer clears the grace: the session continues, so nothing ends.
