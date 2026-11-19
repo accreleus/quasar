@@ -81,18 +81,21 @@ impl AbrLoop {
         self.metrics.upgrade().is_some_and(|m| m.abr_owner() == 0)
     }
 
-    /// Take the ABR write lock and re-check ownership inside it: the check and the
-    /// encoder write are one critical section against a takeover (#1489).
-    fn write_as_owner(&self, write: impl FnOnce()) -> bool {
-        let Some(m) = self.metrics.upgrade() else {
-            return false;
-        };
+    /// Run `act` only while this loop still owns the encoder, with the ownership check and
+    /// the write it authorises one critical section against a takeover (#1489, #1582).
+    /// `None` when the metrics are gone or a takeover claimed the encoder.
+    fn as_owner<T>(&self, act: impl FnOnce() -> T) -> Option<T> {
+        let m = self.metrics.upgrade()?;
         let _guard = m.lock_abr_write();
         if m.abr_owner() != self.id {
-            return false;
+            return None;
         }
-        write();
-        true
+        Some(act())
+    }
+
+    /// [`Self::as_owner`] for a write that has no result: `true` when it landed.
+    fn write_as_owner(&self, write: impl FnOnce()) -> bool {
+        self.as_owner(write).is_some()
     }
 
     fn fps(&self) -> u32 {
@@ -347,7 +350,15 @@ impl AbrLoop {
         let Some(planned) = st.planner.observe_rate(rate, now) else {
             return;
         };
-        let Some(ladder::PlannedStep::Resolution(d)) = actuate(st, &*rungs.lever, planned) else {
+        #[cfg(test)]
+        start_pause::run(&self.session_id, start_pause::Step::BeforeRungWrite);
+        // #1582: re-check ownership under the ABR write lock before the rung write. A
+        // takeover that cleared the owner after `report`'s early check must not let this
+        // step land on the launch point that takeover just wrote back.
+        let Some(actuated) = self.as_owner(|| actuate(st, &*rungs.lever, planned)) else {
+            return;
+        };
+        let Some(ladder::PlannedStep::Resolution(d)) = actuated else {
             return;
         };
         let (w, h) = st.planner.res_size();
@@ -365,13 +376,22 @@ impl AbrLoop {
             self.retarget(prev, kbps, rate);
         }
         let setpoint = self.governor.lock().unwrap().setpoint_kbps();
+        // #1599: a takeover that claimed the encoder between the rung write (as_owner, above)
+        // and here would otherwise receive this step's floor/rung echo over the launch point
+        // it just wrote. Check and publish under the same write lock take_over writes the
+        // launch point under, so the check cannot go stale before the two atomic stores.
+        #[cfg(test)]
+        start_pause::run(&self.session_id, start_pause::Step::BeforeEchoPublish);
         if let Some(m) = self.metrics.upgrade() {
-            m.set_abr_floor(if floor_now == rungs.launch_floor_kbps {
-                0
-            } else {
-                floor_now
-            });
-            m.set_ladder_res_rung(d.to);
+            let _guard = m.lock_abr_write();
+            if m.abr_owner() == self.id {
+                m.set_abr_floor(if floor_now == rungs.launch_floor_kbps {
+                    0
+                } else {
+                    floor_now
+                });
+                m.set_ladder_res_rung(d.to);
+            }
         }
         tracing::info!(
             "SPT-08 ladder step: resolution rung {} → {} ({}), {w}x{h}, rate {rate:.0} kbps; \
@@ -1066,13 +1086,17 @@ fn arm(
     Some((abr_loop, plan))
 }
 
-/// A step inside [`start`] a test can hold the thread at, once, so that a second owner or a
-/// teardown lands in the middle of it (#1295). The two windows are too narrow to hit by
-/// timing: `BeforeClaim` is the gap between a re-take's `orphaned()` read and its claim, and
-/// `BeforeHooks` the one between the claim and the hooks that hold the encoder. Armed for
-/// one session id only, so the other tests in this binary never reach it. Armings are kept
-/// per (step, session): tests run in parallel, and a single slot let one test's `arm`
-/// overwrite another's before its `start` reached the step.
+/// A step inside [`start`] (and [`AbrLoop::step_rung`]) a test can hold the thread at, once,
+/// so that a second owner or a teardown lands in the middle of it (#1295, #1582, #1599). The
+/// windows are too narrow to hit by timing: `BeforeClaim` is the gap between a re-take's
+/// `orphaned()` read and its claim, `BeforeHooks` the one between the claim and the hooks that
+/// hold the encoder, `BeforeRungWrite` the one between the rung planner's decision and the
+/// lever write, `BeforeEchoPublish` the one between that write and the step's floor/rung echo
+/// publish, and `BeforeLaunchWrite` the one in [`take_over`] after it dropped the previous
+/// loop's window hook and before it writes the launch point. Armed for one session id only,
+/// so the other tests in this binary never reach it. Armings are kept per (step, session):
+/// tests run in parallel, and a single slot let one test's `arm` overwrite another's before
+/// its `start` reached the step.
 #[cfg(test)]
 pub(crate) mod start_pause {
     use std::sync::Mutex;
@@ -1085,6 +1109,15 @@ pub(crate) mod start_pause {
         BeforeHooks,
         /// [`super::AbrLoop::report`], after its owner check and before it stores the link rate.
         BeforeRateStore,
+        /// [`super::AbrLoop::step_rung`], after the planner planned a rung step and before
+        /// the lever write (#1582).
+        BeforeRungWrite,
+        /// [`super::AbrLoop::step_rung`], after the rung write and the floor move but before
+        /// it publishes the floor/rung echo to the metrics (#1599).
+        BeforeEchoPublish,
+        /// [`super::take_over`], after dropping the previous loop's window hook and before
+        /// writing the launch point (#1582).
+        BeforeLaunchWrite,
     }
 
     type Hook = Box<dyn Fn() + Send + Sync>;
@@ -1369,15 +1402,22 @@ fn start(
                     // read the LIVE floor: it moves with the rung, and a stale higher
                     // value fires the emergency on a setpoint nowhere near pinned.
                     let live_floor = hint_loop.governor.lock().unwrap().floor_kbps() as f64;
-                    let decision = observe_resolution_rung(
-                        &mut st,
-                        &**lever,
-                        lever.pinned(),
-                        state,
-                        setpoint,
-                        live_floor,
-                        std::time::Instant::now(),
-                    );
+                    // #1582: the rung write runs under the ABR write lock with the owner
+                    // re-checked there. An old hook that survived a takeover (or ran before
+                    // the new loop replaced it) cannot step a rung after the launch point.
+                    let decision = hint_loop
+                        .as_owner(|| {
+                            observe_resolution_rung(
+                                &mut st,
+                                &**lever,
+                                lever.pinned(),
+                                state,
+                                setpoint,
+                                live_floor,
+                                std::time::Instant::now(),
+                            )
+                        })
+                        .flatten();
                     // Re-derive the floor from wherever the rung ENDED this window,
                     // unconditionally: a manual `session_display_update` moves the size
                     // underneath the machine and the resync above adopts it, a rung
@@ -1635,6 +1675,13 @@ fn take_over(abr_loop: &AbrLoop, plan: &Plan, metrics: &SessionMetrics) {
         .fps
         .store(plan.abr_cfg.fps, std::sync::atomic::Ordering::Relaxed);
     metrics.set_abr_setpoint(plan.abr_cfg.ceiling_kbps);
+    // #1582: the previous loop's window hook is still in the slot here — `start` installs
+    // the new loop's only after this function returns — and it can step a rung after the
+    // launch point is written. Drop it FIRST. `clear_hooks` cannot be used: it also zeroes
+    // the owner this loop just claimed.
+    metrics.drop_window_hook();
+    #[cfg(test)]
+    start_pause::run(&abr_loop.session_id, start_pause::Step::BeforeLaunchWrite);
     let written = {
         let _guard = metrics.lock_abr_write();
         write_launch_point(
@@ -2234,6 +2281,251 @@ mod tests {
             11_500,
             "the retarget must not write after the takeover put launch back"
         );
+    }
+
+    /// A Smooth, resolution-rung config at `bitrate_kbps`: the WebTransport ladder armed
+    /// resolution-first with a 720p floor, so a rate under the engage band plans a size step.
+    fn smooth_rung_cfg(bitrate_kbps: u32) -> SessionConfig {
+        let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
+        settings.encoder = EncoderChoice::Openh264;
+        settings.abr_mode = AbrMode::Smooth;
+        settings.ladder.resolution_enabled = true;
+        settings.ladder.res.min_height = 720;
+        settings.ladder.order = ladder::LadderOrder::ResFirst;
+        let stream = crate::session::StreamParams {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_kbps,
+            h264_profile: "constrained-baseline".to_string(),
+            codec: Codec::H264,
+            abr_floor_kbps: 0,
+            mic: false,
+        };
+        let mut cfg = SessionConfig::for_assignment_with(&settings, stream, None);
+        cfg.abr_governor.min_interval_ms = 1;
+        cfg
+    }
+
+    /// #1582: a rung step that passed `report`'s early owner check must not land after a
+    /// takeover claimed the encoder and wrote the launch point back. Deterministic: the
+    /// pause is `BeforeRungWrite`, exactly between the planner's decision and the lever
+    /// write. Without the fix the step writes after the takeover and the launch size is lost.
+    #[test]
+    fn a_takeover_between_the_rung_decision_and_its_write_keeps_the_launch_point() {
+        use start_pause::{arm, Step};
+        init();
+        const SESSION: &str = "rung-takeover-1";
+        let metrics = Arc::new(SessionMetrics::new("smooth", 60));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let trace =
+            crate::session::runner::DiagnosticEventTx::new(tx, Arc::default(), Arc::default());
+        let cfg = smooth_rung_cfg(8000);
+        let Ok(encoder) = gst::ElementFactory::make("openh264enc").build() else {
+            return; // openh264 unavailable: skip
+        };
+        let stage = super::super::scale_stage::build_scale_stage(&cfg, None).unwrap();
+        assert!(stage.supported, "the software arm always carries the lever");
+        let lever = Arc::new(EncodeResolutionLever::new(stage, encoder.clone(), |_| {}));
+
+        let (client_a, abr) = feedback_abr_armed(
+            &encoder,
+            &cfg,
+            metrics.clone(),
+            trace.clone(),
+            SESSION.into(),
+            Some(lever.clone()),
+        )
+        .expect("openh264enc takes live writes");
+        let client_b = feedback_abr(
+            &encoder,
+            &cfg,
+            metrics.clone(),
+            trace,
+            SESSION.into(),
+            Some(lever.clone()),
+        )
+        .expect("openh264enc takes live writes");
+        (client_a.start)();
+        assert_eq!(
+            metrics.hooks_armed(),
+            (true, true),
+            "the first loop owns both hooks"
+        );
+
+        // Two readings in a row under the rate take the governor's rate (not just the
+        // setpoint) to what the link carries: 1000 kbit/s fits no engage line, so the
+        // planner wants a size step.
+        let t0 = std::time::Instant::now();
+        abr.report(Some(1000.0), t0); // the first reading: under, not yet a move
+        abr.report(Some(1000.0), t0 + std::time::Duration::from_millis(100)); // rate moves
+        let rate = abr.governor.lock().unwrap().rate_kbps();
+        assert!(rate <= 1000.0, "the governor's rate stayed at {rate}");
+
+        // The pause: the takeover (the second transport's `start`) lands exactly between
+        // the planner's decision and the lever write.
+        let b = client_b;
+        arm(SESSION, Step::BeforeRungWrite, move || (b.start)());
+        // The rate has been under the band for more than `RATE_CONFIRM`: this report's
+        // `step_rung` plans the step and reaches the pause. No sleeps: the clock is supplied.
+        abr.report(Some(1000.0), t0 + std::time::Duration::from_millis(1500));
+
+        assert_eq!(
+            lever.stage().requested(),
+            (1920, 1080),
+            "the rung write must not land after the takeover put the launch point back"
+        );
+    }
+
+    /// #1582: the previous loop's window hook must be gone BEFORE `take_over` writes the
+    /// launch point, or it can step a rung in the gap before the new loop's `set_on_window`.
+    /// Deterministic: `BeforeHooks` runs exactly after `take_over` and before either hook of
+    /// the new loop is registered.
+    #[test]
+    fn a_takeover_drops_the_previous_loops_window_hook_before_it_writes_launch() {
+        use start_pause::{arm, Step};
+        init();
+        const SESSION: &str = "rung-takeover-2";
+        let metrics = Arc::new(SessionMetrics::new("smooth", 60));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let trace =
+            crate::session::runner::DiagnosticEventTx::new(tx, Arc::default(), Arc::default());
+        let cfg = smooth_rung_cfg(8000);
+        let Ok(encoder) = gst::ElementFactory::make("openh264enc").build() else {
+            return; // openh264 unavailable: skip
+        };
+        let stage = super::super::scale_stage::build_scale_stage(&cfg, None).unwrap();
+        let lever = Arc::new(EncodeResolutionLever::new(stage, encoder.clone(), |_| {}));
+        let client_a = feedback_abr(
+            &encoder,
+            &cfg,
+            metrics.clone(),
+            trace.clone(),
+            SESSION.into(),
+            Some(lever.clone()),
+        )
+        .expect("openh264enc takes live writes");
+        let client_b = feedback_abr(
+            &encoder,
+            &cfg,
+            metrics.clone(),
+            trace,
+            SESSION.into(),
+            Some(lever),
+        )
+        .expect("openh264enc takes live writes");
+        (client_a.start)();
+        assert_eq!(
+            metrics.hooks_armed(),
+            (true, true),
+            "the previous loop armed both hooks"
+        );
+
+        // At `BeforeLaunchWrite` `take_over` has dropped the previous loop's window hook and
+        // has not written the launch point yet: the slot must already be empty. `BeforeHooks`
+        // would prove the gap too late — after the write the test is meant to protect.
+        let window_armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hook_metrics = metrics.clone();
+        let seen = window_armed.clone();
+        arm(SESSION, Step::BeforeLaunchWrite, move || {
+            seen.store(
+                hook_metrics.hooks_armed().1,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        });
+        (client_b.start)();
+
+        assert!(
+            !window_armed.load(std::sync::atomic::Ordering::SeqCst),
+            "the previous loop's window hook survived until the launch-point write"
+        );
+        assert_eq!(
+            metrics.hooks_armed(),
+            (true, true),
+            "and the new loop owns both hooks"
+        );
+        assert_ne!(metrics.abr_owner(), 0, "the new loop owns the encoder");
+    }
+
+    /// #1599: a rung step that passed `as_owner` must not publish its floor/rung echo after a
+    /// takeover claimed the encoder and wrote the launch point back. Deterministic: the pause
+    /// is `BeforeEchoPublish`, exactly between the rung write and the echo publish. Without the
+    /// fix the echo still lands at the rung step's floor/rung, over the launch point the
+    /// takeover just wrote.
+    #[test]
+    fn a_takeover_between_the_rung_write_and_its_echo_keeps_the_launch_echo() {
+        use start_pause::{arm, Step};
+        init();
+        const SESSION: &str = "rung-echo-takeover-1";
+        let metrics = Arc::new(SessionMetrics::new("smooth", 60));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let trace =
+            crate::session::runner::DiagnosticEventTx::new(tx, Arc::default(), Arc::default());
+        let cfg = smooth_rung_cfg(8000);
+        let Ok(encoder) = gst::ElementFactory::make("openh264enc").build() else {
+            return; // openh264 unavailable: skip
+        };
+        let stage = super::super::scale_stage::build_scale_stage(&cfg, None).unwrap();
+        assert!(stage.supported, "the software arm always carries the lever");
+        let lever = Arc::new(EncodeResolutionLever::new(stage, encoder.clone(), |_| {}));
+
+        let (client_a, abr) = feedback_abr_armed(
+            &encoder,
+            &cfg,
+            metrics.clone(),
+            trace.clone(),
+            SESSION.into(),
+            Some(lever.clone()),
+        )
+        .expect("openh264enc takes live writes");
+        let client_b = feedback_abr(
+            &encoder,
+            &cfg,
+            metrics.clone(),
+            trace,
+            SESSION.into(),
+            Some(lever.clone()),
+        )
+        .expect("openh264enc takes live writes");
+        (client_a.start)();
+        assert_eq!(
+            metrics.hooks_armed(),
+            (true, true),
+            "the first loop owns both hooks"
+        );
+
+        // Two readings in a row under the rate take the governor's rate (not just the
+        // setpoint) to what the link carries: 1000 kbit/kb fits no engage line, so the
+        // planner wants a size step.
+        let t0 = std::time::Instant::now();
+        abr.report(Some(1000.0), t0); // the first reading: under, not yet a move
+        abr.report(Some(1000.0), t0 + std::time::Duration::from_millis(100)); // rate moves
+        let rate = abr.governor.lock().unwrap().rate_kbps();
+        assert!(rate <= 1000.0, "the governor's rate stayed at {rate}");
+
+        // The pause: the takeover (the second transport's `start`) lands exactly between the
+        // rung write (as_owner) and the echo publish.
+        let b = client_b;
+        arm(SESSION, Step::BeforeEchoPublish, move || (b.start)());
+        // The rate has been under the band for more than `RATE_CONFIRM`: this report's
+        // `step_rung` plans the step, passes as_owner (Loop A still owns), writes the rung,
+        // then reaches the pause. No sleeps: the clock is supplied.
+        abr.report(Some(1000.0), t0 + std::time::Duration::from_millis(1500));
+
+        // The takeover now owns the encoder, so step_rung's echo publish is skipped: the
+        // echoed floor and ladder rung stay at the launch values the takeover wrote.
+        let now = std::time::Instant::now();
+        assert_eq!(
+            metrics.drain_window(now).abr_floor_kbps,
+            None,
+            "the echoed floor must stay at launch, not the rung step's floor"
+        );
+        assert_eq!(
+            metrics.drain_window(now).ladder_res_rung,
+            None,
+            "the echoed ladder rung must stay at launch, not the rung step's rung"
+        );
+        assert_ne!(metrics.abr_owner(), 0, "the new loop owns the encoder");
     }
 
     /// #1040: a WebRTC answer replaced the video transport under a streaming WebTransport
