@@ -203,6 +203,9 @@ pub(crate) struct SendLog {
     /// The first send since the last feedback: the silence clock starts here, not at the
     /// feedback, or a frame after a still screen would be judged before its answer can come.
     unanswered_since: Option<Instant>,
+    /// That send's `pkt_seq`. The outage mark is taken in send order, not by stamp: held
+    /// video goes out stamped with its queue time, before a report it was sent after.
+    unanswered_seq: Option<u32>,
     /// The last stamp, µs: stamps never go back in `pkt_seq` (send) order, whatever stamped
     /// them (a paced release, a queue time, a resend), or the delay detector reads a send
     /// that went back in time.
@@ -215,6 +218,7 @@ impl SendLog {
             start,
             slots: vec![Slot::default(); LOG],
             unanswered_since: None,
+            unanswered_seq: None,
             last_us: 0,
         }
     }
@@ -237,6 +241,7 @@ impl SendLog {
             status: Status::Unreported,
         };
         self.unanswered_since.get_or_insert(at);
+        self.unanswered_seq.get_or_insert(seq);
     }
 
     fn slot(&mut self, seq: u32) -> Option<&mut Slot> {
@@ -482,11 +487,11 @@ pub(crate) struct Estimator {
     /// faster than AIMD. Dropped when it is reached, when it expires, when the link disagrees
     /// with a delay or loss cut, and on a codec switch (#1417).
     recover_to: Option<(f64, Instant)>,
-    /// The first send after the last feedback, in the log's µs clock, while a detected silence
-    /// is an outage: the report after it counts packets sent from here, up to the first it
-    /// shows received after it, as the outage's losses rather than congestion (#1557). Read by
+    /// The `pkt_seq` of the first send after the last feedback, while a detected silence is an
+    /// outage: the report after it counts packets sent from here, up to the first it shows
+    /// received after it, as the outage's losses rather than congestion (#1557). Read by
     /// `measure`, which clears it.
-    outage_from_us: Option<u64>,
+    outage_from: Option<u32>,
     /// The bound the log last named, and when.
     logged: (Bound, Option<Instant>),
     /// The estimate before a silence decay not logged yet; delay and loss cuts always log.
@@ -531,7 +536,7 @@ impl Estimator {
             loss: None,
             bound: Bound::Ceiling,
             recover_to: None,
-            outage_from_us: None,
+            outage_from: None,
             logged: (Bound::Ceiling, None),
             unlogged: None,
             measured: None,
@@ -585,6 +590,7 @@ impl Estimator {
         self.last_feedback = Some(now);
         self.last_decay = None;
         log.unanswered_since = None;
+        log.unanswered_seq = None;
         let m = self.measure(fb, log, now);
         self.apply(m, now, path)
     }
@@ -779,8 +785,9 @@ impl Estimator {
         }
         // The silence is an outage: the packets sent since the last feedback are its losses
         // (#1557). Kept until the first report after it reads and clears the mark.
-        self.outage_from_us
-            .get_or_insert(sent.saturating_duration_since(log.start).as_micros() as u64);
+        if let Some(seq) = log.unanswered_seq {
+            self.outage_from.get_or_insert(seq);
+        }
         let from = self.last_decay.unwrap_or(sent + timeout);
         let steps = now.saturating_duration_since(from).as_secs_f64() / SILENCE_STEP.as_secs_f64();
         let factor = SILENCE_DECAY.powf(steps);
@@ -880,10 +887,11 @@ impl Estimator {
         let (mut received, mut lost) = (0i64, 0i64);
         // A loss sent during the detected outage belongs to the outage, not congestion: the
         // first report after it must not cut the loss bound (#1557). The exemption ends at
-        // the send time of the first packet this report shows as received after the mark:
-        // from then the link answered, so a loss sent after it is congestion.
-        let outage = self.outage_from_us;
-        let mut answered_from: Option<u64> = None;
+        // the first packet this report shows as received after the mark: from then the link
+        // answered, so a loss sent after it is congestion. In `pkt_seq` (send) order.
+        let outage = self.outage_from;
+        let mut answered_from: Option<u32> = None;
+        let after = |seq: u32, from: u32| seq.wrapping_sub(from) < 1 << 31;
         let mut newest_fresh = None;
         for (i, &arrival) in fb.arrivals.iter().enumerate() {
             let seq = fb.first_pkt_seq.wrapping_add(i as u32);
@@ -903,7 +911,7 @@ impl Estimator {
                 }
                 (Status::Unreported, None) => {
                     let exempt = outage.is_some_and(|from| {
-                        slot.sent_us >= from && answered_from.is_none_or(|at| slot.sent_us < at)
+                        after(seq, from) && answered_from.is_none_or(|at| !after(seq, at))
                     });
                     if exempt {
                         slot.status = Status::Outage;
@@ -923,9 +931,9 @@ impl Estimator {
                     slot.status = Status::Received;
                     received += 1;
                     // The first packet this report shows received after the mark: the
-                    // outage's exemption ends at its send time (#1557).
-                    if outage.is_some_and(|from| slot.sent_us >= from) {
-                        answered_from.get_or_insert(slot.sent_us);
+                    // outage's exemption ends at it (#1557).
+                    if outage.is_some_and(|from| after(seq, from)) {
+                        answered_from.get_or_insert(seq);
                     }
                     if let Some((send_d, arrival_d, arrival_ms)) =
                         self.inter_arrival.push(slot.sent_us, at)
@@ -996,7 +1004,7 @@ impl Estimator {
         let (r, l) = (r.max(0), l.max(0));
         let loss = (r + l >= LOSS_MIN_SAMPLES).then(|| l as f64 / (r + l) as f64);
         // The mark is spent: only the first report after the outage is exempt (#1557).
-        self.outage_from_us = None;
+        self.outage_from = None;
 
         Measured {
             usage: self.trendline.usage,
@@ -1645,9 +1653,11 @@ impl VideoQueue {
     /// Bytes the pacer lets go now: [`PACE_GAIN`] × `kbps`, in bursts of [`PACE_BURST_MS`];
     /// `None` paces nothing.
     pub(crate) fn pace(&mut self, kbps: Option<u64>, now: Instant) -> usize {
+        // Not a `nack` answer: those go ahead of older video (`push`).
         let stale = self
             .held
-            .front()
+            .iter()
+            .find(|h| !h.resend)
             .is_some_and(|h| now.saturating_duration_since(h.queued_at) >= PACE_MAX_WAIT);
         let Some(kbps) = kbps.filter(|_| !stale) else {
             self.counted = None;
@@ -1698,10 +1708,12 @@ impl VideoQueue {
         seq
     }
 
-    /// Past `cap` held bytes the oldest are dropped, as QUIC's own queue drops them.
+    /// Past `cap` held bytes the oldest video is dropped, as QUIC's own queue drops it, and
+    /// `nack` answers only once no video is left.
     pub(crate) fn push(&mut self, held: Held, cap: usize) {
         while self.bytes + held.datagram.len() > cap {
-            let Some(old) = self.held.pop_front() else {
+            let oldest = self.held.iter().position(|h| !h.resend).unwrap_or(0);
+            let Some(old) = self.held.remove(oldest) else {
                 break;
             };
             self.bytes -= old.datagram.len();
