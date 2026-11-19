@@ -129,6 +129,27 @@ describe("DisplayPane stream resolution", () => {
     expect(labels.indexOf("Stream resolution")).toBeLessThan(labels.indexOf("Render resolution"));
   });
 
+  it("puts the stream-resolution caption directly under its control, before the sharpen row", () => {
+    const { container } = render(<DisplayPane {...streamBase} />);
+    // The stream column is the first of the three `.cols` columns.
+    const col = container.querySelector(".cols > div")!;
+    const controlRow = col.querySelector(".ctl-row")!;
+    const caption = screen.getByText(
+      "Changes what is encoded and sent to you; the app keeps drawing at its own size.",
+    );
+    // The switch is nested in its own `.ctl-row`; index that row, not the input.
+    const sharpenRow = screen
+      .getByRole("checkbox", { name: /sharpen an upscaled picture/i })
+      .closest(".ctl-row")!;
+
+    const index = (el: Element) => Array.from(col.children).indexOf(el);
+    // The caption is the element immediately after the resolution control — not
+    // the sharpen switch (which used to sit between them, #1470).
+    expect(index(caption)).toBe(index(controlRow) + 1);
+    // The sharpen row comes after the caption.
+    expect(index(sharpenRow)).toBeGreaterThan(index(caption));
+  });
+
   it("selects the launch size while nothing has changed", () => {
     render(<DisplayPane {...streamBase} />);
     expect(
