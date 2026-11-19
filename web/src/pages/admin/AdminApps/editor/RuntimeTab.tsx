@@ -261,7 +261,7 @@ export function RuntimeTab({
             id="container-systempaths-unconfined"
           />
           <span className="hint">
-            Off by default. Turn it on for desktop images that run Flatpak. A host can refuse it.
+            Off by default. It weakens the container's isolation from the host: turn it on only for desktop images that run Flatpak. A host can refuse it.
           </span>
         </Section>
       )}
