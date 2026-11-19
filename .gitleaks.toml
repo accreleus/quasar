@@ -18,17 +18,29 @@ title = "Quasar gitleaks configuration"
 [extend]
 useDefault = true
 
-# --- test constants and fixtures -------------------------------------------
-# Fake keys/secrets that unit and integration tests assign so they can assert on
-# redaction, rotation and policy. A real secret never lives in a test file.
+# --- test constants -------------------------------------------------------
+# The test files whose fake keys/secrets the broad generic-api-key rule flags
+# (assigned so a test can assert on redaction, rotation or policy). Named one by
+# one and scoped to generic-api-key only: a specifically-typed secret (an AWS,
+# GitHub or Slack token, a private key) in any test file still fails the scan,
+# and a new test file gets no free pass.
 [[allowlists]]
-id = "test-fixtures"
-description = "Test constants: fake keys/secrets assigned by unit and integration tests."
+id = "test-constants"
+targetRules = ["generic-api-key"]
+description = "Test constants: fake keys/secrets assigned by these tests."
 paths = [
-    '''(?i).*/.*_test\.go$''',
-    '''(?i)tests?\.rs$''',
-    '''(?i).*/.*\.test\.tsx$''',
-    '''(?i).*/.*\.test\.mjs$''',
+    '''control-plane/internal/artwork/keysource_test\.go$''',
+    '''control-plane/internal/auth/handler_integration_test\.go$''',
+    '''control-plane/internal/devauth/devauth_test\.go$''',
+    '''control-plane/internal/secrets/crypto_test\.go$''',
+    '''control-plane/internal/secrets/store_test\.go$''',
+    '''node-agent/src/runtime/build_tests\.rs$''',
+    '''node-agent/src/runtime/image_tests\.rs$''',
+    '''node-agent/src/session/warmup/tests\.rs$''',
+    '''scripts/validate/stream/bundle\.test\.mjs$''',
+    '''scripts/validate/stream/pack\.test\.mjs$''',
+    '''scripts/validate/stream/run\.test\.mjs$''',
+    '''web/src/pages/app/account/DeviceCard\.test\.tsx$''',
 ]
 
 # --- test harness and deploy fixtures --------------------------------------
