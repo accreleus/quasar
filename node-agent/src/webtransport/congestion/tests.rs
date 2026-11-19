@@ -594,6 +594,71 @@ fn the_first_report_after_an_outage_counts_no_outage_loss() {
     );
 }
 
+/// #1496 r3: video held in the agent reaches QUIC after the last report still stamped with
+/// the time it was queued, before that report. Marked by time, the outage began before the
+/// last datagrams the client got ahead of it, the first report after it ended the exemption
+/// on one of those, and the outage's own losses cut the estimate to 2.9 Mbit/s (CI, 7bb8e1b1):
+/// the recovery keyframe was then paced under the ABR floor.
+#[test]
+fn video_held_into_an_outage_is_the_outages_loss_not_congestion() {
+    let start = Instant::now();
+    let ms = |ms: u64| start + Duration::from_millis(ms);
+    let mut log = SendLog::new(start);
+    let mut est = Estimator::new(CEILING, start);
+    let send = |log: &mut SendLog, seq: u32, at: Instant| {
+        let mut d = vec![0u8; SIZE];
+        d[1..5].copy_from_slice(&seq.to_le_bytes());
+        log.record(&d, at, false);
+    };
+    let sent = |seq: u32| {
+        if seq < 100 {
+            u64::from(seq) * 10
+        } else {
+            2500 + u64::from(seq - 300) * 5
+        }
+    };
+    let report = |first: u32, last: u32, got: &dyn Fn(u32) -> bool| Feedback {
+        first_pkt_seq: first,
+        ref_us: 0,
+        arrivals: (first..=last)
+            .map(|seq| match got(seq) {
+                true => ((sent(seq) + 5) * 1000 / UNIT_US) as u16,
+                false => NOT_RECEIVED,
+            })
+            .collect(),
+    };
+    for seq in 0..100 {
+        send(&mut log, seq, ms(sent(seq)));
+    }
+    // The last report before the outage: seq 90..100 were still on their way.
+    est.on_feedback(&report(0, 89, &|_| true), &mut log, ms(1000), NO_QUIC);
+    // Queued at 990 ms, handed to QUIC after that report, lost with the path.
+    for seq in 100..300 {
+        send(&mut log, seq, ms(990));
+    }
+    for t in (1100..=2500).step_by(100) {
+        est.on_tick(ms(t), &log, RTT);
+    }
+    assert!(
+        est.recover_to.is_some(),
+        "the silence was not read as an outage"
+    );
+    for seq in 300..340 {
+        send(&mut log, seq, ms(sent(seq)));
+    }
+    let first_after = report(90, 339, &|seq| !(100..300).contains(&seq));
+    est.on_feedback(&first_after, &mut log, ms(2800), NO_QUIC);
+    let loss = est.loss();
+    assert!(
+        loss.is_none_or(|l| l < LOSS_LOW),
+        "the outage's own losses measured {loss:?}"
+    );
+    assert!(
+        est.recover_to.is_some(),
+        "the outage's own losses ended the regrow"
+    );
+}
+
 /// #1557 review A2: the exemption ends at the send time of the first packet the report
 /// shows received after the outage's mark. A burst sent after the link came back is
 /// congestion, even when it falls in the feedback interval before the first report: it
@@ -638,7 +703,7 @@ fn a_late_exempted_outage_loss_does_not_undo_a_counted_loss() {
         let at = start + Duration::from_micros(sent_us(seq));
         log.record(&d, at, false);
     }
-    est.outage_from_us = Some(10_000);
+    est.outage_from = Some(1);
     let first: Vec<u16> = (0..41u32)
         .map(|seq| {
             if seq <= 20 {
@@ -2856,4 +2921,76 @@ fn a_resend_goes_ahead_of_held_video() {
         "the two answers first, then video"
     );
     assert_eq!(wire, [0, 1, 2]);
+}
+
+fn resend(pkt_seq: u32) -> Held {
+    Held {
+        resend: true,
+        ..held(pkt_seq)
+    }
+}
+
+/// #1496 r3 S1: a `nack` answer goes ahead of held video, so the pacer's 100 ms bound reads
+/// the oldest video, not the answer in front of it.
+#[test]
+fn the_pacer_bound_reads_the_oldest_video_not_a_resend_ahead_of_it() {
+    let t0 = Instant::now();
+    let at = |ms| t0 + Duration::from_millis(ms);
+    let mut video = VideoQueue::default();
+    video.push(
+        Held {
+            queued_at: at(0),
+            ..held(0)
+        },
+        BUFFER,
+    );
+    video.push(
+        Held {
+            queued_at: at(150),
+            ..resend(1)
+        },
+        BUFFER,
+    );
+    assert_eq!(
+        video.pace(Some(8000), at(150)),
+        usize::MAX,
+        "video waited 150 ms"
+    );
+
+    let mut video = VideoQueue::default();
+    video.push(
+        Held {
+            queued_at: at(0),
+            ..resend(0)
+        },
+        BUFFER,
+    );
+    video.push(
+        Held {
+            queued_at: at(150),
+            ..held(1)
+        },
+        BUFFER,
+    );
+    assert!(
+        video.pace(Some(8000), at(150)) < usize::MAX,
+        "fresh video is paced"
+    );
+}
+
+/// #1496 r3 S2: past the cap the oldest video goes, not the `nack` answers ahead of it.
+#[test]
+fn held_video_over_the_cap_is_dropped_before_a_resend() {
+    let mut video = VideoQueue::default();
+    video.push(resend(9), 4 * SIZE);
+    for i in 0..4 {
+        video.push(held(i), 4 * SIZE);
+    }
+    assert_eq!(video.dropped, 1);
+    let held: Vec<_> = video
+        .held
+        .iter()
+        .map(|h| (h.resend, wire_seq(&h.datagram)))
+        .collect();
+    assert_eq!(held, [(true, 9), (false, 1), (false, 2), (false, 3)]);
 }
