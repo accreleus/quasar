@@ -12,12 +12,18 @@ import (
 // and this only answers "what is it right now". A restart drops it and the next
 // session_metrics sample refills it — the agent is the only thing that knows.
 type externalState struct {
-	// Width/Height are meaningful only when HasSize is set. HasSize false means
-	// the external size is the launch size, either because nothing moved it or
-	// because the sample omitted the keys (sent only when it differs from launch).
-	Width   int32
-	Height  int32
-	HasSize bool
+	// Width/Height are meaningful only when SizeKnown is set: it says the control
+	// plane knows the CURRENT external size at all. HasSize is the narrower "it is
+	// not the launch size" bit: false with SizeKnown true means the external size
+	// IS the launch size (nothing moved it, or the sample omitted the keys, which
+	// are sent only when they differ from launch). SizeKnown false means UNKNOWN,
+	// the state a render-only display PATCH leaves: it makes the render size known
+	// without ever seeing an external size, and the Session resource must omit
+	// external_width/height rather than report the launch size.
+	Width     int32
+	Height    int32
+	SizeKnown bool
+	HasSize   bool
 	// Supported is the agent's `external_resize_supported` readback. nil (an older
 	// agent, or no sample yet) is PERMISSIVE: the request goes through and the
 	// agent nacks it into display_update_rejected. Only an explicit false
@@ -75,8 +81,9 @@ func (d *displayState) setSize(sessionID string, w, h, launchW, launchH int32) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	st := d.m[sessionID]
-	st.Width, st.Height, st.HasSize = w, h, true
-	if w != launchW || h != launchH {
+	st.Width, st.Height, st.SizeKnown = w, h, true
+	st.HasSize = w != launchW || h != launchH
+	if st.HasSize {
 		st.Owner = "pinned"
 	} else {
 		st.Owner = ""
@@ -109,6 +116,11 @@ func (d *displayState) observe(sessionID string, w, h *int32, supported *bool, o
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	st := d.m[sessionID]
+	// A display-aware sample reports the external size in its own window: even
+	// the absent pair means "the launch size", so the size becomes known. A
+	// render-only PATCH never sets this, which is why the pair stays omitted
+	// until a sample (or a stream 202) lands.
+	st.SizeKnown = true
 	if w != nil && h != nil {
 		st.Width, st.Height, st.HasSize = *w, *h, true
 		st.Owner = owner
