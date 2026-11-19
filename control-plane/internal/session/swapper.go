@@ -150,6 +150,16 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 			if !connected {
 				return Session{}, ErrSessionNotSwappable
 			}
+			// An agent without terminal home cleanup takes no hold on the
+			// target's home, and the row keeps the old app_id until the agent
+			// reports the swap complete: a launch of the target, or another
+			// session's swap into it, admitted in that window passes the
+			// single-writer guard and mounts the same home twice (#1429). Such
+			// an agent cannot make the swap safe, so it is refused the same way
+			// as the connection-less case above.
+			if epoch == nil || !epoch.SupportsHomeCleanup() {
+				return Session{}, ErrSessionNotSwappable
+			}
 		}
 		conflict, err := s.store.HasLiveUserAppSession(ctx, sess.UserID, homeAppID(app), sessionID)
 		if err != nil {
@@ -311,6 +321,14 @@ func (s *swapper) dispatchSwap(hostID, sessionID string, runtimeSpec []byte, man
 		}
 		next, connected := provider.CurrentHomeCommandEpoch(hostID)
 		if !connected {
+			break
+		}
+		// An epoch that lost terminal home cleanup cannot take the target's
+		// hold, so nothing would own its home until the swap commits: the swap
+		// is refused as Swap refuses it at entry (#1429). The unstarted-swap
+		// release below frees whatever the guard took.
+		if next == nil || !next.SupportsHomeCleanup() {
+			s.log.Warn("swap refused: the agent lost home cleanup before handoff", "session_id", sessionID)
 			break
 		}
 		refreshed, refreshErr := s.store.RefreshSwapHomeHold(context.Background(), sessionID,
