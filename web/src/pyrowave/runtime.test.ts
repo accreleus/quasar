@@ -11,9 +11,10 @@ import { PyroWaveError } from "./bitstream";
 import type { Presenter } from "../webtransport/presenter";
 import { WebTransportMedia } from "../webtransport/webTransportMedia";
 import { createWebTransportRuntime, type WebTransportRuntimeDeps } from "../pages/app/webTransportRuntime";
-import { avcC, b64, COORDS, FakeAgent, FakeChunk, FakeDecoder, helloAck, packPyroWave, pyroWaveDatagrams } from "../webtransport/testSupport";
+import { avcC, b64, COORDS, FakeAgent, FakeChunk, FakeDecoder, helloAck, packPyroWave, packetize, pyroWaveDatagrams, bytes } from "../webtransport/testSupport";
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -237,6 +238,41 @@ describe("a PyroWave session in the WebTransport runtime", () => {
     agent.last.datagrams(datagrams(0, 1));
     await vi.waitFor(() => expect(textures).toHaveLength(1));
     expect(loadBench).not.toHaveBeenCalled();
+    rt.destroy();
+  });
+
+  it("clears the standard decoder's keyframe wait when PyroWave takes over mid-session (#1436)", async () => {
+    vi.useFakeTimers();
+    const { agent, rt, textures } = setup();
+    agent.replies = [[helloAck(0, avcC())]];
+    rt.start();
+    await vi.advanceTimersByTimeAsync(20);
+    expect(rt.getSnapshot().channelOpen).toBe(true);
+    // A picture on the standard codec, then a new configuration whose keyframe never comes: the
+    // decode stage waits for it while its deltas keep arriving.
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(10, 0) }));
+    await vi.advanceTimersByTimeAsync(1_000);
+    agent.last.control(helloAck(1, avcC(0x28), 1280, 720));
+    await vi.advanceTimersByTimeAsync(10);
+    for (let i = 0; i < 2; i++) {
+      agent.last.datagrams(packetize({ configId: 1, frameSeq: 1 + i, keyframe: false, data: bytes(10, 1 + i) }));
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+    // The session switches to PyroWave mid-session, and its frames show: the stale keyframe wait
+    // must not outlast its bound (5 s plus four round trips) and end the connection as lost.
+    agent.last.control(pyroAck(2, "switch"));
+    await vi.advanceTimersByTimeAsync(10);
+    // PyroWave frames keep arriving, keeping the picture and the video clock alive; the stale wait
+    // must not end the connection while they do. (A connection ended by the wait is no longer open,
+    // so the loop stops there and the assertion below names the failure.)
+    for (let i = 0; i < 6 && rt.getSnapshot().channelOpen; i++) {
+      agent.last.datagrams(datagrams(2, 2 + i));
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+    expect(textures.length).toBeGreaterThan(0);
+    expect(rt.getSnapshot().channelOpen).toBe(true);
+    expect(agent.sent("hello")).toHaveLength(1);
+    expect(agent.sent("codec_fallback")).toEqual([]);
     rt.destroy();
   });
 });

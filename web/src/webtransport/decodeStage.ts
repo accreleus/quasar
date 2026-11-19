@@ -130,6 +130,17 @@ export class DecodeStage {
     return this.needKey && this.current !== null && (this.decoder?.decodeQueueSize ?? 0) < MAX_DECODE_QUEUE_HARD;
   }
 
+  /** The picture leaves this stage: PyroWave takes it over mid-session, so the keyframe wait here
+   *  is not this connection's and must not end it (#1436). Units held for the old configuration
+   *  cannot follow either. */
+  leave(): void {
+    if (this.stopped) return;
+    this.needKey = false;
+    this.askedKey = false;
+    this.held = [];
+    this.backlogSince = null;
+  }
+
   unit(unit: AccessUnit): void {
     if (this.stopped) return;
     const cur = this.current;

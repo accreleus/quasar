@@ -180,6 +180,9 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   let keyWaitSince: number | null = null;
   /** When a video datagram last arrived on this connection, whether or not its frame completed. */
   let lastDatagramAt: number | null = null;
+  /** When this connection opened; the clock for a connection that has carried no video datagram
+   *  yet, which no other check watches, so a silent first connection would never end (#1436). */
+  let openedAt: number | null = null;
   /** This connection's latest pong: when it came and its round trip; null until one has. */
   let pong: { at: number; rttMs: number } | null = null;
   /** When this connection first showed a picture; null until it has. */
@@ -261,6 +264,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     if (lastVideoAt !== null) lastVideoAt = performance.now();
     if (presentRefAt !== null) presentRefAt = performance.now();
     keyWaitSince = null;
+    openedAt = performance.now();
     stableVideoSince = null;
     telemetry.breakCadence();
     playout?.reset();
@@ -288,11 +292,13 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     // A late tick is a stalled page, not a silent connection: its datagrams are still queued.
     // Only the stall itself is excused, or a page whose ticks always run late would never fire.
     const now = performance.now();
-    if (lastVideoAt !== null && lastTickAt !== null && now - lastTickAt > 2 * TELEMETRY_MS) {
-      lastVideoAt = Math.min(now, lastVideoAt + now - lastTickAt - TELEMETRY_MS);
-      if (presentRefAt !== null) presentRefAt = Math.min(now, presentRefAt + now - lastTickAt - TELEMETRY_MS);
-      if (keyWaitSince !== null) keyWaitSince = Math.min(now, keyWaitSince + now - lastTickAt - TELEMETRY_MS);
-      if (pong) pong.at = Math.min(now, pong.at + now - lastTickAt - TELEMETRY_MS);
+    if (lastTickAt !== null && now - lastTickAt > 2 * TELEMETRY_MS) {
+      const stall = now - lastTickAt - TELEMETRY_MS;
+      if (lastVideoAt !== null) lastVideoAt = Math.min(now, lastVideoAt + stall);
+      if (presentRefAt !== null) presentRefAt = Math.min(now, presentRefAt + stall);
+      if (keyWaitSince !== null) keyWaitSince = Math.min(now, keyWaitSince + stall);
+      if (openedAt !== null) openedAt = Math.min(now, openedAt + stall);
+      if (pong) pong.at = Math.min(now, pong.at + stall);
       stableVideoSince = null;
     }
     lastTickAt = now;
@@ -327,6 +333,20 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     ) {
       if (arriving) keyWaitEnd(transport, "media_silent", now - lastVideoAt);
       else onEnd(transport, { code: null, reason: "media_silent" });
+      if (failed) return;
+    }
+    // A connection that has carried no video datagram at all ends on no check above: each of them
+    // starts from video arriving. Bound it from when it opened, as a silent stream is. A hidden tab
+    // shows nothing, so it is not judged there.
+    if (
+      transport &&
+      snapshot.channelOpen &&
+      lastDatagramAt === null &&
+      openedAt !== null &&
+      document.visibilityState === "visible" &&
+      now - openedAt > MEDIA_SILENCE_MS
+    ) {
+      onEnd(transport, { code: null, reason: "media_silent" });
       if (failed) return;
     }
     // No picture can come while a keyframe is awaited, by the decode stage or on a connection none has
@@ -551,6 +571,9 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
             stage?.config(c);
           } else if (pyroStage) {
             pyroStage.config(c);
+            // The standard decoder no longer draws the picture: its keyframe wait is not this
+            // connection's, and must not end it as a lost stream (#1436).
+            stage?.leave();
           } else {
             // Never offered, so never expected: say so, and the agent sends the standard codec.
             t.codecFallback("decode_error");
@@ -616,6 +639,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     presentRefAt = null; // a new connection counts from its own first keyframe
     keyWaitSince = null;
     lastDatagramAt = null;
+    openedAt = performance.now();
     pong = null;
     shownAt = null;
     keyAsks = 0;

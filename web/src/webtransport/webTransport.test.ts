@@ -496,6 +496,30 @@ describe("WebTransportMedia loss recovery", () => {
     expect(agent.sent("nack")).toEqual([{ type: "nack", frame_seq: 1, frags: [[1, 1]] }]);
     t.close();
   });
+
+  it("carries a datagram-armed deadline from the next datagram when the page timer never gets its turn (#1436)", async () => {
+    const agent = new FakeAgent();
+    agent.replies = [[helloAck(0, avcC())]];
+    let now = 1_000;
+    const t = transport(agent, { now: () => now });
+    await t.connect(NO_SINK);
+    vi.useFakeTimers();
+    const pkt = { n: 0 };
+    const key = packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(3000, 0) }, pkt);
+    // A whole frame and its repair (the agent is sending FEC), then a frame with a gap.
+    agent.last.datagrams([...key, repairOf(key.map((d) => parseVideoDatagram(d)!), 0, 3)]);
+    const gapped = packetize({ configId: 0, frameSeq: 1, keyframe: false, data: bytes(3000, 1) }, pkt);
+    agent.last.datagrams([gapped[0], gapped[2]]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(agent.sent("nack")).toEqual([]);
+    // The held NACK's deadline falls due with no timer to carry it (a hidden tab throttles page
+    // timers): a datagram arriving after the hold sends it, at that datagram's time.
+    now += FEC_HOLD_MS;
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 2, keyframe: false, data: bytes(10, 2) }, pkt));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(agent.sent("nack")).toEqual([{ type: "nack", frame_seq: 1, frags: [[1, 1]] }]);
+    t.close();
+  });
 });
 
 describe("WebTransportMedia receiver feedback", () => {
@@ -514,8 +538,9 @@ describe("WebTransportMedia receiver feedback", () => {
   });
 
   /** How long after a later datagram passes a lost one the feedback reports it, on a link where ten
-   *  datagrams in the last second came 100 ms late. One datagram a millisecond, a message every 5 ms. */
-  async function heldFor(ack: Record<string, unknown>, rttMs: number): Promise<number> {
+   *  datagrams in the last second came 100 ms late. One datagram a millisecond, a message every 5 ms.
+   *  `spikeMs`: a second pong 3 s late at 600 ms; `noPong`: the first pong never comes. */
+  async function heldFor(ack: Record<string, unknown>, rttMs: number, opts: { spikeMs?: number; noPong?: boolean } = {}): Promise<number> {
     let clock = 0;
     let report = () => {};
     const agent = new FakeAgent();
@@ -529,7 +554,8 @@ describe("WebTransportMedia receiver feedback", () => {
     });
     await t.connect(NO_SINK);
     clock = rttMs;
-    agent.last.control({ type: "pong", id: 1, tc: agent.sent("ping")[0].tc, ts: 0, tw: 0 });
+    const pong = (tc: number) => agent.last.control({ type: "pong", id: 1, tc, ts: 0, tw: 0 });
+    if (!opts.noPong) pong(agent.sent("ping")[0].tc as number);
     await flush();
     const late = (s: number) => s >= 100 && s <= 550 && s % 50 === 0;
     const at = new Map<number, number[]>();
@@ -539,6 +565,11 @@ describe("WebTransportMedia receiver feedback", () => {
       const due = at.get(ms) ?? [];
       if (due.length) {
         agent.last.datagrams(due.map((s) => Uint8Array.of(0x01, s & 0xff, (s >> 8) & 0xff, 0, 0)));
+        await flush();
+      }
+      if (ms === 600 && opts.spikeMs) {
+        // One pong 3 s late, on the path that otherwise answers in 50 ms.
+        pong(rttMs + ms - opts.spikeMs);
         await flush();
       }
       if (ms % 5 === 0) report();
@@ -560,6 +591,16 @@ describe("WebTransportMedia receiver feedback", () => {
     const capped = await heldFor({ ...helloAck(0, avcC()), retransmit_window_ms: 250 }, 200);
     expect(capped).toBeGreaterThan(30);
     expect(capped).toBeLessThan(50);
+  });
+
+  it("holds nothing before the first ping: the path's round trip is unknown (#1436)", async () => {
+    expect(await heldFor({ ...helloAck(0, avcC()), retransmit_window_ms: 250 }, 50, { noPong: true })).toBeLessThan(15);
+  });
+
+  it("does not drop the cap to 0 on one ping spike (#1436)", async () => {
+    // 250 ms window, 60 fps, a 50 ms path: about 133 ms of hold. A pong 3 s late is smoothed as a
+    // longer round-trip sample (at most doubling), so the cap does not fall to 0 for its second.
+    expect(await heldFor({ ...helloAck(0, avcC()), retransmit_window_ms: 250 }, 50, { spikeMs: 3_000 })).toBeGreaterThan(100);
   });
 
   it("reports on the transport's ticker, the Worker clock a hidden tab keeps running", async () => {
@@ -1600,7 +1641,7 @@ describe("createWebTransportRuntime fallback", () => {
       expect(agent.conns).toHaveLength(2);
     });
 
-    it("does not fire on a still screen's cadence, nor before the stream has started", async () => {
+    it("does not fire on a still screen's cadence", async () => {
       const { agent, rt } = await streaming();
       for (let seq = 1; seq <= 12; seq++) {
         await vi.advanceTimersByTimeAsync(1_000);
@@ -1608,12 +1649,23 @@ describe("createWebTransportRuntime fallback", () => {
       }
       expect(agent.sent("hello")).toHaveLength(1);
       rt.destroy();
+    });
 
-      const idle = setup();
-      idle.rt.start();
-      await vi.advanceTimersByTimeAsync(3 * SILENT);
-      expect(idle.agent.sent("hello")).toHaveLength(1);
-      idle.rt.destroy();
+    it("a connection that has carried no video datagram ends by itself, once, then falls back (#1436)", async () => {
+      // No check above starts from video arriving, so an untouched first connection never ended
+      // by itself. It is now bounded from when it opened, as a silent stream is.
+      vi.useFakeTimers();
+      const s = setup();
+      s.rt.start();
+      await vi.advanceTimersByTimeAsync(10);
+      expect(s.rt.getSnapshot().channelOpen).toBe(true);
+      expect(s.agent.sent("hello")).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(SILENT);
+      expect(s.agent.sent("hello")).toHaveLength(2); // the one reconnect
+      expect(s.callbacks.onFallback).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(SILENT + BYE_FLUSH_MS);
+      expect(s.callbacks.onFallback).toHaveBeenCalledWith("stream_lost", expect.any(String));
+      s.rt.destroy();
     });
 
     it("does not fire on a tick that ran late: a stalled page has its datagrams still queued", async () => {
@@ -1813,6 +1865,9 @@ describe("createWebTransportRuntime fallback", () => {
         // The reconnect's first keyframe is lost too, while its deltas keep arriving: nothing shows on it.
         await feed(s, 8, 9, delta);
         expect(vi.mocked(s.callbacks.onFallback).mock.calls.map((c) => c[0])).toEqual(["stream_lost"]);
+        // The path that fell back is named for the diagnostic bundle (#1436): a log, and the
+        // fallback's cause, not only the bare reason.
+        expect(s.callbacks.onFallback).toHaveBeenCalledWith("stream_lost", expect.stringContaining("keyframe_wait: none for"));
         expect(s.agent.sent("hello")).toHaveLength(2);
       });
 
