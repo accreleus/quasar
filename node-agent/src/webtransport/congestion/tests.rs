@@ -228,16 +228,14 @@ impl Sim {
         self.send_window(&mut quic, est);
         // The production `feed`'s rates.
         let (governed, paced) = video_rates(&self.governor, &self.est, false);
-        let at = self.start + Duration::from_micros(self.t);
-        let pace = quic.video.pace(paced, at);
         let room = quic
             .video
             .room(governed, BUFFER)
-            .saturating_sub(quic.queued)
-            .min(pace);
-        let frame = (BUFFER / 2).saturating_sub(quic.queued).min(pace);
+            .saturating_sub(quic.queued);
+        let at = self.start + Duration::from_micros(self.t);
+        let room = room.min(quic.video.pace(paced, at));
         let (queue, queued) = (&mut quic.queue, &mut quic.queued);
-        quic.video.feed(room, frame, Some(&mut self.log), |held| {
+        quic.video.feed(room, Some(&mut self.log), |held| {
             *queued += held.datagram.len();
             queue.push_back(held.datagram);
             Handed::Sent
@@ -2621,37 +2619,6 @@ fn quic(wire: &mut Vec<u32>, held: Held) -> Handed {
 
 const BUFFER: usize = 1 << 20;
 
-/// #1496 bench: on a clean path, where QUIC sends at once, a frame over the room went out
-/// across drain ticks, and the WebTransport racer run's present interval sd went 0.90 → 5.8 ms
-/// on both lab hosts. The room holds back a frame's start, never the rest of it.
-#[test]
-fn a_frame_over_the_room_goes_out_whole_and_the_next_waits_for_room() {
-    let mut video = VideoQueue::default();
-    let room = video.room(Some(8000), BUFFER);
-    let frame = |seq: u32, n: u32, at: Instant| {
-        (seq..seq + n).map(move |s| Held {
-            datagram: video_datagram(s),
-            logged: true,
-            resend: false,
-            queued_at: at,
-        })
-    };
-    let n = (3 * room / SIZE) as u32;
-    let at = Instant::now();
-    for h in frame(0, n, at) {
-        video.push(h, BUFFER);
-    }
-    let mut wire = Vec::new();
-    assert!(video.feed(room, BUFFER / 2, None, |h| quic(&mut wire, h)));
-    assert_eq!(wire.len(), n as usize, "the frame was split by the room");
-    // QUIC still holds that frame: the next one waits for room.
-    for h in frame(n, 3, at + Duration::from_millis(16)) {
-        video.push(h, BUFFER);
-    }
-    assert!(video.feed(0, BUFFER / 2, None, |h| quic(&mut wire, h)));
-    assert_eq!(wire.len(), n as usize, "the next frame went past the room");
-}
-
 #[test]
 fn audio_leaves_ahead_of_video_over_the_send_budget_and_video_waits() {
     let mut video = VideoQueue::default();
@@ -2664,12 +2631,12 @@ fn audio_leaves_ahead_of_video_over_the_send_budget_and_video_waits() {
     for i in 0..40 {
         video.push(held(first + i), BUFFER);
     }
-    assert!(video.feed(room, room, None, |h| quic(&mut wire, h)));
+    assert!(video.feed(room, None, |h| quic(&mut wire, h)));
     // QUIC drains nothing while three audio datagrams arrive.
     let mut audio = Vec::new();
     for _ in 0..3 {
         audio.push(video.take_seq());
-        assert!(video.feed(0, 0, None, |h| quic(&mut wire, h)));
+        assert!(video.feed(0, None, |h| quic(&mut wire, h)));
     }
     assert_eq!(
         wire,
@@ -2680,7 +2647,7 @@ fn audio_leaves_ahead_of_video_over_the_send_budget_and_video_waits() {
     assert_eq!(video.bytes(), 36 * SIZE);
 
     // The path drains: the rest follows, numbered after the audio, with no gap.
-    assert!(video.feed(usize::MAX, usize::MAX, None, |h| quic(&mut wire, h)));
+    assert!(video.feed(usize::MAX, None, |h| quic(&mut wire, h)));
     assert_eq!(wire[4..], (7..43).collect::<Vec<_>>());
     assert!(video.is_empty());
 }
@@ -2693,7 +2660,7 @@ fn held_video_over_the_cap_drops_oldest_first_and_leaves_no_gap() {
     }
     assert_eq!((video.bytes(), video.dropped), (3 * SIZE, 2));
     let mut wire = Vec::new();
-    assert!(video.feed(usize::MAX, usize::MAX, None, |h| quic(&mut wire, h)));
+    assert!(video.feed(usize::MAX, None, |h| quic(&mut wire, h)));
     assert_eq!(
         wire,
         [0, 1, 2],
@@ -2730,7 +2697,7 @@ fn video_held_when_the_governor_lets_go_drains_at_the_last_governed_rate() {
     }
     assert_eq!(video.room(None, BUFFER), 5000, "released with video held");
     let mut wire = Vec::new();
-    assert!(video.feed(usize::MAX, usize::MAX, None, |h| quic(&mut wire, h)));
+    assert!(video.feed(usize::MAX, None, |h| quic(&mut wire, h)));
     assert!(video.is_empty());
     assert_eq!(
         video.room(None, BUFFER),
@@ -2748,12 +2715,12 @@ fn a_cleared_queue_holds_nothing_and_keeps_its_numbering() {
         video.push(held(i), BUFFER);
     }
     let mut wire = Vec::new();
-    assert!(video.feed(SIZE, SIZE, None, |h| quic(&mut wire, h)));
+    assert!(video.feed(SIZE, None, |h| quic(&mut wire, h)));
     video.clear();
     assert!(video.is_empty() && video.bytes() == 0);
     assert_eq!(video.room(None, BUFFER), BUFFER);
     video.push(held(9), BUFFER);
-    assert!(video.feed(usize::MAX, usize::MAX, None, |h| quic(&mut wire, h)));
+    assert!(video.feed(usize::MAX, None, |h| quic(&mut wire, h)));
     assert_eq!(wire, [0, 1], "no gap across the clear");
 }
 
@@ -2775,7 +2742,7 @@ fn a_skipped_datagram_takes_no_pkt_seq_and_too_large_is_counted() {
     ]
     .into_iter();
     let mut wire = Vec::new();
-    assert!(video.feed(usize::MAX, usize::MAX, None, |h| {
+    assert!(video.feed(usize::MAX, None, |h| {
         match verdicts.next().unwrap() {
             Handed::Sent => quic(&mut wire, h),
             other => other,
@@ -2846,7 +2813,7 @@ fn the_pacer_lets_video_go_at_its_rate_in_short_bursts_and_never_holds_video_100
     let send = |video: &mut VideoQueue, kbps, at| {
         let room = video.pace(kbps, at);
         let mut wire = Vec::new();
-        assert!(video.feed(room, room, None, |h| quic(&mut wire, h)));
+        assert!(video.feed(room, None, |h| quic(&mut wire, h)));
         40 - video.bytes() / SIZE
     };
     // 40 datagrams queued at `t0` exactly.
@@ -3066,7 +3033,7 @@ fn a_resend_goes_ahead_of_held_video() {
     video.push(resend(101), BUFFER);
     let mut wire = Vec::new();
     let mut order = Vec::new();
-    assert!(video.feed(3 * SIZE, 3 * SIZE, None, |h| {
+    assert!(video.feed(3 * SIZE, None, |h| {
         order.push(h.resend);
         quic(&mut wire, h)
     }));

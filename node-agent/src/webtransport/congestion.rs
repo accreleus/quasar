@@ -518,15 +518,10 @@ pub(crate) struct Measured {
     pub(crate) loss: Option<f64>,
 }
 
-/// A detected outage's losses (#1557): every datagram from `from`, the first no report had
-/// covered, reported not received is the outage's, until a later one is reported received.
-/// Marked by what the reports covered, not by what was sent after the last one: only the
-/// host → client path may drop, and the client's report of what arrived before the cut then
-/// comes after it, below a mark taken at the send after that report (19 and 48 ms of video on
-/// the NVIDIA lab host, #1496). The mark lasts until a datagram is received after one of its
-/// losses, or one sent after the silence was detected (`by`) is received with none ahead of
-/// it: a report of what arrived before the cut that comes late, behind a dropped one, is no
-/// end to it.
+/// A detected outage's losses (#1557): those reported not received from `from`, the first
+/// datagram no report had covered, until one after a loss (or any sent after detection, `by`)
+/// is received. Not from the first send after the last report: when only host → client drops,
+/// the client's report of what came before the cut arrives after it (#1496 lab round).
 #[derive(Debug, Clone, Copy)]
 struct Outage {
     from: u32,
@@ -1642,8 +1637,6 @@ pub(crate) struct VideoQueue {
     /// The pacer: bytes video may still send now, and when they were counted.
     tokens: f64,
     counted: Option<Instant>,
-    /// When the frame last handed to QUIC was queued: the rest of it is not held by the room.
-    going: Option<Instant>,
     /// Video and resent datagrams over the path's datagram size, skipped.
     pub(crate) too_large: u64,
     pub(crate) resends_too_large: u64,
@@ -1728,7 +1721,6 @@ impl VideoQueue {
         self.bytes = 0;
         self.pace = None;
         self.counted = None;
-        self.going = None;
     }
 
     /// The `pkt_seq` new video is numbered from, a guess `feed` corrects: after everything
@@ -1766,23 +1758,18 @@ impl VideoQueue {
         self.held.insert(at, held);
     }
 
-    /// Hands `send` the oldest datagrams that fit, each carrying the next wire `pkt_seq`, and
-    /// logs each sent one at the time it was queued. A datagram fits in `room` bytes, or in
-    /// `frame` bytes if it is the rest of the frame last handed over: on a clean path a frame
-    /// over the room went out across drain ticks, and a 1080p60 racer stream presented
-    /// unevenly (#1496 bench), so only the pacer and `frame` split one. False when the
+    /// Hands `send` the oldest datagrams that fit in `room` bytes, each carrying the next
+    /// wire `pkt_seq`, and logs each sent one at the time it was queued. False when the
     /// connection is gone.
     pub(crate) fn feed(
         &mut self,
         mut room: usize,
-        mut frame: usize,
         mut log: Option<&mut SendLog>,
         mut send: impl FnMut(Held) -> Handed,
     ) -> bool {
         while let Some(next) = self.held.front() {
             let len = next.datagram.len();
-            let going = !next.resend && self.going == Some(next.queued_at);
-            if len > if going { frame } else { room } {
+            if len > room {
                 break;
             }
             let mut held = self.held.pop_front().expect("front exists");
@@ -1802,8 +1789,7 @@ impl VideoQueue {
             // is the pacer's, not the path's, and read as delay it cut the estimate at each
             // keyframe on a link faster than the pace. Unpaced, its queue time is logged, as
             // it was in QUIC's queue before #1321. `SendLog::record` keeps the mix monotone.
-            let frame_at = held.queued_at;
-            let (resend, queued_at) = (held.resend, self.counted.unwrap_or(frame_at));
+            let (resend, queued_at) = (held.resend, self.counted.unwrap_or(held.queued_at));
             let logged = log.as_deref_mut().filter(|_| held.logged);
             let record = logged.map(|log| (log, held.datagram.clone()));
             match send(held) {
@@ -1811,13 +1797,9 @@ impl VideoQueue {
                     if let Some((log, d)) = record {
                         log.record(&d, queued_at, resend);
                     }
-                    room = room.saturating_sub(len);
-                    frame = frame.saturating_sub(len);
+                    room -= len;
                     self.tokens -= len as f64;
                     self.wire = self.wire.wrapping_add(1);
-                    if !resend {
-                        self.going = Some(frame_at);
-                    }
                 }
                 Handed::Skipped => {}
                 Handed::TooLarge if resend => self.resends_too_large += 1,
