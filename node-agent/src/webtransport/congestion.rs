@@ -44,8 +44,11 @@ const NOT_RECEIVED: u16 = 0xFFFF;
 /// The client's cadence (§Feedback).
 const FEEDBACK_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Send records kept, by `pkt_seq`: over a second at 100 Mbit/s.
-const LOG: usize = 1 << 14;
+/// Send records kept, by `pkt_seq`: over the estimator's 0.5 s rate window at a 400 Mbit/s
+/// grant, 25 MB of datagrams, ~21 800 of them (#1430). Sized for PyroWave's grant; the
+/// standard codec's 100 Mbit/s left the 0.5 s window at 400 Mbit/s under-read, so windows
+/// read as application-limited.
+const LOG: usize = 1 << 15;
 
 // Packet groups (libwebrtc `InterArrival`): one send burst, plus what arrived in a burst
 // behind it.
@@ -114,7 +117,9 @@ const APP_LIMITED: f64 = 0.8;
 /// Datagrams that arrived at under this share of the rate they were sent at: the link held
 /// them back (a queue or loss), so the report is evidence of the link ([`Estimator::measured`]).
 const LINK_LIMITED: f64 = 0.95;
-const MAX_ARRIVALS: usize = 1 << 14;
+/// Arrivals kept for the rate window, by receive order, one per datagram: the same 0.5 s at a
+/// 400 Mbit/s grant, ~21 800 of them (#1430).
+const MAX_ARRIVALS: usize = 1 << 15;
 
 /// Feedback silence while media is sent: past max(this, 2 intervals + RTT), the estimate
 /// decays by `SILENCE_DECAY` every `SILENCE_STEP`.
