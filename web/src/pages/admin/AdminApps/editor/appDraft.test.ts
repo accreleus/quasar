@@ -10,11 +10,13 @@ import {
   draftFromApp,
   isDirty,
   patchBody,
+  specFlag,
   tabForError,
   validateDraft,
   withLaunchProfile,
   withLibraryProvider,
   withProfilePolicy,
+  withSpecFlag,
 } from "./appDraft";
 
 function app(over: Partial<AdminApp> = {}): AdminApp {
@@ -286,5 +288,32 @@ describe("the derived edits", () => {
     const pinned = withLaunchProfile(draftFromApp(null), profile());
     expect(withProfilePolicy(pinned, "inherit", [profile()]).defaultProfileId).toBe("");
     expect(withProfilePolicy(draftFromApp(null), "force", [profile()]).defaultProfileId).toBe("lp-1");
+  });
+});
+
+describe("container flags in runtime_spec (#179)", () => {
+  const custom = () =>
+    app({ library_provider: "", runtime_spec: { image: "ghcr.io/x/y:1", args: [], env: {}, mounts: [], gpu: false } });
+
+  it("reads an absent key as the default and a stored value as stored", () => {
+    const d = draftFromApp(custom());
+    expect(specFlag(d, "no_new_privileges")).toBe(true);
+    expect(specFlag(d, "systempaths_unconfined")).toBe(false);
+    expect(specFlag(draftFromApp(app()), "no_new_privileges")).toBe(false);
+  });
+
+  it("sends the whole runtime_spec once a flag moves, keeping its other keys", () => {
+    const base = custom();
+    const body = patchBody(base, withSpecFlag(draftFromApp(base), "systempaths_unconfined", true));
+    expect(body).toEqual({
+      runtime_spec: { image: "ghcr.io/x/y:1", args: [], env: {}, mounts: [], gpu: false, systempaths_unconfined: true },
+    });
+  });
+
+  it("sends gpu from the draft and nothing when a flag is toggled back", () => {
+    const base = custom();
+    expect(patchBody(base, { ...draftFromApp(base), gpu: true }).runtime_spec).toMatchObject({ gpu: true });
+    const there = withSpecFlag(draftFromApp(base), "no_new_privileges", false);
+    expect(patchBody(base, withSpecFlag(there, "no_new_privileges", true))).toEqual({});
   });
 });

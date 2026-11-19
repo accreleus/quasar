@@ -241,12 +241,16 @@ describe("HostDetail — the last report (#366)", () => {
 describe("HostDetail — remove host (#366)", () => {
   // The Fleet row menu sends an admin here on the same rule; when it says no, the page
   // has to say why (#1240).
-  it("says why removal is not offered while its recovery actor has not reported", async () => {
+  it("says why removal is not offered, matching the banner's 'has not answered'", async () => {
+    // #1499: the hint and the banner above it now use one wording for the same condition.
     mocked.getHost.mockResolvedValue({ host: host({ updater_present: false }) } as never);
     renderDetail();
     const c = await card();
     expect(within(c).queryByRole("button", { name: /Remove host/ })).toBeNull();
-    expect(within(c).getByText(/Its recovery actor has not reported/)).toBeTruthy();
+    // The removal-blocked hint — scoped to its own wording. The ServicesCard banner above it
+    // says the same "has not answered" but with "since"/"for", so the hint's ", and that actor"
+    // is what disambiguates it (both render for this host, #1499).
+    expect(within(c).getByText(/Its recovery actor has not answered, and/)).toBeTruthy();
   });
 
   it("confirms, drains, waits for the host's sessions, then asks the recovery actor", async () => {

@@ -110,7 +110,14 @@ export function removalBlockedReason(
   if (ownerConflict(host)) {
     return "Another owner’s container is in the way on this machine, so removal is not offered. Quasar never acts on that container; clear it on the machine first.";
   }
-  if (host.updater_present !== true) {
+  // #1499: the services banner already says these two apart — "did not answer"/"has not
+  // answered" when the actor answered and went silent (`updater_present: false`), and
+  // "has not reported" while it never answered (`updater_present` null). Match the banner
+  // for each so the hint and the banner above it use one wording for the same condition.
+  if (host.updater_present === false) {
+    return "Its recovery actor has not answered, and that actor is what performs a removal. Removal is offered again once the host answers.";
+  }
+  if (host.updater_present == null) {
     return "Its recovery actor has not reported, and that actor is what performs a removal. Removal is offered again once the host reports.";
   }
   return null;

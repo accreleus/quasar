@@ -337,12 +337,17 @@ func toSessionRespExt(s Session, ext externalState, haveExt bool) sessionResp {
 		// Emitted whenever the size is KNOWN, including when it equals the launch
 		// size. Suppressing that case would make the poll non-authoritative: a
 		// client holding its last-acked value on absence could never learn that
-		// another actor put the session back at launch size.
-		w, h := s.Width, s.Height
-		if ext.HasSize {
-			w, h = ext.Width, ext.Height
+		// another actor put the session back at launch size. UNKNOWN is the
+		// separate state a render-only PATCH leaves behind (SizeKnown false):
+		// reporting the launch size there would invent a value the control plane
+		// never saw, so the pair stays absent.
+		if ext.SizeKnown {
+			w, h := ext.Width, ext.Height
+			if !ext.HasSize {
+				w, h = s.Width, s.Height
+			}
+			stream.ExternalWidth, stream.ExternalHeight = &w, &h
 		}
-		stream.ExternalWidth, stream.ExternalHeight = &w, &h
 		stream.ExternalResizeSupported = ext.Supported
 		stream.ExternalOwner = ext.Owner
 		stream.ConsoleMode = ext.ConsoleMode

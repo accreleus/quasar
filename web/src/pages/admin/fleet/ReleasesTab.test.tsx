@@ -422,6 +422,28 @@ describe("ReleasesTab", () => {
     ).toBeInTheDocument();
   });
 
+  it("names the held-back release instead of nothing-detected when available is empty", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(
+      view({
+        available: [],
+        targets: [],
+        held_back: { channel: "stable", schema_version: 73, reason: "schema_below_installed" },
+      }),
+    );
+    renderTab();
+
+    // The note wraps the schema version in a mono span, so the prose regex
+    // matches the contiguous text node before it; the number lives in the
+    // span (getByText reads only an element's direct text nodes, not its
+    // child elements').
+    const note = await screen.findByText(/channel is held back: its schema/);
+    expect(within(note).getByText("73")).toBeInTheDocument();
+    expect(note).toHaveTextContent("is below the installed control plane");
+    expect(
+      screen.queryByText(/Nothing newer than this control plane has been detected/),
+    ).toBeNull();
+  });
+
   it("reports a load failure instead of spinning", async () => {
     mocked.getPlatformReleases.mockRejectedValue(new ApiError(503, "internal", "database down"));
     renderTab();

@@ -6,6 +6,9 @@ package session
 // GPU cannot encode, console auto-start, the heartbeat's qualification stop,
 // the post-eviction cooldown, a stripped adoption, a claimed id never stopped,
 // and the home hold that waits for the agent's adoption.
+//
+// round 2 (#1224 follow-up): a host where every GPU plans WebRTC parks unpinned,
+// so a full GPU 0 no longer leaves the park nowhere — it lands on the free GPU 1.
 
 import (
 	"context"
@@ -547,5 +550,34 @@ func TestMarkReleasedKeepsOnlyEntitlementRevoked(t *testing.T) {
 		if got := readRow(t, f.pool, sess.ID).StopReason; got != want {
 			t.Errorf("after %q: stop_reason = %q, want %q", reason, got, want)
 		}
+	}
+}
+
+// #1224 (round 2): on a host where EVERY GPU plans WebRTC — none can do PyroWave, so none plan
+// WebTransport — the park is unpinned, exactly as before the pin. With GPU 0 full the unpinned
+// park lands on the free GPU 1, where a WebRTC launch adopts it; the current head pins the park to
+// GPU 0 and, full, places nothing at all.
+func TestHeartbeatParksUnpinnedWhenEveryGPUPlansWebRTC(t *testing.T) {
+	f := newWarmFixture(t, 4) // GPU 0, 4 slots
+	// A second GPU of equal size, so an unpinned park has somewhere else to go.
+	must(t, exec(t, f.pool, `INSERT INTO gpus (host_id, index, vram_mb_total, encode_slots_total)
+		VALUES ($1::uuid, 1, 16384, 4)`, f.hostID))
+	f.enableWebTransport(t)
+	f.enablePyroWavePrefer(t)
+	// Neither GPU can do PyroWave, so the launch plans WebRTC on both: a host where every GPU
+	// plans WebRTC, not a mixed host.
+	must(t, exec(t, f.pool, `UPDATE gpus SET codecs = '["h264"]' WHERE host_id = $1::uuid`, f.hostID))
+
+	// Fill GPU 0 with another user's running session, so an unpinned park cannot take it.
+	other := warmUser(t, f.pool, "other")
+	insertParked(t, f.pool, other, f.steam, f.hostID, f.gpuID, 4, "10 minutes")
+
+	f.coord.SteamWarmHeartbeat(context.Background(), f.userID, false, f.deviceID)
+
+	// The park the heartbeat created for THIS user, not the other user's row on GPU 0.
+	var idx int32
+	if err := f.pool.QueryRow(context.Background(), `SELECT g.index FROM sessions s JOIN gpus g ON g.id = s.gpu_id
+		WHERE s.kind = 'parked' AND s.user_id = $1::uuid`, f.userID).Scan(&idx); err != nil || idx != 1 {
+		t.Fatalf("this user's park on gpu %v (err %v), want the free GPU 1 (unpinned, as before the pin)", idx, err)
 	}
 }
