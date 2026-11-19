@@ -298,9 +298,11 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		}
 		// Every park is WebRTC-only (#1161): a launch that would plan WebTransport supersedes it
 		// and cold-starts Steam behind a 503, so park nothing for that user (#1163).
-		if c.launchWouldPlanWebTransport(ctx, p, owner, launchProfile, lp, ov, env, source) {
+		pin, withhold := c.launchWouldPlanWebTransport(ctx, p, owner, launchProfile, lp, ov, env, source)
+		if withhold {
 			return LaunchResult{}, errParkRefused
 		}
+		p.PinGPUIndex = pin // on a mixed-GPU host, only a GPU a WebRTC launch plans on (#1224)
 		// A heartbeat never waits on a settling hold: it simply parks nothing.
 		p.Kind, p.PinHostID, p.NoHomeSettleWait = KindParked, owner, true
 	} else if parked, err = c.store.liveParked(ctx, userID); err != nil {
