@@ -35,7 +35,14 @@ export function fallbackCause(code: string, err?: unknown): string {
   } else if (err !== undefined) {
     parts.push(String(err));
   }
-  return parts.join(": ").slice(0, 200);
+  const cause = parts.join(": ");
+  if (cause.length <= 200) return cause;
+  // A UTF-16 slice can cut a surrogate pair in half (an emoji in a device name, say), which
+  // the HUD would show as a replacement character: end the cause before the high half instead
+  // (#1478).
+  const cut = cause.slice(0, 200);
+  const last = cut.charCodeAt(cut.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
 }
 
 const REMEMBER_PREFIX = "quasar.wt-fallback.";
