@@ -399,6 +399,18 @@ fn parse_validated_ms(
 /// the silence decay's.
 const REPORT_GAP: Duration = Duration::from_millis(500);
 
+/// A receiver report's evidence that the link held the sender back
+/// (`webtransport::congestion::Estimator::measured`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Held {
+    /// The share of the setpoint to go to: what the link delivered of the video sent, less
+    /// a drain margin. A share of the setpoint, not a rate, so what the wire adds to the
+    /// setpoint (headers, encoder overshoot) cannot leave the wire over the link (#1496).
+    pub share: f64,
+    /// When the measured video began to be sent.
+    pub since: Instant,
+}
+
 /// The ABR governor state machine. Fed the rtpgccbwe estimate; emits a new CBR
 /// setpoint when (and only when) a retarget is warranted.
 #[derive(Debug)]
@@ -570,16 +582,19 @@ impl Governor {
         Some(target)
     }
 
-    /// Per-report loop, once per receiver report: `reading` is what the report showed the
-    /// link carrying when the link held the sender back (`webtransport::Rate::measured`),
-    /// `None` when it did not. A link that delivers what it is sent gives no reading,
-    /// whatever its delay detector says: that is the #68 guard. Two readings in a row under
-    /// the rate by more than the deadband take the rate and the setpoint to the higher of
-    /// them in one move, with no step cap and no dwell.
-    pub fn observe_report(&mut self, reading: Option<f64>, now: Instant) -> Option<u32> {
+    /// Per-report loop, once per receiver report: `held` is what the report showed when the
+    /// link held the sender back, `None` when it did not. A link that delivers what it is
+    /// sent gives none, whatever its delay detector says: that is the #68 guard. Two in a row
+    /// take the rate and the setpoint to the higher of their shares of the setpoint in one
+    /// move, with no step cap, no dwell and no deadband. Video sent before the last write
+    /// measured the setpoint before it, so its evidence is none.
+    pub fn observe_report(&mut self, held: Option<Held>, now: Instant) -> Option<u32> {
         self.cfg.per_report?;
         self.last_report = Some(now);
-        let Some(reading) = reading.filter(|&r| r < self.rate * (1.0 - self.cfg.deadband)) else {
+        let Some(reading) = held
+            .filter(|h| h.since >= self.last_retarget)
+            .map(|h| h.share * f64::from(self.setpoint))
+        else {
             self.under = None;
             return None;
         };
@@ -1231,6 +1246,14 @@ mod tests {
         base + Duration::from_millis(ms)
     }
 
+    /// A report whose link carries `kbps` of the setpoint, measured on video sent from `at`.
+    fn held(g: &Governor, kbps: f64, at: Instant) -> Option<Held> {
+        Some(Held {
+            share: kbps / f64::from(g.setpoint_kbps()),
+            since: at,
+        })
+    }
+
     /// Down: two readings in a row under the rate by more than the deadband take the
     /// setpoint to the higher of them at once, with no −12.5 % cap, and a deeper drop right
     /// after is not held by a dwell. The window loop caps a step at −12.5 % and dwells 7 s.
@@ -1240,7 +1263,7 @@ mod tests {
         let mut g = Governor::new(per_report(0), base);
         assert_eq!(g.observe(10_000.0, ms(base, 0)), None);
         assert_eq!(
-            g.observe_report(Some(5000.0), ms(base, 0)),
+            g.observe_report(held(&g, 5000.0, ms(base, 0)), ms(base, 0)),
             None,
             "one reading is no evidence"
         );
@@ -1250,38 +1273,46 @@ mod tests {
             "the estimate alone never goes down"
         );
         assert_eq!(
-            g.observe_report(Some(5100.0), ms(base, 100)),
+            g.observe_report(held(&g, 5100.0, ms(base, 100)), ms(base, 100)),
             Some(5100),
             "the higher of the two"
         );
         assert_eq!(g.rate_kbps(), 5100.0);
-        g.observe_report(Some(800.0), ms(base, 300));
+        g.observe_report(held(&g, 800.0, ms(base, 300)), ms(base, 300));
         assert_eq!(
-            g.observe_report(Some(700.0), ms(base, 400)),
+            g.observe_report(held(&g, 700.0, ms(base, 400)), ms(base, 400)),
             Some(1000),
             "the setpoint stops at the floor"
         );
         assert_eq!(g.rate_kbps(), 800.0, "the rate does not");
     }
 
-    /// A report with no reading between two low ones breaks the run, and a reading inside
-    /// the deadband is none.
+    /// A report with no reading between two low ones breaks the run, and video sent before
+    /// the last write is no evidence. A share inside the deadband still moves the setpoint:
+    /// the deadband held a wire 5 % over its setpoint over the link for good (#1496).
     #[test]
-    fn per_report_a_broken_run_or_a_reading_in_the_deadband_holds() {
+    fn per_report_a_broken_run_or_a_window_before_the_last_write_holds() {
         let base = Instant::now();
         let mut g = Governor::new(per_report(0), base);
         for i in 0..20 {
-            let r = (i % 2 == 0).then_some(5000.0);
-            assert_eq!(g.observe_report(r, ms(base, i * 100)), None);
+            let at = ms(base, i * 100);
+            let r = held(&g, 5000.0, at).filter(|_| i % 2 == 0);
+            assert_eq!(g.observe_report(r, at), None);
         }
-        for i in 20..40 {
+        g.observe_report(held(&g, 8600.0, ms(base, 2000)), ms(base, 2000));
+        assert_eq!(
+            g.observe_report(held(&g, 8600.0, ms(base, 2100)), ms(base, 2100)),
+            Some(8600),
+            "inside the 15 % deadband"
+        );
+        for i in 22..40 {
             assert_eq!(
-                g.observe_report(Some(8600.0), ms(base, i * 100)),
+                g.observe_report(held(&g, 5000.0, ms(base, 2000)), ms(base, i * 100)),
                 None,
-                "inside 15 %"
+                "sent before the write at 2.1 s"
             );
         }
-        assert_eq!(g.setpoint_kbps(), 10_000);
+        assert_eq!(g.setpoint_kbps(), 8600);
     }
 
     /// #68: with reports flowing, an estimate under the setpoint (a delay detector misreading
@@ -1317,8 +1348,11 @@ mod tests {
         let base = Instant::now();
         let mut g = Governor::new(per_report(0), base);
         g.observe(10_000.0, ms(base, 0));
-        g.observe_report(Some(2000.0), ms(base, 0));
-        assert_eq!(g.observe_report(Some(2000.0), ms(base, 100)), Some(2000));
+        g.observe_report(held(&g, 2000.0, ms(base, 0)), ms(base, 0));
+        assert_eq!(
+            g.observe_report(held(&g, 2000.0, ms(base, 100)), ms(base, 100)),
+            Some(2000)
+        );
         let (mut est, mut moves) = (2000.0f64, vec![2000u32]);
         for i in 2..300u64 {
             // The estimate climbs 34 %/s here, faster than the slew lets the setpoint.
@@ -1372,16 +1406,25 @@ mod tests {
     fn per_report_writes_wait_out_the_gap() {
         let base = Instant::now();
         let mut g = Governor::new(per_report(1000), base);
-        g.observe_report(Some(5000.0), ms(base, 500));
+        g.observe_report(held(&g, 5000.0, ms(base, 500)), ms(base, 500));
         assert_eq!(
-            g.observe_report(Some(5000.0), ms(base, 600)),
+            g.observe_report(held(&g, 5000.0, ms(base, 600)), ms(base, 600)),
             None,
             "1 s since the start"
         );
-        assert_eq!(g.observe_report(Some(5000.0), ms(base, 1000)), Some(5000));
-        g.observe_report(Some(2000.0), ms(base, 1100));
-        assert_eq!(g.observe_report(Some(2000.0), ms(base, 1200)), None);
-        assert_eq!(g.observe_report(Some(2000.0), ms(base, 2000)), Some(2000));
+        assert_eq!(
+            g.observe_report(held(&g, 5000.0, ms(base, 1000)), ms(base, 1000)),
+            Some(5000)
+        );
+        g.observe_report(held(&g, 2000.0, ms(base, 1100)), ms(base, 1100));
+        assert_eq!(
+            g.observe_report(held(&g, 2000.0, ms(base, 1200)), ms(base, 1200)),
+            None
+        );
+        assert_eq!(
+            g.observe_report(held(&g, 2000.0, ms(base, 2000)), ms(base, 2000)),
+            Some(2000)
+        );
     }
 
     /// #1376 review R3: the silence decay is paced by `per_report` as well. With a 100 ms
@@ -1417,7 +1460,10 @@ mod tests {
         let base = Instant::now();
         let mut g = Governor::new(AbrConfig::new_smooth(1000, 10_000, 60), base);
         for i in 0..10 {
-            assert_eq!(g.observe_report(Some(2000.0), ms(base, i * 100)), None);
+            assert_eq!(
+                g.observe_report(held(&g, 2000.0, ms(base, i * 100)), ms(base, i * 100)),
+                None
+            );
         }
         assert_eq!(g.setpoint_kbps(), 10_000);
     }

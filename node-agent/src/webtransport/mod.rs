@@ -131,9 +131,9 @@ pub(crate) struct Rate {
     pub(crate) displaced: Box<dyn Fn() + Send + Sync>,
     pub(crate) observe: Box<dyn Fn(f64) + Send + Sync>,
     /// After `observe`, for every estimate that came from a receiver report, never for the
-    /// silence decay: what the report showed the link carrying when the link held the
-    /// sender back (`congestion::Estimator::measured`), `None` when it did not.
-    pub(crate) measured: Box<dyn Fn(Option<f64>) + Send + Sync>,
+    /// silence decay: what the report showed when the link held the sender back
+    /// (`congestion::Estimator::measured`), `None` when it did not.
+    pub(crate) measured: Box<dyn Fn(Option<crate::session::abr::Held>) + Send + Sync>,
     /// Amendment 85: FEC telemetry — whether this connection's `hello_ack.fec` named a
     /// scheme, and per protected frame the video and repair datagram payload bytes sent.
     /// FEC exists only where this estimate writes the encoder, so it is reported here.
@@ -265,11 +265,8 @@ impl<'a> Control<'a> {
             fec.overhead().min(room)
         });
         if report {
-            (self.rate.measured)(
-                self.estimator
-                    .measured()
-                    .map(|link| link / (1.0 + self.charged)),
-            );
+            // A share of everything sent, FEC included: it scales the encoder's setpoint as is.
+            (self.rate.measured)(self.estimator.measured());
         }
         (self.rate.observe)(kbps / (1.0 + self.charged));
     }

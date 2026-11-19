@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 use super::*;
+use crate::session::abr::{AbrConfig, Governor as Abr};
 use crate::webtransport::tests::Captured;
 
 const SIZE: usize = 1148;
@@ -64,6 +65,14 @@ struct Sim {
     floor_kbps: f64,
     /// (seconds, µs the oldest held video had waited), each queued-mode tick.
     held_waits: Vec<(f64, u64)>,
+    /// The production ABR, fed as `Control::feed` feeds it, and the wire rate over its
+    /// setpoint: the sender follows the setpoint, not the estimate.
+    abr: Option<(Abr, f64)>,
+    /// Reports that were evidence of the link (`Estimator::measured`).
+    readings: u32,
+    /// With `abr`: bytes owed to the next frame, so the wire is exactly its rate rather than
+    /// rounded up to whole datagrams a frame.
+    owed: f64,
 }
 
 /// The agent's [`VideoQueue`] and QUIC behind it: a datagram leaves QUIC's queue once the
@@ -115,6 +124,9 @@ impl Sim {
             governor: Governor::default(),
             floor_kbps: 0.0,
             held_waits: Vec::new(),
+            abr: None,
+            readings: 0,
+            owed: 0.0,
         }
     }
 
@@ -164,14 +176,24 @@ impl Sim {
     }
 
     fn frame(&mut self) {
-        let kbps = self
-            .send_kbps
-            .unwrap_or(self.est.estimate_kbps().max(self.floor_kbps))
-            .min((self.content_kbps)(self.t));
+        let kbps = match &self.abr {
+            Some((abr, wire)) => wire * f64::from(abr.setpoint_kbps()),
+            None => self
+                .send_kbps
+                .unwrap_or(self.est.estimate_kbps().max(self.floor_kbps)),
+        }
+        .min((self.content_kbps)(self.t));
         let key = self.keyframe_every > 0 && self.frames.is_multiple_of(self.keyframe_every);
         self.frames += 1;
         let bytes = kbps * 1000.0 / 8.0 / 60.0 * if key { 5.0 } else { 1.0 };
-        let n = (bytes / SIZE as f64).ceil().max(1.0) as u32;
+        let n = if self.abr.is_some() {
+            self.owed += bytes;
+            let n = (self.owed / SIZE as f64).floor();
+            self.owed -= n * SIZE as f64;
+            n as u32
+        } else {
+            (bytes / SIZE as f64).ceil().max(1.0) as u32
+        };
         if let Some(quic) = self.quic.as_mut() {
             let queued_at = self.start + Duration::from_micros(self.t);
             for _ in 0..n {
@@ -340,6 +362,12 @@ impl Sim {
         let at = self.start + Duration::from_micros(now);
         if let Some(kbps) = self.est.on_feedback(&fb, &mut self.log, at, NO_QUIC) {
             self.governor.govern(kbps.max(self.floor_kbps));
+            if let Some((abr, _)) = self.abr.as_mut() {
+                let held = self.est.measured();
+                self.readings += u32::from(held.is_some());
+                abr.observe_report(held, at);
+                abr.observe(kbps, at);
+            }
         }
         self.trace
             .push((now as f64 / 1e6, self.est.estimate_kbps()));
@@ -804,6 +832,58 @@ fn a_late_report_of_what_arrived_before_the_cut_does_not_spend_the_outage_mark()
     assert_ne!(est.bound, Bound::Loss, "they cut the loss bound");
 }
 
+/// #1496 review: a hole in the late report of what arrived before the cut (a datagram
+/// reordered behind it, on a Wi-Fi peer) is no sign the link answered. Ending the mark at the
+/// next datagram after it read the outage's own losses as congestion in the next report.
+#[test]
+fn a_reordered_hole_in_the_late_report_does_not_spend_the_outage_mark() {
+    let start = Instant::now();
+    let ms = |ms: u64| start + Duration::from_millis(ms);
+    let mut log = SendLog::new(start);
+    let mut est = Estimator::new(CEILING, start);
+    let sent = |i: u32| {
+        if i < 300 {
+            u64::from(i)
+        } else {
+            u64::from(i) + 700
+        }
+    };
+    let got = |i: u32| !(100..300).contains(&i) && i != 70;
+    for i in 0..60 {
+        send_nth(&mut log, start, 0, i, sent(i));
+    }
+    est.on_feedback(&report_nth(0, 0, 49, sent, got), &mut log, ms(60), NO_QUIC);
+    for i in 60..300 {
+        send_nth(&mut log, start, 0, i, sent(i));
+    }
+    for t in (600..=900).step_by(100) {
+        est.on_tick(ms(t), &log, RTT);
+    }
+    for i in 300..340 {
+        send_nth(&mut log, start, 0, i, sent(i));
+    }
+    est.on_feedback(
+        &report_nth(0, 50, 99, sent, got),
+        &mut log,
+        ms(1100),
+        NO_QUIC,
+    );
+    assert!(est.outage.is_some(), "a reordered hole spent the mark");
+    est.on_feedback(
+        &report_nth(0, 100, 339, sent, got),
+        &mut log,
+        ms(1150),
+        NO_QUIC,
+    );
+    let loss = est.loss();
+    assert!(
+        loss.is_none_or(|l| l < LOSS_LOW),
+        "the outage's own losses measured {loss:?}"
+    );
+    assert_ne!(est.bound, Bound::Loss, "they cut the loss bound");
+    assert!(est.outage.is_none(), "the link answered, the mark is spent");
+}
+
 /// #1557 review A2: the exemption ends at the send time of the first packet the report
 /// shows received after the outage's mark. A burst sent after the link came back is
 /// congestion, even when it falls in the feedback interval before the first report: it
@@ -848,11 +928,7 @@ fn a_late_exempted_outage_loss_does_not_undo_a_counted_loss() {
         let at = start + Duration::from_micros(sent_us(seq));
         log.record(&d, at, false);
     }
-    est.outage = Some(Outage {
-        from: 1,
-        by: 41,
-        lost: false,
-    });
+    est.outage = Some(Outage { from: 1, by: 41 });
     let first: Vec<u16> = (0..41u32)
         .map(|seq| {
             if seq <= 20 {
@@ -1049,6 +1125,8 @@ fn the_regrow_caps_each_bound_at_the_pre_outage_rate() {
         rate_kbps: Some(20_000.0),
         sent_kbps: None,
         delivery: None,
+        queue_us: None,
+        since: None,
         fresh: true,
         loss: None,
     };
@@ -1083,6 +1161,8 @@ fn the_loss_bound_grows_within_the_receive_rate_cap() {
         rate_kbps: Some(300.0),
         sent_kbps: None,
         delivery: None,
+        queue_us: None,
+        since: None,
         fresh: true,
         loss: None,
     };
@@ -1861,6 +1941,8 @@ fn a_bound_flipping_at_the_feedback_rate_is_logged_at_most_once_a_second() {
                 rate_kbps: None,
                 sent_kbps: None,
                 delivery: None,
+                queue_us: None,
+                since: None,
                 fresh: false,
                 loss: delay_grows.then_some(0.05),
             };
@@ -1937,6 +2019,8 @@ fn each_line_names_every_cause_of_the_fall_it_covers() {
             rate_kbps: None,
             sent_kbps: None,
             delivery: None,
+            queue_us: None,
+            since: None,
             fresh: false,
             loss: Some(0.5),
         };
@@ -1952,83 +2036,131 @@ fn each_line_names_every_cause_of_the_fall_it_covers() {
     assert_eq!(cuts[2].2, est.estimate_kbps().round());
 }
 
-/// #1376: a report is evidence of the link (`measured`) only when its datagrams arrived
-/// slower than they were sent, and then it is the estimate, never under `BETA` × the
-/// receive rate. A clean link, an idle sender and a report with no receive rate give none.
-/// Old code: the higher of the estimate and the receive rate for any busy report, a clean
-/// link's included, and the estimate alone (a silence decay's included) with no receive rate.
+/// #1376, #1496: a report is evidence of the link (`measured`) only when the link holds the
+/// sender back: a standing queue and datagrams arriving slower than they were sent. It is then
+/// `BETA` × that share, of the video sent from the window's start. A queue that drains, a
+/// clean link (whatever it delivers) and a report with no rate give none.
 #[test]
 fn a_report_is_evidence_only_when_the_link_held_the_sender_back() {
     let start = Instant::now();
     let at = |ms| start + Duration::from_millis(ms);
-    let report = |rate_kbps, sent_kbps, loss| Measured {
+    let report = |delivery, queue_ms: i64| Measured {
         usage: Usage::Normal,
-        rate_kbps,
-        sent_kbps,
-        delivery: None,
+        rate_kbps: Some(7000.0),
+        sent_kbps: Some(8000.0),
+        delivery: Some(delivery),
+        queue_us: Some(queue_ms * 1000),
+        since: Some(at(50)),
         fresh: true,
-        loss,
+        loss: None,
     };
     let mut est = Estimator::new(CEILING, start);
-    est.apply(report(Some(7900.0), Some(8000.0), None), at(100), NO_QUIC);
-    assert_eq!(est.measured(), None, "a clean link: arrived as sent");
-    est.apply(report(Some(1000.0), Some(3000.0), None), at(200), NO_QUIC);
-    assert_eq!(est.measured(), None, "an idle sender (application-limited)");
-    est.apply(report(None, Some(8000.0), None), at(300), NO_QUIC);
-    assert_eq!(est.measured(), None, "no receive rate");
-    est.apply(report(Some(6000.0), Some(8000.0), None), at(400), NO_QUIC);
+    est.apply(report(0.9, 5), at(100), NO_QUIC);
+    assert_eq!(est.measured(), None, "no standing queue: a burst, or loss");
+    est.apply(report(1.05, 200), at(200), NO_QUIC);
+    assert_eq!(est.measured(), None, "a queue that drains");
+    est.apply(
+        Measured {
+            delivery: None,
+            ..report(0.9, 200)
+        },
+        at(400),
+        NO_QUIC,
+    );
+    assert_eq!(est.measured(), None, "no rate");
+    est.apply(report(0.99, 200), at(500), NO_QUIC);
     assert_eq!(
         est.measured(),
-        Some(CEILING),
-        "held back: the estimate, above 0.85 × 6000"
+        Some(abr::Held {
+            share: BETA * 0.99,
+            since: at(50)
+        })
     );
-    // A loss cut leaves the estimate under what arrived: the reading stops at BETA × that.
-    est.apply(report(None, None, Some(0.6)), at(500), NO_QUIC);
-    assert!(est.estimate_kbps() < BETA * 7000.0);
-    est.apply(report(Some(7000.0), Some(7500.0), None), at(600), NO_QUIC);
-    assert_eq!(est.measured(), Some(BETA * 7000.0));
 }
 
-/// #1496 lab round, AMD lab host at a 2 Mbit/s cap: delay cuts held the estimate at 0.85 × the
-/// 1688 kbit/s the link carried, the ABR's setpoint stayed at 1668 (inside its deadband) and
-/// the wire carried 1749, 1.05 × the setpoint, with no loss: the link's queue grew for good (RTT
-/// 101 → 437 ms in 9 s, later 1.5 s) and audio starved. The reports must take the setpoint
-/// under what the link carries.
-#[test]
-fn a_link_that_carries_less_than_the_wire_sends_takes_the_setpoint_under_it() {
-    use crate::session::abr::{AbrConfig, Governor as Abr};
-    let start = Instant::now();
-    let at = |ms| start + Duration::from_millis(ms);
+/// A sender whose ABR is at `setpoint` with no room over it, the wire `WIRE` × that, into a
+/// `link` kbit/s bottleneck.
+fn abr_at(link: f64, setpoint: u32) -> Sim {
+    let mut s = Sim::new(link);
     let cfg = AbrConfig {
         per_report: Some(Duration::ZERO),
-        ..AbrConfig::new_smooth(577, CEILING as u32, 60)
+        ..AbrConfig::new_smooth(577, setpoint, 60)
     };
-    let mut abr = Abr::new(cfg, start);
-    abr.observe_report(Some(1668.0), at(0));
-    assert_eq!(abr.observe_report(Some(1668.0), at(50)), Some(1668));
-    let mut est = Estimator::new(CEILING, start);
-    est.delay_kbps = 1441.0;
-    est.settle();
-    let (recv, sent) = (1688.0, 1749.0);
-    let report = Measured {
-        usage: Usage::Overusing,
-        rate_kbps: Some(recv),
-        sent_kbps: Some(sent),
-        delivery: Some(recv / sent),
-        fresh: true,
-        loss: Some(0.0),
-    };
-    let mut cut = None;
-    for ms in [100, 200] {
-        est.apply(report, at(ms), NO_QUIC);
-        cut = cut.or(abr.observe_report(est.measured(), at(ms)));
+    s.abr = Some((Abr::new(cfg, s.start), WIRE));
+    s
+}
+
+/// What the wire adds to the setpoint: 1.05 × on the AMD lab host at a 2 Mbit/s cap (#1496).
+const WIRE: f64 = 1.05;
+
+/// #1496 review: with the estimate held at 0.85 × the link by delay cuts, a reading in link
+/// units and the ABR's 15 % deadband cut only a setpoint over link / √1.05, and a rate gate
+/// read nothing under link / 1.029: any setpoint between link / 1.05 and the link put a wire
+/// on it that the link could not carry, and its queue grew for good (1645 of 1688: 22 ms a
+/// second). From the ABR's worst case, its rate at the setpoint after an up step, each is
+/// taken under the link within seconds, and the queue stays bounded while the ABR probes
+/// back up.
+#[test]
+fn every_setpoint_over_the_link_is_taken_under_it() {
+    const LINK: f64 = 1688.0;
+    let mut table = Vec::new();
+    for over in [0.005, 0.01, 0.014, 0.023, 0.03, 0.04, 0.05] {
+        let setpoint = (LINK / WIRE * (1.0 + over)).round() as u32;
+        let mut s = abr_at(LINK, setpoint);
+        let mut under = None;
+        let mut wait_max: u64 = 0;
+        for tenth in 1..=600 {
+            s.run(0.1);
+            let wire = WIRE * f64::from(s.abr.as_ref().unwrap().0.setpoint_kbps());
+            if wire < LINK {
+                under.get_or_insert(f64::from(tenth) / 10.0);
+            }
+            if tenth > 300 {
+                wait_max = wait_max.max(s.free_at.saturating_sub(s.t));
+            }
+        }
+        table.push((setpoint, under, wait_max / 1000, s.readings));
     }
-    let sp = cut.expect("the setpoint stayed over the link");
-    let wire = f64::from(sp) * sent / 1668.0;
-    assert!(
-        wire < recv,
-        "setpoint {sp} still puts {wire:.0} on a {recv} link"
-    );
+    for &(setpoint, under, wait_ms, _) in &table {
+        let under =
+            under.unwrap_or_else(|| panic!("setpoint {setpoint} stayed over the link: {table:?}"));
+        assert!(
+            under < 15.0,
+            "setpoint {setpoint} went under the link only at {under} s: {table:?}"
+        );
+        assert!(
+            wait_ms < 500,
+            "setpoint {setpoint}: the queue reached {wait_ms} ms: {table:?}"
+        );
+    }
+}
+
+/// A clean link with jitter and a wire over the setpoint gives no reading, through
+/// `measure`: the ABR stays at its ceiling (#68).
+#[test]
+fn a_clean_jittery_link_gives_no_reading() {
+    let mut s = abr_at(20_000.0, 8000);
+    s.extra_us = jitter(110);
+    s.run(30.0);
+    assert_eq!(s.readings, 0);
+    assert_eq!(s.abr.as_ref().unwrap().0.setpoint_kbps(), 8000);
+}
+
+/// Random loss is not congestion: 2 % of datagrams lost on a link with room leave the
+/// delivered share at 1 and move nothing, though the send rate counts the lost bytes.
+#[test]
+fn random_loss_leaves_the_delivered_share_at_one() {
+    let mut s = abr_at(20_000.0, 8000);
+    s.drop_every = 50;
+    s.run(30.0);
+    let span = |key: fn(&(u64, u32, u64)) -> u64| {
+        let keys = s.est.arrivals.iter().map(key);
+        (keys.clone().max().unwrap() - keys.min().unwrap()) as f64
+    };
+    let share = span(|a| a.2) / span(|a| a.0);
+    assert!((share - 1.0).abs() < 0.01, "delivered share {share}");
+    assert_eq!(s.readings, 0);
+    assert_eq!(s.abr.as_ref().unwrap().0.setpoint_kbps(), 8000);
 }
 
 const PYRO_TARGET: u32 = 200_000;
@@ -3115,4 +3247,15 @@ fn held_video_over_the_cap_is_dropped_before_a_resend() {
         .map(|h| (h.resend, wire_seq(&h.datagram)))
         .collect();
     assert_eq!(held, [(true, 9), (false, 1), (false, 2), (false, 3)]);
+}
+
+/// A path whose delay rises 60 ms and stays there (a roam) reads as a queue until the floor
+/// ages it out, but a queue that does not grow delivers what is sent: it costs no cut.
+#[test]
+fn a_path_whose_delay_rises_costs_no_cut() {
+    let mut s = abr_at(20_000.0, 8000);
+    let j = jitter(0);
+    s.extra_us = Box::new(move |t| j(t) + if t >= 5_000_000 { 60_000 } else { 0 });
+    s.run(30.0);
+    assert_eq!(s.abr.as_ref().unwrap().0.setpoint_kbps(), 8000);
 }

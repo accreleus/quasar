@@ -37,6 +37,8 @@ use quinn_proto::RttEstimator;
 use serde_json::Value;
 use web_transport_quinn::quinn::congestion::{Controller, ControllerFactory, CubicConfig};
 
+use crate::session::abr;
+
 /// §Feedback: `count` is at most 8192; arrivals are in 50 µs units, `0xFFFF` not received.
 const MAX_COUNT: usize = 8192;
 const UNIT_US: u64 = 50;
@@ -111,10 +113,19 @@ const OVERUSE_GAP: Duration = Duration::from_millis(250);
 /// A window whose datagrams were sent under this share of the estimate is
 /// application-limited, and is no throughput sample.
 const APP_LIMITED: f64 = 0.8;
-/// Datagrams that arrived at under this share of the rate they were sent at: the link held
-/// them back (a queue or loss), so the report is evidence of the link ([`Estimator::measured`]).
-/// A clean link measures within 1 %; 0.95 hid a queue growing 37 ms a second (#1496).
-const LINK_LIMITED: f64 = 0.98;
+/// The least one-way delay in the rate window this far over the least of the last
+/// [`FLOOR_WINDOW_US`] is a standing queue: the link holds the sender back
+/// ([`Estimator::measured`]). A rate gate cannot tell a link a wire 1 % over fills from a
+/// clean one, which measures within 1 %, and that queue grows for good (#1496); a queue
+/// that keeps growing crosses any line.
+const QUEUE_HELD_US: i64 = 30_000;
+/// The delay floor is the least one-way delay over this much send time, in steps of
+/// [`FLOOR_STEP_US`]: long enough that a wire 0.4 % over the link crosses
+/// [`QUEUE_HELD_US`] before its queue ages into the floor, short enough that a path whose
+/// delay rose (a roam) stops reading as a queue.
+/// shortcut: a wire under 0.4 % over the link is never seen; raise this if one shows.
+const FLOOR_WINDOW_US: u64 = 10_000_000;
+const FLOOR_STEP_US: u64 = 1_000_000;
 const MAX_ARRIVALS: usize = 1 << 14;
 
 /// Feedback silence while media is sent: past max(this, 2 intervals + RTT), the estimate
@@ -472,8 +483,10 @@ pub(crate) struct Estimator {
     newest_arrival: u64,
     /// (agent instant, receive rate) of recent windows that were not application-limited.
     throughput: VecDeque<(Instant, f64)>,
-    /// What the last message showed the link carrying, see [`Self::measured`].
-    measured: Option<f64>,
+    /// What the last message showed, see [`Self::measured`].
+    measured: Option<abr::Held>,
+    /// (start of a [`FLOOR_STEP_US`] of send time, the least one-way delay sent in it, µs).
+    floor: VecDeque<(u64, i64)>,
     overusing_since: Option<Instant>,
     last_overusing: Option<Instant>,
     /// Per message: (agent instant, received, lost); a late arrival after a loss is a
@@ -513,20 +526,24 @@ pub(crate) struct Measured {
     /// The received datagrams' arrival rate over the rate they were sent at: under 1, the link
     /// queued them; loss does not lower it.
     pub(crate) delivery: Option<f64>,
+    /// How far the least one-way delay in the rate window is over the delay floor, µs.
+    pub(crate) queue_us: Option<i64>,
+    /// When the window's first datagram was sent.
+    pub(crate) since: Option<Instant>,
     /// A video datagram (not a resend) first reported here is in the rate window.
     pub(crate) fresh: bool,
     pub(crate) loss: Option<f64>,
 }
 
 /// A detected outage's losses (#1557): those reported not received from `from`, the first
-/// datagram no report had covered, until one after a loss (or any sent after detection, `by`)
-/// is received. Not from the first send after the last report: when only host → client drops,
-/// the client's report of what came before the cut arrives after it (#1496 lab round).
+/// datagram no report had covered, until one sent after detection (`by`) is received. Not
+/// from the first send after the last report: when only host → client drops, the client's
+/// report of what came before the cut arrives after it (#1496 lab round). Not ended by a
+/// datagram received after a hole either: reordering puts holes in that late report.
 #[derive(Debug, Clone, Copy)]
 struct Outage {
     from: u32,
     by: u32,
-    lost: bool,
 }
 
 impl Estimator {
@@ -559,6 +576,7 @@ impl Estimator {
             logged: (Bound::Ceiling, None),
             unlogged: None,
             measured: None,
+            floor: VecDeque::new(),
         }
     }
 
@@ -588,14 +606,14 @@ impl Estimator {
         self.loss
     }
 
-    /// What the last message showed the link carrying, when the link held the sender back:
-    /// the higher of the estimate and `BETA` × the receive rate (the delay cut's own drain
-    /// margin, so neither a loss cut's overshoot nor a silence decay goes under it), times the
-    /// share of the send rate the queue let through (`Measured::delivery`). `None`
-    /// when the datagrams arrived at the rate they were sent (a clean link, whatever the
-    /// delay detector says: #68), when the sender was application-limited, or when no
-    /// receive rate was measured. The ABR's down path reads only this (#1376).
-    pub(crate) fn measured(&self) -> Option<f64> {
+    /// What the last message showed, when the link held the sender back (a standing queue,
+    /// [`QUEUE_HELD_US`], and datagrams arriving slower than they were sent): `BETA` (the
+    /// delay cut's own drain margin) × that share of the send rate, of the video sent from
+    /// `since`. `None` on a clean link, whatever the delay detector says (#68), under random
+    /// loss, which leaves the share at 1, and when no rate was measured. A sender under its
+    /// estimate counts: a wire 1 % over the link fires no delay cut, so the estimate stays at
+    /// the ceiling while the queue grows (#1496). The ABR's down path reads only this (#1376).
+    pub(crate) fn measured(&self) -> Option<abr::Held> {
         self.measured
     }
 
@@ -749,16 +767,15 @@ impl Estimator {
         {
             self.stop_regrow("reached");
         }
-        // Scaled by the delivery: the ABR moves only on a reading 15 % under its rate, and with
-        // BETA at 0.85 a link carrying between the setpoint and what the wire adds to it
-        // (headers, encoder overshoot: 1.05 × on the AMD lab host at a 2 Mbit/s cap) gave none,
-        // and the link's queue grew for good (#1496).
-        let delivery = m.delivery.map_or(1.0, |d| d.min(1.0));
         self.measured = m
-            .rate_kbps
-            .zip(m.sent_kbps)
-            .filter(|&(r, s)| !app_limited && r < LINK_LIMITED * s)
-            .map(|(r, _)| self.estimate_kbps.max(BETA * r) * delivery);
+            .delivery
+            .zip(m.queue_us)
+            .zip(m.since)
+            .filter(|&((d, q), _)| d < 1.0 && q > QUEUE_HELD_US)
+            .map(|((d, _), since)| abr::Held {
+                share: BETA * d,
+                since,
+            });
         let due = self.log_due(now) && (self.unlogged.is_some() || self.bound != self.logged.0);
         if !cut_by.is_empty() || due {
             // A silence fall not logged yet is part of this line's "from → to".
@@ -813,7 +830,6 @@ impl Estimator {
             self.outage.get_or_insert(Outage {
                 from: self.reported_to.unwrap_or(seq),
                 by: log.next_seq,
-                lost: false,
             });
         }
         let from = self.last_decay.unwrap_or(sent + timeout);
@@ -937,9 +953,7 @@ impl Estimator {
                     received += 1;
                 }
                 (Status::Unreported, None) => {
-                    let outage = self.outage.as_mut().filter(|o| after(seq, o.from));
-                    if let Some(o) = outage {
-                        o.lost = true;
+                    if self.outage.is_some_and(|o| after(seq, o.from)) {
                         slot.status = Status::Outage;
                     } else {
                         slot.status = Status::Lost;
@@ -957,10 +971,7 @@ impl Estimator {
                     slot.status = Status::Received;
                     received += 1;
                     // The link answered: a loss sent after this is congestion (#1557).
-                    if self
-                        .outage
-                        .is_some_and(|o| after(seq, o.from) && (o.lost || after(seq, o.by)))
-                    {
+                    if self.outage.is_some_and(|o| after(seq, o.by)) {
                         self.outage = None;
                     }
                     if let Some((send_d, arrival_d, arrival_ms)) =
@@ -971,6 +982,20 @@ impl Estimator {
                 }
             }
             if let (false, Some(at)) = (slot.resend, at_us) {
+                let delay = at as i64 - slot.sent_us as i64;
+                match self.floor.back_mut() {
+                    Some((from, least)) if slot.sent_us < *from + FLOOR_STEP_US => {
+                        *least = (*least).min(delay);
+                    }
+                    _ => self.floor.push_back((slot.sent_us, delay)),
+                }
+                while self
+                    .floor
+                    .front()
+                    .is_some_and(|&(from, _)| from + FLOOR_WINDOW_US < slot.sent_us)
+                {
+                    self.floor.pop_front();
+                }
                 self.arrivals
                     .push_back((at, u32::from(slot.bytes), slot.sent_us));
                 self.newest_arrival = self.newest_arrival.max(at);
@@ -996,9 +1021,18 @@ impl Estimator {
         };
         let rate_kbps = rate(|a| a.0, MIN_RATE_SPAN_US);
         let delivery = rate_kbps.zip(rate(|a| a.2, 1)).map(|(r, s)| r / s);
+        let floor = self.floor.iter().map(|&(_, d)| d).min();
+        let queue_us = self
+            .arrivals
+            .iter()
+            .map(|&(at, _, sent)| at as i64 - sent as i64)
+            .min()
+            .zip(floor)
+            .map(|(window, floor)| window - floor);
         // Over every datagram sent in the span, lost ones too: a busy sender under loss is
         // still busy. Datagrams all sent in one instant give no send rate.
         let first_sent = self.arrivals.iter().map(|a| a.2).min();
+        let since = first_sent.map(|us| log.start + Duration::from_micros(us));
         let last_sent = self.arrivals.iter().map(|a| a.2).max();
         let sent_kbps = match (fresh, rate_kbps, first_sent, last_sent) {
             (true, Some(_), Some(lo), Some(hi)) if hi > lo => {
@@ -1038,6 +1072,8 @@ impl Estimator {
             rate_kbps,
             sent_kbps,
             delivery,
+            queue_us,
+            since,
             fresh,
             loss,
         }
