@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+- **The app editor can set GPU access and the two container opt-outs for an app that brings its own image (#179).** A new Container group on the Runtime tab has switches for GPU access, privilege-escalation blocking and unmasking /proc and /sys. It is hidden when the app uses a runtime preset, which supplies them.
+
 ### Upgrading
 - **This release changes the database (migration 0118), so there is no going back below it.** Once applied, an older control plane will not start. For Quasar's own database the way back is a restore of the dump the update takes first (`docs/upgrading.md`, "The one-way migration rule"); on your own database, back up first. Fleet ▸ Releases ▸ Update Quasar waits for live sessions to end before it replaces the control plane (or tick "Update now" to end them), and automatic updates never install a release that changes the database.
 - **It worked when** Fleet ▸ Releases shows this release everywhere and the run ends `succeeded`.
@@ -60,6 +63,8 @@ own; the two do not move together, and that is deliberate.
 - **A mouse button pressed on the picture is released over the HUD (#1464).** The release lands on the HUD overlay, not the video, so it used to be dropped and the host kept the button down until capture ended; a button this capture pressed now lifts wherever the pointer comes up, while a HUD-only click still sends nothing.
 - **The session view keeps adopting the session's render and interface sizes until this tab changes them (#1491).** A tab that loaded in the ~1 s window where a stale pre-PATCH metrics sample had overwritten the newer value latched the stale one for good; adoption now runs on every poll, so the next sample corrects it, while a change this tab ACKs ends adoption permanently — a delayed poll sampled before that PATCH can no longer overwrite the UI, the stored ack or the cursor scaling. Reported values go through the display patch contract's own bounds.
 - **A WebTransport close that races a `hello_ack` on a dead datagram reader is reported as that close's refusal (#1478).** The accept check could not see the session's own close once the reader had died, so a takeover (4410) or a session end (4404) resolving in the same instant as the `hello_ack` degraded to `internal`; it now reads the close that already settled and reports `taken_over` / `session_ended`. The fallback cause's 200-unit cap also no longer ends on half of a surrogate pair (`😀` in a device name), which the HUD showed as a replacement character.
+- **Flaky test: a swap back into a sharing desktop read the session detail before the rejected swap wrote it.** The test now waits for that last write.
+- **Hot Loading no longer parks Steam on a GPU a WebTransport launch cannot adopt (#1224).** On a host with mixed GPUs (for example one PyroWave-capable and one not), the library-open warm is now placed on a GPU where the launch plans WebRTC, instead of any GPU; when every GPU would plan WebTransport it still parks nothing. A host where every GPU plans WebRTC places the warm as before.
 
 ## 0.6.1 — 2026-11-18
 
