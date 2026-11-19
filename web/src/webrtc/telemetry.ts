@@ -34,7 +34,8 @@ export type AbsCaptureTimeNegotiation = "pending" | "negotiated" | "unavailable"
 /**
  * Which clock a present window's samples came from (#552). `rvfc` is display
  * pacing from RVFC frame metadata; `callback` is the requestAnimationFrame
- * fallback and must never be read as display pacing.
+ * fallback and must never be read as display pacing. Client-snapshot only:
+ * nothing reads it and it has no wire/stored key (see docs/testing-bench-mode.md).
  */
 export type PresentSource = "rvfc" | "callback";
 
@@ -102,6 +103,7 @@ export interface TelemetrySnapshot {
    *  display metadata (expectedDisplayTime/presentationTime + presentedFrames),
    *  `callback` = the requestAnimationFrame fallback (no RVFC metadata) or RVFC
    *  metadata without presentedFrames — callback cadence, NOT display pacing.
+   *  Client snapshot only: no wire or stored key (docs/testing-bench-mode.md).
    *  Absent before any sample and on WebTransport (stamped at its display frame). */
   presentSource?: PresentSource;
   playoutTargetMs: number;
@@ -249,7 +251,8 @@ export class SessionTelemetry {
    * tick re-firing for an already-presented frame doesn't pollute the samples. */
   private frameDedupState: FrameDedupState = INITIAL_FRAME_DEDUP_STATE;
   /** #552: RVFC metadata accounting (presentedFrames deltas + display times). Kept
-   *  across drains, so a delta is never cut in half at a window boundary. */
+   *  across drains, so a delta is never cut in half at a window boundary; reset
+   *  only when the page hides or the RVFC loop restarts, never by a drain. */
   private presentMetadataState: PresentFrameMetadataState = INITIAL_PRESENT_FRAME_METADATA_STATE;
   /** Which clock the present window's samples came from (#552); null until a sample. */
   private presentSource: PresentSource | null = null;
@@ -383,6 +386,11 @@ export class SessionTelemetry {
 
     this.onVisibilityChange = () => {
       if (document.visibilityState === "visible") this.remeasureDisplayRefresh();
+      // A hidden tab presents nothing: the browser pauses RVFC, so the first
+      // callback after the return carries a delta and a display clock spanning
+      // the whole hidden time. Drop the state instead (#552) — the gap was not
+      // a frame duration, and it must not become the window's longest interval.
+      else this.resetPresentFrameState();
     };
     // Fullscreen and resize share one debounced handler: entering fullscreen
     // fires BOTH events, and a window dragged across a monitor edge fires
@@ -681,6 +689,17 @@ export class SessionTelemetry {
     if (this.updateListener) this.updateListener(snap);
   }
 
+  /**
+   * Drop both presentation clocks so the next callback seeds instead of spanning
+   * a gap nothing was presented in (#552). Called when the page hides and when
+   * the RVFC loop restarts — never by drainPresentWindow, because a real freeze
+   * while VISIBLE must still span a drain and read as a long frame.
+   */
+  private resetPresentFrameState(): void {
+    this.presentMetadataState = INITIAL_PRESENT_FRAME_METADATA_STATE;
+    this.frameDedupState = INITIAL_FRAME_DEDUP_STATE;
+  }
+
   /** Requires >=5 samples to avoid noise from a near-empty window (e.g. a hidden
    * tab, where RVFC stops firing, leaves all three null). */
   private drainPresentWindow(): void {
@@ -702,7 +721,9 @@ export class SessionTelemetry {
     this.frameDedupState = INITIAL_FRAME_DEDUP_STATE;
     // presentMetadataState deliberately NOT reset (#552): the presentedFrames
     // delta and display clock must span the drain boundary, or every window
-    // would begin with a seed callback and lose the interval across it.
+    // would begin with a seed callback and lose the interval across it. It IS
+    // reset by resetPresentFrameState() when the page hides or the loop restarts,
+    // so a hidden gap never becomes one long frame.
   }
 
   private buildMetrics(): Record<string, number> {
@@ -898,6 +919,8 @@ export class SessionTelemetry {
   private startOverlayLoop(): void {
     if (this.overlayRunning) return;
     this.overlayRunning = true;
+    // A restarted loop cannot continue the previous run's display clock (#552).
+    this.resetPresentFrameState();
     this.scheduleFrame();
   }
 
@@ -925,10 +948,14 @@ export class SessionTelemetry {
     // #552: presentation pacing is read from RVFC frame metadata — presented
     // frames from the UA's presentedFrames delta, intervals from the display
     // times (expectedDisplayTime, else presentationTime) — not from when this
-    // callback runs. A coalesced callback (delta > 1) counts every presented
-    // frame and contributes one per-frame interval (elapsed / frames), so it is
-    // not read as one long frame. A delta <= 0 is a tick for an already-presented
-    // frame: no sample.
+    // callback runs. A delta <= 0 is a tick for an already-presented frame: no
+    // sample.
+    //
+    // One sample per PRESENTED frame, not per callback (#552): a coalesced
+    // callback's frames share its averaged per-frame interval (elapsed / frames),
+    // each counted once, so `present_n` counts presented frames and the mean is
+    // weighted per frame. LIMIT: inside one coalesced callback the frames share
+    // that average, so a long frame covered by that callback cannot be seen.
     //
     // Without RVFC metadata (the requestAnimationFrame fallback, or metadata
     // with no presentedFrames) there is no display clock: fall back to the
@@ -936,7 +963,7 @@ export class SessionTelemetry {
     const presented = metadata?.presentedFrames;
     const displayMs = presentedDisplayMs(metadata);
     if (typeof presented === "number" && Number.isFinite(presented) && displayMs != null) {
-      const { intervalMs, nextState } = feedPresentedFrames(
+      const { frames, intervalMs, nextState } = feedPresentedFrames(
         this.presentMetadataState,
         presented,
         displayMs,
@@ -944,7 +971,7 @@ export class SessionTelemetry {
       this.presentMetadataState = nextState;
       this.presentSource = "rvfc";
       if (intervalMs != null) {
-        this.presentIntervals.push(intervalMs);
+        for (let i = 0; i < frames; i++) this.presentIntervals.push(intervalMs);
       }
     } else {
       const { intervalMs, nextState } = feedPresentedFrame(

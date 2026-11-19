@@ -384,6 +384,7 @@ describe("SessionTelemetry present pacing from RVFC metadata (#552)", () => {
   type PresentInternals = {
     overlayRunning: boolean;
     onDisplayedFrame(m?: VideoFrameCallbackMetadata): void;
+    onVisibilityChange(): void;
     pendingSamples: Array<{ metrics: Record<string, number> }>;
   };
 
@@ -434,7 +435,8 @@ describe("SessionTelemetry present pacing from RVFC metadata (#552)", () => {
           }));
         }
       });
-      expect(sample.metrics["present_n"]).toBe(10);
+      // One interval sample per PRESENTED frame: 10 coalesced callbacks × delta 2.
+      expect(sample.metrics["present_n"]).toBe(20);
       expect(sample.metrics["present_interval_median_ms"]).toBeCloseTo(16.67, 2);
       expect(sample.metrics["present_interval_max_ms"]).toBeLessThan(17);
       expect(sample.metrics["present_long_frames"]).toBe(0);
@@ -458,5 +460,116 @@ describe("SessionTelemetry present pacing from RVFC metadata (#552)", () => {
     } finally {
       now.mockRestore();
     }
+  });
+
+  it("counts and weights a coalesced callback per presented frame, not per callback", async () => {
+    const { sample } = await sampleAfter((t) => {
+      t.onDisplayedFrame(metadata({ presentedFrames: 1, expectedDisplayTime: 1000 })); // seed
+      // One callback the UA coalesced over 3 presentations across 50 ms.
+      t.onDisplayedFrame(metadata({ presentedFrames: 4, expectedDisplayTime: 1050 }));
+      // Three ordinary callbacks, 33 ms apart on the display clock.
+      for (let k = 1; k <= 3; k++) {
+        t.onDisplayedFrame(metadata({ presentedFrames: 4 + k, expectedDisplayTime: 1050 + k * 33 }));
+      }
+    });
+    // 6 presented frames over 149 ms: 3 × (50/3) + 3 × 33 → mean 24.83 ms → ~40 fps.
+    // One averaged interval per CALLBACK would read (16.67, 33, 33, 33), n 4, ~34.5 fps.
+    expect(sample.metrics["present_n"]).toBe(6);
+    expect(sample.metrics["present_fps"]).toBeCloseTo(40.27, 2);
+    expect(sample.metrics["present_interval_max_ms"]).toBeCloseTo(33, 5);
+  });
+
+  it("does not read a hidden tab's gap as one long frame", async () => {
+    const vis = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    const now = vi.spyOn(performance, "now");
+    try {
+      const { sample } = await sampleAfter((t) => {
+        for (let k = 0; k < 30; k++) {
+          now.mockReturnValue(5000 + k * 100); // callback runs unrelated to the display
+          t.onDisplayedFrame(metadata({ presentedFrames: k + 1, expectedDisplayTime: 1000 + k * 16.67 }));
+        }
+        // The tab hides (RVFC stops), then returns 20 s later with one callback
+        // whose presentedFrames delta is 1 and whose display clock spans the
+        // whole hidden time. That gap is not a frame duration.
+        vis.mockReturnValue("hidden");
+        t.onVisibilityChange();
+        vis.mockReturnValue("visible");
+        t.onDisplayedFrame(metadata({ presentedFrames: 31, expectedDisplayTime: 20000 }));
+      });
+      // The hidden gap must not become the window's longest interval.
+      expect(sample.metrics["present_interval_max_ms"]).toBeCloseTo(16.67, 2);
+      expect(sample.metrics["present_long_frames"]).toBe(0);
+      expect(sample.metrics["present_n"]).toBe(29); // the 30 callbacks, not the gap callback
+    } finally {
+      vis.mockRestore();
+      now.mockRestore();
+    }
+  });
+
+  it("reseeds the presentation clock when the RVFC loop restarts", async () => {
+    type RestartInternals = PresentInternals & { startOverlayLoop(): void };
+    const now = vi.spyOn(performance, "now");
+    try {
+      const tm = telemetryWithStats(async () => inboundReport());
+      const t = tm as unknown as RestartInternals;
+      t.overlayRunning = true;
+      for (let k = 0; k < 30; k++) {
+        now.mockReturnValue(0);
+        t.onDisplayedFrame(metadata({ presentedFrames: k + 1, expectedDisplayTime: 1000 + k * 16.67 }));
+      }
+      // stop() cleared the loop; a restart cannot continue the old display clock.
+      t.overlayRunning = false;
+      t.startOverlayLoop();
+      t.onDisplayedFrame(metadata({ presentedFrames: 31, expectedDisplayTime: 20000 }));
+      await pollOnce(tm);
+      const sample = t.pendingSamples[0]!;
+      expect(sample.metrics["present_interval_max_ms"]).toBeCloseTo(16.67, 2);
+      expect(sample.metrics["present_n"]).toBe(29);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("still reads a freeze while visible, spanning a drain, as long", async () => {
+    const now = vi.spyOn(performance, "now");
+    try {
+      const tm = telemetryWithStats(async () => inboundReport());
+      const t = tm as unknown as PresentInternals;
+      t.overlayRunning = true;
+      for (let k = 0; k < 11; k++) {
+        now.mockReturnValue(0);
+        t.onDisplayedFrame(metadata({ presentedFrames: k + 1, expectedDisplayTime: 1000 + k * 16.67 }));
+      }
+      await pollOnce(tm); // drain the window in the middle of the run
+      // The page stayed VISIBLE: a 400 ms freeze, then the stream resumes.
+      t.onDisplayedFrame(metadata({ presentedFrames: 12, expectedDisplayTime: 1000 + 10 * 16.67 + 400 }));
+      for (let k = 0; k < 10; k++) {
+        t.onDisplayedFrame(metadata({
+          presentedFrames: 13 + k,
+          expectedDisplayTime: 1000 + 10 * 16.67 + 400 + (k + 1) * 16.67,
+        }));
+      }
+      await pollOnce(tm);
+      const sample = t.pendingSamples[1]!;
+      expect(sample.metrics["present_interval_max_ms"]).toBeCloseTo(400, 5);
+      expect(sample.metrics["present_long_frames"]).toBe(1);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("measures intervals from presentationTime when expectedDisplayTime is absent", async () => {
+    const { sample, snapshot } = await sampleAfter((t) => {
+      for (let k = 0; k < 31; k++) {
+        t.onDisplayedFrame(metadata({
+          presentedFrames: k + 1,
+          expectedDisplayTime: undefined,
+          presentationTime: 1000 + k * 16.67,
+        }));
+      }
+    });
+    expect(sample.metrics["present_n"]).toBe(30);
+    expect(sample.metrics["present_interval_median_ms"]).toBeCloseTo(16.67, 2);
+    expect(snapshot.presentSource).toBe("rvfc");
   });
 });

@@ -6,9 +6,12 @@
  * 1. RVFC frame metadata (feedPresentedFrames): count presented frames from the
  *    UA's own `presentedFrames` counter and take intervals from
  *    `expectedDisplayTime` (else `presentationTime`) — times the display showed
- *    distinct frames. A callback that coalesced N presentations contributes ONE
- *    per-frame interval (elapsed / N), so a skipped callback is not one long
- *    frame; the page's callback cadence no longer moves the cadence metrics.
+ *    distinct frames. A callback that coalesced N presentations contributes one
+ *    per-frame interval (elapsed / N) PER presented frame, so a skipped callback
+ *    is not one long frame; the page's callback cadence no longer moves the
+ *    cadence metrics. LIMIT: the N frames inside one coalesced callback share
+ *    that averaged interval, so a long frame covered by one callback cannot be
+ *    seen (it is averaged across the frames that callback counted).
  * 2. Callback cadence (feedPresentedFrame): the requestAnimationFrame fallback,
  *    and RVFC metadata without presentedFrames, have no display clock. Samples
  *    come from when the callback runs; telemetry labels them as callback cadence
@@ -88,7 +91,7 @@ export const INITIAL_PRESENT_FRAME_METADATA_STATE: PresentFrameMetadataState = {
 export interface PresentFrameMetadataResult {
   /** Presentations the UA counted since the last counted callback (presentedFrames delta); 0 for a duplicate tick. */
   frames: number;
-  /** Display-to-display interval, averaged per presented frame (elapsed / frames); null when there is nothing to measure from. */
+  /** Display-to-display interval, averaged per presented frame (elapsed / frames). The caller must add it ONCE PER presented frame (`frames` times), not once per callback. Null when there is nothing to measure from. */
   intervalMs: number | null;
   /** State to pass into the next feedPresentedFrames() call. */
   nextState: PresentFrameMetadataState;
@@ -117,9 +120,11 @@ export function presentedDisplayMs(
  * UA's own presented-frame delta: a callback the UA coalesced over several
  * presentations counts all of them, and its interval is divided by that count —
  * the display cadence per frame, not one callback-to-callback span read as a
- * long frame. A delta of 0 is a tick for an already-presented frame and yields
- * no sample (state untouched, so the next new frame's interval still spans the
- * real gap); a negative delta means the UA's counter restarted, and reseeds.
+ * long frame. The caller adds that interval once PER presented frame, so a
+ * coalesced callback contributes `frames` samples and a per-frame weighting.
+ * A delta of 0 is a tick for an already-presented frame and yields no sample
+ * (state untouched, so the next new frame's interval still spans the real gap);
+ * a negative delta means the UA's counter restarted, and reseeds.
  */
 export function feedPresentedFrames(
   state: PresentFrameMetadataState,
