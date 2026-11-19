@@ -856,7 +856,7 @@
       "n_key": "present_n",
       "deprecated_for": null,
       "since": "2026-08-22",
-      "why": "THE READING. fps from the MEDIAN RVFC interval \u2014 the fps a viewer perceives, unmoved by an occasional doubled frame. Its input intervals are display-refresh independent since #263 (2026-08-24): RVFC ticks are deduped by the frame's identity before summarising (metadata.mediaTime, or its rtpTimestamp where a browser reports mediaTime 0 for WebRTC, as Firefox does: #686), so a display whose refresh rate is not an integer multiple of the source fps (e.g. 98 Hz) no longer pollutes the samples with vsync ticks that carry no new frame \u2014 a healthy 60 fps stream on such a display previously read ~43-49. WebTransport: stamped at the display frame, as WebRTC's are (see present_interval_median_ms)."
+      "why": "THE READING. fps from the MEDIAN RVFC interval \u2014 the fps a viewer perceives, unmoved by an occasional doubled frame. Since #552 its intervals come from RVFC display metadata (expectedDisplayTime, else presentationTime) and its frames from presentedFrames deltas: RVFC ticks for an already-presented frame (delta 0) are dropped, and a callback the UA coalesced over several presentations contributes one per-frame interval (elapsed / presented frames), so neither a display whose refresh rate is not an integer multiple of the source fps (e.g. 98 Hz) nor a skipped callback pollutes the samples \u2014 a healthy 60 fps stream on such a display previously read ~43-49 (#263), and the page's callback cadence moved the number (#552). The mediaTime/rtpTimestamp dedup survives only in the callback-cadence fallback (no RVFC metadata). WebTransport: stamped at the display frame (see present_interval_median_ms)."
     },
     {
       "key": "present_interval_median_ms",
@@ -869,7 +869,7 @@
       "n_key": "present_n",
       "deprecated_for": null,
       "since": "2026-08-22",
-      "why": "The median frame-to-frame presentation interval itself. Every other cadence key is defined relative to it (doubled band, long-frame factor). Stamped the same way on both transports: WebRTC at the times the display showed distinct frames (RVFC); WebTransport at the start of the display frame (requestAnimationFrame) each picture lands in, pictures submitted within one display frame counting as one displayed frame. Neither is scan-out. A tab with no display frames (hidden) reports none."
+      "why": "The median frame-to-frame presentation interval itself. Every other cadence key is defined relative to it (doubled band, long-frame factor). WebRTC: the times the display showed distinct frames from RVFC metadata (expectedDisplayTime, else presentationTime); a callback the UA coalesced over several presentations contributes one per-frame interval (elapsed / presented frames), and the callback-cadence fallback (no RVFC metadata) measures requestAnimationFrame callback times instead. WebTransport: at the start of the display frame (requestAnimationFrame) each picture lands in, pictures submitted within one display frame counting as one displayed frame. Neither is scan-out. A tab with no display frames (hidden) reports none."
     },
     {
       "key": "present_interval_sd_ms",
@@ -947,7 +947,7 @@
       "n_key": null,
       "deprecated_for": null,
       "since": "2026-08-22",
-      "why": "How many intervals the window actually held. Below 5 every other present_* key is OMITTED rather than computed from a fragment \u2014 this is the key that tells 'quiet' from 'unmeasured'. WebTransport: stamped at the display frame, as WebRTC's are (see present_interval_median_ms)."
+      "why": "How many intervals the window actually held. Below 5 every other present_* key is OMITTED rather than computed from a fragment \u2014 this is the key that tells 'quiet' from 'unmeasured'. A callback the UA coalesced over several presentations contributes one per-frame interval, not one per presented frame, so this is an interval count rather than a presented-frame count. WebTransport: stamped at the display frame, as WebRTC's are (see present_interval_median_ms)."
     },
     {
       "key": "is_hidden",
