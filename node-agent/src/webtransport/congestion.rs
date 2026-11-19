@@ -113,7 +113,8 @@ const OVERUSE_GAP: Duration = Duration::from_millis(250);
 const APP_LIMITED: f64 = 0.8;
 /// Datagrams that arrived at under this share of the rate they were sent at: the link held
 /// them back (a queue or loss), so the report is evidence of the link ([`Estimator::measured`]).
-const LINK_LIMITED: f64 = 0.95;
+/// A clean link measures within 1 %; 0.95 hid a queue growing 37 ms a second (#1496).
+const LINK_LIMITED: f64 = 0.98;
 const MAX_ARRIVALS: usize = 1 << 14;
 
 /// Feedback silence while media is sent: past max(this, 2 intervals + RTT), the estimate
@@ -206,6 +207,8 @@ pub(crate) struct SendLog {
     /// That send's `pkt_seq`. The outage mark is taken in send order, not by stamp: held
     /// video goes out stamped with its queue time, before a report it was sent after.
     unanswered_seq: Option<u32>,
+    /// The `pkt_seq` after the last one recorded.
+    next_seq: u32,
     /// The last stamp, µs: stamps never go back in `pkt_seq` (send) order, whatever stamped
     /// them (a paced release, a queue time, a resend), or the delay detector reads a send
     /// that went back in time.
@@ -219,6 +222,7 @@ impl SendLog {
             slots: vec![Slot::default(); LOG],
             unanswered_since: None,
             unanswered_seq: None,
+            next_seq: 0,
             last_us: 0,
         }
     }
@@ -242,6 +246,7 @@ impl SendLog {
         };
         self.unanswered_since.get_or_insert(at);
         self.unanswered_seq.get_or_insert(seq);
+        self.next_seq = seq.wrapping_add(1);
     }
 
     fn slot(&mut self, seq: u32) -> Option<&mut Slot> {
@@ -487,11 +492,10 @@ pub(crate) struct Estimator {
     /// faster than AIMD. Dropped when it is reached, when it expires, when the link disagrees
     /// with a delay or loss cut, and on a codec switch (#1417).
     recover_to: Option<(f64, Instant)>,
-    /// The `pkt_seq` of the first send after the last feedback, while a detected silence is an
-    /// outage: the report after it counts packets sent from here, up to the first it shows
-    /// received after it, as the outage's losses rather than congestion (#1557). Read by
-    /// `measure`, which clears it.
-    outage_from: Option<u32>,
+    /// While a detected silence is an outage: its losses are not congestion (#1557).
+    outage: Option<Outage>,
+    /// The `pkt_seq` after the newest any report has covered.
+    reported_to: Option<u32>,
     /// The bound the log last named, and when.
     logged: (Bound, Option<Instant>),
     /// The estimate before a silence decay not logged yet; delay and loss cuts always log.
@@ -506,9 +510,28 @@ pub(crate) struct Measured {
     /// The rate every video datagram sent over the same span was sent at, lost ones
     /// included, on the agent's clock; `None` when the message added no fresh arrival.
     pub(crate) sent_kbps: Option<f64>,
+    /// The received datagrams' arrival rate over the rate they were sent at: under 1, the link
+    /// queued them; loss does not lower it.
+    pub(crate) delivery: Option<f64>,
     /// A video datagram (not a resend) first reported here is in the rate window.
     pub(crate) fresh: bool,
     pub(crate) loss: Option<f64>,
+}
+
+/// A detected outage's losses (#1557): every datagram from `from`, the first no report had
+/// covered, reported not received is the outage's, until a later one is reported received.
+/// Marked by what the reports covered, not by what was sent after the last one: only the
+/// host → client path may drop, and the client's report of what arrived before the cut then
+/// comes after it, below a mark taken at the send after that report (19 and 48 ms of video on
+/// the NVIDIA lab host, #1496). The mark lasts until a datagram is received after one of its
+/// losses, or one sent after the silence was detected (`by`) is received with none ahead of
+/// it: a report of what arrived before the cut that comes late, behind a dropped one, is no
+/// end to it.
+#[derive(Debug, Clone, Copy)]
+struct Outage {
+    from: u32,
+    by: u32,
+    lost: bool,
 }
 
 impl Estimator {
@@ -536,7 +559,8 @@ impl Estimator {
             loss: None,
             bound: Bound::Ceiling,
             recover_to: None,
-            outage_from: None,
+            outage: None,
+            reported_to: None,
             logged: (Bound::Ceiling, None),
             unlogged: None,
             measured: None,
@@ -571,7 +595,8 @@ impl Estimator {
 
     /// What the last message showed the link carrying, when the link held the sender back:
     /// the higher of the estimate and `BETA` × the receive rate (the delay cut's own drain
-    /// margin, so neither a loss cut's overshoot nor a silence decay goes under it). `None`
+    /// margin, so neither a loss cut's overshoot nor a silence decay goes under it), times the
+    /// share of the send rate the queue let through (`Measured::delivery`). `None`
     /// when the datagrams arrived at the rate they were sent (a clean link, whatever the
     /// delay detector says: #68), when the sender was application-limited, or when no
     /// receive rate was measured. The ABR's down path reads only this (#1376).
@@ -729,11 +754,16 @@ impl Estimator {
         {
             self.stop_regrow("reached");
         }
+        // Scaled by the delivery: the ABR moves only on a reading 15 % under its rate, and with
+        // BETA at 0.85 a link carrying between the setpoint and what the wire adds to it
+        // (headers, encoder overshoot: 1.05 × on the AMD lab host at a 2 Mbit/s cap) gave none,
+        // and the link's queue grew for good (#1496).
+        let delivery = m.delivery.map_or(1.0, |d| d.min(1.0));
         self.measured = m
             .rate_kbps
             .zip(m.sent_kbps)
             .filter(|&(r, s)| !app_limited && r < LINK_LIMITED * s)
-            .map(|(r, _)| self.estimate_kbps.max(BETA * r));
+            .map(|(r, _)| self.estimate_kbps.max(BETA * r) * delivery);
         let due = self.log_due(now) && (self.unlogged.is_some() || self.bound != self.logged.0);
         if !cut_by.is_empty() || due {
             // A silence fall not logged yet is part of this line's "from → to".
@@ -783,10 +813,13 @@ impl Estimator {
         if now.saturating_duration_since(sent) <= timeout {
             return None;
         }
-        // The silence is an outage: the packets sent since the last feedback are its losses
-        // (#1557). Kept until the first report after it reads and clears the mark.
+        // The silence is an outage (#1557).
         if let Some(seq) = log.unanswered_seq {
-            self.outage_from.get_or_insert(seq);
+            self.outage.get_or_insert(Outage {
+                from: self.reported_to.unwrap_or(seq),
+                by: log.next_seq,
+                lost: false,
+            });
         }
         let from = self.last_decay.unwrap_or(sent + timeout);
         let steps = now.saturating_duration_since(from).as_secs_f64() / SILENCE_STEP.as_secs_f64();
@@ -885,13 +918,12 @@ impl Estimator {
     /// in `pkt_seq` (send) order, and read the windowed receive rate and loss.
     pub(crate) fn measure(&mut self, fb: &Feedback, log: &mut SendLog, now: Instant) -> Measured {
         let (mut received, mut lost) = (0i64, 0i64);
-        // A loss sent during the detected outage belongs to the outage, not congestion: the
-        // first report after it must not cut the loss bound (#1557). The exemption ends at
-        // the first packet this report shows as received after the mark: from then the link
-        // answered, so a loss sent after it is congestion. In `pkt_seq` (send) order.
-        let outage = self.outage_from;
-        let mut answered_from: Option<u32> = None;
+        // At or after `from`, in u32 serial arithmetic.
         let after = |seq: u32, from: u32| seq.wrapping_sub(from) < 1 << 31;
+        let end = fb.first_pkt_seq.wrapping_add(fb.arrivals.len() as u32);
+        if self.reported_to.is_none_or(|to| after(end, to)) {
+            self.reported_to = Some(end);
+        }
         let mut newest_fresh = None;
         for (i, &arrival) in fb.arrivals.iter().enumerate() {
             let seq = fb.first_pkt_seq.wrapping_add(i as u32);
@@ -910,10 +942,9 @@ impl Estimator {
                     received += 1;
                 }
                 (Status::Unreported, None) => {
-                    let exempt = outage.is_some_and(|from| {
-                        after(seq, from) && answered_from.is_none_or(|at| !after(seq, at))
-                    });
-                    if exempt {
+                    let outage = self.outage.as_mut().filter(|o| after(seq, o.from));
+                    if let Some(o) = outage {
+                        o.lost = true;
                         slot.status = Status::Outage;
                     } else {
                         slot.status = Status::Lost;
@@ -930,10 +961,12 @@ impl Estimator {
                 (Status::Unreported, Some(at)) => {
                     slot.status = Status::Received;
                     received += 1;
-                    // The first packet this report shows received after the mark: the
-                    // outage's exemption ends at it (#1557).
-                    if outage.is_some_and(|from| after(seq, from)) {
-                        answered_from.get_or_insert(seq);
+                    // The link answered: a loss sent after this is congestion (#1557).
+                    if self
+                        .outage
+                        .is_some_and(|o| after(seq, o.from) && (o.lost || after(seq, o.by)))
+                    {
+                        self.outage = None;
                     }
                     if let Some((send_d, arrival_d, arrival_ms)) =
                         self.inter_arrival.push(slot.sent_us, at)
@@ -967,6 +1000,7 @@ impl Estimator {
                 .then(|| (bytes - u64::from(first.1)) as f64 * 8.0 * 1000.0 / span as f64)
         };
         let rate_kbps = rate(|a| a.0, MIN_RATE_SPAN_US);
+        let delivery = rate_kbps.zip(rate(|a| a.2, 1)).map(|(r, s)| r / s);
         // Over every datagram sent in the span, lost ones too: a busy sender under loss is
         // still busy. Datagrams all sent in one instant give no send rate.
         let first_sent = self.arrivals.iter().map(|a| a.2).min();
@@ -1003,13 +1037,12 @@ impl Estimator {
             .fold((0i64, 0i64), |(r, l), &(_, a, b)| (r + a, l + b));
         let (r, l) = (r.max(0), l.max(0));
         let loss = (r + l >= LOSS_MIN_SAMPLES).then(|| l as f64 / (r + l) as f64);
-        // The mark is spent: only the first report after the outage is exempt (#1557).
-        self.outage_from = None;
 
         Measured {
             usage: self.trendline.usage,
             rate_kbps,
             sent_kbps,
+            delivery,
             fresh,
             loss,
         }
@@ -1609,6 +1642,8 @@ pub(crate) struct VideoQueue {
     /// The pacer: bytes video may still send now, and when they were counted.
     tokens: f64,
     counted: Option<Instant>,
+    /// When the frame last handed to QUIC was queued: the rest of it is not held by the room.
+    going: Option<Instant>,
     /// Video and resent datagrams over the path's datagram size, skipped.
     pub(crate) too_large: u64,
     pub(crate) resends_too_large: u64,
@@ -1693,6 +1728,7 @@ impl VideoQueue {
         self.bytes = 0;
         self.pace = None;
         self.counted = None;
+        self.going = None;
     }
 
     /// The `pkt_seq` new video is numbered from, a guess `feed` corrects: after everything
@@ -1730,18 +1766,23 @@ impl VideoQueue {
         self.held.insert(at, held);
     }
 
-    /// Hands `send` the oldest datagrams that fit in `room` bytes, each carrying the next
-    /// wire `pkt_seq`, and logs each sent one at the time it was queued. False when the
+    /// Hands `send` the oldest datagrams that fit, each carrying the next wire `pkt_seq`, and
+    /// logs each sent one at the time it was queued. A datagram fits in `room` bytes, or in
+    /// `frame` bytes if it is the rest of the frame last handed over: on a clean path a frame
+    /// over the room went out across drain ticks, and a 1080p60 racer stream presented
+    /// unevenly (#1496 bench), so only the pacer and `frame` split one. False when the
     /// connection is gone.
     pub(crate) fn feed(
         &mut self,
         mut room: usize,
+        mut frame: usize,
         mut log: Option<&mut SendLog>,
         mut send: impl FnMut(Held) -> Handed,
     ) -> bool {
         while let Some(next) = self.held.front() {
             let len = next.datagram.len();
-            if len > room {
+            let going = !next.resend && self.going == Some(next.queued_at);
+            if len > if going { frame } else { room } {
                 break;
             }
             let mut held = self.held.pop_front().expect("front exists");
@@ -1761,7 +1802,8 @@ impl VideoQueue {
             // is the pacer's, not the path's, and read as delay it cut the estimate at each
             // keyframe on a link faster than the pace. Unpaced, its queue time is logged, as
             // it was in QUIC's queue before #1321. `SendLog::record` keeps the mix monotone.
-            let (resend, queued_at) = (held.resend, self.counted.unwrap_or(held.queued_at));
+            let frame_at = held.queued_at;
+            let (resend, queued_at) = (held.resend, self.counted.unwrap_or(frame_at));
             let logged = log.as_deref_mut().filter(|_| held.logged);
             let record = logged.map(|log| (log, held.datagram.clone()));
             match send(held) {
@@ -1769,9 +1811,13 @@ impl VideoQueue {
                     if let Some((log, d)) = record {
                         log.record(&d, queued_at, resend);
                     }
-                    room -= len;
+                    room = room.saturating_sub(len);
+                    frame = frame.saturating_sub(len);
                     self.tokens -= len as f64;
                     self.wire = self.wire.wrapping_add(1);
+                    if !resend {
+                        self.going = Some(frame_at);
+                    }
                 }
                 Handed::Skipped => {}
                 Handed::TooLarge if resend => self.resends_too_large += 1,

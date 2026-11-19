@@ -1259,14 +1259,19 @@ fn feed(
         congestion::video_rates(&c.governor, &c.estimator, pyrowave)
     });
     let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
-    let room = video.room(governed, DATAGRAM_BUFFER).saturating_sub(queued);
-    let room = room.min(video.pace(paced, std::time::Instant::now()));
+    let pace = video.pace(paced, std::time::Instant::now());
+    let room = video
+        .room(governed, DATAGRAM_BUFFER)
+        .saturating_sub(queued)
+        .min(pace);
+    // Half the queue, as the room's own bound: audio always fits beside it.
+    let frame = (DATAGRAM_BUFFER / 2).saturating_sub(queued).min(pace);
     let log = match pyro {
         Some(rate) if pyrowave => Some(&mut rate.log),
         _ => control.filter(|_| !pyrowave).map(|c| &mut c.log),
     };
     let too_large = video.too_large;
-    let alive = video.feed(room, log, |held| {
+    let alive = video.feed(room, frame, log, |held| {
         if held.resend && !sent.allows(&held.datagram) {
             return congestion::Handed::Skipped;
         }
