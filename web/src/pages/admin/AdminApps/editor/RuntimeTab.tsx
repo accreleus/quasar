@@ -75,6 +75,13 @@ export function RuntimeTab({
                 <span className="muted">None</span>
               )}
             </Fact>
+            <Fact label="Managed home">
+              {app.effective_managed_home ? (
+                <span className="mono">{app.effective_home_container_path || "mounted"}</span>
+              ) : (
+                <span className="muted">None</span>
+              )}
+            </Fact>
             <Fact label="Own runtime spec">
               <span className="mono">{JSON.stringify(app.runtime_spec ?? {})}</span>
             </Fact>
