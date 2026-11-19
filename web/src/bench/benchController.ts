@@ -297,13 +297,14 @@ export class BenchController {
    * next window.
    */
   private async settleReadbacks(): Promise<void> {
-    const deadline = this.deps.nowEpochMs() + READBACK_SETTLE_MS;
+    // One timer for the whole wait, so the bound and the wait share one clock (#1575).
+    let timedOut = false;
+    const deadline = this.settleDelay(READBACK_SETTLE_MS).then(() => { timedOut = true; });
     let tail = this.readTail;
     for (;;) {
-      await Promise.race([tail, this.settleDelay(deadline - this.deps.nowEpochMs())]);
-      if (this.readTail === tail) return;
+      await Promise.race([tail, deadline]);
+      if (timedOut || this.readTail === tail) return;
       tail = this.readTail;
-      if (this.deps.nowEpochMs() >= deadline) return;
     }
   }
 

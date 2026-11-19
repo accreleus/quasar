@@ -671,6 +671,29 @@ describe("BenchController — settle deadline (#1575)", () => {
     ctl.stop();
   });
 
+  it("stops at READBACK_SETTLE_MS with a frozen nowEpochMs while frames keep arriving", async () => {
+    const ctl = new BenchController({ sendInput: () => {}, emitWindow: () => {}, getClockOffsetMs: () => 0, nowEpochMs: () => BASE.host_time_ms });
+    const s = { image: scene(1) };
+    const gpu = orderedReadbackDevice();
+    const texture = { width: W, height: H } as GPUTexture;
+    ctl.start();
+
+    ctl.onTexture(gpu.device, texture);
+    const start = Date.now();
+    let settled = -1;
+    ctl.tickForTest().then(() => { settled = Date.now() - start; });
+    // A new frame every 50 ms, each settling the one before: readTail never stops changing.
+    for (let i = 2; i <= 16 && settled < 0; i++) {
+      await vi.advanceTimersByTimeAsync(50);
+      s.image = scene(i);
+      ctl.onTexture(gpu.device, texture);
+      gpu.releaseOne();
+    }
+    expect(settled).toBeGreaterThanOrEqual(0);
+    expect(settled).toBeLessThan(READBACK_SETTLE_MS + 60);
+    ctl.stop();
+  });
+
   /**
    * The loop waits while a new frame keeps swapping `readTail`. A frame submitted during the wait
    * must be waited for and measured before the window closes, so it lands in the current window,
