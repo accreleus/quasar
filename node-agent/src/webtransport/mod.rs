@@ -1262,18 +1262,17 @@ fn feed(
     media: &Media,
     handed: &mut u64,
 ) -> bool {
-    let (governed, paced) = control.as_ref().map_or((None, None), |c| {
+    let rates = control.as_ref().map_or((None, None), |c| {
         congestion::video_rates(&c.governor, &c.estimator, pyrowave)
     });
     let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
-    let room = video.room(governed, DATAGRAM_BUFFER).saturating_sub(queued);
-    let room = room.min(video.pace(paced, std::time::Instant::now()));
+    let (room, frame) = video.budget(rates, queued, DATAGRAM_BUFFER, std::time::Instant::now());
     let log = match pyro {
         Some(rate) if pyrowave => Some(&mut rate.log),
         _ => control.filter(|_| !pyrowave).map(|c| &mut c.log),
     };
     let too_large = video.too_large;
-    let alive = video.feed(room, log, |held| {
+    let alive = video.feed(room, frame, log, |held| {
         if held.resend && !sent.allows(&held.datagram) {
             return congestion::Handed::Skipped;
         }

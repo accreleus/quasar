@@ -25,7 +25,7 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Fixed
-- **WebTransport sound no longer drops out on a slow link (#1433, #1321).** On a link the stream filled, audio waited in the link's queue behind video the host sent faster than the link carried (each keyframe, once a second), and played about one gap a second. The host now sends audio ahead of any video it holds, and, once the link's rate is known, sends video at no more than 1.25 × that rate, so video waits at the host instead of in the link.
+- **WebTransport sound no longer drops out on a slow link (#1433, #1321).** On a link the stream filled, audio waited in the link's queue behind video the host sent faster than the link carried (each keyframe, once a second), and played about one gap a second. The host now sends audio ahead of any video it holds, and, once its estimate of the link is under the ceiling, sends video at no more than 1.25 × the rate it holds the encoder to, so a keyframe waits at the host instead of in the link. A frame that finds the host's queue empty still goes to the network whole, and the losses of an outage are read from what the client's reports covered, so the first report after one no longer cuts the rate.
 
 ## 0.6.2 — 2026-11-20
 
