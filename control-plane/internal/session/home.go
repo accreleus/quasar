@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"path"
 	"strings"
 
@@ -262,6 +263,8 @@ func (s *Store) sharedHomeChoice(ctx context.Context, app LaunchApp, userID stri
 		return "", "", err
 	}
 	if shared == "" {
+		slog.InfoContext(ctx, "Steam library not shared", "reason", "no_unique_steam_provider",
+			"app_id", app.ID, "user_id", userID)
 		return "", noticeSharedUnavailable, nil
 	}
 	return shared, "", nil
