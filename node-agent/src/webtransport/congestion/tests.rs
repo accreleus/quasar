@@ -49,6 +49,34 @@ struct Sim {
     pending: VecDeque<(u32, Option<u64>)>,
     /// (seconds, estimate) after each message.
     trace: Vec<(f64, f64)>,
+    /// Video goes through the agent's queue and QUIC's governed window, not straight out.
+    quic: Option<Quic>,
+    /// The most video the queue held, bytes, and when, seconds.
+    held_max: (usize, f64),
+    /// Every `n`th frame is a keyframe of five frames' bytes (0: none).
+    keyframe_every: u32,
+    frames: u32,
+    /// (seconds, µs a datagram entering the bottleneck now would wait), each queued-mode tick.
+    waits: Vec<(f64, u64)>,
+    /// As production's `Control`: feedback governs at the estimate, never under the ABR floor
+    /// (which the encoder never goes under either); silence releases it.
+    governor: Governor,
+    floor_kbps: f64,
+    /// (seconds, µs the oldest held video had waited), each queued-mode tick.
+    held_waits: Vec<(f64, u64)>,
+}
+
+/// The agent's [`VideoQueue`] and QUIC behind it: a datagram leaves QUIC's queue once the
+/// governed window (`Window`: 2 × estimate × max(sRTT, 100 ms)) has room for it.
+#[derive(Default)]
+struct Quic {
+    video: VideoQueue,
+    queue: VecDeque<bytes::Bytes>,
+    queued: usize,
+    /// (sent µs, acknowledged or declared lost µs, bytes, arrived).
+    flight: VecDeque<(u64, u64, usize, bool)>,
+    in_flight: usize,
+    srtt_us: f64,
 }
 
 impl Sim {
@@ -79,6 +107,14 @@ impl Sim {
             queue_drops: 0,
             pending: VecDeque::new(),
             trace: Vec::new(),
+            quic: None,
+            held_max: (0, 0.0),
+            keyframe_every: 0,
+            frames: 0,
+            waits: Vec::new(),
+            governor: Governor::default(),
+            floor_kbps: 0.0,
+            held_waits: Vec::new(),
         }
     }
 
@@ -86,8 +122,13 @@ impl Sim {
         let end = self.t + (secs * 1e6) as u64;
         let mut next_frame = self.t;
         let mut next_feedback = self.t + 50_000;
+        let mut next_tick = self.t + 1000;
         while self.t < end {
-            if next_frame <= next_feedback {
+            if self.quic.is_some() && next_tick < next_frame.min(next_feedback) {
+                self.t = next_tick;
+                self.drain();
+                next_tick += 1000;
+            } else if next_frame <= next_feedback {
                 self.t = next_frame;
                 self.frame();
                 next_frame += 16_667;
@@ -109,7 +150,9 @@ impl Sim {
             self.t = from + step * 100_000;
             self.frame();
             let at = self.start + Duration::from_micros(self.t);
-            self.est.on_tick(at, &self.log, RTT);
+            if self.est.on_tick(at, &self.log, RTT).is_some() {
+                self.governor.release();
+            }
         }
         // The packets sent during the outage stay pending as lost, as a real client's first
         // report after it names them NOT_RECEIVED (#1557). Earlier packets keep their arrival.
@@ -123,30 +166,122 @@ impl Sim {
     fn frame(&mut self) {
         let kbps = self
             .send_kbps
-            .unwrap_or(self.est.estimate_kbps())
+            .unwrap_or(self.est.estimate_kbps().max(self.floor_kbps))
             .min((self.content_kbps)(self.t));
-        let bytes = kbps * 1000.0 / 8.0 / 60.0;
+        let key = self.keyframe_every > 0 && self.frames.is_multiple_of(self.keyframe_every);
+        self.frames += 1;
+        let bytes = kbps * 1000.0 / 8.0 / 60.0 * if key { 5.0 } else { 1.0 };
         let n = (bytes / SIZE as f64).ceil().max(1.0) as u32;
-        let service = (SIZE as f64 * 8.0 * 1000.0 / self.cap_kbps) as u64;
+        if let Some(quic) = self.quic.as_mut() {
+            let queued_at = self.start + Duration::from_micros(self.t);
+            for _ in 0..n {
+                let datagram = video_datagram(quic.video.next_seq());
+                let held = Held {
+                    datagram,
+                    logged: true,
+                    resend: false,
+                    queued_at,
+                };
+                quic.video.push(held, BUFFER);
+            }
+            self.drain();
+            return;
+        }
         for _ in 0..n {
             let mut d = vec![0u8; SIZE];
             d[1..5].copy_from_slice(&self.seq.to_le_bytes());
             self.log
                 .record(&d, self.start + Duration::from_micros(self.t), false);
-            let backlog = self.free_at.saturating_sub(self.t) as f64 / service as f64 * SIZE as f64;
-            let dropped = self.drop_every > 0 && self.seq.is_multiple_of(self.drop_every);
-            let full = backlog + SIZE as f64 > self.queue_bytes;
-            self.queue_drops += u32::from(full);
-            let arrival = (!dropped && !full).then(|| {
-                self.free_at = self.free_at.max(self.t) + service;
-                // One path, first in first out: a delay spike holds back what follows it.
-                self.last_arrival = self
-                    .last_arrival
-                    .max(self.free_at + 10_000 + (self.extra_us)(self.t));
-                self.last_arrival + (self.reorder_us)(self.seq)
-            });
-            self.pending.push_back((self.seq, arrival));
+            self.transmit(self.seq);
             self.seq = self.seq.wrapping_add(1);
+        }
+    }
+
+    /// One datagram onto the path now; its arrival on the agent's clock, or `None` dropped.
+    fn transmit(&mut self, seq: u32) -> Option<u64> {
+        let service = (SIZE as f64 * 8.0 * 1000.0 / self.cap_kbps) as u64;
+        let backlog = self.free_at.saturating_sub(self.t) as f64 / service as f64 * SIZE as f64;
+        let dropped = self.drop_every > 0 && seq.is_multiple_of(self.drop_every);
+        let full = backlog + SIZE as f64 > self.queue_bytes;
+        self.queue_drops += u32::from(full);
+        let arrival = (!dropped && !full).then(|| {
+            self.free_at = self.free_at.max(self.t) + service;
+            // One path, first in first out: a delay spike holds back what follows it.
+            self.last_arrival = self
+                .last_arrival
+                .max(self.free_at + 10_000 + (self.extra_us)(self.t));
+            self.last_arrival + (self.reorder_us)(seq)
+        });
+        self.pending.push_back((seq, arrival));
+        arrival
+    }
+
+    /// QUIC sends what its window allows, the queue hands it what fits in the room the
+    /// production `feed` gives it, and QUIC sends again.
+    fn drain(&mut self) {
+        let mut quic = self.quic.take().expect("queued mode");
+        let est = if self.governor.governs() {
+            self.governor.kbps() as f64
+        } else {
+            self.est.estimate_kbps()
+        };
+        self.send_window(&mut quic, est);
+        // The production `feed`'s rates.
+        let rates = video_rates(&self.governor, &self.est, false);
+        let at = self.start + Duration::from_micros(self.t);
+        let (room, frame) = quic.video.budget(rates, quic.queued, BUFFER, at);
+        let (queue, queued) = (&mut quic.queue, &mut quic.queued);
+        quic.video.feed(room, frame, Some(&mut self.log), |held| {
+            *queued += held.datagram.len();
+            queue.push_back(held.datagram);
+            Handed::Sent
+        });
+        if quic.video.bytes() > self.held_max.0 {
+            self.held_max = (quic.video.bytes(), self.t as f64 / 1e6);
+        }
+        self.send_window(&mut quic, est);
+        self.waits
+            .push((self.t as f64 / 1e6, self.free_at.saturating_sub(self.t)));
+        let oldest = quic
+            .video
+            .oldest()
+            .map_or(0, |q| at.saturating_duration_since(q).as_micros() as u64);
+        self.held_waits.push((self.t as f64 / 1e6, oldest));
+        self.quic = Some(quic);
+    }
+
+    fn send_window(&mut self, quic: &mut Quic, est_kbps: f64) {
+        let now = self.t;
+        while let Some(&(sent, done, _, arrived)) = quic.flight.front() {
+            if done > now {
+                break;
+            }
+            if arrived {
+                let rtt = (done - sent) as f64;
+                quic.srtt_us = if quic.srtt_us == 0.0 {
+                    rtt
+                } else {
+                    0.875 * quic.srtt_us + 0.125 * rtt
+                };
+            }
+            quic.in_flight -= quic.flight.pop_front().unwrap().2;
+        }
+        let srtt = quic.srtt_us.max(100_000.0) / 1e6;
+        let window = (2.0 * est_kbps * 1000.0 / 8.0 * srtt) as usize;
+        while let Some(d) = quic.queue.front() {
+            if quic.in_flight + d.len() > window {
+                break;
+            }
+            let d = quic.queue.pop_front().unwrap();
+            quic.queued -= d.len();
+            quic.in_flight += d.len();
+            let arrival = self.transmit(wire_seq(&d));
+            // The ACK returns over the same 10 ms; a loss is declared about 200 ms on.
+            // Kept in completion order: arrivals are first in first out already.
+            let last = quic.flight.back().map_or(0, |f| f.1);
+            let done = arrival.map_or(now + 200_000, |a| a + 10_000).max(last);
+            quic.flight
+                .push_back((now, done, d.len(), arrival.is_some()));
         }
     }
 
@@ -199,7 +334,9 @@ impl Sim {
             arrivals,
         };
         let at = self.start + Duration::from_micros(now);
-        self.est.on_feedback(&fb, &mut self.log, at, NO_QUIC);
+        if let Some(kbps) = self.est.on_feedback(&fb, &mut self.log, at, NO_QUIC) {
+            self.governor.govern(kbps.max(self.floor_kbps));
+        }
         self.trace
             .push((now as f64 / 1e6, self.est.estimate_kbps()));
     }
@@ -453,6 +590,268 @@ fn the_first_report_after_an_outage_counts_no_outage_loss() {
     );
 }
 
+/// #1496 r3: video held in the agent reaches QUIC after the last report still stamped with
+/// the time it was queued, before that report. Marked by time, the outage began before the
+/// last datagrams the client got ahead of it, the first report after it ended the exemption
+/// on one of those, and the outage's own losses cut the estimate to 2.9 Mbit/s (CI, 7bb8e1b1):
+/// the recovery keyframe was then paced under the ABR floor.
+#[test]
+fn video_held_into_an_outage_is_the_outages_loss_not_congestion() {
+    let start = Instant::now();
+    let ms = |ms: u64| start + Duration::from_millis(ms);
+    let mut log = SendLog::new(start);
+    let mut est = Estimator::new(CEILING, start);
+    let send = |log: &mut SendLog, seq: u32, at: Instant| {
+        let mut d = vec![0u8; SIZE];
+        d[1..5].copy_from_slice(&seq.to_le_bytes());
+        log.record(&d, at, false);
+    };
+    let sent = |seq: u32| {
+        if seq < 100 {
+            u64::from(seq) * 10
+        } else {
+            2500 + u64::from(seq - 300) * 5
+        }
+    };
+    let report = |first: u32, last: u32, got: &dyn Fn(u32) -> bool| Feedback {
+        first_pkt_seq: first,
+        ref_us: 0,
+        arrivals: (first..=last)
+            .map(|seq| match got(seq) {
+                true => ((sent(seq) + 5) * 1000 / UNIT_US) as u16,
+                false => NOT_RECEIVED,
+            })
+            .collect(),
+    };
+    for seq in 0..100 {
+        send(&mut log, seq, ms(sent(seq)));
+    }
+    // The last report before the outage: seq 90..100 were still on their way.
+    est.on_feedback(&report(0, 89, &|_| true), &mut log, ms(1000), NO_QUIC);
+    // Queued at 990 ms, handed to QUIC after that report, lost with the path.
+    for seq in 100..300 {
+        send(&mut log, seq, ms(990));
+    }
+    for t in (1100..=2500).step_by(100) {
+        est.on_tick(ms(t), &log, RTT);
+    }
+    assert!(
+        est.recover_to.is_some(),
+        "the silence was not read as an outage"
+    );
+    for seq in 300..340 {
+        send(&mut log, seq, ms(sent(seq)));
+    }
+    let first_after = report(90, 339, &|seq| !(100..300).contains(&seq));
+    est.on_feedback(&first_after, &mut log, ms(2800), NO_QUIC);
+    let loss = est.loss();
+    assert!(
+        loss.is_none_or(|l| l < LOSS_LOW),
+        "the outage's own losses measured {loss:?}"
+    );
+    assert!(
+        est.recover_to.is_some(),
+        "the outage's own losses ended the regrow"
+    );
+}
+
+/// One datagram `i` after `base` in the send log, sent at `sent_ms`.
+fn send_nth(log: &mut SendLog, start: Instant, base: u32, i: u32, sent_ms: u64) {
+    let mut d = vec![0u8; SIZE];
+    d[1..5].copy_from_slice(&base.wrapping_add(i).to_le_bytes());
+    log.record(&d, start + Duration::from_millis(sent_ms), false);
+}
+
+/// A report of datagrams `first..=last` after `base`: each arrived 1 ms after `sent_ms`, or not
+/// at all.
+fn report_nth(
+    base: u32,
+    first: u32,
+    last: u32,
+    sent_ms: impl Fn(u32) -> u64,
+    got: impl Fn(u32) -> bool,
+) -> Feedback {
+    Feedback {
+        first_pkt_seq: base.wrapping_add(first),
+        ref_us: 0,
+        arrivals: (first..=last)
+            .map(|i| match got(i) {
+                true => ((sent_ms(i) + 1) * 1000 / UNIT_US) as u16,
+                false => NOT_RECEIVED,
+            })
+            .collect(),
+    }
+}
+
+/// #1496 lab round: the outage dropped only host → client UDP, so the client's report of what
+/// arrived before the cut reached the agent after the cut, and what the agent sent in between
+/// (19 and 48 ms of video on the NVIDIA lab host) sat below a mark taken at the send after
+/// that report: the first report after the path returned read it as 31 % and 100 % loss
+/// (`cut="silence+loss"`) and ended the regrow. Across the `pkt_seq` wrap too.
+#[test]
+fn video_sent_between_the_cut_and_the_last_report_is_the_outages_loss() {
+    for base in [0, u32::MAX - 150] {
+        let start = Instant::now();
+        let ms = |ms: u64| start + Duration::from_millis(ms);
+        let mut log = SendLog::new(start);
+        let mut est = Estimator::new(CEILING, start);
+        // One a millisecond; the path drops from 100 ms until 1000 ms, when 400.. go.
+        let sent = |i: u32| {
+            if i < 400 {
+                u64::from(i)
+            } else {
+                u64::from(i) + 600
+            }
+        };
+        let got = |i: u32| !(100..400).contains(&i);
+        for i in 0..140 {
+            send_nth(&mut log, start, base, i, sent(i));
+        }
+        // What arrived before the cut, reported after it.
+        est.on_feedback(
+            &report_nth(base, 0, 99, sent, got),
+            &mut log,
+            ms(140),
+            NO_QUIC,
+        );
+        for i in 140..400 {
+            send_nth(&mut log, start, base, i, sent(i));
+        }
+        for t in (600..=900).step_by(100) {
+            est.on_tick(ms(t), &log, RTT);
+        }
+        assert!(
+            est.recover_to.is_some(),
+            "the silence was not read as an outage"
+        );
+        for i in 400..440 {
+            send_nth(&mut log, start, base, i, sent(i));
+        }
+        est.on_feedback(
+            &report_nth(base, 100, 439, sent, got),
+            &mut log,
+            ms(1100),
+            NO_QUIC,
+        );
+        let loss = est.loss();
+        assert!(
+            loss.is_none_or(|l| l < LOSS_LOW),
+            "base {base}: the outage's own losses measured {loss:?}"
+        );
+        assert_ne!(
+            est.bound,
+            Bound::Loss,
+            "base {base}: they cut the loss bound"
+        );
+        assert!(
+            est.outage.is_none(),
+            "base {base}: the link answered, the mark is spent"
+        );
+    }
+}
+
+/// With both directions down, the client's report of what arrived before the cut comes after
+/// the path returns (QUIC resends it), ahead of the report of what came after: it must not
+/// spend the mark, or the next report reads the outage's losses as congestion.
+#[test]
+fn a_late_report_of_what_arrived_before_the_cut_does_not_spend_the_outage_mark() {
+    let start = Instant::now();
+    let ms = |ms: u64| start + Duration::from_millis(ms);
+    let mut log = SendLog::new(start);
+    let mut est = Estimator::new(CEILING, start);
+    let sent = |i: u32| {
+        if i < 300 {
+            u64::from(i)
+        } else {
+            u64::from(i) + 700
+        }
+    };
+    let got = |i: u32| !(100..300).contains(&i);
+    for i in 0..60 {
+        send_nth(&mut log, start, 0, i, sent(i));
+    }
+    est.on_feedback(&report_nth(0, 0, 49, sent, got), &mut log, ms(60), NO_QUIC);
+    for i in 60..300 {
+        send_nth(&mut log, start, 0, i, sent(i));
+    }
+    for t in (600..=900).step_by(100) {
+        est.on_tick(ms(t), &log, RTT);
+    }
+    for i in 300..340 {
+        send_nth(&mut log, start, 0, i, sent(i));
+    }
+    est.on_feedback(
+        &report_nth(0, 50, 99, sent, got),
+        &mut log,
+        ms(1100),
+        NO_QUIC,
+    );
+    est.on_feedback(
+        &report_nth(0, 100, 339, sent, got),
+        &mut log,
+        ms(1150),
+        NO_QUIC,
+    );
+    let loss = est.loss();
+    assert!(
+        loss.is_none_or(|l| l < LOSS_LOW),
+        "the outage's own losses measured {loss:?}"
+    );
+    assert_ne!(est.bound, Bound::Loss, "they cut the loss bound");
+}
+
+/// #1496 review: a hole in the late report of what arrived before the cut (a datagram
+/// reordered behind it, on a Wi-Fi peer) is no sign the link answered. Ending the mark at the
+/// next datagram after it read the outage's own losses as congestion in the next report.
+#[test]
+fn a_reordered_hole_in_the_late_report_does_not_spend_the_outage_mark() {
+    let start = Instant::now();
+    let ms = |ms: u64| start + Duration::from_millis(ms);
+    let mut log = SendLog::new(start);
+    let mut est = Estimator::new(CEILING, start);
+    let sent = |i: u32| {
+        if i < 300 {
+            u64::from(i)
+        } else {
+            u64::from(i) + 700
+        }
+    };
+    let got = |i: u32| !(100..300).contains(&i) && i != 70;
+    for i in 0..60 {
+        send_nth(&mut log, start, 0, i, sent(i));
+    }
+    est.on_feedback(&report_nth(0, 0, 49, sent, got), &mut log, ms(60), NO_QUIC);
+    for i in 60..300 {
+        send_nth(&mut log, start, 0, i, sent(i));
+    }
+    for t in (600..=900).step_by(100) {
+        est.on_tick(ms(t), &log, RTT);
+    }
+    for i in 300..340 {
+        send_nth(&mut log, start, 0, i, sent(i));
+    }
+    est.on_feedback(
+        &report_nth(0, 50, 99, sent, got),
+        &mut log,
+        ms(1100),
+        NO_QUIC,
+    );
+    assert!(est.outage.is_some(), "a reordered hole spent the mark");
+    est.on_feedback(
+        &report_nth(0, 100, 339, sent, got),
+        &mut log,
+        ms(1150),
+        NO_QUIC,
+    );
+    let loss = est.loss();
+    assert!(
+        loss.is_none_or(|l| l < LOSS_LOW),
+        "the outage's own losses measured {loss:?}"
+    );
+    assert_ne!(est.bound, Bound::Loss, "they cut the loss bound");
+    assert!(est.outage.is_none(), "the link answered, the mark is spent");
+}
+
 /// #1557 review A2: the exemption ends at the send time of the first packet the report
 /// shows received after the outage's mark. A burst sent after the link came back is
 /// congestion, even when it falls in the feedback interval before the first report: it
@@ -497,7 +896,7 @@ fn a_late_exempted_outage_loss_does_not_undo_a_counted_loss() {
         let at = start + Duration::from_micros(sent_us(seq));
         log.record(&d, at, false);
     }
-    est.outage_from_us = Some(10_000);
+    est.outage = Some(Outage { from: 1, by: 41 });
     let first: Vec<u16> = (0..41u32)
         .map(|seq| {
             if seq <= 20 {
@@ -2260,4 +2659,605 @@ fn pyrowave_a_picture_under_its_budget_on_a_link_under_the_floor_steps_down() {
             "feedback {feedback}: {verdicts:?}"
         );
     }
+}
+
+/// A video-lane datagram as `packetize` numbers it: channel, then `pkt_seq` (§Channels).
+fn video_datagram(pkt_seq: u32) -> bytes::Bytes {
+    let mut d = vec![0x01];
+    d.extend_from_slice(&pkt_seq.to_le_bytes());
+    d.resize(SIZE, 0);
+    d.into()
+}
+
+fn held(pkt_seq: u32) -> Held {
+    Held {
+        datagram: video_datagram(pkt_seq),
+        logged: true,
+        resend: false,
+        queued_at: Instant::now(),
+    }
+}
+
+fn wire_seq(d: &[u8]) -> u32 {
+    u32::from_le_bytes(d[1..5].try_into().unwrap())
+}
+
+/// QUIC taking a datagram: its wire `pkt_seq` is noted.
+fn quic(wire: &mut Vec<u32>, held: Held) -> Handed {
+    wire.push(wire_seq(&held.datagram));
+    Handed::Sent
+}
+
+const BUFFER: usize = 1 << 20;
+
+#[test]
+fn audio_leaves_ahead_of_video_over_the_send_budget_and_video_waits() {
+    let mut video = VideoQueue::default();
+    // 1 Mbit/s: 40 ms of it is 5000 bytes, four video datagrams.
+    let room = video.room(Some(1000), BUFFER);
+    assert_eq!(room, 5000);
+    let mut wire = Vec::new();
+    // A keyframe of 40 datagrams lands on a path that has not drained.
+    let first = video.next_seq();
+    for i in 0..40 {
+        video.push(held(first + i), BUFFER);
+    }
+    assert!(video.feed(room, 0, None, |h| quic(&mut wire, h)));
+    // QUIC drains nothing while three audio datagrams arrive.
+    let mut audio = Vec::new();
+    for _ in 0..3 {
+        audio.push(video.take_seq());
+        assert!(video.feed(0, 0, None, |h| quic(&mut wire, h)));
+    }
+    assert_eq!(
+        wire,
+        [0, 1, 2, 3],
+        "only the budget's worth of video is with QUIC"
+    );
+    assert_eq!(audio, [4, 5, 6], "audio goes next, ahead of the 36 held");
+    assert_eq!(video.bytes(), 36 * SIZE);
+
+    // The path drains: the rest follows, numbered after the audio, with no gap.
+    assert!(video.feed(usize::MAX, 0, None, |h| quic(&mut wire, h)));
+    assert_eq!(wire[4..], (7..43).collect::<Vec<_>>());
+    assert!(video.is_empty());
+}
+
+/// The clean-link racer regression (#1433): a frame over the room went out across 1 ms drain
+/// ticks. A frame that finds the agent's queue empty goes whole; the room gates its start.
+#[test]
+fn a_frame_arriving_to_an_empty_queue_goes_to_quic_whole() {
+    let mut video = VideoQueue::default();
+    let now = Instant::now();
+    let first = video.next_seq();
+    for i in 0..40 {
+        video.push(
+            Held {
+                queued_at: now,
+                ..held(first + i)
+            },
+            BUFFER,
+        );
+    }
+    // 1 Mbit/s, unpaced: the room is four datagrams, the frame forty.
+    let (room, frame) = video.budget((Some(1000), None), 0, BUFFER, now);
+    assert_eq!(room, 5000);
+    let mut wire = Vec::new();
+    assert!(video.feed(room, frame, None, |h| quic(&mut wire, h)));
+    assert_eq!(wire.len(), 40, "the frame was split by the room");
+    assert!(video.is_empty());
+}
+
+#[test]
+fn a_frame_behind_held_video_is_still_split_by_the_room() {
+    let mut video = VideoQueue::default();
+    let t0 = Instant::now();
+    let t1 = t0 + Duration::from_millis(16);
+    let first = video.next_seq();
+    for i in 0..10 {
+        video.push(
+            Held {
+                queued_at: t0,
+                ..held(first + i)
+            },
+            BUFFER,
+        );
+    }
+    // QUIC's queue is full: nothing goes, and a second frame arrives behind the first (a stall).
+    let mut wire = Vec::new();
+    let (room, frame) = video.budget((Some(1000), None), 5000, BUFFER, t0);
+    assert!(video.feed(room, frame, None, |h| quic(&mut wire, h)));
+    assert!(wire.is_empty());
+    for i in 0..40 {
+        video.push(
+            Held {
+                queued_at: t1,
+                ..held(first + 10 + i)
+            },
+            BUFFER,
+        );
+    }
+    let (room, frame) = video.budget((Some(1000), None), 0, BUFFER, t1);
+    assert!(video.feed(room, frame, None, |h| quic(&mut wire, h)));
+    assert_eq!(wire.len(), 4, "video already held goes by the room");
+    assert_eq!(video.bytes(), 46 * SIZE);
+}
+
+/// #1591: held video is queued before a report it is sent after, and a stamp is never
+/// earlier than the last (`last_us`): the silence clock runs from the stamp.
+#[test]
+fn the_silence_clock_starts_at_the_stamp_not_the_queue_time() {
+    let start = Instant::now();
+    let ms = |n: u64| start + Duration::from_millis(n);
+    let mut log = SendLog::new(start);
+    log.record(&video_datagram(0), ms(1000), false);
+    log.unanswered_since = None;
+    // Queued at 400 ms, handed to QUIC after a report: stamped 1000 ms.
+    log.record(&video_datagram(1), ms(400), false);
+    assert_eq!(log.unanswered_since, Some(ms(1000)));
+}
+
+#[test]
+fn held_video_over_the_cap_drops_oldest_first_and_leaves_no_gap() {
+    let mut video = VideoQueue::default();
+    for i in 0..5 {
+        video.push(held(i), 3 * SIZE);
+    }
+    assert_eq!((video.bytes(), video.dropped), (3 * SIZE, 2));
+    let mut wire = Vec::new();
+    assert!(video.feed(usize::MAX, 0, None, |h| quic(&mut wire, h)));
+    assert_eq!(
+        wire,
+        [0, 1, 2],
+        "the three newest, numbered from the wire's next"
+    );
+}
+
+#[test]
+fn the_room_is_two_datagrams_at_least_and_half_the_buffer_at_most() {
+    let mut video = VideoQueue::default();
+    assert_eq!(
+        video.room(None, BUFFER),
+        BUFFER,
+        "never governed: QUIC's whole queue"
+    );
+    let two = 2 * super::super::media::MAX_DATAGRAM;
+    assert_eq!(video.room(Some(100), BUFFER), two);
+    assert_eq!(video.room(Some(10_000_000), BUFFER), BUFFER / 2);
+    assert_eq!(
+        video.room(Some(100), 1000),
+        500,
+        "a tiny buffer: half, no panic"
+    );
+}
+
+/// A2/S4: feedback silence releases the governor; what is held then drains at the last
+/// governed rate, not into QUIC in one go ahead of audio.
+#[test]
+fn video_held_when_the_governor_lets_go_drains_at_the_last_governed_rate() {
+    let mut video = VideoQueue::default();
+    assert_eq!(video.room(Some(1000), BUFFER), 5000);
+    for i in 0..40 {
+        video.push(held(i), BUFFER);
+    }
+    assert_eq!(video.room(None, BUFFER), 5000, "released with video held");
+    let mut wire = Vec::new();
+    assert!(video.feed(usize::MAX, 0, None, |h| quic(&mut wire, h)));
+    assert!(video.is_empty());
+    assert_eq!(
+        video.room(None, BUFFER),
+        BUFFER,
+        "drained: QUIC's whole queue again"
+    );
+}
+
+/// A10/S1: a configuration change drops what is held, and the rate it was paced at.
+#[test]
+fn a_cleared_queue_holds_nothing_and_keeps_its_numbering() {
+    let mut video = VideoQueue::default();
+    video.room(Some(1000), BUFFER);
+    for i in 0..4 {
+        video.push(held(i), BUFFER);
+    }
+    let mut wire = Vec::new();
+    assert!(video.feed(SIZE, 0, None, |h| quic(&mut wire, h)));
+    video.clear();
+    assert!(video.is_empty() && video.bytes() == 0);
+    assert_eq!(video.room(None, BUFFER), BUFFER);
+    video.push(held(9), BUFFER);
+    assert!(video.feed(usize::MAX, 0, None, |h| quic(&mut wire, h)));
+    assert_eq!(wire, [0, 1], "no gap across the clear");
+}
+
+/// A4: a datagram over the path's size is counted and takes no `pkt_seq`; nor does a resend
+/// whose budget is spent.
+#[test]
+fn a_skipped_datagram_takes_no_pkt_seq_and_too_large_is_counted() {
+    let mut video = VideoQueue::default();
+    let mut resend = held(1);
+    resend.resend = true;
+    for h in [held(0), resend, held(2), held(3)] {
+        video.push(h, BUFFER);
+    }
+    let mut verdicts = [
+        Handed::TooLarge,
+        Handed::TooLarge,
+        Handed::Skipped,
+        Handed::Sent,
+    ]
+    .into_iter();
+    let mut wire = Vec::new();
+    assert!(
+        video.feed(usize::MAX, 0, None, |h| match verdicts.next().unwrap() {
+            Handed::Sent => quic(&mut wire, h),
+            other => other,
+        })
+    );
+    assert_eq!((video.too_large, video.resends_too_large), (1, 1));
+    assert_eq!(wire, [0], "the one sent takes the first number");
+}
+
+/// M1: a step cut under a deep bottleneck buffer, with video handed to QUIC through the
+/// queue and QUIC's governed window (`Window`) in between. The send log stamps the time a
+/// datagram was queued, so the estimate comes down as it does with no queue.
+#[test]
+fn a_step_cut_under_a_deep_buffer_brings_the_estimate_down_through_the_queue() {
+    let cut = |queued: bool| {
+        let mut s = Sim::new(20_000.0);
+        s.queue_bytes = 8.0 * 1024.0 * 1024.0;
+        if queued {
+            s.quic = Some(Quic::default());
+        }
+        s.run(10.0);
+        assert_eq!(s.est.estimate_kbps(), CEILING, "the ceiling before the cut");
+        s.cap_kbps = 2000.0;
+        s.run(20.0);
+        (s.mean_after(20.0), s.held_max)
+    };
+    let (direct, _) = cut(false);
+    let (queued, held_max) = cut(true);
+    eprintln!(
+        "estimate 10-20 s after the cut: direct {direct:.0}, through the queue {queued:.0}; \
+         most held {} B at {:.2} s",
+        held_max.0, held_max.1
+    );
+    assert!(direct < 2400.0, "no queue: {direct:.0}");
+    assert!(queued < 2400.0, "through the queue: {queued:.0}");
+}
+
+/// #1433: a 5 Mbit/s link, keyframes once a second, video through the agent's queue and QUIC's
+/// governed window. Audio sent at any moment waits behind whatever is in the link's queue
+/// then; QUIC unpaced put each keyframe there at once (110-190 ms late on the lab host).
+#[test]
+fn a_keyframe_waits_in_the_agent_not_in_the_links_queue() {
+    let mut s = Sim::new(5000.0);
+    s.quic = Some(Quic::default());
+    s.keyframe_every = 60;
+    s.run(30.0);
+    assert!(s.est.found_link(), "the estimate found the 5 Mbit/s link");
+    let mut waits: Vec<u64> = s
+        .waits
+        .iter()
+        .filter(|&&(t, _)| t >= 10.0)
+        .map(|&(_, w)| w)
+        .collect();
+    waits.sort_unstable();
+    let p95 = waits[waits.len() * 95 / 100] / 1000;
+    let max = waits[waits.len() - 1] / 1000;
+    let estimate = s.mean_after(10.0);
+    eprintln!("link queue after 10 s: p95 {p95} ms, max {max} ms; estimate {estimate:.0} kbps");
+    assert!(p95 <= 35 && max <= 45, "p95 {p95} ms, max {max} ms");
+    assert!(estimate > 3500.0, "pacing kept the estimate: {estimate:.0}");
+}
+
+#[test]
+fn the_pacer_lets_video_go_at_its_rate_in_short_bursts_and_never_holds_video_100_ms() {
+    let t0 = Instant::now();
+    let ms = |n: u64| t0 + Duration::from_millis(n);
+    // The datagrams the queue has handed QUIC after `pace(kbps, at)`.
+    let send = |video: &mut VideoQueue, kbps, at| {
+        let room = video.pace(kbps, at);
+        let mut wire = Vec::new();
+        assert!(video.feed(room, 0, None, |h| quic(&mut wire, h)));
+        40 - video.bytes() / SIZE
+    };
+    // 40 datagrams queued at `t0` exactly.
+    let keyframe = || {
+        let mut video = VideoQueue::default();
+        let first = video.next_seq();
+        for i in 0..40 {
+            video.push(
+                Held {
+                    queued_at: t0,
+                    ..held(first + i)
+                },
+                BUFFER,
+            );
+        }
+        video
+    };
+    let mut video = keyframe();
+    // 8 Mbit/s × 1.25 is 1250 bytes a millisecond; a burst is 5 ms of it.
+    assert_eq!(send(&mut video, Some(8000), ms(0)), 5, "one burst at once");
+    assert_eq!(
+        send(&mut video, Some(8000), ms(1)),
+        6,
+        "then 1250 bytes a ms"
+    );
+    assert_eq!(send(&mut video, Some(8000), ms(3)), 8);
+    assert_eq!(
+        send(&mut video, Some(8000), ms(99)),
+        13,
+        "idle time saves one burst"
+    );
+    assert_eq!(
+        send(&mut video, None, ms(99)),
+        40,
+        "not governed: not paced"
+    );
+
+    let mut video = keyframe();
+    assert_eq!(send(&mut video, Some(8000), ms(0)), 5);
+    assert_eq!(
+        send(&mut video, Some(8000), ms(99)),
+        10,
+        "waited 99 ms: still paced"
+    );
+    assert_eq!(
+        send(&mut video, Some(8000), ms(100)),
+        40,
+        "waited 100 ms: goes at once"
+    );
+}
+
+/// #1496 review A M1: the rates `feed` uses. The pacer holds video to the governed rate, never
+/// under the ABR floor the encoder is held to: an outage that decayed the estimate to 500 under
+/// a 2500 floor still leaves the encoder at 2500, and pacing that at 1.25 × 500 held it until
+/// it was stale.
+#[test]
+fn video_is_paced_at_the_governed_rate_not_at_an_estimate_under_the_floor() {
+    let mut est = Estimator::new(CEILING, Instant::now());
+    let governor = Governor::default();
+    assert_eq!(
+        video_rates(&governor, &est, false),
+        (None, None),
+        "not governed"
+    );
+    governor.govern(CEILING);
+    assert_eq!(
+        video_rates(&governor, &est, false),
+        (Some(8000), None),
+        "at the ceiling: not paced"
+    );
+    est.resume_at(500.0);
+    governor.govern(2500.0);
+    assert_eq!(video_rates(&governor, &est, false), (Some(500), Some(2500)));
+    assert_eq!(video_rates(&governor, &est, true), (None, None), "PyroWave");
+}
+
+/// The same in the sim: an outage decays the estimate under the ABR floor and the encoder keeps
+/// sending the floor. Paced at the governed rate, held video never waits long.
+#[test]
+fn after_an_outage_under_the_floor_held_video_does_not_go_stale() {
+    let mut s = Sim::new(6000.0);
+    s.quic = Some(Quic::default());
+    s.floor_kbps = 4000.0;
+    s.run(10.0);
+    s.outage(5.0);
+    let resumed = s.t as f64 / 1e6;
+    s.run(5.0);
+    let worst = s
+        .held_waits
+        .iter()
+        .filter(|&&(t, _)| t >= resumed)
+        .map(|&(_, w)| w)
+        .max()
+        .unwrap()
+        / 1000;
+    eprintln!("after the outage: oldest held video waited at most {worst} ms");
+    assert!(worst < 50, "held video waited {worst} ms");
+}
+
+/// #1496 review B M1: a cap that lifts. The pacer's wait is not path delay; logged as it, each
+/// paced keyframe read as overuse on the faster link and cut the estimate, which took about
+/// 45 s and 32 delay cuts to get back to the ceiling instead of about 10 s.
+#[test]
+fn after_a_cap_lifts_the_estimate_climbs_back_to_the_ceiling_promptly() {
+    let mut s = Sim::new(5000.0);
+    s.quic = Some(Quic::default());
+    s.keyframe_every = 60;
+    s.run(30.0);
+    assert!(s.est.found_link(), "the 5 Mbit/s cap was found");
+    s.cap_kbps = 50_000.0;
+    let lifted = s.t as f64 / 1e6;
+    let lines = logged(|| s.run(30.0));
+    let back = s
+        .trace
+        .iter()
+        .find(|&&(t, e)| t >= lifted && e >= CEILING)
+        .map(|&(t, _)| t - lifted);
+    let delay_cuts = cuts(&lines)
+        .iter()
+        .filter(|c| c.0.contains("delay"))
+        .count();
+    eprintln!("cap lifted: back at the ceiling after {back:?} s, {delay_cuts} delay cuts");
+    assert!(
+        back.is_some_and(|b| b <= 15.0),
+        "{back:?} s, {delay_cuts} delay cuts"
+    );
+}
+
+/// #1417 × #1433: a silence decay leaves the estimate under the ceiling, but the link has not
+/// said it carries less, so the pacer stays off while the outage regrow runs: a recovery
+/// keyframe paced at the decayed rate came late (and, logged at its queue time, read as a
+/// delay cut that ended the regrow).
+#[test]
+fn the_pacer_stays_off_while_the_outage_regrow_runs() {
+    let mut s = Sim::new(50_000.0);
+    s.quic = Some(Quic::default());
+    s.keyframe_every = 60;
+    s.run(10.0);
+    assert_eq!(s.est.estimate_kbps(), CEILING);
+    s.outage(10.0);
+    assert!(s.est.estimate_kbps() < CEILING && s.est.recover_to.is_some());
+    let resumed = s.t as f64 / 1e6;
+    let lines = logged(|| s.run(0.5));
+    assert!(s.governor.governs(), "feedback governs again");
+    assert_eq!(
+        video_rates(&s.governor, &s.est, false).1,
+        None,
+        "paced during the regrow"
+    );
+    let lines = [lines, logged(|| s.run(14.5))].concat();
+    let back = s
+        .trace
+        .iter()
+        .find(|&&(t, e)| t >= resumed && e >= CEILING)
+        .map(|&(t, _)| t - resumed);
+    let ended: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("regrow") && l.contains("ended"))
+        .collect();
+    eprintln!("after the outage: back at the ceiling after {back:?} s; {ended:?}");
+    assert!(ended.iter().all(|l| l.contains("reached")), "{ended:?}");
+    assert!(back.is_some_and(|b| b <= 10.0), "{back:?} s");
+}
+
+/// #1496 r2 M1: a second step down while the pacer is on (5 Mbit/s with a keyframe each
+/// second, then 2 Mbit/s). Paced datagrams are logged at their release and unpaced ones at
+/// their queue time; the send log keeps every stamp at or after the one before it in
+/// `pkt_seq` order, or the delay detector reads a send that went back in time.
+#[test]
+fn send_stamps_never_go_back_through_a_second_step_down_while_paced() {
+    let mut s = Sim::new(5000.0);
+    s.quic = Some(Quic::default());
+    s.keyframe_every = 60;
+    s.run(30.0);
+    assert!(s.est.found_link(), "paced before the second step");
+    s.cap_kbps = 2000.0;
+    s.run(30.0);
+    let mut slots: Vec<&Slot> = s.log.slots.iter().filter(|s| s.bytes > 0).collect();
+    slots.sort_by_key(|s| s.seq);
+    let back = slots
+        .windows(2)
+        .filter(|w| w[1].sent_us < w[0].sent_us)
+        .count();
+    assert_eq!(back, 0, "{back} stamps went back in pkt_seq order");
+    assert!(
+        s.est.estimate_kbps() < 2000.0,
+        "{:.0}",
+        s.est.estimate_kbps()
+    );
+}
+
+/// A group sent no later than the one before it gives no delay sample, and no panic.
+#[test]
+fn a_send_group_that_went_back_in_time_is_no_delay_sample() {
+    // A group whose last send is before the previous group's.
+    let mut ia = InterArrival::default();
+    ia.push(100_000, 110_000);
+    ia.push(200_000, 210_000);
+    ia.current.as_mut().unwrap().last_send = 50_000;
+    assert_eq!(ia.push(300_000, 310_000), None);
+}
+
+/// #1496 r2 S2: a `nack` answer goes ahead of held video, after earlier answers, and keeps
+/// the wire `pkt_seq` +1 per datagram.
+#[test]
+fn a_resend_goes_ahead_of_held_video() {
+    let mut video = VideoQueue::default();
+    let first = video.next_seq();
+    for i in 0..40 {
+        video.push(held(first + i), BUFFER);
+    }
+    let resend = |seq| Held {
+        resend: true,
+        ..held(seq)
+    };
+    video.push(resend(100), BUFFER);
+    video.push(resend(101), BUFFER);
+    let mut wire = Vec::new();
+    let mut order = Vec::new();
+    assert!(video.feed(3 * SIZE, 0, None, |h| {
+        order.push(h.resend);
+        quic(&mut wire, h)
+    }));
+    assert_eq!(
+        order,
+        [true, true, false],
+        "the two answers first, then video"
+    );
+    assert_eq!(wire, [0, 1, 2]);
+}
+
+fn resend(pkt_seq: u32) -> Held {
+    Held {
+        resend: true,
+        ..held(pkt_seq)
+    }
+}
+
+/// #1496 r3 S1: a `nack` answer goes ahead of held video, so the pacer's 100 ms bound reads
+/// the oldest video, not the answer in front of it.
+#[test]
+fn the_pacer_bound_reads_the_oldest_video_not_a_resend_ahead_of_it() {
+    let t0 = Instant::now();
+    let at = |ms| t0 + Duration::from_millis(ms);
+    let mut video = VideoQueue::default();
+    video.push(
+        Held {
+            queued_at: at(0),
+            ..held(0)
+        },
+        BUFFER,
+    );
+    video.push(
+        Held {
+            queued_at: at(150),
+            ..resend(1)
+        },
+        BUFFER,
+    );
+    assert_eq!(
+        video.pace(Some(8000), at(150)),
+        usize::MAX,
+        "video waited 150 ms"
+    );
+
+    let mut video = VideoQueue::default();
+    video.push(
+        Held {
+            queued_at: at(0),
+            ..resend(0)
+        },
+        BUFFER,
+    );
+    video.push(
+        Held {
+            queued_at: at(150),
+            ..held(1)
+        },
+        BUFFER,
+    );
+    assert!(
+        video.pace(Some(8000), at(150)) < usize::MAX,
+        "fresh video is paced"
+    );
+}
+
+/// #1496 r3 S2: past the cap the oldest video goes, not the `nack` answers ahead of it.
+#[test]
+fn held_video_over_the_cap_is_dropped_before_a_resend() {
+    let mut video = VideoQueue::default();
+    video.push(resend(9), 4 * SIZE);
+    for i in 0..4 {
+        video.push(held(i), 4 * SIZE);
+    }
+    assert_eq!(video.dropped, 1);
+    let held: Vec<_> = video
+        .held
+        .iter()
+        .map(|h| (h.resend, wire_seq(&h.datagram)))
+        .collect();
+    assert_eq!(held, [(true, 9), (false, 1), (false, 2), (false, 3)]);
 }

@@ -208,6 +208,15 @@ pub(crate) struct SendLog {
     /// The first send since the last feedback: the silence clock starts here, not at the
     /// feedback, or a frame after a still screen would be judged before its answer can come.
     unanswered_since: Option<Instant>,
+    /// That send's `pkt_seq`. The outage mark is taken in send order, not by stamp: held
+    /// video goes out stamped with its queue time, before a report it was sent after.
+    unanswered_seq: Option<u32>,
+    /// The `pkt_seq` after the last one recorded.
+    next_seq: u32,
+    /// The last stamp, µs: stamps never go back in `pkt_seq` (send) order, whatever stamped
+    /// them (a paced release, a queue time, a resend), or the delay detector reads a send
+    /// that went back in time.
+    last_us: u64,
 }
 
 impl SendLog {
@@ -216,6 +225,9 @@ impl SendLog {
             start,
             slots: vec![Slot::default(); LOG],
             unanswered_since: None,
+            unanswered_seq: None,
+            next_seq: 0,
+            last_us: 0,
         }
     }
 
@@ -226,14 +238,21 @@ impl SendLog {
             return;
         };
         let seq = u32::from_le_bytes([seq[0], seq[1], seq[2], seq[3]]);
+        self.last_us = self
+            .last_us
+            .max(at.saturating_duration_since(self.start).as_micros() as u64);
         self.slots[seq as usize % LOG] = Slot {
             seq,
-            sent_us: at.saturating_duration_since(self.start).as_micros() as u64,
+            sent_us: self.last_us,
             bytes: datagram.len().min(u16::MAX as usize) as u16,
             resend,
             status: Status::Unreported,
         };
-        self.unanswered_since.get_or_insert(at);
+        // The stamp, not `at`: held video is queued before a report it is sent after.
+        self.unanswered_since
+            .get_or_insert(self.start + Duration::from_micros(self.last_us));
+        self.unanswered_seq.get_or_insert(seq);
+        self.next_seq = seq.wrapping_add(1);
     }
 
     fn slot(&mut self, seq: u32) -> Option<&mut Slot> {
@@ -309,10 +328,13 @@ impl InterArrival {
             return None;
         }
         let done = *cur;
+        // A group sent before the one before it is no delay sample. An equal send is one: a
+        // frame's datagrams share a stamp, and a delay spike can split them across groups.
         let out = self.previous.and_then(|prev| {
+            let send_d = done.last_send.checked_sub(prev.last_send)?;
             (done.last_arrival >= prev.last_arrival).then(|| {
                 (
-                    (done.last_send - prev.last_send) as f64 / 1000.0,
+                    send_d as f64 / 1000.0,
                     (done.last_arrival - prev.last_arrival) as f64 / 1000.0,
                     done.last_arrival as f64 / 1000.0,
                 )
@@ -476,11 +498,10 @@ pub(crate) struct Estimator {
     /// faster than AIMD. Dropped when it is reached, when it expires, when the link disagrees
     /// with a delay or loss cut, and on a codec switch (#1417).
     recover_to: Option<(f64, Instant)>,
-    /// The first send after the last feedback, in the log's µs clock, while a detected silence
-    /// is an outage: the report after it counts packets sent from here, up to the first it
-    /// shows received after it, as the outage's losses rather than congestion (#1557). Read by
-    /// `measure`, which clears it.
-    outage_from_us: Option<u64>,
+    /// While a detected silence is an outage: its losses are not congestion (#1557).
+    outage: Option<Outage>,
+    /// The `pkt_seq` after the newest any report has covered.
+    reported_to: Option<u32>,
     /// The bound the log last named, and when.
     logged: (Bound, Option<Instant>),
     /// The estimate before a silence decay not logged yet; delay and loss cuts always log.
@@ -498,6 +519,17 @@ pub(crate) struct Measured {
     /// A video datagram (not a resend) first reported here is in the rate window.
     pub(crate) fresh: bool,
     pub(crate) loss: Option<f64>,
+}
+
+/// A detected outage's losses (#1557): those reported not received from `from`, the first
+/// datagram no report had covered, until one sent after detection (`by`) is received. Not
+/// from the first send after the last report: when only host → client drops, the client's
+/// report of what came before the cut arrives after it (#1496 lab round). Not ended by a
+/// datagram received after a hole either: reordering puts holes in that late report.
+#[derive(Debug, Clone, Copy)]
+struct Outage {
+    from: u32,
+    by: u32,
 }
 
 impl Estimator {
@@ -525,16 +557,23 @@ impl Estimator {
             loss: None,
             bound: Bound::Ceiling,
             recover_to: None,
-            outage_from_us: None,
+            outage: None,
+            reported_to: None,
             logged: (Bound::Ceiling, None),
             unlogged: None,
             measured: None,
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn estimate_kbps(&self) -> f64 {
         self.estimate_kbps
+    }
+
+    /// The link set the estimate: a delay or loss cut holds it under the ceiling. A silence
+    /// decay does not count while its regrow memory is held (#1417): the link has not said it
+    /// carries less, and pacing a recovery keyframe at a decayed rate only delays it.
+    pub(crate) fn found_link(&self) -> bool {
+        self.bound != Bound::Ceiling && self.recover_to.is_none()
     }
 
     /// Start again from `kbps` (never above the ceiling): codec-pyrowave.md §Rate, the ABR
@@ -573,6 +612,7 @@ impl Estimator {
         self.last_feedback = Some(now);
         self.last_decay = None;
         log.unanswered_since = None;
+        log.unanswered_seq = None;
         let m = self.measure(fb, log, now);
         self.apply(m, now, path)
     }
@@ -765,10 +805,13 @@ impl Estimator {
         if now.saturating_duration_since(sent) <= timeout {
             return None;
         }
-        // The silence is an outage: the packets sent since the last feedback are its losses
-        // (#1557). Kept until the first report after it reads and clears the mark.
-        self.outage_from_us
-            .get_or_insert(sent.saturating_duration_since(log.start).as_micros() as u64);
+        // The silence is an outage (#1557).
+        if let Some(seq) = log.unanswered_seq {
+            self.outage.get_or_insert(Outage {
+                from: self.reported_to.unwrap_or(seq),
+                by: log.next_seq,
+            });
+        }
         let from = self.last_decay.unwrap_or(sent + timeout);
         let steps = now.saturating_duration_since(from).as_secs_f64() / SILENCE_STEP.as_secs_f64();
         let factor = SILENCE_DECAY.powf(steps);
@@ -866,12 +909,12 @@ impl Estimator {
     /// in `pkt_seq` (send) order, and read the windowed receive rate and loss.
     pub(crate) fn measure(&mut self, fb: &Feedback, log: &mut SendLog, now: Instant) -> Measured {
         let (mut received, mut lost) = (0i64, 0i64);
-        // A loss sent during the detected outage belongs to the outage, not congestion: the
-        // first report after it must not cut the loss bound (#1557). The exemption ends at
-        // the send time of the first packet this report shows as received after the mark:
-        // from then the link answered, so a loss sent after it is congestion.
-        let outage = self.outage_from_us;
-        let mut answered_from: Option<u64> = None;
+        // At or after `from`, in u32 serial arithmetic.
+        let after = |seq: u32, from: u32| seq.wrapping_sub(from) < 1 << 31;
+        let end = fb.first_pkt_seq.wrapping_add(fb.arrivals.len() as u32);
+        if self.reported_to.is_none_or(|to| after(end, to)) {
+            self.reported_to = Some(end);
+        }
         let mut newest_fresh = None;
         for (i, &arrival) in fb.arrivals.iter().enumerate() {
             let seq = fb.first_pkt_seq.wrapping_add(i as u32);
@@ -890,10 +933,7 @@ impl Estimator {
                     received += 1;
                 }
                 (Status::Unreported, None) => {
-                    let exempt = outage.is_some_and(|from| {
-                        slot.sent_us >= from && answered_from.is_none_or(|at| slot.sent_us < at)
-                    });
-                    if exempt {
+                    if self.outage.is_some_and(|o| after(seq, o.from)) {
                         slot.status = Status::Outage;
                     } else {
                         slot.status = Status::Lost;
@@ -910,10 +950,9 @@ impl Estimator {
                 (Status::Unreported, Some(at)) => {
                     slot.status = Status::Received;
                     received += 1;
-                    // The first packet this report shows received after the mark: the
-                    // outage's exemption ends at its send time (#1557).
-                    if outage.is_some_and(|from| slot.sent_us >= from) {
-                        answered_from.get_or_insert(slot.sent_us);
+                    // The link answered: a loss sent after this is congestion (#1557).
+                    if self.outage.is_some_and(|o| after(seq, o.by)) {
+                        self.outage = None;
                     }
                     if let Some((send_d, arrival_d, arrival_ms)) =
                         self.inter_arrival.push(slot.sent_us, at)
@@ -983,8 +1022,6 @@ impl Estimator {
             .fold((0i64, 0i64), |(r, l), &(_, a, b)| (r + a, l + b));
         let (r, l) = (r.max(0), l.max(0));
         let loss = (r + l >= LOSS_MIN_SAMPLES).then(|| l as f64 / (r + l) as f64);
-        // The mark is spent: only the first report after the outage is exempt (#1557).
-        self.outage_from_us = None;
 
         Measured {
             usage: self.trendline.usage,
@@ -1229,6 +1266,22 @@ impl Governor {
     pub(crate) fn kbps(&self) -> u64 {
         self.0.load(Ordering::Relaxed) / 1000
     }
+}
+
+/// The rates `VideoQueue` holds video to, kbit/s: QUIC's room ([`VideoQueue::room`]) at the
+/// governed rate or the estimate if lower, and the pacer ([`VideoQueue::pace`]) at the
+/// governed rate, never under the ABR floor the encoder is held to, once the estimate is under
+/// the ceiling. `None`: the session is not governed (or PyroWave), or nothing to pace.
+pub(crate) fn video_rates(
+    governor: &Governor,
+    estimator: &Estimator,
+    pyrowave: bool,
+) -> (Option<u64>, Option<u64>) {
+    if pyrowave || !governor.governs() {
+        return (None, None);
+    }
+    let room = (governor.kbps() as f64).min(estimator.estimate_kbps()) as u64;
+    (Some(room), estimator.found_link().then(|| governor.kbps()))
 }
 
 fn cubic(window: u64, now: Instant, mtu: u16) -> Box<dyn Controller> {
@@ -1532,6 +1585,247 @@ impl Backlog {
         } else {
             Admit::Skip
         }
+    }
+}
+
+/// Video QUIC may hold ahead of the next audio datagram, in time at the governed rate. Over
+/// two frames at 60 fps: at 20 ms a 1080p60 frame at 8 Mbit/s plus its FEC filled it, waited a
+/// drain tick, and a clean link presented 3 ms later at the median (#1433, lab host).
+/// shortcut: at 30 fps a frame is 33 ms of rate, so one over this with its FEC still waits a
+/// tick; make it frame-relative if a 30 fps session shows that cost.
+const AUDIO_AHEAD_MS: u64 = 40;
+/// Video leaves at most this × the governed rate (the estimate, never under the ABR floor)
+/// once the estimate is under the ceiling (#1433), so a keyframe waits here, where audio
+/// overtakes it, not in the link's queue: right after a delay cut this is 1.06 × what the
+/// link carried. quinn alone paces at 1.25 × window / RTT, 2.5 × the rate or more. Must stay
+/// over 1 / (1 − the ABR's 0.15 deadband), the most video plus FEC is sent at, or held video
+/// never drains.
+const PACE_GAIN: f64 = 1.25;
+/// The pacer's burst: this long at the pace, at least two datagrams.
+const PACE_BURST_MS: f64 = 5.0;
+/// Video that has waited this long is not paced: a paced keyframe of five frames' bytes waits
+/// at most 5 / (60 fps × `PACE_GAIN`), 67 ms, so this is a path back from an outage, or a
+/// source over the pace, and it drains at QUIC's own pace as before #1433.
+const PACE_MAX_WAIT: Duration = Duration::from_millis(100);
+
+/// Video, FEC and `nack` answers waiting for room in QUIC's datagram queue, so audio, which
+/// goes straight to QUIC, never queues behind more than [`VideoQueue::room`] of video and
+/// is never the datagram QUIC drops to make space (#1321). `pkt_seq` is taken as a datagram
+/// is handed to QUIC, so it follows send order (§Channels) even when audio overtakes.
+#[derive(Default)]
+pub(crate) struct VideoQueue {
+    held: VecDeque<Held>,
+    bytes: usize,
+    /// The `pkt_seq` of the next datagram handed to QUIC.
+    wire: u32,
+    /// The rate the room was last sized at: held video drains at it after a release.
+    pace: Option<u64>,
+    /// Video datagrams dropped at the cap; they never take a `pkt_seq`, so no feedback
+    /// reports them lost.
+    pub(crate) dropped: u64,
+    /// The pacer: bytes video may still send now, and when they were counted.
+    tokens: f64,
+    counted: Option<Instant>,
+    /// The frame last pushed (by its queue time) and whether it arrived to an empty queue:
+    /// that frame's tail is not held by the room.
+    frame: Option<(Instant, bool)>,
+    /// Video and resent datagrams over the path's datagram size, skipped.
+    pub(crate) too_large: u64,
+    pub(crate) resends_too_large: u64,
+}
+
+pub(crate) struct Held {
+    pub(crate) datagram: bytes::Bytes,
+    /// Goes in the send log, stamped `queued_at`: time held here is delay the estimate
+    /// must see, as it saw time in QUIC's queue.
+    pub(crate) logged: bool,
+    pub(crate) resend: bool,
+    pub(crate) queued_at: Instant,
+}
+
+/// What became of a datagram handed to QUIC.
+pub(crate) enum Handed {
+    Sent,
+    /// Not sent and its `pkt_seq` not used: a resend the fragment's budget no longer allows.
+    Skipped,
+    /// Over the path's datagram size: skipped like [`Handed::Skipped`], and counted.
+    TooLarge,
+    Gone,
+}
+
+impl VideoQueue {
+    /// Bytes of QUIC's datagram queue video may fill: [`AUDIO_AHEAD_MS`] at `kbps`, at
+    /// least two datagrams, at most half the queue so audio always fits beside it. With no
+    /// rate (`None`), video held from a governed spell still drains at that spell's last
+    /// rate; only an empty queue goes back to QUIC's whole buffer.
+    /// shortcut: a session never governed (no feedback, ABR off, PyroWave) gets the whole
+    /// buffer, so under congestion audio waits behind QUIC's queue as before #1321.
+    pub(crate) fn room(&mut self, kbps: Option<u64>, buffer: usize) -> usize {
+        let kbps = kbps.or(self.pace.filter(|_| !self.held.is_empty()));
+        self.pace = kbps;
+        kbps.map_or(buffer, |kbps| {
+            ((kbps * AUDIO_AHEAD_MS / 8) as usize)
+                .max(2 * super::media::MAX_DATAGRAM)
+                .min(buffer / 2)
+        })
+    }
+
+    /// Bytes the pacer lets go now: [`PACE_GAIN`] × `kbps`, in bursts of [`PACE_BURST_MS`];
+    /// `None` paces nothing.
+    pub(crate) fn pace(&mut self, kbps: Option<u64>, now: Instant) -> usize {
+        // Not a `nack` answer: those go ahead of older video (`push`).
+        let stale = self
+            .held
+            .iter()
+            .find(|h| !h.resend)
+            .is_some_and(|h| now.saturating_duration_since(h.queued_at) >= PACE_MAX_WAIT);
+        let Some(kbps) = kbps.filter(|_| !stale) else {
+            self.counted = None;
+            return usize::MAX;
+        };
+        let per_s = kbps as f64 * PACE_GAIN * 1000.0 / 8.0;
+        let burst = (per_s * PACE_BURST_MS / 1000.0).max(2.0 * super::media::MAX_DATAGRAM as f64);
+        self.tokens = match self.counted {
+            Some(at) => self.tokens + per_s * now.saturating_duration_since(at).as_secs_f64(),
+            None => burst,
+        }
+        .min(burst);
+        self.counted = Some(now);
+        self.tokens as usize
+    }
+
+    /// What `feed` may hand QUIC now: `(room, frame)`. `room` is the bytes of QUIC's queue
+    /// still free to video (`queued` already there), under the pacer's burst; `frame` bounds
+    /// a frame that arrived to an empty queue, which `room` gates only at its start: split
+    /// across drain ticks, a clean 1080p60 stream presented unevenly (#1433, racer σ 0.90 →
+    /// 5.8 ms). Never past half the buffer, so audio still fits beside it.
+    pub(crate) fn budget(
+        &mut self,
+        (governed, paced): (Option<u64>, Option<u64>),
+        queued: usize,
+        buffer: usize,
+        now: Instant,
+    ) -> (usize, usize) {
+        let pace = self.pace(paced, now);
+        let room = self.room(governed, buffer).saturating_sub(queued).min(pace);
+        (room, pace.min((buffer / 2).saturating_sub(queued)))
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn oldest(&self) -> Option<Instant> {
+        self.held.front().map(|h| h.queued_at)
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Drops everything held: datagrams of a configuration the client has left.
+    pub(crate) fn clear(&mut self) {
+        self.held.clear();
+        self.bytes = 0;
+        self.pace = None;
+        self.counted = None;
+        self.frame = None;
+    }
+
+    /// The `pkt_seq` new video is numbered from, a guess `feed` corrects: after everything
+    /// held.
+    pub(crate) fn next_seq(&self) -> u32 {
+        self.wire.wrapping_add(self.held.len() as u32)
+    }
+
+    /// The `pkt_seq` of a datagram handed to QUIC now, ahead of everything held.
+    pub(crate) fn take_seq(&mut self) -> u32 {
+        let seq = self.wire;
+        self.wire = seq.wrapping_add(1);
+        seq
+    }
+
+    /// Past `cap` held bytes the oldest video is dropped, as QUIC's own queue drops it, and
+    /// `nack` answers only once no video is left.
+    pub(crate) fn push(&mut self, held: Held, cap: usize) {
+        while self.bytes + held.datagram.len() > cap {
+            let oldest = self.held.iter().position(|h| !h.resend).unwrap_or(0);
+            let Some(old) = self.held.remove(oldest) else {
+                break;
+            };
+            self.bytes -= old.datagram.len();
+            self.dropped += 1;
+        }
+        self.bytes += held.datagram.len();
+        if !held.resend && self.frame.is_none_or(|(at, _)| at != held.queued_at) {
+            self.frame = Some((held.queued_at, self.held.is_empty()));
+        }
+        // A resend goes ahead of held video (after earlier resends): the client gives a frame
+        // up about 2 × (sRTT + 10 ms) after its first NACK, sooner than a paced keyframe drains.
+        let at = if held.resend {
+            self.held.iter().take_while(|h| h.resend).count()
+        } else {
+            self.held.len()
+        };
+        self.held.insert(at, held);
+    }
+
+    /// Hands `send` the oldest datagrams that fit in `room` bytes, each carrying the next
+    /// wire `pkt_seq`, and logs each sent one at the time it was queued. A frame that arrived
+    /// to an empty queue goes whole, up to `frame` bytes, once `room` lets it start. False
+    /// when the connection is gone.
+    pub(crate) fn feed(
+        &mut self,
+        mut room: usize,
+        mut frame: usize,
+        mut log: Option<&mut SendLog>,
+        mut send: impl FnMut(Held) -> Handed,
+    ) -> bool {
+        let open = room > 0;
+        while let Some(next) = self.held.front() {
+            let len = next.datagram.len();
+            let whole = open && !next.resend && self.frame == Some((next.queued_at, true));
+            if len > if whole { room.max(frame) } else { room } {
+                break;
+            }
+            let mut held = self.held.pop_front().expect("front exists");
+            self.bytes -= len;
+            let seq = self.wire.to_le_bytes();
+            if held.datagram.get(1..5) != Some(&seq[..]) {
+                // Renumbered only after audio overtook it; a fragment the retransmit store
+                // shares is copied, a FEC repair or `nack` answer is not.
+                let mut d = held
+                    .datagram
+                    .try_into_mut()
+                    .unwrap_or_else(|d| bytes::BytesMut::from(&d[..]));
+                d[1..5].copy_from_slice(&seq);
+                held.datagram = d.freeze();
+            }
+            // While paced, a datagram is logged as sent when the pacer let it go: its wait here
+            // is the pacer's, not the path's, and read as delay it cut the estimate at each
+            // keyframe on a link faster than the pace. Unpaced, its queue time is logged, as
+            // it was in QUIC's queue before #1321. `SendLog::record` keeps the mix monotone.
+            let (resend, queued_at) = (held.resend, self.counted.unwrap_or(held.queued_at));
+            let logged = log.as_deref_mut().filter(|_| held.logged);
+            let record = logged.map(|log| (log, held.datagram.clone()));
+            match send(held) {
+                Handed::Sent => {
+                    if let Some((log, d)) = record {
+                        log.record(&d, queued_at, resend);
+                    }
+                    room = room.saturating_sub(len);
+                    frame = frame.saturating_sub(len);
+                    self.tokens -= len as f64;
+                    self.wire = self.wire.wrapping_add(1);
+                }
+                Handed::Skipped => {}
+                Handed::TooLarge if resend => self.resends_too_large += 1,
+                Handed::TooLarge => self.too_large += 1,
+                Handed::Gone => return false,
+            }
+        }
+        true
     }
 }
 
