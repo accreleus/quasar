@@ -75,6 +75,47 @@ func (f *warmFixture) claimHolder(t *testing.T, appID string) (holder, token str
 	return deref(h), deref(tok)
 }
 
+func assertShareRefusalReason(t *testing.T, logs *syncBuffer, reason string) {
+	t.Helper()
+	if !strings.Contains(logs.String(), `msg="Steam library not shared" reason=`+reason+" ") {
+		t.Errorf("missing Steam library refusal log with reason=%s", reason)
+	}
+}
+
+func TestSharingDesktopLogsProviderAndHomeRefusals(t *testing.T) {
+	for _, tc := range []struct {
+		reason string
+		setup  func(*testing.T, *warmFixture)
+	}{
+		{"no_unique_steam_provider", func(t *testing.T, f *warmFixture) {
+			must(t, exec(t, f.pool, `UPDATE apps SET library_provider='' WHERE id=$1::uuid`, f.steam))
+		}},
+		{"steam_home_location_conflict", func(t *testing.T, f *warmFixture) {
+			must(t, exec(t, f.pool, `INSERT INTO managed_home_claims
+				(user_id, canonical_app_id, state, conflict_reason)
+				VALUES ($1::uuid, $2::uuid, 'conflict', 'claim_owner_missing')`, f.userID, f.steam))
+		}},
+		{"steam_home_claim_conflict", func(t *testing.T, f *warmFixture) {
+			holder := f.startedLaunch(t, f.steam)
+			must(t, exec(t, f.pool, `UPDATE sessions SET state='stopped', ended_at=now() - interval '3 minutes'
+				WHERE id=$1::uuid`, holder))
+		}},
+	} {
+		t.Run(tc.reason, func(t *testing.T) {
+			f := newWarmFixture(t, 8)
+			desktop := seedDesktop(t, f, true)
+			tc.setup(t, f)
+			logs := captureDefaultLogs(t)
+
+			res := f.mustLaunch(t, desktop)
+			if res.Notice != noticeSharedUnavailable || res.Session.SharedHomeAppID != nil {
+				t.Fatalf("notice=%q shared=%v, want the unavailable notice and no share", res.Notice, res.Session.SharedHomeAppID)
+			}
+			assertShareRefusalReason(t, logs, tc.reason)
+		})
+	}
+}
+
 func TestSharingDesktopMountsTheSteamLibraryAndLocksTheSteamFamily(t *testing.T) {
 	f := newWarmFixture(t, 8)
 	desktop := seedDesktop(t, f, true)
@@ -205,11 +246,13 @@ func TestSharingDesktopOnAnotherHostThanSteamOpensWithoutIt(t *testing.T) {
 	desktop := seedDesktop(t, f, true)
 	host2, _ := addHost(t, f.pool, "host-2", 8)
 	provisionHome(t, f.pool, f.userID, desktop, host2)
+	logs := captureDefaultLogs(t)
 
 	res := f.mustLaunch(t, desktop)
 	if res.Notice != noticeSharedOtherHost || res.Session.SharedHomeAppID != nil {
 		t.Fatalf("notice=%q shared=%v, want no sharing and the other-host notice", res.Notice, res.Session.SharedHomeAppID)
 	}
+	assertShareRefusalReason(t, logs, "steam_home_other_host")
 	if deref(res.Session.HostID) != host2 {
 		t.Errorf("desktop placed on %s, want its own home's host %s", deref(res.Session.HostID), host2)
 	}
@@ -829,6 +872,7 @@ func TestSwapIntoASharingDesktopSharesOnlyWithAHold(t *testing.T) {
 			must(t, err)
 			appB, err := f.store.GetLaunchApp(ctx, sharingB)
 			must(t, err)
+			logs := captureDefaultLogs(t)
 			guard, err := f.store.GuardHomeForSwapWithHold(ctx, a, f.userID, appA, f.hostID, capable, f.steam)
 			must(t, err)
 			guardB, errB := f.store.GuardHomeForSwapWithHold(ctx, b, f.userID, appB, f.hostID, capable, f.steam)
@@ -851,6 +895,7 @@ func TestSwapIntoASharingDesktopSharesOnlyWithAHold(t *testing.T) {
 			if guard.sharedID != "" || guard.notice != noticeSharedUnavailable || guard.sharedHold != nil {
 				t.Fatalf("legacy guard = %+v, want no share and the notice", guard)
 			}
+			assertShareRefusalReason(t, logs, "agent_cannot_hold")
 			if h, _ := f.claimHolder(t, f.steam); h != "" {
 				t.Errorf("Steam hold = %q after a legacy swap, want none", h)
 			}
@@ -1080,11 +1125,13 @@ func TestSharingDesktopNeverCreatesASteamHomeWhereSteamCannotRun(t *testing.T) {
 		ON CONFLICT (app_id) DO UPDATE SET mode='fixed'`, f.steam))
 	must(t, exec(t, f.pool, `INSERT INTO app_placement_hosts (app_id, host_id) VALUES ($1::uuid, $2::uuid)`, f.steam, host2))
 	provisionHome(t, f.pool, f.userID, desktop, f.hostID)
+	logs := captureDefaultLogs(t)
 
 	res := f.mustLaunch(t, desktop)
 	if res.Notice != noticeSharedUnavailable || res.Session.SharedHomeAppID != nil {
 		t.Fatalf("notice=%q shared=%v, want no sharing and the notice: Steam may not run on this host", res.Notice, res.Session.SharedHomeAppID)
 	}
+	assertShareRefusalReason(t, logs, "steam_placement_excludes_host")
 	var claims, homes int
 	must(t, f.pool.QueryRow(context.Background(), `SELECT
 		(SELECT count(*) FROM managed_home_claims WHERE canonical_app_id=$1::uuid),
