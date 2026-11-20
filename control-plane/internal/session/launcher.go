@@ -1118,10 +1118,7 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 	res, err := c.dispatcher.SendWithAck(actx, hostID, start.ID, start)
 	cancel()
 	if err != nil {
-		// A lost ack leaves open whether the agent took the start, so the watchdog
-		// and the heartbeat own the row from here: only a refusal proves it did not
-		// start the session. Never end it on this path.
-		c.failCommand(sess.ID, fmt.Sprintf("start dispatch failed: %v", err))
+		c.failStart(sess, hostID, fmt.Sprintf("start dispatch failed: %v", err))
 		return
 	}
 	if !res.OK {
@@ -1133,7 +1130,7 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 			c.endUnsentStopOnHost(sess.ID, &hostID)
 			return
 		}
-		c.failCommand(sess.ID, fmt.Sprintf("agent rejected start: %s", res.Error))
+		c.failStart(sess, hostID, fmt.Sprintf("agent rejected start: %s", res.Error))
 		return
 	}
 	c.log.Info("session start dispatched", "session_id", sess.ID)
@@ -1141,6 +1138,19 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 	// stuck-start watchdog: the agent acked start, so it must reach running
 	// within the window or be reaped.
 	go c.watchStartToRunning(sess.ID, hostID)
+}
+
+func (c *Coordinator) failStart(sess Session, hostID, reason string) {
+	stopAdopter := sess.AdoptSessionID != "" && !c.stopInGrace(sess.ID)
+	// Record the failure before a fast stop report can end the row cleanly.
+	c.failCommand(sess.ID, reason)
+	if stopAdopter {
+		// A missing start ack can leave a fresh build running under the new id.
+		cmd := agentws.SessionStopCmd{Type: "session_stop", ID: newCmdID(), SessionID: sess.ID, Reason: "error"}
+		if err := c.dispatcher.Send(hostID, cmd); err != nil {
+			c.log.Warn("adopting session stop dispatch failed", "session_id", sess.ID, "err", err)
+		}
+	}
 }
 
 // sendHomeBoundAssign uses the exact authenticated command epoch for both the
