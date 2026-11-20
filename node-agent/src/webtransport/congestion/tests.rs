@@ -231,11 +231,12 @@ impl Sim {
         let at = self.start + Duration::from_micros(self.t);
         let (room, frame) = quic.video.budget(rates, quic.queued, BUFFER, at);
         let (queue, queued) = (&mut quic.queue, &mut quic.queued);
-        quic.video.feed(room, frame, Some(&mut self.log), |held| {
-            *queued += held.datagram.len();
-            queue.push_back(held.datagram);
-            Handed::Sent
-        });
+        quic.video
+            .feed(room, frame, Some((&mut self.log, at)), |held| {
+                *queued += held.datagram.len();
+                queue.push_back(held.datagram);
+                Handed::Sent
+            });
         if quic.video.bytes() > self.held_max.0 {
             self.held_max = (quic.video.bytes(), self.t as f64 / 1e6);
         }
@@ -852,8 +853,8 @@ fn a_reordered_hole_in_the_late_report_does_not_spend_the_outage_mark() {
     assert!(est.outage.is_none(), "the link answered, the mark is spent");
 }
 
-/// #1557 review A2: the exemption ends at the send time of the first packet the report
-/// shows received after the outage's mark. A burst sent after the link came back is
+/// #1557 review A2: the exemption ends at the first packet the report shows received at or
+/// after the outage's `by` (sent after detection). A burst sent after the link came back is
 /// congestion, even when it falls in the feedback interval before the first report: it
 /// must cut, and the exemption must not swallow it for the whole report.
 #[test]
@@ -887,7 +888,7 @@ fn a_late_exempted_outage_loss_does_not_undo_a_counted_loss() {
     let mut log = SendLog::new(start);
     let mut est = Estimator::new(CEILING, start);
     // seq 0 sent before the mark (counted when lost), seq 1..20 after it (the outage's
-    // own), seq 21..40 received after the mark: the first of those ends the exemption.
+    // own); seq 21..40 are received but sent before `by` (41), so none ends the exemption.
     let sent_us = |seq: u32| u64::from(seq) * 10_000;
     let arrived = |seq: u32| ((sent_us(seq) + 5_000) / UNIT_US) as u16;
     for seq in 0..41u32 {
@@ -2783,17 +2784,30 @@ fn a_frame_behind_held_video_is_still_split_by_the_room() {
     assert_eq!(video.bytes(), 46 * SIZE);
 }
 
-/// #1591: held video is queued before a report it is sent after, and a stamp is never
-/// earlier than the last (`last_us`): the silence clock runs from the stamp.
+/// #1591 point 2: unpaced held video is stamped with its queue time, but the silence clock
+/// runs from the hand-off to QUIC: a frame held 600 ms under backpressure is not 600 ms
+/// unanswered the moment it leaves.
 #[test]
-fn the_silence_clock_starts_at_the_stamp_not_the_queue_time() {
+fn the_silence_clock_starts_when_held_unpaced_video_is_handed_to_quic() {
     let start = Instant::now();
     let ms = |n: u64| start + Duration::from_millis(n);
     let mut log = SendLog::new(start);
-    log.record(&video_datagram(0), ms(1000), false);
-    log.unanswered_since = None;
-    // Queued at 400 ms, handed to QUIC after a report: stamped 1000 ms.
-    log.record(&video_datagram(1), ms(400), false);
+    let mut video = VideoQueue::default();
+    video.push(
+        Held {
+            queued_at: ms(400),
+            ..held(0)
+        },
+        BUFFER,
+    );
+    let mut wire = Vec::new();
+    // Handed to QUIC at 1000 ms, after a report that cleared the clock.
+    assert!(
+        video.feed(usize::MAX, 0, Some((&mut log, ms(1000))), |h| quic(
+            &mut wire, h
+        ))
+    );
+    assert_eq!(wire.len(), 1);
     assert_eq!(log.unanswered_since, Some(ms(1000)));
 }
 

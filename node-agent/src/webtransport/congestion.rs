@@ -231,9 +231,22 @@ impl SendLog {
         }
     }
 
-    /// `pkt_seq` is bytes 1..5 of every datagram (§Channels). A `resend` (a NACK answer)
-    /// counts toward loss, not toward the receive rate.
+    /// [`Self::record_handed`] for a datagram stamped when it was handed to QUIC.
+    #[cfg(test)]
     pub(crate) fn record(&mut self, datagram: &[u8], at: Instant, resend: bool) {
+        self.record_handed(datagram, at, at, resend);
+    }
+
+    /// `pkt_seq` is bytes 1..5 of every datagram (§Channels). A `resend` (a NACK answer)
+    /// counts toward loss, not toward the receive rate. `at` stamps the delay detector;
+    /// `handed` is when QUIC got it, and starts the silence clock.
+    pub(crate) fn record_handed(
+        &mut self,
+        datagram: &[u8],
+        at: Instant,
+        handed: Instant,
+        resend: bool,
+    ) {
         let Some(seq) = datagram.get(1..5) else {
             return;
         };
@@ -248,9 +261,9 @@ impl SendLog {
             resend,
             status: Status::Unreported,
         };
-        // The stamp, not `at`: held video is queued before a report it is sent after.
-        self.unanswered_since
-            .get_or_insert(self.start + Duration::from_micros(self.last_us));
+        // The hand-off, not the stamp: unpaced held video is stamped with its queue time,
+        // before a report it is handed to QUIC after (#1591).
+        self.unanswered_since.get_or_insert(handed);
         self.unanswered_seq.get_or_insert(seq);
         self.next_seq = seq.wrapping_add(1);
     }
@@ -1772,14 +1785,15 @@ impl VideoQueue {
     }
 
     /// Hands `send` the oldest datagrams that fit in `room` bytes, each carrying the next
-    /// wire `pkt_seq`, and logs each sent one at the time it was queued. A frame that arrived
+    /// wire `pkt_seq`, and logs each sent one at the time it was queued; the log's `Instant` is
+    /// now, when QUIC gets them. A frame that arrived
     /// to an empty queue goes whole, up to `frame` bytes, once `room` lets it start. False
     /// when the connection is gone.
     pub(crate) fn feed(
         &mut self,
         mut room: usize,
         mut frame: usize,
-        mut log: Option<&mut SendLog>,
+        mut log: Option<(&mut SendLog, Instant)>,
         mut send: impl FnMut(Held) -> Handed,
     ) -> bool {
         let open = room > 0;
@@ -1807,12 +1821,12 @@ impl VideoQueue {
             // keyframe on a link faster than the pace. Unpaced, its queue time is logged, as
             // it was in QUIC's queue before #1321. `SendLog::record` keeps the mix monotone.
             let (resend, queued_at) = (held.resend, self.counted.unwrap_or(held.queued_at));
-            let logged = log.as_deref_mut().filter(|_| held.logged);
-            let record = logged.map(|log| (log, held.datagram.clone()));
+            let logged = log.as_mut().filter(|_| held.logged);
+            let record = logged.map(|(log, now)| (log, *now, held.datagram.clone()));
             match send(held) {
                 Handed::Sent => {
-                    if let Some((log, d)) = record {
-                        log.record(&d, queued_at, resend);
+                    if let Some((log, now, d)) = record {
+                        log.record_handed(&d, queued_at, now, resend);
                     }
                     room = room.saturating_sub(len);
                     frame = frame.saturating_sub(len);

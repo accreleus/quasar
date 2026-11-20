@@ -1261,16 +1261,19 @@ fn feed(
     sent: &mut retransmit::Retransmit,
     media: &Media,
     handed: &mut u64,
+    fec: bool,
 ) -> bool {
     let rates = control.as_ref().map_or((None, None), |c| {
         congestion::video_rates(&c.governor, &c.estimator, pyrowave)
     });
     let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
-    let (room, frame) = video.budget(rates, queued, DATAGRAM_BUFFER, std::time::Instant::now());
+    let now = std::time::Instant::now();
+    let (room, frame) = video.budget(rates, queued, DATAGRAM_BUFFER, now);
     let log = match pyro {
         Some(rate) if pyrowave => Some(&mut rate.log),
         _ => control.filter(|_| !pyrowave).map(|c| &mut c.log),
-    };
+    }
+    .map(|log| (log, now));
     let too_large = video.too_large;
     let alive = video.feed(room, frame, log, |held| {
         if held.resend && !sent.allows(&held.datagram) {
@@ -1282,6 +1285,14 @@ fn feed(
                 *handed += 1;
                 if let Some(d) = resend {
                     sent.charge(&d);
+                    // A retransmit is video sent in the window too (amendment 85), counted
+                    // once it is handed over: a resend skipped or dropped never was.
+                    if let Some(rate) = media.rate().filter(|_| fec) {
+                        (rate.fec)(FecEvent::Sent {
+                            video: video_payload(&[d]),
+                            repair: 0,
+                        });
+                    }
                 }
                 congestion::Handed::Sent
             }
@@ -1726,7 +1737,7 @@ async fn stream(
                 None => audio_open = false,
             },
             () = &mut drain, if !video.is_empty() => {
-                if !feed(session, &mut video, control.as_mut(), pyro.as_mut(), current.codec == "pyrowave", &mut sent, media, &mut handed) {
+                if !feed(session, &mut video, control.as_mut(), pyro.as_mut(), current.codec == "pyrowave", &mut sent, media, &mut handed, fec) {
                     break QUIET;
                 }
                 drain.as_mut().reset(Instant::now() + DRAIN_EVERY);
@@ -1801,7 +1812,7 @@ async fn stream(
                     for datagram in datagrams {
                         video.push(congestion::Held { datagram, logged, resend: false, queued_at: now }, DATAGRAM_BUFFER);
                     }
-                    if !feed(session, &mut video, control.as_mut(), pyro.as_mut(), current.codec == "pyrowave", &mut sent, media, &mut handed) {
+                    if !feed(session, &mut video, control.as_mut(), pyro.as_mut(), current.codec == "pyrowave", &mut sent, media, &mut handed, fec) {
                         break QUIET;
                     }
                     drain.as_mut().reset(Instant::now() + DRAIN_EVERY);
@@ -1859,17 +1870,10 @@ async fn stream(
                                 });
                                 if let Some((frame_seq, answer)) = answer {
                                     let (logged, now) = (control.is_some(), std::time::Instant::now());
-                                    // A retransmit is video sent in the window too (amendment 85).
-                                    if let Some(rate) = media.rate().filter(|_| fec) {
-                                        (rate.fec)(FecEvent::Sent {
-                                            video: video_payload(&answer.resend),
-                                            repair: 0,
-                                        });
-                                    }
                                     for datagram in answer.resend {
                                         video.push(congestion::Held { datagram, logged, resend: true, queued_at: now }, DATAGRAM_BUFFER);
                                     }
-                                    if !feed(session, &mut video, control.as_mut(), pyro.as_mut(), current.codec == "pyrowave", &mut sent, media, &mut handed) {
+                                    if !feed(session, &mut video, control.as_mut(), pyro.as_mut(), current.codec == "pyrowave", &mut sent, media, &mut handed, fec) {
                                         break QUIET;
                                     }
                                     drain.as_mut().reset(Instant::now() + DRAIN_EVERY);
