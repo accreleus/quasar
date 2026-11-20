@@ -48,6 +48,7 @@ paths = [
 # test; the enroll fixture's token is a stand-in, not a real credential.
 [[allowlists]]
 id = "harness-fixtures"
+targetRules = ["generic-api-key"]
 description = "Test harness and enroll fixture: invented tokens and cp.example hosts."
 paths = [
     '''dx/tests/run\.sh$''',
@@ -60,6 +61,7 @@ paths = [
 # design and the fixture must keep carrying them to stay a valid test.
 [[allowlists]]
 id = "redaction-fixture"
+targetRules = ["private-key", "curl-auth-header", "jwt", "generic-api-key"]
 description = "Redaction test fixture: deliberately-fake secrets that prove redaction."
 paths = [
     '''fixtures/redact-input\.txt$''',
@@ -69,6 +71,7 @@ paths = [
 # UI mock assets ship placeholder credentials for layout; nothing here is real.
 [[allowlists]]
 id = "design-mocks"
+targetRules = ["generic-api-key"]
 description = "Design mocks: placeholder credentials in UI mock assets."
 paths = [
     '''design_handoff_v3/.*''',
@@ -90,6 +93,7 @@ paths = [
 # metric keys, not credentials.
 [[allowlists]]
 id = "generated-metrics"
+targetRules = ["generic-api-key"]
 description = "Generated metric manifest/snapshot: metric keys, not credentials."
 paths = [
     '''(?i).*/metrics(\.generated)?\.json$''',
@@ -100,6 +104,7 @@ paths = [
 # UUIDs from an archived run, not credentials.
 [[allowlists]]
 id = "archived-report-logs"
+targetRules = ["generic-api-key"]
 description = "Archived run-report logs: findings are run/session/host UUIDs, not credentials."
 paths = [
     '''reports/.*\.log$''',
