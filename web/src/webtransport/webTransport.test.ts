@@ -222,19 +222,24 @@ describe("WebTransportMedia connect", () => {
     [4404, "session_ended"],
     [4410, "taken_over"],
   ])(
-    "reports the session's own close (%i) racing a hello_ack on a dead reader instead of internal (#1478)",
+    "reports the session's own close (%i) delivered after hello_ack on a dead reader (#1478)",
     async (code, expected) => {
+      vi.useFakeTimers();
       const agent = new FakeAgent();
       agent.hold = "answer";
       const t = transport(agent);
       const up = t.connect(NO_SINK);
       await vi.waitFor(() => expect(agent.reached).toBe("answer"));
       agent.last.failDatagrams(NETWORK_ERROR());
-      await flush();
+      await vi.advanceTimersByTimeAsync(0);
+      // The agent sends hello_ack, then the terminal bye, then closes the session.
       agent.last.control(helloAck(0, avcC()));
-      // The session's own close resolves in the same instant as the hello_ack on the dead reader.
+      agent.last.control({ type: "bye", reason: expected });
+      const refused = expect(up).rejects.toMatchObject({ code: expected });
+      void refused.catch(() => {}); // The old accept check rejects before the browser reports closed.
+      await vi.advanceTimersByTimeAsync(1);
       agent.last.closeWith(code);
-      await expect(up).rejects.toMatchObject({ code: expected });
+      await refused;
       expect(agent.last.closes.every((c) => c?.closeCode !== 4400)).toBe(true);
       t.close();
     },

@@ -46,11 +46,13 @@ export function fallbackCause(code: string, err?: unknown): string {
 }
 
 const REMEMBER_PREFIX = "quasar.wt-fallback.";
+const CAUSE_PREFIX = "quasar.wt-fallback-cause.";
 
 /** Keeps a session on WebRTC across a reload of this tab, so each reload does not retry WebTransport. */
-export function rememberFallback(sessionId: string, reason: string): void {
+export function rememberFallback(sessionId: string, reason: string, cause: string): void {
   try {
     sessionStorage.setItem(REMEMBER_PREFIX + sessionId, reason);
+    sessionStorage.setItem(CAUSE_PREFIX + sessionId, cause);
   } catch {
     /* Storage blocked: a reload retries WebTransport, which falls back again. */
   }
@@ -59,6 +61,14 @@ export function rememberFallback(sessionId: string, reason: string): void {
 export function rememberedFallback(sessionId: string | undefined): string | null {
   try {
     return sessionId ? sessionStorage.getItem(REMEMBER_PREFIX + sessionId) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function rememberedFallbackCause(sessionId: string | undefined): string | null {
+  try {
+    return sessionId ? sessionStorage.getItem(CAUSE_PREFIX + sessionId) : null;
   } catch {
     return null;
   }
