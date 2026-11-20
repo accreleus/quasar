@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Fixed
+- WebTransport preserves session-ended and takeover close reasons during connection and keeps the WebRTC fallback cause visible after reload (#1478).
+
 ## 0.6.2 — 2026-11-20
 
 ### Upgrading
