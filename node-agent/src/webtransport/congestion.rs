@@ -44,8 +44,11 @@ const NOT_RECEIVED: u16 = 0xFFFF;
 /// The client's cadence (§Feedback).
 const FEEDBACK_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Send records kept, by `pkt_seq`: over a second at 100 Mbit/s.
-const LOG: usize = 1 << 14;
+/// Send records kept, by `pkt_seq`: over the estimator's 0.5 s rate window at a 400 Mbit/s
+/// grant, 25 MB of datagrams, ~21 800 of them (#1430). Sized for PyroWave's grant; the
+/// standard codec's 100 Mbit/s left the 0.5 s window at 400 Mbit/s under-read, so windows
+/// read as application-limited.
+const LOG: usize = 1 << 15;
 
 // Packet groups (libwebrtc `InterArrival`): one send burst, plus what arrived in a burst
 // behind it.
@@ -114,7 +117,9 @@ const APP_LIMITED: f64 = 0.8;
 /// Datagrams that arrived at under this share of the rate they were sent at: the link held
 /// them back (a queue or loss), so the report is evidence of the link ([`Estimator::measured`]).
 const LINK_LIMITED: f64 = 0.95;
-const MAX_ARRIVALS: usize = 1 << 14;
+/// Arrivals kept for the rate window, by receive order, one per datagram: the same 0.5 s at a
+/// 400 Mbit/s grant, ~21 800 of them (#1430).
+const MAX_ARRIVALS: usize = 1 << 15;
 
 /// Feedback silence while media is sent: past max(this, 2 intervals + RTT), the estimate
 /// decays by `SILENCE_DECAY` every `SILENCE_STEP`.
@@ -178,6 +183,9 @@ enum Status {
     #[default]
     Unreported,
     Lost,
+    /// Reported not received while an outage's own losses were exempt: no loss was counted,
+    /// so a late arrival of it has none to undo (#1557).
+    Outage,
     Received,
 }
 
@@ -468,6 +476,11 @@ pub(crate) struct Estimator {
     /// faster than AIMD. Dropped when it is reached, when it expires, when the link disagrees
     /// with a delay or loss cut, and on a codec switch (#1417).
     recover_to: Option<(f64, Instant)>,
+    /// The first send after the last feedback, in the log's µs clock, while a detected silence
+    /// is an outage: the report after it counts packets sent from here, up to the first it
+    /// shows received after it, as the outage's losses rather than congestion (#1557). Read by
+    /// `measure`, which clears it.
+    outage_from_us: Option<u64>,
     /// The bound the log last named, and when.
     logged: (Bound, Option<Instant>),
     /// The estimate before a silence decay not logged yet; delay and loss cuts always log.
@@ -512,6 +525,7 @@ impl Estimator {
             loss: None,
             bound: Bound::Ceiling,
             recover_to: None,
+            outage_from_us: None,
             logged: (Bound::Ceiling, None),
             unlogged: None,
             measured: None,
@@ -751,6 +765,10 @@ impl Estimator {
         if now.saturating_duration_since(sent) <= timeout {
             return None;
         }
+        // The silence is an outage: the packets sent since the last feedback are its losses
+        // (#1557). Kept until the first report after it reads and clears the mark.
+        self.outage_from_us
+            .get_or_insert(sent.saturating_duration_since(log.start).as_micros() as u64);
         let from = self.last_decay.unwrap_or(sent + timeout);
         let steps = now.saturating_duration_since(from).as_secs_f64() / SILENCE_STEP.as_secs_f64();
         let factor = SILENCE_DECAY.powf(steps);
@@ -848,6 +866,12 @@ impl Estimator {
     /// in `pkt_seq` (send) order, and read the windowed receive rate and loss.
     pub(crate) fn measure(&mut self, fb: &Feedback, log: &mut SendLog, now: Instant) -> Measured {
         let (mut received, mut lost) = (0i64, 0i64);
+        // A loss sent during the detected outage belongs to the outage, not congestion: the
+        // first report after it must not cut the loss bound (#1557). The exemption ends at
+        // the send time of the first packet this report shows as received after the mark:
+        // from then the link answered, so a loss sent after it is congestion.
+        let outage = self.outage_from_us;
+        let mut answered_from: Option<u64> = None;
         let mut newest_fresh = None;
         for (i, &arrival) in fb.arrivals.iter().enumerate() {
             let seq = fb.first_pkt_seq.wrapping_add(i as u32);
@@ -858,10 +882,23 @@ impl Estimator {
                 .then(|| fb.ref_us.checked_add(u64::from(arrival) * UNIT_US))
                 .flatten();
             match (slot.status, at_us) {
-                (Status::Received, _) | (Status::Lost, None) => continue,
+                (Status::Received, _) | (Status::Lost, None) | (Status::Outage, None) => continue,
+                (Status::Outage, Some(_)) => {
+                    // Late: no loss was counted for it, so there is none to undo; it is no
+                    // delay sample either.
+                    slot.status = Status::Received;
+                    received += 1;
+                }
                 (Status::Unreported, None) => {
-                    slot.status = Status::Lost;
-                    lost += 1;
+                    let exempt = outage.is_some_and(|from| {
+                        slot.sent_us >= from && answered_from.is_none_or(|at| slot.sent_us < at)
+                    });
+                    if exempt {
+                        slot.status = Status::Outage;
+                    } else {
+                        slot.status = Status::Lost;
+                        lost += 1;
+                    }
                     continue;
                 }
                 (Status::Lost, Some(_)) => {
@@ -873,6 +910,11 @@ impl Estimator {
                 (Status::Unreported, Some(at)) => {
                     slot.status = Status::Received;
                     received += 1;
+                    // The first packet this report shows received after the mark: the
+                    // outage's exemption ends at its send time (#1557).
+                    if outage.is_some_and(|from| slot.sent_us >= from) {
+                        answered_from.get_or_insert(slot.sent_us);
+                    }
                     if let Some((send_d, arrival_d, arrival_ms)) =
                         self.inter_arrival.push(slot.sent_us, at)
                     {
@@ -941,6 +983,8 @@ impl Estimator {
             .fold((0i64, 0i64), |(r, l), &(_, a, b)| (r + a, l + b));
         let (r, l) = (r.max(0), l.max(0));
         let loss = (r + l >= LOSS_MIN_SAMPLES).then(|| l as f64 / (r + l) as f64);
+        // The mark is spent: only the first report after the outage is exempt (#1557).
+        self.outage_from_us = None;
 
         Measured {
             usage: self.trendline.usage,

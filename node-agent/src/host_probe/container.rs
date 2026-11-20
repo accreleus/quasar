@@ -18,9 +18,10 @@ pub enum Observed {
     Busy,
     /// The runtime API returned an error this probe cannot interpret further.
     RuntimeError(String),
-    /// The audio sidecar's socket became connectable.
+    /// The audio sidecar's socket became connectable AND its three baked devices
+    /// (`quasar_output`, `quasar_mic`, `quasar_mic_src`) were listed (#479).
     SocketReady,
-    /// The audio sidecar's socket never became connectable within its wait budget.
+    /// The audio sidecar's socket and devices never became ready within its wait budget.
     SocketTimeout,
 }
 

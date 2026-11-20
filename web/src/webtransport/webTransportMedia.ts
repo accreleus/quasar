@@ -350,9 +350,17 @@ export class WebTransportMedia implements MediaTransport {
     } catch {
       return refused("connect_failed");
     }
-    // Read here or below; a failed connect must not leave it unhandled.
+    // Read here or below; a failed connect must not leave it unhandled. `settled.close` keeps the
+    // close a connection that already ended gave, so the accept check can read it without waiting
+    // out {@link CLOSE_CODE_WAIT_MS} for a session whose close raced the `hello_ack` (#1478). The
+    // holder object, not a `let`, because TypeScript narrows a `let` assigned in a callback to its
+    // initializer's `null`.
+    const settled: { close: WebTransportCloseInfo | null } = { close: null };
     const closeInfo = wt.closed.then(
-      (info) => info,
+      (info) => {
+        settled.close = info;
+        return info;
+      },
       () => null,
     );
     const abandon = (answer: Answer, sent?: WebTransportCloseInfo): Answer => {
@@ -438,11 +446,12 @@ export class WebTransportMedia implements MediaTransport {
     // Datagrams can overtake the hello_ack; the decode stage holds units by config_id, the
     // router PyroWave fragments.
     const feedback = new FeedbackRecorder(this.now());
-    /** `hello_ack.retransmit_window_ms`, and the path's round trip from the latest pong; until
-     *  both are known, no gap is held. */
+    /** `hello_ack.retransmit_window_ms`, and the path's round trip from the pongs; until both are
+     *  known, no gap is held. The round trip is smoothed as the assembler's own is: one ping spike
+     *  is not the path, and its cap must not fall to 0 for a second (#1436). */
     let retransmitWindowMs = 0;
-    let pathRttMs = Infinity;
-    const router = this.makeRouter(sink, live, feedback, () => retransmitWindowMs - pathRttMs);
+    let pathRttMs: number | null = null;
+    const router = this.makeRouter(sink, live, feedback, () => retransmitWindowMs - (pathRttMs ?? Infinity));
     /** Set once this attempt's datagram reader has failed: `datagrams: <name>: <message>`. */
     const datagramReader = { death: null as string | null };
     void this.readDatagrams(wt, sink, router, live, feedback, datagramReader).catch((err: unknown) => {
@@ -477,7 +486,16 @@ export class WebTransportMedia implements MediaTransport {
 
     if (this.closed) return abandon(refused("closed"));
     // Accepted, but no video can arrive on this connection: never call it connected (#1403).
-    if (datagramReader.death) return abandon(refused("internal", datagramReader.death), { closeCode: 4400, reason: datagramReader.death.slice(0, 100) });
+    if (datagramReader.death) {
+      // The session's own close outranks the reader's death even here: a takeover (4410) or a
+      // session end (4404) that resolved in the same instant as the `hello_ack` is that
+      // refusal, not `internal` (#1478).
+      const code = settled.close?.closeCode ?? null;
+      if (code !== null && code !== 0 && CLOSE_REFUSALS[code]) {
+        return abandon(refused(CLOSE_REFUSALS[code], closeDetail(code, settled.close?.reason)));
+      }
+      return abandon(refused("internal", datagramReader.death), { closeCode: 4400, reason: datagramReader.death.slice(0, 100) });
+    }
     this.abortAttempt = null;
     this.wt = wt;
     this.writer = writer;
@@ -511,8 +529,11 @@ export class WebTransportMedia implements MediaTransport {
           else if (m.type === "nack_miss" && typeof m.frame_seq === "number" && Array.isArray(m.frags)) {
             router.miss(m.frame_seq, m.frags as [number, number][]);
           } else if (m.type === "pong" && typeof m.tc === "number") {
-            pathRttMs = Math.max(0, this.now() - m.tc);
-            sink.rtt?.(pathRttMs, typeof m.tw === "number" ? m.tw : undefined);
+            const rtt = Math.max(0, this.now() - m.tc);
+            // A longer sample at most doubles the estimate and a shorter one is averaged in at 1/8,
+            // as the assembler's round trip is: a spike from one ping does not shrink the window.
+            pathRttMs = pathRttMs === null ? rtt : rtt > pathRttMs ? Math.min(rtt, 2 * pathRttMs) : (7 * pathRttMs + rtt) / 8;
+            sink.rtt?.(rtt, typeof m.tw === "number" ? m.tw : undefined);
           }
           else if (m.type === "ping") {
             this.send({ type: "pong", id: m.id, ts: m.ts, tw: m.tw, tc: this.now() });

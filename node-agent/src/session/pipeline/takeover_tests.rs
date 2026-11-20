@@ -8,7 +8,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -856,6 +856,17 @@ fn input_reaches_host(host: &mut Host, peer: &mut Peer) -> bool {
 
 fn threads() -> usize {
     std::fs::read_dir("/proc/self/task").map_or(0, |d| d.count())
+}
+
+/// `pc.close()` in a browser: an SCTP ABORT, then the peer connections go — what a page does
+/// on a reload (amendment 92: `runner::PeerRejoinGrace` holds the session for the rejoin).
+fn close_as_a_browser(session: &mut Session, peer: &mut Peer) {
+    let sent = peer.video.abort_sctp();
+    let left = session.pump(peer, Duration::from_secs(2), |_, _| {
+        sent.load(Ordering::SeqCst)
+    });
+    assert!(left, "the ABORT never left the peer");
+    peer.stop();
 }
 
 /// The issue: a second page opens a session a first page is streaming.
@@ -3183,6 +3194,297 @@ fn a_session_nobody_answered_stops() {
     session.stop.store(true, Ordering::SeqCst);
 
     let ended = session.ends_within(Duration::from_secs(15));
+    assert!(
+        matches!(ended, Some(SessionEvent::Stopped { .. })),
+        "the session did not stop: {ended:?}"
+    );
+}
+
+/// Amendment 92 (#1005): a reload inside the peer-rejoin grace rejoins its own live session.
+/// The page's peer connections close, the reloaded page recreates them and sends `restart_ice`
+/// for each, and the same session continues with media and input on the new peer's transports.
+#[test]
+fn a_reload_inside_the_peer_rejoin_grace_rejoins_the_same_session() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut session = Session::start("rejoin-attach", Duration::from_secs(600));
+    let mut a = Peer::new();
+    assert!(
+        session.pump(&mut a, Duration::from_secs(20), |_, p| streaming(p)),
+        "the first peer never streamed: {}",
+        describe(&a)
+    );
+    // The page reloads: its peer connections close, so the host sees the `"input"`
+    // DataChannel's association end.
+    close_as_a_browser(&mut session, &mut a);
+    // The reloaded page mints a token for the same session, opens a new socket and recreates
+    // its peer connections, sending one `restart_ice` for each inside the grace.
+    let mut b = Peer::new();
+    for pc in [PcId::Video, PcId::Audio] {
+        let _ = session.to_host.send(SignalMsg::RestartIce { pc: Some(pc) });
+    }
+    let up = session.pump(&mut b, Duration::from_secs(20), |_, p| streaming(p));
+    assert!(
+        up,
+        "the reloaded peer never received media: {} (offers {:?})",
+        describe(&b),
+        session.offers
+    );
+    assert!(
+        session.ended.is_none(),
+        "the session ended instead of rejoining: {:?}",
+        session.ended
+    );
+    // The same session: input reaches the host on the rejoined transport...
+    let pongs = b.video.pongs.load(Ordering::Relaxed);
+    b.video.ping();
+    assert!(
+        session.pump(&mut b, Duration::from_secs(2), |_, p| {
+            p.video.pongs.load(Ordering::Relaxed) > pongs
+        }),
+        "input never reached the host on the rejoined transport"
+    );
+    // ...and media resumes.
+    let before = rtp(&b.video);
+    session.pump(&mut b, Duration::from_millis(400), |_, _| false);
+    assert!(
+        rtp(&b.video) > before + 10,
+        "media stopped after the rejoin: video rtp {before} -> {}",
+        rtp(&b.video)
+    );
+
+    session.stop.store(true, Ordering::SeqCst);
+    let ended = session.pump(&mut b, Duration::from_secs(20), |s, _| s.ended.is_some());
+    assert!(ended, "the rejoined session never stopped");
+    assert!(
+        matches!(session.ended, Some(SessionEvent::Stopped { .. })),
+        "the rejoined session did not stop cleanly: {:?}",
+        session.ended
+    );
+    session.thread.take().unwrap().join().unwrap();
+}
+
+/// Amendment 92 (#1005): a reload that never comes holds the session for the peer-rejoin
+/// grace (ten seconds after the one-second stop-race grace) and only then ends it on today's
+/// clean peer-disconnect path, with the exact detail.
+#[test]
+fn a_reload_that_never_comes_ends_the_session_after_the_peer_rejoin_grace() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut session = Session::start("rejoin-expire", Duration::from_secs(600));
+    let mut a = Peer::new();
+    assert!(
+        session.pump(&mut a, Duration::from_secs(20), |_, p| streaming(p)),
+        "the first peer never streamed: {}",
+        describe(&a)
+    );
+    close_as_a_browser(&mut session, &mut a);
+    // Nobody rejoins. Today's end used to arrive about a second after the association died;
+    // amendment 92 holds the session for ten more seconds first.
+    let mut nobody = Peer::new();
+    assert!(
+        !session.pump(&mut nobody, Duration::from_secs(3), |s, _| s
+            .ended
+            .is_some()),
+        "the session ended without the peer-rejoin grace: {:?}",
+        session.ended
+    );
+    let ended = session.ends_within(Duration::from_secs(20));
+    assert!(ended.is_some(), "the session never ended after the grace");
+    assert!(
+        session
+            .log
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Stopping)),
+        "the grace ends with Stopping first"
+    );
+    assert!(
+        matches!(
+            session.ended,
+            Some(SessionEvent::Stopped { detail: Some(d), .. })
+                if d == "peer disconnected: WebRTC data channel closed"
+        ),
+        "want stopped with the peer-disconnect detail: {:?}",
+        session.ended
+    );
+}
+
+/// The registry a `Session` with WebTransport attaches its tap to: assigned for the session
+/// before the runner starts, so `Tap::attach` finds it assigned on the first transport build
+/// (a listener-less test, `TEST_REGISTRY`).
+fn webtransport_registry(tag: &str) -> Arc<crate::webtransport::Registry> {
+    let registry = Arc::new(crate::webtransport::Registry::default());
+    *crate::webtransport::TEST_REGISTRY.lock().unwrap() = Some(registry.clone());
+    registry.assign(
+        &format!("takeover-{tag}"),
+        "grace-test-token",
+        SystemTime::now() + Duration::from_secs(3600),
+    );
+    registry
+}
+
+/// Drives a game exit on the named session's runner: the launch helper that reports one is
+/// not installed beside the test binary.
+struct ForcedGameExit;
+
+impl ForcedGameExit {
+    fn on(session_id: &str) -> ForcedGameExit {
+        *crate::session::runner::FORCED_GAME_EXIT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(session_id.to_string());
+        ForcedGameExit
+    }
+}
+
+impl Drop for ForcedGameExit {
+    fn drop(&mut self) {
+        *crate::session::runner::FORCED_GAME_EXIT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// Amendment 92 + 39 (#1005): a game exit during the peer-rejoin grace hands the runtime to
+/// adoption (`Held`, `held_since`), so the grace's deadline must never send `Stopping` /
+/// `Stopped(PEER_DISCONNECT_DETAIL)` and tear down a runtime a new session may adopt inside
+/// the grace. Without the clear, the deadline ends the held runtime.
+#[test]
+fn a_game_exit_during_the_peer_rejoin_grace_never_ends_the_held_runtime() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let mut session = Session::start_with("rejoin-held", Duration::from_secs(600), |cfg| {
+        cfg.kind = Some(crate::messages::SessionKind::Play);
+    });
+    let mut a = Peer::new();
+    assert!(
+        session.pump(&mut a, Duration::from_secs(20), |_, p| streaming(p)),
+        "the first peer never streamed: {}",
+        describe(&a)
+    );
+    close_as_a_browser(&mut session, &mut a);
+    // The grace starts after the one-second stop-race grace; it is holding here.
+    let mut nobody = Peer::new();
+    assert!(
+        !session.pump(&mut nobody, Duration::from_secs(3), |s, _| s
+            .ended
+            .is_some()),
+        "the session ended without the peer-rejoin grace: {:?}",
+        session.ended
+    );
+    let _exit = ForcedGameExit::on(&session.id);
+    assert!(
+        session.pump(&mut nobody, Duration::from_secs(3), |s, _| s
+            .log
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Held))),
+        "the game exit never held the runtime: {:?}",
+        session.log
+    );
+    // Past the grace's deadline (~11 s after the association died): the runtime stays held.
+    assert!(
+        !session.pump(&mut nobody, Duration::from_secs(10), |s, _| s
+            .ended
+            .is_some()),
+        "the grace ended a runtime held for adoption: {:?}",
+        session.ended
+    );
+    assert!(session.ended.is_none());
+    assert!(
+        !session
+            .log
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Stopping | SessionEvent::Stopped { .. })),
+        "the grace emitted Stopping/Stopped after Held: {:?}",
+        session.log
+    );
+
+    drop(_exit);
+    session.stop.store(true, Ordering::SeqCst);
+    let ended = session.ends_within(Duration::from_secs(10));
+    assert!(
+        matches!(ended, Some(SessionEvent::Stopped { .. })),
+        "the held runtime did not stop: {ended:?}"
+    );
+}
+
+/// Amendment 92 (#1005): a WebTransport `hello` inside the peer-rejoin grace is a new peer
+/// (amendment 92: every attach inside the grace continues the session), so its deadline must
+/// not end the session while that client streams. Without the clear, the holder's transport
+/// is muted (`take_from_webrtc`) and the session ends "peer disconnected" at the deadline.
+#[test]
+fn a_webtransport_takeover_inside_the_peer_rejoin_grace_keeps_the_session() {
+    if !live_webrtc_available() {
+        return;
+    }
+    let _serial = serial();
+    let registry = webtransport_registry("rejoin-wt");
+    let mut session = Session::start_with("rejoin-wt", Duration::from_secs(600), |cfg| {
+        cfg.webtransport = true;
+    });
+    let mut a = Peer::new();
+    assert!(
+        session.pump(&mut a, Duration::from_secs(20), |_, p| streaming(p)),
+        "the first peer never streamed: {}",
+        describe(&a)
+    );
+    let media = {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(media) = registry.media_of(&session.id) {
+                break media;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the session's WebTransport tap never registered"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    close_as_a_browser(&mut session, &mut a);
+    // The grace starts after the one-second stop-race grace; it is holding here.
+    let mut nobody = Peer::new();
+    assert!(
+        !session.pump(&mut nobody, Duration::from_secs(3), |s, _| s
+            .ended
+            .is_some()),
+        "the session ended without the peer-rejoin grace: {:?}",
+        session.ended
+    );
+    // Inside the grace a WebTransport client sends its `hello`: a new peer.
+    let _wt = media
+        .attach(false, Duration::ZERO)
+        .expect("the WebTransport hello is accepted");
+    assert!(media.attached(), "the WebTransport client is not attached");
+    // Past the grace's deadline: the client still holds the session.
+    assert!(
+        !session.pump(&mut nobody, Duration::from_secs(11), |s, _| s
+            .ended
+            .is_some()),
+        "the grace ended the session while its WebTransport client streamed: {:?}",
+        session.ended
+    );
+    assert!(
+        session.ended.is_none(),
+        "the session ended: {:?}",
+        session.ended
+    );
+    assert!(
+        !session
+            .log
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Stopping | SessionEvent::Stopped { .. })),
+        "the grace emitted Stopping/Stopped after the takeover: {:?}",
+        session.log
+    );
+
+    session.stop.store(true, Ordering::SeqCst);
+    let ended = session.ends_within(Duration::from_secs(10));
     assert!(
         matches!(ended, Some(SessionEvent::Stopped { .. })),
         "the session did not stop: {ended:?}"

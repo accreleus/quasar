@@ -385,7 +385,18 @@ func TestDeveloperApplyRefusals(t *testing.T) {
 		t.Errorf("sent %d release_apply, want at most the one accepted", h.agent.sentCount())
 	}
 
-	// A registry host is never given one.
+	// A registry host is never given one. The accepted attempt above started a
+	// runner goroutine writing platform_apply_attempts and hosts; the second
+	// harness's setup TRUNCATEs ... CASCADE, and the two raced into a 40P01
+	// deadlock under load (#1329). Stop it and prove nothing is still driving
+	// before the truncate.
+	h.runner.Close()
+	h.runner.mu.Lock()
+	inflight := len(h.runner.running)
+	h.runner.mu.Unlock()
+	if inflight != 0 {
+		t.Fatalf("%d attempt(s) still driving after Close; the next harness's truncate would race them", inflight)
+	}
 	h2 := newDevHarness(t)
 	mustExec(t, h2.pool, `UPDATE hosts SET install_mode = 'registry' WHERE id = $1::uuid`, h2.hostID)
 	if status, out := h2.post(t, devURL, h2.adminToken, h2.body(agentComponent())); status != http.StatusConflict || errCode(t, out) != CodeTargetNotOwned {

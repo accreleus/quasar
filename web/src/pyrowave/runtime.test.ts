@@ -11,9 +11,10 @@ import { PyroWaveError } from "./bitstream";
 import type { Presenter } from "../webtransport/presenter";
 import { WebTransportMedia } from "../webtransport/webTransportMedia";
 import { createWebTransportRuntime, type WebTransportRuntimeDeps } from "../pages/app/webTransportRuntime";
-import { avcC, b64, COORDS, FakeAgent, FakeChunk, FakeDecoder, helloAck, packPyroWave, pyroWaveDatagrams } from "../webtransport/testSupport";
+import { avcC, b64, COORDS, FakeAgent, FakeChunk, FakeDecoder, helloAck, packPyroWave, packetize, pyroWaveDatagrams, bytes } from "../webtransport/testSupport";
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -39,7 +40,7 @@ const pyroAck = (configId: number, reason = "launch") => ({
   codec_switch_reason: reason,
 });
 
-function setup(opts: { offer?: boolean; warm?: boolean; deps?: Partial<WebTransportRuntimeDeps> } = {}) {
+function setup(opts: { offer?: boolean; warm?: boolean; keyRequired?: boolean; deps?: Partial<WebTransportRuntimeDeps> } = {}) {
   vi.stubGlobal("EncodedVideoChunk", FakeChunk);
   const agent = new FakeAgent();
   agent.replies = [[pyroAck(0)]];
@@ -86,6 +87,7 @@ function setup(opts: { offer?: boolean; warm?: boolean; deps?: Partial<WebTransp
       decoder: {
         createDecoder: (init) => {
           const d = new FakeDecoder(init);
+          if (opts.keyRequired) d.keyRequired = true;
           h264.push(d);
           return d as unknown as VideoDecoder;
         },
@@ -237,6 +239,46 @@ describe("a PyroWave session in the WebTransport runtime", () => {
     agent.last.datagrams(datagrams(0, 1));
     await vi.waitFor(() => expect(textures).toHaveLength(1));
     expect(loadBench).not.toHaveBeenCalled();
+    rt.destroy();
+  });
+
+  it("clears the standard decoder's keyframe wait when PyroWave takes over mid-session (#1436)", async () => {
+    vi.useFakeTimers();
+    // The fake decoder now rejects a delta with no keyframe since configure(), as Chrome does: a
+    // stale unit of the old configuration reaching it after leave() would end the connection.
+    const { agent, rt, textures } = setup({ keyRequired: true });
+    agent.replies = [[helloAck(0, avcC())]];
+    rt.start();
+    await vi.advanceTimersByTimeAsync(20);
+    expect(rt.getSnapshot().channelOpen).toBe(true);
+    // A picture on the standard codec, then a new configuration whose keyframe never comes: the
+    // decode stage waits for it while its deltas keep arriving.
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(10, 0) }));
+    await vi.advanceTimersByTimeAsync(1_000);
+    agent.last.control(helloAck(1, avcC(0x28), 1280, 720));
+    await vi.advanceTimersByTimeAsync(10);
+    for (let i = 0; i < 2; i++) {
+      agent.last.datagrams(packetize({ configId: 1, frameSeq: 1 + i, keyframe: false, data: bytes(10, 1 + i) }));
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+    // The session switches to PyroWave mid-session, and its frames show: the stale keyframe wait
+    // must not outlast its bound (5 s plus four round trips) and end the connection as lost.
+    agent.last.control(pyroAck(2, "switch"));
+    await vi.advanceTimersByTimeAsync(10);
+    // A stale delta of the old configuration trails the PyroWave ack. With the stage still holding
+    // the old decoder and needKey off, it reaches decode() as a delta with no keyframe and ends the
+    // connection as a lost stream (#1436) unless leave() has made the stage inert until the next
+    // config(). (A connection ended by the wait is no longer open, so the loop stops there and the
+    // assertion below names the failure.)
+    agent.last.datagrams(packetize({ configId: 1, frameSeq: 3, keyframe: false, data: bytes(10, 3) }));
+    for (let i = 0; i < 6 && rt.getSnapshot().channelOpen; i++) {
+      agent.last.datagrams(datagrams(2, 2 + i));
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+    expect(textures.length).toBeGreaterThan(0);
+    expect(rt.getSnapshot().channelOpen).toBe(true);
+    expect(agent.sent("hello")).toHaveLength(1);
+    expect(agent.sent("codec_fallback")).toEqual([]);
     rt.destroy();
   });
 });

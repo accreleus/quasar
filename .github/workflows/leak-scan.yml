@@ -70,3 +70,45 @@ jobs:
           LEAK_SCAN_OPERATOR_PATTERNS: ${{ secrets.LEAK_SCAN_OPERATOR_PATTERNS }}
           LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS: '1'
         run: bash scripts/dev/leak-scan.sh --issues
+
+  # CREDENTIALS — the scanner the issue asked for (#595). leak-scan.sh refuses
+  # operator fingerprints; it does not look for keys, tokens or passwords at all.
+  # This job runs gitleaks over a pull request so a credential-shaped string fails
+  # before merge.
+  #
+  # NO REPOSITORY SECRET. The official gitleaks GitHub action asks for a
+  # GITLEAKS_LICENSE on org accounts. Running the pinned gitleaks container directly
+  # needs none, so a pull request from a fork scans with no secret — the whole point
+  # of the issue. The image is pinned by version AND digest, the same way the
+  # WebGPU job pins the Playwright image above.
+  #
+  # ONLY THE PR'S COMMITS. In pull_request mode gitleaks scans the range
+  # merge-base..HEAD, so the fixtures and fingerprints already in history can never
+  # block a pull request; a push / dispatch / scheduled run scans the whole tree
+  # instead (the fixtures are allow-listed in .gitleaks.toml, and a real secret
+  # anywhere in the tree is what that run exists to catch). .gitleaks.toml is read
+  # from /repo automatically.
+  credentials:
+    name: credential scanner (gitleaks)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Scan for credentials
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            base="$(git merge-base HEAD "${{ github.event.pull_request.base.sha }}")"
+            echo "credentials: scanning pull-request commits ${base}..HEAD"
+            scan=(git --log-opts "${base}..HEAD")
+          else
+            echo "credentials: scanning the full tree (push / dispatch / schedule)"
+            scan=(dir)
+          fi
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}":/repo \
+            ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+            --timeout 600 "${scan[@]}" /repo --no-banner --redact

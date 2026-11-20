@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::{live_webrtc_available, rtp, serial, streaming, Peer, Session};
+use super::{close_as_a_browser, live_webrtc_available, rtp, serial, streaming, Peer, Session};
 use crate::messages::SessionKind;
 use crate::session::container::ContainerSpec;
 use crate::session::runner::{AdoptRequest, SessionEvent, SwapRequest};
@@ -113,13 +113,28 @@ impl FakeHelper {
 
     /// The next command the runner sent, while `session` and `peer` keep talking.
     fn command(&mut self, session: &mut Session, peer: &mut Peer) -> String {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        self.command_within(session, peer, Duration::from_secs(10))
+    }
+
+    /// [`FakeHelper::command`] with its own deadline: an end that waits out the peer-rejoin
+    /// grace (amendment 92) can arrive more than ten seconds after the association died.
+    fn command_within(
+        &mut self,
+        session: &mut Session,
+        peer: &mut Peer,
+        within: Duration,
+    ) -> String {
+        let deadline = Instant::now() + within;
         loop {
             let mut line = String::new();
             if matches!(self.reader.read_line(&mut line), Ok(n) if n > 0) {
                 return line.trim_end().to_string();
             }
-            assert!(Instant::now() < deadline, "no command reached the helper");
+            assert!(
+                Instant::now() < deadline,
+                "no command reached the helper within {}s",
+                within.as_secs()
+            );
             session.pump(peer, Duration::from_millis(30), |_, _| false);
         }
     }
@@ -231,7 +246,18 @@ fn adopt_as(session: &mut Session, flags: &str, kind: Option<SessionKind>) -> us
 /// One `app booting` (the adopting session's `running`: a `running` report without it would
 /// let a client reveal a stream the game has not drawn on, #749) and one `effective_media`
 /// for the adopting session, the restart offers notwithstanding.
+///
+/// The window starts at the adopting session's `Starting`, not at the log's length taken
+/// before the adopt: the parked session's `running` and `effective_media` are two separate
+/// reports, and a pump that stops on the first leaves the second in the event channel.
+/// Drained later, it lands behind that length and reads as a second report for the adopter
+/// (#1549). The channel's order puts every event the parked session emitted before the
+/// adoption, so the adopting session's own `Starting` is the deterministic boundary.
 fn assert_one_session_start(log: &[SessionEvent], from: usize) {
+    let from = log[from..]
+        .iter()
+        .position(|e| matches!(e, SessionEvent::Starting))
+        .map_or(from, |i| from + i);
     let count = |what: fn(&SessionEvent) -> bool| log.iter().skip(from).filter(|e| what(e)).count();
     assert_eq!(
         count(|e| matches!(e, SessionEvent::Starting)),
@@ -511,16 +537,6 @@ fn a_stop_with_the_game_running_ends_media_first_and_waits_for_the_cloud_sync() 
     synced_then_ended(session, &mut a, &helper, None);
 }
 
-/// `pc.close()` in a browser: an SCTP ABORT, then the peer connections go.
-fn close_as_a_browser(session: &mut Session, peer: &mut Peer) {
-    let sent = peer.video.abort_sctp();
-    let out = session.pump(peer, Duration::from_secs(2), |_, _| {
-        sent.load(Ordering::SeqCst)
-    });
-    assert!(out, "the ABORT never left the peer");
-    peer.stop();
-}
-
 /// The web client's Stop: `bye` and its peer connections closed, then the HTTP stop, which
 /// reaches the runner inside `SCTP_STOP_RACE_GRACE` after the association died.
 #[test]
@@ -538,8 +554,8 @@ fn a_browser_stop_closes_its_peer_first_and_the_game_still_quits() {
     synced_then_ended(session, &mut a, &helper, None);
 }
 
-/// The peer goes and no stop follows (a closed tab): the session ends, and the game is quit
-/// for it like any other end.
+/// The peer goes and no stop follows (a closed tab): the session holds for the peer-rejoin
+/// grace (amendment 92) and only then ends, quitting the game for it like any other end.
 #[test]
 fn a_peer_that_leaves_with_no_stop_still_has_its_game_quit() {
     if !live_webrtc_available() {
@@ -548,7 +564,15 @@ fn a_peer_that_leaves_with_no_stop_still_has_its_game_quit() {
     let _serial = serial();
     let (_runtime, mut session, mut a, mut helper) = running_620("end-quit-gone");
     close_as_a_browser(&mut session, &mut a);
-    assert_eq!(helper.command(&mut session, &mut a), "quit 620");
+    assert!(
+        !session.pump(&mut a, Duration::from_secs(3), |s, _| s.ended.is_some()),
+        "the session ended without the peer-rejoin grace: {:?}",
+        session.ended
+    );
+    assert_eq!(
+        helper.command_within(&mut session, &mut a, Duration::from_secs(20)),
+        "quit 620"
+    );
     synced_then_ended(
         session,
         &mut a,
@@ -991,7 +1015,7 @@ fn a_restreamed_adoptions_viewer_leaving_ends_the_session() {
     helper.launch_state("game_running");
     close_as_a_browser(&mut session, &mut b);
     assert_eq!(
-        helper.command(&mut session, &mut b),
+        helper.command_within(&mut session, &mut b, Duration::from_secs(20)),
         "quit 730",
         "the viewer leaving was read as the old viewer's transport closing"
     );

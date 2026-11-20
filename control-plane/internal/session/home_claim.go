@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -271,6 +272,8 @@ const (
 func resolveSharedHome(ctx context.Context, tx pgx.Tx, p *CreateParams) (string, error) {
 	owner, _, err := homeClaimLocation(ctx, tx, p.sharedParams())
 	if errors.Is(err, ErrHomeConflict) {
+		slog.InfoContext(ctx, "Steam library not shared", "reason", "steam_home_location_conflict",
+			"app_id", p.AppID, "user_id", p.UserID, "shared_home_app_id", p.SharedHomeAppID)
 		p.SharedHomeAppID = ""
 		return noticeSharedUnavailable, nil
 	}
@@ -287,6 +290,8 @@ func resolveSharedHome(ctx context.Context, tx pgx.Tx, p *CreateParams) (string,
 			return "", nil
 		}
 	}
+	slog.InfoContext(ctx, "Steam library not shared", "reason", "steam_home_other_host",
+		"app_id", p.AppID, "user_id", p.UserID, "shared_home_app_id", p.SharedHomeAppID, "steam_home_host_id", owner)
 	p.SharedHomeAppID = ""
 	return noticeSharedOtherHost, nil
 }
@@ -301,6 +306,10 @@ func resolveSharedHome(ctx context.Context, tx pgx.Tx, p *CreateParams) (string,
 // claim when it was a Steam session, and its own hold is not a conflict with
 // itself. A launch passes none.
 func claimSharedHome(ctx context.Context, tx pgx.Tx, p *CreateParams, hostID string, sameSession ...string) (string, error) {
+	var sessionID string
+	if len(sameSession) > 0 {
+		sessionID = sameSession[0]
+	}
 	sp, err := tx.Begin(ctx)
 	if err != nil {
 		return "", fmt.Errorf("begin shared home claim: %w", err)
@@ -308,13 +317,15 @@ func claimSharedHome(ctx context.Context, tx pgx.Tx, p *CreateParams, hostID str
 	defer sp.Rollback(ctx) //nolint:errcheck
 	// A first Steam claim goes only where Steam itself may run, or the next
 	// Steam launch meets a home its placement excludes: home_conflict.
-	owner, _, err := homeClaimLocation(ctx, sp, p.sharedParams())
+	owner, holder, err := homeClaimLocation(ctx, sp, p.sharedParams())
 	if err == nil && owner == "" {
 		selected, err := placementSelectedForHost(ctx, sp, p.SharedHomeAppID, hostID)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return "", fmt.Errorf("check shared home placement: %w", err)
 		}
 		if !selected {
+			slog.InfoContext(ctx, "Steam library not shared", "reason", "steam_placement_excludes_host",
+				"app_id", p.AppID, "user_id", p.UserID, "session_id", sessionID, "shared_home_app_id", p.SharedHomeAppID, "host_id", hostID)
 			p.SharedHomeAppID = ""
 			return noticeSharedUnavailable, nil
 		}
@@ -332,6 +343,9 @@ func claimSharedHome(ctx context.Context, tx pgx.Tx, p *CreateParams, hostID str
 		if err := sp.Rollback(ctx); err != nil {
 			return "", fmt.Errorf("roll back shared home claim: %w", err)
 		}
+		slog.InfoContext(ctx, "Steam library not shared", "reason", "steam_home_claim_conflict",
+			"app_id", p.AppID, "user_id", p.UserID, "session_id", sessionID, "shared_home_app_id", p.SharedHomeAppID,
+			"host_id", hostID, "pending_home_session_id", holder)
 		p.SharedHomeAppID = ""
 		return noticeSharedUnavailable, nil
 	case err != nil:
@@ -636,6 +650,8 @@ func (s *Store) GuardHomeForSwapWithHold(ctx context.Context, sessionID, userID 
 	if !capable && p.SharedHomeAppID != "" {
 		// No hold is possible and the row records the share only at commit, so
 		// nothing would own the Steam claim until then (#1253): run without it.
+		slog.InfoContext(ctx, "Steam library not shared", "reason", "agent_cannot_hold",
+			"app_id", app.ID, "user_id", userID, "session_id", sessionID, "shared_home_app_id", p.SharedHomeAppID, "host_id", hostID)
 		p.SharedHomeAppID, notice = "", noticeSharedUnavailable
 	}
 	if p.SharedHomeAppID != "" {

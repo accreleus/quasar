@@ -1,0 +1,126 @@
+# Gitleaks configuration — the credential scanner that complements leak-scan.sh.
+#
+# WHY. leak-scan.sh refuses operator *fingerprints* (host names, LAN addresses,
+# private paths); it does not look for keys, tokens or passwords. This file
+# teaches gitleaks — run in .github/workflows/leak-scan.yml against a pull
+# request's commits — which committed strings are known-fake fixtures, so a real
+# credential-shaped string in a pull request is the only thing that can fail the
+# scan.
+#
+# The default gitleaks rule set is inherited ([extend] useDefault = true). These
+# allowlists only SUPPRESS known-fake findings; they never weaken detection of a
+# real secret. Paths are ECMA regexes matched against the scanned path (anchored
+# at the file, prefix-agnostic, the way the gitleaks examples are written). Each
+# entry carries the one-line reason it exists.
+
+title = "Quasar gitleaks configuration"
+
+[extend]
+useDefault = true
+
+# --- test constants -------------------------------------------------------
+# The test files whose fake keys/secrets the broad generic-api-key rule flags
+# (assigned so a test can assert on redaction, rotation or policy). Named one by
+# one and scoped to generic-api-key only: a specifically-typed secret (an AWS,
+# GitHub or Slack token, a private key) in any test file still fails the scan,
+# and a new test file gets no free pass.
+[[allowlists]]
+id = "test-constants"
+targetRules = ["generic-api-key"]
+description = "Test constants: fake keys/secrets assigned by these tests."
+paths = [
+    '''control-plane/internal/artwork/keysource_test\.go$''',
+    '''control-plane/internal/auth/handler_integration_test\.go$''',
+    '''control-plane/internal/devauth/devauth_test\.go$''',
+    '''control-plane/internal/secrets/crypto_test\.go$''',
+    '''control-plane/internal/secrets/store_test\.go$''',
+    '''node-agent/src/runtime/build_tests\.rs$''',
+    '''node-agent/src/runtime/image_tests\.rs$''',
+    '''node-agent/src/session/warmup/tests\.rs$''',
+    '''scripts/validate/stream/bundle\.test\.mjs$''',
+    '''scripts/validate/stream/pack\.test\.mjs$''',
+    '''scripts/validate/stream/run\.test\.mjs$''',
+    '''web/src/pages/app/account/DeviceCard\.test\.tsx$''',
+]
+
+# --- test harness and deploy fixtures --------------------------------------
+# Invented tokens and cp.example hosts that drive the harness and the enroll
+# test; the enroll fixture's token is a stand-in, not a real credential.
+[[allowlists]]
+id = "harness-fixtures"
+targetRules = ["generic-api-key"]
+description = "Test harness and enroll fixture: invented tokens and cp.example hosts."
+paths = [
+    '''dx/tests/run\.sh$''',
+    '''test-enroll-host\.sh$''',
+]
+
+# --- redaction test fake secrets -------------------------------------------
+# The redaction test's fixture: deliberately-fake AWS / JWT / private-key /
+# bearer strings that prove the report redacts secrets. The values are fake by
+# design and the fixture must keep carrying them to stay a valid test.
+[[allowlists]]
+id = "redaction-fixture"
+targetRules = ["private-key", "curl-auth-header", "jwt", "generic-api-key"]
+description = "Redaction test fixture: deliberately-fake secrets that prove redaction."
+paths = [
+    '''fixtures/redact-input\.txt$''',
+]
+
+# --- design mocks ----------------------------------------------------------
+# UI mock assets ship placeholder credentials for layout; nothing here is real.
+[[allowlists]]
+id = "design-mocks"
+targetRules = ["generic-api-key"]
+description = "Design mocks: placeholder credentials in UI mock assets."
+paths = [
+    '''design_handoff_v3/.*''',
+]
+
+# --- common-password deny-list ---------------------------------------------
+# Low-entropy passwords that must be rejected: they are not real credentials and
+# sit below the secret-entropy floor, but the entry keeps a future rule from
+# flagging the list itself.
+[[allowlists]]
+id = "common-passwords"
+description = "Common-password deny-list: low-entropy passwords, not real credentials."
+paths = [
+    '''auth/common_passwords\.go$''',
+]
+
+# --- generated metric manifests --------------------------------------------
+# The metric dictionary — the manifest, its generated copy and a doc snapshot —
+# metric keys, not credentials.
+[[allowlists]]
+id = "generated-metrics"
+targetRules = ["generic-api-key"]
+description = "Generated metric manifest/snapshot: metric keys, not credentials."
+paths = [
+    '''(?i).*/metrics(\.generated)?\.json$''',
+]
+
+# --- archived run-report logs ----------------------------------------------
+# Run-report logs under docs/reports: the flagged values are run/session/host
+# UUIDs from an archived run, not credentials.
+[[allowlists]]
+id = "archived-report-logs"
+targetRules = ["generic-api-key"]
+description = "Archived run-report logs: findings are run/session/host UUIDs, not credentials."
+paths = [
+    '''reports/.*\.log$''',
+]
+
+# --- source field false positives ------------------------------------------
+# In these real source files a `token`/`key` field carries a container directory,
+# a validated env value or a metric name, not a credential. Each is scoped to the
+# broad generic-api-key rule only, so a real, specifically-typed secret in the
+# file still fails the scan.
+[[allowlists]]
+id = "source-field-false-positives"
+targetRules = ["generic-api-key"]
+description = "False positive: a token/key field carrying a container dir, env value or metric name, not a credential."
+paths = [
+    '''session/container\.rs$''',
+    '''session/ladder\.rs$''',
+    '''stream/review\.mjs$''',
+]

@@ -482,6 +482,20 @@ impl Media {
         self.lock().config.is_some()
     }
 
+    /// Amendment 85: publish this connection's FEC attach only while it is still the session's
+    /// attached client. The check and the publish run under the same state lock `attach`
+    /// replaces its client under, so a successor's takeover cannot land between them: a
+    /// displaced connection's late attach is refused instead of publishing after the
+    /// successor's and overwriting its telemetry (#1569).
+    pub(crate) fn fec_attach(&self, client: u64, fec: bool) {
+        let st = self.lock();
+        if st.client.as_ref().is_some_and(|c| c.id == client) {
+            if let Some(rate) = self.rate.as_ref() {
+                (rate.fec)(super::FecEvent::Attached { client, fec });
+            }
+        }
+    }
+
     /// A WebTransport client takes the session, displacing its holder unless that is past
     /// §Takeover's bound. What the holder held is lifted now, before the new client can send;
     /// a displaced WebRTC peer's transport is left for the runner to stop
@@ -1512,6 +1526,54 @@ mod tests {
         assert!(
             media.attach(false, Duration::ZERO).is_err(),
             "a hello racing the end gets nothing"
+        );
+    }
+
+    /// #1569: the FEC attach publish refuses a client the session no longer has, under the
+    /// same lock `attach` replaces it under. Client A's check passes while it is current;
+    /// the successor's takeover, `hello_ack` and attach publish then all land before A's
+    /// attach publish, and A's late publish must not overwrite the successor's telemetry.
+    #[test]
+    fn a_displaced_clients_fec_attach_publish_is_refused_after_the_successors() {
+        gst::init().unwrap();
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let log = published.clone();
+        let rate = crate::webtransport::Rate {
+            measured: Box::new(|_| {}),
+            ceiling_kbps: 8000.0,
+            floor_kbps: Box::new(|| 4000.0),
+            retargets: true,
+            start: Box::new(|| {}),
+            owns: Box::new(|| false),
+            displaced: Box::new(|| {}),
+            observe: Box::new(|_| {}),
+            fec: Box::new(move |event| {
+                if let crate::webtransport::FecEvent::Attached { client, fec } = event {
+                    log.lock().unwrap().push((client, fec));
+                }
+            }),
+        };
+        let encoder = gst::ElementFactory::make("identity").build().unwrap();
+        let media = Media::new(
+            &encoder,
+            crate::webtransport::tests::no_input(),
+            Audio::new(audio::Plan::default()),
+            Some(rate),
+        );
+        media.on_caps(&caps(1280), "s");
+        let a = media.attach(false, Duration::ZERO).unwrap();
+        // A's check passes while it is still the session's client: its attach publishes.
+        media.fec_attach(a.id, true);
+        // The successor's takeover (a new attach), its `hello_ack` (the new client is current)
+        // and its attach publish land, then A's attach publish reaches us late.
+        let b = media.attach(false, Duration::ZERO).unwrap();
+        assert_eq!(a.gone.get(), Some(&Gone::TakenOver));
+        media.fec_attach(b.id, true);
+        media.fec_attach(a.id, true);
+        assert_eq!(
+            *published.lock().unwrap(),
+            [(a.id, true), (b.id, true)],
+            "A's stale attach published after B's and overwrote the successor's telemetry"
         );
     }
 

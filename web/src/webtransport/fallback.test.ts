@@ -48,4 +48,27 @@ describe("fallbackCause (#1403)", () => {
   it("is capped at 200 characters", () => {
     expect(fallbackCause("internal", new Error("x".repeat(500)))).toHaveLength(200);
   });
+  it("never splits a surrogate pair at the 200-character cap (#1478)", () => {
+    // The prefix is 17 units, so 182 x's put an emoji's high half at unit 199 and its low half
+    // at unit 200: the cap used to end the cause on the lone high half.
+    const split = fallbackCause("internal", new Error("x".repeat(182) + "😀 tail"));
+    expect(split).toHaveLength(199);
+    expect(hasLoneSurrogate(split)).toBe(false);
+    // A pair that ends exactly inside the cap is kept whole.
+    const whole = fallbackCause("internal", new Error("x".repeat(181) + "😀 tail"));
+    expect(whole).toHaveLength(200);
+    expect(hasLoneSurrogate(whole)).toBe(false);
+  });
 });
+
+/** True when `s` holds a UTF-16 code unit left unpaired, which a render shows as U+FFFD. */
+function hasLoneSurrogate(s: string): boolean {
+  const isHigh = (c: number) => c >= 0xd800 && c <= 0xdbff;
+  const isLow = (c: number) => c >= 0xdc00 && c <= 0xdfff;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (isHigh(c) && !(i + 1 < s.length && isLow(s.charCodeAt(i + 1)))) return true;
+    if (isLow(c) && !(i > 0 && isHigh(s.charCodeAt(i - 1)))) return true;
+  }
+  return false;
+}

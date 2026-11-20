@@ -11,11 +11,13 @@ mkdir "$work/bin"
 cat >"$work/bin/docker" <<'DOCKER'
 #!/usr/bin/env bash
 # FAKE_BASE: ok|fail   FAKE_MANIFEST: present|unknown|name-unknown|denied
+# FAKE_PRESENT_REF: that exact reference is published, whatever FAKE_MANIFEST says.
 case "$1 $2" in
   "buildx imagetools")
     [ "${FAKE_BASE:-ok}" = ok ] || { echo "dial tcp: i/o timeout" >&2; exit 1; }
     echo sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef ;;
   "manifest inspect")
+    if [ -n "${FAKE_PRESENT_REF:-}" ] && [ "$3" = "$FAKE_PRESENT_REF" ]; then echo '{}'; exit 0; fi
     case "${FAKE_MANIFEST:-present}" in
       present) echo '{}' ;;
       unknown) echo "manifest unknown" >&2; exit 1 ;;
@@ -47,4 +49,38 @@ for m in denied timeout nodocker shnodocker; do
 done
 rc=0; out="$(run FAKE_BASE=fail)" || rc=$?
 [ "$rc" -ne 0 ] || fail "an unreadable base must be an error: $out"
+
+# #1092: the refresh's recheck passes the base digest its `check` job recorded. A base rebuilt
+# between the jobs must not change which tag is asked about: the tag for the recorded digest is
+# the one this run builds, so it stands down when that one is published and does not even ask
+# the registry for the mutable tag.
+recorded=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+tag="$(QUASAR_BASE_DIGEST="$recorded" bash "$root/deploy/toolchain-hash.sh")"
+image="ghcr.io/example/quasar/quasar-gst-toolchain:$tag"
+out="$(run QUASAR_BASE_DIGEST="$recorded" FAKE_PRESENT_REF="$image" FAKE_MANIFEST=unknown)" || fail "recorded digest: $out"
+grep -qx 'build=false' <<<"$out" || fail "the published tag for the RECORDED digest must stand down (a base rebuild must not change the tag asked about): $out"
+grep -qx "image=$image" <<<"$out" || fail "the recheck must name the recorded digest's tag: $out"
+grep -Eq "^base_ref=.*@$recorded$" <<<"$out" || fail "the base_ref line must carry the recorded digest: $out"
+rc=0; out="$(run QUASAR_BASE_DIGEST="$recorded" FAKE_BASE=fail FAKE_PRESENT_REF="$image")" || rc=$?
+[ "$rc" -eq 0 ] || fail "a recorded digest must not need the live base ($rc): $out"
+grep -qx "image=$image" <<<"$out" || fail "recorded digest with an unreadable live base: $out"
+
+# #1092: the digest must be a whole sha256:<64 lowercase hex>; a shortened, prefixed or
+# upper-case one is an error, never a tag.
+short=sha256:0123456789abcdef
+upper=sha256:0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+for bad in "$short" "$upper" sha256: md5:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef; do
+  rc=0; out="$(run QUASAR_BASE_DIGEST="$bad")" || rc=$?
+  [ "$rc" -ne 0 ] || fail "a malformed digest must be an error, got: $bad ($out)"
+  grep -q '^image=' <<<"$out" && fail "a malformed digest still worked out a tag: $bad ($out)"
+done
+
+# #1092: a recheck whose `check` output went missing (empty base_ref) must FAIL, not fall
+# back to asking the live base: that would ask about a tag this run is not about to build.
+# The fake docker would answer a valid digest if the script asked it.
+rc=0; out="$(run QUASAR_BASE_DIGEST="" FAKE_BASE=ok)" || rc=$?
+[ "$rc" -ne 0 ] || fail "an empty recorded digest must be an error, not a live lookup: $out"
+grep -q '^image=' <<<"$out" && fail "an empty recorded digest still worked out a tag: $out"
+grep -q '::error::QUASAR_BASE_DIGEST is set but empty' <<<"$out" || fail "the empty-digest error was not named: $out"
+
 echo "PASS toolchain-missing: absent builds, present reuses, a registry failure is an error"

@@ -27,6 +27,12 @@ type warmDispatcher struct {
 	compat   bool // answers compat_tools_v1
 	restream bool // adopt_restream_v1
 	noEpoch  bool // the agent's socket is gone: no command epoch to send on
+	// incapable is a connection that did not report terminal_home_cleanup_v1.
+	incapable bool
+	// downgradeSwap answers the FIRST swap ack as a lost frame and marks the
+	// connection incapable: an agent that reconnects without home cleanup
+	// between the swap's guard and its handoff.
+	downgradeSwap bool
 	// reject answers one command kind: "assign" or "start" refused, "assign-ack"
 	// queued with its ack lost, or "swap" refused.
 	reject  string
@@ -62,6 +68,33 @@ func (d *warmDispatcher) setParks(v bool) {
 	d.mu.Lock()
 	d.parks = v
 	d.mu.Unlock()
+}
+
+// setIncapable makes the current connection one without terminal_home_cleanup_v1.
+func (d *warmDispatcher) setIncapable(v bool) {
+	d.mu.Lock()
+	d.incapable = v
+	d.mu.Unlock()
+}
+
+// downgradeOnSwap marks the connection incapable when the next swap is sent:
+// the agent reconnected without cleanup before the command left the control plane.
+func (d *warmDispatcher) downgradeOnSwap() {
+	d.mu.Lock()
+	d.downgradeSwap = true
+	d.mu.Unlock()
+}
+
+// consumeDowngrade answers the swap ack as a lost frame and flips the capability,
+// reporting whether this call was the downgrade.
+func (d *warmDispatcher) consumeDowngrade() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.downgradeSwap {
+		return false
+	}
+	d.downgradeSwap, d.incapable = false, true
+	return true
 }
 
 func (d *warmDispatcher) record(v any) {
@@ -108,7 +141,11 @@ func (d *warmDispatcher) dropEpoch() {
 
 type warmEpoch struct{ d *warmDispatcher }
 
-func (warmEpoch) SupportsHomeCleanup() bool      { return true }
+func (e warmEpoch) SupportsHomeCleanup() bool {
+	e.d.mu.Lock()
+	defer e.d.mu.Unlock()
+	return !e.d.incapable
+}
 func (e warmEpoch) SupportsParkedSessions() bool { return e.d.SupportsParkedSessions("") }
 func (e warmEpoch) SupportsCompatTools() bool    { return e.d.compat }
 func (e warmEpoch) Send(v any) (bool, error)     { e.d.record(v); return true, nil }
@@ -123,6 +160,9 @@ func (e warmEpoch) SendWithAck(_ context.Context, _ string, v any) (agentws.AckR
 			return agentws.AckResult{}, true, errors.New("ack timeout")
 		}
 	case agentws.SessionSwapAppCmd:
+		if e.d.consumeDowngrade() {
+			return agentws.AckResult{}, false, errors.New("connection replaced before handoff")
+		}
 		if e.d.rejecting() == "swap" {
 			return agentws.AckResult{OK: false, Error: "refused"}, true, nil
 		}
@@ -1048,6 +1088,26 @@ func TestHeartbeatSkipsAUserWhoseLaunchWouldBeWebTransport(t *testing.T) {
 				t.Fatalf("parked rows = %d, want %d", n, tc.parked)
 			}
 		})
+	}
+}
+
+// #1224: on a mixed-GPU host (GPU 0 PyroWave-capable, GPU 1 not) the launch plans WebTransport
+// on GPU 0 and WebRTC on GPU 1, so the park must land on GPU 1, where a WebRTC launch adopts it.
+// GPU 1 has fewer free slots, so an unpinned park would take GPU 0.
+func TestHeartbeatPinsTheParkToAWebRTCPlanningGPU(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	f.enableWebTransport(t)
+	f.enablePyroWavePrefer(t)
+	must(t, exec(t, f.pool, `INSERT INTO gpus (host_id, index, vram_mb_total, encode_slots_total)
+		VALUES ($1::uuid, 1, 16384, 3)`, f.hostID))
+	must(t, exec(t, f.pool, `UPDATE gpus SET codecs = '["h264"]' WHERE host_id = $1::uuid AND index = 1`, f.hostID))
+
+	f.coord.SteamWarmHeartbeat(context.Background(), f.userID, false, f.deviceID)
+
+	var idx int32
+	if err := f.pool.QueryRow(context.Background(), `SELECT g.index FROM sessions s JOIN gpus g ON g.id = s.gpu_id
+		WHERE s.kind = 'parked'`).Scan(&idx); err != nil || idx != 1 {
+		t.Fatalf("parked on gpu %v (err %v), want the WebRTC-planning GPU 1", idx, err)
 	}
 }
 

@@ -460,6 +460,13 @@ impl Registry {
         }
     }
 
+    /// Test hook (#1005): the media the session's tap registered, so a live test can send a
+    /// `hello` at the session's own client path.
+    #[cfg(test)]
+    pub(crate) fn media_of(&self, session_id: &str) -> Option<Arc<Media>> {
+        self.lock().get(session_id).and_then(|e| e.media.clone())
+    }
+
     /// The session is stopping: its tokens go, and its client gets `bye session_ended`.
     pub fn end(&self, session_id: &str) {
         self.end_if(session_id, |_| true);
@@ -1583,13 +1590,12 @@ async fn stream(
     let (mut nacks_capped, mut resends_too_large) = (0u64, 0u64);
     let mut warned_oversized = false;
     // Amendment 85: whether this connection is sent repairs, so the session's windows carry
-    // the FEC keys (0 repair) exactly while it is.
-    if let Some(rate) = media.rate() {
-        (rate.fec)(FecEvent::Attached {
-            client: client.id,
-            fec,
-        });
-    }
+    // the FEC keys (0 repair) exactly while it is. The publish refuses a client the session
+    // no longer has, under the lock that replaces it: a displaced connection's attach lands
+    // after the successor's, whether it arrived before the successor's takeover (#1554) or
+    // between that check and its publish (#1569), so it must not overwrite the successor's
+    // telemetry.
+    media.fec_attach(client.id, fec);
     let mut control = media
         .rate()
         .map(|rate| Control::new(rate, client.gone.clone(), fec, governor.clone()));

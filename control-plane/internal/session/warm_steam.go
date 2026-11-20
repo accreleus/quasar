@@ -180,42 +180,54 @@ func (c *Coordinator) SteamWarmHeartbeat(ctx context.Context, userID string, isA
 
 // launchWouldPlanWebTransport is the heartbeat's "would a launch for this user adopt a park?":
 // it runs the launch's own stream plan (gatherStreamInputs + planStream, so planTransport and the
-// PyroWave intent) as a play on the home's host, once per GPU, and is true only when every GPU
-// plans WebTransport. A WebRTC-only park is useless to such a launch (#1163); anything that fails
-// to plan is "no", so a park is only ever withheld on a positive answer. The PyroWave slot is
-// assumed free, as for a claim (claimCandidate).
+// PyroWave intent) as a play on the home's host, once per GPU. A WebRTC-only park is useless to a
+// launch that plans WebTransport (#1163), so the second result (withhold) is true only when every
+// GPU plans WebTransport. The first result is a GPU pin, returned only on a truly mixed host —
+// at least one GPU plans WebTransport AND at least one plans WebRTC — where the park is pinned to
+// the first GPU a WebRTC launch plans, so it never parks where a WebTransport launch cannot adopt
+// it (#1224). On a host where every GPU plans WebRTC there is no pin, exactly as before the pin:
+// the park is unpinned and the scheduler places it on a GPU with room. Anything that fails to read
+// or plan is "no" (park, unpinned), so a park is only ever withheld on a positive answer. The
+// PyroWave slot is assumed free, as for a claim (claimCandidate).
 // shortcut: the profile resolved is the Steam parent's default; a tile pinned to another profile
-// is not seen, and a WebTransport-planned user still gets no warm. The real fix is #1214
-// (transport-neutral parks).
+// is not seen, and a WebTransport-planned user still gets no warm; on a mixed host with two or more
+// WebRTC GPUs the single PinGPUIndex takes the first even if it is full or blocked, so the park is
+// then not placed. The real fix is #1214 (transport-neutral parks).
 func (c *Coordinator) launchWouldPlanWebTransport(ctx context.Context, p CreateParams, hostID string,
 	chain profile.LaunchProfile, lp LaunchParams, ov StreamOverride, env ProbeEnvelope, source string,
-) bool {
-	// shortcut: every GPU on the host must plan WebTransport, but the park is not pinned to a
-	// WebRTC-planning GPU, so a mixed-GPU host can still park on one a WebTransport launch
-	// cannot adopt. Upgrade with #1214 (transport-neutral parks) or a placement pin.
+) (*int32, bool) {
 	// planTransport can only answer WebTransport for these two; skip the reads for the rest.
 	if chain.Transport != transportWebTransport && chain.Transport != transportOptIn {
-		return false
+		return nil, false
 	}
 	rows, err := c.store.pool.Query(ctx, `SELECT index FROM gpus WHERE host_id = $1::uuid ORDER BY index`, hostID)
 	if err != nil {
 		c.log.Warn("warm steam: gpu list read failed, parking without a transport check", "host_id", hostID, "err", err)
-		return false
+		return nil, false
 	}
 	var gpus []int32
 	for rows.Next() {
 		var idx int32
 		if err := rows.Scan(&idx); err != nil {
 			rows.Close()
-			return false // a partial GPU list must not withhold the park
+			return nil, false // a partial GPU list must not withhold the park
 		}
 		gpus = append(gpus, idx)
 	}
 	rows.Close()
 	if rows.Err() != nil || len(gpus) == 0 {
-		return false
+		return nil, false
 	}
 	lp.parked = false
+	// Plan every GPU, then decide from the whole set: pin only on a truly mixed
+	// host (at least one GPU plans WebTransport AND at least one plans WebRTC),
+	// so a host where every GPU plans WebRTC parks unpinned, as before the pin,
+	// and a host where every GPU plans WebTransport still withholds the park.
+	var (
+		hasWebTransport bool
+		webRTCIdx       int32
+		haveWebRTC      bool
+	)
 	for _, idx := range gpus {
 		prov := Session{
 			UserID: p.UserID, AppID: p.AppID, HostID: &hostID, GPUIndex: &idx,
@@ -227,11 +239,26 @@ func (c *Coordinator) launchWouldPlanWebTransport(ctx context.Context, p CreateP
 			prov.DeviceID = &lp.DeviceID
 		}
 		plan, err := planStream(c.gatherStreamInputs(ctx, &prov, chain, lp, ov, env, source))
-		if err != nil || plan.Update.Transport != transportWebTransport {
-			return false
+		if err != nil {
+			return nil, false
+		}
+		if plan.Update.Transport == transportWebTransport {
+			hasWebTransport = true
+			continue
+		}
+		if !haveWebRTC {
+			webRTCIdx = idx
+			haveWebRTC = true
 		}
 	}
-	return true
+	switch {
+	case haveWebRTC && hasWebTransport:
+		return &webRTCIdx, false
+	case haveWebRTC:
+		return nil, false
+	default:
+		return nil, true
+	}
 }
 
 // warmSteamApp is the Steam parent app a heartbeat would warm for this user,
@@ -672,7 +699,7 @@ func (s *Store) adoptedByLive(ctx context.Context, id string) bool {
 func adoptRuntime(ctx context.Context, tx pgx.Tx, from, to string) error {
 	if _, err := tx.Exec(ctx, `UPDATE sessions t SET adopt_session_id = f.id,
 		    managed_home_id = f.managed_home_id, managed_home_mount_sha256 = f.managed_home_mount_sha256,
-		    compat_tool_names = f.compat_tool_names
+		    compat_tool_names = f.compat_tool_names, compat_mapping_revision = f.compat_mapping_revision
 		FROM sessions f WHERE f.id = $1::uuid AND t.id = $2::uuid`, from, to); err != nil {
 		return fmt.Errorf("record adoption: %w", err)
 	}

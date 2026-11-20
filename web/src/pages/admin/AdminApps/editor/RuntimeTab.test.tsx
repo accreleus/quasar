@@ -7,7 +7,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { RuntimeTab } from "./RuntimeTab";
 import { draftFromApp } from "./appDraft";
-import type { RuntimePreset } from "../../../../api/types";
+import type { AdminApp, RuntimePreset } from "../../../../api/types";
 
 type Draft = ReturnType<typeof draftFromApp>;
 
@@ -101,5 +101,154 @@ describe("RuntimeTab managed home", () => {
   it("keeps the switch on a library-provider app that already shares, so it can be turned off", () => {
     renderTab(true, { libraryProvider: "steam", shareSteamLibrary: true });
     expect(screen.getByLabelText("Share the user's Steam library")).toBeTruthy();
+  });
+});
+
+describe("RuntimeTab container flags (#179)", () => {
+  let latest: Draft;
+  function renderFlags(draftOver: Partial<Draft> = {}) {
+    function Harness() {
+      const [draft, setDraft] = useState<Draft>({ ...draftFromApp(null), ...draftOver });
+      latest = draft;
+      return (
+        <RuntimeTab
+          draft={draft}
+          onChange={setDraft}
+          errors={{}}
+          app={null}
+          parent={null}
+          presets={[]}
+          storageProvider={null}
+        />
+      );
+    }
+    render(
+      <MemoryRouter>
+        <Harness />
+      </MemoryRouter>,
+    );
+  }
+  const flag = (name: string) => screen.getByLabelText(name) as HTMLInputElement;
+
+  it("offers the three flags with their defaults on an app with no preset", () => {
+    renderFlags();
+    expect(flag("GPU access").checked).toBe(false);
+    expect(flag("Block privilege escalation").checked).toBe(true);
+    expect(flag("Unmask /proc and /sys").checked).toBe(false);
+  });
+
+  it("writes each flag to the draft, and drops a key that goes back to its default", () => {
+    renderFlags();
+    fireEvent.click(flag("GPU access"));
+    expect(latest.gpu).toBe(true);
+    fireEvent.click(flag("Block privilege escalation"));
+    expect(latest.specExtras).toEqual({ no_new_privileges: false });
+    fireEvent.click(flag("Unmask /proc and /sys"));
+    expect(latest.specExtras).toEqual({ no_new_privileges: false, systempaths_unconfined: true });
+    fireEvent.click(flag("Block privilege escalation"));
+    expect(latest.specExtras).toEqual({ systempaths_unconfined: true });
+  });
+
+  it("shows a stored opt-out as it is", () => {
+    renderFlags({ gpu: true, specExtras: { no_new_privileges: false } });
+    expect(flag("GPU access").checked).toBe(true);
+    expect(flag("Block privilege escalation").checked).toBe(false);
+  });
+
+  it("is absent when a runtime preset supplies the runtime", () => {
+    renderTab(false);
+    expect(screen.queryByLabelText("GPU access")).toBeNull();
+    expect(screen.queryByLabelText("Block privilege escalation")).toBeNull();
+  });
+});
+
+// A derived tile has no runtime of its own, so the editor must not derive its
+// managed home client-side from the parent: it reads effective_managed_home /
+// effective_home_container_path off the app the API returned (amendment 82).
+describe("RuntimeTab derived tile", () => {
+  function renderDerived(opts: { parent: Partial<AdminApp>; app: Partial<AdminApp> }) {
+    const preset = {
+      id: "preset-1",
+      name: "KDE Desktop",
+      managed_home: true,
+      home_container_path: "/home/kde",
+      env: {},
+    } as unknown as RuntimePreset;
+    function Harness() {
+      const [draft, setDraft] = useState<Draft>(draftFromApp(null));
+      return (
+        <RuntimeTab
+          draft={draft}
+          onChange={setDraft}
+          errors={{}}
+          app={{ id: "app-1", ...opts.app } as unknown as AdminApp}
+          parent={{ id: "parent-1", ...opts.parent } as unknown as AdminApp}
+          presets={[preset]}
+          storageProvider={null}
+        />
+      );
+    }
+    render(
+      <MemoryRouter>
+        <Harness />
+      </MemoryRouter>,
+    );
+  }
+
+  it("shows the app's effective managed home and its path for a derived tile", () => {
+    renderDerived({
+      parent: {
+        id: "parent-1",
+        name: "KDE Desktop",
+        runtime_spec: {},
+        runtime_preset_id: "preset-1",
+      },
+      app: {
+        id: "app-1",
+        runtime_spec: {},
+        effective_managed_home: true,
+        effective_home_container_path: "/home/kde",
+      },
+    });
+    expect(screen.getByText("Managed home")).toBeInTheDocument();
+    expect(screen.getByText(/\/home\/kde/)).toBeInTheDocument();
+  });
+
+  it("reads the home from the API, not a client-side merge of the parent", () => {
+    renderDerived({
+      parent: {
+        id: "parent-1",
+        name: "KDE Desktop",
+        runtime_spec: {},
+        runtime_preset_id: "preset-1",
+      },
+      app: {
+        id: "app-1",
+        runtime_spec: {},
+        // The parent's preset provides no managed home, so a client-side merge
+        // of parent + preset would show none; the API says otherwise.
+        effective_managed_home: true,
+        effective_home_container_path: "/srv/effective",
+      },
+    });
+    expect(screen.getByText("/srv/effective")).toBeInTheDocument();
+  });
+
+  it("shows None when the app's effective managed home is off", () => {
+    renderDerived({
+      parent: {
+        id: "parent-1",
+        name: "KDE Desktop",
+        runtime_spec: {},
+        runtime_preset_id: "preset-1",
+      },
+      app: {
+        id: "app-1",
+        runtime_spec: {},
+        effective_managed_home: false,
+      },
+    });
+    expect(screen.getByText("Managed home")).toBeInTheDocument();
+    expect(screen.getByText("None")).toBeInTheDocument();
   });
 });
