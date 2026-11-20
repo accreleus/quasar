@@ -460,6 +460,13 @@ impl Registry {
         }
     }
 
+    /// Test hook (#1005): the media the session's tap registered, so a live test can send a
+    /// `hello` at the session's own client path.
+    #[cfg(test)]
+    pub(crate) fn media_of(&self, session_id: &str) -> Option<Arc<Media>> {
+        self.lock().get(session_id).and_then(|e| e.media.clone())
+    }
+
     /// The session is stopping: its tokens go, and its client gets `bye session_ended`.
     pub fn end(&self, session_id: &str) {
         self.end_if(session_id, |_| true);
