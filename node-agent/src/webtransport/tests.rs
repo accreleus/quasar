@@ -5225,13 +5225,16 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
                 };
                 seqs.clear();
                 let count = (last - first + 1) as usize;
-                let mut arrivals = vec![0xFFu8; count * 2];
-                arrivals[..2].fill(0);
+                // Every other one lost, ending at an arrival as a browser's report does.
+                let mut arrivals = vec![0u8; count * 2];
+                for i in (1..count.saturating_sub(1)).step_by(2) {
+                    arrivals[2 * i..2 * i + 2].fill(0xFF);
+                }
                 fb_seq += 1;
                 let fb = json!({"type": "feedback", "seq": fb_seq, "first_pkt_seq": first,
                     "count": count, "ref_us": 0,
                     "arrivals_b64": base64::engine::general_purpose::STANDARD.encode(&arrivals),
-                    "recv_kbps": 0, "lost": count - 1, "interval_ms": 50});
+                    "recv_kbps": 0, "lost": count.saturating_sub(1) / 2, "interval_ms": 50});
                 write_message(&mut send, &fb).await.unwrap();
             }
             m = read_message(&mut recv) => break m.unwrap(),
@@ -5463,10 +5466,10 @@ fn releasing_the_tap_stops_its_pyrowave_encoder_and_keeps_the_tap() {
 
 /// #1321: an outage stops every ACK, so QUIC's queue stalls and video waits in the agent.
 /// Audio still goes to QUIC ahead of it, also after feedback silence has released the
-/// governor (held video then drains at the last governed rate, not into QUIC in one go):
-/// when the path returns, audio captured late in the outage arrives before video captured
-/// well before it. The relay holds the outage's datagrams rather than dropping them, so the
-/// order QUIC sent them in is what the client sees.
+/// governor; video held past the NACK hold is dropped, so when the path returns the outage's
+/// audio arrives before the picture, which resumes at a keyframe. The relay holds the
+/// outage's datagrams rather than dropping them, so the order QUIC sent them in is what the
+/// client sees.
 #[tokio::test]
 async fn audio_overtakes_video_held_behind_a_stalled_path() {
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -5507,14 +5510,19 @@ async fn audio_overtakes_video_held_behind_a_stalled_path() {
     let mut report = tokio::time::interval(Duration::from_millis(50));
     // Audio captured from here on was captured after the governor let go (silence: 500 ms).
     let mut late = None::<u64>;
-    // (arrival order, capture µs) of every audio and video datagram from the outage on.
-    let (mut audio, mut video, mut n) = (Vec::new(), Vec::new(), 0);
+    // When the path came back.
+    let mut up_wall = None::<u64>;
+    // (arrival µs, capture µs, keyframe) of every audio and video datagram from the outage on.
+    let (mut audio, mut video) = (Vec::new(), Vec::new());
     loop {
         let now = Instant::now();
         if now >= end {
             break;
         }
         down.store((outage..up_at).contains(&now), Relaxed);
+        if up_wall.is_none() && now >= up_at {
+            up_wall = Some(wall_us());
+        }
         if late.is_none() && now >= outage + Duration::from_millis(800) {
             late = Some(wall_us());
         }
@@ -5525,11 +5533,11 @@ async fn audio_overtakes_video_held_behind_a_stalled_path() {
                 if d.len() < 5 { continue; }
                 path.receive(&d);
                 if now < outage { continue; }
-                n += 1;
+                let n = wall_us();
                 let at = |r: std::ops::Range<usize>| u64::from_le_bytes(d[r].try_into().unwrap());
                 match d[0] {
-                    0x02 => audio.push((n, at(11..19))),
-                    0x01 => video.push((n, at(17..25))),
+                    0x02 => audio.push((n, at(11..19), false)),
+                    0x01 => video.push((n, at(17..25), d[5] & 1 != 0)),
                     _ => {}
                 }
             }
@@ -5547,20 +5555,26 @@ async fn audio_overtakes_video_held_behind_a_stalled_path() {
         !late_audio.is_empty(),
         "no audio from late in the outage arrived"
     );
-    // Video captured over 200 ms before an audio packet that arrived before it.
-    let overtaken: usize = late_audio
+    // Video held past the NACK hold is dropped (`VideoQueue::drop_stale`), so the picture
+    // resumes at a keyframe, and the outage's audio is not behind any of it.
+    let up_wall = up_wall.unwrap();
+    let resumed = video
         .iter()
-        .map(|&&(at, cap)| {
-            video
-                .iter()
-                .filter(|v| v.0 > at && v.1 + 200_000 < cap)
-                .count()
-        })
-        .max()
-        .unwrap();
+        .find(|v| v.1 >= up_wall)
+        .expect("video resumed");
+    let last_audio = late_audio
+        .iter()
+        .filter(|a| a.1 < up_wall)
+        .map(|a| a.0)
+        .max();
     eprintln!(
-        "{} late audio datagrams; the most video one overtook: {overtaken}",
-        late_audio.len()
+        "{} late audio datagrams; video resumed at a keyframe: {}",
+        late_audio.len(),
+        resumed.2
     );
-    assert!(overtaken > 0, "late audio waited behind older held video");
+    assert!(resumed.2, "video resumed on a delta frame");
+    assert!(
+        last_audio.is_some_and(|a| a <= resumed.0),
+        "the outage's audio arrived behind the video after it"
+    );
 }

@@ -1259,7 +1259,8 @@ fn video_payload(datagrams: &[bytes::Bytes]) -> u64 {
 /// governed rate or, when it is lower, the estimate itself: the governor never goes under
 /// the ABR floor, the link may. False when the connection is gone. A resend sends only while
 /// its fragment's budget allows; a video datagram the path's maximum datagram size has
-/// shrunk below is skipped, and its frame cannot complete, so a keyframe is asked for.
+/// shrunk below is skipped, and its frame cannot complete, so a keyframe is asked for. Held
+/// video past the NACK hold is dropped first (`VideoQueue::drop_stale`).
 #[allow(clippy::too_many_arguments)]
 fn feed(
     session: &Session,
@@ -1271,12 +1272,16 @@ fn feed(
     media: &Media,
     handed: &mut u64,
     fec: bool,
+    backlog: &mut congestion::Backlog,
 ) -> bool {
     let rates = control.as_ref().map_or((None, None), |c| {
         congestion::video_rates(&c.governor, &c.estimator, pyrowave)
     });
     let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
     let now = std::time::Instant::now();
+    if video.drop_stale(now, retransmit_window(session)) {
+        backlog.skip_to_keyframe();
+    }
     let (room, frame) = video.budget(rates, queued, DATAGRAM_BUFFER, now);
     let log = match pyro {
         Some(rate) if pyrowave => Some(&mut rate.log),
@@ -1746,7 +1751,7 @@ async fn stream(
                 None => audio_open = false,
             },
             () = &mut drain, if !video.is_empty() => {
-                if !feed(session, &mut video, control.as_mut(), pyro.as_mut(), current.codec == "pyrowave", &mut sent, media, &mut handed, fec) {
+                if !feed(session, &mut video, control.as_mut(), pyro.as_mut(), current.codec == "pyrowave", &mut sent, media, &mut handed, fec, &mut backlog) {
                     break QUIET;
                 }
                 drain.as_mut().reset(Instant::now() + DRAIN_EVERY);
@@ -1819,9 +1824,9 @@ async fn stream(
                     // pace it over half a frame interval (§Rate's SHOULD) if bursts lose datagrams.
                     let logged = if unit.pyrowave { pyro.is_some() } else { control.is_some() };
                     for datagram in datagrams {
-                        video.push(congestion::Held { datagram, logged, resend: false, queued_at: now }, DATAGRAM_BUFFER);
+                        video.push(congestion::Held { datagram, logged, resend: false, queued_at: now, keyframe: unit.keyframe || unit.pyrowave }, DATAGRAM_BUFFER);
                     }
-                    if !feed(session, &mut video, control.as_mut(), pyro.as_mut(), current.codec == "pyrowave", &mut sent, media, &mut handed, fec) {
+                    if !feed(session, &mut video, control.as_mut(), pyro.as_mut(), current.codec == "pyrowave", &mut sent, media, &mut handed, fec, &mut backlog) {
                         break QUIET;
                     }
                     drain.as_mut().reset(Instant::now() + DRAIN_EVERY);
@@ -1880,9 +1885,9 @@ async fn stream(
                                 if let Some((frame_seq, answer)) = answer {
                                     let (logged, now) = (control.is_some(), std::time::Instant::now());
                                     for datagram in answer.resend {
-                                        video.push(congestion::Held { datagram, logged, resend: true, queued_at: now }, DATAGRAM_BUFFER);
+                                        video.push(congestion::Held { datagram, logged, resend: true, queued_at: now, keyframe: false }, DATAGRAM_BUFFER);
                                     }
-                                    if !feed(session, &mut video, control.as_mut(), pyro.as_mut(), current.codec == "pyrowave", &mut sent, media, &mut handed, fec) {
+                                    if !feed(session, &mut video, control.as_mut(), pyro.as_mut(), current.codec == "pyrowave", &mut sent, media, &mut handed, fec, &mut backlog) {
                                         break QUIET;
                                     }
                                     drain.as_mut().reset(Instant::now() + DRAIN_EVERY);
@@ -1955,6 +1960,7 @@ async fn stream(
         datagrams_sent = quic.frame_tx.datagram,
         units_and_nack_answers_skipped_total = backlog.skipped,
         held_video_dropped = video.dropped,
+        held_video_stale = video.stale,
         video_datagrams_too_large = video.too_large,
         starved_probes,
         governed = governor.governs(),

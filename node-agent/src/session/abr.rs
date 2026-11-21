@@ -398,6 +398,12 @@ fn parse_validated_ms(
 /// Per-report loop: no report for this long is feedback silence, so the estimate fed is
 /// the silence decay's.
 const REPORT_GAP: Duration = Duration::from_millis(500);
+/// Per-report loop: for this long after a reading moved the rate down, the up path climbs one
+/// deadband step per `EVIDENCED_STEP`, not the slew, so an estimate that never saw the
+/// sender's excess (it waited in the agent's queue) does not climb straight back into it
+/// (#1433 design §2).
+const EVIDENCE_MEMORY: Duration = Duration::from_secs(30);
+const EVIDENCED_STEP: Duration = Duration::from_secs(2);
 
 /// The ABR governor state machine. Fed the rtpgccbwe estimate; emits a new CBR
 /// setpoint when (and only when) a retarget is warranted.
@@ -426,6 +432,8 @@ pub struct Governor {
     last_report: Option<Instant>,
     /// Per-report loop: the first reading of a run under the line.
     under: Option<f64>,
+    /// Per-report loop: when a reading last moved the rate down.
+    evidenced: Option<Instant>,
 }
 
 impl Governor {
@@ -443,6 +451,7 @@ impl Governor {
             fed: None,
             last_report: None,
             under: None,
+            evidenced: None,
         }
     }
 
@@ -553,7 +562,12 @@ impl Governor {
                 .then(|| self.observe_window(estimate, now))
                 .flatten();
         }
-        let slew = self.cfg.max_up_step / self.cfg.min_interval.as_secs_f64();
+        let slew = match self.evidenced {
+            Some(at) if now.saturating_duration_since(at) < EVIDENCE_MEMORY => {
+                self.cfg.deadband / EVIDENCED_STEP.as_secs_f64()
+            }
+            _ => self.cfg.max_up_step / self.cfg.min_interval.as_secs_f64(),
+        };
         if estimate > self.rate {
             self.rate = estimate
                 .min(self.rate * (1.0 + slew * dt))
@@ -580,7 +594,8 @@ impl Governor {
     pub fn observe_report(&mut self, reading: Option<f64>, now: Instant) -> Option<u32> {
         self.cfg.per_report?;
         self.last_report = Some(now);
-        let Some(reading) = reading.filter(|&r| r < self.rate) else {
+        // Not positive (or NaN) is no capacity sample: a zero rate would never grow again.
+        let Some(reading) = reading.filter(|&r| r > 0.0 && r < self.rate) else {
             self.under = None;
             return None;
         };
@@ -592,6 +607,7 @@ impl Governor {
         }
         self.under = None;
         self.rate = target;
+        self.evidenced = Some(now);
         let sp = self.clamp(target);
         if sp >= self.setpoint {
             return None;
@@ -1290,6 +1306,80 @@ mod tests {
             g.observe_report(Some(8600.0), ms(base, 200)),
             None,
             "a reading at the rate is none"
+        );
+    }
+
+    /// #1433 review M4: a reading of 0 (a backlog window that released nothing) is no capacity
+    /// sample. Old code: the rate went to 0 and the up path, which multiplies it, never grew
+    /// again, whatever the estimate.
+    #[test]
+    fn per_report_a_zero_reading_is_no_reading() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        for i in 0..2 {
+            assert_eq!(g.observe_report(Some(0.0), ms(base, i * 100)), None);
+        }
+        assert_eq!(g.rate_kbps(), 10_000.0);
+        assert_eq!(g.setpoint_kbps(), 10_000);
+    }
+
+    /// #1433 review M7: for 30 s after a reading moved the rate down, the up path climbs one
+    /// deadband step per 2 s, not the 25 %/s slew, so an estimate that never saw the excess
+    /// does not take the rate straight back over the link. Old code: 4000 → 8000 in about 3 s.
+    #[test]
+    fn per_report_after_a_reading_the_up_path_climbs_a_deadband_step_per_2_s() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        g.observe_report(Some(4000.0), ms(base, 0));
+        assert_eq!(g.observe_report(Some(4000.0), ms(base, 100)), Some(4000));
+        let climb = |g: &mut Governor, from: u64, to: u64, estimate: f64| {
+            for t in (from..to).step_by(100) {
+                g.observe_report(None, ms(base, t));
+                g.observe(estimate, ms(base, t));
+            }
+        };
+        let mut h = Governor::new(per_report(0), base);
+        h.observe_report(Some(4000.0), ms(base, 0));
+        h.observe_report(Some(4000.0), ms(base, 100));
+        climb(&mut g, 200, 2200, 10_000.0);
+        let rate = g.rate_kbps();
+        assert!((4500.0..4700.0).contains(&rate), "{rate:.0} after 2 s");
+        // The memory expires 30 s after the reading: then the slew.
+        climb(&mut h, 200, 30_100, 4000.0);
+        climb(&mut h, 30_100, 31_100, 10_000.0);
+        assert!(
+            h.rate_kbps() > 1.2 * 4000.0,
+            "{:.0} 1 s after",
+            h.rate_kbps()
+        );
+    }
+
+    /// Lab 0.6.3 R3: readings keep coming while the estimate, which never saw the excess, stays
+    /// at the ceiling. The resolution rung steps down only once the rate stays under
+    /// `engage_frac` × its comfort (the ceiling at the launch rung) for `RATE_CONFIRM`
+    /// (`LadderPlanner::observe_rate`). Old code: the slew lifted 5000 back over 6000 in 0.7 s
+    /// after every reading, so the rung never stepped down.
+    #[test]
+    fn per_report_readings_with_a_high_estimate_hold_the_rate_long_enough_for_the_rung() {
+        use crate::session::ladder::{LadderPlanner, ResolutionPolicy};
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        let line = ResolutionPolicy::DEFAULT_ENGAGE_FRAC * 10_000.0;
+        let (mut under, mut longest) = (None::<u64>, 0u64);
+        for t in (0..20_000u64).step_by(100) {
+            // Two readings at 5000 every 3 s, as the evidence comes.
+            let reading = (t % 3000 < 200).then_some(5000.0);
+            g.observe_report(reading, ms(base, t));
+            g.observe(10_000.0, ms(base, t));
+            match (g.rate_kbps() < line, under) {
+                (true, None) => under = Some(t),
+                (true, Some(from)) => longest = longest.max(t - from),
+                (false, _) => under = None,
+            }
+        }
+        assert!(
+            longest >= LadderPlanner::RATE_CONFIRM.as_millis() as u64,
+            "under the rung's line {longest} ms at most"
         );
     }
 
