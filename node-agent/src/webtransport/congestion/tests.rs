@@ -3984,14 +3984,10 @@ fn a_blackout_split_across_two_reports_is_still_a_blackout() {
     assert!((600..750).all(|i| log.peek(i).unwrap().status == Status::Outage));
 }
 
-/// I4 (review N1, M2): a run of loss is decided once, at its closing report when that comes
-/// within `RUN_MAX_WAIT`, otherwise as loss at expiry, and nothing later reads it again. The
-/// 150 ms blackout of the test above, its reports split at 700: closed on time, closed late, by
-/// a report that does not continue it, and expired by a report that only extends it, then
-/// closed. Old code: the late closing report ended the run before the expiry was checked, and
-/// called it a blackout.
-#[test]
-fn a_loss_run_is_decided_once_on_time_or_as_loss() {
+/// The 150 ms blackout of the test above (600..750 lost), its first report ending at 700, then
+/// `reports` as `(from, to, ms after the first)`: the last report's loss, and how many of the
+/// run's 150 datagrams ended `Lost` and `Outage`.
+fn split_run(reports: &[(u32, u32, u64)]) -> (Option<f64>, usize, usize) {
     let arrival = |i: u32| match (600..750).contains(&i) {
         true => NOT_RECEIVED,
         false => ((u64::from(i) + 1) * 1000 / UNIT_US) as u16,
@@ -4001,48 +3997,78 @@ fn a_loss_run_is_decided_once_on_time_or_as_loss() {
         ref_us: 0,
         arrivals: (from..to).map(arrival).collect(),
     };
-    // (loss of the last report, status of a datagram in the run), after reports `(from, to, ms
-    // after the first)`.
-    let run = |reports: &[(u32, u32, u64)]| {
-        let start = Instant::now();
-        let (mut log, mut est) = (SendLog::new(start), Estimator::new(CEILING, start));
-        for i in 0..1000 {
-            send_nth(&mut log, start, 0, i, u64::from(i));
-        }
-        let at = start + Duration::from_millis(1100);
-        est.measure(&report(0, 700), &mut log, at);
-        let mut loss = None;
-        for &(from, to, after) in reports {
-            loss = est
-                .measure(
-                    &report(from, to),
-                    &mut log,
-                    at + Duration::from_millis(after),
-                )
-                .loss;
-        }
-        (loss, log.peek(650).unwrap().status)
+    let start = Instant::now();
+    let (mut log, mut est) = (SendLog::new(start), Estimator::new(CEILING, start));
+    for i in 0..1000 {
+        send_nth(&mut log, start, 0, i, u64::from(i));
+    }
+    let at = start + Duration::from_millis(1100);
+    est.measure(&report(0, 700), &mut log, at);
+    let mut loss = None;
+    for &(from, to, after) in reports {
+        loss = est
+            .measure(
+                &report(from, to),
+                &mut log,
+                at + Duration::from_millis(after),
+            )
+            .loss;
+    }
+    let count = |s| {
+        (600..750)
+            .filter(|&i| log.peek(i).unwrap().status == s)
+            .count()
     };
+    (loss, count(Status::Lost), count(Status::Outage))
+}
+
+/// I4 (review N1, M2, R3-1): a run of loss is decided once, at its closing report when that
+/// comes within `RUN_MAX_WAIT`, otherwise as loss at expiry, and that decision covers the whole
+/// contiguous run. Closed on time, closed late (and at exactly `RUN_MAX_WAIT`), expired by a
+/// report that only extends it, then closed, and by a report that does not continue it. Old code: a late
+/// closing report counted 600..700 as loss and then found 700..750 a blackout.
+#[test]
+fn a_loss_run_is_decided_once_on_time_or_as_loss() {
     let wait = RUN_MAX_WAIT.as_millis() as u64;
     assert_eq!(
-        run(&[(700, 1000, wait - 100)]),
-        (Some(0.0), Status::Outage),
+        split_run(&[(700, 1000, wait - 100)]),
+        (Some(0.0), 0, 150),
         "on time"
     );
-    let (loss, status) = run(&[(700, 1000, wait + 100)]);
+    for (name, reports) in [
+        ("late", &[(700, 1000, wait + 100)][..]),
+        ("at the wait", &[(700, 1000, wait)]),
+        ("expired", &[(700, 720, wait), (720, 1000, wait + 50)]),
+    ] {
+        let (loss, lost, outage) = split_run(reports);
+        assert!(
+            loss.is_some_and(|l| l > 0.1) && (lost, outage) == (150, 0),
+            "{name}: {loss:?} lost {lost} outage {outage}"
+        );
+    }
+    // 700 never reported: a discontinuity ends the run, and 701..750 is a run of its own.
+    let (loss, lost, outage) = split_run(&[(701, 1000, 100)]);
     assert!(
-        loss.is_some_and(|l| l > 0.1) && status == Status::Lost,
-        "late: {loss:?} {status:?}"
+        loss.is_some_and(|l| l > 0.1) && (lost, outage) == (100, 49),
+        "not continued: {loss:?} lost {lost} outage {outage}"
     );
-    let (loss, status) = run(&[(701, 1000, 100)]);
+}
+
+/// I4 (R3-1): a run decided as loss at expiry stays loss while later contiguous reports keep
+/// extending it, however many, until an arrival ends it at the floor. Old code: the tail after
+/// the expiry began a new run and was found a blackout.
+#[test]
+fn a_loss_run_growing_after_expiry_stays_loss() {
+    let wait = RUN_MAX_WAIT.as_millis() as u64;
+    let (loss, lost, outage) = split_run(&[
+        (700, 710, wait),
+        (710, 720, wait + 10),
+        (720, 740, wait + 20),
+        (740, 1000, wait + 40),
+    ]);
     assert!(
-        loss.is_some_and(|l| l > 0.1) && status == Status::Lost,
-        "not continued: {loss:?}"
-    );
-    let (loss, status) = run(&[(700, 720, wait), (720, 1000, wait + 50)]);
-    assert!(
-        loss.is_some_and(|l| l > 0.1) && status == Status::Lost,
-        "expired: {loss:?}"
+        loss.is_some_and(|l| l > 0.0) && (lost, outage) == (150, 0),
+        "{loss:?} lost {lost} outage {outage}"
     );
 }
 

@@ -561,6 +561,9 @@ struct Evidence {
     /// the run no blackout: the link carried something inside it.
     run_heard: bool,
     run_broken: bool,
+    /// The run was decided as loss and no arrival or discontinuity has ended it: what follows
+    /// it contiguously is the same run, and loss too.
+    run_lost: bool,
     at_floor: bool,
     /// (send-time bucket, least one-way delay µs) of each bucket done, oldest first, and the
     /// one being filled. One-way delay is on two clocks: only differences mean anything.
@@ -1198,9 +1201,11 @@ impl Estimator {
         // A pending run continues only into the report that starts where its own ended, and
         // only within `RUN_MAX_WAIT`.
         let mut lost = 0i64;
-        if self.reported_to != Some(fb.first_pkt_seq) || self.run_expired(now) {
-            lost += self.end_run(log, false, now, &mut classed);
+        let continues = self.reported_to == Some(fb.first_pkt_seq);
+        if !continues || self.run_expired(now) {
+            lost += self.end_run(log, None, now, &mut classed);
         }
+        self.evidence.run_lost &= continues;
         if self.reported_to.is_none_or(|to| after(end, to)) {
             self.reported_to = Some(end);
         }
@@ -1266,7 +1271,7 @@ impl Estimator {
                         self.trendline.update(send_d, arrival_d, arrival_ms);
                     }
                     let at_floor = self.evidence.arrival(sent_us, at);
-                    lost += self.end_run(log, at_floor, now, &mut classed);
+                    lost += self.end_run(log, Some(at_floor), now, &mut classed);
                     self.evidence.at_floor = at_floor;
                     classed.push((seq, 1, 0));
                 }
@@ -1284,7 +1289,7 @@ impl Estimator {
 
         // No arrival ended it in time: its losses.
         if self.run_expired(now) {
-            lost += self.end_run(log, false, now, &mut classed);
+            lost += self.end_run(log, None, now, &mut classed);
         }
 
         let newest = self.newest_arrival;
@@ -1393,16 +1398,17 @@ impl Estimator {
     }
 
     /// The one place a run of loss is decided, once: its datagrams leave the run as lost or
-    /// as a blackout here, and nothing later reads them as either. An arrival at the floor
-    /// (`at_floor`) makes it a blackout when the run is solid over `BLACKOUT_MIN_US` of send
-    /// time and `BLACKOUT_MIN_DATAGRAMS`, with no queue on either side (a 60–300 ms drop: the
-    /// client's NACK and keyframe request repair it). Anything else is its losses: a run
-    /// open `RUN_MAX_WAIT` or more is loss whatever closes it, since hiding congestion as a
-    /// blackout is the dangerous mistake. Returns the losses counted.
+    /// as a blackout here, and nothing later reads them as either. A run decided as loss with
+    /// no arrival to end it (`at_floor` `None`) stays loss through its contiguous tail. An
+    /// arrival at the floor (`at_floor`) makes it a blackout when the run is solid over
+    /// `BLACKOUT_MIN_US` of send time and `BLACKOUT_MIN_DATAGRAMS`, with no queue on either
+    /// side (a 60–300 ms drop: the client's NACK and keyframe request repair it). Anything
+    /// else is its losses: a run open `RUN_MAX_WAIT` or more is loss whatever closes it, since
+    /// hiding congestion as a blackout is the dangerous mistake. Returns the losses counted.
     fn end_run(
         &mut self,
         log: &mut SendLog,
-        at_floor: bool,
+        at_floor: Option<bool>,
         now: Instant,
         classed: &mut Vec<(u32, i64, i64)>,
     ) -> i64 {
@@ -1416,11 +1422,13 @@ impl Estimator {
             .map_or(0, |(to, from)| to.saturating_sub(from));
         self.evidence.run_since = None;
         let blackout = !expired
+            && !self.evidence.run_lost
             && run.len() >= BLACKOUT_MIN_DATAGRAMS
             && span >= BLACKOUT_MIN_US
             && self.evidence.run_from_floor
             && !self.evidence.run_broken
-            && at_floor;
+            && at_floor == Some(true);
+        self.evidence.run_lost = at_floor.is_none() && (self.evidence.run_lost || !run.is_empty());
         let mut lost = 0;
         for seq in run {
             let Some(slot) = log.slot(seq) else {
