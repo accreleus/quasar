@@ -948,8 +948,9 @@ def build_payload(rundir: str, root: str, args) -> dict:
 # 552-617 browser bench windows where 276 was correct, and there is NO signal
 # from the outside except an implausible window count. So: refuse, don't warn.
 
-#: keys that identify a browser bench-window series (old and current names)
-BENCH_WINDOW_KEYS = ("missing_indices", "dropped")
+#: keys that identify a browser bench-window series (old and current names;
+#: bench_n / bench_decoded cover no-marker windows where missing_indices is omitted)
+BENCH_WINDOW_KEYS = ("bench_n", "bench_decoded", "missing_indices", "dropped")
 #: how far a re-submitted window may move and still count as "the same instant"
 SHIFT_TOLERANCE_MS = 1000
 

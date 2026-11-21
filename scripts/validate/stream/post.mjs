@@ -25,6 +25,7 @@ import { EFFECTIVE_UNKNOWN, SHAPES } from "./collect.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 export const SUBMIT = path.join(ROOT, "scripts/dx/bench_submit.py");
+const LEAK_SCAN = path.join(ROOT, "scripts/dev/leak-scan.sh");
 export const SUITE = "e2e";
 export const REPO = "accreleus/quasar";
 export const EXIT = { ok: 0, failed: 1, error: 2 };
@@ -62,10 +63,11 @@ export function criteriaNotes(criteria) {
 // another's params is still another name. What decides comparison comes first, in this
 // order; the app follows, then every other param, sorted.
 const NAME_KEYS = ["transport", "codec", "profile"];
-// The three that do not change what is measured in a way the bench splits on: `hold_s` is
-// kept as a tag (how long it ran), the other two are how the app was presented. A plan run
-// against another app measured another thing, so `app` is in the name (`appSlug`).
-const NOT_IN_NAME = new Set(["bench", "cover_qr", "hold_s"]);
+// The four that do not change what is measured in a way the bench splits on: `hold_s` is
+// kept as a tag (how long it ran), and the others are how the app was presented or whether a
+// marker is expected (`app` already identifies the app). A plan run against another app
+// measured another thing, so `app` is in the name (`appSlug`).
+const NOT_IN_NAME = new Set(["bench", "cover_qr", "expect_marker", "hold_s"]);
 /** A bench scenario's whole name; the service takes it as text, and this is our own cap. */
 const NAME_MAX = 200;
 /** The shape such a name has: what `[scenario, k=v, ...].join("/")` can make out of identifiers,
@@ -120,8 +122,8 @@ export function benchIdentity(sc) {
   if (params.app !== undefined) {
     if (typeof params.app !== "string") return noName("its param app is not an app name (a string)");
     const slug = appSlug(params.app);
-    if (slug) pairs.push(["app", slug]);
-    else leftOut.push("app"); // a name with nothing to slug: no app in the name, and counted
+    if (!slug) return noName("its param app produces an empty slug (no ASCII letters or digits)");
+    pairs.push(["app", slug]);
   }
   for (const k of Object.keys(params).sort()) {
     if (NAME_KEYS.includes(k) || NOT_IN_NAME.has(k) || k === "app") continue;
@@ -233,6 +235,7 @@ function filesProblem(sdir) {
     // bench_submit.py posts every member of this file as the run's conditions: only the ones the collector writes may be there.
     const extra = Object.keys(cond).find((k) => !["effective", "negotiated", "unknown"].includes(k));
     if (extra !== undefined) return `conditions.json holds ${PLAIN_NAME.test(extra) ? extra : "a member"}, which this suite does not write`;
+    if (cond.effective !== undefined && cond.unknown !== undefined) return "conditions.json holds both effective and unknown";
     if (cond.unknown !== undefined && !(isObj(cond.unknown) && Object.keys(cond.unknown).length === 1 && cond.unknown.effective === EFFECTIVE_UNKNOWN)) return "conditions.json's unknown is not what the collector writes";
     const effective = cond.effective;
     if (effective !== undefined && !isObj(effective)) return "conditions.json's effective is not a map";
@@ -289,11 +292,11 @@ function archive(dir, spawn, tar) {
 
 /**
  * Post every scenario of `dir` that is not skipped. `spawn` is injected so a test can record
- * the argv without running anything; the defaults are the real bench_submit.py and tar.
+ * the argv without running anything. `scan` runs the leak check before either command.
  */
 export function postBundle(
   given,
-  { host, dryRun = false, spawn = spawnSync, python = "python3", submit = SUBMIT, tar = "tar", env = process.env } = {},
+  { host, dryRun = false, spawn = spawnSync, scan = spawnSync, python = "python3", submit = SUBMIT, tar = "tar", env = process.env } = {},
 ) {
   const out = { status: "ok", exit: EXIT.ok, posted: 0, skipped: 0, failed: 0, warn: 0, leftOut: 0, dryRun, reason: null, problems: [] };
   const dir = fs.realpathSync(given);
@@ -308,6 +311,17 @@ export function postBundle(
   if (!fits(SHAPES.commit, commit)) {
     console.error("builds.json has no node agent commit: run e2e-collect first, or the build has no commit");
     return { ...out, status: "failed", exit: EXIT.failed, reason: "no-commit" };
+  }
+
+  const checked = scan("bash", [LEAK_SCAN, "--dir", dir], {
+    cwd: ROOT,
+    encoding: "utf8",
+    env: { LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS: "1", ...env },
+  });
+  if (checked?.error || checked?.status !== 0) {
+    if (checked?.stderr) console.error(checked.stderr.trimEnd());
+    console.error(`leak-scan failed (${checked?.error?.message ?? `exit ${checked?.status ?? "unknown"}`}); nothing is posted`);
+    return { ...out, status: "failed", exit: EXIT.failed, reason: "leak-scan-failed" };
   }
 
   // The host that pairs runs is `<role>@<client label>`: two clients on one host never compare.

@@ -113,6 +113,12 @@ type Coordinator struct {
 	// stopping row). A restart loses it, which reads as past the grace.
 	stopMu        sync.Mutex
 	stopRequested map[string]time.Time
+	// adopterStops: runtime id -> the adopting row failed on a lost start ack and
+	// its stop sent, until that row's own proof (under stopMu). Entries older than
+	// homeHoldSettleWindow are pruned when one is added. A restart loses it, and
+	// nothing restores a hold that already cleared: heartbeat and reconcile only
+	// resend stops (shortcut: in memory like stopRequested, #1615).
+	adopterStops map[string]adopterStop
 
 	// forgetters hold per-session in-memory state to drop when a session goes
 	// terminal (#402). Written once at construction, read-only after, so no lock
@@ -135,6 +141,7 @@ func NewCoordinator(store *Store, dispatcher Dispatcher, log *slog.Logger, opts 
 		log:                   log,
 		startToRunningTimeout: defaultStartToRunningTimeout,
 		stopRequested:         make(map[string]time.Time),
+		adopterStops:          make(map[string]adopterStop),
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	for _, o := range opts {
@@ -168,6 +175,53 @@ func (c *Coordinator) forgetTerminalSession(sessionID string) {
 			f.Forget(sessionID)
 		}
 	}
+}
+
+type adopterStop struct {
+	adopter string
+	at      time.Time
+}
+
+// noteAdopterStop records that adopter's stop is in flight for the runtime it
+// adopts, pruning records no proof can still need.
+func (c *Coordinator) noteAdopterStop(runtime, adopter string) {
+	c.stopMu.Lock()
+	for rt, a := range c.adopterStops {
+		if time.Since(a.at) > homeHoldSettleWindow {
+			delete(c.adopterStops, rt)
+		}
+	}
+	c.adopterStops[runtime] = adopterStop{adopter, time.Now()}
+	c.stopMu.Unlock()
+}
+
+// adopterStopMarked answers, for a runtime whose proof is arriving, whether a row
+// is its failed adopter with the stop still in flight (its hold passes to that
+// row). It only reads: dropAdopterStop consumes the record after the proof commits.
+func (c *Coordinator) adopterStopMarked(runtime string) func(string) bool {
+	return func(adopter string) bool {
+		c.stopMu.Lock()
+		defer c.stopMu.Unlock()
+		a, ok := c.adopterStops[runtime]
+		return ok && a.adopter == adopter && time.Since(a.at) <= homeHoldSettleWindow
+	}
+}
+
+func (c *Coordinator) dropAdopterStop(runtime string) {
+	c.stopMu.Lock()
+	delete(c.adopterStops, runtime)
+	c.stopMu.Unlock()
+}
+
+// adopterProven drops the records of an adopter that has answered its stop.
+func (c *Coordinator) adopterProven(adopter string) {
+	c.stopMu.Lock()
+	for rt, a := range c.adopterStops {
+		if a.adopter == adopter {
+			delete(c.adopterStops, rt)
+		}
+	}
+	c.stopMu.Unlock()
 }
 
 // noteStopRequested keeps the first time only: a repeated stop must not restart

@@ -20,7 +20,7 @@
 | `audio_latency_ms` | `not judged` | `null` | `<= 80` |
 Passed: `first_frame_s`, `freeze_count`
 ### Worst one-second windows
-Ranked on `fps` (lowest); absent: `present_interval_max_ms`, `g2g_p95_ms`, `missing_indices`.
+Ranked on `fps` (lowest); absent: `present_interval_max_ms`, `g2g_p95_ms`, `missing_indices`, `bench_n`.
 
 | ts_unix_ms | worst for | value |
 | --- | --- | --- |

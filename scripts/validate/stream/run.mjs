@@ -10,6 +10,7 @@
 //        QUASAR_E2E_APP (reference app name), CHROME (browser to launch when --cdp is absent),
 //        CLIENT (a label for this test client, a role, never a host name),
 //        INSECURE_TLS=1 (a stack with a self-signed certificate: turns certificate checks off),
+//        QUASAR_E2E_HEADLESS=1 (force headless Chrome when --cdp is absent, e.g. over ssh on macOS; =0 forces headed),
 //        HOOKS / QUASAR_E2E_HOOKS (--hooks: the caller's directory of hook scripts, see hooks.mjs)
 //        WEB_DIST / QUASAR_E2E_WEB_DIST (--web-dist: a local web build served in the runner's own browser context, see webdist.mjs)
 //
@@ -22,9 +23,10 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "../lib/args.mjs";
 import { attachEvidenceListeners } from "../lib/listeners.mjs";
-import { FORMAT, validateBundle } from "./bundle.mjs";
+import { FORMAT, parseWebBuild, validateBundle } from "./bundle.mjs";
 import { declaredHooks, Hooks, LEDGER } from "./hooks.mjs";
 import { Recorder, ScenarioRecorder } from "./record.mjs";
+import { errorReason } from "./scenarios/stream-common.mjs";
 import { loadWebDist, serveWebDist, webBuild } from "./webdist.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -47,7 +49,7 @@ const NOT_RECORDED = [
   { fact: "audio_latency_ms", why: "nothing in the product or the page measures audio latency yet" },
   { fact: "audio_video_offset_ms", why: "the WebTransport client computes an audio/video offset but bench mode does not expose it" },
   { fact: "client_thermal_state", why: "no browser API reports thermal pressure to a page" },
-  { fact: "path_rtt_ms", why: "bench-mode windows carry no round-trip time; the page's own samples are not read" },
+  { fact: "path_rtt_ms", why: "bench-mode windows carry no round-trip time; only present cadence and visibility are copied from the page's stats posts" },
 ];
 
 export function loadPlan(arg) {
@@ -177,8 +179,8 @@ export async function stopOwned(api, launches, rec) {
         await api.stop(id);
         rec.step("stopped", { session: id });
       } catch (e) {
-        rec.step("stop-failed", { session: id, message: String(e?.message ?? e) });
-        cleanup.push(`session ${id} is not confirmed stopped (${String(e?.message ?? e)})`);
+        rec.step("stop-failed", { session: id, message: errorReason(e) });
+        cleanup.push(`session ${id} is not confirmed stopped (${errorReason(e)})`);
       }
     }
   }
@@ -303,7 +305,10 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
     // Hooks: a runner that died between apply and clear left a ledger beside the bundle; it is cleared before anything else, or the run does not start.
     const hooks = hooksDir ? new Hooks({ dir: hooksDir, ledgerDir: path.dirname(path.resolve(dir)), timeoutMs: hookTimeoutMs, redact: (s) => bundle.text(s) }) : null;
     // Without HOOKS= nothing here can clear a hook; a ledger beside the bundle says a run left one applied.
-    if (!hooks && fs.existsSync(path.join(path.dirname(path.resolve(dir)), LEDGER))) onNote(`warning: ${LEDGER} beside the bundle says an earlier run left a hook applied; this run has no HOOKS= and cannot clear it`);
+    const hookLedgerWarning = !hooks && fs.existsSync(path.join(path.dirname(path.resolve(dir)), LEDGER))
+      ? `${LEDGER} beside the bundle says an earlier run left a hook applied; this run has no HOOKS= and cannot clear it`
+      : null;
+    if (hookLedgerWarning) onNote(`warning: ${hookLedgerWarning}`);
     const recovered = hooks ? await hooks.recover((ev, d) => onNote(bundle.text(`${ev} ${JSON.stringify(d)}`))) : [];
     if (recovered.length) onNote(`cleared hook(s) a runner that died had left applied: ${recovered.join(", ")}`);
     const startedAt = now();
@@ -335,6 +340,7 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
 
     const counts = { pass: 0, fail: 0, error: 0, skipped: 0 };
     const dirs = [];
+    const reportedWeb = new Set(); // the web builds the scenarios' pages reported through bench mode, as JSON
     let interrupted = false;
     abort.then(() => { interrupted = true; });
     for (const e of entries) {
@@ -387,11 +393,17 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
           }
         } catch (err) {
           // A page-derived message is not written while the page's bearer is unknown (the scenario catches its own errors; this is what escapes it).
-          out = { status: "error", reason: page && rec.holding ? "the scenario did not complete (the page's own words are not written before its sign-in is read)" : String(err?.message ?? err), criteria: [], sessions: [], clock_offset_ms: null };
+          out = { status: "error", reason: page && rec.holding ? "the scenario did not complete (the page's own words are not written before its sign-in is read)" : errorReason(err), criteria: [], sessions: [], clock_offset_ms: null };
         } finally {
+          // Every scenario's page is asked for its web build before it closes; one that has no bench mode, or no page to ask, says nothing.
+          if (page) {
+            const asked = await Promise.race([page.evaluate(() => window.__qBench?.build?.() ?? null).catch(() => null), new Promise((r) => setTimeout(() => r(null), 5000).unref())]);
+            const reported = parseWebBuild(asked);
+            if (reported) reportedWeb.add(JSON.stringify(reported));
+          }
           // Order matters: close the page, wait for every response it was still delivering, then stop what the run owns.
           // The close error's words are the browser's about a page: held back like the page's own until its bearer is known.
-          if (page) await host.closePage(page).catch((err) => { left = `a page it opened would not close${rec.holding ? "" : ` (${err?.message ?? err})`}`; });
+          if (page) await host.closePage(page).catch((err) => { left = `a page it opened would not close${rec.holding ? "" : ` (${errorReason(err)})`}`; });
           // Every applied hook is cleared on every exit path, before the sessions are stopped so that the stop is not made over the fault.
           if (hooks && !stuck.length) hookLeft = await hooks.clearAll((ev, d) => rec.step(ev, d));
           if (launches) owned = await stopOwned(api, launches, rec);
@@ -407,15 +419,29 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
         }
       }
       counts[["pass", "fail", "skipped"].includes(out.status) ? out.status : "error"] += 1;
-      rec.json("scenario.json", { id: e.id, scenario: String(e.scenario), params: e.params, status: out.status, ...(out.reason ? { reason: out.reason } : {}), sessions: out.sessions ?? [], clock_offset_ms: out.clock_offset_ms ?? null, criteria: out.criteria ?? [] });
+      const reason = typeof out.reason === "string" && out.reason.trim() ? out.reason : out.status === "error" ? "error with no message" : null;
+      rec.json("scenario.json", { id: e.id, scenario: String(e.scenario), params: e.params, status: out.status, ...(reason ? { reason } : {}), sessions: out.sessions ?? [], clock_offset_ms: out.clock_offset_ms ?? null, criteria: out.criteria ?? [] });
       if (out.status === "skipped") rec.step("skipped", { reason: out.reason });
     }
 
     const info = host.info ?? {};
+    // A web build served from WEB_DIST is named by its digest; otherwise by what the page reported, when every scenario agreed.
+    // What is recorded must be what the validator accepts after the recorder's own cleaning: a report that cannot be, is not recorded.
+    const agreed = reportedWeb.size === 1 ? JSON.parse([...reportedWeb][0]) : null;
+    const lost = !webDist && agreed !== null && !bundle.unchanged(agreed);
+    const web = webDist ? webBuild(webDist) : agreed !== null && !lost ? agreed : null;
+    const HOST_HALF = "the host half (e2e-collect) fills this; the client cannot see it";
+    const why = {
+      web: lost ? "the build report did not survive recording (the recorder removes a part of it: it matches the test user's sign-in or a secret)" : reportedWeb.size > 1 ? "the scenarios' pages reported different web builds" : "no page reported a web build: bench mode was off, no scenario got as far as reading it, or the build has no commit or time (an unstamped build)",
+      control_plane: HOST_HALF,
+      node_agent: HOST_HALF,
+      encoder: "the host half (e2e-collect) fills this from the session's caps.negotiated trace event; the client cannot see it",
+      reference_app: "the app's own log stays on the host and nothing collects it (the session's app log tail is kept for failures only); no API of the stack reports the app's version (issue #1281)",
+      gpu_driver: "no session-bound API field reports the GPU driver: the host policy approval preview can name a candidate GPU's driver_identity, not necessarily the one the session ran on (issue #1281)",
+    };
     bundle.json("builds.json", {
-      components: { browser: client.browser, os: client.os, web: webDist ? webBuild(webDist) : null, control_plane: null, node_agent: null, reference_app: null, gpu_driver: null },
-      // e2e-collect reads the control plane and the node agent only (collect.mjs). A web build the runner served is known, so it has no reason.
-      unknown: Object.fromEntries(["web", "control_plane", "node_agent", "reference_app", "gpu_driver"].filter((k) => !(k === "web" && webDist)).map((k) => [k, info[k] ?? (["control_plane", "node_agent"].includes(k) ? "the host half (e2e-collect) fills this; the client cannot see it" : "the client cannot see it, and e2e-collect does not read it yet")])),
+      components: { browser: client.browser, os: client.os, web, control_plane: null, node_agent: null, encoder: null, reference_app: null, gpu_driver: null },
+      unknown: Object.fromEntries(Object.keys(why).filter((k) => !(k === "web" && web)).map((k) => [k, info[k] ?? why[k]])),
     });
     bundle.json("network.json", { path: { rtt_ms: null }, shaping: null, tls_verification: insecureTls ? "off (INSECURE_TLS=1)" : "on" });
     bundle.json("manifest.json", {
@@ -431,6 +457,7 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
       redacted: Object.keys(bundle.redacted),
       target: "stack",
       ...(webDist ? { web_build: { served_by: "runner", source: "web-dist" } } : {}),
+      ...(hookLedgerWarning ? { warnings: [hookLedgerWarning] } : {}),
     });
     const errors = [...bundle.problems, ...validateBundle(staging)];
     if (!errors.length) { fs.renameSync(staging, dir); committed = true; }
@@ -448,8 +475,15 @@ export function runnerState(cwd = ROOT) {
   try { return { commit: git("rev-parse", "HEAD").trim(), dirty: git("status", "--porcelain", "--untracked-files=no").trim() !== "" }; } catch { return { commit: "unknown", dirty: false }; /* not a checkout */ }
 }
 
-/** Headless only on a Linux box with no display: a Mac or Windows desktop has no DISPLAY and is not headless. */
-export const headless = (env = process.env, platform = process.platform) => platform === "linux" && !(env.DISPLAY || env.WAYLAND_DISPLAY);
+/** Headless only on a Linux box with no display: a Mac or Windows desktop has no DISPLAY and is not headless. QUASAR_E2E_HEADLESS=1 forces headless; =0 forces headed. */
+export function headless(env = process.env, platform = process.platform) {
+  if (env.QUASAR_E2E_HEADLESS === "1") return true;
+  if (env.QUASAR_E2E_HEADLESS === "0") return false;
+  return platform === "linux" && !(env.DISPLAY || env.WAYLAND_DISPLAY);
+}
+
+/** Prefers the pinned playwright-core before falling back to playwright, so an unrelated playwright above an unpacked pack folder does not win. */
+export const loadPlaywright = () => import("playwright-core").catch(() => import("playwright"));
 
 /** Certificate checks stay on unless the caller asks (INSECURE_TLS=1, for a stack with a self-signed certificate): the process-wide switch Node's fetch has. */
 export function configureTls(insecure, env = process.env) {
@@ -479,7 +513,8 @@ export async function openHost(browser, { attached, insecureTls, baseUrl = null,
 
 /** The RESULT line's status and the exit code: ok only when something passed and nothing failed. */
 export function summarise({ counts: { pass, fail, error }, errors, closeFailed = null }) {
-  if (errors.length || closeFailed) return { status: "error", code: 2, more: "" };
+  if (errors.length) return { status: "error", code: 2, more: "" };
+  if (closeFailed) return { status: "error", code: 2, more: " reason=browser-close" };
   if (fail + error) return { status: "failed", code: 1, more: "" };
   if (pass === 0) return { status: "failed", code: 1, more: " reason=nothing-passed" };
   return { status: "ok", code: 0, more: "" };
@@ -520,7 +555,7 @@ async function main() {
     try { webDist = loadWebDist(webDistDir); } catch (e) { return usage(e.message); }
   }
   const insecureTls = configureTls(process.env.INSECURE_TLS === "1");
-  const { chromium } = await import("playwright").catch(() => import("playwright-core"));
+  const { chromium } = await loadPlaywright();
   const browser = args.cdp
     ? await chromium.connectOverCDP(args.cdp)
     : await chromium.launch({ executablePath: process.env.CHROME || undefined, headless: headless() });

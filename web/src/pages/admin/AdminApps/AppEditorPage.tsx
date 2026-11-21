@@ -134,6 +134,16 @@ export function AppEditorPage() {
     },
     [appId],
   );
+  const steamProviders = useResource<number>(
+    {
+      label: "Steam providers",
+      fetch: async (ctx) =>
+        (await adminApi.listAdminApps(ctx.token)).items.filter(
+          (a) => a.library_provider === "steam" && a.enabled && !a.parent_app_id,
+        ).length,
+    },
+    [],
+  );
   const parent = useResource<AdminApp | null>(
     {
       label: "parent tile",
@@ -372,6 +382,7 @@ export function AppEditorPage() {
                 parent={parent.data ?? null}
                 presets={presets.data ?? []}
                 storageProvider={settings.data?.storage_provider ?? null}
+                steamProviders={steamProviders.data ?? null}
                 compat={
                   steamAppid
                     ? {
