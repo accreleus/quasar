@@ -1918,8 +1918,10 @@ impl Backlog {
 
     /// Held video went stale with no keyframe held ([`VideoQueue::drop_stale`]): what comes
     /// next depends on it, so units are skipped until the queue drains and a keyframe comes,
-    /// as after a stall.
-    pub(crate) fn skip_to_keyframe(&mut self) {
+    /// as after a stall. The drop emptied the queue, not the path: an ACK after `acks` must
+    /// prove the path moves first.
+    pub(crate) fn skip_to_keyframe(&mut self, acks: u64) {
+        self.probed(acks);
         if !self.skipping {
             tracing::info!(
                 token = "webtransport-video-stale",
@@ -1930,6 +1932,14 @@ impl Backlog {
             self.backed_up = Holds::default();
             self.asks = Holds::default();
         }
+    }
+
+    /// Whether [`VideoQueue::drop_stale`] may run: not while this guard skips (a stalled queue
+    /// is its to drain, and only its drain proves the path moves: emptied by a drop in an
+    /// outage, a stray ACK resumed video and the next NACK was answered), and not on a path
+    /// that acknowledged nothing since the last probe tick.
+    pub(crate) fn may_drop_stale(&self, acks: u64) -> bool {
+        !self.skipping && self.tick_acks != Some(acks)
     }
 
     pub(crate) fn starved(&self, queued: usize) -> bool {

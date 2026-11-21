@@ -1279,8 +1279,9 @@ fn feed(
     });
     let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
     let now = std::time::Instant::now();
-    if video.drop_stale(now, retransmit_window(session)) {
-        backlog.skip_to_keyframe();
+    let acks = quinn::Connection::stats(session).frame_rx.acks;
+    if backlog.may_drop_stale(acks) && video.drop_stale(now, retransmit_window(session)) {
+        backlog.skip_to_keyframe(acks);
     }
     let (room, frame) = video.budget(rates, queued, DATAGRAM_BUFFER, now);
     let log = match pyro {

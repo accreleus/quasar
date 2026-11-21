@@ -93,6 +93,8 @@ struct Quic {
     in_flight: usize,
     floor: RttFloor,
     min_rtt: Duration,
+    /// Datagrams acknowledged: the guard's ACK count.
+    acks: u64,
 }
 
 impl Sim {
@@ -216,6 +218,7 @@ impl Sim {
         self.frames += 1;
         if let (Some(guard), Some(quic)) = (self.guard.as_mut(), self.quic.as_ref()) {
             let at = self.start + Duration::from_micros(self.t);
+            guard.acknowledge(quic.acks);
             match guard.admit(quic.queued + quic.video.bytes(), key, at, HOLD) {
                 Admit::Send => {}
                 Admit::SkipForKeyframe => {
@@ -286,9 +289,9 @@ impl Sim {
         // The production `feed`'s rates.
         let rates = video_rates(&self.governor, &self.est, false);
         let at = self.start + Duration::from_micros(self.t);
-        if let Some(guard) = self.guard.as_mut() {
+        if let Some(guard) = self.guard.as_mut().filter(|g| g.may_drop_stale(quic.acks)) {
             if quic.video.drop_stale(at, HOLD) {
-                guard.skip_to_keyframe();
+                guard.skip_to_keyframe(quic.acks);
             }
         }
         let (room, frame) = quic.video.budget(rates, quic.queued, BUFFER, at);
@@ -332,6 +335,7 @@ impl Sim {
                 break;
             }
             if arrived {
+                quic.acks += 1;
                 let at = self.start + Duration::from_micros(done);
                 // Idle: nothing waits behind the window.
                 let idle = quic.queue.is_empty();
@@ -3794,6 +3798,33 @@ fn stale_held_video_is_dropped_and_the_picture_resumes_at_a_keyframe() {
             "{case}: {end} ms at the end"
         );
     }
+}
+
+/// M1: a stale drop empties the agent's queue, not the path. Video resumes at a keyframe only
+/// once an ACK came after the drop, and no drop runs while the stall guard skips (its queue
+/// drains only through the path) or on a path silent since the last probe tick. Without the
+/// guard check, an outage's drop emptied the queue, a stray ACK resumed video, and a NACK in
+/// the outage was answered (`video_behind_a_stalled_path_is_skipped_not_queued`, 2 runs in 14).
+#[test]
+fn after_a_stale_drop_video_resumes_only_once_an_ack_comes() {
+    let start = Instant::now();
+    let mut b = Backlog::default();
+    assert!(b.may_drop_stale(5));
+    b.skip_to_keyframe(5);
+    assert!(!b.may_drop_stale(5), "skipping");
+    assert_ne!(
+        b.admit(0, true, start, HOLD),
+        Admit::Send,
+        "no ACK since the drop"
+    );
+    b.acknowledge(6);
+    assert_eq!(b.admit(0, true, start + FRAME, HOLD), Admit::Send);
+    let mut b = Backlog::default();
+    stalled(&mut b, start);
+    assert!(!b.may_drop_stale(7), "the stall guard's queue");
+    let mut b = Backlog::default();
+    b.probe(0, 7);
+    assert!(!b.may_drop_stale(7), "silent since the last tick");
 }
 
 /// M1: what the stale drop keeps. A keyframe at the head is never stale however slowly it
