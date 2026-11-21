@@ -45,7 +45,9 @@ in a browser context of its own: with `CDP=` it attaches to a browser that is al
 (the Mac test client) and opens a separate context in it, a separate storage partition in the same
 real browser, so the person's tabs, storage and sign-in on the stack are never read or written; it
 closes that context at the end and nothing else. Without `CDP=` it launches `CHROME=` (or
-Playwright's Chromium). Each `stream-hold` signs in through the login form, opens the game page,
+Playwright's Chromium), headed on macOS, Windows and Linux with a display, and headless on Linux
+with no display (`QUASAR_E2E_HEADLESS=1` forces headless, e.g. over ssh on macOS; `=0` forces
+headed). Each `stream-hold` signs in through the login form, opens the game page,
 asks for the codec, frame rate and resolution through the page's own Launch options ("Change"), and
 presses Play now, with the product's `?transport=` and `?codec=pyrowave` switches and bench mode
 on. It holds, then stops the session.
@@ -90,7 +92,7 @@ and the scenario is judged on the remaining criteria).
 The run ends with one line:
 
 ```
-RESULT status=ok|failed|error target=e2e-run bundle=<dir> pass=N fail=N error=N skipped=N [reason=nothing-passed]
+RESULT status=ok|failed|error target=e2e-run bundle=<dir> pass=N fail=N error=N skipped=N [reason=nothing-passed|browser-close]
 ```
 
 Exit 0 only when at least one scenario passed and none failed or errored (skipped ones are
@@ -691,14 +693,19 @@ bash run.sh https://<stack> [<plan>] [--insecure]     # macOS, Linux
 ```
 
 `--insecure` is `INSECURE_TLS=1`. The first run fetches `playwright-core` with `npm ci` (online,
-without the sign-in in that process' environment). Then `doctor` checks, in order, Node, Chrome, the
-plan, that the stack answers, that the sign-in is accepted, that the reference app is in the user's
+without the sign-in in that process' environment), and the runner loads the pinned `playwright-core`
+before any `playwright` installed above the folder. Then `doctor` checks, in order, Node, Chrome, the
+plan, that the stack answers, that the sign-in is accepted (saying whether it came from `signin.txt`,
+the environment or `QUASAR_E2E_CRED_FILE` without printing the password, and flagging a Notepad
+`signin.txt.txt` when `signin.txt` is absent), that the reference app is in the user's
 library, that Chrome can open the stack's page (on a Mac a failure here is most often the Local
 Network permission, and the message says so) and that this Chrome can decode what the plan asks
 (a scenario it cannot run is a note; none that it can is a failure). Each line is `ok` or
-`FAIL` with a sentence in plain words. `run.sh doctor https://<stack>` stops there. A failed check
+`FAIL` with a sentence in plain words. `run.sh doctor https://<stack>` stops there and writes no
+zip. A failed check
 ends the command (exit 1, `zip=` empty); otherwise it runs the plan (default `smoke`, in a headed
-Chrome on Mac and Windows, since a desktop there has no `DISPLAY`), validates the bundle with
+Chrome on Mac and Windows, since a desktop there has no `DISPLAY`; `QUASAR_E2E_HEADLESS=1` forces
+headless), validates the bundle with
 `validateBundle`, and writes `results/quasar-e2e-<time>.zip`: the bundle and nothing else. Hooks
 are not part of the pack, so a scenario that needs one is `skipped`.
 

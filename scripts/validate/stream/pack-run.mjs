@@ -13,7 +13,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { zip } from "./archive.mjs";
 import { validateBundle } from "./bundle.mjs";
-import { configureTls, DEFAULT_APP, headless, loadPlan, makeApi, probeClient, readCreds, secretTooShort } from "./run.mjs";
+import { configureTls, DEFAULT_APP, headless, loadPlan, loadPlaywright, makeApi, probeClient, readCreds, secretTooShort } from "./run.mjs";
 import { cannotRun } from "./scenarios/stream-common.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -51,6 +51,33 @@ export function dropSignIn(env) {
   return env;
 }
 
+/** Reads the test user's sign-in and says which source supplied it ("signin.txt", "environment", "QUASAR_E2E_CRED_FILE"), never printing a password, e-mail or path. */
+export function resolveSignIn(env = process.env, root = ROOT) {
+  const signin = path.join(root, "signin.txt");
+  const hasSignin = fs.existsSync(signin);
+  const envEmail = env.QUASAR_E2E_EMAIL !== undefined;
+  const envPass = env.QUASAR_E2E_PASSWORD !== undefined;
+  const envFile = !!env.QUASAR_E2E_CRED_FILE;
+  const useSignin = !envEmail && !envFile && hasSignin;
+  const creds = readCreds(useSignin ? { ...env, QUASAR_E2E_CRED_FILE: signin } : env);
+  const emailSrc = envEmail ? "environment" : envFile ? "QUASAR_E2E_CRED_FILE" : useSignin && creds.email ? "signin.txt" : null;
+  const passSrc = envPass ? "environment" : envFile ? "QUASAR_E2E_CRED_FILE" : useSignin && creds.password ? "signin.txt" : null;
+  const parts = [...new Set([emailSrc, passSrc].filter(Boolean))];
+  let source = parts.length ? parts.join(" + ") : null;
+  if (source && !parts.includes("signin.txt") && hasSignin) source += "; signin.txt ignored";
+  return { creds, source };
+}
+
+/** Why a pack run could not zip a bundle: "no-bundle" only when no bundle exists on disk; otherwise the runner's own reason (e.g. "browser-close") or "runner-error". */
+export function runnerFailureReason(code, bundleExists, out = "") {
+  if (!bundleExists) return "no-bundle";
+  if (code > 1) {
+    const m = /RESULT [^\n]*\breason=([a-z0-9-]+)\b/.exec(out);
+    return m ? m[1] : "runner-error";
+  }
+  return null;
+}
+
 /** The pack carries no node_modules: the first run installs playwright-core from the lockfile. The sign-in is not in this process' environment. */
 function ensureDeps() {
   if (!fs.existsSync(path.join(ROOT, "package.json")) || fs.existsSync(path.join(ROOT, "node_modules", "playwright-core"))) return null;
@@ -59,13 +86,13 @@ function ensureDeps() {
   return r.status === 0 ? null : "npm ci failed: is this machine online, and is npm installed with Node?";
 }
 
-const loadChromium = async () => (await import("playwright").catch(() => import("playwright-core"))).chromium;
+const loadChromium = async () => (await loadPlaywright()).chromium;
 
 /**
  * Each check says ok or why not, in words for someone who is not a developer. Returns { ok, checks: [{ name, ok, detail }] }.
  * `deps` lets a test stand in for the network and the browser.
  */
-export async function doctor({ target, plan, creds, chrome, insecure, deps = {}, env = process.env, platform = process.platform }) {
+export async function doctor({ target, plan, creds, credSource = null, chrome, insecure, deps = {}, env = process.env, platform = process.platform, root = ROOT }) {
   const checks = [];
   const add = (name, ok, detail) => { checks.push({ name, ok, detail }); return ok; };
   const fetchFn = deps.fetch ?? fetch;
@@ -87,13 +114,24 @@ export async function doctor({ target, plan, creds, chrome, insecure, deps = {},
 
   let signedIn = false;
   let apps = [];
-  if (!creds.email || !creds.password) add("sign-in", false, "no sign-in: make signin.txt in this folder with QUASAR_E2E_EMAIL=... and QUASAR_E2E_PASSWORD=... lines");
-  else if (secretTooShort(creds)) add("sign-in", false, secretTooShort(creds));
+  const from = credSource ? ` (from ${credSource})` : "";
+  if (!creds.email || !creds.password) {
+    const doubleTxt = !fs.existsSync(path.join(root, "signin.txt")) && fs.existsSync(path.join(root, "signin.txt.txt"));
+    add(
+      "sign-in",
+      false,
+      doubleTxt
+        ? "no sign-in: found signin.txt.txt in this folder instead of signin.txt (Notepad adds .txt when file extensions are hidden). Rename it to signin.txt."
+        : credSource
+          ? `incomplete sign-in${from}: set both QUASAR_E2E_EMAIL and QUASAR_E2E_PASSWORD, or unset them to use signin.txt`
+          : "no sign-in: make signin.txt in this folder with QUASAR_E2E_EMAIL=... and QUASAR_E2E_PASSWORD=... lines",
+    );
+  } else if (secretTooShort(creds)) add("sign-in", false, `${secretTooShort(creds)}${from}`);
   else if (stackOk) {
     try {
       apps = await makeApi(target, creds, { fetchFn }).apps();
-      signedIn = add("sign-in", true, "accepted");
-    } catch (e) { add("sign-in", false, `${e.message}. Check the e-mail and password you were given.`); }
+      signedIn = add("sign-in", true, `accepted${from}`);
+    } catch (e) { add("sign-in", false, `${e.message}${from}. Check the e-mail and password you were given.`); }
   }
   const app = env.QUASAR_E2E_APP || DEFAULT_APP;
   if (signedIn) add("library", apps.some((a) => a.name === app), apps.some((a) => a.name === app) ? `"${app}" is there` : `"${app}" is not in this user's library: ask whoever gave you the sign-in`);
@@ -157,16 +195,14 @@ async function main() {
   const label = process.env.CLIENT || null;
   if (label !== null && !/^[A-Za-z0-9_.-]{1,64}$/.test(label)) { console.error("CLIENT must be a plain identifier (letters, digits, _ . -)"); result("error", "zip="); return 2; }
   const insecure = configureTls(cli.insecure || process.env.INSECURE_TLS === "1");
-  const signin = path.join(ROOT, "signin.txt");
-  if (!process.env.QUASAR_E2E_EMAIL && !process.env.QUASAR_E2E_CRED_FILE && fs.existsSync(signin)) process.env.QUASAR_E2E_CRED_FILE = signin;
   const failed = ensureDeps();
   if (failed) { console.error(failed); result("failed", "zip= reason=install"); return 1; }
   // The sign-in lives in this process and the runner's child only: Chrome and npm never see it.
-  const creds = readCreds(process.env);
+  const { creds, source } = resolveSignIn(process.env, ROOT);
   dropSignIn(process.env);
 
   const chrome = findChrome();
-  const d = await doctor({ target: cli.target, plan: cli.plan, creds, chrome, insecure });
+  const d = await doctor({ target: cli.target, plan: cli.plan, creds, credSource: source, chrome, insecure, root: ROOT });
   for (const c of d.checks) console.log(`${c.ok ? "ok  " : "FAIL"} ${c.name}: ${c.detail}`);
   if (!d.ok) { result("failed", `zip= reason=doctor`); return 1; }
   if (cli.doctor) { result("ok", "zip= doctor=ok"); return 0; }
@@ -183,7 +219,8 @@ async function main() {
   const code = await new Promise((r) => child.on("close", (c) => r(c ?? 1)));
   const counts = /RESULT status=(\w+) .*pass=(\d+) fail=(\d+) error=(\d+) skipped=(\d+)/.exec(out);
   const line = counts ? `run=${counts[1]} pass=${counts[2]} fail=${counts[3]} error=${counts[4]} skipped=${counts[5]}` : "run=unknown";
-  if (code > 1 || !fs.existsSync(bundle)) { result("failed", `zip= reason=no-bundle ${line}`); return 1; }
+  const failReason = runnerFailureReason(code, fs.existsSync(bundle), out);
+  if (failReason) { result("failed", `zip= reason=${failReason} ${line}`); return 1; }
   const problems = validateBundle(bundle);
   if (problems.length) { for (const p of problems) console.error(p); result("failed", `zip= reason=bundle-invalid ${line}`); return 1; }
   const file = path.join(results, `quasar-e2e-${stamp}.zip`);

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # make e2e-run: runs a plan of the end-to-end streaming suite (docs/testing-e2e-suite.md) from
 # this machine against a stack. Needs Node 22 and a Chrome; no admin token, no ssh.
-# env: TARGET PLAN [CDP] [OUT] [CHROME] [CLIENT=<label>] [HOOKS=<dir>, or QUASAR_E2E_HOOKS] [WEB_DIST=<dir>, or QUASAR_E2E_WEB_DIST] [INSECURE_TLS=1], and the test user's
+# env: TARGET PLAN [CDP] [OUT] [CHROME] [CLIENT=<label>] [HOOKS=<dir>, or QUASAR_E2E_HOOKS] [WEB_DIST=<dir>, or QUASAR_E2E_WEB_DIST] [INSECURE_TLS=1] [QUASAR_E2E_HEADLESS=1|0], and the test user's
 # QUASAR_E2E_EMAIL / QUASAR_E2E_PASSWORD (or QUASAR_E2E_CRED_FILE). Ends with one RESULT line;
 # exit 0 ok, 1 a scenario failed or nothing passed, 2 usage or a bundle that failed its check.
 set -euo pipefail

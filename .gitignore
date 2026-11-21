@@ -105,6 +105,9 @@ deploy/.build-report.json
 e2e-bundle-*/
 .e2e-bundle-*.staging-*/
 .e2e-hooks-applied.json*
+# make e2e-pack with no OUT= writes its archives here
+/quasar-e2e-pack-*.tar.gz
+/quasar-e2e-pack-*.zip
 
 # scripts/dx/uiaudit.sh evidence dirs (screenshots + metrics + reports) —
 # local-only, never committed (reports are shared by attaching the generated
