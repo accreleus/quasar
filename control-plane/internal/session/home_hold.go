@@ -31,13 +31,14 @@ var errSwapSharedHoldLost = errors.New("the swap's shared Steam hold was release
 // row is allowed; a present row must still belong to the reporting host.
 // Claim rows are locked in canonical order and NULL-host claims stay held.
 func (s *Store) ClearQualifiedHomeHolds(ctx context.Context, hostID, sessionID string) error {
-	_, err := s.clearQualifiedHomeHolds(ctx, hostID, sessionID)
+	_, err := s.clearQualifiedHomeHolds(ctx, hostID, sessionID, "")
 	return err
 }
 
 // clearQualifiedHomeHolds is ClearQualifiedHomeHolds reporting how many holds
-// it released.
-func (s *Store) clearQualifiedHomeHolds(ctx context.Context, hostID, sessionID string) (int, error) {
+// it released. unprovenAdopter, when set, is a failed row adopting sessionID whose
+// stop is still in flight (Coordinator.adopterStops).
+func (s *Store) clearQualifiedHomeHolds(ctx context.Context, hostID, sessionID, unprovenAdopter string) (int, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("begin home cleanup proof: %w", err)
@@ -52,10 +53,13 @@ func (s *Store) clearQualifiedHomeHolds(ctx context.Context, hostID, sessionID s
 		return 0, nil
 	}
 	// The runtime has ended, but a live row adopting it may already be building
-	// fresh on the home: the hold passes to that row rather than lapsing.
+	// fresh on the home: the hold passes to that row rather than lapsing. So does a
+	// row that failed on a lost start ack while its stop is still in flight: the
+	// build it may have begun is gone only at that row's own proof (#1615).
 	var adopter *string
 	err = tx.QueryRow(ctx, `SELECT id::text FROM sessions WHERE adopt_session_id=$1::uuid
-		AND state NOT IN ('stopped','failed') AND host_id=$2::uuid FOR UPDATE`, sessionID, hostID).Scan(&adopter)
+		AND (state NOT IN ('stopped','failed') OR id=NULLIF($3,'')::uuid)
+		AND host_id=$2::uuid FOR UPDATE`, sessionID, hostID, unprovenAdopter).Scan(&adopter)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return 0, fmt.Errorf("lock adopting session: %w", err)
 	}

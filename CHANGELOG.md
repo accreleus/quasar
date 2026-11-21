@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Fixed
+- Warm Steam: when an adopting session's start ack is lost, the old runtime's cleanup proof can no longer release the managed-home hold while that session's stop is still in flight; the hold passes to the failed session and clears at its own proof (#1615).
+
 ## 0.6.3 — 2026-11-21
 
 ### Upgrading

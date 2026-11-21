@@ -66,7 +66,8 @@ func (c *Coordinator) AgentState(ctx context.Context, hostID string, m agentws.S
 		// A qualified late terminal is useful even after a synthetic reaper or
 		// session-row deletion. The store checks the reporting host and clears
 		// only matching hold columns; it never changes public session history.
-		n, err := c.store.clearQualifiedHomeHolds(ctx, hostID, m.SessionID)
+		c.adopterProven(m.SessionID)
+		n, err := c.store.clearQualifiedHomeHolds(ctx, hostID, m.SessionID, c.unprovenAdopterOf(m.SessionID))
 		if err != nil {
 			c.log.Error("apply home cleanup proof failed", "err", err)
 		}

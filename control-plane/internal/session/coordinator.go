@@ -113,6 +113,11 @@ type Coordinator struct {
 	// stopping row). A restart loses it, which reads as past the grace.
 	stopMu        sync.Mutex
 	stopRequested map[string]time.Time
+	// adopterStops: runtime id -> the adopting row failed on a lost start ack and
+	// its stop sent, until that row's own proof (under stopMu). Bounded to
+	// homeHoldSettleWindow; a restart loses it and the heartbeat and reconcile
+	// back the hold up (shortcut: in memory like stopRequested, #1615).
+	adopterStops map[string]adopterStop
 
 	// forgetters hold per-session in-memory state to drop when a session goes
 	// terminal (#402). Written once at construction, read-only after, so no lock
@@ -135,6 +140,7 @@ func NewCoordinator(store *Store, dispatcher Dispatcher, log *slog.Logger, opts 
 		log:                   log,
 		startToRunningTimeout: defaultStartToRunningTimeout,
 		stopRequested:         make(map[string]time.Time),
+		adopterStops:          make(map[string]adopterStop),
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	for _, o := range opts {
@@ -168,6 +174,42 @@ func (c *Coordinator) forgetTerminalSession(sessionID string) {
 			f.Forget(sessionID)
 		}
 	}
+}
+
+type adopterStop struct {
+	adopter string
+	at      time.Time
+}
+
+// noteAdopterStop records that adopter's stop is in flight for the runtime it adopts.
+func (c *Coordinator) noteAdopterStop(runtime, adopter string) {
+	c.stopMu.Lock()
+	c.adopterStops[runtime] = adopterStop{adopter, time.Now()}
+	c.stopMu.Unlock()
+}
+
+// unprovenAdopterOf consumes the record for a runtime whose proof just arrived
+// (its hold passes to the adopter); proven drops a record whose adopter has
+// answered. A stale record reads as none.
+func (c *Coordinator) unprovenAdopterOf(runtime string) string {
+	c.stopMu.Lock()
+	defer c.stopMu.Unlock()
+	a, ok := c.adopterStops[runtime]
+	delete(c.adopterStops, runtime)
+	if !ok || time.Since(a.at) > homeHoldSettleWindow {
+		return ""
+	}
+	return a.adopter
+}
+
+func (c *Coordinator) adopterProven(adopter string) {
+	c.stopMu.Lock()
+	for rt, a := range c.adopterStops {
+		if a.adopter == adopter {
+			delete(c.adopterStops, rt)
+		}
+	}
+	c.stopMu.Unlock()
 }
 
 // noteStopRequested keeps the first time only: a repeated stop must not restart

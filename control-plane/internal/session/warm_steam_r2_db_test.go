@@ -450,6 +450,33 @@ func TestAClaimEndedBeforeAdoptionKeepsTheHoldOnTheParkedRuntime(t *testing.T) {
 	}
 }
 
+// The start ack is lost AFTER the agent began the new build: the new session's
+// stop is still in flight when the old runtime's proof lands, which is the
+// agent's real order (the fresh build waits for the old runner to exit, and its
+// proof can trail the failure). The hold passes to the failed row, so only that
+// row's own proof - the answer to the stop - releases it (#1615).
+func TestTheOldRuntimesProofCannotReleaseTheHoldWhileTheNewSessionsStopIsInFlight(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	ctx := context.Background()
+	k := f.park(t)
+	rejectAdoptionDispatch(f.disp, "lost start ack")
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID, Mic: true})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	q := res.Session.ID
+	waitState(t, f, q, "failed")
+	f.disp.waitStop(t, q) // the stop for the new session is now in flight
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: k, State: "stopped", HomeCleanupQualified: true})
+	if got := f.holder(t); got != q {
+		t.Fatalf("hold = %q after the old runtime's proof, want it kept on the failed new session %s", got, q)
+	}
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: q, State: "stopped", HomeCleanupQualified: true})
+	if got := f.holder(t); got != "" {
+		t.Errorf("hold = %q after the new session's own proof, want cleared", got)
+	}
+}
+
 // The agent's declined or fresh path: the parked runtime exits first and its
 // proof arrives while the claim waits to build fresh. The hold passes to the
 // claim and is never free in between.
