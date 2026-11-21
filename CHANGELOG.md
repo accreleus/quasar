@@ -28,6 +28,7 @@ own; the two do not move together, and that is deliberate.
 - Dependency updates
 
 ### Fixed
+- WebTransport input detects full writers and keeps only the latest pending mouse move when datagrams back up (#1154).
 - WebTransport preserves session-ended and takeover close reasons during connection and keeps the WebRTC fallback cause visible after reload (#1478).
 - A failed start during warm Steam adoption immediately queues teardown of the new session (#768).
 

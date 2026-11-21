@@ -214,6 +214,8 @@ export class WebTransportMedia implements MediaTransport {
 
   /** Both paths are no-ops until connected. */
   readonly input: InputWire = {
+    datagramState: () => this.live?.on ? this.datagramWriter : null,
+    controlDesiredSize: () => this.live?.on ? this.writer?.desiredSize ?? null : null,
     reliable: (event) => this.send({ type: "input", event }),
     datagram: (bytes) => {
       const cap = Math.min(this.wt?.datagrams.maxDatagramSize ?? MAX_INPUT_DATAGRAM, MAX_INPUT_DATAGRAM);

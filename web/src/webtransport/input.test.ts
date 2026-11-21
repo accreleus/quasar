@@ -231,6 +231,69 @@ describe("WebTransportMedia input and ping", () => {
     t.close();
   });
 
+  it.each(["mm", "ma"])("sends only the newest pending %s when the datagram writer drains", async (kind) => {
+    const { agent, t, up } = connected();
+    await up;
+    const sender = webTransportInputSender(t.input);
+    const scroll = { t: "ms", dx: 0, dy: 120 };
+    const key = { t: "k", code: 30, pressed: false };
+    const button = { t: "mb", button: 272, pressed: false };
+    const move = kind === "mm" ? { t: kind, dx: 1, dy: 2 } : { t: kind, x: 0.1, y: 0.2 };
+    const latest = kind === "mm" ? { t: kind, dx: 3, dy: 4 } : { t: kind, x: 0.3, y: 0.4 };
+    const datagrams = () => agent.datagramsSent.map((d) => JSON.parse(text(d.subarray(1))));
+    try {
+      agent.hold = "datagram-write";
+      sender.send(scroll); // fills the writer's single slot
+      sender.send(move);
+      sender.send(Object.assign(move, latest)); // capture reuses its relative-motion object
+      Object.assign(move, kind === "mm" ? { dx: 5, dy: 6 } : { x: 0.5, y: 0.6 });
+      sender.send(scroll); // retains its datagram path even when full
+      sender.send(key);
+      if (kind === "mm") sender.send(button);
+      await flush();
+      expect(datagrams()).toEqual([scroll]);
+      const reliable = () => agent.sent("input").map((m) => m.event);
+      expect(reliable()).toEqual(kind === "mm" ? [key, button] : [key]);
+
+      agent.hold = null;
+      agent.release();
+      await flush();
+      expect(datagrams()).toEqual([scroll, scroll, latest]);
+    } finally {
+      sender.dispose();
+      agent.hold = null;
+      agent.release();
+      await t.close();
+    }
+  });
+
+  it("sends the latest blocked absolute position before a click without replaying it as a datagram", async () => {
+    const { agent, t, up } = connected();
+    await up;
+    const sender = webTransportInputSender(t.input);
+    const before = { t: "ma", x: 0.1, y: 0.2 };
+    const latest = { t: "ma", x: 0.3, y: 0.4 };
+    const click = { t: "mb", button: 272, pressed: true };
+    try {
+      agent.hold = "datagram-write";
+      sender.send(before);
+      sender.send(latest);
+      sender.send(click);
+      await flush();
+      expect(agent.sent("input").map((m) => m.event)).toEqual([latest, click]);
+
+      agent.hold = null;
+      agent.release();
+      await flush();
+      expect(agent.datagramsSent.map((d) => JSON.parse(text(d.subarray(1))))).toEqual([before]);
+    } finally {
+      sender.dispose();
+      agent.hold = null;
+      agent.release();
+      await t.close();
+    }
+  });
+
   it("pings once a second and reports each pong's round trip", async () => {
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     let clock = 1000;
@@ -460,5 +523,33 @@ describe("input through the WebTransport runtime", () => {
     await vi.waitFor(() => expect(snaps.at(-1)?.rttMs).toEqual(expect.any(Number)), { timeout: 3000 });
     expect(snaps.at(-1)!.rttMs).toBeGreaterThanOrEqual(0);
     rt.destroy();
+  });
+
+  it.each(["write", "datagram-write"] as const)("latches capture backpressure from a stalled %s", async (stage) => {
+    const { agent, canvas, rt } = setup();
+    const snaps: TelemetrySnapshot[] = [];
+    rt.registerTelemetry((s) => snaps.push(s));
+    rt.start();
+    try {
+      await vi.waitFor(() => expect(agent.sent("ping")).toHaveLength(1));
+      lock(canvas);
+      agent.hold = stage;
+      if (stage === "write") {
+        document.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, code: "KeyA" }));
+      } else {
+        document.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, movementX: 3, movementY: -5 }));
+      }
+      await flush();
+      expect(agent.reached).toBe(stage);
+      document.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, code: "KeyB" }));
+      agent.hold = null;
+      agent.release();
+      await vi.waitFor(() => expect(snaps.some((s) => s.inputMetrics?.backpressureDetected)).toBe(true), { timeout: 3000 });
+      await vi.waitFor(() => expect(snaps.at(-1)?.inputMetrics?.backpressureDetected).toBe(false), { timeout: 3000 });
+    } finally {
+      agent.hold = null;
+      agent.release();
+      rt.destroy();
+    }
   });
 });
