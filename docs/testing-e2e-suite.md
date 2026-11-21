@@ -228,15 +228,17 @@ bundle, or add `RESUME=1` to finish a collection **this machine started** (a sce
 or a run that was cut short).
 
 The collector reads the control plane's own answers, in the control plane's own shapes: the
-session row first, then the trace for the window the session ran in (`started_at - 5 s` to
-`ended_at + 5 s`, or now), in reads the server allows (10 minutes at most; a read that comes
-back full is split), then the raw samples, the host's settings and both builds. **The stack
+session row, the raw samples, and the trace for the window the session ran in (`started_at - 5 s`
+to `ended_at + 5 s`, or now), followed by the host's settings and agent build. Trace reads cover
+at most 10 minutes each. A read that reaches the sample or event cap is split. The control
+plane's build is read once per collection that needs it. **The stack
 deletes telemetry after its retention period** (a day by default; the row stays), so a session
 collected later than that has no trace: it is not an error and not an empty half, it is
 `collected: false` with the reason "the trace is no longer kept". Debug captures (`diag.*`
 events) outlive the sweep and do not count as a trace. A live session over an hour has already
-lost its oldest telemetry. A session that **never started** (a launch failure: no `started_at`)
-is collected: its row (with `has_failure_code` and `has_error_message`; the code and the message
+lost its oldest telemetry. A session that **never started** has an end time and no `started_at`.
+This includes a launch failure or cancellation during launch. The collector records
+its row (with `has_failure_code` and `has_error_message`; the code and the message
 are text the agent chose and are not copied, read them on the stack), its conditions and the
 agent identity, no trace; `host-half.json` says
 `"trace": "the session never started"`.
@@ -246,7 +248,8 @@ addresses are replaced wherever they appear, and free text an answer carries (an
 message) is passed through the validator's secret patterns. That last step is best effort: no
 pattern finds every credential in free text. So every string the collector projects itself into
 `session.json`, `conditions.json`, `host-half.json` and `builds.json` passes a shape check for
-its own field or is left out, and the count of what was left out is written in that scenario's
+its own field, including closed vocabularies such as session state and transport, or is left out.
+The count of what was left out is written in that scenario's
 `host-half.json` `not_projected` (`{"session": 2, "conditions": 1, "identity": 0}`, absent when
 nothing was); a failed session's code and message are never copied; a host path setting is written as
 `[omitted]`. `scripts/dev/leak-scan.sh` with the operator's patterns still runs before a bundle
@@ -272,8 +275,10 @@ running again. A scenario's files are committed together: all are written to tem
 first and renamed into place together, `host-half.json` last, so a failed write leaves the
 scenario as it was and a retry merges with the client's rows only. The settings are **as read
 at collection**, not as they were when the session ran (a host can be changed between):
-`host-half.json` records `read_at_ms`. The builds are read when a scenario is collected; a failed
-build read is not retried by `RESUME=1`, only by collecting a fresh copy.
+`host-half.json` records `read_at_ms`. When `RESUME=1` has a scenario left to collect, it reads
+the control-plane build again and reads the agent build for the sessions it collects. A scenario
+already collected keeps its recorded agent build. Finishing an interrupted top-level write also
+reads the control-plane build again.
 
 ### What the host half adds
 
@@ -284,7 +289,7 @@ build read is not retried by `RESUME=1`, only by collecting a fresh copy.
 | `<scenario>/conditions.json` | `effective`: the host's effective settings as read at collection, projected as `bench_run.sh`'s `flag()` does (a value that reads `true` or `false` in any case becomes `on`/`off`; the ladder aliases are added) |
 | `<scenario>/metrics.jsonl` | the session's raw samples (every key, string-valued ones too, at their own timestamps) **merged** with the client half's own rows: same source and `ts_unix_ms` is the same row, joined key by key, the client half's value winning a key both have; sorted by ts then source. A key the metric manifest lacks, or a source the format lacks, is dropped and listed in `host-half.json` |
 | `<scenario>/trace.json` | the session's stored trace events (as stored, not clock-aligned), merged with the client half's; a clock the client measured is kept when the server's is unmeasured. A second session's own events are in its `sessions/<id>/trace.json` |
-| `<scenario>/host-half.json` | `{ "collected": true, "read_at_ms": ..., "node_agent": ... }` (plus `metric_keys_not_in_manifest` and `sources_not_in_bundle` when something was dropped: a name is listed only if it is a plain identifier, any other is counted in `other_dropped`; `"trace": "the session never started"` for a launch failure; `not_projected` when a projected value had the wrong shape and was left out), or `collected: false` with the `reason` |
+| `<scenario>/host-half.json` | `{ "collected": true, "read_at_ms": ..., "node_agent": ... }` (plus `metric_keys_not_in_manifest` and `sources_not_in_bundle` when something was dropped: a name is listed only if it is a plain identifier, any other is counted in `other_dropped`; `"trace": "the session never started"` when all sessions ended before starting; `not_projected` when a projected value had the wrong shape and was left out), or `collected: false` with the `reason` |
 | `builds.json` | `components.control_plane` from `GET /v1/admin/platform/identity`, `components.node_agent` from the host row's `agent_version`/`source_commit`/`built_at` (`GET /v1/hosts/{id}`, which answers `{"host": ...}`); a build that cannot be read is `null` with its reason in `unknown`, replacing whatever the client half held; every other component is left as the client half wrote it |
 | `manifest.json` | `halves.host: true`, only when every scenario is collected |
 
@@ -704,7 +709,7 @@ A directory, zipped when it is handed between machines.
 - **Keys are the metric manifest's.** An `agent` or `browser` sample key must be in `docs/session-trace/metrics.json` (bench-mode keys ride in `browser` samples, with the six keys `scripts/dx/bench_app_samples.py` derives: `bench_n`, `bench_decoded`, `i2p_p50_ms`, `i2p_max_ms`, `i2p_n`, `ts_nudged`). Sample sources are the five quasar-bench accepts: `agent`, `browser`, `app`, `netem`, `harness`.
 - **Every timestamp names its clock.** A timeline row says `client` or `host`; a sample's clock is its key's clock in the metric manifest. `clock_offset_ms` is the measured client-to-host offset, or `null`.
 - **A missing build has a reason.** A web build the runner served is `web: {source: "web-dist", sha256, files}` and nothing else, with `manifest.web_build: {served_by: "runner", source: "web-dist"}`; each without the other is refused.
-- **No address, token or password** in any text file, whatever its name. A JSON field whose name says it holds a credential (`authorization`, `cookie`, any `*token`, `password`, `secret`, `api key`, `private key`; any case, hyphen or camelCase) and whose value is not a "there is none" word is a credential too. A bundle's text is UTF-8: a file whose first two or four bytes are a UTF-16 or UTF-32 byte-order mark is not valid, and any other file with a NUL byte in its first 4 KB is taken as binary (a picture, a video, an archive) and not read. Documentation addresses (RFC 5737) pass. Known limits: the address check knows IPv4 only, reads a four-part version such as `1.2.3.4` as an address, and lets `x.0.0.0` and `127.0.0.1` through (a browser's version looks like the first); a bearer token made of letters only is not seen, nor is UTF-16 text with no byte-order mark (it reads as binary); host names and home paths are not looked for (a session container's own home is a real path in app logs). `scripts/dev/leak-scan.sh` with the operator's patterns still runs before a bundle goes anywhere public.
+- **No address, token or password** in any text file, whatever its name. A JSON field whose name says it holds a credential (`authorization`, `cookie`, any `*token`, `password`, `secret`, `api key`, `private key`; any case, hyphen or camelCase) and whose value is not a "there is none" word is a credential too. The validator checks the first two or four bytes of each file for a UTF-16 or UTF-32 byte-order mark and rejects either. A file with a NUL byte in its first 4 KB is otherwise treated as binary (a picture, a video, an archive). Documentation addresses (RFC 5737) pass. Known limits: the address check knows IPv4 only, reads a four-part version such as `1.2.3.4` as an address, and lets `x.0.0.0` and `127.0.0.1` through (a browser's version looks like the first); a bearer token made of letters only is not seen, nor is UTF-16 text with no byte-order mark (it reads as binary); host names and home paths are not looked for (a session container's own home is a real path in app logs). `scripts/dev/leak-scan.sh` with the operator's patterns still runs before a bundle goes anywhere public.
 
 The test (`node --test scripts/validate/stream/bundle.test.mjs`, part of `make verify`) breaks the
 fixture once per rule above. The collector's test drives it against a fake API as an in-process

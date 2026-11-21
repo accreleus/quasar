@@ -33,7 +33,7 @@ export const EXIT = { ok: 0, invalid: 1, error: 2, incomplete: 3 };
 // host-half.json or builds.json passes the shape for its own field, or it is not written and is
 // counted in host-half.json's not_projected: the collector never copies free text. These are
 // field shapes, not patterns that hunt for a credential.
-const IDENT = /^[A-Za-z0-9_.-]{1,64}$/; // a name: a state, a transport, a codec, a settings key
+const IDENT = /^[A-Za-z0-9_.-]{1,64}$/; // an open-ended name: a profile id, a settings key
 const VERSION = /^[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}$/; // a build's version
 const COMMIT = /^[0-9a-f]{7,40}$/i; // a build's commit
 // A host setting's value. A path holds a "/" and free text a space: neither matches, and neither
@@ -230,9 +230,23 @@ const CONDITION_ALIAS = {
   abr_ladder_floor_follows_rung: "floor_follows_rung",
 };
 const flag = (v) => (String(v).toLowerCase() === "true" ? "on" : String(v).toLowerCase() === "false" ? "off" : String(v));
+// The boolean and enum values from control-plane/internal/hostcfg/catalog.go, after flag().
+const TOGGLE = ["on", "off"];
+const CLOSED_SETTINGS = {
+  abr_enabled: TOGGLE,
+  abr_ladder: TOGGLE,
+  abr_ladder_resolution: TOGGLE,
+  abr_ladder_fps: TOGGLE,
+  abr_ladder_floor_follows_rung: TOGGLE,
+  zerocopy: TOGGLE,
+  latency_probe: TOGGLE,
+  abr_mode: ["off", "protective", "smooth"],
+  abr_ladder_order: ["res_first", "fps_first", "hybrid"],
+  encoder: ["openh264", "va", "nvenc", "vulkan"],
+};
 
-// A key that is not a name is not written; a value is written only in a setting value's shape, so
-// a host path or free text becomes "[omitted]". Both are counted once per answer value left out
+// A key that is not a name is not written; a value must match its vocabulary or setting shape.
+// Rejects are counted once per answer value left out
 // (an alias repeats the same value and is not a second one).
 function conditions(effective, note) {
   if (effective === null) return { unknown: { effective: EFFECTIVE_UNKNOWN } };
@@ -243,10 +257,11 @@ function conditions(effective, note) {
       continue;
     }
     const value = flag(effective[k]);
-    const shown = fits(SETTING, value) ? value : "[omitted]";
+    const valid = Object.hasOwn(CLOSED_SETTINGS, k) ? CLOSED_SETTINGS[k].includes(value) : fits(SETTING, value);
+    const shown = valid ? value : "[omitted]";
     if (shown === "[omitted]") note("conditions");
     projected[k] = shown;
-    if (CONDITION_ALIAS[k]) projected[CONDITION_ALIAS[k]] = shown;
+    if (Object.hasOwn(CONDITION_ALIAS, k)) projected[CONDITION_ALIAS[k]] = shown;
   }
   return { effective: projected };
 }
@@ -254,7 +269,7 @@ function conditions(effective, note) {
 // The members of sessionResp's pyrowave (session.PyroWaveRecord,
 // control-plane/internal/session/pyrowave_plan.go:47-57) and the type each is written as. Nothing
 // else from the answer is projected: a member not named here, and a nested object or array, is
-// left out and counted. A string member is written only in a name's shape.
+// left out and counted. The reason strings are open; choice is explicit or auto.
 const PYROWAVE = {
   allowed: "boolean",
   wanted: "boolean",
@@ -262,7 +277,7 @@ const PYROWAVE = {
   used: "boolean",
   target_kbps: "number",
   reason: "string",
-  choice: "string",
+  choice: ["explicit", "auto"],
   auto_reason: "string",
   switch_reason: "string",
 };
@@ -271,17 +286,27 @@ const PYROWAVE = {
 function pyrowave(o, note) {
   if (o == null) return undefined;
   const out = {};
-  for (const [k, type] of Object.entries(PYROWAVE)) {
+  for (const [k, shape] of Object.entries(PYROWAVE)) {
     const v = o[k];
     if (v === undefined) continue;
     // The Go field is a pointer: null is "the answer held none", and no text at all.
     if (v === null) out[k] = null;
-    else if (type === "string" ? fits(IDENT, v) : type === "number" ? num(v) : typeof v === "boolean") out[k] = v;
+    else if (Array.isArray(shape) ? shape.includes(v) : shape === "string" ? fits(IDENT, v) : shape === "number" ? num(v) : typeof v === shape) out[k] = v;
     else note("session");
   }
   for (const k of Object.keys(o)) if (!Object.hasOwn(PYROWAVE, k) && o[k] != null) note("session");
   return out;
 }
+
+// Session and StreamSpec vocabularies (session/state.go, stream_plan.go, codec.go).
+const SESSION_FIELDS = {
+  state: ["pending", "assigned", "starting", "running", "stopping", "stopped", "failed"],
+  transport: ["webrtc", "webtransport"],
+  profile_id: IDENT,
+  // The browser can report a codec outside the server's supported set (e.g. vp9).
+  negotiated_codec: IDENT,
+};
+const STREAM_CODECS = ["h264", "h265", "av1"];
 
 // The `session.json` shape scripts/dx/bench_submit.py reads (session_soak_driver.py builds the
 // same record from GET /v1/sessions/{id}), plus the fields the 0.6 parity gate compares,
@@ -290,9 +315,9 @@ function pyrowave(o, note) {
 function sessionRow(s, never, note) {
   const st = s.stream;
   const row = { kind: "session", id: s.id };
-  for (const k of ["state", "profile_id", "transport", "negotiated_codec"]) {
+  for (const [k, shape] of Object.entries(SESSION_FIELDS)) {
     if (s[k] === undefined) continue;
-    if (s[k] === null || fits(IDENT, s[k])) row[k] = s[k];
+    if (s[k] === null || (Array.isArray(shape) ? shape.includes(s[k]) : fits(shape, s[k]))) row[k] = s[k];
     else note("session");
   }
   if (s.app_id !== undefined) {
@@ -313,7 +338,7 @@ function sessionRow(s, never, note) {
   if (num(st.width) && num(st.height)) row.launch = [st.width, st.height];
   for (const k of ["fps", "bitrate_kbps", "external_resize_supported"]) if (st[k] != null) row[k] = st[k];
   if (st.codec != null) {
-    if (fits(IDENT, st.codec)) row.codec = st.codec;
+    if (STREAM_CODECS.includes(st.codec)) row.codec = st.codec;
     else note("session");
   }
   row.rungs = st.rungs.map(([w, h]) => [w, h]);
@@ -404,6 +429,17 @@ const traceEvent = (e) => point(e) && typeof e.type === "string" && typeof e.sou
 // Captures (diag.*) outlive the retention sweep (telemetry/policy.go), so they are not data.
 const isData = (e) => !e.type.startsWith("diag.");
 
+function lowerBound(sorted, value) {
+  let lo = 0;
+  let hi = sorted.length;
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (sorted[mid] < value) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
 // What one session's answers hold, all read and shape-checked before anything is written.
 // Routes and shapes are the handlers': diagnostic_handler.go (resolveWindow,
 // handleDiagnosticBundle, handleAdminTelemetryRead), metrics_handler.go (handleAdminMetrics),
@@ -457,6 +493,25 @@ async function fetchSession(get, id, now, note) {
     to = (s.ended_at != null ? Date.parse(s.ended_at) : now()) + PAD;
     need(from < to, "its trace window is empty (it starts after it ends, or after now)");
     need(Math.ceil((to - from) / (10 * MIN)) <= MAX_READS, "its trace is longer than one collection reads");
+    // handleAdminMetrics: { items: [{source, ts_unix_ms, metrics}], next_cursor }, newest first.
+    // The RAW samples, every key and the original timestamps; paged until the cursor ends.
+    let cursor = "";
+    for (let page = 0; ; page += 1) {
+      need(page < MAX_PAGES, "it has more samples than one collection reads");
+      const m = await ok(`/v1/admin/sessions/${sid}/metrics?limit=${PAGE}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
+      need(
+        Array.isArray(m.items) && m.items.every((i) => isObj(i) && typeof i.source === "string" && num(i.ts_unix_ms) && isObj(i.metrics)),
+        "the metrics are not samples",
+      );
+      samples.push(...m.items);
+      cursor = m.next_cursor;
+      if (cursor == null) break;
+      need(typeof cursor === "string" && cursor !== "", "the metrics cursor is not a cursor");
+    }
+
+    // The store caps raw rows across sources before producing diagnostic series. Count
+    // the rows in the API's resolved window, including equal timestamps and both bounds.
+    const stamps = samples.map((sample) => sample.ts_unix_ms).sort((a, b) => a - b);
     let n = 0;
     const span = async (a, b) => {
       need((n += 1) <= MAX_READS, "its trace is longer than one collection reads");
@@ -479,11 +534,8 @@ async function fetchSession(get, id, now, note) {
       // handleAdminTelemetryRead projectionEvents: { window, events }, the RAW events, not clock-aligned
       const ev = await ok(`/v1/admin/sessions/${sid}/trace/events${q}`);
       need(Array.isArray(ev.events) && ev.events.every(traceEvent), "the trace events are not events");
-      // The store keeps the newest 1000 raw samples per read across all sources, so a series
-      // can hold fewer points than the read dropped: count the distinct instants of all of them.
-      const stamps = new Set();
-      for (const pts of Object.values(diag.series)) for (const p of pts) stamps.add(p.ts_unix_ms);
-      const full = ev.events.length >= PAGE || diag.events.length >= PAGE || stamps.size >= PAGE;
+      const cappedAt = stamps[lowerBound(stamps, diag.window.from_ms) + PAGE - 1];
+      const full = ev.events.length >= PAGE || diag.events.length >= PAGE || (cappedAt !== undefined && cappedAt <= diag.window.to_ms);
       if (!full) return reads.push({ diag, events: ev.events });
       need(b - a >= 4 * MIN, "its trace is denser than one read holds, even in the smallest window");
       const mid = Math.floor((a + b) / 2);
@@ -492,22 +544,6 @@ async function fetchSession(get, id, now, note) {
     };
     for (let a = from; a < to; a += 10 * MIN) await span(a, Math.min(a + 10 * MIN, to));
     need(reads.length > 0, "no trace window could be read");
-
-    // handleAdminMetrics: { items: [{source, ts_unix_ms, metrics}], next_cursor }, newest first.
-    // The RAW samples, every key and the original timestamps; paged until the cursor ends.
-    let cursor = "";
-    for (let page = 0; ; page += 1) {
-      need(page < MAX_PAGES, "it has more samples than one collection reads");
-      const m = await ok(`/v1/admin/sessions/${sid}/metrics?limit=${PAGE}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
-      need(
-        Array.isArray(m.items) && m.items.every((i) => isObj(i) && typeof i.source === "string" && num(i.ts_unix_ms) && isObj(i.metrics)),
-        "the metrics are not samples",
-      );
-      samples.push(...m.items);
-      cursor = m.next_cursor;
-      if (cursor == null) break;
-      need(typeof cursor === "string" && cursor !== "", "the metrics cursor is not a cursor");
-    }
 
     const hasData =
       samples.length > 0 ||

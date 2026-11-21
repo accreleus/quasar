@@ -434,20 +434,26 @@ test("I2 under --resume a collected scenario is not fetched again, and a second 
   assert.equal(treeHash(dir), first, "not one byte of the bundle changed");
 });
 
-test("I2 under --resume a first-run failure is retried, and the scenario that was collected is left alone", async () => {
+test("I2 under --resume the failed scenario and build read are retried", async () => {
   const dir = clientBundle();
   // a second scenario with its own session
   fs.cpSync(path.join(dir, SC), path.join(dir, "02-second"), { recursive: true });
   edit(dir, "02-second/scenario.json", (s) => ({ ...s, id: "02-second", sessions: [SID2] }));
   edit(dir, "manifest.json", (m) => ({ ...m, scenarios: [SC, "02-second"] }));
 
-  const failing = world({ ids: [SID, SID2], tweak: (route) => (route.includes(SID2) && route.endsWith("/metrics") ? [500, {}] : undefined) });
+  const failing = world({
+    ids: [SID, SID2],
+    tweak: (route) => {
+      if (route === "/v1/admin/platform/identity" || (route.includes(SID2) && route.endsWith("/metrics"))) return [500, {}];
+    },
+  });
   const r1 = await run(dir, failing);
   assert.equal(r1.complete, false);
   assert.equal(r1.incomplete[0].scenario, "02-second");
   assert.equal(readJson(dir, `${SC}/host-half.json`).collected, true);
   assert.equal(readJson(dir, "02-second/host-half.json").collected, false);
   assert.equal(readJson(dir, "manifest.json").halves.host, false);
+  assert.equal(readJson(dir, "builds.json").components.control_plane, null);
   const kept = treeHash(path.join(dir, SC));
 
   const r2 = await run(dir, world({ ids: [SID, SID2], effective: { abr_mode: "protective" } }), { resume: true });
@@ -458,6 +464,7 @@ test("I2 under --resume a first-run failure is retried, and the scenario that wa
   assert.equal(readJson(dir, "02-second/host-half.json").collected, true);
   assert.equal(readJson(dir, "manifest.json").halves.host, true);
   assert.equal(readJson(dir, "builds.json").components.node_agent.version, "0.6.1-dev");
+  assert.equal(readJson(dir, "builds.json").components.control_plane.commit, "f00dfeed");
   assert.deepEqual(validateBundle(dir), []);
 });
 
@@ -1049,16 +1056,20 @@ test("B2 a session read in several windows keeps its whole analysis; a single re
   assert.equal(single.derived_windows.hitches.length, 1);
 });
 
-test("S5 a read is full when its series hold 1000 distinct instants: the store caps samples per read across sources", async () => {
+test("S5 a read is full at 1000 raw rows even with shared timestamps and non-numeric rows", async () => {
   const agent = Array.from({ length: 600 }, (_, i) => ({ source: "agent", ts_unix_ms: T_START + 1000 + i * 400, metrics: { fps: 60 } }));
-  const browser = Array.from({ length: 600 }, (_, i) => ({ source: "browser", ts_unix_ms: T_START + 1200 + i * 400, metrics: { fps: 120 } }));
+  const browser = agent.map(({ ts_unix_ms }, i) => ({
+    source: "browser",
+    ts_unix_ms,
+    metrics: i % 2 ? { fps: 120 } : { status: "playing" },
+  }));
   const dir = clientBundle();
-  const r = await run(dir, world({ samples: [...agent, ...browser] }));
+  const r = await run(dir, world({ samples: [...agent, ...browser], clockOffsetMs: 0 }));
   assert.equal(r.complete, true);
   assert.ok(r.f.calls.filter((u) => u.includes("/diagnostic-bundle")).length > 1, "the read the cap truncated was split");
   const d = readJson(dir, `${SC}/diagnostic-bundle.json`);
   assert.equal(d.series["encoder.fps"].length, 600);
-  assert.equal(d.series["client.fps"].length, 600, "no point was lost to the cap");
+  assert.equal(d.series["client.fps"].length, 300, "no point was lost to the cap");
 });
 
 test("S6 a session that never started is collected: its row, its conditions and the agent identity, no trace", async () => {
@@ -1090,6 +1101,13 @@ test("S6 a session that never started is collected: its row, its conditions and 
   assert.deepEqual(r.problems, []);
   // --resume knows it is whole
   assert.equal((await run(dir, world({ start: null }), { resume: true })).f.calls.length, 0);
+
+  const cancelled = clientBundle();
+  const stopped = await run(cancelled, world({ start: null, rowExtra: { state: "stopped" } }));
+  assert.equal(stopped.complete, true);
+  assert.equal(readJson(cancelled, `${SC}/host-half.json`).trace, "the session never started");
+  assert.equal(readJson(cancelled, `${SC}/session.json`).has_failure_code, false);
+  assert.ok(!fs.existsSync(path.join(cancelled, SC, "diagnostic-bundle.json")));
 
   // a session still launching (no start, no end) is not collected
   const live = clientBundle();
@@ -1277,6 +1295,50 @@ test("A22 conditions.json: a host path and free text are [omitted]; a key that i
   assert.equal(effective.ladder_resolution, "on", "the alias carries the same value, and is not a second omission");
   assertMarkerNowhere(dir);
   assert.deepEqual(readJson(dir, `${SC}/host-half.json`).not_projected, { session: 0, conditions: 3, identity: 0 });
+});
+
+test("A22 opaque identifiers are rejected in closed session and settings vocabularies", async () => {
+  const dir = clientBundle();
+  const opaque = "opaque123";
+  const r = await run(dir, world({
+    tweak: (route, body) => {
+      if (route !== `/v1/sessions/${SID}`) return;
+      const { session } = body[1];
+      return [200, { session: {
+        ...session,
+        state: opaque,
+        transport: opaque,
+        stream: { ...session.stream, codec: opaque },
+        pyrowave: { ...session.pyrowave, choice: opaque },
+        negotiated_codec: "vp9",
+      } }];
+    },
+    effective: {
+      abr_mode: opaque,
+      abr_ladder_order: opaque,
+      encoder: opaque,
+      abr_ladder_resolution: opaque,
+      abr_ladder_fps: "False",
+    },
+  }));
+  assert.equal(r.complete, true);
+  assert.deepEqual(r.problems, []);
+  const session = readJson(dir, `${SC}/session.json`);
+  for (const field of ["state", "transport", "codec"]) assert.equal(session[field], undefined, field);
+  assert.equal(session.pyrowave.choice, undefined);
+  assert.equal(session.negotiated_codec, "vp9", "preserve an unexpected codec reported by the browser");
+  const { effective } = readJson(dir, `${SC}/conditions.json`);
+  assert.deepEqual(effective, {
+    abr_mode: "[omitted]",
+    abr_ladder_order: "[omitted]",
+    encoder: "[omitted]",
+    abr_ladder_resolution: "[omitted]",
+    ladder_resolution: "[omitted]",
+    abr_ladder_fps: "off",
+    ladder_fps: "off",
+  });
+  assert.deepEqual(readJson(dir, `${SC}/host-half.json`).not_projected, { session: 4, conditions: 4, identity: 0 });
+  assert.ok(walk(dir).every((rel) => !read(dir, rel).includes(opaque)));
 });
 
 test("A22 host-half.json and builds.json: a build's version, commit and time are written only in their own shapes", async () => {
