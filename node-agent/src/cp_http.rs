@@ -81,7 +81,7 @@ impl<In: Transport> Connector<In> for PolicyTlsConnector {
         let conn = ClientConnection::new(self.config.clone(), name.to_owned())?;
         let stream = StreamOwned {
             conn,
-            sock: TransportAdapter::new(transport.boxed()),
+            sock: TransportAdapter::new(transport.boxed(), details.current_time.clone()),
         };
         let buffers = LazyBuffers::new(
             details.config.input_buffer_size(),
