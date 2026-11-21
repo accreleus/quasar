@@ -1241,11 +1241,13 @@ test("WEB_DIST: the runner's own context serves it, and without it no route is i
 
 // ── hooks (hooks.mjs): apply and clear around a scenario ────────────────────
 
-import { declaredHooks, Hooks, hookScript, LEDGER, runHook } from "./hooks.mjs";
+import { declaredHooks, Hooks, hookScript, isAlive, LEDGER, runHook } from "./hooks.mjs";
 import { pathToFileURL } from "node:url";
 
 const BLOCK = "fault:webtransport-block";
-const tmp = (p = "e2e-hooks-") => fs.mkdtempSync(path.join(os.tmpdir(), p));
+const hooksTmp = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-hooks-test-"));
+process.on("exit", () => fs.rmSync(hooksTmp, { recursive: true, force: true }));
+const tmp = (p = "e2e-hooks-") => fs.mkdtempSync(path.join(hooksTmp, p));
 /** A hooks directory: each script logs "<phase> <scenario> <session> <transport>" to `log` beside it, then runs `extra` (a phase-aware snippet). */
 function mkHooks(extra = "", names = ["fault-webtransport-block"]) {
   const dir = tmp();
@@ -1440,13 +1442,19 @@ test("hooks: the timeout kills the hook's own children too", async () => {
   assert.throws(() => process.kill(pid, 0), "the grandchild is gone");
 });
 
-test("hooks: a run with no HOOKS= says so when a ledger beside the bundle shows a hook left applied", async () => {
+test("hooks: a run with no HOOKS= warns on stderr and in the valid bundle manifest", async () => {
   notes = [];
   const w = world();
   const parent = tmp("e2e-parent-");
   fs.writeFileSync(path.join(parent, LEDGER), "{}");
-  await runHooks(w, fake(w, async () => {}, []), { parent, hooksDir: null }).catch(() => {});
-  assert.ok(notes.some((n) => /earlier run left a hook applied/.test(n)), notes.join("|"));
+  const noop = { hooks: [], async run() { return { status: "pass", criteria: PASS }; } };
+  const r = await runHooks(w, noop, { parent, hooksDir: null });
+  assert.deepEqual(r.result.errors, []);
+  const warning = notes.find((n) => n.startsWith("warning:") && n.includes("earlier run left a hook applied"));
+  assert.ok(warning, notes.join("|"));
+  assert.deepEqual(JSON.parse(read(r.dir, "manifest.json")).warnings, [warning.slice("warning: ".length)]);
+  const clean = await runHooks(world(), noop, { hooksDir: null });
+  assert.equal(JSON.parse(read(clean.dir, "manifest.json")).warnings, undefined);
 });
 
 test("hooks: a runner killed between apply and clear leaves a ledger; the next run clears it first and says so", async () => {
@@ -1544,6 +1552,130 @@ test("hooks: a stale hook that will not clear stops the run before anything star
   const r = await runHooks(world(), noop, { hooksDir, parent });
   assert.deepEqual(r.result.recovered, []);
   assert.equal(JSON.parse(fs.readFileSync(path.join(parent, LEDGER), "utf8")).entries.length, 1);
+});
+
+test("hooks: a spawn-time ledger failure kills the group and reports a failed hook", async (t) => {
+  const h = new Hooks({ dir: mkHooks("exec sleep 30"), ledgerDir: tmp("e2e-parent-") });
+  const write = h.writeLedger.bind(h);
+  let pid;
+  h.writeLedger = (entries) => {
+    pid ??= entries[0]?.hook_pid;
+    if (pid) throw new Error("disk full");
+    write(entries);
+  };
+  const kill = t.mock.method(process, "kill");
+  const timeline = [];
+  try {
+    await assert.rejects(h.call(BLOCK, "apply", { scenario: "s", transport: "webrtc" }, (_, data) => timeline.push(data)),
+      /hook fault:webtransport-block apply failed \(ledger write failed: disk full\)/);
+    assert.ok(kill.mock.calls.some(({ arguments: args }) => args[0] === -pid && args[1] === "SIGKILL"));
+    assert.throws(() => process.kill(-pid, 0), { code: "ESRCH" });
+    assert.equal(timeline[0].stderr, "ledger write failed: disk full");
+  } finally {
+    if (pid) {
+      try { process.kill(-pid, "SIGKILL"); } catch (e) { if (e.code !== "ESRCH") throw e; }
+    }
+  }
+});
+
+const deadPid = 2 ** 22 + 12345; // outside the OS's PID range
+function staleHook(h, name = BLOCK, extra = {}) {
+  return { id: name, pid: deadPid, hooks_dir: h.root, name, state: "applied", facts: { scenario: "s", transport: "webrtc" }, ...extra };
+}
+
+test("hooks: recovery shares one deadline across process groups", async (t) => {
+  const h = new Hooks({ dir: mkHooks("", ["fault-webtransport-block", "shape-slow"]), ledgerDir: tmp(), timeoutMs: 250 });
+  h.writeLedger([
+    staleHook(h, BLOCK, { state: "applying", hook_pid: 101 }),
+    staleHook(h, "shape:slow", { state: "applying", hook_pid: 102 }),
+  ]);
+  let elapsed = 0;
+  const checks = new Map([[-101, 0], [-102, 0]]);
+  const kill = process.kill;
+  t.mock.method(performance, "now", () => elapsed);
+  t.mock.method(process, "kill", (pid, signal) => {
+    if (signal !== 0 || !checks.has(pid)) return kill(pid, signal);
+    const seen = checks.get(pid) + 1;
+    checks.set(pid, seen);
+    if (seen > 2) throw Object.assign(new Error("group gone"), { code: "ESRCH" });
+    elapsed += 100;
+    return true;
+  });
+  await assert.rejects(h.recover(() => {}), /hook shape:slow .* still running \(process group 102\).*may belong to another process \(PID reuse\)/);
+  assert.deepEqual(h.readLedger().map(({ pid }) => pid), [deadPid, deadPid], "a refused recovery releases ownership for a retry");
+});
+
+test("hooks: a runner arriving during recovery sees the recovering PID and refuses", async () => {
+  const dir = mkHooks();
+  const ledgerDir = tmp();
+  const h = new Hooks({ dir, ledgerDir });
+  h.writeLedger([staleHook(h)]);
+  let finish;
+  h.run = () => new Promise((resolve) => { finish = resolve; });
+  const recovering = h.recover(() => {});
+  try {
+    assert.equal(h.readLedger()[0].pid, process.pid);
+    await assert.rejects(new Hooks({ dir, ledgerDir }).recover(() => {}), /still holds hook fault:webtransport-block/);
+  } finally {
+    finish({ code: 0 });
+    assert.deepEqual(await recovering, [BLOCK]);
+  }
+  assert.deepEqual(h.readLedger(), []);
+});
+
+test("hooks: liveness never probes non-integer PIDs or PIDs below 2", (t) => {
+  const kill = t.mock.method(process, "kill", () => true);
+  for (const pid of [0, -1, 1, 2.5, NaN]) assert.equal(isAlive(pid), false);
+  assert.equal(kill.mock.callCount(), 0);
+});
+
+test("hooks: readLedger rejects PIDs below 2", () => {
+  const h = new Hooks({ dir: mkHooks(), ledgerDir: tmp() });
+  for (const pid of [0, -1, 1]) {
+    h.writeLedger([staleHook(h, BLOCK, { pid })]);
+    assert.throws(() => h.readLedger(), /is not a ledger this runner wrote/);
+  }
+});
+
+test("hooks: runHook keeps at most 64000 bytes of each output stream", async () => {
+  const file = path.join(tmp(), "hook");
+  fs.writeFileSync(file, `#!${process.execPath}\nprocess.stdout.write("x".repeat(90000));\nprocess.stderr.write("é".repeat(45000));\n`, { mode: 0o755 });
+  const r = await runHook(file, "apply", process.env, 5000);
+  assert.equal(r.code, 0);
+  assert.equal(Buffer.byteLength(r.stdout), 64000);
+  assert.equal(Buffer.byteLength(r.stderr), 64000);
+  assert.ok(r.stderr.endsWith("é"));
+});
+
+test("hooks: a failed ledger rename removes the temporary file", () => {
+  const ledgerDir = tmp();
+  const h = new Hooks({ dir: mkHooks(), ledgerDir });
+  fs.mkdirSync(h.ledger); // Write succeeds, rename onto the directory fails.
+  assert.throws(() => h.writeLedger([staleHook(h)]), { code: "EISDIR" });
+  assert.deepEqual(fs.readdirSync(ledgerDir), [LEDGER]);
+});
+
+test("hooks: clearAll waits for an in-flight apply, even when it fails", async () => {
+  const h = new Hooks({ dir: mkHooks(), ledgerDir: tmp() });
+  const order = [];
+  let finish;
+  h.run = async (_, phase) => {
+    if (phase === "apply") {
+      order.push("apply-start");
+      await new Promise((resolve) => { finish = resolve; });
+      order.push("apply-end");
+      return { code: 1 };
+    }
+    order.push("clear");
+    return { code: 0 };
+  };
+  const applying = assert.rejects(h.call(BLOCK, "apply", { scenario: "s", transport: "webrtc" }, () => {}), /apply failed/);
+  const clearing = h.clearAll(() => {});
+  finish();
+  await applying;
+  assert.deepEqual(await clearing, []);
+  assert.deepEqual(order, ["apply-start", "apply-end", "clear"]);
+  assert.deepEqual(h.readLedger(), []);
 });
 
 // ── transport-fallback and input-kbm (the real scenario modules, against the same fake page) ─────────────────

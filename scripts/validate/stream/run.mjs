@@ -304,7 +304,10 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
     // Hooks: a runner that died between apply and clear left a ledger beside the bundle; it is cleared before anything else, or the run does not start.
     const hooks = hooksDir ? new Hooks({ dir: hooksDir, ledgerDir: path.dirname(path.resolve(dir)), timeoutMs: hookTimeoutMs, redact: (s) => bundle.text(s) }) : null;
     // Without HOOKS= nothing here can clear a hook; a ledger beside the bundle says a run left one applied.
-    if (!hooks && fs.existsSync(path.join(path.dirname(path.resolve(dir)), LEDGER))) onNote(`warning: ${LEDGER} beside the bundle says an earlier run left a hook applied; this run has no HOOKS= and cannot clear it`);
+    const hookLedgerWarning = !hooks && fs.existsSync(path.join(path.dirname(path.resolve(dir)), LEDGER))
+      ? `${LEDGER} beside the bundle says an earlier run left a hook applied; this run has no HOOKS= and cannot clear it`
+      : null;
+    if (hookLedgerWarning) onNote(`warning: ${hookLedgerWarning}`);
     const recovered = hooks ? await hooks.recover((ev, d) => onNote(bundle.text(`${ev} ${JSON.stringify(d)}`))) : [];
     if (recovered.length) onNote(`cleared hook(s) a runner that died had left applied: ${recovered.join(", ")}`);
     const startedAt = now();
@@ -433,6 +436,7 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
       redacted: Object.keys(bundle.redacted),
       target: "stack",
       ...(webDist ? { web_build: { served_by: "runner", source: "web-dist" } } : {}),
+      ...(hookLedgerWarning ? { warnings: [hookLedgerWarning] } : {}),
     });
     const errors = [...bundle.problems, ...validateBundle(staging)];
     if (!errors.length) { fs.renameSync(staging, dir); committed = true; }
