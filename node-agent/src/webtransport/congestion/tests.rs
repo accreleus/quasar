@@ -4444,6 +4444,30 @@ fn a_keyframe_burst_after_a_quiet_scene_on_a_reordering_link_moves_nothing() {
     assert!(down.is_none(), "the setpoint moved down: {down:?}");
 }
 
+/// RB (design test 11): 60, 150 and 300 ms of total loss every 10 s on the path to the client,
+/// on a link far over the ceiling, are blackouts: no loss cut and no ABR move, and the guard
+/// stalls at most once a burst.
+#[test]
+fn burst_loss_of_60_to_300_ms_moves_nothing() {
+    let mut s = Sim::new(50_000.0).with_abr().with_guard();
+    s.quic = Some(Quic::default());
+    s.keyframe_every = 60;
+    s.run(5.0);
+    let bursts = [60u64, 150, 300, 60, 150, 300];
+    for ms in bursts {
+        s.run(10.0 - ms as f64 / 1000.0);
+        s.drop_every = 1;
+        s.run(ms as f64 / 1000.0);
+        s.drop_every = 0;
+    }
+    s.run(5.0);
+    let cut = s.loss_bounds.iter().find(|&&(t, k)| t >= 5.0 && k < CEILING);
+    assert!(cut.is_none(), "a loss cut: {cut:?}");
+    let down = s.rates.windows(2).find(|w| w[1].1 < w[0].1);
+    assert!(down.is_none(), "the ABR moved down: {down:?}");
+    assert!(s.stalls.len() <= bursts.len(), "stalls {:?}", s.stalls);
+}
+
 /// `QUASAR_WT_CAPACITY=legacy` (design §4): no pacing and no audio room, 0.6.3's reading (the
 /// estimate or `BETA` × the receive rate, no gap taken out), blackouts counted as loss, and the
 /// window on the smoothed RTT.
