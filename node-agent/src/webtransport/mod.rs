@@ -133,7 +133,7 @@ pub(crate) struct Rate {
     /// After `observe`, for every estimate that came from a receiver report, never for the
     /// silence decay: what the report showed the link carrying when the link held the
     /// sender back (`congestion::Estimator::measured`), `None` when it did not.
-    pub(crate) measured: Box<dyn Fn(Option<f64>) + Send + Sync>,
+    pub(crate) measured: Box<dyn Fn(Option<congestion::Reading>) + Send + Sync>,
     /// Amendment 85: FEC telemetry — whether this connection's `hello_ack.fec` named a
     /// scheme, and per protected frame the video and repair datagram payload bytes sent.
     /// FEC exists only where this estimate writes the encoder, so it is reported here.
@@ -198,7 +198,7 @@ impl<'a> Control<'a> {
         message: &Value,
         path: congestion::QuicPath,
         now: std::time::Instant,
-        backlog: Option<f64>,
+        backlog: Option<(f64, std::time::Instant)>,
     ) {
         let fb = match congestion::feedback_of(message) {
             Ok(fb) => fb,
@@ -277,7 +277,7 @@ impl<'a> Control<'a> {
             (self.rate.measured)(
                 self.estimator
                     .measured()
-                    .map(|link| link / (1.0 + self.charged)),
+                    .map(|(link, piece)| (link / (1.0 + self.charged), piece)),
             );
         }
         (self.rate.observe)(kbps / (1.0 + self.charged));
@@ -1217,17 +1217,19 @@ fn retransmit_window(session: &Session) -> Duration {
 }
 
 /// The backlog guard's verdict on the next video unit or `nack` answer; a skip that wants a
-/// keyframe has asked for it. `held`: video bytes not yet handed to QUIC.
+/// keyframe has asked for it. `held`: video bytes not yet handed to QUIC; `acks`:
+/// [`congestion::Governor::acks`].
 fn admit(
     backlog: &mut congestion::Backlog,
     session: &Session,
     media: &Media,
     keyframe: bool,
     held: usize,
+    acks: u64,
 ) -> congestion::Admit {
     let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space()) + held;
     let hold = retransmit_window(session);
-    backlog.acknowledge(quinn::Connection::stats(session).frame_rx.acks);
+    backlog.acknowledge(acks);
     let admit = backlog.admit(queued, keyframe, std::time::Instant::now(), hold);
     if admit == congestion::Admit::SkipForKeyframe {
         media.keyframe();
@@ -1259,8 +1261,8 @@ fn video_payload(datagrams: &[bytes::Bytes]) -> u64 {
 /// governed rate or, when it is lower, the estimate itself: the governor never goes under
 /// the ABR floor, the link may. False when the connection is gone. A resend sends only while
 /// its fragment's budget allows; a video datagram the path's maximum datagram size has
-/// shrunk below is skipped, and its frame cannot complete, so a keyframe is asked for. Held
-/// video past the NACK hold is dropped first (`VideoQueue::drop_stale`).
+/// shrunk below is skipped, and its frame cannot complete, so a keyframe is asked for. Nothing
+/// held past the NACK hold is handed over (`VideoQueue::feed`).
 #[allow(clippy::too_many_arguments)]
 fn feed(
     session: &Session,
@@ -1273,24 +1275,21 @@ fn feed(
     handed: &mut u64,
     fec: bool,
     backlog: &mut congestion::Backlog,
+    governor: &congestion::Governor,
 ) -> bool {
     let rates = control.as_ref().map_or((None, None), |c| {
         congestion::video_rates(&c.governor, &c.estimator, pyrowave)
     });
     let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
     let now = std::time::Instant::now();
-    let acks = quinn::Connection::stats(session).frame_rx.acks;
-    if backlog.may_drop_stale(acks) && video.drop_stale(now, retransmit_window(session)) {
-        backlog.skip_to_keyframe(acks);
-    }
     let (room, frame) = video.budget(rates, queued, DATAGRAM_BUFFER, now);
     let log = match pyro {
         Some(rate) if pyrowave => Some(&mut rate.log),
         _ => control.filter(|_| !pyrowave).map(|c| &mut c.log),
-    }
-    .map(|log| (log, now));
+    };
     let too_large = video.too_large;
-    let alive = video.feed(room, frame, log, |held| {
+    let hold = (now, retransmit_window(session));
+    let alive = video.feed(room, frame, hold, log, |held| {
         if held.resend && !sent.allows(&held.datagram) {
             return congestion::Handed::Skipped;
         }
@@ -1327,6 +1326,9 @@ fn feed(
             );
         }
         media.keyframe();
+    }
+    if video.orphaned() {
+        backlog.skip_to_keyframe(governor.acks());
     }
     alive
 }
@@ -1692,7 +1694,7 @@ async fn stream(
             _ = probe_tick.tick() => {
                 let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space())
                     + video.bytes();
-                let acks = quinn::Connection::stats(session).frame_rx.acks;
+                let acks = governor.acks();
                 // Only a session the estimate can govern (#1332's invariant): with ABR off (an
                 // ABR loop exists then, but retargets nothing), and while PyroWave is active,
                 // QUIC's own congestion control stands untouched. The estimate itself lets go
@@ -1752,7 +1754,7 @@ async fn stream(
                 None => audio_open = false,
             },
             () = &mut drain, if !video.is_empty() => {
-                if !feed(session, &mut video, control.as_mut(), pyro.as_mut(), current.codec == "pyrowave", &mut sent, media, &mut handed, fec, &mut backlog) {
+                if !feed(session, &mut video, control.as_mut(), pyro.as_mut(), current.codec == "pyrowave", &mut sent, media, &mut handed, fec, &mut backlog, &governor) {
                     break QUIET;
                 }
                 drain.as_mut().reset(Instant::now() + DRAIN_EVERY);
@@ -1770,7 +1772,7 @@ async fn stream(
                     if let Some(rate) = pyro.as_mut().filter(|_| unit.pyrowave) {
                         rate.offer(unit.data.len());
                     }
-                    match admit(&mut backlog, session, media, unit.keyframe || unit.pyrowave, video.bytes()) {
+                    match admit(&mut backlog, session, media, unit.keyframe || unit.pyrowave, video.bytes(), governor.acks()) {
                         congestion::Admit::Send => {}
                         congestion::Admit::GiveUp => break stalled(),
                         _ => continue,
@@ -1827,7 +1829,7 @@ async fn stream(
                     for datagram in datagrams {
                         video.push(congestion::Held { datagram, logged, resend: false, queued_at: now, keyframe: unit.keyframe || unit.pyrowave }, DATAGRAM_BUFFER);
                     }
-                    if !feed(session, &mut video, control.as_mut(), pyro.as_mut(), current.codec == "pyrowave", &mut sent, media, &mut handed, fec, &mut backlog) {
+                    if !feed(session, &mut video, control.as_mut(), pyro.as_mut(), current.codec == "pyrowave", &mut sent, media, &mut handed, fec, &mut backlog, &governor) {
                         break QUIET;
                     }
                     drain.as_mut().reset(Instant::now() + DRAIN_EVERY);
@@ -1872,7 +1874,7 @@ async fn stream(
                         // retransmission and no nack_miss.
                         Some("nack") if nack_of(&message).is_some_and(|(seq, _)| pyrowave_frames.ignores(seq)) => {}
                         Some("nack") if !nack_budget.take(std::time::Instant::now()) => nacks_capped += 1,
-                        Some("nack") => match admit(&mut backlog, session, media, false, video.bytes()) {
+                        Some("nack") => match admit(&mut backlog, session, media, false, video.bytes(), governor.acks()) {
                             congestion::Admit::GiveUp => break stalled(),
                             // Behind a stalled queue a resend is as stale as new video.
                             congestion::Admit::Skip | congestion::Admit::SkipForKeyframe => {}
@@ -1888,7 +1890,7 @@ async fn stream(
                                     for datagram in answer.resend {
                                         video.push(congestion::Held { datagram, logged, resend: true, queued_at: now, keyframe: false }, DATAGRAM_BUFFER);
                                     }
-                                    if !feed(session, &mut video, control.as_mut(), pyro.as_mut(), current.codec == "pyrowave", &mut sent, media, &mut handed, fec, &mut backlog) {
+                                    if !feed(session, &mut video, control.as_mut(), pyro.as_mut(), current.codec == "pyrowave", &mut sent, media, &mut handed, fec, &mut backlog, &governor) {
                                         break QUIET;
                                     }
                                     drain.as_mut().reset(Instant::now() + DRAIN_EVERY);

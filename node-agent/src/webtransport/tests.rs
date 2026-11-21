@@ -5555,7 +5555,7 @@ async fn audio_overtakes_video_held_behind_a_stalled_path() {
         !late_audio.is_empty(),
         "no audio from late in the outage arrived"
     );
-    // Video held past the NACK hold is dropped (`VideoQueue::drop_stale`), so the picture
+    // Nothing held past the NACK hold reaches QUIC (`VideoQueue::feed`), so the picture
     // resumes at a keyframe, and the outage's audio is not behind any of it.
     let up_wall = up_wall.unwrap();
     let resumed = video

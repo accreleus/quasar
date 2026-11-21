@@ -289,7 +289,7 @@ impl AbrLoop {
     /// path, then the resolution rung. A reading taken while a step is in flight or within
     /// `LadderPlanner::STEP_SETTLE` of a step or a manual resize is the encoder restart's
     /// pause and keyframe burst, not the link, so it counts as none.
-    fn report(&self, reading: Option<f64>, now: std::time::Instant) {
+    fn report(&self, reading: Option<(f64, u64)>, now: std::time::Instant) {
         if !self.per_report || self.mode == AbrMode::Off || !self.owns_encoder() {
             return;
         }
@@ -313,7 +313,7 @@ impl AbrLoop {
             m.set_abr_link_rate(self.id, rate);
         }
         if let Some(kbps) = cut {
-            self.retarget(prev, kbps, reading.unwrap_or_default());
+            self.retarget(prev, kbps, reading.map_or(0.0, |(link, _)| link));
         }
         self.step_rung(now);
     }
@@ -2357,8 +2357,11 @@ mod tests {
         // setpoint) to what the link carries: 1000 kbit/s fits no engage line, so the
         // planner wants a size step.
         let t0 = std::time::Instant::now();
-        abr.report(Some(1000.0), t0); // the first reading: under, not yet a move
-        abr.report(Some(1000.0), t0 + std::time::Duration::from_millis(100)); // rate moves
+        abr.report(Some((1000.0, 1)), t0); // the first reading: under, not yet a move
+        abr.report(
+            Some((1000.0, 2)),
+            t0 + std::time::Duration::from_millis(100),
+        ); // rate moves
         let rate = abr.governor.lock().unwrap().rate_kbps();
         assert!(rate <= 1000.0, "the governor's rate stayed at {rate}");
 
@@ -2368,7 +2371,10 @@ mod tests {
         arm(SESSION, Step::BeforeRungWrite, move || (b.start)());
         // The rate has been under the band for more than `RATE_CONFIRM`: this report's
         // `step_rung` plans the step and reaches the pause. No sleeps: the clock is supplied.
-        abr.report(Some(1000.0), t0 + std::time::Duration::from_millis(1500));
+        abr.report(
+            Some((1000.0, 3)),
+            t0 + std::time::Duration::from_millis(1500),
+        );
 
         assert_eq!(
             lever.stage().requested(),
@@ -2498,8 +2504,11 @@ mod tests {
         // setpoint) to what the link carries: 1000 kbit/kb fits no engage line, so the
         // planner wants a size step.
         let t0 = std::time::Instant::now();
-        abr.report(Some(1000.0), t0); // the first reading: under, not yet a move
-        abr.report(Some(1000.0), t0 + std::time::Duration::from_millis(100)); // rate moves
+        abr.report(Some((1000.0, 1)), t0); // the first reading: under, not yet a move
+        abr.report(
+            Some((1000.0, 2)),
+            t0 + std::time::Duration::from_millis(100),
+        ); // rate moves
         let rate = abr.governor.lock().unwrap().rate_kbps();
         assert!(rate <= 1000.0, "the governor's rate stayed at {rate}");
 
@@ -2510,7 +2519,10 @@ mod tests {
         // The rate has been under the band for more than `RATE_CONFIRM`: this report's
         // `step_rung` plans the step, passes as_owner (Loop A still owns), writes the rung,
         // then reaches the pause. No sleeps: the clock is supplied.
-        abr.report(Some(1000.0), t0 + std::time::Duration::from_millis(1500));
+        abr.report(
+            Some((1000.0, 3)),
+            t0 + std::time::Duration::from_millis(1500),
+        );
 
         // The takeover now owns the encoder, so step_rung's echo publish is skipped: the
         // echoed floor and ladder rung stay at the launch values the takeover wrote.
@@ -2798,9 +2810,9 @@ mod tests {
         // A report every 100 ms (`REPORT_EVERY`) saying the link held the sender to
         // 1000 kbit/s. The closures read the wall clock, so this test waits out
         // `RATE_CONFIRM` for real.
-        for _ in 0..15 {
+        for piece in 1..=15 {
             (client.observe)(1000.0);
-            (client.measured)(Some(1000.0));
+            (client.measured)(Some((1000.0, piece)));
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         assert_eq!(
@@ -2936,10 +2948,11 @@ mod tests {
                     .min(10_000.0);
                 None
             };
-            self.feed(ms, self.est, reading);
+            // Each report's reading is a piece of evidence of its own.
+            self.feed(ms, self.est, reading.map(|r| (r, ms + 1)));
         }
 
-        fn feed(&mut self, ms: u64, est: f64, reading: Option<f64>) {
+        fn feed(&mut self, ms: u64, est: f64, reading: Option<(f64, u64)>) {
             let now = self.t0 + std::time::Duration::from_millis(ms);
             self.abr_loop.report(reading, now);
             self.abr_loop.observe(est, true, now);
