@@ -2603,6 +2603,11 @@ bs.refuse_on_shifted_resubmit(B(), "r", smp, False, can_replace=True)
 if died: p.append("shifted re-submit died despite can_replace")
 bs.refuse_on_shifted_resubmit(B(), "r", smp, False, can_replace=False)
 if not died: p.append("shifted re-submit NOT refused on old service")
+# #1334: no-marker bench windows omit missing_indices and carry bench_n/bench_decoded only.
+died.clear()
+smp_nomarker=[{"source":"browser","ts_unix_ms":t+65_000,"metrics":{"bench_n":60,"bench_decoded":0}} for t in base]
+bs.refuse_on_shifted_resubmit(B(), "r", smp_nomarker, False, can_replace=False)
+if not died: p.append("shifted no-marker re-submit (bench_n only) NOT refused on old service")
 print("OK" if not p else "; ".join(p))' "$DX/bench_submit.py" "$DX/vendor")
   if [ "$rg_check" = OK ]; then pass "bench:replace-guard" "re-fold uses replace+expected_count, gated on service >= 1.2"; else fail "bench:replace-guard" "$rg_check"; fi
 else

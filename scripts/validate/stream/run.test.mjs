@@ -2507,7 +2507,8 @@ test("malformed window times, frame timestamps and counts never pass or coerce a
   assert.deepEqual(hitchCount(frames(50), NaN, T0 + 50_000, [], T), { judged: 0, hitches: 0 });
   assert.deepEqual(instrumentShare(frames(50), [], NaN, T0 + 50_000), { malformed: true });
 
-  // 4. pullFrames ignores non-finite/string present_ms so Infinity cannot poison lastPresent and drop valid frames.
+  // 4. pullFrames neither lets Infinity poison lastPresent nor silently drops malformed entries:
+  //    valid frames after Infinity still land in bench-frames.json, AND present_cadence fails closed (pass: null).
   const poisoned = [
     { present_ms: Infinity, decoded: true },
     { present_ms: "1800000099999", decoded: true },
@@ -2516,5 +2517,12 @@ test("malformed window times, frame timestamps and counts never pass or coerce a
   ];
   const r = await run(world({ extraFrames: poisoned }));
   assert.deepEqual(r.result.errors, []);
-  assert.equal(r.by().present_cadence.pass, true, "malformed entries before valid frames must not poison lastPresent");
+  const writtenFrames = JSON.parse(read(r.dir, "01-stream-hold/bench-frames.json")).frames;
+  assert.equal(writtenFrames.length, frames(50).length, "Infinity must not poison lastPresent and drop valid frames");
+  assert.equal(r.by().present_cadence.pass, null, "malformed entries in dump.frames must fail closed");
+  assert.match(r.by().present_cadence.expected, /not a number/);
+
+  // 5. Scenarios without marker_decoded reject expect_marker under the strict-plan invariant.
+  assert.match(checkFallback({ transport: "webtransport", codec: "h264", profile: "1080p60", hold_s: 30, app: "x", expect_marker: false }), /does not define.*expect_marker/);
+  assert.match(checkInput({ transport: "webrtc", codec: "h264", profile: "1080p60", hold_s: 5, app: "x", expect_marker: false }), /does not define.*expect_marker/);
 });

@@ -20,6 +20,7 @@ const KEY = { code: "KeyW", key: "w", vk: 87 };
 export function check(p) {
   const { when, ...rest } = p;
   if (when !== undefined && !["mid", "connect"].includes(when)) return `when must be mid or connect, got ${JSON.stringify(when)?.slice(0, 40)}`;
+  if ("expect_marker" in rest) return 'params has a key transport-fallback does not define: "expect_marker"';
   if (rest.transport !== "webtransport") return "transport-fallback needs transport webtransport: it is the WebTransport session that falls back";
   return holdCheck(rest);
 }

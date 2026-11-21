@@ -158,7 +158,7 @@ function transportObserved(s) {
   return String(s.transport);
 }
 
-export function judge({ params, session, windows, frames, firstFrameS, stats, hidden = [], videoSamples = [], thresholds: T }) {
+export function judge({ params, session, windows, frames, firstFrameS, stats, hidden = [], videoSamples = [], malformedFrames = false, thresholds: T }) {
   const windowTimesValid = Array.isArray(windows) && windows.every(validWindowTimes);
   const obs = windowTimesValid ? observeWindows(windows, T.warmup_exclude_s, hidden) : [];
   const warm = `${T.warmup_exclude_s} s warm-up`;
@@ -180,7 +180,7 @@ export function judge({ params, session, windows, frames, firstFrameS, stats, hi
   let cadence = crit("present_cadence", null, null, `no ${warm} window had ${T.present_min_samples} present intervals`);
   if (!windowTimesValid) {
     cadence = crit("present_cadence", null, null, "not judged: a window time in the evidence is not a finite number");
-  } else if (inst?.malformed) {
+  } else if (malformedFrames || inst?.malformed) {
     cadence = crit("present_cadence", null, null, "not judged: a frame time or a video frame count in the evidence is not a number");
   } else if (cad?.judged && inst && inst.seen / inst.decoded < INSTRUMENT_MIN_SHARE) {
     cadence = crit("present_cadence", null, null, `not judged: the bench callback saw ${saw} the video decoded (${Math.round((inst.seen / inst.decoded) * 100)}%), so the instrument set the cadence (issue #1304)`);
@@ -253,10 +253,16 @@ export default {
 
       const frames = [];
       let lastPresent = -Infinity;
+      let malformedFrames = false;
       const pullFrames = async () => {
         const dump = await page.evaluate(() => window.__qBench?.dump() ?? null);
+        if (dump != null && dump.frames !== undefined && !Array.isArray(dump.frames)) malformedFrames = true;
         for (const f of Array.isArray(dump?.frames) ? dump.frames : []) {
-          if (f && typeof f === "object" && finite(f.present_ms) && f.present_ms > lastPresent) {
+          if (!(f && typeof f === "object" && finite(f.present_ms))) {
+            malformedFrames = true;
+            continue;
+          }
+          if (f.present_ms > lastPresent) {
             frames.push(f);
             lastPresent = f.present_ms;
           }
@@ -317,7 +323,7 @@ export default {
       rec.json("session.json", { session: row });
       const known = [...windows].reverse().find((w) => w?.offset_unknown === false && finite(w.offset_ms));
       result = {
-        criteria: judge({ params, session: row, windows, frames, firstFrameS, stats, hidden, videoSamples, thresholds: ctx.thresholds }),
+        criteria: judge({ params, session: row, windows, frames, firstFrameS, stats, hidden, videoSamples, malformedFrames, thresholds: ctx.thresholds }),
         clock_offset_ms: known ? known.offset_ms : null,
       };
       // A session that is already over before this run's own stop was not held: whatever the criteria say.
