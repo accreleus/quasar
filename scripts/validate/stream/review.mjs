@@ -92,7 +92,7 @@ export const WINDOW_KEYS = [
 //
 // - `classifier.hitch_sd_ms`, as far as one sample per second can stand for it: it skips
 //   the first `classifier.warmup_exclude_s` seconds after the scenario's first browser
-//   sample (the control plane anchors on the session's running time, so the review can
+//   telemetry sample (the control plane anchors on the session's running time, so the review can
 //   miss a hitch the control plane counts; it never adds one so long as the client clock
 //   is not behind the host clock by more than the connect time), and a hitch needs at
 //   least `classifier.hitch_min_samples` samples over it.
@@ -219,8 +219,8 @@ export const median = (values) => {
 
 /**
  * Where the review starts judging a scenario's samples: `classifier.warmup_exclude_s` seconds
- * after its first browser sample, on the client's clock. Null when the thresholds file states no
- * warm-up, or the scenario has no browser sample to anchor on: it is never defaulted, so a caller
+ * after its first browser telemetry sample. Null when the thresholds file states no
+ * warm-up, or the scenario has no browser telemetry to anchor on: it is never defaulted, so a caller
  * that cannot get a start time says "no warm-up" rather than inventing one. `e2e-compare` reads
  * its metric medians after the same instant.
  */
@@ -229,7 +229,11 @@ export function warmupStartMs(samples, thresholds, warmupKey = "classifier.warmu
   if (warmup === null) return null;
   let first = Infinity;
   for (const s of samples) {
-    if (s.source === "browser" && typeof s.ts_unix_ms === "number" && s.ts_unix_ms < first) first = s.ts_unix_ms;
+    if (s.source !== "browser" || !s.metrics) continue;
+    // Both bench folds write offset_unknown, even when a decoded marker supplies host time.
+    // The ranked bench keys also identify older rows without the flag.
+    if (Object.hasOwn(s.metrics, "offset_unknown") || HOST_CLOCK_KEYS.some((key) => Object.hasOwn(s.metrics, key))) continue;
+    if (Number.isFinite(s.ts_unix_ms) && s.ts_unix_ms < first) first = s.ts_unix_ms;
   }
   return Number.isFinite(first) ? first + warmup * 1000 : null;
 }
@@ -349,11 +353,6 @@ function anomalies(rows, thresholds) {
     // `backgrounded_or_hidden` before any present_* comparison.
     if (rule.skipHidden) pool = pool.filter((s) => !sampleHidden(s.metrics));
     if (rule.warmup) {
-      // The anchor is the scenario's first browser sample, on the client's clock. The
-      // control plane anchors on the session's running time, so the review can miss a
-      // hitch the control plane counts; it never adds one so long as the client clock is
-      // not behind the host clock by more than the connect time. The warm-up itself is
-      // `warmupStartMs`, which `e2e-compare` reads its metric medians after too.
       const start = warmupStartMs(samples, thresholds, rule.warmup);
       if (start !== null) pool = pool.filter((s) => s.ts_unix_ms >= start);
     }

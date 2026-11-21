@@ -232,7 +232,8 @@ or a run that was cut short).
 The collector reads the control plane's own answers, in the control plane's own shapes: the
 session row, the raw samples, and the trace for the window the session ran in (`started_at - 5 s`
 to `ended_at + 5 s`, or now), followed by the host's settings and agent build. Trace reads cover
-at most 10 minutes each. A read that reaches the sample or event cap is split. The control
+at most 10 minutes each. A read is split when the window has more than 1,000 raw samples
+or either event response reaches 1,000 rows. The control
 plane's build is read once per collection that needs it. **The stack
 deletes telemetry after its retention period** (a day by default; the row stays), so a session
 collected later than that has no trace: it is not an error and not an empty half, it is
@@ -773,7 +774,7 @@ recorded — but the run's result is derived from it, not copied.
   the client clock rather than the host's).
 - **Anomalies** use a rule only where the comparison is the one the product makes.
   `classifier.hitch_sd_ms` skips the first `classifier.warmup_exclude_s` seconds after the
-  scenario's first browser sample (the control plane anchors on the session's running time, so
+  scenario's first browser telemetry sample (the control plane anchors on the session's running time, so
   the review can miss a hitch the control plane counts; it never adds one so long as the client
   clock is not behind the host clock by more than the connect time) and needs at least
   `classifier.hitch_min_samples` samples over it; the two `web.client_health.present_*` limits
