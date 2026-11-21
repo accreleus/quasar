@@ -178,7 +178,7 @@ test-web: ## Web SPA: install, typecheck, unit tests, production build
 test-webgpu: ## Web WebGPU tests (the PyroWave decoder vs the golden fixtures) in headless Chromium
 	@bash $(DX)/common.sh require-local test-webgpu
 	docker run --rm --user "$$(id -u):$$(id -g)" -e HOME=/tmp/h -v "$(CURDIR)":/w -w /w/web \
-	  mcr.microsoft.com/playwright:v1.56.0-noble@sha256:35246d87a7c88ea9b771c65d33171b2611b02a8253b4b12ce6f94376c55f99f2 sh -c 'npm ci --no-audit --no-fund && npx vitest run --config vitest.webgpu.config.ts'
+	  mcr.microsoft.com/playwright:v1.65.1-noble@sha256:1507cbfc550a63a6b7396791ca4f00df17beb56342d2447b3f106c306f525579 sh -c 'npm ci --no-audit --no-fund && npx vitest run --config vitest.webgpu.config.ts'
 
 test-db: ## Control-plane DB tests against a FRESH ephemeral Postgres (-p 1)
 	@bash $(DX)/testdb.sh
