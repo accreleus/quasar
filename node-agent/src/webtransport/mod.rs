@@ -133,7 +133,7 @@ pub(crate) struct Rate {
     /// After `observe`, for every estimate that came from a receiver report, never for the
     /// silence decay: what the report showed the link carrying when the link held the
     /// sender back (`congestion::Estimator::measured`), `None` when it did not.
-    pub(crate) measured: Box<dyn Fn(Option<congestion::Reading>) + Send + Sync>,
+    pub(crate) measured: Box<dyn Fn(Option<f64>) + Send + Sync>,
     /// Amendment 85: FEC telemetry — whether this connection's `hello_ack.fec` named a
     /// scheme, and per protected frame the video and repair datagram payload bytes sent.
     /// FEC exists only where this estimate writes the encoder, so it is reported here.
@@ -192,14 +192,7 @@ impl<'a> Control<'a> {
         }
     }
 
-    /// `backlog`: [`congestion::VideoQueue::backlog`].
-    fn feedback(
-        &mut self,
-        message: &Value,
-        path: congestion::QuicPath,
-        now: std::time::Instant,
-        backlog: Option<(f64, std::time::Instant)>,
-    ) {
+    fn feedback(&mut self, message: &Value, path: congestion::QuicPath, now: std::time::Instant) {
         let fb = match congestion::feedback_of(message) {
             Ok(fb) => fb,
             Err(field) => {
@@ -217,7 +210,7 @@ impl<'a> Control<'a> {
         };
         let estimate = self
             .estimator
-            .on_feedback(&fb, &mut self.log, now, path, backlog);
+            .on_feedback(&fb, &mut self.log, now, path);
         // Before the estimate is fed: the encoder's share follows the level this loss sets.
         if let (Some(fec), Some(loss)) = (self.fec.as_mut(), self.estimator.fec_loss()) {
             let was = fec.overhead();
@@ -277,7 +270,7 @@ impl<'a> Control<'a> {
             (self.rate.measured)(
                 self.estimator
                     .measured()
-                    .map(|(link, piece)| (link / (1.0 + self.charged), piece)),
+                    .map(|link| link / (1.0 + self.charged)),
             );
         }
         (self.rate.observe)(kbps / (1.0 + self.charged));
@@ -1925,7 +1918,7 @@ async fn stream(
                         Some("feedback") => {
                             if let Some(control) = control.as_mut() {
                                 let now = std::time::Instant::now();
-                                control.feedback(&message, quic_path(session), now, video.backlog(now));
+                                control.feedback(&message, quic_path(session), now);
                             }
                         }
                         Some("input") => {

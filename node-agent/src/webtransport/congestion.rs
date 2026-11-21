@@ -44,46 +44,20 @@ const NOT_RECEIVED: u16 = 0xFFFF;
 /// The client's cadence (§Feedback).
 const FEEDBACK_INTERVAL: Duration = Duration::from_millis(50);
 
-// The capacity detector's thresholds (#1433 design), all untested on hardware: the lab
-// campaign tunes them here. The ABR moves down only on evidence that the sender's own excess
-// is what the link queues or drops (`Estimator::measured`).
+// The blackout classifier's thresholds (#1433), untested on hardware: the lab campaign tunes them.
 /// A solid run of loss over at least this much send time and `BLACKOUT_MIN_DATAGRAMS`, with
-/// the arrivals on both sides at the path floor, is a blackout: no loss, no evidence, no FEC.
+/// the arrivals on both sides at the path floor, is a blackout: no loss, no reading, no FEC.
 const BLACKOUT_MIN_US: u64 = 30_000;
 const BLACKOUT_MIN_DATAGRAMS: usize = 4;
 /// A run of loss a report ends inside (the browser stops at `MAX_COUNT` or before an open gap)
 /// waits for the next report's arrival this long, then is loss.
 const RUN_MAX_WAIT: Duration = Duration::from_millis(500);
-/// One-way delay this far over the path floor is a queue; under it, an arrival is at the floor.
-const QUEUE_MS: f64 = 30.0;
-/// A queue whose least-squares slope over each half of `SLOPE_SPAN_US` is above this keeps
-/// rising (a deep buffer): 1 ms/s is a wire 0.1 % over the link, and 10× a 100 ppm clock
-/// drift. Each half on its own: one fit over the whole span slopes up across a delay step.
-const QUEUE_SLOPE_MS_S: f64 = 1.0;
-/// The queue reading is the least one-way delay of each this much send time.
+/// An arrival under this much one-way delay over the path floor is at the floor.
+const AT_FLOOR_MS: f64 = 30.0;
+/// The path floor is the least one-way delay over `FLOOR_SPAN_US` of send time, read as the
+/// least of each `DELAY_BUCKET_US`: a delay step ages in within the span.
 const DELAY_BUCKET_US: u64 = 500_000;
-const SLOPE_SPAN_US: u64 = 4_000_000;
-/// The path floor is the least reading of this much send time; it never rises while the
-/// slope is positive, so a growing queue never ages into it, and a delay step ages in.
 const FLOOR_SPAN_US: u64 = 10_000_000;
-/// A datagram is sent "over" when the sender's own rate over this much send time before it
-/// (itself left out) is above the window's delivered rate. The design's 20 ms reads every
-/// datagram of a 60 fps frame burst as over: it always holds the frame before.
-const FOLLOW_SEND_US: u64 = 10_000;
-/// Loss follows the send rate (a full shallow buffer or a policer) when the loss rate of the
-/// "over" datagrams is at least `FOLLOW_RATIO` × that of the rest and `FOLLOW_MIN_LOSS`, over
-/// at least `FOLLOW_MIN_LOSSES` losses in `FOLLOW_WINDOW`. Random loss is blind to the rate.
-const FOLLOW_RATIO: f64 = 3.0;
-const FOLLOW_MIN_LOSS: f64 = 0.05;
-const FOLLOW_MIN_LOSSES: i64 = 20;
-/// Datagrams each side of the test needs to judge it; with fewer (a sender always over what
-/// was delivered, as any loss puts it) loss is read as GCC reads it.
-const FOLLOW_MIN_SENT: i64 = 20;
-const FOLLOW_WINDOW: Duration = Duration::from_secs(1);
-/// Held video (not a resend) older than this for over half of `BACKLOG_WINDOW` is the agent's
-/// own queue holding the overrun. A paced keyframe holds 67 ms at most once a GOP.
-const BACKLOG_AGE: Duration = Duration::from_millis(50);
-const BACKLOG_WINDOW: Duration = Duration::from_secs(1);
 
 /// Send records kept, by `pkt_seq`: over the estimator's 0.5 s rate window at a 400 Mbit/s
 /// grant, 25 MB of datagrams, ~21 800 of them (#1430). Sized for PyroWave's grant; the
@@ -155,6 +129,9 @@ const OVERUSE_GAP: Duration = Duration::from_millis(250);
 /// A window whose datagrams were sent under this share of the estimate is
 /// application-limited, and is no throughput sample.
 const APP_LIMITED: f64 = 0.8;
+/// Datagrams that arrived at under this share of the rate they were sent at: the link held
+/// them back (a queue or loss), so the report is a reading of the link ([`Estimator::measured`]).
+const LINK_LIMITED: f64 = 0.95;
 /// Arrivals kept for the rate window, by receive order, one per datagram: the same 0.5 s at a
 /// 400 Mbit/s grant, ~21 800 of them (#1430).
 const MAX_ARRIVALS: usize = 1 << 15;
@@ -235,8 +212,6 @@ struct Slot {
     bytes: u16,
     resend: bool,
     status: Status,
-    /// A counted loss's rate-following entry: the message it was counted in, and its cohort.
-    charged: Option<(Instant, bool)>,
 }
 
 /// When, and how big, each recent agent → client video or FEC datagram was sent, by its `pkt_seq`,
@@ -300,7 +275,6 @@ impl SendLog {
             bytes: datagram.len().min(u16::MAX as usize) as u16,
             resend,
             status: Status::Unreported,
-            charged: None,
         };
         // The hand-off, not the stamp: unpaced held video is stamped with its queue time,
         // before a report it is handed to QUIC after (#1591).
@@ -315,29 +289,6 @@ impl SendLog {
 
     fn peek(&self, seq: u32) -> Option<&Slot> {
         Some(&self.slots[seq as usize % LOG]).filter(|s| s.seq == seq && s.bytes > 0)
-    }
-
-    /// The rate, kbit/s, of what was sent over the `FOLLOW_SEND_US` before `seq`.
-    fn rate_before(&self, seq: u32) -> f64 {
-        let Some(sent_us) = self.peek(seq).map(|s| s.sent_us) else {
-            return 0.0;
-        };
-        let from = sent_us.saturating_sub(FOLLOW_SEND_US);
-        let (mut bytes, mut misses, mut q) = (0u64, 0, seq.wrapping_sub(1));
-        // Audio shares `pkt_seq` and is not logged: a few misses in a row are audio, many the
-        // log's end.
-        while misses < 64 {
-            match self.peek(q) {
-                Some(s) if s.sent_us > from => {
-                    bytes += u64::from(s.bytes);
-                    misses = 0;
-                }
-                Some(_) => break,
-                None => misses += 1,
-            }
-            q = q.wrapping_sub(1);
-        }
-        bytes as f64 * 8.0 * 1000.0 / FOLLOW_SEND_US as f64
     }
 }
 
@@ -546,8 +497,8 @@ fn slope(points: &VecDeque<(f64, f64)>) -> Option<f64> {
     (den != 0.0).then(|| num / den)
 }
 
-/// What the capacity detector classifies from the reports (#1433): the queue reading, a run of
-/// loss until an arrival ends it, and each datagram's loss by the rate it was sent at.
+/// The blackout classifier's state (#1433): a run of loss until an arrival ends it, and the
+/// path floor that says whether the arrivals on both sides of it were at the floor.
 #[derive(Default)]
 struct Evidence {
     /// Lost `pkt_seq`s no arrival has ended yet, whether the arrival before them was at the
@@ -570,15 +521,10 @@ struct Evidence {
     buckets: VecDeque<(u64, i64)>,
     current: Option<(u64, i64)>,
     floor: Option<i64>,
-    /// At the last bucket done: the queue over the floor, ms, and its slope, ms/s.
-    queue_ms: f64,
-    slope_ms_s: f64,
-    /// Per message: (agent instant, [sent over, lost over, sent under, lost under]).
-    classes: VecDeque<(Instant, [i64; 4])>,
 }
 
 impl Evidence {
-    /// One fresh arrival into the queue reading; true when it arrived at the floor.
+    /// One fresh arrival into the floor reading; true when it arrived at the floor.
     fn arrival(&mut self, sent_us: u64, at_us: u64) -> bool {
         // Two clocks, and `feedback_of` accepts any u64 receiver clock: never overflow.
         let delay = (i128::from(at_us) - i128::from(sent_us))
@@ -595,76 +541,20 @@ impl Evidence {
         let floor = self
             .floor
             .unwrap_or_else(|| self.current.map_or(delay, |c| c.1));
-        (delay.saturating_sub(floor) as f64) < QUEUE_MS * 1000.0
+        (delay.saturating_sub(floor) as f64) < AT_FLOOR_MS * 1000.0
     }
 
     fn close(&mut self, (bucket, least): (u64, i64)) {
-        let age = |b: u64| (bucket - b) * DELAY_BUCKET_US;
         self.buckets.push_back((bucket, least));
         while self
             .buckets
             .front()
-            .is_some_and(|&(b, _)| age(b) >= FLOOR_SPAN_US)
+            .is_some_and(|&(b, _)| (bucket - b) * DELAY_BUCKET_US >= FLOOR_SPAN_US)
         {
             self.buckets.pop_front();
         }
-        let half = |from: u64, to: u64| {
-            let points: VecDeque<(f64, f64)> = self
-                .buckets
-                .iter()
-                .filter(|&&(b, _)| (from..to).contains(&age(b)))
-                .map(|&(b, d)| ((b * DELAY_BUCKET_US) as f64 / 1e6, d as f64 / 1000.0))
-                .collect();
-            (points.len() >= 3).then(|| slope(&points)).flatten()
-        };
-        let mid = SLOPE_SPAN_US / 2;
-        self.slope_ms_s = half(0, mid)
-            .zip(half(mid, SLOPE_SPAN_US))
-            .map_or(0.0, |(recent, older)| recent.min(older));
-        let lowest = self.buckets.iter().map(|&(_, d)| d).min().unwrap_or(least);
-        let floor = match self.floor {
-            Some(f) if self.slope_ms_s > 0.0 => f.min(least),
-            _ => lowest,
-        };
-        self.floor = Some(floor);
-        self.queue_ms = least.saturating_sub(floor) as f64 / 1000.0;
+        self.floor = self.buckets.iter().map(|&(_, d)| d).min();
     }
-
-    /// The queue keeps rising: a deep buffer filling with the sender's excess.
-    fn rising(&self) -> bool {
-        self.queue_ms > QUEUE_MS && self.slope_ms_s > QUEUE_SLOPE_MS_S
-    }
-
-    /// Loss follows the send rate: a full shallow buffer or a policer.
-    fn follows_rate(&self) -> bool {
-        let [so, lo, su, lu] = self.classes.iter().fold([0i64; 4], |a, (_, c)| {
-            [a[0] + c[0], a[1] + c[1], a[2] + c[2], a[3] + c[3]]
-        });
-        let (lo, lu) = (lo.max(0), lu.max(0));
-        let rate = |l: i64, n: i64| if n > 0 { l as f64 / n as f64 } else { 0.0 };
-        let (over, under) = (rate(lo, so), rate(lu, su));
-        lo + lu >= FOLLOW_MIN_LOSSES
-            && over >= FOLLOW_MIN_LOSS
-            && (so.min(su) < FOLLOW_MIN_SENT || over >= FOLLOW_RATIO * under)
-    }
-}
-
-/// A reading, kbit/s, and the id of the piece of evidence it came from ([`Estimator::measured`]).
-pub(crate) type Reading = (f64, u64);
-
-/// The id of the piece of evidence `slot` holds, a new one first when there is none or `new`
-/// says its data are spent (`Estimator::measured`). `since`: when a new piece's data begin.
-fn piece(
-    next: &mut u64,
-    slot: &mut Option<(u64, Instant)>,
-    new: impl Fn(&(u64, Instant)) -> bool,
-    since: Instant,
-) -> u64 {
-    if slot.as_ref().is_none_or(new) {
-        *next += 1;
-        *slot = Some((*next, since));
-    }
-    slot.map_or(*next, |(id, _)| id)
 }
 
 /// The rate estimate one client's feedback drives, in kbit/s.
@@ -681,15 +571,7 @@ pub(crate) struct Estimator {
     /// (agent instant, receive rate) of recent windows that were not application-limited.
     throughput: VecDeque<(Instant, f64)>,
     /// What the last message showed the link carrying, see [`Self::measured`].
-    measured: Option<Reading>,
-    /// The id of the newest piece of evidence, and the piece of each kind now in use (its id,
-    /// and when its data began): see [`Self::measured`].
-    pieces: u64,
-    queue_piece: Option<(u64, Instant)>,
-    loss_piece: Option<(u64, Instant)>,
-    backlog_piece: Option<(u64, Instant)>,
-    /// When a loss cut last spent the window's losses: what is read after it is new.
-    losses_spent: Option<Instant>,
+    measured: Option<f64>,
     overusing_since: Option<Instant>,
     last_overusing: Option<Instant>,
     /// Per message: (agent instant, received, lost); a late arrival after a loss is a
@@ -736,10 +618,6 @@ pub(crate) struct Measured {
     pub(crate) fresh: bool,
     /// Blackouts left out.
     pub(crate) loss: Option<f64>,
-    /// The window's loss follows the send rate ([`Evidence::follows_rate`]).
-    pub(crate) follows_rate: bool,
-    /// The queue keeps rising ([`Evidence::rising`]).
-    pub(crate) rising: bool,
 }
 
 /// A detected outage's losses (#1557): those reported not received from `from`, the first
@@ -786,11 +664,6 @@ impl Estimator {
             logged: (Bound::Ceiling, None),
             unlogged: None,
             measured: None,
-            pieces: 0,
-            queue_piece: None,
-            loss_piece: None,
-            backlog_piece: None,
-            losses_spent: None,
         }
     }
 
@@ -822,52 +695,34 @@ impl Estimator {
         self.scattered
     }
 
-    /// The ABR's only down path (#1376, #1433): `BETA` × what the link delivered, kbit/s, when
-    /// the last message carried evidence that the sender's own excess is what the link queues
-    /// or drops: a queue that keeps rising, loss that follows the send rate, or video ageing in
-    /// the agent's own queue (`backlog`, released kbit/s). `None` otherwise: a delay gradient
-    /// alone (#68), a blackout, reorder and scattered loss are no evidence. Never the estimate,
-    /// which may float over the link while the sender is application-limited (#1503).
-    ///
-    /// With the id of the piece of evidence it came from. The ABR confirms a step only on two
-    /// different ids and spends both, so one piece never confirms twice: a backlog verdict is
-    /// one piece per window, a rising queue one per half of its slope span (each later piece's
-    /// recent half shares no bucket with the last one's), rate-following loss one per
-    /// `FOLLOW_WINDOW` or loss cut (no loss is in two).
-    pub(crate) fn measured(&self) -> Option<Reading> {
+    /// The ABR's only down path (#1376): what the last message showed the link carrying, when
+    /// the link held the sender back: the higher of the estimate and `BETA` × the receive rate.
+    /// `None` when the datagrams arrived at the rate they were sent (a clean link, whatever the
+    /// delay detector says: #68), when the sender was application-limited, or when no receive
+    /// rate was measured.
+    pub(crate) fn measured(&self) -> Option<f64> {
         self.measured
     }
 
-    /// Take one message; `Some(estimate)` when it is time to feed the ABR. `backlog`: the rate
-    /// held video left the agent's queue at, kbit/s, when it aged there, and when that window
-    /// closed ([`VideoQueue::backlog`]).
+    /// Take one message; `Some(estimate)` when it is time to feed the ABR.
     pub(crate) fn on_feedback(
         &mut self,
         fb: &Feedback,
         log: &mut SendLog,
         now: Instant,
         path: QuicPath,
-        backlog: Option<(f64, Instant)>,
     ) -> Option<f64> {
         self.last_feedback = Some(now);
         self.last_decay = None;
         log.unanswered_since = None;
         log.unanswered_seq = None;
         let m = self.measure(fb, log, now);
-        self.apply(m, now, path, backlog)
+        self.apply(m, now, path)
     }
 
     /// Act on what one message measured.
-    fn apply(
-        &mut self,
-        m: Measured,
-        now: Instant,
-        path: QuicPath,
-        backlog: Option<(f64, Instant)>,
-    ) -> Option<f64> {
-        // The estimate's loss bound reads only loss that follows the send rate; FEC only the
-        // rest. A deliberate departure from GCC: reorder and random loss cut nothing (#1446).
-        let follows = m.follows_rate || self.gcc_loss;
+    fn apply(&mut self, m: Measured, now: Instant, path: QuicPath) -> Option<f64> {
+        let follows = self.gcc_loss;
         self.loss = m.loss.filter(|_| follows);
         self.scattered = m.loss.filter(|_| !follows);
         let dt = now
@@ -976,8 +831,6 @@ impl Estimator {
                     self.stop_regrow("loss cut");
                     // These losses are spent; the next decision reads new ones.
                     self.losses.clear();
-                    self.evidence.classes.clear();
-                    self.losses_spent = Some(now);
                 }
             }
             Some(loss) if loss >= LOSS_LOW => {}
@@ -1003,38 +856,11 @@ impl Estimator {
         {
             self.stop_regrow("reached");
         }
-        let evidence = match (m.rising, m.follows_rate, backlog) {
-            (true, _, _) => "queue",
-            (_, true, _) => "loss",
-            (_, _, Some(_)) => "backlog",
-            _ => "none",
-        };
-        // Only a report with fresh video: the window's delivered rate is otherwise stale.
-        let link = m.rate_kbps.filter(|_| m.fresh);
-        let next = &mut self.pieces;
-        let queue = link.filter(|_| m.rising).map(|kbps| {
-            let new = |&(_, at): &(u64, Instant)| {
-                now.saturating_duration_since(at) >= Duration::from_micros(SLOPE_SPAN_US / 2)
-            };
-            (kbps, piece(next, &mut self.queue_piece, new, now))
-        });
-        let spent = self.losses_spent;
-        let loss = link.filter(|_| m.follows_rate).map(|kbps| {
-            let new = |&(_, at): &(u64, Instant)| {
-                now.saturating_duration_since(at) >= FOLLOW_WINDOW
-                    || spent.is_some_and(|c| at <= c && c < now)
-            };
-            (kbps, piece(next, &mut self.loss_piece, new, now))
-        });
-        let backlog = backlog.map(|(kbps, closed)| {
-            let new = |&(_, at): &(u64, Instant)| at != closed;
-            (kbps, piece(next, &mut self.backlog_piece, new, closed))
-        });
-        self.measured = [queue.or(loss), backlog]
-            .into_iter()
-            .flatten()
-            .reduce(|a, b| if b.0 < a.0 { b } else { a })
-            .map(|(kbps, id)| (BETA * kbps, id));
+        self.measured = m
+            .rate_kbps
+            .zip(m.sent_kbps)
+            .filter(|&(r, s)| m.fresh && !app_limited && r < LINK_LIMITED * s)
+            .map(|(r, _)| self.estimate_kbps.max(BETA * r));
         let due = self.log_due(now)
             && (self.unlogged.is_some() || self.bound != self.logged.0 || self.measured.is_some());
         if !cut_by.is_empty() || due {
@@ -1062,10 +888,7 @@ impl Estimator {
                 app_limited,
                 base_kbps = base as u64,
                 loss_pct = m.loss.unwrap_or(0.0) * 100.0,
-                evidence,
-                queue_ms = self.evidence.queue_ms,
-                slope_ms_s = self.evidence.slope_ms_s,
-                backlog_kbps = backlog.map_or(0.0, |b| b.0) as u64,
+                reading_kbps = self.measured.unwrap_or(0.0) as u64,
                 delay_kbps = self.delay_kbps as u64,
                 loss_kbps = self.loss_kbps as u64,
                 rtt_ms = path.rtt.as_millis() as u64,
@@ -1195,15 +1018,12 @@ impl Estimator {
         // At or after `from`, in u32 serial arithmetic.
         let after = |seq: u32, from: u32| seq.wrapping_sub(from) < 1 << 31;
         let end = fb.first_pkt_seq.wrapping_add(fb.arrivals.len() as u32);
-        // Each datagram's part in the rate-following test, once the window's delivered rate is
-        // known: (`pkt_seq`, sent, lost).
-        let mut classed: Vec<(u32, i64, i64)> = Vec::new();
         // A pending run continues only into the report that starts where its own ended, and
         // only within `RUN_MAX_WAIT`.
         let mut lost = 0i64;
         let continues = self.reported_to == Some(fb.first_pkt_seq);
         if !continues || self.run_expired(now) {
-            lost += self.end_run(log, None, now, &mut classed);
+            lost += self.end_run(log, None, now);
         }
         self.evidence.run_lost &= continues;
         if self.reported_to.is_none_or(|to| after(end, to)) {
@@ -1251,12 +1071,10 @@ impl Estimator {
                     continue;
                 }
                 (Status::Lost, Some(_)) => {
-                    // Late: the loss is undone, but it is no delay sample. Reordered, so it
-                    // was no rate-following loss either.
+                    // Late: the loss is undone, but it is no delay sample.
                     slot.status = Status::Received;
                     lost -= 1;
                     received += 1;
-                    classed.push((seq, 0, -1));
                 }
                 (Status::Unreported, Some(at)) => {
                     slot.status = Status::Received;
@@ -1271,9 +1089,8 @@ impl Estimator {
                         self.trendline.update(send_d, arrival_d, arrival_ms);
                     }
                     let at_floor = self.evidence.arrival(sent_us, at);
-                    lost += self.end_run(log, Some(at_floor), now, &mut classed);
+                    lost += self.end_run(log, Some(at_floor), now);
                     self.evidence.at_floor = at_floor;
-                    classed.push((seq, 1, 0));
                 }
             }
             if let (false, Some(at)) = (resend, at_us) {
@@ -1289,7 +1106,7 @@ impl Estimator {
 
         // No arrival ended it in time: its losses.
         if self.run_expired(now) {
-            lost += self.end_run(log, None, now, &mut classed);
+            lost += self.end_run(log, None, now);
         }
 
         let newest = self.newest_arrival;
@@ -1345,49 +1162,12 @@ impl Estimator {
         let (r, l) = (r.max(0), l.max(0));
         let loss = (r + l >= LOSS_MIN_SAMPLES).then(|| l as f64 / (r + l) as f64);
 
-        // A late arrival undoes its loss in the entry and cohort that counted it, while that
-        // entry is still in the window; the delivered rate has moved since.
-        classed.retain(|&(seq, _, lost)| {
-            if lost < 0 {
-                let charged = log.peek(seq).and_then(|s| s.charged);
-                if let Some((at, over)) = charged {
-                    if let Some((_, c)) = self.evidence.classes.iter_mut().find(|e| e.0 == at) {
-                        c[if over { 1 } else { 3 }] -= 1;
-                    }
-                }
-            }
-            lost >= 0
-        });
-        if let Some(delivered) = rate_kbps.filter(|_| !classed.is_empty()) {
-            let mut c = [0i64; 4];
-            for (seq, sent, lost) in classed {
-                let over = log.rate_before(seq) > delivered;
-                let i = if over { 0 } else { 2 };
-                c[i] += sent;
-                c[i + 1] += lost;
-                if let Some(slot) = log.slot(seq).filter(|_| lost > 0) {
-                    slot.charged = Some((now, over));
-                }
-            }
-            self.evidence.classes.push_back((now, c));
-        }
-        while self
-            .evidence
-            .classes
-            .front()
-            .is_some_and(|&(at, _)| now.saturating_duration_since(at) > FOLLOW_WINDOW)
-        {
-            self.evidence.classes.pop_front();
-        }
-
         Measured {
             usage: self.trendline.usage,
             rate_kbps,
             sent_kbps,
             fresh,
             loss,
-            follows_rate: self.evidence.follows_rate(),
-            rising: self.evidence.rising(),
         }
     }
 
@@ -1410,7 +1190,6 @@ impl Estimator {
         log: &mut SendLog,
         at_floor: Option<bool>,
         now: Instant,
-        classed: &mut Vec<(u32, i64, i64)>,
     ) -> i64 {
         let expired = self.run_expired(now);
         let run = std::mem::take(&mut self.evidence.run);
@@ -1439,7 +1218,6 @@ impl Estimator {
             } else {
                 slot.status = Status::Lost;
                 lost += 1;
-                classed.push((seq, 1, 1));
             }
         }
         lost
@@ -1546,7 +1324,7 @@ impl PyroRate {
     ) -> PyroVerdict {
         self.judged_from.get_or_insert(now);
         self.estimator
-            .on_feedback(fb, &mut self.log, now, path, None);
+            .on_feedback(fb, &mut self.log, now, path);
         self.judge(now, path)
     }
 
@@ -2154,7 +1932,6 @@ pub(crate) struct VideoQueue {
     /// Video and resent datagrams over the path's datagram size, skipped.
     pub(crate) too_large: u64,
     pub(crate) resends_too_large: u64,
-    ageing: Ageing,
     /// The keyframe (its `queued_at`) whose first datagram was handed within the hold: the
     /// rest of it may still go however old (`Self::feed`).
     keyframe_started: Option<Instant>,
@@ -2163,25 +1940,6 @@ pub(crate) struct VideoQueue {
     /// Video was dropped as stale with no keyframe held: units are skipped to the next one
     /// ([`Self::orphaned`]).
     orphaned: bool,
-}
-
-/// One `BACKLOG_WINDOW` of the agent's queue: how long held video was over `BACKLOG_AGE`,
-/// and the video bytes produced and released (resends left out).
-#[derive(Default)]
-struct Ageing {
-    from: Option<Instant>,
-    /// The last look, and whether held video was over the age then.
-    seen: Option<(Instant, bool)>,
-    aged: Duration,
-    produced: usize,
-    released: usize,
-    /// Video went stale here in this window: it aged, whatever share of the window it held.
-    dropped: bool,
-    /// The release rate of the last window, kbit/s, when it aged.
-    last: Option<f64>,
-    /// The verdict: the rate video was released at, kbit/s, when two windows in a row aged, and
-    /// when the second closed. The ABR's two readings then come from two windows, not one.
-    verdict: Option<(f64, Instant)>,
 }
 
 pub(crate) struct Held {
@@ -2258,7 +2016,6 @@ impl VideoQueue {
         buffer: usize,
         now: Instant,
     ) -> (usize, usize) {
-        self.age(now);
         let pace = self.pace(paced, now);
         let room = self.room(governed, buffer).saturating_sub(queued).min(pace);
         (room, pace.min((buffer / 2).saturating_sub(queued)))
@@ -2266,47 +2023,6 @@ impl VideoQueue {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.held.is_empty()
-    }
-
-    /// Evidence of the sender's own excess (#1433): the rate, kbit/s, video left this queue at
-    /// over the last `BACKLOG_WINDOW`, when held video was older than `BACKLOG_AGE` for more
-    /// than half of it. Local and exact: the overrun the window on the RTT floor keeps out of
-    /// the link, and the pacer's own wait, which a release stamp hides from the link's delay.
-    /// With when the window closed: the verdict's identity (`Estimator::measured`).
-    pub(crate) fn backlog(&mut self, now: Instant) -> Option<(f64, Instant)> {
-        self.age(now);
-        self.ageing
-            .verdict
-            .filter(|&(_, at)| now.saturating_duration_since(at) < BACKLOG_WINDOW)
-    }
-
-    fn age(&mut self, now: Instant) {
-        let old = self
-            .held
-            .iter()
-            .find(|h| !h.resend)
-            .is_some_and(|h| now.saturating_duration_since(h.queued_at) > BACKLOG_AGE);
-        let a = &mut self.ageing;
-        // Each span is judged by what was held at its start: the drain tick looks every 1 ms
-        // while anything is held.
-        if let Some((at, true)) = a.seen.replace((now, old)) {
-            a.aged += now.saturating_duration_since(at);
-        }
-        let from = *a.from.get_or_insert(now);
-        let span = now.saturating_duration_since(from);
-        if span >= BACKLOG_WINDOW {
-            let kbps = a.released as f64 * 8.0 / span.as_secs_f64() / 1000.0;
-            // Nothing released is no capacity sample: a stalled path is the stall guard's.
-            let aged = ((a.aged * 2 > span || a.dropped) && a.produced > 0 && a.released > 0)
-                .then_some(kbps);
-            a.verdict = a.last.and(aged).map(|kbps| (kbps, now));
-            a.last = aged;
-            a.from = Some(now);
-            a.aged = Duration::ZERO;
-            a.dropped = false;
-            a.produced = 0;
-            a.released = 0;
-        }
     }
 
     #[cfg(test)]
@@ -2327,7 +2043,7 @@ impl VideoQueue {
 
     /// Drops the expired head: a resend alone; video with everything held that depends on it,
     /// up to the next keyframe, or all of it, which leaves units to skip to a keyframe.
-    fn expire_head(&mut self, now: Instant) {
+    fn expire_head(&mut self) {
         let Some(head) = self.held.pop_front() else {
             return;
         };
@@ -2336,7 +2052,6 @@ impl VideoQueue {
         if head.resend {
             return;
         }
-        self.age(now);
         let key = self
             .held
             .iter()
@@ -2351,7 +2066,6 @@ impl VideoQueue {
             }
             keep
         });
-        self.ageing.dropped = true;
         self.frame = None;
         self.orphaned |= key.is_none();
     }
@@ -2365,7 +2079,6 @@ impl VideoQueue {
     /// Drops everything held: datagrams of a configuration the client has left.
     pub(crate) fn clear(&mut self) {
         self.held.clear();
-        self.ageing = Ageing::default();
         self.bytes = 0;
         self.pace = None;
         self.counted = None;
@@ -2399,9 +2112,6 @@ impl VideoQueue {
             self.dropped += 1;
         }
         self.bytes += held.datagram.len();
-        if !held.resend {
-            self.ageing.produced += held.datagram.len();
-        }
         if !held.resend && self.frame.is_none_or(|(at, _)| at != held.queued_at) {
             self.frame = Some((held.queued_at, self.held.is_empty()));
         }
@@ -2435,7 +2145,7 @@ impl VideoQueue {
         let open = room > 0;
         while let Some(next) = self.held.front() {
             if self.expired(next, now, hold) {
-                self.expire_head(now);
+                self.expire_head();
                 continue;
             }
             let len = next.datagram.len();
@@ -2471,9 +2181,6 @@ impl VideoQueue {
                     }
                     if started.is_some() {
                         self.keyframe_started = started;
-                    }
-                    if !resend {
-                        self.ageing.released += len;
                     }
                     room = room.saturating_sub(len);
                     frame = frame.saturating_sub(len);

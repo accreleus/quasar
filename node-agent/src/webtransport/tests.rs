@@ -2253,7 +2253,7 @@ fn answered(control: &mut Control, first: u32, at: std::time::Instant) {
         congestion_events: 0,
         queued_bytes: 0,
     };
-    control.feedback(&fb, path, at + Duration::from_millis(250), None);
+    control.feedback(&fb, path, at + Duration::from_millis(250));
 }
 
 /// §Feedback: with the ABR off the estimate never reaches the encoder, so QUIC keeps its
