@@ -4,7 +4,7 @@
 import zlib from "node:zlib";
 
 export function checkName(name) {
-  if (typeof name !== "string" || name === "" || name.length > 100 || /[\0\\]/.test(name) || name.startsWith("/") || /^[A-Za-z]:/.test(name)
+  if (typeof name !== "string" || name === "" || Buffer.byteLength(name, "utf8") > 100 || /[\0\\]/.test(name) || name.startsWith("/") || /^[A-Za-z]:/.test(name)
     || name.split("/").some((p) => p === "" || p === "." || p === "..")) {
     throw new Error(`unsafe archive member name ${JSON.stringify(String(name).slice(0, 60))}`);
   }

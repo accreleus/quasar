@@ -360,6 +360,18 @@ test("two scenarios of one bundle with the same identity pair in plan order; non
   assert.equal(lone.only_a.filter((x) => x.id.startsWith("stream-hold/")).length, 1);
 });
 
+test("#1281 two runs on different web builds differ by commit, not by build time; a different encoder differs as a whole", () => {
+  const { a, b } = pair();
+  const web = (commit, built_at) => (x) => ({ ...x, components: { ...x.components, web: { commit, built_at }, encoder: { factory: "vulkanh264enc", codec: "h264" } } });
+  edit(a, "builds.json", web("0123456789abcdef0123456789abcdef01234567", "2026-11-21T01:02:03.000Z"));
+  edit(b, "builds.json", (x) => ({ ...web("fedcba9876543210fedcba9876543210fedcba98", "2026-11-22T01:02:03.000Z")(x), components: { ...web("fedcba9876543210fedcba9876543210fedcba98", "2026-11-22T01:02:03.000Z")(x).components, encoder: { factory: "nvh264enc", codec: "h264" } } }));
+  const fields = compare(a, b).runs.fields;
+  const row = (f) => fields.find((x) => x.field === f);
+  assert.deepEqual([row("builds.web.commit").a, row("builds.web.commit").b, row("builds.web.commit").same], ["0123456789abcdef0123456789abcdef01234567", "fedcba9876543210fedcba9876543210fedcba98", false]);
+  assert.equal(row("builds.web.built_at"), undefined, "a build time is not compared");
+  assert.equal(row("builds.encoder.build").same, false);
+});
+
 test("a member named like something every object has is not read as a bundle value; no number written is infinite", () => {
   const { a, b } = pair();
   // B has a build component called `constructor`; A has none. It must read as absent on A, never as Object's own constructor.

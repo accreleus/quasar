@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
@@ -272,7 +273,26 @@ function pinnedInlineScripts(): Plugin {
   };
 }
 
+// The build's own identity, baked in as constants and reported by bench mode
+// (window.__qBench.build(), src/bench/webBuild.ts) so a suite run can name the web client it
+// used (#1281). The image build has no .git, so deploy/Dockerfile.control.prod passes
+// SOURCE_COMMIT and BUILT_AT; "unknown" is the Dockerfile's own default and counts as unset.
+const stamped = (v: string | undefined) => (v && v !== "unknown" ? v : undefined);
+function gitHead(): string | undefined {
+  try {
+    return execFileSync("git", ["rev-parse", "HEAD"], { cwd: __dirname, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+  } catch {
+    return undefined; // not a checkout, or no git here
+  }
+}
+const webCommit = stamped(process.env.QUASAR_WEB_COMMIT) ?? stamped(process.env.SOURCE_COMMIT) ?? gitHead() ?? "unknown";
+const webBuiltAt = stamped(process.env.QUASAR_WEB_BUILT_AT) ?? stamped(process.env.BUILT_AT) ?? new Date().toISOString();
+
 export default defineConfig({
+  define: {
+    __QUASAR_WEB_COMMIT__: JSON.stringify(webCommit),
+    __QUASAR_WEB_BUILT_AT__: JSON.stringify(webBuiltAt),
+  },
   plugins: [react(), preloadFonts(), operatorScripts(), routePreloads(), entryBudget(), pinnedInlineScripts()],
   build: {
     rolldownOptions: {

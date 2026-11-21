@@ -24,6 +24,29 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Upgrading
+- Callers of `make e2e-post` must now supply operator leak-scan patterns, including for dry runs (`DRY_RUN=1`). Use `LEAK_SCAN_OPERATOR_PATTERNS` or `LEAK_SCAN_PATTERNS_FILE`. See [posting in the E2E suite guide](docs/testing-e2e-suite.md#what-the-host-half-adds).
+### Added
+- **The end-to-end suite's `builds.json` now names the web client and the encoder (#1281).** The web build carries its commit and build time (bench mode reports them as `window.__qBench.build()`), and `e2e-collect` adds the negotiated encoder from the session's `caps.negotiated` event; `reference_app` and `gpu_driver` stay `null` with a reason: nothing ties either to the session (the host policy preview names a candidate GPU's driver, not the session's).
+
+### Changed
+- Dependency updates
+- E2E hooks stop their process group on a failed ledger write, share a recovery wait deadline, and record uncleared hook warnings in run bundles. E2E posting leak-scans run bundles and refuses ambiguous conditions or empty app slugs (#1341).
+- `make e2e-review` ranks `bench_n` (lowest) with accurate `offset_unknown` clock notes and control-plane-matching `is_hidden` handling, `stream-hold` captures `present_interval_sd_ms`, `present_interval_p95_ms`, and `is_hidden` from the page's own `/stats` posts so review anomaly rules run on client-only runner bundles without duplicating collected host samples, empty error messages always write a non-empty scenario reason, and `docs/testing-e2e-suite.md` and counter-rule comments are corrected (#1303).
+- **E2E bench folds, review and `stream-hold` tighten unmeasured counts, non-marker apps and cadence guards (#1334).** `benchfold.mjs` and `bench_app_samples.py` omit `missing_indices`/`duplicated`/`reordered` on windows with no decoded marker (`e2e-review` skips ranking them when `bench_decoded <= 0`), `stream-hold` adds optional `expect_marker` (excluded from bench scenario names) and finite-number instrument guards, cadence tests pin `hitchCount`'s hidden-span exclusion and `>=` boundary, and `docs/testing-e2e-suite.md` wraps the runner sections.
+- **E2E fallback/input scenarios and bundle credential checks tighten lock-log isolation, honest lock wording, surface/move-log guards and glued credential names (#1343).** `input-kbm` starts its page recorder after pointer lock settles so lock clicks stay out of `input-sent.json`, states only the observed wait and unknown cause when no "Click to play" layer appears, and guards unreadable or throwing move logs as `pass: null`; `transport-fallback` records freeze as `null` with a reason (never `0`) when no visible `<video>`/canvas surface exists at the fault; and `bundle.mjs` flags glued credential names (`accessToken=`, `authtoken=`, `myApiKey=`) linearly without breaking prose exemptions.
+- **E2E client pack follow-ups tighten the Windows launcher notes, sign-in diagnostics, `playwright-core` resolution, archive name limits and headless/error handling (#1280).** the README says to quote an address that holds `&` or `=`, `doctor` reports which sign-in source was used (without printing credentials) and flags a Notepad `signin.txt.txt`, the pinned `playwright-core` wins over an unrelated `playwright` above the unpacked folder, `README.txt` clarifies that `doctor` writes no zip, `archive.mjs` enforces tar's 100-byte name limit in UTF-8 bytes, default `quasar-e2e-pack-*` archives are git-ignored, `QUASAR_E2E_HEADLESS=1|0` overrides headless mode (default unchanged), and `pack-run.mjs` reports `reason=browser-close` (or `runner-error`) instead of `reason=no-bundle` when the runner wrote a bundle before failing on browser close; offline tests now cover the full unpacked run path and the real `npm ci` spawn environment.
+
+### Fixed
+- WebTransport PyroWave frames are handed to QUIC in slices of at most 128 KiB, one per timer deadline across a target of a quarter of the frame interval (audio and control keep running between slices), instead of one ~435 KB burst per frame, which lost thousands of datagrams at 1080p60 (#1606).
+- WebTransport keeps its initial 100 ms video repair estimate until the first retransmission is measured, so a faster control-stream pong no longer causes premature repeat NACKs or keyframe requests (#1436).
+- End-to-end review anchors hitch warm-up on browser telemetry, and collection accepts a diagnostic read with exactly 1,000 raw samples when its event responses are below the cap.
+- End-to-end collection now splits capped trace reads by raw sample count, validates session and host setting vocabularies, and shows each collected window's verdict in offline diagnoses (#1331).
+- WebTransport repeat NACK timing now waits on the longer of the smoothed control-stream path round trip that caps the reorder window and the measured repair round trip, avoiding premature duplicate NACKs on congested links (#1436).
+- WebTransport input detects full writers, combines pending relative mouse deltas, and keeps the latest absolute position when datagrams back up. Pending relative motion goes out before the next button, key, scroll, or other input event (#1154).
+- WebTransport preserves session-ended and takeover close reasons during connection and keeps the WebRTC fallback cause visible after reload (#1478).
+- A failed start during warm Steam adoption immediately queues teardown of the new session (#768).
+
 ## 0.6.2 — 2026-11-20
 
 ### Upgrading

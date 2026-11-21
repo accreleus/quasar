@@ -34,7 +34,7 @@ import {
 import { createWebTransportRuntime } from "./webTransportRuntime";
 import { TraceEventEmitter } from "../../webrtc/traceEvents";
 // Aliased: `fallbackCause` is also this page's state for the overlay's row.
-import { fallbackCause as describeFallback, rememberedFallback, rememberFallback } from "../../webtransport/fallback";
+import { fallbackCause as describeFallback, rememberedFallback, rememberedFallbackCause, rememberFallback } from "../../webtransport/fallback";
 import { MicCapture, MicCaptureError, withUntrustedCertContext } from "../../webrtc/mic";
 import { probeCertificateTrust, type CertTrust } from "../../lib/certTrust";
 import { useToast } from "../../components/Toast";
@@ -186,8 +186,7 @@ function SessionPageBody() {
   // A reload of a session that already fell back goes straight to WebRTC.
   const [remembered] = useState(() => rememberedFallback(sessionId));
   const [fallbackReason, setFallbackReason] = useState<string | null>(remembered);
-  // Only this page load's fallback has a cause; a remembered one (reload) has none.
-  const [fallbackCause, setFallbackCause] = useState<string | null>(null);
+  const [fallbackCause, setFallbackCause] = useState(() => rememberedFallbackCause(sessionId));
   // The status line from the moment WebTransport gives up until WebRTC's signaling is open.
   const [switching, setSwitching] = useState(false);
   // The launch's WebTransport coordinates arrive in router state; a resume (#1415)
@@ -583,7 +582,7 @@ function SessionPageBody() {
     // `||`: a first reveal still owed keeps its "Click to play".
     if (!autoArmedRef.current) resumeFullscreenRef.current = document.fullscreenElement !== null;
     autoArmedRef.current ||= "resume";
-    rememberFallback(sessionId ?? "", reason);
+    rememberFallback(sessionId ?? "", reason, cause);
     new TraceEventEmitter(sessionId ?? "", authToken ?? "").emitTransportFallback(reason);
     // Before the mint: a mint that hangs or fails must not hide why WebTransport gave up.
     setFallbackCause(cause);

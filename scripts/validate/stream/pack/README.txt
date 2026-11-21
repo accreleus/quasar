@@ -13,13 +13,15 @@ What to do
   2. Open a terminal in this folder and run ONE command:
          macOS / Linux:   bash run.sh https://the-stack-address
          Windows:         .\run.cmd https://the-stack-address
+                          (an address with & or = in it goes in double quotes)
      It checks this machine first and says plainly what is wrong, if anything. If the
      stack uses a self-made certificate, add   --insecure   after the address. The test
      streams for several minutes and opens a Chrome window: leave it alone until the
      command ends.
      Just to check this machine without streaming, put the word doctor before the address:
          bash run.sh doctor https://the-stack-address      (Windows: .\run.cmd doctor https://...)
-  3. When it ends it prints the path of one .zip file (in the "results" folder).
+  3. When the full test ends it prints the path of one .zip file (in the "results"
+     folder). A doctor run only prints the check lines and makes no .zip file.
 
 What to send back
   Send that one .zip file, whether the streams passed or not. It holds no password and

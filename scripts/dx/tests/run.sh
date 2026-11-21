@@ -952,6 +952,58 @@ else
   fail "leakscan:issues-fetch-failure-is-not-clean" "expected rc=2, got rc=$ls_missing_rc"
 fi
 
+mkdir -p "$WORK/leak-dir/nested"
+leak_dir="$WORK/leak-dir"
+ls_dir() {
+  LEAK_SCAN_OPERATOR_PATTERNS="$LS_TEST_PATTERNS" LEAK_SCAN_BENCH_URL_FILE="$LS_NO_FILE" bash "$LS" --dir "$@"
+}
+# Build the invented home path at runtime so the tracked tree stays clean.
+printf '%s%s\n' '/Users/' 'alice/foo' > "$WORK/outside-leak-dir"
+ln -s "$WORK/outside-leak-dir" "$leak_dir/nested/link"
+printf 'ordinary text\n' > "$leak_dir/nested/text"
+printf 'ordinary text\0\n' > "$leak_dir/binary"
+ls_dir_out="$(ls_dir "$leak_dir" 2>&1)"
+ls_dir_rc=$?
+if [ "$ls_dir_rc" -eq 0 ] && [[ "$ls_dir_out" == *"leak-scan: clean (dir)"* ]]; then
+  pass "leakscan:dir-clean" "ordinary files are clean and a link outside the directory is skipped"
+else
+  fail "leakscan:dir-clean" "expected rc=0 and clean (dir), got rc=$ls_dir_rc: $ls_dir_out"
+fi
+
+cp "$WORK/outside-leak-dir" "$leak_dir/nested/.log file"
+printf 'standin-nas\n' > "$leak_dir/public"
+ls_dir_out="$(ls_dir "$leak_dir" 2>&1)"
+ls_dir_rc=$?
+if [ "$ls_dir_rc" -eq 1 ] && [[ "$ls_dir_out" == *"./nested/.log file:1:"* && "$ls_dir_out" == *"./public:1:standin-nas"* ]]; then
+  pass "leakscan:dir-detects" "nested home path and issue-only operator name are flagged"
+else
+  fail "leakscan:dir-detects" "expected rc=1 and both hits, got rc=$ls_dir_rc: $ls_dir_out"
+fi
+
+mkdir "$WORK/leak-dir-nul"
+{ printf 'raw console\0 '; cat "$WORK/outside-leak-dir"; } > "$WORK/leak-dir-nul/console.log"
+ls_dir_out="$(ls_dir "$WORK/leak-dir-nul" 2>&1)"
+ls_dir_rc=$?
+if [ "$ls_dir_rc" -eq 1 ] && [[ "$ls_dir_out" == *"./console.log:1:"* ]]; then
+  pass "leakscan:dir-nul-detects" "a NUL before a home path on the same line still exits 1"
+else
+  fail "leakscan:dir-nul-detects" "expected rc=1 and console.log hit, got rc=$ls_dir_rc: $ls_dir_out"
+fi
+
+ls_dir_out="$(ls_dir "$WORK/no-such-directory" 2>&1)"
+ls_dir_rc=$?
+if [ "$ls_dir_rc" -eq 2 ] && [[ "$ls_dir_out" == *"--dir <existing-directory>"* ]]; then
+  pass "leakscan:dir-missing" "missing directory exits 2"
+else
+  fail "leakscan:dir-missing" "expected rc=2 and directory usage, got rc=$ls_dir_rc: $ls_dir_out"
+fi
+
+if bash "$LS" --help | grep -Fxq 'to anything real.'; then
+  pass "leakscan:help-complete" "help includes the final header line"
+else
+  fail "leakscan:help-complete" "missing the final header line"
+fi
+
 printf '\n== redaction ==\n'
 
 # ── golden test ──────────────────────────────────────────────────────────────
@@ -2603,6 +2655,11 @@ bs.refuse_on_shifted_resubmit(B(), "r", smp, False, can_replace=True)
 if died: p.append("shifted re-submit died despite can_replace")
 bs.refuse_on_shifted_resubmit(B(), "r", smp, False, can_replace=False)
 if not died: p.append("shifted re-submit NOT refused on old service")
+# #1334: no-marker bench windows omit missing_indices and carry bench_n/bench_decoded only.
+died.clear()
+smp_nomarker=[{"source":"browser","ts_unix_ms":t+65_000,"metrics":{"bench_n":60,"bench_decoded":0}} for t in base]
+bs.refuse_on_shifted_resubmit(B(), "r", smp_nomarker, False, can_replace=False)
+if not died: p.append("shifted no-marker re-submit (bench_n only) NOT refused on old service")
 print("OK" if not p else "; ".join(p))' "$DX/bench_submit.py" "$DX/vendor")
   if [ "$rg_check" = OK ]; then pass "bench:replace-guard" "re-fold uses replace+expected_count, gated on service >= 1.2"; else fail "bench:replace-guard" "$rg_check"; fi
 else
@@ -3818,6 +3875,8 @@ if [ $? -eq 0 ]; then
 else
   fail "manifest:bench-keys-not-drifted" "$BENCH_KEYS_OUT"
 fi
+
+rc_of 0 "session-diagnose:bundle-verdicts" -- python3 -B "$TESTS_DIR/test_session_diagnose.py"
 
 # The end-to-end suite's run bundle (#1272): the fixture is valid, each rule has a bundle that breaks it.
 if command -v node >/dev/null 2>&1; then

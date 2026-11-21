@@ -7,6 +7,9 @@ const num = (v) => typeof v === "number" && Number.isFinite(v);
 const LEGACY_KEYS = { dropped: "missing_indices", crc_fail: "undecoded" };
 const PLAIN_KEYS = ["n", "decoded", "undecoded", "no_image", "missing_indices", "duplicated", "reordered",
   "g2g_p50_ms", "g2g_p95_ms", "g2g_max_ms", "render_w", "render_h", "offset_ms", "i2p_missed"];
+// Index-delta counts are only measured from decoded marker frame indices (web/src/bench/aggregate.ts);
+// a window that decoded no marker (`!(w.decoded > 0)`) has no measurement, never zero.
+const MARKER_COUNT_KEYS = new Set(["missing_indices", "duplicated", "reordered"]);
 
 function percentile(values, q) {
   if (!values.length) return null;
@@ -18,7 +21,7 @@ function percentile(values, q) {
 function windowTs(w, prev, fallback) {
   const cands = ["last_host_time_ms", "t_end_host_ms", "t_end_ms"].filter((k) => num(w[k]) && w[k] > 0).map((k) => [Math.trunc(w[k]), k]);
   for (const [v, k] of cands) if (prev === null || v > prev) return { ts: v, src: k, nudged: false };
-  const [base, src] = cands[0] ?? [Math.trunc(fallback), "fallback_ordinal"];
+  const [base, src] = cands[0] ?? [num(fallback) ? Math.trunc(fallback) : 0, "fallback_ordinal"];
   return { ts: prev === null ? base : prev + 1, src, nudged: true };
 }
 
@@ -26,16 +29,21 @@ function windowTs(w, prev, fallback) {
 export function benchRows(windows, fallbackT0Ms = 0) {
   const rows = [];
   let prev = null;
-  windows.forEach((raw, i) => {
+  const t0 = num(fallbackT0Ms) ? fallbackT0Ms : 0;
+  (Array.isArray(windows) ? windows : []).forEach((raw, i) => {
     if (raw === null || typeof raw !== "object") return;
     const w = { ...raw };
     for (const [old, now] of Object.entries(LEGACY_KEYS)) if (old in w && !(now in w)) { w[now] = w[old]; delete w[old]; }
-    const { ts, nudged } = windowTs(w, prev, fallbackT0Ms + i * 1000);
+    const { ts, nudged } = windowTs(w, prev, t0 + i * 1000);
     prev = ts;
+    const hasMarker = num(w.decoded) && w.decoded > 0;
     const m = {};
-    for (const k of PLAIN_KEYS) if (num(w[k])) m[k === "n" || k === "decoded" ? `bench_${k}` : k] = w[k];
+    for (const k of PLAIN_KEYS) {
+      if (MARKER_COUNT_KEYS.has(k) && !hasMarker) continue;
+      if (num(w[k])) m[k === "n" || k === "decoded" ? `bench_${k}` : k] = w[k];
+    }
     for (const [k, v] of Object.entries(w)) if (k.startsWith("stage_") && num(v)) m[k] = v;
-    const i2p = (w.i2p_ms ?? []).filter(num);
+    const i2p = (Array.isArray(w.i2p_ms) ? w.i2p_ms : []).filter(num);
     if (i2p.length) Object.assign(m, { i2p_p50_ms: percentile(i2p, 0.5), i2p_max_ms: Math.max(...i2p), i2p_n: i2p.length });
     m.offset_unknown = w.offset_unknown ? 1 : 0;
     if (nudged) m.ts_nudged = 1;

@@ -199,7 +199,7 @@ export class FakeAgent {
   /** Control-stream writes fail from here on, as on a stream the agent reset. */
   controlReset = false;
   /** Park the client at one await of its connect until `release()`; `answer` means no reply. */
-  hold: "ready" | "stream" | "write" | "answer" | null = null;
+  hold: "ready" | "stream" | "write" | "datagram-write" | "answer" | null = null;
   /** Off: datagrams already in flight still arrive after close(), the case a stale attempt must ignore. */
   closeEndsDatagrams = true;
   /** Safari's datagram shape (the current spec): `createWritable()` and no `writable`. */
@@ -213,7 +213,7 @@ export class FakeAgent {
   private heldReply: (() => void) | null = null;
   private hellos = 0;
 
-  private parked(stage: "ready" | "stream" | "write"): Promise<void> {
+  private parked(stage: "ready" | "stream" | "write" | "datagram-write"): Promise<void> {
     if (this.hold !== stage) return Promise.resolve();
     this.reached = stage;
     let open!: () => void;
@@ -287,7 +287,12 @@ export class FakeAgent {
         ? undefined
         : (() => {
             const readable = new ReadableStream<Uint8Array>({ start: (c) => void (dgram = c) });
-            const writable = () => new WritableStream<Uint8Array>({ write: (chunk) => void agent.datagramsSent.push(chunk) });
+            const writable = () => new WritableStream<Uint8Array>({
+              write(chunk) {
+                agent.datagramsSent.push(chunk);
+                if (agent.hold === "datagram-write") return agent.parked("datagram-write");
+              },
+            });
             return this.safariDatagrams ? { readable, createWritable: writable } : { readable, writable: writable() };
           })(),
       async createBidirectionalStream() {

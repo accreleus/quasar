@@ -231,6 +231,131 @@ describe("WebTransportMedia input and ping", () => {
     t.close();
   });
 
+  it("combines three blocked relative moves into one datagram when the writer drains", async () => {
+    const { agent, t, up } = connected();
+    await up;
+    const sender = webTransportInputSender(t.input);
+    const scroll = { t: "ms", dx: 0, dy: 120 };
+    const move = { t: "mm", dx: 1, dy: 2, seq: 17, tc: 10 };
+    const datagrams = () => agent.datagramsSent.map((d) => JSON.parse(text(d.subarray(1))));
+    try {
+      agent.hold = "datagram-write";
+      sender.send(scroll); // fills the writer's single slot
+      sender.send(move);
+      sender.send(Object.assign(move, { dx: 3, dy: -4, seq: 18, tc: 20 }));
+      sender.send({ t: "mm", dx: -5, dy: 6, seq: 19 });
+      Object.assign(move, { dx: 100, dy: 100 }); // capture reuses its relative-motion object
+      await flush();
+      expect(datagrams()).toEqual([scroll]);
+      expect(agent.sent("input")).toEqual([]);
+
+      agent.hold = null;
+      agent.release();
+      await flush();
+      expect(datagrams()).toEqual([scroll, { t: "mm", dx: -1, dy: 4, seq: 19, tc: 20 }]);
+      expect(agent.sent("input")).toEqual([]);
+    } finally {
+      sender.dispose();
+      agent.hold = null;
+      agent.release();
+      await t.close();
+    }
+  });
+
+  it.each([
+    { t: "mb", button: 272, pressed: true },
+    { t: "k", code: 30, pressed: true },
+    { t: "ms", dx: 0, dy: 120 },
+    { t: "gp", i: 0, buttons: [], axes: [1, 0] },
+    { t: "ma", x: 0.3, y: 0.4 },
+  ])("sends blocked relative motion on the control stream before $t", async (event) => {
+    const { agent, t, up } = connected();
+    await up;
+    const sender = webTransportInputSender(t.input);
+    const scroll = { t: "ms", dx: 0, dy: -120 };
+    const rest = { t: "gp", i: 0, buttons: [], axes: [0, 0] };
+    const move = { t: "mm", dx: 1, dy: 2 };
+    try {
+      sender.send(rest); // the next gamepad event only changes a stick
+      agent.hold = "datagram-write";
+      sender.send(scroll);
+      sender.send(move);
+      sender.send(event);
+      await flush();
+      expect(agent.sent("input").map((m) => m.event)).toEqual([rest, move, event]);
+
+      agent.hold = null;
+      agent.release();
+      await flush();
+      expect(agent.datagramsSent.map((d) => JSON.parse(text(d.subarray(1))))).toEqual([scroll]);
+    } finally {
+      sender.dispose();
+      agent.hold = null;
+      agent.release();
+      await t.close();
+    }
+  });
+
+  it("sends only the newest pending ma when the datagram writer drains", async () => {
+    const { agent, t, up } = connected();
+    await up;
+    const sender = webTransportInputSender(t.input);
+    const scroll = { t: "ms", dx: 0, dy: 120 };
+    const key = { t: "k", code: 30, pressed: false };
+    const move = { t: "ma", x: 0.1, y: 0.2 };
+    const latest = { t: "ma", x: 0.3, y: 0.4 };
+    const datagrams = () => agent.datagramsSent.map((d) => JSON.parse(text(d.subarray(1))));
+    try {
+      agent.hold = "datagram-write";
+      sender.send(scroll); // fills the writer's single slot
+      sender.send(move);
+      sender.send(Object.assign(move, latest));
+      Object.assign(move, { x: 0.5, y: 0.6 });
+      sender.send(scroll); // retains its datagram path even when full
+      sender.send(key);
+      await flush();
+      expect(datagrams()).toEqual([scroll]);
+      expect(agent.sent("input").map((m) => m.event)).toEqual([key]);
+
+      agent.hold = null;
+      agent.release();
+      await flush();
+      expect(datagrams()).toEqual([scroll, scroll, latest]);
+    } finally {
+      sender.dispose();
+      agent.hold = null;
+      agent.release();
+      await t.close();
+    }
+  });
+
+  it("sends the latest blocked absolute position before a click without replaying it as a datagram", async () => {
+    const { agent, t, up } = connected();
+    await up;
+    const sender = webTransportInputSender(t.input);
+    const before = { t: "ma", x: 0.1, y: 0.2 };
+    const latest = { t: "ma", x: 0.3, y: 0.4 };
+    const click = { t: "mb", button: 272, pressed: true };
+    try {
+      agent.hold = "datagram-write";
+      sender.send(before);
+      sender.send(latest);
+      sender.send(click);
+      await flush();
+      expect(agent.sent("input").map((m) => m.event)).toEqual([latest, click]);
+
+      agent.hold = null;
+      agent.release();
+      await flush();
+      expect(agent.datagramsSent.map((d) => JSON.parse(text(d.subarray(1))))).toEqual([before]);
+    } finally {
+      sender.dispose();
+      agent.hold = null;
+      agent.release();
+      await t.close();
+    }
+  });
+
   it("pings once a second and reports each pong's round trip", async () => {
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     let clock = 1000;
@@ -460,5 +585,33 @@ describe("input through the WebTransport runtime", () => {
     await vi.waitFor(() => expect(snaps.at(-1)?.rttMs).toEqual(expect.any(Number)), { timeout: 3000 });
     expect(snaps.at(-1)!.rttMs).toBeGreaterThanOrEqual(0);
     rt.destroy();
+  });
+
+  it.each(["write", "datagram-write"] as const)("latches capture backpressure from a stalled %s", async (stage) => {
+    const { agent, canvas, rt } = setup();
+    const snaps: TelemetrySnapshot[] = [];
+    rt.registerTelemetry((s) => snaps.push(s));
+    rt.start();
+    try {
+      await vi.waitFor(() => expect(agent.sent("ping")).toHaveLength(1));
+      lock(canvas);
+      agent.hold = stage;
+      if (stage === "write") {
+        document.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, code: "KeyA" }));
+      } else {
+        document.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, movementX: 3, movementY: -5 }));
+      }
+      await flush();
+      expect(agent.reached).toBe(stage);
+      document.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, code: "KeyB" }));
+      agent.hold = null;
+      agent.release();
+      await vi.waitFor(() => expect(snaps.some((s) => s.inputMetrics?.backpressureDetected)).toBe(true), { timeout: 3000 });
+      await vi.waitFor(() => expect(snaps.at(-1)?.inputMetrics?.backpressureDetected).toBe(false), { timeout: 3000 });
+    } finally {
+      agent.hold = null;
+      agent.release();
+      rt.destroy();
+    }
   });
 });

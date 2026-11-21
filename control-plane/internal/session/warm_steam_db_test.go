@@ -34,7 +34,7 @@ type warmDispatcher struct {
 	// between the swap's guard and its handoff.
 	downgradeSwap bool
 	// reject answers one command kind: "assign" or "start" refused, "assign-ack"
-	// queued with its ack lost, or "swap" refused.
+	// or "start-ack" queued with its ack lost, or "swap" refused.
 	reject  string
 	assigns []agentws.SessionAssignCmd
 	stops   []agentws.SessionStopCmd
@@ -172,8 +172,13 @@ func (e warmEpoch) SendWithAck(_ context.Context, _ string, v any) (agentws.AckR
 
 func (d *warmDispatcher) SendWithAck(_ context.Context, _, _ string, v any) (agentws.AckResult, error) {
 	d.record(v)
-	if _, ok := v.(agentws.SessionStartCmd); ok && d.rejecting() == "start" {
-		return agentws.AckResult{OK: false, Error: "refused"}, nil
+	if _, ok := v.(agentws.SessionStartCmd); ok {
+		switch d.rejecting() {
+		case "start":
+			return agentws.AckResult{OK: false, Error: "refused"}, nil
+		case "start-ack":
+			return agentws.AckResult{}, context.DeadlineExceeded
+		}
 	}
 	return agentws.AckResult{OK: true}, nil
 }

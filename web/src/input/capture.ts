@@ -14,7 +14,7 @@
 //
 // Hot path (#139): `mm`/`ms` reuse one hoisted object each — no per-event heap
 // allocation; wire format unchanged. AS10-13 CaptureMetrics are observational
-// only — bufferedAmount is read for backpressure detection, the send path never
+// only — queue pressure is read for backpressure detection, capture never
 // skips on it. `?itrace=1` stamps optional seq/tc on each `mm` (additive per
 // protocol/input.md; agent side gated on QUASAR_INPUT_TRACE).
 //
@@ -29,6 +29,7 @@
 // (matched by pointerId, so chrome taps are never seen here).
 
 import { EVDEV, MB_MAP } from "./evdev";
+import type { InputSender } from "./inputSender";
 import { type VirtualPadState } from "./virtualPad";
 import { detectPadEnv, isRemapped, remapGamepad, type PadEnv } from "./gamepadRemap";
 import { createMouseScaler, mouseGain, NEUTRAL_MOUSE, type MouseSettings } from "./mouseScale";
@@ -93,8 +94,7 @@ export interface CaptureMetrics {
   /** Coalesced pointer samples/sec — a subset of inputMsgPerSec. */
   coalescedSamplesPerSec: number;
   channelBufferedAmount: number;
-  /** bufferedAmount exceeded BACKPRESSURE_THRESHOLD_BYTES at least once this
-   *  window. Early warning only — capture.ts never skips sends. */
+  /** A writer was full or bufferedAmount exceeded the byte threshold on a send this window. */
   backpressureDetected: boolean;
   gamepadCount: number;
   /** From the same getGamepads() pass as gamepadCount, so they never disagree. */
@@ -137,9 +137,8 @@ export interface CaptureOptions {
   /** Both booleans, every transition: `captured` drives the session chrome,
    *  `pointerLocked` decides whether an on-screen tap target is reachable. */
   onCaptureChange: (state: CaptureState) => void;
-  /** Read only for bufferedAmount backpressure detection (AS10-13); never
-   *  written from capture.ts. */
-  channel?: { readonly bufferedAmount: number };
+  /** Read only for backpressure detection (AS10-13). */
+  channel?: Pick<InputSender, "bufferedAmount" | "backpressured">;
   /** Live fullscreen state, read on every keyboard-lock re-evaluation (the API
    *  only grants Escape capture in fullscreen). Absent → Keyboard Lock never
    *  engaged. */
@@ -341,7 +340,7 @@ export function setupCapture({
   let coalescedCount = 0;     // coalesced pointer samples forwarded
   let gpSendCount = 0;        // gamepad state-change messages sent
   let mmSendCount = 0;        // relative mouse-move messages sent
-  let backpressureSeen = false; // latched: bufferedAmount > threshold this window
+  let backpressureSeen = false;
   let windowStartMs = performance.now();
 
   // Whether getCoalescedEvents is available — probed once at setup time.
@@ -351,9 +350,11 @@ export function setupCapture({
 
   // Wrap sendInput to count every outbound message and sample backpressure.
   const send = (msg: InputMsg) => {
+    // A single write can fill an empty WebTransport writer until that write completes.
+    const writerWasFull = channel?.backpressured;
     sendInput(msg);
     msgCount++;
-    if (channel && channel.bufferedAmount > BACKPRESSURE_THRESHOLD_BYTES) {
+    if (writerWasFull || (channel && channel.bufferedAmount > BACKPRESSURE_THRESHOLD_BYTES)) {
       backpressureSeen = true;
     }
   };

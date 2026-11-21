@@ -168,14 +168,15 @@ async function readBack(device: GPUDevice, texture: GPUTexture, w: number, h: nu
   await buffer.mapAsync(GPUMapMode.READ);
   const src = new Uint8Array(buffer.getMappedRange());
   const out = new Uint8ClampedArray(w * h * 4);
+  // Normalize the browser's preferred canvas format to RGBA for assertions and captures.
+  const [redOffset, blueOffset] = texture.format === "bgra8unorm" ? [2, 0] : [0, 2];
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const i = y * bytesPerRow + x * 4;
       const o = (y * w + x) * 4;
-      // The canvas format is bgra8unorm; the assertions and the captures want rgba.
-      out[o] = src[i + 2];
+      out[o] = src[i + redOffset];
       out[o + 1] = src[i + 1];
-      out[o + 2] = src[i];
+      out[o + 2] = src[i + blueOffset];
       out[o + 3] = src[i + 3];
     }
   }

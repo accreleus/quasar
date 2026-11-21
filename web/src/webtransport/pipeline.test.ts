@@ -352,6 +352,82 @@ describe("FrameAssembler", () => {
     expect(a.tick().nacks).toEqual([{ frameSeq: 3, frags: [[0, 0]] }]);
   });
 
+  it("uses the transport's path round trip for repeat NACKs once known, overriding the repair round trip (#1436)", () => {
+    let t = 0;
+    let pathRtt: number | null = null;
+    const a = new FrameAssembler(() => t, () => 0, () => pathRtt);
+    a.push(unitOf(1, true)[0]);
+    // Before the first pong, a repair sample still drives rttMs.
+    const two = unitOf(2, false, 2000);
+    a.push(two[1]);
+    t = 20;
+    a.push({ ...two[0], retransmit: true });
+    expect(a.rttMs).toBe(20);
+    // Once the path round trip is known (the same smoothed estimate that caps the reorder window),
+    // repeat NACKs wait on it rather than the 20 ms repair sample.
+    pathRtt = 60;
+    expect(a.rttMs).toBe(60);
+    const three = unitOf(3, false, 2000);
+    t = 100;
+    expect(a.push(three[1]).nacks).toEqual([{ frameSeq: 3, frags: [[0, 0]] }]);
+    t = 100 + 20 + RTT_SLACK_MS;
+    expect(a.tick().nacks).toEqual([]);
+    t = 100 + 60 + RTT_SLACK_MS - 1;
+    expect(a.tick().nacks).toEqual([]);
+    t += 1;
+    expect(a.tick().nacks).toEqual([{ frameSeq: 3, frags: [[0, 0]] }]);
+  });
+
+  it("accepts an 80 ms first repair after a 20 ms path pong", () => {
+    let t = 0;
+    let pathRtt: number | null = null;
+    const a = new FrameAssembler(() => t, () => 4, () => pathRtt);
+    a.push(unitOf(1, true)[0]);
+    pathRtt = 20;
+
+    const reference = unitOf(2, false, 3000);
+    a.push(reference[0]);
+    expect(a.push(reference[2])).toEqual({ ...NONE, wakeMs: 4 });
+    t = 4;
+    expect(a.tick().nacks).toEqual([{ frameSeq: 2, frags: [[1, 1]] }]);
+
+    // Drive the old repeat and drop deadlines (34 and 68 ms after the first NACK).
+    const waiting = [0, 17, 34, 51, 68].map((elapsed, i) => {
+      t = 4 + elapsed;
+      return a.push(unitOf(3 + i, false)[0]);
+    });
+    t = 4 + 80;
+    const repaired = a.push({ ...reference[1], retransmit: true });
+    expect(seqs(repaired)).toEqual([2, 3, 4, 5, 6, 7]);
+    expect(waiting).toEqual([NONE, NONE, NONE, NONE, NONE]);
+    expect(a.rttMs).toBe(80);
+  });
+
+  it("waits on the longer measured repair round trip when it exceeds the path round trip (#1436)", () => {
+    let t = 0;
+    const pathRtt = 20;
+    const a = new FrameAssembler(() => t, () => 0, () => pathRtt);
+    a.push(unitOf(1, true)[0]);
+    // Measure a 120 ms repair round trip (e.g. retransmits queued behind video on a congested link)
+    // while the control-stream path round trip stays at 20 ms.
+    const two = unitOf(2, false, 2000);
+    a.push(two[1]);
+    t = 120;
+    a.push({ ...two[0], retransmit: true });
+    expect(a.rttMs).toBe(120);
+    const three = unitOf(3, false, 2000);
+    t = 200;
+    expect(a.push(three[1]).nacks).toEqual([{ frameSeq: 3, frags: [[0, 0]] }]);
+    // At path RTT + slack (20 ms), the repeat must NOT fire before a repair can arrive.
+    t = 200 + 20 + RTT_SLACK_MS;
+    expect(a.tick().nacks).toEqual([]);
+    // Wait until repair RTT + slack (120 ms).
+    t = 200 + 120 + RTT_SLACK_MS - 1;
+    expect(a.tick().nacks).toEqual([]);
+    t += 1;
+    expect(a.tick().nacks).toEqual([{ frameSeq: 3, frags: [[0, 0]] }]);
+  });
+
   /** An assembler whose estimate is `rtt` ms (one loss, resent after `rtt`), at frame 3. */
   function measured(rtt: number) {
     const clock = { t: 0 };

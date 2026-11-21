@@ -108,8 +108,10 @@
         "absent": [
           "present_interval_max_ms",
           "g2g_p95_ms",
-          "missing_indices"
+          "missing_indices",
+          "bench_n"
         ],
+        "bench_offset_unknown": false,
         "keys": [
           "fps"
         ],

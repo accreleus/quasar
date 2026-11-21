@@ -12,18 +12,23 @@ export interface InputWire {
   reliable(event: InputMsg): void;
   /** One datagram; false when it does not fit, and the sender then goes reliable. */
   datagram(bytes: Uint8Array): boolean;
+  datagramState?(): Pick<WritableStreamDefaultWriter, "desiredSize" | "ready"> | null;
+  controlDesiredSize?(): number | null;
 }
 
 /** After this long without another datagram, a pad's or the pointer's latest state is sent again reliably. */
 export const SETTLE_MS = 100;
 
 const encoder = new TextEncoder();
+const full = (size: number | null | undefined) => size != null && size <= 0;
 
 export function webTransportInputSender(wire: InputWire, settleMs = SETTLE_MS): InputSender & { dispose(): void } {
   /** The last button values sent per pad; every one is a value, triggers are analog. */
   const pads = new Map<number, number[]>();
   /** The latest state of what was last sent as a datagram, until it has been repeated reliably. */
   const settling = new Map<string, { msg: InputMsg; timer: ReturnType<typeof setTimeout> }>();
+  let pendingMotion: InputMsg | undefined;
+  let scheduledReady: Promise<void> | undefined;
   let disposed = false;
   const scratch = new Uint8Array(1200);
   scratch[0] = CHANNEL_INPUT;
@@ -41,10 +46,12 @@ export function webTransportInputSender(wire: InputWire, settleMs = SETTLE_MS): 
       msg,
       timer: setTimeout(() => {
         settling.delete(key);
+        if (key === "ma" && pendingMotion?.t === "ma") pendingMotion = undefined;
         wire.reliable(msg);
       }, settleMs),
     });
   };
+  const settleAbsolute = (msg: InputMsg) => settleLater("ma", { t: "ma", x: msg.x, y: msg.y });
   const padKey = (msg: InputMsg) => `gp:${typeof msg.i === "number" ? msg.i : 0}`;
 
   const lossy = (msg: InputMsg): boolean => {
@@ -67,35 +74,81 @@ export function webTransportInputSender(wire: InputWire, settleMs = SETTLE_MS): 
     }
   };
 
-  return {
-    send(msg) {
-      // A stale capture handler must not reach a connection that is gone or replaced.
-      if (disposed) return;
-      if (lossy(msg)) {
-        const json = JSON.stringify(msg);
-        const { read, written } = encoder.encodeInto(json, scratch.subarray(1));
-        // read < json.length: it overran the scratch; the wire decides the real limit.
-        if (read === json.length && wire.datagram(scratch.slice(0, 1 + written))) {
-          if (msg.t === "ma") settleLater("ma", { t: "ma", x: msg.x, y: msg.y });
-          else if (msg.t === "gp") settleLater(padKey(msg), JSON.parse(json) as InputMsg);
-          return; // mm and ms are relative: nothing to settle
-        }
+  function send(msg: InputMsg): void {
+    // A stale capture handler must not reach a connection that is gone or replaced.
+    if (disposed) return;
+    const relative = msg.t !== "mm" && pendingMotion?.t === "mm" ? pendingMotion : undefined;
+    if (relative) {
+      wire.reliable(relative);
+      pendingMotion = undefined;
+    }
+    if (msg.t === "mm" || msg.t === "ma") {
+      if (msg.t === "mm" && pendingMotion?.t === "mm") {
+        msg = {
+          ...msg,
+          dx: Number(pendingMotion.dx) + Number(msg.dx),
+          dy: Number(pendingMotion.dy) + Number(msg.dy),
+          seq: msg.seq ?? pendingMotion.seq,
+          tc: msg.tc ?? pendingMotion.tc,
+        };
+      } else if (msg.t === "mm" && pendingMotion?.t === "ma") {
+        // A late absolute settle could overwrite the new relative motion.
+        drop("ma");
       }
-      // A click must land where the pointer was, and a datagram `ma` can lose or trail the reliable
-      // `mb`: the position goes first on the same ordered stream. Relative motion has no position to
-      // repeat, so a late `mm` just shifts the cursor slightly; accepted.
-      if (msg.t === "mb") {
-        const abs = drop("ma");
-        if (abs) wire.reliable(abs);
-      } else if (msg.t === "ma") drop("ma");
-      else if (msg.t === "gp") drop(padKey(msg)); // this reliable state is the newest
-      wire.reliable(msg);
+      pendingMotion = undefined;
+      const writer = wire.datagramState?.();
+      if (!relative && writer && full(writer.desiredSize)) {
+        pendingMotion = { ...msg }; // capture mutates and reuses its motion objects
+        if (msg.t === "ma") settleAbsolute(msg);
+        const ready = writer.ready;
+        // One callback per readiness promise, including when a closed writer reports zero.
+        if (scheduledReady !== ready) {
+          scheduledReady = ready;
+          void ready.then(() => {
+            if (pendingMotion && wire.datagramState?.() === writer) {
+              const pending = pendingMotion;
+              pendingMotion = undefined;
+              send(pending);
+            }
+          }, () => {
+            pendingMotion = undefined;
+          });
+        }
+        return;
+      }
+    }
+    // Keep the next event on the same ordered stream as the motion it drained.
+    if (lossy(msg) && !relative) {
+      const json = JSON.stringify(msg);
+      const { read, written } = encoder.encodeInto(json, scratch.subarray(1));
+      // read < json.length: it overran the scratch; the wire decides the real limit.
+      if (read === json.length && wire.datagram(scratch.slice(0, 1 + written))) {
+        if (msg.t === "ma") settleAbsolute(msg);
+        else if (msg.t === "gp") settleLater(padKey(msg), JSON.parse(json) as InputMsg);
+        return; // mm and ms are relative: nothing to settle
+      }
+    }
+    // A datagram `ma` can lose or trail the click, so repeat the position before the click.
+    if (msg.t === "mb") {
+      if (pendingMotion?.t === "ma") pendingMotion = undefined;
+      const abs = drop("ma");
+      if (abs) wire.reliable(abs);
+    } else if (msg.t === "ma") drop("ma");
+    else if (msg.t === "gp") drop(padKey(msg)); // this reliable state is the newest
+    wire.reliable(msg);
+  }
+
+  return {
+    send,
+    get backpressured() {
+      return !disposed && (full(wire.datagramState?.()?.desiredSize) || full(wire.controlDesiredSize?.()));
     },
-    // shortcut: the browser exposes no queue depth for datagrams; upgrade if backpressure needs it (#1154).
+    // desiredSize is writer capacity and can count chunks. Capture's byte metric requires bytes.
     bufferedAmount: 0,
     /** Forgets what was waiting to settle: the connection is going, and the host releases what it held. */
     dispose() {
       disposed = true;
+      pendingMotion = undefined;
       for (const key of [...settling.keys()]) drop(key);
     },
   };

@@ -120,6 +120,17 @@ def validate_bundle(bundle: dict) -> list[str]:
     if not isinstance(cl.get("verdict"), str) or not cl["verdict"]:
         raise ValueError("classifier.verdict must be a non-empty string")
 
+    if "classifier_reads" in bundle:
+        reads = bundle["classifier_reads"]
+        if not isinstance(reads, list) or not reads:
+            raise ValueError("classifier_reads must be a non-empty list")
+        for read in reads:
+            if not isinstance(read, dict) or not isinstance(read.get("verdict"), str) or not read["verdict"]:
+                raise ValueError("each classifier read must have a verdict")
+            window = read.get("window")
+            if not isinstance(window, dict) or any(type(window.get(k)) is not int for k in ("from_ms", "to_ms")):
+                raise ValueError("each classifier read must have integer window bounds")
+
     clock = bundle["clock"]
     if isinstance(clock, dict):
         if clock.get("unmeasured") is True:
@@ -186,6 +197,7 @@ def analyse(bundle: dict, sid: str, host: str, warnings: list[str]) -> dict:
         "clock": bundle.get("clock"),
         "abr_mode": bundle.get("abr_mode"),
         "classifier": cl,
+        **({"classifier_reads": bundle["classifier_reads"]} if "classifier_reads" in bundle else {}),
         "series": {name: series_stats(pts) for name, pts in ser.items()},
         "events": dict(Counter(e.get("type") for e in ev).most_common()),
         "derived_windows": {k: len(v or []) for k, v in dw.items()},
@@ -230,22 +242,7 @@ def render_falsifiers(cl: dict) -> None:
         print("    thresholds: %s" % cl["thresholds_version"])
 
 
-def render(a: dict) -> None:
-    sep = "─" * 72
-    cl = a["classifier"]
-    win = a["window"]
-    print(sep)
-    print(f"QUASAR SESSION DIAGNOSIS  host={a['session']['host']}  session={a['session']['id']}")
-    if a["session"].get("profile"):
-        print(f"  profile: {a['session']['profile']}")
-    if a.get("abr_mode"):
-        print(f"  abr:     {a['abr_mode']}")
-    if win:
-        span = (int(win.get("to_ms") or 0) - int(win.get("from_ms") or 0)) / 1000
-        print(f"  window:  {span:.0f}s  ({win.get('from_ms')} → {win.get('to_ms')})")
-    print(sep)
-
-    print("\nCLASSIFIER")
+def render_classifier(cl: dict) -> None:
     print(f"  verdict:  {cl.get('verdict')}")
     # ST-09: the classifier is the Verdict VALUE. Everything below is read
     # defensively — a control plane that predates ST-09 returns only verdict +
@@ -267,6 +264,33 @@ def render(a: dict) -> None:
         print("  samples:  %s host / %s client" % (win.get("n_host", "?"), win.get("n_client", "?")))
     for line in (cl.get("evidence") or []):
         print(f"  evidence: {line}")
+
+
+def render(a: dict) -> None:
+    sep = "─" * 72
+    cl = a["classifier"]
+    reads = a.get("classifier_reads")
+    win = a["window"]
+    print(sep)
+    print(f"QUASAR SESSION DIAGNOSIS  host={a['session']['host']}  session={a['session']['id']}")
+    if a["session"].get("profile"):
+        print(f"  profile: {a['session']['profile']}")
+    if a.get("abr_mode"):
+        print(f"  abr:     {a['abr_mode']}")
+    if win:
+        span = (int(win.get("to_ms") or 0) - int(win.get("from_ms") or 0)) / 1000
+        print(f"  window:  {span:.0f}s  ({win.get('from_ms')} → {win.get('to_ms')})")
+    print(sep)
+
+    if reads:
+        for read in reads:
+            win = read["window"]
+            print(f"\nCLASSIFIER  ({win['from_ms']} → {win['to_ms']})")
+            render_classifier(read)
+            render_falsifiers(read)
+    else:
+        print("\nCLASSIFIER")
+        render_classifier(cl)
 
     print("\nSERIES  (metric: count  [min / p50 / p95 / max])")
     printed = set()
@@ -304,6 +328,8 @@ def render(a: dict) -> None:
         for w in a["warnings"]:
             print(f"  ! {w}")
 
+    if reads:
+        return
     verdict = cl.get("verdict") or "?"
     label = VERDICT_LABELS.get(verdict)
     if label is None:

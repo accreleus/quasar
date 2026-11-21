@@ -214,6 +214,8 @@ export class WebTransportMedia implements MediaTransport {
 
   /** Both paths are no-ops until connected. */
   readonly input: InputWire = {
+    datagramState: () => this.live?.on ? this.datagramWriter : null,
+    controlDesiredSize: () => this.live?.on ? this.writer?.desiredSize ?? null : null,
     reliable: (event) => this.send({ type: "input", event }),
     datagram: (bytes) => {
       const cap = Math.min(this.wt?.datagrams.maxDatagramSize ?? MAX_INPUT_DATAGRAM, MAX_INPUT_DATAGRAM);
@@ -350,19 +352,9 @@ export class WebTransportMedia implements MediaTransport {
     } catch {
       return refused("connect_failed");
     }
-    // Read here or below; a failed connect must not leave it unhandled. `settled.close` keeps the
-    // close a connection that already ended gave, so the accept check can read it without waiting
-    // out {@link CLOSE_CODE_WAIT_MS} for a session whose close raced the `hello_ack` (#1478). The
-    // holder object, not a `let`, because TypeScript narrows a `let` assigned in a callback to its
-    // initializer's `null`.
-    const settled: { close: WebTransportCloseInfo | null } = { close: null };
-    const closeInfo = wt.closed.then(
-      (info) => {
-        settled.close = info;
-        return info;
-      },
-      () => null,
-    );
+    // A failed connection may reject `closed` without a close code.
+    const closeInfo = wt.closed.catch(() => null);
+    const waitForClose = () => Promise.race([closeInfo, after(CLOSE_CODE_WAIT_MS, null)]);
     const abandon = (answer: Answer, sent?: WebTransportCloseInfo): Answer => {
       live.on = false;
       // Our own close (a malformed hello_ack and the like) says why, in the close reason.
@@ -379,7 +371,7 @@ export class WebTransportMedia implements MediaTransport {
     this.abortAttempt = abort;
     /** The answer a connection that ended without a message gave, read off its close code. */
     const fromClose = async (): Promise<Answer> => {
-      const info = await Promise.race([closeInfo, after(CLOSE_CODE_WAIT_MS, null)]);
+      const info = await waitForClose();
       const code = info?.closeCode ?? null;
       return abandon(code === null || code === 0 ? { kind: "retry" } : refused(CLOSE_REFUSALS[code] ?? "internal", closeDetail(code, info?.reason)));
     };
@@ -451,7 +443,7 @@ export class WebTransportMedia implements MediaTransport {
      *  is not the path, and its cap must not fall to 0 for a second (#1436). */
     let retransmitWindowMs = 0;
     let pathRttMs: number | null = null;
-    const router = this.makeRouter(sink, live, feedback, () => retransmitWindowMs - (pathRttMs ?? Infinity));
+    const router = this.makeRouter(sink, live, feedback, () => retransmitWindowMs, () => pathRttMs);
     /** Set once this attempt's datagram reader has failed: `datagrams: <name>: <message>`. */
     const datagramReader = { death: null as string | null };
     void this.readDatagrams(wt, sink, router, live, feedback, datagramReader).catch((err: unknown) => {
@@ -487,12 +479,14 @@ export class WebTransportMedia implements MediaTransport {
     if (this.closed) return abandon(refused("closed"));
     // Accepted, but no video can arrive on this connection: never call it connected (#1403).
     if (datagramReader.death) {
-      // The session's own close outranks the reader's death even here: a takeover (4410) or a
-      // session end (4404) that resolved in the same instant as the `hello_ack` is that
-      // refusal, not `internal` (#1478).
-      const code = settled.close?.closeCode ?? null;
+      // The browser can deliver a terminal close after the ack and the datagram read error
+      // (#1478). This branch owns teardown while it waits for that close code.
+      live.on = false;
+      const info = await waitForClose();
+      if (this.closed) return abandon(refused("closed"));
+      const code = info?.closeCode ?? null;
       if (code !== null && code !== 0 && CLOSE_REFUSALS[code]) {
-        return abandon(refused(CLOSE_REFUSALS[code], closeDetail(code, settled.close?.reason)));
+        return abandon(refused(CLOSE_REFUSALS[code], closeDetail(code, info?.reason)));
       }
       return abandon(refused("internal", datagramReader.death), { closeCode: 4400, reason: datagramReader.death.slice(0, 100) });
     }
@@ -532,7 +526,9 @@ export class WebTransportMedia implements MediaTransport {
             const rtt = Math.max(0, this.now() - m.tc);
             // A longer sample at most doubles the estimate and a shorter one is averaged in at 1/8,
             // as the assembler's round trip is: a spike from one ping does not shrink the window.
-            pathRttMs = pathRttMs === null ? rtt : rtt > pathRttMs ? Math.min(rtt, 2 * pathRttMs) : (7 * pathRttMs + rtt) / 8;
+            // Floored at 1 ms so a 0 ms first pong cannot trap 2 * pathRttMs at 0 on later growth.
+            const sample = Math.max(1, rtt);
+            pathRttMs = pathRttMs === null ? sample : sample > pathRttMs ? Math.min(sample, 2 * pathRttMs) : (7 * pathRttMs + sample) / 8;
             sink.rtt?.(rtt, typeof m.tw === "number" ? m.tw : undefined);
           }
           else if (m.type === "ping") {
@@ -619,15 +615,21 @@ export class WebTransportMedia implements MediaTransport {
     }
   }
 
-  private makeRouter(sink: MediaSink, live: { on: boolean }, feedback: FeedbackRecorder, headroomMs: () => number): Router {
-    const assembler = new FrameAssembler(this.now, (now) => feedback.reorderMs(now));
+  private makeRouter(
+    sink: MediaSink,
+    live: { on: boolean },
+    feedback: FeedbackRecorder,
+    retransmitWindowMs: () => number,
+    pathRttMs: () => number | null,
+  ): Router {
+    const assembler = new FrameAssembler(this.now, (now) => feedback.reorderMs(now), pathRttMs);
     const configs = new Map<number, VideoConfig>();
     let latest: number | null = null;
     // A held first NACK reaches the agent one frame interval (until a later datagram shows the gap),
     // the hold and a round trip after the fragment was sent: all inside the retransmit window.
     feedback.capMs = () => {
       const fps = (latest !== null && configs.get(latest)?.fps) || 60;
-      return Math.min(MAX_REORDER_MS, headroomMs() - 1000 / fps);
+      return Math.min(MAX_REORDER_MS, retransmitWindowMs() - (pathRttMs() ?? Infinity) - 1000 / fps);
     };
     let pyro: PyroWaveReceiver | null = null;
     /** What the PyroWave receivers already replaced counted lost. */

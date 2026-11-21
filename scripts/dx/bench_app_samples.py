@@ -32,11 +32,16 @@ Idempotent: rows this script appends are tagged and stripped on a re-run.
 
 import argparse
 import json
+import math
 import os
 import sys
 
 # Marks a row/event as ours so a second run replaces rather than duplicates.
 STAMP_KEY = "_bench_app_samples"
+
+
+def _num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
 def _p(values, q):
@@ -236,7 +241,7 @@ def window_ts(w, prev_ts, fallback_ms):
     candidates = []
     for key in ("last_host_time_ms", "t_end_host_ms", "t_end_ms"):
         v = w.get(key)
-        if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+        if _num(v) and v > 0:
             candidates.append((int(v), key))
     for v, key in candidates:
         if prev_ts is None or v > prev_ts:
@@ -261,6 +266,11 @@ LEGACY_KEYS = {
     "dropped": "missing_indices",   # never meant "pipeline loss" — see aggregate.ts
     "crc_fail": "undecoded",        # also counted "no marker present at all"
 }
+
+# Index-delta counts are only measured from decoded marker frame indices
+# (web/src/bench/aggregate.ts); a window that decoded no marker has no
+# measurement, never zero. Kept in lockstep with scripts/validate/stream/benchfold.mjs.
+MARKER_COUNT_KEYS = frozenset(("missing_indices", "duplicated", "reordered"))
 
 
 def normalise_window(w):
@@ -291,13 +301,17 @@ def bench_rows(windows, fallback_t0_ms, window_ms=1000):
         sources[src] = sources.get(src, 0) + 1
         if nudged:
             nudged_count += 1
+        decoded = w.get("decoded")
+        has_marker = _num(decoded) and decoded > 0
         m = {}
         for key in ("n", "decoded", "undecoded", "no_image",
                     "missing_indices", "duplicated", "reordered",
                     "g2g_p50_ms", "g2g_p95_ms", "g2g_max_ms", "render_w", "render_h",
                     "offset_ms", "i2p_missed"):
+            if key in MARKER_COUNT_KEYS and not has_marker:
+                continue
             v = w.get(key)
-            if isinstance(v, (int, float)) and not isinstance(v, bool):
+            if _num(v):
                 # `n`/`decoded` are too generic to share a namespace with the
                 # SPA's own browser stats keys; everything else is unambiguous.
                 name = ("bench_" + key) if key in ("n", "decoded") else key
@@ -313,9 +327,10 @@ def bench_rows(windows, fallback_t0_ms, window_ms=1000):
         for key, v in w.items():
             if not (isinstance(key, str) and key.startswith("stage_")):
                 continue
-            if isinstance(v, (int, float)) and not isinstance(v, bool):
+            if _num(v):
                 m[key] = v
-        i2p = [x for x in (w.get("i2p_ms") or []) if isinstance(x, (int, float))]
+        raw_i2p = w.get("i2p_ms")
+        i2p = [x for x in (raw_i2p if isinstance(raw_i2p, list) else []) if _num(x)]
         if i2p:
             m["i2p_p50_ms"] = _p(i2p, 0.5)
             m["i2p_max_ms"] = max(i2p)

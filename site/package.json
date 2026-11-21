@@ -11,14 +11,14 @@
     "test": "node --test \"src/data/*.test.js\""
   },
   "dependencies": {
-    "@astrojs/starlight": "^0.42.10",
+    "@astrojs/starlight": "^0.43.1",
     "@fontsource/ibm-plex-mono": "^5.3.0",
     "@fontsource/ibm-plex-sans": "^5.3.0",
     "@fontsource/michroma": "^5.3.0",
-    "astro": "^7.4.2",
+    "astro": "^7.4.12",
     "js-yaml": "5.5.0",
     "sharp": "^0.35.5",
-    "starlight-openapi": "^0.26.3"
+    "starlight-openapi": "^0.27.1"
   },
   "overrides": {
     "form-data": "4.0.6"

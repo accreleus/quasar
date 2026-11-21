@@ -322,7 +322,10 @@ describe("HostDetail — remove host (#366)", () => {
     renderDetail();
     fireEvent.click(await screen.findByRole("button", { name: /Remove host/ }));
     fireEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: /Remove host/ }));
-    fireEvent.click(await screen.findByRole("button", { name: "Cancel removal" }));
+    const cancel = await screen.findByRole("button", { name: "Cancel removal" });
+    await waitFor(() => expect(cancel).toBeEnabled());
+    expect(mocked.drainHost).toHaveBeenCalledWith("tok", ID);
+    fireEvent.click(cancel);
     await waitFor(() => expect(mocked.uncordonHost).toHaveBeenCalledWith("tok", ID));
     await waitFor(() => expect(screen.queryByText("Removing gpu-host-4.")).toBeNull());
   });
