@@ -98,15 +98,3 @@ export async function serveWebDist(context, baseUrl, dist) {
     return route.fulfill({ status: d.status, headers, body: d.body ?? d.why });
   });
 }
-
-/**
- * The web build a page reported through bench mode (`window.__qBench.build()`, web/src/bench/webBuild.ts), in the only
- * shape builds.json holds it: a commit (7-40 hex) and an ISO build time, nothing else. `null` for anything else,
- * including the `"unknown"` a build made with no commit or time reports; the page's own text is never copied.
- */
-export function reportedWebBuild(v) {
-  if (v === null || typeof v !== "object" || Array.isArray(v)) return null;
-  const ms = typeof v.built_at === "string" ? Date.parse(v.built_at) : NaN;
-  if (typeof v.commit !== "string" || !/^[0-9a-f]{7,40}$/i.test(v.commit) || Number.isNaN(ms)) return null;
-  return { commit: v.commit.toLowerCase(), built_at: new Date(ms).toISOString() };
-}

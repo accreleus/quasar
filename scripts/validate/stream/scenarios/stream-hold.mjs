@@ -313,7 +313,6 @@ export default {
       await shot("end");
       const windows = Array.isArray(dump?.windows) ? dump.windows : [];
       const stats = await page.evaluate(() => window.__qBench?.stats() ?? null);
-      const webBuild = await page.evaluate(() => window.__qBench?.build?.() ?? null); // the web client's own identity; the runner shape-checks it
       rec.json("bench-windows.json", { windows });
       rec.json("bench-frames.json", { frames });
       rec.jsonl("metrics.jsonl", [...benchRows(windows, 0), ...dedupStatsRows(postedStats, sid)]);
@@ -326,7 +325,6 @@ export default {
       result = {
         criteria: judge({ params, session: row, windows, frames, firstFrameS, stats, hidden, videoSamples, malformedFrames, thresholds: ctx.thresholds }),
         clock_offset_ms: known ? known.offset_ms : null,
-        web_build: webBuild,
       };
       // A session that is already over before this run's own stop was not held: whatever the criteria say.
       if (TERMINAL.includes(row.state)) result = { ...result, status: "error", reason: `the session ended during the hold (it was ${row.state} before this run stopped it)` };

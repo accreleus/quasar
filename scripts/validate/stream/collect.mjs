@@ -24,7 +24,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { SECRETS, SOURCES, isCredentialName, manifestKeys, validateBundle } from "./bundle.mjs";
+import { SECRETS, SOURCES, isCredentialName, isEncoder, manifestKeys, validateBundle } from "./bundle.mjs";
 
 export const EXIT = { ok: 0, invalid: 1, error: 2, incomplete: 3 };
 
@@ -375,11 +375,11 @@ function identity(o, versionKey, note) {
  * the agent built). null when the session has no such event or none of the four fits.
  */
 function negotiatedEncoder(reads, note) {
-  const ev = reads
-    .flatMap((r) => [...r.events, ...r.diag.events])
-    .filter((e) => e.type === "caps.negotiated" && isObj(e.payload))
-    .sort((a, b) => a.ts_unix_ms - b.ts_unix_ms)
-    .at(-1);
+  // The store answers newest first and breaks a timestamp tie by creation time, so within one millisecond the first row is the later one.
+  let ev = null;
+  for (const e of reads.flatMap((r) => [...r.events, ...r.diag.events])) {
+    if (e.type === "caps.negotiated" && isObj(e.payload) && (ev === null || e.ts_unix_ms > ev.ts_unix_ms)) ev = e;
+  }
   if (!ev) return null;
   const out = {};
   for (const [to, from, ok] of [["factory", "encoder_factory", (v) => fits(IDENT, v)], ["codec", "codec", (v) => [...STREAM_CODECS, "pyrowave"].includes(v)], ["profile", "profile", (v) => fits(SETTING, v)], ["level", "level", (v) => fits(SETTING, v)]]) {
@@ -688,7 +688,7 @@ function intact(item) {
     const agent = item.prior.node_agent;
     need(agent === null || (isObj(agent) && Object.values(agent).every((v) => typeof v === "string")), "node_agent");
     const encoder = item.prior.encoder; // absent in a host half an older collector wrote: read as "none"
-    need(encoder === undefined || encoder === null || (isObj(encoder) && Object.values(encoder).every((v) => typeof v === "string")), "encoder");
+    need(encoder === undefined || encoder === null || isEncoder(encoder), "encoder");
     item.ids.forEach((id, i) => {
       const out = item.outs[i].out;
       const session = readJson(path.join(out, "session.json"));

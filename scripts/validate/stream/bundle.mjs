@@ -134,6 +134,28 @@ export function manifestEstimators(file = path.join(ROOT, "docs/session-trace/me
   return out;
 }
 
+const COMMIT = /^[0-9a-f]{7,40}$/i;
+// A complete time with a zone: a date alone would invent a time of day.
+const ZONED = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+
+/**
+ * The web build a page reported (`window.__qBench.build()`), in the one shape builds.json holds it, or null.
+ * `v` is a plain object whose `commit` is a hex string and `built_at` a complete timestamp with a zone; any
+ * other member is ignored and never copied. The runner writes this form, and the validator accepts only it.
+ */
+export function parseWebBuild(v) {
+  if (v === null || typeof v !== "object" || Array.isArray(v)) return null;
+  if (typeof v.commit !== "string" || !COMMIT.test(v.commit) || typeof v.built_at !== "string" || !ZONED.test(v.built_at)) return null;
+  const ms = Date.parse(v.built_at);
+  return Number.isNaN(ms) ? null : { commit: v.commit.toLowerCase(), built_at: new Date(ms).toISOString() };
+}
+
+const ENCODER_MEMBERS = ["factory", "codec", "profile", "level"];
+/** Is `v` an encoder record as e2e-collect writes it: some of factory, codec, profile and level, each a plain name, and no other member? */
+export const isEncoder = (v) =>
+  v !== null && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length > 0 &&
+  Object.entries(v).every(([k, x]) => ENCODER_MEMBERS.includes(k) && typeof x === "string" && /^[A-Za-z0-9_.:+-]{1,64}$/.test(x));
+
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 
 /** Every way `dir` is not a valid bundle. An empty list means valid. It never throws. */
@@ -239,15 +261,16 @@ function check(dir, errors, { keys = manifestKeys() } = {}) {
     } else if (served !== undefined) {
       err("manifest.json", "web_build is set and builds.json has no web-dist web build");
     }
-    // A web build the page reported through bench mode (#1281): its commit and build time, nothing else.
-    if (isObj(web) && web.source !== "web-dist" && (Object.keys(web).sort().join() !== "built_at,commit" || !/^[0-9a-f]{7,40}$/.test(web.commit) || Number.isNaN(Date.parse(web.built_at)))) {
-      err("builds.json", "web must be exactly commit (7-40 lowercase hex) and built_at (an ISO time), or the web-dist digest");
+    // A web build the page reported through bench mode (#1281): its commit and build time, nothing else, in the form the runner writes.
+    if (web !== undefined && web !== null && !(isObj(web) && web.source === "web-dist")) {
+      const parsed = parseWebBuild(web);
+      if (!parsed || Object.keys(web).sort().join() !== "built_at,commit" || parsed.commit !== web.commit || parsed.built_at !== web.built_at) {
+        err("builds.json", "web must be exactly commit (7-40 lowercase hex) and built_at (an ISO UTC time like 2026-11-21T01:02:03.000Z), or the web-dist digest");
+      }
     }
-    // The negotiated encoder, as e2e-collect projects it from the caps.negotiated trace event (#1281): closed members, each a plain name.
+    // The negotiated encoder, as e2e-collect projects it from the caps.negotiated trace event (#1281).
     const enc = builds.components?.encoder;
-    if (enc !== undefined && enc !== null && (!isObj(enc) || Object.keys(enc).length === 0 || Object.entries(enc).some(([k, v]) => !["factory", "codec", "profile", "level"].includes(k) || typeof v !== "string" || !/^[A-Za-z0-9_.:+-]{1,64}$/.test(v)))) {
-      err("builds.json", "encoder must be factory, codec, profile and level, each a plain name");
-    }
+    if (enc !== undefined && enc !== null && !isEncoder(enc)) err("builds.json", "encoder must be factory, codec, profile and level, each a plain name");
   }
   if (network && !("shaping" in network)) err("network.json", "no shaping (null when none was applied)");
 

@@ -1207,7 +1207,7 @@ test("B8: builds.json says which builds e2e-collect fills and which it does not 
   for (const k of ["control_plane", "node_agent"]) assert.match(u[k], /e2e-collect\) fills this/);
   assert.match(u.encoder, /e2e-collect\) fills this from the session's caps.negotiated/);
   assert.match(u.web, /no page reported a web build/);
-  for (const k of ["gpu_driver", "reference_app"]) assert.match(u[k], /no API of the stack reports|nothing collects it/);
+  for (const k of ["gpu_driver", "reference_app"]) assert.match(u[k], /no source tied to the session|nothing collects it/);
 });
 
 const WEB = { commit: "0123456789abcdef0123456789abcdef01234567", built_at: "2026-11-21T01:02:03.000Z" };
@@ -1239,6 +1239,25 @@ test("#1281: two scenarios that saw different web builds name neither", async ()
   const builds = JSON.parse(read(dir, "builds.json"));
   assert.equal(builds.components.web, null);
   assert.match(builds.unknown.web, /different web builds/);
+});
+
+test("#1281: every scenario kind hands its page's web build back, and a scenario with none does not disagree with those that have one", async () => {
+  const input = await runReal(world({ wins: echoWindows([40, 50, 60]), webBuild: WEB }), INPUT());
+  assert.deepEqual(JSON.parse(read(input.dir, "builds.json")).components.web, WEB, "input-kbm");
+  const fb = fallbackWorld({ webBuild: WEB });
+  const fallback = await runReal(fb.w, FALLBACK("mid"), { hooksDir: fb.hooksDir });
+  assert.deepEqual(JSON.parse(read(fallback.dir, "builds.json")).components.web, WEB, "transport-fallback");
+  // One scenario's page reports and the other's does not (an older web build): the suite names the one that did.
+  let n = 0;
+  const mixed = await run(world({ webBuild: () => (++n === 1 ? WEB : null) }), PLAN({}, {}));
+  assert.deepEqual(JSON.parse(read(mixed.dir, "builds.json")).components.web, WEB);
+});
+
+test("#1281: a report with a date and no time, a numeric commit, or a time with no zone is not a web build", async () => {
+  for (const bad of [{ commit: WEB.commit, built_at: "2026-11-21" }, { commit: 1234567, built_at: WEB.built_at }, { commit: WEB.commit, built_at: "2026-11-21T01:02:03" }, { commit: WEB.commit, built_at: 1763686923000 }]) {
+    const { dir } = await run(world({ webBuild: bad }));
+    assert.equal(JSON.parse(read(dir, "builds.json")).components.web, null, JSON.stringify(bad));
+  }
 });
 
 test("#1281: a WEB_DIST run keeps naming its served build by digest, whatever the page reports", async () => {

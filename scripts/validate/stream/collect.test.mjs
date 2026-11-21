@@ -177,7 +177,7 @@ function fake(w = world()) {
     if (m && (m[2] === "diagnostic-bundle" || m[2] === "trace/events")) {
       const [from, to] = resolveWindow(q, w.now);
       const inWin = (ts) => ts >= from && ts <= to;
-      const events = [...live(w.events), ...w.captures].filter((e) => inWin(e.ts_unix_ms)).sort((a, b) => a.ts_unix_ms - b.ts_unix_ms).slice(-SAMPLE_CAP);
+      const events = [...live(w.events), ...w.captures].filter((e) => inWin(e.ts_unix_ms)).sort((a, b) => b.ts_unix_ms - a.ts_unix_ms).slice(0, SAMPLE_CAP); // telemetry.Events: newest first, a tie in the order the test lists it
       if (m[2] === "trace/events") return [200, { window: { from_ms: from, to_ms: to }, events }]; // projectionEvents: raw
       // handleDiagnosticBundle: Window() reads the newest 1000 raw samples of the window across ALL
       // sources (samplesInWindow), then assess() turns them into series keyed by taxonomy name, with
@@ -348,6 +348,26 @@ test("#1281 --resume keeps a collected scenario's recorded encoder, and reads a 
   assert.equal(readJson(dir, "builds.json").components.encoder, null);
   assert.match(readJson(dir, "builds.json").unknown.encoder, /no caps.negotiated/);
   assert.deepEqual(validateBundle(dir), []);
+});
+
+test("#1281 two negotiations in the same millisecond: the store lists the later one first, and that one is the encoder", async () => {
+  const dir = clientBundle();
+  await run(dir, world({ events: [CAPS(1786940050000, { profile: "high" }), CAPS(1786940050000, { profile: "main" }), CAPS(1786940040000, { profile: "baseline" })] }));
+  assert.equal(readJson(dir, "builds.json").components.encoder.profile, "high");
+});
+
+test("#1281 --resume does not count a host half whose saved encoder has the wrong shape: the session is read again and builds.json is never written with the bad one", async () => {
+  for (const bad of [{}, { factory: "a b" }, { caps: "x" }, "vulkanh264enc", []]) {
+    const dir = clientBundle();
+    await run(dir, world({ events: [CAPS(1786940050000)] }));
+    edit(dir, "manifest.json", (m) => ({ ...m, halves: { client: true, host: false } }));
+    edit(dir, `${SC}/host-half.json`, (h) => ({ ...h, encoder: bad }));
+    const r = await run(dir, world({ events: [CAPS(1786940050000)] }), { resume: true });
+    assert.ok(r.f.calls.some((u) => u.includes(SID)), `read again for ${JSON.stringify(bad)}`);
+    assert.equal(readJson(dir, "builds.json").components.encoder.factory, "vulkanh264enc");
+    assert.deepEqual(readJson(dir, `${SC}/host-half.json`).encoder, { factory: "vulkanh264enc", codec: "h264", profile: "main", level: "4.2" });
+    assert.deepEqual(validateBundle(dir), []);
+  }
 });
 
 test("S1 metrics.jsonl is built from the raw samples: every key, strings too, original timestamps", async () => {

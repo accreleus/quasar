@@ -22,11 +22,11 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "../lib/args.mjs";
 import { attachEvidenceListeners } from "../lib/listeners.mjs";
-import { FORMAT, validateBundle } from "./bundle.mjs";
+import { FORMAT, parseWebBuild, validateBundle } from "./bundle.mjs";
 import { declaredHooks, Hooks, LEDGER } from "./hooks.mjs";
 import { Recorder, ScenarioRecorder } from "./record.mjs";
 import { errorReason } from "./scenarios/stream-common.mjs";
-import { loadWebDist, reportedWebBuild, serveWebDist, webBuild } from "./webdist.mjs";
+import { loadWebDist, serveWebDist, webBuild } from "./webdist.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "../../..");
@@ -391,6 +391,12 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
           // A page-derived message is not written while the page's bearer is unknown (the scenario catches its own errors; this is what escapes it).
           out = { status: "error", reason: page && rec.holding ? "the scenario did not complete (the page's own words are not written before its sign-in is read)" : errorReason(err), criteria: [], sessions: [], clock_offset_ms: null };
         } finally {
+          // Every scenario's page is asked for its web build before it closes; one that has no bench mode, or no page to ask, says nothing.
+          if (page) {
+            const asked = await Promise.race([page.evaluate(() => window.__qBench?.build?.() ?? null).catch(() => null), new Promise((r) => setTimeout(() => r(null), 5000).unref())]);
+            const reported = parseWebBuild(asked);
+            if (reported) reportedWeb.add(JSON.stringify(reported));
+          }
           // Order matters: close the page, wait for every response it was still delivering, then stop what the run owns.
           // The close error's words are the browser's about a page: held back like the page's own until its bearer is known.
           if (page) await host.closePage(page).catch((err) => { left = `a page it opened would not close${rec.holding ? "" : ` (${errorReason(err)})`}`; });
@@ -408,8 +414,6 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
           out = { ...out, status: "error", reason: `${out.reason ? `${out.reason}; ` : ""}left behind: ${cleanup.join("; ")}` };
         }
       }
-      const reported = reportedWebBuild(out.web_build);
-      if (reported) reportedWeb.add(JSON.stringify(reported));
       counts[["pass", "fail", "skipped"].includes(out.status) ? out.status : "error"] += 1;
       const reason = typeof out.reason === "string" && out.reason.trim() ? out.reason : out.status === "error" ? "error with no message" : null;
       rec.json("scenario.json", { id: e.id, scenario: String(e.scenario), params: e.params, status: out.status, ...(reason ? { reason } : {}), sessions: out.sessions ?? [], clock_offset_ms: out.clock_offset_ms ?? null, criteria: out.criteria ?? [] });
@@ -425,8 +429,8 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
       control_plane: HOST_HALF,
       node_agent: HOST_HALF,
       encoder: "the host half (e2e-collect) fills this from the session's caps.negotiated trace event; the client cannot see it",
-      reference_app: "the reference app's own log is on the host and nothing collects it; no API of the stack reports the app's version (issue #1281)",
-      gpu_driver: "no API of the stack reports the GPU driver version (issue #1281)",
+      reference_app: "the app's own log stays on the host and nothing collects it (the session's app log tail is kept for failures only); no API of the stack reports the app's version (issue #1281)",
+      gpu_driver: "no source tied to the session reports the GPU driver: the host policy approval preview can name a candidate GPU's driver_identity, which is not the one the session ran on (issue #1281)",
     };
     bundle.json("builds.json", {
       components: { browser: client.browser, os: client.os, web, control_plane: null, node_agent: null, encoder: null, reference_app: null, gpu_driver: null },
