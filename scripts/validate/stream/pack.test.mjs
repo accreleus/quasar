@@ -484,19 +484,16 @@ test("default pack archives written to the repo root are git-ignored (#1280)", (
   }
 });
 
-test("Windows launcher run.cmd quotes forwarded arguments without unquoted %*, and README clarifies .\\run.cmd and doctor (#1280)", () => {
+test("Windows launcher run.cmd forwards the tester's own quoting (%*), and README clarifies .\\run.cmd, quoting and doctor (#1280)", () => {
   const cmd = fs.readFileSync(path.join(HERE, "pack/run.cmd"), "utf8");
-  assert.doesNotMatch(cmd, /%\*/, "run.cmd must not use unquoted %* (splits & in URLs)");
-  assert.match(cmd, /pack-run\.mjs "%~1" "%~2" "%~3" "%~4"/, "run.cmd must quote every forwarded positional arg up to at least 4");
-  for (const line of cmd.split(/\r?\n/)) {
-    if (/node scripts\\validate\\stream\\pack-run\.mjs/.test(line)) {
-      assert.doesNotMatch(line, /(?<!")%~[1-9]|%~[1-9](?!")/, `unquoted arg in: ${line}`);
-    }
-  }
+  // "%~1".."%~6" splits an unquoted arg at = , ; and drops arguments past the sixth; %* re-emits the text as typed, quotes included.
+  assert.match(cmd, /pack-run\.mjs %\*/, "run.cmd forwards %* as typed");
+  assert.doesNotMatch(cmd, /%~[1-9]/, "run.cmd must not rebuild the arguments one by one");
   assert.doesNotMatch(cmd, /\([^)]*%ERRORLEVEL%[^)]*\)/s, "run.cmd must not expand %ERRORLEVEL% inside a parenthesized block");
 
   const readme = fs.readFileSync(path.join(HERE, "pack/README.txt"), "utf8");
   assert.doesNotMatch(readme, /(?<!\.\\)\brun\.cmd\b/, "README.txt must write .\\run.cmd for PowerShell");
+  assert.match(readme, /\.\\run\.cmd https:\/\/the-stack-address\s+\(an address with & or = in it goes in double quotes\)/, "README says to quote an address that holds & or =");
   assert.match(readme, /3\.[^\n]*full test[^\n]*\.zip[\s\S]*doctor[^\n]*no \.zip/i, "README step 3 must clarify that doctor writes no .zip");
 });
 
