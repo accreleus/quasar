@@ -212,7 +212,7 @@ impl<'a> Control<'a> {
             .estimator
             .on_feedback(&fb, &mut self.log, now, path);
         // Before the estimate is fed: the encoder's share follows the level this loss sets.
-        if let (Some(fec), Some(loss)) = (self.fec.as_mut(), self.estimator.fec_loss()) {
+        if let (Some(fec), Some(loss)) = (self.fec.as_mut(), self.estimator.loss()) {
             let was = fec.overhead();
             fec.observe(loss, now);
             if fec.overhead() != was {

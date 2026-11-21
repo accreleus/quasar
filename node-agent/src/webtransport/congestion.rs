@@ -595,11 +595,6 @@ pub(crate) struct Estimator {
     /// The `pkt_seq` after the newest any report has covered.
     reported_to: Option<u32>,
     evidence: Evidence,
-    /// Every loss outside a blackout is read as congestion, as GCC reads it: PyroWave's
-    /// estimate (codec-pyrowave.md §Rate), which no ABR reads.
-    gcc_loss: bool,
-    /// The FEC loss: loss that does not follow the send rate (`Self::fec_loss`).
-    scattered: Option<f64>,
     /// The bound the log last named, and when.
     logged: (Bound, Option<Instant>),
     /// The estimate before a silence decay not logged yet; delay and loss cuts always log.
@@ -659,8 +654,6 @@ impl Estimator {
             outage: None,
             reported_to: None,
             evidence: Evidence::default(),
-            gcc_loss: false,
-            scattered: None,
             logged: (Bound::Ceiling, None),
             unlogged: None,
             measured: None,
@@ -687,12 +680,12 @@ impl Estimator {
         self.settle();
     }
 
-    /// The loss FEC sizes its repairs by: the last window's loss fraction when it is scattered,
-    /// `None` on too few datagrams or when it follows the send rate (repairs on a capped link
-    /// add to the excess it drops). Blackouts are never in it: XOR cannot rebuild one. Lost
-    /// repair datagrams count: they crossed the same path.
-    pub(crate) fn fec_loss(&self) -> Option<f64> {
-        self.scattered
+    /// The loss fraction the last message's window measured, blackouts and an outage's own
+    /// losses left out; `None` on too few datagrams. The estimate's loss bound and FEC both read
+    /// it (XOR cannot rebuild a blackout). Lost repair datagrams count: they crossed the same
+    /// path.
+    pub(crate) fn loss(&self) -> Option<f64> {
+        self.loss
     }
 
     /// The ABR's only down path (#1376): what the last message showed the link carrying, when
@@ -722,9 +715,7 @@ impl Estimator {
 
     /// Act on what one message measured.
     fn apply(&mut self, m: Measured, now: Instant, path: QuicPath) -> Option<f64> {
-        let follows = self.gcc_loss;
-        self.loss = m.loss.filter(|_| follows);
-        self.scattered = m.loss.filter(|_| !follows);
+        self.loss = m.loss;
         let dt = now
             .saturating_duration_since(self.last_update)
             .as_secs_f64()
@@ -1296,10 +1287,7 @@ pub(crate) struct PyroRate {
 impl PyroRate {
     pub(crate) fn new(target_kbps: u32, floor_kbps: u32, now: Instant) -> Self {
         Self {
-            estimator: Estimator {
-                gcc_loss: true,
-                ..Estimator::new(f64::from(target_kbps), now)
-            },
+            estimator: Estimator::new(f64::from(target_kbps), now),
             log: SendLog::new(now),
             target_kbps: f64::from(target_kbps),
             floor_kbps: f64::from(floor_kbps),

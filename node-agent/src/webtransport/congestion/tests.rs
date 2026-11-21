@@ -647,26 +647,9 @@ fn growth_never_passes_one_and_a_half_times_the_receive_rate() {
     );
 }
 
-/// #1433: loss blind to the send rate (random loss, and Chrome's late datagrams it gave up on,
-/// #1446) cuts nothing and is no reading for the ABR; FEC reads it. GCC's rule, kept for loss
-/// that follows the rate and for PyroWave, scales by (1 − loss/2). Old code: 20 % random loss
-/// cut 8000 → 7200 in 0.3 s and kept cutting.
 #[test]
-fn scattered_loss_cuts_nothing_and_goes_to_fec() {
+fn heavy_loss_scales_the_estimate_by_one_minus_half_the_loss() {
     let mut s = Sim::new(50_000.0);
-    s.send_kbps = Some(6000.0);
-    s.drop_every = 5;
-    s.run(5.0);
-    assert_eq!(s.min_after(0.0), CEILING, "scattered loss cut the estimate");
-    assert_eq!(s.est.measured(), None, "scattered loss is no reading");
-    let loss = s.est.fec_loss();
-    assert!(
-        loss.is_some_and(|l| (0.15..0.25).contains(&l)),
-        "FEC reads it: {loss:?}"
-    );
-
-    let mut s = Sim::new(50_000.0);
-    s.est.gcc_loss = true;
     s.send_kbps = Some(6000.0);
     s.drop_every = 5;
     // One decision: the next waits 300 ms + RTT for losses it has not counted yet.
@@ -676,6 +659,8 @@ fn scattered_loss_cuts_nothing_and_goes_to_fec() {
         (7000.0..7400.0).contains(&e),
         "20 % loss: 8000 × 0.9, got {e:.0}"
     );
+    let loss = s.est.loss();
+    assert!(loss.is_some_and(|l| l > 0.15), "FEC reads it: {loss:?}");
 }
 
 #[test]
@@ -860,9 +845,9 @@ fn video_held_into_an_outage_is_the_outages_loss_not_congestion() {
     );
 }
 
-/// The last window's loss fraction, scattered or following the rate.
+/// The last window's loss fraction.
 fn window_loss(est: &Estimator) -> Option<f64> {
-    est.loss.or(est.scattered)
+    est.loss
 }
 
 /// What the ABR reads from the last message, kbit/s.
@@ -1089,14 +1074,17 @@ fn a_congestion_burst_right_after_recovery_still_cuts() {
     s.outage(10.0);
     assert!(s.est.recover_to.is_some(), "the outage left no memory");
     // The link is back, but the first frames after it lose a burst: the report shows a
-    // received packet behind the gap, so the mark ends before those losses. Scattered, they
-    // cut nothing (#1433), but they are counted: FEC reads them.
+    // received packet behind the gap, so the mark ends before those losses.
     s.drop_every = 4;
-    s.run(0.05);
-    let loss = s.est.fec_loss();
+    let lines = logged(|| s.run(0.05));
+    let labels: Vec<String> = cuts(&lines).into_iter().map(|c| c.0).collect();
     assert!(
-        loss.is_some_and(|l| l > 0.2),
-        "the burst right after recovery was exempted: {loss:?}"
+        labels.iter().any(|l| l.contains("loss")),
+        "the burst right after recovery was exempted: {labels:?}"
+    );
+    assert!(
+        s.est.recover_to.is_none(),
+        "the pre-outage rate outlived the loss cut: {labels:?}"
     );
 }
 
@@ -1156,7 +1144,7 @@ fn a_late_exempted_outage_loss_does_not_undo_a_counted_loss() {
         start + Duration::from_millis(1_050),
         NO_QUIC,
     );
-    let loss = est.fec_loss();
+    let loss = est.loss();
     assert!(
         loss.is_some_and(|l| (l - 1.0 / 22.0).abs() < 1e-12),
         "the exempted packet's late arrival subtracted a loss never counted: {loss:?}"
@@ -1645,18 +1633,15 @@ fn a_link_that_reorders_keeps_the_estimate_at_the_link_rate() {
     );
 }
 
-/// #1446, #1433 (row G2): reorder and random loss together are blind to the send rate, so
-/// they cut nothing and give the ABR no reading; FEC reads the loss. Old code: one in seven
-/// lost took the estimate under half the ceiling, and the picture to 360p.
+/// #1446 (row G2, design §5): Chrome's reorder discards are loss to the agent, and v2 reads
+/// them as 0.6.3 does: the estimate steps down.
 #[test]
-fn a_link_that_reorders_and_loses_at_random_cuts_nothing() {
+fn a_link_that_reorders_and_loses_still_cuts_on_the_loss() {
+    // Over LOSS_HIGH: 5 % sits in the band that holds the estimate (libwebrtc's rule).
     let mut s = reordering(7);
     s.run(30.0);
     let mean = s.mean_after(10.0);
-    assert!(mean > 0.95 * CEILING, "mean {mean:.0}");
-    assert_eq!(s.est.measured(), None);
-    let loss = s.est.fec_loss();
-    assert!(loss.is_some_and(|l| l > 0.1), "FEC reads it: {loss:?}");
+    assert!(mean < 0.5 * CEILING, "mean {mean:.0}");
 }
 
 fn window(governor: &Governor, now: Instant) -> Box<Window> {
@@ -3615,7 +3600,7 @@ fn a_short_blackout_is_no_loss_no_cut_and_no_reading() {
         est.apply(m, start + Duration::from_millis(1100), NO_QUIC);
         assert_eq!(est.estimate_kbps(), CEILING, "{ms} ms");
         assert_eq!(est.measured(), None, "{ms} ms");
-        assert_eq!(est.fec_loss(), Some(0.0), "{ms} ms: FEC reads no loss");
+        assert_eq!(est.loss(), Some(0.0), "{ms} ms: FEC reads no loss");
     }
     // Behind a queue: the arrival before the run waited 50 ms.
     let start = Instant::now();
