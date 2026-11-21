@@ -369,6 +369,34 @@ function identity(o, versionKey, note) {
   return Object.keys(out).length ? out : null;
 }
 
+/**
+ * The encoder a session negotiated (#1281): the latest `caps.negotiated` trace event the agent sent, projected to its
+ * factory, codec, profile and level, each only in its own shape. The caps strings are not copied (they are free text
+ * the agent built). null when the session has no such event or none of the four fits.
+ */
+function negotiatedEncoder(reads, note) {
+  const ev = reads
+    .flatMap((r) => [...r.events, ...r.diag.events])
+    .filter((e) => e.type === "caps.negotiated" && isObj(e.payload))
+    .sort((a, b) => a.ts_unix_ms - b.ts_unix_ms)
+    .at(-1);
+  if (!ev) return null;
+  const out = {};
+  for (const [to, from, ok] of [["factory", "encoder_factory", (v) => fits(IDENT, v)], ["codec", "codec", (v) => [...STREAM_CODECS, "pyrowave"].includes(v)], ["profile", "profile", (v) => fits(SETTING, v)], ["level", "level", (v) => fits(SETTING, v)]]) {
+    const v = ev.payload[from];
+    if (v == null) continue;
+    if (ok(v)) out[to] = v;
+    else note("identity");
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+/** The one value every session shares, or null when they differ or none has one. */
+const distinctOrNull = (values) => {
+  const set = new Set(values.map((v) => JSON.stringify(v ?? null)));
+  return set.size === 1 ? JSON.parse([...set][0]) : null;
+};
+
 const usage = (message, code = "usage") => Object.assign(new Error(message), { code });
 
 /** The stack's origin: http(s), no userinfo, query, fragment or path. Requests are `new URL(route, origin)`. */
@@ -562,7 +590,7 @@ async function fetchSession(get, id, now, note) {
   const host = (await ok(`/v1/hosts/${hid}`)).host;
   need(isObj(host), "the host row is not an object");
 
-  return { id, row: s, never, from, to, reads, samples, effective: settings.effective, agent: identity(host, "agent_version", note) };
+  return { id, row: s, never, from, to, reads, samples, effective: settings.effective, agent: identity(host, "agent_version", note), encoder: negotiatedEncoder(reads, note) };
 }
 
 // A name from an answer goes into a file only if it is a plain identifier and not a credential's
@@ -659,6 +687,8 @@ function intact(item) {
     if (!item.ids.length) return true;
     const agent = item.prior.node_agent;
     need(agent === null || (isObj(agent) && Object.values(agent).every((v) => typeof v === "string")), "node_agent");
+    const encoder = item.prior.encoder; // absent in a host half an older collector wrote: read as "none"
+    need(encoder === undefined || encoder === null || (isObj(encoder) && Object.values(encoder).every((v) => typeof v === "string")), "encoder");
     item.ids.forEach((id, i) => {
       const out = item.outs[i].out;
       const session = readJson(path.join(out, "session.json"));
@@ -763,7 +793,7 @@ export async function collect(dir, { baseUrl, token, fetch: fetchFn = globalThis
   const get = (route) => getJson(origin, token, fetchFn, route);
   const todo = plan.filter((p) => !p.done && p.ids.length);
   const state = new Map(); // scenario -> { collected, agent } once this run is done
-  for (const p of plan) state.set(p.name, p.done && p.ids.length ? { collected: true, agent: p.prior.node_agent } : { collected: !p.ids.length, agent: undefined });
+  for (const p of plan) state.set(p.name, p.done && p.ids.length ? { collected: true, agent: p.prior.node_agent, encoder: p.prior.encoder ?? null } : { collected: !p.ids.length, agent: undefined, encoder: null });
   const incomplete = [];
   const withSessions = plan.some((p) => p.ids.length);
 
@@ -838,6 +868,7 @@ export async function collect(dir, { baseUrl, token, fetch: fetchFn = globalThis
       for (const [file, rows] of metricFiles) write(file, rows);
       const agents = new Set(docs.map((d) => JSON.stringify(d.agent)));
       const agent = agents.size === 1 ? JSON.parse([...agents][0]) : null;
+      const encoder = distinctOrNull(docs.map((d) => d.encoder));
       if (!cpCounted) {
         leftOut.identity += cpLeftOut.identity;
         cpCounted = true;
@@ -846,12 +877,13 @@ export async function collect(dir, { baseUrl, token, fetch: fetchFn = globalThis
         collected: true,
         read_at_ms: readAt,
         node_agent: agent,
+        encoder,
         ...(docs.every((d) => d.never) ? { trace: "the session never started" } : {}),
         ...(leftOut.session || leftOut.conditions || leftOut.identity ? { not_projected: { ...leftOut } } : {}),
         ...dropped.fields(),
       });
       commit();
-      state.set(p.name, { collected: true, agent });
+      state.set(p.name, { collected: true, agent, encoder });
     } catch (e) {
       discard();
       throw e;
@@ -873,6 +905,15 @@ export async function collect(dir, { baseUrl, token, fetch: fetchFn = globalThis
       "node_agent",
       distinct.size === 1 && !distinct.has("null") ? JSON.parse([...distinct][0]) : null,
       agents.length ? "the collected sessions did not share one readable host agent build" : "no session was collected, so no host agent identity was read",
+    );
+  }
+  if (withSessions) {
+    const sessions = [...state.values()].filter((s) => s.collected && s.agent !== undefined);
+    const distinct = new Set(sessions.map((s) => JSON.stringify(s.encoder ?? null)));
+    setBuild(
+      "encoder",
+      distinct.size === 1 && !distinct.has("null") ? JSON.parse([...distinct][0]) : null,
+      sessions.length ? "no caps.negotiated trace event, or the collected sessions did not negotiate one encoder" : "no session was collected, so no negotiated encoder was read",
     );
   }
   manifest.halves = isObj(manifest.halves) ? manifest.halves : {};

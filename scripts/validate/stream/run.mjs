@@ -26,7 +26,7 @@ import { FORMAT, validateBundle } from "./bundle.mjs";
 import { declaredHooks, Hooks, LEDGER } from "./hooks.mjs";
 import { Recorder, ScenarioRecorder } from "./record.mjs";
 import { errorReason } from "./scenarios/stream-common.mjs";
-import { loadWebDist, serveWebDist, webBuild } from "./webdist.mjs";
+import { loadWebDist, reportedWebBuild, serveWebDist, webBuild } from "./webdist.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "../../..");
@@ -336,6 +336,7 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
 
     const counts = { pass: 0, fail: 0, error: 0, skipped: 0 };
     const dirs = [];
+    const reportedWeb = new Set(); // the web builds the scenarios' pages reported through bench mode, as JSON
     let interrupted = false;
     abort.then(() => { interrupted = true; });
     for (const e of entries) {
@@ -407,6 +408,8 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
           out = { ...out, status: "error", reason: `${out.reason ? `${out.reason}; ` : ""}left behind: ${cleanup.join("; ")}` };
         }
       }
+      const reported = reportedWebBuild(out.web_build);
+      if (reported) reportedWeb.add(JSON.stringify(reported));
       counts[["pass", "fail", "skipped"].includes(out.status) ? out.status : "error"] += 1;
       const reason = typeof out.reason === "string" && out.reason.trim() ? out.reason : out.status === "error" ? "error with no message" : null;
       rec.json("scenario.json", { id: e.id, scenario: String(e.scenario), params: e.params, status: out.status, ...(reason ? { reason } : {}), sessions: out.sessions ?? [], clock_offset_ms: out.clock_offset_ms ?? null, criteria: out.criteria ?? [] });
@@ -414,10 +417,20 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
     }
 
     const info = host.info ?? {};
+    // A web build served from WEB_DIST is named by its digest; otherwise by what the page reported, when every scenario agreed.
+    const web = webDist ? webBuild(webDist) : reportedWeb.size === 1 ? JSON.parse([...reportedWeb][0]) : null;
+    const HOST_HALF = "the host half (e2e-collect) fills this; the client cannot see it";
+    const why = {
+      web: reportedWeb.size > 1 ? "the scenarios' pages reported different web builds" : "no page reported a web build: bench mode was off, no scenario got as far as reading it, or the build has no commit or time (an unstamped build)",
+      control_plane: HOST_HALF,
+      node_agent: HOST_HALF,
+      encoder: "the host half (e2e-collect) fills this from the session's caps.negotiated trace event; the client cannot see it",
+      reference_app: "the reference app's own log is on the host and nothing collects it; no API of the stack reports the app's version (issue #1281)",
+      gpu_driver: "no API of the stack reports the GPU driver version (issue #1281)",
+    };
     bundle.json("builds.json", {
-      components: { browser: client.browser, os: client.os, web: webDist ? webBuild(webDist) : null, control_plane: null, node_agent: null, reference_app: null, gpu_driver: null },
-      // e2e-collect reads the control plane and the node agent only (collect.mjs). A web build the runner served is known, so it has no reason.
-      unknown: Object.fromEntries(["web", "control_plane", "node_agent", "reference_app", "gpu_driver"].filter((k) => !(k === "web" && webDist)).map((k) => [k, info[k] ?? (["control_plane", "node_agent"].includes(k) ? "the host half (e2e-collect) fills this; the client cannot see it" : "the client cannot see it, and e2e-collect does not read it yet")])),
+      components: { browser: client.browser, os: client.os, web, control_plane: null, node_agent: null, encoder: null, reference_app: null, gpu_driver: null },
+      unknown: Object.fromEntries(Object.keys(why).filter((k) => !(k === "web" && web)).map((k) => [k, info[k] ?? why[k]])),
     });
     bundle.json("network.json", { path: { rtt_ms: null }, shaping: null, tls_verification: insecureTls ? "off (INSECURE_TLS=1)" : "on" });
     bundle.json("manifest.json", {

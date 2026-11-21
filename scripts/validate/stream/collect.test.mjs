@@ -297,6 +297,59 @@ test("a client-only bundle comes out complete and valid", async () => {
   assert.equal(readJson(dir, `${SC}/host-half.json`).not_projected, undefined, "a normal answer leaves nothing out");
 });
 
+// The agent's trace event (protocol/agent-api.md session_trace_event, caps.negotiated), in its real payload shape.
+const CAPS = (ts, over = {}) => ({
+  source: "agent",
+  ts_unix_ms: ts,
+  type: "caps.negotiated",
+  payload: { trigger: "launch", encoder_factory: "vulkanh264enc", codec: "h264", profile: "main", level: "4.2", encoder_sink_caps: "video/x-raw(memory:VulkanImage)", encoder_src_caps: "video/x-h264", payloader_src_caps: "application/x-rtp", size: { w: 1920, h: 1080, fps: 60 }, ...over },
+});
+
+test("#1281 builds.json names the negotiated encoder: the latest caps.negotiated, four members, no caps text", async () => {
+  const dir = clientBundle();
+  await run(dir, world({ events: [CAPS(1786940150000, { trigger: "rung_step", profile: "high" }), CAPS(1786940050000)] }));
+  const want = { factory: "vulkanh264enc", codec: "h264", profile: "high", level: "4.2" };
+  const builds = readJson(dir, "builds.json");
+  assert.deepEqual(builds.components.encoder, want);
+  assert.equal("encoder" in builds.unknown, false);
+  assert.deepEqual(readJson(dir, `${SC}/host-half.json`).encoder, want);
+  for (const f of ["builds.json", `${SC}/host-half.json`]) assert.ok(!read(dir, f).includes("VulkanImage"), `${f} copies caps text`);
+  assert.deepEqual(validateBundle(dir), []);
+});
+
+test("#1281 a session with no caps.negotiated, or one with values of the wrong shape, leaves the encoder out with its reason", async () => {
+  const none = clientBundle();
+  await run(none);
+  assert.equal(readJson(none, "builds.json").components.encoder, null);
+  assert.match(readJson(none, "builds.json").unknown.encoder, /no caps.negotiated trace event/);
+  assert.equal(readJson(none, `${SC}/host-half.json`).encoder, null);
+
+  const bad = clientBundle();
+  await run(bad, world({ events: [CAPS(1786940050000, { encoder_factory: "not a name", codec: "vp9", level: 4.2 })] }));
+  assert.deepEqual(readJson(bad, "builds.json").components.encoder, { profile: "main" }, "only the member in its own shape");
+  assert.equal(readJson(bad, `${SC}/host-half.json`).not_projected.identity, 3);
+  assert.deepEqual(validateBundle(bad), []);
+});
+
+test("#1281 --resume keeps a collected scenario's recorded encoder, and reads a host half from before this change as none", async () => {
+  const dir = clientBundle();
+  await run(dir, world({ events: [CAPS(1786940050000)] }));
+  const stale = () => {
+    edit(dir, "manifest.json", (m) => ({ ...m, halves: { client: true, host: false } }));
+    edit(dir, "builds.json", (b) => ({ ...b, components: { ...b.components, encoder: null }, unknown: { ...b.unknown, encoder: "stale" } }));
+  };
+  stale();
+  const r = await run(dir, world(), { resume: true });
+  assert.ok(r.f.calls.every((u) => !u.includes(SID + "/") && !u.endsWith(SID)), "the collected session is not asked for");
+  assert.equal(readJson(dir, "builds.json").components.encoder.factory, "vulkanh264enc");
+  stale();
+  edit(dir, `${SC}/host-half.json`, ({ encoder, ...rest }) => rest);
+  await run(dir, world(), { resume: true });
+  assert.equal(readJson(dir, "builds.json").components.encoder, null);
+  assert.match(readJson(dir, "builds.json").unknown.encoder, /no caps.negotiated/);
+  assert.deepEqual(validateBundle(dir), []);
+});
+
 test("S1 metrics.jsonl is built from the raw samples: every key, strings too, original timestamps", async () => {
   const dir = clientBundle();
   await run(dir);

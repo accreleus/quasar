@@ -239,6 +239,15 @@ function check(dir, errors, { keys = manifestKeys() } = {}) {
     } else if (served !== undefined) {
       err("manifest.json", "web_build is set and builds.json has no web-dist web build");
     }
+    // A web build the page reported through bench mode (#1281): its commit and build time, nothing else.
+    if (isObj(web) && web.source !== "web-dist" && (Object.keys(web).sort().join() !== "built_at,commit" || !/^[0-9a-f]{7,40}$/.test(web.commit) || Number.isNaN(Date.parse(web.built_at)))) {
+      err("builds.json", "web must be exactly commit (7-40 lowercase hex) and built_at (an ISO time), or the web-dist digest");
+    }
+    // The negotiated encoder, as e2e-collect projects it from the caps.negotiated trace event (#1281): closed members, each a plain name.
+    const enc = builds.components?.encoder;
+    if (enc !== undefined && enc !== null && (!isObj(enc) || Object.keys(enc).length === 0 || Object.entries(enc).some(([k, v]) => !["factory", "codec", "profile", "level"].includes(k) || typeof v !== "string" || !/^[A-Za-z0-9_.:+-]{1,64}$/.test(v)))) {
+      err("builds.json", "encoder must be factory, codec, profile and level, each a plain name");
+    }
   }
   if (network && !("shaping" in network)) err("network.json", "no shaping (null when none was applied)");
 

@@ -49,6 +49,38 @@ test("a web build the runner served from WEB_DIST is a valid bundle", () => {
   assert.deepEqual(validateBundle(d), []);
 });
 
+const REPORTED = { commit: "0123456789abcdef0123456789abcdef01234567", built_at: "2026-11-21T01:02:03.000Z" };
+const withComponent = (d, name, value) => edit(d, "builds.json", (b) => ({ ...b, components: { ...b.components, [name]: value }, unknown: Object.fromEntries(Object.entries(b.unknown).filter(([k]) => k !== name)) }));
+
+test("a web build the page reported (commit and time) and a negotiated encoder are valid, with no reason needed", () => {
+  const d = bundle();
+  withComponent(d, "web", REPORTED);
+  withComponent(d, "encoder", { factory: "vulkanh264enc", codec: "h264", profile: "main", level: "4.2" });
+  assert.deepEqual(validateBundle(d), []);
+});
+
+test("a null component still needs its reason, the encoder included", () => {
+  const d = bundle();
+  edit(d, "builds.json", (b) => ({ ...b, components: { ...b.components, encoder: null } }));
+  assert.match(validateBundle(d).join("\n"), /encoder is null with no reason in unknown/);
+});
+
+test("a rejected-shape web build or encoder", () => {
+  for (const [name, value, re] of [
+    ["web", { ...REPORTED, commit: "main" }, /web must be exactly commit/],
+    ["web", { ...REPORTED, built_at: "yesterday" }, /web must be exactly commit/],
+    ["web", { ...REPORTED, url: "x" }, /web must be exactly commit/],
+    ["encoder", { factory: "a b" }, /encoder must be factory/],
+    ["encoder", { factory: "vulkanh264enc", caps: "video/x-h264" }, /encoder must be factory/],
+    ["encoder", {}, /encoder must be factory/],
+    ["encoder", "vulkanh264enc", /encoder must be factory/],
+  ]) {
+    const d = bundle();
+    withComponent(d, name, value);
+    assert.match(validateBundle(d).join("\n"), re, JSON.stringify(value));
+  }
+});
+
 test("a scenario directory is a bench_submit.py run directory", () => {
   const out = execFileSync("python3", [path.join(DX, "bench_submit.py"), "--dir", path.join(bundle(), SC), "--suite", "e2e-smoke", "--scenario", "stream-hold", "--dry-run"], { env: ENV, encoding: "utf8" });
   assert.match(out, /dry run, no service contacted/);

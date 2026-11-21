@@ -290,7 +290,7 @@ reads the control-plane build again.
 | `<scenario>/metrics.jsonl` | the session's raw samples (every key, string-valued ones too, at their own timestamps) **merged** with the client half's own rows: same source and `ts_unix_ms` is the same row, joined key by key, the client half's value winning a key both have; sorted by ts then source. A key the metric manifest lacks, or a source the format lacks, is dropped and listed in `host-half.json` |
 | `<scenario>/trace.json` | the session's stored trace events (as stored, not clock-aligned), merged with the client half's; a clock the client measured is kept when the server's is unmeasured. A second session's own events are in its `sessions/<id>/trace.json` |
 | `<scenario>/host-half.json` | `{ "collected": true, "read_at_ms": ..., "node_agent": ... }` (plus `metric_keys_not_in_manifest` and `sources_not_in_bundle` when something was dropped: a name is listed only if it is a plain identifier, any other is counted in `other_dropped`; `"trace": "the session never started"` when all sessions ended before starting; `not_projected` when a projected value had the wrong shape and was left out), or `collected: false` with the `reason` |
-| `builds.json` | `components.control_plane` from `GET /v1/admin/platform/identity`, `components.node_agent` from the host row's `agent_version`/`source_commit`/`built_at` (`GET /v1/hosts/{id}`, which answers `{"host": ...}`); a build that cannot be read is `null` with its reason in `unknown`, replacing whatever the client half held; every other component is left as the client half wrote it |
+| `builds.json` | `components.control_plane` from `GET /v1/admin/platform/identity`, `components.node_agent` from the host row's `agent_version`/`source_commit`/`built_at` (`GET /v1/hosts/{id}`, which answers `{"host": ...}`), `components.encoder` from the session's latest `caps.negotiated` trace event (the sessions must agree); a build that cannot be read is `null` with its reason in `unknown`, replacing whatever the client half held; every other component is left as the client half wrote it |
 | `manifest.json` | `halves.host: true`, only when every scenario is collected |
 
 Every file the collector writes goes through one function: credential-named fields
@@ -513,6 +513,21 @@ bundles are valid and the comparison was written (whether or not anything change
 valid (`reason=invalid-a` or `invalid-b`), 2 usage, or a comparison that cannot be written
 (`reason=out-exists`, `out-inside-bundle`, `cannot-write`). A bundle zip is not read: unzip it first.
 
+### What builds.json names (#1281)
+
+One run, one set of builds. A part that cannot say is `null` and `unknown` holds the reason; `make e2e-run` and `e2e-collect` write no `null` without one.
+
+| component | filled by | holds |
+|---|---|---|
+| `browser`, `os` | `e2e-run`, from the client probe | name and version |
+| `web` | `e2e-run`, from the page: bench mode's `window.__qBench.build()` | `{commit, built_at}`: the commit the web build was made from (7-40 hex) and its build time. Only when every scenario's page reported the same build. A `WEB_DIST=` run says `{source: "web-dist", sha256, files}` instead |
+| `control_plane` | `e2e-collect`, `GET /v1/admin/platform/identity` | `version`, `commit`, `built_at` |
+| `node_agent` | `e2e-collect`, the host row | `version`, `commit`, `built_at` |
+| `encoder` | `e2e-collect`, the latest `caps.negotiated` trace event of the session | `factory`, `codec`, `profile`, `level`; never the caps text |
+| `reference_app`, `gpu_driver` | nothing yet: `null`, with the reason | no API of the stack reports them, and the app's own log is on the host (see the gap list on #1281) |
+
+The web build's identity is baked in when the web client is built: `QUASAR_WEB_COMMIT` / `SOURCE_COMMIT` and `QUASAR_WEB_BUILT_AT` / `BUILT_AT` if set, else `git rev-parse HEAD` and the build time. The control plane's image build passes `SOURCE_COMMIT` and `BUILT_AT`, so an image names the commit it came from. A build made with neither reports `unknown`, and the bundle then says why `web` is `null`. `e2e-review` prints a build by its version and commit; `e2e-compare` compares builds by commit (a build time alone is not a difference).
+
 ### Testing a web build against a running stack
 
 ```
@@ -708,7 +723,7 @@ A directory, zipped when it is handed between machines.
 - **Not measured is `null`, never `0`.** A criterion that was not judged has `observed: null`. A fact listed in `not_recorded` has no value as a criterion or as a sample.
 - **Keys are the metric manifest's.** An `agent` or `browser` sample key must be in `docs/session-trace/metrics.json` (bench-mode keys ride in `browser` samples, with the six keys `scripts/dx/bench_app_samples.py` derives: `bench_n`, `bench_decoded`, `i2p_p50_ms`, `i2p_max_ms`, `i2p_n`, `ts_nudged`). Sample sources are the five quasar-bench accepts: `agent`, `browser`, `app`, `netem`, `harness`.
 - **Every timestamp names its clock.** A timeline row says `client` or `host`; a sample's clock is its key's clock in the metric manifest. `clock_offset_ms` is the measured client-to-host offset, or `null`.
-- **A missing build has a reason.** A web build the runner served is `web: {source: "web-dist", sha256, files}` and nothing else, with `manifest.web_build: {served_by: "runner", source: "web-dist"}`; each without the other is refused.
+- **A missing build has a reason.** A web build the page reported is `web: {commit, built_at}` and nothing else (a commit of 7-40 lowercase hex, an ISO time); `encoder` is `factory`, `codec`, `profile` and `level`, each a plain name. A web build the runner served is `web: {source: "web-dist", sha256, files}` and nothing else, with `manifest.web_build: {served_by: "runner", source: "web-dist"}`; each without the other is refused.
 - **No address, token or password** in any text file, whatever its name. A JSON field whose name says it holds a credential (`authorization`, `cookie`, any `*token`, `password`, `secret`, `api key`, `private key`; any case, hyphen or camelCase) and whose value is not a "there is none" word is a credential too. The validator checks the first two or four bytes of each file for a UTF-16 or UTF-32 byte-order mark and rejects either. A file with a NUL byte in its first 4 KB is otherwise treated as binary (a picture, a video, an archive). Documentation addresses (RFC 5737) pass. Known limits: the address check knows IPv4 only, reads a four-part version such as `1.2.3.4` as an address, and lets `x.0.0.0` and `127.0.0.1` through (a browser's version looks like the first); a bearer token made of letters only is not seen, nor is UTF-16 text with no byte-order mark (it reads as binary); host names and home paths are not looked for (a session container's own home is a real path in app logs). `scripts/dev/leak-scan.sh` with the operator's patterns still runs before a bundle goes anywhere public.
 
 The test (`node --test scripts/validate/stream/bundle.test.mjs`, part of `make verify`) breaks the
