@@ -5460,3 +5460,45 @@ fn releasing_the_tap_stops_its_pyrowave_encoder_and_keeps_the_tap() {
     let _ = main.set_state(gst::State::Null);
     let _ = pipeline.set_state(gst::State::Null);
 }
+
+/// #1606: 363 datagrams of ~1200 B, the size of one 1080p60 PyroWave frame at 200 Mbit/s.
+fn big_frame() -> Vec<Bytes> {
+    vec![Bytes::from(vec![0u8; 1200]); 363]
+}
+
+#[test]
+fn a_big_pyrowave_frame_is_handed_over_in_bounded_slices_inside_the_frame_interval() {
+    let frame = big_frame();
+    for fps in [60, 120] {
+        let plan = burst_plan(&frame, true, fps);
+        assert_eq!(plan.iter().map(|(n, _)| n).sum::<usize>(), frame.len());
+        assert!(plan.len() > 1);
+        assert!(
+            plan.iter().all(|(n, _)| n * 1200 <= PYRO_BURST_BYTES),
+            "{plan:?}"
+        );
+        assert_eq!(plan[0].1, Duration::ZERO);
+        let last = plan.last().unwrap().1;
+        assert!(
+            last <= Duration::from_secs(1) / (fps as u32 * 4),
+            "{fps} fps: {last:?}"
+        );
+        assert!(
+            plan.windows(2).all(|w| w[0].1 < w[1].1),
+            "slices are spread out in time"
+        );
+    }
+}
+
+#[test]
+fn a_frame_under_the_burst_limit_and_every_other_codec_go_as_one_slice() {
+    assert_eq!(
+        burst_plan(&big_frame(), false, 60),
+        vec![(363, Duration::ZERO)]
+    );
+    assert_eq!(
+        burst_plan(&big_frame()[..50], true, 60),
+        vec![(50, Duration::ZERO)]
+    );
+    assert_eq!(burst_plan(&[], true, 60), vec![(0, Duration::ZERO)]);
+}

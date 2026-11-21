@@ -30,6 +30,7 @@ own; the two do not move together, and that is deliberate.
 - **E2E bench folds, review and `stream-hold` tighten unmeasured counts, non-marker apps and cadence guards (#1334).** `benchfold.mjs` and `bench_app_samples.py` omit `missing_indices`/`duplicated`/`reordered` on windows with no decoded marker (`e2e-review` skips ranking them when `bench_decoded <= 0`), `stream-hold` adds optional `expect_marker` (excluded from bench scenario names) and finite-number instrument guards, cadence tests pin `hitchCount`'s hidden-span exclusion and `>=` boundary, and `docs/testing-e2e-suite.md` wraps the runner sections.
 
 ### Fixed
+- WebTransport PyroWave frames are handed to QUIC in slices of at most 128 KiB spread over a quarter of the frame interval instead of one ~435 KB burst per frame, which lost thousands of datagrams at 1080p60 (#1606).
 - End-to-end collection now splits capped trace reads by raw sample count, validates session and host setting vocabularies, and shows each collected window's verdict in offline diagnoses (#1331).
 - WebTransport repeat NACK timing now waits on the longer of the smoothed control-stream path round trip that caps the reorder window and the measured repair round trip, avoiding premature duplicate NACKs on congested links (#1436).
 - WebTransport input detects full writers, combines pending relative mouse deltas, and keeps the latest absolute position when datagrams back up. Pending relative motion goes out before the next button, key, scroll, or other input event (#1154).

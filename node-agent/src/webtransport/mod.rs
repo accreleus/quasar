@@ -1235,6 +1235,41 @@ fn stalled() -> (Option<Value>, u32, &'static str) {
     )
 }
 
+/// The most bytes of one PyroWave frame handed to QUIC back-to-back (#1606). A ~435 KB frame
+/// (1080p60 at 200 Mbit/s) sent whole lost thousands of datagrams after the agent's send; a
+/// half-size frame (~215 KB) was clean in every lab run. 128 KiB (about 110 datagrams, four
+/// slices of that frame) sits well under the clean burst and is a round number.
+const PYRO_BURST_BYTES: usize = 128 * 1024;
+
+/// The slices a frame's datagrams are handed over in: each a datagram count and its offset from
+/// the frame's start. PyroWave is cut so no slice passes `PYRO_BURST_BYTES`, the slices spread
+/// evenly over a quarter of the frame interval: the frame is out by interval/4 (4.2 ms at 60 fps,
+/// 2.1 ms at 120) plus the timer's 1 ms rounding. Every other codec is one slice at once.
+fn burst_plan(
+    datagrams: &[bytes::Bytes],
+    pyrowave: bool,
+    fps: i32,
+) -> Vec<(usize, std::time::Duration)> {
+    let mut counts = vec![0usize];
+    let mut bytes = 0;
+    for d in datagrams {
+        if pyrowave && bytes > 0 && bytes + d.len() > PYRO_BURST_BYTES {
+            counts.push(0);
+            bytes = 0;
+        }
+        bytes += d.len();
+        *counts.last_mut().expect("one slice") += 1;
+    }
+    let gap = std::time::Duration::from_secs(1)
+        / (fps.max(1) as u32 * 4)
+        / (counts.len() as u32 - 1).max(1);
+    counts
+        .into_iter()
+        .zip(0..)
+        .map(|(n, i)| (n, gap * i))
+        .collect()
+}
+
 /// The payload bytes of video datagrams: what amendment 85's FEC share is measured against.
 fn video_payload(datagrams: &[bytes::Bytes]) -> u64 {
     datagrams
@@ -1746,20 +1781,33 @@ async fn stream(
                         }
                         datagrams.extend(repairs);
                     }
-                    // shortcut: a PyroWave frame (~380 datagrams at 1080p/200) goes as one burst;
-                    // pace it over half a frame interval (§Rate's SHOULD) if bursts lose datagrams.
                     let mut log = match pyro.as_mut() {
                         Some(rate) if unit.pyrowave => Some(&mut rate.log),
                         _ => control.as_mut().filter(|_| !unit.pyrowave).map(|c| &mut c.log),
                     };
                     handed += datagrams.len() as u64;
-                    let sent = datagrams.into_iter().try_for_each(|d| {
-                        if let Some(log) = log.as_deref_mut() {
-                            log.record(&d, now, false);
+                    // #1606: a PyroWave frame goes in bounded slices spread over part of the
+                    // frame interval; anything else is one slice at once, as it always was.
+                    let plan = burst_plan(&datagrams, unit.pyrowave, current.fps);
+                    let started = tokio::time::Instant::now();
+                    let mut rest = datagrams.into_iter();
+                    let mut alive = true;
+                    for (count, offset) in plan {
+                        if !offset.is_zero() {
+                            tokio::time::sleep_until(started + offset).await;
                         }
-                        session.send_datagram(d)
-                    });
-                    if sent.is_err() {
+                        let at = if offset.is_zero() { now } else { std::time::Instant::now() };
+                        alive = rest.by_ref().take(count).try_for_each(|d| {
+                            if let Some(log) = log.as_deref_mut() {
+                                log.record(&d, at, false);
+                            }
+                            session.send_datagram(d)
+                        }).is_ok();
+                        if !alive {
+                            break;
+                        }
+                    }
+                    if !alive {
                         break QUIET;
                     }
                 }
