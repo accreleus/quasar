@@ -2801,6 +2801,50 @@ fn governor_bound(estimate_kbps: f64) -> f64 {
     estimate_kbps / (1.0 - crate::session::abr::AbrConfig::DEFAULT_DEADBAND)
 }
 
+/// #1433 (R3, rule 1): the pacer and QUIC's window are governed at what the encoder sends, the
+/// ABR's setpoint plus its FEC share, when the estimate is under it: the average output of the
+/// encoder always leaves the agent, so an overload shows at the link and not as held video the
+/// stall guard reads as a dead path. Estimate 3500, setpoint 4500, 10 % FEC: 4950. Old code:
+/// the estimate, 3500.
+#[test]
+fn the_pacer_never_holds_video_under_the_setpoint() {
+    use crate::session::abr::{AbrConfig, Governor};
+    let base = std::time::Instant::now();
+    // A smooth governor whose ceiling is the setpoint, and so starts there.
+    let abr = Arc::new(Mutex::new(Governor::new(
+        AbrConfig::new_smooth(1000, 4500, 60),
+        base,
+    )));
+    assert_eq!(abr.lock().unwrap().setpoint_kbps(), 4500);
+    let rate = Rate {
+        measured: Box::new(|_| {}),
+        ceiling_kbps: 4500.0,
+        floor_kbps: Box::new(|| 1000.0),
+        retargets: true,
+        start: Box::new(|| {}),
+        owns: Box::new(|| false),
+        displaced: Box::new(|| {}),
+        observe: Box::new(|_| {}),
+        fec: Box::new(|_| {}),
+    };
+    let governor = congestion::Governor::default();
+    let mut control = Control::new(&rate, Arc::default(), true, governor.clone());
+    control.fec.as_mut().unwrap().observe(0.02, base);
+    control.estimator.resume_at(3500.0);
+    answered(&mut control, 0, base);
+    assert_eq!(control.charged, 0.1);
+    let estimate = control.estimator.estimate_kbps();
+    assert!(
+        (3400.0..3700.0).contains(&estimate),
+        "the estimate is {estimate:.0}"
+    );
+    assert!(
+        governor.kbps() >= 4950,
+        "governed at {} kbit/s",
+        governor.kbps()
+    );
+}
+
 /// #1046: a FEC share inside the governor's deadband (levels 1 to 3, up to 15 %) does not
 /// move the encoder. At the ceiling the repairs go on top of it, so the session sends more
 /// than its ceiling, and no more than the governor's own bound.
