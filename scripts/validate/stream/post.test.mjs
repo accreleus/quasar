@@ -142,7 +142,7 @@ test("every param that changes what is measured is in the name, in a fixed order
   edit(dir, `${SC}/scenario.json`, (s) => ({
     ...s,
     scenario: "transport-fallback",
-    params: { when: "connect", hold_s: 60, codec: "h264", profile: "1080p60", transport: "webtransport", app: "Steam", bench: true, cover_qr: true },
+    params: { when: "connect", hold_s: 60, codec: "h264", profile: "1080p60", transport: "webtransport", app: "Steam", bench: true, cover_qr: true, expect_marker: false },
   }));
   const rec = recorder();
   assert.equal(postBundle(dir, { host: HOST, spawn: rec.spawn }).posted, 1);
@@ -150,7 +150,7 @@ test("every param that changes what is measured is in the name, in a fixed order
   assert.equal(after(a, "--scenario"), "transport-fallback/transport=webtransport/codec=h264/profile=1080p60/app=steam/when=connect");
   const tags = valuesOf(a, "--tag");
   for (const t of ["hold_s=60", "transport=webtransport", "codec=h264", "profile=1080p60", "app=steam"]) assert.ok(tags.includes(t), t);
-  for (const t of ["bench=", "cover_qr=", "when="]) assert.ok(!tags.some((x) => x.startsWith(t)), t);
+  for (const t of ["bench=", "cover_qr=", "expect_marker=", "when="]) assert.ok(!tags.some((x) => x.startsWith(t)), t);
 });
 
 test("the app in the name is a slug: lower case, runs of other characters one `-`, trimmed, 40 at most", () => {

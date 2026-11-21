@@ -2356,3 +2356,165 @@ test("stream-hold captures page /stats cadence samples so e2e-review checks anom
   assert.equal(unkRev.scenarios[0].windows.bench_offset_unknown, true);
   assert.match(renderReview(unkRev), /when `offset_unknown` was set with no decoded marker/);
 });
+
+// ── #1334 follow-ups ────────────────────────────────────────────────────────
+
+test("benchfold omits unmeasured index-delta counts on no-marker windows and tolerates malformed i2p_ms (#1334)", () => {
+  const rows = benchRows([
+    ...FIXTURE,
+    // A live no-marker app window: 60 frames displayed, 0 markers decoded.
+    { ...FIXTURE[0], t_start_ms: 1800000002000, t_end_ms: 1800000003000, t_end_host_ms: 1800000003003, last_host_time_ms: null, n: 60, decoded: 0, undecoded: 60, missing_indices: 0, duplicated: 0, reordered: 0 },
+  ]);
+  assert.equal(rows.length, 3);
+  // Decoded window keeps missing_indices, duplicated, reordered.
+  assert.equal(rows[0].metrics.bench_decoded, 60);
+  assert.equal(rows[0].metrics.missing_indices, 1);
+  assert.equal(rows[0].metrics.duplicated, 0);
+  assert.equal(rows[0].metrics.reordered, 0);
+  // Empty and live no-marker windows omit all three unmeasured index-delta counts.
+  for (const idx of [1, 2]) {
+    assert.equal(rows[idx].metrics.bench_decoded, 0);
+    for (const k of ["missing_indices", "duplicated", "reordered"]) {
+      assert.equal(k in rows[idx].metrics, false, `row ${idx} with decoded=0 must omit ${k}`);
+    }
+  }
+  // Malformed i2p_ms (non-array) must not throw.
+  const badI2p = benchRows([{ ...FIXTURE[0], i2p_ms: "not-an-array" }]);
+  assert.equal(badI2p.length, 1);
+  assert.equal("i2p_n" in badI2p[0].metrics, false);
+});
+
+test("expect_marker: false records marker_decoded as not judged so a no-marker app passes on the remaining criteria (#1334)", async () => {
+  const noMarkerWins = windows(50).map((x) => ({ ...x, n: 60, decoded: 0, undecoded: 60, missing_indices: 0, duplicated: 0, reordered: 0 }));
+
+  // 1. Default (omitted) and expect_marker: true still fail marker_decoded on a no-marker app.
+  for (const extra of [{}, { expect_marker: true }]) {
+    const r = await run(world({ stats: { frames: 100, decoded: 0 }, wins: noMarkerWins }), PLAN(extra));
+    assert.equal(r.by().marker_decoded.pass, false, JSON.stringify(extra));
+    assert.equal(r.scenario().status, "fail", JSON.stringify(extra));
+  }
+
+  // 2. expect_marker: false leaves marker_decoded not judged and passes on the remaining criteria;
+  //    benchfold omits missing_indices from metrics.jsonl and review lists it as absent.
+  const r = await run(world({ stats: { frames: 100, decoded: 0 }, wins: noMarkerWins }), PLAN({ expect_marker: false }));
+  assert.deepEqual(r.result.errors, []);
+  assert.equal(r.scenario().status, "pass", JSON.stringify(r.scenario().criteria));
+  assert.deepEqual(r.by().marker_decoded, {
+    id: "marker_decoded",
+    pass: null,
+    observed: null,
+    expected: "not judged: plan says this app has no marker",
+  });
+  for (const id of ["first_frame_s", "transport_as_asked", "codec_as_asked", "profile_as_asked", "frameless_seconds", "present_cadence"]) {
+    assert.equal(r.by()[id].pass, true, `${id} should still be judged and pass`);
+  }
+  assert.equal(r.by().missing_indices_rate.pass, null);
+  const folded = read(r.dir, "01-stream-hold/metrics.jsonl").trim().split("\n").map((l) => JSON.parse(l));
+  assert.ok(folded.length > 0 && folded.every((row) => !("missing_indices" in row.metrics)), "no-marker rows omit missing_indices");
+  const rev = review(r.dir);
+  assert.ok(!rev.scenarios[0].windows.keys.includes("missing_indices"));
+  assert.ok(rev.scenarios[0].windows.absent.includes("missing_indices"));
+
+  // 3. Non-boolean expect_marker is refused by check() before launching anything.
+  for (const bad of ["false", 0, 1, null, {}]) {
+    assert.match(
+      check({ transport: "webrtc", codec: "h264", profile: "1080p60", hold_s: 30, app: "x", expect_marker: bad }),
+      /expect_marker must be a boolean/,
+      String(bad),
+    );
+    const w = world();
+    const res = await run(w, PLAN({ expect_marker: bad }));
+    assert.equal(res.scenario().status, "error", String(bad));
+    assert.match(res.scenario().reason, /expect_marker must be a boolean/);
+    assert.deepEqual(w.clicks, [], "nothing was launched");
+  }
+  assert.equal(check({ transport: "webrtc", codec: "h264", profile: "1080p60", hold_s: 30, app: "x", expect_marker: false }), null);
+  assert.equal(check({ transport: "webrtc", codec: "h264", profile: "1080p60", hold_s: 30, app: "x", expect_marker: true }), null);
+});
+
+test("hitchCount excludes hidden spans and uses >= on hitch_sd_ms at exact boundary (#1334)", () => {
+  // Helper: build one clock second [secStart, secStart + 1000) with 20 intervals alternating (40 - d) and (40 + d).
+  // Exact integer arithmetic: 10*(40-d) + 10*(40+d) = 800 ms < 1000 ms, mean = 40, sd = Math.sqrt(d^2) === d exactly.
+  const clockSecondFrames = (secStart, d) => {
+    const out = [{ present_ms: secStart }];
+    let t = secStart;
+    for (let i = 0; i < 20; i += 1) {
+      t += i % 2 === 0 ? 40 - d : 40 + d;
+      out.push({ present_ms: t });
+    }
+    return out;
+  };
+
+  const sec1 = T0 + 25_000;
+  const sec2 = T0 + 26_000;
+  const sec3 = T0 + 27_000;
+
+  // 1. Exact >= boundary: sd === T.hitch_sd_ms (18) MUST count as a hitch; sd === T.hitch_sd_ms - 1 (17) MUST NOT.
+  const atLimit = clockSecondFrames(sec1, T.hitch_sd_ms);
+  const belowLimit = clockSecondFrames(sec2, T.hitch_sd_ms - 1);
+  assert.deepEqual(
+    hitchCount(atLimit, sec1, sec1 + 1000, [], T),
+    { judged: 1, hitches: 1 },
+    "exact sd === hitch_sd_ms must count as a hitch (>=, not >)",
+  );
+  assert.deepEqual(
+    hitchCount(belowLimit, sec2, sec2 + 1000, [], T),
+    { judged: 1, hitches: 0 },
+    "sd below hitch_sd_ms must not count as a hitch",
+  );
+
+  // 2. Hidden-span exclusion: a jerky second (sd = 30 >= 18) inside a hidden span must be excluded,
+  //    while an unhidden steady second stays judged with 0 hitches.
+  const steadyAndHiddenJerky = [
+    ...clockSecondFrames(sec1, 0),
+    ...clockSecondFrames(sec2, 30),
+    ...clockSecondFrames(sec3, 30),
+  ];
+  assert.deepEqual(
+    hitchCount(steadyAndHiddenJerky, sec1, sec3 + 1000, [[sec2, sec3 + 1000]], T),
+    { judged: 1, hitches: 0 },
+    "hidden spans must exclude jerky intervals from hitchCount",
+  );
+  // Same frames without the hidden span: both jerky seconds count.
+  assert.deepEqual(
+    hitchCount(steadyAndHiddenJerky, sec1, sec3 + 1000, [], T),
+    { judged: 3, hitches: 2 },
+  );
+});
+
+test("malformed window times, frame timestamps and counts never pass or coerce as finite numbers (#1334)", async () => {
+  // 1. Malformed window times (non-finite, string, or t_end_ms < t_start_ms) leave frameless_seconds and present_cadence unjudged.
+  const baseWins = windows(50);
+  for (const [label, patch] of [
+    ["NaN t_start_ms", { t_start_ms: NaN }],
+    ["Infinity t_end_ms", { t_end_ms: Infinity }],
+    ["string t_start_ms", { t_start_ms: String(T0 + 40_000) }],
+    ["inverted bounds", { t_start_ms: T0 + 41_000, t_end_ms: T0 + 40_000 }],
+  ]) {
+    const malformed = baseWins.map((w, i) => (i === 40 ? { ...w, ...patch } : w));
+    const res = J({ windows: malformed });
+    assert.equal(res.frameless_seconds.pass, null, `${label}: frameless_seconds must not be judged`);
+    assert.equal(res.frameless_seconds.observed, null, label);
+    assert.equal(res.present_cadence.pass, null, `${label}: present_cadence must not be judged`);
+    assert.match(res.present_cadence.expected, /window time.*not a finite number/, label);
+    assert.match(res.missing_indices_rate.expected, /no usable counts/, label);
+  }
+
+  // 2. framelessSeconds does not coerce string no_image into > 0.
+  assert.equal(framelessSeconds([{ n: 0, no_image: "4" }, { n: "0", no_image: 0 }]), 1);
+
+  // 3. hitchCount and instrumentShare guard non-finite bounds and malformed hidden spans.
+  assert.deepEqual(hitchCount(frames(50), NaN, T0 + 50_000, [], T), { judged: 0, hitches: 0 });
+  assert.deepEqual(instrumentShare(frames(50), [], NaN, T0 + 50_000), { malformed: true });
+
+  // 4. pullFrames ignores non-finite/string present_ms so Infinity cannot poison lastPresent and drop valid frames.
+  const poisoned = [
+    { present_ms: Infinity, decoded: true },
+    { present_ms: "1800000099999", decoded: true },
+    null,
+    ...frames(50),
+  ];
+  const r = await run(world({ extraFrames: poisoned }));
+  assert.deepEqual(r.result.errors, []);
+  assert.equal(r.by().present_cadence.pass, true, "malformed entries before valid frames must not poison lastPresent");
+});

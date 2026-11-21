@@ -96,6 +96,11 @@ if len(brow) > 1:
         problems.append("empty window must still be a sample with bench_n=0")
     if brow[1]["metrics"].get("i2p_missed") != 1:
         problems.append("empty-window i2p_missed %r" % brow[1]["metrics"].get("i2p_missed"))
+    # #1334: a window that decoded no marker never measured index-delta counts;
+    # they must be absent rather than folded in as 0.
+    for k in ("missing_indices", "duplicated", "reordered"):
+        if k in brow[1]["metrics"]:
+            problems.append("no-marker window folded unmeasured %s as %r" % (k, brow[1]["metrics"][k]))
 
 kinds = {}
 for e in tr.get("events") or []:

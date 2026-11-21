@@ -62,10 +62,11 @@ export function criteriaNotes(criteria) {
 // another's params is still another name. What decides comparison comes first, in this
 // order; the app follows, then every other param, sorted.
 const NAME_KEYS = ["transport", "codec", "profile"];
-// The three that do not change what is measured in a way the bench splits on: `hold_s` is
-// kept as a tag (how long it ran), the other two are how the app was presented. A plan run
-// against another app measured another thing, so `app` is in the name (`appSlug`).
-const NOT_IN_NAME = new Set(["bench", "cover_qr", "hold_s"]);
+// The four that do not change what is measured in a way the bench splits on: `hold_s` is
+// kept as a tag (how long it ran), and the others are how the app was presented or whether a
+// marker is expected (`app` already identifies the app). A plan run against another app
+// measured another thing, so `app` is in the name (`appSlug`).
+const NOT_IN_NAME = new Set(["bench", "cover_qr", "expect_marker", "hold_s"]);
 /** A bench scenario's whole name; the service takes it as text, and this is our own cap. */
 const NAME_MAX = 200;
 /** The shape such a name has: what `[scenario, k=v, ...].join("/")` can make out of identifiers,

@@ -975,3 +975,52 @@ test("any finite non-zero is_hidden is treated as hidden, matching the control p
     );
   }
 });
+
+// ── #1334 follow-ups ────────────────────────────────────────────────────────
+
+test("missing_indices is not ranked on rows whose bench_decoded is 0, while legacy rows without bench_decoded still rank (#1334)", () => {
+  // 1. An older bundle from a no-marker app wrote missing_indices: 0 beside bench_decoded: 0.
+  //    review must omit missing_indices from ranked keys and list it as absent.
+  const noMarker = bundle();
+  metrics(noMarker, [
+    browser(1000, { bench_n: 60, bench_decoded: 0, missing_indices: 0, offset_unknown: 0 }),
+    browser(2000, { bench_n: 60, bench_decoded: 0, missing_indices: 0, offset_unknown: 0 }),
+    browser(3000, { bench_n: 60, bench_decoded: 0, missing_indices: 0, offset_unknown: 0 }),
+  ]);
+  const noMarkerWin = review(noMarker).scenarios[0].windows;
+  assert.deepEqual(noMarkerWin.keys, ["bench_n"], "missing_indices must not be ranked when no window decoded a marker");
+  assert.ok(noMarkerWin.absent.includes("missing_indices"), "missing_indices must appear in absent");
+  assert.deepEqual(noMarkerWin.rows, []);
+
+  // 2. Mixed decoded and unmeasured (bench_decoded: 0, missing_indices: 0) rows:
+  //    the unmeasured rows must not pull down the median or be ranked on missing_indices.
+  const mixed = bundle();
+  metrics(mixed, [
+    browser(1000, { bench_n: 0, bench_decoded: 0, missing_indices: 0 }),
+    browser(2000, { bench_n: 0, bench_decoded: 0, missing_indices: 0 }),
+    browser(3000, { bench_n: 0, bench_decoded: 0, missing_indices: 0 }),
+    browser(4000, { bench_n: 60, bench_decoded: 60, missing_indices: 2 }),
+    browser(5000, { bench_n: 60, bench_decoded: 60, missing_indices: 2 }),
+  ]);
+  const mixedWin = review(mixed).scenarios[0].windows;
+  assert.ok(mixedWin.keys.includes("missing_indices"), "decoded rows still rank missing_indices");
+  assert.deepEqual(
+    mixedWin.rows.filter((r) => r.worst_for === "missing_indices"),
+    [],
+    "unmeasured bench_decoded: 0 rows must not pull median to 0 and turn uniform decoded rows into worst windows",
+  );
+
+  // 3. A legacy row carrying missing_indices WITHOUT bench_decoded still ranks as before.
+  const legacy = bundle();
+  metrics(legacy, [
+    browser(1000, { missing_indices: 0 }),
+    browser(2000, { missing_indices: 0 }),
+    browser(3000, { missing_indices: 5 }),
+  ]);
+  const legacyWin = review(legacy).scenarios[0].windows;
+  assert.deepEqual(legacyWin.keys, ["missing_indices"]);
+  assert.deepEqual(
+    legacyWin.rows.map((r) => [r.ts_unix_ms, r.worst_for, r.value]),
+    [[3000, "missing_indices", 5]],
+  );
+});

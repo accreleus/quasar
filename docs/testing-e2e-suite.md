@@ -13,12 +13,23 @@ loop, leaving one **run bundle** that an agent or a person reviews afterwards. S
 ## What you need
 
 - Node 22. The validator, the review and the collector have no dependencies.
-- To run a plan (`e2e-run`): Chrome or Chromium, `npm ci` in `scripts/validate` (the verb does it on first use, without your sign-in in its environment), and the stack's URL.
-- A test user: an ordinary user's sign-in in `QUASAR_E2E_EMAIL` and `QUASAR_E2E_PASSWORD`, or in a file of `KEY=value` lines named by `QUASAR_E2E_CRED_FILE`. No admin token is needed or used. The password and the e-mail's local part must each be at least 8 characters: a shorter secret cannot be removed from the bundle without damaging unrelated values, so the runner refuses to start with one (exit 2). The account must not have the Classic layout on (the runner needs the game page).
+- To run a plan (`e2e-run`): Chrome or Chromium, `npm ci` in `scripts/validate` (the verb does it on
+  first use, without your sign-in in its environment), and the stack's URL.
+- A test user: an ordinary user's sign-in in `QUASAR_E2E_EMAIL` and `QUASAR_E2E_PASSWORD`, or in a
+  file of `KEY=value` lines named by `QUASAR_E2E_CRED_FILE`. No admin token is needed or used. The
+  password and the e-mail's local part must each be at least 8 characters: a shorter secret cannot be
+  removed from the bundle without damaging unrelated values, so the runner refuses to start with one
+  (exit 2). The account must not have the Classic layout on (the runner needs the game page).
 - The reference app in that user's library (`QUASAR_E2E_APP` names it, default `Quasar Benchapp`).
-- `CLIENT=<label>`: a name for this test client, by role (`mac-test-client`), never a host name. Letters, digits, `_`, `.`, `-`.
-- A web build served from your machine instead of the stack's own copy: `WEB_DIST=<dir>` (also `QUASAR_E2E_WEB_DIST`); see "Testing a web build against a running stack" below. Use an absolute path: `make` runs from the repo root.
-- A stack with a self-signed certificate: `INSECURE_TLS=1`. Certificate checks are on otherwise, for the runner's own requests and for a browser it launches, whatever `NODE_TLS_REJECT_UNAUTHORIZED` says in your environment (the runner removes it, and the verb keeps it out of `npm ci`); `network.json` records what was in force.
+- `CLIENT=<label>`: a name for this test client, by role (`mac-test-client`), never a host name.
+  Letters, digits, `_`, `.`, `-`.
+- A web build served from your machine instead of the stack's own copy: `WEB_DIST=<dir>` (also
+  `QUASAR_E2E_WEB_DIST`); see "Testing a web build against a running stack" below. Use an absolute
+  path: `make` runs from the repo root.
+- A stack with a self-signed certificate: `INSECURE_TLS=1`. Certificate checks are on otherwise, for
+  the runner's own requests and for a browser it launches, whatever `NODE_TLS_REJECT_UNAUTHORIZED`
+  says in your environment (the runner removes it, and the verb keeps it out of `npm ci`);
+  `network.json` records what was in force.
 - The host half (`e2e-collect`) also needs an admin bearer for the stack, and a certificate Node trusts (the fleet's certs are; set `NODE_EXTRA_CA_CERTS` otherwise).
 
 ## What to do
@@ -72,7 +83,9 @@ A plan is strict. The plan has `name` and `scenarios`; an entry has `scenario` a
 runner or the scenario does not define is that entry's `error` (an unknown top-level key is a usage
 error, exit 2), so a typo cannot silently select a default. `params` may be omitted. The defaults of
 `stream-hold`: `transport: "webrtc"`, `codec: "h264"`, `profile: "1080p60"`, `hold_s: 90`, `app`: the
-`QUASAR_E2E_APP` app (`Quasar Benchapp`), `bench: true`, `cover_qr`: true for an app named `Steam`.
+`QUASAR_E2E_APP` app (`Quasar Benchapp`), `bench: true`, `cover_qr`: true for an app named `Steam`,
+`expect_marker: true` (set `false` on a non-marker app so `marker_decoded` is recorded as not judged
+and the scenario is judged on the remaining criteria).
 
 The run ends with one line:
 
@@ -94,13 +107,13 @@ launched; the bundle is still complete and the run goes on.
 | criterion | judged as |
 |---|---|
 | `first_frame_s` | the first frame the client decoded came within 30 s of the Play click (the runner's budget, not a product limit). It can still be under the loader: the loader's own reveal comes later and is recorded as the timeline step `revealed`, not judged. A frame is the bench ring's first frame or the visible `<video>`'s first frame; the loader is never one. A scenario with `bench: false` on WebTransport (a canvas) cannot see a frame and is `error` before launch ("bench mode is needed to see a frame on this transport"). No frame by the deadline is `pass: false`, and a scenario is never `pass` without this one |
-| `marker_decoded` | the bench instrument decoded at least one marker frame (`stats().decoded > 0`) |
+| `marker_decoded` | the bench instrument decoded at least one marker frame (`stats().decoded > 0`); recorded as not judged (`pass: null`) when `params.expect_marker` is `false` |
 | `transport_as_asked` | the session's `transport` is the asked one and `transport_fallback_reason` is empty; `observed` carries the transport and any `transport_reason` or fallback reason |
 | `codec_as_asked` | `negotiated_codec` (or `stream.codec`, or `pyrowave.active/used`) is the asked codec; `observed` names the field read |
 | `profile_as_asked` | the asked height and frame rate against `stream.height` and `stream.fps`, the launch size (not `external_*`). It is not a profile id: the Launch options choose a codec, frame rate and resolution. Only the resolutions the sheet lists can be asked |
 | `frameless_seconds` | the number of one-second bench windows with no frame at all, after the warm-up, excluding any span the page was hidden. Not Chrome's `freeze_count`; a stall shorter than a window is invisible to it. It is the bench callback's view: a stall of the instrument itself also counts (a false fail, never a false pass). It needs no marker |
 | `missing_indices_rate` | recorded, not judged (`pass: null`): `missing / (decoded + missing)` over the judged span is in `expected`. No limit has been calibrated on the marker app (the first 60 s of a healthy bench cell read 6.95 % in `docs/testing-bench-mode.md`) |
-| `present_cadence` | the control plane's hitch rule on the bench ring: per one-second window with at least `web.present_cadence.min_samples` present intervals, sd against `classifier.hitch_sd_ms`, a hitch at `classifier.hitch_min_samples` such windows. It needs no marker. When the bench callback saw under 90 % of the frames the video decoded over the span it is not judged, because the instrument set the cadence (issue #1304); `expected` carries the share as "N of M frames" |
+| `present_cadence` | the control plane's hitch rule on the bench ring: consecutive present intervals grouped by clock second (`Math.floor(present_ms / 1000)`, not by bench window boundaries), excluding intervals overlapping a hidden span, keeping seconds with at least `web.present_cadence.min_samples` intervals, sd `>= classifier.hitch_sd_ms`, a hitch at `classifier.hitch_min_samples` such seconds. It needs no marker. When the bench callback saw under 90 % of the frames the video decoded over the span it is not judged, because the instrument set the cadence (issue #1304); `expected` carries the share as "N of M frames" |
 
 The warm-up is one value for every criterion that has one: `classifier.warmup_exclude_s` in
 `docs/session-trace/thresholds.json` (20 s). The smoke plan holds 90 s so the judged span is at
@@ -328,8 +341,9 @@ neither, so a scenario's own name can never spell another scenario's params. An 
 hold spaces and capitals, so it enters the name as a slug — lower case, every run of characters
 outside `[a-z0-9]` replaced by one `-`, trimmed, at most 40 characters (`Quasar Benchapp` is
 `quasar-benchapp`) — and is posted as the tag `app=<slug>` as well; an app name with nothing to
-slug is left out of the name and counted. `bench`, `cover_qr` and `hold_s` are not in the name —
-they are how the app was presented and how long it ran, and `hold_s` is a tag. **A run posted
+slug is left out of the name and counted. `bench`, `cover_qr`, `expect_marker` and `hold_s` are not
+in the name — they are how the app was presented, whether a marker is expected (the app name already
+identifies it) and how long it ran, and `hold_s` is a tag. **A run posted
 before this change has another name**: an app is part of it now, so re-posting an older bundle
 creates a second run. A param whose value is not an identifier, a finite number or a boolean
 refuses its scenario (`failed=N`, and the reason names the key) instead of being left out: two
@@ -500,35 +514,41 @@ valid (`reason=invalid-a` or `invalid-b`), 2 usage, or a comparison that cannot 
 make e2e-run TARGET=<stack url> PLAN=<plan> WEB_DIST=<dir> OUT=<dir>
 ```
 
-**What you need.** A build of the web client (`cd web && npm ci && npm run build` writes `web/dist/`; build
-each variant into its own directory), and a running stack with its test user, as for any run. Nothing is
-deployed and nothing on the stack changes.
+**What you need.** A build of the web client (`cd web && npm ci && npm run build` writes
+`web/dist/`; build each variant into its own directory), and a running stack with its test user, as
+for any run. Nothing is deployed and nothing on the stack changes.
 
-**What it does.** In the runner's own browser context (with `CDP=` that is still a separate context, never
-your tabs), every same-origin `GET` or `HEAD` for a document or a static file is answered from `<dir>`
-with `cache-control: no-store`. Everything else goes to the stack as before. Never answered from the
-directory, because the control plane routes them: `/v1/*` (the API and the signaling socket),
-`/health`, `/agent/*`, `/wt`, `/debug/*` and `/enroll-host.sh`. It follows the control plane's own static
-handler (`control-plane/internal/httpx/spa.go`): a file in the directory is served; an `/assets/*` path with no file is a 404
-(never `index.html`); any other path with no file, such as `/app/...`, `/admin/...` and `/login`, gets `index.html`.
-A document carries the stack's own security headers, copied from the stack's answer for that address, so a build that the stack's
-content security policy would block is blocked in the run too (that policy pins the two inline scripts in `web/index.html` by hash; changing one
-needs the control plane's hash changed with it, and the run will show the block). The page registers no service worker of its own (it
-registers one empty probe worker and unregisters it at once), and the run's browser context is fresh, so the stack's copy cannot be cached
-behind the directory's. A write (`POST`, `PUT`, ...) to a static path is not answered here: it goes to the stack and the page-write watch counts it as before.
+**What it does.** In the runner's own browser context (with `CDP=` that is still a separate context,
+never your tabs), every same-origin `GET` or `HEAD` for a document or a static file is answered from
+`<dir>` with `cache-control: no-store`. Everything else goes to the stack as before. Never answered
+from the directory, because the control plane routes them: `/v1/*` (the API and the signaling
+socket), `/health`, `/agent/*`, `/wt`, `/debug/*` and `/enroll-host.sh`. It follows the control
+plane's own static handler (`control-plane/internal/httpx/spa.go`): a file in the directory is
+served; an `/assets/*` path with no file is a 404 (never `index.html`); any other path with no file,
+such as `/app/...`, `/admin/...` and `/login`, gets `index.html`. A document carries the stack's own
+security headers, copied from the stack's answer for that address, so a build that the stack's
+content security policy would block is blocked in the run too (that policy pins the two inline
+scripts in `web/index.html` by hash; changing one needs the control plane's hash changed with it,
+and the run will show the block). The page registers no service worker of its own (it registers one
+empty probe worker and unregisters it at once), and the run's browser context is fresh, so the
+stack's copy cannot be cached behind the directory's. A write (`POST`, `PUT`, ...) to a static path
+is not answered here: it goes to the stack and the page-write watch counts it as before.
 
 **Trust.** The directory is as trusted as the stack's own web client: its scripts run in the browser
-as the stack's origin, with the test user's session. The runner serves it only to the stack's origin and
-only in its own context. A request path is decoded as the server does and must be a plain name: `..`, an
-encoded `/` or `\`, a NUL or an empty segment is refused with a 400 and never reaches the file system. The
-directory is read once at the start, so the bytes served are the bytes digested. It is refused (exit 2, nothing run)
-when `index.html` is missing, when anything in it is a link or other non-regular file, when it holds more
-than 200 MB, or when a file has an extension outside the table the runner knows (what Vite emits: html, js, css, json, webmanifest, svg, images, fonts, wasm, map, txt, sh).
+as the stack's origin, with the test user's session. The runner serves it only to the stack's origin
+and only in its own context. A request path is decoded as the server does and must be a plain name:
+`..`, an encoded `/` or `\`, a NUL or an empty segment is refused with a 400 and never reaches the
+file system. The directory is read once at the start, so the bytes served are the bytes digested. It
+is refused (exit 2, nothing run) when `index.html` is missing, when anything in it is a link or
+other non-regular file, when it holds more than 200 MB, or when a file has an extension outside the
+table the runner knows (what Vite emits: html, js, css, json, webmanifest, svg, images, fonts, wasm,
+map, txt, sh).
 
-**How to read the result.** `builds.json` says `web: {"source": "web-dist", "sha256": ..., "files": N}`
-and `manifest.json` has `web_build: {"served_by": "runner", "source": "web-dist"}`. The digest is of the sorted file paths and file
-hashes: the same build in another directory has the same digest, one changed byte has a different one.
-No path or file name from your machine is written. `make e2e-review` and `e2e-compare` show it as the web build.
+**How to read the result.** `builds.json` says `web: {"source": "web-dist", "sha256": ...,
+"files": N}` and `manifest.json` has `web_build: {"served_by": "runner", "source": "web-dist"}`. The
+digest is of the sorted file paths and file hashes: the same build in another directory has the same
+digest, one changed byte has a different one. No path or file name from your machine is written.
+`make e2e-review` and `e2e-compare` show it as the web build.
 
 **A/B of a web change**, two runs on the same stack, then the comparison:
 
@@ -538,12 +558,15 @@ make e2e-run TARGET=<stack url> PLAN=smoke WEB_DIST=/abs/path/build-b OUT=/abs/p
 make e2e-compare A=/abs/path/run-a B=/abs/path/run-b
 ```
 
-`COMPARE.md` opens with `builds.web.build` differing between the two (the two digests), and then what moved. One pair of runs is not a regression: repeat each side.
-Both sides of an A/B must be `WEB_DIST` runs: compare a build against the stack's own copy by building that copy too. A run with `WEB_DIST` loads
-the web client's files from the runner's memory with the browser's HTTP cache off, so the page's own download-speed probe (it times the main script
-bundle) says nothing about the path to the stack; requests the stack answers, such as its health probe, are not touched.
-A stray file with no known extension in the directory (a `.DS_Store` from a Mac) refuses the run: remove it.
-The pack for a remote tester takes the same variable in its environment (`QUASAR_E2E_WEB_DIST`); it has no flag for it.
+`COMPARE.md` opens with `builds.web.build` differing between the two (the two digests), and then
+what moved. One pair of runs is not a regression: repeat each side. Both sides of an A/B must be
+`WEB_DIST` runs: compare a build against the stack's own copy by building that copy too. A run with
+`WEB_DIST` loads the web client's files from the runner's memory with the browser's HTTP cache off,
+so the page's own download-speed probe (it times the main script bundle) says nothing about the path
+to the stack; requests the stack answers, such as its health probe, are not touched. A stray file
+with no known extension in the directory (a `.DS_Store` from a Mac) refuses the run: remove it. The
+pack for a remote tester takes the same variable in its environment (`QUASAR_E2E_WEB_DIST`); it has
+no flag for it.
 
 ### The fallback and keyboard-and-mouse scenarios
 
@@ -552,18 +575,23 @@ make e2e-run TARGET=... PLAN=fallback HOOKS=<dir>     # needs the hook fault:web
 make e2e-run TARGET=... PLAN=input
 ```
 
-Neither is in `smoke`. Both launch the way `stream-hold` does and take its `transport`, `codec`, `profile`, `app`,
-`bench` and `cover_qr`; `first_frame_s` is judged first and a scenario is never `pass` without it. A criterion
-with no evidence source today is `pass: null` and its `expected` says what is missing: nothing is invented and
-no telemetry key, trace event or stats field is added for it.
+Neither is in `smoke`. Both launch the way `stream-hold` does and take its `transport`, `codec`,
+`profile`, `app`, `bench` and `cover_qr`; `first_frame_s` is judged first and a scenario is never
+`pass` without it. A criterion with no evidence source today is `pass: null` and its `expected` says
+what is missing: nothing is invented and no telemetry key, trace event or stats field is added for
+it.
 
-`transport-fallback` takes `transport: webtransport` and `when`: `mid` (default; the pointer lock is taken and a
-key held, then the hook is applied while streaming) or `connect` (applied before the launch). `hold_s` is how
-long it waits for the fallback and a frame: counted from the fault in `mid`, from the first frame in `connect`
-(the fault was already on). A `mid` run whose session had already fallen back before the fault (the session row
-has a reason, the page already posted the event, or the `<video>` is already decoding) is an `error` that says so
-and the hook is not applied; only evidence from after the fault counts. That check runs before the pointer lock is taken and the key held, so such a run touches nothing, and a session row it cannot read just before the fault is an `error` that says so. The key is held only when the lock is held. With no first frame the fault is never
-applied (`mid`) or nothing is watched after it (`connect`), so the criteria after the fault are `pass: null`.
+`transport-fallback` takes `transport: webtransport` and `when`: `mid` (default; the pointer lock is
+taken and a key held, then the hook is applied while streaming) or `connect` (applied before the
+launch). `hold_s` is how long it waits for the fallback and a frame: counted from the fault in
+`mid`, from the first frame in `connect` (the fault was already on). A `mid` run whose session had
+already fallen back before the fault (the session row has a reason, the page already posted the
+event, or the `<video>` is already decoding) is an `error` that says so and the hook is not applied;
+only evidence from after the fault counts. That check runs before the pointer lock is taken and the
+key held, so such a run touches nothing, and a session row it cannot read just before the fault is
+an `error` that says so. The key is held only when the lock is held. With no first frame the fault
+is never applied (`mid`) or nothing is watched after it (`connect`), so the criteria after the fault
+are `pass: null`.
 
 | criterion | judged as |
 |---|---|
@@ -573,20 +601,32 @@ applied (`mid`) or nothing is watched after it (`connect`), so the criteria afte
 | `frame_after_fallback` | the `<video>` decoded a frame after the fault went on (it had none before it); `observed` is the seconds from the fault and, in `mid`, how long no frame advanced (see below) |
 | `held_key_released` | `pass: null`. A key held across the fallback (`key-held`, then `key-released` by the runner at the end) is the test; the client cannot see the host's key state. Needs the host half (an agent input log) or the reference app logging individual keys. In `connect` nothing is held: no input is captured before the first picture |
 
-`fallback.json` also records why the wait ended (`wait_ended_by`: `fallback_and_frame_seen`, `hold_elapsed` or `session_ended`; the same in the timeline step `wait-ended`) with the seconds waited (`waited_s`), and, in `mid`, `no_frame_advance_before_video_s`: the longest run of one-second samples between the fault and the first `<video>` frame in which neither the bench frames nor the `<video>` advanced (about the seconds the picture froze; one-second resolution; when no `<video>` frame came it runs to the end of the wait). It is `null` in `connect`, when no sample was taken (the session ended at once), when a count could not be read, and once the bench's frame ring is full (5000 frames), because its count then stops growing. It is a fact, not a criterion, and has no threshold. `fallback_event` and `frame_after_fallback` say where their wait starts: the fault in `mid`, the first frame in `connect`.
+`fallback.json` also records why the wait ended (`wait_ended_by`: `fallback_and_frame_seen`,
+`hold_elapsed` or `session_ended`; the same in the timeline step `wait-ended`) with the seconds
+waited (`waited_s`), and, in `mid`, `no_frame_advance_before_video_s`: the longest run of one-second
+samples between the fault and the first `<video>` frame in which neither the bench frames nor the
+`<video>` advanced (about the seconds the picture froze; one-second resolution; when no `<video>`
+frame came it runs to the end of the wait). It is `null` in `connect`, when no sample was taken (the
+session ended at once), when a count could not be read, and once the bench's frame ring is full
+(5000 frames), because its count then stops growing. It is a fact, not a criterion, and has no
+threshold. `fallback_event` and `frame_after_fallback` say where their wait starts: the fault in
+`mid`, the first frame in `connect`.
 
-`input-kbm` sends one fixed sequence (`SEQUENCE` in the scenario file: six keys, the three mouse buttons, wheel up
-and down, relative motion) as trusted events through the DevTools protocol (`Input.dispatchKeyEvent`,
-`Input.dispatchMouseEvent`). The pointer lock first: the product takes it from its "Click to play" layer (a click on
-the stage only opens the HUD shelf), so the scenario waits for that layer and clicks it once with a trusted click (the
-product removes the layer on the first click), then waits for the lock. With no layer within the wait the launch was not
-immersive, and it tries the HUD's own route: a trusted click on the stream, which opens the shelf, then a click on the
-shelf's "Capture input" button (the product's `aria-label`); `pointer_lock_taken`'s `observed` says which route held the lock
-or why none did. A key or button held when the run is cut is released on the way out; a release that fails is named
-in "left behind". `hold_s` is the pause after the sequence. `input-sent.json` holds what was sent (in order, with `sent_motion_sum`) and what the page
-received (each `mousemove` as `[movementX, movementY, isTrusted]`, at most 200, with the total count and `motion_sum`; the motion
-before the sequence starts is not counted), for the host half to compare. The moves sum to (50, 25), not zero, so no motion and
-motion that cancels are different bundles.
+`input-kbm` sends one fixed sequence (`SEQUENCE` in the scenario file: six keys, the three mouse
+buttons, wheel up and down, relative motion) as trusted events through the DevTools protocol
+(`Input.dispatchKeyEvent`, `Input.dispatchMouseEvent`). The pointer lock first: the product takes it
+from its "Click to play" layer (a click on the stage only opens the HUD shelf), so the scenario
+waits for that layer and clicks it once with a trusted click (the product removes the layer on the
+first click), then waits for the lock. With no layer within the wait the launch was not immersive,
+and it tries the HUD's own route: a trusted click on the stream, which opens the shelf, then a click
+on the shelf's "Capture input" button (the product's `aria-label`); `pointer_lock_taken`'s
+`observed` says which route held the lock or why none did. A key or button held when the run is cut
+is released on the way out; a release that fails is named in "left behind". `hold_s` is the pause
+after the sequence. `input-sent.json` holds what was sent (in order, with `sent_motion_sum`) and
+what the page received (each `mousemove` as `[movementX, movementY, isTrusted]`, at most 200, with
+the total count and `motion_sum`; the motion before the sequence starts is not counted), for the
+host half to compare. The moves sum to (50, 25), not zero, so no motion and motion that cancels are
+different bundles.
 
 | criterion | judged as |
 |---|---|
@@ -603,7 +643,8 @@ the runner and every file it imports (worked out from the code, not listed by ha
 `thresholds.json` and `metrics.json`, `package.json` and a lockfile for `playwright-core` alone,
 `run.sh` and `run.cmd`, a plain `README.txt` and `VERSION` (the commit it was made from, `dirty`
 after it if tracked files differed; a scenario or plan git does not track stops the pack). No
-tests, no hook scripts, no host or `.env` file, nothing from `.claude/`. The tester needs Node 22 and Chrome, nothing from this repository.
+tests, no hook scripts, no host or `.env` file, nothing from `.claude/`. The tester needs Node 22
+and Chrome, nothing from this repository.
 
 What the tester does (they are also told in `README.txt`): unpack, make `signin.txt` in the folder
 with `QUASAR_E2E_EMAIL=` and `QUASAR_E2E_PASSWORD=` lines (the sign-in is never a command-line
@@ -698,7 +739,10 @@ recorded — but the run's result is derived from it, not copied.
   known) and telemetry rows on the client's, and two rows that share a timestamp are two windows
   that collide. A row is a candidate for `present_interval_max_ms`, `g2g_p95_ms` and
   `missing_indices` (highest) or `fps` and `bench_n` (lowest) only when its finite value is
-  strictly worse than that key's median, so a clean window is never called worst. Candidates are
+  strictly worse than that key's median, so a clean window is never called worst. `missing_indices`
+  is omitted by both bench folds when a window decoded no marker (`decoded <= 0`) and is not ranked
+  on any row whose `bench_decoded` is 0 (a legacy row carrying `missing_indices` without
+  `bench_decoded` still ranks). Candidates are
   ranked densely per key (equal values share a rank, 0 is the worst value) and the five with the
   lowest rank are shown, ties going to the earlier key and then the earlier timestamp; when a tie
   is cut, the last row shown at that value says `(+N more at this value)`. The line above the

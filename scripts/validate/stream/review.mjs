@@ -249,23 +249,35 @@ export function warmupStartMs(samples, thresholds, warmupKey = "classifier.warmu
  * timestamp. A tie at the same value is cut only at the end, and the row before the cut
  * says how many more there were.
  */
+// `missing_indices` is measured from decoded marker frame indices (web/src/bench/aggregate.ts);
+// an older bundle can carry `missing_indices: 0` beside `bench_decoded: 0`, which is unmeasured,
+// never zero. A legacy row that carries `missing_indices` without `bench_decoded` still counts.
+const windowMetricValue = (metrics, key) => {
+  if (key === "missing_indices" && metrics.bench_decoded !== undefined && !(Number.isFinite(metrics.bench_decoded) && metrics.bench_decoded > 0)) {
+    return null;
+  }
+  const value = metrics[key];
+  return Number.isFinite(value) ? value : null;
+};
+
 function worstWindows(rows) {
   const windows = rows
     .filter((row) => row.source === "browser" && row.metrics && typeof row.ts_unix_ms === "number")
     .map((row) => ({ ts_unix_ms: row.ts_unix_ms, metrics: row.metrics }));
-  const ranked = WINDOW_KEYS.filter(({ key }) => windows.some((w) => Number.isFinite(w.metrics[key])));
+  const ranked = WINDOW_KEYS.filter(({ key }) => windows.some((w) => windowMetricValue(w.metrics, key) !== null));
 
   const candidates = [];
   ranked.forEach(({ key, worst }, keyIndex) => {
-    const values = windows.map((w) => w.metrics[key]).filter(Number.isFinite);
+    const values = windows.map((w) => windowMetricValue(w.metrics, key)).filter((v) => v !== null);
     const middle = median(values);
-    const worse = windows.filter(
-      (w) => Number.isFinite(w.metrics[key]) && (worst === "lowest" ? w.metrics[key] < middle : w.metrics[key] > middle),
-    );
+    const worse = windows.filter((w) => {
+      const value = windowMetricValue(w.metrics, key);
+      return value !== null && (worst === "lowest" ? value < middle : value > middle);
+    });
     // Dense rank: the worst distinct value is 0, the next 1, and equal values share one.
-    const byBadness = [...new Set(worse.map((w) => w.metrics[key]))].sort((a, b) => (worst === "lowest" ? a - b : b - a));
+    const byBadness = [...new Set(worse.map((w) => windowMetricValue(w.metrics, key)))].sort((a, b) => (worst === "lowest" ? a - b : b - a));
     for (const w of worse) {
-      const value = w.metrics[key];
+      const value = windowMetricValue(w.metrics, key);
       // Every sample row is a window, so two rows with the same timestamp, key and value
       // are two windows: they are two candidates, and the tie count says so.
       candidates.push({ ts_unix_ms: w.ts_unix_ms, worst_for: key, value, rank: byBadness.indexOf(value), keyIndex });
@@ -285,7 +297,7 @@ function worstWindows(rows) {
   shown.forEach((c, i) => lastShown.set(group(c), i));
 
   const benchOffsetUnknown = windows.some(
-    (w) => HOST_CLOCK_KEYS.some((key) => Number.isFinite(w.metrics[key])) && flagSet(w.metrics.offset_unknown),
+    (w) => HOST_CLOCK_KEYS.some((key) => windowMetricValue(w.metrics, key) !== null) && flagSet(w.metrics.offset_unknown),
   );
 
   return {
