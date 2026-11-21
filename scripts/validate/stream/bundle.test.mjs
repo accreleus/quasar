@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { validateBundle } from "./bundle.mjs";
+import { scrub, validateBundle } from "./bundle.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "../../..");
@@ -47,6 +47,44 @@ test("a web build the runner served from WEB_DIST is a valid bundle", () => {
   const d = bundle();
   withWeb(d);
   assert.deepEqual(validateBundle(d), []);
+});
+
+const REPORTED = { commit: "0123456789abcdef0123456789abcdef01234567", built_at: "2026-11-21T01:02:03.000Z" };
+const withComponent = (d, name, value) => edit(d, "builds.json", (b) => ({ ...b, components: { ...b.components, [name]: value }, unknown: Object.fromEntries(Object.entries(b.unknown).filter(([k]) => k !== name)) }));
+
+test("a web build the page reported (commit and time) and a negotiated encoder are valid, with no reason needed", () => {
+  const d = bundle();
+  withComponent(d, "web", REPORTED);
+  withComponent(d, "encoder", { factory: "vulkanh264enc", codec: "h264", profile: "main", level: "4.2" });
+  assert.deepEqual(validateBundle(d), []);
+});
+
+test("a null component still needs its reason, the encoder included", () => {
+  const d = bundle();
+  edit(d, "builds.json", (b) => ({ ...b, components: { ...b.components, encoder: null } }));
+  assert.match(validateBundle(d).join("\n"), /encoder is null with no reason in unknown/);
+});
+
+test("a rejected-shape web build or encoder", () => {
+  for (const [name, value, re] of [
+    ["web", { ...REPORTED, commit: "main" }, /web must be exactly commit/],
+    ["web", { ...REPORTED, built_at: "yesterday" }, /web must be exactly commit/],
+    ["web", { ...REPORTED, url: "x" }, /web must be exactly commit/],
+    ["web", { ...REPORTED, built_at: "2026-11-21" }, /web must be exactly commit/],
+    ["web", { ...REPORTED, built_at: "2026-11-21T01:02:03" }, /web must be exactly commit/],
+    ["web", { ...REPORTED, built_at: "2026-11-21T11:02:03+10:00" }, /web must be exactly commit/],
+    ["web", { ...REPORTED, commit: 1234567 }, /web must be exactly commit/],
+    ["web", [REPORTED], /web must be exactly commit/],
+    ["web", "0123456", /web must be exactly commit/],
+    ["encoder", { factory: "a b" }, /encoder must be factory/],
+    ["encoder", { factory: "vulkanh264enc", caps: "video/x-h264" }, /encoder must be factory/],
+    ["encoder", {}, /encoder must be factory/],
+    ["encoder", "vulkanh264enc", /encoder must be factory/],
+  ]) {
+    const d = bundle();
+    withComponent(d, name, value);
+    assert.match(validateBundle(d).join("\n"), re, JSON.stringify(value));
+  }
 });
 
 test("a scenario directory is a bench_submit.py run directory", () => {
@@ -97,6 +135,13 @@ const RULES = [
   ["a credential in angle brackets", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "password=<hunterzzz>\n"), /x.log: holds a credential/],
   ["a credential that starts like a marker", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "password=<credential>hunter2secret\n"), /x.log: holds a credential/],
   ["a token= in free text", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "MY_TOKEN=abcdef123456\n"), /x.log: holds a credential/],
+  ["a glued camelCase accessToken= in a log", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "GET /v1/x?accessToken=abcdef123456\n"), /x.log: holds a credential/],
+  ["a glued lowercase authtoken= in a log", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "authtoken=abcdef123456\n"), /x.log: holds a credential/],
+  ["a glued refreshToken: in a log", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "refreshToken: secret-value-99\n"), /x.log: holds a credential/],
+  ["a glued clientSecret= in a log", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "clientSecret=abcdef123456\n"), /x.log: holds a credential/],
+  ["a glued userPassword= in a log", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "userPassword=hunter2\n"), /x.log: holds a credential/],
+  ["a glued myApiKey= in a log", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "myApiKey=abcdef123456\n"), /x.log: holds a credential/],
+  ["a glued googleApikey: in a log", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "googleApikey: secret-value-99\n"), /x.log: holds a credential/],
   ["a password that only starts like 'none'", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "password: none-of-your-business1\n"), /x.log: holds a credential/],
   ["a password with an exempt word followed by a dotted suffix", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "password: none.part123\n"), /x.log: holds a credential/],
   ["a password that only starts like 'null'", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "password: nullify\n"), /x.log: holds a credential/],
@@ -187,8 +232,33 @@ test("a browser version, a documentation address and a container's home are not 
 
 test("authorization requirements and none-words with sentence punctuation are prose", () => {
   const dir = bundle();
-  fs.writeFileSync(path.join(dir, "README.md"), "authorization: required\nAuthorization: required.\npassword: none.\nsecret: n/a.\n");
+  fs.writeFileSync(path.join(dir, "README.md"), "authorization: required\nAuthorization: required.\npassword: none.\nsecret: n/a.\naccessToken=none\nauthtoken=<credential>\nmyApiKey=none\nmonkey=1\nmonkey=abcd1234\nhotkey: ctrl+alt+del\nprimaryKey=abcdef12\n");
   assert.deepEqual(validateBundle(dir), []);
+});
+
+test("glued credential names are scrubbed cleanly and the pattern stays linear on 100k-char adversarial inputs", () => {
+  const counts = {};
+  const scrubbed = scrub("url?accessToken=abcdef123456 authtoken=zyxwvu987654 myApiKey=keyval123456", counts);
+  assert.ok(!scrubbed.includes("abcdef123456") && !scrubbed.includes("zyxwvu987654") && !scrubbed.includes("keyval123456"), scrubbed);
+  assert.equal(counts.credentials, 3);
+  const dir = bundle();
+  fs.writeFileSync(path.join(dir, SC, "x.log"), `${scrubbed}\n`);
+  assert.deepEqual(validateBundle(dir), []);
+
+  // Adversarial 100k-char strings: linear regex finishes in milliseconds, never quadratic backtracking.
+  const adversarial = [
+    "a".repeat(100_000),
+    `${"access".repeat(16_667)}Token=abc`,
+    `${"google".repeat(16_667)}ApiKey=abc`,
+    `token${" ".repeat(100_000)}`,
+    `authorization:${" ".repeat(100_000)}`,
+  ];
+  const t0 = performance.now();
+  for (const s of adversarial) {
+    assert.equal(scrub(s), s);
+  }
+  const elapsedMs = performance.now() - t0;
+  assert.ok(elapsedMs < 500, `credential pattern took ${elapsedMs.toFixed(1)} ms on 100k-char inputs`);
 });
 
 test("the command: 0 valid, 1 not valid, 2 usage, and a RESULT line", () => {

@@ -31,8 +31,8 @@ export const SECRETS = [
   // A value that says there is none ("password": null, secret: none, token=[REDACTED], password: none.) is not one.
   // Nor is one of the markers a redaction leaves, alone (token=<credential>); anything else in angle brackets is a value.
   // Bare "authorization: required" is prose. Assignments, quoted values and longer tokens still count.
-  // No letter before the name, so MY_TOKEN= and hook_secret: count as well as token= itself.
-  [/(?<![A-Za-z])(?!(?<![\w-])authorization:[ \t]+required[.;!?]?[ \t]*(?=[\r\n"']|$))(authorization|cookie|password|passwd|secret|token|api[_-]?key)["']?\s*[=:]\s*["']?(?!<(?:credential|token|address|stack|user)>(?!\w))(?!\[?(?:null|none|n\/?a|redacted|omitted|unknown|true|false|bearer)\]?(?=[.;!?]?(?:[\s"',}]|$)))[^\s"',}]{4,}/i, "a credential"],
+  // Glued names (accessToken=, authtoken=, clientSecret=, userPassword=, setCookie=, myApiKey=) match too; authorization still requires no leading letter so prose exemptions stay exact.
+  [/(?:(?<![A-Za-z])(?!(?<![\w-])authorization:[ \t]+required[.;!?]?[ \t]*(?=[\r\n"']|$))authorization|(?:cookie|password|passwd|secret|token|api[_-]?key))["']?\s*[=:]\s*["']?(?!<(?:credential|token|address|stack|user)>(?!\w))(?!\[?(?:null|none|n\/?a|redacted|omitted|unknown|true|false|bearer)\]?(?=[.;!?]?(?:[\s"',}]|$)))[^\s"',}]{4,}/i, "a credential"],
 ];
 
 /**
@@ -133,6 +133,31 @@ export function manifestEstimators(file = path.join(ROOT, "docs/session-trace/me
   }
   return out;
 }
+
+const COMMIT = /^[0-9a-f]{7,40}$/i;
+// A complete time with a zone: a date alone would invent a time of day.
+const ZONED = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+
+/**
+ * The web build a page reported (`window.__qBench.build()`), in the one shape builds.json holds it, or null.
+ * `v` is a plain object whose `commit` is a hex string and `built_at` a complete timestamp with a zone; any
+ * other member is ignored and never copied. The runner writes this form, and the validator accepts only it.
+ */
+export function parseWebBuild(v) {
+  if (v === null || typeof v !== "object" || Array.isArray(v)) return null;
+  if (typeof v.commit !== "string" || !COMMIT.test(v.commit) || typeof v.built_at !== "string" || !ZONED.test(v.built_at)) return null;
+  const ms = Date.parse(v.built_at);
+  if (Number.isNaN(ms)) return null;
+  const built_at = new Date(ms).toISOString();
+  // A year outside 0000-9999 is written with a sign and six digits, which the validator refuses.
+  return /^\d{4}-/.test(built_at) ? { commit: v.commit.toLowerCase(), built_at } : null;
+}
+
+const ENCODER_MEMBERS = ["factory", "codec", "profile", "level"];
+/** Is `v` an encoder record as e2e-collect writes it: some of factory, codec, profile and level, each a plain name, and no other member? */
+export const isEncoder = (v) =>
+  v !== null && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length > 0 &&
+  Object.entries(v).every(([k, x]) => ENCODER_MEMBERS.includes(k) && typeof x === "string" && /^[A-Za-z0-9_.:+-]{1,64}$/.test(x));
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 
@@ -239,6 +264,16 @@ function check(dir, errors, { keys = manifestKeys() } = {}) {
     } else if (served !== undefined) {
       err("manifest.json", "web_build is set and builds.json has no web-dist web build");
     }
+    // A web build the page reported through bench mode (#1281): its commit and build time, nothing else, in the form the runner writes.
+    if (web !== undefined && web !== null && !(isObj(web) && web.source === "web-dist")) {
+      const parsed = parseWebBuild(web);
+      if (!parsed || Object.keys(web).sort().join() !== "built_at,commit" || parsed.commit !== web.commit || parsed.built_at !== web.built_at) {
+        err("builds.json", "web must be exactly commit (7-40 lowercase hex) and built_at (an ISO UTC time like 2026-11-21T01:02:03.000Z), or the web-dist digest");
+      }
+    }
+    // The negotiated encoder, as e2e-collect projects it from the caps.negotiated trace event (#1281).
+    const enc = builds.components?.encoder;
+    if (enc !== undefined && enc !== null && !isEncoder(enc)) err("builds.json", "encoder must be factory, codec, profile and level, each a plain name");
   }
   if (network && !("shaping" in network)) err("network.json", "no shaping (null when none was applied)");
 

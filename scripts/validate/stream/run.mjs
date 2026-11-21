@@ -22,7 +22,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "../lib/args.mjs";
 import { attachEvidenceListeners } from "../lib/listeners.mjs";
-import { FORMAT, validateBundle } from "./bundle.mjs";
+import { FORMAT, parseWebBuild, validateBundle } from "./bundle.mjs";
 import { declaredHooks, Hooks, LEDGER } from "./hooks.mjs";
 import { Recorder, ScenarioRecorder } from "./record.mjs";
 import { errorReason } from "./scenarios/stream-common.mjs";
@@ -304,7 +304,10 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
     // Hooks: a runner that died between apply and clear left a ledger beside the bundle; it is cleared before anything else, or the run does not start.
     const hooks = hooksDir ? new Hooks({ dir: hooksDir, ledgerDir: path.dirname(path.resolve(dir)), timeoutMs: hookTimeoutMs, redact: (s) => bundle.text(s) }) : null;
     // Without HOOKS= nothing here can clear a hook; a ledger beside the bundle says a run left one applied.
-    if (!hooks && fs.existsSync(path.join(path.dirname(path.resolve(dir)), LEDGER))) onNote(`warning: ${LEDGER} beside the bundle says an earlier run left a hook applied; this run has no HOOKS= and cannot clear it`);
+    const hookLedgerWarning = !hooks && fs.existsSync(path.join(path.dirname(path.resolve(dir)), LEDGER))
+      ? `${LEDGER} beside the bundle says an earlier run left a hook applied; this run has no HOOKS= and cannot clear it`
+      : null;
+    if (hookLedgerWarning) onNote(`warning: ${hookLedgerWarning}`);
     const recovered = hooks ? await hooks.recover((ev, d) => onNote(bundle.text(`${ev} ${JSON.stringify(d)}`))) : [];
     if (recovered.length) onNote(`cleared hook(s) a runner that died had left applied: ${recovered.join(", ")}`);
     const startedAt = now();
@@ -336,6 +339,7 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
 
     const counts = { pass: 0, fail: 0, error: 0, skipped: 0 };
     const dirs = [];
+    const reportedWeb = new Set(); // the web builds the scenarios' pages reported through bench mode, as JSON
     let interrupted = false;
     abort.then(() => { interrupted = true; });
     for (const e of entries) {
@@ -390,6 +394,12 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
           // A page-derived message is not written while the page's bearer is unknown (the scenario catches its own errors; this is what escapes it).
           out = { status: "error", reason: page && rec.holding ? "the scenario did not complete (the page's own words are not written before its sign-in is read)" : errorReason(err), criteria: [], sessions: [], clock_offset_ms: null };
         } finally {
+          // Every scenario's page is asked for its web build before it closes; one that has no bench mode, or no page to ask, says nothing.
+          if (page) {
+            const asked = await Promise.race([page.evaluate(() => window.__qBench?.build?.() ?? null).catch(() => null), new Promise((r) => setTimeout(() => r(null), 5000).unref())]);
+            const reported = parseWebBuild(asked);
+            if (reported) reportedWeb.add(JSON.stringify(reported));
+          }
           // Order matters: close the page, wait for every response it was still delivering, then stop what the run owns.
           // The close error's words are the browser's about a page: held back like the page's own until its bearer is known.
           if (page) await host.closePage(page).catch((err) => { left = `a page it opened would not close${rec.holding ? "" : ` (${errorReason(err)})`}`; });
@@ -414,10 +424,23 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
     }
 
     const info = host.info ?? {};
+    // A web build served from WEB_DIST is named by its digest; otherwise by what the page reported, when every scenario agreed.
+    // What is recorded must be what the validator accepts after the recorder's own cleaning: a report that cannot be, is not recorded.
+    const agreed = reportedWeb.size === 1 ? JSON.parse([...reportedWeb][0]) : null;
+    const lost = !webDist && agreed !== null && !bundle.unchanged(agreed);
+    const web = webDist ? webBuild(webDist) : agreed !== null && !lost ? agreed : null;
+    const HOST_HALF = "the host half (e2e-collect) fills this; the client cannot see it";
+    const why = {
+      web: lost ? "the build report did not survive recording (the recorder removes a part of it: it matches the test user's sign-in or a secret)" : reportedWeb.size > 1 ? "the scenarios' pages reported different web builds" : "no page reported a web build: bench mode was off, no scenario got as far as reading it, or the build has no commit or time (an unstamped build)",
+      control_plane: HOST_HALF,
+      node_agent: HOST_HALF,
+      encoder: "the host half (e2e-collect) fills this from the session's caps.negotiated trace event; the client cannot see it",
+      reference_app: "the app's own log stays on the host and nothing collects it (the session's app log tail is kept for failures only); no API of the stack reports the app's version (issue #1281)",
+      gpu_driver: "no session-bound API field reports the GPU driver: the host policy approval preview can name a candidate GPU's driver_identity, not necessarily the one the session ran on (issue #1281)",
+    };
     bundle.json("builds.json", {
-      components: { browser: client.browser, os: client.os, web: webDist ? webBuild(webDist) : null, control_plane: null, node_agent: null, reference_app: null, gpu_driver: null },
-      // e2e-collect reads the control plane and the node agent only (collect.mjs). A web build the runner served is known, so it has no reason.
-      unknown: Object.fromEntries(["web", "control_plane", "node_agent", "reference_app", "gpu_driver"].filter((k) => !(k === "web" && webDist)).map((k) => [k, info[k] ?? (["control_plane", "node_agent"].includes(k) ? "the host half (e2e-collect) fills this; the client cannot see it" : "the client cannot see it, and e2e-collect does not read it yet")])),
+      components: { browser: client.browser, os: client.os, web, control_plane: null, node_agent: null, encoder: null, reference_app: null, gpu_driver: null },
+      unknown: Object.fromEntries(Object.keys(why).filter((k) => !(k === "web" && web)).map((k) => [k, info[k] ?? why[k]])),
     });
     bundle.json("network.json", { path: { rtt_ms: null }, shaping: null, tls_verification: insecureTls ? "off (INSECURE_TLS=1)" : "on" });
     bundle.json("manifest.json", {
@@ -433,6 +456,7 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
       redacted: Object.keys(bundle.redacted),
       target: "stack",
       ...(webDist ? { web_build: { served_by: "runner", source: "web-dist" } } : {}),
+      ...(hookLedgerWarning ? { warnings: [hookLedgerWarning] } : {}),
     });
     const errors = [...bundle.problems, ...validateBundle(staging)];
     if (!errors.length) { fs.renameSync(staging, dir); committed = true; }

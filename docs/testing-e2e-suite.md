@@ -155,12 +155,14 @@ make e2e-run TARGET=... PLAN=... HOOKS=<dir>        # or QUASAR_E2E_HOOKS=<dir>
   hook under "left behind", and the following scenarios are `skipped` until it clears.
 - **A runner killed between apply and clear** (`kill -9`) cannot clear. Before each apply it writes
   `.e2e-hooks-applied.json` in the directory that holds `OUT`; the next run with the same `HOOKS=` and
-  an `OUT` in the same directory runs `clear` for every entry first and says so on stderr. A run with
-  no `HOOKS=` that finds the file only warns: it cannot clear anything. A hook that was still running
-  when its runner died keeps running; the next run waits for it to end (up to the hook's 30 s) before
-  it clears, and does not start if it does not end. If one will not clear, or the process that wrote it is
-  still running, the run does not start. A damaged ledger also stops it: remove the file once the hooks are
-  known to be clear.
+  an `OUT` in the same directory runs `clear` for every entry first and says so on stderr. A run
+  without `HOOKS=` that finds the file warns on stderr and records the warning in
+  `manifest.json` under `warnings`. Recovery waits up to 30 s total for all recorded hook process
+  groups to end before clearing. A background child left in its hook's process group keeps that
+  group alive after the runner dies. Recovery refuses to start a suite while that group survives
+  the deadline. A hook that fails to clear, a live ledger owner or a damaged ledger also stops
+  the run. Remove a damaged ledger once the hooks are known to be clear.
+  Run one recoverer per ledger at a time. Concurrent recoverers can claim and clear the same entries.
 - **No script.** A scenario whose hook has no executable script (or no `HOOKS=`) is `skipped`; the reason
   names the hook. Nothing is launched.
 
@@ -230,7 +232,8 @@ or a run that was cut short).
 The collector reads the control plane's own answers, in the control plane's own shapes: the
 session row, the raw samples, and the trace for the window the session ran in (`started_at - 5 s`
 to `ended_at + 5 s`, or now), followed by the host's settings and agent build. Trace reads cover
-at most 10 minutes each. A read that reaches the sample or event cap is split. The control
+at most 10 minutes each. A read is split when the window has more than 1,000 raw samples
+or either event response reaches 1,000 rows. The control
 plane's build is read once per collection that needs it. **The stack
 deletes telemetry after its retention period** (a day by default; the row stays), so a session
 collected later than that has no trace: it is not an error and not an empty half, it is
@@ -290,7 +293,7 @@ reads the control-plane build again.
 | `<scenario>/metrics.jsonl` | the session's raw samples (every key, string-valued ones too, at their own timestamps) **merged** with the client half's own rows: same source and `ts_unix_ms` is the same row, joined key by key, the client half's value winning a key both have; sorted by ts then source. A key the metric manifest lacks, or a source the format lacks, is dropped and listed in `host-half.json` |
 | `<scenario>/trace.json` | the session's stored trace events (as stored, not clock-aligned), merged with the client half's; a clock the client measured is kept when the server's is unmeasured. A second session's own events are in its `sessions/<id>/trace.json` |
 | `<scenario>/host-half.json` | `{ "collected": true, "read_at_ms": ..., "node_agent": ... }` (plus `metric_keys_not_in_manifest` and `sources_not_in_bundle` when something was dropped: a name is listed only if it is a plain identifier, any other is counted in `other_dropped`; `"trace": "the session never started"` when all sessions ended before starting; `not_projected` when a projected value had the wrong shape and was left out), or `collected: false` with the `reason` |
-| `builds.json` | `components.control_plane` from `GET /v1/admin/platform/identity`, `components.node_agent` from the host row's `agent_version`/`source_commit`/`built_at` (`GET /v1/hosts/{id}`, which answers `{"host": ...}`); a build that cannot be read is `null` with its reason in `unknown`, replacing whatever the client half held; every other component is left as the client half wrote it |
+| `builds.json` | `components.control_plane` from `GET /v1/admin/platform/identity`, `components.node_agent` from the host row's `agent_version`/`source_commit`/`built_at` (`GET /v1/hosts/{id}`, which answers `{"host": ...}`), `components.encoder` from the session's latest `caps.negotiated` trace event (the sessions must agree); a build that cannot be read is `null` with its reason in `unknown`, replacing whatever the client half held; every other component is left as the client half wrote it |
 | `manifest.json` | `halves.host: true`, only when every scenario is collected |
 
 Every file the collector writes goes through one function: credential-named fields
@@ -345,8 +348,11 @@ must not share a name. `/` and `=` are the separators because an identifier and 
 neither, so a scenario's own name can never spell another scenario's params. An app's name may
 hold spaces and capitals, so it enters the name as a slug — lower case, every run of characters
 outside `[a-z0-9]` replaced by one `-`, trimmed, at most 40 characters (`Quasar Benchapp` is
-`quasar-benchapp`) — and is posted as the tag `app=<slug>` as well; an app name with nothing to
-slug is left out of the name and counted. `bench`, `cover_qr`, `expect_marker` and `hold_s` are not
+`quasar-benchapp`) — and is posted as the tag `app=<slug>` as well. An empty slug refuses the
+scenario. Distinct app names can share a bench scenario when the other parameters match.
+For example, `Quasar Benchapp` and `quasar-benchapp` both produce `app=quasar-benchapp`.
+Names that produce the same truncated slug also collide.
+`bench`, `cover_qr`, `expect_marker` and `hold_s` are not
 in the name — they are how the app was presented, whether a marker is expected (the app name already
 identifies it) and how long it ran, and `hold_s` is a tag. **A run posted
 before this change has another name**: an app is part of it now, so re-posting an older bundle
@@ -406,6 +412,11 @@ never through a shell. A scenario is not posted (`failed=N`, and the reason says
   (below), or one of its own files in a shape it does not write.
 
 If the bundle cannot be archived, nothing is posted (`reason=no-archive`).
+Before archiving or posting, `scripts/dev/leak-scan.sh --dir` checks every regular file in the run
+bundle, including files with NUL bytes. The post requires operator patterns by default. A hit,
+missing required patterns, or a scan error stops the entire post (`reason=leak-scan-failed`,
+`posted=0`). The scan also runs with `DRY_RUN=1`. Set `LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS=0`
+to allow the generic-only scan on an isolated fixture.
 
 **Every file `bench_submit.py` reads in a scenario directory is checked, or the scenario is
 refused**, because each field it takes from one reaches the run's tags, its `conditions` or its
@@ -416,7 +427,7 @@ validity:
 | `session.json` | checked: `id`, `codec`, `profile`, `host_id`, `encoder`, `profile_id`, and `launch`, `fps`, `bitrate_kbps`, `started_at_ms` as finite numbers |
 | `metrics.jsonl` | checked by the bundle validator, row by row: a numeric `ts_unix_ms`, a source quasar-bench accepts, keys the metric manifest defines |
 | `trace.json` | checked: an object whose `events` are objects, each `payload` an object |
-| `conditions.json` | checked, member by member (the script posts the whole file as the run's conditions): only `effective`, `negotiated` and `unknown` may be there; `effective` maps identifiers to a setting or `[omitted]` (what the collector writes); `unknown` is the collector's one sentence; and `negotiated`'s members are in the shapes `session.json` was checked for — `width`, `height` and `fps` finite numbers, `codec`, `codec_profile` and `profile_id` identifiers, `encoder` and `encoder_negotiated` settings. A member this suite does not write is refused |
+| `conditions.json` | checked, member by member (the script posts the whole file as the run's conditions). The collector writes either `effective`, a map of identifiers to settings or `[omitted]`, or `unknown`, its one sentence. A file with both is refused. Allowed `negotiated` members are finite numbers `width`, `height` and `fps`, identifiers `codec`, `codec_profile` and `profile_id`, and settings `encoder` and `encoder_negotiated` |
 | `summary.json` | checked: an object (the script posts it as the run's summary as it is, text included) |
 | `caps-negotiated.json`, `verdict.json`, `steps.jsonl`, `marks.jsonl`, any `.md` | **refused**: this suite writes none of them, so a bundle that carries one is not posted and the file is named |
 
@@ -428,10 +439,10 @@ RESULT status=ok|failed|error target=e2e-post posted=N skipped=N [failed=N] [lef
 
 Exit 0 every scenario posted (or planned, with `DRY_RUN=1`), 1 the bundle is not valid
 (`reason=invalid-bundle`), the build has no commit (`reason=no-commit`), the archive could not be
-made (`reason=no-archive`), a scenario was refused (`failed=N`, nothing posted for it) or a post
-failed, 2 usage. A run `bench_submit.py` posted but whose tags disagree with what the host actually
-did (its exit 3) is counted as posted and as `warn=N`, and the verb still exits 0: the evidence is
-there, and it is not re-posted.
+made (`reason=no-archive`), the leak scan failed (`reason=leak-scan-failed`), a scenario was refused
+(`failed=N`, nothing posted for it) or a post failed, 2 usage. A run `bench_submit.py` posted but
+whose tags disagree with what the host actually did (its exit 3) is counted as posted and as
+`warn=N`, and the verb still exits 0: the evidence is there, and it is not re-posted.
 
 `DRY_RUN=1` runs `bench_submit.py --dry-run` for each scenario: it posts nothing (with a bench
 server configured the script still asks it for its version) and prints each run's plan, tags and
@@ -512,6 +523,21 @@ is the pairs compared. Exit 0 both
 bundles are valid and the comparison was written (whether or not anything changed), 1 a bundle is not
 valid (`reason=invalid-a` or `invalid-b`), 2 usage, or a comparison that cannot be written
 (`reason=out-exists`, `out-inside-bundle`, `cannot-write`). A bundle zip is not read: unzip it first.
+
+### What builds.json names (#1281)
+
+One run, one set of builds. A part that cannot say is `null` and `unknown` holds the reason; `make e2e-run` and `e2e-collect` write no `null` without one.
+
+| component | filled by | holds |
+|---|---|---|
+| `browser`, `os` | `e2e-run`, from the client probe | name and version |
+| `web` | `e2e-run`, from every scenario's page before it closes: bench mode's `window.__qBench.build()` | `{commit, built_at}`: the commit (7-40 hex) and the build time as an ISO UTC time. A report with a date and no time, no zone, a year outside 0000-9999 or a non-string member is ignored. A report the recorder would change (a commit that starts with the test user's sign-in name, say) is not recorded: `web` is `null` and `unknown` says it did not survive recording. The suite names the build when every page that reported agreed; a scenario whose page reported nothing (bench off, an older web build, a crashed page) neither names nor disputes it, and two different builds leave `web` `null`. A `WEB_DIST=` run says `{source: "web-dist", sha256, files}` instead |
+| `control_plane` | `e2e-collect`, `GET /v1/admin/platform/identity` | `version`, `commit`, `built_at` |
+| `node_agent` | `e2e-collect`, the host row | `version`, `commit`, `built_at` |
+| `encoder` | `e2e-collect`, the latest `caps.negotiated` trace event of the session (of two in one millisecond, the one the store lists first, which is the later) | `factory`, `codec`, `profile`, `level`; never the caps text. It describes the GStreamer branch: a PyroWave switch is reported apart (`codec.switched`), so on a PyroWave smoke run it does not name the active wire codec |
+| `reference_app`, `gpu_driver` | nothing yet: `null`, with the reason | No session-bound API field carries either. The app's own log stays on the host and the session's app log tail is kept for failures only. The GPU driver appears in the host policy approval preview (`GET /v1/admin/hosts/{id}/policy`, fact `driver_identity`) for a candidate GPU, and the control plane logs it with the session id only when a certification cap applies. See the gap list on #1281 |
+
+The web build's identity is baked in when the web client is built: `QUASAR_WEB_COMMIT` / `SOURCE_COMMIT` and `QUASAR_WEB_BUILT_AT` / `BUILT_AT` if set, else `git rev-parse HEAD` and the build time. The control plane's image build passes `SOURCE_COMMIT` and `BUILT_AT`, so an image names the commit it came from. A build made with neither reports `unknown`, and the bundle then says why `web` is `null`. `e2e-review` prints a build by its version and commit; `e2e-compare` compares builds by commit (a build time alone is not a difference).
 
 ### Testing a web build against a running stack
 
@@ -612,8 +638,9 @@ waited (`waited_s`), and, in `mid`, `no_frame_advance_before_video_s`: the longe
 samples between the fault and the first `<video>` frame in which neither the bench frames nor the
 `<video>` advanced (about the seconds the picture froze; one-second resolution; when no `<video>`
 frame came it runs to the end of the wait). It is `null` in `connect`, when no sample was taken (the
-session ended at once), when a count could not be read, and once the bench's frame ring is full
-(5000 frames), because its count then stops growing. It is a fact, not a criterion, and has no
+session ended at once), when no visible `<video>`/canvas stream surface was present at the fault
+(with `no_frame_advance_reason`), when a count could not be read, and once the bench's frame ring is
+full (5000 frames), because its count then stops growing. It is a fact, not a criterion, and has no
 threshold. `fallback_event` and `frame_after_fallback` say where their wait starts: the fault in
 `mid`, the first frame in `connect`.
 
@@ -622,20 +649,23 @@ buttons, wheel up and down, relative motion) as trusted events through the DevTo
 (`Input.dispatchKeyEvent`, `Input.dispatchMouseEvent`). The pointer lock first: the product takes it
 from its "Click to play" layer (a click on the stage only opens the HUD shelf), so the scenario
 waits for that layer and clicks it once with a trusted click (the product removes the layer on the
-first click), then waits for the lock. With no layer within the wait the launch was not immersive,
-and it tries the HUD's own route: a trusted click on the stream, which opens the shelf, then a click
-on the shelf's "Capture input" button (the product's `aria-label`); `pointer_lock_taken`'s
-`observed` says which route held the lock or why none did. A key or button held when the run is cut
-is released on the way out; a release that fails is named in "left behind". `hold_s` is the pause
-after the sequence. `input-sent.json` holds what was sent (in order, with `sent_motion_sum`) and
-what the page received (each `mousemove` as `[movementX, movementY, isTrusted]`, at most 200, with
-the total count and `motion_sum`; the motion before the sequence starts is not counted), for the
-host half to compare. The moves sum to (50, 25), not zero, so no motion and motion that cancels are
-different bundles.
+first click), then waits for the lock. When no layer appears within the wait (5 s) and no lock is
+held (cause unknown; the page does not report whether the launch was immersive), it tries the HUD's
+own route: a trusted click on the stream, which opens the shelf, then a click on the shelf's
+"Capture input" button (the product's `aria-label`); `pointer_lock_taken`'s `observed` says only
+what was observed (which route held the lock, or that no layer appeared within the wait and no lock
+was held, cause unknown). The page's input recorder starts after the pointer lock is settled, so the
+lock click(s) and pointer walk before the sequence are not left in `input-sent.json`'s event log or
+motion counts. A key or button held when the run is cut is released on the way out; a release that
+fails is named in "left behind". `hold_s` is the pause after the sequence. `input-sent.json` holds
+what was sent (in order, with `sent_motion_sum`) and what the page received (only the sequence's own
+events, plus each `mousemove` as `[movementX, movementY, isTrusted]`, at most 200, with the total
+count and `motion_sum`), for the host half to compare. The moves sum to (50, 25), not zero, so no
+motion and motion that cancels are different bundles.
 
 | criterion | judged as |
 |---|---|
-| `pointer_lock_taken` | `document.pointerLockElement` is the stream surface after the click on the "Click to play" layer, or on the HUD's "Capture input" button when the launch was not immersive; `pass: null` when no first frame was seen (the sequence was not sent) |
+| `pointer_lock_taken` | `document.pointerLockElement` is the stream surface after the click on the "Click to play" layer, or on the HUD's "Capture input" button when no layer appeared within the wait and no lock was held (cause unknown); `pass: null` when no first frame was seen (the sequence was not sent) |
 | `keys_match`, `buttons_match`, `motion_sum_matches` | `pass: null`. The reference app does not log individual keys, buttons or motion (its echo is one bit) and the runner cannot see the page's input channel. Needs the app's own input log on the host. `motion_sum_matches`'s `expected` also says how many `mousemove` events the page received, their sum, and the sum sent |
 | `nothing_held_at_end` | every key and button the page was sent down was also sent up, as the page received them. The product's own held-key set is not exposed, so a key the page failed to release on the host is not seen here |
 | `input_to_photon_ms` | `pass: null` (no limit is calibrated); `expected` carries the count, median and max of the samples from eight `__qBench.pressKey` rounds. A sample that is not a finite number is not counted; none at all says the marker echoed no key |
@@ -708,7 +738,7 @@ A directory, zipped when it is handed between machines.
 - **Not measured is `null`, never `0`.** A criterion that was not judged has `observed: null`. A fact listed in `not_recorded` has no value as a criterion or as a sample.
 - **Keys are the metric manifest's.** An `agent` or `browser` sample key must be in `docs/session-trace/metrics.json` (bench-mode keys ride in `browser` samples, with the six keys `scripts/dx/bench_app_samples.py` derives: `bench_n`, `bench_decoded`, `i2p_p50_ms`, `i2p_max_ms`, `i2p_n`, `ts_nudged`). Sample sources are the five quasar-bench accepts: `agent`, `browser`, `app`, `netem`, `harness`.
 - **Every timestamp names its clock.** A timeline row says `client` or `host`; a sample's clock is its key's clock in the metric manifest. `clock_offset_ms` is the measured client-to-host offset, or `null`.
-- **A missing build has a reason.** A web build the runner served is `web: {source: "web-dist", sha256, files}` and nothing else, with `manifest.web_build: {served_by: "runner", source: "web-dist"}`; each without the other is refused.
+- **A missing build has a reason.** A web build the page reported is `web: {commit, built_at}` and nothing else (a commit of 7-40 lowercase hex, an ISO time); `encoder` is `factory`, `codec`, `profile` and `level`, each a plain name. A web build the runner served is `web: {source: "web-dist", sha256, files}` and nothing else, with `manifest.web_build: {served_by: "runner", source: "web-dist"}`; each without the other is refused.
 - **No address, token or password** in any text file, whatever its name. A JSON field whose name says it holds a credential (`authorization`, `cookie`, any `*token`, `password`, `secret`, `api key`, `private key`; any case, hyphen or camelCase) and whose value is not a "there is none" word is a credential too. The validator checks the first two or four bytes of each file for a UTF-16 or UTF-32 byte-order mark and rejects either. A file with a NUL byte in its first 4 KB is otherwise treated as binary (a picture, a video, an archive). Documentation addresses (RFC 5737) pass. Known limits: the address check knows IPv4 only, reads a four-part version such as `1.2.3.4` as an address, and lets `x.0.0.0` and `127.0.0.1` through (a browser's version looks like the first); a bearer token made of letters only is not seen, nor is UTF-16 text with no byte-order mark (it reads as binary); host names and home paths are not looked for (a session container's own home is a real path in app logs). `scripts/dev/leak-scan.sh` with the operator's patterns still runs before a bundle goes anywhere public.
 
 The test (`node --test scripts/validate/stream/bundle.test.mjs`, part of `make verify`) breaks the
@@ -759,7 +789,7 @@ recorded — but the run's result is derived from it, not copied.
   the client clock rather than the host's).
 - **Anomalies** use a rule only where the comparison is the one the product makes.
   `classifier.hitch_sd_ms` skips the first `classifier.warmup_exclude_s` seconds after the
-  scenario's first browser sample (the control plane anchors on the session's running time, so
+  scenario's first browser telemetry sample (the control plane anchors on the session's running time, so
   the review can miss a hitch the control plane counts; it never adds one so long as the client
   clock is not behind the host clock by more than the connect time) and needs at least
   `classifier.hitch_min_samples` samples over it; the two `web.client_health.present_*` limits

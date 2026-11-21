@@ -7,7 +7,8 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { validateBundle } from "./bundle.mjs";
-import { ANOMALY_RULES, review, renderReview } from "./review.mjs";
+import { benchRows } from "./benchfold.mjs";
+import { ANOMALY_RULES, review, renderReview, warmupStartMs } from "./review.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "../../..");
@@ -384,6 +385,37 @@ test("an anomaly fires at its limit, over distinct timestamps, after warm-up", (
   );
 });
 
+test("bench rows do not move the client telemetry warm-up or add hitches", () => {
+  const dir = bundle();
+  const thresholdsFile = path.join(TMP, "thresholds-mixed-clocks.json");
+  const thresholds = {
+    version: "test",
+    thresholds: {
+      "classifier.hitch_sd_ms": { value: 18, unit: "ms" },
+      "classifier.warmup_exclude_s": { value: 20, unit: "s" },
+      "classifier.hitch_min_samples": { value: 2, unit: "count" },
+    },
+  };
+  fs.writeFileSync(thresholdsFile, JSON.stringify(thresholds));
+  const client = [4000, 21000, 23000, 24000, 25000].map((ts) => browser(ts, { present_interval_sd_ms: 20 }));
+  const hostBench = benchRows([{ last_host_time_ms: 1000, n: 60, decoded: 60, offset_unknown: false }]);
+  for (const bench of [
+    [],
+    hostBench,
+    benchRows([{ last_host_time_ms: 1000, n: 60, decoded: 60, offset_unknown: true }]),
+    benchRows([{ t_end_ms: 1000, n: 60, decoded: 0, offset_unknown: true }]),
+    [browser(1000, { missing_indices: 0 })],
+  ]) {
+    const rows = [...bench, ...client];
+    metrics(dir, rows);
+    const [hitch] = review(dir, { thresholdsFile }).scenarios[0].anomalies.rows;
+    assert.equal(hitch.samples_over, 2, "only the two post-warm-up samples count");
+    assert.equal(hitch.first_ts_unix_ms, 24000);
+    assert.equal(warmupStartMs(rows, thresholds), 24000);
+  }
+  assert.equal(warmupStartMs(hostBench, thresholds), null);
+});
+
 test("a hidden tab is not a sample the client judges, whether the flag is 1 or true", () => {
   // The contract posts `is_hidden` as 0 or 1 (`docs/session-trace/metrics.json`, and both
   // web clients); an older fixture wrote a boolean. Only those two true shapes are hidden.
@@ -588,6 +620,20 @@ test("a build component that says neither version nor commit prints from its sor
   assert.equal(reverse.md, forward.md, "member order changed the page");
   assert.equal(reverse.json, forward.json, "member order changed the summary");
   assert.match(forward.md, /`other` `\{\\"a\\":2,\\"nested\\":\{\\"b\\":2,\\"y\\":1\},\\"z\\":1\}`/);
+});
+
+test("#1281 the review's Builds line names a reported web build by its commit and a negotiated encoder by its members, and a null by its reason", () => {
+  const dir = bundle();
+  edit(dir, "builds.json", (b) => ({
+    ...b,
+    components: { ...b.components, web: { commit: "0123456789abcdef0123456789abcdef01234567", built_at: "2026-11-21T01:02:03.000Z" }, encoder: { factory: "vulkanh264enc", codec: "h264", profile: "main", level: "4.2" }, gpu_driver: null },
+    unknown: { ...b.unknown, gpu_driver: "no API of the stack reports the GPU driver version (issue #1281)" },
+  }));
+  assert.equal(run(dir).status, 0);
+  const builds = JSON.parse(read(dir, "summary.json")).builds;
+  assert.equal(builds.find((x) => x.component === "web").build, "(0123456789abcdef0123456789abcdef01234567)");
+  assert.equal(builds.find((x) => x.component === "encoder").build, '{"codec":"h264","factory":"vulkanh264enc","level":"4.2","profile":"main"}');
+  assert.match(builds.find((x) => x.component === "gpu_driver").why, /no API of the stack reports the GPU driver version/);
 });
 
 test("a param named __proto__ reaches both files", () => {
