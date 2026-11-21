@@ -571,15 +571,16 @@ impl Governor {
     }
 
     /// Per-report loop, once per receiver report: `reading` is what the report showed the
-    /// link carrying when the link held the sender back (`webtransport::Rate::measured`),
-    /// `None` when it did not. A link that delivers what it is sent gives no reading,
-    /// whatever its delay detector says: that is the #68 guard. Two readings in a row under
-    /// the rate by more than the deadband take the rate and the setpoint to the higher of
-    /// them in one move, with no step cap and no dwell.
+    /// link carrying when it carried evidence of the sender's own excess
+    /// (`webtransport::Rate::measured`), `None` when it did not. A delay gradient alone gives
+    /// no reading: that is the #68 guard. Two readings in a row under the rate take the rate
+    /// and the setpoint to the higher of them in one move, with no step cap, no dwell and no
+    /// deadband: a reading is under what left the wire, so no dead zone between the link and
+    /// the deadband over it can hold the sender there (#1503).
     pub fn observe_report(&mut self, reading: Option<f64>, now: Instant) -> Option<u32> {
         self.cfg.per_report?;
         self.last_report = Some(now);
-        let Some(reading) = reading.filter(|&r| r < self.rate * (1.0 - self.cfg.deadband)) else {
+        let Some(reading) = reading.filter(|&r| r < self.rate) else {
             self.under = None;
             return None;
         };
@@ -1231,8 +1232,7 @@ mod tests {
         base + Duration::from_millis(ms)
     }
 
-    /// Down: two readings in a row under the rate by more than the deadband take the
-    /// setpoint to the higher of them at once, with no −12.5 % cap, and a deeper drop right
+    /// Down: two readings in a row under the rate take the setpoint to the higher of them at once, with no −12.5 % cap, and a deeper drop right
     /// after is not held by a dwell. The window loop caps a step at −12.5 % and dwells 7 s.
     #[test]
     fn per_report_down_takes_the_reading_in_one_move() {
@@ -1264,24 +1264,33 @@ mod tests {
         assert_eq!(g.rate_kbps(), 800.0, "the rate does not");
     }
 
-    /// A report with no reading between two low ones breaks the run, and a reading inside
-    /// the deadband is none.
+    /// A report with no reading between two low ones breaks the run.
     #[test]
-    fn per_report_a_broken_run_or_a_reading_in_the_deadband_holds() {
+    fn per_report_a_broken_run_holds() {
         let base = Instant::now();
         let mut g = Governor::new(per_report(0), base);
         for i in 0..20 {
             let r = (i % 2 == 0).then_some(5000.0);
             assert_eq!(g.observe_report(r, ms(base, i * 100)), None);
         }
-        for i in 20..40 {
-            assert_eq!(
-                g.observe_report(Some(8600.0), ms(base, i * 100)),
-                None,
-                "inside 15 %"
-            );
-        }
         assert_eq!(g.setpoint_kbps(), 10_000);
+    }
+
+    /// #1503: a reading carries evidence that the sender's own excess is what the link queues
+    /// or drops, so it moves the setpoint however close under the rate it is. With the 15 %
+    /// deadband a link at 0.86 × the setpoint held a sender 1.18–1.22× over its estimate
+    /// (lab 0.6.2, 2 Mbit/s), and RTT reached 1.5–3.6 s. Old code: no move.
+    #[test]
+    fn per_report_a_reading_inside_the_old_deadband_moves() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        g.observe_report(Some(8600.0), ms(base, 0));
+        assert_eq!(g.observe_report(Some(8600.0), ms(base, 100)), Some(8600));
+        assert_eq!(
+            g.observe_report(Some(8600.0), ms(base, 200)),
+            None,
+            "a reading at the rate is none"
+        );
     }
 
     /// #68: with reports flowing, an estimate under the setpoint (a delay detector misreading

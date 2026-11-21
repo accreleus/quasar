@@ -192,7 +192,14 @@ impl<'a> Control<'a> {
         }
     }
 
-    fn feedback(&mut self, message: &Value, path: congestion::QuicPath, now: std::time::Instant) {
+    /// `backlog`: [`congestion::VideoQueue::backlog`].
+    fn feedback(
+        &mut self,
+        message: &Value,
+        path: congestion::QuicPath,
+        now: std::time::Instant,
+        backlog: Option<f64>,
+    ) {
         let fb = match congestion::feedback_of(message) {
             Ok(fb) => fb,
             Err(field) => {
@@ -208,9 +215,11 @@ impl<'a> Control<'a> {
                 return;
             }
         };
-        let estimate = self.estimator.on_feedback(&fb, &mut self.log, now, path);
+        let estimate = self
+            .estimator
+            .on_feedback(&fb, &mut self.log, now, path, backlog);
         // Before the estimate is fed: the encoder's share follows the level this loss sets.
-        if let (Some(fec), Some(loss)) = (self.fec.as_mut(), self.estimator.loss()) {
+        if let (Some(fec), Some(loss)) = (self.fec.as_mut(), self.estimator.fec_loss()) {
             let was = fec.overhead();
             fec.observe(loss, now);
             if fec.overhead() != was {
@@ -1907,7 +1916,8 @@ async fn stream(
                         }
                         Some("feedback") => {
                             if let Some(control) = control.as_mut() {
-                                control.feedback(&message, quic_path(session), std::time::Instant::now());
+                                let now = std::time::Instant::now();
+                                control.feedback(&message, quic_path(session), now, video.backlog(now));
                             }
                         }
                         Some("input") => {
