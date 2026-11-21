@@ -717,16 +717,24 @@ impl Agent {
         token: &str,
         extra: Value,
     ) -> (Session, SendStream, RecvStream, Value) {
-        let session = self.connect().await;
-        let (mut send, mut recv) = session.open_bi().await.unwrap();
-        let mut hello = json!({"type": "hello", "wt_proto": 1, "token": token,
-                               "session_id": SESSION, "client": "browser"});
-        let extra = extra.as_object().unwrap().clone();
-        hello.as_object_mut().unwrap().extend(extra);
-        write_message(&mut send, &hello).await.unwrap();
-        let reply = read_message(&mut recv).await.unwrap();
-        (session, send, recv, reply)
+        hello_over(self.connect().await, token, extra).await
     }
+}
+
+/// Opens the control stream on `session` and sends `hello`; the first reply.
+async fn hello_over(
+    session: Session,
+    token: &str,
+    extra: Value,
+) -> (Session, SendStream, RecvStream, Value) {
+    let (mut send, mut recv) = session.open_bi().await.unwrap();
+    let mut hello = json!({"type": "hello", "wt_proto": 1, "token": token,
+                           "session_id": SESSION, "client": "browser"});
+    let extra = extra.as_object().unwrap().clone();
+    hello.as_object_mut().unwrap().extend(extra);
+    write_message(&mut send, &hello).await.unwrap();
+    let reply = read_message(&mut recv).await.unwrap();
+    (session, send, recv, reply)
 }
 
 thread_local! {
@@ -1563,7 +1571,8 @@ async fn through(
 ) -> (Session, SendStream, RecvStream) {
     let port = relay(agent.url.port().unwrap(), impair).await;
     agent.url.set_port(Some(port)).unwrap();
-    let (session, send, recv, reply) = agent.hello(TOKEN).await;
+    let session = client_with(|_| {}).connect(agent.url.clone()).await.unwrap();
+    let (session, send, recv, reply) = hello_over(session, TOKEN, json!({"fec": []})).await;
     assert_eq!(reply["type"], "hello_ack");
     (session, send, recv)
 }
@@ -4420,6 +4429,23 @@ fn client_with(shape: impl FnOnce(&mut quinn::TransportConfig)) -> web_transport
     let mut config = quinn::ClientConfig::new(Arc::new(crypto));
     config.transport_config(Arc::new(transport));
     let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    // Chrome's QUIC asks for 1 MiB (`kQuicSocketReceiveBufferSize`). At the kernel default
+    // (212 992 bytes, 92 loopback datagrams) a keyframe of 95 lost its tail whenever the agent,
+    // on this test's one thread, sent it before the client read: no whole keyframe for seconds.
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let size: libc::c_int = 1 << 20;
+    // SAFETY: `socket` owns a valid fd, and the option is a c_int of its own size.
+    let set = unsafe {
+        libc::setsockopt(
+            std::os::fd::AsRawFd::as_raw_fd(&socket),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&size as *const libc::c_int).cast(),
+            std::mem::size_of_val(&size) as libc::socklen_t,
+        )
+    };
+    assert_eq!(set, 0, "SO_RCVBUF: {}", std::io::Error::last_os_error());
+    endpoint.rebind(socket).unwrap();
     web_transport_quinn::Client::new(endpoint, config)
 }
 
