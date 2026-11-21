@@ -147,7 +147,10 @@ export function parseWebBuild(v) {
   if (v === null || typeof v !== "object" || Array.isArray(v)) return null;
   if (typeof v.commit !== "string" || !COMMIT.test(v.commit) || typeof v.built_at !== "string" || !ZONED.test(v.built_at)) return null;
   const ms = Date.parse(v.built_at);
-  return Number.isNaN(ms) ? null : { commit: v.commit.toLowerCase(), built_at: new Date(ms).toISOString() };
+  if (Number.isNaN(ms)) return null;
+  const built_at = new Date(ms).toISOString();
+  // A year outside 0000-9999 is written with a sign and six digits, which the validator refuses.
+  return /^\d{4}-/.test(built_at) ? { commit: v.commit.toLowerCase(), built_at } : null;
 }
 
 const ENCODER_MEMBERS = ["factory", "codec", "profile", "level"];

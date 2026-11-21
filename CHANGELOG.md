@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+- **The end-to-end suite's `builds.json` now names the web client and the encoder (#1281).** The web build carries its commit and build time (bench mode reports them as `window.__qBench.build()`), and `e2e-collect` adds the negotiated encoder from the session's `caps.negotiated` event; `reference_app` and `gpu_driver` stay `null` with a reason: nothing ties either to the session (the host policy preview names a candidate GPU's driver, not the session's).
+
 ### Changed
 - Dependency updates
 - `make e2e-review` ranks `bench_n` (lowest) with accurate `offset_unknown` clock notes and control-plane-matching `is_hidden` handling, `stream-hold` captures `present_interval_sd_ms`, `present_interval_p95_ms`, and `is_hidden` from the page's own `/stats` posts so review anomaly rules run on client-only runner bundles without duplicating collected host samples, empty error messages always write a non-empty scenario reason, and `docs/testing-e2e-suite.md` and counter-rule comments are corrected (#1303).
@@ -43,7 +46,6 @@ own; the two do not move together, and that is deliberate.
 - **It worked when** Fleet ▸ Releases shows this release everywhere and the run ends `succeeded`.
 
 ### Added
-- **The end-to-end suite's `builds.json` now names the web client and the encoder (#1281).** The web build carries its commit and build time (bench mode reports them as `window.__qBench.build()`), and `e2e-collect` adds the negotiated encoder from the session's `caps.negotiated` event; `reference_app` and `gpu_driver` stay `null` with a reason: nothing ties either to the session (the host policy preview names a candidate GPU's driver, not the session's).
 - **CI now scans pull requests for credentials (#595).** A new gitleaks job in `.github/workflows/leak-scan.yml` runs on the pinned `ghcr.io/gitleaks/gitleaks:v8.30.1` image (pinned by version and digest) with no repository secret, so a fork pull request scans too; it scans the pull request's own commits, and a credential-shaped string fails the check before merge. Test fixtures and known false positives are allow-listed in the committed `.gitleaks.toml`.
 - **The app editor can set GPU access and the two container opt-outs for an app that brings its own image (#179).** A new Container group on the Runtime tab has switches for GPU access, privilege-escalation blocking and unmasking /proc and /sys. It is hidden when the app uses a runtime preset, which supplies them.
 

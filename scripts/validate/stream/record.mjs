@@ -68,6 +68,18 @@ export class Recorder {
     return out;
   }
 
+  /** Would `v` be written exactly as it is? Counts nothing and records no problem. */
+  unchanged(v) {
+    const keep = [this.redacted, this.problems];
+    this.redacted = {};
+    this.problems = [];
+    try {
+      return JSON.stringify(this.value(v)) === JSON.stringify(v) && this.problems.length === 0;
+    } finally {
+      [this.redacted, this.problems] = keep;
+    }
+  }
+
   file(rel) {
     const file = path.join(this.dir, rel);
     fs.mkdirSync(path.dirname(file), { recursive: true });

@@ -422,15 +422,18 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
 
     const info = host.info ?? {};
     // A web build served from WEB_DIST is named by its digest; otherwise by what the page reported, when every scenario agreed.
-    const web = webDist ? webBuild(webDist) : reportedWeb.size === 1 ? JSON.parse([...reportedWeb][0]) : null;
+    // What is recorded must be what the validator accepts after the recorder's own cleaning: a report that cannot be, is not recorded.
+    const agreed = reportedWeb.size === 1 ? JSON.parse([...reportedWeb][0]) : null;
+    const lost = !webDist && agreed !== null && !bundle.unchanged(agreed);
+    const web = webDist ? webBuild(webDist) : agreed !== null && !lost ? agreed : null;
     const HOST_HALF = "the host half (e2e-collect) fills this; the client cannot see it";
     const why = {
-      web: reportedWeb.size > 1 ? "the scenarios' pages reported different web builds" : "no page reported a web build: bench mode was off, no scenario got as far as reading it, or the build has no commit or time (an unstamped build)",
+      web: lost ? "the build report did not survive recording (the recorder removes a part of it: it matches the test user's sign-in or a secret)" : reportedWeb.size > 1 ? "the scenarios' pages reported different web builds" : "no page reported a web build: bench mode was off, no scenario got as far as reading it, or the build has no commit or time (an unstamped build)",
       control_plane: HOST_HALF,
       node_agent: HOST_HALF,
       encoder: "the host half (e2e-collect) fills this from the session's caps.negotiated trace event; the client cannot see it",
       reference_app: "the app's own log stays on the host and nothing collects it (the session's app log tail is kept for failures only); no API of the stack reports the app's version (issue #1281)",
-      gpu_driver: "no source tied to the session reports the GPU driver: the host policy approval preview can name a candidate GPU's driver_identity, which is not the one the session ran on (issue #1281)",
+      gpu_driver: "no session-bound API field reports the GPU driver: the host policy approval preview can name a candidate GPU's driver_identity, not necessarily the one the session ran on (issue #1281)",
     };
     bundle.json("builds.json", {
       components: { browser: client.browser, os: client.os, web, control_plane: null, node_agent: null, encoder: null, reference_app: null, gpu_driver: null },
