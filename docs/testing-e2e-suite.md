@@ -612,7 +612,8 @@ waited (`waited_s`), and, in `mid`, `no_frame_advance_before_video_s`: the longe
 samples between the fault and the first `<video>` frame in which neither the bench frames nor the
 `<video>` advanced (about the seconds the picture froze; one-second resolution; when no `<video>`
 frame came it runs to the end of the wait). It is `null` in `connect`, when no sample was taken (the
-session ended at once), when a count could not be read, and once the bench's frame ring is full
+session ended at once), when no visible `<video>`/canvas stream surface was present (with
+`no_frame_advance_reason`), when a count could not be read, and once the bench's frame ring is full
 (5000 frames), because its count then stops growing. It is a fact, not a criterion, and has no
 threshold. `fallback_event` and `frame_after_fallback` say where their wait starts: the fault in
 `mid`, the first frame in `connect`.
@@ -622,20 +623,23 @@ buttons, wheel up and down, relative motion) as trusted events through the DevTo
 (`Input.dispatchKeyEvent`, `Input.dispatchMouseEvent`). The pointer lock first: the product takes it
 from its "Click to play" layer (a click on the stage only opens the HUD shelf), so the scenario
 waits for that layer and clicks it once with a trusted click (the product removes the layer on the
-first click), then waits for the lock. With no layer within the wait the launch was not immersive,
-and it tries the HUD's own route: a trusted click on the stream, which opens the shelf, then a click
-on the shelf's "Capture input" button (the product's `aria-label`); `pointer_lock_taken`'s
-`observed` says which route held the lock or why none did. A key or button held when the run is cut
-is released on the way out; a release that fails is named in "left behind". `hold_s` is the pause
-after the sequence. `input-sent.json` holds what was sent (in order, with `sent_motion_sum`) and
-what the page received (each `mousemove` as `[movementX, movementY, isTrusted]`, at most 200, with
-the total count and `motion_sum`; the motion before the sequence starts is not counted), for the
-host half to compare. The moves sum to (50, 25), not zero, so no motion and motion that cancels are
-different bundles.
+first click), then waits for the lock. When no layer appears within the wait (5 s) and no lock is
+held (cause unknown; the page does not report whether the launch was immersive), it tries the HUD's
+own route: a trusted click on the stream, which opens the shelf, then a click on the shelf's
+"Capture input" button (the product's `aria-label`); `pointer_lock_taken`'s `observed` says only
+what was observed (which route held the lock, or that no layer appeared within the wait and no lock
+was held, cause unknown). The page's input recorder starts after the pointer lock is settled, so the
+lock click(s) and pointer walk before the sequence are not left in `input-sent.json`'s event log or
+motion counts. A key or button held when the run is cut is released on the way out; a release that
+fails is named in "left behind". `hold_s` is the pause after the sequence. `input-sent.json` holds
+what was sent (in order, with `sent_motion_sum`) and what the page received (only the sequence's own
+events, plus each `mousemove` as `[movementX, movementY, isTrusted]`, at most 200, with the total
+count and `motion_sum`), for the host half to compare. The moves sum to (50, 25), not zero, so no
+motion and motion that cancels are different bundles.
 
 | criterion | judged as |
 |---|---|
-| `pointer_lock_taken` | `document.pointerLockElement` is the stream surface after the click on the "Click to play" layer, or on the HUD's "Capture input" button when the launch was not immersive; `pass: null` when no first frame was seen (the sequence was not sent) |
+| `pointer_lock_taken` | `document.pointerLockElement` is the stream surface after the click on the "Click to play" layer, or on the HUD's "Capture input" button when no layer appeared within the wait and no lock was held (cause unknown); `pass: null` when no first frame was seen (the sequence was not sent) |
 | `keys_match`, `buttons_match`, `motion_sum_matches` | `pass: null`. The reference app does not log individual keys, buttons or motion (its echo is one bit) and the runner cannot see the page's input channel. Needs the app's own input log on the host. `motion_sum_matches`'s `expected` also says how many `mousemove` events the page received, their sum, and the sum sent |
 | `nothing_held_at_end` | every key and button the page was sent down was also sent up, as the page received them. The product's own held-key set is not exposed, so a key the page failed to release on the host is not seen here |
 | `input_to_photon_ms` | `pass: null` (no limit is calibrated); `expected` carries the count, median and max of the samples from eight `__qBench.pressKey` rounds. A sample that is not a finite number is not counted; none at all says the marker echoed no key |

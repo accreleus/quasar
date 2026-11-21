@@ -176,11 +176,12 @@ async function waitForSession(page, ctx) {
 // The loader keeps is-locking / is-streaming on a failed or ended session (SessionLoader.tsx adds is-failed and is-over beside it), so those are not a frame.
 export const REVEALED = ".sl-root.is-locking:not(.is-failed):not(.is-over), .sl-root.is-streaming:not(.is-failed):not(.is-over)";
 
-/** What the page shows right now: bench frames, the playing <video> (WebRTC), whether the loader has revealed the stream (noted, never a frame), and whether it is visible. */
+/** What the page shows right now: bench frames, the playing <video> (WebRTC), whether a stream surface (<video>/canvas) is visible, whether the loader has revealed the stream (noted, never a frame), and whether it is visible. */
 export const probe = (page) =>
   page.evaluate((sel) => ({
     frames: window.__qBench?.stats().frames ?? 0,
     videoFrames: document.querySelector("video.session-video:not([hidden])")?.getVideoPlaybackQuality?.().totalVideoFrames ?? 0,
+    surface: [...document.querySelectorAll(".session-video")].some((e) => e.videoWidth || e.tagName === "CANVAS"),
     revealed: !!document.querySelector(sel),
     visible: document.visibilityState,
     focused: document.hasFocus?.(),
@@ -215,10 +216,10 @@ const HUD_WAIT_S = 2; // how long the HUD's "Capture input" button is waited for
 /**
  * Takes the pointer lock the way the product does (SessionPage.tsx): a stage click while input is not captured only opens the HUD
  * shelf; the lock is requested from the "Click to play" layer (`.session-play`), which the page raises once the loader is inert and the
- * channel is open (and only when Play went immersive, the default). The product removes that layer on the first click, so this waits
- * for it, clicks it ONCE with a trusted click, then waits for the lock. With no layer within LOCK_WAIT_S and no lock (auto-capture can
- * take it with no click) the launch was not immersive: the HUD's own route is tried, a click on the stage (which opens the shelf) and a
- * click on its "Capture input" button (an aria-label the product sets, HudBar.tsx).
+ * channel is open. The product removes that layer on the first click, so this waits for it, clicks it ONCE with a trusted click, then
+ * waits for the lock. When no layer appears within LOCK_WAIT_S and no lock is held (auto-capture can take it with no click; otherwise
+ * the cause is unknown because the page does not report it), the HUD's own route is tried: a click on the stage (which opens the shelf)
+ * and a click on its "Capture input" button (an aria-label the product sets, HudBar.tsx).
  * Returns { held, clicks, hud, at }: `clicks` is the clicks on the layer (0 or 1); `hud` is null (not tried), "no-surface" (no visible stream surface, so nothing was clicked), "no-button" (the shelf showed
  * no enabled button) or "clicked"; `at` is where the last click was.
  */
@@ -251,7 +252,7 @@ export async function takeLock(page, cdp, { now, sleep }) {
     await click(layer);
     return { held: !!(await wait(LOCK_WAIT_S, held)), clicks: 1, hud: null, at: layer };
   }
-  // No layer: the launch was not immersive. A click on the stage opens the HUD shelf; its button takes the lock.
+  // No layer appeared within LOCK_WAIT_S and no lock is held (cause unknown). Try the HUD shelf's button.
   const centre = await streamCentre(page);
   if (!centre) return { held: false, clicks: 0, hud: "no-surface", at: null };
   await click(centre);
