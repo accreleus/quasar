@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from "vitest";
 import { useState } from "react";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { RuntimeTab } from "./RuntimeTab";
 import { draftFromApp } from "./appDraft";
@@ -11,7 +11,12 @@ import type { AdminApp, RuntimePreset } from "../../../../api/types";
 
 type Draft = ReturnType<typeof draftFromApp>;
 
-function renderTab(presetHome: boolean, draftOver: Partial<Draft> = {}, presetPath = "/home/kde") {
+function renderTab(
+  presetHome: boolean,
+  draftOver: Partial<Draft> = {},
+  presetPath = "/home/kde",
+  steamProviders: number | null = null,
+) {
   const preset = {
     id: "preset-1",
     name: "KDE Desktop",
@@ -38,6 +43,7 @@ function renderTab(presetHome: boolean, draftOver: Partial<Draft> = {}, presetPa
         parent={null}
         presets={[preset]}
         storageProvider={null}
+        steamProviders={steamProviders}
       />
     );
   }
@@ -250,5 +256,31 @@ describe("RuntimeTab derived tile", () => {
     });
     expect(screen.getByText("Managed home")).toBeInTheDocument();
     expect(screen.getByText("None")).toBeInTheDocument();
+  });
+});
+
+describe("RuntimeTab Steam library sharing warning (#1631)", () => {
+  const warning = () => screen.queryByTestId("share-steam-no-provider");
+
+  it("warns when sharing is on and no Steam provider app is enabled", () => {
+    renderTab(true, { shareSteamLibrary: true }, "/home/kde", 0);
+    expect(warning()?.textContent).toMatch(/No enabled Steam provider app/);
+    expect(warning()?.textContent).toMatch(/Library provider set to Steam/);
+  });
+
+  it("warns when more than one provider would make the choice ambiguous", () => {
+    renderTab(true, { shareSteamLibrary: true }, "/home/kde", 2);
+    expect(warning()?.textContent).toMatch(/More than one/);
+  });
+
+  it("stays quiet with exactly one provider, sharing off, or the count not loaded", () => {
+    renderTab(true, { shareSteamLibrary: true }, "/home/kde", 1);
+    expect(warning()).toBeNull();
+    cleanup();
+    renderTab(true, { shareSteamLibrary: false }, "/home/kde", 0);
+    expect(warning()).toBeNull();
+    cleanup();
+    renderTab(true, { shareSteamLibrary: true });
+    expect(warning()).toBeNull();
   });
 });

@@ -36,6 +36,8 @@ interface RuntimeTabProps {
   presets: RuntimePreset[];
   /** Instance-wide, read-only here. Null when the settings read failed. */
   storageProvider: StorageProvider | null;
+  /** Enabled Steam provider apps in the catalog; null until loaded. Sharing needs exactly one. */
+  steamProviders?: number | null;
   /** A derived Steam game's own tool; null for any other tile. */
   compat?: ComponentProps<typeof CompatToolSection> | null;
 }
@@ -48,6 +50,7 @@ export function RuntimeTab({
   parent,
   presets,
   storageProvider,
+  steamProviders = null,
   compat,
 }: RuntimeTabProps) {
   if (parent && app) {
@@ -317,6 +320,20 @@ export function RuntimeTab({
               While it is open, the user's Steam games cannot start. Turn this on only once every
               host runs Quasar 0.5.2 or later.
             </span>
+            {draft.shareSteamLibrary && steamProviders !== null && steamProviders !== 1 && (
+              <div className="note warn" data-testid="share-steam-no-provider">
+                <div>
+                  <b>
+                    {steamProviders === 0
+                      ? "No enabled Steam provider app."
+                      : "More than one enabled Steam provider app."}
+                  </b>{" "}
+                  Launches of this desktop will not share the user&rsquo;s Steam library until exactly
+                  one app has its Library provider set to Steam (Identity tab), is enabled, and is
+                  available to the user.
+                </div>
+              </div>
+            )}
           </>
         )}
         <div className="ae-facts">
