@@ -35,7 +35,7 @@ const SUMMARY_FILE = "summary.json";
 const MARKDOWN_FILE = "REVIEW.md";
 export const FORMAT = 1;
 
-// One browser sample is one second of the run. These four keys each say how bad that
+// One browser sample is one second of the run. These five keys each say how bad that
 // second was; a key the samples do not carry is skipped, never scored as 0, so a
 // bundle that records only fps is ranked on fps and the report says so.
 export const WINDOW_KEYS = [
@@ -43,6 +43,7 @@ export const WINDOW_KEYS = [
   { key: "g2g_p95_ms", worst: "highest" },
   { key: "missing_indices", worst: "highest" },
   { key: "fps", worst: "lowest" },
+  { key: "bench_n", worst: "lowest" },
 ];
 
 // A rule fires at or above its limit (every one is phrased `>=` in thresholds.json), on
@@ -63,7 +64,14 @@ export const WINDOW_KEYS = [
 // - `web.client_health.*` other than the two present limits below:
 //   `freeze_degraded_count` is the cumulative counter discussed next, and
 //   `decode_budget_fraction` / `decode_abs_ceiling_ms` are a fraction and its fallback
-//   ceiling, not a pass rule on one sample.
+//   ceiling, not a single static pass rule on one sample: `web/src/webrtc/clientHealth.ts`
+//   compares `decodeMs` against `(1000 / profileFps) * decode_budget_fraction` (using
+//   `decode_abs_ceiling_ms` only when `profileFps` is unknown) after checking `isHidden`.
+//   Bench mode's `stage_decode_stats_mean_ms` is also absent for this reason — and it is
+//   WebRTC-only (`web/src/bench/stages.ts`, fed by `RTCPeerConnection.getStats()` in
+//   `sessionRuntime.ts`; `webTransportRuntime.ts` passes no `getStats` to `BenchController`
+//   and measures `decode_ms` via `decodeIn`→`decodeOut` in `WtTelemetry` instead), and
+//   bench-mode windows carry no `is_hidden` flag.
 // - `web.present_cadence.*` describes how a cadence window is recognised (a minimum
 //   sample count, bands and factors), not a value to cross.
 // - `web.playout.*` values are controller steps and their knees: an input to the
@@ -75,16 +83,18 @@ export const WINDOW_KEYS = [
 // The three counter rules are absent for a contract reason. `packets_lost` and
 // `freeze_count` are CUMULATIVE in `docs/session-trace/metrics.json` (`window:
 // cumulative`, `estimator: raw`) and in the `BrowserMetrics` contract, so one sample is
-// not one window's loss; issue #1270 records that the transport already posts per-window
-// deltas while the client still posts the session total, so a per-window rule cannot be
-// right for both. `web.signal.packets_lost_fair`, `web.signal.packets_lost_poor` and
-// `web.client_health.freeze_degraded_count` therefore map onto no comparable sample and
-// are not used. What is used:
+// not one window's loss: the WebTransport client posts the session total, and the WebRTC
+// client posted per-window deltas until #1270 fixed it to cumulative, so a per-window
+// rule on one sample is wrong for cumulative series and cannot agree across pre-#1270
+// WebRTC bundles either. `web.signal.packets_lost_fair`, `web.signal.packets_lost_poor`
+// and `web.client_health.freeze_degraded_count` therefore map onto no comparable sample
+// and are not used. What is used:
 //
 // - `classifier.hitch_sd_ms`, as far as one sample per second can stand for it: it skips
 //   the first `classifier.warmup_exclude_s` seconds after the scenario's first browser
 //   sample (the control plane anchors on the session's running time, so the review can
-//   miss a hitch the control plane counts; it never adds one), and a hitch needs at
+//   miss a hitch the control plane counts; it never adds one so long as the client clock
+//   is not behind the host clock by more than the connect time), and a hitch needs at
 //   least `classifier.hitch_min_samples` samples over it.
 // - the two `web.client_health.present_*` limits, per sample, exactly as the client
 //   classifies a sample, except that a hidden tab is not a sample the client judges.
@@ -100,8 +110,10 @@ export const ANOMALY_RULES = [
 ];
 
 const PICTURES = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif"]);
-// The two ranked keys that come from a bench-mode row, which is stamped on the host clock.
-const HOST_CLOCK_KEYS = ["g2g_p95_ms", "missing_indices"];
+// The ranked keys that come from a bench-mode row, which is stamped on the host clock
+// when a marker decoded or the offset was known, and on the client's when `offset_unknown`
+// is set with no decoded marker (see `clockLine`).
+const HOST_CLOCK_KEYS = ["g2g_p95_ms", "missing_indices", "bench_n"];
 // Text evidence, by file name: what a runner or the harness wrote beside the pictures.
 // `timeline.jsonl` is listed first because it is the run's order of events.
 const TIMELINE = "timeline.jsonl";
@@ -116,10 +128,12 @@ const WORST_SHOWN = 5;
 const FILES_SHOWN = 12;
 const MAX_TEXT = 200;
 
-// A sample is hidden when `is_hidden` is 1 or true: the contract says 0 or 1
+// A boolean flag in a metrics row: true or any finite non-zero number, matching the
+// control plane's `telemetry.HiddenFlag`. The contract says 0 or 1
 // (`docs/session-trace/metrics.json`) and both web clients post the number, while an
-// older fixture wrote a boolean. Nothing else is hidden.
-const sampleHidden = (metrics) => metrics.is_hidden === 1 || metrics.is_hidden === true;
+// older fixture wrote a boolean. Nothing else (0, false, strings, non-finite) is set.
+const flagSet = (value) => value === true || (typeof value === "number" && Number.isFinite(value) && value !== 0);
+const sampleHidden = (metrics) => flagSet(metrics.is_hidden);
 
 const readJson = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
 /** Every non-empty line of a JSONL file, parsed; [] when there is no file. */
@@ -268,10 +282,15 @@ function worstWindows(rows) {
   const lastShown = new Map();
   shown.forEach((c, i) => lastShown.set(group(c), i));
 
+  const benchOffsetUnknown = windows.some(
+    (w) => HOST_CLOCK_KEYS.some((key) => Number.isFinite(w.metrics[key])) && flagSet(w.metrics.offset_unknown),
+  );
+
   return {
     sampled: windows.length > 0,
     keys: ranked.map(({ key }) => key),
     absent: WINDOW_KEYS.filter(({ key }) => !ranked.some((r) => r.key === key)).map(({ key }) => key),
+    bench_offset_unknown: benchOffsetUnknown,
     rows: shown.map((c, i) => ({
       ts_unix_ms: c.ts_unix_ms,
       worst_for: c.worst_for,
@@ -318,7 +337,8 @@ function anomalies(rows, thresholds) {
     if (rule.warmup) {
       // The anchor is the scenario's first browser sample, on the client's clock. The
       // control plane anchors on the session's running time, so the review can miss a
-      // hitch the control plane counts; it never adds one. The warm-up itself is
+      // hitch the control plane counts; it never adds one so long as the client clock is
+      // not behind the host clock by more than the connect time. The warm-up itself is
       // `warmupStartMs`, which `e2e-compare` reads its metric medians after too.
       const start = warmupStartMs(samples, thresholds, rule.warmup);
       if (start !== null) pool = pool.filter((s) => s.ts_unix_ms >= start);
@@ -485,17 +505,30 @@ function buildText(build) {
     : `${code(build.component)} ${code(build.build)}`;
 }
 
-// The clocks line exists to explain a ranked key that is on the host clock, so it is
-// printed only when one of those keys is ranked, and it names only those keys: the rest
-// come from telemetry rows on the client's clock.
+function listJoin(items) {
+  if (items.length <= 1) return items[0] ?? "";
+  return `${items.slice(0, -1).join(", ")} and ${items.at(-1)}`;
+}
+
+// The clocks line exists to explain ranked keys from bench-mode rows, so it is printed
+// only when one of those keys is ranked, and it names only those keys: the rest come
+// from telemetry rows on the client's clock. When `offset_unknown` was set on a bench
+// window, a window with no decoded marker (such as a frameless second) was stamped on
+// the client clock (`t_end_ms`) rather than the host clock (`last_host_time_ms` /
+// `t_end_host_ms`), so the note says so rather than claiming host clock unconditionally.
 function clockLine(scenario) {
   const host = scenario.windows.keys.filter((key) => HOST_CLOCK_KEYS.includes(key));
   if (!host.length) return null;
+  const names = listJoin(host.map(code));
+  const verb = host.length === 1 ? "is" : "are";
   const offset =
     scenario.clock_offset_ms === null
       ? "an unmeasured amount"
       : `${code(scenario.clock_offset_ms)} ms`;
-  return `Clocks: ${host.map(code).join(" and ")} ${host.length === 1 ? "is" : "are"} on the host clock; the other keys are on the client's, offset by ${offset}.`;
+  if (scenario.windows.bench_offset_unknown) {
+    return `Clocks: ${names} ${verb} on the host clock when a marker decoded or the offset was known, and on the client's when \`offset_unknown\` was set with no decoded marker; the other keys are on the client's, offset by ${offset}.`;
+  }
+  return `Clocks: ${names} ${verb} on the host clock; the other keys are on the client's, offset by ${offset}.`;
 }
 
 /** REVIEW.md, rendered from the summary alone, so both files describe the same run. */

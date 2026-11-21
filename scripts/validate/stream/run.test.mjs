@@ -12,7 +12,9 @@ import { benchRows } from "./benchfold.mjs";
 import { Recorder } from "./record.mjs";
 import { loadWebDist } from "./webdist.mjs";
 import { configureTls, loadPlan, makeApi, openHost, probeClient, readThresholds, runnerState, runSuite, secretTooShort, summarise } from "./run.mjs";
-import { check, framelessSeconds, hitchCount, instrumentShare, judge, missingRate, observeWindows, shotCovered, verdict } from "./scenarios/stream-hold.mjs";
+import { review, renderReview } from "./review.mjs";
+import { errorReason } from "./scenarios/stream-common.mjs";
+import { cadenceRows, check, framelessSeconds, hitchCount, instrumentShare, judge, missingRate, observeWindows, shotCovered, verdict } from "./scenarios/stream-hold.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE = JSON.parse(fs.readFileSync(path.join(HERE, "../../dx/tests/fixtures/appfold/bench-windows.json"), "utf8")).windows;
@@ -2081,4 +2083,118 @@ test("#1343 items 6 and 7: why the wait ended, how long, and how long no frame a
   const get = (freezeS) => Object.fromEntries(judgeFallback({ params: { hold_s: 30 }, firstFrameS: 1, seen: { row: { state: "running" }, fallbackReason: "x", posted: [], videoAfterS: 4, tail: { before: 1, after: 9 }, keyHeld: false, faultApplied: true, watched: true, freezeS } }).map((c) => [c.id, c]));
   assert.doesNotMatch(get(NaN).frame_after_fallback.observed, /no frame advanced/);
   assert.match(get(2).frame_after_fallback.observed, /no frame advanced for 2 s of it/);
+});
+
+// ── #1303 follow-ups ────────────────────────────────────────────────────────
+
+test("empty error messages still write a non-empty reason in scenario.json so validateBundle accepts it (#1303)", async () => {
+  assert.equal(errorReason(new Error("")), "Error (no message)");
+  assert.equal(errorReason(new TypeError("   ")), "TypeError (no message)");
+  assert.equal(errorReason(""), "error with no message");
+  assert.equal(errorReason(null), "error with no message");
+  assert.equal(errorReason(new Error("boom")), "boom");
+
+  // 1. new Error("") thrown inside stream-hold after sign-in (rec.holding is false).
+  const w1 = world();
+  w1.api.apps = async () => { throw new Error(""); };
+  const r1 = await run(w1);
+  assert.deepEqual(r1.result.errors, [], "bundle with empty-message Error must validate");
+  assert.ok(r1.result.bundle, "bundle directory was committed");
+  assert.equal(r1.scenario().status, "error");
+  assert.equal(r1.scenario().reason, "Error (no message)");
+
+  // 2. Empty string "" thrown escaping a scenario directly to runSuite.
+  const w2 = world();
+  const r2 = await run(w2, PLAN({}), {
+    load: async () => ({
+      name: "stream-hold",
+      run: async (page, ctx) => {
+        ctx.rec.release();
+        throw "";
+      },
+    }),
+  });
+  assert.deepEqual(r2.result.errors, [], "bundle with empty string throw must validate");
+  assert.equal(r2.scenario().status, "error");
+  assert.equal(r2.scenario().reason, "error with no message");
+
+  // 3. Scenario returning status error with an empty reason directly.
+  const w3 = world();
+  const r3 = await run(w3, PLAN({}), {
+    load: async () => ({
+      name: "stream-hold",
+      run: async () => ({ status: "error", reason: "", criteria: [], clock_offset_ms: null }),
+    }),
+  });
+  assert.deepEqual(r3.result.errors, [], "bundle with empty error reason must validate");
+  assert.equal(r3.scenario().status, "error");
+  assert.equal(r3.scenario().reason, "error with no message");
+});
+
+test("stream-hold records one-second cadence samples so e2e-review checks anomalies and ranks frameless seconds on a real runner bundle (#1303)", async () => {
+  // Unit checks on cadenceRows: visible cadence, fragment omission, and hidden spans.
+  const cleanFrames = frames(3);
+  const rows = cadenceRows(cleanFrames, [], T.present_min_samples);
+  assert.equal(rows.length, 3);
+  for (const r of rows) {
+    assert.equal(r.source, "browser");
+    assert.equal(r.metrics.is_hidden, 0);
+    assert.ok(Number.isFinite(r.metrics.present_interval_sd_ms) && r.metrics.present_interval_sd_ms < 2);
+    assert.ok(Number.isFinite(r.metrics.present_interval_p95_ms) && r.metrics.present_interval_p95_ms <= 20);
+  }
+  // Fewer than minSamples intervals in a second is a fragment and produces no cadence row.
+  assert.deepEqual(cadenceRows([{ present_ms: T0 }, { present_ms: T0 + 200 }, { present_ms: T0 + 400 }], [], 5), []);
+  // A hidden second records is_hidden: 1 and drops intervals overlapping the hidden span.
+  const hiddenRows = cadenceRows(cleanFrames, [[T0 + 1000, T0 + 2000]], T.present_min_samples);
+  const sec2 = hiddenRows.find((r) => r.ts_unix_ms === T0 + 2000);
+  assert.deepEqual(sec2.metrics, { is_hidden: 1 });
+
+  // End-to-end 1: healthy runner bundle -> review checks all three anomaly rules and reports No threshold crossed.
+  const healthy = await run(world());
+  assert.deepEqual(healthy.result.errors, []);
+  const healthyRev = review(healthy.dir);
+  assert.deepEqual(healthyRev.scenarios[0].anomalies.not_checked, [], "all three anomaly rules ran on the runner bundle");
+  assert.deepEqual(healthyRev.scenarios[0].anomalies.rows, []);
+  assert.match(renderReview(healthyRev), /^No threshold crossed\.$/m);
+
+  // End-to-end 2: runner bundle with a frameless second and jerky frames after warm-up ->
+  // review names the frameless second in Worst Windows AND fires all three anomaly rules.
+  const warm = T.warmup_exclude_s;
+  const jerky = [];
+  let t = T0;
+  for (let s = 0; s < 50; s += 1) {
+    for (let i = 0; i < 20; i += 1) {
+      t += s >= warm + 2 && s < warm + 5 ? (i % 2 ? 90 : 10) : 50;
+      jerky.push({ present_ms: t, decoded: true });
+    }
+  }
+  const bad = await run(world({ wins: windows(50, [warm + 5]), extraFrames: jerky }));
+  assert.deepEqual(bad.result.errors, []);
+  const badRev = review(bad.dir);
+  assert.ok(
+    badRev.scenarios[0].windows.rows.some((r) => r.worst_for === "bench_n" && r.value === 0),
+    `frameless second missing from worst windows: ${JSON.stringify(badRev.scenarios[0].windows.rows)}`,
+  );
+  assert.deepEqual(badRev.scenarios[0].anomalies.not_checked, []);
+  assert.deepEqual(
+    badRev.scenarios[0].anomalies.rows.map((r) => r.threshold),
+    [
+      "classifier.hitch_sd_ms",
+      "web.client_health.present_sd_degraded_ms",
+      "web.client_health.present_p95_degraded_ms",
+    ],
+  );
+
+  // End-to-end 3: runner bundle with offset_unknown=true and a frameless second -> review notes client clock fallback.
+  const unknownWins = windows(50, [warm + 5]).map((win) => ({
+    ...win,
+    offset_ms: null,
+    offset_unknown: true,
+    t_end_host_ms: null,
+  }));
+  const unk = await run(world({ wins: unknownWins }));
+  assert.deepEqual(unk.result.errors, []);
+  const unkRev = review(unk.dir);
+  assert.equal(unkRev.scenarios[0].windows.bench_offset_unknown, true);
+  assert.match(renderReview(unkRev), /when `offset_unknown` was set with no decoded marker/);
 });

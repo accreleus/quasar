@@ -6,7 +6,7 @@
 // thresholds, secrets, now(), clockOffset(), sleep(ms) }.
 // Returns { status, reason?, criteria, clock_offset_ms }; the runner owns the sessions (ctx.launches) and their cleanup.
 import { benchRows } from "../benchfold.mjs";
-import { cannotRun, CODEC_LABEL, crit, FIRST_FRAME_LIMIT_S, finite, firstFrameCriterion, play, probe, REVEALED, shotCovered, shown, signIn, skipped, verdict, watchApiErrors } from "./stream-common.mjs";
+import { cannotRun, CODEC_LABEL, crit, errorReason, FIRST_FRAME_LIMIT_S, finite, firstFrameCriterion, play, probe, REVEALED, shotCovered, shown, signIn, skipped, verdict, watchApiErrors } from "./stream-common.mjs";
 
 export { FIRST_FRAME_LIMIT_S, REVEALED, shotCovered, verdict };
 
@@ -19,6 +19,10 @@ const INSTRUMENT_MIN_SHARE = 0.9;
 
 const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
 const sd = (xs) => Math.sqrt(mean(xs.map((x) => (x - mean(xs)) ** 2)));
+const p95 = (xs) => {
+  const s = [...xs].sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.max(0, Math.ceil(0.95 * s.length) - 1))];
+};
 
 /** What a plan entry's params may hold; all but `app` and `bench`/`cover_qr` have a default (docs/testing-e2e-suite.md lists them). */
 export const PARAM_KEYS = ["transport", "codec", "profile", "hold_s", "app", "bench", "cover_qr"];
@@ -77,6 +81,50 @@ export function hitchCount(frames, fromMs, toMs, hidden, t) {
   }
   const sds = [...by.values()].filter((iv) => iv.length >= t.present_min_samples).map(sd);
   return { judged: sds.length, hitches: sds.filter((s) => s >= t.hitch_sd_ms).length };
+}
+
+/**
+ * One-second presentation-cadence samples derived from the bench ring's `present_ms` and the
+ * runner's own visibility spans, using exact browser keys from `docs/session-trace/metrics.json`
+ * (`present_interval_sd_ms`, `present_interval_p95_ms`, `is_hidden`), so `e2e-review`'s anomaly
+ * rules run on a client-only runner bundle. Intervals overlapping a hidden span are skipped
+ * (matching `hitchCount` and the web client's `breakCadence`), and buckets with fewer than
+ * `minSamples` intervals omit cadence metrics rather than reporting a fragment as a cadence.
+ */
+export function cadenceRows(frames, hidden = [], minSamples = 5) {
+  const spans = hidden.filter((h) => Array.isArray(h) && finite(h[0]) && finite(h[1]) && h[1] > h[0]);
+  const ps = frames.map((f) => f?.present_ms).filter(finite).sort((a, b) => a - b);
+  const by = new Map();
+  for (let i = 1; i < ps.length; i += 1) {
+    if (spans.some(([a, b]) => ps[i - 1] < b && ps[i] > a)) continue;
+    const k = Math.floor(ps[i] / 1000);
+    let iv = by.get(k);
+    if (!iv) { iv = []; by.set(k, iv); }
+    iv.push(ps[i] - ps[i - 1]);
+  }
+  const hiddenBuckets = new Set();
+  for (const [a, b] of spans) {
+    const start = Math.floor(a / 1000);
+    const end = Math.ceil(b / 1000) - 1;
+    for (let k = start; k <= end; k += 1) hiddenBuckets.add(k);
+  }
+  const keys = [...new Set([...by.keys(), ...hiddenBuckets])].sort((a, b) => a - b);
+  const rows = [];
+  for (const k of keys) {
+    const iv = by.get(k) ?? [];
+    const isHidden = hiddenBuckets.has(k) ? 1 : 0;
+    const hasCadence = iv.length >= minSamples;
+    if (!hasCadence && !isHidden) continue;
+    const metrics = { is_hidden: isHidden };
+    if (hasCadence) {
+      const sdVal = sd(iv);
+      const p95Val = p95(iv);
+      if (finite(sdVal)) metrics.present_interval_sd_ms = sdVal;
+      if (finite(p95Val)) metrics.present_interval_p95_ms = p95Val;
+    }
+    rows.push({ kind: "metric", source: "browser", ts_unix_ms: (k + 1) * 1000, metrics });
+  }
+  return rows;
 }
 
 /** The frames the bench callback saw (`seen`) of the frames the video element decoded (`decoded`) over [a, b]; null when there is no video to compare with, `{ malformed: true }` when a time or a count is not a number. */
@@ -218,7 +266,7 @@ export default {
       const stats = await page.evaluate(() => window.__qBench?.stats() ?? null);
       rec.json("bench-windows.json", { windows });
       rec.json("bench-frames.json", { frames });
-      rec.jsonl("metrics.jsonl", benchRows(windows, 0));
+      rec.jsonl("metrics.jsonl", [...benchRows(windows, 0), ...cadenceRows(frames, hidden, ctx.thresholds.present_min_samples)]);
 
       const row = await api.session(sid);
       if (!row || row.id !== sid) throw new Error("the API no longer returns the session this run started");
@@ -235,7 +283,7 @@ export default {
     } catch (err) {
       // Until the page's bearer is known, an error's words (Playwright quotes the page's address and text) are held like any
       // other page output, and the reason that is written is a fixed one for the step that failed.
-      const message = String(err?.message ?? err);
+      const message = errorReason(err);
       if (rec.holding) rec.pageStep("error", { message });
       else rec.step("error", { message });
       result = { status: "error", reason: rec.holding ? `${stage} did not complete (the page's own words are not written before its sign-in is read)` : message, criteria: [], clock_offset_ms: null };
