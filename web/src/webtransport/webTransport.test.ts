@@ -30,7 +30,7 @@ import {
   type FakeFrame,
 } from "./testSupport";
 import { parseVideoDatagram } from "./framing";
-import { FEC_HOLD_MS } from "./reassembly";
+import { FEC_HOLD_MS, RTT_SLACK_MS } from "./reassembly";
 
 /** Every runtime a test builds: one left running ticks after the test's `document` is gone. */
 const live: ReturnType<typeof createRuntime>[] = [];
@@ -222,19 +222,24 @@ describe("WebTransportMedia connect", () => {
     [4404, "session_ended"],
     [4410, "taken_over"],
   ])(
-    "reports the session's own close (%i) racing a hello_ack on a dead reader instead of internal (#1478)",
+    "reports the session's own close (%i) delivered after hello_ack on a dead reader (#1478)",
     async (code, expected) => {
+      vi.useFakeTimers();
       const agent = new FakeAgent();
       agent.hold = "answer";
       const t = transport(agent);
       const up = t.connect(NO_SINK);
       await vi.waitFor(() => expect(agent.reached).toBe("answer"));
       agent.last.failDatagrams(NETWORK_ERROR());
-      await flush();
+      await vi.advanceTimersByTimeAsync(0);
+      // The agent sends hello_ack, then the terminal bye, then closes the session.
       agent.last.control(helloAck(0, avcC()));
-      // The session's own close resolves in the same instant as the hello_ack on the dead reader.
+      agent.last.control({ type: "bye", reason: expected });
+      const refused = expect(up).rejects.toMatchObject({ code: expected });
+      void refused.catch(() => {}); // The old accept check rejects before the browser reports closed.
+      await vi.advanceTimersByTimeAsync(1);
       agent.last.closeWith(code);
-      await expect(up).rejects.toMatchObject({ code: expected });
+      await refused;
       expect(agent.last.closes.every((c) => c?.closeCode !== 4400)).toBe(true);
       t.close();
     },
@@ -520,6 +525,95 @@ describe("WebTransportMedia loss recovery", () => {
     expect(agent.sent("nack")).toEqual([{ type: "nack", frame_seq: 1, frags: [[1, 1]] }]);
     t.close();
   });
+
+  it("repeats a NACK on the path's smoothed round trip rather than the repair round trip (#1436)", async () => {
+    const agent = new FakeAgent();
+    agent.replies = [[{ ...helloAck(0, avcC()), retransmit_window_ms: 250 }]];
+    let now = 1_000;
+    const t = transport(agent, { now: () => now, ticker: () => () => {} });
+    await t.connect(NO_SINK);
+    vi.useFakeTimers();
+    const pkt = { n: 0 };
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(10, 0) }, pkt));
+    // Measure a 20 ms repair round trip before any pong arrives.
+    const one = packetize({ configId: 0, frameSeq: 1, keyframe: false, data: bytes(2000, 1) }, pkt);
+    agent.last.datagrams([one[1]]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(agent.sent("nack")).toHaveLength(1);
+    now += 20;
+    const resend = one[0].slice();
+    resend[5] |= 0x04; // FLAG_RETRANSMIT
+    agent.last.datagrams([resend]);
+    await vi.advanceTimersByTimeAsync(0);
+    // Now the path's pong reports 60 ms: both the reorder-window cap and the repeat NACK wait use it.
+    now = 2_000;
+    agent.last.control({ type: "pong", id: 1, tc: now - 60, ts: 0, tw: 0 });
+    await vi.advanceTimersByTimeAsync(0);
+    const two = packetize({ configId: 0, frameSeq: 2, keyframe: false, data: bytes(2000, 2) }, pkt);
+    agent.last.datagrams([two[1]]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(agent.sent("nack")).toHaveLength(2);
+    // At 20 ms + slack (the repair round trip), the repeat must NOT fire yet.
+    now = 2_000 + 20 + RTT_SLACK_MS;
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 3, keyframe: false, data: bytes(10, 3) }, pkt));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(agent.sent("nack")).toHaveLength(2);
+    // At 60 ms + slack - 1, still not due; at 60 ms + slack, the repeat fires.
+    now = 2_000 + 60 + RTT_SLACK_MS - 1;
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 4, keyframe: false, data: bytes(10, 4) }, pkt));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(agent.sent("nack")).toHaveLength(2);
+    now += 1;
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 5, keyframe: false, data: bytes(10, 5) }, pkt));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(agent.sent("nack")).toHaveLength(3);
+    expect(agent.sent("nack")[2]).toEqual({ type: "nack", frame_seq: 2, frags: [[0, 0]] });
+    t.close();
+  });
+
+  it("waits on a longer measured repair round trip than the 20 ms path round trip (#1436)", async () => {
+    const agent = new FakeAgent();
+    agent.replies = [[{ ...helloAck(0, avcC()), retransmit_window_ms: 250 }]];
+    let now = 1_000;
+    const t = transport(agent, { now: () => now, ticker: () => () => {} });
+    await t.connect(NO_SINK);
+    vi.useFakeTimers();
+    // Control-stream pong reports a 20 ms path round trip.
+    agent.last.control({ type: "pong", id: 1, tc: now - 20, ts: 0, tw: 0 });
+    await vi.advanceTimersByTimeAsync(0);
+    const pkt = { n: 0 };
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(10, 0) }, pkt));
+    // Measure a 120 ms repair round trip while retransmits queue behind video.
+    const one = packetize({ configId: 0, frameSeq: 1, keyframe: false, data: bytes(2000, 1) }, pkt);
+    agent.last.datagrams([one[1]]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(agent.sent("nack")).toHaveLength(1);
+    now += 120;
+    const resend = one[0].slice();
+    resend[5] |= 0x04; // FLAG_RETRANSMIT
+    agent.last.datagrams([resend]);
+    await vi.advanceTimersByTimeAsync(0);
+    // Next loss: repeat NACK must wait for the 120 ms repair RTT, not fire early at 20 ms.
+    now = 2_000;
+    const two = packetize({ configId: 0, frameSeq: 2, keyframe: false, data: bytes(2000, 2) }, pkt);
+    agent.last.datagrams([two[1]]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(agent.sent("nack")).toHaveLength(2);
+    now = 2_000 + 20 + RTT_SLACK_MS;
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 3, keyframe: false, data: bytes(10, 3) }, pkt));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(agent.sent("nack")).toHaveLength(2);
+    now = 2_000 + 120 + RTT_SLACK_MS - 1;
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 4, keyframe: false, data: bytes(10, 4) }, pkt));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(agent.sent("nack")).toHaveLength(2);
+    now += 1;
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 5, keyframe: false, data: bytes(10, 5) }, pkt));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(agent.sent("nack")).toHaveLength(3);
+    expect(agent.sent("nack")[2]).toEqual({ type: "nack", frame_seq: 2, frags: [[0, 0]] });
+    t.close();
+  });
 });
 
 describe("WebTransportMedia receiver feedback", () => {
@@ -601,6 +695,40 @@ describe("WebTransportMedia receiver feedback", () => {
     // 250 ms window, 60 fps, a 50 ms path: about 133 ms of hold. A pong 3 s late is smoothed as a
     // longer round-trip sample (at most doubling), so the cap does not fall to 0 for its second.
     expect(await heldFor({ ...helloAck(0, avcC()), retransmit_window_ms: 250 }, 50, { spikeMs: 3_000 })).toBeGreaterThan(100);
+  });
+
+  it("grows the path round trip after a 0 ms first pong (#1436)", async () => {
+    const agent = new FakeAgent();
+    agent.replies = [[{ ...helloAck(0, avcC()), retransmit_window_ms: 250 }]];
+    let now = 1_000;
+    const t = transport(agent, { now: () => now, ticker: () => () => {} });
+    await t.connect(NO_SINK);
+    vi.useFakeTimers();
+    // A 0 ms first pong followed by nine 160 ms pongs (distinct from INITIAL_RTT_MS = 100):
+    // doubling from the 1 ms floor reaches 160 ms instead of staying trapped at 0.
+    agent.last.control({ type: "pong", id: 1, tc: now, ts: 0, tw: 0 });
+    await vi.advanceTimersByTimeAsync(0);
+    for (let i = 0; i < 9; i++) {
+      now += 1_000;
+      agent.last.control({ type: "pong", id: 2 + i, tc: now - 160, ts: 0, tw: 0 });
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    const pkt = { n: 0 };
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(10, 0) }, pkt));
+    const one = packetize({ configId: 0, frameSeq: 1, keyframe: false, data: bytes(2000, 1) }, pkt);
+    agent.last.datagrams([one[1]]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(agent.sent("nack")).toHaveLength(1);
+    // Neither trapped at 0 ms (10 ms) nor stuck on INITIAL_RTT_MS (110 ms): waits for 160 + slack.
+    now += RTT_SLACK_MS + 100;
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 2, keyframe: false, data: bytes(10, 2) }, pkt));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(agent.sent("nack")).toHaveLength(1);
+    now += 60;
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 3, keyframe: false, data: bytes(10, 3) }, pkt));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(agent.sent("nack")).toHaveLength(2);
+    t.close();
   });
 
   it("reports on the transport's ticker, the Worker clock a hidden tab keeps running", async () => {
@@ -1958,6 +2086,28 @@ describe("createWebTransportRuntime fallback", () => {
           delta(s.agent, i);
           await vi.advanceTimersByTimeAsync(6_000);
         }
+        expect(s.agent.sent("hello")).toHaveLength(2);
+        s.rt.destroy();
+      });
+
+      it("does not fire the datagram-armed keyframe wait in a hidden tab, and gives a tab that shows again the whole bound (#1436)", async () => {
+        vi.useFakeTimers();
+        const vis = vi.spyOn(document, "visibilityState", "get");
+        vis.mockReturnValue("hidden");
+        const s = setup();
+        s.rt.start();
+        await vi.advanceTimersByTimeAsync(10);
+        // Deltas arrive with no keyframe while the tab is hidden: the deadline is armed by video
+        // datagrams, yet must not end the connection in the background.
+        await feed(s, 10, 0, delta);
+        expect(s.agent.sent("hello")).toHaveLength(1);
+        expect(s.callbacks.onFallback).not.toHaveBeenCalled();
+        // Showing the tab clears the armed wait so it gets the full 5 s bound once visible.
+        vis.mockReturnValue("visible");
+        document.dispatchEvent(new Event("visibilitychange"));
+        await feed(s, 3, 10, delta);
+        expect(s.agent.sent("hello")).toHaveLength(1);
+        await feed(s, 4, 13, delta);
         expect(s.agent.sent("hello")).toHaveLength(2);
         s.rt.destroy();
       });

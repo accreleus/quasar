@@ -1441,6 +1441,25 @@ describe("SessionPage — WebTransport falls back to WebRTC (A11)", () => {
     const hud = lastDrawerProps as Record<string, unknown>;
     expect(hud.transport).toBe("webrtc");
     expect(hud.transportFallbackReason).toBe("connect_timeout");
+    expect(hud.transportFallbackCause).toBeNull();
+  });
+
+  it("shows the original WebTransport fallback cause after reloading the session (#1478)", async () => {
+    mintSignalingToken.mockResolvedValue({ signaling: { url: "wss://fresh", token: "fresh", ice_servers: [] } });
+    const page = renderPage({ webtransport: wt });
+    await act(async () => {
+      lastWtCallbacks!.onFallback("internal", "internal: TypeError: reader failed");
+    });
+    page.unmount();
+
+    renderPage();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    const hud = lastDrawerProps as Record<string, unknown>;
+    expect(hud.transport).toBe("webrtc");
+    expect(hud.transportFallbackReason).toBe("internal");
+    expect(hud.transportFallbackCause).toBe("internal: TypeError: reader failed");
   });
 });
 

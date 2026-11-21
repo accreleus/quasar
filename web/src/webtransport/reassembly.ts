@@ -123,18 +123,26 @@ export class FrameAssembler {
   private wakeAt: number | null = null;
 
   /** `reorderMs`: how late reordered datagrams come on this path (`FeedbackRecorder.reorderMs`).
-   *  A gap's first NACK waits that long and each repeat waits that much longer (#1330). */
+   *  A gap's first NACK waits that long and each repeat waits that much longer (#1330).
+   *  `pathRttMs`: the path's smoothed round trip from control-stream pongs, when supplied by the
+   *  transport (the same estimate that caps the reorder window); null until known (#1436). */
   constructor(
     private readonly now: () => number = () => performance.now(),
     private readonly reorderMs: (now: number) => number = () => 0,
+    private readonly pathRttMs: () => number | null = () => null,
   ) {}
 
   /** Fragments found missing so far, each counted once at its first NACK: the loss telemetry reads. */
   lost = 0;
 
-  /** The round trip loss recovery waits on, in ms. */
+  /** The round trip loss recovery waits on, in ms: the longer of the path's smoothed round trip
+   *  (the same estimate that caps the reorder window) and the repair round trip, using
+   *  {@link INITIAL_RTT_MS} until the first repair is measured. Taking the maximum ensures a repeat NACK
+   *  never fires before a repair could arrive on a congested link where retransmits queue behind
+   *  video, and never sooner than the path round trip the reorder cap assumes. */
   get rttMs(): number {
-    return this.srtt ?? INITIAL_RTT_MS;
+    const path = this.pathRttMs();
+    return Math.max(path ?? 0, this.srtt ?? INITIAL_RTT_MS);
   }
 
   push(f: VideoFragment): Reassembled {

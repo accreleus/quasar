@@ -11,8 +11,12 @@ import { fileURLToPath } from "node:url";
 import { benchRows } from "./benchfold.mjs";
 import { Recorder } from "./record.mjs";
 import { loadWebDist } from "./webdist.mjs";
+import { validateBundle } from "./bundle.mjs";
+import { collect } from "./collect.mjs";
 import { configureTls, loadPlan, makeApi, openHost, probeClient, readThresholds, runnerState, runSuite, secretTooShort, summarise } from "./run.mjs";
-import { check, framelessSeconds, hitchCount, instrumentShare, judge, missingRate, observeWindows, shotCovered, verdict } from "./scenarios/stream-hold.mjs";
+import { review, renderReview } from "./review.mjs";
+import { errorReason } from "./scenarios/stream-common.mjs";
+import { check, framelessSeconds, hitchCount, instrumentShare, judge, missingRate, observeWindows, shotCovered, statsSamples, verdict } from "./scenarios/stream-hold.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE = JSON.parse(fs.readFileSync(path.join(HERE, "../../dx/tests/fixtures/appfold/bench-windows.json"), "utf8")).windows;
@@ -43,8 +47,8 @@ const matches = (sel, classes) => {
 };
 
 /** A world holding the fake clock, the fake page's state and the fake API's record. */
-function world({ wins = windows(50), session = {}, failScreenshotAt = null, webtransport = true, noBench = false, refuse = false, noFrame = false, revealed = false, stopFails = false, closeFails = false, noUrl = false, url = null, stats = { frames: 100, decoded: 100 }, videoRate = 60, hiddenBetween = null, skew = 0, extraFrames = null, loader = null, onPlay = null, bare = false, hooksDir = null, lockOnClick = true, hud = false, layerStays = false, lockDelayMs = 0, swallowMoves = false, layerAfterMs = 0, noLayer = false, keyUpFails = null, swallowKeyUp = null, fallbackDelayMs = 3000, fallbackReason = "stream_lost", noFallback = false } = {}) {
-  const w = { cdp: [], listeners: {}, locked: false, lastX: null, lastY: null, videoStart: T0, hooksDir, faultSeenAt: null, t: T0, stopped: [], live: [], url: "about:blank", ls: new Map(), shots: 0, failScreenshotAt, calls: [], gone: new Set(), secrets: new Set(), handlers: {}, opened: [], closed: [], clicks: [], gotos: [], playAt: null, stageClicks: 0, layerClicks: 0, hudOpen: false, hudClicks: 0, lockAt: 0 };
+function world({ wins = windows(50), session = {}, failScreenshotAt = null, webtransport = true, noBench = false, refuse = false, noFrame = false, noSurface = false, revealed = false, stopFails = false, closeFails = false, noUrl = false, url = null, stats = { frames: 100, decoded: 100 }, videoRate = 60, hiddenBetween = null, skew = 0, extraFrames = null, loader = null, onPlay = null, bare = false, hooksDir = null, lockOnClick = true, hud = false, layerStays = false, lockDelayMs = 0, swallowMoves = false, layerAfterMs = 0, noLayer = false, keyUpFails = null, swallowKeyUp = null, fallbackDelayMs = 3000, fallbackReason = "stream_lost", noFallback = false, webBuild = undefined } = {}) {
+  const w = { cdp: [], listeners: {}, locked: false, lastX: null, lastY: null, videoStart: T0, hooksDir, faultSeenAt: null, t: T0, stopped: [], live: [], url: "about:blank", ls: new Map(), shots: 0, failScreenshotAt, calls: [], gone: new Set(), secrets: new Set(), handlers: {}, opened: [], closed: [], clicks: [], gotos: [], playAt: null, stageClicks: 0, layerClicks: 0, hudOpen: false, hudClicks: 0, lockAt: 0, noSurface };
   // The page's "Click to play" layer (SessionPage.tsx): raised some time after Play and removed by the FIRST click on it, whether or not that click
   // took the lock (handleClickToPlay); a click before it only opens the HUD shelf.
   const layerUp = () => !noLayer && w.playAt !== null && w.t >= w.playAt + layerAfterMs && !w.locked && (layerStays || w.layerClicks === 0);
@@ -78,7 +82,7 @@ function world({ wins = windows(50), session = {}, failScreenshotAt = null, webt
     },
   };
   w.rows = rows;
-  const qbench = { pressKey: () => true, dump: () => ({ frames: noFrame ? [] : extraFrames ?? frames(wins.length), windows: noFrame ? [] : wins }), stats: () => (noFrame ? { frames: 0, decoded: 0 } : stats) };
+  const qbench = { ...(webBuild === undefined ? {} : { build: () => (typeof webBuild === "function" ? webBuild() : webBuild) }), pressKey: () => true, dump: () => ({ frames: noFrame ? [] : extraFrames ?? frames(wins.length), windows: noFrame ? [] : wins }), stats: () => (noFrame ? { frames: 0, decoded: 0 } : stats) };
   // A chainable fake locator: its element is enabled, and clicking "Play now" starts the session.
   const loc = (desc) => ({
     first: () => loc(desc),
@@ -145,7 +149,8 @@ function world({ wins = windows(50), session = {}, failScreenshotAt = null, webt
       const hiddenVideo = { tagName: "VIDEO", videoWidth: 0, getBoundingClientRect: () => ({ left: 0, top: 0, width: 0, height: 0 }) };
       const canvas = { tagName: "CANVAS", getBoundingClientRect: () => ({ left: 100, top: 50, width: 800, height: 600 }) };
       const video = { tagName: "VIDEO", videoWidth: 1920, getVideoPlaybackQuality: () => ({ totalVideoFrames: w.t < w.videoStart ? 0 : Math.round(((w.t - w.videoStart) / 1000) * videoRate) }), getBoundingClientRect: () => ({ left: 100, top: 50, width: 800, height: 600 }) };
-      const doc = { pointerLockElement: w.locked && w.t >= w.lockAt ? { classList: { contains: (c) => c === "session-video" } } : null, visibilityState: hidden ? "hidden" : "visible", hasFocus: () => true, querySelectorAll: () => (noFrame ? [] : w.t < w.videoStart ? [hiddenVideo, canvas] : [video]), querySelector: (sel) => (sel === ".session-video" ? (noFrame ? [] : w.t < w.videoStart ? [hiddenVideo, canvas] : [video])[0] ?? null : /Capture input/.test(sel) ? (hudUp() ? { getBoundingClientRect: () => ({ left: hudButton.x - 20, top: hudButton.y - 20, width: 40, height: 40 }) } : null) : /session-play/.test(sel) ? (layerUp() ? { getBoundingClientRect: () => ({ left: 0, top: 0, width: 1280, height: 720 }) } : null) : /sl-root/.test(sel) ? (loader ? matches(sel, loader) : revealed ? {} : null) : /video/.test(sel) && !noBench && !revealed && !noFrame ? video : null) };
+      const surfaceEls = noFrame || w.noSurface ? [] : w.t < w.videoStart ? [hiddenVideo, canvas] : [video];
+      const doc = { pointerLockElement: w.locked && w.t >= w.lockAt ? { classList: { contains: (c) => c === "session-video" } } : null, visibilityState: hidden ? "hidden" : "visible", hasFocus: () => true, querySelectorAll: () => surfaceEls, querySelector: (sel) => (sel === ".session-video" ? surfaceEls[0] ?? null : /Capture input/.test(sel) ? (hudUp() ? { getBoundingClientRect: () => ({ left: hudButton.x - 20, top: hudButton.y - 20, width: 40, height: 40 }) } : null) : /session-play/.test(sel) ? (layerUp() ? { getBoundingClientRect: () => ({ left: 0, top: 0, width: 1280, height: 720 }) } : null) : /sl-root/.test(sel) ? (loader ? matches(sel, loader) : revealed ? {} : null) : /video/.test(sel) && !noBench && !revealed && !noFrame && !w.noSurface ? video : null) };
       w.win ??= { addEventListener: (type, fn) => { (w.listeners[type] ??= []).push(fn); } };
       w.win.__qBench = noBench ? undefined : qbench;
       Object.assign(globalThis, { window: w.win, localStorage: store, sessionStorage: { getItem: () => null }, document: doc });
@@ -1197,10 +1202,98 @@ test("B7: the manifest says when the runner's tracked files differ from its comm
 });
 
 test("B8: builds.json says which builds e2e-collect fills and which it does not read yet", async () => {
-  const { dir } = await run(world());
+  const { dir, result } = await run(world());
+  assert.deepEqual(result.errors, []);
   const u = JSON.parse(read(dir, "builds.json")).unknown;
   for (const k of ["control_plane", "node_agent"]) assert.match(u[k], /e2e-collect\) fills this/);
-  for (const k of ["web", "gpu_driver", "reference_app"]) assert.equal(u[k], "the client cannot see it, and e2e-collect does not read it yet");
+  assert.match(u.encoder, /e2e-collect\) fills this from the session's caps.negotiated/);
+  assert.match(u.web, /no page reported a web build/);
+  for (const k of ["gpu_driver", "reference_app"]) assert.match(u[k], /no session-bound API field|nothing collects it/);
+});
+
+const WEB = { commit: "0123456789abcdef0123456789abcdef01234567", built_at: "2026-11-21T01:02:03.000Z" };
+
+test("#1281: the web build the page reports through bench mode is written, and then it needs no reason", async () => {
+  const { dir, result } = await run(world({ webBuild: { ...WEB, commit: WEB.commit.toUpperCase(), built_at: "2026-11-21T11:02:03+10:00" } }));
+  assert.deepEqual(result.errors, []);
+  const builds = JSON.parse(read(dir, "builds.json"));
+  assert.deepEqual(builds.components.web, WEB, "lower-case commit, ISO UTC time");
+  assert.equal("web" in builds.unknown, false);
+  assert.equal("web_build" in JSON.parse(read(dir, "manifest.json")), false, "only a WEB_DIST run names a served build");
+  assert.equal("web_build" in JSON.parse(read(dir, "01-stream-hold/scenario.json")), false, "the scenario's own file does not carry it");
+});
+
+test("#1281: a web build that is not a commit and an ISO time, or an unstamped one, is not written (null, with its reason)", async () => {
+  for (const bad of [{ commit: "unknown", built_at: "unknown" }, { commit: "main", built_at: WEB.built_at }, { commit: WEB.commit, built_at: "yesterday" }, "text", [WEB], null]) {
+    const { dir, result } = await run(world({ webBuild: bad }));
+    assert.deepEqual(result.errors, [], JSON.stringify(bad));
+    const builds = JSON.parse(read(dir, "builds.json"));
+    assert.equal(builds.components.web, null, JSON.stringify(bad));
+    assert.match(builds.unknown.web, /no page reported a web build/);
+  }
+});
+
+test("#1281: two scenarios that saw different web builds name neither", async () => {
+  let n = 0;
+  const { dir, result } = await run(world({ webBuild: () => (++n === 1 ? WEB : { ...WEB, commit: "fedcba9876543210fedcba9876543210fedcba98" }) }), PLAN({}, {}));
+  assert.deepEqual(result.errors, []);
+  const builds = JSON.parse(read(dir, "builds.json"));
+  assert.equal(builds.components.web, null);
+  assert.match(builds.unknown.web, /different web builds/);
+});
+
+test("#1281: every scenario kind hands its page's web build back, and a scenario with none does not disagree with those that have one", async () => {
+  const input = await runReal(world({ wins: echoWindows([40, 50, 60]), webBuild: WEB }), INPUT());
+  assert.deepEqual(JSON.parse(read(input.dir, "builds.json")).components.web, WEB, "input-kbm");
+  const fb = fallbackWorld({ webBuild: WEB });
+  const fallback = await runReal(fb.w, FALLBACK("mid"), { hooksDir: fb.hooksDir });
+  assert.deepEqual(JSON.parse(read(fallback.dir, "builds.json")).components.web, WEB, "transport-fallback");
+  // One scenario's page reports and the other's does not (an older web build): the suite names the one that did.
+  let n = 0;
+  const mixed = await run(world({ webBuild: () => (++n === 1 ? WEB : null) }), PLAN({}, {}));
+  assert.deepEqual(JSON.parse(read(mixed.dir, "builds.json")).components.web, WEB);
+});
+
+test("#1281: a report with a date and no time, a numeric commit, or a time with no zone is not a web build", async () => {
+  for (const bad of [{ commit: WEB.commit, built_at: "2026-11-21" }, { commit: 1234567, built_at: WEB.built_at }, { commit: WEB.commit, built_at: "2026-11-21T01:02:03" }, { commit: WEB.commit, built_at: 1763686923000 }]) {
+    const { dir } = await run(world({ webBuild: bad }));
+    assert.equal(JSON.parse(read(dir, "builds.json")).components.web, null, JSON.stringify(bad));
+  }
+});
+
+test("#1281: a report the recorder would change, or that cannot be written in the validator's form, leaves web null with its reason, and the bundle is kept", async () => {
+  const creds = { email: "ada@example.test", password: "correct-horse-battery" };
+  for (const [what, report, extra] of [
+    ["a commit that starts with the sign-in's name", { commit: "ada0123456789abcdef0123456789abcdef0123", built_at: WEB.built_at }, { creds }],
+    ["a year past 9999", { commit: WEB.commit, built_at: "9999-12-31T23:59:59-01:00" }, {}],
+    ["a year before 0000", { commit: WEB.commit, built_at: "-000001-01-01T00:00:00Z" }, {}],
+  ]) {
+    const { dir, result } = await run(world({ webBuild: report }), PLAN({}), extra);
+    assert.deepEqual(result.errors, [], what);
+    assert.equal(result.bundle, dir, `${what}: the bundle is kept`);
+    const builds = JSON.parse(read(dir, "builds.json"));
+    assert.equal(builds.components.web, null, what);
+    assert.match(builds.unknown.web, /did not survive recording|no page reported a web build/, what);
+  }
+  // Invariant: whatever is recorded for web is a value the validator accepts, for every report tried.
+  const sha = "0123456789abcdef0123456789abcdef01234567";
+  for (const report of [WEB, { commit: "ada", built_at: WEB.built_at }, { commit: "tester0", built_at: WEB.built_at }, { commit: "1234567", built_at: "0000-01-01T00:00:00Z" }, { commit: sha, built_at: "2026-11-21T01:02:03.123456+10:00" }, { commit: sha, built_at: "2026-11-21T01:02Z" }, { commit: "ada", built_at: "9999-12-31T23:59:59.999Z" }]) {
+    for (const extra of [{}, { creds: { email: "ada@example.test", password: "correct-horse-battery" } }]) {
+      const { dir, result } = await run(world({ webBuild: report }), PLAN({}), extra);
+      assert.deepEqual(result.errors, [], JSON.stringify(report));
+      assert.deepEqual(validateBundle(dir), [], JSON.stringify(report));
+    }
+  }
+});
+
+test("#1281: a WEB_DIST run keeps naming its served build by digest, whatever the page reports", async () => {
+  const src = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-wd-"));
+  fs.writeFileSync(path.join(src, "index.html"), "<html></html>");
+  const webDist = loadWebDist(src);
+  const { dir, result } = await run(world({ webBuild: WEB }), PLAN({}), { webDist });
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(JSON.parse(read(dir, "builds.json")).components.web, { source: "web-dist", sha256: webDist.sha256, files: 1 });
+  fs.rmSync(src, { recursive: true, force: true });
 });
 
 test("WEB_DIST: the bundle says which web build was served (digest and count, no path), and a run without it is as before", async () => {
@@ -1236,11 +1329,13 @@ test("WEB_DIST: the runner's own context serves it, and without it no route is i
 
 // ── hooks (hooks.mjs): apply and clear around a scenario ────────────────────
 
-import { declaredHooks, Hooks, hookScript, LEDGER, runHook } from "./hooks.mjs";
+import { declaredHooks, Hooks, hookScript, isAlive, LEDGER, runHook } from "./hooks.mjs";
 import { pathToFileURL } from "node:url";
 
 const BLOCK = "fault:webtransport-block";
-const tmp = (p = "e2e-hooks-") => fs.mkdtempSync(path.join(os.tmpdir(), p));
+const hooksTmp = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-hooks-test-"));
+process.on("exit", () => fs.rmSync(hooksTmp, { recursive: true, force: true }));
+const tmp = (p = "e2e-hooks-") => fs.mkdtempSync(path.join(hooksTmp, p));
 /** A hooks directory: each script logs "<phase> <scenario> <session> <transport>" to `log` beside it, then runs `extra` (a phase-aware snippet). */
 function mkHooks(extra = "", names = ["fault-webtransport-block"]) {
   const dir = tmp();
@@ -1435,13 +1530,19 @@ test("hooks: the timeout kills the hook's own children too", async () => {
   assert.throws(() => process.kill(pid, 0), "the grandchild is gone");
 });
 
-test("hooks: a run with no HOOKS= says so when a ledger beside the bundle shows a hook left applied", async () => {
+test("hooks: a run with no HOOKS= warns on stderr and in the valid bundle manifest", async () => {
   notes = [];
   const w = world();
   const parent = tmp("e2e-parent-");
   fs.writeFileSync(path.join(parent, LEDGER), "{}");
-  await runHooks(w, fake(w, async () => {}, []), { parent, hooksDir: null }).catch(() => {});
-  assert.ok(notes.some((n) => /earlier run left a hook applied/.test(n)), notes.join("|"));
+  const noop = { hooks: [], async run() { return { status: "pass", criteria: PASS }; } };
+  const r = await runHooks(w, noop, { parent, hooksDir: null });
+  assert.deepEqual(r.result.errors, []);
+  const warning = notes.find((n) => n.startsWith("warning:") && n.includes("earlier run left a hook applied"));
+  assert.ok(warning, notes.join("|"));
+  assert.deepEqual(JSON.parse(read(r.dir, "manifest.json")).warnings, [warning.slice("warning: ".length)]);
+  const clean = await runHooks(world(), noop, { hooksDir: null });
+  assert.equal(JSON.parse(read(clean.dir, "manifest.json")).warnings, undefined);
 });
 
 test("hooks: a runner killed between apply and clear leaves a ledger; the next run clears it first and says so", async () => {
@@ -1539,6 +1640,130 @@ test("hooks: a stale hook that will not clear stops the run before anything star
   const r = await runHooks(world(), noop, { hooksDir, parent });
   assert.deepEqual(r.result.recovered, []);
   assert.equal(JSON.parse(fs.readFileSync(path.join(parent, LEDGER), "utf8")).entries.length, 1);
+});
+
+test("hooks: a spawn-time ledger failure kills the group and reports a failed hook", async (t) => {
+  const h = new Hooks({ dir: mkHooks("exec sleep 30"), ledgerDir: tmp("e2e-parent-") });
+  const write = h.writeLedger.bind(h);
+  let pid;
+  h.writeLedger = (entries) => {
+    pid ??= entries[0]?.hook_pid;
+    if (pid) throw new Error("disk full");
+    write(entries);
+  };
+  const kill = t.mock.method(process, "kill");
+  const timeline = [];
+  try {
+    await assert.rejects(h.call(BLOCK, "apply", { scenario: "s", transport: "webrtc" }, (_, data) => timeline.push(data)),
+      /hook fault:webtransport-block apply failed \(ledger write failed: disk full\)/);
+    assert.ok(kill.mock.calls.some(({ arguments: args }) => args[0] === -pid && args[1] === "SIGKILL"));
+    assert.throws(() => process.kill(-pid, 0), { code: "ESRCH" });
+    assert.equal(timeline[0].stderr, "ledger write failed: disk full");
+  } finally {
+    if (pid) {
+      try { process.kill(-pid, "SIGKILL"); } catch (e) { if (e.code !== "ESRCH") throw e; }
+    }
+  }
+});
+
+const deadPid = 2 ** 22 + 12345; // outside the OS's PID range
+function staleHook(h, name = BLOCK, extra = {}) {
+  return { id: name, pid: deadPid, hooks_dir: h.root, name, state: "applied", facts: { scenario: "s", transport: "webrtc" }, ...extra };
+}
+
+test("hooks: recovery shares one deadline across process groups", async (t) => {
+  const h = new Hooks({ dir: mkHooks("", ["fault-webtransport-block", "shape-slow"]), ledgerDir: tmp(), timeoutMs: 250 });
+  h.writeLedger([
+    staleHook(h, BLOCK, { state: "applying", hook_pid: 101 }),
+    staleHook(h, "shape:slow", { state: "applying", hook_pid: 102 }),
+  ]);
+  let elapsed = 0;
+  const checks = new Map([[-101, 0], [-102, 0]]);
+  const kill = process.kill;
+  t.mock.method(performance, "now", () => elapsed);
+  t.mock.method(process, "kill", (pid, signal) => {
+    if (signal !== 0 || !checks.has(pid)) return kill(pid, signal);
+    const seen = checks.get(pid) + 1;
+    checks.set(pid, seen);
+    if (seen > 2) throw Object.assign(new Error("group gone"), { code: "ESRCH" });
+    elapsed += 100;
+    return true;
+  });
+  await assert.rejects(h.recover(() => {}), /hook shape:slow .* still running \(process group 102\).*may belong to another process \(PID reuse\)/);
+  assert.deepEqual(h.readLedger().map(({ pid }) => pid), [deadPid, deadPid], "a refused recovery releases ownership for a retry");
+});
+
+test("hooks: a runner arriving during recovery sees the recovering PID and refuses", async () => {
+  const dir = mkHooks();
+  const ledgerDir = tmp();
+  const h = new Hooks({ dir, ledgerDir });
+  h.writeLedger([staleHook(h)]);
+  let finish;
+  h.run = () => new Promise((resolve) => { finish = resolve; });
+  const recovering = h.recover(() => {});
+  try {
+    assert.equal(h.readLedger()[0].pid, process.pid);
+    await assert.rejects(new Hooks({ dir, ledgerDir }).recover(() => {}), /still holds hook fault:webtransport-block/);
+  } finally {
+    finish({ code: 0 });
+    assert.deepEqual(await recovering, [BLOCK]);
+  }
+  assert.deepEqual(h.readLedger(), []);
+});
+
+test("hooks: liveness never probes non-integer PIDs or PIDs below 2", (t) => {
+  const kill = t.mock.method(process, "kill", () => true);
+  for (const pid of [0, -1, 1, 2.5, NaN]) assert.equal(isAlive(pid), false);
+  assert.equal(kill.mock.callCount(), 0);
+});
+
+test("hooks: readLedger rejects PIDs below 2", () => {
+  const h = new Hooks({ dir: mkHooks(), ledgerDir: tmp() });
+  for (const pid of [0, -1, 1]) {
+    h.writeLedger([staleHook(h, BLOCK, { pid })]);
+    assert.throws(() => h.readLedger(), /is not a ledger this runner wrote/);
+  }
+});
+
+test("hooks: runHook keeps at most 64000 bytes of each output stream", async () => {
+  const file = path.join(tmp(), "hook");
+  fs.writeFileSync(file, `#!${process.execPath}\nprocess.stdout.write("x".repeat(90000));\nprocess.stderr.write("é".repeat(45000));\n`, { mode: 0o755 });
+  const r = await runHook(file, "apply", process.env, 5000);
+  assert.equal(r.code, 0);
+  assert.equal(Buffer.byteLength(r.stdout), 64000);
+  assert.equal(Buffer.byteLength(r.stderr), 64000);
+  assert.ok(r.stderr.endsWith("é"));
+});
+
+test("hooks: a failed ledger rename removes the temporary file", () => {
+  const ledgerDir = tmp();
+  const h = new Hooks({ dir: mkHooks(), ledgerDir });
+  fs.mkdirSync(h.ledger); // Write succeeds, rename onto the directory fails.
+  assert.throws(() => h.writeLedger([staleHook(h)]), { code: "EISDIR" });
+  assert.deepEqual(fs.readdirSync(ledgerDir), [LEDGER]);
+});
+
+test("hooks: clearAll waits for an in-flight apply, even when it fails", async () => {
+  const h = new Hooks({ dir: mkHooks(), ledgerDir: tmp() });
+  const order = [];
+  let finish;
+  h.run = async (_, phase) => {
+    if (phase === "apply") {
+      order.push("apply-start");
+      await new Promise((resolve) => { finish = resolve; });
+      order.push("apply-end");
+      return { code: 1 };
+    }
+    order.push("clear");
+    return { code: 0 };
+  };
+  const applying = assert.rejects(h.call(BLOCK, "apply", { scenario: "s", transport: "webrtc" }, () => {}), /apply failed/);
+  const clearing = h.clearAll(() => {});
+  finish();
+  await applying;
+  assert.deepEqual(await clearing, []);
+  assert.deepEqual(order, ["apply-start", "apply-end", "clear"]);
+  assert.deepEqual(h.readLedger(), []);
 });
 
 // ── transport-fallback and input-kbm (the real scenario modules, against the same fake page) ─────────────────
@@ -1728,7 +1953,7 @@ test("input-kbm: a sample that is not a number is not counted", async () => {
 
 // ── review round 1 on #1338 ─────────────────────────────────────────────────
 
-import { streamCentre } from "./scenarios/stream-common.mjs";
+import { probe, streamCentre } from "./scenarios/stream-common.mjs";
 const keyEvents = (w) => w.cdp.filter(([m]) => m === "Input.dispatchKeyEvent").map(([, p]) => `${p.type}:${p.code}`);
 const posts = (reason = "stream_lost") => JSON.stringify({ client: "browser", events: [{ ts_unix_ms: 5, type: "transport.fallback", payload: { reason } }] });
 const post = (w, body) => w.emit("request", { url: () => `${BASE}/v1/sessions/${SID}/trace/events`, method: () => "POST", postData: () => body });
@@ -1830,14 +2055,15 @@ test("B3 (#1343): the lock is taken from the \"Click to play\" layer: waited for
   assert.equal(f.w.stageClicks, 0);
 });
 
-test("#1343 item 3: with no layer the HUD's own route is tried, and what it found is said; with no route the text says the launch was not immersive", async () => {
+test("#1343 item 3: with no layer the HUD's own route is tried, and observed text states only the wait, no lock and unknown cause", async () => {
   // The page offers the HUD route: a trusted click on the stage opens the shelf, a trusted click on "Capture input" takes the lock.
   const h = world({ noLayer: true, hud: true });
   const r = await runReal(h, INPUT());
   assert.equal(h.hudClicks, 1);
   assert.equal(h.layerClicks, 0);
   assert.equal(r.by().pointer_lock_taken.pass, true);
-  assert.match(r.by().pointer_lock_taken.observed, /taken through the HUD's "Capture input": the launch was not immersive/);
+  assert.match(r.by().pointer_lock_taken.observed, /no "Click to play" layer appeared within 5 s and no lock was held — cause unknown; taken through the HUD's "Capture input"/);
+  assert.doesNotMatch(r.by().pointer_lock_taken.observed, /immersive/i);
   assert.equal(r.timeline().find((x) => x.ev === "pointer-lock").hud, "clicked");
   // The sequence's pointer starts where the lock click left it, so the first move is a real delta.
   assert.deepEqual(JSON.parse(read(r.dir, `${r.id()}/input-sent.json`)).received_by_page.motion_sum, { x: 50, y: 25 });
@@ -1845,12 +2071,14 @@ test("#1343 item 3: with no layer the HUD's own route is tried, and what it foun
   const nolock = world({ noLayer: true, hud: true, lockOnClick: false });
   const rn = await runReal(nolock, INPUT());
   assert.equal(rn.by().pointer_lock_taken.pass, false);
-  assert.match(rn.by().pointer_lock_taken.observed, /^no pointer lock: the launch was not immersive, so there is no layer to click; the HUD's "Capture input" was clicked and did not lock$/);
+  assert.match(rn.by().pointer_lock_taken.observed, /^no pointer lock: no "Click to play" layer appeared within 5 s and no lock was held \(cause unknown\); the HUD's "Capture input" was clicked and did not lock$/);
+  assert.doesNotMatch(rn.by().pointer_lock_taken.observed, /immersive/i);
   // No layer and no button (the stage click showed none): said so.
   const bare = world({ noLayer: true });
   const rb = await runReal(bare, INPUT());
   assert.equal(rb.by().pointer_lock_taken.pass, false);
-  assert.match(rb.by().pointer_lock_taken.observed, /^no pointer lock: the launch was not immersive, so there is no layer to click; a click on the stream showed no "Capture input" button in the HUD$/);
+  assert.match(rb.by().pointer_lock_taken.observed, /^no pointer lock: no "Click to play" layer appeared within 5 s and no lock was held \(cause unknown\); a click on the stream showed no "Capture input" button in the HUD$/);
+  assert.doesNotMatch(rb.by().pointer_lock_taken.observed, /immersive/i);
   assert.equal(bare.hudClicks, 0);
   assert.equal(rb.timeline().find((x) => x.ev === "pointer-lock").hud, "no-button");
   // transport-fallback: the same route lets it hold the key.
@@ -2081,4 +2309,642 @@ test("#1343 items 6 and 7: why the wait ended, how long, and how long no frame a
   const get = (freezeS) => Object.fromEntries(judgeFallback({ params: { hold_s: 30 }, firstFrameS: 1, seen: { row: { state: "running" }, fallbackReason: "x", posted: [], videoAfterS: 4, tail: { before: 1, after: 9 }, keyHeld: false, faultApplied: true, watched: true, freezeS } }).map((c) => [c.id, c]));
   assert.doesNotMatch(get(NaN).frame_after_fallback.observed, /no frame advanced/);
   assert.match(get(2).frame_after_fallback.observed, /no frame advanced for 2 s of it/);
+});
+
+// ── #1303 follow-ups ────────────────────────────────────────────────────────
+
+test("empty error messages still write a non-empty reason in scenario.json so validateBundle accepts it (#1303)", async () => {
+  assert.equal(errorReason(new Error("")), "Error (no message)");
+  assert.equal(errorReason(new TypeError("   ")), "TypeError (no message)");
+  assert.equal(errorReason(""), "error with no message");
+  assert.equal(errorReason(null), "error with no message");
+  assert.equal(errorReason(new Error("boom")), "boom");
+
+  // 1. new Error("") thrown inside stream-hold after sign-in (rec.holding is false).
+  const w1 = world();
+  w1.api.apps = async () => { throw new Error(""); };
+  const r1 = await run(w1);
+  assert.deepEqual(r1.result.errors, [], "bundle with empty-message Error must validate");
+  assert.ok(r1.result.bundle, "bundle directory was committed");
+  assert.equal(r1.scenario().status, "error");
+  assert.equal(r1.scenario().reason, "Error (no message)");
+
+  // 2. Empty string "" thrown escaping a scenario directly to runSuite.
+  const w2 = world();
+  const r2 = await run(w2, PLAN({}), {
+    load: async () => ({
+      name: "stream-hold",
+      run: async (page, ctx) => {
+        ctx.rec.release();
+        throw "";
+      },
+    }),
+  });
+  assert.deepEqual(r2.result.errors, [], "bundle with empty string throw must validate");
+  assert.equal(r2.scenario().status, "error");
+  assert.equal(r2.scenario().reason, "error with no message");
+
+  // 3. Scenario returning status error with an empty reason directly.
+  const w3 = world();
+  const r3 = await run(w3, PLAN({}), {
+    load: async () => ({
+      name: "stream-hold",
+      run: async () => ({ status: "error", reason: "", criteria: [], clock_offset_ms: null }),
+    }),
+  });
+  assert.deepEqual(r3.result.errors, [], "bundle with empty error reason must validate");
+  assert.equal(r3.scenario().status, "error");
+  assert.equal(r3.scenario().reason, "error with no message");
+});
+
+test("stream-hold captures page /stats cadence samples so e2e-review checks anomalies and e2e-collect merges without duplication (#1303)", async () => {
+  // Unit checks on statsSamples: replays the exact web/src/{webrtc,webtransport}/telemetry.ts POST shape.
+  const projected = statsSamples(JSON.stringify({
+    samples: [
+      {
+        ts_unix_ms: 1800000001234.7,
+        metrics: {
+          fps: 60,
+          bitrate_kbps: 12000,
+          rtt_ms: 4.2,
+          present_interval_sd_ms: 2.5,
+          present_interval_p95_ms: 17.1,
+          is_hidden: 0,
+          unknown_key: 99,
+          free_text: "never copy",
+        },
+        device_key: "dev-key-123",
+        codec_mime_type: "video/H264",
+      },
+      // Sample with no cadence/visibility keys: dropped.
+      { ts_unix_ms: 1800000002234, metrics: { fps: 60, bitrate_kbps: 12000 } },
+      // Non-finite / string values for the three keys: ignored.
+      { ts_unix_ms: 1800000003234, metrics: { present_interval_sd_ms: "40", present_interval_p95_ms: null, is_hidden: 1 } },
+      // Missing ts_unix_ms: dropped.
+      { metrics: { present_interval_sd_ms: 5, is_hidden: 0 } },
+    ],
+  }));
+  assert.deepEqual(projected, [
+    {
+      kind: "metric",
+      source: "browser",
+      ts_unix_ms: 1800000001234,
+      metrics: { present_interval_sd_ms: 2.5, present_interval_p95_ms: 17.1, is_hidden: 0 },
+    },
+    {
+      kind: "metric",
+      source: "browser",
+      ts_unix_ms: 1800000003234,
+      metrics: { is_hidden: 1 },
+    },
+  ]);
+  assert.deepEqual(statsSamples("not json"), []);
+
+  const emitStats = (w, samples, { sid = SID, origin = BASE } = {}) =>
+    w.emit("request", {
+      url: () => `${origin}/v1/sessions/${sid}/stats`,
+      method: () => "POST",
+      postData: () => JSON.stringify({ samples }),
+    });
+
+  // Helper: real web-client POST /v1/sessions/{id}/stats samples at arbitrary ms (not multiples of 1000).
+  const warm = T.warmup_exclude_s;
+  const makeStatsBatch = (degraded) => {
+    const out = [];
+    for (let s = 0; s < 35; s += 1) {
+      const bad = degraded && s >= warm + 2 && s < warm + 5;
+      out.push({
+        ts_unix_ms: T0 + s * 1000 + 347,
+        metrics: {
+          fps: 60,
+          bitrate_kbps: 12000,
+          rtt_ms: 4.5,
+          present_interval_sd_ms: bad ? 35 : 2.1,
+          present_interval_p95_ms: bad ? 62 : 17.2,
+          is_hidden: 0,
+          stray_text: "drop-me",
+        },
+        device_key: "dev-1",
+        codec_mime_type: "video/H264",
+      });
+    }
+    return out;
+  };
+
+  // End-to-end 1: healthy runner bundle with captured /stats -> review checks all three anomaly rules.
+  const healthyBatch = makeStatsBatch(false);
+  const wHealthy = world({
+    onPlay: (w) => {
+      // Posts for another session and another origin must be ignored.
+      emitStats(w, [{ ts_unix_ms: T0 + 25_111, metrics: { present_interval_sd_ms: 99, present_interval_p95_ms: 99, is_hidden: 0 } }], { sid: OTHER });
+      emitStats(w, [{ ts_unix_ms: T0 + 26_111, metrics: { present_interval_sd_ms: 99, present_interval_p95_ms: 99, is_hidden: 0 } }], { origin: "https://other.example.test" });
+      // Real session batch, plus a duplicate timestamp to verify dedup.
+      emitStats(w, [...healthyBatch, { ts_unix_ms: healthyBatch[0].ts_unix_ms, metrics: { present_interval_sd_ms: 99, is_hidden: 0 } }]);
+    },
+  });
+  const healthy = await run(wHealthy);
+  assert.deepEqual(healthy.result.errors, []);
+  const healthyRev = review(healthy.dir);
+  assert.deepEqual(healthyRev.scenarios[0].anomalies.not_checked, [], "all three anomaly rules ran on the client-only runner bundle");
+  assert.deepEqual(healthyRev.scenarios[0].anomalies.rows, []);
+  assert.match(renderReview(healthyRev), /^No threshold crossed\.$/m);
+  const healthyMetrics = read(healthy.dir, "01-stream-hold/metrics.jsonl").trim().split("\n").map((l) => JSON.parse(l));
+  const healthyStatsRows = healthyMetrics.filter((r) => "present_interval_sd_ms" in r.metrics);
+  assert.equal(healthyStatsRows.length, healthyBatch.length, "duplicate ts deduplicated and foreign session/origin ignored");
+  assert.ok(healthyStatsRows.every((r) => !("stray_text" in r.metrics) && !("fps" in r.metrics)), "only the three projected keys are written");
+
+  // End-to-end 2: degraded runner bundle with a frameless second and degraded /stats samples ->
+  // review names the frameless second in Worst Windows AND fires all three anomaly rules;
+  // then e2e-collect merges the host copy of the same /stats timestamps into ONE row per timestamp (no duplication).
+  const degradedBatch = makeStatsBatch(true);
+  const wBad = world({
+    wins: windows(50, [warm + 5]),
+    onPlay: (w) => emitStats(w, degradedBatch),
+  });
+  const bad = await run(wBad);
+  assert.deepEqual(bad.result.errors, []);
+  const badRev = review(bad.dir);
+  assert.ok(
+    badRev.scenarios[0].windows.rows.some((r) => r.worst_for === "bench_n" && r.value === 0),
+    `frameless second missing from worst windows: ${JSON.stringify(badRev.scenarios[0].windows.rows)}`,
+  );
+  assert.deepEqual(badRev.scenarios[0].anomalies.not_checked, []);
+  assert.deepEqual(
+    badRev.scenarios[0].anomalies.rows.map((r) => [r.threshold, r.samples_over]),
+    [
+      ["classifier.hitch_sd_ms", 3],
+      ["web.client_health.present_sd_degraded_ms", 3],
+      ["web.client_health.present_p95_degraded_ms", 3],
+    ],
+  );
+
+  // Now run the real e2e-collect over `bad.dir` with the host returning the exact same browser samples
+  // (at the same ts_unix_ms, plus extra host-stored keys like fps and rtt_ms) and verify 1:1 dedup.
+  const HOST_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const hostBrowserSamples = degradedBatch.map((s) => ({
+    source: "browser",
+    ts_unix_ms: s.ts_unix_ms,
+    metrics: {
+      fps: s.metrics.fps,
+      rtt_ms: s.metrics.rtt_ms,
+      present_interval_sd_ms: s.metrics.present_interval_sd_ms,
+      present_interval_p95_ms: s.metrics.present_interval_p95_ms,
+      is_hidden: s.metrics.is_hidden,
+    },
+  }));
+  const fakeFetch = async (url) => {
+    const route = new URL(url).pathname;
+    if (route === `/v1/sessions/${SID}`) {
+      return {
+        status: 200,
+        json: async () => ({
+          session: {
+            id: SID,
+            app_id: "app-1",
+            host_id: HOST_ID,
+            state: "stopped",
+            profile_id: "1080p60-h264",
+            stream: { width: 1920, height: 1080, fps: 60, bitrate_kbps: 12000, codec: "h264", rungs: [[1920, 1080]] },
+            negotiated_codec: "h264",
+            transport: "webrtc",
+            created_at: new Date(T0).toISOString(),
+            started_at: new Date(T0).toISOString(),
+            ended_at: new Date(T0 + 50_000).toISOString(),
+          },
+        }),
+      };
+    }
+    if (route === `/v1/admin/sessions/${SID}/metrics`) {
+      return { status: 200, json: async () => ({ items: [...hostBrowserSamples].reverse(), next_cursor: null }) };
+    }
+    if (route === `/v1/admin/sessions/${SID}/trace/events`) {
+      return { status: 200, json: async () => ({ window: { from_ms: T0, to_ms: T0 + 50_000 }, events: [] }) };
+    }
+    if (route === `/v1/admin/sessions/${SID}/diagnostic-bundle`) {
+      return {
+        status: 200,
+        json: async () => ({
+          trace: { session_id: SID, host_id: HOST_ID, profile_id: "1080p60-h264", started_at: new Date(T0).toISOString(), ended_at: new Date(T0 + 50_000).toISOString() },
+          window: { from_ms: T0, to_ms: T0 + 50_000 },
+          clock: { client_offset_ms: 3, uncertainty_ms: 1, measured_at: new Date(T0 + 5000).toISOString() },
+          abr_mode: "smooth",
+          series: {},
+          events: [],
+          derived_windows: { hitches: [], abr_downshifts: [], encoder_saturation: [], likely_network_congestion: [] },
+          agent_adaptation: [],
+          classifier: { verdict: "healthy" },
+          captures: [],
+        }),
+      };
+    }
+    if (route === `/v1/admin/hosts/${HOST_ID}/settings`) {
+      return { status: 200, json: async () => ({ effective: { abr_mode: "smooth" } }) };
+    }
+    if (route === `/v1/hosts/${HOST_ID}`) {
+      return { status: 200, json: async () => ({ host: { id: HOST_ID, agent_version: "0.6.3-dev", source_commit: "abc1234", built_at: "2026-11-20T00:00:00Z" } }) };
+    }
+    if (route === "/v1/admin/platform/identity") {
+      return { status: 200, json: async () => ({ identity: { version: "0.6.3-dev", source_commit: "def5678", built_at: "2026-11-20T00:00:00Z" } }) };
+    }
+    return { status: 404, json: async () => ({}) };
+  };
+  const collected = await collect(bad.dir, { baseUrl: "https://stack.invalid", token: "admintoken-9f3c2b7a41", fetch: fakeFetch, now: () => T0 + 60_000 });
+  assert.equal(collected.complete, true, JSON.stringify(collected));
+  assert.deepEqual(collected.problems, [], JSON.stringify(collected));
+  assert.deepEqual(validateBundle(bad.dir), []);
+  const mergedMetrics = read(bad.dir, "01-stream-hold/metrics.jsonl").trim().split("\n").map((l) => JSON.parse(l));
+  const mergedStatsRows = mergedMetrics.filter((r) => r.source === "browser" && "present_interval_sd_ms" in r.metrics);
+  assert.equal(mergedStatsRows.length, degradedBatch.length, "collect must merge client and host rows 1:1 on ts_unix_ms with zero duplication");
+  assert.ok(mergedStatsRows.every((r) => r.metrics.fps === 60 && r.metrics.rtt_ms === 4.5), "host keys joined onto the same row");
+  const afterCollectRev = review(bad.dir);
+  assert.deepEqual(
+    afterCollectRev.scenarios[0].anomalies.rows.map((r) => [r.threshold, r.samples_over]),
+    [
+      ["classifier.hitch_sd_ms", 3],
+      ["web.client_health.present_sd_degraded_ms", 3],
+      ["web.client_health.present_p95_degraded_ms", 3],
+    ],
+    "samples_over stays 3 after collect (no duplicate rows)",
+  );
+
+  // End-to-end 3: runner bundle with offset_unknown=true and a frameless second -> review notes client clock fallback.
+  const unknownWins = windows(50, [warm + 5]).map((win) => ({
+    ...win,
+    offset_ms: null,
+    offset_unknown: true,
+    t_end_host_ms: null,
+  }));
+  const unk = await run(world({ wins: unknownWins }));
+  assert.deepEqual(unk.result.errors, []);
+  const unkRev = review(unk.dir);
+  assert.equal(unkRev.scenarios[0].windows.bench_offset_unknown, true);
+  assert.match(renderReview(unkRev), /when `offset_unknown` was set with no decoded marker/);
+});
+
+// ── #1334 follow-ups ────────────────────────────────────────────────────────
+
+test("benchfold omits unmeasured index-delta counts on no-marker windows and tolerates malformed i2p_ms (#1334)", () => {
+  const rows = benchRows([
+    ...FIXTURE,
+    // A live no-marker app window: 60 frames displayed, 0 markers decoded.
+    { ...FIXTURE[0], t_start_ms: 1800000002000, t_end_ms: 1800000003000, t_end_host_ms: 1800000003003, last_host_time_ms: null, n: 60, decoded: 0, undecoded: 60, missing_indices: 0, duplicated: 0, reordered: 0 },
+  ]);
+  assert.equal(rows.length, 3);
+  // Decoded window keeps missing_indices, duplicated, reordered.
+  assert.equal(rows[0].metrics.bench_decoded, 60);
+  assert.equal(rows[0].metrics.missing_indices, 1);
+  assert.equal(rows[0].metrics.duplicated, 0);
+  assert.equal(rows[0].metrics.reordered, 0);
+  // Empty and live no-marker windows omit all three unmeasured index-delta counts.
+  for (const idx of [1, 2]) {
+    assert.equal(rows[idx].metrics.bench_decoded, 0);
+    for (const k of ["missing_indices", "duplicated", "reordered"]) {
+      assert.equal(k in rows[idx].metrics, false, `row ${idx} with decoded=0 must omit ${k}`);
+    }
+  }
+  // Malformed i2p_ms (non-array) must not throw.
+  const badI2p = benchRows([{ ...FIXTURE[0], i2p_ms: "not-an-array" }]);
+  assert.equal(badI2p.length, 1);
+  assert.equal("i2p_n" in badI2p[0].metrics, false);
+});
+
+test("expect_marker: false records marker_decoded as not judged so a no-marker app passes on the remaining criteria (#1334)", async () => {
+  const noMarkerWins = windows(50).map((x) => ({ ...x, n: 60, decoded: 0, undecoded: 60, missing_indices: 0, duplicated: 0, reordered: 0 }));
+
+  // 1. Default (omitted) and expect_marker: true still fail marker_decoded on a no-marker app.
+  for (const extra of [{}, { expect_marker: true }]) {
+    const r = await run(world({ stats: { frames: 100, decoded: 0 }, wins: noMarkerWins }), PLAN(extra));
+    assert.equal(r.by().marker_decoded.pass, false, JSON.stringify(extra));
+    assert.equal(r.scenario().status, "fail", JSON.stringify(extra));
+  }
+
+  // 2. expect_marker: false leaves marker_decoded not judged and passes on the remaining criteria;
+  //    benchfold omits missing_indices from metrics.jsonl and review lists it as absent.
+  const r = await run(world({ stats: { frames: 100, decoded: 0 }, wins: noMarkerWins }), PLAN({ expect_marker: false }));
+  assert.deepEqual(r.result.errors, []);
+  assert.equal(r.scenario().status, "pass", JSON.stringify(r.scenario().criteria));
+  assert.deepEqual(r.by().marker_decoded, {
+    id: "marker_decoded",
+    pass: null,
+    observed: null,
+    expected: "not judged: plan says this app has no marker",
+  });
+  for (const id of ["first_frame_s", "transport_as_asked", "codec_as_asked", "profile_as_asked", "frameless_seconds", "present_cadence"]) {
+    assert.equal(r.by()[id].pass, true, `${id} should still be judged and pass`);
+  }
+  assert.equal(r.by().missing_indices_rate.pass, null);
+  const folded = read(r.dir, "01-stream-hold/metrics.jsonl").trim().split("\n").map((l) => JSON.parse(l));
+  assert.ok(folded.length > 0 && folded.every((row) => !("missing_indices" in row.metrics)), "no-marker rows omit missing_indices");
+  const rev = review(r.dir);
+  assert.ok(!rev.scenarios[0].windows.keys.includes("missing_indices"));
+  assert.ok(rev.scenarios[0].windows.absent.includes("missing_indices"));
+
+  // 3. Non-boolean expect_marker is refused by check() before launching anything.
+  for (const bad of ["false", 0, 1, null, {}]) {
+    assert.match(
+      check({ transport: "webrtc", codec: "h264", profile: "1080p60", hold_s: 30, app: "x", expect_marker: bad }),
+      /expect_marker must be a boolean/,
+      String(bad),
+    );
+    const w = world();
+    const res = await run(w, PLAN({ expect_marker: bad }));
+    assert.equal(res.scenario().status, "error", String(bad));
+    assert.match(res.scenario().reason, /expect_marker must be a boolean/);
+    assert.deepEqual(w.clicks, [], "nothing was launched");
+  }
+  assert.equal(check({ transport: "webrtc", codec: "h264", profile: "1080p60", hold_s: 30, app: "x", expect_marker: false }), null);
+  assert.equal(check({ transport: "webrtc", codec: "h264", profile: "1080p60", hold_s: 30, app: "x", expect_marker: true }), null);
+});
+
+test("hitchCount excludes hidden spans and uses >= on hitch_sd_ms at exact boundary (#1334)", () => {
+  // Helper: build one clock second [secStart, secStart + 1000) with 20 intervals alternating (40 - d) and (40 + d).
+  // Exact integer arithmetic: 10*(40-d) + 10*(40+d) = 800 ms < 1000 ms, mean = 40, sd = Math.sqrt(d^2) === d exactly.
+  const clockSecondFrames = (secStart, d) => {
+    const out = [{ present_ms: secStart }];
+    let t = secStart;
+    for (let i = 0; i < 20; i += 1) {
+      t += i % 2 === 0 ? 40 - d : 40 + d;
+      out.push({ present_ms: t });
+    }
+    return out;
+  };
+
+  const sec1 = T0 + 25_000;
+  const sec2 = T0 + 26_000;
+  const sec3 = T0 + 27_000;
+
+  // 1. Exact >= boundary: sd === T.hitch_sd_ms (18) MUST count as a hitch; sd === T.hitch_sd_ms - 1 (17) MUST NOT.
+  const atLimit = clockSecondFrames(sec1, T.hitch_sd_ms);
+  const belowLimit = clockSecondFrames(sec2, T.hitch_sd_ms - 1);
+  assert.deepEqual(
+    hitchCount(atLimit, sec1, sec1 + 1000, [], T),
+    { judged: 1, hitches: 1 },
+    "exact sd === hitch_sd_ms must count as a hitch (>=, not >)",
+  );
+  assert.deepEqual(
+    hitchCount(belowLimit, sec2, sec2 + 1000, [], T),
+    { judged: 1, hitches: 0 },
+    "sd below hitch_sd_ms must not count as a hitch",
+  );
+
+  // 2. Hidden-span exclusion: a jerky second (sd = 30 >= 18) inside a hidden span must be excluded,
+  //    while an unhidden steady second stays judged with 0 hitches.
+  const steadyAndHiddenJerky = [
+    ...clockSecondFrames(sec1, 0),
+    ...clockSecondFrames(sec2, 30),
+    ...clockSecondFrames(sec3, 30),
+  ];
+  assert.deepEqual(
+    hitchCount(steadyAndHiddenJerky, sec1, sec3 + 1000, [[sec2, sec3 + 1000]], T),
+    { judged: 1, hitches: 0 },
+    "hidden spans must exclude jerky intervals from hitchCount",
+  );
+  // Same frames without the hidden span: both jerky seconds count.
+  assert.deepEqual(
+    hitchCount(steadyAndHiddenJerky, sec1, sec3 + 1000, [], T),
+    { judged: 3, hitches: 2 },
+  );
+});
+
+test("malformed window times, frame timestamps and counts never pass or coerce as finite numbers (#1334)", async () => {
+  // 1. Malformed window times (non-finite, string, or t_end_ms < t_start_ms) leave frameless_seconds and present_cadence unjudged.
+  const baseWins = windows(50);
+  for (const [label, patch] of [
+    ["NaN t_start_ms", { t_start_ms: NaN }],
+    ["Infinity t_end_ms", { t_end_ms: Infinity }],
+    ["string t_start_ms", { t_start_ms: String(T0 + 40_000) }],
+    ["inverted bounds", { t_start_ms: T0 + 41_000, t_end_ms: T0 + 40_000 }],
+  ]) {
+    const malformed = baseWins.map((w, i) => (i === 40 ? { ...w, ...patch } : w));
+    const res = J({ windows: malformed });
+    assert.equal(res.frameless_seconds.pass, null, `${label}: frameless_seconds must not be judged`);
+    assert.equal(res.frameless_seconds.observed, null, label);
+    assert.equal(res.present_cadence.pass, null, `${label}: present_cadence must not be judged`);
+    assert.match(res.present_cadence.expected, /window time.*not a finite number/, label);
+    assert.match(res.missing_indices_rate.expected, /no usable counts/, label);
+  }
+
+  // 2. framelessSeconds does not coerce string no_image into > 0.
+  assert.equal(framelessSeconds([{ n: 0, no_image: "4" }, { n: "0", no_image: 0 }]), 1);
+
+  // 3. hitchCount and instrumentShare guard non-finite bounds and malformed hidden spans.
+  assert.deepEqual(hitchCount(frames(50), NaN, T0 + 50_000, [], T), { judged: 0, hitches: 0 });
+  assert.deepEqual(instrumentShare(frames(50), [], NaN, T0 + 50_000), { malformed: true });
+
+  // 4. pullFrames neither lets Infinity poison lastPresent nor silently drops malformed entries:
+  //    valid frames after Infinity still land in bench-frames.json, AND present_cadence fails closed (pass: null).
+  const poisoned = [
+    { present_ms: Infinity, decoded: true },
+    { present_ms: "1800000099999", decoded: true },
+    null,
+    ...frames(50),
+  ];
+  const r = await run(world({ extraFrames: poisoned }));
+  assert.deepEqual(r.result.errors, []);
+  const writtenFrames = JSON.parse(read(r.dir, "01-stream-hold/bench-frames.json")).frames;
+  assert.equal(writtenFrames.length, frames(50).length, "Infinity must not poison lastPresent and drop valid frames");
+  assert.equal(r.by().present_cadence.pass, null, "malformed entries in dump.frames must fail closed");
+  assert.match(r.by().present_cadence.expected, /not a number/);
+
+  // 5. Scenarios without marker_decoded reject expect_marker under the strict-plan invariant.
+  assert.match(checkFallback({ transport: "webtransport", codec: "h264", profile: "1080p60", hold_s: 30, app: "x", expect_marker: false }), /does not define.*expect_marker/);
+  assert.match(checkInput({ transport: "webrtc", codec: "h264", profile: "1080p60", hold_s: 5, app: "x", expect_marker: false }), /does not define.*expect_marker/);
+});
+
+// ── #1343 round-2 follow-ups ────────────────────────────────────────────────
+
+test("#1343 r2 item 1: lock clicks on the layer or HUD are not left in the page's event log in input-sent.json", async () => {
+  const btnCode = { left: 0, right: 2, middle: 1 };
+  const expectedLog = SEQUENCE.flatMap((s) =>
+    s.kind === "key" ? [["keydown", s.code], ["keyup", s.code]]
+    : s.kind === "button" ? [["mousedown", btnCode[s.button]], ["mouseup", btnCode[s.button]]]
+    : s.kind === "wheel" ? [["wheel", s.dy]]
+    : []
+  );
+
+  // 1. Default "Click to play" layer click path: 1 lock click before the sequence must not appear in events.
+  const layer = world({ wins: echoWindows([40]) });
+  const rl = await runReal(layer, INPUT());
+  assert.deepEqual(rl.result.errors, []);
+  assert.equal(layer.layerClicks, 1, "the layer was clicked once to take pointer lock");
+  const layerRec = JSON.parse(read(rl.dir, `${rl.id()}/input-sent.json`));
+  assert.deepEqual(layerRec.received_by_page.events, expectedLog, "lock click must not pollute received_by_page.events");
+
+  // 2. HUD fallback path: stage click + "Capture input" click (2 clicks) must not appear in events either.
+  const hud = world({ wins: echoWindows([40]), noLayer: true, hud: true });
+  const rh = await runReal(hud, INPUT());
+  assert.deepEqual(rh.result.errors, []);
+  assert.equal(hud.stageClicks, 1);
+  assert.equal(hud.hudClicks, 1);
+  const hudRec = JSON.parse(read(rh.dir, `${rh.id()}/input-sent.json`));
+  assert.deepEqual(hudRec.received_by_page.events, expectedLog, "stage and HUD lock clicks must not pollute received_by_page.events");
+});
+
+test("#1343 r2 item 3a: freeze baseline is taken right before the fault, not from an earlier sample before takeLock", async () => {
+  // Frames advance continuously during takeLock's 2 s wait for the layer, then freeze at the fault (T0 + 2000).
+  // Baseline at p0 (before takeLock, frames=100) would see 100 -> 160 on the first post-fault sample and under-report freeze as 3 s instead of 4 s.
+  let ww;
+  const stats = {
+    get frames() {
+      const t = ww ? Math.min(ww.t, T0 + 2000) : T0;
+      return 100 + Math.floor((t - T0) / 1000) * 30;
+    },
+    decoded: 100,
+  };
+  const f = fallbackWorld({ layerAfterMs: 2000, stats });
+  ww = f.w;
+  const r = await runReal(f.w, FALLBACK("mid"), { hooksDir: f.hooksDir });
+  assert.deepEqual(r.result.errors, []);
+  assert.equal(r.sc().status, "pass", JSON.stringify(r.sc().criteria));
+  assert.equal(stats.frames, 160, "frames advanced from 100 to 160 during takeLock before freezing at the fault");
+  const rec = JSON.parse(read(r.dir, `${r.id()}/fallback.json`));
+  assert.equal(rec.no_frame_advance_before_video_s, 4, "freeze must be measured from the fault, not from p0 before takeLock");
+  assert.match(r.by().frame_after_fallback.observed, /^5 s after the fault; no frame advanced for 4 s of it$/);
+});
+
+test("#1343 r2 item 3b: an unreadable move log (garbage or throw) keeps motion_sum_matches pass: null with a reason and no crash", async () => {
+  // 1. Page overwrites __e2eInput with non-object garbage before readout.
+  {
+    const w = world({ wins: echoWindows([40]) });
+    const orig = w.host.newPage;
+    w.host.newPage = async () => {
+      const p = await orig();
+      const ev = p.evaluate;
+      p.evaluate = async (fn, arg) => (String(fn).includes("__e2eInput ?? null") ? "not-an-object" : ev(fn, arg));
+      return p;
+    };
+    const r = await runReal(w, INPUT());
+    assert.deepEqual(r.result.errors, []);
+    assert.notEqual(r.sc().status, "error");
+    assert.equal(r.by().motion_sum_matches.pass, null);
+    assert.equal(r.by().motion_sum_matches.observed, null);
+    assert.match(r.by().motion_sum_matches.expected, /The page's move log could not be read/);
+    assert.equal(r.by().nothing_held_at_end.pass, null);
+    assert.equal(JSON.parse(read(r.dir, `${r.id()}/input-sent.json`)).received_by_page, null);
+  }
+
+  // 2. Page returns an object with malformed moveCount / move / moves.
+  {
+    const w = world({ wins: echoWindows([40]) });
+    const orig = w.host.newPage;
+    w.host.newPage = async () => {
+      const p = await orig();
+      const ev = p.evaluate;
+      p.evaluate = async (fn, arg) => (String(fn).includes("__e2eInput ?? null") ? { moveCount: -3, move: { x: NaN, y: "x" }, moves: "bad", keys: [], buttons: [], log: "bad", wheel: null, untrusted: "nope" } : ev(fn, arg));
+      return p;
+    };
+    const r = await runReal(w, INPUT());
+    assert.deepEqual(r.result.errors, []);
+    assert.equal(r.sc().status, "pass", JSON.stringify(r.sc().criteria));
+    assert.equal(r.by().motion_sum_matches.pass, null);
+    assert.equal(r.by().motion_sum_matches.observed, null);
+    assert.match(r.by().motion_sum_matches.expected, /The page's move log could not be read/);
+    const rec = JSON.parse(read(r.dir, `${r.id()}/input-sent.json`));
+    assert.equal(rec.received_by_page.mouse_moves_total, null);
+    assert.equal(rec.received_by_page.motion_sum, null);
+  }
+
+  // 3. Page throws when the scenario reads __e2eInput.
+  {
+    const w = world({ wins: echoWindows([40]) });
+    const orig = w.host.newPage;
+    w.host.newPage = async () => {
+      const p = await orig();
+      const ev = p.evaluate;
+      p.evaluate = async (fn, arg) => {
+        if (String(fn).includes("__e2eInput ?? null")) throw new Error("Execution context was destroyed");
+        return ev(fn, arg);
+      };
+      return p;
+    };
+    const r = await runReal(w, INPUT());
+    assert.deepEqual(r.result.errors, []);
+    assert.equal(r.sc().status, "pass", JSON.stringify(r.sc()));
+    assert.equal(r.by().motion_sum_matches.pass, null);
+    assert.equal(r.by().motion_sum_matches.observed, null);
+    assert.match(r.by().motion_sum_matches.expected, /The page's move log could not be read/);
+    assert.equal(r.by().nothing_held_at_end.pass, null);
+    assert.equal(JSON.parse(read(r.dir, `${r.id()}/input-sent.json`)).received_by_page, null);
+  }
+});
+
+test("#1343 r2 item 3c: no visible stream surface leaves freeze null with a reason (never 0) and records no-surface lock state", async () => {
+  // 1. transport-fallback mid with no <video>/canvas surface at the fault (even with advancing bench frames so unguarded freeze would be 0).
+  {
+    let ww;
+    const moving = { get frames() { return Math.floor((ww.t - T0) / 1000) * 30 + 10; }, decoded: 100 };
+    const f = fallbackWorld({ noSurface: true, stats: moving });
+    ww = f.w;
+    const r = await runReal(f.w, FALLBACK("mid", { hold_s: 10 }), { hooksDir: f.hooksDir });
+    assert.deepEqual(r.result.errors, []);
+    const rec = JSON.parse(read(r.dir, `${r.id()}/fallback.json`));
+    assert.equal(rec.no_frame_advance_before_video_s, null, "no surface must yield null freeze, never 0");
+    assert.equal(rec.no_frame_advance_reason, "no visible stream surface");
+    const step = r.timeline().find((x) => x.ev === "wait-ended");
+    assert.equal(step.no_frame_advance_s, null);
+    assert.equal(step.no_frame_advance_reason, "no visible stream surface");
+  }
+
+  // 2. Normal fallback (M1): the page unmounts its canvas at the fallback and the <video> has no frames until WebRTC starts 2 s later.
+  // That gap IS the freeze mid measures, so the freeze must remain a number (6 s), not be wiped to null.
+  {
+    const f = fallbackWorld();
+    const origSess = f.w.api.session;
+    let delayed = false;
+    f.w.api.session = async (id) => {
+      const row = await origSess(id);
+      if (row?.transport_fallback_reason && !delayed) {
+        delayed = true;
+        f.w.videoStart = f.w.t + 2000;
+        f.w.noSurface = true;
+      } else if (delayed && f.w.t >= f.w.videoStart) {
+        f.w.noSurface = false;
+      }
+      return row;
+    };
+    const r = await runReal(f.w, FALLBACK("mid"), { hooksDir: f.hooksDir });
+    assert.deepEqual(r.result.errors, []);
+    assert.equal(r.sc().status, "pass", JSON.stringify(r.sc().criteria));
+    const rec = JSON.parse(read(r.dir, `${r.id()}/fallback.json`));
+    assert.equal(rec.no_frame_advance_before_video_s, 6, "canvas unmount during fallback must count as freeze, not wipe it to null");
+    assert.equal("no_frame_advance_reason" in rec, false);
+    assert.match(r.by().frame_after_fallback.observed, /^7 s after the fault; no frame advanced for 6 s of it$/);
+  }
+
+  // 3. input-kbm with no layer and no stream surface exercises takeLock's "no-surface" path end-to-end.
+  {
+    const w = world({ noLayer: true, noSurface: true });
+    const r = await runReal(w, INPUT());
+    assert.deepEqual(r.result.errors, []);
+    const beforeSequence = w.cdp.slice(0, w.cdp.findIndex(([, p]) => p.type === "keyDown"));
+    assert.equal(beforeSequence.filter(([, p]) => p.type === "mousePressed").length, 0, "no surface so takeLock clicked nothing");
+    assert.equal(w.hudClicks, 0);
+    assert.equal(r.timeline().find((x) => x.ev === "pointer-lock").hud, "no-surface");
+    assert.ok(r.timeline().some((x) => x.ev === "no-stream-surface"));
+    assert.equal(r.by().pointer_lock_taken.pass, false);
+    assert.match(r.by().pointer_lock_taken.observed, /no "Click to play" layer appeared within 5 s and no lock was held \(cause unknown\); there was no visible stream surface to click either/);
+    assert.doesNotMatch(r.by().pointer_lock_taken.observed, /immersive/i);
+  }
+});
+
+test("#1343 r2 N1: probe().surface requires a non-hidden element with positive box dimensions", async () => {
+  const probeWith = (els) =>
+    probe({
+      evaluate: async (fn, arg) => {
+        const saved = { window: globalThis.window, document: globalThis.document };
+        globalThis.window = {};
+        globalThis.document = {
+          querySelectorAll: () => els,
+          querySelector: () => null,
+          visibilityState: "visible",
+          hasFocus: () => true,
+        };
+        try { return await fn(arg); } finally { Object.assign(globalThis, saved); }
+      },
+    });
+  assert.equal((await probeWith([{ tagName: "CANVAS", hidden: true, getBoundingClientRect: () => ({ width: 800, height: 600 }) }])).surface, false, "hidden canvas is not visible");
+  assert.equal((await probeWith([{ tagName: "CANVAS", hidden: false, getBoundingClientRect: () => ({ width: 0, height: 0 }) }])).surface, false, "zero-size canvas is not visible");
+  assert.equal((await probeWith([{ tagName: "VIDEO", videoWidth: 1920, hidden: true, getBoundingClientRect: () => ({ width: 800, height: 600 }) }])).surface, false, "hidden video is not visible");
+  assert.equal((await probeWith([{ tagName: "CANVAS", hidden: false, getBoundingClientRect: () => ({ width: 800, height: 600 }) }])).surface, true);
+  assert.equal((await probeWith([{ tagName: "VIDEO", videoWidth: 1920, hidden: false, getBoundingClientRect: () => ({ width: 800, height: 600 }) }])).surface, true);
 });

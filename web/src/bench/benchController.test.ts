@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BenchController, READBACK_SETTLE_MS, READBACKS_IN_FLIGHT, presentEpochMs } from "./benchController";
 import { syntheticFrame, type MarkerFields } from "./syntheticMarker";
 import type { MarkerImageData } from "./marker_decode.js";
+import { WEB_BUILD } from "./webBuild";
 import type { BenchWindowPayload } from "./aggregate";
 
 const BASE: MarkerFields = {
@@ -193,6 +194,10 @@ describe("BenchController", () => {
     expect(dumped.frames[0]!.scene_id).toBe(2);
     expect(dumped.windows).toHaveLength(1);
     expect(handle.stats()).toMatchObject({ frames: 1, decoded: 1, located: true });
+  });
+
+  it("reports the web build through the __qBench handle (#1281)", () => {
+    expect(harness().ctl.handle().build()).toEqual(WEB_BUILD);
   });
 
   it("does nothing once stopped", () => {

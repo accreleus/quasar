@@ -30,7 +30,7 @@ describe("rememberFallback", () => {
   it("keeps the reason per session id for this tab", () => {
     sessionStorage.clear();
     expect(rememberedFallback("s1")).toBeNull();
-    rememberFallback("s1", "connect_timeout");
+    rememberFallback("s1", "connect_timeout", "connect_timeout: deadline");
     expect(rememberedFallback("s1")).toBe("connect_timeout");
     expect(rememberedFallback("s2")).toBeNull();
     expect(rememberedFallback(undefined)).toBeNull();
