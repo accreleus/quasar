@@ -24,6 +24,8 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+## 0.6.3 — 2026-11-21
+
 ### Upgrading
 - Callers of `make e2e-post` must now supply operator leak-scan patterns, including for dry runs (`DRY_RUN=1`). Use `LEAK_SCAN_OPERATOR_PATTERNS` or `LEAK_SCAN_PATTERNS_FILE`. See [posting in the E2E suite guide](docs/testing-e2e-suite.md#what-the-host-half-adds).
 ### Added
