@@ -97,6 +97,9 @@ pub struct AbrConfig {
     /// ([`Governor::observe_report`]) instead of windows, the value being the least time
     /// between two encoder writes (zero where a write costs no keyframe).
     pub per_report: Option<Duration>,
+    /// Per-report loop: a reading must be under the rate by more than the deadband, as 0.6.3
+    /// filtered it (`QUASAR_WT_CAPACITY=legacy`).
+    pub legacy_readings: bool,
 }
 
 impl AbrConfig {
@@ -131,6 +134,7 @@ impl AbrConfig {
             down_dwell: Self::DEFAULT_DOWN_DWELL,
             cliff_guard_frac: Self::DEFAULT_CLIFF_GUARD_FRAC,
             per_report: None,
+            legacy_readings: false,
         }
     }
 
@@ -581,7 +585,11 @@ impl Governor {
         self.cfg.per_report?;
         self.last_report = Some(now);
         // Not positive (or NaN) is no capacity sample: a zero rate would never grow again.
-        let Some(reading) = reading.filter(|&r| r > 0.0 && r < self.rate) else {
+        let line = match self.cfg.legacy_readings {
+            true => self.rate * (1.0 - self.cfg.deadband),
+            false => self.rate,
+        };
+        let Some(reading) = reading.filter(|&r| r > 0.0 && r < line) else {
             self.under = None;
             return None;
         };
@@ -1309,6 +1317,22 @@ mod tests {
         }
         assert_eq!(g.rate_kbps(), 10_000.0);
         assert_eq!(g.setpoint_kbps(), 10_000);
+    }
+
+    /// `QUASAR_WT_CAPACITY=legacy`: a reading inside the deadband is none, as in 0.6.3.
+    #[test]
+    fn per_report_legacy_readings_keep_the_deadband() {
+        let base = Instant::now();
+        let cfg = AbrConfig {
+            legacy_readings: true,
+            ..per_report(0)
+        };
+        let mut g = Governor::new(cfg, base);
+        for i in 0..4 {
+            assert_eq!(g.observe_report(Some(8600.0), ms(base, i * 100)), None);
+        }
+        g.observe_report(Some(8400.0), ms(base, 400));
+        assert_eq!(g.observe_report(Some(8400.0), ms(base, 500)), Some(8400));
     }
 
     /// #68: with reports flowing, an estimate under the setpoint (a delay detector misreading

@@ -740,6 +740,12 @@ flag are set, `QUASAR_ABR_MODE` wins (it is checked first and short-circuits).
 | `QUASAR_ABR_LADDER_FLOOR_FOLLOWS_RUNG` | `on` | **Amendment 5, 2026-08-17.** While a ladder rung is engaged, the ABR **floor** is scaled by the same factor the rung scales the comfort bitrate by: `floor_eff = launch_floor × (B_eff / ceiling)`, with `B_eff = B(r) × 0.6` when the fps rung is down — and it rises again as the ladder climbs back. Without this a rung is only half a lever: it changes bits per pixel, not bandwidth. Measured (run C): a 1080p120 h264 session with bounds `[4000, 11500]` behind a 3.5 Mbps link bottomed the setpoint at ~4.4 Mbps and flooded the pipe for a full 90 s window — 83 packets lost, 107 ms jitter buffer, ~6 fps at the browser — having taken every rung it had. With this on, that session's floor is 2400 kbps after the fps step alone and ≈1307 kbps at 720p60. **Inert with the ladder off or at the launch rung** (at rung 0 `B_eff == ceiling`, so the floor is today's exactly). Never below 300 kbps, never above the launch floor. A **host-level** `abr_floor_kbps` / `QUASAR_ABR_FLOOR_KBPS` is an absolute bound that always wins; a per-profile wire floor is NOT — it describes that profile's picture, so it travels with the rung (when the floor is instead `ratio × ceiling`, the formula reduces exactly to `abr_floor_ratio × B_eff`). The move applies to **both** bounds — the governor's floor and `rtpgccbwe`'s own `min-bitrate`; moving only the governor's is a measured no-op (run D: GCC pinned at exactly the launch floor and nothing downstream changed). `0`/`false` restores the pre-amendment fixed floor. Published per window as `abr_floor_kbps` in `session_metrics` (omitted while at the launch floor) and as `floor_kbps` in the `abr.ladder.step` trace event. Live-proven on the devbox NVENC path 2026-08-17 (run E: under a 3.5 Mbps cap the browser holds 60 fps at 720p60 where it previously sat at ~0); **not yet run on VA** — #499 gates the fps rung there. |
 | `QUASAR_ABR_LADDER_ORDER` | unset: `res_first` for a WebTransport session, `hybrid` for WebRTC | Unset: `res_first` only for a WebTransport session that also gets the resolution rung by default (above); a host that set `abr_ladder_resolution` keeps `hybrid` or its own order. A set value applies to both transports. **Shipped 2026-08-17**, actuated whenever both rungs can move. Enum `res_first`\|`fps_first`\|`hybrid`. `hybrid` = resolution rungs down to 1080p, **then** fps 120→60, **then** the deeper resolution rungs (a frame-rate halving is the smaller perceptual cost at 1080p). `res_first`/`fps_first` are the two pure orders, for A/B. **Recovery always unwinds in the exact reverse of the engage order**, derived per window from the two rungs' positions — never a replayed stack, so a manual resize cannot desync it. With only one rung enabled the order is moot (the other rung is retired and every window falls through). |
 
+### `QUASAR_WT_CAPACITY` — WebTransport capacity detection (#1433)
+
+| Variable | Default | Values / notes |
+|---|---|---|
+| `QUASAR_WT_CAPACITY` | `v2` | `v2` → the host paces video and sizes QUIC's window at no less than what the encoder sends (setpoint plus FEC), reads a shortfall only when the link delivered under 0.95 × what was sent with the single largest arrival gap taken out, and counts every loss but short blackouts and outages. `legacy` → 0.6.3's sender and reading: no pacing and no audio room, the reading is the estimate or 0.85 × the receive rate with no gap taken out and filtered by `abr_deadband`, blackouts count as loss, and the window follows the smoothed RTT. Anything else warns (`token="wt-capacity-unrecognised"`) and stays `v2`. Read once at agent start; it applies to every WebTransport session, the native client's included. The bug fixes of the same release (send stamps, the outage mark, audio ahead of held video) stay on in both. |
+
 #### WebTransport in `smooth`: the per-report loop (#1376)
 
 On a WebTransport session in `smooth` the governor and the resolution rung act on each
@@ -748,17 +754,20 @@ WebTransport in `protective`, keep the window loop the rest of this section desc
 
 - **What a report says.** A report is a *reading* only when its datagrams arrived slower
   than they were sent (under 0.95 ×: a queue or loss on the link), the host was busy (it
-  sent at least 0.8 × the estimate) and a receive rate was measured. The reading is the
-  estimate, never under 0.85 × the receive rate. A clean link that delivers what it is
-  sent gives no reading whatever its delay detector says (the #68 lesson), and neither
+  sent at least 0.8 × the estimate) and a receive rate was measured. The delivered rate
+  has the window's single largest arrival gap taken out, so a delay step or a short
+  blackout is no reading; the reading is 0.85 × that rate (with `QUASAR_WT_CAPACITY=legacy`:
+  the estimate, never under 0.85 × the plain receive rate). A clean link that delivers what
+  it is sent gives no reading whatever its delay detector says (the #68 lesson), and neither
   does an idle sender or the silence decay.
-- **Down.** Two readings in a row under the rate by more than `abr_deadband` take the rate
-  and the setpoint to the higher of the two in one move, about 100 ms after the first
+- **Down.** Two readings in a row under the rate (`legacy`: by more than `abr_deadband`)
+  take the rate and the setpoint to the higher of the two in one move, about 100 ms after the first
   report that shows the link short: no `abr_max_down_step` cap, no `abr_down_dwell_ms`,
   no `abr_min_interval_ms`.
 - **Up.** Each estimate may raise the rate by at most `abr_max_up_step` × the time since
   the last estimate (counted up to 1 s) / `abr_min_interval_ms`, never above the estimate:
-  2.5 % per 100 ms report by default, which compounds to 28 % a second. The setpoint follows
+  2.5 % per 100 ms report by default, which compounds to 28 % a second. While the report's
+  window loses 2 % or more the rate does not climb (`legacy`: it does). The setpoint follows
   in moves of more than `abr_deadband`, and to the ceiling once the estimate is there. No
   timer and no EWMA.
 - **Silence.** With no report for 500 ms (a hidden tab, a Wi-Fi roam) the silence decay

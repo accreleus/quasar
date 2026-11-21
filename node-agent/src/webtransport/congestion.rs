@@ -595,6 +595,8 @@ pub(crate) struct Estimator {
     /// The `pkt_seq` after the newest any report has covered.
     reported_to: Option<u32>,
     evidence: Evidence,
+    /// `QUASAR_WT_CAPACITY=legacy`: 0.6.3's reading, and no blackouts.
+    pub(crate) legacy: bool,
     /// The bound the log last named, and when.
     logged: (Bound, Option<Instant>),
     /// The estimate before a silence decay not logged yet; delay and loss cuts always log.
@@ -658,6 +660,7 @@ impl Estimator {
             outage: None,
             reported_to: None,
             evidence: Evidence::default(),
+            legacy: false,
             logged: (Bound::Ceiling, None),
             unlogged: None,
             measured: None,
@@ -843,11 +846,18 @@ impl Estimator {
             }
         }
 
-        self.measured = m
-            .delivered_kbps
-            .zip(m.sent_kbps)
-            .filter(|&(d, s)| m.fresh && !app_limited && d < LINK_LIMITED * s)
-            .map(|(d, _)| BETA * d);
+        self.measured = match self.legacy {
+            false => m
+                .delivered_kbps
+                .zip(m.sent_kbps)
+                .filter(|&(d, s)| m.fresh && !app_limited && d < LINK_LIMITED * s)
+                .map(|(d, _)| BETA * d),
+            true => m
+                .rate_kbps
+                .zip(m.sent_kbps)
+                .filter(|&(r, s)| m.fresh && !app_limited && r < LINK_LIMITED * s)
+                .map(|(r, _)| self.estimate_kbps.max(BETA * r)),
+        };
         let was = self.estimate_kbps;
         self.settle();
         if self
@@ -1214,7 +1224,8 @@ impl Estimator {
             .zip(run.first().and_then(sent))
             .map_or(0, |(to, from)| to.saturating_sub(from));
         self.evidence.run_since = None;
-        let blackout = !expired
+        let blackout = !self.legacy
+            && !expired
             && !self.evidence.run_lost
             && run.len() >= BLACKOUT_MIN_DATAGRAMS
             && span >= BLACKOUT_MIN_US
@@ -1495,6 +1506,7 @@ pub(crate) struct Window {
     governed: Arc<AtomicU64>,
     probe: Arc<AtomicBool>,
     acks: Arc<AtomicU64>,
+    legacy: Arc<AtomicBool>,
     /// The rate it was last governed at, bit/s; 0 while Cubic has it.
     held: u64,
     srtt: Duration,
@@ -1512,9 +1524,19 @@ pub(crate) struct WindowFactory(pub(crate) Governor);
 /// What sets a connection's window: the estimate, while it governs the encoder. Also counts
 /// the packets QUIC newly acknowledged ([`Self::acks`]).
 #[derive(Clone, Default)]
-pub(crate) struct Governor(Arc<AtomicU64>, Arc<AtomicBool>, Arc<AtomicU64>);
+pub(crate) struct Governor(
+    Arc<AtomicU64>,
+    Arc<AtomicBool>,
+    Arc<AtomicU64>,
+    Arc<AtomicBool>,
+);
 
 impl Governor {
+    /// `QUASAR_WT_CAPACITY=legacy`: the window is sized on the smoothed RTT, as in 0.6.3.
+    pub(crate) fn legacy(&self, legacy: bool) {
+        self.3.store(legacy, Ordering::Relaxed);
+    }
+
     pub(crate) fn probe(&self, due: bool) {
         self.1.store(due, Ordering::Relaxed);
     }
@@ -1577,7 +1599,7 @@ pub(crate) fn video_rates(
     estimator: &Estimator,
     pyrowave: bool,
 ) -> (Option<u64>, Option<u64>) {
-    if pyrowave || !governor.governs() {
+    if pyrowave || !governor.governs() || estimator.legacy {
         return (None, None);
     }
     let room = (governor.kbps() as f64).min(estimator.estimate_kbps()) as u64;
@@ -1599,6 +1621,7 @@ impl ControllerFactory for WindowFactory {
             governed: self.0 .0.clone(),
             probe: self.0 .1.clone(),
             acks: self.0 .2.clone(),
+            legacy: self.0 .3.clone(),
             held: 0,
             srtt: Duration::ZERO,
             min_rtt: Duration::ZERO,
@@ -1703,7 +1726,11 @@ impl Controller for Window {
             Some(bps) => {
                 // The RTT floor, not the smoothed RTT, which a queue at the link inflates: the
                 // window never grows with a standing queue (#1503).
-                let rtt = self.min_rtt.max(WINDOW_RTT_MIN).as_secs_f64();
+                let rtt = match self.legacy.load(Ordering::Relaxed) {
+                    true => self.srtt,
+                    false => self.min_rtt,
+                };
+                let rtt = rtt.max(WINDOW_RTT_MIN).as_secs_f64();
                 ((WINDOW_GAIN * bps as f64 / 8.0 * rtt) as u64).max(self.first)
             }
             // Released since the last call that could rebuild Cubic.
@@ -1718,6 +1745,7 @@ impl Controller for Window {
             governed: self.governed.clone(),
             probe: self.probe.clone(),
             acks: self.acks.clone(),
+            legacy: self.legacy.clone(),
             held: self.held,
             srtt: self.srtt,
             min_rtt: self.min_rtt,

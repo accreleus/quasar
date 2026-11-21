@@ -474,6 +474,8 @@ services:
       QUASAR_ABR_MODE: ${QUASAR_ABR_MODE:-smooth}
       QUASAR_ABR_FLOOR_KBPS: ${QUASAR_ABR_FLOOR_KBPS:-}
       QUASAR_ABR_FLOOR_RATIO: ${QUASAR_ABR_FLOOR_RATIO:-0.3}
+      # WebTransport capacity detection: v2 (default) or legacy (docs/configuration.md).
+      QUASAR_WT_CAPACITY: ${QUASAR_WT_CAPACITY:-}
       # SPT-04 governor hysteresis knobs (docs/configuration.md). Documented as
       # Live-class/operator-settable but never wired into this passthrough, so
       # setting them in deploy/.env silently did nothing

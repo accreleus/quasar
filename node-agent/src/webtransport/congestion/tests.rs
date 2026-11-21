@@ -4479,6 +4479,54 @@ fn a_keyframe_burst_after_a_quiet_scene_on_a_reordering_link_moves_nothing() {
     assert!(down.is_none(), "the setpoint moved down: {down:?}");
 }
 
+/// `QUASAR_WT_CAPACITY=legacy` (design §4): no pacing and no audio room, 0.6.3's reading (the
+/// estimate or `BETA` × the receive rate, no gap taken out), blackouts counted as loss, and the
+/// window on the smoothed RTT.
+#[test]
+fn legacy_capacity_is_the_0_6_3_sender() {
+    let start = Instant::now();
+    let legacy = || Estimator {
+        legacy: true,
+        ..Estimator::new(CEILING, start)
+    };
+    let governor = Governor::default();
+    governor.govern(5000.0);
+    let mut est = legacy();
+    est.resume_at(5000.0);
+    assert_eq!(video_rates(&governor, &est, false), (None, None), "paced");
+    est.resume_at(5000.0);
+    est.legacy = false;
+    assert_eq!(video_rates(&governor, &est, false).1, Some(5000), "v2 paces");
+
+    // One +60 ms gap in a window that delivered what was sent: v2 takes it out, legacy reads it.
+    let shortfall = Measured {
+        usage: Usage::Normal,
+        rate_kbps: Some(6000.0),
+        delivered_kbps: Some(7900.0),
+        gap_us: 60_000,
+        sent_kbps: Some(8000.0),
+        fresh: true,
+        loss: None,
+    };
+    let (mut v2, mut old) = (Estimator::new(CEILING, start), legacy());
+    v2.apply(shortfall, start + Duration::from_millis(100), NO_QUIC);
+    old.apply(shortfall, start + Duration::from_millis(100), NO_QUIC);
+    assert_eq!(v2.measured(), None);
+    assert_eq!(old.measured(), Some(CEILING), "the estimate, over 0.85 × 6000");
+
+    // A 150 ms blackout is loss.
+    let (mut log, mut old) = (SendLog::new(start), legacy());
+    let m = blackout_report(&mut old, &mut log, start, 600..750, |_| 1);
+    assert!(m.loss.is_some_and(|l| l > 0.1), "{:?}", m.loss);
+
+    // The window follows a queue's smoothed RTT.
+    let mut w = window(&governor, start);
+    governor.govern(8000.0);
+    governor.legacy(true);
+    acked(&mut w, Duration::from_secs(2), Duration::from_millis(150));
+    assert_eq!(w.window(), 4_000_000, "2 × 8 Mbit/s × 2 s");
+}
+
 /// R1 (lead's question on rule 1): on a deep buffer (5 Mbit/s, 500 ms of `tbf` queue) the encoder's
 /// average output reaches the link, so audio could again wait behind video in the link's queue
 /// (0.6.3: ~116 underruns a minute on the lab row). The descent drains it: after convergence an

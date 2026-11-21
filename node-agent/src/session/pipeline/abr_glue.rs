@@ -969,6 +969,8 @@ fn arm(
     // `WelsEncoderParamAdjust` applies without the reset that would force an IDR.
     if source != RTPGCCBWE && mode == AbrMode::Smooth {
         abr_cfg.per_report = Some(report_write_gap(cfg.encoder, abr_cfg.min_interval));
+        abr_cfg.legacy_readings =
+            crate::session::settings::wt_capacity() == crate::session::settings::WtCapacity::Legacy;
     }
 
     if mode != AbrMode::Off && !encoder_abr_writable(encoder, cfg.encoder) {
@@ -1624,6 +1626,7 @@ fn feedback_abr_armed(
             setpoint_kbps: Box::new(move || {
                 f64::from(setpoint_loop.governor.lock().unwrap().setpoint_kbps())
             }),
+            capacity: crate::session::settings::wt_capacity(),
             retargets: mode != AbrMode::Off,
             // Each client starts afresh: it takes the encoder over (a WebRTC peer that started
             // since owns it until then) and registers new hooks.

@@ -260,6 +260,8 @@ impl RuntimeSettings {
     /// Resolve from the environment (the historical defaults). This is the agent's
     /// starting point before any `config_update` arrives.
     pub fn baseline() -> Self {
+        // Read here so an unrecognised value warns at agent start.
+        wt_capacity();
         Self::baseline_with(&|k| std::env::var(k).ok())
     }
 
@@ -542,6 +544,38 @@ fn env_pos_u32(var: &str, default: u32, lookup: &dyn Fn(&str) -> Option<String>)
         .unwrap_or(default)
 }
 
+/// WebTransport capacity detection (`QUASAR_WT_CAPACITY`, `docs/configuration.md`): `v2`
+/// (#1433) or 0.6.3's sender and ABR reading (`legacy`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WtCapacity {
+    #[default]
+    V2,
+    Legacy,
+}
+
+impl WtCapacity {
+    /// Anything but `v2` or `legacy` warns and stays `v2`.
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
+            None | Some("") | Some("v2") => Self::V2,
+            Some("legacy") => Self::Legacy,
+            Some(other) => {
+                tracing::warn!(
+                    token = "wt-capacity-unrecognised",
+                    "QUASAR_WT_CAPACITY={other:?} is not v2|legacy; using v2"
+                );
+                Self::V2
+            }
+        }
+    }
+}
+
+/// The agent's `QUASAR_WT_CAPACITY`, read once for the life of the process.
+pub fn wt_capacity() -> WtCapacity {
+    static CAPACITY: std::sync::OnceLock<WtCapacity> = std::sync::OnceLock::new();
+    *CAPACITY.get_or_init(|| WtCapacity::parse(std::env::var("QUASAR_WT_CAPACITY").ok().as_deref()))
+}
+
 fn env_bool(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
     matches!(
         lookup(var).as_deref(),
@@ -552,6 +586,21 @@ fn env_bool(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `QUASAR_WT_CAPACITY`: `v2` by default, `legacy` on request, anything else `v2`.
+    #[test]
+    fn capacity_knob_parses() {
+        for (raw, want) in [
+            (None, WtCapacity::V2),
+            (Some(""), WtCapacity::V2),
+            (Some("v2"), WtCapacity::V2),
+            (Some(" legacy "), WtCapacity::Legacy),
+            (Some("LEGACY"), WtCapacity::V2),
+            (Some("0.6.3"), WtCapacity::V2),
+        ] {
+            assert_eq!(WtCapacity::parse(raw), want, "{raw:?}");
+        }
+    }
 
     #[test]
     fn resolve_explicit_env_wins_over_detection() {

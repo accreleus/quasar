@@ -118,6 +118,8 @@ pub(crate) struct Rate {
     pub(crate) floor_kbps: Box<dyn Fn() -> f64 + Send + Sync>,
     /// The ABR's setpoint now, what the encoder is asked to send (`congestion::governed_kbps`).
     pub(crate) setpoint_kbps: Box<dyn Fn() -> f64 + Send + Sync>,
+    /// `QUASAR_WT_CAPACITY`: v2, or 0.6.3's sender and reading (`legacy`).
+    pub(crate) capacity: crate::session::settings::WtCapacity,
     /// False with the ABR off: the estimate is tracked and never written to the encoder,
     /// so nothing would pay for FEC.
     pub(crate) retargets: bool,
@@ -181,9 +183,13 @@ impl<'a> Control<'a> {
         governor: congestion::Governor,
     ) -> Self {
         let now = std::time::Instant::now();
+        let legacy = rate.capacity == crate::session::settings::WtCapacity::Legacy;
+        governor.legacy(legacy);
+        let mut estimator = congestion::Estimator::new(rate.ceiling_kbps, now);
+        estimator.legacy = legacy;
         Self {
             rate,
-            estimator: congestion::Estimator::new(rate.ceiling_kbps, now),
+            estimator,
             log: congestion::SendLog::new(now),
             started: false,
             refused: 0,
@@ -231,12 +237,16 @@ impl<'a> Control<'a> {
             // QUIC's loss response is given up only while the estimate drives the encoder
             // from live feedback.
             if self.rate.retargets && self.gone.get().is_none() {
-                self.governor.govern(congestion::governed_kbps(
-                    kbps,
-                    (self.rate.setpoint_kbps)(),
-                    self.charged,
-                    (self.rate.floor_kbps)(),
-                ));
+                let floor = (self.rate.floor_kbps)();
+                self.governor.govern(match self.estimator.legacy {
+                    true => kbps.max(floor),
+                    false => congestion::governed_kbps(
+                        kbps,
+                        (self.rate.setpoint_kbps)(),
+                        self.charged,
+                        floor,
+                    ),
+                });
             }
         }
     }
@@ -279,7 +289,7 @@ impl<'a> Control<'a> {
                     .map(|link| link / (1.0 + self.charged)),
             );
         }
-        let loss = self.estimator.loss().filter(|_| report);
+        let loss = self.estimator.loss().filter(|_| report && !self.estimator.legacy);
         let setpoint = (self.rate.setpoint_kbps)();
         (self.rate.observe)(congestion::abr_estimate(kbps, self.charged, loss, setpoint));
     }

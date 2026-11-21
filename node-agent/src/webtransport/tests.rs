@@ -1543,6 +1543,7 @@ async fn governed_agent(stream: Stream) -> Agent {
                 ceiling_kbps: 8000.0,
                 floor_kbps: Box::new(|| 4000.0),
                 setpoint_kbps: Box::new(|| 0.0),
+                capacity: Default::default(),
                 retargets: true,
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
@@ -2079,6 +2080,7 @@ async fn feedback_while_pyrowave_is_active_feeds_no_estimate() {
                 ceiling_kbps: 4000.0,
                 floor_kbps: Box::new(|| 500.0),
                 setpoint_kbps: Box::new(|| 0.0),
+                capacity: Default::default(),
                 retargets: true,
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
@@ -2177,6 +2179,7 @@ async fn audio_alone_never_moves_the_video_estimate() {
             ceiling_kbps: 4000.0,
             floor_kbps: Box::new(|| 500.0),
             setpoint_kbps: Box::new(|| 0.0),
+            capacity: Default::default(),
             retargets: true,
             start: Box::new(|| {}),
             owns: Box::new(|| false),
@@ -2223,6 +2226,7 @@ fn rate(retargets: bool) -> Rate {
         ceiling_kbps: 8000.0,
         floor_kbps: Box::new(|| 4000.0),
         setpoint_kbps: Box::new(|| 0.0),
+        capacity: Default::default(),
         retargets,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -2311,6 +2315,7 @@ fn the_silence_decay_is_never_fed_to_the_collapse_as_a_measured_link() {
         ceiling_kbps: 8000.0,
         floor_kbps: Box::new(|| 4000.0),
         setpoint_kbps: Box::new(|| 0.0),
+        capacity: Default::default(),
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -2358,6 +2363,7 @@ fn a_report_gives_the_abr_its_reading_before_its_estimate() {
         ceiling_kbps: 8000.0,
         floor_kbps: Box::new(|| 4000.0),
         setpoint_kbps: Box::new(|| 0.0),
+        capacity: Default::default(),
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -2383,6 +2389,7 @@ fn a_client_that_is_gone_neither_starts_nor_feeds_the_abr() {
         ceiling_kbps: 4000.0,
         floor_kbps: Box::new(|| 500.0),
         setpoint_kbps: Box::new(|| 0.0),
+        capacity: Default::default(),
         retargets: true,
         start: Box::new(move || {
             started.fetch_add(1, SeqCst);
@@ -2447,6 +2454,7 @@ fn the_abr_is_fed_the_estimate_less_the_fec_share() {
         ceiling_kbps: 6000.0,
         floor_kbps: Box::new(|| 500.0),
         setpoint_kbps: Box::new(|| 0.0),
+        capacity: Default::default(),
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -2481,6 +2489,7 @@ async fn lossy_session(retargets: bool) -> (Agent, Arc<crate::session::metrics::
                 ceiling_kbps: 4000.0,
                 floor_kbps: Box::new(|| 500.0),
                 setpoint_kbps: Box::new(|| 0.0),
+                capacity: Default::default(),
                 retargets,
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
@@ -2733,6 +2742,7 @@ fn repairs_spend_only_what_the_estimate_leaves_above_the_abr_floor() {
         ceiling_kbps: 6000.0,
         floor_kbps: Box::new(|| 2500.0),
         setpoint_kbps: Box::new(|| 0.0),
+        capacity: Default::default(),
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -2773,6 +2783,7 @@ fn governed(level: u8, estimate_kbps: f64, seconds: u64) -> Vec<(u32, f64)> {
         ceiling_kbps: 8000.0,
         floor_kbps: Box::new(move || f64::from(floor.lock().unwrap().0.floor_kbps())),
         setpoint_kbps: Box::new(move || f64::from(setpoint.lock().unwrap().0.setpoint_kbps())),
+        capacity: Default::default(),
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -2819,6 +2830,25 @@ fn governor_bound(estimate_kbps: f64) -> f64 {
 /// the estimate, 3500.
 #[test]
 fn the_pacer_never_holds_video_under_the_setpoint() {
+    let (estimate, governed) = governed_after_a_report(Default::default());
+    assert!(
+        (3400.0..3700.0).contains(&estimate),
+        "the estimate is {estimate:.0}"
+    );
+    assert!(governed >= 4950, "governed at {governed} kbit/s");
+}
+
+/// `QUASAR_WT_CAPACITY=legacy` governs at the estimate, as 0.6.3 did.
+#[test]
+fn legacy_capacity_governs_at_the_estimate() {
+    let (estimate, governed) =
+        governed_after_a_report(crate::session::settings::WtCapacity::Legacy);
+    assert_eq!(governed, estimate as u64);
+}
+
+/// The estimate and the governed rate, kbit/s, after one report: estimate 3500, setpoint 4500,
+/// 10 % FEC.
+fn governed_after_a_report(capacity: crate::session::settings::WtCapacity) -> (f64, u64) {
     use crate::session::abr::{AbrConfig, Governor};
     let base = std::time::Instant::now();
     // A smooth governor whose ceiling is the setpoint, and so starts there.
@@ -2833,6 +2863,7 @@ fn the_pacer_never_holds_video_under_the_setpoint() {
         ceiling_kbps: 4500.0,
         floor_kbps: Box::new(|| 1000.0),
         setpoint_kbps: Box::new(move || f64::from(setpoint.lock().unwrap().setpoint_kbps())),
+        capacity,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -2846,16 +2877,7 @@ fn the_pacer_never_holds_video_under_the_setpoint() {
     control.estimator.resume_at(3500.0);
     answered(&mut control, 0, base);
     assert_eq!(control.charged, 0.1);
-    let estimate = control.estimator.estimate_kbps();
-    assert!(
-        (3400.0..3700.0).contains(&estimate),
-        "the estimate is {estimate:.0}"
-    );
-    assert!(
-        governor.kbps() >= 4950,
-        "governed at {} kbit/s",
-        governor.kbps()
-    );
+    (control.estimator.estimate_kbps(), governor.kbps())
 }
 
 /// #1046: a FEC share inside the governor's deadband (levels 1 to 3, up to 15 %) does not
@@ -2920,6 +2942,7 @@ fn a_pyrowave_frame_gets_no_repair_at_any_overhead() {
         ceiling_kbps: 6000.0,
         floor_kbps: Box::new(|| 500.0),
         setpoint_kbps: Box::new(|| 0.0),
+        capacity: Default::default(),
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -5218,6 +5241,7 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
                 ceiling_kbps: 1_000_000.0,
                 floor_kbps: Box::new(|| 500.0),
                 setpoint_kbps: Box::new(|| 0.0),
+                capacity: Default::default(),
                 retargets: true,
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
