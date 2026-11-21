@@ -136,13 +136,13 @@ export class FrameAssembler {
   lost = 0;
 
   /** The round trip loss recovery waits on, in ms: the longer of the path's smoothed round trip
-   *  (the same estimate that caps the reorder window) and the measured repair round trip, else
-   *  {@link INITIAL_RTT_MS} before either is known. Taking the maximum ensures a repeat NACK
+   *  (the same estimate that caps the reorder window) and the repair round trip, using
+   *  {@link INITIAL_RTT_MS} until the first repair is measured. Taking the maximum ensures a repeat NACK
    *  never fires before a repair could arrive on a congested link where retransmits queue behind
    *  video, and never sooner than the path round trip the reorder cap assumes. */
   get rttMs(): number {
     const path = this.pathRttMs();
-    return Math.max(path ?? 0, this.srtt ?? (path === null ? INITIAL_RTT_MS : 0));
+    return Math.max(path ?? 0, this.srtt ?? INITIAL_RTT_MS);
   }
 
   push(f: VideoFragment): Reassembled {

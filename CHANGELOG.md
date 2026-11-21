@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Upgrading
+- Callers of `make e2e-post` must now supply operator leak-scan patterns, including for dry runs (`DRY_RUN=1`). Use `LEAK_SCAN_OPERATOR_PATTERNS` or `LEAK_SCAN_PATTERNS_FILE`. See [posting in the E2E suite guide](docs/testing-e2e-suite.md#what-the-host-half-adds).
+
 ### Changed
 - Dependency updates
 - E2E hooks stop their process group on a failed ledger write, share a recovery wait deadline, and record uncleared hook warnings in run bundles. E2E posting leak-scans run bundles and refuses ambiguous conditions or empty app slugs (#1341).
@@ -32,6 +35,7 @@ own; the two do not move together, and that is deliberate.
 - **E2E fallback/input scenarios and bundle credential checks tighten lock-log isolation, honest lock wording, surface/move-log guards and glued credential names (#1343).** `input-kbm` starts its page recorder after pointer lock settles so lock clicks stay out of `input-sent.json`, states only the observed wait and unknown cause when no "Click to play" layer appears, and guards unreadable or throwing move logs as `pass: null`; `transport-fallback` records freeze as `null` with a reason (never `0`) when no visible `<video>`/canvas surface exists at the fault; and `bundle.mjs` flags glued credential names (`accessToken=`, `authtoken=`, `myApiKey=`) linearly without breaking prose exemptions.
 
 ### Fixed
+- WebTransport keeps its initial 100 ms video repair estimate until the first retransmission is measured, so a faster control-stream pong no longer causes premature repeat NACKs or keyframe requests (#1436).
 - End-to-end collection now splits capped trace reads by raw sample count, validates session and host setting vocabularies, and shows each collected window's verdict in offline diagnoses (#1331).
 - WebTransport repeat NACK timing now waits on the longer of the smoothed control-stream path round trip that caps the reorder window and the measured repair round trip, avoiding premature duplicate NACKs on congested links (#1436).
 - WebTransport input detects full writers, combines pending relative mouse deltas, and keeps the latest absolute position when datagrams back up. Pending relative motion goes out before the next button, key, scroll, or other input event (#1154).
