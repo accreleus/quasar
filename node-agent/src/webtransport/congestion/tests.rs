@@ -514,7 +514,9 @@ impl Sim {
             if let Some(abr) = self.abr.as_mut() {
                 let share = 1.0 + self.fec_share;
                 abr.observe_report(self.est.measured().map(|r| r / share), at);
-                abr.observe(kbps / share, at);
+                let setpoint = f64::from(abr.setpoint_kbps());
+                let fed = abr_estimate(kbps, self.fec_share, self.est.loss(), setpoint);
+                abr.observe(fed, at);
             }
             let setpoint = self.abr.as_ref().map_or(0.0, |a| f64::from(a.setpoint_kbps()));
             self.governor.govern(governed_kbps(

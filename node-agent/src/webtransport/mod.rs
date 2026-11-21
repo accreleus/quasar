@@ -279,7 +279,9 @@ impl<'a> Control<'a> {
                     .map(|link| link / (1.0 + self.charged)),
             );
         }
-        (self.rate.observe)(kbps / (1.0 + self.charged));
+        let loss = self.estimator.loss().filter(|_| report);
+        let setpoint = (self.rate.setpoint_kbps)();
+        (self.rate.observe)(congestion::abr_estimate(kbps, self.charged, loss, setpoint));
     }
 
     /// The repair datagrams that follow one frame's video datagrams. A PyroWave frame gets

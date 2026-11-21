@@ -1556,6 +1556,18 @@ pub(crate) fn governed_kbps(estimate: f64, setpoint: f64, charged: f64, floor: f
     estimate.max(setpoint * (1.0 + charged)).max(floor)
 }
 
+/// What the ABR is fed from an estimate, kbit/s of video: the estimate less the FEC share
+/// `charged`, and no more than the ABR's own setpoint while the window loses `LOSS_LOW` or more.
+/// GCC holds at 2–10 % loss; an ABR fed the estimate climbed back over the link between a
+/// reading's steps (sim R4, `a_policer_steps_down_until_its_loss_ends`: up moves at 11–31 % loss).
+pub(crate) fn abr_estimate(kbps: f64, charged: f64, loss: Option<f64>, setpoint: f64) -> f64 {
+    let video = kbps / (1.0 + charged);
+    match loss {
+        Some(l) if l >= LOSS_LOW => video.min(setpoint),
+        _ => video,
+    }
+}
+
 /// The rates `VideoQueue` holds video to, kbit/s: QUIC's room ([`VideoQueue::room`]) at the
 /// governed rate or the estimate if lower, and the pacer ([`VideoQueue::pace`]) at the
 /// governed rate ([`governed_kbps`]) once the estimate is under the ceiling. `None`: the
