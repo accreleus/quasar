@@ -47,8 +47,8 @@ const matches = (sel, classes) => {
 };
 
 /** A world holding the fake clock, the fake page's state and the fake API's record. */
-function world({ wins = windows(50), session = {}, failScreenshotAt = null, webtransport = true, noBench = false, refuse = false, noFrame = false, revealed = false, stopFails = false, closeFails = false, noUrl = false, url = null, stats = { frames: 100, decoded: 100 }, videoRate = 60, hiddenBetween = null, skew = 0, extraFrames = null, loader = null, onPlay = null, bare = false, hooksDir = null, lockOnClick = true, hud = false, layerStays = false, lockDelayMs = 0, swallowMoves = false, layerAfterMs = 0, noLayer = false, keyUpFails = null, swallowKeyUp = null, fallbackDelayMs = 3000, fallbackReason = "stream_lost", noFallback = false, webBuild = undefined } = {}) {
-  const w = { cdp: [], listeners: {}, locked: false, lastX: null, lastY: null, videoStart: T0, hooksDir, faultSeenAt: null, t: T0, stopped: [], live: [], url: "about:blank", ls: new Map(), shots: 0, failScreenshotAt, calls: [], gone: new Set(), secrets: new Set(), handlers: {}, opened: [], closed: [], clicks: [], gotos: [], playAt: null, stageClicks: 0, layerClicks: 0, hudOpen: false, hudClicks: 0, lockAt: 0 };
+function world({ wins = windows(50), session = {}, failScreenshotAt = null, webtransport = true, noBench = false, refuse = false, noFrame = false, noSurface = false, revealed = false, stopFails = false, closeFails = false, noUrl = false, url = null, stats = { frames: 100, decoded: 100 }, videoRate = 60, hiddenBetween = null, skew = 0, extraFrames = null, loader = null, onPlay = null, bare = false, hooksDir = null, lockOnClick = true, hud = false, layerStays = false, lockDelayMs = 0, swallowMoves = false, layerAfterMs = 0, noLayer = false, keyUpFails = null, swallowKeyUp = null, fallbackDelayMs = 3000, fallbackReason = "stream_lost", noFallback = false, webBuild = undefined } = {}) {
+  const w = { cdp: [], listeners: {}, locked: false, lastX: null, lastY: null, videoStart: T0, hooksDir, faultSeenAt: null, t: T0, stopped: [], live: [], url: "about:blank", ls: new Map(), shots: 0, failScreenshotAt, calls: [], gone: new Set(), secrets: new Set(), handlers: {}, opened: [], closed: [], clicks: [], gotos: [], playAt: null, stageClicks: 0, layerClicks: 0, hudOpen: false, hudClicks: 0, lockAt: 0, noSurface };
   // The page's "Click to play" layer (SessionPage.tsx): raised some time after Play and removed by the FIRST click on it, whether or not that click
   // took the lock (handleClickToPlay); a click before it only opens the HUD shelf.
   const layerUp = () => !noLayer && w.playAt !== null && w.t >= w.playAt + layerAfterMs && !w.locked && (layerStays || w.layerClicks === 0);
@@ -149,7 +149,8 @@ function world({ wins = windows(50), session = {}, failScreenshotAt = null, webt
       const hiddenVideo = { tagName: "VIDEO", videoWidth: 0, getBoundingClientRect: () => ({ left: 0, top: 0, width: 0, height: 0 }) };
       const canvas = { tagName: "CANVAS", getBoundingClientRect: () => ({ left: 100, top: 50, width: 800, height: 600 }) };
       const video = { tagName: "VIDEO", videoWidth: 1920, getVideoPlaybackQuality: () => ({ totalVideoFrames: w.t < w.videoStart ? 0 : Math.round(((w.t - w.videoStart) / 1000) * videoRate) }), getBoundingClientRect: () => ({ left: 100, top: 50, width: 800, height: 600 }) };
-      const doc = { pointerLockElement: w.locked && w.t >= w.lockAt ? { classList: { contains: (c) => c === "session-video" } } : null, visibilityState: hidden ? "hidden" : "visible", hasFocus: () => true, querySelectorAll: () => (noFrame ? [] : w.t < w.videoStart ? [hiddenVideo, canvas] : [video]), querySelector: (sel) => (sel === ".session-video" ? (noFrame ? [] : w.t < w.videoStart ? [hiddenVideo, canvas] : [video])[0] ?? null : /Capture input/.test(sel) ? (hudUp() ? { getBoundingClientRect: () => ({ left: hudButton.x - 20, top: hudButton.y - 20, width: 40, height: 40 }) } : null) : /session-play/.test(sel) ? (layerUp() ? { getBoundingClientRect: () => ({ left: 0, top: 0, width: 1280, height: 720 }) } : null) : /sl-root/.test(sel) ? (loader ? matches(sel, loader) : revealed ? {} : null) : /video/.test(sel) && !noBench && !revealed && !noFrame ? video : null) };
+      const surfaceEls = noFrame || w.noSurface ? [] : w.t < w.videoStart ? [hiddenVideo, canvas] : [video];
+      const doc = { pointerLockElement: w.locked && w.t >= w.lockAt ? { classList: { contains: (c) => c === "session-video" } } : null, visibilityState: hidden ? "hidden" : "visible", hasFocus: () => true, querySelectorAll: () => surfaceEls, querySelector: (sel) => (sel === ".session-video" ? surfaceEls[0] ?? null : /Capture input/.test(sel) ? (hudUp() ? { getBoundingClientRect: () => ({ left: hudButton.x - 20, top: hudButton.y - 20, width: 40, height: 40 }) } : null) : /session-play/.test(sel) ? (layerUp() ? { getBoundingClientRect: () => ({ left: 0, top: 0, width: 1280, height: 720 }) } : null) : /sl-root/.test(sel) ? (loader ? matches(sel, loader) : revealed ? {} : null) : /video/.test(sel) && !noBench && !revealed && !noFrame && !w.noSurface ? video : null) };
       w.win ??= { addEventListener: (type, fn) => { (w.listeners[type] ??= []).push(fn); } };
       w.win.__qBench = noBench ? undefined : qbench;
       Object.assign(globalThis, { window: w.win, localStorage: store, sessionStorage: { getItem: () => null }, document: doc });
@@ -1328,11 +1329,13 @@ test("WEB_DIST: the runner's own context serves it, and without it no route is i
 
 // ── hooks (hooks.mjs): apply and clear around a scenario ────────────────────
 
-import { declaredHooks, Hooks, hookScript, LEDGER, runHook } from "./hooks.mjs";
+import { declaredHooks, Hooks, hookScript, isAlive, LEDGER, runHook } from "./hooks.mjs";
 import { pathToFileURL } from "node:url";
 
 const BLOCK = "fault:webtransport-block";
-const tmp = (p = "e2e-hooks-") => fs.mkdtempSync(path.join(os.tmpdir(), p));
+const hooksTmp = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-hooks-test-"));
+process.on("exit", () => fs.rmSync(hooksTmp, { recursive: true, force: true }));
+const tmp = (p = "e2e-hooks-") => fs.mkdtempSync(path.join(hooksTmp, p));
 /** A hooks directory: each script logs "<phase> <scenario> <session> <transport>" to `log` beside it, then runs `extra` (a phase-aware snippet). */
 function mkHooks(extra = "", names = ["fault-webtransport-block"]) {
   const dir = tmp();
@@ -1527,13 +1530,19 @@ test("hooks: the timeout kills the hook's own children too", async () => {
   assert.throws(() => process.kill(pid, 0), "the grandchild is gone");
 });
 
-test("hooks: a run with no HOOKS= says so when a ledger beside the bundle shows a hook left applied", async () => {
+test("hooks: a run with no HOOKS= warns on stderr and in the valid bundle manifest", async () => {
   notes = [];
   const w = world();
   const parent = tmp("e2e-parent-");
   fs.writeFileSync(path.join(parent, LEDGER), "{}");
-  await runHooks(w, fake(w, async () => {}, []), { parent, hooksDir: null }).catch(() => {});
-  assert.ok(notes.some((n) => /earlier run left a hook applied/.test(n)), notes.join("|"));
+  const noop = { hooks: [], async run() { return { status: "pass", criteria: PASS }; } };
+  const r = await runHooks(w, noop, { parent, hooksDir: null });
+  assert.deepEqual(r.result.errors, []);
+  const warning = notes.find((n) => n.startsWith("warning:") && n.includes("earlier run left a hook applied"));
+  assert.ok(warning, notes.join("|"));
+  assert.deepEqual(JSON.parse(read(r.dir, "manifest.json")).warnings, [warning.slice("warning: ".length)]);
+  const clean = await runHooks(world(), noop, { hooksDir: null });
+  assert.equal(JSON.parse(read(clean.dir, "manifest.json")).warnings, undefined);
 });
 
 test("hooks: a runner killed between apply and clear leaves a ledger; the next run clears it first and says so", async () => {
@@ -1631,6 +1640,130 @@ test("hooks: a stale hook that will not clear stops the run before anything star
   const r = await runHooks(world(), noop, { hooksDir, parent });
   assert.deepEqual(r.result.recovered, []);
   assert.equal(JSON.parse(fs.readFileSync(path.join(parent, LEDGER), "utf8")).entries.length, 1);
+});
+
+test("hooks: a spawn-time ledger failure kills the group and reports a failed hook", async (t) => {
+  const h = new Hooks({ dir: mkHooks("exec sleep 30"), ledgerDir: tmp("e2e-parent-") });
+  const write = h.writeLedger.bind(h);
+  let pid;
+  h.writeLedger = (entries) => {
+    pid ??= entries[0]?.hook_pid;
+    if (pid) throw new Error("disk full");
+    write(entries);
+  };
+  const kill = t.mock.method(process, "kill");
+  const timeline = [];
+  try {
+    await assert.rejects(h.call(BLOCK, "apply", { scenario: "s", transport: "webrtc" }, (_, data) => timeline.push(data)),
+      /hook fault:webtransport-block apply failed \(ledger write failed: disk full\)/);
+    assert.ok(kill.mock.calls.some(({ arguments: args }) => args[0] === -pid && args[1] === "SIGKILL"));
+    assert.throws(() => process.kill(-pid, 0), { code: "ESRCH" });
+    assert.equal(timeline[0].stderr, "ledger write failed: disk full");
+  } finally {
+    if (pid) {
+      try { process.kill(-pid, "SIGKILL"); } catch (e) { if (e.code !== "ESRCH") throw e; }
+    }
+  }
+});
+
+const deadPid = 2 ** 22 + 12345; // outside the OS's PID range
+function staleHook(h, name = BLOCK, extra = {}) {
+  return { id: name, pid: deadPid, hooks_dir: h.root, name, state: "applied", facts: { scenario: "s", transport: "webrtc" }, ...extra };
+}
+
+test("hooks: recovery shares one deadline across process groups", async (t) => {
+  const h = new Hooks({ dir: mkHooks("", ["fault-webtransport-block", "shape-slow"]), ledgerDir: tmp(), timeoutMs: 250 });
+  h.writeLedger([
+    staleHook(h, BLOCK, { state: "applying", hook_pid: 101 }),
+    staleHook(h, "shape:slow", { state: "applying", hook_pid: 102 }),
+  ]);
+  let elapsed = 0;
+  const checks = new Map([[-101, 0], [-102, 0]]);
+  const kill = process.kill;
+  t.mock.method(performance, "now", () => elapsed);
+  t.mock.method(process, "kill", (pid, signal) => {
+    if (signal !== 0 || !checks.has(pid)) return kill(pid, signal);
+    const seen = checks.get(pid) + 1;
+    checks.set(pid, seen);
+    if (seen > 2) throw Object.assign(new Error("group gone"), { code: "ESRCH" });
+    elapsed += 100;
+    return true;
+  });
+  await assert.rejects(h.recover(() => {}), /hook shape:slow .* still running \(process group 102\).*may belong to another process \(PID reuse\)/);
+  assert.deepEqual(h.readLedger().map(({ pid }) => pid), [deadPid, deadPid], "a refused recovery releases ownership for a retry");
+});
+
+test("hooks: a runner arriving during recovery sees the recovering PID and refuses", async () => {
+  const dir = mkHooks();
+  const ledgerDir = tmp();
+  const h = new Hooks({ dir, ledgerDir });
+  h.writeLedger([staleHook(h)]);
+  let finish;
+  h.run = () => new Promise((resolve) => { finish = resolve; });
+  const recovering = h.recover(() => {});
+  try {
+    assert.equal(h.readLedger()[0].pid, process.pid);
+    await assert.rejects(new Hooks({ dir, ledgerDir }).recover(() => {}), /still holds hook fault:webtransport-block/);
+  } finally {
+    finish({ code: 0 });
+    assert.deepEqual(await recovering, [BLOCK]);
+  }
+  assert.deepEqual(h.readLedger(), []);
+});
+
+test("hooks: liveness never probes non-integer PIDs or PIDs below 2", (t) => {
+  const kill = t.mock.method(process, "kill", () => true);
+  for (const pid of [0, -1, 1, 2.5, NaN]) assert.equal(isAlive(pid), false);
+  assert.equal(kill.mock.callCount(), 0);
+});
+
+test("hooks: readLedger rejects PIDs below 2", () => {
+  const h = new Hooks({ dir: mkHooks(), ledgerDir: tmp() });
+  for (const pid of [0, -1, 1]) {
+    h.writeLedger([staleHook(h, BLOCK, { pid })]);
+    assert.throws(() => h.readLedger(), /is not a ledger this runner wrote/);
+  }
+});
+
+test("hooks: runHook keeps at most 64000 bytes of each output stream", async () => {
+  const file = path.join(tmp(), "hook");
+  fs.writeFileSync(file, `#!${process.execPath}\nprocess.stdout.write("x".repeat(90000));\nprocess.stderr.write("é".repeat(45000));\n`, { mode: 0o755 });
+  const r = await runHook(file, "apply", process.env, 5000);
+  assert.equal(r.code, 0);
+  assert.equal(Buffer.byteLength(r.stdout), 64000);
+  assert.equal(Buffer.byteLength(r.stderr), 64000);
+  assert.ok(r.stderr.endsWith("é"));
+});
+
+test("hooks: a failed ledger rename removes the temporary file", () => {
+  const ledgerDir = tmp();
+  const h = new Hooks({ dir: mkHooks(), ledgerDir });
+  fs.mkdirSync(h.ledger); // Write succeeds, rename onto the directory fails.
+  assert.throws(() => h.writeLedger([staleHook(h)]), { code: "EISDIR" });
+  assert.deepEqual(fs.readdirSync(ledgerDir), [LEDGER]);
+});
+
+test("hooks: clearAll waits for an in-flight apply, even when it fails", async () => {
+  const h = new Hooks({ dir: mkHooks(), ledgerDir: tmp() });
+  const order = [];
+  let finish;
+  h.run = async (_, phase) => {
+    if (phase === "apply") {
+      order.push("apply-start");
+      await new Promise((resolve) => { finish = resolve; });
+      order.push("apply-end");
+      return { code: 1 };
+    }
+    order.push("clear");
+    return { code: 0 };
+  };
+  const applying = assert.rejects(h.call(BLOCK, "apply", { scenario: "s", transport: "webrtc" }, () => {}), /apply failed/);
+  const clearing = h.clearAll(() => {});
+  finish();
+  await applying;
+  assert.deepEqual(await clearing, []);
+  assert.deepEqual(order, ["apply-start", "apply-end", "clear"]);
+  assert.deepEqual(h.readLedger(), []);
 });
 
 // ── transport-fallback and input-kbm (the real scenario modules, against the same fake page) ─────────────────
@@ -1820,7 +1953,7 @@ test("input-kbm: a sample that is not a number is not counted", async () => {
 
 // ── review round 1 on #1338 ─────────────────────────────────────────────────
 
-import { streamCentre } from "./scenarios/stream-common.mjs";
+import { probe, streamCentre } from "./scenarios/stream-common.mjs";
 const keyEvents = (w) => w.cdp.filter(([m]) => m === "Input.dispatchKeyEvent").map(([, p]) => `${p.type}:${p.code}`);
 const posts = (reason = "stream_lost") => JSON.stringify({ client: "browser", events: [{ ts_unix_ms: 5, type: "transport.fallback", payload: { reason } }] });
 const post = (w, body) => w.emit("request", { url: () => `${BASE}/v1/sessions/${SID}/trace/events`, method: () => "POST", postData: () => body });
@@ -1922,14 +2055,15 @@ test("B3 (#1343): the lock is taken from the \"Click to play\" layer: waited for
   assert.equal(f.w.stageClicks, 0);
 });
 
-test("#1343 item 3: with no layer the HUD's own route is tried, and what it found is said; with no route the text says the launch was not immersive", async () => {
+test("#1343 item 3: with no layer the HUD's own route is tried, and observed text states only the wait, no lock and unknown cause", async () => {
   // The page offers the HUD route: a trusted click on the stage opens the shelf, a trusted click on "Capture input" takes the lock.
   const h = world({ noLayer: true, hud: true });
   const r = await runReal(h, INPUT());
   assert.equal(h.hudClicks, 1);
   assert.equal(h.layerClicks, 0);
   assert.equal(r.by().pointer_lock_taken.pass, true);
-  assert.match(r.by().pointer_lock_taken.observed, /taken through the HUD's "Capture input": the launch was not immersive/);
+  assert.match(r.by().pointer_lock_taken.observed, /no "Click to play" layer appeared within 5 s and no lock was held — cause unknown; taken through the HUD's "Capture input"/);
+  assert.doesNotMatch(r.by().pointer_lock_taken.observed, /immersive/i);
   assert.equal(r.timeline().find((x) => x.ev === "pointer-lock").hud, "clicked");
   // The sequence's pointer starts where the lock click left it, so the first move is a real delta.
   assert.deepEqual(JSON.parse(read(r.dir, `${r.id()}/input-sent.json`)).received_by_page.motion_sum, { x: 50, y: 25 });
@@ -1937,12 +2071,14 @@ test("#1343 item 3: with no layer the HUD's own route is tried, and what it foun
   const nolock = world({ noLayer: true, hud: true, lockOnClick: false });
   const rn = await runReal(nolock, INPUT());
   assert.equal(rn.by().pointer_lock_taken.pass, false);
-  assert.match(rn.by().pointer_lock_taken.observed, /^no pointer lock: the launch was not immersive, so there is no layer to click; the HUD's "Capture input" was clicked and did not lock$/);
+  assert.match(rn.by().pointer_lock_taken.observed, /^no pointer lock: no "Click to play" layer appeared within 5 s and no lock was held \(cause unknown\); the HUD's "Capture input" was clicked and did not lock$/);
+  assert.doesNotMatch(rn.by().pointer_lock_taken.observed, /immersive/i);
   // No layer and no button (the stage click showed none): said so.
   const bare = world({ noLayer: true });
   const rb = await runReal(bare, INPUT());
   assert.equal(rb.by().pointer_lock_taken.pass, false);
-  assert.match(rb.by().pointer_lock_taken.observed, /^no pointer lock: the launch was not immersive, so there is no layer to click; a click on the stream showed no "Capture input" button in the HUD$/);
+  assert.match(rb.by().pointer_lock_taken.observed, /^no pointer lock: no "Click to play" layer appeared within 5 s and no lock was held \(cause unknown\); a click on the stream showed no "Capture input" button in the HUD$/);
+  assert.doesNotMatch(rb.by().pointer_lock_taken.observed, /immersive/i);
   assert.equal(bare.hudClicks, 0);
   assert.equal(rb.timeline().find((x) => x.ev === "pointer-lock").hud, "no-button");
   // transport-fallback: the same route lets it hold the key.
@@ -2613,4 +2749,202 @@ test("malformed window times, frame timestamps and counts never pass or coerce a
   // 5. Scenarios without marker_decoded reject expect_marker under the strict-plan invariant.
   assert.match(checkFallback({ transport: "webtransport", codec: "h264", profile: "1080p60", hold_s: 30, app: "x", expect_marker: false }), /does not define.*expect_marker/);
   assert.match(checkInput({ transport: "webrtc", codec: "h264", profile: "1080p60", hold_s: 5, app: "x", expect_marker: false }), /does not define.*expect_marker/);
+});
+
+// ── #1343 round-2 follow-ups ────────────────────────────────────────────────
+
+test("#1343 r2 item 1: lock clicks on the layer or HUD are not left in the page's event log in input-sent.json", async () => {
+  const btnCode = { left: 0, right: 2, middle: 1 };
+  const expectedLog = SEQUENCE.flatMap((s) =>
+    s.kind === "key" ? [["keydown", s.code], ["keyup", s.code]]
+    : s.kind === "button" ? [["mousedown", btnCode[s.button]], ["mouseup", btnCode[s.button]]]
+    : s.kind === "wheel" ? [["wheel", s.dy]]
+    : []
+  );
+
+  // 1. Default "Click to play" layer click path: 1 lock click before the sequence must not appear in events.
+  const layer = world({ wins: echoWindows([40]) });
+  const rl = await runReal(layer, INPUT());
+  assert.deepEqual(rl.result.errors, []);
+  assert.equal(layer.layerClicks, 1, "the layer was clicked once to take pointer lock");
+  const layerRec = JSON.parse(read(rl.dir, `${rl.id()}/input-sent.json`));
+  assert.deepEqual(layerRec.received_by_page.events, expectedLog, "lock click must not pollute received_by_page.events");
+
+  // 2. HUD fallback path: stage click + "Capture input" click (2 clicks) must not appear in events either.
+  const hud = world({ wins: echoWindows([40]), noLayer: true, hud: true });
+  const rh = await runReal(hud, INPUT());
+  assert.deepEqual(rh.result.errors, []);
+  assert.equal(hud.stageClicks, 1);
+  assert.equal(hud.hudClicks, 1);
+  const hudRec = JSON.parse(read(rh.dir, `${rh.id()}/input-sent.json`));
+  assert.deepEqual(hudRec.received_by_page.events, expectedLog, "stage and HUD lock clicks must not pollute received_by_page.events");
+});
+
+test("#1343 r2 item 3a: freeze baseline is taken right before the fault, not from an earlier sample before takeLock", async () => {
+  // Frames advance continuously during takeLock's 2 s wait for the layer, then freeze at the fault (T0 + 2000).
+  // Baseline at p0 (before takeLock, frames=100) would see 100 -> 160 on the first post-fault sample and under-report freeze as 3 s instead of 4 s.
+  let ww;
+  const stats = {
+    get frames() {
+      const t = ww ? Math.min(ww.t, T0 + 2000) : T0;
+      return 100 + Math.floor((t - T0) / 1000) * 30;
+    },
+    decoded: 100,
+  };
+  const f = fallbackWorld({ layerAfterMs: 2000, stats });
+  ww = f.w;
+  const r = await runReal(f.w, FALLBACK("mid"), { hooksDir: f.hooksDir });
+  assert.deepEqual(r.result.errors, []);
+  assert.equal(r.sc().status, "pass", JSON.stringify(r.sc().criteria));
+  assert.equal(stats.frames, 160, "frames advanced from 100 to 160 during takeLock before freezing at the fault");
+  const rec = JSON.parse(read(r.dir, `${r.id()}/fallback.json`));
+  assert.equal(rec.no_frame_advance_before_video_s, 4, "freeze must be measured from the fault, not from p0 before takeLock");
+  assert.match(r.by().frame_after_fallback.observed, /^5 s after the fault; no frame advanced for 4 s of it$/);
+});
+
+test("#1343 r2 item 3b: an unreadable move log (garbage or throw) keeps motion_sum_matches pass: null with a reason and no crash", async () => {
+  // 1. Page overwrites __e2eInput with non-object garbage before readout.
+  {
+    const w = world({ wins: echoWindows([40]) });
+    const orig = w.host.newPage;
+    w.host.newPage = async () => {
+      const p = await orig();
+      const ev = p.evaluate;
+      p.evaluate = async (fn, arg) => (String(fn).includes("__e2eInput ?? null") ? "not-an-object" : ev(fn, arg));
+      return p;
+    };
+    const r = await runReal(w, INPUT());
+    assert.deepEqual(r.result.errors, []);
+    assert.notEqual(r.sc().status, "error");
+    assert.equal(r.by().motion_sum_matches.pass, null);
+    assert.equal(r.by().motion_sum_matches.observed, null);
+    assert.match(r.by().motion_sum_matches.expected, /The page's move log could not be read/);
+    assert.equal(r.by().nothing_held_at_end.pass, null);
+    assert.equal(JSON.parse(read(r.dir, `${r.id()}/input-sent.json`)).received_by_page, null);
+  }
+
+  // 2. Page returns an object with malformed moveCount / move / moves.
+  {
+    const w = world({ wins: echoWindows([40]) });
+    const orig = w.host.newPage;
+    w.host.newPage = async () => {
+      const p = await orig();
+      const ev = p.evaluate;
+      p.evaluate = async (fn, arg) => (String(fn).includes("__e2eInput ?? null") ? { moveCount: -3, move: { x: NaN, y: "x" }, moves: "bad", keys: [], buttons: [], log: "bad", wheel: null, untrusted: "nope" } : ev(fn, arg));
+      return p;
+    };
+    const r = await runReal(w, INPUT());
+    assert.deepEqual(r.result.errors, []);
+    assert.equal(r.sc().status, "pass", JSON.stringify(r.sc().criteria));
+    assert.equal(r.by().motion_sum_matches.pass, null);
+    assert.equal(r.by().motion_sum_matches.observed, null);
+    assert.match(r.by().motion_sum_matches.expected, /The page's move log could not be read/);
+    const rec = JSON.parse(read(r.dir, `${r.id()}/input-sent.json`));
+    assert.equal(rec.received_by_page.mouse_moves_total, null);
+    assert.equal(rec.received_by_page.motion_sum, null);
+  }
+
+  // 3. Page throws when the scenario reads __e2eInput.
+  {
+    const w = world({ wins: echoWindows([40]) });
+    const orig = w.host.newPage;
+    w.host.newPage = async () => {
+      const p = await orig();
+      const ev = p.evaluate;
+      p.evaluate = async (fn, arg) => {
+        if (String(fn).includes("__e2eInput ?? null")) throw new Error("Execution context was destroyed");
+        return ev(fn, arg);
+      };
+      return p;
+    };
+    const r = await runReal(w, INPUT());
+    assert.deepEqual(r.result.errors, []);
+    assert.equal(r.sc().status, "pass", JSON.stringify(r.sc()));
+    assert.equal(r.by().motion_sum_matches.pass, null);
+    assert.equal(r.by().motion_sum_matches.observed, null);
+    assert.match(r.by().motion_sum_matches.expected, /The page's move log could not be read/);
+    assert.equal(r.by().nothing_held_at_end.pass, null);
+    assert.equal(JSON.parse(read(r.dir, `${r.id()}/input-sent.json`)).received_by_page, null);
+  }
+});
+
+test("#1343 r2 item 3c: no visible stream surface leaves freeze null with a reason (never 0) and records no-surface lock state", async () => {
+  // 1. transport-fallback mid with no <video>/canvas surface at the fault (even with advancing bench frames so unguarded freeze would be 0).
+  {
+    let ww;
+    const moving = { get frames() { return Math.floor((ww.t - T0) / 1000) * 30 + 10; }, decoded: 100 };
+    const f = fallbackWorld({ noSurface: true, stats: moving });
+    ww = f.w;
+    const r = await runReal(f.w, FALLBACK("mid", { hold_s: 10 }), { hooksDir: f.hooksDir });
+    assert.deepEqual(r.result.errors, []);
+    const rec = JSON.parse(read(r.dir, `${r.id()}/fallback.json`));
+    assert.equal(rec.no_frame_advance_before_video_s, null, "no surface must yield null freeze, never 0");
+    assert.equal(rec.no_frame_advance_reason, "no visible stream surface");
+    const step = r.timeline().find((x) => x.ev === "wait-ended");
+    assert.equal(step.no_frame_advance_s, null);
+    assert.equal(step.no_frame_advance_reason, "no visible stream surface");
+  }
+
+  // 2. Normal fallback (M1): the page unmounts its canvas at the fallback and the <video> has no frames until WebRTC starts 2 s later.
+  // That gap IS the freeze mid measures, so the freeze must remain a number (6 s), not be wiped to null.
+  {
+    const f = fallbackWorld();
+    const origSess = f.w.api.session;
+    let delayed = false;
+    f.w.api.session = async (id) => {
+      const row = await origSess(id);
+      if (row?.transport_fallback_reason && !delayed) {
+        delayed = true;
+        f.w.videoStart = f.w.t + 2000;
+        f.w.noSurface = true;
+      } else if (delayed && f.w.t >= f.w.videoStart) {
+        f.w.noSurface = false;
+      }
+      return row;
+    };
+    const r = await runReal(f.w, FALLBACK("mid"), { hooksDir: f.hooksDir });
+    assert.deepEqual(r.result.errors, []);
+    assert.equal(r.sc().status, "pass", JSON.stringify(r.sc().criteria));
+    const rec = JSON.parse(read(r.dir, `${r.id()}/fallback.json`));
+    assert.equal(rec.no_frame_advance_before_video_s, 6, "canvas unmount during fallback must count as freeze, not wipe it to null");
+    assert.equal("no_frame_advance_reason" in rec, false);
+    assert.match(r.by().frame_after_fallback.observed, /^7 s after the fault; no frame advanced for 6 s of it$/);
+  }
+
+  // 3. input-kbm with no layer and no stream surface exercises takeLock's "no-surface" path end-to-end.
+  {
+    const w = world({ noLayer: true, noSurface: true });
+    const r = await runReal(w, INPUT());
+    assert.deepEqual(r.result.errors, []);
+    const beforeSequence = w.cdp.slice(0, w.cdp.findIndex(([, p]) => p.type === "keyDown"));
+    assert.equal(beforeSequence.filter(([, p]) => p.type === "mousePressed").length, 0, "no surface so takeLock clicked nothing");
+    assert.equal(w.hudClicks, 0);
+    assert.equal(r.timeline().find((x) => x.ev === "pointer-lock").hud, "no-surface");
+    assert.ok(r.timeline().some((x) => x.ev === "no-stream-surface"));
+    assert.equal(r.by().pointer_lock_taken.pass, false);
+    assert.match(r.by().pointer_lock_taken.observed, /no "Click to play" layer appeared within 5 s and no lock was held \(cause unknown\); there was no visible stream surface to click either/);
+    assert.doesNotMatch(r.by().pointer_lock_taken.observed, /immersive/i);
+  }
+});
+
+test("#1343 r2 N1: probe().surface requires a non-hidden element with positive box dimensions", async () => {
+  const probeWith = (els) =>
+    probe({
+      evaluate: async (fn, arg) => {
+        const saved = { window: globalThis.window, document: globalThis.document };
+        globalThis.window = {};
+        globalThis.document = {
+          querySelectorAll: () => els,
+          querySelector: () => null,
+          visibilityState: "visible",
+          hasFocus: () => true,
+        };
+        try { return await fn(arg); } finally { Object.assign(globalThis, saved); }
+      },
+    });
+  assert.equal((await probeWith([{ tagName: "CANVAS", hidden: true, getBoundingClientRect: () => ({ width: 800, height: 600 }) }])).surface, false, "hidden canvas is not visible");
+  assert.equal((await probeWith([{ tagName: "CANVAS", hidden: false, getBoundingClientRect: () => ({ width: 0, height: 0 }) }])).surface, false, "zero-size canvas is not visible");
+  assert.equal((await probeWith([{ tagName: "VIDEO", videoWidth: 1920, hidden: true, getBoundingClientRect: () => ({ width: 800, height: 600 }) }])).surface, false, "hidden video is not visible");
+  assert.equal((await probeWith([{ tagName: "CANVAS", hidden: false, getBoundingClientRect: () => ({ width: 800, height: 600 }) }])).surface, true);
+  assert.equal((await probeWith([{ tagName: "VIDEO", videoWidth: 1920, hidden: false, getBoundingClientRect: () => ({ width: 800, height: 600 }) }])).surface, true);
 });

@@ -62,7 +62,7 @@ export function judge({ params, firstFrameS, seen }) {
     crit("webtransport_closed_first", null, null, "not judged: no source today. The page does not expose when its WebTransport session closed relative to opening WebRTC, the trace has no event for it, and the agent logs nothing of its own for a lost WebTransport client (#1260). It needs a client trace event or bench field for the close time, or an agent log line, in the host half"),
     continues,
     !s.watched ? crit("fallback_event", null, null, unwatched) : crit("fallback_event", reason !== null, reason === null ? `none within ${params.hold_s} s of ${from}` : `${reason} (${s.fallbackReason ? "the session row" : "the page's own post only: the session row has none"}${s.fallbackReason && s.posted.length ? "; the page also posted it" : ""})`, `a transport.fallback event with a reason matching ${REASON}, as the session row's transport_fallback_reason or the event the page posts to the stack`),
-    !s.watched ? crit("frame_after_fallback", null, null, unwatched) : crit("frame_after_fallback", finite(s.videoAfterS), s.videoAfterS === null ? `no <video> frame within ${params.hold_s} s of ${from}` : `${s.videoAfterS} s after the fault${finite(s.freezeS) ? `; no frame advanced for ${s.freezeS} s of it` : ""}`, "a frame decoded by the <video> (the WebRTC path) after the fault was applied (a <video> already decoding before it ends the run: the fallback happened at connect)"),
+    !s.watched ? crit("frame_after_fallback", null, null, unwatched) : crit("frame_after_fallback", finite(s.videoAfterS), s.videoAfterS === null ? `no <video> frame within ${params.hold_s} s of ${from}` : `${s.videoAfterS} s after the fault${finite(s.freezeS) ? `; no frame advanced for ${s.freezeS} s of it` : s.freezeReason ? `; freeze not measured (${s.freezeReason})` : ""}`, "a frame decoded by the <video> (the WebRTC path) after the fault was applied (a <video> already decoding before it ends the run: the fallback happened at connect)"),
     // Nothing is held in `connect` (no input is captured before the first picture), with or without a frame.
     when === "connect"
       ? crit("held_key_released", null, null, "not judged: nothing was held; no input is captured before the first picture, and the fault was on before it (#1260)")
@@ -170,7 +170,7 @@ export default {
         rec.step("fault-applied", { when });
       }
 
-      const seen = { row: undefined, fallbackReason: null, posted: [], videoAfterS: null, tail: null, keyHeld, faultApplied, watched: firstFrameAt !== null, freezeS: null };
+      const seen = { row: undefined, fallbackReason: null, posted: [], videoAfterS: null, tail: null, keyHeld, faultApplied, watched: firstFrameAt !== null, freezeS: null, freezeReason: null };
       let waitedS = null;
       let waitEndedBy = null;
       if (firstFrameAt !== null) {
@@ -179,9 +179,12 @@ export default {
         let videoAt = null;
         const waitStart = now();
         // The freeze (mid): the longest run of samples, from the fault to the first <video> frame, in which neither the bench frames nor the <video> advanced.
+        // Without a visible stream surface (<video>/canvas) at the fault, freeze is null with a reason, never 0.
+        // Inside the loop, a vanished surface (the canvas unmounts on fallback before WebRTC decodes) counts as no advance.
         let last = frames0;
         let lastMoveAt = tFault;
-        let freeze = frames0 ? 0 : null;
+        let freeze = frames0 ? (frames0.surface === false ? null : 0) : null;
+        let freezeReason = frames0?.surface === false ? "no visible stream surface" : null;
         let sampled = false; // a freeze of 0 s is a fact only once a sample was compared
         let ended = false;
         while (now() < until && !(fallbackAt !== null && videoAt !== null)) {
@@ -210,9 +213,10 @@ export default {
         }
         if (!sampled) freeze = null;
         seen.freezeS = freeze;
+        seen.freezeReason = freeze === null ? freezeReason : null;
         waitedS = (now() - waitStart) / 1000;
         waitEndedBy = ended ? "session_ended" : fallbackAt !== null && videoAt !== null ? "fallback_and_frame_seen" : "hold_elapsed";
-        rec.step("wait-ended", { by: waitEndedBy, waited_s: waitedS, no_frame_advance_s: freeze });
+        rec.step("wait-ended", { by: waitEndedBy, waited_s: waitedS, no_frame_advance_s: freeze, ...(seen.freezeReason ? { no_frame_advance_reason: seen.freezeReason } : {}) });
         await shot("after-fallback");
         // Does it keep going: the <video>'s frames across a short tail.
         const before = (await probe(page)).videoFrames;
@@ -226,7 +230,7 @@ export default {
 
       // The release is part of the record: fallback.json does not claim a clean release that did not happen.
       const released = await release("the runner, at the end: the host half must read the host's key state before this");
-      rec.json("fallback.json", { when, fault_applied: faultApplied, reason: seen.fallbackReason, posted_events: seen.posted, video_after_fault_s: seen.videoAfterS, no_frame_advance_before_video_s: seen.freezeS, wait_ended_by: waitEndedBy, waited_s: waitedS, tail_video_frames: seen.tail, key_held: keyHeld, key_released_by_runner: released });
+      rec.json("fallback.json", { when, fault_applied: faultApplied, reason: seen.fallbackReason, posted_events: seen.posted, video_after_fault_s: seen.videoAfterS, no_frame_advance_before_video_s: seen.freezeS, ...(seen.freezeReason ? { no_frame_advance_reason: seen.freezeReason } : {}), wait_ended_by: waitEndedBy, waited_s: waitedS, tail_video_frames: seen.tail, key_held: keyHeld, key_released_by_runner: released });
       result = { criteria: judge({ params, firstFrameS, seen }), clock_offset_ms: null };
       if (seen.row && TERMINAL.includes(seen.row.state)) result = { ...result, status: "error", reason: `the session ended during the run (it was ${seen.row.state} before this run stopped it)` };
     } catch (err) {

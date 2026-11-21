@@ -6,7 +6,7 @@
 // exposed, and the reference app echoes one bit, so what the HOST received per key, button and motion unit is not
 // known here. input-sent.json holds what was sent and what the page received, for the host half to compare.
 import { check as holdCheck } from "./stream-hold.mjs";
-import { cannotRun, crit, errorReason, finite, firstFrameCriterion, keyEvent, mouseEvent, openCdp, play, shotCovered, signIn, skipped, streamCentre, takeLock, verdict, waitFirstFrame, watchApiErrors } from "./stream-common.mjs";
+import { LOCK_WAIT_S, cannotRun, crit, errorReason, finite, firstFrameCriterion, keyEvent, mouseEvent, openCdp, play, shotCovered, signIn, skipped, streamCentre, takeLock, verdict, waitFirstFrame, watchApiErrors } from "./stream-common.mjs";
 
 export const name = "input-kbm";
 const STEP_MS = 60; // between two steps of the sequence
@@ -52,14 +52,6 @@ export function installRecorder() {
   on("wheel", (e) => { r.wheel.x += e.deltaX || 0; r.wheel.y += e.deltaY || 0; r.log.push(["wheel", e.deltaY]); });
 }
 
-/** In the page: forgets the motion seen so far (the pointer's walk to the lock click), so what is kept is the sequence's own. */
-export function resetMotion() {
-  const r = window.__e2eInput;
-  r.move = { x: 0, y: 0 };
-  r.moves = [];
-  r.moveCount = 0;
-}
-
 const sum = (xs) => xs.reduce((a, v) => ({ x: a.x + v.dx, y: a.y + v.dy }), { x: 0, y: 0 });
 // The page is untrusted: a move is two finite numbers and a flag, anything else is null.
 const cleanMoves = (m) => (Array.isArray(m) ? m.slice(0, 200).map((v) => [finite(v?.[0]) ? v[0] : null, finite(v?.[1]) ? v[1] : null, v?.[2] === true]) : []);
@@ -88,7 +80,7 @@ export function judge({ firstFrameS, seen }) {
   return [
     firstFrameCriterion(firstFrameS),
     s.sequenceRan
-      ? crit("pointer_lock_taken", s.locked, s.locked ? `the stream surface holds the pointer lock${s.lockHud === "clicked" ? ' (taken through the HUD\'s "Capture input": the launch was not immersive, so there was no "Click to play" layer)' : ""}` : s.lockClicks ? 'no pointer lock after the click on the "Click to play" layer' : `no pointer lock: the launch was not immersive, so there is no layer to click${s.lockHud === "clicked" ? '; the HUD\'s "Capture input" was clicked and did not lock' : s.lockHud === "no-button" ? '; a click on the stream showed no "Capture input" button in the HUD' : s.lockHud === "no-surface" ? "; there was no visible stream surface to click either" : ""}`, `document.pointerLockElement is the stream surface (the product takes it from a trusted click on its "Click to play" layer)`)
+      ? crit("pointer_lock_taken", s.locked, s.locked ? `the stream surface holds the pointer lock${s.lockHud === "clicked" ? ` (no "Click to play" layer appeared within ${LOCK_WAIT_S} s and no lock was held — cause unknown; taken through the HUD's "Capture input")` : ""}` : s.lockClicks ? 'no pointer lock after the click on the "Click to play" layer' : `no pointer lock: no "Click to play" layer appeared within ${LOCK_WAIT_S} s and no lock was held (cause unknown)${s.lockHud === "clicked" ? '; the HUD\'s "Capture input" was clicked and did not lock' : s.lockHud === "no-button" ? '; a click on the stream showed no "Capture input" button in the HUD' : s.lockHud === "no-surface" ? "; there was no visible stream surface to click either" : ""}`, `document.pointerLockElement is the stream surface (the product takes it from a trusted click on its "Click to play" layer)`)
       : crit("pointer_lock_taken", null, null, unsent),
     crit("keys_match", null, null, noLog),
     crit("buttons_match", null, null, noLog),
@@ -148,7 +140,6 @@ export default {
       const seen = { locked: false, lockClicks: 0, lockHud: null, motion: null, sequenceRan: false, held: null, i2p: [], i2pMissed: 0 };
       if (firstFrameAt !== null) {
         cdp = await openCdp(page);
-        await page.evaluate(installRecorder);
         const lock = await takeLock(page, cdp, ctx);
         seen.locked = lock.held;
         seen.lockClicks = lock.clicks;
@@ -161,7 +152,8 @@ export default {
           rec.step("no-stream-surface", { why: "no visible stream surface: the pointer events go to 0,0" });
           centre = { x: 0, y: 0 };
         }
-        await page.evaluate(resetMotion);
+        // Installed after pointer lock is settled so the lock click(s) and pointer walk are not logged as scenario input.
+        await page.evaluate(installRecorder);
         seen.sequenceRan = true;
         const sent = [];
         const tStart = now();
@@ -206,15 +198,17 @@ export default {
         rec.json("bench-windows.json", { windows });
         seen.i2p = windows.flatMap((w) => (Array.isArray(w?.i2p_ms) ? w.i2p_ms : [])).filter(finite);
         seen.i2pMissed = windows.reduce((n, w) => n + (finite(w?.i2p_missed) ? w.i2p_missed : 0), 0);
-        const received = await page.evaluate(() => window.__e2eInput ?? null);
+        const rawReceived = await page.evaluate(() => window.__e2eInput ?? null).catch(() => null);
+        const received = rawReceived && typeof rawReceived === "object" ? rawReceived : null;
         const sentMotion = sum(sent.filter((x) => x.kind === "move"));
         const receivedMotion = received && finite(received.move?.x) && finite(received.move?.y) ? { x: received.move.x, y: received.move.y } : null;
-        seen.motion = { sent: sentMotion, received: receivedMotion, events: finite(received?.moveCount) ? received.moveCount : null };
+        const receivedWheel = received && finite(received.wheel?.x) && finite(received.wheel?.y) ? { x: received.wheel.x, y: received.wheel.y } : null;
+        seen.motion = { sent: sentMotion, received: receivedMotion, events: finite(received?.moveCount) && received.moveCount >= 0 ? received.moveCount : null };
         seen.held = received && Array.isArray(received.keys) && Array.isArray(received.buttons) ? { keys: received.keys.map(String), buttons: received.buttons.filter(finite) } : null;
         rec.json("input-sent.json", {
           sequence: sent,
           sent_motion_sum: sentMotion,
-          received_by_page: received ? { events: received.log, motion_sum: received.move, mouse_moves: cleanMoves(received.moves), mouse_moves_total: seen.motion.events, wheel_sum: received.wheel, untrusted: received.untrusted } : null,
+          received_by_page: received ? { events: Array.isArray(received.log) ? received.log : null, motion_sum: receivedMotion, mouse_moves: cleanMoves(received.moves), mouse_moves_total: seen.motion.events, wheel_sum: receivedWheel, untrusted: finite(received.untrusted) ? received.untrusted : null } : null,
           held_at_end: seen.held,
           bench_keys_pressed: pressed,
         });
