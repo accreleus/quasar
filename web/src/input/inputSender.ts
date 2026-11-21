@@ -6,8 +6,10 @@ export type InputMsg = Record<string, unknown>;
 
 export interface InputSender {
   send(msg: InputMsg): void;
-  /** Bytes queued and not yet on the wire; capture flags backpressure on it. */
+  /** Bytes queued and not yet on the wire, if the transport exposes a byte count. */
   readonly bufferedAmount: number;
+  /** For transports that expose writer capacity independently of queued bytes. */
+  readonly backpressured?: boolean;
 }
 
 export function dataChannelSender(ch: RTCDataChannel): InputSender {
