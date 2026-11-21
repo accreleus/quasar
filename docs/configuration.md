@@ -744,7 +744,7 @@ flag are set, `QUASAR_ABR_MODE` wins (it is checked first and short-circuits).
 
 | Variable | Default | Values / notes |
 |---|---|---|
-| `QUASAR_WT_CAPACITY` | `v2` | `v2` → the host paces video and sizes QUIC's window at no less than what the encoder sends (setpoint plus FEC), reads a shortfall only when the link delivered under 0.95 × what was sent with the single largest arrival gap taken out, and counts every loss but short blackouts and outages. `legacy` → 0.6.3's sender and reading: no pacing and no audio room, the reading is the estimate or 0.85 × the receive rate with no gap taken out and filtered by `abr_deadband`, blackouts count as loss, and the window follows the smoothed RTT. Anything else warns (`token="wt-capacity-unrecognised"`) and stays `v2`. Read once at agent start; it applies to every WebTransport session, the native client's included. The bug fixes of the same release (send stamps, the outage mark, audio ahead of held video) stay on in both. |
+| `QUASAR_WT_CAPACITY` | `v2` | `v2` → the host paces video and sizes QUIC's window at no less than what the encoder sends (setpoint plus FEC), reads a shortfall only when the link delivered under 0.95 × what was sent with the two largest arrival-gap excesses over their send gaps taken out, and counts every loss but short blackouts and outages. `legacy` → 0.6.3's sender and reading: no pacing and no audio room, the reading is the estimate or 0.85 × the receive rate with no gap taken out and filtered by `abr_deadband`, blackouts count as loss, and the window follows the smoothed RTT. Anything else warns (`token="wt-capacity-unrecognised"`) and stays `v2`. Read once at agent start; it applies to every WebTransport session, the native client's included. The bug fixes of the same release (send stamps, the outage mark, audio ahead of held video) stay on in both. |
 
 #### WebTransport in `smooth`: the per-report loop (#1376)
 
@@ -755,7 +755,7 @@ WebTransport in `protective`, keep the window loop the rest of this section desc
 - **What a report says.** A report is a *reading* only when its datagrams arrived slower
   than they were sent (under 0.95 ×: a queue or loss on the link), the host was busy (it
   sent at least 0.8 × the estimate) and a receive rate was measured. The delivered rate
-  has the window's single largest arrival gap taken out, so a delay step or a short
+  has the window's two largest arrival-gap excesses over their send gaps taken out, so a delay step or a short
   blackout is no reading; the reading is 0.85 × that rate (with `QUASAR_WT_CAPACITY=legacy`:
   the estimate, never under 0.85 × the plain receive rate). A clean link that delivers what
   it is sent gives no reading whatever its delay detector says (the #68 lesson), and neither

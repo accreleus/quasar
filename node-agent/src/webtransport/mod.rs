@@ -1720,6 +1720,9 @@ fn pyro_rate(
             grant.target_kbps,
             grant.floor_kbps,
             std::time::Instant::now(),
+            media
+                .rate()
+                .is_some_and(|r| r.capacity == crate::session::settings::WtCapacity::Legacy),
         ))
     })
 }

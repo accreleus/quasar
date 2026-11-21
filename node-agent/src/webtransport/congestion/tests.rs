@@ -43,6 +43,8 @@ struct Sim {
     hold_us: u64,
     /// Every `n`th datagram is dropped on the way (0: none).
     drop_every: u32,
+    /// The chance a datagram sent at this time is dropped on the way, seeded (`rng`).
+    loss_at: Box<dyn Fn(u64) -> f64>,
     /// The path carries and acknowledges nothing (queued mode): an outage QUIC sees.
     blackhole: bool,
     /// Datagrams the full bottleneck queue dropped.
@@ -148,6 +150,7 @@ impl Sim {
             reorder_us: Box::new(|_| 0),
             hold_us: 0,
             drop_every: 0,
+            loss_at: Box::new(|_| 0.0),
             blackhole: false,
             queue_drops: 0,
             pending: VecDeque::new(),
@@ -312,6 +315,8 @@ impl Sim {
         let backlog = self.free_at.saturating_sub(self.t) as f64 / service as f64 * SIZE as f64;
         let mut dropped =
             self.blackhole || self.drop_every > 0 && seq.is_multiple_of(self.drop_every);
+        let chance = (self.loss_at)(self.t);
+        dropped |= chance > 0.0 && ((self.rand() % 1_000_000) as f64) < chance * 1e6;
         let full = match self.bucket_bytes {
             Some(bucket) => {
                 let refill = (self.t - self.tokens_at) as f64 * self.cap_kbps / 8000.0;
@@ -2272,7 +2277,7 @@ fn half_lost(first: u32) -> Feedback {
 #[test]
 fn pyrowave_budget_starts_at_the_target_and_follows_a_lower_estimate() {
     let on = Instant::now();
-    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on, false);
     let open = quic_at(8_000_000.0);
     assert_eq!(
         rate.on_tick(on, open),
@@ -2294,7 +2299,7 @@ fn pyrowave_budget_starts_at_the_target_and_follows_a_lower_estimate() {
 #[test]
 fn pyrowave_quic_cap_applies_from_the_first_feedback_and_never_lifts_the_target() {
     let on = Instant::now();
-    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on, false);
     let target = budget_of(f64::from(PYRO_TARGET));
     // Before the first feedback, and under 1 s: the window is the standard codec's, not judged.
     assert_eq!(
@@ -2388,7 +2393,7 @@ fn pyrowave_quic_cap_applies_from_the_first_feedback_and_never_lifts_the_target(
 #[test]
 fn pyrowave_under_the_floor_for_1_s_steps_down_and_not_before() {
     let on = Instant::now();
-    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on, false);
     let narrow = backed_up(80_000.0);
     let mut seq = 0;
     let first = pyro_send(&mut rate, &mut seq, on);
@@ -2430,7 +2435,7 @@ fn pyrowave_under_the_floor_for_1_s_steps_down_and_not_before() {
 #[test]
 fn pyrowave_feedback_silence_does_not_step_down() {
     let on = Instant::now();
-    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on, false);
     let open = quic_at(8_000_000.0);
     let mut seq = 0;
     let first = pyro_send(&mut rate, &mut seq, on);
@@ -2458,7 +2463,7 @@ fn pyrowave_feedback_silence_does_not_step_down() {
 #[test]
 fn pyrowave_withheld_feedback_is_judged_on_quic_from_1_s_after_the_switch_on() {
     let on = Instant::now();
-    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on, false);
     let narrow = backed_up(80_000.0);
     let mut stepped = None;
     for ms in (0..=3000u64).step_by(100) {
@@ -2532,7 +2537,7 @@ fn pyro_clean_run(
 #[test]
 fn pyrowave_an_application_limited_sender_with_a_small_window_never_steps_down() {
     let on = Instant::now();
-    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on, false);
     // Quinn's first window (12 000 B) at a 1 ms RTT: 96 Mbit/s, under the floor. A dark
     // screen's frames fit it, so nothing queues and Cubic never grows it.
     let window = QuicPath {
@@ -2590,7 +2595,7 @@ fn pyrowave_send_log_spans_the_rate_window_at_a_400_mbit_grant() {
 #[test]
 fn pyrowave_a_burst_phase_locked_to_the_tick_is_not_a_standing_queue() {
     let on = Instant::now();
-    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on, false);
     // Quinn's first window at a 1 ms RTT: 12 000 B, 96 Mbit/s, 1/35 of one whole frame at
     // the target. The report 50 ms after a tick sees it drained; the tick sees the next burst.
     let small = quic_at(96_000.0);
@@ -2629,7 +2634,7 @@ fn pyrowave_a_burst_phase_locked_to_the_tick_is_not_a_standing_queue() {
 #[test]
 fn pyrowave_clean_feedback_at_the_target_for_10_s_never_steps_down() {
     let on = Instant::now();
-    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on, false);
     // 200 Mbit/s at 60 fps: 363 full datagrams a frame.
     let verdicts = pyro_clean_run(&mut rate, on, quic_at(8_000_000.0), 363, 10);
     assert!(
@@ -2777,7 +2782,7 @@ fn steps_down(verdicts: &[(u64, PyroVerdict)]) -> Option<u64> {
 #[test]
 fn pyrowave_a_link_under_the_floor_steps_down_with_feedback_withheld_and_the_budget_holds() {
     let on = Instant::now();
-    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on, false);
     let verdicts = QueuedPath::new(80_000.0).run(&mut rate, on, 4, |_| f64::MAX, None, false);
     let stepped = steps_down(&verdicts);
     assert!(
@@ -2801,7 +2806,7 @@ fn pyrowave_a_link_under_the_floor_steps_down_with_feedback_withheld_and_the_bud
 fn pyrowave_through_a_responsive_path_a_dark_screen_and_a_single_loss_never_step_down() {
     for loss_ms in [None, Some(3000)] {
         let on = Instant::now();
-        let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
+        let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on, false);
         // A dark screen fits quinn's first window: nothing waits on it, and it never grows.
         let verdicts =
             QueuedPath::new(1_000_000.0).run(&mut rate, on, 10, |_| 5_000.0, loss_ms, false);
@@ -2817,7 +2822,7 @@ fn pyrowave_through_a_responsive_path_a_dark_screen_and_a_single_loss_never_step
 #[test]
 fn pyrowave_a_dark_screen_that_turns_to_full_detail_dips_once_and_does_not_step_down() {
     let on = Instant::now();
-    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on, false);
     let content = |ms: u64| if ms < 3000 { 5_000.0 } else { f64::MAX };
     let verdicts = QueuedPath::new(1_000_000.0).run(&mut rate, on, 10, content, None, false);
     assert_eq!(steps_down(&verdicts), None, "{verdicts:?}");
@@ -2838,7 +2843,7 @@ fn pyrowave_a_picture_under_its_budget_on_a_link_under_the_floor_steps_down() {
     let give_up_ms = u64::from(GIVE_UP_HOLDS) * super::super::retransmit::WINDOW.as_millis() as u64;
     for feedback in [false, true] {
         let on = Instant::now();
-        let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on);
+        let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on, false);
         let verdicts =
             QueuedPath::new(60_000.0).run(&mut rate, on, 6, |_| 70_000.0, None, feedback);
         let stepped = steps_down(&verdicts);
@@ -4346,7 +4351,7 @@ fn a_shallow_buffer_steps_the_rung_down_without_a_stall() {
         longest >= crate::session::ladder::LadderPlanner::RATE_CONFIRM.as_secs_f64(),
         "the rung would never step down: under the line {longest:.2} s at most"
     );
-    // The design's 2 %, with room for the sim's keyframe a second: 1.8 % here, 5.2 % with no
+    // The design's 2 %, with room for the sim's keyframe a second: 2.4 % here, 5.2 % with no
     // persistence cut (`LOSS_PERSIST`).
     assert!(
         s.loss_after(15.0) <= 0.025,
@@ -4375,7 +4380,7 @@ fn a_policer_steps_down_until_its_loss_ends() {
         s.stalls,
         s.loss_after(20.0)
     );
-    // As the shallow buffer's: 1.5 % here, 6.2 % with no persistence cut.
+    // As the shallow buffer's: 2.1 % here, 6.2 % with no persistence cut.
     assert!(
         s.loss_after(20.0) <= 0.025,
         "loss {:.3}",
@@ -4383,6 +4388,161 @@ fn a_policer_steps_down_until_its_loss_ends() {
     );
     assert!(ups.is_empty(), "rate climbed under over 10 % loss: {ups:?}");
     assert!(s.stalls.len() <= 1, "the guard stalled at {:?} s", s.stalls);
+}
+
+/// Steady loss that is not congestion (Wi-Fi, reorder discards): 3 % at random on a link far over
+/// the 8000 kbit/s ceiling, FEC on, under the real ABR and stall guard. The link delivers 0.97 ×
+/// what is sent, and the persistence cut never takes the loss bound under that, nor under a clean
+/// window of the run after a random shortfall has moved the setpoint down (52.6 s here): the
+/// estimate stays at the ceiling and FEC keeps its share (`Control::feed` charges at most
+/// estimate / floor − 1). Unbounded cut: 8000 → 2066; bounded by the current window only: 5823.
+#[test]
+fn steady_loss_on_an_uncapped_link_never_ratchets_the_estimate() {
+    let mut s = Sim::new(50_000.0).with_abr().with_guard();
+    s.quic = Some(Quic::default());
+    s.keyframe_every = 60;
+    s.fec_share = 0.1;
+    s.loss_at = Box::new(|_| 0.03);
+    s.run(180.0);
+    let low = s.min_after(5.0);
+    let floor = f64::from(s.abr.as_ref().unwrap().floor_kbps());
+    eprintln!(
+        "estimate from 5 s: min {low:.0}, end {:.0}; loss {:.3}; setpoint end {:?}; stalls {:?}",
+        s.est.estimate_kbps(),
+        s.loss_after(5.0),
+        s.setpoints.last(),
+        s.stalls
+    );
+    assert!(low >= 0.95 * CEILING, "the estimate fell to {low:.0}");
+    assert!(low / floor - 1.0 >= s.fec_share, "FEC starved at {low:.0}");
+    assert!(s.stalls.is_empty(), "stalls {:?}", s.stalls);
+}
+
+/// 2.5 % random loss at a 2500 kbit/s session on a link far over it, and one 300 ms burst of
+/// 25 % at 20 s. The burst may move the setpoint down; the steady loss under it must not hold it
+/// there: the setpoint is back at the ceiling by 60 s and the guard never stalls after that.
+/// Unbounded persistence cut: the setpoint ratchets to 1818 and never comes back.
+#[test]
+fn random_loss_and_one_burst_recover_to_the_ceiling_without_a_stall() {
+    const SESSION: f64 = 2500.0;
+    let mut s = Sim::new(50_000.0).with_guard();
+    s.est = Estimator::new(SESSION, s.start);
+    let cfg = crate::session::abr::AbrConfig {
+        per_report: Some(Duration::ZERO),
+        ..crate::session::abr::AbrConfig::new_smooth(500, SESSION as u32, 60)
+    };
+    s.abr = Some(crate::session::abr::Governor::new(cfg, s.start));
+    s.quic = Some(Quic::default());
+    s.keyframe_every = 60;
+    s.loss_at = Box::new(|t| match (20_000_000..20_300_000).contains(&t) {
+        true => 0.25,
+        false => 0.025,
+    });
+    s.run(90.0);
+    let low = s.setpoints.iter().map(|&(_, sp)| sp).min();
+    let back = s
+        .setpoints
+        .iter()
+        .find(|&&(t, sp)| t >= 20.3 && f64::from(sp) >= SESSION)
+        .map(|&(t, _)| t);
+    let after: Vec<_> = s
+        .stalls
+        .iter()
+        .filter(|&&t| back.is_some_and(|b| t >= b))
+        .collect();
+    let mut steps: Vec<u32> = Vec::new();
+    for &(_, sp) in &s.setpoints {
+        if steps.last() != Some(&sp) {
+            steps.push(sp);
+        }
+    }
+    eprintln!(
+        "setpoint min {low:?}, back at {back:?} s, path {:?}; stalls {:?}; estimate end {:.0}",
+        &steps[..steps.len().min(20)],
+        s.stalls,
+        s.est.estimate_kbps()
+    );
+    assert!(back.is_some_and(|b| b <= 60.0), "back at {back:?} s");
+    assert!(after.is_empty(), "stalls after recovery: {after:?}");
+}
+
+/// Rule 1 (#1433), system level: an 800 ms delay spike in a quiet scene cuts the estimate to the
+/// quiet receive rate, and the setpoint stays at the ceiling (an idle sender gives no reading).
+/// When the scene turns busy the encoder sends at its setpoint while the estimate is far under
+/// it and regrows at 8 % a second. The pacer and QUIC's window follow what the encoder sends, so
+/// nothing waits in the agent: no stall, no stale drop. Governed at the estimate: the agent holds
+/// the excess and the guard stalls.
+#[test]
+fn a_busy_scene_after_a_cut_in_a_quiet_one_leaves_nothing_waiting_in_the_agent() {
+    let mut s = Sim::new(50_000.0).with_abr().with_guard();
+    s.quic = Some(Quic::default());
+    s.keyframe_every = 60;
+    s.content_kbps = Box::new(|t| if t < 6_000_000 { 1500.0 } else { f64::MAX });
+    s.extra_us = Box::new(|t| match t {
+        3_000_000..3_200_000 => (t - 3_000_000) * 800 / 200,
+        3_200_000..3_500_000 => (3_500_000 - t) * 800 / 300,
+        _ => 0,
+    });
+    s.run(6.0);
+    let low = s.est.estimate_kbps();
+    s.run(14.0);
+    let stale = s.quic.as_ref().map_or(0, |q| q.video.stale);
+    let late: Vec<_> = s.stalls.iter().filter(|&&t| t >= 6.0).collect();
+    eprintln!(
+        "estimate at 6 s {low:.0}, setpoint {:?}; stalls {:?}, {stale} stale",
+        s.setpoints.last(),
+        s.stalls
+    );
+    assert!(low < 0.5 * CEILING, "no cut in the quiet scene: {low:.0}");
+    assert!(
+        late.is_empty() && stale == 0,
+        "stalls {late:?}, {stale} stale"
+    );
+}
+
+/// Rule 2's gap correction takes out the largest excesses of an arrival gap over its send gap, not
+/// the largest arrival gaps. Unpaced at 30 fps, 29 datagrams a frame 20 µs apart (8 Mbit/s): each
+/// gap between frames is 32.8 ms of arrival and as much of sending. Two +30 ms steps land inside
+/// frames' bursts in one window, each a gap shorter than a frame gap: both are taken out, and the
+/// window is no shortfall. Taking out the largest arrival gap removes a frame gap and leaves the
+/// steps: a reading.
+#[test]
+fn delay_steps_inside_unpaced_frames_are_the_gaps_taken_out() {
+    let start = Instant::now();
+    let (mut log, mut est) = (SendLog::new(start), Estimator::new(CEILING, start));
+    let step = |t: u64| 30_000 * (u64::from(t >= 1_000_300) + u64::from(t >= 1_200_300));
+    let mut reports = Vec::new();
+    for r in 0..20u32 {
+        let mut arrivals = Vec::new();
+        for f in r * 3..r * 3 + 3 {
+            for i in 0..29u32 {
+                let at = u64::from(f) * 33_333 + u64::from(i) * 20;
+                let mut d = vec![0u8; SIZE];
+                d[1..5].copy_from_slice(&(f * 29 + i).to_le_bytes());
+                log.record(&d, start + Duration::from_micros(at), false);
+                arrivals.push(at + 11_000 + step(at));
+            }
+        }
+        let ref_us = arrivals[0];
+        let fb = Feedback {
+            first_pkt_seq: r * 87,
+            ref_us,
+            arrivals: arrivals
+                .iter()
+                .map(|a| ((a - ref_us) / UNIT_US) as u16)
+                .collect(),
+        };
+        let now = read_at(start, &fb);
+        let m = est.measure(&fb, &mut log, now);
+        est.apply(m, now, NO_QUIC);
+        reports.push((r, m.gap_us, reading(&est)));
+    }
+    assert!(
+        reports.iter().any(|&(_, gap, _)| gap >= 59_000),
+        "both steps not taken out: {reports:?}"
+    );
+    let read = reports.iter().find(|r| r.2.is_some());
+    assert!(read.is_none(), "a reading: {read:?}");
 }
 
 /// R4: 11 % of every datagram lost, evenly, never grows the estimate: the loss bound cuts above
@@ -4510,6 +4670,78 @@ fn burst_loss_of_60_to_300_ms_moves_nothing() {
     assert!(s.stalls.len() <= bursts.len(), "stalls {:?}", s.stalls);
 }
 
+/// 3 s of `BUSY` reports losing every 20th datagram (5 %, under the cut line): the loss bound
+/// after them.
+fn persistent_loss(est: &mut Estimator, start: Instant) -> f64 {
+    let mut log = SendLog::new(start);
+    for r in 0..30u64 {
+        let first = r as u32 * BUSY.0 * BUSY.1;
+        let from = r * u64::from(BUSY.0) * 16_667;
+        let fb = frames_report(&mut log, start, first, from, BUSY, |seq, t| {
+            (!seq.is_multiple_of(20)).then_some(t + 11_000)
+        });
+        let now = read_at(start, &fb);
+        let m = est.measure(&fb, &mut log, now);
+        est.apply(m, now, NO_QUIC);
+    }
+    est.loss_kbps
+}
+
+/// What `Control::feed` gives the ABR for an estimate of 6000 while the window loses 5 % and the
+/// setpoint is 3000.
+fn fed_while_losing(capacity: crate::session::settings::WtCapacity) -> f64 {
+    let fed = std::sync::Arc::new(std::sync::Mutex::new(0.0));
+    let sink = fed.clone();
+    let rate = crate::webtransport::Rate {
+        ceiling_kbps: CEILING,
+        floor_kbps: Box::new(|| 500.0),
+        setpoint_kbps: Box::new(|| 3000.0),
+        capacity,
+        retargets: true,
+        start: Box::new(|| {}),
+        owns: Box::new(|| false),
+        displaced: Box::new(|| {}),
+        observe: Box::new(move |k| *sink.lock().unwrap() = k),
+        measured: Box::new(|_| {}),
+        fec: Box::new(|_| {}),
+    };
+    let mut control = crate::webtransport::Control::new(
+        &rate,
+        std::sync::Arc::default(),
+        false,
+        Governor::default(),
+    );
+    control.estimator.loss = Some(0.05);
+    control.feed(6000.0, true);
+    let fed = *fed.lock().unwrap();
+    fed
+}
+
+/// PyroWave (design §5, out of scope): under `legacy` its estimator is 0.6.3's, a blackout counted
+/// as loss; under v2 it keeps the blackout exclusion and takes no persistence cut, which only
+/// tightens a pacer PyroWave does not have.
+#[test]
+fn pyrowave_follows_the_capacity_knob_without_the_persistence_cut() {
+    let start = Instant::now();
+    let mut legacy = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, start, true);
+    let m = blackout_report(
+        &mut legacy.estimator,
+        &mut legacy.log,
+        start,
+        600..750,
+        |_| 1,
+    );
+    assert!(m.loss.is_some_and(|l| l > 0.1), "legacy: {:?}", m.loss);
+    let mut v2 = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, start, false);
+    let m = blackout_report(&mut v2.estimator, &mut v2.log, start, 600..750, |_| 1);
+    assert_eq!(m.loss, Some(0.0), "v2: the blackout is loss");
+    for legacy in [false, true] {
+        let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, start, legacy);
+        let bound = persistent_loss(&mut rate.estimator, start);
+        assert_eq!(bound, f64::from(PYRO_TARGET), "legacy {legacy}: cut");
+    }
+}
+
 /// `QUASAR_WT_CAPACITY=legacy` (design §4): no pacing and no audio room, 0.6.3's reading (the
 /// estimate or `BETA` × the receive rate, no gap taken out), blackouts counted as loss, and the
 /// window on the smoothed RTT.
@@ -4553,10 +4785,34 @@ fn legacy_capacity_is_the_0_6_3_sender() {
         "the estimate, over 0.85 × 6000"
     );
 
+    // The reading is taken after this report's own loss cut, as 0.6.3 did.
+    let cut = Measured {
+        loss: Some(0.2),
+        ..shortfall
+    };
+    let mut old = legacy();
+    old.apply(cut, start + Duration::from_millis(100), NO_QUIC);
+    assert_eq!(
+        old.measured(),
+        Some(0.9 * CEILING),
+        "the estimate after its cut"
+    );
+
     // A 150 ms blackout is loss.
     let (mut log, mut old) = (SendLog::new(start), legacy());
     let m = blackout_report(&mut old, &mut log, start, 600..750, |_| 1);
     assert!(m.loss.is_some_and(|l| l > 0.1), "{:?}", m.loss);
+
+    // Loss under the cut line that persists holds the bound: no persistence cut.
+    let mut old = legacy();
+    assert_eq!(persistent_loss(&mut old, start), CEILING, "legacy cut");
+    let mut v2 = Estimator::new(CEILING, start);
+    assert!(persistent_loss(&mut v2, start) < CEILING, "v2 did not cut");
+
+    // No up-path hold: a lossy report feeds the ABR the estimate, not its own setpoint.
+    use crate::session::settings::WtCapacity;
+    assert_eq!(fed_while_losing(WtCapacity::Legacy), 6000.0);
+    assert_eq!(fed_while_losing(WtCapacity::V2), 3000.0);
 
     // The window follows a queue's smoothed RTT.
     let mut w = window(&governor, start);

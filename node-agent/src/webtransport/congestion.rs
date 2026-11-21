@@ -119,6 +119,9 @@ const MAX_LOSS_ENTRIES: usize = 64;
 const RATE_WINDOW_US: u64 = 500_000;
 /// A rate measured over less than this is noise; the last good one stands in.
 const MIN_RATE_SPAN_US: u64 = 100_000;
+/// Arrival gaps whose excess over their send gap rule 2 takes out of a rate window: two steps of a
+/// path's delay can land in one window.
+const GAPS_TAKEN_OUT: usize = 2;
 /// The overuse cut's base is the highest of this many throughput samples: 0.4–2 s of busy
 /// feedback (§Feedback's 20–100 ms). An app-limited stretch ages none of them.
 const THROUGHPUT_SAMPLES: usize = 20;
@@ -586,6 +589,9 @@ pub(crate) struct Estimator {
     last_loss_decrease: Option<Instant>,
     /// v2: (start, last report) of the current run of lossy reports, see `LOSS_PERSIST`.
     lossy: Option<(Instant, Instant)>,
+    /// v2: the highest receive rate a window of the current run delivered losing under
+    /// `LOSS_LOW`, kbit/s.
+    run_clean_kbps: f64,
     last_report: Option<Instant>,
     last_feedback: Option<Instant>,
     last_decay: Option<Instant>,
@@ -603,6 +609,9 @@ pub(crate) struct Estimator {
     evidence: Evidence,
     /// `QUASAR_WT_CAPACITY=legacy`: 0.6.3's reading, and no blackouts.
     pub(crate) legacy: bool,
+    /// v2's persistence cut (`LOSS_PERSIST`); off for PyroWave, which has no pacer for it to
+    /// tighten and no keyframes to overflow a link.
+    persist: bool,
     /// The bound the log last named, and when.
     logged: (Bound, Option<Instant>),
     /// The estimate before a silence decay not logged yet; delay and loss cuts always log.
@@ -614,8 +623,8 @@ pub(crate) struct Estimator {
 pub(crate) struct Measured {
     pub(crate) usage: Usage,
     pub(crate) rate_kbps: Option<f64>,
-    /// The receive rate with the single largest arrival gap's excess over its send gap, `gap_us`,
-    /// taken out of the span: what the ABR's reading reads (rule 2).
+    /// The receive rate with the `GAPS_TAKEN_OUT` largest excesses of an arrival gap over its send
+    /// gap, `gap_us` in all, taken out of the span: what the ABR's reading reads (rule 2).
     pub(crate) delivered_kbps: Option<f64>,
     pub(crate) gap_us: u64,
     /// The rate every video datagram sent over the same span was sent at, lost ones
@@ -658,6 +667,7 @@ impl Estimator {
             last_decrease: None,
             last_loss_decrease: None,
             lossy: None,
+            run_clean_kbps: 0.0,
             last_report: None,
             last_feedback: None,
             last_decay: None,
@@ -668,6 +678,7 @@ impl Estimator {
             reported_to: None,
             evidence: Evidence::default(),
             legacy: false,
+            persist: true,
             logged: (Bound::Ceiling, None),
             unlogged: None,
             measured: None,
@@ -822,7 +833,7 @@ impl Estimator {
             }
         }
 
-        if self.legacy {
+        if self.legacy || !self.persist {
             self.lossy = None;
         } else if self.loss.is_some_and(|l| l >= LOSS_LOW) {
             self.lossy = Some((self.lossy.map_or(now, |(since, _)| since), now));
@@ -831,6 +842,13 @@ impl Estimator {
             .is_some_and(|(_, last)| now.saturating_duration_since(last) > LOSS_RUN_GAP)
         {
             self.lossy = None;
+        }
+        match (self.lossy, m.rate_kbps) {
+            (None, _) => self.run_clean_kbps = 0.0,
+            (Some(_), Some(r)) if self.loss.is_none_or(|l| l < LOSS_LOW) => {
+                self.run_clean_kbps = self.run_clean_kbps.max(r);
+            }
+            _ => {}
         }
         let persisted = self.lossy.is_some_and(|(since, last)| {
             last == now && now.saturating_duration_since(since) >= LOSS_PERSIST
@@ -842,15 +860,27 @@ impl Estimator {
                     .last_loss_decrease
                     .is_none_or(|at| now.saturating_duration_since(at) >= gap)
                 {
-                    self.loss_kbps = self.estimate_kbps * (1.0 - 0.5 * loss);
+                    // A persistent run never cuts under what the link delivered, now or in a
+                    // clean window of the run: steady loss that is no congestion (Wi-Fi, reorder
+                    // discards) would otherwise ratchet the bound down after the sender for as
+                    // long as it lasts.
+                    // shortcut: the clean rate is held for the whole run, so a capacity drop that
+                    // loses only 2-10 % is left to the readings; age it if a lab row shows one.
+                    let delivered = m
+                        .rate_kbps
+                        .filter(|_| loss <= LOSS_HIGH)
+                        .map_or(0.0, |r| r.max(self.run_clean_kbps).min(self.estimate_kbps));
+                    self.loss_kbps = (self.estimate_kbps * (1.0 - 0.5 * loss)).max(delivered);
                     self.last_loss_decrease = Some(now);
                     // A persistent run starts again; a cut over `LOSS_HIGH` spends it.
                     self.lossy = (loss <= LOSS_HIGH).then_some((now, now));
-                    cut_by.push("loss");
-                    // The link no longer carries what it did before the outage.
-                    self.stop_regrow("loss cut");
-                    // These losses are spent; the next decision reads new ones.
-                    self.losses.clear();
+                    if self.loss_kbps < self.estimate_kbps {
+                        cut_by.push("loss");
+                        // The link no longer carries what it did before the outage.
+                        self.stop_regrow("loss cut");
+                        // These losses are spent; the next decision reads new ones.
+                        self.losses.clear();
+                    }
                 }
             }
             Some(loss) if loss >= LOSS_LOW => {}
@@ -870,6 +900,15 @@ impl Estimator {
             }
         }
 
+        let was = self.estimate_kbps;
+        self.settle();
+        if self
+            .recover_to
+            .is_some_and(|(to, _)| self.estimate_kbps >= to)
+        {
+            self.stop_regrow("reached");
+        }
+        // After `settle`: legacy's reading is at least this report's estimate, as 0.6.3's.
         self.measured = match self.legacy {
             false => m
                 .delivered_kbps
@@ -882,14 +921,6 @@ impl Estimator {
                 .filter(|&(r, s)| m.fresh && !app_limited && r < LINK_LIMITED * s)
                 .map(|(r, _)| self.estimate_kbps.max(BETA * r)),
         };
-        let was = self.estimate_kbps;
-        self.settle();
-        if self
-            .recover_to
-            .is_some_and(|(to, _)| self.estimate_kbps >= to)
-        {
-            self.stop_regrow("reached");
-        }
         let due = self.log_due(now)
             && (self.unlogged.is_some() || self.bound != self.logged.0 || self.measured.is_some());
         if !cut_by.is_empty() || due {
@@ -1154,20 +1185,22 @@ impl Estimator {
                 .then(|| (bytes - u64::from(first.1)) as f64 * 8.0 * 1000.0 / span as f64)
         };
         let rate_kbps = rate(|a| a.0, MIN_RATE_SPAN_US);
-        // Rule 2's delivered rate (#1433): the arrival span less the excess of its single largest
-        // arrival gap over the send gap between the same two datagrams. A delay step or a blackout
-        // leaves one such gap; a deep buffer stretches every gap, and keeps its shortfall.
+        // Rule 2's delivered rate (#1433): the arrival span less the `GAPS_TAKEN_OUT` largest
+        // excesses of an arrival gap over the send gap between the same two datagrams, not the
+        // largest arrival gaps: an unpaced frame's gap can be longer than a step inside a burst.
+        // A delay step or a blackout leaves one such gap; a deep buffer stretches every gap, and
+        // keeps its shortfall.
         let mut gap_us = 0;
         let delivered_kbps = rate_kbps.and_then(|r| {
             let mut order: Vec<(u64, u64)> =
                 self.arrivals.iter().map(|&(t, _, s)| (t, s)).collect();
             order.sort_unstable();
-            gap_us = order
+            let mut excess: Vec<u64> = order
                 .windows(2)
-                .max_by_key(|w| w[1].0 - w[0].0)
-                .map_or(0, |w| {
-                    (w[1].0 - w[0].0).saturating_sub(w[1].1.saturating_sub(w[0].1))
-                });
+                .map(|w| (w[1].0 - w[0].0).saturating_sub(w[1].1.saturating_sub(w[0].1)))
+                .collect();
+            excess.sort_unstable_by(|a, b| b.cmp(a));
+            gap_us = excess.iter().take(GAPS_TAKEN_OUT).sum();
             let span = order.last()?.0 - order.first()?.0;
             (span > gap_us).then(|| r * span as f64 / (span - gap_us) as f64)
         });
@@ -1340,9 +1373,14 @@ pub(crate) struct PyroRate {
 }
 
 impl PyroRate {
-    pub(crate) fn new(target_kbps: u32, floor_kbps: u32, now: Instant) -> Self {
+    /// `legacy`: `QUASAR_WT_CAPACITY=legacy`, 0.6.3's estimator.
+    pub(crate) fn new(target_kbps: u32, floor_kbps: u32, now: Instant, legacy: bool) -> Self {
         Self {
-            estimator: Estimator::new(f64::from(target_kbps), now),
+            estimator: Estimator {
+                legacy,
+                persist: false,
+                ..Estimator::new(f64::from(target_kbps), now)
+            },
             log: SendLog::new(now),
             target_kbps: f64::from(target_kbps),
             floor_kbps: f64::from(floor_kbps),
