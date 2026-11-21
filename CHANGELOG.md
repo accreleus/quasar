@@ -26,6 +26,8 @@ own; the two do not move together, and that is deliberate.
 
 ### Upgrading
 - Callers of `make e2e-post` must now supply operator leak-scan patterns, including for dry runs (`DRY_RUN=1`). Use `LEAK_SCAN_OPERATOR_PATTERNS` or `LEAK_SCAN_PATTERNS_FILE`. See [posting in the E2E suite guide](docs/testing-e2e-suite.md#what-the-host-half-adds).
+### Added
+- **The end-to-end suite's `builds.json` now names the web client and the encoder (#1281).** The web build carries its commit and build time (bench mode reports them as `window.__qBench.build()`), and `e2e-collect` adds the negotiated encoder from the session's `caps.negotiated` event; `reference_app` and `gpu_driver` stay `null` with a reason: nothing ties either to the session (the host policy preview names a candidate GPU's driver, not the session's).
 
 ### Changed
 - Dependency updates

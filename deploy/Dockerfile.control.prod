@@ -39,6 +39,11 @@ COPY deploy/enroll-host.sh /deploy/
 # `tsc -b` typechecks the tests too, and the PyroWave decoder test imports the fixture
 # manifest from the repo root (#1105). Only the manifest: the fixtures are read at test time.
 COPY testdata/pyrowave/manifest.json /testdata/pyrowave/
+# The web build's identity (#1281): web/vite.config.ts bakes these in and bench mode reports
+# them (window.__qBench.build()). Declared last so a changed commit or time reruns only the
+# build, not `npm ci`. build-images.sh and the images workflow pass both (#107).
+ARG SOURCE_COMMIT=unknown
+ARG BUILT_AT=unknown
 RUN npm run build
 
 # ── Go build stage ────────────────────────────────────────────────────────────
