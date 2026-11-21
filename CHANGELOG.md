@@ -24,6 +24,8 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Upgrading
+- Callers of `make e2e-post` must now supply operator leak-scan patterns, including for dry runs (`DRY_RUN=1`). Use `LEAK_SCAN_OPERATOR_PATTERNS` or `LEAK_SCAN_PATTERNS_FILE`. See [posting in the E2E suite guide](docs/testing-e2e-suite.md#what-the-host-half-adds).
 ### Added
 - **The end-to-end suite's `builds.json` now names the web client and the encoder (#1281).** The web build carries its commit and build time (bench mode reports them as `window.__qBench.build()`), and `e2e-collect` adds the negotiated encoder from the session's `caps.negotiated` event; `reference_app` and `gpu_driver` stay `null` with a reason: nothing ties either to the session (the host policy preview names a candidate GPU's driver, not the session's).
 
@@ -35,6 +37,7 @@ own; the two do not move together, and that is deliberate.
 - **E2E fallback/input scenarios and bundle credential checks tighten lock-log isolation, honest lock wording, surface/move-log guards and glued credential names (#1343).** `input-kbm` starts its page recorder after pointer lock settles so lock clicks stay out of `input-sent.json`, states only the observed wait and unknown cause when no "Click to play" layer appears, and guards unreadable or throwing move logs as `pass: null`; `transport-fallback` records freeze as `null` with a reason (never `0`) when no visible `<video>`/canvas surface exists at the fault; and `bundle.mjs` flags glued credential names (`accessToken=`, `authtoken=`, `myApiKey=`) linearly without breaking prose exemptions.
 
 ### Fixed
+- WebTransport keeps its initial 100 ms video repair estimate until the first retransmission is measured, so a faster control-stream pong no longer causes premature repeat NACKs or keyframe requests (#1436).
 - End-to-end review anchors hitch warm-up on browser telemetry, and collection accepts a diagnostic read with exactly 1,000 raw samples when its event responses are below the cap.
 - End-to-end collection now splits capped trace reads by raw sample count, validates session and host setting vocabularies, and shows each collected window's verdict in offline diagnoses (#1331).
 - WebTransport repeat NACK timing now waits on the longer of the smoothed control-stream path round trip that caps the reorder window and the measured repair round trip, avoiding premature duplicate NACKs on congested links (#1436).

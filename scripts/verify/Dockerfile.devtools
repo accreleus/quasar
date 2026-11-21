@@ -1,5 +1,5 @@
 ARG GO_IMAGE=golang:1.26.8-bookworm
-ARG NODE_IMAGE=node:22.22.0-bookworm
+ARG NODE_IMAGE=node:22.23.5-bookworm
 # Must stay >= deploy/pins.env RUST_VERSION: the node-agent's locked deps
 # (gstreamer-rs 0.25 / glib 0.22) carry an MSRV, and a lower pin fails
 # `cargo clippy` at RESOLUTION with "rustc X is not supported", before it
