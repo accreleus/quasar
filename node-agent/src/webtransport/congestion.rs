@@ -1141,7 +1141,9 @@ impl Estimator {
             gap_us = order
                 .windows(2)
                 .max_by_key(|w| w[1].0 - w[0].0)
-                .map_or(0, |w| (w[1].0 - w[0].0).saturating_sub(w[1].1.saturating_sub(w[0].1)));
+                .map_or(0, |w| {
+                    (w[1].0 - w[0].0).saturating_sub(w[1].1.saturating_sub(w[0].1))
+                });
             let span = order.last()?.0 - order.first()?.0;
             (span > gap_us).then(|| r * span as f64 / (span - gap_us) as f64)
         });
@@ -1209,12 +1211,7 @@ impl Estimator {
     /// side (a 60–300 ms drop: the client's NACK and keyframe request repair it). Anything
     /// else is its losses: a run open `RUN_MAX_WAIT` or more is loss whatever closes it, since
     /// hiding congestion as a blackout is the dangerous mistake. Returns the losses counted.
-    fn end_run(
-        &mut self,
-        log: &mut SendLog,
-        at_floor: Option<bool>,
-        now: Instant,
-    ) -> i64 {
+    fn end_run(&mut self, log: &mut SendLog, at_floor: Option<bool>, now: Instant) -> i64 {
         let expired = self.run_expired(now);
         let run = std::mem::take(&mut self.evidence.run);
         let sent = |seq: &u32| log.peek(*seq).map(|s| s.sent_us);
@@ -1345,8 +1342,7 @@ impl PyroRate {
         path: QuicPath,
     ) -> PyroVerdict {
         self.judged_from.get_or_insert(now);
-        self.estimator
-            .on_feedback(fb, &mut self.log, now, path);
+        self.estimator.on_feedback(fb, &mut self.log, now, path);
         self.judge(now, path)
     }
 

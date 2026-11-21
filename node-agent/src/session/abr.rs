@@ -1294,10 +1294,7 @@ mod tests {
         let base = Instant::now();
         let mut g = Governor::new(per_report(0), base);
         g.observe_report(Some(8600.0), ms(base, 0));
-        assert_eq!(
-            g.observe_report(Some(8600.0), ms(base, 100)),
-            Some(8600)
-        );
+        assert_eq!(g.observe_report(Some(8600.0), ms(base, 100)), Some(8600));
         assert_eq!(
             g.observe_report(Some(8600.0), ms(base, 200)),
             None,
@@ -1369,10 +1366,7 @@ mod tests {
         let mut g = Governor::new(per_report(0), base);
         g.observe(10_000.0, ms(base, 0));
         g.observe_report(Some(2000.0), ms(base, 0));
-        assert_eq!(
-            g.observe_report(Some(2000.0), ms(base, 100)),
-            Some(2000)
-        );
+        assert_eq!(g.observe_report(Some(2000.0), ms(base, 100)), Some(2000));
         let (mut est, mut moves) = (2000.0f64, vec![2000u32]);
         for i in 2..300u64 {
             // The estimate climbs 34 %/s here, faster than the slew lets the setpoint.
@@ -1432,16 +1426,10 @@ mod tests {
             None,
             "1 s since the start"
         );
-        assert_eq!(
-            g.observe_report(Some(5000.0), ms(base, 1000)),
-            Some(5000)
-        );
+        assert_eq!(g.observe_report(Some(5000.0), ms(base, 1000)), Some(5000));
         g.observe_report(Some(2000.0), ms(base, 1100));
         assert_eq!(g.observe_report(Some(2000.0), ms(base, 1200)), None);
-        assert_eq!(
-            g.observe_report(Some(2000.0), ms(base, 2000)),
-            Some(2000)
-        );
+        assert_eq!(g.observe_report(Some(2000.0), ms(base, 2000)), Some(2000));
     }
 
     /// #1376 review R3: the silence decay is paced by `per_report` as well. With a 100 ms
@@ -1477,10 +1465,7 @@ mod tests {
         let base = Instant::now();
         let mut g = Governor::new(AbrConfig::new_smooth(1000, 10_000, 60), base);
         for i in 0..10 {
-            assert_eq!(
-                g.observe_report(Some(2000.0), ms(base, i * 100)),
-                None
-            );
+            assert_eq!(g.observe_report(Some(2000.0), ms(base, i * 100)), None);
         }
         assert_eq!(g.setpoint_kbps(), 10_000);
     }
