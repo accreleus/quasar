@@ -443,7 +443,7 @@ export class WebTransportMedia implements MediaTransport {
      *  is not the path, and its cap must not fall to 0 for a second (#1436). */
     let retransmitWindowMs = 0;
     let pathRttMs: number | null = null;
-    const router = this.makeRouter(sink, live, feedback, () => retransmitWindowMs - (pathRttMs ?? Infinity));
+    const router = this.makeRouter(sink, live, feedback, () => retransmitWindowMs, () => pathRttMs);
     /** Set once this attempt's datagram reader has failed: `datagrams: <name>: <message>`. */
     const datagramReader = { death: null as string | null };
     void this.readDatagrams(wt, sink, router, live, feedback, datagramReader).catch((err: unknown) => {
@@ -526,7 +526,9 @@ export class WebTransportMedia implements MediaTransport {
             const rtt = Math.max(0, this.now() - m.tc);
             // A longer sample at most doubles the estimate and a shorter one is averaged in at 1/8,
             // as the assembler's round trip is: a spike from one ping does not shrink the window.
-            pathRttMs = pathRttMs === null ? rtt : rtt > pathRttMs ? Math.min(rtt, 2 * pathRttMs) : (7 * pathRttMs + rtt) / 8;
+            // Floored at 1 ms so a 0 ms first pong cannot trap 2 * pathRttMs at 0 on later growth.
+            const sample = Math.max(1, rtt);
+            pathRttMs = pathRttMs === null ? sample : sample > pathRttMs ? Math.min(sample, 2 * pathRttMs) : (7 * pathRttMs + sample) / 8;
             sink.rtt?.(rtt, typeof m.tw === "number" ? m.tw : undefined);
           }
           else if (m.type === "ping") {
@@ -613,15 +615,21 @@ export class WebTransportMedia implements MediaTransport {
     }
   }
 
-  private makeRouter(sink: MediaSink, live: { on: boolean }, feedback: FeedbackRecorder, headroomMs: () => number): Router {
-    const assembler = new FrameAssembler(this.now, (now) => feedback.reorderMs(now));
+  private makeRouter(
+    sink: MediaSink,
+    live: { on: boolean },
+    feedback: FeedbackRecorder,
+    retransmitWindowMs: () => number,
+    pathRttMs: () => number | null,
+  ): Router {
+    const assembler = new FrameAssembler(this.now, (now) => feedback.reorderMs(now), pathRttMs);
     const configs = new Map<number, VideoConfig>();
     let latest: number | null = null;
     // A held first NACK reaches the agent one frame interval (until a later datagram shows the gap),
     // the hold and a round trip after the fragment was sent: all inside the retransmit window.
     feedback.capMs = () => {
       const fps = (latest !== null && configs.get(latest)?.fps) || 60;
-      return Math.min(MAX_REORDER_MS, headroomMs() - 1000 / fps);
+      return Math.min(MAX_REORDER_MS, retransmitWindowMs() - (pathRttMs() ?? Infinity) - 1000 / fps);
     };
     let pyro: PyroWaveReceiver | null = null;
     /** What the PyroWave receivers already replaced counted lost. */

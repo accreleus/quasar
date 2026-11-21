@@ -28,6 +28,7 @@ own; the two do not move together, and that is deliberate.
 - Dependency updates
 
 ### Fixed
+- WebTransport repeat NACK timing now uses the same smoothed control-stream path round trip that caps the reorder window instead of a separate repair round trip (#1436).
 - WebTransport input detects full writers, combines pending relative mouse deltas, and keeps the latest absolute position when datagrams back up. Pending relative motion goes out before the next button, key, scroll, or other input event (#1154).
 - WebTransport preserves session-ended and takeover close reasons during connection and keeps the WebRTC fallback cause visible after reload (#1478).
 - A failed start during warm Steam adoption immediately queues teardown of the new session (#768).
