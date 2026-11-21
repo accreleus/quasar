@@ -26,6 +26,7 @@ own; the two do not move together, and that is deliberate.
 
 ### Changed
 - Dependency updates
+- `make e2e-review` ranks `bench_n` (lowest) with accurate `offset_unknown` clock notes and control-plane-matching `is_hidden` handling, `stream-hold` captures `present_interval_sd_ms`, `present_interval_p95_ms`, and `is_hidden` from the page's own `/stats` posts so review anomaly rules run on client-only runner bundles without duplicating collected host samples, empty error messages always write a non-empty scenario reason, and `docs/testing-e2e-suite.md` and counter-rule comments are corrected (#1303).
 
 ### Fixed
 - WebTransport repeat NACK timing now waits on the longer of the smoothed control-stream path round trip that caps the reorder window and the measured repair round trip, avoiding premature duplicate NACKs on congested links (#1436).

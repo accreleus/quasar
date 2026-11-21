@@ -5,7 +5,7 @@
 //
 // A criterion with no evidence source today is `pass: null` and says what is missing; nothing is invented.
 import { check as holdCheck } from "./stream-hold.mjs";
-import { cannotRun, crit, finite, firstFrameCriterion, openCdp, keyEvent, play, probe, shotCovered, signIn, skipped, takeLock, verdict, waitFirstFrame, watchApiErrors } from "./stream-common.mjs";
+import { cannotRun, crit, errorReason, finite, firstFrameCriterion, openCdp, keyEvent, play, probe, shotCovered, signIn, skipped, takeLock, verdict, waitFirstFrame, watchApiErrors } from "./stream-common.mjs";
 
 export const name = "transport-fallback";
 export const HOOK = "fault:webtransport-block";
@@ -111,8 +111,8 @@ export default {
         rec.step("key-released", { code: KEY.code, by });
         return true;
       } catch (err) {
-        rec.step("key-release-failed", { code: KEY.code, message: String(err?.message ?? err) });
-        cleanup.push(`key ${KEY.code} could not be released (${String(err?.message ?? err)})`);
+        rec.step("key-release-failed", { code: KEY.code, message: errorReason(err) });
+        cleanup.push(`key ${KEY.code} could not be released (${errorReason(err)})`);
         return false;
       }
     };
@@ -229,7 +229,7 @@ export default {
       result = { criteria: judge({ params, firstFrameS, seen }), clock_offset_ms: null };
       if (seen.row && TERMINAL.includes(seen.row.state)) result = { ...result, status: "error", reason: `the session ended during the run (it was ${seen.row.state} before this run stopped it)` };
     } catch (err) {
-      const message = String(err?.message ?? err);
+      const message = errorReason(err);
       if (rec.holding) rec.pageStep("error", { message });
       else rec.step("error", { message });
       result = { status: "error", reason: rec.holding ? `${stage} did not complete (the page's own words are not written before its sign-in is read)` : message, criteria: [], clock_offset_ms: null };

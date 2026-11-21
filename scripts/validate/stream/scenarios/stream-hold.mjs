@@ -6,7 +6,7 @@
 // thresholds, secrets, now(), clockOffset(), sleep(ms) }.
 // Returns { status, reason?, criteria, clock_offset_ms }; the runner owns the sessions (ctx.launches) and their cleanup.
 import { benchRows } from "../benchfold.mjs";
-import { cannotRun, CODEC_LABEL, crit, FIRST_FRAME_LIMIT_S, finite, firstFrameCriterion, play, probe, REVEALED, shotCovered, shown, signIn, skipped, verdict, watchApiErrors } from "./stream-common.mjs";
+import { cannotRun, CODEC_LABEL, crit, errorReason, FIRST_FRAME_LIMIT_S, finite, firstFrameCriterion, play, probe, REVEALED, shotCovered, shown, signIn, skipped, verdict, watchApiErrors } from "./stream-common.mjs";
 
 export { FIRST_FRAME_LIMIT_S, REVEALED, shotCovered, verdict };
 
@@ -19,6 +19,54 @@ const INSTRUMENT_MIN_SHARE = 0.9;
 
 const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
 const sd = (xs) => Math.sqrt(mean(xs.map((x) => (x - mean(xs)) ** 2)));
+
+const STATS_POST = /^\/v1\/sessions\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/stats$/i;
+// The three manifest keys `review.mjs`'s anomaly rules read from browser telemetry rows.
+const STATS_KEYS = ["present_interval_sd_ms", "present_interval_p95_ms", "is_hidden"];
+
+/**
+ * Projects the three review-checked cadence/visibility keys from a `POST /v1/sessions/{id}/stats`
+ * request body (`{ samples: [{ ts_unix_ms, metrics: { ... } }] }`, web/src/{webrtc,webtransport}/telemetry.ts
+ * and control-plane/internal/session/metrics_handler.go). Keeps only finite numbers for STATS_KEYS,
+ * never copies free text or unknown keys, and drops samples carrying none of them.
+ */
+export function statsSamples(postData) {
+  let body;
+  try { body = JSON.parse(postData); } catch { return []; }
+  if (!body || typeof body !== "object" || !Array.isArray(body.samples)) return [];
+  const out = [];
+  for (const s of body.samples) {
+    if (!s || typeof s !== "object" || !finite(s.ts_unix_ms) || !s.metrics || typeof s.metrics !== "object" || Array.isArray(s.metrics)) continue;
+    const metrics = {};
+    for (const k of STATS_KEYS) {
+      if (Object.hasOwn(s.metrics, k) && finite(s.metrics[k])) metrics[k] = s.metrics[k];
+    }
+    if (!Object.keys(metrics).length) continue;
+    out.push({ kind: "metric", source: "browser", ts_unix_ms: Math.trunc(s.ts_unix_ms), metrics });
+  }
+  return out;
+}
+
+/** Filters captured `/stats` rows to `sid` and deduplicates by `ts_unix_ms` (first value per key wins). */
+function dedupStatsRows(entries, sid) {
+  const want = sid.toLowerCase();
+  const byTs = new Map();
+  const out = [];
+  for (const { session, row } of entries) {
+    if (session !== want) continue;
+    const existing = byTs.get(row.ts_unix_ms);
+    if (!existing) {
+      const copy = { ...row, metrics: { ...row.metrics } };
+      byTs.set(row.ts_unix_ms, copy);
+      out.push(copy);
+    } else {
+      for (const [k, v] of Object.entries(row.metrics)) {
+        if (!Object.hasOwn(existing.metrics, k)) existing.metrics[k] = v;
+      }
+    }
+  }
+  return out;
+}
 
 /** What a plan entry's params may hold; all but `app` and `bench`/`cover_qr` have a default (docs/testing-e2e-suite.md lists them). */
 export const PARAM_KEYS = ["transport", "codec", "profile", "hold_s", "app", "bench", "cover_qr"];
@@ -151,6 +199,18 @@ export default {
 
     // The sessions this run owns are the runner's to track and stop (ctx.launches): a page address never adds one.
     const pending = watchApiErrors(page, ctx);
+    // Capture the page's own cadence/visibility samples from POST /v1/sessions/{id}/stats on the stack's origin
+    // (a read of the request the page already sends, attached before play() so nothing is missed).
+    const origin = new URL(ctx.baseUrl).origin;
+    const postedStats = [];
+    page.on("request", (q) => {
+      let u;
+      try { u = new URL(q.url()); } catch { return; }
+      const m = u.origin === origin && q.method() === "POST" ? STATS_POST.exec(u.pathname) : null;
+      if (!m) return;
+      const session = m[1].toLowerCase();
+      for (const row of statsSamples(q.postData?.() ?? "")) postedStats.push({ session, row });
+    });
 
     let result;
     // What step the run is in, for the one reason that may be written before the page's bearer is known (see the catch).
@@ -218,7 +278,7 @@ export default {
       const stats = await page.evaluate(() => window.__qBench?.stats() ?? null);
       rec.json("bench-windows.json", { windows });
       rec.json("bench-frames.json", { frames });
-      rec.jsonl("metrics.jsonl", benchRows(windows, 0));
+      rec.jsonl("metrics.jsonl", [...benchRows(windows, 0), ...dedupStatsRows(postedStats, sid)]);
 
       const row = await api.session(sid);
       if (!row || row.id !== sid) throw new Error("the API no longer returns the session this run started");
@@ -235,7 +295,7 @@ export default {
     } catch (err) {
       // Until the page's bearer is known, an error's words (Playwright quotes the page's address and text) are held like any
       // other page output, and the reason that is written is a fixed one for the step that failed.
-      const message = String(err?.message ?? err);
+      const message = errorReason(err);
       if (rec.holding) rec.pageStep("error", { message });
       else rec.step("error", { message });
       result = { status: "error", reason: rec.holding ? `${stage} did not complete (the page's own words are not written before its sign-in is read)` : message, criteria: [], clock_offset_ms: null };
