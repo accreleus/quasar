@@ -4461,7 +4461,10 @@ fn burst_loss_of_60_to_300_ms_moves_nothing() {
         s.drop_every = 0;
     }
     s.run(5.0);
-    let cut = s.loss_bounds.iter().find(|&&(t, k)| t >= 5.0 && k < CEILING);
+    let cut = s
+        .loss_bounds
+        .iter()
+        .find(|&&(t, k)| t >= 5.0 && k < CEILING);
     assert!(cut.is_none(), "a loss cut: {cut:?}");
     let down = s.rates.windows(2).find(|w| w[1].1 < w[0].1);
     assert!(down.is_none(), "the ABR moved down: {down:?}");

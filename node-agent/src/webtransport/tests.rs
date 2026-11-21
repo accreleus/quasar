@@ -1571,7 +1571,10 @@ async fn through(
 ) -> (Session, SendStream, RecvStream) {
     let port = relay(agent.url.port().unwrap(), impair).await;
     agent.url.set_port(Some(port)).unwrap();
-    let session = client_with(|_| {}).connect(agent.url.clone()).await.unwrap();
+    let session = client_with(|_| {})
+        .connect(agent.url.clone())
+        .await
+        .unwrap();
     let (session, send, recv, reply) = hello_over(session, TOKEN, json!({"fec": []})).await;
     assert_eq!(reply["type"], "hello_ack");
     (session, send, recv)
