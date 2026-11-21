@@ -289,7 +289,7 @@ impl<'a> Control<'a> {
         }
         let loss = self
             .estimator
-            .loss()
+            .excess_loss()
             .filter(|_| report && !self.estimator.legacy);
         let setpoint = (self.rate.setpoint_kbps)();
         (self.rate.observe)(congestion::abr_estimate(kbps, self.charged, loss, setpoint));

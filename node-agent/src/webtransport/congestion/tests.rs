@@ -520,7 +520,7 @@ impl Sim {
                 let share = 1.0 + self.fec_share;
                 abr.observe_report(self.est.measured().map(|r| r / share), at);
                 let setpoint = f64::from(abr.setpoint_kbps());
-                let fed = abr_estimate(kbps, self.fec_share, self.est.loss(), setpoint);
+                let fed = abr_estimate(kbps, self.fec_share, self.est.excess_loss(), setpoint);
                 abr.observe(fed, at);
             }
             let setpoint = self
@@ -4351,8 +4351,8 @@ fn a_shallow_buffer_steps_the_rung_down_without_a_stall() {
         longest >= crate::session::ladder::LadderPlanner::RATE_CONFIRM.as_secs_f64(),
         "the rung would never step down: under the line {longest:.2} s at most"
     );
-    // The design's 2 %, with room for the sim's keyframe a second: 2.4 % here, 5.2 % with no
-    // persistence cut (`LOSS_PERSIST`).
+    // 2.5 %: the design's 2 % plus room for the sim's keyframe a second. 2.4 % here, 5.2 % with
+    // no persistence cut (`LOSS_PERSIST`).
     assert!(
         s.loss_after(15.0) <= 0.025,
         "loss {:.3}",
@@ -4380,7 +4380,7 @@ fn a_policer_steps_down_until_its_loss_ends() {
         s.stalls,
         s.loss_after(20.0)
     );
-    // As the shallow buffer's: 2.1 % here, 6.2 % with no persistence cut.
+    // 2.5 %, as the shallow buffer's: 2.1 % here, 6.2 % with no persistence cut.
     assert!(
         s.loss_after(20.0) <= 0.025,
         "loss {:.3}",
@@ -4852,4 +4852,142 @@ fn a_deep_buffer_keeps_the_links_queue_short_for_audio() {
     // guard stalls in the first 3 s.
     assert!(at(0.95) <= 60 && at(1.0) <= 100, "p95 {} ms", at(0.95));
     assert!(s.stalls.is_empty(), "stalls {:?}", s.stalls);
+}
+
+/// One run of random i.i.d. loss `p` on a 50 Mbit/s link, FEC 0.1, the real ABR and stall guard:
+/// (setpoint at the end, the estimate's minimum after 5 s, stall times).
+fn random_loss_run(p: f64, secs: f64) -> (u32, f64, Vec<f64>) {
+    let mut s = Sim::new(50_000.0).with_abr().with_guard();
+    s.quic = Some(Quic::default());
+    s.keyframe_every = 60;
+    s.fec_share = 0.1;
+    s.loss_at = Box::new(move |_| p);
+    s.run(secs);
+    let end = s.setpoints.last().map_or(0, |&(_, sp)| sp);
+    (end, s.min_after(5.0), s.stalls)
+}
+
+/// Random 3–6 % loss on an uncapped link (Wi-Fi) is no congestion: at the end of 180 s the
+/// setpoint is within 0.9 × of what 0.6.3 holds there (the ceiling less the FEC share, 7273), with
+/// no stall. Reading every random loss as a shortfall: 6665, 4872, 3864, 1685.
+#[test]
+fn random_loss_of_3_to_6_percent_on_an_uncapped_link_keeps_the_setpoint() {
+    let held = CEILING / 1.1;
+    let mut rows = Vec::new();
+    for p in [0.03, 0.04, 0.05, 0.06] {
+        let (end, low, stalls) = random_loss_run(p, 180.0);
+        eprintln!("loss {p}: setpoint end {end}, estimate min {low:.0}, stalls {stalls:?}");
+        rows.push((p, end, low, stalls));
+    }
+    for (p, end, _, stalls) in &rows {
+        assert!(f64::from(*end) >= 0.9 * held, "loss {p}: setpoint {end}");
+        assert!(stalls.is_empty(), "loss {p}: stalls {stalls:?}");
+    }
+}
+
+/// 90 s on a 50 Mbit/s link losing `p` at random, FEC 0.1, the real ABR and stall guard, then a
+/// 5 Mbit/s cap (256 kB buffer) for 60 s: (the loss floor at the cap, when video plus FEC first
+/// fit the cap, stall times after the cap).
+fn random_loss_then_cap(p: f64) -> (f64, Option<f64>, Vec<f64>) {
+    const CAP: f64 = 5000.0;
+    let mut s = Sim::new(50_000.0).with_abr().with_guard();
+    s.quic = Some(Quic::default());
+    s.keyframe_every = 60;
+    s.fec_share = 0.1;
+    s.loss_at = Box::new(move |_| p);
+    s.run(90.0);
+    let floor = s.est.loss_floor();
+    s.cap_kbps = CAP;
+    s.run(60.0);
+    let under = s
+        .setpoints
+        .iter()
+        .find(|&&(t, sp)| t >= 90.0 && f64::from(sp) * (1.0 + s.fec_share) <= CAP)
+        .map(|&(t, _)| t);
+    let stalls = s.stalls.into_iter().filter(|&t| t >= 90.0).collect();
+    (floor, under, stalls)
+}
+
+/// Random 3 % loss, then a real cap: the loss floor the random loss earned does not hide the cap.
+/// The sender fits under it as fast as on a link with no random loss (within 1 s), and stalls no
+/// more than that link's cap step does (the drain-and-climb transient of a step into a deep
+/// buffer: 6 stalls there).
+#[test]
+fn random_loss_then_a_real_cap_still_steps_down_to_the_cap() {
+    let (floor, under, stalls) = random_loss_then_cap(0.03);
+    let (_, clean_under, clean_stalls) = random_loss_then_cap(0.0);
+    eprintln!(
+        "3 %: floor {floor:.4}, under the cap at {under:?} s, stalls {stalls:?}; \
+         no random loss: under at {clean_under:?} s, stalls {clean_stalls:?}"
+    );
+    assert!(floor >= 0.02, "no floor before the cap: {floor:.4}");
+    assert!(
+        under.is_some_and(|t| t <= 91.0),
+        "under the cap at {under:?} s"
+    );
+    assert!(under <= clean_under, "{under:?} after {clean_under:?}");
+    assert!(stalls.len() <= clean_stalls.len(), "stalls {stalls:?}");
+}
+
+/// S1 (#1433 round 2): a cut over `LOSS_HIGH` ends the persistent run, and the run that follows
+/// keeps nothing of it: its clean-window memory starts empty. 3 % @ 8000, 1 % @ 8000 (a clean
+/// window of the run), 20 % @ 8000 (cut to 7200), then 4 s of 5 % at a 4000 receive rate: the
+/// persistence cut takes the estimate under 7200. Old code: floored at the old run's 8000, no
+/// cut.
+#[test]
+fn a_cut_over_the_cut_line_ends_the_runs_clean_memory() {
+    let start = Instant::now();
+    let mut est = Estimator::new(CEILING, start);
+    let report = |kbps: f64, loss: f64| Measured {
+        usage: Usage::Normal,
+        rate_kbps: Some(kbps),
+        delivered_kbps: Some(kbps),
+        gap_us: 0,
+        sent_kbps: Some(kbps / (1.0 - loss)),
+        fresh: true,
+        loss: Some(loss),
+    };
+    let mut at = start;
+    let mut step = |est: &mut Estimator, m: Measured| {
+        at += Duration::from_millis(100);
+        est.apply(m, at, NO_QUIC);
+    };
+    step(&mut est, report(8000.0, 0.03));
+    step(&mut est, report(8000.0, 0.01));
+    step(&mut est, report(8000.0, 0.20));
+    assert_eq!(est.estimate_kbps(), 7200.0);
+    for _ in 0..40 {
+        step(&mut est, report(4000.0, 0.05));
+    }
+    assert!(est.estimate_kbps() < 7200.0, "{:.0}", est.estimate_kbps());
+}
+
+/// N2 (#1433 round 2): an outage ends the persistent run. 1.4 s of 3 % loss, an outage, and a
+/// lossy report 0.8 s after the last: a new run, no persistence cut. Old code: the run went on
+/// from before the outage and the first report after it cut.
+#[test]
+fn an_outage_ends_the_persistent_run() {
+    let start = Instant::now();
+    let mut est = Estimator::new(CEILING, start);
+    let mut log = SendLog::new(start);
+    let report = Measured {
+        usage: Usage::Normal,
+        rate_kbps: Some(2000.0),
+        delivered_kbps: Some(2000.0),
+        gap_us: 0,
+        sent_kbps: Some(2000.0 / 0.97),
+        fresh: true,
+        loss: Some(0.03),
+    };
+    let at = |ms: u64| start + Duration::from_millis(ms);
+    for ms in (100..=1500).step_by(100) {
+        est.apply(report, at(ms), NO_QUIC);
+    }
+    est.last_feedback = Some(at(1500));
+    log.record(&video_datagram(0), at(1500), false);
+    est.on_tick(at(2200), &log, RTT);
+    assert!(est.outage.is_some(), "no outage detected");
+    let before = est.loss_kbps;
+    est.apply(report, at(2300), NO_QUIC);
+    assert_eq!(est.loss_kbps, before, "the run before the outage cut");
 }

@@ -111,6 +111,15 @@ const LOSS_DECREASE_GAP: Duration = Duration::from_millis(300);
 const LOSS_PERSIST: Duration = Duration::from_secs(2);
 const LOSS_RUN_GAP: Duration = Duration::from_secs(1);
 const LOSS_WINDOW: Duration = Duration::from_millis(500);
+/// v2's loss floor (`Estimator::floor_bin_closed`) is judged over the last `FLOOR_BINS` bins of
+/// at least `FLOOR_BIN` and `FLOOR_BIN_SAMPLES` datagrams each (16 s), from bins sent at
+/// `FLOOR_SPREAD` or less of the busiest one's rate.
+const FLOOR_BIN: Duration = Duration::from_secs(2);
+const FLOOR_BINS: usize = 8;
+const FLOOR_BIN_SAMPLES: i64 = 200;
+const FLOOR_SPREAD: f64 = 0.9;
+/// Loss at the lower rate this share of the higher rate's or more did not fall with it.
+const FLOOR_FLAT: f64 = 0.8;
 /// Fewer datagrams than this in the window decide nothing about loss.
 const LOSS_MIN_SAMPLES: i64 = 20;
 const MAX_LOSS_ENTRIES: usize = 64;
@@ -592,6 +601,11 @@ pub(crate) struct Estimator {
     /// v2: the highest receive rate a window of the current run delivered losing under
     /// `LOSS_LOW`, kbit/s.
     run_clean_kbps: f64,
+    /// v2: the open loss-floor bin (start, received, lost), the closed ones (datagrams a
+    /// second, loss), and the loss floor ([`Self::loss_floor`]).
+    floor_bin: Option<(Instant, i64, i64)>,
+    floor_bins: VecDeque<(f64, f64)>,
+    floor: f64,
     last_report: Option<Instant>,
     last_feedback: Option<Instant>,
     last_decay: Option<Instant>,
@@ -668,6 +682,9 @@ impl Estimator {
             last_loss_decrease: None,
             lossy: None,
             run_clean_kbps: 0.0,
+            floor_bin: None,
+            floor_bins: VecDeque::new(),
+            floor: 0.0,
             last_report: None,
             last_feedback: None,
             last_decay: None,
@@ -711,6 +728,57 @@ impl Estimator {
     /// path.
     pub(crate) fn loss(&self) -> Option<f64> {
         self.loss
+    }
+
+    /// Loss the link shows whatever the sender does (Wi-Fi), which v2 does not read as
+    /// congestion; 0 in legacy and for PyroWave. See [`Self::floor_bin_closed`].
+    fn loss_floor(&self) -> f64 {
+        match !self.legacy && self.persist {
+            true => self.floor,
+            false => 0.0,
+        }
+    }
+
+    /// The discriminator: congestion loss falls when the sender's rate falls, random loss does
+    /// not. The floor rises to the least loss of the last 16 s only when bins sent at
+    /// `FLOOR_SPREAD` or less of the busiest bin's rate lost `FLOOR_FLAT` of what the busier
+    /// bins did; any bin losing less lowers it at once. A link the sender overloads loses less
+    /// once the readings step it down, so it never grants a floor, and loss above the floor
+    /// still cuts the loss bound and gives a reading.
+    fn floor_bin_closed(&mut self, rate: f64, loss: f64) {
+        self.floor_bins.push_back((rate, loss));
+        if self.floor_bins.len() > FLOOR_BINS {
+            self.floor_bins.pop_front();
+        }
+        self.floor = self.floor.min(loss);
+        let top = self.floor_bins.iter().map(|b| b.0).fold(0.0, f64::max);
+        let mean = |low: bool| {
+            let v: Vec<f64> = self
+                .floor_bins
+                .iter()
+                .filter(|b| (b.0 <= FLOOR_SPREAD * top) == low)
+                .map(|b| b.1)
+                .collect();
+            (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
+        };
+        if let (FLOOR_BINS, Some(low), Some(high)) =
+            (self.floor_bins.len(), mean(true), mean(false))
+        {
+            if low >= FLOOR_FLAT * high {
+                let least = self
+                    .floor_bins
+                    .iter()
+                    .map(|b| b.1)
+                    .fold(LOSS_HIGH, f64::min);
+                self.floor = self.floor.max(least);
+            }
+        }
+    }
+
+    /// The window's loss over the loss floor: what the estimate's loss bound and the ABR's hold
+    /// (`abr_estimate`) read.
+    pub(crate) fn excess_loss(&self) -> Option<f64> {
+        self.loss.map(|l| (l - self.loss_floor()).max(0.0))
     }
 
     /// The ABR's only down path (#1376, rule 2 of #1433): `BETA` × what the link delivered,
@@ -833,9 +901,11 @@ impl Estimator {
             }
         }
 
+        let floor = self.loss_floor();
+        let excess = self.excess_loss();
         if self.legacy || !self.persist {
             self.lossy = None;
-        } else if self.loss.is_some_and(|l| l >= LOSS_LOW) {
+        } else if excess.is_some_and(|l| l >= LOSS_LOW) {
             self.lossy = Some((self.lossy.map_or(now, |(since, _)| since), now));
         } else if self
             .lossy
@@ -845,7 +915,7 @@ impl Estimator {
         }
         match (self.lossy, m.rate_kbps) {
             (None, _) => self.run_clean_kbps = 0.0,
-            (Some(_), Some(r)) if self.loss.is_none_or(|l| l < LOSS_LOW) => {
+            (Some(_), Some(r)) if excess.is_none_or(|l| l < LOSS_LOW) => {
                 self.run_clean_kbps = self.run_clean_kbps.max(r);
             }
             _ => {}
@@ -853,7 +923,7 @@ impl Estimator {
         let persisted = self.lossy.is_some_and(|(since, last)| {
             last == now && now.saturating_duration_since(since) >= LOSS_PERSIST
         });
-        match self.loss {
+        match excess {
             Some(loss) if loss > LOSS_HIGH || persisted => {
                 let gap = LOSS_DECREASE_GAP + path.rtt;
                 if self
@@ -874,6 +944,9 @@ impl Estimator {
                     self.last_loss_decrease = Some(now);
                     // A persistent run starts again; a cut over `LOSS_HIGH` spends it.
                     self.lossy = (loss <= LOSS_HIGH).then_some((now, now));
+                    if loss > LOSS_HIGH {
+                        self.run_clean_kbps = 0.0;
+                    }
                     if self.loss_kbps < self.estimate_kbps {
                         cut_by.push("loss");
                         // The link no longer carries what it did before the outage.
@@ -913,7 +986,10 @@ impl Estimator {
             false => m
                 .delivered_kbps
                 .zip(m.sent_kbps)
-                .filter(|&(d, s)| m.fresh && !app_limited && d < LINK_LIMITED * s)
+                .filter(|&(d, s)| {
+                    let floor = floor.min(m.loss.unwrap_or(0.0));
+                    m.fresh && !app_limited && d < (LINK_LIMITED - floor) * s
+                })
                 .map(|(d, _)| BETA * d),
             true => m
                 .rate_kbps
@@ -980,6 +1056,9 @@ impl Estimator {
                 from: self.reported_to.unwrap_or(seq),
                 by: log.next_seq,
             });
+            // Loss after the outage is a new run, judged on its own.
+            self.lossy = None;
+            self.run_clean_kbps = 0.0;
         }
         let from = self.last_decay.unwrap_or(sent + timeout);
         let steps = now.saturating_duration_since(from).as_secs_f64() / SILENCE_STEP.as_secs_f64();
@@ -1224,6 +1303,16 @@ impl Estimator {
         };
 
         if received != 0 || lost != 0 {
+            let bin = self.floor_bin.get_or_insert((now, 0, 0));
+            bin.1 += received;
+            bin.2 += lost;
+            let (since, r, l) = *bin;
+            let span = now.saturating_duration_since(since);
+            if span >= FLOOR_BIN && r + l >= FLOOR_BIN_SAMPLES {
+                self.floor_bin = None;
+                let n = (r + l) as f64;
+                self.floor_bin_closed(n / span.as_secs_f64(), l.max(0) as f64 / n);
+            }
             self.losses.push_back((now, received, lost));
             if self.losses.len() > MAX_LOSS_ENTRIES {
                 self.losses.pop_front();
@@ -1637,7 +1726,8 @@ pub(crate) fn governed_kbps(estimate: f64, setpoint: f64, charged: f64, floor: f
 }
 
 /// What the ABR is fed from an estimate, kbit/s of video: the estimate less the FEC share
-/// `charged`, and no more than the ABR's own setpoint while the window loses `LOSS_LOW` or more.
+/// `charged`, and no more than the ABR's own setpoint while the window loses `LOSS_LOW` or more
+/// over the loss floor (`loss`: [`Estimator::excess_loss`]).
 /// GCC holds at 2–10 % loss; an ABR fed the estimate climbed back over the link between a
 /// reading's steps (sim R4, `a_policer_steps_down_until_its_loss_ends`: up moves at 11–31 % loss).
 pub(crate) fn abr_estimate(kbps: f64, charged: f64, loss: Option<f64>, setpoint: f64) -> f64 {
