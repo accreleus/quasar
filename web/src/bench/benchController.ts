@@ -15,6 +15,8 @@
 import { decodeMarker } from "./marker_decode.js";
 import type { MarkerDecodeResult, MarkerImageData, MarkerLocation } from "./marker_decode.js";
 import { EVDEV } from "../input/evdev";
+import { WEB_BUILD } from "./webBuild";
+import type { WebBuild } from "./webBuild";
 import {
   FLAG_INPUT_ECHO,
   classifyIndexDelta,
@@ -116,6 +118,8 @@ export interface BenchDeps {
 export interface BenchHandle {
   enabled: true;
   pressKey: (code: string) => boolean;
+  /** The web build's own identity, for a suite run's builds.json (#1281). */
+  build: () => WebBuild;
   dump: () => { frames: BenchFrame[]; windows: BenchWindowPayload[] };
   windows: () => BenchWindowPayload[];
   stats: () => {
@@ -352,6 +356,7 @@ export class BenchController {
     return {
       enabled: true,
       pressKey: (code: string) => this.pressKey(code),
+      build: () => WEB_BUILD,
       dump: () => ({ frames: [...this.ring], windows: [...this.windowsOut] }),
       windows: () => [...this.windowsOut],
       stats: () => ({

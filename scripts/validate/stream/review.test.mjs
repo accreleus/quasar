@@ -622,6 +622,20 @@ test("a build component that says neither version nor commit prints from its sor
   assert.match(forward.md, /`other` `\{\\"a\\":2,\\"nested\\":\{\\"b\\":2,\\"y\\":1\},\\"z\\":1\}`/);
 });
 
+test("#1281 the review's Builds line names a reported web build by its commit and a negotiated encoder by its members, and a null by its reason", () => {
+  const dir = bundle();
+  edit(dir, "builds.json", (b) => ({
+    ...b,
+    components: { ...b.components, web: { commit: "0123456789abcdef0123456789abcdef01234567", built_at: "2026-11-21T01:02:03.000Z" }, encoder: { factory: "vulkanh264enc", codec: "h264", profile: "main", level: "4.2" }, gpu_driver: null },
+    unknown: { ...b.unknown, gpu_driver: "no API of the stack reports the GPU driver version (issue #1281)" },
+  }));
+  assert.equal(run(dir).status, 0);
+  const builds = JSON.parse(read(dir, "summary.json")).builds;
+  assert.equal(builds.find((x) => x.component === "web").build, "(0123456789abcdef0123456789abcdef01234567)");
+  assert.equal(builds.find((x) => x.component === "encoder").build, '{"codec":"h264","factory":"vulkanh264enc","level":"4.2","profile":"main"}');
+  assert.match(builds.find((x) => x.component === "gpu_driver").why, /no API of the stack reports the GPU driver version/);
+});
+
 test("a param named __proto__ reaches both files", () => {
   // A19: a plain `{}` accumulator loses the member. The bundle may carry the key.
   const dir = bundle();

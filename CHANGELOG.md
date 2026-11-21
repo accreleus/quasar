@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+- **The end-to-end suite's `builds.json` now names the web client and the encoder (#1281).** The web build carries its commit and build time (bench mode reports them as `window.__qBench.build()`), and `e2e-collect` adds the negotiated encoder from the session's `caps.negotiated` event; `reference_app` and `gpu_driver` stay `null` with a reason: nothing ties either to the session (the host policy preview names a candidate GPU's driver, not the session's).
+
 ### Changed
 - Dependency updates
 - E2E hooks stop their process group on a failed ledger write, share a recovery wait deadline, and record uncleared hook warnings in run bundles. E2E posting leak-scans run bundles and refuses ambiguous conditions or empty app slugs (#1341).

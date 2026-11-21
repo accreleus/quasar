@@ -47,7 +47,7 @@ const matches = (sel, classes) => {
 };
 
 /** A world holding the fake clock, the fake page's state and the fake API's record. */
-function world({ wins = windows(50), session = {}, failScreenshotAt = null, webtransport = true, noBench = false, refuse = false, noFrame = false, noSurface = false, revealed = false, stopFails = false, closeFails = false, noUrl = false, url = null, stats = { frames: 100, decoded: 100 }, videoRate = 60, hiddenBetween = null, skew = 0, extraFrames = null, loader = null, onPlay = null, bare = false, hooksDir = null, lockOnClick = true, hud = false, layerStays = false, lockDelayMs = 0, swallowMoves = false, layerAfterMs = 0, noLayer = false, keyUpFails = null, swallowKeyUp = null, fallbackDelayMs = 3000, fallbackReason = "stream_lost", noFallback = false } = {}) {
+function world({ wins = windows(50), session = {}, failScreenshotAt = null, webtransport = true, noBench = false, refuse = false, noFrame = false, noSurface = false, revealed = false, stopFails = false, closeFails = false, noUrl = false, url = null, stats = { frames: 100, decoded: 100 }, videoRate = 60, hiddenBetween = null, skew = 0, extraFrames = null, loader = null, onPlay = null, bare = false, hooksDir = null, lockOnClick = true, hud = false, layerStays = false, lockDelayMs = 0, swallowMoves = false, layerAfterMs = 0, noLayer = false, keyUpFails = null, swallowKeyUp = null, fallbackDelayMs = 3000, fallbackReason = "stream_lost", noFallback = false, webBuild = undefined } = {}) {
   const w = { cdp: [], listeners: {}, locked: false, lastX: null, lastY: null, videoStart: T0, hooksDir, faultSeenAt: null, t: T0, stopped: [], live: [], url: "about:blank", ls: new Map(), shots: 0, failScreenshotAt, calls: [], gone: new Set(), secrets: new Set(), handlers: {}, opened: [], closed: [], clicks: [], gotos: [], playAt: null, stageClicks: 0, layerClicks: 0, hudOpen: false, hudClicks: 0, lockAt: 0, noSurface };
   // The page's "Click to play" layer (SessionPage.tsx): raised some time after Play and removed by the FIRST click on it, whether or not that click
   // took the lock (handleClickToPlay); a click before it only opens the HUD shelf.
@@ -82,7 +82,7 @@ function world({ wins = windows(50), session = {}, failScreenshotAt = null, webt
     },
   };
   w.rows = rows;
-  const qbench = { pressKey: () => true, dump: () => ({ frames: noFrame ? [] : extraFrames ?? frames(wins.length), windows: noFrame ? [] : wins }), stats: () => (noFrame ? { frames: 0, decoded: 0 } : stats) };
+  const qbench = { ...(webBuild === undefined ? {} : { build: () => (typeof webBuild === "function" ? webBuild() : webBuild) }), pressKey: () => true, dump: () => ({ frames: noFrame ? [] : extraFrames ?? frames(wins.length), windows: noFrame ? [] : wins }), stats: () => (noFrame ? { frames: 0, decoded: 0 } : stats) };
   // A chainable fake locator: its element is enabled, and clicking "Play now" starts the session.
   const loc = (desc) => ({
     first: () => loc(desc),
@@ -1202,10 +1202,98 @@ test("B7: the manifest says when the runner's tracked files differ from its comm
 });
 
 test("B8: builds.json says which builds e2e-collect fills and which it does not read yet", async () => {
-  const { dir } = await run(world());
+  const { dir, result } = await run(world());
+  assert.deepEqual(result.errors, []);
   const u = JSON.parse(read(dir, "builds.json")).unknown;
   for (const k of ["control_plane", "node_agent"]) assert.match(u[k], /e2e-collect\) fills this/);
-  for (const k of ["web", "gpu_driver", "reference_app"]) assert.equal(u[k], "the client cannot see it, and e2e-collect does not read it yet");
+  assert.match(u.encoder, /e2e-collect\) fills this from the session's caps.negotiated/);
+  assert.match(u.web, /no page reported a web build/);
+  for (const k of ["gpu_driver", "reference_app"]) assert.match(u[k], /no session-bound API field|nothing collects it/);
+});
+
+const WEB = { commit: "0123456789abcdef0123456789abcdef01234567", built_at: "2026-11-21T01:02:03.000Z" };
+
+test("#1281: the web build the page reports through bench mode is written, and then it needs no reason", async () => {
+  const { dir, result } = await run(world({ webBuild: { ...WEB, commit: WEB.commit.toUpperCase(), built_at: "2026-11-21T11:02:03+10:00" } }));
+  assert.deepEqual(result.errors, []);
+  const builds = JSON.parse(read(dir, "builds.json"));
+  assert.deepEqual(builds.components.web, WEB, "lower-case commit, ISO UTC time");
+  assert.equal("web" in builds.unknown, false);
+  assert.equal("web_build" in JSON.parse(read(dir, "manifest.json")), false, "only a WEB_DIST run names a served build");
+  assert.equal("web_build" in JSON.parse(read(dir, "01-stream-hold/scenario.json")), false, "the scenario's own file does not carry it");
+});
+
+test("#1281: a web build that is not a commit and an ISO time, or an unstamped one, is not written (null, with its reason)", async () => {
+  for (const bad of [{ commit: "unknown", built_at: "unknown" }, { commit: "main", built_at: WEB.built_at }, { commit: WEB.commit, built_at: "yesterday" }, "text", [WEB], null]) {
+    const { dir, result } = await run(world({ webBuild: bad }));
+    assert.deepEqual(result.errors, [], JSON.stringify(bad));
+    const builds = JSON.parse(read(dir, "builds.json"));
+    assert.equal(builds.components.web, null, JSON.stringify(bad));
+    assert.match(builds.unknown.web, /no page reported a web build/);
+  }
+});
+
+test("#1281: two scenarios that saw different web builds name neither", async () => {
+  let n = 0;
+  const { dir, result } = await run(world({ webBuild: () => (++n === 1 ? WEB : { ...WEB, commit: "fedcba9876543210fedcba9876543210fedcba98" }) }), PLAN({}, {}));
+  assert.deepEqual(result.errors, []);
+  const builds = JSON.parse(read(dir, "builds.json"));
+  assert.equal(builds.components.web, null);
+  assert.match(builds.unknown.web, /different web builds/);
+});
+
+test("#1281: every scenario kind hands its page's web build back, and a scenario with none does not disagree with those that have one", async () => {
+  const input = await runReal(world({ wins: echoWindows([40, 50, 60]), webBuild: WEB }), INPUT());
+  assert.deepEqual(JSON.parse(read(input.dir, "builds.json")).components.web, WEB, "input-kbm");
+  const fb = fallbackWorld({ webBuild: WEB });
+  const fallback = await runReal(fb.w, FALLBACK("mid"), { hooksDir: fb.hooksDir });
+  assert.deepEqual(JSON.parse(read(fallback.dir, "builds.json")).components.web, WEB, "transport-fallback");
+  // One scenario's page reports and the other's does not (an older web build): the suite names the one that did.
+  let n = 0;
+  const mixed = await run(world({ webBuild: () => (++n === 1 ? WEB : null) }), PLAN({}, {}));
+  assert.deepEqual(JSON.parse(read(mixed.dir, "builds.json")).components.web, WEB);
+});
+
+test("#1281: a report with a date and no time, a numeric commit, or a time with no zone is not a web build", async () => {
+  for (const bad of [{ commit: WEB.commit, built_at: "2026-11-21" }, { commit: 1234567, built_at: WEB.built_at }, { commit: WEB.commit, built_at: "2026-11-21T01:02:03" }, { commit: WEB.commit, built_at: 1763686923000 }]) {
+    const { dir } = await run(world({ webBuild: bad }));
+    assert.equal(JSON.parse(read(dir, "builds.json")).components.web, null, JSON.stringify(bad));
+  }
+});
+
+test("#1281: a report the recorder would change, or that cannot be written in the validator's form, leaves web null with its reason, and the bundle is kept", async () => {
+  const creds = { email: "ada@example.test", password: "correct-horse-battery" };
+  for (const [what, report, extra] of [
+    ["a commit that starts with the sign-in's name", { commit: "ada0123456789abcdef0123456789abcdef0123", built_at: WEB.built_at }, { creds }],
+    ["a year past 9999", { commit: WEB.commit, built_at: "9999-12-31T23:59:59-01:00" }, {}],
+    ["a year before 0000", { commit: WEB.commit, built_at: "-000001-01-01T00:00:00Z" }, {}],
+  ]) {
+    const { dir, result } = await run(world({ webBuild: report }), PLAN({}), extra);
+    assert.deepEqual(result.errors, [], what);
+    assert.equal(result.bundle, dir, `${what}: the bundle is kept`);
+    const builds = JSON.parse(read(dir, "builds.json"));
+    assert.equal(builds.components.web, null, what);
+    assert.match(builds.unknown.web, /did not survive recording|no page reported a web build/, what);
+  }
+  // Invariant: whatever is recorded for web is a value the validator accepts, for every report tried.
+  const sha = "0123456789abcdef0123456789abcdef01234567";
+  for (const report of [WEB, { commit: "ada", built_at: WEB.built_at }, { commit: "tester0", built_at: WEB.built_at }, { commit: "1234567", built_at: "0000-01-01T00:00:00Z" }, { commit: sha, built_at: "2026-11-21T01:02:03.123456+10:00" }, { commit: sha, built_at: "2026-11-21T01:02Z" }, { commit: "ada", built_at: "9999-12-31T23:59:59.999Z" }]) {
+    for (const extra of [{}, { creds: { email: "ada@example.test", password: "correct-horse-battery" } }]) {
+      const { dir, result } = await run(world({ webBuild: report }), PLAN({}), extra);
+      assert.deepEqual(result.errors, [], JSON.stringify(report));
+      assert.deepEqual(validateBundle(dir), [], JSON.stringify(report));
+    }
+  }
+});
+
+test("#1281: a WEB_DIST run keeps naming its served build by digest, whatever the page reports", async () => {
+  const src = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-wd-"));
+  fs.writeFileSync(path.join(src, "index.html"), "<html></html>");
+  const webDist = loadWebDist(src);
+  const { dir, result } = await run(world({ webBuild: WEB }), PLAN({}), { webDist });
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(JSON.parse(read(dir, "builds.json")).components.web, { source: "web-dist", sha256: webDist.sha256, files: 1 });
+  fs.rmSync(src, { recursive: true, force: true });
 });
 
 test("WEB_DIST: the bundle says which web build was served (digest and count, no path), and a run without it is as before", async () => {
