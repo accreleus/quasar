@@ -117,11 +117,13 @@ func homeHoldRefusal(ctx context.Context, tx pgx.Tx, holder, claimHost, claimApp
 	var kind string
 	var released, shares bool
 	// A hold on a runtime that a row adopts answers as that row while it lives.
-	// Once it ended unadopted the runtime is being released, timed from its end.
+	// Once it ended unadopted the runtime is being released, timed from its end, as is
+	// a failed adopter holding it with its stop in flight.
 	err := tx.QueryRow(ctx, `SELECT s.id::text, s.state, s.host_id::text,
 		COALESCE(h.status IN ('online','draining'), false),
 		COALESCE(a.ended_at, k.ended_at, k.updated_at) > now() - ($2::int * interval '1 second'), s.kind,
-		COALESCE(k.stop_reason = $3, false) OR a.id IS NOT NULL,
+		COALESCE(k.stop_reason = $3, false) OR a.id IS NOT NULL
+		  OR (k.state IN ('stopped','failed') AND k.adopt_session_id IS NOT NULL),
 		COALESCE(s.shared_home_app_id = $4::uuid, false)
 		FROM sessions k
 		LEFT JOIN sessions a ON a.adopt_session_id = k.id

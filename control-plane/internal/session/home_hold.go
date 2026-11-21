@@ -31,14 +31,14 @@ var errSwapSharedHoldLost = errors.New("the swap's shared Steam hold was release
 // row is allowed; a present row must still belong to the reporting host.
 // Claim rows are locked in canonical order and NULL-host claims stay held.
 func (s *Store) ClearQualifiedHomeHolds(ctx context.Context, hostID, sessionID string) error {
-	_, err := s.clearQualifiedHomeHolds(ctx, hostID, sessionID, "")
+	_, err := s.clearQualifiedHomeHolds(ctx, hostID, sessionID, nil)
 	return err
 }
 
 // clearQualifiedHomeHolds is ClearQualifiedHomeHolds reporting how many holds
-// it released. unprovenAdopter, when set, is a failed row adopting sessionID whose
-// stop is still in flight (Coordinator.adopterStops).
-func (s *Store) clearQualifiedHomeHolds(ctx context.Context, hostID, sessionID, unprovenAdopter string) (int, error) {
+// it released. stopInFlight (nil: never) says whether a row adopting sessionID is
+// a failed adopter whose stop is still in flight (Coordinator.adopterStops).
+func (s *Store) clearQualifiedHomeHolds(ctx context.Context, hostID, sessionID string, stopInFlight func(adopter string) bool) (int, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("begin home cleanup proof: %w", err)
@@ -52,20 +52,36 @@ func (s *Store) clearQualifiedHomeHolds(ctx context.Context, hostID, sessionID, 
 	if err == nil && (owner == nil || *owner != hostID) {
 		return 0, nil
 	}
-	// The runtime has ended, but a live row adopting it may already be building
-	// fresh on the home: the hold passes to that row rather than lapsing. So does a
-	// row that failed on a lost start ack while its stop is still in flight: the
-	// build it may have begun is gone only at that row's own proof (#1615).
-	var adopter *string
-	err = tx.QueryRow(ctx, `SELECT id::text FROM sessions WHERE adopt_session_id=$1::uuid
-		AND (state NOT IN ('stopped','failed') OR id=NULLIF($3,'')::uuid)
-		AND host_id=$2::uuid FOR UPDATE`, sessionID, hostID, unprovenAdopter).Scan(&adopter)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	// The hold passes to a live row adopting the ended runtime, or to a failed one
+	// whose stop is still in flight (#1615). Candidates are locked before the
+	// marker is read: failStart records it before failing the row, so a row read
+	// as failed already has its marker.
+	adoptRows, err := tx.Query(ctx, `SELECT id::text, state NOT IN ('stopped','failed') FROM sessions
+		WHERE adopt_session_id=$1::uuid AND host_id=$2::uuid ORDER BY id FOR UPDATE`, sessionID, hostID)
+	if err != nil {
 		return 0, fmt.Errorf("lock adopting session: %w", err)
 	}
-	// Its runtime ended while that row was live: the agent declined the adoption and
-	// builds fresh, so the row adopts nothing (a park on exit then takes its own size).
-	if adopter != nil {
+	var adopter *string
+	var adopterLive bool
+	for adoptRows.Next() {
+		var id string
+		var live bool
+		if err := adoptRows.Scan(&id, &live); err != nil {
+			adoptRows.Close()
+			return 0, fmt.Errorf("read adopting session: %w", err)
+		}
+		if adopter == nil && (live || (stopInFlight != nil && stopInFlight(id))) {
+			adopter, adopterLive = &id, live
+		}
+	}
+	if err := adoptRows.Err(); err != nil {
+		adoptRows.Close()
+		return 0, fmt.Errorf("read adopting sessions: %w", err)
+	}
+	adoptRows.Close()
+	// A live adopter's runtime ended: the agent declined and builds fresh, so it adopts
+	// nothing. A failed adopter keeps the link, which homeHoldRefusal reads as stopping.
+	if adopter != nil && adopterLive {
 		if _, err := tx.Exec(ctx, `UPDATE sessions SET adopt_session_id = NULL WHERE id = $1::uuid`, *adopter); err != nil {
 			return 0, fmt.Errorf("clear declined adoption: %w", err)
 		}
