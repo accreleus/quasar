@@ -416,6 +416,45 @@ test("M1 a read the server fills is split, not trusted", async () => {
   assert.match(t.incomplete[0].reason, /denser than one read holds/);
 });
 
+test("a short diagnostic read accepts exactly 1000 raw samples", async () => {
+  const dir = clientBundle();
+  const end = T_START + 60_000;
+  const samples = Array.from({ length: SAMPLE_CAP }, (_, i) => (
+    { source: "agent", ts_unix_ms: T_START + i, metrics: { fps: 60 } }
+  ));
+  samples.push({ source: "agent", ts_unix_ms: end + 5001, metrics: { fps: 60 } });
+  const r = await run(dir, world({ samples, end }));
+  assert.equal(r.complete, true, r.incomplete[0]?.reason);
+  assert.equal(r.f.calls.filter((u) => u.includes("/diagnostic-bundle")).length, 1);
+  assert.equal(readJson(dir, `${SC}/diagnostic-bundle.json`).series["encoder.fps"].length, SAMPLE_CAP);
+});
+
+test("a diagnostic read splits at 1001 raw samples, including the window end", async () => {
+  const dir = clientBundle();
+  const samples = Array.from({ length: SAMPLE_CAP }, (_, i) => (
+    { source: "agent", ts_unix_ms: T_START + i, metrics: { fps: 60 } }
+  ));
+  samples.push({ source: "agent", ts_unix_ms: T_END + 5000, metrics: { fps: 60 } });
+  const r = await run(dir, world({ samples }));
+  assert.equal(r.complete, true, r.incomplete[0]?.reason);
+  assert.equal(r.f.calls.filter((u) => u.includes("/diagnostic-bundle")).length, 3);
+  assert.equal(readJson(dir, `${SC}/diagnostic-bundle.json`).series["encoder.fps"].length, SAMPLE_CAP + 1);
+});
+
+test("a full event response remains inconclusive for each endpoint", async () => {
+  const events = Array.from({ length: SAMPLE_CAP }, (_, i) => (
+    { source: "agent", type: "abr.ladder.step", ts_unix_ms: T_START + i * 250, payload: {} }
+  ));
+  for (const emptyRoute of ["/trace/events", "/diagnostic-bundle"]) {
+    const r = await run(clientBundle(), world({
+      events,
+      tweak: (route, [status, body]) => route.endsWith(emptyRoute) ? [status, { ...body, events: [] }] : undefined,
+    }));
+    assert.equal(r.complete, true, r.incomplete[0]?.reason);
+    assert.equal(r.f.calls.filter((u) => u.includes("/diagnostic-bundle")).length, 3);
+  }
+});
+
 // ── idempotence: a collected scenario is never fetched again ────────────────
 test("I2 under --resume a collected scenario is not fetched again, and a second run with other answers changes no byte of it", async () => {
   const dir = clientBundle();
@@ -1056,7 +1095,7 @@ test("B2 a session read in several windows keeps its whole analysis; a single re
   assert.equal(single.derived_windows.hitches.length, 1);
 });
 
-test("S5 a read is full at 1000 raw rows even with shared timestamps and non-numeric rows", async () => {
+test("S5 the raw row cap counts shared timestamps and rows without numeric metrics", async () => {
   const agent = Array.from({ length: 600 }, (_, i) => ({ source: "agent", ts_unix_ms: T_START + 1000 + i * 400, metrics: { fps: 60 } }));
   const browser = agent.map(({ ts_unix_ms }, i) => ({
     source: "browser",
