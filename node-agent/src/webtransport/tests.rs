@@ -5502,3 +5502,154 @@ fn a_frame_under_the_burst_limit_and_every_other_codec_go_as_one_slice() {
     );
     assert_eq!(burst_plan(&[], true, 60), vec![(0, Duration::ZERO)]);
 }
+
+#[test]
+fn an_unusable_frame_rate_still_plans_a_bounded_spread() {
+    for fps in [0, -1, i32::MIN, i32::MAX] {
+        let plan = burst_plan(&big_frame(), true, fps);
+        let last = plan.last().unwrap().1;
+        assert!(
+            plan.len() > 1 && last <= Duration::from_secs(1) / 4,
+            "{fps}: {plan:?}"
+        );
+    }
+    assert_eq!(
+        burst_plan(&big_frame()[..50], true, 0),
+        vec![(50, Duration::ZERO)]
+    );
+}
+
+/// A slice of `n` datagrams that each carry `tag`, to tell slices apart.
+fn tagged(tag: u8, n: usize) -> Vec<Bytes> {
+    vec![Bytes::from(vec![tag; 8]); n]
+}
+
+#[test]
+fn a_late_wake_up_hands_over_one_slice_and_spaces_the_rest_from_now() {
+    let gap = Duration::from_millis(5);
+    let t0 = Instant::now();
+    let mut pacing = Pacing::default();
+    pacing.push(
+        1,
+        gap,
+        vec![tagged(0, 1), tagged(1, 1), tagged(2, 1), tagged(3, 1)],
+    );
+    assert_eq!(
+        pacing.pop(t0).unwrap()[0][0],
+        0,
+        "the first slice goes at once"
+    );
+    assert!(pacing.pop(t0 + Duration::from_millis(1)).is_none());
+    // The timer fires 95 ms late: two deadlines have passed, and one slice goes.
+    let late = t0 + Duration::from_millis(100);
+    assert_eq!(pacing.pop(late).unwrap()[0][0], 1);
+    assert!(pacing.pop(late).is_none(), "no second slice behind it");
+    assert_eq!(
+        pacing.deadline(),
+        Some(late + gap),
+        "re-spaced from the wake-up"
+    );
+    assert_eq!(pacing.pop(late + gap).unwrap()[0][0], 2);
+}
+
+#[test]
+fn a_frame_queues_behind_one_older_frame_and_a_third_drops_the_oldests_tail() {
+    let gap = Duration::from_millis(5);
+    let t0 = Instant::now();
+    let mut pacing = Pacing::default();
+    pacing.push(1, gap, vec![tagged(10, 1), tagged(11, 1), tagged(12, 1)]);
+    assert_eq!(pacing.pop(t0).unwrap()[0][0], 10);
+    pacing.push(2, gap, vec![tagged(20, 1), tagged(21, 1)]);
+    let order = |p: &Pacing| {
+        p.queue
+            .iter()
+            .map(|s| s.datagrams[0][0])
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        order(&pacing),
+        [11, 12, 20, 21],
+        "appended: nothing is sent early"
+    );
+    pacing.push(3, gap, vec![tagged(30, 1)]);
+    assert_eq!(
+        order(&pacing),
+        [20, 21, 30],
+        "the oldest frame's unsent tail is dropped"
+    );
+}
+
+/// #1606: the send loop keeps serving audio and the control stream between the slices of one big
+/// PyroWave frame, and `pkt_seq` follows handoff order across them.
+#[tokio::test]
+async fn audio_and_a_ping_are_served_between_the_slices_of_one_big_pyrowave_frame() {
+    use std::time::Instant as Clock;
+    let plan = audio::Plan {
+        audio: true,
+        ..Default::default()
+    };
+    let agent = agent_with_plan(Limits::default(), plan).await;
+    let hub = audio_hub(&agent);
+    let media = agent.listener.registry().lock()[SESSION]
+        .media
+        .clone()
+        .unwrap();
+    let grant = PyroWaveGrant {
+        wanted: true,
+        target_kbps: 200_000,
+        floor_kbps: 100_000,
+        max_rtt_ms: 1_000,
+    };
+    // 1 fps: the slices spread over 250 ms, far above a loaded host's scheduling noise.
+    media.grant_pyrowave(grant, (320, 192, 1), true);
+    let (session, mut send, mut recv, reply) =
+        agent.hello_with(TOKEN, json!({"pyrowave": true})).await;
+    assert_eq!(reply["video"]["codec"], "pyrowave");
+    let n = pyrowave::block_count(320, 192);
+    let blocks: Vec<(u32, u32)> = (0..n.min(40)).map(|i| (i, 3000)).collect();
+    let pong = tokio::spawn(async move {
+        read_message(&mut recv).await.unwrap();
+        Clock::now()
+    });
+    let frame = pyrowave::tests::frame(320, 192, &blocks);
+    assert!(frame.len() > 3 * PYRO_BURST_BYTES, "{} bytes", frame.len());
+    media.on_pyrowave_frame(&gst::Buffer::from_slice(frame));
+    let (mut video, mut audio_at, mut seqs) = (Vec::new(), None, Vec::new());
+    while let Ok(Ok(d)) =
+        tokio::time::timeout(Duration::from_millis(600), session.read_datagram()).await
+    {
+        seqs.push(u32::from_le_bytes(d[1..5].try_into().unwrap()));
+        match d[0] {
+            0x01 => {
+                video.push(Clock::now());
+                if video.len() == 1 {
+                    write_message(&mut send, &json!({"type": "ping", "id": 1, "tc": 0}))
+                        .await
+                        .unwrap();
+                    hub.on_packet(Bytes::from(vec![7; 4]), None, 0);
+                }
+            }
+            0x02 => {
+                audio_at.get_or_insert(Clock::now());
+            }
+            other => panic!("channel {other:#x}"),
+        }
+    }
+    let (first, last) = (video[0], *video.last().unwrap());
+    assert!(
+        last - first >= Duration::from_millis(150),
+        "slices are spread: {:?}",
+        last - first
+    );
+    let margin = Duration::from_millis(50);
+    let pong_at = pong.await.unwrap();
+    assert!(pong_at + margin < last, "the pong waited for the frame");
+    assert!(
+        audio_at.expect("audio sent") + margin < last,
+        "audio waited for the frame"
+    );
+    assert!(
+        seqs.windows(2).all(|w| w[1] == w[0].wrapping_add(1)),
+        "one pkt_seq in handoff order: {seqs:?}"
+    );
+}

@@ -1241,10 +1241,13 @@ fn stalled() -> (Option<Value>, u32, &'static str) {
 /// slices of that frame) sits well under the clean burst and is a round number.
 const PYRO_BURST_BYTES: usize = 128 * 1024;
 
+/// The frame rate the slice spacing assumes when the configuration carries none.
+const PACING_FALLBACK_FPS: u32 = 60;
+
 /// The slices a frame's datagrams are handed over in: each a datagram count and its offset from
 /// the frame's start. PyroWave is cut so no slice passes `PYRO_BURST_BYTES`, the slices spread
-/// evenly over a quarter of the frame interval: the frame is out by interval/4 (4.2 ms at 60 fps,
-/// 2.1 ms at 120) plus the timer's 1 ms rounding. Every other codec is one slice at once.
+/// evenly over a quarter of the frame interval (a target: `Pacing` keeps the spacing, not the
+/// frame-relative offsets). Every other codec is one slice at once.
 fn burst_plan(
     datagrams: &[bytes::Bytes],
     pyrowave: bool,
@@ -1260,14 +1263,113 @@ fn burst_plan(
         bytes += d.len();
         *counts.last_mut().expect("one slice") += 1;
     }
-    let gap = std::time::Duration::from_secs(1)
-        / (fps.max(1) as u32 * 4)
-        / (counts.len() as u32 - 1).max(1);
+    if counts.len() == 1 {
+        return vec![(counts[0], std::time::Duration::ZERO)];
+    }
+    let fps = u32::try_from(fps)
+        .ok()
+        .filter(|f| *f > 0)
+        .unwrap_or(PACING_FALLBACK_FPS);
+    let gap = std::time::Duration::from_secs(1) / fps / 4 / (counts.len() as u32 - 1);
     counts
         .into_iter()
         .zip(0..)
         .map(|(n, i)| (n, gap * i))
         .collect()
+}
+
+/// One slice of a PyroWave frame, with the spacing that follows it.
+struct Slice {
+    frame: u16,
+    gap: Duration,
+    datagrams: Vec<bytes::Bytes>,
+}
+
+/// The most frames `Pacing` holds: a frame never waits behind more than one older frame.
+const PACING_FRAMES: usize = 2;
+
+/// PyroWave slices not yet handed to QUIC, released one per `gap` by the send loop's own
+/// deadline arm so audio, input, feedback and pongs run between them. Slices keep their order
+/// across frames (a frame arriving mid-way queues behind the older one); a third frame drops the
+/// oldest frame's unsent tail, which the next frame repairs (codec-pyrowave.md §Loss).
+#[derive(Default)]
+struct Pacing {
+    queue: std::collections::VecDeque<Slice>,
+    /// When the next slice may go; `None` while idle, when a slice goes at once.
+    ready: Option<Instant>,
+}
+
+impl Pacing {
+    fn push(&mut self, frame: u16, gap: Duration, slices: Vec<Vec<bytes::Bytes>>) {
+        let frame_slices = slices.into_iter().map(|datagrams| Slice {
+            frame,
+            gap,
+            datagrams,
+        });
+        self.queue.extend(frame_slices);
+        while self
+            .queue
+            .iter()
+            .map(|s| s.frame)
+            .collect::<Vec<_>>()
+            .chunk_by(|a, b| a == b)
+            .count()
+            > PACING_FRAMES
+        {
+            let oldest = self.queue[0].frame;
+            while self.queue.front().is_some_and(|s| s.frame == oldest) {
+                self.queue.pop_front();
+            }
+        }
+    }
+
+    /// When the next slice is due; `None` with nothing queued.
+    fn deadline(&self) -> Option<Instant> {
+        (!self.queue.is_empty()).then(|| self.ready.unwrap_or_else(Instant::now))
+    }
+
+    /// The next slice if it is due. A late caller gets one slice, and the rest are spaced from
+    /// `now`, never from the missed deadline: no catch-up burst.
+    fn pop(&mut self, now: Instant) -> Option<Vec<bytes::Bytes>> {
+        if self.ready.is_some_and(|t| t > now) {
+            return None;
+        }
+        let slice = self.queue.pop_front()?;
+        self.ready = (!self.queue.is_empty()).then(|| now + slice.gap);
+        Some(slice.datagrams)
+    }
+}
+
+/// Give `datagrams` to QUIC in order, counting each one it accepted in `handed`. With `restamp`
+/// the `pkt_seq` (bytes 1..5) is assigned now, so it follows handoff order across audio and
+/// video; each datagram is logged with its own enqueue time. False when QUIC refused one.
+fn hand_over(
+    session: &Session,
+    datagrams: Vec<bytes::Bytes>,
+    mut restamp: Option<&mut u32>,
+    mut log: Option<&mut congestion::SendLog>,
+    at: std::time::Instant,
+    handed: &mut u64,
+) -> bool {
+    for d in datagrams {
+        let d = match restamp.as_deref_mut() {
+            Some(seq) => {
+                let mut copy = bytes::BytesMut::from(&d[..]);
+                copy[1..5].copy_from_slice(&seq.to_le_bytes());
+                *seq = seq.wrapping_add(1);
+                copy.freeze()
+            }
+            None => d,
+        };
+        if let Some(log) = log.as_deref_mut() {
+            log.record(&d, at, false);
+        }
+        if session.send_datagram(d).is_err() {
+            return false;
+        }
+        *handed += 1;
+    }
+    true
 }
 
 /// The payload bytes of video datagrams: what amendment 85's FEC share is measured against.
@@ -1651,6 +1753,7 @@ async fn stream(
     let mut current = client.config.clone();
     let mut pyro = pyro_rate(media, &current, None);
     let mut pyro_refused = 0u64;
+    let mut pacing = Pacing::default();
     // What ends the stream: an optional last message, the close code and its reason.
     const QUIET: (Option<Value>, u32, &str) = (None, CLOSE_NORMAL, "");
     let mut idle = pin!(tokio::time::sleep(CONTROL_IDLE));
@@ -1688,6 +1791,15 @@ async fn stream(
                     pyro_act(media, &client, &mut pyro, control.as_mut(), verdict);
                 } else if let Some(control) = control.as_mut() {
                     control.tick(quinn::Connection::rtt(session), std::time::Instant::now());
+                }
+            }
+            // #1606: the next PyroWave slice, one at a time so the arms around it keep running.
+            _ = tokio::time::sleep_until(pacing.deadline().unwrap_or_else(Instant::now)), if pacing.deadline().is_some() => {
+                if let Some(slice) = pacing.pop(Instant::now()) {
+                    let log = pyro.as_mut().map(|rate| &mut rate.log);
+                    if !hand_over(session, slice, Some(&mut pkt_seq), log, std::time::Instant::now(), &mut handed) {
+                        break QUIET;
+                    }
                 }
             }
             packet = client.audio.recv(), if audio_open => match packet {
@@ -1738,7 +1850,10 @@ async fn stream(
                     }
                     let now = std::time::Instant::now();
                     let max = session.max_datagram_size().min(media::MAX_DATAGRAM);
-                    let Some(mut datagrams) = media::packetize(&unit, &current, max, &mut pkt_seq) else {
+                    // A PyroWave slice takes its `pkt_seq` when it is handed over (`hand_over`).
+                    let mut placeholder = 0u32;
+                    let seq = if unit.pyrowave { &mut placeholder } else { &mut pkt_seq };
+                    let Some(mut datagrams) = media::packetize(&unit, &current, max, seq) else {
                         if !warned_oversized {
                             warned_oversized = true;
                             tracing::warn!(
@@ -1781,34 +1896,24 @@ async fn stream(
                         }
                         datagrams.extend(repairs);
                     }
-                    let mut log = match pyro.as_mut() {
-                        Some(rate) if unit.pyrowave => Some(&mut rate.log),
-                        _ => control.as_mut().filter(|_| !unit.pyrowave).map(|c| &mut c.log),
-                    };
-                    handed += datagrams.len() as u64;
-                    // #1606: a PyroWave frame goes in bounded slices spread over part of the
-                    // frame interval; anything else is one slice at once, as it always was.
-                    let plan = burst_plan(&datagrams, unit.pyrowave, current.fps);
-                    let started = tokio::time::Instant::now();
-                    let mut rest = datagrams.into_iter();
-                    let mut alive = true;
-                    for (count, offset) in plan {
-                        if !offset.is_zero() {
-                            tokio::time::sleep_until(started + offset).await;
-                        }
-                        let at = if offset.is_zero() { now } else { std::time::Instant::now() };
-                        alive = rest.by_ref().take(count).try_for_each(|d| {
-                            if let Some(log) = log.as_deref_mut() {
-                                log.record(&d, at, false);
+                    if unit.pyrowave {
+                        // #1606: slices go out one per deadline, from the arm below.
+                        let plan = burst_plan(&datagrams, true, current.fps);
+                        let gap = plan.get(1).map_or(Duration::ZERO, |p| p.1);
+                        let mut rest = datagrams.into_iter();
+                        let slices = plan.iter().map(|(n, _)| rest.by_ref().take(*n).collect()).collect();
+                        pacing.push(unit.frame_seq, gap, slices);
+                        if let Some(slice) = pacing.pop(Instant::now()) {
+                            let log = pyro.as_mut().map(|rate| &mut rate.log);
+                            if !hand_over(session, slice, Some(&mut pkt_seq), log, std::time::Instant::now(), &mut handed) {
+                                break QUIET;
                             }
-                            session.send_datagram(d)
-                        }).is_ok();
-                        if !alive {
-                            break;
                         }
-                    }
-                    if !alive {
-                        break QUIET;
+                    } else {
+                        let log = control.as_mut().map(|c| &mut c.log);
+                        if !hand_over(session, datagrams, None, log, now, &mut handed) {
+                            break QUIET;
+                        }
                     }
                 }
                 Some(Out::Config(config, reason)) => {
@@ -1816,6 +1921,7 @@ async fn stream(
                         pyrowave_frames.forget();
                     }
                     current = config.clone();
+                    pacing = Pacing::default();
                     pyro = pyro_rate(media, &current, pyro);
                     let ack = hello_ack(&config, media.audio(), reason, fec, audio_red);
                     let write = write_message(&mut send, &ack);
