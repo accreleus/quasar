@@ -31,8 +31,8 @@ export const SECRETS = [
   // A value that says there is none ("password": null, secret: none, token=[REDACTED], password: none.) is not one.
   // Nor is one of the markers a redaction leaves, alone (token=<credential>); anything else in angle brackets is a value.
   // Bare "authorization: required" is prose. Assignments, quoted values and longer tokens still count.
-  // No letter before the name, so MY_TOKEN= and hook_secret: count as well as token= itself.
-  [/(?<![A-Za-z])(?!(?<![\w-])authorization:[ \t]+required[.;!?]?[ \t]*(?=[\r\n"']|$))(authorization|cookie|password|passwd|secret|token|api[_-]?key)["']?\s*[=:]\s*["']?(?!<(?:credential|token|address|stack|user)>(?!\w))(?!\[?(?:null|none|n\/?a|redacted|omitted|unknown|true|false|bearer)\]?(?=[.;!?]?(?:[\s"',}]|$)))[^\s"',}]{4,}/i, "a credential"],
+  // Glued names (accessToken=, authtoken=, clientSecret=, userPassword=, setCookie=, myApiKey=) match too; authorization still requires no leading letter so prose exemptions stay exact.
+  [/(?:(?<![A-Za-z])(?!(?<![\w-])authorization:[ \t]+required[.;!?]?[ \t]*(?=[\r\n"']|$))authorization|(?:cookie|password|passwd|secret|token|api[_-]?key))["']?\s*[=:]\s*["']?(?!<(?:credential|token|address|stack|user)>(?!\w))(?!\[?(?:null|none|n\/?a|redacted|omitted|unknown|true|false|bearer)\]?(?=[.;!?]?(?:[\s"',}]|$)))[^\s"',}]{4,}/i, "a credential"],
 ];
 
 /**

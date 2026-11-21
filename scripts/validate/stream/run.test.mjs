@@ -47,8 +47,8 @@ const matches = (sel, classes) => {
 };
 
 /** A world holding the fake clock, the fake page's state and the fake API's record. */
-function world({ wins = windows(50), session = {}, failScreenshotAt = null, webtransport = true, noBench = false, refuse = false, noFrame = false, revealed = false, stopFails = false, closeFails = false, noUrl = false, url = null, stats = { frames: 100, decoded: 100 }, videoRate = 60, hiddenBetween = null, skew = 0, extraFrames = null, loader = null, onPlay = null, bare = false, hooksDir = null, lockOnClick = true, hud = false, layerStays = false, lockDelayMs = 0, swallowMoves = false, layerAfterMs = 0, noLayer = false, keyUpFails = null, swallowKeyUp = null, fallbackDelayMs = 3000, fallbackReason = "stream_lost", noFallback = false } = {}) {
-  const w = { cdp: [], listeners: {}, locked: false, lastX: null, lastY: null, videoStart: T0, hooksDir, faultSeenAt: null, t: T0, stopped: [], live: [], url: "about:blank", ls: new Map(), shots: 0, failScreenshotAt, calls: [], gone: new Set(), secrets: new Set(), handlers: {}, opened: [], closed: [], clicks: [], gotos: [], playAt: null, stageClicks: 0, layerClicks: 0, hudOpen: false, hudClicks: 0, lockAt: 0 };
+function world({ wins = windows(50), session = {}, failScreenshotAt = null, webtransport = true, noBench = false, refuse = false, noFrame = false, noSurface = false, revealed = false, stopFails = false, closeFails = false, noUrl = false, url = null, stats = { frames: 100, decoded: 100 }, videoRate = 60, hiddenBetween = null, skew = 0, extraFrames = null, loader = null, onPlay = null, bare = false, hooksDir = null, lockOnClick = true, hud = false, layerStays = false, lockDelayMs = 0, swallowMoves = false, layerAfterMs = 0, noLayer = false, keyUpFails = null, swallowKeyUp = null, fallbackDelayMs = 3000, fallbackReason = "stream_lost", noFallback = false } = {}) {
+  const w = { cdp: [], listeners: {}, locked: false, lastX: null, lastY: null, videoStart: T0, hooksDir, faultSeenAt: null, t: T0, stopped: [], live: [], url: "about:blank", ls: new Map(), shots: 0, failScreenshotAt, calls: [], gone: new Set(), secrets: new Set(), handlers: {}, opened: [], closed: [], clicks: [], gotos: [], playAt: null, stageClicks: 0, layerClicks: 0, hudOpen: false, hudClicks: 0, lockAt: 0, noSurface };
   // The page's "Click to play" layer (SessionPage.tsx): raised some time after Play and removed by the FIRST click on it, whether or not that click
   // took the lock (handleClickToPlay); a click before it only opens the HUD shelf.
   const layerUp = () => !noLayer && w.playAt !== null && w.t >= w.playAt + layerAfterMs && !w.locked && (layerStays || w.layerClicks === 0);
@@ -149,7 +149,8 @@ function world({ wins = windows(50), session = {}, failScreenshotAt = null, webt
       const hiddenVideo = { tagName: "VIDEO", videoWidth: 0, getBoundingClientRect: () => ({ left: 0, top: 0, width: 0, height: 0 }) };
       const canvas = { tagName: "CANVAS", getBoundingClientRect: () => ({ left: 100, top: 50, width: 800, height: 600 }) };
       const video = { tagName: "VIDEO", videoWidth: 1920, getVideoPlaybackQuality: () => ({ totalVideoFrames: w.t < w.videoStart ? 0 : Math.round(((w.t - w.videoStart) / 1000) * videoRate) }), getBoundingClientRect: () => ({ left: 100, top: 50, width: 800, height: 600 }) };
-      const doc = { pointerLockElement: w.locked && w.t >= w.lockAt ? { classList: { contains: (c) => c === "session-video" } } : null, visibilityState: hidden ? "hidden" : "visible", hasFocus: () => true, querySelectorAll: () => (noFrame ? [] : w.t < w.videoStart ? [hiddenVideo, canvas] : [video]), querySelector: (sel) => (sel === ".session-video" ? (noFrame ? [] : w.t < w.videoStart ? [hiddenVideo, canvas] : [video])[0] ?? null : /Capture input/.test(sel) ? (hudUp() ? { getBoundingClientRect: () => ({ left: hudButton.x - 20, top: hudButton.y - 20, width: 40, height: 40 }) } : null) : /session-play/.test(sel) ? (layerUp() ? { getBoundingClientRect: () => ({ left: 0, top: 0, width: 1280, height: 720 }) } : null) : /sl-root/.test(sel) ? (loader ? matches(sel, loader) : revealed ? {} : null) : /video/.test(sel) && !noBench && !revealed && !noFrame ? video : null) };
+      const surfaceEls = noFrame || w.noSurface ? [] : w.t < w.videoStart ? [hiddenVideo, canvas] : [video];
+      const doc = { pointerLockElement: w.locked && w.t >= w.lockAt ? { classList: { contains: (c) => c === "session-video" } } : null, visibilityState: hidden ? "hidden" : "visible", hasFocus: () => true, querySelectorAll: () => surfaceEls, querySelector: (sel) => (sel === ".session-video" ? surfaceEls[0] ?? null : /Capture input/.test(sel) ? (hudUp() ? { getBoundingClientRect: () => ({ left: hudButton.x - 20, top: hudButton.y - 20, width: 40, height: 40 }) } : null) : /session-play/.test(sel) ? (layerUp() ? { getBoundingClientRect: () => ({ left: 0, top: 0, width: 1280, height: 720 }) } : null) : /sl-root/.test(sel) ? (loader ? matches(sel, loader) : revealed ? {} : null) : /video/.test(sel) && !noBench && !revealed && !noFrame && !w.noSurface ? video : null) };
       w.win ??= { addEventListener: (type, fn) => { (w.listeners[type] ??= []).push(fn); } };
       w.win.__qBench = noBench ? undefined : qbench;
       Object.assign(globalThis, { window: w.win, localStorage: store, sessionStorage: { getItem: () => null }, document: doc });
@@ -1864,7 +1865,7 @@ test("input-kbm: a sample that is not a number is not counted", async () => {
 
 // ── review round 1 on #1338 ─────────────────────────────────────────────────
 
-import { streamCentre } from "./scenarios/stream-common.mjs";
+import { probe, streamCentre } from "./scenarios/stream-common.mjs";
 const keyEvents = (w) => w.cdp.filter(([m]) => m === "Input.dispatchKeyEvent").map(([, p]) => `${p.type}:${p.code}`);
 const posts = (reason = "stream_lost") => JSON.stringify({ client: "browser", events: [{ ts_unix_ms: 5, type: "transport.fallback", payload: { reason } }] });
 const post = (w, body) => w.emit("request", { url: () => `${BASE}/v1/sessions/${SID}/trace/events`, method: () => "POST", postData: () => body });
@@ -1966,14 +1967,15 @@ test("B3 (#1343): the lock is taken from the \"Click to play\" layer: waited for
   assert.equal(f.w.stageClicks, 0);
 });
 
-test("#1343 item 3: with no layer the HUD's own route is tried, and what it found is said; with no route the text says the launch was not immersive", async () => {
+test("#1343 item 3: with no layer the HUD's own route is tried, and observed text states only the wait, no lock and unknown cause", async () => {
   // The page offers the HUD route: a trusted click on the stage opens the shelf, a trusted click on "Capture input" takes the lock.
   const h = world({ noLayer: true, hud: true });
   const r = await runReal(h, INPUT());
   assert.equal(h.hudClicks, 1);
   assert.equal(h.layerClicks, 0);
   assert.equal(r.by().pointer_lock_taken.pass, true);
-  assert.match(r.by().pointer_lock_taken.observed, /taken through the HUD's "Capture input": the launch was not immersive/);
+  assert.match(r.by().pointer_lock_taken.observed, /no "Click to play" layer appeared within 5 s and no lock was held — cause unknown; taken through the HUD's "Capture input"/);
+  assert.doesNotMatch(r.by().pointer_lock_taken.observed, /immersive/i);
   assert.equal(r.timeline().find((x) => x.ev === "pointer-lock").hud, "clicked");
   // The sequence's pointer starts where the lock click left it, so the first move is a real delta.
   assert.deepEqual(JSON.parse(read(r.dir, `${r.id()}/input-sent.json`)).received_by_page.motion_sum, { x: 50, y: 25 });
@@ -1981,12 +1983,14 @@ test("#1343 item 3: with no layer the HUD's own route is tried, and what it foun
   const nolock = world({ noLayer: true, hud: true, lockOnClick: false });
   const rn = await runReal(nolock, INPUT());
   assert.equal(rn.by().pointer_lock_taken.pass, false);
-  assert.match(rn.by().pointer_lock_taken.observed, /^no pointer lock: the launch was not immersive, so there is no layer to click; the HUD's "Capture input" was clicked and did not lock$/);
+  assert.match(rn.by().pointer_lock_taken.observed, /^no pointer lock: no "Click to play" layer appeared within 5 s and no lock was held \(cause unknown\); the HUD's "Capture input" was clicked and did not lock$/);
+  assert.doesNotMatch(rn.by().pointer_lock_taken.observed, /immersive/i);
   // No layer and no button (the stage click showed none): said so.
   const bare = world({ noLayer: true });
   const rb = await runReal(bare, INPUT());
   assert.equal(rb.by().pointer_lock_taken.pass, false);
-  assert.match(rb.by().pointer_lock_taken.observed, /^no pointer lock: the launch was not immersive, so there is no layer to click; a click on the stream showed no "Capture input" button in the HUD$/);
+  assert.match(rb.by().pointer_lock_taken.observed, /^no pointer lock: no "Click to play" layer appeared within 5 s and no lock was held \(cause unknown\); a click on the stream showed no "Capture input" button in the HUD$/);
+  assert.doesNotMatch(rb.by().pointer_lock_taken.observed, /immersive/i);
   assert.equal(bare.hudClicks, 0);
   assert.equal(rb.timeline().find((x) => x.ev === "pointer-lock").hud, "no-button");
   // transport-fallback: the same route lets it hold the key.
@@ -2657,4 +2661,202 @@ test("malformed window times, frame timestamps and counts never pass or coerce a
   // 5. Scenarios without marker_decoded reject expect_marker under the strict-plan invariant.
   assert.match(checkFallback({ transport: "webtransport", codec: "h264", profile: "1080p60", hold_s: 30, app: "x", expect_marker: false }), /does not define.*expect_marker/);
   assert.match(checkInput({ transport: "webrtc", codec: "h264", profile: "1080p60", hold_s: 5, app: "x", expect_marker: false }), /does not define.*expect_marker/);
+});
+
+// ── #1343 round-2 follow-ups ────────────────────────────────────────────────
+
+test("#1343 r2 item 1: lock clicks on the layer or HUD are not left in the page's event log in input-sent.json", async () => {
+  const btnCode = { left: 0, right: 2, middle: 1 };
+  const expectedLog = SEQUENCE.flatMap((s) =>
+    s.kind === "key" ? [["keydown", s.code], ["keyup", s.code]]
+    : s.kind === "button" ? [["mousedown", btnCode[s.button]], ["mouseup", btnCode[s.button]]]
+    : s.kind === "wheel" ? [["wheel", s.dy]]
+    : []
+  );
+
+  // 1. Default "Click to play" layer click path: 1 lock click before the sequence must not appear in events.
+  const layer = world({ wins: echoWindows([40]) });
+  const rl = await runReal(layer, INPUT());
+  assert.deepEqual(rl.result.errors, []);
+  assert.equal(layer.layerClicks, 1, "the layer was clicked once to take pointer lock");
+  const layerRec = JSON.parse(read(rl.dir, `${rl.id()}/input-sent.json`));
+  assert.deepEqual(layerRec.received_by_page.events, expectedLog, "lock click must not pollute received_by_page.events");
+
+  // 2. HUD fallback path: stage click + "Capture input" click (2 clicks) must not appear in events either.
+  const hud = world({ wins: echoWindows([40]), noLayer: true, hud: true });
+  const rh = await runReal(hud, INPUT());
+  assert.deepEqual(rh.result.errors, []);
+  assert.equal(hud.stageClicks, 1);
+  assert.equal(hud.hudClicks, 1);
+  const hudRec = JSON.parse(read(rh.dir, `${rh.id()}/input-sent.json`));
+  assert.deepEqual(hudRec.received_by_page.events, expectedLog, "stage and HUD lock clicks must not pollute received_by_page.events");
+});
+
+test("#1343 r2 item 3a: freeze baseline is taken right before the fault, not from an earlier sample before takeLock", async () => {
+  // Frames advance continuously during takeLock's 2 s wait for the layer, then freeze at the fault (T0 + 2000).
+  // Baseline at p0 (before takeLock, frames=100) would see 100 -> 160 on the first post-fault sample and under-report freeze as 3 s instead of 4 s.
+  let ww;
+  const stats = {
+    get frames() {
+      const t = ww ? Math.min(ww.t, T0 + 2000) : T0;
+      return 100 + Math.floor((t - T0) / 1000) * 30;
+    },
+    decoded: 100,
+  };
+  const f = fallbackWorld({ layerAfterMs: 2000, stats });
+  ww = f.w;
+  const r = await runReal(f.w, FALLBACK("mid"), { hooksDir: f.hooksDir });
+  assert.deepEqual(r.result.errors, []);
+  assert.equal(r.sc().status, "pass", JSON.stringify(r.sc().criteria));
+  assert.equal(stats.frames, 160, "frames advanced from 100 to 160 during takeLock before freezing at the fault");
+  const rec = JSON.parse(read(r.dir, `${r.id()}/fallback.json`));
+  assert.equal(rec.no_frame_advance_before_video_s, 4, "freeze must be measured from the fault, not from p0 before takeLock");
+  assert.match(r.by().frame_after_fallback.observed, /^5 s after the fault; no frame advanced for 4 s of it$/);
+});
+
+test("#1343 r2 item 3b: an unreadable move log (garbage or throw) keeps motion_sum_matches pass: null with a reason and no crash", async () => {
+  // 1. Page overwrites __e2eInput with non-object garbage before readout.
+  {
+    const w = world({ wins: echoWindows([40]) });
+    const orig = w.host.newPage;
+    w.host.newPage = async () => {
+      const p = await orig();
+      const ev = p.evaluate;
+      p.evaluate = async (fn, arg) => (String(fn).includes("__e2eInput ?? null") ? "not-an-object" : ev(fn, arg));
+      return p;
+    };
+    const r = await runReal(w, INPUT());
+    assert.deepEqual(r.result.errors, []);
+    assert.notEqual(r.sc().status, "error");
+    assert.equal(r.by().motion_sum_matches.pass, null);
+    assert.equal(r.by().motion_sum_matches.observed, null);
+    assert.match(r.by().motion_sum_matches.expected, /The page's move log could not be read/);
+    assert.equal(r.by().nothing_held_at_end.pass, null);
+    assert.equal(JSON.parse(read(r.dir, `${r.id()}/input-sent.json`)).received_by_page, null);
+  }
+
+  // 2. Page returns an object with malformed moveCount / move / moves.
+  {
+    const w = world({ wins: echoWindows([40]) });
+    const orig = w.host.newPage;
+    w.host.newPage = async () => {
+      const p = await orig();
+      const ev = p.evaluate;
+      p.evaluate = async (fn, arg) => (String(fn).includes("__e2eInput ?? null") ? { moveCount: -3, move: { x: NaN, y: "x" }, moves: "bad", keys: [], buttons: [], log: "bad", wheel: null, untrusted: "nope" } : ev(fn, arg));
+      return p;
+    };
+    const r = await runReal(w, INPUT());
+    assert.deepEqual(r.result.errors, []);
+    assert.equal(r.sc().status, "pass", JSON.stringify(r.sc().criteria));
+    assert.equal(r.by().motion_sum_matches.pass, null);
+    assert.equal(r.by().motion_sum_matches.observed, null);
+    assert.match(r.by().motion_sum_matches.expected, /The page's move log could not be read/);
+    const rec = JSON.parse(read(r.dir, `${r.id()}/input-sent.json`));
+    assert.equal(rec.received_by_page.mouse_moves_total, null);
+    assert.equal(rec.received_by_page.motion_sum, null);
+  }
+
+  // 3. Page throws when the scenario reads __e2eInput.
+  {
+    const w = world({ wins: echoWindows([40]) });
+    const orig = w.host.newPage;
+    w.host.newPage = async () => {
+      const p = await orig();
+      const ev = p.evaluate;
+      p.evaluate = async (fn, arg) => {
+        if (String(fn).includes("__e2eInput ?? null")) throw new Error("Execution context was destroyed");
+        return ev(fn, arg);
+      };
+      return p;
+    };
+    const r = await runReal(w, INPUT());
+    assert.deepEqual(r.result.errors, []);
+    assert.equal(r.sc().status, "pass", JSON.stringify(r.sc()));
+    assert.equal(r.by().motion_sum_matches.pass, null);
+    assert.equal(r.by().motion_sum_matches.observed, null);
+    assert.match(r.by().motion_sum_matches.expected, /The page's move log could not be read/);
+    assert.equal(r.by().nothing_held_at_end.pass, null);
+    assert.equal(JSON.parse(read(r.dir, `${r.id()}/input-sent.json`)).received_by_page, null);
+  }
+});
+
+test("#1343 r2 item 3c: no visible stream surface leaves freeze null with a reason (never 0) and records no-surface lock state", async () => {
+  // 1. transport-fallback mid with no <video>/canvas surface at the fault (even with advancing bench frames so unguarded freeze would be 0).
+  {
+    let ww;
+    const moving = { get frames() { return Math.floor((ww.t - T0) / 1000) * 30 + 10; }, decoded: 100 };
+    const f = fallbackWorld({ noSurface: true, stats: moving });
+    ww = f.w;
+    const r = await runReal(f.w, FALLBACK("mid", { hold_s: 10 }), { hooksDir: f.hooksDir });
+    assert.deepEqual(r.result.errors, []);
+    const rec = JSON.parse(read(r.dir, `${r.id()}/fallback.json`));
+    assert.equal(rec.no_frame_advance_before_video_s, null, "no surface must yield null freeze, never 0");
+    assert.equal(rec.no_frame_advance_reason, "no visible stream surface");
+    const step = r.timeline().find((x) => x.ev === "wait-ended");
+    assert.equal(step.no_frame_advance_s, null);
+    assert.equal(step.no_frame_advance_reason, "no visible stream surface");
+  }
+
+  // 2. Normal fallback (M1): the page unmounts its canvas at the fallback and the <video> has no frames until WebRTC starts 2 s later.
+  // That gap IS the freeze mid measures, so the freeze must remain a number (6 s), not be wiped to null.
+  {
+    const f = fallbackWorld();
+    const origSess = f.w.api.session;
+    let delayed = false;
+    f.w.api.session = async (id) => {
+      const row = await origSess(id);
+      if (row?.transport_fallback_reason && !delayed) {
+        delayed = true;
+        f.w.videoStart = f.w.t + 2000;
+        f.w.noSurface = true;
+      } else if (delayed && f.w.t >= f.w.videoStart) {
+        f.w.noSurface = false;
+      }
+      return row;
+    };
+    const r = await runReal(f.w, FALLBACK("mid"), { hooksDir: f.hooksDir });
+    assert.deepEqual(r.result.errors, []);
+    assert.equal(r.sc().status, "pass", JSON.stringify(r.sc().criteria));
+    const rec = JSON.parse(read(r.dir, `${r.id()}/fallback.json`));
+    assert.equal(rec.no_frame_advance_before_video_s, 6, "canvas unmount during fallback must count as freeze, not wipe it to null");
+    assert.equal("no_frame_advance_reason" in rec, false);
+    assert.match(r.by().frame_after_fallback.observed, /^7 s after the fault; no frame advanced for 6 s of it$/);
+  }
+
+  // 3. input-kbm with no layer and no stream surface exercises takeLock's "no-surface" path end-to-end.
+  {
+    const w = world({ noLayer: true, noSurface: true });
+    const r = await runReal(w, INPUT());
+    assert.deepEqual(r.result.errors, []);
+    const beforeSequence = w.cdp.slice(0, w.cdp.findIndex(([, p]) => p.type === "keyDown"));
+    assert.equal(beforeSequence.filter(([, p]) => p.type === "mousePressed").length, 0, "no surface so takeLock clicked nothing");
+    assert.equal(w.hudClicks, 0);
+    assert.equal(r.timeline().find((x) => x.ev === "pointer-lock").hud, "no-surface");
+    assert.ok(r.timeline().some((x) => x.ev === "no-stream-surface"));
+    assert.equal(r.by().pointer_lock_taken.pass, false);
+    assert.match(r.by().pointer_lock_taken.observed, /no "Click to play" layer appeared within 5 s and no lock was held \(cause unknown\); there was no visible stream surface to click either/);
+    assert.doesNotMatch(r.by().pointer_lock_taken.observed, /immersive/i);
+  }
+});
+
+test("#1343 r2 N1: probe().surface requires a non-hidden element with positive box dimensions", async () => {
+  const probeWith = (els) =>
+    probe({
+      evaluate: async (fn, arg) => {
+        const saved = { window: globalThis.window, document: globalThis.document };
+        globalThis.window = {};
+        globalThis.document = {
+          querySelectorAll: () => els,
+          querySelector: () => null,
+          visibilityState: "visible",
+          hasFocus: () => true,
+        };
+        try { return await fn(arg); } finally { Object.assign(globalThis, saved); }
+      },
+    });
+  assert.equal((await probeWith([{ tagName: "CANVAS", hidden: true, getBoundingClientRect: () => ({ width: 800, height: 600 }) }])).surface, false, "hidden canvas is not visible");
+  assert.equal((await probeWith([{ tagName: "CANVAS", hidden: false, getBoundingClientRect: () => ({ width: 0, height: 0 }) }])).surface, false, "zero-size canvas is not visible");
+  assert.equal((await probeWith([{ tagName: "VIDEO", videoWidth: 1920, hidden: true, getBoundingClientRect: () => ({ width: 800, height: 600 }) }])).surface, false, "hidden video is not visible");
+  assert.equal((await probeWith([{ tagName: "CANVAS", hidden: false, getBoundingClientRect: () => ({ width: 800, height: 600 }) }])).surface, true);
+  assert.equal((await probeWith([{ tagName: "VIDEO", videoWidth: 1920, hidden: false, getBoundingClientRect: () => ({ width: 800, height: 600 }) }])).surface, true);
 });
