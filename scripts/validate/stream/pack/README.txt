@@ -19,7 +19,8 @@ What to do
      command ends.
      Just to check this machine without streaming, put the word doctor before the address:
          bash run.sh doctor https://the-stack-address      (Windows: .\run.cmd doctor https://...)
-  3. When it ends it prints the path of one .zip file (in the "results" folder).
+  3. When the full test ends it prints the path of one .zip file (in the "results"
+     folder). A doctor run only prints the check lines and makes no .zip file.
 
 What to send back
   Send that one .zip file, whether the streams passed or not. It holds no password and

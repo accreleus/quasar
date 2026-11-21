@@ -10,6 +10,7 @@
 //        QUASAR_E2E_APP (reference app name), CHROME (browser to launch when --cdp is absent),
 //        CLIENT (a label for this test client, a role, never a host name),
 //        INSECURE_TLS=1 (a stack with a self-signed certificate: turns certificate checks off),
+//        QUASAR_E2E_HEADLESS=1 (force headless Chrome when --cdp is absent, e.g. over ssh on macOS; =0 forces headed),
 //        HOOKS / QUASAR_E2E_HOOKS (--hooks: the caller's directory of hook scripts, see hooks.mjs)
 //        WEB_DIST / QUASAR_E2E_WEB_DIST (--web-dist: a local web build served in the runner's own browser context, see webdist.mjs)
 //
@@ -474,8 +475,15 @@ export function runnerState(cwd = ROOT) {
   try { return { commit: git("rev-parse", "HEAD").trim(), dirty: git("status", "--porcelain", "--untracked-files=no").trim() !== "" }; } catch { return { commit: "unknown", dirty: false }; /* not a checkout */ }
 }
 
-/** Headless only on a Linux box with no display: a Mac or Windows desktop has no DISPLAY and is not headless. */
-export const headless = (env = process.env, platform = process.platform) => platform === "linux" && !(env.DISPLAY || env.WAYLAND_DISPLAY);
+/** Headless only on a Linux box with no display: a Mac or Windows desktop has no DISPLAY and is not headless. QUASAR_E2E_HEADLESS=1 forces headless; =0 forces headed. */
+export function headless(env = process.env, platform = process.platform) {
+  if (env.QUASAR_E2E_HEADLESS === "1") return true;
+  if (env.QUASAR_E2E_HEADLESS === "0") return false;
+  return platform === "linux" && !(env.DISPLAY || env.WAYLAND_DISPLAY);
+}
+
+/** Prefers the pinned playwright-core before falling back to playwright, so an unrelated playwright above an unpacked pack folder does not win. */
+export const loadPlaywright = () => import("playwright-core").catch(() => import("playwright"));
 
 /** Certificate checks stay on unless the caller asks (INSECURE_TLS=1, for a stack with a self-signed certificate): the process-wide switch Node's fetch has. */
 export function configureTls(insecure, env = process.env) {
@@ -505,7 +513,8 @@ export async function openHost(browser, { attached, insecureTls, baseUrl = null,
 
 /** The RESULT line's status and the exit code: ok only when something passed and nothing failed. */
 export function summarise({ counts: { pass, fail, error }, errors, closeFailed = null }) {
-  if (errors.length || closeFailed) return { status: "error", code: 2, more: "" };
+  if (errors.length) return { status: "error", code: 2, more: "" };
+  if (closeFailed) return { status: "error", code: 2, more: " reason=browser-close" };
   if (fail + error) return { status: "failed", code: 1, more: "" };
   if (pass === 0) return { status: "failed", code: 1, more: " reason=nothing-passed" };
   return { status: "ok", code: 0, more: "" };
@@ -546,7 +555,7 @@ async function main() {
     try { webDist = loadWebDist(webDistDir); } catch (e) { return usage(e.message); }
   }
   const insecureTls = configureTls(process.env.INSECURE_TLS === "1");
-  const { chromium } = await import("playwright").catch(() => import("playwright-core"));
+  const { chromium } = await loadPlaywright();
   const browser = args.cdp
     ? await chromium.connectOverCDP(args.cdp)
     : await chromium.launch({ executablePath: process.env.CHROME || undefined, headless: headless() });

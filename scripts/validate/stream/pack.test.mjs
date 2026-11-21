@@ -12,8 +12,8 @@ import { fileURLToPath } from "node:url";
 import { checkName, crc32, tarGz, zip } from "./archive.mjs";
 import { validateBundle } from "./bundle.mjs";
 import { closure, packMembers, playwrightFiles, requireTracked } from "./pack.mjs";
-import { doctor, dropSignIn, findChrome, parseCli, sendBack, withoutSignIn, zipBundle } from "./pack-run.mjs";
-import { headless, runnerState } from "./run.mjs";
+import { doctor, dropSignIn, findChrome, parseCli, resolveSignIn, runnerFailureReason, sendBack, withoutSignIn, zipBundle } from "./pack-run.mjs";
+import { headless, runnerState, summarise } from "./run.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "../../..");
@@ -126,17 +126,129 @@ const run = (cmd, args, opts) => new Promise((resolve) => {
   p.on("close", (status) => resolve({ status, stdout, stderr }));
 });
 
-/** A stack that answers: the page, the sign-in, the library. */
-async function fakeStack({ apps = [{ name: "Quasar Benchapp" }], login = 200 } = {}) {
+/** A stack that answers: the page, the sign-in, the library, and session status/stop for full runs. */
+async function fakeStack({ apps = [{ id: "app-1", name: "Quasar Benchapp" }], login = 200 } = {}) {
+  const stopped = [];
   const server = http.createServer((req, res) => {
     const json = (code, body) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(body)); };
-    if (req.method === "POST" && req.url === "/v1/auth/login") return json(login, login === 200 ? { access_token: "tok-12345678" } : { error: "no" });
-    if (req.url === "/v1/apps") return json(200, { items: apps });
+    const u = new URL(req.url, "http://127.0.0.1");
+    if (req.method === "POST" && u.pathname === "/v1/auth/login") return json(login, login === 200 ? { access_token: "ApiTok12345678" } : { error: "no" });
+    if (req.method === "GET" && u.pathname === "/v1/apps") return json(200, { items: apps });
+    const m = /^\/v1\/sessions\/([^/]+)$/.exec(u.pathname);
+    if (m && req.method === "DELETE") { stopped.push(m[1]); res.writeHead(204); return res.end(); }
+    if (m && req.method === "GET") {
+      return json(200, {
+        session: {
+          id: m[1],
+          app_id: apps[0]?.id ?? "app-1",
+          state: stopped.includes(m[1]) ? "stopped" : "running",
+          transport: "webrtc",
+          negotiated_codec: "h264",
+          stream: { height: 1080, fps: 60 },
+        },
+      });
+    }
     res.writeHead(200, { "content-type": "text/html" });
     res.end("<title>fake stack</title>");
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
-  return { url: `http://127.0.0.1:${server.address().port}`, close: () => new Promise((r) => server.close(r)) };
+  return { url: `http://127.0.0.1:${server.address().port}`, stopped, close: () => new Promise((r) => server.close(r)) };
+}
+
+/** Installs an offline fake `playwright-core` inside an unpacked pack directory so the real `pack-run.mjs` -> `run.mjs` -> `stream-hold.mjs` path runs without a real Chrome binary. */
+function installFakePlaywrightCore(packDir) {
+  const pkgDir = path.join(packDir, "node_modules/playwright-core");
+  fs.mkdirSync(pkgDir, { recursive: true });
+  fs.writeFileSync(path.join(pkgDir, "package.json"), JSON.stringify({ name: "playwright-core", version: "0.0.0-test", type: "module", exports: "./index.mjs" }));
+  fs.writeFileSync(
+    path.join(pkgDir, "index.mjs"),
+    `import fs from "node:fs";
+const SID = "11111111-2222-3333-4444-555555555555";
+const PAGE_BEARER = "PageTok1234567890";
+const T0 = 1_800_000_000_000;
+const windows = Array.from({ length: 25 }, (_, i) => ({
+  t_start_ms: T0 + i * 1000, t_end_ms: T0 + (i + 1) * 1000, t_end_host_ms: T0 + (i + 1) * 1000 + 2,
+  last_host_time_ms: T0 + i * 1000 + 950, n: 60, decoded: 60, no_image: 0, missing_indices: 0, duplicated: 0, reordered: 0,
+  offset_unknown: false, offset_ms: 2, g2g_p50_ms: 20, g2g_p95_ms: 25,
+}));
+const frames = Array.from({ length: 25 * 60 }, (_, i) => ({ present_ms: T0 + Math.round(i * (1000 / 60)), decoded: true }));
+const response = (status, p, body, origin) => ({
+  status: () => status, url: () => origin + p, request: () => ({ method: () => "POST" }),
+  json: async () => body, text: async () => JSON.stringify(body),
+});
+function makePage() {
+  const handlers = {};
+  const ls = new Map();
+  let curUrl = "about:blank";
+  let origin = "http://127.0.0.1";
+  const emit = (ev, arg) => (handlers[ev] ?? []).forEach((fn) => fn(arg));
+  const loc = (desc) => ({
+    first: () => loc(desc),
+    getByRole: (role, o) => loc(desc + " > " + role + ":" + o?.name),
+    evaluate: async (fn) => fn({
+      disabled: false, getAttribute: () => null,
+      click: () => {
+        if (!/Play now/.test(desc)) return;
+        emit("response", response(201, "/v1/sessions", { session: { id: SID } }, origin));
+        curUrl = origin + "/app/session/" + SID;
+      },
+    }),
+  });
+  return {
+    on: (ev, fn) => { (handlers[ev] ??= []).push(fn); },
+    goto: async (u) => { curUrl = u; try { origin = new URL(u).origin; } catch {} },
+    url: () => curUrl,
+    fill: async () => {},
+    click: async () => { ls.set("quasar.auth.token", PAGE_BEARER); emit("response", response(200, "/v1/auth/login", { access_token: PAGE_BEARER }, origin)); curUrl = origin + "/app"; },
+    waitForURL: async () => {},
+    close: async () => {},
+    screenshot: async ({ path: p }) => { fs.writeFileSync(p, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0])); },
+    getByRole: (role, o) => loc(role + ":" + o?.name),
+    evaluate: async (fn, arg) => {
+      const store = Object.create({ getItem(k) { return this[k] ?? null; }, setItem(k, v) { this[k] = v; }, removeItem(k) { delete this[k]; } });
+      for (const [k, v] of ls) store[k] = v;
+      const keys = ["window", "document", "navigator", "screen", "devicePixelRatio", "requestAnimationFrame", "WebTransport", "VideoDecoder", "localStorage", "sessionStorage"];
+      const saved = Object.fromEntries(keys.map((k) => [k, Object.getOwnPropertyDescriptor(globalThis, k)]));
+      const setG = (k, v) => Object.defineProperty(globalThis, k, { value: v, configurable: true, writable: true });
+      const video = { tagName: "VIDEO", videoWidth: 1920, getVideoPlaybackQuality: () => ({ totalVideoFrames: 1500 }), getBoundingClientRect: () => ({ left: 0, top: 0, width: 1280, height: 720 }) };
+      let rafT = 0;
+      setG("window", { __qBench: { dump: () => ({ frames, windows }), stats: () => ({ frames: 1500, decoded: 1500 }) } });
+      setG("document", {
+        visibilityState: "visible", hasFocus: () => true,
+        createElement: () => ({ getContext: () => null }),
+        querySelectorAll: () => [video],
+        querySelector: (s) => (/video/.test(s) ? video : null),
+      });
+      setG("navigator", {
+        userAgent: "Chrome/157.0.0.0", platform: "Linux", hardwareConcurrency: 4,
+        userAgentData: { platform: "Linux", brands: [{ brand: "Google Chrome", version: "157" }], getHighEntropyValues: async () => ({ platform: "Linux", platformVersion: "6.0", architecture: "x86", fullVersionList: [{ brand: "Google Chrome", version: "157.0.0.0" }] }) },
+        gpu: { requestAdapter: async () => ({ info: { vendor: "fake", architecture: "test" } }) },
+        mediaCapabilities: { decodingInfo: async () => ({ supported: true, powerEfficient: true }) },
+      });
+      setG("screen", { width: 1920, height: 1080 });
+      setG("devicePixelRatio", 1);
+      setG("requestAnimationFrame", (cb) => queueMicrotask(() => cb((rafT += 500))));
+      setG("WebTransport", function WebTransport() {});
+      setG("VideoDecoder", { isConfigSupported: async () => ({ supported: true }) });
+      setG("localStorage", store);
+      setG("sessionStorage", { getItem: () => null });
+      try { return await fn(arg); } finally {
+        ls.clear();
+        for (const [k, v] of Object.entries(store)) ls.set(k, v);
+        for (const [k, d] of Object.entries(saved)) { if (d) Object.defineProperty(globalThis, k, d); else delete globalThis[k]; }
+      }
+    },
+  };
+}
+export const chromium = {
+  launch: async () => ({
+    version: () => "157.0.0.0",
+    newContext: async () => ({ grantPermissions: async () => {}, newPage: async () => makePage(), close: async () => {} }),
+    close: async () => { if (process.env.FAKE_CLOSE_FAIL === "1") throw new Error("browser hung on close"); },
+  }),
+};
+`,
+  );
 }
 
 test("unpacked alone into an empty directory the entry starts (--help, doctor) with no module missing, and says Chrome is absent plainly", async () => {
@@ -339,10 +451,229 @@ test("a pack names its commit: the runner reads VERSION, not a git history it do
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("a Mac or Windows desktop is not headless; a Linux box is only without a display", () => {
+test("a Mac or Windows desktop is not headless; a Linux box is only without a display; QUASAR_E2E_HEADLESS overrides", () => {
   assert.equal(headless({}, "darwin"), false);
   assert.equal(headless({}, "win32"), false);
   assert.equal(headless({}, "linux"), true);
   assert.equal(headless({ DISPLAY: ":0" }, "linux"), false);
   assert.equal(headless({ WAYLAND_DISPLAY: "w" }, "linux"), false);
+  assert.equal(headless({ QUASAR_E2E_HEADLESS: "1" }, "darwin"), true);
+  assert.equal(headless({ QUASAR_E2E_HEADLESS: "1" }, "win32"), true);
+  assert.equal(headless({ QUASAR_E2E_HEADLESS: "1", DISPLAY: ":0" }, "linux"), true);
+  assert.equal(headless({ QUASAR_E2E_HEADLESS: "0" }, "linux"), false);
+});
+
+test("archive name limit counts UTF-8 bytes (100 bytes), not JS characters (#1280)", () => {
+  const overBytes = "a".repeat(99) + "é"; // 100 chars, 101 UTF-8 bytes
+  assert.equal(overBytes.length, 100);
+  assert.equal(Buffer.byteLength(overBytes, "utf8"), 101);
+  assert.throws(() => checkName(overBytes), /unsafe archive member name/);
+  assert.throws(() => tarGz([{ name: overBytes, data: Buffer.alloc(0) }]), /unsafe archive member name/);
+  assert.throws(() => zip([{ name: overBytes, data: Buffer.alloc(0) }]), /unsafe archive member name/);
+  assert.throws(() => checkName("é".repeat(51)), /unsafe archive member name/);
+  const exact = "é".repeat(50); // 50 chars, 100 UTF-8 bytes
+  assert.equal(Buffer.byteLength(exact, "utf8"), 100);
+  assert.equal(checkName(exact), exact);
+  assert.ok(tarGz([{ name: exact, data: Buffer.from("ok") }]).length > 0);
+});
+
+test("default pack archives written to the repo root are git-ignored (#1280)", () => {
+  for (const name of ["quasar-e2e-pack-01234567.tar.gz", "quasar-e2e-pack-01234567.zip"]) {
+    const r = spawnSync("git", ["check-ignore", "-q", name], { cwd: ROOT, encoding: "utf8" });
+    assert.equal(r.status, 0, `${name} in repo root must be git-ignored (${r.stderr.trim()})`);
+  }
+});
+
+test("Windows launcher run.cmd quotes forwarded arguments without unquoted %*, and README clarifies .\\run.cmd and doctor (#1280)", () => {
+  const cmd = fs.readFileSync(path.join(HERE, "pack/run.cmd"), "utf8");
+  assert.doesNotMatch(cmd, /%\*/, "run.cmd must not use unquoted %* (splits & in URLs)");
+  assert.match(cmd, /pack-run\.mjs "%~1" "%~2" "%~3" "%~4"/, "run.cmd must quote every forwarded positional arg up to at least 4");
+  for (const line of cmd.split(/\r?\n/)) {
+    if (/node scripts\\validate\\stream\\pack-run\.mjs/.test(line)) {
+      assert.doesNotMatch(line, /(?<!")%~[1-9]|%~[1-9](?!")/, `unquoted arg in: ${line}`);
+    }
+  }
+  assert.doesNotMatch(cmd, /\([^)]*%ERRORLEVEL%[^)]*\)/s, "run.cmd must not expand %ERRORLEVEL% inside a parenthesized block");
+
+  const readme = fs.readFileSync(path.join(HERE, "pack/README.txt"), "utf8");
+  assert.doesNotMatch(readme, /(?<!\.\\)\brun\.cmd\b/, "README.txt must write .\\run.cmd for PowerShell");
+  assert.match(readme, /3\.[^\n]*full test[^\n]*\.zip[\s\S]*doctor[^\n]*no \.zip/i, "README step 3 must clarify that doctor writes no .zip");
+});
+
+test("doctor flags signin.txt.txt when signin.txt is absent, and does not when signin.txt exists (#1280)", async () => {
+  const dir = tmp();
+  const stack = await fakeStack();
+  try {
+    fs.writeFileSync(path.join(dir, "signin.txt.txt"), "QUASAR_E2E_EMAIL=a\nQUASAR_E2E_PASSWORD=b\n");
+    const d1 = await doctor({ target: stack.url, plan: "smoke", creds: {}, chrome: "/x/chrome", insecure: false, root: dir, deps: { loadChromium: fakeChromium() } });
+    const s1 = d1.checks.find((c) => c.name === "sign-in");
+    assert.equal(s1.ok, false);
+    assert.match(s1.detail, /signin\.txt\.txt/);
+    assert.match(s1.detail, /Notepad/i);
+
+    fs.writeFileSync(path.join(dir, "signin.txt"), "");
+    const d2 = await doctor({ target: stack.url, plan: "smoke", creds: {}, chrome: "/x/chrome", insecure: false, root: dir, deps: { loadChromium: fakeChromium() } });
+    const s2 = d2.checks.find((c) => c.name === "sign-in");
+    assert.equal(s2.ok, false);
+    assert.doesNotMatch(s2.detail, /signin\.txt\.txt/);
+  } finally { await stack.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("doctor reports which sign-in source was used without leaking credentials (#1280)", async () => {
+  const dir = tmp();
+  const stack = await fakeStack();
+  const bad = await fakeStack({ login: 401 });
+  try {
+    fs.writeFileSync(path.join(dir, "signin.txt"), "QUASAR_E2E_EMAIL=file-user@example.test\nQUASAR_E2E_PASSWORD=file-secret-password\n");
+    assert.equal(resolveSignIn({}, dir).source, "signin.txt");
+    const over = resolveSignIn({ QUASAR_E2E_EMAIL: "env-user@example.test", QUASAR_E2E_PASSWORD: "env-secret-password" }, dir);
+    assert.equal(over.source, "environment; signin.txt ignored");
+    assert.equal(over.creds.email, "env-user@example.test");
+    const credPath = path.join(dir, "other.creds");
+    fs.writeFileSync(credPath, "QUASAR_E2E_EMAIL=other-user@example.test\nQUASAR_E2E_PASSWORD=other-secret-pass\n");
+    const fromFile = resolveSignIn({ QUASAR_E2E_CRED_FILE: credPath }, dir);
+    assert.equal(fromFile.source, "QUASAR_E2E_CRED_FILE; signin.txt ignored");
+    assert.ok(!fromFile.source.includes(credPath), "must not leak local file path");
+
+    const okRes = await doctor({ target: stack.url, plan: "smoke", creds: over.creds, credSource: over.source, chrome: "/x/chrome", insecure: false, root: dir, deps: { loadChromium: fakeChromium() } });
+    const okLine = okRes.checks.find((c) => c.name === "sign-in");
+    assert.equal(okLine.ok, true);
+    assert.match(okLine.detail, /\(from environment; signin\.txt ignored\)/);
+    assert.doesNotMatch(okLine.detail, /env-secret-password|env-user@example\.test/);
+
+    const failRes = await doctor({ target: bad.url, plan: "smoke", creds: over.creds, credSource: over.source, chrome: "/x/chrome", insecure: false, root: dir, deps: { loadChromium: fakeChromium() } });
+    const failLine = failRes.checks.find((c) => c.name === "sign-in");
+    assert.equal(failLine.ok, false);
+    assert.match(failLine.detail, /API sign-in failed \(401\) \(from environment; signin\.txt ignored\)/);
+    assert.doesNotMatch(failLine.detail, /env-secret-password|env-user@example\.test/);
+  } finally { await Promise.all([stack.close(), bad.close()]); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("unpacked alone, the full run path runs a plan end-to-end against a fake stack and writes a valid bundle zip (#1280)", async () => {
+  const dir = tmp();
+  const stack = await fakeStack();
+  try {
+    extract(dir, unzip(zip(members)));
+    const pack = path.join(dir, "quasar-e2e-pack");
+    installFakePlaywrightCore(pack);
+    const chrome = path.join(dir, "fake-chrome");
+    fs.writeFileSync(chrome, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const planFile = path.join(dir, "short-plan.json");
+    fs.writeFileSync(planFile, JSON.stringify({ name: "short", scenarios: [{ scenario: "stream-hold", params: { transport: "webrtc", codec: "h264", profile: "1080p60", hold_s: 0.1 } }] }));
+    fs.writeFileSync(path.join(pack, "signin.txt"), "QUASAR_E2E_EMAIL=tester-account@example.test\nQUASAR_E2E_PASSWORD=correct-horse-battery\n");
+
+    const r = await run("bash", [path.join(pack, "run.sh"), stack.url, planFile], { cwd: dir, env: { PATH: process.env.PATH, CHROME: chrome } });
+    assert.equal(r.status, 0, `stdout:\n${r.stdout}\nstderr:\n${r.stderr}`);
+    assert.doesNotMatch(r.stdout + r.stderr, /ERR_MODULE_NOT_FOUND|Cannot find module/);
+    assert.match(r.stdout, /ok {3}sign-in: accepted \(from signin\.txt\)/);
+    const resMatch = /RESULT status=ok target=e2e-pack zip=(\S+) run=ok pass=1 fail=0 error=0 skipped=0/.exec(r.stdout);
+    assert.ok(resMatch, `missing ok RESULT line in:\n${r.stdout}`);
+    assert.deepEqual(stack.stopped, ["11111111-2222-3333-4444-555555555555"]);
+    assert.doesNotMatch(r.stdout + r.stderr, /correct-horse-battery|tester-account@example\.test|ApiTok12345678|PageTok1234567890/);
+
+    const zipPath = resMatch[1];
+    assert.ok(fs.existsSync(zipPath), `expected zip on disk at ${zipPath}`);
+    const out = path.join(dir, "unzipped");
+    extract(out, unzip(fs.readFileSync(zipPath)));
+    const [top] = fs.readdirSync(out);
+    const unzippedBundle = path.join(out, top);
+    assert.deepEqual(validateBundle(unzippedBundle), []);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(unzippedBundle, "manifest.json"), "utf8")).runner.commit, SHA);
+    const sc = JSON.parse(fs.readFileSync(path.join(unzippedBundle, "01-stream-hold/scenario.json"), "utf8"));
+    assert.equal(sc.status, "pass", JSON.stringify(sc));
+  } finally { await stack.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("npm ci really spawns without the sign-in or NODE_TLS_REJECT_UNAUTHORIZED in its environment (#1280)", async () => {
+  const dir = tmp();
+  const stack = await fakeStack();
+  try {
+    extract(dir, unzip(zip(members)));
+    const pack = path.join(dir, "quasar-e2e-pack");
+    const bin = path.join(dir, "bin");
+    fs.mkdirSync(bin);
+    const dumpFile = path.join(dir, "npm-env.json");
+    fs.writeFileSync(
+      path.join(bin, "npm"),
+      `#!${process.execPath}\nimport fs from "node:fs";\nfs.writeFileSync(process.env.NPM_ENV_DUMP, JSON.stringify({ argv: process.argv.slice(2), env: process.env }));\n`,
+      { mode: 0o755 },
+    );
+    const credFile = path.join(dir, "creds.txt");
+    fs.writeFileSync(credFile, "QUASAR_E2E_EMAIL=file-user@example.test\nQUASAR_E2E_PASSWORD=file-secret-password\n");
+    const env = {
+      PATH: `${bin}:${process.env.PATH}`,
+      NPM_ENV_DUMP: dumpFile,
+      CHROME: path.join(dir, "no-such-chrome"),
+      QUASAR_E2E_EMAIL: "tester-account@example.test",
+      QUASAR_E2E_PASSWORD: "correct-horse-battery",
+      QUASAR_E2E_CRED_FILE: credFile,
+      NODE_TLS_REJECT_UNAUTHORIZED: "0",
+    };
+    await run(process.execPath, [path.join(pack, "scripts/validate/stream/pack-run.mjs"), "doctor", stack.url], { cwd: pack, env });
+    assert.ok(fs.existsSync(dumpFile), "fake npm was not spawned by ensureDeps");
+    const dump = JSON.parse(fs.readFileSync(dumpFile, "utf8"));
+    assert.deepEqual(dump.argv, ["ci", "--omit=dev", "--no-audit", "--no-fund"]);
+    assert.equal(dump.env.NPM_ENV_DUMP, dumpFile);
+    for (const k of ["QUASAR_E2E_EMAIL", "QUASAR_E2E_PASSWORD", "QUASAR_E2E_CRED_FILE", "NODE_TLS_REJECT_UNAUTHORIZED"]) {
+      assert.equal(Object.hasOwn(dump.env, k), false, `npm ci environment must not contain ${k}`);
+    }
+  } finally { await stack.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("unpacked pack prefers its pinned playwright-core over an unrelated playwright above the folder (#1280)", async () => {
+  const outer = tmp();
+  const stack = await fakeStack();
+  try {
+    // Unrelated playwright in an ancestor folder above the unpacked pack: imports cleanly so .catch() cannot mask it, then fails on launch.
+    const parentPw = path.join(outer, "node_modules/playwright");
+    fs.mkdirSync(parentPw, { recursive: true });
+    fs.writeFileSync(path.join(parentPw, "package.json"), JSON.stringify({ name: "playwright", version: "9.9.9", type: "module", exports: "./index.mjs" }));
+    fs.writeFileSync(path.join(parentPw, "index.mjs"), 'export const chromium = { launch: async () => { throw new Error("unrelated parent playwright was loaded"); } };\n');
+
+    const sub = path.join(outer, "sub");
+    fs.mkdirSync(sub);
+    extract(sub, unzip(zip(members)));
+    const pack = path.join(sub, "quasar-e2e-pack");
+    installFakePlaywrightCore(pack);
+    const chrome = path.join(outer, "fake-chrome");
+    fs.writeFileSync(chrome, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const planFile = path.join(outer, "short-plan.json");
+    fs.writeFileSync(planFile, JSON.stringify({ name: "short", scenarios: [{ scenario: "stream-hold", params: { transport: "webrtc", codec: "h264", profile: "1080p60", hold_s: 0.1 } }] }));
+    fs.writeFileSync(path.join(pack, "signin.txt"), "QUASAR_E2E_EMAIL=tester-account@example.test\nQUASAR_E2E_PASSWORD=correct-horse-battery\n");
+
+    const env = { PATH: process.env.PATH, CHROME: chrome };
+    const doc = await run(process.execPath, [path.join(pack, "scripts/validate/stream/pack-run.mjs"), "doctor", stack.url, planFile], { cwd: pack, env });
+    assert.equal(doc.status, 0, `doctor failed:\n${doc.stdout}\n${doc.stderr}`);
+    assert.doesNotMatch(doc.stdout + doc.stderr, /unrelated parent playwright/);
+    const full = await run(process.execPath, [path.join(pack, "scripts/validate/stream/pack-run.mjs"), stack.url, planFile], { cwd: pack, env });
+    assert.equal(full.status, 0, `full run failed:\n${full.stdout}\n${full.stderr}`);
+    assert.doesNotMatch(full.stdout + full.stderr, /unrelated parent playwright/);
+  } finally { await stack.close(); fs.rmSync(outer, { recursive: true, force: true }); }
+});
+
+test("when the runner exits 2 after writing a bundle because the browser would not close, pack reports browser-close instead of no-bundle (#1280)", async () => {
+  assert.deepEqual(summarise({ counts: { pass: 1, fail: 0, error: 0, skipped: 0 }, errors: [], closeFailed: new Error("hung") }), { status: "error", code: 2, more: " reason=browser-close" });
+  assert.equal(runnerFailureReason(2, false, ""), "no-bundle");
+  assert.equal(runnerFailureReason(2, true, "RESULT status=error target=e2e-run bundle=/b pass=1 fail=0 error=0 skipped=0 reason=browser-close\n"), "browser-close");
+  assert.equal(runnerFailureReason(2, true, "RESULT status=error target=e2e-run bundle=/b pass=1 fail=0 error=0 skipped=0\n"), "runner-error");
+  assert.equal(runnerFailureReason(0, true, ""), null);
+  assert.equal(runnerFailureReason(1, true, ""), null);
+
+  const dir = tmp();
+  const stack = await fakeStack();
+  try {
+    extract(dir, unzip(zip(members)));
+    const pack = path.join(dir, "quasar-e2e-pack");
+    installFakePlaywrightCore(pack);
+    const chrome = path.join(dir, "fake-chrome");
+    fs.writeFileSync(chrome, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const planFile = path.join(dir, "short-plan.json");
+    fs.writeFileSync(planFile, JSON.stringify({ name: "short", scenarios: [{ scenario: "stream-hold", params: { transport: "webrtc", codec: "h264", profile: "1080p60", hold_s: 0.1 } }] }));
+    fs.writeFileSync(path.join(pack, "signin.txt"), "QUASAR_E2E_EMAIL=tester-account@example.test\nQUASAR_E2E_PASSWORD=correct-horse-battery\n");
+
+    const r = await run(process.execPath, [path.join(pack, "scripts/validate/stream/pack-run.mjs"), stack.url, planFile], { cwd: pack, env: { PATH: process.env.PATH, CHROME: chrome, FAKE_CLOSE_FAIL: "1" } });
+    assert.equal(r.status, 1, `stdout:\n${r.stdout}\nstderr:\n${r.stderr}`);
+    assert.match(r.stdout, /RESULT status=failed target=e2e-pack zip= reason=browser-close run=error pass=1 fail=0 error=0 skipped=0/);
+    assert.doesNotMatch(r.stdout, /reason=no-bundle/);
+  } finally { await stack.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
