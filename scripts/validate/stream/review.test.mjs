@@ -7,7 +7,8 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { validateBundle } from "./bundle.mjs";
-import { ANOMALY_RULES, review, renderReview } from "./review.mjs";
+import { benchRows } from "./benchfold.mjs";
+import { ANOMALY_RULES, review, renderReview, warmupStartMs } from "./review.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "../../..");
@@ -382,6 +383,37 @@ test("an anomaly fires at its limit, over distinct timestamps, after warm-up", (
     renderReview(review(dir, { thresholdsFile: path.join(TMP, "missing.json") })),
     /^Not checked: no thresholds file was read\.$/m,
   );
+});
+
+test("bench rows do not move the client telemetry warm-up or add hitches", () => {
+  const dir = bundle();
+  const thresholdsFile = path.join(TMP, "thresholds-mixed-clocks.json");
+  const thresholds = {
+    version: "test",
+    thresholds: {
+      "classifier.hitch_sd_ms": { value: 18, unit: "ms" },
+      "classifier.warmup_exclude_s": { value: 20, unit: "s" },
+      "classifier.hitch_min_samples": { value: 2, unit: "count" },
+    },
+  };
+  fs.writeFileSync(thresholdsFile, JSON.stringify(thresholds));
+  const client = [4000, 21000, 23000, 24000, 25000].map((ts) => browser(ts, { present_interval_sd_ms: 20 }));
+  const hostBench = benchRows([{ last_host_time_ms: 1000, n: 60, decoded: 60, offset_unknown: false }]);
+  for (const bench of [
+    [],
+    hostBench,
+    benchRows([{ last_host_time_ms: 1000, n: 60, decoded: 60, offset_unknown: true }]),
+    benchRows([{ t_end_ms: 1000, n: 60, decoded: 0, offset_unknown: true }]),
+    [browser(1000, { missing_indices: 0 })],
+  ]) {
+    const rows = [...bench, ...client];
+    metrics(dir, rows);
+    const [hitch] = review(dir, { thresholdsFile }).scenarios[0].anomalies.rows;
+    assert.equal(hitch.samples_over, 2, "only the two post-warm-up samples count");
+    assert.equal(hitch.first_ts_unix_ms, 24000);
+    assert.equal(warmupStartMs(rows, thresholds), 24000);
+  }
+  assert.equal(warmupStartMs(hostBench, thresholds), null);
 });
 
 test("a hidden tab is not a sample the client judges, whether the flag is 1 or true", () => {

@@ -488,7 +488,7 @@ async function fetchSession(get, id, now, note) {
   const samples = [];
   if (!never) {
     // The server's resolveWindow default is the 5 minutes ending NOW, empty days later, so the
-    // window is explicit, in reads of at most 10 minutes; a read that comes back full is split.
+    // window is explicit, in reads of at most 10 minutes. Split reads that may have lost data.
     from = Date.parse(s.started_at) - PAD;
     to = (s.ended_at != null ? Date.parse(s.ended_at) : now()) + PAD;
     need(from < to, "its trace window is empty (it starts after it ends, or after now)");
@@ -534,8 +534,10 @@ async function fetchSession(get, id, now, note) {
       // handleAdminTelemetryRead projectionEvents: { window, events }, the RAW events, not clock-aligned
       const ev = await ok(`/v1/admin/sessions/${sid}/trace/events${q}`);
       need(Array.isArray(ev.events) && ev.events.every(traceEvent), "the trace events are not events");
-      const cappedAt = stamps[lowerBound(stamps, diag.window.from_ms) + PAGE - 1];
-      const full = ev.events.length >= PAGE || diag.events.length >= PAGE || (cappedAt !== undefined && cappedAt <= diag.window.to_ms);
+      // Metrics were paged in full. Only the first row beyond the cap proves truncation.
+      // Events have no paged total, so a full response could have lost events.
+      const firstOmitted = stamps[lowerBound(stamps, diag.window.from_ms) + PAGE];
+      const full = ev.events.length >= PAGE || diag.events.length >= PAGE || (firstOmitted !== undefined && firstOmitted <= diag.window.to_ms);
       if (!full) return reads.push({ diag, events: ev.events });
       need(b - a >= 4 * MIN, "its trace is denser than one read holds, even in the smallest window");
       const mid = Math.floor((a + b) / 2);

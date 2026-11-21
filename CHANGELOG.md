@@ -36,6 +36,7 @@ own; the two do not move together, and that is deliberate.
 
 ### Fixed
 - WebTransport keeps its initial 100 ms video repair estimate until the first retransmission is measured, so a faster control-stream pong no longer causes premature repeat NACKs or keyframe requests (#1436).
+- End-to-end review anchors hitch warm-up on browser telemetry, and collection accepts a diagnostic read with exactly 1,000 raw samples when its event responses are below the cap.
 - End-to-end collection now splits capped trace reads by raw sample count, validates session and host setting vocabularies, and shows each collected window's verdict in offline diagnoses (#1331).
 - WebTransport repeat NACK timing now waits on the longer of the smoothed control-stream path round trip that caps the reorder window and the measured repair round trip, avoiding premature duplicate NACKs on congested links (#1436).
 - WebTransport input detects full writers, combines pending relative mouse deltas, and keeps the latest absolute position when datagrams back up. Pending relative motion goes out before the next button, key, scroll, or other input event (#1154).
