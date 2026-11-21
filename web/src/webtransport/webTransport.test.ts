@@ -570,6 +570,50 @@ describe("WebTransportMedia loss recovery", () => {
     expect(agent.sent("nack")[2]).toEqual({ type: "nack", frame_seq: 2, frags: [[0, 0]] });
     t.close();
   });
+
+  it("waits on a longer measured repair round trip than the 20 ms path round trip (#1436)", async () => {
+    const agent = new FakeAgent();
+    agent.replies = [[{ ...helloAck(0, avcC()), retransmit_window_ms: 250 }]];
+    let now = 1_000;
+    const t = transport(agent, { now: () => now, ticker: () => () => {} });
+    await t.connect(NO_SINK);
+    vi.useFakeTimers();
+    // Control-stream pong reports a 20 ms path round trip.
+    agent.last.control({ type: "pong", id: 1, tc: now - 20, ts: 0, tw: 0 });
+    await vi.advanceTimersByTimeAsync(0);
+    const pkt = { n: 0 };
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(10, 0) }, pkt));
+    // Measure a 120 ms repair round trip while retransmits queue behind video.
+    const one = packetize({ configId: 0, frameSeq: 1, keyframe: false, data: bytes(2000, 1) }, pkt);
+    agent.last.datagrams([one[1]]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(agent.sent("nack")).toHaveLength(1);
+    now += 120;
+    const resend = one[0].slice();
+    resend[5] |= 0x04; // FLAG_RETRANSMIT
+    agent.last.datagrams([resend]);
+    await vi.advanceTimersByTimeAsync(0);
+    // Next loss: repeat NACK must wait for the 120 ms repair RTT, not fire early at 20 ms.
+    now = 2_000;
+    const two = packetize({ configId: 0, frameSeq: 2, keyframe: false, data: bytes(2000, 2) }, pkt);
+    agent.last.datagrams([two[1]]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(agent.sent("nack")).toHaveLength(2);
+    now = 2_000 + 20 + RTT_SLACK_MS;
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 3, keyframe: false, data: bytes(10, 3) }, pkt));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(agent.sent("nack")).toHaveLength(2);
+    now = 2_000 + 120 + RTT_SLACK_MS - 1;
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 4, keyframe: false, data: bytes(10, 4) }, pkt));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(agent.sent("nack")).toHaveLength(2);
+    now += 1;
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 5, keyframe: false, data: bytes(10, 5) }, pkt));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(agent.sent("nack")).toHaveLength(3);
+    expect(agent.sent("nack")[2]).toEqual({ type: "nack", frame_seq: 2, frags: [[0, 0]] });
+    t.close();
+  });
 });
 
 describe("WebTransportMedia receiver feedback", () => {
