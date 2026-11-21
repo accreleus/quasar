@@ -606,6 +606,10 @@ pub(crate) struct Estimator {
 pub(crate) struct Measured {
     pub(crate) usage: Usage,
     pub(crate) rate_kbps: Option<f64>,
+    /// The receive rate with the single largest arrival gap's excess over its send gap, `gap_us`,
+    /// taken out of the span: what the ABR's reading reads (rule 2).
+    pub(crate) delivered_kbps: Option<f64>,
+    pub(crate) gap_us: u64,
     /// The rate every video datagram sent over the same span was sent at, lost ones
     /// included, on the agent's clock; `None` when the message added no fresh arrival.
     pub(crate) sent_kbps: Option<f64>,
@@ -688,11 +692,11 @@ impl Estimator {
         self.loss
     }
 
-    /// The ABR's only down path (#1376): what the last message showed the link carrying, when
-    /// the link held the sender back: the higher of the estimate and `BETA` × the receive rate.
-    /// `None` when the datagrams arrived at the rate they were sent (a clean link, whatever the
-    /// delay detector says: #68), when the sender was application-limited, or when no receive
-    /// rate was measured.
+    /// The ABR's only down path (#1376, rule 2 of #1433): `BETA` × what the link delivered,
+    /// kbit/s, when it delivered under `LINK_LIMITED` × what was sent and the sender was not
+    /// application-limited. `None` otherwise: a clean link, whatever its delay detector says
+    /// (#68), a delay step or a blackout (one gap, taken out of `delivered`). Never the
+    /// estimate, which may float over the link while the sender is application-limited (#1503).
     pub(crate) fn measured(&self) -> Option<f64> {
         self.measured
     }
@@ -848,10 +852,10 @@ impl Estimator {
             self.stop_regrow("reached");
         }
         self.measured = m
-            .rate_kbps
+            .delivered_kbps
             .zip(m.sent_kbps)
-            .filter(|&(r, s)| m.fresh && !app_limited && r < LINK_LIMITED * s)
-            .map(|(r, _)| self.estimate_kbps.max(BETA * r));
+            .filter(|&(d, s)| m.fresh && !app_limited && d < LINK_LIMITED * s)
+            .map(|(d, _)| BETA * d);
         let due = self.log_due(now)
             && (self.unlogged.is_some() || self.bound != self.logged.0 || self.measured.is_some());
         if !cut_by.is_empty() || due {
@@ -875,6 +879,8 @@ impl Estimator {
                 cut = cut.as_str(),
                 usage = ?m.usage,
                 recv_kbps = m.rate_kbps.unwrap_or(0.0) as u64,
+                delivered_kbps = m.delivered_kbps.unwrap_or(0.0) as u64,
+                gap_ms = m.gap_us as f64 / 1000.0,
                 sent_kbps = m.sent_kbps.unwrap_or(0.0) as u64,
                 app_limited,
                 base_kbps = base as u64,
@@ -1114,6 +1120,21 @@ impl Estimator {
                 .then(|| (bytes - u64::from(first.1)) as f64 * 8.0 * 1000.0 / span as f64)
         };
         let rate_kbps = rate(|a| a.0, MIN_RATE_SPAN_US);
+        // Rule 2's delivered rate (#1433): the arrival span less the excess of its single largest
+        // arrival gap over the send gap between the same two datagrams. A delay step or a blackout
+        // leaves one such gap; a deep buffer stretches every gap, and keeps its shortfall.
+        let mut gap_us = 0;
+        let delivered_kbps = rate_kbps.and_then(|r| {
+            let mut order: Vec<(u64, u64)> =
+                self.arrivals.iter().map(|&(t, _, s)| (t, s)).collect();
+            order.sort_unstable();
+            gap_us = order
+                .windows(2)
+                .max_by_key(|w| w[1].0 - w[0].0)
+                .map_or(0, |w| (w[1].0 - w[0].0).saturating_sub(w[1].1.saturating_sub(w[0].1)));
+            let span = order.last()?.0 - order.first()?.0;
+            (span > gap_us).then(|| r * span as f64 / (span - gap_us) as f64)
+        });
         // Over every datagram sent in the span, lost ones too: a busy sender under loss is
         // still busy. Datagrams all sent in one instant give no send rate.
         let first_sent = self.arrivals.iter().map(|a| a.2).min();
@@ -1156,6 +1177,8 @@ impl Estimator {
         Measured {
             usage: self.trendline.usage,
             rate_kbps,
+            delivered_kbps,
+            gap_us,
             sent_kbps,
             fresh,
             loss,

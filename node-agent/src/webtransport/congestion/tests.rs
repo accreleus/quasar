@@ -1306,6 +1306,8 @@ fn the_regrow_caps_each_bound_at_the_pre_outage_rate() {
     let m = Measured {
         usage: Usage::Normal,
         rate_kbps: Some(20_000.0),
+        delivered_kbps: Some(20_000.0),
+        gap_us: 0,
         sent_kbps: None,
         fresh: true,
         loss: None,
@@ -1339,6 +1341,8 @@ fn the_loss_bound_grows_within_the_receive_rate_cap() {
     let m = Measured {
         usage: Usage::Normal,
         rate_kbps: Some(300.0),
+        delivered_kbps: Some(300.0),
+        gap_us: 0,
         sent_kbps: None,
         fresh: true,
         loss: None,
@@ -2128,6 +2132,8 @@ fn a_bound_flipping_at_the_feedback_rate_is_logged_at_most_once_a_second() {
                     Usage::Underusing
                 },
                 rate_kbps: None,
+                delivered_kbps: None,
+                gap_us: 0,
                 sent_kbps: None,
                 fresh: false,
                 loss: delay_grows.then_some(0.05),
@@ -2207,6 +2213,8 @@ fn each_line_names_every_cause_of_the_fall_it_covers() {
         let m = Measured {
             usage: Usage::Normal,
             rate_kbps: None,
+            delivered_kbps: None,
+            gap_us: 0,
             sent_kbps: None,
             fresh: false,
             loss: Some(0.5),
@@ -3623,6 +3631,34 @@ fn a_short_blackout_is_no_loss_no_cut_and_no_reading() {
 
 
 
+/// Rule 2 (#1433): a report is a reading only when the link delivered under 0.95 × what was sent
+/// by a sender that was not application-limited, and then it is `BETA` × what was delivered,
+/// never the estimate (#1503: an estimate that floated over the link held the sender over it).
+/// Old code (0.6.3): the higher of the estimate and `BETA` × the receive rate.
+#[test]
+fn a_report_is_a_reading_only_when_the_link_delivered_under_what_was_sent() {
+    let start = Instant::now();
+    let at = |ms| start + Duration::from_millis(ms);
+    let report = |delivered_kbps, sent_kbps| Measured {
+        usage: Usage::Normal,
+        rate_kbps: delivered_kbps,
+        delivered_kbps,
+        gap_us: 0,
+        sent_kbps,
+        fresh: true,
+        loss: None,
+    };
+    let mut est = Estimator::new(CEILING, start);
+    est.apply(report(Some(7900.0), Some(8000.0)), at(100), NO_QUIC);
+    assert_eq!(est.measured(), None, "a clean link: arrived as sent");
+    est.apply(report(Some(1000.0), Some(3000.0)), at(200), NO_QUIC);
+    assert_eq!(est.measured(), None, "an idle sender (application-limited)");
+    est.apply(report(None, Some(8000.0)), at(300), NO_QUIC);
+    assert_eq!(est.measured(), None, "no delivered rate");
+    est.apply(report(Some(6000.0), Some(8000.0)), at(400), NO_QUIC);
+    assert_eq!(est.measured(), Some(BETA * 6000.0), "never the estimate");
+}
+
 /// A reading moves the ABR only: at the ceiling no frame is paced, whatever the readings say.
 #[test]
 fn capacity_evidence_paces_nothing_at_the_ceiling() {
@@ -3633,6 +3669,8 @@ fn capacity_evidence_paces_nothing_at_the_ceiling() {
     let m = Measured {
         usage: Usage::Normal,
         rate_kbps: Some(5000.0),
+        delivered_kbps: Some(5000.0),
+        gap_us: 0,
         sent_kbps: Some(8000.0),
         fresh: true,
         loss: None,
@@ -3933,6 +3971,8 @@ fn a_report_with_no_fresh_video_is_no_reading() {
     let m = Measured {
         usage: Usage::Normal,
         rate_kbps: Some(5000.0),
+        delivered_kbps: Some(5000.0),
+        gap_us: 0,
         sent_kbps: None,
         fresh: false,
         loss: None,
