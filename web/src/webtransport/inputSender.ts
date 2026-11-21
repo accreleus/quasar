@@ -77,11 +77,27 @@ export function webTransportInputSender(wire: InputWire, settleMs = SETTLE_MS): 
   function send(msg: InputMsg): void {
     // A stale capture handler must not reach a connection that is gone or replaced.
     if (disposed) return;
+    const relative = msg.t !== "mm" && pendingMotion?.t === "mm" ? pendingMotion : undefined;
+    if (relative) {
+      wire.reliable(relative);
+      pendingMotion = undefined;
+    }
     if (msg.t === "mm" || msg.t === "ma") {
-      if (msg.t === "mm" && pendingMotion?.t === "ma") drop("ma");
+      if (msg.t === "mm" && pendingMotion?.t === "mm") {
+        msg = {
+          ...msg,
+          dx: Number(pendingMotion.dx) + Number(msg.dx),
+          dy: Number(pendingMotion.dy) + Number(msg.dy),
+          seq: msg.seq ?? pendingMotion.seq,
+          tc: msg.tc ?? pendingMotion.tc,
+        };
+      } else if (msg.t === "mm" && pendingMotion?.t === "ma") {
+        // A late absolute settle could overwrite the new relative motion.
+        drop("ma");
+      }
       pendingMotion = undefined;
       const writer = wire.datagramState?.();
-      if (writer && full(writer.desiredSize)) {
+      if (!relative && writer && full(writer.desiredSize)) {
         pendingMotion = { ...msg }; // capture mutates and reuses its motion objects
         if (msg.t === "ma") settleAbsolute(msg);
         const ready = writer.ready;
@@ -89,7 +105,11 @@ export function webTransportInputSender(wire: InputWire, settleMs = SETTLE_MS): 
         if (scheduledReady !== ready) {
           scheduledReady = ready;
           void ready.then(() => {
-            if (pendingMotion && wire.datagramState?.() === writer) send(pendingMotion);
+            if (pendingMotion && wire.datagramState?.() === writer) {
+              const pending = pendingMotion;
+              pendingMotion = undefined;
+              send(pending);
+            }
           }, () => {
             pendingMotion = undefined;
           });
@@ -97,7 +117,8 @@ export function webTransportInputSender(wire: InputWire, settleMs = SETTLE_MS): 
         return;
       }
     }
-    if (lossy(msg)) {
+    // Keep the next event on the same ordered stream as the motion it drained.
+    if (lossy(msg) && !relative) {
       const json = JSON.stringify(msg);
       const { read, written } = encoder.encodeInto(json, scratch.subarray(1));
       // read < json.length: it overran the scratch; the wire decides the real limit.
@@ -107,9 +128,7 @@ export function webTransportInputSender(wire: InputWire, settleMs = SETTLE_MS): 
         return; // mm and ms are relative: nothing to settle
       }
     }
-    // A click must land where the pointer was, and a datagram `ma` can lose or trail the reliable
-    // `mb`: the position goes first on the same ordered stream. Relative motion has no position to
-    // repeat, so a late `mm` just shifts the cursor slightly; accepted.
+    // A datagram `ma` can lose or trail the click, so repeat the position before the click.
     if (msg.t === "mb") {
       if (pendingMotion?.t === "ma") pendingMotion = undefined;
       const abs = drop("ma");

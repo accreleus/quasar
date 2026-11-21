@@ -231,29 +231,91 @@ describe("WebTransportMedia input and ping", () => {
     t.close();
   });
 
-  it.each(["mm", "ma"])("sends only the newest pending %s when the datagram writer drains", async (kind) => {
+  it("combines three blocked relative moves into one datagram when the writer drains", async () => {
     const { agent, t, up } = connected();
     await up;
     const sender = webTransportInputSender(t.input);
     const scroll = { t: "ms", dx: 0, dy: 120 };
-    const key = { t: "k", code: 30, pressed: false };
-    const button = { t: "mb", button: 272, pressed: false };
-    const move = kind === "mm" ? { t: kind, dx: 1, dy: 2 } : { t: kind, x: 0.1, y: 0.2 };
-    const latest = kind === "mm" ? { t: kind, dx: 3, dy: 4 } : { t: kind, x: 0.3, y: 0.4 };
+    const move = { t: "mm", dx: 1, dy: 2, seq: 17, tc: 10 };
     const datagrams = () => agent.datagramsSent.map((d) => JSON.parse(text(d.subarray(1))));
     try {
       agent.hold = "datagram-write";
       sender.send(scroll); // fills the writer's single slot
       sender.send(move);
-      sender.send(Object.assign(move, latest)); // capture reuses its relative-motion object
-      Object.assign(move, kind === "mm" ? { dx: 5, dy: 6 } : { x: 0.5, y: 0.6 });
-      sender.send(scroll); // retains its datagram path even when full
-      sender.send(key);
-      if (kind === "mm") sender.send(button);
+      sender.send(Object.assign(move, { dx: 3, dy: -4, seq: 18, tc: 20 }));
+      sender.send({ t: "mm", dx: -5, dy: 6, seq: 19 });
+      Object.assign(move, { dx: 100, dy: 100 }); // capture reuses its relative-motion object
       await flush();
       expect(datagrams()).toEqual([scroll]);
-      const reliable = () => agent.sent("input").map((m) => m.event);
-      expect(reliable()).toEqual(kind === "mm" ? [key, button] : [key]);
+      expect(agent.sent("input")).toEqual([]);
+
+      agent.hold = null;
+      agent.release();
+      await flush();
+      expect(datagrams()).toEqual([scroll, { t: "mm", dx: -1, dy: 4, seq: 19, tc: 20 }]);
+      expect(agent.sent("input")).toEqual([]);
+    } finally {
+      sender.dispose();
+      agent.hold = null;
+      agent.release();
+      await t.close();
+    }
+  });
+
+  it.each([
+    { t: "mb", button: 272, pressed: true },
+    { t: "k", code: 30, pressed: true },
+    { t: "ms", dx: 0, dy: 120 },
+    { t: "gp", i: 0, buttons: [], axes: [1, 0] },
+    { t: "ma", x: 0.3, y: 0.4 },
+  ])("sends blocked relative motion on the control stream before $t", async (event) => {
+    const { agent, t, up } = connected();
+    await up;
+    const sender = webTransportInputSender(t.input);
+    const scroll = { t: "ms", dx: 0, dy: -120 };
+    const rest = { t: "gp", i: 0, buttons: [], axes: [0, 0] };
+    const move = { t: "mm", dx: 1, dy: 2 };
+    try {
+      sender.send(rest); // the next gamepad event only changes a stick
+      agent.hold = "datagram-write";
+      sender.send(scroll);
+      sender.send(move);
+      sender.send(event);
+      await flush();
+      expect(agent.sent("input").map((m) => m.event)).toEqual([rest, move, event]);
+
+      agent.hold = null;
+      agent.release();
+      await flush();
+      expect(agent.datagramsSent.map((d) => JSON.parse(text(d.subarray(1))))).toEqual([scroll]);
+    } finally {
+      sender.dispose();
+      agent.hold = null;
+      agent.release();
+      await t.close();
+    }
+  });
+
+  it("sends only the newest pending ma when the datagram writer drains", async () => {
+    const { agent, t, up } = connected();
+    await up;
+    const sender = webTransportInputSender(t.input);
+    const scroll = { t: "ms", dx: 0, dy: 120 };
+    const key = { t: "k", code: 30, pressed: false };
+    const move = { t: "ma", x: 0.1, y: 0.2 };
+    const latest = { t: "ma", x: 0.3, y: 0.4 };
+    const datagrams = () => agent.datagramsSent.map((d) => JSON.parse(text(d.subarray(1))));
+    try {
+      agent.hold = "datagram-write";
+      sender.send(scroll); // fills the writer's single slot
+      sender.send(move);
+      sender.send(Object.assign(move, latest));
+      Object.assign(move, { x: 0.5, y: 0.6 });
+      sender.send(scroll); // retains its datagram path even when full
+      sender.send(key);
+      await flush();
+      expect(datagrams()).toEqual([scroll]);
+      expect(agent.sent("input").map((m) => m.event)).toEqual([key]);
 
       agent.hold = null;
       agent.release();
