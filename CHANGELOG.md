@@ -26,6 +26,7 @@ own; the two do not move together, and that is deliberate.
 
 ### Changed
 - Dependency updates
+- E2E hooks stop their process group on a failed ledger write, share a recovery wait deadline, and record uncleared hook warnings in run bundles. E2E posting leak-scans run bundles and refuses ambiguous conditions or empty app slugs (#1341).
 - `make e2e-review` ranks `bench_n` (lowest) with accurate `offset_unknown` clock notes and control-plane-matching `is_hidden` handling, `stream-hold` captures `present_interval_sd_ms`, `present_interval_p95_ms`, and `is_hidden` from the page's own `/stats` posts so review anomaly rules run on client-only runner bundles without duplicating collected host samples, empty error messages always write a non-empty scenario reason, and `docs/testing-e2e-suite.md` and counter-rule comments are corrected (#1303).
 - **E2E bench folds, review and `stream-hold` tighten unmeasured counts, non-marker apps and cadence guards (#1334).** `benchfold.mjs` and `bench_app_samples.py` omit `missing_indices`/`duplicated`/`reordered` on windows with no decoded marker (`e2e-review` skips ranking them when `bench_decoded <= 0`), `stream-hold` adds optional `expect_marker` (excluded from bench scenario names) and finite-number instrument guards, cadence tests pin `hitchCount`'s hidden-span exclusion and `>=` boundary, and `docs/testing-e2e-suite.md` wraps the runner sections.
 
