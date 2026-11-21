@@ -484,6 +484,32 @@ func TestTheOldRuntimesProofCannotReleaseTheHoldWhileTheNewSessionsStopIsInFligh
 	}
 }
 
+// A successful adopter keeps adopt_session_id after it runs. When it ends with its
+// proof still trailing, a relaunch settles and then answers home_conflict, as any
+// ended holder does; the 503 stopping answer is only for a failed adopter that
+// never ran (#1615 review).
+func TestAnEndedSuccessfulAdopterWithItsProofTrailingSettlesLikeAnyHolder(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	ctx := context.Background()
+	f.park(t)
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID, Mic: true})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	q := res.Session.ID
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: q, State: "running"})
+	waitState(t, f, q, "running")
+	if got := f.holder(t); got != q {
+		t.Fatalf("hold = %q once the claim runs, want %s", got, q)
+	}
+	must(t, exec(t, f.pool, `UPDATE sessions SET state = 'stopped', ended_at = now() WHERE id = $1::uuid`, q))
+	withHomeHoldSettleWait(t, 300*time.Millisecond)
+	_, err = f.launch(t, f.steam)
+	if !errors.Is(err, ErrHomeConflict) {
+		t.Fatalf("relaunch while an ended successful adopter's proof trails = %v, want home_conflict after the settle wait", err)
+	}
+}
+
 // The marker is read with the candidate adopter rows locked: failStart records it
 // before failing the row, so a row read as failed already has it, and a concurrent
 // failCommand cannot slip between the read and the lock.
