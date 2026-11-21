@@ -8,13 +8,14 @@
 # durable, permanently-archived hint about a private network. A scrub is a
 # one-time act; this script is what stops the next commit re-adding one.
 #
-# WHAT IT SCANS. Git-tracked content only, never the working tree, so
-# deliberately-untracked operator config (.claude/skills/_shared/hosts.json,
-# .mcp.json) is invisible to it by construction rather than by allowlist.
+# WHAT IT SCANS. The git modes scan tracked content only, so deliberately
+# untracked operator config (.claude/skills/_shared/hosts.json, .mcp.json)
+# is invisible to those modes by construction rather than by allowlist.
 #
 #   scripts/dev/leak-scan.sh            # the tracked tree at HEAD's index
 #   scripts/dev/leak-scan.sh --staged   # staged content only (pre-push/pre-commit)
 #   scripts/dev/leak-scan.sh --issues   # GitHub issue titles/bodies/comments
+#   scripts/dev/leak-scan.sh --dir PATH # public-destined directory of text files
 #
 # THE TRACKER IS THE OTHER PUBLIC SURFACE. The repo is not the only thing that
 # gets published: an issue body is just as public and just as permanently
@@ -40,12 +41,20 @@ case "${1:-}" in
   "") ;;
   --staged) MODE="staged" ;;
   --issues) MODE="issues" ;;
+  --dir)
+    if [ "$#" -ne 2 ] || [ ! -d "$2" ]; then
+      echo "usage: $0 --dir <existing-directory>" >&2
+      exit 2
+    fi
+    MODE="dir"
+    DIR_TARGET="$2"
+    ;;
   -h | --help)
     sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
     ;;
   *)
-    echo "usage: $0 [--staged|--issues]" >&2
+    echo "usage: $0 [--staged|--issues|--dir <path>]" >&2
     exit 2
     ;;
 esac
@@ -77,8 +86,8 @@ PATTERNS=(
 #                                a worktree finds the same file.
 #
 # Format: one extended regex per line. `tree:` (or no prefix) applies to every
-# mode; `issues:` applies to the issue tracker only — bare host names, which
-# tracked prose may still carry. Blank lines and `#` comments are ignored.
+# mode; `issues:` also checks public issue and directory scans for bare host
+# names that tracked prose may still carry. Blank lines and comments are ignored.
 #
 # With neither source the scan runs the generic shapes only and says so on
 # stderr. LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS=1 turns that into exit 2; CI sets it
@@ -285,6 +294,37 @@ Beware `gh api -f body=@file`: -f writes the LITERAL string "@file" and silently
 blanks the issue. Use `jq -Rs '{body: .}' < file | gh api <path> -X PATCH --input -`
 and read one object back afterwards.
 EOF
+  exit 1
+fi
+
+# Match the full public-surface pattern set, without the tracked tree's exclusions.
+if [ "$MODE" = dir ]; then
+  # Compare against the same bytes with NULs removed. grep -I alone can report
+  # a match before reaching a NUL later in the file.
+  if ! HITS="$(cd -- "$DIR_TARGET" && find -P . -type f -exec bash -c '
+    pattern=$1
+    shift
+    for file; do
+      LC_ALL=C tr -d "\000" < "$file" | cmp -s "$file" -
+      statuses=("${PIPESTATUS[@]}")
+      case "${statuses[*]}" in
+        "0 1"|"141 1") continue ;; # A NUL made cmp stop, possibly closing the pipe early.
+        "0 0") ;;
+        *) exit 2 ;;
+      esac
+      grep --line-number --with-filename --extended-regexp --color=never -e "$pattern" -- "$file"
+      if [ "$?" -gt 1 ]; then exit 2; fi
+    done
+  ' bash "$ISSUE_ALTERNATION" {} +)"; then
+    echo "leak-scan: could not scan the directory." >&2
+    exit 2
+  fi
+  if [ -z "$HITS" ]; then
+    echo "leak-scan: clean (dir) — no operator fingerprints in directory."
+    exit 0
+  fi
+  echo "leak-scan: FINGERPRINTS FOUND in directory." >&2
+  printf '%s\n' "$HITS" >&2
   exit 1
 fi
 

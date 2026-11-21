@@ -169,14 +169,16 @@ test("the app in the name is a slug: lower case, runs of other characters one `-
     assert.equal(after(a, "--scenario"), `stream-hold/transport=webrtc/codec=h264/profile=1080p60/app=${slug}`, app);
     assert.ok(valuesOf(a, "--tag").includes(`app=${slug}`), app);
   }
-  // A name with nothing to slug is not in the name and is counted; nothing of it is posted.
-  edit(dir, `${SC}/scenario.json`, (s) => ({ ...s, params: { ...s.params, app: "  ??  " } }));
+});
+
+test("an app that produces an empty slug refuses the scenario", () => {
+  const dir = bundle();
+  edit(dir, `${SC}/scenario.json`, (s) => ({ ...s, params: { ...s.params, app: "!!!" } }));
   const rec = recorder();
-  const out = postBundle(dir, { host: HOST, spawn: rec.spawn });
-  assert.equal(out.posted, 1);
-  assert.equal(out.leftOut, 1);
-  assert.equal(after(rec.submitted()[0].args, "--scenario"), "stream-hold/transport=webrtc/codec=h264/profile=1080p60");
-  assert.ok(!valuesOf(rec.submitted()[0].args, "--tag").some((t) => t.startsWith("app=")));
+  const { out, said } = postCapturingStderr(dir, { host: HOST, spawn: rec.spawn });
+  assert.deepEqual([out.exit, out.posted, out.failed], [1, 0, 1]);
+  assert.equal(rec.calls.length, 0);
+  assert.match(said, /param app produces an empty slug/);
 });
 
 test("a scenario name holding a dot cannot collide with another scenario's params", () => {
@@ -477,7 +479,6 @@ test("the other files bench_submit.py reads are checked where they reach the run
     path.join(good, SC, "conditions.json"),
     JSON.stringify({
       effective: { encoder_family: "vulkan", ladder_resolution: "off", host_path: "[omitted]" },
-      unknown: { effective: "the host has not reported its effective settings" },
       negotiated: { width: 1920, height: 1080, fps: 60, codec: "h264", encoder: "vulkanh264enc:0", profile_id: "observe" },
     }),
   );
@@ -497,7 +498,6 @@ test("the other files bench_submit.py reads are checked where they reach the run
     ["conditions.json", { negotiated: { encoder: "a b" } }],
     ["conditions.json", { negotiated: { profile_id: ["observe"] } }],
     ["conditions.json", { negotiated: { bitrate_kbps: 5000 } }],
-    ["conditions.json", { negotiated: { made_up: "x" } }],
     // bench_submit.py posts every member of this file: only the collector's own may be there, in the collector's shapes.
     ["conditions.json", { effective: { abr_mode: "free text with spaces / and a path" } }],
     ["conditions.json", { effective: {}, verdict: "likely_network_congestion free text" }],
@@ -521,6 +521,57 @@ test("the other files bench_submit.py reads are checked where they reach the run
     assert.deepEqual([out.status, out.posted, out.failed], ["failed", 0, 1], `${file} ${JSON.stringify(doc)}`);
     assert.equal(rec.calls.length, 0, `${file} ${JSON.stringify(doc)}`);
   }
+});
+
+test("conditions.json refuses effective and unknown together", () => {
+  const dir = bundle();
+  const file = path.join(dir, SC, "conditions.json");
+  const unknown = { effective: "the host has not reported its effective settings" };
+  fs.writeFileSync(file, JSON.stringify({ unknown }));
+  assert.equal(postBundle(dir, { host: HOST, spawn: recorder().spawn }).posted, 1);
+  fs.writeFileSync(file, JSON.stringify({ effective: { encoder_family: "vulkan" }, unknown }));
+  const rec = recorder();
+  const { out, said } = postCapturingStderr(dir, { host: HOST, spawn: rec.spawn });
+  assert.deepEqual([out.exit, out.posted, out.failed], [1, 0, 1]);
+  assert.equal(rec.calls.length, 0);
+  assert.match(said, /conditions\.json holds both effective and unknown/);
+});
+
+test("conditions.json refuses an unknown negotiated member", () => {
+  const dir = bundle();
+  fs.writeFileSync(path.join(dir, SC, "conditions.json"), JSON.stringify({ negotiated: { codec: "h264", made_up: "x" } }));
+  const rec = recorder();
+  const { out, said } = postCapturingStderr(dir, { host: HOST, spawn: rec.spawn });
+  assert.deepEqual([out.exit, out.posted, out.failed], [1, 0, 1]);
+  assert.equal(rec.calls.length, 0);
+  assert.match(said, /negotiated holds made_up this suite does not write/);
+});
+
+test("a failed run bundle leak scan blocks archiving and posting", () => {
+  const dir = bundle();
+  for (const result of [{ status: 1 }, { status: 2 }, { error: new Error("bash missing") }]) {
+    const rec = recorder();
+    const scanned = [];
+    const { code, out } = cli([dir, "--host", HOST], {
+      spawn: rec.spawn,
+      scan: (cmd, args) => { scanned.push([cmd, ...args]); return result; },
+    });
+    assert.equal(code, 1);
+    assert.deepEqual(scanned, [["bash", path.resolve(HERE, "../../dev/leak-scan.sh"), "--dir", fs.realpathSync(dir)]]);
+    assert.deepEqual(rec.calls, []);
+    assert.match(out, /RESULT status=failed target=e2e-post posted=0 skipped=0 reason=leak-scan-failed/);
+  }
+});
+
+test("the real directory scan refuses a home path in a run bundle", () => {
+  const dir = bundle();
+  fs.writeFileSync(path.join(dir, SC, "console.log"), `opened ${"/Users/"}alice/foo\n`);
+  const rec = recorder();
+  const env = { ...ENV, LEAK_SCAN_OPERATOR_PATTERNS: "", LEAK_SCAN_PATTERNS_FILE: path.join(TMP, "absent"), LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS: "" };
+  const { out, said } = postCapturingStderr(dir, { host: HOST, spawn: rec.spawn, env });
+  assert.deepEqual([out.exit, out.posted, out.reason], [1, 0, "leak-scan-failed"]);
+  assert.equal(rec.calls.length, 0);
+  assert.match(said, /console\.log:1:/);
 });
 
 // The rest of session.json that reaches a tag or conditions.negotiated is a number, and

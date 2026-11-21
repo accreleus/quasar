@@ -155,12 +155,13 @@ make e2e-run TARGET=... PLAN=... HOOKS=<dir>        # or QUASAR_E2E_HOOKS=<dir>
   hook under "left behind", and the following scenarios are `skipped` until it clears.
 - **A runner killed between apply and clear** (`kill -9`) cannot clear. Before each apply it writes
   `.e2e-hooks-applied.json` in the directory that holds `OUT`; the next run with the same `HOOKS=` and
-  an `OUT` in the same directory runs `clear` for every entry first and says so on stderr. A run with
-  no `HOOKS=` that finds the file only warns: it cannot clear anything. A hook that was still running
-  when its runner died keeps running; the next run waits for it to end (up to the hook's 30 s) before
-  it clears, and does not start if it does not end. If one will not clear, or the process that wrote it is
-  still running, the run does not start. A damaged ledger also stops it: remove the file once the hooks are
-  known to be clear.
+  an `OUT` in the same directory runs `clear` for every entry first and says so on stderr. A run
+  without `HOOKS=` that finds the file warns on stderr and records the warning in
+  `manifest.json` under `warnings`. Recovery waits up to 30 s total for all recorded hook process
+  groups to end before clearing. A background child left in its hook's process group keeps that
+  group alive after the runner dies. Recovery refuses to start a suite while that group survives
+  the deadline. A hook that fails to clear, a live ledger owner or a damaged ledger also stops
+  the run. Remove a damaged ledger once the hooks are known to be clear.
 - **No script.** A scenario whose hook has no executable script (or no `HOOKS=`) is `skipped`; the reason
   names the hook. Nothing is launched.
 
@@ -345,8 +346,10 @@ must not share a name. `/` and `=` are the separators because an identifier and 
 neither, so a scenario's own name can never spell another scenario's params. An app's name may
 hold spaces and capitals, so it enters the name as a slug — lower case, every run of characters
 outside `[a-z0-9]` replaced by one `-`, trimmed, at most 40 characters (`Quasar Benchapp` is
-`quasar-benchapp`) — and is posted as the tag `app=<slug>` as well; an app name with nothing to
-slug is left out of the name and counted. `bench`, `cover_qr`, `expect_marker` and `hold_s` are not
+`quasar-benchapp`) — and is posted as the tag `app=<slug>` as well. An empty slug refuses the
+scenario. App names that normalise to the same slug or share the same truncated slug still
+share a bench scenario when their other parameters match.
+`bench`, `cover_qr`, `expect_marker` and `hold_s` are not
 in the name — they are how the app was presented, whether a marker is expected (the app name already
 identifies it) and how long it ran, and `hold_s` is a tag. **A run posted
 before this change has another name**: an app is part of it now, so re-posting an older bundle
@@ -406,6 +409,9 @@ never through a shell. A scenario is not posted (`failed=N`, and the reason says
   (below), or one of its own files in a shape it does not write.
 
 If the bundle cannot be archived, nothing is posted (`reason=no-archive`).
+Before archiving or posting, `scripts/dev/leak-scan.sh --dir` checks the run bundle's regular
+text files against the public leak patterns. A hit or scan error stops the entire post
+(`reason=leak-scan-failed`, `posted=0`). The scan also runs with `DRY_RUN=1`.
 
 **Every file `bench_submit.py` reads in a scenario directory is checked, or the scenario is
 refused**, because each field it takes from one reaches the run's tags, its `conditions` or its
@@ -416,7 +422,7 @@ validity:
 | `session.json` | checked: `id`, `codec`, `profile`, `host_id`, `encoder`, `profile_id`, and `launch`, `fps`, `bitrate_kbps`, `started_at_ms` as finite numbers |
 | `metrics.jsonl` | checked by the bundle validator, row by row: a numeric `ts_unix_ms`, a source quasar-bench accepts, keys the metric manifest defines |
 | `trace.json` | checked: an object whose `events` are objects, each `payload` an object |
-| `conditions.json` | checked, member by member (the script posts the whole file as the run's conditions): only `effective`, `negotiated` and `unknown` may be there; `effective` maps identifiers to a setting or `[omitted]` (what the collector writes); `unknown` is the collector's one sentence; and `negotiated`'s members are in the shapes `session.json` was checked for — `width`, `height` and `fps` finite numbers, `codec`, `codec_profile` and `profile_id` identifiers, `encoder` and `encoder_negotiated` settings. A member this suite does not write is refused |
+| `conditions.json` | checked, member by member (the script posts the whole file as the run's conditions). The collector writes either `effective`, a map of identifiers to settings or `[omitted]`, or `unknown`, its one sentence. A file with both is refused. Allowed `negotiated` members are finite numbers `width`, `height` and `fps`, identifiers `codec`, `codec_profile` and `profile_id`, and settings `encoder` and `encoder_negotiated` |
 | `summary.json` | checked: an object (the script posts it as the run's summary as it is, text included) |
 | `caps-negotiated.json`, `verdict.json`, `steps.jsonl`, `marks.jsonl`, any `.md` | **refused**: this suite writes none of them, so a bundle that carries one is not posted and the file is named |
 
@@ -428,10 +434,10 @@ RESULT status=ok|failed|error target=e2e-post posted=N skipped=N [failed=N] [lef
 
 Exit 0 every scenario posted (or planned, with `DRY_RUN=1`), 1 the bundle is not valid
 (`reason=invalid-bundle`), the build has no commit (`reason=no-commit`), the archive could not be
-made (`reason=no-archive`), a scenario was refused (`failed=N`, nothing posted for it) or a post
-failed, 2 usage. A run `bench_submit.py` posted but whose tags disagree with what the host actually
-did (its exit 3) is counted as posted and as `warn=N`, and the verb still exits 0: the evidence is
-there, and it is not re-posted.
+made (`reason=no-archive`), the leak scan failed (`reason=leak-scan-failed`), a scenario was refused
+(`failed=N`, nothing posted for it) or a post failed, 2 usage. A run `bench_submit.py` posted but
+whose tags disagree with what the host actually did (its exit 3) is counted as posted and as
+`warn=N`, and the verb still exits 0: the evidence is there, and it is not re-posted.
 
 `DRY_RUN=1` runs `bench_submit.py --dry-run` for each scenario: it posts nothing (with a bench
 server configured the script still asks it for its version) and prints each run's plan, tags and

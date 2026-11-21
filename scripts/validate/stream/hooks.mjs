@@ -46,36 +46,64 @@ export function hookScript(dir, name) {
 export function runHook(file, phase, env, timeoutMs, onSpawn = () => {}) {
   return new Promise((resolve) => {
     const t0 = Date.now();
-    const out = { stdout: "", stderr: "" };
-    const take = (k) => (b) => { if (out[k].length < READ_MAX) out[k] += b.toString("utf8"); };
+    const chunks = { stdout: [], stderr: [] };
+    const remaining = { stdout: READ_MAX, stderr: READ_MAX };
+    const take = (k) => (b) => {
+      if (!remaining[k]) return;
+      const kept = b.length <= remaining[k] ? b : Buffer.from(b.subarray(0, remaining[k]));
+      chunks[k].push(kept);
+      remaining[k] -= kept.length;
+    };
+    let ledgerError;
     let done = false;
     let child;
     const end = (r) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      resolve({ ...out, ms: Date.now() - t0, code: null, signal: null, timedOut: false, ...r });
+      resolve({
+        stdout: Buffer.concat(chunks.stdout).toString("utf8"),
+        stderr: Buffer.concat(chunks.stderr).toString("utf8"),
+        ms: Date.now() - t0, code: null, signal: null, timedOut: false, ...r,
+        ...(ledgerError ? { code: null, error: ledgerError, stderr: ledgerError } : {}),
+      });
     };
     // detached: the whole process group is killed at the timeout, so a hook's own children cannot outlive it.
-    const timer = setTimeout(() => { try { process.kill(-child.pid, "SIGKILL"); } catch { /* already gone */ } end({ timedOut: true }); }, timeoutMs);
+    const killGroup = () => {
+      if (!validPid(child?.pid)) return;
+      try { process.kill(-child.pid, "SIGKILL"); } catch { /* already gone */ }
+    };
+    const timer = setTimeout(() => { killGroup(); end({ timedOut: true }); }, timeoutMs);
     try {
       child = spawn(file, [phase], { env, cwd: path.dirname(file), stdio: ["ignore", "pipe", "pipe"], detached: true, shell: false });
     } catch (e) {
       return end({ stderr: String(e?.message ?? e) });
     }
-    onSpawn(child.pid); // detached: the pid is the hook's process group
     child.stdout.on("data", take("stdout"));
     child.stderr.on("data", take("stderr"));
     child.on("error", (e) => end({ stderr: String(e?.message ?? e) }));
     child.on("close", (code, signal) => end({ code, signal }));
+    try {
+      if (validPid(child.pid)) onSpawn(child.pid); // detached: the pid is the hook's process group
+    } catch (e) {
+      ledgerError = ledgerFailure(e);
+      clearTimeout(timer);
+      killGroup();
+      child.stdout.destroy();
+      child.stderr.destroy();
+    }
   });
 }
 
-const ok = (r) => r.code === 0 && !r.timedOut;
-const why = (r) => (r.timedOut ? "timed out" : r.signal ? `killed by ${r.signal}` : `exit ${r.code}`);
+const ledgerFailure = (e) => `ledger write failed: ${e?.message ?? e}`;
+const ok = (r) => r.code === 0 && !r.timedOut && !r.error;
+const why = (r) => r.error ?? (r.timedOut ? "timed out" : r.signal ? `killed by ${r.signal}` : `exit ${r.code}`);
 
-function isAlive(pid) {
-  try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; }
+const validPid = (pid) => Number.isInteger(pid) && pid > 1;
+
+export function isAlive(pid, { group = false } = {}) {
+  if (!validPid(pid)) return false; // kill(0, 0) and kill(-1, 0) address multiple processes.
+  try { process.kill(group ? -pid : pid, 0); return true; } catch (e) { return e.code === "EPERM"; }
 }
 const STATES = ["applying", "applied", "clearing"];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -88,7 +116,7 @@ export class Hooks {
     this.ledger = path.join(ledgerDir, LEDGER);
     this.env = env;
     this.timeoutMs = timeoutMs;
-    this.applied = new Map(); // name -> { id, facts }
+    this.applied = new Map(); // name -> { id, facts, applying? }
   }
 
   has(name) { return hookScript(this.root, name) !== null; }
@@ -98,8 +126,8 @@ export class Hooks {
     try { text = fs.readFileSync(this.ledger, "utf8"); } catch (e) { if (e.code === "ENOENT") return []; throw e; }
     let entries;
     try { entries = JSON.parse(text).entries; } catch { entries = null; }
-    const valid = (e) => e && typeof e.id === "string" && Number.isInteger(e.pid) && typeof e.hooks_dir === "string" && HOOK_NAME.test(e.name)
-      && STATES.includes(e.state) && (e.hook_pid === undefined || (Number.isInteger(e.hook_pid) && e.hook_pid > 1))
+    const valid = (e) => e && typeof e.id === "string" && validPid(e.pid) && typeof e.hooks_dir === "string" && HOOK_NAME.test(e.name)
+      && STATES.includes(e.state) && (e.hook_pid === undefined || validPid(e.hook_pid))
       && e.facts && typeof e.facts === "object" && Object.values(e.facts).every((v) => FACT.test(v));
     if (!Array.isArray(entries) || !entries.every(valid)) throw new Error(`${this.ledger} is not a ledger this runner wrote; it cannot say what is still applied, so it is not guessed (remove it once the hooks are known to be clear)`);
     return entries;
@@ -109,8 +137,13 @@ export class Hooks {
   writeLedger(entries) {
     if (!entries.length) { fs.rmSync(this.ledger, { force: true }); return; }
     const tmp = `${this.ledger}.${crypto.randomBytes(4).toString("hex")}.tmp`;
-    fs.writeFileSync(tmp, `${JSON.stringify({ format: 1, entries })}\n`);
-    fs.renameSync(tmp, this.ledger);
+    try {
+      fs.writeFileSync(tmp, `${JSON.stringify({ format: 1, entries })}\n`);
+      fs.renameSync(tmp, this.ledger);
+    } catch (e) {
+      try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ }
+      throw e;
+    }
   }
 
   /** The environment a hook sees: the caller's own, plus the scenario's facts (the session only when it is known). */
@@ -141,9 +174,14 @@ export class Hooks {
     const going = phase === "apply" ? "applying" : "clearing";
     if (file) this.mark(id, going);
     const r = file ? await runHook(file, phase, this.hookEnv(phase, facts), this.timeoutMs, (pid) => this.mark(id, going, pid)) : { code: null, signal: null, timedOut: false, ms: 0, stdout: "", stderr: "the script is gone or not executable" };
-    note("hook", { hook: name, phase, exit_code: r.code, ...(r.signal ? { signal: r.signal } : {}), timed_out: r.timedOut, ms: r.ms, stdout: this.redact(r.stdout).slice(0, OUTPUT_MAX), stderr: this.redact(r.stderr).slice(0, OUTPUT_MAX) });
     // The hook process is gone (runHook waited for it, or killed its group): only now is the entry plain `applied` again.
-    if (file) this.mark(id, "applied");
+    if (file) {
+      try { this.mark(id, "applied"); } catch (e) {
+        r.error ??= ledgerFailure(e);
+        r.stderr = r.error;
+      }
+    }
+    note("hook", { hook: name, phase, exit_code: r.error ? null : r.code, ...(r.signal ? { signal: r.signal } : {}), timed_out: r.timedOut, ms: r.ms, stdout: this.redact(r.stdout).slice(0, OUTPUT_MAX), stderr: this.redact(r.stderr).slice(0, OUTPUT_MAX) });
     return r;
   }
 
@@ -158,15 +196,22 @@ export class Hooks {
       const id = crypto.randomBytes(6).toString("hex");
       // The ledger first: a runner killed during the apply must still be known to have started it.
       this.writeLedger([...this.readLedger(), { id, pid: process.pid, hooks_dir: this.root, name, state: "applying", facts: mine }]);
-      this.applied.set(name, { id, facts: mine });
-      const r = await this.run(name, "apply", mine, note, id);
-      if (!ok(r)) throw new Error(`hook ${name} apply failed (${why(r)})`);
+      const a = { id, facts: mine };
+      this.applied.set(name, a);
+      a.applying = this.run(name, "apply", mine, note, id);
+      try {
+        const r = await a.applying;
+        if (!ok(r)) throw new Error(`hook ${name} apply failed (${this.redact(why(r))})`);
+      } finally {
+        delete a.applying;
+      }
       return;
     }
     const a = this.applied.get(name);
     if (!a) throw new Error(`hook ${name} is not applied`);
+    if (a.applying) await a.applying.catch(() => {}); // A failed apply is still owed a clear.
     const r = await this.run(name, "clear", a.facts, note, a.id);
-    if (!ok(r)) throw new Error(`hook ${name} clear failed (${why(r)})`);
+    if (!ok(r)) throw new Error(`hook ${name} clear failed (${this.redact(why(r))})`);
     this.applied.delete(name);
     this.writeLedger(this.readLedger().filter((e) => e.id !== a.id));
   }
@@ -182,27 +227,44 @@ export class Hooks {
 
   /** Clears what a runner that died left applied for this directory, before anything else. Refuses to start when it cannot. Returns the names cleared. */
   async recover(note) {
-    const mine = this.readLedger().filter((e) => e.hooks_dir === this.root);
-    const live = mine.filter((e) => isAlive(e.pid));
-    if (live.length) throw new Error(`refusing to start: process ${live[0].pid} still holds hook ${live[0].name}; it is another e2e-run using these hooks`);
+    const entries = this.readLedger();
+    const mine = entries.filter((e) => e.hooks_dir === this.root);
+    if (!mine.length) return [];
+    const live = mine.find((e) => isAlive(e.pid));
+    if (live) throw new Error(`refusing to start: process ${live.pid} still holds hook ${live.name}; it is another e2e-run using these hooks`);
+    const owners = new Map(mine.map((e) => [e.id, e.pid]));
+    this.writeLedger(entries.map((e) => owners.has(e.id) ? { ...e, pid: process.pid } : e));
     // A runner killed while a hook ran left that hook running (it is its own process group). Clearing over it
     // would let the old apply land after the clear, so it is waited for; one that does not end stops the run.
-    for (const e of mine.filter((x) => x.state !== "applied")) {
-      if (!e.hook_pid) throw new Error(`refusing to start: hook ${e.name} was ${e.state} when its runner died and its process is not known; remove ${this.ledger} once the hook is known to be clear`);
-      const until = Date.now() + this.timeoutMs;
-      while (isAlive(-e.hook_pid) && Date.now() < until) await sleep(100);
-      if (isAlive(-e.hook_pid)) throw new Error(`refusing to start: hook ${e.name} from a runner that died is still running (process group ${e.hook_pid}); end it, then run again`);
+    // The OS may have recycled a waited-for process group ID, so wait without signalling it.
+    try {
+      const until = performance.now() + this.timeoutMs;
+      for (const e of mine.filter((x) => x.state !== "applied")) {
+        if (!e.hook_pid) throw new Error(`refusing to start: hook ${e.name} was ${e.state} when its runner died and its process is not known; remove ${this.ledger} once the hook is known to be clear`);
+        while (isAlive(e.hook_pid, { group: true })) {
+          const remaining = until - performance.now();
+          if (remaining <= 0) throw new Error(`refusing to start: hook ${e.name} from a runner that died is still running (process group ${e.hook_pid}); end it, then run again`);
+          await sleep(Math.min(100, remaining));
+        }
+      }
+      const cleared = [];
+      const failed = [];
+      for (const e of mine.reverse()) {
+        const r = await this.run(e.name, "clear", e.facts, note, e.id);
+        if (ok(r)) {
+          this.writeLedger(this.readLedger().filter((x) => x.id !== e.id));
+          cleared.push(e.name);
+        } else failed.push(`${e.name} (${this.redact(why(r))})`);
+      }
+      if (failed.length) throw new Error(`refusing to start: a runner that died left hook(s) applied and they would not clear: ${failed.join(", ")}`);
+      return cleared;
+    } catch (e) {
+      // Keep the remaining state, but let another recovery attempt pick it up.
+      try {
+        this.writeLedger(this.readLedger().map((x) =>
+          x.pid === process.pid && owners.has(x.id) ? { ...x, pid: owners.get(x.id) } : x));
+      } catch { /* preserve the recovery error */ }
+      throw e;
     }
-    const cleared = [];
-    const failed = [];
-    for (const e of mine.reverse()) {
-      const r = await this.run(e.name, "clear", e.facts, note, e.id);
-      if (ok(r)) {
-        this.writeLedger(this.readLedger().filter((x) => x.id !== e.id));
-        cleared.push(e.name);
-      } else failed.push(`${e.name} (${why(r)})`);
-    }
-    if (failed.length) throw new Error(`refusing to start: a runner that died left hook(s) applied and they would not clear: ${failed.join(", ")}`);
-    return cleared;
   }
 }

@@ -952,6 +952,42 @@ else
   fail "leakscan:issues-fetch-failure-is-not-clean" "expected rc=2, got rc=$ls_missing_rc"
 fi
 
+mkdir -p "$WORK/leak-dir/nested"
+leak_dir="$WORK/leak-dir"
+ls_dir() {
+  LEAK_SCAN_OPERATOR_PATTERNS="$LS_TEST_PATTERNS" LEAK_SCAN_BENCH_URL_FILE="$LS_NO_FILE" bash "$LS" --dir "$@"
+}
+# Build the invented home path at runtime so the tracked tree stays clean.
+printf '%s%s\n' '/Users/' 'alice/foo' > "$WORK/outside-leak-dir"
+ln -s "$WORK/outside-leak-dir" "$leak_dir/nested/link"
+printf 'ordinary text\n' > "$leak_dir/nested/text"
+{ cat "$WORK/outside-leak-dir"; printf '%70000s\0' ''; } > "$leak_dir/binary"
+ls_dir_out="$(ls_dir "$leak_dir" 2>&1)"
+ls_dir_rc=$?
+if [ "$ls_dir_rc" -eq 0 ] && [[ "$ls_dir_out" == *"leak-scan: clean (dir)"* ]]; then
+  pass "leakscan:dir-clean" "text is clean, a binary and a link outside the directory are skipped"
+else
+  fail "leakscan:dir-clean" "expected rc=0 and clean (dir), got rc=$ls_dir_rc: $ls_dir_out"
+fi
+
+cp "$WORK/outside-leak-dir" "$leak_dir/nested/.log file"
+printf 'standin-nas\n' > "$leak_dir/public"
+ls_dir_out="$(ls_dir "$leak_dir" 2>&1)"
+ls_dir_rc=$?
+if [ "$ls_dir_rc" -eq 1 ] && [[ "$ls_dir_out" == *"./nested/.log file:1:"* && "$ls_dir_out" == *"./public:1:standin-nas"* ]]; then
+  pass "leakscan:dir-detects" "nested home path and issue-only operator name are flagged"
+else
+  fail "leakscan:dir-detects" "expected rc=1 and both hits, got rc=$ls_dir_rc: $ls_dir_out"
+fi
+
+ls_dir_out="$(ls_dir "$WORK/no-such-directory" 2>&1)"
+ls_dir_rc=$?
+if [ "$ls_dir_rc" -eq 2 ] && [[ "$ls_dir_out" == *"--dir <existing-directory>"* ]]; then
+  pass "leakscan:dir-missing" "missing directory exits 2"
+else
+  fail "leakscan:dir-missing" "expected rc=2 and directory usage, got rc=$ls_dir_rc: $ls_dir_out"
+fi
+
 printf '\n== redaction ==\n'
 
 # ── golden test ──────────────────────────────────────────────────────────────
