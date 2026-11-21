@@ -116,6 +116,8 @@ pub(crate) struct Rate {
     pub(crate) ceiling_kbps: f64,
     /// The floor the ABR's setpoint is clamped to now; it moves with the ladder's rung.
     pub(crate) floor_kbps: Box<dyn Fn() -> f64 + Send + Sync>,
+    /// The ABR's setpoint now, what the encoder is asked to send (`congestion::governed_kbps`).
+    pub(crate) setpoint_kbps: Box<dyn Fn() -> f64 + Send + Sync>,
     /// False with the ABR off: the estimate is tracked and never written to the encoder,
     /// so nothing would pay for FEC.
     pub(crate) retargets: bool,
@@ -227,10 +229,14 @@ impl<'a> Control<'a> {
         if let Some(kbps) = estimate {
             self.feed(kbps, true);
             // QUIC's loss response is given up only while the estimate drives the encoder
-            // from live feedback; the encoder never goes under the ABR's floor, so neither
-            // does the window.
+            // from live feedback.
             if self.rate.retargets && self.gone.get().is_none() {
-                self.governor.govern(kbps.max((self.rate.floor_kbps)()));
+                self.governor.govern(congestion::governed_kbps(
+                    kbps,
+                    (self.rate.setpoint_kbps)(),
+                    self.charged,
+                    (self.rate.floor_kbps)(),
+                ));
             }
         }
     }

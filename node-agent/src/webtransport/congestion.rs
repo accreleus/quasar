@@ -843,6 +843,11 @@ impl Estimator {
             }
         }
 
+        self.measured = m
+            .delivered_kbps
+            .zip(m.sent_kbps)
+            .filter(|&(d, s)| m.fresh && !app_limited && d < LINK_LIMITED * s)
+            .map(|(d, _)| BETA * d);
         let was = self.estimate_kbps;
         self.settle();
         if self
@@ -851,11 +856,6 @@ impl Estimator {
         {
             self.stop_regrow("reached");
         }
-        self.measured = m
-            .delivered_kbps
-            .zip(m.sent_kbps)
-            .filter(|&(d, s)| m.fresh && !app_limited && d < LINK_LIMITED * s)
-            .map(|(d, _)| BETA * d);
         let due = self.log_due(now)
             && (self.unlogged.is_some() || self.bound != self.logged.0 || self.measured.is_some());
         if !cut_by.is_empty() || due {
@@ -1414,14 +1414,15 @@ fn quic_kbps(path: QuicPath) -> f64 {
     path.cwnd_bytes as f64 * 8.0 / path.rtt.as_secs_f64() / 1000.0
 }
 
-/// QUIC's window over the estimate's rate × the path's RTT floor: a keyframe burst and RTT
+/// QUIC's window over the governed rate × the path's RTT floor: a keyframe burst and RTT
 /// jitter fit under it, and quinn paces at 1.25 × window / RTT, 2.5 × the rate.
 const WINDOW_GAIN: f64 = 2.0;
-/// A LAN's RTT would make the window a few datagrams, and a keyframe wait behind them. At
-/// `QUEUE_MS`, the window at the governed rate queues at most 2 × 30 ms − RTT at a link that
-/// carries that rate: no more than the detector itself allows (100 ms let a 5 ms LAN queue 320 ms
-/// of 8 Mbit/s video at a 5 Mbit/s bottleneck).
-const WINDOW_RTT_MIN: Duration = Duration::from_millis(30);
+/// The window covers the BDP of any path up to a 200 ms round trip, so a route step under that
+/// never makes the window the bottleneck: at 30 ms a +60 ms step held the sender to 6 of its
+/// 8 Mbit/s and the ABR read its own window as the link (#1433, lab row R8).
+/// shortcut: a route step to over 200 ms RTT is window-limited until the RTT floor adopts it
+/// (10–20 s); size on srtt with a queue cap if a real path shows it.
+const WINDOW_RTT_MIN: Duration = Duration::from_millis(100);
 /// The RTT floor is the least sample of this long, as BBR's: quinn's minimum is for the
 /// connection's life, so a longer route on the same path kept the window at the old BDP.
 const RTT_FLOOR_SPAN: Duration = Duration::from_secs(10);
@@ -1547,10 +1548,18 @@ impl Governor {
     }
 }
 
+/// Rule 1 (#1433): the rate the pacer and QUIC's window are governed at. What the encoder sends,
+/// its setpoint plus the FEC share `charged`, when the estimate is under it, and never under the
+/// ABR floor: the encoder's average output always leaves the agent, so an overload shows at the
+/// link as loss and delay, not as held video the stall guard reads as a dead path (lab row R3).
+pub(crate) fn governed_kbps(estimate: f64, setpoint: f64, charged: f64, floor: f64) -> f64 {
+    estimate.max(setpoint * (1.0 + charged)).max(floor)
+}
+
 /// The rates `VideoQueue` holds video to, kbit/s: QUIC's room ([`VideoQueue::room`]) at the
 /// governed rate or the estimate if lower, and the pacer ([`VideoQueue::pace`]) at the
-/// governed rate, never under the ABR floor the encoder is held to, once the estimate is under
-/// the ceiling. `None`: the session is not governed (or PyroWave), or nothing to pace.
+/// governed rate ([`governed_kbps`]) once the estimate is under the ceiling. `None`: the
+/// session is not governed (or PyroWave), or nothing to pace.
 pub(crate) fn video_rates(
     governor: &Governor,
     estimator: &Estimator,
@@ -1680,10 +1689,8 @@ impl Controller for Window {
         }
         match self.governing() {
             Some(bps) => {
-                // The RTT floor, not the smoothed RTT, which a queue at the link inflates: an
-                // overrun the link-side evidence misses backs up into the agent's own queue,
-                // where it is measured (`VideoQueue::backlog`), instead of growing the link's
-                // queue unseen (#1433, #1503).
+                // The RTT floor, not the smoothed RTT, which a queue at the link inflates: the
+                // window never grows with a standing queue (#1503).
                 let rtt = self.min_rtt.max(WINDOW_RTT_MIN).as_secs_f64();
                 ((WINDOW_GAIN * bps as f64 / 8.0 * rtt) as u64).max(self.first)
             }
@@ -1905,12 +1912,10 @@ impl Backlog {
 /// shortcut: at 30 fps a frame is 33 ms of rate, so one over this with its FEC still waits a
 /// tick; make it frame-relative if a 30 fps session shows that cost.
 const AUDIO_AHEAD_MS: u64 = 40;
-/// Video leaves at most this × the governed rate (the estimate, never under the ABR floor)
-/// once the estimate is under the ceiling (#1433), so a keyframe waits here, where audio
-/// overtakes it, not in the link's queue: right after a delay cut this is 1.06 × what the
-/// link carried. quinn alone paces at 1.25 × window / RTT, 2.5 × the rate or more. Must stay
-/// over 1 / (1 − the ABR's 0.15 deadband), the most video plus FEC is sent at, or held video
-/// never drains.
+/// Video leaves at most this × the governed rate ([`governed_kbps`], never under what the
+/// encoder sends) once the estimate is under the ceiling (#1433), so a keyframe waits here,
+/// where audio overtakes it, not in the link's queue. quinn alone paces at 1.25 × window / RTT,
+/// 2.5 × the rate or more. Must stay over 1, or held video never drains.
 const PACE_GAIN: f64 = 1.25;
 /// The pacer's burst: this long at the pace, at least two datagrams.
 const PACE_BURST_MS: f64 = 5.0;

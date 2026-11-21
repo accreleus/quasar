@@ -1569,6 +1569,7 @@ fn feedback_abr_armed(
     let mode = cfg.abr_mode;
     let observe_loop = abr_loop.clone();
     let floor_loop = abr_loop.clone();
+    let setpoint_loop = abr_loop.clone();
     let report_loop = abr_loop.clone();
     let handle = abr_loop.clone();
     let observed = latest.clone();
@@ -1619,6 +1620,9 @@ fn feedback_abr_armed(
             // The governor's lock, alone and released: `observe` takes it again after.
             floor_kbps: Box::new(move || {
                 f64::from(floor_loop.governor.lock().unwrap().floor_kbps())
+            }),
+            setpoint_kbps: Box::new(move || {
+                f64::from(setpoint_loop.governor.lock().unwrap().setpoint_kbps())
             }),
             retargets: mode != AbrMode::Off,
             // Each client starts afresh: it takes the encoder over (a WebRTC peer that started

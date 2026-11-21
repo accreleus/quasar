@@ -1542,6 +1542,7 @@ async fn governed_agent(stream: Stream) -> Agent {
                 measured: Box::new(|_| {}),
                 ceiling_kbps: 8000.0,
                 floor_kbps: Box::new(|| 4000.0),
+                setpoint_kbps: Box::new(|| 0.0),
                 retargets: true,
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
@@ -2077,6 +2078,7 @@ async fn feedback_while_pyrowave_is_active_feeds_no_estimate() {
                 measured: Box::new(|_| {}),
                 ceiling_kbps: 4000.0,
                 floor_kbps: Box::new(|| 500.0),
+                setpoint_kbps: Box::new(|| 0.0),
                 retargets: true,
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
@@ -2174,6 +2176,7 @@ async fn audio_alone_never_moves_the_video_estimate() {
             measured: Box::new(|_| {}),
             ceiling_kbps: 4000.0,
             floor_kbps: Box::new(|| 500.0),
+            setpoint_kbps: Box::new(|| 0.0),
             retargets: true,
             start: Box::new(|| {}),
             owns: Box::new(|| false),
@@ -2219,6 +2222,7 @@ fn rate(retargets: bool) -> Rate {
         measured: Box::new(|_| {}),
         ceiling_kbps: 8000.0,
         floor_kbps: Box::new(|| 4000.0),
+        setpoint_kbps: Box::new(|| 0.0),
         retargets,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -2306,6 +2310,7 @@ fn the_silence_decay_is_never_fed_to_the_collapse_as_a_measured_link() {
         }),
         ceiling_kbps: 8000.0,
         floor_kbps: Box::new(|| 4000.0),
+        setpoint_kbps: Box::new(|| 0.0),
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -2352,6 +2357,7 @@ fn a_report_gives_the_abr_its_reading_before_its_estimate() {
         measured: Box::new(move |_| m.lock().unwrap().push("measured")),
         ceiling_kbps: 8000.0,
         floor_kbps: Box::new(|| 4000.0),
+        setpoint_kbps: Box::new(|| 0.0),
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -2376,6 +2382,7 @@ fn a_client_that_is_gone_neither_starts_nor_feeds_the_abr() {
         measured: Box::new(|_| {}),
         ceiling_kbps: 4000.0,
         floor_kbps: Box::new(|| 500.0),
+        setpoint_kbps: Box::new(|| 0.0),
         retargets: true,
         start: Box::new(move || {
             started.fetch_add(1, SeqCst);
@@ -2439,6 +2446,7 @@ fn the_abr_is_fed_the_estimate_less_the_fec_share() {
         measured: Box::new(|_| {}),
         ceiling_kbps: 6000.0,
         floor_kbps: Box::new(|| 500.0),
+        setpoint_kbps: Box::new(|| 0.0),
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -2472,6 +2480,7 @@ async fn lossy_session(retargets: bool) -> (Agent, Arc<crate::session::metrics::
                 measured: Box::new(|_| {}),
                 ceiling_kbps: 4000.0,
                 floor_kbps: Box::new(|| 500.0),
+                setpoint_kbps: Box::new(|| 0.0),
                 retargets,
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
@@ -2723,6 +2732,7 @@ fn repairs_spend_only_what_the_estimate_leaves_above_the_abr_floor() {
         measured: Box::new(|_| {}),
         ceiling_kbps: 6000.0,
         floor_kbps: Box::new(|| 2500.0),
+        setpoint_kbps: Box::new(|| 0.0),
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -2757,11 +2767,12 @@ fn governed(level: u8, estimate_kbps: f64, seconds: u64) -> Vec<(u32, f64)> {
         Governor::new(AbrConfig::new_smooth(2500, 8000, 60), base),
         base,
     )));
-    let (floor, observed) = (governor.clone(), governor.clone());
+    let (floor, setpoint, observed) = (governor.clone(), governor.clone(), governor.clone());
     let rate = Rate {
         measured: Box::new(|_| {}),
         ceiling_kbps: 8000.0,
         floor_kbps: Box::new(move || f64::from(floor.lock().unwrap().0.floor_kbps())),
+        setpoint_kbps: Box::new(move || f64::from(setpoint.lock().unwrap().0.setpoint_kbps())),
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -2816,10 +2827,12 @@ fn the_pacer_never_holds_video_under_the_setpoint() {
         base,
     )));
     assert_eq!(abr.lock().unwrap().setpoint_kbps(), 4500);
+    let setpoint = abr.clone();
     let rate = Rate {
         measured: Box::new(|_| {}),
         ceiling_kbps: 4500.0,
         floor_kbps: Box::new(|| 1000.0),
+        setpoint_kbps: Box::new(move || f64::from(setpoint.lock().unwrap().setpoint_kbps())),
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -2906,6 +2919,7 @@ fn a_pyrowave_frame_gets_no_repair_at_any_overhead() {
         measured: Box::new(|_| {}),
         ceiling_kbps: 6000.0,
         floor_kbps: Box::new(|| 500.0),
+        setpoint_kbps: Box::new(|| 0.0),
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -5203,6 +5217,7 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
                 measured: Box::new(|_| {}),
                 ceiling_kbps: 1_000_000.0,
                 floor_kbps: Box::new(|| 500.0),
+                setpoint_kbps: Box::new(|| 0.0),
                 retargets: true,
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),

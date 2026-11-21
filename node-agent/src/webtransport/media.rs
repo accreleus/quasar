@@ -1542,6 +1542,7 @@ mod tests {
             measured: Box::new(|_| {}),
             ceiling_kbps: 8000.0,
             floor_kbps: Box::new(|| 4000.0),
+            setpoint_kbps: Box::new(|| 0.0),
             retargets: true,
             start: Box::new(|| {}),
             owns: Box::new(|| false),
