@@ -48,7 +48,7 @@ const NOT_RECORDED = [
   { fact: "audio_latency_ms", why: "nothing in the product or the page measures audio latency yet" },
   { fact: "audio_video_offset_ms", why: "the WebTransport client computes an audio/video offset but bench mode does not expose it" },
   { fact: "client_thermal_state", why: "no browser API reports thermal pressure to a page" },
-  { fact: "path_rtt_ms", why: "bench-mode windows carry no round-trip time; the page's own samples are not read" },
+  { fact: "path_rtt_ms", why: "bench-mode windows carry no round-trip time; only present cadence and visibility are copied from the page's stats posts" },
 ];
 
 export function loadPlan(arg) {

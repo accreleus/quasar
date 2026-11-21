@@ -129,9 +129,11 @@ const FILES_SHOWN = 12;
 const MAX_TEXT = 200;
 
 // A boolean flag in a metrics row: true or any finite non-zero number, matching the
-// control plane's `telemetry.HiddenFlag`. The contract says 0 or 1
-// (`docs/session-trace/metrics.json`) and both web clients post the number, while an
-// older fixture wrote a boolean. Nothing else (0, false, strings, non-finite) is set.
+// control plane's numeric-flag rule in `telemetry.HiddenFlag` (`metrics.jsonl` carries
+// manifest keys only, so `sampleHidden` reads `is_hidden` and not the trace-event
+// `hidden` key). The contract says 0 or 1 (`docs/session-trace/metrics.json`) and both
+// web clients post the number, while an older fixture wrote a boolean. Nothing else
+// (0, false, strings, non-finite) is set.
 const flagSet = (value) => value === true || (typeof value === "number" && Number.isFinite(value) && value !== 0);
 const sampleHidden = (metrics) => flagSet(metrics.is_hidden);
 

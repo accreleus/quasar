@@ -11,10 +11,12 @@ import { fileURLToPath } from "node:url";
 import { benchRows } from "./benchfold.mjs";
 import { Recorder } from "./record.mjs";
 import { loadWebDist } from "./webdist.mjs";
+import { validateBundle } from "./bundle.mjs";
+import { collect } from "./collect.mjs";
 import { configureTls, loadPlan, makeApi, openHost, probeClient, readThresholds, runnerState, runSuite, secretTooShort, summarise } from "./run.mjs";
 import { review, renderReview } from "./review.mjs";
 import { errorReason } from "./scenarios/stream-common.mjs";
-import { cadenceRows, check, framelessSeconds, hitchCount, instrumentShare, judge, missingRate, observeWindows, shotCovered, verdict } from "./scenarios/stream-hold.mjs";
+import { check, framelessSeconds, hitchCount, instrumentShare, judge, missingRate, observeWindows, shotCovered, statsSamples, verdict } from "./scenarios/stream-hold.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE = JSON.parse(fs.readFileSync(path.join(HERE, "../../dx/tests/fixtures/appfold/bench-windows.json"), "utf8")).windows;
@@ -2131,44 +2133,111 @@ test("empty error messages still write a non-empty reason in scenario.json so va
   assert.equal(r3.scenario().reason, "error with no message");
 });
 
-test("stream-hold records one-second cadence samples so e2e-review checks anomalies and ranks frameless seconds on a real runner bundle (#1303)", async () => {
-  // Unit checks on cadenceRows: visible cadence, fragment omission, and hidden spans.
-  const cleanFrames = frames(3);
-  const rows = cadenceRows(cleanFrames, [], T.present_min_samples);
-  assert.equal(rows.length, 3);
-  for (const r of rows) {
-    assert.equal(r.source, "browser");
-    assert.equal(r.metrics.is_hidden, 0);
-    assert.ok(Number.isFinite(r.metrics.present_interval_sd_ms) && r.metrics.present_interval_sd_ms < 2);
-    assert.ok(Number.isFinite(r.metrics.present_interval_p95_ms) && r.metrics.present_interval_p95_ms <= 20);
-  }
-  // Fewer than minSamples intervals in a second is a fragment and produces no cadence row.
-  assert.deepEqual(cadenceRows([{ present_ms: T0 }, { present_ms: T0 + 200 }, { present_ms: T0 + 400 }], [], 5), []);
-  // A hidden second records is_hidden: 1 and drops intervals overlapping the hidden span.
-  const hiddenRows = cadenceRows(cleanFrames, [[T0 + 1000, T0 + 2000]], T.present_min_samples);
-  const sec2 = hiddenRows.find((r) => r.ts_unix_ms === T0 + 2000);
-  assert.deepEqual(sec2.metrics, { is_hidden: 1 });
+test("stream-hold captures page /stats cadence samples so e2e-review checks anomalies and e2e-collect merges without duplication (#1303)", async () => {
+  // Unit checks on statsSamples: replays the exact web/src/{webrtc,webtransport}/telemetry.ts POST shape.
+  const projected = statsSamples(JSON.stringify({
+    samples: [
+      {
+        ts_unix_ms: 1800000001234.7,
+        metrics: {
+          fps: 60,
+          bitrate_kbps: 12000,
+          rtt_ms: 4.2,
+          present_interval_sd_ms: 2.5,
+          present_interval_p95_ms: 17.1,
+          is_hidden: 0,
+          unknown_key: 99,
+          free_text: "never copy",
+        },
+        device_key: "dev-key-123",
+        codec_mime_type: "video/H264",
+      },
+      // Sample with no cadence/visibility keys: dropped.
+      { ts_unix_ms: 1800000002234, metrics: { fps: 60, bitrate_kbps: 12000 } },
+      // Non-finite / string values for the three keys: ignored.
+      { ts_unix_ms: 1800000003234, metrics: { present_interval_sd_ms: "40", present_interval_p95_ms: null, is_hidden: 1 } },
+      // Missing ts_unix_ms: dropped.
+      { metrics: { present_interval_sd_ms: 5, is_hidden: 0 } },
+    ],
+  }));
+  assert.deepEqual(projected, [
+    {
+      kind: "metric",
+      source: "browser",
+      ts_unix_ms: 1800000001234,
+      metrics: { present_interval_sd_ms: 2.5, present_interval_p95_ms: 17.1, is_hidden: 0 },
+    },
+    {
+      kind: "metric",
+      source: "browser",
+      ts_unix_ms: 1800000003234,
+      metrics: { is_hidden: 1 },
+    },
+  ]);
+  assert.deepEqual(statsSamples("not json"), []);
 
-  // End-to-end 1: healthy runner bundle -> review checks all three anomaly rules and reports No threshold crossed.
-  const healthy = await run(world());
+  const emitStats = (w, samples, { sid = SID, origin = BASE } = {}) =>
+    w.emit("request", {
+      url: () => `${origin}/v1/sessions/${sid}/stats`,
+      method: () => "POST",
+      postData: () => JSON.stringify({ samples }),
+    });
+
+  // Helper: real web-client POST /v1/sessions/{id}/stats samples at arbitrary ms (not multiples of 1000).
+  const warm = T.warmup_exclude_s;
+  const makeStatsBatch = (degraded) => {
+    const out = [];
+    for (let s = 0; s < 35; s += 1) {
+      const bad = degraded && s >= warm + 2 && s < warm + 5;
+      out.push({
+        ts_unix_ms: T0 + s * 1000 + 347,
+        metrics: {
+          fps: 60,
+          bitrate_kbps: 12000,
+          rtt_ms: 4.5,
+          present_interval_sd_ms: bad ? 35 : 2.1,
+          present_interval_p95_ms: bad ? 62 : 17.2,
+          is_hidden: 0,
+          stray_text: "drop-me",
+        },
+        device_key: "dev-1",
+        codec_mime_type: "video/H264",
+      });
+    }
+    return out;
+  };
+
+  // End-to-end 1: healthy runner bundle with captured /stats -> review checks all three anomaly rules.
+  const healthyBatch = makeStatsBatch(false);
+  const wHealthy = world({
+    onPlay: (w) => {
+      // Posts for another session and another origin must be ignored.
+      emitStats(w, [{ ts_unix_ms: T0 + 25_111, metrics: { present_interval_sd_ms: 99, present_interval_p95_ms: 99, is_hidden: 0 } }], { sid: OTHER });
+      emitStats(w, [{ ts_unix_ms: T0 + 26_111, metrics: { present_interval_sd_ms: 99, present_interval_p95_ms: 99, is_hidden: 0 } }], { origin: "https://other.example.test" });
+      // Real session batch, plus a duplicate timestamp to verify dedup.
+      emitStats(w, [...healthyBatch, { ts_unix_ms: healthyBatch[0].ts_unix_ms, metrics: { present_interval_sd_ms: 99, is_hidden: 0 } }]);
+    },
+  });
+  const healthy = await run(wHealthy);
   assert.deepEqual(healthy.result.errors, []);
   const healthyRev = review(healthy.dir);
-  assert.deepEqual(healthyRev.scenarios[0].anomalies.not_checked, [], "all three anomaly rules ran on the runner bundle");
+  assert.deepEqual(healthyRev.scenarios[0].anomalies.not_checked, [], "all three anomaly rules ran on the client-only runner bundle");
   assert.deepEqual(healthyRev.scenarios[0].anomalies.rows, []);
   assert.match(renderReview(healthyRev), /^No threshold crossed\.$/m);
+  const healthyMetrics = read(healthy.dir, "01-stream-hold/metrics.jsonl").trim().split("\n").map((l) => JSON.parse(l));
+  const healthyStatsRows = healthyMetrics.filter((r) => "present_interval_sd_ms" in r.metrics);
+  assert.equal(healthyStatsRows.length, healthyBatch.length, "duplicate ts deduplicated and foreign session/origin ignored");
+  assert.ok(healthyStatsRows.every((r) => !("stray_text" in r.metrics) && !("fps" in r.metrics)), "only the three projected keys are written");
 
-  // End-to-end 2: runner bundle with a frameless second and jerky frames after warm-up ->
-  // review names the frameless second in Worst Windows AND fires all three anomaly rules.
-  const warm = T.warmup_exclude_s;
-  const jerky = [];
-  let t = T0;
-  for (let s = 0; s < 50; s += 1) {
-    for (let i = 0; i < 20; i += 1) {
-      t += s >= warm + 2 && s < warm + 5 ? (i % 2 ? 90 : 10) : 50;
-      jerky.push({ present_ms: t, decoded: true });
-    }
-  }
-  const bad = await run(world({ wins: windows(50, [warm + 5]), extraFrames: jerky }));
+  // End-to-end 2: degraded runner bundle with a frameless second and degraded /stats samples ->
+  // review names the frameless second in Worst Windows AND fires all three anomaly rules;
+  // then e2e-collect merges the host copy of the same /stats timestamps into ONE row per timestamp (no duplication).
+  const degradedBatch = makeStatsBatch(true);
+  const wBad = world({
+    wins: windows(50, [warm + 5]),
+    onPlay: (w) => emitStats(w, degradedBatch),
+  });
+  const bad = await run(wBad);
   assert.deepEqual(bad.result.errors, []);
   const badRev = review(bad.dir);
   assert.ok(
@@ -2177,12 +2246,101 @@ test("stream-hold records one-second cadence samples so e2e-review checks anomal
   );
   assert.deepEqual(badRev.scenarios[0].anomalies.not_checked, []);
   assert.deepEqual(
-    badRev.scenarios[0].anomalies.rows.map((r) => r.threshold),
+    badRev.scenarios[0].anomalies.rows.map((r) => [r.threshold, r.samples_over]),
     [
-      "classifier.hitch_sd_ms",
-      "web.client_health.present_sd_degraded_ms",
-      "web.client_health.present_p95_degraded_ms",
+      ["classifier.hitch_sd_ms", 3],
+      ["web.client_health.present_sd_degraded_ms", 3],
+      ["web.client_health.present_p95_degraded_ms", 3],
     ],
+  );
+
+  // Now run the real e2e-collect over `bad.dir` with the host returning the exact same browser samples
+  // (at the same ts_unix_ms, plus extra host-stored keys like fps and rtt_ms) and verify 1:1 dedup.
+  const HOST_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const hostBrowserSamples = degradedBatch.map((s) => ({
+    source: "browser",
+    ts_unix_ms: s.ts_unix_ms,
+    metrics: {
+      fps: s.metrics.fps,
+      rtt_ms: s.metrics.rtt_ms,
+      present_interval_sd_ms: s.metrics.present_interval_sd_ms,
+      present_interval_p95_ms: s.metrics.present_interval_p95_ms,
+      is_hidden: s.metrics.is_hidden,
+    },
+  }));
+  const fakeFetch = async (url) => {
+    const route = new URL(url).pathname;
+    if (route === `/v1/sessions/${SID}`) {
+      return {
+        status: 200,
+        json: async () => ({
+          session: {
+            id: SID,
+            app_id: "app-1",
+            host_id: HOST_ID,
+            state: "stopped",
+            profile_id: "1080p60-h264",
+            stream: { width: 1920, height: 1080, fps: 60, bitrate_kbps: 12000, codec: "h264", rungs: [[1920, 1080]] },
+            negotiated_codec: "h264",
+            transport: "webrtc",
+            created_at: new Date(T0).toISOString(),
+            started_at: new Date(T0).toISOString(),
+            ended_at: new Date(T0 + 50_000).toISOString(),
+          },
+        }),
+      };
+    }
+    if (route === `/v1/admin/sessions/${SID}/metrics`) {
+      return { status: 200, json: async () => ({ items: [...hostBrowserSamples].reverse(), next_cursor: null }) };
+    }
+    if (route === `/v1/admin/sessions/${SID}/trace/events`) {
+      return { status: 200, json: async () => ({ window: { from_ms: T0, to_ms: T0 + 50_000 }, events: [] }) };
+    }
+    if (route === `/v1/admin/sessions/${SID}/diagnostic-bundle`) {
+      return {
+        status: 200,
+        json: async () => ({
+          trace: { session_id: SID, host_id: HOST_ID, profile_id: "1080p60-h264", started_at: new Date(T0).toISOString(), ended_at: new Date(T0 + 50_000).toISOString() },
+          window: { from_ms: T0, to_ms: T0 + 50_000 },
+          clock: { client_offset_ms: 3, uncertainty_ms: 1, measured_at: new Date(T0 + 5000).toISOString() },
+          abr_mode: "smooth",
+          series: {},
+          events: [],
+          derived_windows: { hitches: [], abr_downshifts: [], encoder_saturation: [], likely_network_congestion: [] },
+          agent_adaptation: [],
+          classifier: { verdict: "healthy" },
+          captures: [],
+        }),
+      };
+    }
+    if (route === `/v1/admin/hosts/${HOST_ID}/settings`) {
+      return { status: 200, json: async () => ({ effective: { abr_mode: "smooth" } }) };
+    }
+    if (route === `/v1/hosts/${HOST_ID}`) {
+      return { status: 200, json: async () => ({ host: { id: HOST_ID, agent_version: "0.6.3-dev", source_commit: "abc1234", built_at: "2026-11-20T00:00:00Z" } }) };
+    }
+    if (route === "/v1/admin/platform/identity") {
+      return { status: 200, json: async () => ({ identity: { version: "0.6.3-dev", source_commit: "def5678", built_at: "2026-11-20T00:00:00Z" } }) };
+    }
+    return { status: 404, json: async () => ({}) };
+  };
+  const collected = await collect(bad.dir, { baseUrl: "https://stack.invalid", token: "admintoken-9f3c2b7a41", fetch: fakeFetch, now: () => T0 + 60_000 });
+  assert.equal(collected.complete, true, JSON.stringify(collected));
+  assert.deepEqual(collected.problems, [], JSON.stringify(collected));
+  assert.deepEqual(validateBundle(bad.dir), []);
+  const mergedMetrics = read(bad.dir, "01-stream-hold/metrics.jsonl").trim().split("\n").map((l) => JSON.parse(l));
+  const mergedStatsRows = mergedMetrics.filter((r) => r.source === "browser" && "present_interval_sd_ms" in r.metrics);
+  assert.equal(mergedStatsRows.length, degradedBatch.length, "collect must merge client and host rows 1:1 on ts_unix_ms with zero duplication");
+  assert.ok(mergedStatsRows.every((r) => r.metrics.fps === 60 && r.metrics.rtt_ms === 4.5), "host keys joined onto the same row");
+  const afterCollectRev = review(bad.dir);
+  assert.deepEqual(
+    afterCollectRev.scenarios[0].anomalies.rows.map((r) => [r.threshold, r.samples_over]),
+    [
+      ["classifier.hitch_sd_ms", 3],
+      ["web.client_health.present_sd_degraded_ms", 3],
+      ["web.client_health.present_p95_degraded_ms", 3],
+    ],
+    "samples_over stays 3 after collect (no duplicate rows)",
   );
 
   // End-to-end 3: runner bundle with offset_unknown=true and a frameless second -> review notes client clock fallback.

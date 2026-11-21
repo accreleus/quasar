@@ -125,8 +125,8 @@ export default {
         else await mouseEvent(cdp, { type: "mouseReleased", x: d.pos.x, y: d.pos.y, button: d.button, buttons: 0, clickCount: 1 });
         rec.step("released", { what: d.code ?? d.button, by });
       } catch (err) {
-        rec.step("release-failed", { what: d.code ?? d.button, message: String(err?.message ?? err) });
-        cleanup.push(`${d.kind === "key" ? `key ${d.code}` : `mouse button ${d.button}`} could not be released (${String(err?.message ?? err)})`);
+        rec.step("release-failed", { what: d.code ?? d.button, message: errorReason(err) });
+        cleanup.push(`${d.kind === "key" ? `key ${d.code}` : `mouse button ${d.button}`} could not be released (${errorReason(err)})`);
       }
     };
     try {

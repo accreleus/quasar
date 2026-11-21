@@ -163,9 +163,11 @@ browser's clock with it, and each row says `clock_source`.
 
 The runner reads only what the product exposes (`window.__qBench`, the page, the API) and wraps no
 browser API. What it cannot see is in `manifest.json` `not_recorded`, each with a reason. The
-issue also asked for a decoded-frame grab every 10 s, the client's own telemetry and the bundle
-attached to the issue; none is done (the screenshot every 10 s stands in for the first, the bench
-windows for the second, and posting is `e2e-post`, #1276).
+issue also asked for a decoded-frame grab every 10 s, the client's full telemetry and the bundle
+attached to the issue; the screenshot every 10 s stands in for the first, `stream-hold` copies
+`present_interval_sd_ms`, `present_interval_p95_ms` and `is_hidden` from the page's own
+`POST /v1/sessions/{id}/stats` requests beside the bench windows (the host half adds the rest),
+and posting is `e2e-post` (#1276).
 
 **Redaction.** Every secret the run holds is an exact literal removed from every string before
 anything is serialised: the password, the e-mail and its local part, the stack's host name, the bearer
@@ -713,8 +715,8 @@ recorded — but the run's result is derived from it, not copied.
   clock is not behind the host clock by more than the connect time) and needs at least
   `classifier.hitch_min_samples` samples over it; the two `web.client_health.present_*` limits
   are per sample, as the client applies them, and skip a hidden tab (any finite non-zero
-  `is_hidden` or `true`, matching the control plane). One row per rule that fired, with the
-  samples over, the worst value and the first one.
+  `is_hidden` or `true`, matching the control plane's numeric-flag rule). One row per rule that
+  fired, with the samples over, the worst value and the first one.
   A rule is **checked** only when the thresholds file states every key it needs — its limit and
   its helpers (`classifier.warmup_exclude_s`, `classifier.hitch_min_samples`), each a finite
   number — and at least one sample carries its sample key. Nothing is defaulted: no value is

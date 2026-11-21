@@ -111,8 +111,8 @@ export default {
         rec.step("key-released", { code: KEY.code, by });
         return true;
       } catch (err) {
-        rec.step("key-release-failed", { code: KEY.code, message: String(err?.message ?? err) });
-        cleanup.push(`key ${KEY.code} could not be released (${String(err?.message ?? err)})`);
+        rec.step("key-release-failed", { code: KEY.code, message: errorReason(err) });
+        cleanup.push(`key ${KEY.code} could not be released (${errorReason(err)})`);
         return false;
       }
     };

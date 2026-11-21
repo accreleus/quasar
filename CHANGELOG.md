@@ -26,7 +26,7 @@ own; the two do not move together, and that is deliberate.
 
 ### Changed
 - Dependency updates
-- `make e2e-review` ranks `bench_n` (lowest) with accurate `offset_unknown` clock notes and control-plane-matching `is_hidden` handling, `stream-hold` records one-second cadence samples (`present_interval_sd_ms`, `present_interval_p95_ms`, `is_hidden`) so review anomaly rules run on client-only runner bundles, empty error messages always write a non-empty scenario reason, and `docs/testing-e2e-suite.md` and counter-rule comments are corrected (#1303).
+- `make e2e-review` ranks `bench_n` (lowest) with accurate `offset_unknown` clock notes and control-plane-matching `is_hidden` handling, `stream-hold` captures `present_interval_sd_ms`, `present_interval_p95_ms`, and `is_hidden` from the page's own `/stats` posts so review anomaly rules run on client-only runner bundles without duplicating collected host samples, empty error messages always write a non-empty scenario reason, and `docs/testing-e2e-suite.md` and counter-rule comments are corrected (#1303).
 
 ### Fixed
 - WebTransport input detects full writers, combines pending relative mouse deltas, and keeps the latest absolute position when datagrams back up. Pending relative motion goes out before the next button, key, scroll, or other input event (#1154).

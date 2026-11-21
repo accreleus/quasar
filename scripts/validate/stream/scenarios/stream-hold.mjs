@@ -19,10 +19,54 @@ const INSTRUMENT_MIN_SHARE = 0.9;
 
 const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
 const sd = (xs) => Math.sqrt(mean(xs.map((x) => (x - mean(xs)) ** 2)));
-const p95 = (xs) => {
-  const s = [...xs].sort((a, b) => a - b);
-  return s[Math.min(s.length - 1, Math.max(0, Math.ceil(0.95 * s.length) - 1))];
-};
+
+const STATS_POST = /^\/v1\/sessions\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/stats$/i;
+// The three manifest keys `review.mjs`'s anomaly rules read from browser telemetry rows.
+const STATS_KEYS = ["present_interval_sd_ms", "present_interval_p95_ms", "is_hidden"];
+
+/**
+ * Projects the three review-checked cadence/visibility keys from a `POST /v1/sessions/{id}/stats`
+ * request body (`{ samples: [{ ts_unix_ms, metrics: { ... } }] }`, web/src/{webrtc,webtransport}/telemetry.ts
+ * and control-plane/internal/session/metrics_handler.go). Keeps only finite numbers for STATS_KEYS,
+ * never copies free text or unknown keys, and drops samples carrying none of them.
+ */
+export function statsSamples(postData) {
+  let body;
+  try { body = JSON.parse(postData); } catch { return []; }
+  if (!body || typeof body !== "object" || !Array.isArray(body.samples)) return [];
+  const out = [];
+  for (const s of body.samples) {
+    if (!s || typeof s !== "object" || !finite(s.ts_unix_ms) || !s.metrics || typeof s.metrics !== "object" || Array.isArray(s.metrics)) continue;
+    const metrics = {};
+    for (const k of STATS_KEYS) {
+      if (Object.hasOwn(s.metrics, k) && finite(s.metrics[k])) metrics[k] = s.metrics[k];
+    }
+    if (!Object.keys(metrics).length) continue;
+    out.push({ kind: "metric", source: "browser", ts_unix_ms: Math.trunc(s.ts_unix_ms), metrics });
+  }
+  return out;
+}
+
+/** Filters captured `/stats` rows to `sid` and deduplicates by `ts_unix_ms` (first value per key wins). */
+function dedupStatsRows(entries, sid) {
+  const want = sid.toLowerCase();
+  const byTs = new Map();
+  const out = [];
+  for (const { session, row } of entries) {
+    if (session !== want) continue;
+    const existing = byTs.get(row.ts_unix_ms);
+    if (!existing) {
+      const copy = { ...row, metrics: { ...row.metrics } };
+      byTs.set(row.ts_unix_ms, copy);
+      out.push(copy);
+    } else {
+      for (const [k, v] of Object.entries(row.metrics)) {
+        if (!Object.hasOwn(existing.metrics, k)) existing.metrics[k] = v;
+      }
+    }
+  }
+  return out;
+}
 
 /** What a plan entry's params may hold; all but `app` and `bench`/`cover_qr` have a default (docs/testing-e2e-suite.md lists them). */
 export const PARAM_KEYS = ["transport", "codec", "profile", "hold_s", "app", "bench", "cover_qr"];
@@ -81,50 +125,6 @@ export function hitchCount(frames, fromMs, toMs, hidden, t) {
   }
   const sds = [...by.values()].filter((iv) => iv.length >= t.present_min_samples).map(sd);
   return { judged: sds.length, hitches: sds.filter((s) => s >= t.hitch_sd_ms).length };
-}
-
-/**
- * One-second presentation-cadence samples derived from the bench ring's `present_ms` and the
- * runner's own visibility spans, using exact browser keys from `docs/session-trace/metrics.json`
- * (`present_interval_sd_ms`, `present_interval_p95_ms`, `is_hidden`), so `e2e-review`'s anomaly
- * rules run on a client-only runner bundle. Intervals overlapping a hidden span are skipped
- * (matching `hitchCount` and the web client's `breakCadence`), and buckets with fewer than
- * `minSamples` intervals omit cadence metrics rather than reporting a fragment as a cadence.
- */
-export function cadenceRows(frames, hidden = [], minSamples = 5) {
-  const spans = hidden.filter((h) => Array.isArray(h) && finite(h[0]) && finite(h[1]) && h[1] > h[0]);
-  const ps = frames.map((f) => f?.present_ms).filter(finite).sort((a, b) => a - b);
-  const by = new Map();
-  for (let i = 1; i < ps.length; i += 1) {
-    if (spans.some(([a, b]) => ps[i - 1] < b && ps[i] > a)) continue;
-    const k = Math.floor(ps[i] / 1000);
-    let iv = by.get(k);
-    if (!iv) { iv = []; by.set(k, iv); }
-    iv.push(ps[i] - ps[i - 1]);
-  }
-  const hiddenBuckets = new Set();
-  for (const [a, b] of spans) {
-    const start = Math.floor(a / 1000);
-    const end = Math.ceil(b / 1000) - 1;
-    for (let k = start; k <= end; k += 1) hiddenBuckets.add(k);
-  }
-  const keys = [...new Set([...by.keys(), ...hiddenBuckets])].sort((a, b) => a - b);
-  const rows = [];
-  for (const k of keys) {
-    const iv = by.get(k) ?? [];
-    const isHidden = hiddenBuckets.has(k) ? 1 : 0;
-    const hasCadence = iv.length >= minSamples;
-    if (!hasCadence && !isHidden) continue;
-    const metrics = { is_hidden: isHidden };
-    if (hasCadence) {
-      const sdVal = sd(iv);
-      const p95Val = p95(iv);
-      if (finite(sdVal)) metrics.present_interval_sd_ms = sdVal;
-      if (finite(p95Val)) metrics.present_interval_p95_ms = p95Val;
-    }
-    rows.push({ kind: "metric", source: "browser", ts_unix_ms: (k + 1) * 1000, metrics });
-  }
-  return rows;
 }
 
 /** The frames the bench callback saw (`seen`) of the frames the video element decoded (`decoded`) over [a, b]; null when there is no video to compare with, `{ malformed: true }` when a time or a count is not a number. */
@@ -199,6 +199,18 @@ export default {
 
     // The sessions this run owns are the runner's to track and stop (ctx.launches): a page address never adds one.
     const pending = watchApiErrors(page, ctx);
+    // Capture the page's own cadence/visibility samples from POST /v1/sessions/{id}/stats on the stack's origin
+    // (a read of the request the page already sends, attached before play() so nothing is missed).
+    const origin = new URL(ctx.baseUrl).origin;
+    const postedStats = [];
+    page.on("request", (q) => {
+      let u;
+      try { u = new URL(q.url()); } catch { return; }
+      const m = u.origin === origin && q.method() === "POST" ? STATS_POST.exec(u.pathname) : null;
+      if (!m) return;
+      const session = m[1].toLowerCase();
+      for (const row of statsSamples(q.postData?.() ?? "")) postedStats.push({ session, row });
+    });
 
     let result;
     // What step the run is in, for the one reason that may be written before the page's bearer is known (see the catch).
@@ -266,7 +278,7 @@ export default {
       const stats = await page.evaluate(() => window.__qBench?.stats() ?? null);
       rec.json("bench-windows.json", { windows });
       rec.json("bench-frames.json", { frames });
-      rec.jsonl("metrics.jsonl", [...benchRows(windows, 0), ...cadenceRows(frames, hidden, ctx.thresholds.present_min_samples)]);
+      rec.jsonl("metrics.jsonl", [...benchRows(windows, 0), ...dedupStatsRows(postedStats, sid)]);
 
       const row = await api.session(sid);
       if (!row || row.id !== sid) throw new Error("the API no longer returns the session this run started");
