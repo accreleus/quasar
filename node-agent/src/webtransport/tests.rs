@@ -2253,7 +2253,7 @@ fn answered(control: &mut Control, first: u32, at: std::time::Instant) {
         congestion_events: 0,
         queued_bytes: 0,
     };
-    control.feedback(&fb, path, at + Duration::from_millis(250));
+    control.feedback(&fb, path, at + Duration::from_millis(250), None);
 }
 
 /// §Feedback: with the ABR off the estimate never reaches the encoder, so QUIC keeps its
@@ -5225,13 +5225,16 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
                 };
                 seqs.clear();
                 let count = (last - first + 1) as usize;
-                let mut arrivals = vec![0xFFu8; count * 2];
-                arrivals[..2].fill(0);
+                // Every other one lost, ending at an arrival as a browser's report does.
+                let mut arrivals = vec![0u8; count * 2];
+                for i in (1..count.saturating_sub(1)).step_by(2) {
+                    arrivals[2 * i..2 * i + 2].fill(0xFF);
+                }
                 fb_seq += 1;
                 let fb = json!({"type": "feedback", "seq": fb_seq, "first_pkt_seq": first,
                     "count": count, "ref_us": 0,
                     "arrivals_b64": base64::engine::general_purpose::STANDARD.encode(&arrivals),
-                    "recv_kbps": 0, "lost": count - 1, "interval_ms": 50});
+                    "recv_kbps": 0, "lost": count.saturating_sub(1) / 2, "interval_ms": 50});
                 write_message(&mut send, &fb).await.unwrap();
             }
             m = read_message(&mut recv) => break m.unwrap(),
@@ -5459,4 +5462,119 @@ fn releasing_the_tap_stops_its_pyrowave_encoder_and_keeps_the_tap() {
 
     let _ = main.set_state(gst::State::Null);
     let _ = pipeline.set_state(gst::State::Null);
+}
+
+/// #1321: an outage stops every ACK, so QUIC's queue stalls and video waits in the agent.
+/// Audio still goes to QUIC ahead of it, also after feedback silence has released the
+/// governor; video held past the NACK hold is dropped, so when the path returns the outage's
+/// audio arrives before the picture, which resumes at a keyframe. The relay holds the
+/// outage's datagrams rather than dropping them, so the order QUIC sent them in is what the
+/// client sees.
+#[tokio::test]
+async fn audio_overtakes_video_held_behind_a_stalled_path() {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let plan = audio::Plan {
+        audio: true,
+        mic: false,
+        pulse_server: None,
+        jitter_ms: 40,
+    };
+    let mut agent = agent_built(Stream::Av1Heavy, Limits::default(), plan, "snow", |_| {
+        Some(rate(true))
+    })
+    .await;
+    tap_session_audio(&mut agent);
+    let t0 = Instant::now();
+    let (outage, up_at, end) = (
+        t0 + Duration::from_secs(2),
+        t0 + Duration::from_millis(3500),
+        t0 + Duration::from_millis(5500),
+    );
+    let down = Arc::new(AtomicBool::new(false));
+    let cut = down.clone();
+    let (session, mut send, _recv) = through(&mut agent, move || {
+        Some(if cut.load(Relaxed) {
+            up_at.saturating_duration_since(Instant::now())
+        } else {
+            Duration::ZERO
+        })
+    })
+    .await;
+    let wall_us = || {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64
+    };
+    let mut path = Arrivals::default();
+    let mut report = tokio::time::interval(Duration::from_millis(50));
+    // Audio captured from here on was captured after the governor let go (silence: 500 ms).
+    let mut late = None::<u64>;
+    // When the path came back.
+    let mut up_wall = None::<u64>;
+    // (arrival µs, capture µs, keyframe) of every audio and video datagram from the outage on.
+    let (mut audio, mut video) = (Vec::new(), Vec::new());
+    loop {
+        let now = Instant::now();
+        if now >= end {
+            break;
+        }
+        down.store((outage..up_at).contains(&now), Relaxed);
+        if up_wall.is_none() && now >= up_at {
+            up_wall = Some(wall_us());
+        }
+        if late.is_none() && now >= outage + Duration::from_millis(800) {
+            late = Some(wall_us());
+        }
+        tokio::select! {
+            d = session.read_datagram() => {
+                let d = d.unwrap();
+                // The starved-path probe (#1333) carries no `pkt_seq`.
+                if d.len() < 5 { continue; }
+                path.receive(&d);
+                if now < outage { continue; }
+                let n = wall_us();
+                let at = |r: std::ops::Range<usize>| u64::from_le_bytes(d[r].try_into().unwrap());
+                match d[0] {
+                    0x02 => audio.push((n, at(11..19), false)),
+                    0x01 => video.push((n, at(17..25), d[5] & 1 != 0)),
+                    _ => {}
+                }
+            }
+            _ = report.tick() => {
+                if let Some(fb) = path.feedback() {
+                    write_message(&mut send, &fb).await.unwrap();
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+    let late = late.unwrap();
+    let late_audio: Vec<_> = audio.iter().filter(|a| a.1 >= late).collect();
+    assert!(
+        !late_audio.is_empty(),
+        "no audio from late in the outage arrived"
+    );
+    // Nothing held past the NACK hold reaches QUIC (`VideoQueue::feed`), so the picture
+    // resumes at a keyframe, and the outage's audio is not behind any of it.
+    let up_wall = up_wall.unwrap();
+    let resumed = video
+        .iter()
+        .find(|v| v.1 >= up_wall)
+        .expect("video resumed");
+    let last_audio = late_audio
+        .iter()
+        .filter(|a| a.1 < up_wall)
+        .map(|a| a.0)
+        .max();
+    eprintln!(
+        "{} late audio datagrams; video resumed at a keyframe: {}",
+        late_audio.len(),
+        resumed.2
+    );
+    assert!(resumed.2, "video resumed on a delta frame");
+    assert!(
+        last_audio.is_some_and(|a| a <= resumed.0),
+        "the outage's audio arrived behind the video after it"
+    );
 }

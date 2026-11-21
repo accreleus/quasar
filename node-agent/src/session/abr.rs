@@ -398,6 +398,16 @@ fn parse_validated_ms(
 /// Per-report loop: no report for this long is feedback silence, so the estimate fed is
 /// the silence decay's.
 const REPORT_GAP: Duration = Duration::from_millis(500);
+/// Per-report loop: for this long after a reading moved the rate down, the up path climbs one
+/// deadband step per `EVIDENCED_STEP`, not the slew, so an estimate that never saw the
+/// sender's excess (it waited in the agent's queue) does not climb straight back into it
+/// (#1433 design §2).
+const EVIDENCE_MEMORY: Duration = Duration::from_secs(30);
+/// Per-report loop: the second piece of evidence must come this soon after the first. A rising
+/// queue renews its piece every 2 s, the slowest kind (`webtransport::congestion`), and a report
+/// may come late by one gap.
+const CONFIRM_SPAN: Duration = Duration::from_millis(2500);
+const EVIDENCED_STEP: Duration = Duration::from_secs(2);
 
 /// The ABR governor state machine. Fed the rtpgccbwe estimate; emits a new CBR
 /// setpoint when (and only when) a retarget is warranted.
@@ -424,8 +434,12 @@ pub struct Governor {
     fed: Option<Instant>,
     /// Per-report loop: when the last receiver report came.
     last_report: Option<Instant>,
-    /// Per-report loop: the first reading of a run under the line.
-    under: Option<f64>,
+    /// Per-report loop: the first reading under the line, its evidence id, and when it came.
+    under: Option<(f64, u64, Instant)>,
+    /// Per-report loop: evidence ids up to this one have confirmed a step.
+    spent: u64,
+    /// Per-report loop: when a reading last moved the rate down.
+    evidenced: Option<Instant>,
 }
 
 impl Governor {
@@ -443,6 +457,8 @@ impl Governor {
             fed: None,
             last_report: None,
             under: None,
+            spent: 0,
+            evidenced: None,
         }
     }
 
@@ -553,7 +569,12 @@ impl Governor {
                 .then(|| self.observe_window(estimate, now))
                 .flatten();
         }
-        let slew = self.cfg.max_up_step / self.cfg.min_interval.as_secs_f64();
+        let slew = match self.evidenced {
+            Some(at) if now.saturating_duration_since(at) < EVIDENCE_MEMORY => {
+                self.cfg.deadband / EVIDENCED_STEP.as_secs_f64()
+            }
+            _ => self.cfg.max_up_step / self.cfg.min_interval.as_secs_f64(),
+        };
         if estimate > self.rate {
             self.rate = estimate
                 .min(self.rate * (1.0 + slew * dt))
@@ -571,26 +592,48 @@ impl Governor {
     }
 
     /// Per-report loop, once per receiver report: `reading` is what the report showed the
-    /// link carrying when the link held the sender back (`webtransport::Rate::measured`),
-    /// `None` when it did not. A link that delivers what it is sent gives no reading,
-    /// whatever its delay detector says: that is the #68 guard. Two readings in a row under
-    /// the rate by more than the deadband take the rate and the setpoint to the higher of
-    /// them in one move, with no step cap and no dwell.
-    pub fn observe_report(&mut self, reading: Option<f64>, now: Instant) -> Option<u32> {
+    /// link carrying when it carried evidence of the sender's own excess
+    /// (`webtransport::Rate::measured`), `None` when it did not. A delay gradient alone gives
+    /// no reading: that is the #68 guard. Two readings in a row under the rate take the rate
+    /// and the setpoint to the higher of them in one move, with no step cap, no dwell and no
+    /// deadband: a reading is under what left the wire, so no dead zone between the link and
+    /// the deadband over it can hold the sender there (#1503).
+    ///
+    /// Each reading carries the id of the piece of evidence it came from
+    /// (`webtransport::congestion::Estimator::measured`): the two readings must come from two
+    /// pieces within `CONFIRM_SPAN`, and a step spends both, so one piece confirms at most one
+    /// step. A piece renews only every 1–2 s, so reports between the two (on the first piece, on
+    /// a spent one, on none, or at or over the rate, which is no capacity sample under it)
+    /// neither confirm nor break the run.
+    pub fn observe_report(&mut self, reading: Option<(f64, u64)>, now: Instant) -> Option<u32> {
         self.cfg.per_report?;
         self.last_report = Some(now);
-        let Some(reading) = reading.filter(|&r| r < self.rate * (1.0 - self.cfg.deadband)) else {
+        if self
+            .under
+            .is_some_and(|(_, _, at)| now.saturating_duration_since(at) > CONFIRM_SPAN)
+        {
             self.under = None;
-            return None;
+        }
+        // Not positive (or NaN) is no capacity sample: a zero rate would never grow again.
+        let (reading, id) =
+            reading.filter(|&(r, id)| r > 0.0 && r < self.rate && id > self.spent)?;
+        let (first, piece) = match self.under {
+            Some((first, piece, _)) if piece != id => (first, piece),
+            _ => {
+                self.under.get_or_insert((reading, id, now));
+                return None;
+            }
         };
-        let first = self.under.replace(reading)?;
         let target = first.max(reading);
         if !self.write_due(now) {
-            self.under = Some(target);
+            // Confirmed, held for the write: the next report on `id` makes the move.
+            self.under = Some((target, piece, now));
             return None;
         }
         self.under = None;
+        self.spent = piece.max(id);
         self.rate = target;
+        self.evidenced = Some(now);
         let sp = self.clamp(target);
         if sp >= self.setpoint {
             return None;
@@ -1220,6 +1263,15 @@ mod tests {
 
     // ── #1376: the per-report loop (WebTransport) ─────────────────────────────
 
+    /// A reading from a piece of evidence no earlier reading came from.
+    fn fresh(kbps: f64) -> (f64, u64) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        (
+            kbps,
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
     fn per_report(gap_ms: u64) -> AbrConfig {
         AbrConfig {
             per_report: Some(Duration::from_millis(gap_ms)),
@@ -1231,8 +1283,7 @@ mod tests {
         base + Duration::from_millis(ms)
     }
 
-    /// Down: two readings in a row under the rate by more than the deadband take the
-    /// setpoint to the higher of them at once, with no −12.5 % cap, and a deeper drop right
+    /// Down: two readings in a row under the rate take the setpoint to the higher of them at once, with no −12.5 % cap, and a deeper drop right
     /// after is not held by a dwell. The window loop caps a step at −12.5 % and dwells 7 s.
     #[test]
     fn per_report_down_takes_the_reading_in_one_move() {
@@ -1240,7 +1291,7 @@ mod tests {
         let mut g = Governor::new(per_report(0), base);
         assert_eq!(g.observe(10_000.0, ms(base, 0)), None);
         assert_eq!(
-            g.observe_report(Some(5000.0), ms(base, 0)),
+            g.observe_report(Some(fresh(5000.0)), ms(base, 0)),
             None,
             "one reading is no evidence"
         );
@@ -1250,38 +1301,152 @@ mod tests {
             "the estimate alone never goes down"
         );
         assert_eq!(
-            g.observe_report(Some(5100.0), ms(base, 100)),
+            g.observe_report(Some(fresh(5100.0)), ms(base, 100)),
             Some(5100),
             "the higher of the two"
         );
         assert_eq!(g.rate_kbps(), 5100.0);
-        g.observe_report(Some(800.0), ms(base, 300));
+        g.observe_report(Some(fresh(800.0)), ms(base, 300));
         assert_eq!(
-            g.observe_report(Some(700.0), ms(base, 400)),
+            g.observe_report(Some(fresh(700.0)), ms(base, 400)),
             Some(1000),
             "the setpoint stops at the floor"
         );
         assert_eq!(g.rate_kbps(), 800.0, "the rate does not");
     }
 
-    /// A report with no reading between two low ones breaks the run, and a reading inside
-    /// the deadband is none.
+    /// Two pieces of evidence further apart than `CONFIRM_SPAN` confirm nothing.
     #[test]
-    fn per_report_a_broken_run_or_a_reading_in_the_deadband_holds() {
+    fn per_report_pieces_too_far_apart_hold() {
         let base = Instant::now();
         let mut g = Governor::new(per_report(0), base);
         for i in 0..20 {
-            let r = (i % 2 == 0).then_some(5000.0);
-            assert_eq!(g.observe_report(r, ms(base, i * 100)), None);
-        }
-        for i in 20..40 {
-            assert_eq!(
-                g.observe_report(Some(8600.0), ms(base, i * 100)),
-                None,
-                "inside 15 %"
-            );
+            let r = (i % 2 == 0).then(|| fresh(5000.0));
+            assert_eq!(g.observe_report(r, ms(base, i * 1300)), None);
         }
         assert_eq!(g.setpoint_kbps(), 10_000);
+    }
+
+    /// #1503: a reading carries evidence that the sender's own excess is what the link queues
+    /// or drops, so it moves the setpoint however close under the rate it is. With the 15 %
+    /// deadband a link at 0.86 × the setpoint held a sender 1.18–1.22× over its estimate
+    /// (lab 0.6.2, 2 Mbit/s), and RTT reached 1.5–3.6 s. Old code: no move.
+    #[test]
+    fn per_report_a_reading_inside_the_old_deadband_moves() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        g.observe_report(Some(fresh(8600.0)), ms(base, 0));
+        assert_eq!(
+            g.observe_report(Some(fresh(8600.0)), ms(base, 100)),
+            Some(8600)
+        );
+        assert_eq!(
+            g.observe_report(Some(fresh(8600.0)), ms(base, 200)),
+            None,
+            "a reading at the rate is none"
+        );
+    }
+
+    /// #1433 review M4: a reading of 0 (a backlog window that released nothing) is no capacity
+    /// sample. Old code: the rate went to 0 and the up path, which multiplies it, never grew
+    /// again, whatever the estimate.
+    #[test]
+    fn per_report_a_zero_reading_is_no_reading() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        for i in 0..2 {
+            assert_eq!(g.observe_report(Some(fresh(0.0)), ms(base, i * 100)), None);
+        }
+        assert_eq!(g.rate_kbps(), 10_000.0);
+        assert_eq!(g.setpoint_kbps(), 10_000);
+    }
+
+    /// #1433 I2 (review M4): a step needs readings from two pieces of evidence and spends both.
+    /// More reports on one piece neither confirm nor break the run, and a spent piece is no
+    /// reading. Old code: two reports on one backlog window confirmed a step.
+    #[test]
+    fn per_report_one_piece_of_evidence_confirms_at_most_one_step() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        for i in 0..10 {
+            assert_eq!(g.observe_report(Some((5000.0, 1)), ms(base, i * 100)), None);
+        }
+        assert_eq!(
+            g.observe_report(Some((5000.0, 2)), ms(base, 1000)),
+            Some(5000)
+        );
+        for (i, piece) in [2, 1, 2].into_iter().enumerate() {
+            let at = ms(base, 1100 + i as u64 * 100);
+            assert_eq!(g.observe_report(Some((4000.0, piece)), at), None, "spent");
+        }
+        assert_eq!(g.observe_report(Some((4000.0, 3)), ms(base, 1400)), None);
+        assert_eq!(
+            g.observe_report(Some((4000.0, 4)), ms(base, 1500)),
+            Some(4000)
+        );
+    }
+
+    /// #1433 review M7: for 30 s after a reading moved the rate down, the up path climbs one
+    /// deadband step per 2 s, not the 25 %/s slew, so an estimate that never saw the excess
+    /// does not take the rate straight back over the link. Old code: 4000 → 8000 in about 3 s.
+    #[test]
+    fn per_report_after_a_reading_the_up_path_climbs_a_deadband_step_per_2_s() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        g.observe_report(Some(fresh(4000.0)), ms(base, 0));
+        assert_eq!(
+            g.observe_report(Some(fresh(4000.0)), ms(base, 100)),
+            Some(4000)
+        );
+        let climb = |g: &mut Governor, from: u64, to: u64, estimate: f64| {
+            for t in (from..to).step_by(100) {
+                g.observe_report(None, ms(base, t));
+                g.observe(estimate, ms(base, t));
+            }
+        };
+        let mut h = Governor::new(per_report(0), base);
+        h.observe_report(Some(fresh(4000.0)), ms(base, 0));
+        h.observe_report(Some(fresh(4000.0)), ms(base, 100));
+        climb(&mut g, 200, 2200, 10_000.0);
+        let rate = g.rate_kbps();
+        assert!((4500.0..4700.0).contains(&rate), "{rate:.0} after 2 s");
+        // The memory expires 30 s after the reading: then the slew.
+        climb(&mut h, 200, 30_100, 4000.0);
+        climb(&mut h, 30_100, 31_100, 10_000.0);
+        assert!(
+            h.rate_kbps() > 1.2 * 4000.0,
+            "{:.0} 1 s after",
+            h.rate_kbps()
+        );
+    }
+
+    /// Lab 0.6.3 R3: readings keep coming while the estimate, which never saw the excess, stays
+    /// at the ceiling. The resolution rung steps down only once the rate stays under
+    /// `engage_frac` × its comfort (the ceiling at the launch rung) for `RATE_CONFIRM`
+    /// (`LadderPlanner::observe_rate`). Old code: the slew lifted 5000 back over 6000 in 0.7 s
+    /// after every reading, so the rung never stepped down.
+    #[test]
+    fn per_report_readings_with_a_high_estimate_hold_the_rate_long_enough_for_the_rung() {
+        use crate::session::ladder::{LadderPlanner, ResolutionPolicy};
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        let line = ResolutionPolicy::DEFAULT_ENGAGE_FRAC * 10_000.0;
+        let (mut under, mut longest) = (None::<u64>, 0u64);
+        for t in (0..20_000u64).step_by(100) {
+            // Two readings at 5000 every 3 s, as the evidence comes.
+            let reading = (t % 3000 < 200).then(|| fresh(5000.0));
+            g.observe_report(reading, ms(base, t));
+            g.observe(10_000.0, ms(base, t));
+            match (g.rate_kbps() < line, under) {
+                (true, None) => under = Some(t),
+                (true, Some(from)) => longest = longest.max(t - from),
+                (false, _) => under = None,
+            }
+        }
+        assert!(
+            longest >= LadderPlanner::RATE_CONFIRM.as_millis() as u64,
+            "under the rung's line {longest} ms at most"
+        );
     }
 
     /// #68: with reports flowing, an estimate under the setpoint (a delay detector misreading
@@ -1317,8 +1482,11 @@ mod tests {
         let base = Instant::now();
         let mut g = Governor::new(per_report(0), base);
         g.observe(10_000.0, ms(base, 0));
-        g.observe_report(Some(2000.0), ms(base, 0));
-        assert_eq!(g.observe_report(Some(2000.0), ms(base, 100)), Some(2000));
+        g.observe_report(Some(fresh(2000.0)), ms(base, 0));
+        assert_eq!(
+            g.observe_report(Some(fresh(2000.0)), ms(base, 100)),
+            Some(2000)
+        );
         let (mut est, mut moves) = (2000.0f64, vec![2000u32]);
         for i in 2..300u64 {
             // The estimate climbs 34 %/s here, faster than the slew lets the setpoint.
@@ -1372,16 +1540,22 @@ mod tests {
     fn per_report_writes_wait_out_the_gap() {
         let base = Instant::now();
         let mut g = Governor::new(per_report(1000), base);
-        g.observe_report(Some(5000.0), ms(base, 500));
+        g.observe_report(Some(fresh(5000.0)), ms(base, 500));
         assert_eq!(
-            g.observe_report(Some(5000.0), ms(base, 600)),
+            g.observe_report(Some(fresh(5000.0)), ms(base, 600)),
             None,
             "1 s since the start"
         );
-        assert_eq!(g.observe_report(Some(5000.0), ms(base, 1000)), Some(5000));
-        g.observe_report(Some(2000.0), ms(base, 1100));
-        assert_eq!(g.observe_report(Some(2000.0), ms(base, 1200)), None);
-        assert_eq!(g.observe_report(Some(2000.0), ms(base, 2000)), Some(2000));
+        assert_eq!(
+            g.observe_report(Some(fresh(5000.0)), ms(base, 1000)),
+            Some(5000)
+        );
+        g.observe_report(Some(fresh(2000.0)), ms(base, 1100));
+        assert_eq!(g.observe_report(Some(fresh(2000.0)), ms(base, 1200)), None);
+        assert_eq!(
+            g.observe_report(Some(fresh(2000.0)), ms(base, 2000)),
+            Some(2000)
+        );
     }
 
     /// #1376 review R3: the silence decay is paced by `per_report` as well. With a 100 ms
@@ -1417,7 +1591,10 @@ mod tests {
         let base = Instant::now();
         let mut g = Governor::new(AbrConfig::new_smooth(1000, 10_000, 60), base);
         for i in 0..10 {
-            assert_eq!(g.observe_report(Some(2000.0), ms(base, i * 100)), None);
+            assert_eq!(
+                g.observe_report(Some(fresh(2000.0)), ms(base, i * 100)),
+                None
+            );
         }
         assert_eq!(g.setpoint_kbps(), 10_000);
     }
