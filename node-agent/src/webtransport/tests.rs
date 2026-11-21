@@ -5553,6 +5553,38 @@ fn a_late_wake_up_hands_over_one_slice_and_spaces_the_rest_from_now() {
 }
 
 #[test]
+fn a_late_final_slice_does_not_let_the_next_frame_follow_it_inside_one_gap() {
+    let gap = Duration::from_millis(5);
+    let t0 = Instant::now();
+    let mut pacing = Pacing::default();
+    pacing.push(1, gap, vec![tagged(0, 1), tagged(1, 1)]);
+    assert_eq!(pacing.pop(t0).unwrap()[0][0], 0);
+    // The final slice wakes 95 ms late and empties the queue; the next frame is already waiting.
+    let late = t0 + Duration::from_millis(100);
+    assert_eq!(pacing.pop(late).unwrap()[0][0], 1);
+    pacing.push(2, gap, vec![tagged(20, 1), tagged(21, 1)]);
+    assert!(pacing.pop(late).is_none(), "two slices inside one gap");
+    assert_eq!(pacing.deadline(), Some(late + gap));
+    assert_eq!(pacing.pop(late + gap).unwrap()[0][0], 20);
+}
+
+#[test]
+fn backlogged_one_slice_frames_are_spaced_and_an_idle_sender_sends_at_once() {
+    let gap = pacing_gap(60, 1);
+    assert!(gap > Duration::ZERO);
+    let t0 = Instant::now();
+    let mut pacing = Pacing::default();
+    pacing.push(1, gap, vec![tagged(1, 1)]);
+    pacing.push(2, gap, vec![tagged(2, 1)]);
+    assert_eq!(pacing.pop(t0).unwrap()[0][0], 1);
+    assert!(pacing.pop(t0).is_none(), "the second frame waits a gap");
+    assert_eq!(pacing.pop(t0 + gap).unwrap()[0][0], 2);
+    // Idle for longer than a gap: the next frame's first slice adds no latency.
+    pacing.push(3, gap, vec![tagged(3, 1)]);
+    assert_eq!(pacing.pop(t0 + gap * 3).unwrap()[0][0], 3);
+}
+
+#[test]
 fn a_frame_queues_behind_one_older_frame_and_a_third_drops_the_oldests_tail() {
     let gap = Duration::from_millis(5);
     let t0 = Instant::now();

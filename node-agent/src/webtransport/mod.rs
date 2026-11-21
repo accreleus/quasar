@@ -1244,6 +1244,16 @@ const PYRO_BURST_BYTES: usize = 128 * 1024;
 /// The frame rate the slice spacing assumes when the configuration carries none.
 const PACING_FALLBACK_FPS: u32 = 60;
 
+/// The spacing between a frame's slices: a quarter of the frame interval over its gaps. A
+/// one-slice frame gets the same quarter, so the next frame's first slice still waits it out.
+fn pacing_gap(fps: i32, slices: usize) -> std::time::Duration {
+    let fps = u32::try_from(fps)
+        .ok()
+        .filter(|f| *f > 0)
+        .unwrap_or(PACING_FALLBACK_FPS);
+    std::time::Duration::from_secs(1) / fps / 4 / (slices.max(2) as u32 - 1)
+}
+
 /// The slices a frame's datagrams are handed over in: each a datagram count and its offset from
 /// the frame's start. PyroWave is cut so no slice passes `PYRO_BURST_BYTES`, the slices spread
 /// evenly over a quarter of the frame interval (a target: `Pacing` keeps the spacing, not the
@@ -1266,11 +1276,7 @@ fn burst_plan(
     if counts.len() == 1 {
         return vec![(counts[0], std::time::Duration::ZERO)];
     }
-    let fps = u32::try_from(fps)
-        .ok()
-        .filter(|f| *f > 0)
-        .unwrap_or(PACING_FALLBACK_FPS);
-    let gap = std::time::Duration::from_secs(1) / fps / 4 / (counts.len() as u32 - 1);
+    let gap = pacing_gap(fps, counts.len());
     counts
         .into_iter()
         .zip(0..)
@@ -1295,7 +1301,9 @@ const PACING_FRAMES: usize = 2;
 #[derive(Default)]
 struct Pacing {
     queue: std::collections::VecDeque<Slice>,
-    /// When the next slice may go; `None` while idle, when a slice goes at once.
+    /// When the next slice may go: the last hand-off plus its gap, kept across frames and an
+    /// empty queue so no two slices are closer than a gap. Past (or `None`) when idle: a slice
+    /// goes at once.
     ready: Option<Instant>,
 }
 
@@ -1329,13 +1337,14 @@ impl Pacing {
     }
 
     /// The next slice if it is due. A late caller gets one slice, and the rest are spaced from
-    /// `now`, never from the missed deadline: no catch-up burst.
+    /// `now`, never from the missed deadline: no catch-up burst. That holds at a frame boundary
+    /// too: a frame queued after the last pop waits out the previous slice's gap.
     fn pop(&mut self, now: Instant) -> Option<Vec<bytes::Bytes>> {
         if self.ready.is_some_and(|t| t > now) {
             return None;
         }
         let slice = self.queue.pop_front()?;
-        self.ready = (!self.queue.is_empty()).then(|| now + slice.gap);
+        self.ready = Some(now + slice.gap);
         Some(slice.datagrams)
     }
 }
@@ -1899,7 +1908,7 @@ async fn stream(
                     if unit.pyrowave {
                         // #1606: slices go out one per deadline, from the arm below.
                         let plan = burst_plan(&datagrams, true, current.fps);
-                        let gap = plan.get(1).map_or(Duration::ZERO, |p| p.1);
+                        let gap = pacing_gap(current.fps, plan.len());
                         let mut rest = datagrams.into_iter();
                         let slices = plan.iter().map(|(n, _)| rest.by_ref().take(*n).collect()).collect();
                         pacing.push(unit.frame_seq, gap, slices);
@@ -1921,7 +1930,7 @@ async fn stream(
                         pyrowave_frames.forget();
                     }
                     current = config.clone();
-                    pacing = Pacing::default();
+                    pacing.queue.clear();
                     pyro = pyro_rate(media, &current, pyro);
                     let ack = hello_ack(&config, media.audio(), reason, fec, audio_red);
                     let write = write_message(&mut send, &ack);
