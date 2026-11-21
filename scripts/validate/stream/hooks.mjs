@@ -232,6 +232,7 @@ export class Hooks {
     if (!mine.length) return [];
     const live = mine.find((e) => isAlive(e.pid));
     if (live) throw new Error(`refusing to start: process ${live.pid} still holds hook ${live.name}; it is another e2e-run using these hooks`);
+    // shortcut: one recoverer per ledger, add locking when concurrent recovery is needed.
     const owners = new Map(mine.map((e) => [e.id, e.pid]));
     this.writeLedger(entries.map((e) => owners.has(e.id) ? { ...e, pid: process.pid } : e));
     // A runner killed while a hook ran left that hook running (it is its own process group). Clearing over it
@@ -243,7 +244,7 @@ export class Hooks {
         if (!e.hook_pid) throw new Error(`refusing to start: hook ${e.name} was ${e.state} when its runner died and its process is not known; remove ${this.ledger} once the hook is known to be clear`);
         while (isAlive(e.hook_pid, { group: true })) {
           const remaining = until - performance.now();
-          if (remaining <= 0) throw new Error(`refusing to start: hook ${e.name} from a runner that died is still running (process group ${e.hook_pid}); end it, then run again`);
+          if (remaining <= 0) throw new Error(`refusing to start: hook ${e.name} from a runner that died is still running (process group ${e.hook_pid}). The waited-for group may belong to another process (PID reuse). Verify the group before ending it, then run again`);
           await sleep(Math.min(100, remaining));
         }
       }

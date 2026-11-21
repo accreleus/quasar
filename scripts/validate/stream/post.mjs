@@ -313,7 +313,11 @@ export function postBundle(
     return { ...out, status: "failed", exit: EXIT.failed, reason: "no-commit" };
   }
 
-  const checked = scan("bash", [LEAK_SCAN, "--dir", dir], { cwd: ROOT, encoding: "utf8", env });
+  const checked = scan("bash", [LEAK_SCAN, "--dir", dir], {
+    cwd: ROOT,
+    encoding: "utf8",
+    env: { LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS: "1", ...env },
+  });
   if (checked?.error || checked?.status !== 0) {
     if (checked?.stderr) console.error(checked.stderr.trimEnd());
     console.error(`leak-scan failed (${checked?.error?.message ?? `exit ${checked?.status ?? "unknown"}`}); nothing is posted`);

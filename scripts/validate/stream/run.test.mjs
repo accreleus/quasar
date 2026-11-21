@@ -1600,7 +1600,7 @@ test("hooks: recovery shares one deadline across process groups", async (t) => {
     elapsed += 100;
     return true;
   });
-  await assert.rejects(h.recover(() => {}), /hook shape:slow .* still running \(process group 102\)/);
+  await assert.rejects(h.recover(() => {}), /hook shape:slow .* still running \(process group 102\).*may belong to another process \(PID reuse\)/);
   assert.deepEqual(h.readLedger().map(({ pid }) => pid), [deadPid, deadPid], "a refused recovery releases ownership for a retry");
 });
 

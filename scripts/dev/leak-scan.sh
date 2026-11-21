@@ -15,7 +15,7 @@
 #   scripts/dev/leak-scan.sh            # the tracked tree at HEAD's index
 #   scripts/dev/leak-scan.sh --staged   # staged content only (pre-push/pre-commit)
 #   scripts/dev/leak-scan.sh --issues   # GitHub issue titles/bodies/comments
-#   scripts/dev/leak-scan.sh --dir PATH # public-destined directory of text files
+#   scripts/dev/leak-scan.sh --dir PATH # regular files in a public-destined directory
 #
 # THE TRACKER IS THE OTHER PUBLIC SURFACE. The repo is not the only thing that
 # gets published: an issue body is just as public and just as permanently
@@ -50,7 +50,7 @@ case "${1:-}" in
     DIR_TARGET="$2"
     ;;
   -h | --help)
-    sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
     ;;
   *)
@@ -299,23 +299,12 @@ fi
 
 # Match the full public-surface pattern set, without the tracked tree's exclusions.
 if [ "$MODE" = dir ]; then
-  # Compare against the same bytes with NULs removed. grep -I alone can report
-  # a match before reaching a NUL later in the file.
+  # Scan all bytes, including NULs in console logs. Strip NULs only from the diagnostics.
   if ! HITS="$(cd -- "$DIR_TARGET" && find -P . -type f -exec bash -c '
     pattern=$1
     shift
-    for file; do
-      LC_ALL=C tr -d "\000" < "$file" | cmp -s "$file" -
-      statuses=("${PIPESTATUS[@]}")
-      case "${statuses[*]}" in
-        "0 1"|"141 1") continue ;; # A NUL made cmp stop, possibly closing the pipe early.
-        "0 0") ;;
-        *) exit 2 ;;
-      esac
-      grep --line-number --with-filename --extended-regexp --color=never -e "$pattern" -- "$file"
-      if [ "$?" -gt 1 ]; then exit 2; fi
-    done
-  ' bash "$ISSUE_ALTERNATION" {} +)"; then
+    LC_ALL=C grep -a --line-number --with-filename --extended-regexp --color=never -e "$pattern" -- "$@" || [ "$?" -eq 1 ]
+  ' bash "$ISSUE_ALTERNATION" {} + | tr -d '\000')"; then
     echo "leak-scan: could not scan the directory." >&2
     exit 2
   fi

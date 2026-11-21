@@ -162,6 +162,7 @@ make e2e-run TARGET=... PLAN=... HOOKS=<dir>        # or QUASAR_E2E_HOOKS=<dir>
   group alive after the runner dies. Recovery refuses to start a suite while that group survives
   the deadline. A hook that fails to clear, a live ledger owner or a damaged ledger also stops
   the run. Remove a damaged ledger once the hooks are known to be clear.
+  Run one recoverer per ledger at a time. Concurrent recoverers can claim and clear the same entries.
 - **No script.** A scenario whose hook has no executable script (or no `HOOKS=`) is `skipped`; the reason
   names the hook. Nothing is launched.
 
@@ -347,8 +348,9 @@ neither, so a scenario's own name can never spell another scenario's params. An 
 hold spaces and capitals, so it enters the name as a slug — lower case, every run of characters
 outside `[a-z0-9]` replaced by one `-`, trimmed, at most 40 characters (`Quasar Benchapp` is
 `quasar-benchapp`) — and is posted as the tag `app=<slug>` as well. An empty slug refuses the
-scenario. App names that normalise to the same slug or share the same truncated slug still
-share a bench scenario when their other parameters match.
+scenario. Distinct app names can share a bench scenario when the other parameters match.
+For example, `Quasar Benchapp` and `quasar-benchapp` both produce `app=quasar-benchapp`.
+Names that produce the same truncated slug also collide.
 `bench`, `cover_qr`, `expect_marker` and `hold_s` are not
 in the name — they are how the app was presented, whether a marker is expected (the app name already
 identifies it) and how long it ran, and `hold_s` is a tag. **A run posted
@@ -409,9 +411,11 @@ never through a shell. A scenario is not posted (`failed=N`, and the reason says
   (below), or one of its own files in a shape it does not write.
 
 If the bundle cannot be archived, nothing is posted (`reason=no-archive`).
-Before archiving or posting, `scripts/dev/leak-scan.sh --dir` checks the run bundle's regular
-text files against the public leak patterns. A hit or scan error stops the entire post
-(`reason=leak-scan-failed`, `posted=0`). The scan also runs with `DRY_RUN=1`.
+Before archiving or posting, `scripts/dev/leak-scan.sh --dir` checks every regular file in the run
+bundle, including files with NUL bytes. The post requires operator patterns by default. A hit,
+missing required patterns, or a scan error stops the entire post (`reason=leak-scan-failed`,
+`posted=0`). The scan also runs with `DRY_RUN=1`. Set `LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS=0`
+to allow the generic-only scan on an isolated fixture.
 
 **Every file `bench_submit.py` reads in a scenario directory is checked, or the scenario is
 refused**, because each field it takes from one reaches the run's tags, its `conditions` or its

@@ -9,7 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { main, postBundle } from "./post.mjs";
+import { main, postBundle as post } from "./post.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "../../..");
@@ -18,8 +18,18 @@ const DX = path.join(ROOT, "scripts/dx");
 const HOST = "gpu-test";
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-post-test-"));
 process.on("exit", () => fs.rmSync(TMP, { recursive: true, force: true }));
-// No bench server and no operator config: even the real script must not reach a service.
-const ENV = { ...process.env, BENCH_URL: "", BENCH_KEY: "", XDG_CONFIG_HOME: TMP };
+// Keep the real scripts offline and independent of the operator's configuration.
+const absent = path.join(TMP, "absent");
+const ENV = {
+  ...process.env,
+  BENCH_URL: "",
+  BENCH_KEY: "",
+  XDG_CONFIG_HOME: TMP,
+  LEAK_SCAN_OPERATOR_PATTERNS: "tree:standin[.]example[.]invalid",
+  LEAK_SCAN_PATTERNS_FILE: absent,
+  LEAK_SCAN_BENCH_URL_FILE: absent,
+};
+const postBundle = (dir, opts) => post(dir, { env: ENV, ...opts });
 
 // The committed fixture, with the DX suite's own bench run directory in the scenario, so
 // "a scenario directory is a bench_submit.py run directory" is true by construction.
@@ -55,7 +65,7 @@ function cli(args, opts) {
   console.log = (...a) => lines.push(a.join(" "));
   console.error = () => {};
   try {
-    return { code: main(args, opts), out: lines.join("\n") };
+    return { code: main(args, { env: ENV, ...opts }), out: lines.join("\n") };
   } finally {
     console.log = log;
     console.error = error;
@@ -563,15 +573,28 @@ test("a failed run bundle leak scan blocks archiving and posting", () => {
   }
 });
 
-test("the real directory scan refuses a home path in a run bundle", () => {
+test("the real directory scan refuses a home path after a NUL in a run bundle", () => {
   const dir = bundle();
-  fs.writeFileSync(path.join(dir, SC, "console.log"), `opened ${"/Users/"}alice/foo\n`);
+  fs.writeFileSync(path.join(dir, SC, "console.log"), `opened\0 ${"/Users/"}alice/foo\n`);
   const rec = recorder();
-  const env = { ...ENV, LEAK_SCAN_OPERATOR_PATTERNS: "", LEAK_SCAN_PATTERNS_FILE: path.join(TMP, "absent"), LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS: "" };
+  const env = { ...ENV, LEAK_SCAN_OPERATOR_PATTERNS: "", LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS: "0" };
   const { out, said } = postCapturingStderr(dir, { host: HOST, spawn: rec.spawn, env });
   assert.deepEqual([out.exit, out.posted, out.reason], [1, 0, "leak-scan-failed"]);
   assert.equal(rec.calls.length, 0);
   assert.match(said, /console\.log:1:/);
+});
+
+test("posting requires operator leak patterns by default", () => {
+  const dir = bundle();
+  const rec = recorder();
+  const env = { ...ENV, LEAK_SCAN_OPERATOR_PATTERNS: "" };
+  delete env.LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS;
+  const { out, said } = postCapturingStderr(dir, { host: HOST, spawn: rec.spawn, env });
+  assert.deepEqual([out.exit, out.posted, out.reason], [1, 0, "leak-scan-failed"]);
+  assert.deepEqual(rec.calls, []);
+  assert.match(said, /operator patterns are required/);
+  const optOut = { ...env, LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS: "0" };
+  assert.equal(postBundle(dir, { host: HOST, spawn: rec.spawn, env: optOut }).posted, 1);
 });
 
 // The rest of session.json that reaches a tag or conditions.negotiated is a number, and

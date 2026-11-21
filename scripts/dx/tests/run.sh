@@ -961,11 +961,11 @@ ls_dir() {
 printf '%s%s\n' '/Users/' 'alice/foo' > "$WORK/outside-leak-dir"
 ln -s "$WORK/outside-leak-dir" "$leak_dir/nested/link"
 printf 'ordinary text\n' > "$leak_dir/nested/text"
-{ cat "$WORK/outside-leak-dir"; printf '%70000s\0' ''; } > "$leak_dir/binary"
+printf 'ordinary text\0\n' > "$leak_dir/binary"
 ls_dir_out="$(ls_dir "$leak_dir" 2>&1)"
 ls_dir_rc=$?
 if [ "$ls_dir_rc" -eq 0 ] && [[ "$ls_dir_out" == *"leak-scan: clean (dir)"* ]]; then
-  pass "leakscan:dir-clean" "text is clean, a binary and a link outside the directory are skipped"
+  pass "leakscan:dir-clean" "ordinary files are clean and a link outside the directory is skipped"
 else
   fail "leakscan:dir-clean" "expected rc=0 and clean (dir), got rc=$ls_dir_rc: $ls_dir_out"
 fi
@@ -980,12 +980,28 @@ else
   fail "leakscan:dir-detects" "expected rc=1 and both hits, got rc=$ls_dir_rc: $ls_dir_out"
 fi
 
+mkdir "$WORK/leak-dir-nul"
+{ printf 'raw console\0 '; cat "$WORK/outside-leak-dir"; } > "$WORK/leak-dir-nul/console.log"
+ls_dir_out="$(ls_dir "$WORK/leak-dir-nul" 2>&1)"
+ls_dir_rc=$?
+if [ "$ls_dir_rc" -eq 1 ] && [[ "$ls_dir_out" == *"./console.log:1:"* ]]; then
+  pass "leakscan:dir-nul-detects" "a NUL before a home path on the same line still exits 1"
+else
+  fail "leakscan:dir-nul-detects" "expected rc=1 and console.log hit, got rc=$ls_dir_rc: $ls_dir_out"
+fi
+
 ls_dir_out="$(ls_dir "$WORK/no-such-directory" 2>&1)"
 ls_dir_rc=$?
 if [ "$ls_dir_rc" -eq 2 ] && [[ "$ls_dir_out" == *"--dir <existing-directory>"* ]]; then
   pass "leakscan:dir-missing" "missing directory exits 2"
 else
   fail "leakscan:dir-missing" "expected rc=2 and directory usage, got rc=$ls_dir_rc: $ls_dir_out"
+fi
+
+if bash "$LS" --help | grep -Fxq 'to anything real.'; then
+  pass "leakscan:help-complete" "help includes the final header line"
+else
+  fail "leakscan:help-complete" "missing the final header line"
 fi
 
 printf '\n== redaction ==\n'
