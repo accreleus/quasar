@@ -181,7 +181,11 @@ export const probe = (page) =>
   page.evaluate((sel) => ({
     frames: window.__qBench?.stats().frames ?? 0,
     videoFrames: document.querySelector("video.session-video:not([hidden])")?.getVideoPlaybackQuality?.().totalVideoFrames ?? 0,
-    surface: [...document.querySelectorAll(".session-video")].some((e) => e.videoWidth || e.tagName === "CANVAS"),
+    surface: [...document.querySelectorAll(".session-video")].some((e) => {
+      if (e.hidden || !(e.videoWidth || e.tagName === "CANVAS")) return false;
+      const r = e.getBoundingClientRect?.();
+      return !!(r && r.width > 0 && r.height > 0);
+    }),
     revealed: !!document.querySelector(sel),
     visible: document.visibilityState,
     focused: document.hasFocus?.(),

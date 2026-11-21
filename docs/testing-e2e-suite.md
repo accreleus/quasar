@@ -622,9 +622,9 @@ waited (`waited_s`), and, in `mid`, `no_frame_advance_before_video_s`: the longe
 samples between the fault and the first `<video>` frame in which neither the bench frames nor the
 `<video>` advanced (about the seconds the picture froze; one-second resolution; when no `<video>`
 frame came it runs to the end of the wait). It is `null` in `connect`, when no sample was taken (the
-session ended at once), when no visible `<video>`/canvas stream surface was present (with
-`no_frame_advance_reason`), when a count could not be read, and once the bench's frame ring is full
-(5000 frames), because its count then stops growing. It is a fact, not a criterion, and has no
+session ended at once), when no visible `<video>`/canvas stream surface was present at the fault
+(with `no_frame_advance_reason`), when a count could not be read, and once the bench's frame ring is
+full (5000 frames), because its count then stops growing. It is a fact, not a criterion, and has no
 threshold. `fallback_event` and `frame_after_fallback` say where their wait starts: the fault in
 `mid`, the first frame in `connect`.
 

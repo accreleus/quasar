@@ -102,6 +102,8 @@ const RULES = [
   ["a glued refreshToken: in a log", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "refreshToken: secret-value-99\n"), /x.log: holds a credential/],
   ["a glued clientSecret= in a log", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "clientSecret=abcdef123456\n"), /x.log: holds a credential/],
   ["a glued userPassword= in a log", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "userPassword=hunter2\n"), /x.log: holds a credential/],
+  ["a glued myApiKey= in a log", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "myApiKey=abcdef123456\n"), /x.log: holds a credential/],
+  ["a glued googleApikey: in a log", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "googleApikey: secret-value-99\n"), /x.log: holds a credential/],
   ["a password that only starts like 'none'", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "password: none-of-your-business1\n"), /x.log: holds a credential/],
   ["a password with an exempt word followed by a dotted suffix", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "password: none.part123\n"), /x.log: holds a credential/],
   ["a password that only starts like 'null'", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "password: nullify\n"), /x.log: holds a credential/],
@@ -192,15 +194,15 @@ test("a browser version, a documentation address and a container's home are not 
 
 test("authorization requirements and none-words with sentence punctuation are prose", () => {
   const dir = bundle();
-  fs.writeFileSync(path.join(dir, "README.md"), "authorization: required\nAuthorization: required.\npassword: none.\nsecret: n/a.\naccessToken=none\nauthtoken=<credential>\n");
+  fs.writeFileSync(path.join(dir, "README.md"), "authorization: required\nAuthorization: required.\npassword: none.\nsecret: n/a.\naccessToken=none\nauthtoken=<credential>\nmyApiKey=none\nmonkey=1\nmonkey=abcd1234\nhotkey: ctrl+alt+del\nprimaryKey=abcdef12\n");
   assert.deepEqual(validateBundle(dir), []);
 });
 
 test("glued credential names are scrubbed cleanly and the pattern stays linear on 100k-char adversarial inputs", () => {
   const counts = {};
-  const scrubbed = scrub("url?accessToken=abcdef123456 authtoken=zyxwvu987654", counts);
-  assert.ok(!scrubbed.includes("abcdef123456") && !scrubbed.includes("zyxwvu987654"), scrubbed);
-  assert.equal(counts.credentials, 2);
+  const scrubbed = scrub("url?accessToken=abcdef123456 authtoken=zyxwvu987654 myApiKey=keyval123456", counts);
+  assert.ok(!scrubbed.includes("abcdef123456") && !scrubbed.includes("zyxwvu987654") && !scrubbed.includes("keyval123456"), scrubbed);
+  assert.equal(counts.credentials, 3);
   const dir = bundle();
   fs.writeFileSync(path.join(dir, SC, "x.log"), `${scrubbed}\n`);
   assert.deepEqual(validateBundle(dir), []);
@@ -209,6 +211,7 @@ test("glued credential names are scrubbed cleanly and the pattern stays linear o
   const adversarial = [
     "a".repeat(100_000),
     `${"access".repeat(16_667)}Token=abc`,
+    `${"google".repeat(16_667)}ApiKey=abc`,
     `token${" ".repeat(100_000)}`,
     `authorization:${" ".repeat(100_000)}`,
   ];

@@ -179,7 +179,8 @@ export default {
         let videoAt = null;
         const waitStart = now();
         // The freeze (mid): the longest run of samples, from the fault to the first <video> frame, in which neither the bench frames nor the <video> advanced.
-        // Without a visible stream surface (<video>/canvas), freeze is null with a reason, never 0.
+        // Without a visible stream surface (<video>/canvas) at the fault, freeze is null with a reason, never 0.
+        // Inside the loop, a vanished surface (the canvas unmounts on fallback before WebRTC decodes) counts as no advance.
         let last = frames0;
         let lastMoveAt = tFault;
         let freeze = frames0 ? (frames0.surface === false ? null : 0) : null;
@@ -199,8 +200,7 @@ export default {
           if (videoAt === null && freeze !== null) {
             sampled = true;
             // The bench frame count is a ring's length and stops growing when the ring is full: from there "no advance" is not known.
-            if (p.surface === false) { freeze = null; freezeReason = "no visible stream surface"; }
-            else if (![p.frames, p.videoFrames, last.frames, last.videoFrames].every(finite) || p.frames >= BENCH_RING) freeze = null;
+            if (![p.frames, p.videoFrames, last.frames, last.videoFrames].every(finite) || p.frames >= BENCH_RING) freeze = null;
             else if (p.frames > last.frames || p.videoFrames > last.videoFrames) lastMoveAt = now();
             else freeze = Math.max(freeze, (now() - lastMoveAt) / 1000);
             last = p;

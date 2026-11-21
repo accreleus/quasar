@@ -1865,7 +1865,7 @@ test("input-kbm: a sample that is not a number is not counted", async () => {
 
 // ── review round 1 on #1338 ─────────────────────────────────────────────────
 
-import { streamCentre } from "./scenarios/stream-common.mjs";
+import { probe, streamCentre } from "./scenarios/stream-common.mjs";
 const keyEvents = (w) => w.cdp.filter(([m]) => m === "Input.dispatchKeyEvent").map(([, p]) => `${p.type}:${p.code}`);
 const posts = (reason = "stream_lost") => JSON.stringify({ client: "browser", events: [{ ts_unix_ms: 5, type: "transport.fallback", payload: { reason } }] });
 const post = (w, body) => w.emit("request", { url: () => `${BASE}/v1/sessions/${SID}/trace/events`, method: () => "POST", postData: () => body });
@@ -2797,25 +2797,30 @@ test("#1343 r2 item 3c: no visible stream surface leaves freeze null with a reas
     assert.equal(step.no_frame_advance_reason, "no visible stream surface");
   }
 
-  // 2. transport-fallback mid where the surface vanishes during the post-fault wait and returns with the <video>.
+  // 2. Normal fallback (M1): the page unmounts its canvas at the fallback and the <video> has no frames until WebRTC starts 2 s later.
+  // That gap IS the freeze mid measures, so the freeze must remain a number (6 s), not be wiped to null.
   {
-    let ww;
-    const moving = { get frames() { return Math.floor((ww.t - T0) / 1000) * 30 + 10; }, decoded: 100 };
-    const f = fallbackWorld({ stats: moving });
-    ww = f.w;
-    f.w.onFault = () => { f.w.noSurface = true; };
+    const f = fallbackWorld();
     const origSess = f.w.api.session;
+    let delayed = false;
     f.w.api.session = async (id) => {
       const row = await origSess(id);
-      if (row?.transport_fallback_reason) f.w.noSurface = false;
+      if (row?.transport_fallback_reason && !delayed) {
+        delayed = true;
+        f.w.videoStart = f.w.t + 2000;
+        f.w.noSurface = true;
+      } else if (delayed && f.w.t >= f.w.videoStart) {
+        f.w.noSurface = false;
+      }
       return row;
     };
     const r = await runReal(f.w, FALLBACK("mid"), { hooksDir: f.hooksDir });
     assert.deepEqual(r.result.errors, []);
+    assert.equal(r.sc().status, "pass", JSON.stringify(r.sc().criteria));
     const rec = JSON.parse(read(r.dir, `${r.id()}/fallback.json`));
-    assert.equal(rec.no_frame_advance_before_video_s, null, "lost surface during wait must yield null freeze, never 0");
-    assert.equal(rec.no_frame_advance_reason, "no visible stream surface");
-    assert.match(r.by().frame_after_fallback.observed, /freeze not measured \(no visible stream surface\)/);
+    assert.equal(rec.no_frame_advance_before_video_s, 6, "canvas unmount during fallback must count as freeze, not wipe it to null");
+    assert.equal("no_frame_advance_reason" in rec, false);
+    assert.match(r.by().frame_after_fallback.observed, /^7 s after the fault; no frame advanced for 6 s of it$/);
   }
 
   // 3. input-kbm with no layer and no stream surface exercises takeLock's "no-surface" path end-to-end.
@@ -2832,4 +2837,26 @@ test("#1343 r2 item 3c: no visible stream surface leaves freeze null with a reas
     assert.match(r.by().pointer_lock_taken.observed, /no "Click to play" layer appeared within 5 s and no lock was held \(cause unknown\); there was no visible stream surface to click either/);
     assert.doesNotMatch(r.by().pointer_lock_taken.observed, /immersive/i);
   }
+});
+
+test("#1343 r2 N1: probe().surface requires a non-hidden element with positive box dimensions", async () => {
+  const probeWith = (els) =>
+    probe({
+      evaluate: async (fn, arg) => {
+        const saved = { window: globalThis.window, document: globalThis.document };
+        globalThis.window = {};
+        globalThis.document = {
+          querySelectorAll: () => els,
+          querySelector: () => null,
+          visibilityState: "visible",
+          hasFocus: () => true,
+        };
+        try { return await fn(arg); } finally { Object.assign(globalThis, saved); }
+      },
+    });
+  assert.equal((await probeWith([{ tagName: "CANVAS", hidden: true, getBoundingClientRect: () => ({ width: 800, height: 600 }) }])).surface, false, "hidden canvas is not visible");
+  assert.equal((await probeWith([{ tagName: "CANVAS", hidden: false, getBoundingClientRect: () => ({ width: 0, height: 0 }) }])).surface, false, "zero-size canvas is not visible");
+  assert.equal((await probeWith([{ tagName: "VIDEO", videoWidth: 1920, hidden: true, getBoundingClientRect: () => ({ width: 800, height: 600 }) }])).surface, false, "hidden video is not visible");
+  assert.equal((await probeWith([{ tagName: "CANVAS", hidden: false, getBoundingClientRect: () => ({ width: 800, height: 600 }) }])).surface, true);
+  assert.equal((await probeWith([{ tagName: "VIDEO", videoWidth: 1920, hidden: false, getBoundingClientRect: () => ({ width: 800, height: 600 }) }])).surface, true);
 });
