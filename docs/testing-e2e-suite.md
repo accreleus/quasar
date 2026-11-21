@@ -163,9 +163,11 @@ browser's clock with it, and each row says `clock_source`.
 
 The runner reads only what the product exposes (`window.__qBench`, the page, the API) and wraps no
 browser API. What it cannot see is in `manifest.json` `not_recorded`, each with a reason. The
-issue also asked for a decoded-frame grab every 10 s, the client's own telemetry and the bundle
-attached to the issue; none is done (the screenshot every 10 s stands in for the first, the bench
-windows for the second, and posting is `e2e-post`, #1276).
+issue also asked for a decoded-frame grab every 10 s, the client's full telemetry and the bundle
+attached to the issue; the screenshot every 10 s stands in for the first, `stream-hold` copies
+`present_interval_sd_ms`, `present_interval_p95_ms` and `is_hidden` from the page's own
+`POST /v1/sessions/{id}/stats` requests beside the bench windows (the host half adds the rest),
+and posting is `e2e-post` (#1276).
 
 **Redaction.** Every secret the run holds is an exact literal removed from every string before
 anything is serialised: the password, the e-mail and its local part, the stack's host name, the bearer
@@ -697,26 +699,29 @@ recorded — but the run's result is derived from it, not copied.
   then by id — each with its observed and expected value. `null` stays `null`: a fact that was
   not measured is never `0`. The passed ones are a single `Passed: ` line.
 - **The worst one-second windows.** One browser sample row is one window: nothing is folded,
-  because bench-mode rows are stamped on the host clock and telemetry rows on the client's, and
-  two rows that share a timestamp are two windows that collide. A row is a candidate for
-  `present_interval_max_ms`, `g2g_p95_ms` and `missing_indices` (highest) or `fps` (lowest) only
-  when its finite value is strictly worse than that key's median, so a clean window is never
-  called worst. Candidates are ranked densely per key (equal values share a rank, 0 is the
-  worst value) and the five with the lowest rank are shown, ties going to the earlier key and
-  then the earlier timestamp; when a tie is cut, the last row shown at that value says
-  `(+N more at this value)`. The line above the table names the keys the bundle does not carry
-  (an absent key is skipped, never scored `0`). When — and only when — a ranked key comes from a
-  bench-mode row, a line below names the ranked keys that are on the host clock (`g2g_p95_ms`,
-  `missing_indices`), says the other keys are on the client's clock, and gives the scenario's
-  `clock_offset_ms`.
+  because bench-mode rows are stamped on the host clock (when a marker decoded or the offset was
+  known) and telemetry rows on the client's, and two rows that share a timestamp are two windows
+  that collide. A row is a candidate for `present_interval_max_ms`, `g2g_p95_ms` and
+  `missing_indices` (highest) or `fps` and `bench_n` (lowest) only when its finite value is
+  strictly worse than that key's median, so a clean window is never called worst. Candidates are
+  ranked densely per key (equal values share a rank, 0 is the worst value) and the five with the
+  lowest rank are shown, ties going to the earlier key and then the earlier timestamp; when a tie
+  is cut, the last row shown at that value says `(+N more at this value)`. The line above the
+  table names the keys the bundle does not carry (an absent key is skipped, never scored `0`).
+  When — and only when — a ranked key comes from a bench-mode row, a line below names the ranked
+  keys from bench-mode rows (`g2g_p95_ms`, `missing_indices`, `bench_n`), says the other keys are
+  on the client's clock, and gives the scenario's `clock_offset_ms` (noting that when
+  `offset_unknown` was set on a bench window with no decoded marker, that window was stamped on
+  the client clock rather than the host's).
 - **Anomalies** use a rule only where the comparison is the one the product makes.
   `classifier.hitch_sd_ms` skips the first `classifier.warmup_exclude_s` seconds after the
   scenario's first browser sample (the control plane anchors on the session's running time, so
-  the review can miss a hitch the control plane counts; it never adds one) and needs at least
+  the review can miss a hitch the control plane counts; it never adds one so long as the client
+  clock is not behind the host clock by more than the connect time) and needs at least
   `classifier.hitch_min_samples` samples over it; the two `web.client_health.present_*` limits
-  are per sample, as the client applies them, and skip a hidden tab (`is_hidden` is `1` or
-  `true`, as the contract posts it). One row per rule that fired, with the seconds over, the
-  worst value and the first one.
+  are per sample, as the client applies them, and skip a hidden tab (any finite non-zero
+  `is_hidden` or `true`, matching the control plane's numeric-flag rule). One row per rule that
+  fired, with the samples over, the worst value and the first one.
   A rule is **checked** only when the thresholds file states every key it needs — its limit and
   its helpers (`classifier.warmup_exclude_s`, `classifier.hitch_min_samples`), each a finite
   number — and at least one sample carries its sample key. Nothing is defaulted: no value is

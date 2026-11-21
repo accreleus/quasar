@@ -817,3 +817,161 @@ test("a threshold written as a string is not a threshold", () => {
   const a = review(dir, { thresholdsFile: thresholds }).scenarios[0].anomalies;
   assert.ok(a.not_checked.some((n) => n.rule === "web.client_health.present_sd_degraded_ms" && /thresholds file has no/.test(n.why)), JSON.stringify(a));
 });
+
+// ── #1303 follow-ups ────────────────────────────────────────────────────────
+
+test("e2e-review clears a stale review before validation fails (#1303)", () => {
+  const dir = bundle();
+  assert.equal(run(dir).status, 0);
+  assert.equal(fs.existsSync(path.join(dir, "review", "REVIEW.md")), true);
+  assert.equal(fs.existsSync(path.join(dir, "review", "summary.json")), true);
+
+  // Now make the bundle invalid: validation fails, and the earlier review must be gone.
+  edit(dir, `${SC}/scenario.json`, ({ reason, ...s }) => ({ ...s, status: "error" }));
+  const invalid = run(dir);
+  assert.equal(invalid.status, 2);
+  assert.match(invalid.stdout, /RESULT status=error target=e2e-review problems=\d+\n$/);
+  assert.equal(fs.existsSync(path.join(dir, "review", "REVIEW.md")), false, "stale REVIEW.md must be cleared before validation fails");
+  assert.equal(fs.existsSync(path.join(dir, "review", "summary.json")), false, "stale summary.json must be cleared before validation fails");
+
+  // When a stale review cannot be removed on an invalid bundle, fail early with cannot-write before validation runs.
+  if (process.getuid?.() !== 0) {
+    const ro = bundle();
+    assert.equal(run(ro).status, 0);
+    edit(ro, `${SC}/scenario.json`, ({ reason, ...s }) => ({ ...s, status: "error" }));
+    fs.chmodSync(path.join(ro, "review"), 0o555);
+    try {
+      const denied = run(ro);
+      assert.equal(denied.status, 2);
+      assert.match(denied.stdout, /^review\/REVIEW\.md may be stale and could not be removed$/m);
+      assert.match(denied.stdout, /RESULT status=error target=e2e-review reason=cannot-write\n$/);
+    } finally {
+      fs.chmodSync(path.join(ro, "review"), 0o755);
+    }
+  }
+});
+
+test("text-evidence files are sorted by relative path regardless of directory order (#1303)", () => {
+  const dir = bundle();
+  edit(dir, `${SC}/scenario.json`, (s) => ({
+    ...s,
+    status: "fail",
+    reason: "text sort check",
+    criteria: [...s.criteria, { id: "x", pass: false, observed: 0, expected: 1 }],
+  }));
+  // Create files in reverse order AND include directory `a` alongside `a-0.log` and `b` alongside `b_0.log`:
+  // even on filesystems whose readdirSync is alphabetically sorted, `"a"` precedes `"a-0.log"`, so `walk`
+  // visits `a/z.log` before `a-0.log`, while UTF-16 code-unit sort puts `a-0.log` (`-` = 45) before `a/z.log` (`/` = 47).
+  fs.mkdirSync(path.join(dir, SC, "a"));
+  fs.mkdirSync(path.join(dir, SC, "b"));
+  fs.writeFileSync(path.join(dir, SC, "z.log"), "");
+  fs.writeFileSync(path.join(dir, SC, "m.log"), "");
+  fs.writeFileSync(path.join(dir, SC, "a", "z.log"), "");
+  fs.writeFileSync(path.join(dir, SC, "a-0.log"), "");
+  fs.writeFileSync(path.join(dir, SC, "b_0.log"), "");
+  fs.writeFileSync(path.join(dir, SC, "b", "a.log"), "");
+  fs.writeFileSync(path.join(dir, SC, "Z.log"), "");
+
+  assert.equal(run(dir).status, 1);
+  const files = read(dir, "REVIEW.md").split("\n").find((l) => l.startsWith("Files worth opening: "));
+  const listed = [...files.matchAll(/`([^`]+)`/g)].map((m) => m[1]);
+  assert.deepEqual(listed, [
+    `${SC}/timeline.jsonl`,
+    `${SC}/Z.log`,
+    `${SC}/a-0.log`,
+    `${SC}/a/z.log`,
+    `${SC}/b/a.log`,
+    `${SC}/b_0.log`,
+    `${SC}/m.log`,
+    `${SC}/session.json`,
+    `${SC}/z.log`,
+  ]);
+});
+
+test("bench_n (lowest) ranks frameless seconds in worst windows and notes offset_unknown clocks (#1303)", () => {
+  const dir = bundle();
+  metrics(dir, [
+    browser(1000, { bench_n: 60, bench_decoded: 60, offset_unknown: 0 }),
+    browser(2000, { bench_n: 60, bench_decoded: 60, offset_unknown: 0 }),
+    browser(3000, { bench_n: 0, bench_decoded: 0, offset_unknown: 0 }),
+    browser(4000, { bench_n: 60, bench_decoded: 60, offset_unknown: 0 }),
+    browser(5000, { bench_n: 60, bench_decoded: 60, offset_unknown: 0 }),
+  ]);
+  const summary = review(dir);
+  const win = summary.scenarios[0].windows;
+  assert.deepEqual(win.keys, ["bench_n"]);
+  assert.equal(win.bench_offset_unknown, false);
+  assert.deepEqual(
+    win.rows.map((w) => [w.ts_unix_ms, w.worst_for, w.value]),
+    [[3000, "bench_n", 0]],
+  );
+  const md = renderReview(summary);
+  assert.match(md, /^Ranked on `bench_n` \(lowest\);/m);
+  assert.match(md, /^\| `3000` \| `bench_n` \| `0` \|$/m);
+  assert.match(md, /^Clocks: `bench_n` is on the host clock; the other keys are on the client's, offset by `3` ms\.$/m);
+
+  // Median gating: equal bench_n values stand out for nothing.
+  metrics(dir, [1000, 2000, 3000].map((ts) => browser(ts, { bench_n: 60, bench_decoded: 60, offset_unknown: 0 })));
+  assert.deepEqual(review(dir).scenarios[0].windows.rows, []);
+
+  // When offset_unknown is set (e.g. a frameless window with no decoded marker stamped on client clock),
+  // the clock note says so rather than claiming host clock unconditionally.
+  edit(dir, `${SC}/scenario.json`, (s) => ({ ...s, clock_offset_ms: null }));
+  metrics(dir, [
+    browser(1000, { bench_n: 60, bench_decoded: 60, g2g_p95_ms: 80, missing_indices: 0, offset_unknown: 1 }),
+    browser(2000, { bench_n: 60, bench_decoded: 60, g2g_p95_ms: 80, missing_indices: 0, offset_unknown: 1 }),
+    browser(3000, { bench_n: 0, bench_decoded: 0, missing_indices: 0, offset_unknown: 1 }),
+  ]);
+  const unknownSummary = review(dir);
+  assert.equal(unknownSummary.scenarios[0].windows.bench_offset_unknown, true);
+  assert.deepEqual(
+    unknownSummary.scenarios[0].windows.rows.map((w) => [w.ts_unix_ms, w.worst_for, w.value]),
+    [[3000, "bench_n", 0]],
+  );
+  const unknownMd = renderReview(unknownSummary);
+  assert.match(
+    unknownMd,
+    /^Clocks: `g2g_p95_ms`, `missing_indices` and `bench_n` are on the host clock when a marker decoded or the offset was known, and on the client's when `offset_unknown` was set with no decoded marker; the other keys are on the client's, offset by an unmeasured amount\.$/m,
+  );
+});
+
+test("any finite non-zero is_hidden is treated as hidden, matching the control plane (#1303)", () => {
+  const thresholds = path.join(TMP, "thresholds-hidden-nonzero.json");
+  fs.writeFileSync(
+    thresholds,
+    JSON.stringify({
+      version: "test",
+      thresholds: {
+        "web.client_health.present_sd_degraded_ms": { value: 28, unit: "ms" },
+        "web.client_health.present_p95_degraded_ms": { value: 45, unit: "ms" },
+      },
+    }),
+  );
+  const dir = bundle();
+  const bad = (ts, hidden) => browser(1000 + ts, { is_hidden: hidden, present_interval_sd_ms: 40, present_interval_p95_ms: 60 });
+  for (const hidden of [2, -1, 0.5]) {
+    metrics(dir, [bad(0, hidden), bad(1000, hidden)]);
+    const a = review(dir, { thresholdsFile: thresholds }).scenarios[0].anomalies;
+    assert.deepEqual(a.rows, [], `is_hidden=${hidden} must be treated as hidden`);
+    assert.deepEqual(
+      a.not_checked.filter((n) => n.rule.startsWith("web.client_health.")).map((n) => [n.rule, n.why]),
+      [
+        ["web.client_health.present_sd_degraded_ms", "no sample it judges carries present_interval_sd_ms"],
+        ["web.client_health.present_p95_degraded_ms", "no sample it judges carries present_interval_p95_ms"],
+      ],
+    );
+  }
+  // Strings and non-finite numbers (1e400 -> Infinity) are not treated as hidden.
+  for (const raw of ['"1"', "1e400"]) {
+    fs.writeFileSync(
+      path.join(dir, SC, "metrics.jsonl"),
+      `{"kind":"metric","source":"browser","ts_unix_ms":1000,"metrics":{"is_hidden":${raw},"present_interval_sd_ms":40,"present_interval_p95_ms":60}}\n`,
+    );
+    const a = review(dir, { thresholdsFile: thresholds }).scenarios[0].anomalies;
+    assert.deepEqual(
+      a.rows.map((r) => r.threshold),
+      ["web.client_health.present_sd_degraded_ms", "web.client_health.present_p95_degraded_ms"],
+      `is_hidden=${raw} must not suppress anomaly rules`,
+    );
+  }
+});

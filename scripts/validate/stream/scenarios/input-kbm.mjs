@@ -6,7 +6,7 @@
 // exposed, and the reference app echoes one bit, so what the HOST received per key, button and motion unit is not
 // known here. input-sent.json holds what was sent and what the page received, for the host half to compare.
 import { check as holdCheck } from "./stream-hold.mjs";
-import { cannotRun, crit, finite, firstFrameCriterion, keyEvent, mouseEvent, openCdp, play, shotCovered, signIn, skipped, streamCentre, takeLock, verdict, waitFirstFrame, watchApiErrors } from "./stream-common.mjs";
+import { cannotRun, crit, errorReason, finite, firstFrameCriterion, keyEvent, mouseEvent, openCdp, play, shotCovered, signIn, skipped, streamCentre, takeLock, verdict, waitFirstFrame, watchApiErrors } from "./stream-common.mjs";
 
 export const name = "input-kbm";
 const STEP_MS = 60; // between two steps of the sequence
@@ -125,8 +125,8 @@ export default {
         else await mouseEvent(cdp, { type: "mouseReleased", x: d.pos.x, y: d.pos.y, button: d.button, buttons: 0, clickCount: 1 });
         rec.step("released", { what: d.code ?? d.button, by });
       } catch (err) {
-        rec.step("release-failed", { what: d.code ?? d.button, message: String(err?.message ?? err) });
-        cleanup.push(`${d.kind === "key" ? `key ${d.code}` : `mouse button ${d.button}`} could not be released (${String(err?.message ?? err)})`);
+        rec.step("release-failed", { what: d.code ?? d.button, message: errorReason(err) });
+        cleanup.push(`${d.kind === "key" ? `key ${d.code}` : `mouse button ${d.button}`} could not be released (${errorReason(err)})`);
       }
     };
     try {
@@ -222,7 +222,7 @@ export default {
       result = { criteria: judge({ firstFrameS, seen }), clock_offset_ms: null };
       if (row && ["stopped", "failed"].includes(row.state)) result = { ...result, status: "error", reason: `the session ended during the run (it was ${row.state} before this run stopped it)` };
     } catch (err) {
-      const message = String(err?.message ?? err);
+      const message = errorReason(err);
       if (rec.holding) rec.pageStep("error", { message });
       else rec.step("error", { message });
       result = { status: "error", reason: rec.holding ? `${stage} did not complete (the page's own words are not written before its sign-in is read)` : message, criteria: [], clock_offset_ms: null };

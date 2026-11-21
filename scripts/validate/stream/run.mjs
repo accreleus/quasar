@@ -25,6 +25,7 @@ import { attachEvidenceListeners } from "../lib/listeners.mjs";
 import { FORMAT, validateBundle } from "./bundle.mjs";
 import { declaredHooks, Hooks, LEDGER } from "./hooks.mjs";
 import { Recorder, ScenarioRecorder } from "./record.mjs";
+import { errorReason } from "./scenarios/stream-common.mjs";
 import { loadWebDist, serveWebDist, webBuild } from "./webdist.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -47,7 +48,7 @@ const NOT_RECORDED = [
   { fact: "audio_latency_ms", why: "nothing in the product or the page measures audio latency yet" },
   { fact: "audio_video_offset_ms", why: "the WebTransport client computes an audio/video offset but bench mode does not expose it" },
   { fact: "client_thermal_state", why: "no browser API reports thermal pressure to a page" },
-  { fact: "path_rtt_ms", why: "bench-mode windows carry no round-trip time; the page's own samples are not read" },
+  { fact: "path_rtt_ms", why: "bench-mode windows carry no round-trip time; only present cadence and visibility are copied from the page's stats posts" },
 ];
 
 export function loadPlan(arg) {
@@ -177,8 +178,8 @@ export async function stopOwned(api, launches, rec) {
         await api.stop(id);
         rec.step("stopped", { session: id });
       } catch (e) {
-        rec.step("stop-failed", { session: id, message: String(e?.message ?? e) });
-        cleanup.push(`session ${id} is not confirmed stopped (${String(e?.message ?? e)})`);
+        rec.step("stop-failed", { session: id, message: errorReason(e) });
+        cleanup.push(`session ${id} is not confirmed stopped (${errorReason(e)})`);
       }
     }
   }
@@ -387,11 +388,11 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
           }
         } catch (err) {
           // A page-derived message is not written while the page's bearer is unknown (the scenario catches its own errors; this is what escapes it).
-          out = { status: "error", reason: page && rec.holding ? "the scenario did not complete (the page's own words are not written before its sign-in is read)" : String(err?.message ?? err), criteria: [], sessions: [], clock_offset_ms: null };
+          out = { status: "error", reason: page && rec.holding ? "the scenario did not complete (the page's own words are not written before its sign-in is read)" : errorReason(err), criteria: [], sessions: [], clock_offset_ms: null };
         } finally {
           // Order matters: close the page, wait for every response it was still delivering, then stop what the run owns.
           // The close error's words are the browser's about a page: held back like the page's own until its bearer is known.
-          if (page) await host.closePage(page).catch((err) => { left = `a page it opened would not close${rec.holding ? "" : ` (${err?.message ?? err})`}`; });
+          if (page) await host.closePage(page).catch((err) => { left = `a page it opened would not close${rec.holding ? "" : ` (${errorReason(err)})`}`; });
           // Every applied hook is cleared on every exit path, before the sessions are stopped so that the stop is not made over the fault.
           if (hooks && !stuck.length) hookLeft = await hooks.clearAll((ev, d) => rec.step(ev, d));
           if (launches) owned = await stopOwned(api, launches, rec);
@@ -407,7 +408,8 @@ export async function runSuite({ plan, dir, baseUrl, creds, host, api, threshold
         }
       }
       counts[["pass", "fail", "skipped"].includes(out.status) ? out.status : "error"] += 1;
-      rec.json("scenario.json", { id: e.id, scenario: String(e.scenario), params: e.params, status: out.status, ...(out.reason ? { reason: out.reason } : {}), sessions: out.sessions ?? [], clock_offset_ms: out.clock_offset_ms ?? null, criteria: out.criteria ?? [] });
+      const reason = typeof out.reason === "string" && out.reason.trim() ? out.reason : out.status === "error" ? "error with no message" : null;
+      rec.json("scenario.json", { id: e.id, scenario: String(e.scenario), params: e.params, status: out.status, ...(reason ? { reason } : {}), sessions: out.sessions ?? [], clock_offset_ms: out.clock_offset_ms ?? null, criteria: out.criteria ?? [] });
       if (out.status === "skipped") rec.step("skipped", { reason: out.reason });
     }
 

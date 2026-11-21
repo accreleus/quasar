@@ -11,6 +11,13 @@ const QR = { x: 0.14, y: 0.185, w: 0.22, h: 0.545 };
 
 export const finite = (x) => typeof x === "number" && Number.isFinite(x);
 export const shown = (v) => JSON.stringify(v)?.slice(0, 40);
+/** A non-empty error reason: `new Error("")` or `""` still produces a reason `validateBundle` accepts. */
+export function errorReason(err) {
+  const raw = typeof err?.message === "string" ? err.message : err == null ? "" : String(err);
+  if (raw.trim()) return raw;
+  const name = typeof err?.name === "string" && err.name.trim() ? err.name.trim() : null;
+  return name ? `${name} (no message)` : "error with no message";
+}
 // A criterion that was not judged has no observed value (the validator's rule).
 export const crit = (id, pass, observed, expected) => ({ id, pass, observed: pass === null ? null : observed, expected });
 
