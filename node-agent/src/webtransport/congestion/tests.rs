@@ -4316,7 +4316,7 @@ fn a_full_shallow_buffer_cuts_the_loss_bound_and_gives_a_reading() {
 /// R3: 5 Mbit/s behind a buffer of 10 ms (five datagrams), FEC on, a keyframe a second, under
 /// the real ABR and stall guard. The sender is stepped down to the link, the rung's rate line is
 /// crossed for `RATE_CONFIRM`, and the excess does not wait in the agent: no stall after 15 s,
-/// and the path drops under the loss bound's cut line. Old code: the agent held what the pacer let no further than
+/// and the path loses at most 2.5 % after 15 s. Old code: the agent held what the pacer let no further than
 /// the estimate, and the guard read that queue as a dead path.
 #[test]
 fn a_shallow_buffer_steps_the_rung_down_without_a_stall() {
@@ -4346,18 +4346,17 @@ fn a_shallow_buffer_steps_the_rung_down_without_a_stall() {
         longest >= crate::session::ladder::LadderPlanner::RATE_CONFIRM.as_secs_f64(),
         "the rung would never step down: under the line {longest:.2} s at most"
     );
-    // Under the loss bound's cut line, not the design's 2 %: v2 holds the estimate at 2–10 %
-    // loss (rule 3) and reads no shortfall under 5 % (rule 2), so it settles in a sawtooth
-    // under the cut line, 5.2 % of the path's datagrams here (#1433 PR body).
+    // The design's 2 %, with room for the sim's keyframe a second: 1.8 % here, 5.2 % with no
+    // persistence cut (`LOSS_PERSIST`).
     assert!(
-        s.loss_after(15.0) < LOSS_HIGH,
+        s.loss_after(15.0) <= 0.025,
         "loss {:.3}",
         s.loss_after(15.0)
     );
 }
 
 /// R4: a policer at 5 Mbit/s with a 15 kB bucket and no queue. The sender steps down until its
-/// frames fit the bucket: loss under the cut line after 20 s, no climb while the window
+/// frames fit the bucket: loss at most 2.5 % after 20 s, no climb while the window
 /// loses over 10 %, and the guard stalls at most once. Old code: the loss bound read only some of
 /// the loss, grew back between cuts, and the rate went up into the policer again.
 #[test]
@@ -4376,9 +4375,9 @@ fn a_policer_steps_down_until_its_loss_ends() {
         s.stalls,
         s.loss_after(20.0)
     );
-    // Under the cut line, as the shallow buffer's (6.2 % here): see there.
+    // As the shallow buffer's: 1.5 % here, 6.2 % with no persistence cut.
     assert!(
-        s.loss_after(20.0) < LOSS_HIGH,
+        s.loss_after(20.0) <= 0.025,
         "loss {:.3}",
         s.loss_after(20.0)
     );
@@ -4403,6 +4402,46 @@ fn ten_percent_loss_never_grows_the_estimate() {
         s.est.estimate_kbps() < 4000.0,
         "{:.0}",
         s.est.estimate_kbps()
+    );
+}
+
+/// v2 (#1433): loss under the cut line that lasts under `LOSS_PERSIST` never cuts the loss bound,
+/// however often it comes back (a bursty link); loss that lasts takes the loss cut once per
+/// `LOSS_PERSIST`. Rows R3/R4: a keyframe a second overflowing the link held 5–6 % loss with the
+/// bound in GCC's 2–10 % hold band, high over the link, so the pacer let keyframes overflow it.
+#[test]
+fn loss_under_the_cut_line_cuts_only_once_it_persists() {
+    let start = Instant::now();
+    let (mut log, mut est) = (SendLog::new(start), Estimator::new(CEILING, start));
+    // 1 s of 5 % loss every 3 s for 12 s, then 3 s of it without a break.
+    let lossy =
+        |seq: u32, t: u64| seq.is_multiple_of(20) && (t >= 12_000_000 || t % 3_000_000 < 1_000_000);
+    let mut bounds = Vec::new();
+    for r in 0..150u64 {
+        let first = r as u32 * BUSY.0 * BUSY.1;
+        let from = r * u64::from(BUSY.0) * 16_667;
+        let fb = frames_report(&mut log, start, first, from, BUSY, |seq, t| {
+            (!lossy(seq, t)).then_some(t + 11_000)
+        });
+        let now = read_at(start, &fb);
+        let m = est.measure(&fb, &mut log, now);
+        est.apply(m, now, NO_QUIC);
+        bounds.push((from as f64 / 1e6, m.loss, est.loss_kbps));
+    }
+    assert!(
+        bounds
+            .iter()
+            .any(|b| b.0 < 12.0 && b.1.is_some_and(|l| l >= LOSS_LOW)),
+        "the bursts lost under {LOSS_LOW}"
+    );
+    let cut = bounds.iter().find(|b| b.0 < 12.0 && b.2 < CEILING);
+    assert!(cut.is_none(), "a burst under LOSS_PERSIST cut: {cut:?}");
+    let cuts: Vec<_> = bounds.windows(2).filter(|w| w[1].2 < w[0].2).collect();
+    assert_eq!(cuts.len(), 1, "one cut in 3 s of loss: {cuts:?}");
+    let (at, _, kbps) = cuts[0][1];
+    assert!(
+        (14.0..15.0).contains(&at) && (0.96 * CEILING..0.99 * CEILING).contains(&kbps),
+        "cut to {kbps:.0} at {at:.1} s"
     );
 }
 

@@ -106,6 +106,10 @@ const REDUCE_MAX: Duration = Duration::from_millis(200);
 const LOSS_LOW: f64 = 0.02;
 const LOSS_HIGH: f64 = 0.10;
 const LOSS_DECREASE_GAP: Duration = Duration::from_millis(300);
+/// v2: a run of reports losing `LOSS_LOW` or more, broken only by `LOSS_RUN_GAP` with none,
+/// holds the loss bound, and takes its cut once per `LOSS_PERSIST` of run (#1433, rows R3/R4).
+const LOSS_PERSIST: Duration = Duration::from_secs(2);
+const LOSS_RUN_GAP: Duration = Duration::from_secs(1);
 const LOSS_WINDOW: Duration = Duration::from_millis(500);
 /// Fewer datagrams than this in the window decide nothing about loss.
 const LOSS_MIN_SAMPLES: i64 = 20;
@@ -580,6 +584,8 @@ pub(crate) struct Estimator {
     last_update: Instant,
     last_decrease: Option<Instant>,
     last_loss_decrease: Option<Instant>,
+    /// v2: (start, last report) of the current run of lossy reports, see `LOSS_PERSIST`.
+    lossy: Option<(Instant, Instant)>,
     last_report: Option<Instant>,
     last_feedback: Option<Instant>,
     last_decay: Option<Instant>,
@@ -651,6 +657,7 @@ impl Estimator {
             last_update: now,
             last_decrease: None,
             last_loss_decrease: None,
+            lossy: None,
             last_report: None,
             last_feedback: None,
             last_decay: None,
@@ -815,8 +822,21 @@ impl Estimator {
             }
         }
 
+        if self.legacy {
+            self.lossy = None;
+        } else if self.loss.is_some_and(|l| l >= LOSS_LOW) {
+            self.lossy = Some((self.lossy.map_or(now, |(since, _)| since), now));
+        } else if self
+            .lossy
+            .is_some_and(|(_, last)| now.saturating_duration_since(last) > LOSS_RUN_GAP)
+        {
+            self.lossy = None;
+        }
+        let persisted = self.lossy.is_some_and(|(since, last)| {
+            last == now && now.saturating_duration_since(since) >= LOSS_PERSIST
+        });
         match self.loss {
-            Some(loss) if loss > LOSS_HIGH => {
+            Some(loss) if loss > LOSS_HIGH || persisted => {
                 let gap = LOSS_DECREASE_GAP + path.rtt;
                 if self
                     .last_loss_decrease
@@ -824,6 +844,8 @@ impl Estimator {
                 {
                     self.loss_kbps = self.estimate_kbps * (1.0 - 0.5 * loss);
                     self.last_loss_decrease = Some(now);
+                    // A persistent run starts again; a cut over `LOSS_HIGH` spends it.
+                    self.lossy = (loss <= LOSS_HIGH).then_some((now, now));
                     cut_by.push("loss");
                     // The link no longer carries what it did before the outage.
                     self.stop_regrow("loss cut");
@@ -832,6 +854,8 @@ impl Estimator {
                 }
             }
             Some(loss) if loss >= LOSS_LOW => {}
+            // A clean report between two keyframe overflows is no headroom.
+            _ if self.lossy.is_some() => {}
             _ => {
                 let mut grown = self.loss_kbps * growth;
                 if let Some(to) = recover {
