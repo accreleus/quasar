@@ -3819,6 +3819,8 @@ else
   fail "manifest:bench-keys-not-drifted" "$BENCH_KEYS_OUT"
 fi
 
+rc_of 0 "session-diagnose:bundle-verdicts" -- python3 -B "$TESTS_DIR/test_session_diagnose.py"
+
 # The end-to-end suite's run bundle (#1272): the fixture is valid, each rule has a bundle that breaks it.
 if command -v node >/dev/null 2>&1; then
   rc_of 0 "e2e:bundle-format" -- node --test "$ROOT/scripts/validate/stream/bundle.test.mjs"

@@ -58,8 +58,11 @@ test("a scenario directory is a bench_submit.py run directory", () => {
 test("bench-mode windows folded by bench_app_samples.py are valid samples", () => {
   const dir = bundle();
   fs.cpSync(path.join(DX, "tests/fixtures/appfold"), path.join(dir, SC), { recursive: true });
+  edit(dir, `${SC}/bench-windows.json`, (b) => ({ ...b, windows: [...b.windows, b.windows.at(-1)] }));
   execFileSync("python3", [path.join(DX, "bench_app_samples.py"), "--dir", path.join(dir, SC), "--t0-ms", "1800000000000"], { env: ENV, stdio: "ignore" });
-  assert.match(fs.readFileSync(path.join(dir, SC, "metrics.jsonl"), "utf8"), /bench_n/);
+  const metrics = fs.readFileSync(path.join(dir, SC, "metrics.jsonl"), "utf8");
+  assert.match(metrics, /"bench_n":/);
+  assert.match(metrics, /"ts_nudged":\s*1/);
   assert.deepEqual(validateBundle(dir), []);
 });
 
@@ -95,8 +98,12 @@ const RULES = [
   ["a credential that starts like a marker", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "password=<credential>hunter2secret\n"), /x.log: holds a credential/],
   ["a token= in free text", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "MY_TOKEN=abcdef123456\n"), /x.log: holds a credential/],
   ["a password that only starts like 'none'", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "password: none-of-your-business1\n"), /x.log: holds a credential/],
+  ["a password with an exempt word followed by a dotted suffix", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "password: none.part123\n"), /x.log: holds a credential/],
   ["a password that only starts like 'null'", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "password: nullify\n"), /x.log: holds a credential/],
   ["an authorization header in a log", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "request failed, authorization=credential-value-1234\n"), /x.log: holds a credential/],
+  ["an authorization assignment with the prose word as its value", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "AUTHORIZATION=required\n"), /x.log: holds a credential/],
+  ["an authorization header with a credential starting with the prose word", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "authorization: required.part123\n"), /x.log: holds a credential/],
+  ["an authorization header with the prose word followed by a value", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "authorization: required opaque123\n"), /x.log: holds a credential/],
   ["a password in a log", (d) => fs.writeFileSync(path.join(d, SC, "x.log"), "login password=hunter2\n"), /x.log: holds a credential/],
   ["no timeline for a scenario that ran", (d) => fs.rmSync(path.join(d, SC, "timeline.jsonl")), /timeline.jsonl: missing/],
   ["a client of no known kind", (d) => edit(d, "client.json", (c) => ({ ...c, kind: "tv" })), /kind must be web or native/],
@@ -175,6 +182,12 @@ test("a browser version, a documentation address and a container's home are not 
   fs.writeFileSync(path.join(dir, "README.md"), "Use Bearer authentication. Secret: none of the builds recorded it. password=[REDACTED]\nThe password: none. The token: n/a; fine. token=<credential> and password: <credential>.\n");
   // A picture is not read for text, whatever bytes it holds after its header.
   fs.writeFileSync(path.join(dir, SC, "shot.png"), Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0, 0, 0]), Buffer.from("Bearer abcdefgh12345678")]));
+  assert.deepEqual(validateBundle(dir), []);
+});
+
+test("authorization requirements and none-words with sentence punctuation are prose", () => {
+  const dir = bundle();
+  fs.writeFileSync(path.join(dir, "README.md"), "authorization: required\nAuthorization: required.\npassword: none.\nsecret: n/a.\n");
   assert.deepEqual(validateBundle(dir), []);
 });
 

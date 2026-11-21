@@ -28,6 +28,7 @@ own; the two do not move together, and that is deliberate.
 - Dependency updates
 
 ### Fixed
+- End-to-end collection now splits capped trace reads by raw sample count, validates session and host setting vocabularies, and shows each collected window's verdict in offline diagnoses (#1331).
 - WebTransport input detects full writers, combines pending relative mouse deltas, and keeps the latest absolute position when datagrams back up. Pending relative motion goes out before the next button, key, scroll, or other input event (#1154).
 - WebTransport preserves session-ended and takeover close reasons during connection and keeps the WebRTC fallback cause visible after reload (#1478).
 - A failed start during warm Steam adoption immediately queues teardown of the new session (#768).
