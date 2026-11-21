@@ -64,8 +64,11 @@ const sum = (xs) => xs.reduce((a, v) => ({ x: a.x + v.dx, y: a.y + v.dy }), { x:
 // The page is untrusted: a move is two finite numbers and a flag, anything else is null.
 const cleanMoves = (m) => (Array.isArray(m) ? m.slice(0, 200).map((v) => [finite(v?.[0]) ? v[0] : null, finite(v?.[1]) ? v[1] : null, v?.[2] === true]) : []);
 
-/** Why `p` cannot be run, or null (the same parameters as stream-hold; hold_s is how long to keep the stream after the sequence). */
-export const check = holdCheck;
+/** Why `p` cannot be run, or null (the same parameters as stream-hold, minus expect_marker; hold_s is how long to keep the stream after the sequence). */
+export function check(p) {
+  if ("expect_marker" in p) return 'params has a key input-kbm does not define: "expect_marker"';
+  return holdCheck(p);
+}
 
 const median = (xs) => { const s = [...xs].sort((a, b) => a - b); return s[Math.floor((s.length - 1) / 2)]; };
 
