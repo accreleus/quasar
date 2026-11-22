@@ -1600,10 +1600,12 @@ class `sys/nvcodec/gstnvencoder.cpp` with NVENC's per-picture long-term referenc
   references, so on `nvav1enc` every recovery is a key frame.
 - An anchor is marked long-term (`ltrMarkFrame`, `ltrMarkFrameIdx`): a free index, else the oldest
   anchor's. A recovery frame codes from that index only (`ltrUseFrames`, `ltrUseFrameBitmap`): its
-  one reference is the anchor, named long-term. Newer anchors are forgotten.
-  `NvEncInvalidateRefFrames` is not used: it drops pictures from NVENC's own DPB that the bitstream
-  still holds, and NVENC then leaves out the MMCO 1 a later long-term marking needs, so every
-  decoder ends one reference over `max_num_ref_frames` (measured).
+  one reference is the anchor, named long-term. Newer anchors are forgotten. On HEVC the recovery
+  frame first invalidates (`NvEncInvalidateRefFrames`) the last eight pictures newer than its
+  anchor, or NVENC keeps the lost ones in its RPS. Never on H.264: invalidation drops pictures from
+  NVENC's own DPB that the sliding window still holds, and NVENC then leaves out the MMCO 1 a later
+  long-term marking needs, so every decoder ends one reference over `max_num_ref_frames`. Both were
+  measured.
 - H.264: an index whose anchor a recovery forgot is retired until the next IDR. Overwriting it
   would send MMCO 6 with no MMCO 1, so a decoder that lost that anchor (its sliding window holds one
   more short-term picture instead) would end one reference over `max_num_ref_frames`; measured,
