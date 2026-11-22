@@ -37,6 +37,8 @@ import {
 
 const WT_PROTO = 1;
 /** `session_not_ready`: retry the same token after this long (§Hello). */
+/** A PyroWave deadline timer later than this means the page was stalled (#1635). */
+const STALL_MS = 3;
 const NOT_READY_RETRY_MS = 250;
 /** How long connect keeps retrying an agent that says it is not ready. */
 export const CONNECT_DEADLINE_MS = 60_000;
@@ -656,7 +658,7 @@ export class WebTransportMedia implements MediaTransport {
     };
     // One timer, at the PyroWave receiver's next frame deadline; re-armed only when that moves,
     // not per datagram (a 1080p frame is ~380 of them).
-    const arm = () => {
+    const arm = (deferred = false) => {
       const at = pyro?.nextDeadline() ?? null;
       if (at === armedAt) return;
       stop();
@@ -665,6 +667,9 @@ export class WebTransportMedia implements MediaTransport {
       timer = setTimeout(() => {
         timer = null;
         armedAt = null;
+        // Reads queued behind a stall have not run yet: closing now would count datagrams the
+        // page is about to read as lost. One more turn lets them in first, once.
+        if (!deferred && this.now() - at > STALL_MS) return arm(true);
         const frame = live.on ? pyro?.due(this.now()) : null;
         if (frame) sink.pyrowave(frame);
         reportLost();
@@ -681,10 +686,8 @@ export class WebTransportMedia implements MediaTransport {
             ? pyro
             : ((pyroLost += pyro?.lost ?? 0),
               (pyro = new PyroWaveReceiver(c.configId, blockLayout(c.width, c.height).totalBlocks, 1000 / (c.fps || 60))));
-        const now = this.now();
-        const due = r.due(now);
-        if (due) sink.pyrowave(due);
-        const done = r.push(f, now);
+        // No `due` here: the timer closes frames and defers after a stall, so a tail read late lands.
+        const done = r.push(f, this.now());
         if (done) sink.pyrowave(done);
         reportLost();
         arm();
