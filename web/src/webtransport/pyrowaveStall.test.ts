@@ -89,6 +89,21 @@ describe("PyroWave deadline across a page stall (#1635)", () => {
     expect(out.map((x) => x.complete)).toEqual([false]);
   });
 
+  it("a fire just under the stall threshold closes at once; a long stall defers at most four frames", () => {
+    const a = setup();
+    frags(1).slice(0, 2).forEach((x) => a.router.datagram(x));
+    a.stall(18); // 1.3 ms late: no stall
+    expect(a.out.map((x) => x.complete)).toEqual([false]);
+    a.out.length = 0;
+    vi.useRealTimers();
+    const b = setup();
+    frags(1).slice(0, 2).forEach((x) => b.router.datagram(x));
+    b.stall(1000); // a throttled tab's clamp
+    expect(b.out).toEqual([]);
+    b.run(Math.ceil(4 * FRAME_MS) + 1);
+    expect(b.out.map((x) => x.complete), "deferred no more than four frames").toEqual([false]);
+  });
+
   it("a complete newer frame is presented at once, never held behind an older incomplete one", () => {
     const { out, router, lost, stall, at } = setup();
     frags(1).slice(0, 2).forEach((x) => router.datagram(x));
