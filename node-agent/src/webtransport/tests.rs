@@ -1557,6 +1557,7 @@ async fn governed_agent(stream: Stream) -> Agent {
                 owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
                 observe: Box::new(|_| {}),
+                held: Box::new(|_| {}),
                 fec: Box::new(|_| {}),
             })
         },
@@ -2100,6 +2101,7 @@ async fn feedback_while_pyrowave_is_active_feeds_no_estimate() {
                 observe: Box::new(move |_| {
                     count.fetch_add(1, Ordering::SeqCst);
                 }),
+                held: Box::new(|_| {}),
                 fec: Box::new(|_| {}),
             })
         },
@@ -2197,6 +2199,7 @@ async fn audio_alone_never_moves_the_video_estimate() {
             owns: Box::new(|| false),
             displaced: Box::new(|| {}),
             observe: Box::new(move |kbps| seen.lock().unwrap().push(kbps)),
+            held: Box::new(|_| {}),
             fec: Box::new(|_| {}),
         })
     })
@@ -2244,6 +2247,7 @@ fn rate(retargets: bool) -> Rate {
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         observe: Box::new(|_| {}),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     }
 }
@@ -2335,6 +2339,7 @@ fn the_silence_decay_is_never_fed_to_the_collapse_as_a_measured_link() {
         observe: Box::new(move |_| {
             f.fetch_add(1, SeqCst);
         }),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), false, Default::default());
@@ -2381,6 +2386,7 @@ fn a_report_gives_the_abr_its_reading_before_its_estimate() {
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         observe: Box::new(move |_| o.lock().unwrap().push("observe")),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), false, Default::default());
@@ -2411,6 +2417,7 @@ fn a_client_that_is_gone_neither_starts_nor_feeds_the_abr() {
         observe: Box::new(move |_| {
             fed.fetch_add(1, SeqCst);
         }),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
     let gone = Arc::new(OnceLock::new());
@@ -2472,6 +2479,7 @@ fn the_abr_is_fed_the_estimate_less_the_fec_share() {
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         observe: Box::new(move |kbps: f64| seen.lock().unwrap().push(kbps.round())),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), true, Default::default());
@@ -2507,6 +2515,7 @@ async fn lossy_session(retargets: bool) -> (Agent, Arc<crate::session::metrics::
                 owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
                 observe: Box::new(|_| {}),
+                held: Box::new(|_| {}),
                 fec: Box::new(move |event| match event {
                     crate::webtransport::FecEvent::Attached { client, fec } => {
                         m.attach_fec(client, fec);
@@ -2760,6 +2769,7 @@ fn repairs_spend_only_what_the_estimate_leaves_above_the_abr_floor() {
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         observe: Box::new(move |kbps: f64| seen.lock().unwrap().push(kbps.round())),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), true, Default::default());
@@ -2805,6 +2815,7 @@ fn governed(level: u8, estimate_kbps: f64, seconds: u64) -> Vec<(u32, f64)> {
             let now = governor.1;
             governor.0.observe(kbps, now);
         }),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), true, Default::default());
@@ -2881,6 +2892,7 @@ fn governed_after_a_report(capacity: crate::session::settings::WtCapacity) -> (f
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         observe: Box::new(|_| {}),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
     let governor = congestion::Governor::default();
@@ -2960,6 +2972,7 @@ fn a_pyrowave_frame_gets_no_repair_at_any_overhead() {
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         observe: Box::new(|_| {}),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), true, Default::default());
@@ -5281,6 +5294,7 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
                     }
                     observed.lock().unwrap().push(kbps)
                 }),
+                held: Box::new(|_| {}),
                 fec: Box::new(|_| {}),
             })
         },

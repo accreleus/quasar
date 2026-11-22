@@ -318,6 +318,34 @@ impl AbrLoop {
         self.step_rung(now);
     }
 
+    /// Per-report loop, once per WebTransport receiver report before its reading: the hold's line
+    /// (`webtransport::Rate::held`) bounds the governor's rate and setpoint at once, settling or
+    /// not, and holds the resolution rung from stepping up.
+    fn hold(&self, line: Option<f64>, now: std::time::Instant) {
+        if !self.per_report || self.mode == AbrMode::Off || !self.owns_encoder() {
+            return;
+        }
+        // Lock order as `step_rung`'s: rungs, then the governor.
+        if let Some(rungs) = self.rungs.lock().unwrap().clone() {
+            rungs
+                .state
+                .lock()
+                .unwrap()
+                .planner
+                .set_up_held(line.is_some());
+        }
+        let Some(line) = line else {
+            return;
+        };
+        let (prev, cut) = {
+            let mut gov = self.governor.lock().unwrap();
+            (gov.setpoint_kbps(), gov.hold_to(line, now))
+        };
+        if let Some(kbps) = cut {
+            self.retarget(prev, kbps, line);
+        }
+    }
+
     /// Per-report loop (#1376): the resolution rung from the governor's rate
     /// ([`ladder::LadderPlanner::observe_rate`]), with the floor, the setpoint and the
     /// encoder's bitrate moved in the same action. WebRTC never calls this.
@@ -1573,6 +1601,7 @@ fn feedback_abr_armed(
     let floor_loop = abr_loop.clone();
     let setpoint_loop = abr_loop.clone();
     let report_loop = abr_loop.clone();
+    let hold_loop = abr_loop.clone();
     let handle = abr_loop.clone();
     let observed = latest.clone();
     // #1294: what the takeover itself does to this session's encoder. A loop — a WebRTC
@@ -1656,6 +1685,7 @@ fn feedback_abr_armed(
             measured: Box::new(move |reading| {
                 report_loop.report(reading, std::time::Instant::now())
             }),
+            held: Box::new(move |line| hold_loop.hold(line, std::time::Instant::now())),
             fec: Box::new(move |event| match event {
                 crate::webtransport::FecEvent::Attached { client, fec } => {
                     fec_metrics.attach_fec(client, fec);

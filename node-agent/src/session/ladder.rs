@@ -1391,6 +1391,8 @@ pub struct LadderPlanner {
     last_down_at: Option<Instant>,
     /// The last size change made outside the ladder (a manual resize), for the settle.
     resized: Option<Instant>,
+    /// WebTransport's hold (`webtransport::congestion::HOLD`) is on: the rate may not step up.
+    up_held: bool,
 }
 
 impl LadderPlanner {
@@ -1426,7 +1428,14 @@ impl LadderPlanner {
             run: None,
             last_down_at: None,
             resized: None,
+            up_held: false,
         }
+    }
+
+    /// WebTransport (#1433): while the sender is held under what a congested link delivered, its
+    /// rung never steps up into that link (lab row R4: a 720p keyframe into a 5 Mbit/s policer).
+    pub fn set_up_held(&mut self, held: bool) {
+        self.up_held = held;
     }
 
     /// WebTransport: the resolution rung moves on [`Self::observe_rate`], never on a window.
@@ -1638,9 +1647,10 @@ impl LadderPlanner {
         };
         self.run = Some(run);
         let held = dir == StepDir::Up
-            && self
-                .last_down_at
-                .is_some_and(|d| now.saturating_duration_since(d).as_secs() < policy.min_step_s);
+            && (self.up_held
+                || self.last_down_at.is_some_and(|d| {
+                    now.saturating_duration_since(d).as_secs() < policy.min_step_s
+                }));
         // A pin holds the step, not the run: released, it steps at once.
         if now.saturating_duration_since(run.0) < Self::RATE_CONFIRM || held || self.res.pinned {
             return None;
@@ -2853,6 +2863,28 @@ mod tests {
             }
         }
         steps
+    }
+
+    /// #1433: while WebTransport's hold is on the rate never steps the rung up, however long it
+    /// sits over the recover line. Like a pin it holds the step, not the run: released, it steps.
+    #[test]
+    fn a_held_rate_never_steps_the_rung_up() {
+        let t = Instant::now();
+        let mut p = rate_planner(LadderOrder::ResFirst, false, 120, t);
+        assert_eq!(
+            rates(&mut p, t, 0, 2, |_| 2500.0),
+            vec![(1000, "res->3".into())]
+        );
+        p.set_up_held(true);
+        assert!(
+            rates(&mut p, t, 2000, 30, |_| 10_000.0).is_empty(),
+            "stepped up while held"
+        );
+        p.set_up_held(false);
+        assert_eq!(
+            rates(&mut p, t, 32_000, 2, |_| 10_000.0),
+            vec![(32_000, "res->0".into())]
+        );
     }
 
     /// Down goes straight to the rung the rate fits, in one step, `RATE_CONFIRM` after the

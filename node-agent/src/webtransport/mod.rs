@@ -138,6 +138,10 @@ pub(crate) struct Rate {
     /// silence decay: what the report showed the link carrying when the link held the
     /// sender back (`congestion::Estimator::measured`), `None` when it did not.
     pub(crate) measured: Box<dyn Fn(Option<f64>) + Send + Sync>,
+    /// Before `measured`, for every receiver report's estimate: the hold's line in kbit/s of video
+    /// (`congestion::HOLD`), `None` while it is off. The ABR's rate and setpoint never go over it,
+    /// and the resolution rung never steps up while it is on.
+    pub(crate) held: Box<dyn Fn(Option<f64>) + Send + Sync>,
     /// Amendment 85: FEC telemetry — whether this connection's `hello_ack.fec` named a
     /// scheme, and per protected frame the video and repair datagram payload bytes sent.
     /// FEC exists only where this estimate writes the encoder, so it is reported here.
@@ -230,7 +234,7 @@ impl<'a> Control<'a> {
                 );
             }
         }
-        if let Some(kbps) = estimate {
+        if let Some(kbps) = estimate.map(|k| self.estimator.hold(k)) {
             self.feed(kbps, true);
             // QUIC's loss response is given up only while the estimate drives the encoder
             // from live feedback.
@@ -250,7 +254,11 @@ impl<'a> Control<'a> {
     }
 
     fn tick(&mut self, rtt: Duration, now: std::time::Instant) {
-        if let Some(kbps) = self.estimator.on_tick(now, &self.log, rtt) {
+        if let Some(kbps) = self
+            .estimator
+            .on_tick(now, &self.log, rtt)
+            .map(|k| self.estimator.hold(k))
+        {
             // Feedback has gone silent: the decay holds the encoder at the floor at best, and
             // that may still overrun the path, so Cubic takes it back until feedback returns.
             self.governor.release();
@@ -281,18 +289,18 @@ impl<'a> Control<'a> {
             fec.overhead().min(room)
         });
         if report {
+            (self.rate.held)(
+                self.estimator
+                    .held_kbps()
+                    .map(|line| line / (1.0 + self.charged)),
+            );
             (self.rate.measured)(
                 self.estimator
                     .measured()
                     .map(|link| link / (1.0 + self.charged)),
             );
         }
-        let loss = self
-            .estimator
-            .excess_loss()
-            .filter(|_| report && !self.estimator.legacy);
-        let setpoint = (self.rate.setpoint_kbps)();
-        (self.rate.observe)(congestion::abr_estimate(kbps, self.charged, loss, setpoint));
+        (self.rate.observe)(congestion::abr_estimate(kbps, self.charged));
     }
 
     /// The repair datagrams that follow one frame's video datagrams. A PyroWave frame gets

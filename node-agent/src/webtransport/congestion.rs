@@ -106,10 +106,19 @@ const REDUCE_MAX: Duration = Duration::from_millis(200);
 const LOSS_LOW: f64 = 0.02;
 const LOSS_HIGH: f64 = 0.10;
 const LOSS_DECREASE_GAP: Duration = Duration::from_millis(300);
-/// v2: a run of reports losing `LOSS_LOW` or more, broken only by `LOSS_RUN_GAP` with none,
-/// holds the loss bound, and takes its cut once per `LOSS_PERSIST` of run (#1433, rows R3/R4).
-const LOSS_PERSIST: Duration = Duration::from_secs(2);
-const LOSS_RUN_GAP: Duration = Duration::from_secs(1);
+/// v2's hold (#1433, lab rows R3/R4): after a window that loses over `LOSS_HIGH` over the loss
+/// floor, or a second shortfall reading in a row, nothing the sender emits goes over `BETA` × what
+/// that window delivered until this long has passed with no report losing `LOSS_LOW` (over the
+/// floor). The probe that ends a hold on a link still shaped meets its edge, and that can freeze
+/// (`a_shallow_buffer_keeps_its_frames_and_reaches_540p_in_15_s`, 180 s shaped: 30 s, two probe
+/// freezes; 60 s, none); the lab's R4 climb came 70 s after its last step. Longer only delays
+/// recovery after a cap lifts (`a_shallow_cap_then_a_lift_bounds_the_abr_and_recovers_it`: 8 s at
+/// 30 s, 36 s at 60 s), which costs resolution, not frames.
+const HOLD: Duration = Duration::from_secs(60);
+/// After the hold its line probes up this much a second until it passes the most the link
+/// delivered while dropping, then at the estimate's 8 % (the link has lifted). Slow enough that
+/// the loss that ends a probe on a link still shaped is a few percent, which FEC and NACK repair.
+const PROBE_PER_S: f64 = 1.02;
 const LOSS_WINDOW: Duration = Duration::from_millis(500);
 /// v2's loss floor (`Estimator::floor_bin_closed`) is judged over the last `FLOOR_BINS` bins of
 /// at least `FLOOR_BIN` and `FLOOR_BIN_SAMPLES` datagrams each (16 s), from bins sent at
@@ -596,11 +605,10 @@ pub(crate) struct Estimator {
     last_update: Instant,
     last_decrease: Option<Instant>,
     last_loss_decrease: Option<Instant>,
-    /// v2: (start, last report) of the current run of lossy reports, see `LOSS_PERSIST`.
-    lossy: Option<(Instant, Instant)>,
-    /// v2: the highest receive rate a window of the current run delivered losing under
-    /// `LOSS_LOW`, kbit/s.
-    run_clean_kbps: f64,
+    /// v2's hold (`HOLD`).
+    held: Option<HoldLine>,
+    /// The last report gave a shortfall reading: a second in a row sets the hold.
+    read_last: bool,
     /// v2: the open loss-floor bin (start, received, lost), the closed ones (datagrams a
     /// second, loss), and the loss floor ([`Self::loss_floor`]).
     floor_bin: Option<(Instant, i64, i64)>,
@@ -623,14 +631,30 @@ pub(crate) struct Estimator {
     evidence: Evidence,
     /// `QUASAR_WT_CAPACITY=legacy`: 0.6.3's reading, and no blackouts.
     pub(crate) legacy: bool,
-    /// v2's persistence cut (`LOSS_PERSIST`); off for PyroWave, which has no pacer for it to
-    /// tighten and no keyframes to overflow a link.
-    persist: bool,
+    /// v2's hold (`HOLD`) and loss floor; off for PyroWave, which has its own controller and no
+    /// keyframes to overflow a link.
+    holds: bool,
     /// The bound the log last named, and when.
     logged: (Bound, Option<Instant>),
     /// The estimate before a silence decay not logged yet; delay and loss cuts always log.
     unlogged: Option<f64>,
 }
+
+/// v2's hold (`HOLD`).
+#[derive(Debug, Clone, Copy)]
+struct HoldLine {
+    /// The line, kbit/s.
+    kbps: f64,
+    /// The last report that lost `LOSS_LOW` or more, and the last that lowered the line.
+    since: Instant,
+    stepped: Instant,
+    /// The most the link delivered while dropping since the hold began.
+    trouble: f64,
+}
+
+/// A congested window this long after the line last stepped down shows the step did not cure
+/// it: the line steps again. Shorter, it is the same burst (the loss window is 500 ms).
+const HOLD_STEP_GAP: Duration = Duration::from_secs(1);
 
 /// What one message measured, for the tests.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -644,6 +668,8 @@ pub(crate) struct Measured {
     /// The rate every video datagram sent over the same span was sent at, lost ones
     /// included, on the agent's clock; `None` when the message added no fresh arrival.
     pub(crate) sent_kbps: Option<f64>,
+    /// The rate the datagrams in the window were sent at: what `delivered_kbps` is read against.
+    pub(crate) arrived_sent_kbps: Option<f64>,
     /// A video datagram (not a resend) first reported here is in the rate window.
     pub(crate) fresh: bool,
     /// Blackouts left out.
@@ -680,8 +706,8 @@ impl Estimator {
             last_update: now,
             last_decrease: None,
             last_loss_decrease: None,
-            lossy: None,
-            run_clean_kbps: 0.0,
+            held: None,
+            read_last: false,
             floor_bin: None,
             floor_bins: VecDeque::new(),
             floor: 0.0,
@@ -695,7 +721,7 @@ impl Estimator {
             reported_to: None,
             evidence: Evidence::default(),
             legacy: false,
-            persist: true,
+            holds: true,
             logged: (Bound::Ceiling, None),
             unlogged: None,
             measured: None,
@@ -710,7 +736,17 @@ impl Estimator {
     /// decay does not count while its regrow memory is held (#1417): the link has not said it
     /// carries less, and pacing a recovery keyframe at a decayed rate only delays it.
     pub(crate) fn found_link(&self) -> bool {
-        self.bound != Bound::Ceiling && self.recover_to.is_none()
+        (self.bound != Bound::Ceiling || self.held.is_some()) && self.recover_to.is_none()
+    }
+
+    /// The hold's line (`HOLD`), kbit/s on the wire, while it is on.
+    pub(crate) fn held_kbps(&self) -> Option<f64> {
+        self.held.map(|h| h.kbps.max(MIN_KBPS))
+    }
+
+    /// `kbps`, never over the hold's line (`HOLD`): what governs the sender and feeds the ABR.
+    pub(crate) fn hold(&self, kbps: f64) -> f64 {
+        self.held.map_or(kbps, |h| kbps.min(h.kbps.max(MIN_KBPS)))
     }
 
     /// Start again from `kbps` (never above the ceiling): codec-pyrowave.md §Rate, the ABR
@@ -733,7 +769,7 @@ impl Estimator {
     /// Loss the link shows whatever the sender does (Wi-Fi), which v2 does not read as
     /// congestion; 0 in legacy and for PyroWave. See [`Self::floor_bin_closed`].
     fn loss_floor(&self) -> f64 {
-        match !self.legacy && self.persist {
+        match !self.legacy && self.holds {
             true => self.floor,
             false => 0.0,
         }
@@ -771,21 +807,26 @@ impl Estimator {
                     .map(|b| b.1)
                     .fold(LOSS_HIGH, f64::min);
                 self.floor = self.floor.max(least);
+                // Backing off did not stop the loss: it is not the link's capacity. Under half the
+                // hold's renewal line it is too little to keep a hold alive anyway.
+                if least >= LOSS_LOW / 2.0 {
+                    self.held = None;
+                }
             }
         }
     }
 
-    /// The window's loss over the loss floor: what the estimate's loss bound and the ABR's hold
-    /// (`abr_estimate`) read.
-    pub(crate) fn excess_loss(&self) -> Option<f64> {
+    /// The window's loss over the loss floor: what the estimate's loss bound and the hold read.
+    fn excess_loss(&self) -> Option<f64> {
         self.loss.map(|l| (l - self.loss_floor()).max(0.0))
     }
 
-    /// The ABR's only down path (#1376, rule 2 of #1433): `BETA` × what the link delivered,
-    /// kbit/s, when it delivered under `LINK_LIMITED` × what was sent and the sender was not
-    /// application-limited. `None` otherwise: a clean link, whatever its delay detector says
-    /// (#68), a delay step or a blackout (one gap, taken out of `delivered`). Never the
-    /// estimate, which may float over the link while the sender is application-limited (#1503).
+    /// The ABR's reading (#1376, rule 2 of #1433): `BETA` × what the link delivered, kbit/s, when
+    /// the datagrams that arrived came over the window slower than `LINK_LIMITED` × the rate they
+    /// were sent at and the sender was not application-limited. `None` otherwise: a clean link,
+    /// whatever its delay detector says (#68), loss (the hold's), a delay step or a blackout (one
+    /// gap, taken out of `delivered`). Never the estimate, which may float over the link while the
+    /// sender is application-limited (#1503).
     pub(crate) fn measured(&self) -> Option<f64> {
         self.measured
     }
@@ -901,52 +942,16 @@ impl Estimator {
             }
         }
 
-        let floor = self.loss_floor();
         let excess = self.excess_loss();
-        if self.legacy || !self.persist {
-            self.lossy = None;
-        } else if excess.is_some_and(|l| l >= LOSS_LOW) {
-            self.lossy = Some((self.lossy.map_or(now, |(since, _)| since), now));
-        } else if self
-            .lossy
-            .is_some_and(|(_, last)| now.saturating_duration_since(last) > LOSS_RUN_GAP)
-        {
-            self.lossy = None;
-        }
-        match (self.lossy, m.rate_kbps) {
-            (None, _) => self.run_clean_kbps = 0.0,
-            (Some(_), Some(r)) if excess.is_none_or(|l| l < LOSS_LOW) => {
-                self.run_clean_kbps = self.run_clean_kbps.max(r);
-            }
-            _ => {}
-        }
-        let persisted = self.lossy.is_some_and(|(since, last)| {
-            last == now && now.saturating_duration_since(since) >= LOSS_PERSIST
-        });
         match excess {
-            Some(loss) if loss > LOSS_HIGH || persisted => {
+            Some(loss) if loss > LOSS_HIGH => {
                 let gap = LOSS_DECREASE_GAP + path.rtt;
                 if self
                     .last_loss_decrease
                     .is_none_or(|at| now.saturating_duration_since(at) >= gap)
                 {
-                    // A persistent run never cuts under what the link delivered, now or in a
-                    // clean window of the run: steady loss that is no congestion (Wi-Fi, reorder
-                    // discards) would otherwise ratchet the bound down after the sender for as
-                    // long as it lasts.
-                    // shortcut: the clean rate is held for the whole run, so a capacity drop that
-                    // loses only 2-10 % is left to the readings; age it if a lab row shows one.
-                    let delivered = m
-                        .rate_kbps
-                        .filter(|_| loss <= LOSS_HIGH)
-                        .map_or(0.0, |r| r.max(self.run_clean_kbps).min(self.estimate_kbps));
-                    self.loss_kbps = (self.estimate_kbps * (1.0 - 0.5 * loss)).max(delivered);
+                    self.loss_kbps = self.estimate_kbps * (1.0 - 0.5 * loss);
                     self.last_loss_decrease = Some(now);
-                    // A persistent run starts again; a cut over `LOSS_HIGH` spends it.
-                    self.lossy = (loss <= LOSS_HIGH).then_some((now, now));
-                    if loss > LOSS_HIGH {
-                        self.run_clean_kbps = 0.0;
-                    }
                     if self.loss_kbps < self.estimate_kbps {
                         cut_by.push("loss");
                         // The link no longer carries what it did before the outage.
@@ -957,8 +962,6 @@ impl Estimator {
                 }
             }
             Some(loss) if loss >= LOSS_LOW => {}
-            // A clean report between two keyframe overflows is no headroom.
-            _ if self.lossy.is_some() => {}
             _ => {
                 let mut grown = self.loss_kbps * growth;
                 if let Some(to) = recover {
@@ -973,6 +976,65 @@ impl Estimator {
             }
         }
 
+        // Rule 2 (#1433): arrivals stretched past their send spacing after the gap correction.
+        // Loss is no reading: the datagrams that arrived are measured against their own sending.
+        let read = m
+            .delivered_kbps
+            .zip(m.arrived_sent_kbps)
+            .filter(|&(d, s)| m.fresh && !app_limited && d < LINK_LIMITED * s)
+            .map(|(d, _)| BETA * d);
+        // The hold (`HOLD`): what a congested window delivered, or a confirmed reading.
+        let holds = self.holds && !self.legacy;
+        let burst = m
+            .rate_kbps
+            .filter(|_| holds && excess.is_some_and(|l| l > LOSS_HIGH))
+            .map(|r| BETA * r);
+        // A probe that meets loss found the link: back off from it, as from a burst.
+        let probing = self
+            .held
+            .is_some_and(|h| now.saturating_duration_since(h.since) >= HOLD);
+        let met = m
+            .rate_kbps
+            .filter(|_| probing && excess.is_some_and(|l| l >= LOSS_LOW))
+            .map(|r| BETA * r);
+        let confirmed = read.filter(|_| self.read_last && holds);
+        self.read_last = read.is_some();
+        if let Some(line) = [burst, met, confirmed]
+            .into_iter()
+            .flatten()
+            .reduce(f64::min)
+        {
+            let mut h = self.held.unwrap_or(HoldLine {
+                kbps: line,
+                since: now,
+                stepped: now,
+                trouble: 0.0,
+            });
+            // Still congested a step after the line came down: that line did not cure it.
+            let again = now.saturating_duration_since(h.stepped) >= HOLD_STEP_GAP;
+            let to = line.min(if again { BETA * h.kbps } else { h.kbps });
+            if to < h.kbps {
+                (h.kbps, h.stepped) = (to, now);
+            }
+            (h.since, h.trouble) = (now, h.trouble.max(line / BETA));
+            self.held = Some(h);
+        } else if let Some(h) = self.held.as_mut() {
+            if excess.is_some_and(|l| l >= LOSS_LOW) {
+                h.since = now;
+            } else if probing {
+                // Gently up to where the link dropped, at the estimate's pace past it.
+                let per_s = if h.kbps < h.trouble {
+                    PROBE_PER_S
+                } else {
+                    GROWTH_PER_S
+                };
+                h.kbps *= per_s.powf(dt);
+                if h.kbps >= self.ceiling_kbps {
+                    self.held = None;
+                }
+            }
+        }
+
         let was = self.estimate_kbps;
         self.settle();
         if self
@@ -983,14 +1045,7 @@ impl Estimator {
         }
         // After `settle`: legacy's reading is at least this report's estimate, as 0.6.3's.
         self.measured = match self.legacy {
-            false => m
-                .delivered_kbps
-                .zip(m.sent_kbps)
-                .filter(|&(d, s)| {
-                    let floor = floor.min(m.loss.unwrap_or(0.0));
-                    m.fresh && !app_limited && d < (LINK_LIMITED - floor) * s
-                })
-                .map(|(d, _)| BETA * d),
+            false => read,
             true => m
                 .rate_kbps
                 .zip(m.sent_kbps)
@@ -1029,6 +1084,7 @@ impl Estimator {
                 reading_kbps = self.measured.unwrap_or(0.0) as u64,
                 delay_kbps = self.delay_kbps as u64,
                 loss_kbps = self.loss_kbps as u64,
+                held_kbps = self.held.map_or(0, |h| h.kbps as u64),
                 rtt_ms = path.rtt.as_millis() as u64,
                 cwnd_bytes = path.cwnd_bytes,
                 quic_congestion_events = path.congestion_events,
@@ -1056,9 +1112,6 @@ impl Estimator {
                 from: self.reported_to.unwrap_or(seq),
                 by: log.next_seq,
             });
-            // Loss after the outage is a new run, judged on its own.
-            self.lossy = None;
-            self.run_clean_kbps = 0.0;
         }
         let from = self.last_decay.unwrap_or(sent + timeout);
         let steps = now.saturating_duration_since(from).as_secs_f64() / SILENCE_STEP.as_secs_f64();
@@ -1301,6 +1354,7 @@ impl Estimator {
             }
             _ => None,
         };
+        let arrived_sent_kbps = rate(|a| a.2, 1).filter(|_| sent_kbps.is_some());
 
         if received != 0 || lost != 0 {
             let bin = self.floor_bin.get_or_insert((now, 0, 0));
@@ -1338,6 +1392,7 @@ impl Estimator {
             delivered_kbps,
             gap_us,
             sent_kbps,
+            arrived_sent_kbps,
             fresh,
             loss,
         }
@@ -1467,7 +1522,7 @@ impl PyroRate {
         Self {
             estimator: Estimator {
                 legacy,
-                persist: false,
+                holds: false,
                 ..Estimator::new(f64::from(target_kbps), now)
             },
             log: SendLog::new(now),
@@ -1726,16 +1781,9 @@ pub(crate) fn governed_kbps(estimate: f64, setpoint: f64, charged: f64, floor: f
 }
 
 /// What the ABR is fed from an estimate, kbit/s of video: the estimate less the FEC share
-/// `charged`, and no more than the ABR's own setpoint while the window loses `LOSS_LOW` or more
-/// over the loss floor (`loss`: [`Estimator::excess_loss`]).
-/// GCC holds at 2–10 % loss; an ABR fed the estimate climbed back over the link between a
-/// reading's steps (sim R4, `a_policer_steps_down_until_its_loss_ends`: up moves at 11–31 % loss).
-pub(crate) fn abr_estimate(kbps: f64, charged: f64, loss: Option<f64>, setpoint: f64) -> f64 {
-    let video = kbps / (1.0 + charged);
-    match loss {
-        Some(l) if l >= LOSS_LOW => video.min(setpoint),
-        _ => video,
-    }
+/// `charged`. The hold (`HOLD`) bounds the estimate, so the ABR cannot climb back over the link.
+pub(crate) fn abr_estimate(kbps: f64, charged: f64) -> f64 {
+    kbps / (1.0 + charged)
 }
 
 /// The rates `VideoQueue` holds video to, kbit/s: QUIC's room ([`VideoQueue::room`]) at the

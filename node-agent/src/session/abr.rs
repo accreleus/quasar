@@ -610,6 +610,21 @@ impl Governor {
         Some(sp)
     }
 
+    /// Per-report loop: WebTransport's hold (`webtransport::congestion::HOLD`) bounds the rate and
+    /// the setpoint at `kbps` at once: no reading run, interval or rung settle delays it, so a
+    /// congested link is never sent more than the hold allows (#1433, sim row R3 at a rung step).
+    pub fn hold_to(&mut self, kbps: f64, now: Instant) -> Option<u32> {
+        self.cfg.per_report?;
+        self.rate = self.rate.min(kbps);
+        let sp = self.clamp(kbps);
+        if sp >= self.setpoint {
+            return None;
+        }
+        self.setpoint = sp;
+        self.last_retarget = now;
+        Some(sp)
+    }
+
     fn clamp(&self, kbps: f64) -> u32 {
         (kbps.round() as i64).clamp(self.cfg.floor_kbps as i64, self.cfg.ceiling_kbps as i64) as u32
     }
@@ -1271,6 +1286,25 @@ mod tests {
             "the setpoint stops at the floor"
         );
         assert_eq!(g.rate_kbps(), 800.0, "the rate does not");
+    }
+
+    /// #1433: WebTransport's hold bounds the rate and the setpoint at once, with no reading run and
+    /// no write gap; a line over the setpoint moves neither, and the window loop has no hold.
+    #[test]
+    fn per_report_the_hold_bounds_the_rate_and_setpoint_at_once() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(1000), base);
+        assert_eq!(g.hold_to(3000.0, ms(base, 10)), Some(3000));
+        assert_eq!((g.rate_kbps(), g.setpoint_kbps()), (3000.0, 3000));
+        assert_eq!(g.hold_to(4000.0, ms(base, 20)), None);
+        assert_eq!(
+            g.hold_to(500.0, ms(base, 30)),
+            Some(1000),
+            "clamped to the floor"
+        );
+        assert_eq!(g.rate_kbps(), 500.0, "the rate is not");
+        let mut w = Governor::new(AbrConfig::new_smooth(1000, 10_000, 60), base);
+        assert_eq!(w.hold_to(3000.0, ms(base, 10)), None);
     }
 
     /// A report with no reading between two low ones breaks the run.
