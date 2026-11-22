@@ -95,7 +95,7 @@ index 7291766..af38313 100644
    NVENCSTATUS   Drain       (GstNvEncTask * task);
  
 diff --git a/subprojects/gst-plugins-bad/sys/nvcodec/gstnvencoder.cpp b/subprojects/gst-plugins-bad/sys/nvcodec/gstnvencoder.cpp
-index ad2b5a0..30e3cbd 100644
+index ad2b5a0..927ccf9 100644
 --- a/subprojects/gst-plugins-bad/sys/nvcodec/gstnvencoder.cpp
 +++ b/subprojects/gst-plugins-bad/sys/nvcodec/gstnvencoder.cpp
 @@ -36,6 +36,7 @@
@@ -195,7 +195,7 @@ index ad2b5a0..30e3cbd 100644
      default:
        G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
        break;
-@@ -637,6 +676,184 @@ gst_nv_encoder_sink_event (GstVideoEncoder * encoder, GstEvent * event)
+@@ -637,6 +676,276 @@ gst_nv_encoder_sink_event (GstVideoEncoder * encoder, GstEvent * event)
    return GST_VIDEO_ENCODER_CLASS (parent_class)->sink_event (encoder, event);
  }
  
@@ -215,6 +215,80 @@ index ad2b5a0..30e3cbd 100644
 +  }
 +
 +  return GST_VIDEO_ENCODER_CLASS (parent_class)->src_event (encoder, event);
++}
++
++/* Reference recovery: the DPB pictures (references + 1) the level allows at
++ * this size and rate, taking the level the stream gets without anchors (the
++ * configured one, else the lowest that fits size and rate; bitrate is left
++ * out, which can only pick a lower level and so a tighter limit). H.264:
++ * MaxDpbFrames from Table A-1; HEVC: MaxDpbSize from A.4.2, Main tier. */
++static guint
++gst_nv_encoder_level_max_dpb (gboolean h264, guint32 level, guint w, guint h,
++    guint fps_n, guint fps_d)
++{
++  static const struct
++  {
++    guint32 idc, mbps, fs, dpb_mbs;
++  } h264_levels[] = {
++    {10, 1485, 99, 396}, {11, 3000, 396, 900}, {12, 6000, 396, 2376},
++    {13, 11880, 396, 2376}, {20, 11880, 396, 2376}, {21, 19800, 792, 4752},
++    {22, 20250, 1620, 8100}, {30, 40500, 1620, 8100}, {31, 108000, 3600, 18000},
++    {32, 216000, 5120, 20480}, {40, 245760, 8192, 32768},
++    {41, 245760, 8192, 32768}, {42, 522240, 8704, 34816},
++    {50, 589824, 22080, 110400}, {51, 983040, 36864, 184320},
++    {52, 2073600, 36864, 184320}, {60, 4177920, 139264, 696320},
++    {61, 8355840, 139264, 696320}, {62, 16711680, 139264, 696320},
++  };
++  static const struct
++  {
++    guint32 idc;
++    guint64 ps, sr;
++  } h265_levels[] = {
++    {30, 36864, 552960}, {60, 122880, 3686400}, {63, 245760, 7372800},
++    {90, 552960, 16588800}, {93, 983040, 33177600}, {120, 2228224, 66846720},
++    {123, 2228224, 133693440}, {150, 8912896, 267386880},
++    {153, 8912896, 534773760}, {156, 8912896, 1069547520},
++    {180, 35651584, 1069547520}, {183, 35651584, 2139095040},
++    {186, 35651584, 4278190080},
++  };
++  guint i;
++
++  if (fps_n == 0 || fps_d == 0) {
++    fps_n = 60;
++    fps_d = 1;
++  }
++
++  if (h264) {
++    guint64 fs = (guint64) ((w + 15) / 16) * ((h + 15) / 16);
++    guint64 mbps = gst_util_uint64_scale_ceil (fs, fps_n, fps_d);
++
++    if (level == NV_ENC_LEVEL_H264_1b)
++      level = NV_ENC_LEVEL_H264_1;
++    for (i = 0; i < G_N_ELEMENTS (h264_levels) - 1; i++) {
++      if (level != NV_ENC_LEVEL_AUTOSELECT ? h264_levels[i].idc == level :
++          (fs <= h264_levels[i].fs && mbps <= h264_levels[i].mbps))
++        break;
++    }
++    return MIN (h264_levels[i].dpb_mbs / MAX (fs, 1), 16);
++  } else {
++    guint64 ps = (guint64) w * h;
++    guint64 sr = gst_util_uint64_scale_ceil (ps, fps_n, fps_d);
++    guint64 max_ps;
++
++    for (i = 0; i < G_N_ELEMENTS (h265_levels) - 1; i++) {
++      if (level != NV_ENC_LEVEL_AUTOSELECT ? h265_levels[i].idc == level :
++          (ps <= h265_levels[i].ps && sr <= h265_levels[i].sr))
++        break;
++    }
++    max_ps = h265_levels[i].ps;
++    if (ps <= (max_ps >> 2))
++      return 16;
++    if (ps <= (max_ps >> 1))
++      return 12;
++    if (ps <= ((3 * max_ps) >> 2))
++      return 8;
++    return 6;
++  }
 +}
 +
 +/* Reference recovery: clamp num-anchors and turn on per-picture LTR in
@@ -260,12 +334,30 @@ index ad2b5a0..30e3cbd 100644
 +    }
 +  }
 +
++  /* K anchors need K + 2 DPB pictures: on H.264 K + 2 references (a decoder
++   * that lost a forgotten anchor holds one more short-term picture), on HEVC
++   * K + 1 references and the current picture. Anchors never raise the level. */
++  if (k > 0) {
++    guint dpb = gst_nv_encoder_level_max_dpb (h264, h264 ?
++        config->encodeCodecConfig.h264Config.level :
++        config->encodeCodecConfig.hevcConfig.level, init_params->encodeWidth,
++        init_params->encodeHeight, init_params->frameRateNum,
++        init_params->frameRateDen);
++
++    if (k + 2 > dpb) {
++      GST_WARNING_OBJECT (self, "num-anchors=%u, the level at %ux%u allows "
++          "%u DPB pictures, %u used", k, init_params->encodeWidth,
++          init_params->encodeHeight, dpb, dpb > 2 ? dpb - 2 : 0);
++      k = dpb > 2 ? dpb - 2 : 0;
++    }
++  }
++
 +  if (k > 0 && h264) {
 +    auto & c = config->encodeCodecConfig.h264Config;
 +    c.enableLTR = 1;
 +    c.ltrTrustMode = 0;
 +    c.ltrNumFrames = k;
-+    c.maxNumRefFrames = MAX (c.maxNumRefFrames, k + 1);
++    c.maxNumRefFrames = MAX (c.maxNumRefFrames, k + 2);
 +  } else if (k > 0) {
 +    auto & c = config->encodeCodecConfig.hevcConfig;
 +    c.enableLTR = 1;
@@ -380,7 +472,7 @@ index ad2b5a0..30e3cbd 100644
  #ifdef HAVE_CUDA_GST_GL
  static void
  gst_nv_encoder_check_cuda_device_from_gl_context (GstGLContext * context,
-@@ -1270,6 +1487,9 @@ gst_nv_encoder_init_session (GstNvEncoder * self, GstBuffer * in_buf)
+@@ -1270,6 +1579,9 @@ gst_nv_encoder_init_session (GstNvEncoder * self, GstBuffer * in_buf)
      goto error;
    }
  
@@ -390,7 +482,7 @@ index ad2b5a0..30e3cbd 100644
    task_pool_size = gst_nv_encoder_calculate_task_pool_size (self,
        &priv->config);
  
-@@ -2264,7 +2484,10 @@ gst_nv_encoder_handle_frame (GstVideoEncoder * encoder,
+@@ -2264,7 +2576,10 @@ gst_nv_encoder_handle_frame (GstVideoEncoder * encoder,
      pic_struct = klass->get_pic_struct (self, &priv->input_state->info, in_buf);
    }
  
