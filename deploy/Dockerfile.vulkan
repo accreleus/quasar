@@ -319,7 +319,7 @@ ARG CARGO_C_VERSION
 RUN cargo install cargo-c --version "${CARGO_C_VERSION}" --locked \
     && rm -rf /opt/cargo/registry/src
 
-# Patched GStreamer 1.28.8 -> /opt/gst. Thirteen vendored patches, applied in the order below; the
+# Patched GStreamer 1.28.8 -> /opt/gst. Sixteen vendored patches, applied in the order below; the
 # order is load-bearing (each was diffed against the tree with its predecessors applied) and is
 # documented per patch in deploy/patches/vulkan/README.md. The fifth (gst-wayland-display's own)
 # shares one GstVulkanQueue per VkQueue, so every submitter on a queue takes one submit lock.
