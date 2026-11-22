@@ -59,11 +59,12 @@ const AT_FLOOR_MS: f64 = 30.0;
 const DELAY_BUCKET_US: u64 = 500_000;
 const FLOOR_SPAN_US: u64 = 10_000_000;
 
-/// Send records kept, by `pkt_seq`: over the estimator's 0.5 s rate window at a 400 Mbit/s
-/// grant, 25 MB of datagrams, ~21 800 of them (#1430). Sized for PyroWave's grant; the
-/// standard codec's 100 Mbit/s left the 0.5 s window at 400 Mbit/s under-read, so windows
-/// read as application-limited.
-const LOG: usize = 1 << 15;
+/// Send records kept, by `pkt_seq`: over the estimator's 0.5 s rate window at the most a
+/// PyroWave grant can be, 1 Gbit/s (`pyrowave_kbps` null caps `target_kbps` at 1 000 000;
+/// codec-pyrowave.md §Rate): 62.5 MB of datagrams, ~54 400 of them (#1430). 4K120's default
+/// target, 800 Mbit/s, is 43 600, and 1<<15 left it under-read, so windows read as
+/// application-limited. 24 B a record.
+const LOG: usize = 1 << 16;
 
 // Packet groups (libwebrtc `InterArrival`): one send burst, plus what arrived in a burst
 // behind it.
@@ -160,8 +161,8 @@ const APP_LIMITED: f64 = 0.8;
 /// them back (a queue or loss), so the report is a reading of the link ([`Estimator::measured`]).
 const LINK_LIMITED: f64 = 0.95;
 /// Arrivals kept for the rate window, by receive order, one per datagram: the same 0.5 s at a
-/// 400 Mbit/s grant, ~21 800 of them (#1430).
-const MAX_ARRIVALS: usize = 1 << 15;
+/// 1 Gbit/s grant, ~54 400 of them (#1430).
+const MAX_ARRIVALS: usize = 1 << 16;
 
 /// Feedback silence while media is sent: past max(this, 2 intervals + RTT), the estimate
 /// decays by `SILENCE_DECAY` every `SILENCE_STEP`.
@@ -327,6 +328,18 @@ pub(crate) struct QuicPath {
     pub(crate) congestion_events: u64,
     /// Bytes waiting in quinn's datagram queue: QUIC is holding the sender back.
     pub(crate) queued_bytes: u64,
+}
+
+impl QuicPath {
+    /// Adds video the agent holds for room in QUIC's queue (`VideoQueue`): it waits on QUIC as
+    /// the queued datagrams do, and a window's worth held back reads as the link limiting the
+    /// sender, as the same bytes inside quinn would (#1633).
+    pub(crate) fn with_held(self, held: usize) -> Self {
+        Self {
+            queued_bytes: self.queued_bytes + held as u64,
+            ..self
+        }
+    }
 }
 
 /// Which bound the estimate sits at; silence decays the delay and loss bounds.
@@ -1552,6 +1565,11 @@ pub(crate) fn pyro_budget(kbps: f64) -> u32 {
     (kbps * PYRO_PAYLOAD_SHARE) as u32
 }
 
+/// How fast the budget climbs back from a released cap, per second: from the floor to the
+/// target in about 2 s when the link has lifted, while one that has not is re-found by a
+/// small overshoot instead of the whole way to the target. A first value; a hardware row tunes it.
+const PYRO_CLIMB_PER_S: f64 = 1.5;
+
 /// What [`PyroRate`] asks of the session.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum PyroVerdict {
@@ -1601,6 +1619,9 @@ pub(crate) struct PyroRate {
     offered: u64,
     /// (when, `offered` then): the older is 100-200 ms back, the window the fill is read over.
     marks: [(Instant, u64); 2],
+    /// A cap at or over the floor has let go: the rate it held and when that was last set. The
+    /// budget climbs back from it at `PYRO_CLIMB_PER_S`, not straight to the target (#1430).
+    climb: Option<(f64, Instant)>,
 }
 
 impl PyroRate {
@@ -1625,6 +1646,7 @@ impl PyroRate {
             waiting_since: None,
             offered: 0,
             marks: [(now, 0); 2],
+            climb: None,
         }
     }
 
@@ -1679,9 +1701,25 @@ impl PyroRate {
         let rose = events.is_some_and(|was| path.congestion_events > was);
         let fills = self.offered_kbps(now) >= APP_LIMITED * f64::from(self.budget);
         if self.judged_from.is_some() {
+            let uncapped = kbps;
             if sustained || ((rose || self.latched) && fills) {
                 kbps = kbps.min(quic_kbps(path));
             }
+            // A link between the floor and the target: a release straight to the target
+            // overran it, the queue built, and the cap came back, every ~400 ms (#1430). Under
+            // the floor the latch above holds the cap instead.
+            self.climb = match self.climb {
+                _ if kbps < uncapped && kbps >= self.floor_kbps => Some((kbps, now)),
+                Some((from, at)) if kbps >= uncapped => {
+                    let rate = from
+                        * PYRO_CLIMB_PER_S.powf(now.saturating_duration_since(at).as_secs_f64());
+                    (rate < kbps).then(|| {
+                        kbps = rate;
+                        (rate, now)
+                    })
+                }
+                _ => None,
+            };
             if kbps < self.floor_kbps {
                 // A single loss (`rose`) never latches: it buys this judgement only.
                 self.latched = sustained || (self.latched && fills);

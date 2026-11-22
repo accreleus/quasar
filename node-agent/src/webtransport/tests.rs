@@ -5722,11 +5722,6 @@ fn a_big_pyrowave_frame_is_handed_over_in_bounded_slices_inside_the_frame_interv
             "{plan:?}"
         );
         assert_eq!(plan[0].1, Duration::ZERO);
-        let last = plan.last().unwrap().1;
-        assert!(
-            last <= Duration::from_secs(1) / (fps as u32 * 4),
-            "{fps} fps: {last:?}"
-        );
         assert!(
             plan.windows(2).all(|w| w[0].1 < w[1].1),
             "slices are spread out in time"
@@ -5734,6 +5729,72 @@ fn a_big_pyrowave_frame_is_handed_over_in_bounded_slices_inside_the_frame_interv
     }
 }
 
+/// A frame of `bytes` as ~1200 B datagrams.
+fn frame_of(bytes: usize) -> Vec<Bytes> {
+    vec![Bytes::from(vec![0u8; 1200]); bytes.div_ceil(1200)]
+}
+
+/// The time from a frame's first slice to its last, with the send loop's own timer arm
+/// (`sleep_until` the pacing deadline, then `pop`) on a paused clock, whose timer wheel rounds
+/// a deadline up to the millisecond as the live one does. `late` is how long after its tick the
+/// loop gets to run (the live loop is never exactly on it); the spread is between ticks.
+async fn spread_of(frame: &[Bytes], fps: i32, late: Duration) -> Duration {
+    let plan = burst_plan(frame, true, fps);
+    let gap = pacing_gap(fps, plan.len());
+    let mut rest = frame.iter().cloned();
+    let slices = plan
+        .iter()
+        .map(|(n, _)| rest.by_ref().take(*n).collect())
+        .collect();
+    let mut pacing = Pacing::default();
+    pacing.push(1, gap, slices);
+    let start = Instant::now();
+    pacing.pop(start).expect("the first slice goes at once");
+    let mut last = start;
+    while let Some(due) = pacing.deadline() {
+        tokio::time::sleep_until(due).await;
+        last = Instant::now();
+        pacing.pop(last + late);
+    }
+    last - start
+}
+
+/// #1633: timers resolve to 1 ms, so a frame cut in many slices at a high frame rate took far
+/// longer than planned (4K120: 6 ms against the contract's 4.17 ms, half a 120 fps interval).
+/// The frame goes in fewer, larger slices until its spread fits.
+#[tokio::test(start_paused = true)]
+async fn a_4k120_pyrowave_frame_is_spread_over_no_more_than_half_a_frame_interval() {
+    let half = Duration::from_secs(1) / 120 / 2;
+    // 4K at the 400 Mbit/s the contract gives 60 fps, times two: 800 Mbit/s.
+    let frame = frame_of(800_000_000 / 8 / 120);
+    let by_size = frame.len().div_ceil(PYRO_BURST_BYTES / 1200);
+    let plan = burst_plan(&frame, true, 120);
+    assert!(
+        plan.len() > 1 && plan.len() < by_size,
+        "{} slices, {by_size} by size",
+        plan.len()
+    );
+    assert_eq!(plan.iter().map(|(n, _)| n).sum::<usize>(), frame.len());
+    for late in [0, 200, 450] {
+        let spread = spread_of(&frame, 120, Duration::from_micros(late)).await;
+        assert!(spread <= half, "{late} us late: {spread:?} over {half:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn pyrowave_frames_of_every_size_and_rate_are_spread_inside_half_a_frame_interval() {
+    for fps in [30, 60, 90, 120, 144, 240] {
+        let half = Duration::from_secs(1) / fps as u32 / 2;
+        for mbit in [50, 100, 200, 400, 800, 1000] {
+            let frame = frame_of(mbit * 1_000_000 / 8 / fps as usize);
+            let spread = spread_of(&frame, fps, Duration::from_micros(200)).await;
+            assert!(
+                spread <= half,
+                "{fps} fps {mbit} Mbit/s: {spread:?} over {half:?}"
+            );
+        }
+    }
+}
 #[test]
 fn a_frame_under_the_burst_limit_and_every_other_codec_go_as_one_slice() {
     assert_eq!(
@@ -5847,7 +5908,11 @@ fn a_frame_queues_behind_one_older_frame_and_a_third_drops_the_oldests_tail() {
         [11, 12, 20, 21],
         "appended: nothing is sent early"
     );
-    pacing.push(3, gap, vec![tagged(30, 1)]);
+    assert_eq!(
+        pacing.push(3, gap, vec![tagged(30, 1)]),
+        2,
+        "the two datagrams dropped are reported, for the log (#1633)"
+    );
     assert_eq!(
         order(&pacing),
         [20, 21, 30],

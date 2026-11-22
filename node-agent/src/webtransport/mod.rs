@@ -1279,20 +1279,45 @@ const PYRO_BURST_BYTES: usize = 128 * 1024;
 /// The frame rate the slice spacing assumes when the configuration carries none.
 const PACING_FALLBACK_FPS: u32 = 60;
 
-/// The spacing between a frame's slices: a quarter of the frame interval over its gaps. A
-/// one-slice frame gets the same quarter, so the next frame's first slice still waits it out.
-fn pacing_gap(fps: i32, slices: usize) -> std::time::Duration {
+/// The timer's resolution: tokio's wheel rounds a deadline up to a whole millisecond, so a gap
+/// between slices takes at least this and a fraction of it costs a whole one (#1633: at 4K120
+/// the planned 2 ms spread took 6).
+const TIMER_TICK: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// What a gap of `gap` takes in practice: whole timer ticks, at least one.
+fn timer_gap(gap: std::time::Duration) -> std::time::Duration {
+    TIMER_TICK * gap.as_micros().div_ceil(TIMER_TICK.as_micros()).max(1) as u32
+}
+
+/// The frame interval at `fps`, which falls back to [`PACING_FALLBACK_FPS`] when unusable.
+fn frame_interval(fps: i32) -> std::time::Duration {
     let fps = u32::try_from(fps)
         .ok()
         .filter(|f| *f > 0)
         .unwrap_or(PACING_FALLBACK_FPS);
-    std::time::Duration::from_secs(1) / fps / 4 / (slices.max(2) as u32 - 1)
+    std::time::Duration::from_secs(1) / fps
+}
+
+/// The spacing a frame of `slices` is aimed at: a quarter of the frame interval over its gaps,
+/// whole ticks. A one-slice frame gets the same quarter, so the next frame's first slice still
+/// waits it out.
+fn pacing_target(fps: i32, slices: usize) -> std::time::Duration {
+    timer_gap(frame_interval(fps) / 4 / (slices.max(2) as u32 - 1))
+}
+
+/// The gap `Pacing` is given. Asked for half a tick under the whole ticks it should take: the
+/// send loop wakes a little after its tick, and a deadline a whole number of ticks after that
+/// wake-up would round up to one more.
+fn pacing_gap(fps: i32, slices: usize) -> std::time::Duration {
+    pacing_target(fps, slices) - TIMER_TICK / 2
 }
 
 /// The slices a frame's datagrams are handed over in: each a datagram count and its offset from
 /// the frame's start. PyroWave is cut so no slice passes `PYRO_BURST_BYTES`, the slices spread
-/// evenly over a quarter of the frame interval (a target: `Pacing` keeps the spacing, not the
-/// frame-relative offsets). Every other codec is one slice at once.
+/// over a quarter of the frame interval (a target: `Pacing` keeps the spacing, not the
+/// frame-relative offsets). When the timer's ticks make that spread take longer than half the
+/// interval (`codec-pyrowave.md` §Rate's limit), the frame is cut in fewer, larger slices that
+/// do fit (#1633). Every other codec is one slice at once.
 fn burst_plan(
     datagrams: &[bytes::Bytes],
     pyrowave: bool,
@@ -1310,6 +1335,16 @@ fn burst_plan(
     }
     if counts.len() == 1 {
         return vec![(counts[0], std::time::Duration::ZERO)];
+    }
+    let spread = |n: usize| pacing_target(fps, n) * (n as u32 - 1);
+    let n = (2..=counts.len())
+        .rev()
+        .find(|&n| spread(n) <= frame_interval(fps) / 2)
+        .unwrap_or(2);
+    if n < counts.len() {
+        // Frames are whole datagrams but for the last: an even split by count is an even one by size.
+        let per = datagrams.len().div_ceil(n);
+        counts = datagrams.chunks(per).map(<[_]>::len).collect();
     }
     let gap = pacing_gap(fps, counts.len());
     counts
@@ -1343,7 +1378,9 @@ struct Pacing {
 }
 
 impl Pacing {
-    fn push(&mut self, frame: u16, gap: Duration, slices: Vec<Vec<bytes::Bytes>>) {
+    /// Queues a frame's slices; the datagrams of an older frame's unsent tail it dropped.
+    fn push(&mut self, frame: u16, gap: Duration, slices: Vec<Vec<bytes::Bytes>>) -> usize {
+        let mut dropped = 0;
         let frame_slices = slices.into_iter().map(|datagrams| Slice {
             frame,
             gap,
@@ -1361,9 +1398,10 @@ impl Pacing {
         {
             let oldest = self.queue[0].frame;
             while self.queue.front().is_some_and(|s| s.frame == oldest) {
-                self.queue.pop_front();
+                dropped += self.queue.pop_front().map_or(0, |s| s.datagrams.len());
             }
         }
+        dropped
     }
 
     /// When the next slice is due; `None` with nothing queued.
@@ -1827,6 +1865,8 @@ async fn stream(
     let mut current = client.config.clone();
     let mut pyro = pyro_rate(media, &current, None);
     let mut pyro_refused = 0u64;
+    // Datagrams of PyroWave frame tails dropped unsent by `Pacing`.
+    let mut pacing_dropped = 0u64;
     let mut pacing = Pacing::default();
     // What ends the stream: an optional last message, the close code and its reason.
     const QUIET: (Option<Value>, u32, &str) = (None, CLOSE_NORMAL, "");
@@ -1862,7 +1902,7 @@ async fn stream(
             // ABR, so the ABR's estimate is fed nothing then.
             _ = control_tick.tick(), if pyro.is_some() || (control.is_some() && current.codec != "pyrowave") => {
                 if let Some(rate) = pyro.as_mut() {
-                    let verdict = rate.on_tick(std::time::Instant::now(), quic_path(session));
+                    let verdict = rate.on_tick(std::time::Instant::now(), quic_path(session).with_held(video.bytes()));
                     pyro_act(media, &client, &mut pyro, control.as_mut(), verdict);
                 } else if let Some(control) = control.as_mut() {
                     control.tick(quinn::Connection::rtt(session), std::time::Instant::now());
@@ -2004,7 +2044,20 @@ async fn stream(
                         let gap = pacing_gap(current.fps, plan.len());
                         let mut rest = datagrams.into_iter();
                         let slices = plan.iter().map(|(n, _)| rest.by_ref().take(*n).collect()).collect();
-                        pacing.push(unit.frame_seq, gap, slices);
+                        let dropped = pacing.push(unit.frame_seq, gap, slices);
+                        if dropped > 0 {
+                            // The next frame repairs it (§Loss), but a sender that falls this far
+                            // behind is the pacing's or QUIC's doing: say so once, count the rest.
+                            if pacing_dropped == 0 {
+                                tracing::warn!(
+                                    token = "pyrowave-pacing-tail-dropped",
+                                    dropped,
+                                    "PyroWave frame tail dropped unsent: the slices of an older frame \
+                                     were still waiting when a third frame arrived; later ones are counted, not logged"
+                                );
+                            }
+                            pacing_dropped += dropped as u64;
+                        }
                         datagrams = pacing.pop(Instant::now()).unwrap_or_default();
                     }
                     for datagram in datagrams {
@@ -2100,7 +2153,7 @@ async fn stream(
                                 pyro_refused += 1;
                             }
                             if let (Some(rate), Ok(fb)) = (pyro.as_mut(), fb) {
-                                let verdict = rate.on_feedback(&fb, std::time::Instant::now(), quic_path(session));
+                                let verdict = rate.on_feedback(&fb, std::time::Instant::now(), quic_path(session).with_held(video.bytes()));
                                 pyro_act(media, &client, &mut pyro, control.as_mut(), verdict);
                             }
                         }
@@ -2170,6 +2223,13 @@ async fn stream(
             token = "pyrowave-feedback-refused",
             refused = pyro_refused,
             "PyroWave feedback messages ignored as out of contract"
+        );
+    }
+    if pacing_dropped > 0 {
+        tracing::debug!(
+            token = "pyrowave-pacing-tail-dropped",
+            dropped = pacing_dropped,
+            "PyroWave datagrams dropped unsent from frame tails by the slice pacing"
         );
     }
     if let Some(refused) = control.as_ref().map(|c| c.refused).filter(|&n| n > 0) {

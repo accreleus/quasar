@@ -2598,6 +2598,11 @@ fn budget_of(kbps: f64) -> u32 {
     pyro_budget(kbps)
 }
 
+/// The verdict `secs` after a cap at `kbps` let go (#1430): the budget has climbed from it.
+fn climbed(kbps: f64, secs: f64) -> PyroVerdict {
+    PyroVerdict::Budget(budget_of(kbps * PYRO_CLIMB_PER_S.powf(secs)))
+}
+
 /// The encoder fills its current budget for `ms`.
 fn fill(rate: &mut PyroRate, ms: u64) {
     rate.offer((u64::from(rate.budget) * ms / 8) as usize);
@@ -2679,15 +2684,15 @@ fn pyrowave_quic_cap_applies_from_the_first_feedback_and_never_lifts_the_target(
             fill(&mut rate, 100);
             rate.on_tick(at + Duration::from_millis(100), backed_up(8_000_000.0))
         },
-        PyroVerdict::Budget(target),
-        "a wider window never lifts the budget past the target"
+        climbed(150_000.0, 0.1),
+        "a wider window lets the cap go: the budget climbs from it, never past the target"
     );
     assert_eq!(
         {
             fill(&mut rate, 100);
             rate.on_tick(at + Duration::from_millis(200), quic_at(150_000.0))
         },
-        PyroVerdict::Hold,
+        climbed(150_000.0, 0.2),
         "a small window with nothing queued is the sender's own rate, not a cap"
     );
     let lossy = QuicPath {
@@ -2707,8 +2712,8 @@ fn pyrowave_quic_cap_applies_from_the_first_feedback_and_never_lifts_the_target(
             fill(&mut rate, 100);
             rate.on_tick(at + Duration::from_millis(400), lossy)
         },
-        PyroVerdict::Budget(target),
-        "no new congestion and an empty queue: the cap lets go"
+        climbed(150_000.0, 0.1),
+        "no new congestion and an empty queue: the cap lets go, and the budget climbs from it"
     );
     let unknown = QuicPath {
         cwnd_bytes: 0,
@@ -2719,7 +2724,7 @@ fn pyrowave_quic_cap_applies_from_the_first_feedback_and_never_lifts_the_target(
             fill(&mut rate, 100);
             rate.on_tick(at + Duration::from_millis(500), unknown)
         },
-        PyroVerdict::Hold,
+        climbed(150_000.0, 0.2),
         "no window known: no cap"
     );
     // From here the encoder gives less than its budget: a desktop under a LAN target.
@@ -2729,12 +2734,12 @@ fn pyrowave_quic_cap_applies_from_the_first_feedback_and_never_lifts_the_target(
     };
     assert_eq!(
         rate.on_tick(at + Duration::from_millis(600), lossier),
-        PyroVerdict::Hold,
+        climbed(150_000.0, 0.3),
         "a congestion rise with an encoder under its budget: the picture sets the rate"
     );
     assert_eq!(
         rate.on_tick(at + Duration::from_millis(700), backed_up(150_000.0)),
-        PyroVerdict::Hold,
+        climbed(150_000.0, 0.4),
         "one judgement of a waiting queue is a burst in flight"
     );
     assert_eq!(
@@ -2911,24 +2916,25 @@ fn pyrowave_an_application_limited_sender_with_a_small_window_never_steps_down()
     assert_eq!(rate.budget, budget_of(f64::from(PYRO_TARGET)));
 }
 
-/// #1430: the send log is sized for PyroWave's grant: the estimator reads the sent rate over
-/// its 0.5 s window, and at 400 Mbit/s that is 25 MB, ~21 800 datagrams, more than a log
-/// sized for the standard codec's 100 Mbit/s. A window the log cannot cover reads as
-/// application-limited, so the log holds it all.
+/// #1430: the send log is sized for the largest PyroWave grant: the estimator reads the sent
+/// rate over its 0.5 s window, and at the 1 Gbit/s a profile can allow (4K120's default is 800)
+/// that is 62.5 MB, ~54 400 datagrams, more than a log sized for 400 Mbit/s held. A window the
+/// log cannot cover reads as application-limited, so the log holds it all.
 #[test]
-fn pyrowave_send_log_spans_the_rate_window_at_a_400_mbit_grant() {
+fn pyrowave_send_log_spans_the_rate_window_at_a_1_gbit_grant() {
     let on = Instant::now();
     let mut log = SendLog::new(on);
-    // 400 Mbit/s is 50 000 B/ms; a whole datagram is 1 148 B, so 21 778 of them in 0.5 s.
-    let count = 21_778usize;
+    // 1 Gbit/s is 125 000 B/ms; a whole datagram is 1 148 B, so 54 439 of them in 0.5 s.
+    let count = 500 * 125_000 / SIZE + 1;
+    assert!(count > 54_000, "{count}");
     for seq in 0..count {
         let mut d = vec![0u8; SIZE];
         d[1..5].copy_from_slice(&(seq as u32).to_le_bytes());
-        log.record(&d, on + Duration::from_micros(seq as u64 * 23), false);
+        log.record(&d, on + Duration::from_micros(seq as u64 * 9), false);
     }
     assert!(
         LOG >= count,
-        "the {count} datagrams of 0.5 s at 400 Mbit/s outgrow the log"
+        "the {count} datagrams of 0.5 s at 1 Gbit/s outgrow the log"
     );
     assert!(
         MAX_ARRIVALS >= count,
@@ -3154,6 +3160,98 @@ fn pyrowave_a_link_under_the_floor_steps_down_with_feedback_withheld_and_the_bud
             .any(|(_, v)| matches!(v, PyroVerdict::Budget(b) if *b >= floor)),
         "the budget bounced back once the cut drained the queue: {verdicts:?}"
     );
+}
+
+/// #1430: on a link between the floor and the target the cap held the budget at the link, the
+/// queue drained, and the release handed back the whole target: the budget swung between the two
+/// every ~400 ms, 200 ms of each a third over the link. It climbs back instead, so it stays
+/// within a small band over the rate it was capped at.
+#[test]
+fn pyrowave_on_a_link_between_the_floor_and_the_target_the_budget_stays_near_the_link() {
+    for link in [150_000.0, 120_000.0] {
+        let on = Instant::now();
+        let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on, false);
+        let verdicts = QueuedPath::new(link).run(&mut rate, on, 12, |_| f64::MAX, None, false);
+        assert_eq!(steps_down(&verdicts), None, "link {link}: {verdicts:?}");
+        let budgets: Vec<u32> = verdicts
+            .iter()
+            .filter_map(|(_, v)| match v {
+                PyroVerdict::Budget(b) => Some(*b),
+                _ => None,
+            })
+            .collect();
+        let capped = budgets.iter().copied().skip(1).min().expect("a cap");
+        let after_cap = &budgets[1..];
+        let peak = after_cap.iter().copied().max().unwrap();
+        assert!(
+            f64::from(peak) <= f64::from(capped) * 1.2,
+            "link {link}: cap {capped}, peak {peak}: {verdicts:?}"
+        );
+        assert!(
+            f64::from(peak) < f64::from(pyro_budget(f64::from(PYRO_TARGET))) * 0.9,
+            "link {link}: the budget went back to the target: {verdicts:?}"
+        );
+    }
+}
+
+/// #1430: once the link has lifted the budget still reaches the target, in a few seconds.
+#[test]
+fn pyrowave_a_released_cap_climbs_back_to_the_target_not_in_one_step() {
+    let on = Instant::now();
+    let at = |ms: u64| on + Duration::from_millis(ms);
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on, false);
+    let target = budget_of(f64::from(PYRO_TARGET));
+    let capped = budget_of(150_000.0);
+    // Two judgements 100 ms apart with more than a window waiting: the cap, at 150 Mbit/s.
+    rate.on_tick(at(1_000), backed_up(150_000.0));
+    assert_eq!(
+        rate.on_tick(at(1_100), backed_up(150_000.0)),
+        PyroVerdict::Budget(capped)
+    );
+    // The queue drained, the window is wide open: the budget rises from the cap.
+    let mut last = capped;
+    let mut ms = 1_100;
+    while last < target {
+        ms += 100;
+        match rate.on_tick(at(ms), quic_at(8_000_000.0)) {
+            PyroVerdict::Budget(b) => {
+                assert!(
+                    b > last && f64::from(b) <= f64::from(last) * 1.1,
+                    "{last} -> {b}"
+                );
+                last = b;
+            }
+            v => panic!("{v:?} at {ms}"),
+        }
+        assert!(
+            ms < 1_100 + 3_000,
+            "not back at the target after 3 s: {last}"
+        );
+    }
+    assert_eq!(last, target);
+}
+
+/// #1633: video the agent holds for room in QUIC's queue waits on QUIC too.
+#[test]
+fn pyrowave_video_held_for_quic_counts_as_a_queue_waiting_on_the_window() {
+    let on = Instant::now();
+    let at = |ms: u64| on + Duration::from_millis(ms);
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on, false);
+    let target = budget_of(f64::from(PYRO_TARGET));
+    let window_full = quic_at(150_000.0);
+    assert!(window_full.cwnd_bytes < 64 * 1024);
+    // Nothing in quinn's queue, 64 KiB held here, over two judgements: the cap.
+    rate.on_tick(at(1_000), window_full.with_held(64 * 1024));
+    assert_ne!(
+        rate.on_tick(at(1_100), window_full.with_held(64 * 1024)),
+        PyroVerdict::Hold
+    );
+    assert!(rate.budget < target);
+    // The same path with nothing held is not capped.
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on, false);
+    rate.on_tick(at(1_000), window_full);
+    rate.on_tick(at(1_100), window_full);
+    assert_eq!(rate.budget, target);
 }
 
 #[test]
