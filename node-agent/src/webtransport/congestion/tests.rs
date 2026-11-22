@@ -5167,9 +5167,9 @@ fn policer(s: &mut Sim) {
     s.bucket_bytes = Some(15_000.0);
 }
 
-/// (freezes after the onset, the rung path, stalls, setpoint min after the onset, loss after
-/// onset + 20 s) of a lab row, printed.
-fn lab_summary(name: &str, s: &Sim) -> (Vec<f64>, Vec<(f64, usize)>, Vec<f64>, u32, f64) {
+/// (freezes after the onset, the rung path) of a lab row; printed with the stalls, the setpoint's
+/// minimum after the onset and the loss after onset + 20 s.
+fn lab_summary(name: &str, s: &Sim) -> (Vec<f64>, Vec<(f64, usize)>) {
     let freezes: Vec<f64> = s.client.as_ref().unwrap().freezes();
     let freezes: Vec<f64> = freezes.into_iter().filter(|&t| t >= 30.0).collect();
     let rungs: Vec<(f64, usize)> = s
@@ -5196,7 +5196,7 @@ fn lab_summary(name: &str, s: &Sim) -> (Vec<f64>, Vec<(f64, usize)>, Vec<f64>, u
         s.stalls,
         loss
     );
-    (freezes, rungs, s.stalls.clone(), low, loss)
+    (freezes, rungs)
 }
 
 /// R3: the sender reaches 540p within 15 s of the onset, the client freezes at most twice, and
@@ -5205,7 +5205,8 @@ fn lab_summary(name: &str, s: &Sim) -> (Vec<f64>, Vec<(f64, usize)>, Vec<f64>, u
 fn a_shallow_buffer_keeps_its_frames_and_reaches_540p_in_15_s() {
     lab_summary("A (legacy)", &lab_row(true, shallow));
     let s = lab_row(false, shallow);
-    let (freezes, _, stalls, _, _) = lab_summary("v2", &s);
+    let (freezes, _) = lab_summary("v2", &s);
+    let stalls = &s.stalls;
     let late: Vec<_> = stalls.iter().filter(|&&t| t >= 45.0).collect();
     assert!(
         s.rung_at(45.0) >= 3,
@@ -5220,9 +5221,9 @@ fn a_shallow_buffer_keeps_its_frames_and_reaches_540p_in_15_s() {
 /// once more than A, and the rung never steps up while the policer is on (the lab's R4 rule).
 #[test]
 fn a_policer_reaches_its_rung_and_never_climbs_back() {
-    let (a, ..) = lab_summary("A (legacy)", &lab_row(true, policer));
+    let (a, _) = lab_summary("A (legacy)", &lab_row(true, policer));
     let s = lab_row(false, policer);
-    let (freezes, rungs, ..) = lab_summary("v2", &s);
+    let (freezes, rungs) = lab_summary("v2", &s);
     let ups: Vec<_> = rungs
         .windows(2)
         .filter(|w| w[1].1 < w[0].1 && w[1].0 > 30.0)
