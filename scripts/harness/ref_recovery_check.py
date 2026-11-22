@@ -3,16 +3,23 @@
 `session::pipeline::ref_recovery::tests::capture_for_harness`.
 
     ref_recovery_check.py <dir> <h264|h265|av1>
+    ref_recovery_check.py --self-test
 
 Drops the capture's lost frames and checks, with ffmpeg as the reference decoder:
+  - the anchors, recovery frames and key frames are exactly what the capture
+    script asked for (the capture's "expect" block), so an encoder that answers
+    a recovery with a key frame, or keeps an anchor it should have forgotten,
+    fails;
   - every frame after a loss is a key frame or a recovery frame whose anchor was kept;
   - the references each kept frame names are the pictures the encoder meant
     (AV1: VBI slots simulated from refresh_frame_flags; HEVC: no RPS entry is a lost
     picture; H.264: the recovery frame names the anchor's LongTermFrameIdx);
   - the pruned stream decodes without an error and every kept frame is bit-identical
     to the full stream's decode;
-  - the full decode stays close to the source (a picture coded from another reference
-    than its header names decodes wrong without an error).
+  - the full decode stays close to the source, and no recovery frame is more than
+    NEAR_DB below the frames before it (a picture coded from another reference
+    than its header names decodes wrong without an error, and a near miss can
+    still score above the absolute floor).
 FFMPEG overrides the ffmpeg command (default: the linuxserver/ffmpeg image via docker).
 Exit 0 on pass; every failure is printed.
 """
@@ -20,11 +27,13 @@ import json
 import os
 import re
 import shlex
+import statistics
 import struct
 import subprocess
 import sys
 
-PSNR_MIN = 20.0  # a picture decoded from the wrong reference falls far below this
+PSNR_MIN = 20.0  # backstop: a picture decoded from a far-off reference
+NEAR_DB = 6.0  # a recovery frame this far below the frames before it decoded wrong
 EXT = {"h264": "h264", "h265": "hevc", "av1": "obu"}
 FMT = {"h264": "h264", "h265": "hevc", "av1": "obu"}
 FIELD = re.compile(r"\]\s+\d+\s+(\S+)\s+[01]+ = (-?\d+)")
@@ -82,6 +91,58 @@ def all_of(fields, prefix):
     return [v for k, v in fields if k.startswith(prefix)]
 
 
+def check_expect(expect, anchors, recov, keys):
+    """The capture script's outcome, exactly (input frame indexes)."""
+    want_recov = {a: b for a, b in expect["recoveries"]}
+    check(anchors == expect["anchors"],
+          f"anchors {anchors}, the script asked for {expect['anchors']}")
+    check(recov == want_recov, f"recoveries {sorted(recov.items())}, the script "
+                               f"asked for {sorted(want_recov.items())}")
+    check(keys == expect["keys"],
+          f"key frames {keys}, the script asked for {expect['keys']}")
+
+
+def check_recovery_psnr(psnr, recov, keys):
+    """Each recovery frame against the median of the four inter frames before it.
+    Not the ones after: they code from the recovery frame and inherit its error."""
+    for i in sorted(recov):
+        before = [psnr[j] for j in range(i - 1, -1, -1)
+                  if j not in recov and j not in keys][:4]
+        if i < len(psnr) and before:
+            med = statistics.median(before)
+            check(psnr[i] >= med - NEAR_DB,
+                  f"recovery frame {i} is {psnr[i]:.1f} dB luma PSNR, "
+                  f"{med - psnr[i]:.1f} dB below the frames before it ({med:.1f})")
+
+
+def self_test():
+    """The checks that judge the encoder, on streams that must fail them."""
+    global fails
+    expect = {"anchors": [10, 20], "recoveries": [[35, 20]], "keys": [0, 85]}
+    cases = [
+        ("honest", lambda: check_expect(expect, [10, 20], {35: 20}, [0, 85]), 0),
+        # answers the recovery with a key frame, and says so
+        ("always key frame", lambda: check_expect(expect, [10, 20], {}, [0, 35, 85]), 2),
+        # recovers from an anchor it should have forgotten instead of a key frame
+        ("kept a forgotten anchor",
+         lambda: check_expect(expect, [10, 20], {35: 20, 85: 10}, [0]), 2),
+        ("recovery close to its neighbours",
+         lambda: check_recovery_psnr([38.0] * 34 + [36.5] + [38.0] * 5, {34: 20}, [0]), 0),
+        # wrong but close: above the 20 dB floor, 14 dB below the frames before
+        ("wrong-reference recovery",
+         lambda: check_recovery_psnr([38.0] * 34 + [24.0] + [25.0] * 5, {34: 20}, [0]), 1),
+    ]
+    bad = 0
+    for name, run, want in cases:
+        fails = []
+        run()
+        ok = len(fails) == want
+        bad += not ok
+        print(f"{'ok  ' if ok else 'FAIL'} {name}: {len(fails)} failure(s), want {want}"
+              + "".join(f"\n       {f}" for f in fails))
+    return 1 if bad else 0
+
+
 def main(d, codec):
     meta = json.load(open(os.path.join(d, f"{codec}.json")))
     raw = open(os.path.join(d, f"{codec}.bin"), "rb").read()
@@ -98,9 +159,11 @@ def main(d, codec):
     reports = {idx[r["pts"]]: r for r in meta["reports"]}
     anchors = sorted(i for i, r in reports.items() if r["anchor"])
     recov = {i: idx[r["recover_from"]] for i, r in reports.items() if r["recover_from"] is not None}
+    keys = [i for i, f in enumerate(frames) if f["key"]]
     print(f"{codec}: {len(frames)} frames, {len(lost)} lost, anchors {anchors}, "
-          f"recoveries {sorted(recov.items())}, key frames "
-          f"{[i for i, f in enumerate(frames) if f['key']]}")
+          f"recoveries {sorted(recov.items())}, key frames {keys}")
+    if check("expect" in meta, "the capture has no expect block"):
+        check_expect(meta["expect"], anchors, recov, keys)
 
     full, pruned = f"full.{EXT[codec]}", f"pruned.{EXT[codec]}"
     open(os.path.join(d, full), "wb").write(b"".join(aus))
@@ -137,18 +200,22 @@ def main(d, codec):
                *(["-c:v", "libdav1d"] if codec == "av1" else []), "-i", full,
                "-f", "rawvideo", "-pix_fmt", "nv12", "-s",
                f"{meta['width']}x{meta['height']}", "-i", f"{codec}.nv12",
-               "-lavfi", "[0:v]setpts=N/(60*TB),format=nv12[a];[1:v]setpts=N/(60*TB)[b];"
-               "[a][b]psnr=stats_file=psnr.log",
+               # one exact timebase, so psnr pairs frame N with frame N (the OBU
+               # demuxer's ms timebase rounds N/60 s and pairs every other frame
+               # with its neighbour)
+               "-lavfi", "[0:v]settb=1/60,setpts=N,format=nv12[a];"
+               "[1:v]settb=1/60,setpts=N[b];[a][b]psnr=stats_file=psnr.log",
                "-f", "null", "-")
     psnr = []
     if os.path.exists(os.path.join(d, "psnr.log")):
         for line in open(os.path.join(d, "psnr.log")):
             m = re.search(r"psnr_y:(\S+)", line)
-            psnr.append(float("inf") if m.group(1) == "inf" else float(m.group(1)))
+            psnr.append(99.0 if m.group(1) == "inf" else float(m.group(1)))
         os.remove(os.path.join(d, "psnr.log"))
     check(len(psnr) == len(aus), f"psnr for {len(psnr)} frames: {r.stderr[:300]}")
     low = [(i, round(p, 1)) for i, p in enumerate(psnr) if p < PSNR_MIN]
     check(not low, f"frames below {PSNR_MIN} dB luma PSNR against the source: {low}")
+    check_recovery_psnr(psnr, recov, keys)
     if psnr:
         print(f"{codec}: luma PSNR min {min(psnr):.1f} dB over {len(psnr)} frames")
 
@@ -242,4 +309,5 @@ def check_h265(pk, frames, kept, lost, recov):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1], sys.argv[2]))
+    sys.exit(self_test() if sys.argv[1:] == ["--self-test"]
+             else main(sys.argv[1], sys.argv[2]))

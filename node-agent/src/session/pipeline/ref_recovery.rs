@@ -115,29 +115,102 @@ mod tests {
         From(usize),
         /// Recover from the newest anchor the encoder reported.
         FromNewest,
+        /// Recover from the frame taken at this input frame, which the encoder no
+        /// longer holds as an anchor: it must send a key frame.
+        Gone(usize),
     }
 
     /// Input frames the harness's checker treats as lost, inclusive ranges. Every
     /// recovery below follows a loss of the frames since its anchor's chain.
-    const LOST: [(usize, usize); 5] = [(21, 34), (41, 49), (59, 65), (67, 69), (72, 79)];
-    const SCRIPT: [(usize, Step); 13] = [
+    const LOST: [(usize, usize); 6] = [
+        (21, 34),
+        (41, 49),
+        (59, 65),
+        (67, 69),
+        (72, 79),
+        (81, 84),
+    ];
+    const SCRIPT: [(usize, Step); 14] = [
         (10, Step::Anchor),
         (20, Step::Anchor),
         (30, Step::Anchor),
+        // forgets 30, the anchor newer than 20
         (35, Step::From(20)),
         (40, Step::Anchor),
         (50, Step::From(40)),
-        // 10 was evicted by 40 (three held): a key frame
+        // 10 is still held (35 forgot only 30); forgets 20 and 40
         (55, Step::From(10)),
         (58, Step::Anchor),
         (63, Step::From(58)),
         // 63 itself lost: the same anchor again
         (66, Step::From(58)),
         (70, Step::From(58)),
+        // on H.264 the anchor is 71: a recovery frame cannot be one there
         (70, Step::Anchor),
         (80, Step::FromNewest),
+        // 30 was forgotten at 35
+        (85, Step::Gone(30)),
     ];
     const FRAMES: usize = 90;
+
+    /// What the encoder must make of [`SCRIPT`], by input frame: the anchors, the
+    /// recoveries (frame, anchor) and the key frames. An anchor request waits out a
+    /// key frame and, on H.264, a recovery frame or the frame after an anchor
+    /// (`gstrefrecovery.h`). The checker requires exactly this.
+    fn expected(codec: &str) -> serde_json::Value {
+        let (mut anchors, mut recoveries, mut keys) = (Vec::new(), Vec::new(), vec![0]);
+        let mut pending = false;
+        for at in 1..FRAMES {
+            let (mut from, mut key) = (None, false);
+            for (_, step) in SCRIPT.iter().filter(|(i, _)| *i == at) {
+                match step {
+                    Step::Anchor => pending = true,
+                    Step::From(i) => from = Some(*i),
+                    Step::FromNewest => from = anchors.last().copied(),
+                    Step::Gone(_) => key = true,
+                }
+            }
+            if key {
+                keys.push(at);
+                continue;
+            }
+            if let Some(a) = from {
+                recoveries.push((at, a));
+            }
+            let waits =
+                codec == "h264" && (from.is_some() || anchors.last() == Some(&(at - 1)));
+            if pending && !waits {
+                anchors.push(at);
+                pending = false;
+            }
+        }
+        serde_json::json!({ "anchors": anchors, "recoveries": recoveries, "keys": keys })
+    }
+
+    #[test]
+    fn expected_follows_the_script() {
+        let recoveries = |newest: usize| {
+            serde_json::json!([[35, 20], [50, 40], [55, 10], [63, 58], [66, 58], [70, 58], [80, newest]])
+        };
+        for codec in ["av1", "h265"] {
+            assert_eq!(
+                expected(codec),
+                serde_json::json!({
+                    "anchors": [10, 20, 30, 40, 58, 70],
+                    "recoveries": recoveries(70),
+                    "keys": [0, 85],
+                })
+            );
+        }
+        assert_eq!(
+            expected("h264"),
+            serde_json::json!({
+                "anchors": [10, 20, 30, 40, 58, 71],
+                "recoveries": recoveries(71),
+                "keys": [0, 85],
+            })
+        );
+    }
 
     /// Hardware capture for `scripts/harness/run-ref-recovery.sh`: encodes a moving test
     /// pattern with `num-anchors=3`, sends [`SCRIPT`], and writes the access units, the
@@ -229,7 +302,7 @@ mod tests {
                     for (_, step) in SCRIPT.iter().filter(|(i, _)| *i == at) {
                         let event = match step {
                             Step::Anchor => anchor_event(),
-                            Step::From(i) => recover_event(seen[*i]),
+                            Step::From(i) | Step::Gone(i) => recover_event(seen[*i]),
                             Step::FromNewest => {
                                 let r = reports.lock().unwrap();
                                 recover_event(r.iter().rev().find(|r| r.anchor).unwrap().pts)
@@ -294,6 +367,7 @@ mod tests {
             "height": 360,
             "input_pts": input_pts.lock().unwrap().iter().map(|p| p.nseconds()).collect::<Vec<_>>(),
             "lost": LOST,
+            "expect": expected(&codec),
             "frames": frames,
             "reports": reports,
         });

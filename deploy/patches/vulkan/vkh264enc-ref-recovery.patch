@@ -1,5 +1,5 @@
 diff --git a/subprojects/gst-plugins-bad/ext/vulkan/base/gsth264encoder.c b/subprojects/gst-plugins-bad/ext/vulkan/base/gsth264encoder.c
-index 4202f8d..76903b2 100644
+index 4202f8d..64cd0c6 100644
 --- a/subprojects/gst-plugins-bad/ext/vulkan/base/gsth264encoder.c
 +++ b/subprojects/gst-plugins-bad/ext/vulkan/base/gsth264encoder.c
 @@ -45,6 +45,7 @@
@@ -18,15 +18,16 @@ index 4202f8d..76903b2 100644
    N_PROPERTIES
  };
  
-@@ -151,6 +153,7 @@ struct _GstH264EncoderPrivate
+@@ -151,6 +153,8 @@ struct _GstH264EncoderPrivate
    {
      guint max_num_reference_list0;
      guint max_num_reference_list1;
 +    guint max_num_anchors;
++    GstH264Level max_level;
      guint preferred_output_delay;
    } config;
  
-@@ -161,6 +164,7 @@ struct _GstH264EncoderPrivate
+@@ -161,6 +165,7 @@ struct _GstH264EncoderPrivate
      guint num_bframes;
      guint num_ref_frames;
      gboolean b_pyramid;
@@ -34,7 +35,7 @@ index 4202f8d..76903b2 100644
    } prop;
  
    struct
-@@ -210,8 +214,14 @@ struct _GstH264EncoderPrivate
+@@ -210,8 +215,14 @@ struct _GstH264EncoderPrivate
      guint max_num_ref_frames;
  
      GstVideoCodecFrame *last_keyframe;
@@ -49,7 +50,7 @@ index 4202f8d..76903b2 100644
    /* current params */
    struct
    {
-@@ -310,6 +320,9 @@ gst_h264_encoder_frame_new (void)
+@@ -310,6 +321,9 @@ gst_h264_encoder_frame_new (void)
    *frame = (GstH264EncoderFrame) {
      .gop_frame_num = 0,
      .unused_for_reference_pic_num = -1,
@@ -59,17 +60,26 @@ index 4202f8d..76903b2 100644
    };
    /* *INDENT-ON */
  
-@@ -539,6 +552,17 @@ gst_h264_encoder_generate_gop_structure (GstH264Encoder * self)
+@@ -539,6 +553,26 @@ gst_h264_encoder_generate_gop_structure (GstH264Encoder * self)
    if (priv->stream.profile == GST_H264_PROFILE_BASELINE)
      priv->gop.num_bframes = 0;
  
 +  /* reference recovery codes every frame from one earlier picture */
 +  if (priv->gop.num_anchors > 0) {
-+    if (priv->gop.num_anchors > priv->config.max_num_anchors) {
-+      GST_WARNING_OBJECT (self, "Lowering num-anchors from %u to %u (DPB size)",
-+          priv->gop.num_anchors, priv->config.max_num_anchors);
-+      priv->gop.num_anchors = priv->config.max_num_anchors;
++    GstVideoInfo *info = &priv->input_state->info;
++    guint by_level = gst_h264_encoder_max_anchors_for_level (priv->stream.profile,
++        info, priv->stream.level, priv->config.max_level);
++    guint max = MIN (priv->config.max_num_anchors, by_level);
++
++    if (priv->gop.num_anchors > max) {
++      GST_WARNING_OBJECT (self, "Lowering num-anchors from %u to %u: the DPB "
++          "holds %u, the level allows %u at %dx%d", priv->gop.num_anchors, max,
++          priv->config.max_num_anchors, by_level, GST_VIDEO_INFO_WIDTH (info),
++          GST_VIDEO_INFO_HEIGHT (info));
++      priv->gop.num_anchors = max;
 +    }
++  }
++  if (priv->gop.num_anchors > 0) {
 +    priv->gop.num_bframes = 0;
 +    priv->gop.b_pyramid = FALSE;
 +  }
@@ -77,7 +87,7 @@ index 4202f8d..76903b2 100644
    /* If not set, generate a idr every second */
    if (priv->gop.idr_period == 0) {
      priv->gop.idr_period = (priv->fps_n + priv->fps_d - 1) / priv->fps_d;
-@@ -738,6 +762,17 @@ create_poc:
+@@ -738,6 +772,17 @@ create_poc:
      priv->gop.max_num_ref_frames = priv->gop.max_dec_frame_buffering - 1;
    }
  
@@ -95,7 +105,7 @@ index 4202f8d..76903b2 100644
    /* logic from x264 -- keep it in order to support open GOPs in the future */
  #if 0
    {
-@@ -833,6 +868,8 @@ gst_h264_encoder_reset (GstH264Encoder * self)
+@@ -833,6 +878,8 @@ gst_h264_encoder_reset (GstH264Encoder * self)
    priv->gop.num_bframes = priv->prop.num_bframes;
    priv->gop.num_iframes = priv->prop.num_iframes;
    priv->gop.b_pyramid = priv->prop.b_pyramid;
@@ -104,10 +114,61 @@ index 4202f8d..76903b2 100644
    GST_OBJECT_UNLOCK (self);
  
    priv->stream.profile = GST_H264_PROFILE_INVALID;
-@@ -1696,6 +1733,178 @@ gst_h264_encoder_encode_frame_with_ref_lists (GstH264Encoder * self,
+@@ -1696,6 +1743,226 @@ gst_h264_encoder_encode_frame_with_ref_lists (GstH264Encoder * self,
        list1);
  }
  
++/* Reference recovery: the most anchors the level allows at @info's size. The
++ * SPS then says max_dec_frame_buffering = K + 2 (the anchors, the chain
++ * picture and the picture being coded), which must stay within MaxDpbFrames
++ * (Table A-1) of the level the stream gets without anchors (@level when it was
++ * negotiated), so anchors never raise the level; @max_level (0 = none) is the
++ * accelerator's, which the subclass clamps the SPS to. */
++guint
++gst_h264_encoder_max_anchors_for_level (GstH264Profile profile,
++    GstVideoInfo * info, GstH264Level level, GstH264Level max_level)
++{
++  const GstH264LevelDescriptor *desc = NULL;
++  guint i, pic_size_mbs, dpb_frames;
++
++  if (level == 0) {
++    desc = gst_h264_get_level_descriptor (profile, 0, info, 2);
++    if (!desc)
++      return 0;
++    level = desc->level_idc;
++  }
++  if (max_level > 0 && level > max_level)
++    level = max_level;
++
++  desc = NULL;
++  for (i = 0; i < G_N_ELEMENTS (_h264_levels); i++) {
++    if (_h264_levels[i].level_idc == level)
++      desc = &_h264_levels[i];
++  }
++  pic_size_mbs = (GST_ROUND_UP_16 (GST_VIDEO_INFO_WIDTH (info)) / 16) *
++      (GST_ROUND_UP_16 (GST_VIDEO_INFO_HEIGHT (info)) / 16);
++  if (!desc || pic_size_mbs == 0)
++    return 0;
++
++  dpb_frames = MIN (desc->max_dpb_mbs / pic_size_mbs, 16);
++  return dpb_frames > 2 ? dpb_frames - 2 : 0;
++}
++
++/* Reference recovery: whether held picture @h stays held once @frame, coded
++ * from @src (NULL for an I frame), is. Only anchors stay: @frame replaces the
++ * chain picture, @evict gives its LongTermFrameIdx to @frame, and after a
++ * recovery the anchors newer than @src may be missing in the decoder. */
++gboolean
++gst_h264_encoder_anchor_ref_kept (GstH264EncoderFrame * h,
++    GstH264EncoderFrame * frame, GstH264EncoderFrame * src,
++    GstH264EncoderFrame * evict)
++{
++  if (h == evict || h->long_term_frame_idx < 0)
++    return FALSE;
++  return !(src && GST_CLOCK_TIME_IS_VALID (frame->recover_from)
++      && h->gop_frame_num > src->gop_frame_num);
++}
++
 +/* Reference recovery: the one picture a P @frame codes from, and whether it
 + * becomes an anchor. @refs is the held set (the chain picture and the
 + * anchors) in ascending frame_num. The chain is the newest; a recovery frame
@@ -254,19 +315,16 @@ index 4202f8d..76903b2 100644
 +  g_assert (klass->encode_frame);
 +  ret = klass->encode_frame (self, frame, h264_frame, &slice_hdr,
 +      priv->ref_list0, priv->ref_list1);
-+  if (ret != GST_FLOW_OK || !h264_frame->type.is_ref || !src)
++  if (ret != GST_FLOW_OK || !h264_frame->type.is_ref)
 +    goto done;
 +
-+  /* Keep the chain and the anchors. After a recovery, anchors newer than
-+   * the one used may be missing in the decoder: forget them. */
++  /* also after a non-IDR I frame, which replaces the chain picture */
 +  for (l = priv->ref_list.head; l;) {
 +    GstVideoCodecFrame *f = l->data;
 +    GstH264EncoderFrame *h = _GET_FRAME (f);
 +    GList *next = l->next;
 +
-+    if (h == evict || h->long_term_frame_idx < 0
-+        || (GST_CLOCK_TIME_IS_VALID (h264_frame->recover_from)
-+            && h->gop_frame_num > src->gop_frame_num)) {
++    if (!gst_h264_encoder_anchor_ref_kept (h, h264_frame, src, evict)) {
 +      g_queue_delete_link (&priv->ref_list, l);
 +      gst_video_codec_frame_unref (f);
 +    }
@@ -283,32 +341,33 @@ index 4202f8d..76903b2 100644
  static GstFlowReturn
  gst_h264_encoder_encode_frame (GstH264Encoder * self,
      GstVideoCodecFrame * frame, gboolean is_last)
-@@ -1708,6 +1917,24 @@ gst_h264_encoder_encode_frame (GstH264Encoder * self,
+@@ -1708,6 +1975,25 @@ gst_h264_encoder_encode_frame (GstH264Encoder * self,
    h264_frame = _GET_FRAME (frame);
    h264_frame->last_frame = is_last;
  
 +  if (priv->gop.num_anchors > 0) {
++    gboolean anchor;
++
 +    ret = gst_h264_encoder_encode_frame_anchors (self, frame);
 +    if (ret != GST_FLOW_OK)
 +      return ret;
 +    g_queue_push_tail (&priv->output_list, gst_video_codec_frame_ref (frame));
-+    if (h264_frame->long_term_frame_idx >= 0
-+        || GST_CLOCK_TIME_IS_VALID (h264_frame->recover_from)) {
-+      if (h264_frame->long_term_frame_idx >= 0) {
-+        GST_OBJECT_LOCK (self);
-+        priv->req.anchor = FALSE;
-+        GST_OBJECT_UNLOCK (self);
-+      }
-+      gst_ref_recovery_report (frame, h264_frame->long_term_frame_idx >= 0,
-+          h264_frame->recover_from);
++    anchor = h264_frame->long_term_frame_idx >= 0;
++    /* this frame could not be the anchor: the request waits for the next */
++    if (h264_frame->want_anchor && !anchor) {
++      GST_OBJECT_LOCK (self);
++      priv->req.anchor = TRUE;
++      GST_OBJECT_UNLOCK (self);
 +    }
++    if (anchor || GST_CLOCK_TIME_IS_VALID (h264_frame->recover_from))
++      gst_ref_recovery_report (frame, anchor, h264_frame->recover_from);
 +    return GST_FLOW_OK;
 +  }
 +
    if (h264_frame->type.is_ref) {
      unused_ref =
          gst_h264_encoder_find_unused_reference_frame (self, h264_frame);
-@@ -2327,7 +2554,8 @@ gst_h264_encoder_sps_init (GstH264Encoder * self)
+@@ -2327,7 +2613,8 @@ gst_h264_encoder_sps_init (GstH264Encoder * self)
      .offset_for_ref_frame = { 0, },
  
      .num_ref_frames = priv->gop.max_num_ref_frames,
@@ -318,7 +377,7 @@ index 4202f8d..76903b2 100644
      .pic_width_in_mbs_minus1 = mb_width - 1,
      .pic_height_in_map_units_minus1 = mb_height - 1,
      .frame_mbs_only_flag = 1,
-@@ -2595,6 +2823,34 @@ gst_h264_encoder_handle_frame (GstVideoEncoder * encoder,
+@@ -2595,6 +2882,36 @@ gst_h264_encoder_handle_frame (GstVideoEncoder * encoder,
        gst_h264_encoder_frame_unref);
    gst_h264_encoder_push_dts (self, frame);
  
@@ -326,8 +385,10 @@ index 4202f8d..76903b2 100644
 +  {
 +    GstRefRecoveryRequest req;
 +
++    /* taken; encode_frame() re-arms an anchor request this frame cannot take */
 +    GST_OBJECT_LOCK (self);
 +    req = priv->req;
++    priv->req.anchor = FALSE;
 +    priv->req.recover = FALSE;
 +    GST_OBJECT_UNLOCK (self);
 +
@@ -353,7 +414,7 @@ index 4202f8d..76903b2 100644
    if (klass->new_output) {
      ret = klass->new_output (self, frame, h264_frame);
      if (ret != GST_FLOW_OK)
-@@ -2672,6 +2928,24 @@ error_push_buffer:
+@@ -2672,6 +2989,24 @@ error_push_buffer:
    }
  }
  
@@ -378,7 +439,7 @@ index 4202f8d..76903b2 100644
  static gboolean
  gst_h264_encoder_flush (GstVideoEncoder * encoder)
  {
-@@ -2709,6 +2983,7 @@ gst_h264_encoder_init (GstH264Encoder * self)
+@@ -2709,6 +3044,7 @@ gst_h264_encoder_init (GstH264Encoder * self)
  
    priv->config.max_num_reference_list0 = 1;
    priv->config.max_num_reference_list1 = 0;
@@ -386,7 +447,7 @@ index 4202f8d..76903b2 100644
    priv->config.preferred_output_delay = 0;
  
    priv->ref_list0 = g_array_sized_new (FALSE, TRUE,
-@@ -2756,6 +3031,9 @@ gst_h264_encoder_get_property (GObject * object, guint property_id,
+@@ -2756,6 +3092,9 @@ gst_h264_encoder_get_property (GObject * object, guint property_id,
      case PROP_B_PYRAMID:
        g_value_set_boolean (value, priv->prop.b_pyramid);
        break;
@@ -396,7 +457,7 @@ index 4202f8d..76903b2 100644
      default:
        G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
        break;
-@@ -2792,6 +3070,9 @@ gst_h264_encoder_set_property (GObject * object, guint property_id,
+@@ -2792,6 +3131,9 @@ gst_h264_encoder_set_property (GObject * object, guint property_id,
        priv->prop.b_pyramid = g_value_get_boolean (value);
        g_atomic_int_set (&priv->need_configure, TRUE);
        break;
@@ -406,7 +467,7 @@ index 4202f8d..76903b2 100644
      default:
        G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
        break;
-@@ -2817,6 +3098,7 @@ gst_h264_encoder_class_init (GstH264EncoderClass * klass)
+@@ -2817,6 +3159,7 @@ gst_h264_encoder_class_init (GstH264EncoderClass * klass)
    encoder_class->handle_frame =
        GST_DEBUG_FUNCPTR (gst_h264_encoder_handle_frame);
    encoder_class->flush = GST_DEBUG_FUNCPTR (gst_h264_encoder_flush);
@@ -414,7 +475,7 @@ index 4202f8d..76903b2 100644
    encoder_class->finish = GST_DEBUG_FUNCPTR (gst_h264_encoder_finish);
  
    klass->negotiate = GST_DEBUG_FUNCPTR (gst_h264_encoder_negotiate_default);
-@@ -2895,6 +3177,21 @@ gst_h264_encoder_class_init (GstH264EncoderClass * klass)
+@@ -2895,6 +3238,21 @@ gst_h264_encoder_class_init (GstH264EncoderClass * klass)
        "Enable the b-pyramid reference structure in the GOP",
        H264ENC_B_PYRAMID_DEFAULT, param_flags);
  
@@ -436,7 +497,7 @@ index 4202f8d..76903b2 100644
    g_object_class_install_properties (object_class, N_PROPERTIES, properties);
  
    gst_type_mark_as_plugin_api (GST_TYPE_H264_ENCODER, 0);
-@@ -2922,6 +3219,25 @@ gst_h264_encoder_set_max_num_references (GstH264Encoder * self, guint list0,
+@@ -2922,6 +3280,29 @@ gst_h264_encoder_set_max_num_references (GstH264Encoder * self, guint list0,
    priv->config.max_num_reference_list1 = list1;
  }
  
@@ -445,11 +506,14 @@ index 4202f8d..76903b2 100644
 + * @self: a #GstH264Encoder
 + * @max_anchors: how many anchors the accelerator's DPB can hold besides the
 + *   chain picture and the picture being coded
++ * @max_level: the accelerator's highest level, 0 when unknown
 + *
-+ * Call from new_sequence(); num-anchors is clamped to it.
++ * Call from new_sequence(); num-anchors is clamped to @max_anchors and to
++ * what the level allows (gst_h264_encoder_max_anchors_for_level()).
 + */
 +void
-+gst_h264_encoder_set_max_num_anchors (GstH264Encoder * self, guint max_anchors)
++gst_h264_encoder_set_max_num_anchors (GstH264Encoder * self, guint max_anchors,
++    GstH264Level max_level)
 +{
 +  GstH264EncoderPrivate *priv;
 +
@@ -457,26 +521,28 @@ index 4202f8d..76903b2 100644
 +
 +  priv = _GET_PRIV (self);
 +  priv->config.max_num_anchors = MIN (max_anchors, 7);
++  priv->config.max_level = max_level > 0 ? max_level : 0;
 +}
 +
  /**
   * gst_h264_encoder_is_live:
   * @self: a #GstH264Encoder
 diff --git a/subprojects/gst-plugins-bad/ext/vulkan/base/gsth264encoder.h b/subprojects/gst-plugins-bad/ext/vulkan/base/gsth264encoder.h
-index 19ebf56..dbbdb58 100644
+index 19ebf56..d189cbd 100644
 --- a/subprojects/gst-plugins-bad/ext/vulkan/base/gsth264encoder.h
 +++ b/subprojects/gst-plugins-bad/ext/vulkan/base/gsth264encoder.h
-@@ -218,6 +218,9 @@ void                 gst_h264_encoder_set_max_num_references (GstH264Encoder * s
+@@ -218,6 +218,10 @@ void                 gst_h264_encoder_set_max_num_references (GstH264Encoder * s
                                                                guint list0,
                                                                guint list1);
  
 +void                 gst_h264_encoder_set_max_num_anchors    (GstH264Encoder * self,
-+                                                              guint max_anchors);
++                                                              guint max_anchors,
++                                                              GstH264Level max_level);
 +
  void                 gst_h264_encoder_set_preferred_output_delay
                                                               (GstH264Encoder * self,
                                                                guint delay);
-@@ -293,6 +296,15 @@ struct _GstH264EncoderFrame
+@@ -293,6 +297,15 @@ struct _GstH264EncoderFrame
     * this frame. -1 if we do not need to care about it explicitly. */
    gint32 unused_for_reference_pic_num;
  
@@ -492,7 +558,7 @@ index 19ebf56..dbbdb58 100644
    gpointer user_data;
    GDestroyNotify user_data_destroy_notify;
  };
-@@ -323,4 +335,18 @@ gst_h264_encoder_frame_unref (void * frame)
+@@ -323,4 +336,28 @@ gst_h264_encoder_frame_unref (void * frame)
    gst_mini_object_unref (GST_MINI_OBJECT_CAST (frame));
  }
  
@@ -505,6 +571,16 @@ index 19ebf56..dbbdb58 100644
 +                                                              GstH264EncoderFrame * frame,
 +                                                              GstH264EncoderFrame ** evict);
 +G_GNUC_INTERNAL
++gboolean             gst_h264_encoder_anchor_ref_kept        (GstH264EncoderFrame * h,
++                                                              GstH264EncoderFrame * frame,
++                                                              GstH264EncoderFrame * src,
++                                                              GstH264EncoderFrame * evict);
++G_GNUC_INTERNAL
++guint                gst_h264_encoder_max_anchors_for_level  (GstH264Profile profile,
++                                                              GstVideoInfo * info,
++                                                              GstH264Level level,
++                                                              GstH264Level max_level);
++G_GNUC_INTERNAL
 +void                 gst_h264_encoder_anchor_slice_hdr       (guint num_anchors,
 +                                                              GstH264EncoderFrame * ref,
 +                                                              GstH264EncoderFrame * frame,
@@ -512,21 +588,23 @@ index 19ebf56..dbbdb58 100644
 +
  G_END_DECLS
 diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
-index b90ca80..86c3bec 100644
+index b90ca80..151e5f1 100644
 --- a/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
 +++ b/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
-@@ -1031,6 +1031,10 @@ gst_vulkan_h264_encoder_new_sequence (GstH264Encoder * encoder,
+@@ -1031,6 +1031,12 @@ gst_vulkan_h264_encoder_new_sequence (GstH264Encoder * encoder,
    gst_h264_encoder_set_max_num_references (encoder,
        vk_h264_caps->maxPPictureL0ReferenceCount,
        vk_h264_caps->maxL1ReferenceCount);
 +  /* reference recovery holds the chain picture, the anchors and the picture
-+   * being coded */
++   * being coded; new_parameters() clamps the level to maxLevelIdc */
 +  gst_h264_encoder_set_max_num_anchors (encoder,
-+      vk_caps.caps.maxDpbSlots > 2 ? vk_caps.caps.maxDpbSlots - 2 : 0);
++      vk_caps.caps.maxDpbSlots > 2 ? vk_caps.caps.maxDpbSlots - 2 : 0,
++      vk_h264_caps->maxLevelIdc > STD_VIDEO_H264_LEVEL_IDC_1_0 ?
++      gst_h264_level_idc_from_vk (vk_h264_caps->maxLevelIdc) : 0);
  
    if (gst_h264_encoder_is_live (encoder)) {
      /* low latency */
-@@ -1537,8 +1541,10 @@ _setup_ref_lists (GstH264EncoderFrame * h264_frame, GstH264SliceHdr * slice_hdr,
+@@ -1537,8 +1543,10 @@ _setup_ref_lists (GstH264EncoderFrame * h264_frame, GstH264SliceHdr * slice_hdr,
    /* *INDENT-OFF* */
    vk_frame->ref_list_info = (StdVideoEncodeH264ReferenceListsInfo) {
      .flags = {
@@ -539,7 +617,7 @@ index b90ca80..86c3bec 100644
        .reserved = 0,
      },
      .num_ref_idx_l0_active_minus1 =
-@@ -1583,7 +1589,10 @@ _setup_ref_lists (GstH264EncoderFrame * h264_frame, GstH264SliceHdr * slice_hdr,
+@@ -1583,7 +1591,10 @@ _setup_ref_lists (GstH264EncoderFrame * h264_frame, GstH264SliceHdr * slice_hdr,
      /* *INDENT-OFF* */
      vk_frame->mods[0][i] = (StdVideoEncodeH264RefListModEntry) {
        .modification_of_pic_nums_idc = mod->modification_of_pic_nums_idc,
@@ -551,7 +629,7 @@ index b90ca80..86c3bec 100644
      };
      /* *INDENT-ON* */
    }
-@@ -1597,7 +1606,10 @@ _setup_ref_lists (GstH264EncoderFrame * h264_frame, GstH264SliceHdr * slice_hdr,
+@@ -1597,7 +1608,10 @@ _setup_ref_lists (GstH264EncoderFrame * h264_frame, GstH264SliceHdr * slice_hdr,
      /* *INDENT-OFF* */
      vk_frame->mods[1][i] = (StdVideoEncodeH264RefListModEntry) {
        .modification_of_pic_nums_idc = mod->modification_of_pic_nums_idc,
@@ -563,7 +641,7 @@ index b90ca80..86c3bec 100644
      };
      /* *INDENT-ON* */
    }
-@@ -1610,6 +1622,8 @@ _setup_ref_lists (GstH264EncoderFrame * h264_frame, GstH264SliceHdr * slice_hdr,
+@@ -1610,6 +1624,8 @@ _setup_ref_lists (GstH264EncoderFrame * h264_frame, GstH264SliceHdr * slice_hdr,
  
      /* *INDENT-OFF* */
      vk_frame->mmco[i] = (StdVideoEncodeH264RefPicMarkingEntry) {
@@ -572,7 +650,7 @@ index b90ca80..86c3bec 100644
        .long_term_frame_idx = mmco->long_term_frame_idx,
        .max_long_term_frame_idx_plus1 = mmco->max_long_term_frame_idx_plus1,
        .long_term_pic_num = mmco->long_term_pic_num,
-@@ -1816,15 +1830,16 @@ gst_vulkan_h264_encoder_encode_frame (GstH264Encoder * base,
+@@ -1816,15 +1832,16 @@ gst_vulkan_h264_encoder_encode_frame (GstH264Encoder * base,
    };
  
    vk_frame->ref_info = (StdVideoEncodeH264ReferenceInfo) {
@@ -594,10 +672,10 @@ index b90ca80..86c3bec 100644
    /* *INDENT-ON* */
 diff --git a/subprojects/gst-plugins-bad/tests/check/libs/vkvideoencodeh264anchors.c b/subprojects/gst-plugins-bad/tests/check/libs/vkvideoencodeh264anchors.c
 new file mode 100644
-index 0000000..bbd5ac1
+index 0000000..97aee21
 --- /dev/null
 +++ b/subprojects/gst-plugins-bad/tests/check/libs/vkvideoencodeh264anchors.c
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,260 @@
 +/* GStreamer
 + * Copyright (C) 2026 Quasar contributors
 + *
@@ -776,6 +854,69 @@ index 0000000..bbd5ac1
 +
 +GST_END_TEST;
 +
++/* Which pictures stay held once a frame is coded: only anchors, and after a
++ * recovery none newer than the one it coded from. */
++GST_START_TEST (test_h264_anchor_prune)
++{
++  GstH264EncoderFrame *a10 = frame (GST_H264_P_SLICE, 10, 0);
++  GstH264EncoderFrame *a20 = frame (GST_H264_P_SLICE, 20, 1);
++  GstH264EncoderFrame *a30 = frame (GST_H264_P_SLICE, 30, 2);
++  GstH264EncoderFrame *chain = frame (GST_H264_P_SLICE, 34, -1);
++  GstH264EncoderFrame *p = frame (GST_H264_P_SLICE, 35, -1);
++  GstH264EncoderFrame *i = frame (GST_H264_I_SLICE, 35, -1);
++
++  /* from the chain: the anchors stay, the chain is replaced */
++  fail_unless (gst_h264_encoder_anchor_ref_kept (a10, p, chain, NULL));
++  fail_unless (gst_h264_encoder_anchor_ref_kept (a30, p, chain, NULL));
++  fail_if (gst_h264_encoder_anchor_ref_kept (chain, p, chain, NULL));
++  /* an evicted anchor goes */
++  fail_if (gst_h264_encoder_anchor_ref_kept (a10, p, chain, a10));
++
++  /* recovering from 20: 30 may be missing in the decoder, forget it */
++  p->recover_from = 20 * GST_MSECOND;
++  fail_unless (gst_h264_encoder_anchor_ref_kept (a10, p, a20, NULL));
++  fail_unless (gst_h264_encoder_anchor_ref_kept (a20, p, a20, NULL));
++  fail_if (gst_h264_encoder_anchor_ref_kept (a30, p, a20, NULL));
++  fail_if (gst_h264_encoder_anchor_ref_kept (chain, p, a20, NULL));
++
++  /* a non-IDR I frame replaces the chain too, and keeps the anchors */
++  fail_unless (gst_h264_encoder_anchor_ref_kept (a30, i, NULL, NULL));
++  fail_if (gst_h264_encoder_anchor_ref_kept (chain, i, NULL, NULL));
++}
++
++GST_END_TEST;
++
++static guint
++anchors_for (gint w, gint h, gint fps, GstH264Level level,
++    GstH264Level max_level)
++{
++  GstVideoInfo info;
++
++  gst_video_info_set_format (&info, GST_VIDEO_FORMAT_NV12, w, h);
++  GST_VIDEO_INFO_FPS_N (&info) = fps;
++  GST_VIDEO_INFO_FPS_D (&info) = 1;
++  return gst_h264_encoder_max_anchors_for_level (GST_H264_PROFILE_BASELINE,
++      &info, level, max_level);
++}
++
++/* K anchors need max_dec_frame_buffering K + 2 within MaxDpbFrames of the
++ * level the stream gets without them (Table A-1). */
++GST_START_TEST (test_h264_anchor_level)
++{
++  assert_equals_int (anchors_for (640, 360, 60, 0, 0), 14);     /* 3.1 */
++  assert_equals_int (anchors_for (1280, 720, 60, 0, 0), 3);     /* 3.2 */
++  assert_equals_int (anchors_for (1920, 1080, 30, 0, 0), 2);    /* 4 */
++  assert_equals_int (anchors_for (1920, 1080, 60, 0, 0), 2);    /* 4.2 */
++  assert_equals_int (anchors_for (2560, 1440, 60, 0, 0), 10);   /* 5.1 */
++  assert_equals_int (anchors_for (3840, 2160, 60, 0, 0), 3);    /* 5.2 */
++  /* a negotiated level is the stream's level */
++  assert_equals_int (anchors_for (1920, 1080, 60, GST_H264_LEVEL_L5_1, 0), 14);
++  /* the accelerator's highest level caps it */
++  assert_equals_int (anchors_for (2560, 1440, 60, 0, GST_H264_LEVEL_L4_1), 0);
++}
++
++GST_END_TEST;
++
 +static Suite *
 +h264anchors_suite (void)
 +{
@@ -788,6 +929,8 @@ index 0000000..bbd5ac1
 +  tcase_add_test (tc, test_h264_anchor_evict);
 +  tcase_add_test (tc, test_h264_anchor_recover);
 +  tcase_add_test (tc, test_h264_anchor_syntax);
++  tcase_add_test (tc, test_h264_anchor_prune);
++  tcase_add_test (tc, test_h264_anchor_level);
 +
 +  return s;
 +}

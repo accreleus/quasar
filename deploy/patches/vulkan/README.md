@@ -1517,10 +1517,10 @@ the same on `vulkanav1enc`, `vulkanh264enc` and `vulkanh265enc`, defined once in
 
 | Direction | Name | Meaning |
 |---|---|---|
-| property | `num-anchors` (0-7, default 0 = off, read at stream start) | anchors held; clamped to the DPB (`maxDpbSlots - 2`) |
-| upstream event on the encoder's src pad | `quasar-ref-anchor` | keep the next inter frame as an anchor (waits out a key frame; on H.264 also out a frame right after another anchor or a recovery frame); at `num-anchors` held the oldest is dropped |
-| upstream event | `quasar-ref-recover`, `pts` (guint64) | code the next frame from the anchor with that input PTS only, and forget every newer anchor; a key frame when that anchor is not held |
-| downstream event, just before the frame's buffer | `quasar-ref-frame`, `pts` (guint64), `anchor` (boolean), `recover-from` (guint64, recovery frames only) | sent for every anchor and every recovery frame |
+| property | `num-anchors` (0-7, default 0 = off, read at stream start) | anchors held; clamped to the DPB and, on H.264 and HEVC, to the level (table below), with a warning in the log |
+| upstream event on the encoder's src pad | `quasar-ref-anchor` | keep the next inter frame as an anchor (waits out a key frame; on H.264 also out a frame right after another anchor or a recovery frame); at `num-anchors` held the oldest is dropped. A second request before a frame takes the first is the same request |
+| upstream event | `quasar-ref-recover`, `pts` (guint64) | code the next frame from the anchor with that input PTS only, and forget every newer anchor; a key frame when that anchor is not held (on AV1 also when it is 128 or more frames old) |
+| downstream event, before the frame's buffer | `quasar-ref-frame`, `pts` (guint64), `anchor` (boolean), `recover-from` (guint64, recovery frames only) | sent for every anchor and every recovery frame; match it to its buffer by `pts` |
 
 While `num-anchors > 0` every inter frame codes from exactly one picture (the previous frame,
 or the anchor on a recovery frame), there are no B frames, and `num-ref-frames` /
@@ -1534,21 +1534,47 @@ decodes silently wrong on hardware):
   the anchor's slot, is `error_resilient_mode` (so `primary_ref_frame` is NONE), and refreshes
   the chain slot, so the slot the decoder may hold stale is overwritten by the first frame it
   receives and the anchor stays held for a second recovery. Anchors 128 or more frames old count
-  as gone (order-hint distance).
+  as gone (relative order hints only reach 127 frames back), so a recovery from one is a key
+  frame.
 - **H.264** (`gsth264encoder.c`, `vkh264enc.c`): the SPS sets
   `gaps_in_frame_num_value_allowed_flag`, `max_num_ref_frames = num-anchors + 1` and two more POC
   LSB bits. An anchor marks itself long-term in its own slice header (MMCO 4, 1, 6); a reference
   to a long-term picture is named by `ref_pic_list_modification` idc 2. A short-term picture is
   never referenced across a `frame_num` gap. The patch also makes `vkh264enc.c` pass the MMCO
-  opcode, the list-modification flags and `long_term_pic_num` to Vulkan, which it dropped.
+  opcode, the list-modification flags and `long_term_pic_num` to Vulkan, which it dropped. That
+  fix changes the output with `num-anchors=0` too, correctly, wherever upstream sends an MMCO or
+  a list modification (B-pyramid, list reordering); with Quasar's settings (no B frames, one
+  reference) the output is unchanged. A non-IDR I frame (not used by Quasar) replaces the chain
+  picture and keeps the anchors.
 - **HEVC** (`gsth265encoder.c`, `vkh265enc.c`): anchors stay short-term, listed in every later
   RPS unused; a recovery frame's RPS is its anchor (used) and older anchors only, so no lost
   picture is ever listed. Two more POC LSB bits, as for H.264.
 
+How many anchors fit. The DPB holds the anchors, the chain picture and the picture being coded:
+on H.264 and HEVC that is `num-anchors + 2`, so at most `maxDpbSlots - 2`. On AV1 the last key
+frame stays held too until anchors overwrite all of its VBI slots, so at most `maxDpbSlots - 3`,
+or 7 from 9 slots up. On H.264 and HEVC the SPS also declares `num-anchors + 2` DPB pictures
+(`max_dec_frame_buffering`, `sps_max_dec_pic_buffering`), which must fit the level's MaxDpbFrames
+(H.264 Table A-1) or MaxDpbSize (HEVC A.4.2). Anchors never raise the level: the limit is taken at
+the level the stream gets without them (or the negotiated one), capped at the driver's
+`maxLevelIdc`. At 60 fps, before the DPB limit (`num-anchors` is at most 7 everywhere):
+
+| Size | H.264 level | H.264 max | HEVC level | HEVC max |
+|---|---|---|---|---|
+| 640x360 | 3.1 | 7 | 3 | 7 |
+| 1280x720 | 3.2 | 3 | 4 | 7 |
+| 1920x1080 | 4.2 | 2 | 4.1 | 4 |
+| 2560x1440 | 5.1 | 7 | 5 | 7 |
+| 3840x2160 | 5.2 | 3 | 5.1 | 4 |
+
+The level follows the frame rate too (1080p30: H.264 4, still 2; HEVC 4, still 4). AV1 levels do
+not bound references (eight VBI slots at every level). The encoder logs every clamp.
+
 Tests without a GPU: `tests/check/libs/vkvideoencodeav1refs.c` (new cases),
 `vkvideoencodeh264anchors.c`, `vkvideoencodeh265anchors.c`. With a GPU:
-`scripts/harness/run-ref-recovery.sh` (encode with losses, then check references, decode and
-PSNR with ffmpeg).
+`scripts/harness/run-ref-recovery.sh` (encode with losses, then check that the anchors,
+recoveries and key frames are exactly what the script asked for, the references, the decode and
+the PSNR with ffmpeg; `ref_recovery_check.py --self-test` checks the checker).
 
 Not built: the NVENC fallback (`nvcuda*enc`; the SDK has `ltrMarkFrame`/`ltrUseFrames` and
 `NvEncInvalidateRefFrames`), VA and openh264.
