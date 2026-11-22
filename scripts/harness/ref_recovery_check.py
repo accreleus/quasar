@@ -88,7 +88,8 @@ def first(fields, name, default=None):
 
 
 def all_of(fields, prefix):
-    return [v for k, v in fields if k.startswith(prefix)]
+    name = prefix.rstrip("[")  # ffmpeg prints some array fields unindexed
+    return [v for k, v in fields if k == name or k.startswith(name + "[")]
 
 
 def check_expect(expect, anchors, recov, keys):
@@ -196,16 +197,19 @@ def main(d, codec):
     bad = [i for k, i in enumerate(kept) if k < len(b) and i < len(a) and a[i] != b[k]]
     check(not bad, f"kept frames differ from the full decode: {bad}")
 
-    r = ffmpeg(d, "-loglevel", "error", "-f", FMT[codec],
-               *(["-c:v", "libdav1d"] if codec == "av1" else []), "-i", full,
-               "-f", "rawvideo", "-pix_fmt", "nv12", "-s",
-               f"{meta['width']}x{meta['height']}", "-i", f"{codec}.nv12",
-               # one exact timebase, so psnr pairs frame N with frame N (the OBU
-               # demuxer's ms timebase rounds N/60 s and pairs every other frame
-               # with its neighbour)
-               "-lavfi", "[0:v]settb=1/60,setpts=N,format=nv12[a];"
-               "[1:v]settb=1/60,setpts=N[b];[a][b]psnr=stats_file=psnr.log",
-               "-f", "null", "-")
+    # decode to raw frames first and compare by index: the elementary stream's
+    # synthetic timestamps make psnr drop and repeat frames, pairing each with
+    # a neighbour of its source
+    size = f"{meta['width']}x{meta['height']}"
+    ffmpeg(d, "-loglevel", "error", "-f", FMT[codec],
+           *(["-c:v", "libdav1d"] if codec == "av1" else []), "-i", full,
+           "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "nv12",
+           "-y", "dec.nv12")
+    raw_in = ["-f", "rawvideo", "-pix_fmt", "nv12", "-s", size, "-r", "60", "-i"]
+    r = ffmpeg(d, "-loglevel", "error", *raw_in, "dec.nv12", *raw_in, f"{codec}.nv12",
+               "-lavfi", "[0:v][1:v]psnr=stats_file=psnr.log", "-f", "null", "-")
+    if os.path.exists(os.path.join(d, "dec.nv12")):
+        os.remove(os.path.join(d, "dec.nv12"))
     psnr = []
     if os.path.exists(os.path.join(d, "psnr.log")):
         for line in open(os.path.join(d, "psnr.log")):

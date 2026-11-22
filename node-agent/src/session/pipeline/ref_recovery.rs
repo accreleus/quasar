@@ -20,7 +20,9 @@ pub(crate) fn anchor_event() -> gst::Event {
 
 /// Code the next frame from the anchor whose PTS is `anchor_pts` only, and forget every
 /// newer anchor; the encoder sends a key frame instead when it holds no such anchor.
-/// Send to the encoder's src pad.
+/// `anchor_pts` is the one the anchor's [`RefFrame`] report carried: the encoder's
+/// output pts, which on H.264 and HEVC is not the input buffer's (GstVideoEncoder's
+/// min-pts offset). Send to the encoder's src pad.
 pub(crate) fn recover_event(anchor_pts: gst::ClockTime) -> gst::Event {
     gst::event::CustomUpstream::new(
         gst::Structure::builder(RECOVER)
@@ -122,15 +124,16 @@ mod tests {
 
     /// Input frames the harness's checker treats as lost, inclusive ranges. Every
     /// recovery below follows a loss of the frames since its anchor's chain.
-    const LOST: [(usize, usize); 6] = [
+    const LOST: [(usize, usize); 7] = [
         (21, 34),
         (41, 49),
         (59, 65),
         (67, 69),
         (72, 79),
         (81, 84),
+        (101, 104),
     ];
-    const SCRIPT: [(usize, Step); 14] = [
+    const SCRIPT: [(usize, Step); 19] = [
         (10, Step::Anchor),
         (20, Step::Anchor),
         (30, Step::Anchor),
@@ -150,8 +153,14 @@ mod tests {
         (80, Step::FromNewest),
         // 30 was forgotten at 35
         (85, Step::Gone(30)),
+        // a fourth anchor evicts the oldest of three
+        (88, Step::Anchor),
+        (92, Step::Anchor),
+        (96, Step::Anchor),
+        (100, Step::Anchor),
+        (105, Step::Gone(88)),
     ];
-    const FRAMES: usize = 90;
+    const FRAMES: usize = 110;
 
     /// What the encoder must make of [`SCRIPT`], by input frame: the anchors, the
     /// recoveries (frame, anchor) and the key frames. An anchor request waits out a
@@ -196,18 +205,18 @@ mod tests {
             assert_eq!(
                 expected(codec),
                 serde_json::json!({
-                    "anchors": [10, 20, 30, 40, 58, 70],
+                    "anchors": [10, 20, 30, 40, 58, 70, 88, 92, 96, 100],
                     "recoveries": recoveries(70),
-                    "keys": [0, 85],
+                    "keys": [0, 85, 105],
                 })
             );
         }
         assert_eq!(
             expected("h264"),
             serde_json::json!({
-                "anchors": [10, 20, 30, 40, 58, 71],
+                "anchors": [10, 20, 30, 40, 58, 71, 88, 92, 96, 100],
                 "recoveries": recoveries(71),
-                "keys": [0, 85],
+                "keys": [0, 85, 105],
             })
         );
     }
@@ -302,7 +311,16 @@ mod tests {
                     for (_, step) in SCRIPT.iter().filter(|(i, _)| *i == at) {
                         let event = match step {
                             Step::Anchor => anchor_event(),
-                            Step::From(i) | Step::Gone(i) => recover_event(seen[*i]),
+                            Step::From(i) | Step::Gone(i) => {
+                                // the pts the anchor's report carried, not its input
+                                // pts: the H.264 and HEVC encoders offset theirs
+                                let n = SCRIPT
+                                    .iter()
+                                    .filter(|(a, s)| matches!(s, Step::Anchor) && a < i)
+                                    .count();
+                                let r = reports.lock().unwrap();
+                                recover_event(r.iter().filter(|r| r.anchor).nth(n).unwrap().pts)
+                            }
                             Step::FromNewest => {
                                 let r = reports.lock().unwrap();
                                 recover_event(r.iter().rev().find(|r| r.anchor).unwrap().pts)

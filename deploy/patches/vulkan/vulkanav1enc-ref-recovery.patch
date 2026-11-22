@@ -561,10 +561,10 @@ index 2387e1f..fcf0005 100644
  
 diff --git a/subprojects/gst-plugins-bad/ext/vulkan/base/gstrefrecovery.h b/subprojects/gst-plugins-bad/ext/vulkan/base/gstrefrecovery.h
 new file mode 100644
-index 0000000..972068c
+index 0000000..c848d88
 --- /dev/null
 +++ b/subprojects/gst-plugins-bad/ext/vulkan/base/gstrefrecovery.h
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,96 @@
 +/* GStreamer
 + * Copyright (C) 2026 Quasar contributors
 + *
@@ -591,6 +591,10 @@ index 0000000..972068c
 + *   "quasar-ref-frame", pts=guint64, anchor=boolean[, recover-from=guint64]
 + *   for every anchor and every recovery frame. Match a report to its buffer by
 + *   pts, not by arrival order.
++ * Every pts here is the frame's pts as the encoder holds it, the one on its
++ * output buffer: GstVideoEncoder offsets input pts below its min-pts (the H.264
++ * and HEVC encoders set 1000 hours), so name an anchor by the pts its report
++ * carries, never by the input buffer's.
 + * The other half is node-agent/src/session/pipeline/ref_recovery.rs. */
 +
 +#pragma once
