@@ -1327,7 +1327,7 @@ fn pacing_gap(fps: i32, slices: usize) -> std::time::Duration {
 }
 
 /// The slices a frame's datagrams are handed over in: each a datagram count and its offset from
-/// the frame's start. PyroWave is cut so no slice passes `PYRO_BURST_BYTES`, the slices spread
+/// the frame's start. PyroWave is first cut so no slice passes `PYRO_BURST_BYTES`, the slices spread
 /// over a quarter of the frame interval (a target: `Pacing` keeps the spacing, not the
 /// frame-relative offsets). When the timer's ticks make that spread take longer than half the
 /// interval (`codec-pyrowave.md` §Rate's limit), the frame is cut in fewer, larger slices that

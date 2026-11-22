@@ -3330,7 +3330,9 @@ fn pyrowave_a_still_picture_after_a_cap_keeps_the_budget_at_the_cap() {
     fill(&mut rate, 100);
     assert!(matches!(
         rate.on_tick(at(2_200), quic_at(8_000_000.0)),
-        PyroVerdict::Budget(b) if b > capped
+        // One climb step from the cap, not the target in one jump (a frozen climb keeping its
+        // old start would hand back the whole target here).
+        PyroVerdict::Budget(b) if b > capped && b <= capped * 11 / 10
     ));
 }
 
