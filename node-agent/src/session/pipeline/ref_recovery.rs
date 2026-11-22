@@ -186,8 +186,7 @@ mod tests {
             if let Some(a) = from {
                 recoveries.push((at, a));
             }
-            let waits =
-                codec == "h264" && (from.is_some() || anchors.last() == Some(&(at - 1)));
+            let waits = codec == "h264" && (from.is_some() || anchors.last() == Some(&(at - 1)));
             if pending && !waits {
                 anchors.push(at);
                 pending = false;
@@ -199,7 +198,15 @@ mod tests {
     #[test]
     fn expected_follows_the_script() {
         let recoveries = |newest: usize| {
-            serde_json::json!([[35, 20], [50, 40], [55, 10], [63, 58], [66, 58], [70, 58], [80, newest]])
+            serde_json::json!([
+                [35, 20],
+                [50, 40],
+                [55, 10],
+                [63, 58],
+                [66, 58],
+                [70, 58],
+                [80, newest]
+            ])
         };
         for codec in ["av1", "h265"] {
             assert_eq!(
