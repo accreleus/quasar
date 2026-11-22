@@ -620,14 +620,18 @@ digest set came from whoever holds the release key. Format:
 
 The org's key is `quasar-release-2026`. Its private half is the secret
 `QUASAR_RELEASE_SIGNING_KEY` of the GitHub environment `release` (deployment policy: tags `v*`),
-beside the environment variable `QUASAR_RELEASE_SIGNING_KEY_ID`. Only the tag-triggered `release`
-job of the Images workflow names that environment, so no other job or workflow can read the key;
-a repository secret would be readable by any of them.
+beside the environment variable `QUASAR_RELEASE_SIGNING_KEY_ID`. Only a run on a `v*` tag can use
+the `release` environment, and the Images workflow's `release` job is the one job that names it; a
+repository secret would be readable by every workflow run.
 
 1. **Cut a release as usual.** The `release` job signs the manifest right after it validates it,
    verifies its own signature before uploading anything, and attaches
-   `platform-release-manifest.v2.json.sig` beside the manifest. With no secret configured it warns
-   and publishes unsigned, which every verifying machine refuses (`signature_missing`).
+   `platform-release-manifest.v2.json.sig` beside the manifest. It also checks that signature
+   against the org key compiled into the actor (`DEFAULT_TRUSTED_KEYS` in
+   `node-agent/crates/quasar-recovery/src/trust/signature.rs`, read by
+   `scripts/release/org-release-keys.sh`), so a release signed by a key the default machines do not
+   trust fails the job. With no secret configured, a tag release of `accreleus/quasar` fails; a
+   fork's warns and publishes unsigned, which every verifying machine refuses (`signature_missing`).
 2. **Check the release**:
 
    ```bash
@@ -640,7 +644,10 @@ a repository secret would be readable by any of them.
 
 3. **A release published unsigned** is signed by hand, by the key holder:
    `scripts/release/sign-platform-release-manifest.sh --manifest platform-release-manifest.v2.json --output platform-release-manifest.v2.json.sig --key-id quasar-release-2026`,
-   then `gh release upload vX.Y.Z platform-release-manifest.v2.json.sig --clobber`.
+   then `gh release upload vX.Y.Z platform-release-manifest.v2.json.sig --clobber`. The releases
+   published before signing was on (v0.4.0 to v0.6.3) get their `.sig` this way, by the
+   maintainer. A named apply or revert to a release with no `.sig` is refused
+   `signature_missing`.
 
 A fork that publishes its own releases makes its own key (`scripts/release/new-release-signing-key.sh`,
 off CI, never inside the working tree), puts it in its own `release` environment, and gives its
@@ -706,8 +713,20 @@ alone.
 4. **Destroy the old private key.**
 
 If a key is **compromised**, step 3 comes first and immediately, and any release signed only by
-it must be re-signed and its `.sig` asset replaced. Until a machine has the new key, its applies
-fail closed with `signature_invalid`.
+it must be re-signed and its `.sig` asset replaced. A machine on the default trusts only the keys
+compiled into its running actor, so a fix release signed only by the new key is refused
+`signature_invalid` there. Until the release whose actor carries the new key is applied, each such
+machine either names the new key (an explicit list replaces the compiled default, so the
+compromised key is no longer trusted):
+
+```bash
+docker exec -it quasar-recovery quasar-recovery reconfigure --yes \
+  QUASAR_UPDATER_TRUSTED_KEYS=<new-id>:<new-key>
+```
+
+or runs `QUASAR_UPDATER_SIGNATURE_MODE=off` for the update and then goes back to `verify`. A
+release cannot revoke a compiled-in key on a machine that never updates: that machine trusts the
+compromised key until its operator applies an update or runs `reconfigure`.
 
 ## See also
 

@@ -2389,7 +2389,7 @@ releases").
 | `verify` | a signature that could **not be fetched** (network, proxy, 5xx) | Refused, `signature_invalid`. "Could not tell" is never read as "unsigned". |
 | `require` | no signature | Refused, `signature_missing`. |
 | `require` | otherwise | As `verify`. |
-| `verify` or `require` | — with no `QUASAR_UPDATER_TRUSTED_KEYS` | Every apply refused, `signature_invalid`. Fail closed: a gate that is on but checking nothing is worse than one that is off. |
+| `verify` or `require` | — with `QUASAR_UPDATER_TRUSTED_KEYS` unset or blank | Checked against the org's key compiled into the actor. A blank list is never "trust nothing" (#621); to trust only your own key, name it, since a list replaces the default. |
 
 Under `require`, **a request with no release version is refused** too: a developer apply, an
 edge-channel build, or a revert to a build the instance can no longer name by release carries no
@@ -2403,7 +2403,8 @@ version, so no published manifest signed it. Drop the machine to `verify` for th
   only through a proxy cannot run `verify` or `require`; it runs `off`. The console still offers
   releases there (the control plane's own egress uses the proxy), and every stable apply is
   refused `signature_invalid` until the machine runs
-  `quasar-recovery reconfigure QUASAR_UPDATER_SIGNATURE_MODE=off`. An offline machine is the same.
+  `docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_UPDATER_SIGNATURE_MODE=off`.
+  An offline machine is the same.
 - **Public trust roots only.** The fetch trusts the public web roots (Mozilla's set) and ignores
   `SSL_CERT_FILE` / `SSL_CERT_DIR`, so a mirror behind a private certificate authority is
   refused. Point `QUASAR_UPDATER_MANIFEST_BASE_URL` at a host with a publicly trusted
