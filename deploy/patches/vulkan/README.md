@@ -1584,14 +1584,15 @@ VA and openh264.
 
 ### `gstreamer-nvenc-ref-recovery.patch`
 
-Quasar-authored (#1348). The control above on the NVENC encoders (`nvcudah264enc`,
-`nvcudah265enc`, `nvcudaav1enc`, all subclasses of `GstNvEncoder`), implemented once in the base
+Quasar-authored (#1348). The control above on the NVENC encoders (`nvh264enc`,
+`nvh265enc`, `nvav1enc` in CUDA mode on 1.28, `nvcuda*enc` on older releases, and the
+`nvautogpu*enc` variants: all subclasses of `GstNvEncoder`), implemented once in the base
 class `sys/nvcodec/gstnvencoder.cpp` with NVENC's per-picture long-term references:
 
 - `num-anchors` > 0 turns on `enableLTR` (per-picture mode, `ltrTrustMode` 0) with
   `ltrNumFrames = num-anchors` and a DPB of at least `num-anchors + 1`. Clamped, with a warning,
   to `NV_ENC_CAPS_NUM_MAX_LTR_FRAMES`; 0 with B frames, and 0 on AV1: the NVENC API GStreamer
-  speaks (12.0) has no AV1 long-term references, so on `nvcudaav1enc` every recovery is a key frame.
+  speaks (12.0) has no AV1 long-term references, so on `nvav1enc` every recovery is a key frame.
 - An anchor is marked long-term (`ltrMarkFrame`, `ltrMarkFrameIdx`): a free index, else the oldest
   anchor's. A recovery frame codes from that index only (`ltrUseFrames`, `ltrUseFrameBitmap`), and
   first invalidates (`NvEncInvalidateRefFrames`) the last eight pictures newer than its anchor, so no
@@ -1603,6 +1604,14 @@ class `sys/nvcodec/gstnvencoder.cpp` with NVENC's per-picture long-term referenc
   NVENC returns as `outputTimeStamp` (the base class sets a 1000 h min-pts, as the Vulkan
   H.264/HEVC encoders do).
 
-Unlike the Vulkan H.264/HEVC encoders, NVENC picks the level itself, and anchors are not clamped
-to the level the stream gets without them. Hardware check: `scripts/harness/run-ref-recovery.sh
---encoder nvenc` on the NVIDIA host.
+NVENC picks the level itself, and anchors are not clamped to the level the stream gets without
+them. Measured at 1920x1080, 60 fps, 20 Mbit/s CBR (RTX 5090, driver 615.78.08): H.264 stays at
+4.2 up to `num-anchors=3` and goes to 5.0 from 4; HEVC stays at 4.1 up to 4 and goes to 5.0 from 5.
+
+On H.264, when a recovery forgets an anchor the encoder keeps that long-term picture until a later
+anchor overwrites its index (the API has no way to unmark one). A decoder that lost the forgotten
+anchor holds one more short-term picture under the sliding window, so the overwriting anchor's
+MMCO 6 leaves it one reference over `max_num_ref_frames`: ffmpeg logs `number of reference frames
+exceeds max` and drops its oldest short-term picture, which nothing references (the harness's
+pruned decode stays bit-identical). HEVC lists its references explicitly and has no such case.
+Hardware check: `scripts/harness/run-ref-recovery.sh --encoder nvenc` on the NVIDIA host.

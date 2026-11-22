@@ -281,7 +281,8 @@ mod tests {
             "vulkan" => ("vulkanupload !", enc_name.to_string(), "idr-period=1000"),
             "nvenc" => (
                 "",
-                enc_name.replace("vulkan", "nvcuda"),
+                // the CUDA-mode elements are nv<codec>enc on GStreamer 1.28
+                enc_name.replace("vulkan", "nv"),
                 "gop-size=1000 preset=p4 tune=ultra-low-latency rc-mode=cbr rc-lookahead=0",
             ),
             other => panic!("QUASAR_REF_RECOVERY_ENCODER={other}"),

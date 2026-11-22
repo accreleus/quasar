@@ -23,7 +23,7 @@ if [ "${1:-}" = --encoder ]; then
 fi
 case "$encoder" in
   vulkan) prefix=vulkan ;;
-  nvenc) prefix=nvcuda ;;
+  nvenc) prefix=nv ;; # CUDA mode: nvh264enc etc. on GStreamer 1.28
   *) echo "--encoder $encoder: vulkan or nvenc" >&2; exit 2 ;;
 esac
 out=$(realpath -m "${1:?usage: $0 [--encoder vulkan|nvenc] <out-dir> [codec...]}")
