@@ -156,6 +156,8 @@ struct Client {
     waiting: Option<u64>,
     asked: Option<u64>,
     freezes: Vec<f64>,
+    /// The longest time between two frames shown, µs, and when it ended.
+    longest: (u64, u64),
 }
 
 /// A keyframe's size in average frames at the encoder's rate; the lab rows also run at 10 × and
@@ -245,6 +247,9 @@ impl Client {
             self.waiting = None;
             if self.shown.is_some_and(|l| at.max(l) - l > FREEZE_US) {
                 self.freezes.push(at as f64 / 1e6);
+            }
+            if let Some(l) = self.shown.filter(|&l| at.max(l) - l > self.longest.0) {
+                self.longest = (at.max(l) - l, at);
             }
             self.shown = Some(self.shown.map_or(at, |l| at.max(l)));
         }
@@ -5377,8 +5382,9 @@ fn a_burst_that_outlasts_the_line_steps_it_down_again() {
 }
 
 /// Seat B's hold round finding (#1433): a later burst losing as much at a send rate under the one
-/// that set the line did not fall with the rate (Wi-Fi): the hold ends, and bursts set no line for
-/// `HOLD` after it. The ratchet stepped the line down on every such burst instead.
+/// that set the line did not fall with the rate (Wi-Fi): once it is over, the sender still at its
+/// rate, the hold ends, and bursts set no line for `HOLD` after it. The ratchet stepped the line
+/// down on every such burst instead.
 #[test]
 fn a_burst_losing_as_much_at_a_lower_rate_releases_the_hold() {
     let start = Instant::now();
@@ -5390,8 +5396,10 @@ fn a_burst_losing_as_much_at_a_lower_rate_releases_the_hold() {
         est.apply(received(5000.0, 0.0), at(ms), NO_QUIC);
     }
     est.apply(received(4000.0, 0.3), at(4000), NO_QUIC);
+    assert!(est.held_kbps().is_some(), "released before the burst is over");
+    est.apply(received(5700.0, 0.0), at(4100), NO_QUIC);
     assert_eq!(est.held_kbps(), None, "released");
-    for ms in (4100..8000).step_by(100) {
+    for ms in (4200..8000).step_by(100) {
         est.apply(received(7000.0, 0.0), at(ms), NO_QUIC);
     }
     est.apply(received(7000.0, 0.3), at(8000), NO_QUIC);
@@ -5406,6 +5414,7 @@ fn a_burst_losing_as_much_at_a_lower_rate_releases_the_hold() {
         capped.apply(received(5000.0, 0.0), at(ms), NO_QUIC);
     }
     capped.apply(received(4500.0, 0.1), at(4000), NO_QUIC);
+    capped.apply(received(5000.0, 0.0), at(4100), NO_QUIC);
     assert!(
         capped.held_kbps().is_some(),
         "loss that fell with the rate keeps it"
@@ -5609,3 +5618,140 @@ fn a_policer_over_a_random_loss_floor_still_sets_the_hold() {
     );
     assert_eq!(est.held_kbps(), Some(BETA * 6000.0));
 }
+
+/// R4 with the policer stepping down again under the hold at 90 s.
+fn second_cap_step(second_kbps: f64, content: f64) -> Sim {
+    let mut s = Sim::lab(false);
+    s.content_gain = Box::new(move |t| content * lab_content(t));
+    s.run(30.0);
+    policer(&mut s);
+    (s.tokens, s.tokens_at) = (15_000.0, s.t);
+    s.run(60.0);
+    s.cap_kbps = second_kbps;
+    s.run(120.0);
+    s
+}
+
+/// Seat B, hold round 3 (#1433 M1a): a policer stepping down again under the hold (5000 → 2500 or
+/// 3000 at 90 s) loses as much at the lower rate as a Wi-Fi burst does, but the loss lasts until
+/// the sender drops: the hold stays, the line and the rung step down, and the client is never
+/// left 2 s without a frame. Old code: released at 90.6 s, back to 1080p, 69.5 % loss after 95 s
+/// and no frame from 90.6 to 156 s (2500); 60 % loss (3000).
+#[test]
+fn a_second_cap_step_under_a_hold_keeps_it_and_steps_down() {
+    for second in [2500.0, 3000.0] {
+        let s = second_cap_step(second, 1.0);
+        let (freezes, rungs) = lab_summary(&format!("5000 → {second}"), &s);
+        let longest = s.client.as_ref().unwrap().longest;
+        let off: Vec<f64> = s
+            .lines
+            .iter()
+            .filter(|&&(t, l)| (89.0..120.0).contains(&t) && l.is_none())
+            .map(|&(t, _)| t)
+            .take(3)
+            .collect();
+        eprintln!(
+            "  longest gap {:.2} s ending {:.1} s; loss after 95 s {:.3}; rung at 105 s {}; \
+             freezes {}; rungs {rungs:?}",
+            longest.0 as f64 / 1e6,
+            longest.1 as f64 / 1e6,
+            s.loss_after(95.0),
+            s.rung_at(105.0),
+            freezes.len()
+        );
+        assert!(off.is_empty(), "{second}: hold off at {off:?}");
+        assert!(
+            s.loss_after(95.0) <= 0.05 || s.rung_at(105.0) >= 4,
+            "{second}: loss after 95 s {:.3}, rung {} at 105 s",
+            s.loss_after(95.0),
+            s.rung_at(105.0)
+        );
+        assert!(
+            longest.0 < 2_000_000,
+            "{second}: no frame for {:.2} s up to {:.1} s",
+            longest.0 as f64 / 1e6,
+            longest.1 as f64 / 1e6
+        );
+    }
+}
+
+/// Two stretched readings in a row at a 7000 send rate: a hold set by readings (a queue).
+fn read_hold(est: &mut Estimator, at: impl Fn(u64) -> Instant) {
+    let stretched = |delivered: f64| Measured {
+        delivered_kbps: Some(delivered),
+        arrived_sent_kbps: Some(7000.0),
+        sent_kbps: Some(7000.0),
+        ..received(delivered, 0.0)
+    };
+    est.apply(stretched(5000.0), at(100), NO_QUIC);
+    est.apply(stretched(4800.0), at(150), NO_QUIC);
+    assert_eq!(est.held_kbps(), Some(BETA * 4800.0));
+}
+
+/// Seat B, hold round 3 (#1433 M1b): a hold set by readings lost nothing, so "as much loss at a
+/// lower rate" is any loss: a later lossy window must not release it. Old code: one 15 % window
+/// at 3000 released it and set the 60 s burst memory.
+#[test]
+fn a_hold_set_by_readings_is_not_released_by_a_later_burst() {
+    let start = Instant::now();
+    let mut est = Estimator::new(CEILING, start);
+    let at = |ms: u64| start + Duration::from_millis(ms);
+    read_hold(&mut est, at);
+    for ms in (200..3000).step_by(50) {
+        est.apply(received(4000.0, 0.0), at(ms), NO_QUIC);
+    }
+    est.apply(received(3000.0, 0.15), at(3000), NO_QUIC);
+    est.apply(received(3000.0, 0.0), at(3050), NO_QUIC);
+    assert!(est.held_kbps().is_some(), "released");
+    assert_eq!(est.random_burst, None, "burst memory set");
+}
+
+/// Seat B, hold round 3 (#1433 M1b): a probe on a hold set by readings that meets loss backs off
+/// from the link (`met`). Old code: the release ran first and ended the hold.
+#[test]
+fn a_probe_on_a_hold_set_by_readings_backs_off_when_it_meets_loss() {
+    let start = Instant::now();
+    let mut est = Estimator::new(CEILING, start);
+    let at = |ms: u64| start + Duration::from_millis(ms);
+    read_hold(&mut est, at);
+    for ms in (200..=62_000).step_by(100) {
+        est.apply(received(4000.0, 0.0), at(ms), NO_QUIC);
+    }
+    est.apply(received(3900.0, 0.03), at(62_100), NO_QUIC);
+    assert_eq!(est.held_kbps(), Some(BETA * 3900.0));
+}
+
+/// Seat B, hold round 3 (#1433 S1): an encoder sending 0.6-0.7 × its setpoint into the R4
+/// policer still overloads it: the sustained loss sets the hold and the sender steps down, and
+/// it loses no more than legacy after onset + 20 s. Old code (0.7 ×): no hold, 1080p, 14.2 % loss
+/// and a late freeze; legacy 540p, 6.4 %. The quiet scene (0.05 ×) is
+/// `a_quiet_scene_sets_no_hold_that_outlives_it`.
+#[test]
+fn an_underfilling_encoder_on_a_policer_still_sets_the_hold() {
+    for fill in [0.6, 0.7] {
+        let run = |legacy: bool| {
+            let mut s = Sim::lab(legacy);
+            s.content_gain = Box::new(move |t| fill * lab_content(t));
+            s.run(30.0);
+            policer(&mut s);
+            (s.tokens, s.tokens_at) = (15_000.0, s.t);
+            s.run(90.0);
+            s
+        };
+        let a = run(true);
+        let s = run(false);
+        lab_summary(&format!("{fill} x legacy"), &a);
+        let (freezes, _) = lab_summary(&format!("{fill} x v2"), &s);
+        let held = s.lines.iter().any(|&(t, l)| t > 30.0 && l.is_some());
+        assert!(held, "{fill} x: no hold");
+        assert!(
+            s.loss_after(50.0) <= a.loss_after(50.0).max(0.02),
+            "{fill} x: loss {:.3}, legacy {:.3}",
+            s.loss_after(50.0),
+            a.loss_after(50.0)
+        );
+        let late: Vec<_> = freezes.iter().filter(|&&t| t >= 60.0).collect();
+        assert!(late.is_empty(), "{fill} x: freezes after 60 s {late:?}");
+    }
+}
+
