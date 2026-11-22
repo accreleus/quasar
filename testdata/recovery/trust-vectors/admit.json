@@ -2650,8 +2650,8 @@
       }
     },
     {
-      "name": "verify accepts a definitive absence and warns",
-      "source": "go:control-plane/internal/updater/signature_test.go:TestCheckSignatureAbsentSignature",
+      "name": "verify refuses a named release that publishes no signature",
+      "source": "changed: #621 option B; was go:control-plane/internal/updater/signature_test.go:TestCheckSignatureAbsentSignature (verify applied it with a WARN)",
       "caller": "control_plane",
       "config": {
         "allowed_namespaces": [
@@ -2686,10 +2686,53 @@
         "why": "release 0.3.0 publishes no signature asset"
       },
       "expect": {
-        "admitted": true,
-        "warnings": [
-          "applying an UNVERIFIED release: release 0.3.0 publishes no signature asset (mode=verify accepts this; mode=require would refuse it)"
+        "admitted": false,
+        "reason": "signature_missing",
+        "message": "this host verifies named releases and this one carries no signature: release 0.3.0 publishes no signature asset (mode=off would apply it)",
+        "warnings": []
+      }
+    },
+    {
+      "name": "a blank mode refuses a named release that publishes no signature",
+      "source": "added: #621 option B (signed releases by default)",
+      "caller": "control_plane",
+      "config": {
+        "allowed_namespaces": [
+          "ghcr.io/accreleus/quasar"
+        ],
+        "in_flight_request_id": "",
+        "signature_mode": "",
+        "trusted_keys": [
+          {
+            "id": "release-2026",
+            "public_key_of": "release-2026"
+          }
         ]
+      },
+      "request": {
+        "request_id": "11111111-2222-3333-4444-555555555555",
+        "components": [
+          {
+            "name": "node-agent",
+            "image": "ghcr.io/accreleus/quasar/quasar-node-agent",
+            "digest": "sha256:bb22000000000000000000000000000000000000000000000000000000000000"
+          }
+        ],
+        "release": {
+          "id": "rel",
+          "version": "0.3.0",
+          "source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+        }
+      },
+      "evidence": {
+        "state": "absent",
+        "why": "release 0.3.0 publishes no signature asset"
+      },
+      "expect": {
+        "admitted": false,
+        "reason": "signature_missing",
+        "message": "this host verifies named releases and this one carries no signature: release 0.3.0 publishes no signature asset (mode=off would apply it)",
+        "warnings": []
       }
     },
     {
@@ -3152,8 +3195,8 @@
       }
     },
     {
-      "name": "verify applies an unpublished version and says so",
-      "source": "go:control-plane/internal/updater/signature_test.go:TestVerifyModeAppliesAnUnpublishedVersionAndSaysSoLoudly (adapted: through admit the request must pass the request gates, so it is a valid request naming 9.9.9 rather than an empty one)",
+      "name": "verify refuses an unpublished named version",
+      "source": "changed: #621 option B; was go:control-plane/internal/updater/signature_test.go:TestVerifyModeAppliesAnUnpublishedVersionAndSaysSoLoudly (adapted: through admit the request must pass the request gates, so it is a valid request naming 9.9.9 rather than an empty one) (verify applied it with a WARN)",
       "caller": "control_plane",
       "config": {
         "allowed_namespaces": [
@@ -3188,10 +3231,10 @@
         "why": "no signature asset published for v9.9.9"
       },
       "expect": {
-        "admitted": true,
-        "warnings": [
-          "applying an UNVERIFIED release: no signature asset published for v9.9.9 (mode=verify accepts this; mode=require would refuse it)"
-        ]
+        "admitted": false,
+        "reason": "signature_missing",
+        "message": "this host verifies named releases and this one carries no signature: no signature asset published for v9.9.9 (mode=off would apply it)",
+        "warnings": []
       }
     },
     {
@@ -4219,8 +4262,8 @@
       }
     },
     {
-      "name": "fetched: missing signature under verify",
-      "source": "go:control-plane/internal/updater/signature_server_test.go:TestServerAcceptsAMissingSignatureUnderVerify",
+      "name": "fetched: a deleted signature on a named release is refused under verify",
+      "source": "changed: #621 option B; was go:control-plane/internal/updater/signature_server_test.go:TestServerAcceptsAMissingSignatureUnderVerify (verify applied it with a WARN)",
       "caller": "control_plane",
       "config": {
         "allowed_namespaces": [
@@ -4255,10 +4298,10 @@
         "responses": {}
       },
       "expect": {
-        "admitted": true,
-        "warnings": [
-          "applying an UNVERIFIED release: release 0.3.0 publishes no platform-release-manifest.json.sig asset (mode=verify accepts this; mode=require would refuse it)"
-        ],
+        "admitted": false,
+        "reason": "signature_missing",
+        "message": "this host verifies named releases and this one carries no signature: release 0.3.0 publishes no platform-release-manifest.json.sig asset (mode=off would apply it)",
+        "warnings": [],
         "fetched": [
           "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig"
         ]
@@ -4430,6 +4473,63 @@
         ],
         "in_flight_request_id": "",
         "signature_mode": "verify",
+        "trusted_keys": [
+          {
+            "id": "release-2026",
+            "public_key_of": "release-2026"
+          }
+        ]
+      },
+      "request": {
+        "request_id": "11111111-2222-3333-4444-555555555555",
+        "components": [
+          {
+            "name": "node-agent",
+            "image": "ghcr.io/accreleus/quasar/quasar-node-agent",
+            "digest": "sha256:bb22000000000000000000000000000000000000000000000000000000000000"
+          }
+        ],
+        "release": {
+          "id": "rel",
+          "version": null,
+          "source_commit": "cccccccccccccccccccccccccccccccccccccccc"
+        }
+      },
+      "fetch": {
+        "base_url": "https://releases.example.invalid/quasar/v{version}/",
+        "responses": {
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json": {
+            "status": 200,
+            "body": {
+              "text": "{\"built_at\":\"2026-09-08T00:00:00Z\",\"components\":[{\"digest\":\"sha256:aa11000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-control-plane\",\"name\":\"control-plane\"},{\"digest\":\"sha256:bb22000000000000000000000000000000000000000000000000000000000000\",\"image\":\"ghcr.io/accreleus/quasar/quasar-node-agent\",\"name\":\"node-agent\"}],\"format_version\":1,\"prerelease\":false,\"schema_version\":80,\"source_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"version\":\"0.3.0\"}"
+            }
+          },
+          "https://releases.example.invalid/quasar/v0.3.0/platform-release-manifest.json.sig": {
+            "status": 200,
+            "body": {
+              "text": "{\"format_version\":1,\"signatures\":[{\"algorithm\":\"ed25519\",\"key_id\":\"release-2026\",\"signature\":\"+QRzRy3+Eygwu3jW+GcXrBR8fT1A9ztJ2UjQU/spwb3JqmnrpwhU3m3mK1wjGKhim+YZZI7zxG8TLjOUy8e9Cw==\"}]}"
+            }
+          }
+        }
+      },
+      "expect": {
+        "admitted": true,
+        "warnings": [
+          "applying an UNVERIFIED release: the request names no release version, so there is no published release manifest to verify against (mode=verify accepts this; mode=require would refuse it)"
+        ],
+        "fetched": []
+      }
+    },
+    {
+      "name": "fetched: a blank mode applies a request with no version and warns",
+      "source": "added: #621 option B (signed releases by default)",
+      "caller": "control_plane",
+      "config": {
+        "allowed_namespaces": [
+          "ghcr.io/accreleus/quasar"
+        ],
+        "in_flight_request_id": "",
+        "signature_mode": "",
         "trusted_keys": [
           {
             "id": "release-2026",

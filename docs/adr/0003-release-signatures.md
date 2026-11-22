@@ -9,6 +9,18 @@ date: 2026-09-08
 > `testdata/recovery/trust-vectors`); the Go updater that implemented it is retired. The
 > decision below is unchanged.
 
+> *#621 (0.6.4), amending "Default off" and "`verify` is the transition rung" under
+> Consequences:* signing is now **on by default**. Every release is signed by the org key
+> `quasar-release-2026`, held as a secret of the `release` GitHub environment that only the
+> tag-triggered release job can use; the recovery actor compiles in its public half as the
+> default `QUASAR_UPDATER_TRUSTED_KEYS` and defaults `QUASAR_UPDATER_SIGNATURE_MODE` to
+> `verify`. One rule changes in `verify`: a request that names a version and finds no
+> signature (a 404) is refused `signature_missing`, so deleting a release's `.sig` no longer
+> downgrades it to unverified. A request that names no version is still applied with the WARN,
+> and the rest of the "not an enforcement boundary" consequence stands for it. A machine that
+> recorded a mode keeps it; one that cannot reach the release host directly over HTTPS runs
+> `off` (`docs/upgrading.md` "Signing platform releases").
+
 ADR 0001 chose digest pinning alone and filed signatures as a follow-up, noting
 that "the manifest already carries the digests a signature would cover" and that
 adding them later "changes the verifier, not the shape". This is that follow-up.
