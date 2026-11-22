@@ -2255,6 +2255,16 @@ fn rate(retargets: bool) -> Rate {
 /// 200 video datagrams logged as sent 1 ms apart from `at`, then feedback that names them
 /// all as arrived 1 ms apart, read 250 ms after `at`.
 fn answered(control: &mut Control, first: u32, at: std::time::Instant) {
+    answered_but(control, first, at, |_| false);
+}
+
+/// [`answered`], with the datagrams `lost` names reported not received.
+fn answered_but(
+    control: &mut Control,
+    first: u32,
+    at: std::time::Instant,
+    lost: impl Fn(u32) -> bool,
+) {
     let mut arrivals = Vec::new();
     for i in 0..200u32 {
         let mut d = vec![0u8; media::MAX_DATAGRAM];
@@ -2262,7 +2272,8 @@ fn answered(control: &mut Control, first: u32, at: std::time::Instant) {
         control
             .log
             .record(&d, at + Duration::from_millis(i.into()), false);
-        arrivals.extend_from_slice(&((i * 20) as u16).to_le_bytes());
+        let arrival = if lost(i) { u16::MAX } else { (i * 20) as u16 };
+        arrivals.extend_from_slice(&arrival.to_le_bytes());
     }
     let fb = json!({
         "type": "feedback", "seq": first / 200 + 1,
@@ -2278,6 +2289,39 @@ fn answered(control: &mut Control, first: u32, at: std::time::Instant) {
         queued_bytes: 0,
     };
     control.feedback(&fb, path, at + Duration::from_millis(250));
+}
+
+/// #1433 lab R3 (NVIDIA lab host, 2026-11-22): the hold's line reaches the ABR as video under the
+/// FEC its loss called for, kept as the level calms, never the share the floor leaves. At 1080p's
+/// floor that share was 3 %, and the rung read the line as 720p video for 37 s.
+#[test]
+fn the_hold_line_reaches_the_abr_under_the_fec_its_loss_called_for() {
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let log = lines.clone();
+    let rate = Rate {
+        floor_kbps: Box::new(|| 6000.0),
+        held: Box::new(move |line| log.lock().unwrap().push(line)),
+        ..rate(true)
+    };
+    let mut control = Control::new(&rate, Arc::default(), true, congestion::Governor::default());
+    let base = std::time::Instant::now();
+    answered_but(&mut control, 0, base, |i| i % 4 == 1);
+    let line = control.estimator.held_kbps().expect("a hold");
+    assert!(control.charged < 0.25, "charged {}", control.charged);
+    for k in 1..20u32 {
+        answered(
+            &mut control,
+            200 * k,
+            base + Duration::from_millis(250 * u64::from(k)),
+        );
+    }
+    let got = lines.lock().unwrap().clone();
+    assert_eq!(got.first(), Some(&Some(line / 1.25)), "{got:?}");
+    assert_eq!(
+        got.last(),
+        Some(&Some(line / 1.25)),
+        "after the level calmed: {got:?}"
+    );
 }
 
 /// §Feedback: with the ABR off the estimate never reaches the encoder, so QUIC keeps its

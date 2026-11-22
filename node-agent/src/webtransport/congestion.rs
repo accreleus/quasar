@@ -110,8 +110,9 @@ const LOSS_DECREASE_GAP: Duration = Duration::from_millis(300);
 /// v2's hold (#1433, lab rows R3/R4): after a window that loses over `LOSS_HIGH` while the encoder
 /// fills its setpoint, or a second shortfall reading in a row, nothing the sender emits goes over
 /// `BETA` × what that window delivered until this long has passed with no busy report losing
-/// `LOSS_LOW` over the loss floor. A later burst losing as much at a lower rate ends it
-/// (`Estimator::apply`, the per-burst discriminator), and while it holds the pacer keeps a keyframe
+/// `LOSS_LOW` over the loss floor. A hold set by loss ends when a later burst that lost as much at
+/// a lower rate is over with the sender still at that rate (`Estimator::apply`, the per-burst
+/// discriminator), and while it holds the pacer keeps a keyframe
 /// paced (`PACE_MAX_WAIT_HELD`). The probe that ends a hold on a link still shaped meets its
 /// edge, and that can freeze (`a_shallow_buffer_keeps_its_frames_and_reaches_540p_in_15_s`, 180 s
 /// shaped: 30 s, two probe freezes; 60 s, none); the lab's R4 climb came 70 s after its last step. Longer only delays
@@ -123,6 +124,9 @@ const HOLD: Duration = Duration::from_secs(60);
 /// the loss that ends a probe on a link still shaped is a few percent, which FEC and NACK repair.
 const PROBE_PER_S: f64 = 1.02;
 const LOSS_WINDOW: Duration = Duration::from_millis(500);
+/// An encoder sending this share of its setpoint or more is busy once heavy loss has lasted
+/// `LOSS_WINDOW` (`Estimator::apply`); a still screen sends far less.
+const UNDERFILL: f64 = 0.5;
 /// v2's loss floor (`Estimator::floor_bin_closed`) is judged over the last `FLOOR_BINS` bins of
 /// at least `FLOOR_BIN` and `FLOOR_BIN_SAMPLES` datagrams each (16 s), from bins sent at
 /// `FLOOR_SPREAD` or less of the busiest one's rate.
@@ -624,10 +628,11 @@ pub(crate) struct Estimator {
     held: Option<HoldLine>,
     /// The last report gave a shortfall reading: a second in a row sets the hold.
     read_last: bool,
-    /// The lossy run going on: (began, datagrams received and lost in it, the send rate it began
-    /// at), and the datagrams the last message counted (`measure`).
-    episode: Option<(Instant, (i64, i64), f64)>,
+    /// The lossy run going on, and the datagrams the last message counted (`measure`).
+    episode: Option<Run>,
     counted: (i64, i64),
+    /// Since when every window with enough datagrams has lost over `LOSS_HIGH`.
+    heavy_since: Option<Instant>,
     /// When a burst last showed its loss did not fall with the sender's rate: loss bursts set no
     /// line for `HOLD` after it.
     random_burst: Option<Instant>,
@@ -675,10 +680,24 @@ struct HoldLine {
     stepped: Instant,
     /// The most the link delivered while dropping since the hold began.
     trouble: f64,
-    /// The lossy run that last lowered the line: (began, its loss, the send rate it began at).
+    /// The lossy run that last lowered the line: (began, its loss over the run, the send rate it
+    /// began at).
     cause: (Instant, f64, f64),
     /// Loss lowered the line (a burst, or a probe meeting loss): the link drops what overflows.
     dropped: bool,
+}
+
+/// v2's lossy run: a burst, its ramp and tail (`Estimator::apply`).
+#[derive(Debug, Clone, Copy)]
+struct Run {
+    at: Instant,
+    /// Datagrams received and lost in it.
+    counted: (i64, i64),
+    /// The send rate it began at, and what the encoder was asked then (`Estimator::encoder_kbps`).
+    from: f64,
+    asked: Option<f64>,
+    /// The most its loss so far reached.
+    peak: f64,
 }
 
 /// A congested window this long after the line last stepped down shows the step did not cure
@@ -739,6 +758,7 @@ impl Estimator {
             read_last: false,
             episode: None,
             counted: (0, 0),
+            heavy_since: None,
             random_burst: None,
             encoder_kbps: None,
             floor_bin: None,
@@ -789,12 +809,28 @@ impl Estimator {
         self.held.map_or(kbps, |h| kbps.min(h.kbps.max(MIN_KBPS)))
     }
 
+    /// Ends the hold (`HOLD`), naming the path that ended it for the lab.
+    fn end_hold(&mut self, reason: &'static str) {
+        if let Some(h) = self.held.take() {
+            tracing::info!(
+                token = "webtransport-hold-ended",
+                reason,
+                held_kbps = h.kbps as u64,
+                cause_loss_pct = h.cause.1 * 100.0,
+                set_by_loss = h.dropped,
+                "WebTransport capacity hold at {:.0} kbps ended ({reason})",
+                h.kbps
+            );
+        }
+    }
+
     /// Start again from `kbps` (never above the ceiling): codec-pyrowave.md §Rate, the ABR
     /// resumes from the estimate after a switch back.
     pub(crate) fn resume_at(&mut self, kbps: f64) {
         self.delay_kbps = kbps;
         self.loss_kbps = kbps;
-        (self.held, self.read_last) = (None, false);
+        self.read_last = false;
+        self.end_hold("codec-switch");
         self.stop_regrow("codec switch");
         self.settle();
     }
@@ -851,7 +887,7 @@ impl Estimator {
                 // Backing off did not stop the loss: it is not the link's capacity. Under half the
                 // hold's renewal line it is too little to keep a hold alive anyway.
                 if least >= LOSS_LOW / 2.0 {
-                    self.held = None;
+                    self.end_hold("loss-floor");
                 }
             }
         }
@@ -891,6 +927,7 @@ impl Estimator {
     /// Act on what one message measured.
     fn apply(&mut self, m: Measured, now: Instant, path: QuicPath) -> Option<f64> {
         self.loss = m.loss;
+        let was_held = self.held.is_some();
         let dt = now
             .saturating_duration_since(self.last_update)
             .as_secs_f64()
@@ -1027,9 +1064,20 @@ impl Estimator {
         // The hold (`HOLD`): what a congested window delivered, or a confirmed reading. Only while
         // the encoder fills what it is asked: a quiet scene's rate is not the link's.
         let holds = self.holds && !self.legacy;
-        let busy = self
+        self.heavy_since = match m.loss {
+            Some(l) if l > LOSS_HIGH => self.heavy_since.or(Some(now)),
+            Some(_) => None,
+            None => self.heavy_since,
+        };
+        let fill = self
             .encoder_kbps
-            .is_none_or(|e| m.sent_kbps.is_some_and(|s| s >= APP_LIMITED * e));
+            .map(|e| m.sent_kbps.unwrap_or(0.0) / e.max(1.0));
+        // An encoder under its setpoint still overloads a link it sends over: heavy loss that lasts
+        // a window counts (S1: 0.7 × into the R4 policer). A still screen's one burst does not.
+        let sustained = self
+            .heavy_since
+            .is_some_and(|at| now.saturating_duration_since(at) >= LOSS_WINDOW);
+        let busy = fill.is_none_or(|f| f >= APP_LIMITED || (f >= UNDERFILL && sustained));
         let congested = holds && busy && m.loss.is_some_and(|l| l > LOSS_HIGH);
         let sent = m.sent_kbps.unwrap_or(0.0);
         let loss = m.loss.unwrap_or(0.0);
@@ -1037,47 +1085,73 @@ impl Estimator {
         // do not end it, and its loss is counted over it (a loss cut restarts the window, so one
         // window's loss is noise).
         let (r, l) = std::mem::take(&mut self.counted);
+        let prev = self.episode;
         self.episode = match self.episode {
-            Some((at, n, from)) if m.loss.is_none_or(|l| l >= LOSS_LOW) => {
-                Some((at, (n.0 + r, n.1 + l), from))
-            }
-            _ if holds && busy && loss >= LOSS_LOW => Some((now, (r, l), sent)),
+            Some(run) if m.loss.is_none_or(|l| l >= LOSS_LOW) => Some(Run {
+                counted: (run.counted.0 + r, run.counted.1 + l),
+                ..run
+            }),
+            _ if holds && busy && loss >= LOSS_LOW => Some(Run {
+                at: now,
+                counted: (r, l),
+                from: sent,
+                asked: self.encoder_kbps,
+                peak: 0.0,
+            }),
             _ => None,
         };
         // Direct `apply` (tests) counts nothing: the window's loss stands in.
-        let run_loss =
-            self.episode
-                .map_or(loss, |(_, (r, l), _)| match r + l >= LOSS_MIN_SAMPLES {
-                    true => l.max(0) as f64 / (r + l) as f64,
-                    false => loss,
-                });
-        if let (Some(h), Some((at, _, _))) = (self.held.as_mut(), self.episode) {
-            if h.cause.0 == at {
+        let run_loss = self.episode.map_or(loss, |run| {
+            let (r, l) = run.counted;
+            match r + l >= LOSS_MIN_SAMPLES {
+                true => l.max(0) as f64 / (r + l) as f64,
+                false => loss,
+            }
+        });
+        if let Some(run) = self.episode.as_mut() {
+            run.peak = run.peak.max(run_loss);
+            if let Some(h) = self.held.as_mut().filter(|h| h.cause.0 == run.at) {
                 h.cause.1 = run_loss;
             }
         }
-        // A run that began a step after the line last came down is a new burst. W2e's
-        // discriminator per burst: losing as much at a rate under the one the line's run began
-        // at, the loss did not fall with the rate (Wi-Fi), so it is not the link. A new burst
+        // A run that began a step after the line last came down is a new burst. A new burst
         // lowers the line only once its window holds it (`LOSS_WINDOW`).
         let later = self
             .episode
             .zip(self.held)
-            .filter(|&((at, _, _), h)| at.saturating_duration_since(h.stepped) >= HOLD_STEP_GAP);
-        let released = later.is_some_and(|((_, _, from), h)| {
-            run_loss >= FLOOR_FLAT * h.cause.1 && from <= FLOOR_SPREAD * h.cause.2
-        });
+            .filter(|&(run, h)| run.at.saturating_duration_since(h.stepped) >= HOLD_STEP_GAP);
+        // W2e's discriminator per burst, once the burst is over: its loss peaked as high as the line's
+        // run lost over it, at a rate under the one that run began at, so it did not fall with the
+        // rate (a later run's tail is longer: the sender no longer drops inside it), and it ended
+        // with the line where it was and the encoder asked as much, so nothing the sender did
+        // ended it (Wi-Fi). Capacity loses as much at a lower rate too, but until the sender drops
+        // (seat B M1: a second cap step). Only a hold set by loss: readings lost nothing.
+        let released = prev
+            .filter(|_| self.episode.is_none())
+            .zip(self.held)
+            .is_some_and(|(run, h)| {
+                h.dropped
+                    && h.cause.1 >= LOSS_HIGH
+                    && run.at.saturating_duration_since(h.stepped) >= HOLD_STEP_GAP
+                    && run.peak >= FLOOR_FLAT * h.cause.1
+                    && run.from <= FLOOR_SPREAD * h.cause.2
+                    && run
+                        .asked
+                        .zip(self.encoder_kbps)
+                        .is_none_or(|(was, now)| now >= FLOOR_SPREAD * was)
+            });
         if released {
-            (self.held, self.random_burst) = (None, Some(now));
+            self.random_burst = Some(now);
+            self.end_hold("burst-not-capacity");
         }
         let random = self
             .random_burst
             .is_some_and(|at| now.saturating_duration_since(at) < HOLD);
         let settled =
-            later.is_none_or(|((at, _, _), _)| now.saturating_duration_since(at) >= LOSS_WINDOW);
+            later.is_none_or(|(run, _)| now.saturating_duration_since(run.at) >= LOSS_WINDOW);
         let burst = m
             .rate_kbps
-            .filter(|_| congested && !released && !random && settled)
+            .filter(|_| congested && !random && settled)
             .map(|r| BETA * r);
         // A probe that meets loss found the link: back off from it, as from a burst.
         let probing = self
@@ -1096,7 +1170,7 @@ impl Estimator {
         {
             let cause = self
                 .episode
-                .map_or((now, loss, sent), |(at, _, from)| (at, run_loss, from));
+                .map_or((now, loss, sent), |run| (run.at, run_loss, run.from));
             let mut h = self.held.unwrap_or(HoldLine {
                 kbps: f64::INFINITY,
                 since: now,
@@ -1129,7 +1203,7 @@ impl Estimator {
                 };
                 h.kbps *= per_s.powf(dt);
                 if h.kbps >= self.ceiling_kbps {
-                    self.held = None;
+                    self.end_hold("probe-reached-ceiling");
                 }
             }
         }
@@ -1153,7 +1227,8 @@ impl Estimator {
         };
         let due = self.log_due(now)
             && (self.unlogged.is_some() || self.bound != self.logged.0 || self.measured.is_some());
-        if !cut_by.is_empty() || due {
+        let hold_began = self.held.is_some() && !was_held;
+        if !cut_by.is_empty() || due || hold_began {
             // A silence fall not logged yet is part of this line's "from → to".
             let from = match self.unlogged.take() {
                 Some(from) => {
@@ -1177,6 +1252,9 @@ impl Estimator {
                 delivered_kbps = m.delivered_kbps.unwrap_or(0.0) as u64,
                 gap_ms = m.gap_us as f64 / 1000.0,
                 sent_kbps = m.sent_kbps.unwrap_or(0.0) as u64,
+                encoder_kbps = self.encoder_kbps.unwrap_or(0.0) as u64,
+                fill = fill.unwrap_or(1.0),
+                busy,
                 app_limited,
                 base_kbps = base as u64,
                 loss_pct = m.loss.unwrap_or(0.0) * 100.0,

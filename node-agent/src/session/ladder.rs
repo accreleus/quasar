@@ -1443,13 +1443,14 @@ impl LadderPlanner {
     /// delivered, its rung never steps up into that link (lab row R4: a 720p keyframe into a
     /// 5 Mbit/s policer), and for `HELD_DOWN_WAIT` after the hold began it does not step down.
     pub fn set_held(&mut self, held: bool, now: Instant) {
-        let was = self.held_since(now);
         // A hold released (a random burst) takes its down run with it: the rate it held climbs
         // back, and only a rate still under the line `RATE_CONFIRM` from now steps.
-        if !held && was.is_some() && self.run.is_some_and(|r| r.1 == StepDir::Down) {
+        if !held && self.held.is_some() && self.run.is_some_and(|r| r.1 == StepDir::Down) {
             self.run = None;
         }
-        self.held = held.then(|| (was.unwrap_or(now), now));
+        // A report gap (a hidden tab) lapses the lease but ends no hold: seen again, it keeps its
+        // start, so the down wait does not begin again (#1433 seat B N3). Released, it is cleared.
+        self.held = held.then(|| (self.held.map_or(now, |(since, _)| since), now));
     }
 
     fn held_since(&self, now: Instant) -> Option<Instant> {
@@ -2940,6 +2941,20 @@ mod tests {
 
     /// #1433: for `HELD_DOWN_WAIT` after a hold began the rung does not step down (a random burst
     /// the next one releases); then it steps at once, the run already confirmed.
+    /// #1433 seat B N3: reports that stop for 2 s (a hidden tab) under a hold do not start its down
+    /// wait again: the rung steps `HELD_DOWN_WAIT` after the hold began. Old code: 2 s later.
+    #[test]
+    fn a_report_gap_under_a_hold_keeps_its_down_wait() {
+        let t = Instant::now();
+        let mut p = rate_planner(LadderOrder::ResFirst, false, 120, t);
+        assert!(held_rates(&mut p, t, 0, 2, |_| 2500.0).is_empty());
+        let wait = LadderPlanner::HELD_DOWN_WAIT.as_millis() as u64;
+        assert_eq!(
+            held_rates(&mut p, t, 4000, 4, |_| 2500.0),
+            vec![(wait, "res->3".into())]
+        );
+    }
+
     #[test]
     fn a_new_hold_waits_before_it_steps_the_rung_down() {
         let t = Instant::now();

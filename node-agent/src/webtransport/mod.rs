@@ -51,6 +51,10 @@ const CONTROL_WRITE: Duration = Duration::from_secs(2);
 /// Nothing received on the control stream for this long means the client is gone
 /// (§Bye and error); the client pings once a second.
 const CONTROL_IDLE: Duration = Duration::from_secs(10);
+/// A keyframe this soon after one was forced was asked for (`webtransport-keyframe-sent`); periodic
+/// (GOP) ones are logged at most once per `KEYFRAME_LOG_EVERY`.
+const KEYFRAME_ASKED: Duration = Duration::from_millis(500);
+const KEYFRAME_LOG_EVERY: Duration = Duration::from_secs(10);
 /// The input datagram channel (§Channels).
 const CHANNEL_INPUT: u8 = 0x03;
 /// The longest prefix of a client-supplied id that reaches a log line.
@@ -176,6 +180,8 @@ struct Control<'a> {
     fec: Option<fec::Policy>,
     /// The FEC overhead the ABR was last charged for, which is all the repairs may spend.
     charged: f64,
+    /// The most FEC the loss called for since the hold began (`Self::feed`); 0 with no hold.
+    hold_fec: f64,
     governor: congestion::Governor,
 }
 
@@ -200,6 +206,7 @@ impl<'a> Control<'a> {
             gone,
             fec: fec.then(fec::Policy::default),
             charged: 0.0,
+            hold_fec: 0.0,
             governor,
         }
     }
@@ -290,11 +297,13 @@ impl<'a> Control<'a> {
             fec.overhead().min(room)
         });
         if report {
-            (self.rate.held)(
-                self.estimator
-                    .held_kbps()
-                    .map(|line| line / (1.0 + self.charged)),
-            );
+            // The line holds video and the FEC its loss called for, kept while the hold lasts and
+            // never capped by the floor: at 1080p's floor the charge was 3 %, so the rung read the
+            // line as 720p video for 37 s under the lab's 5 Mbit/s `tbf` (#1433, R3).
+            let line = self.estimator.held_kbps();
+            let fec = self.fec.as_ref().map_or(0.0, fec::Policy::overhead);
+            self.hold_fec = line.map_or(0.0, |_| self.hold_fec.max(fec));
+            (self.rate.held)(line.map(|line| line / (1.0 + self.hold_fec.max(self.charged))));
             (self.rate.measured)(
                 self.estimator
                     .measured()
@@ -1846,6 +1855,9 @@ async fn stream(
     let mut nack_budget = retransmit::NackBudget::new(std::time::Instant::now());
     let mut nacks_capped = 0u64;
     let mut warned_oversized = false;
+    // `webtransport-keyframe-sent`: every keyframe a request or a new configuration caused, a
+    // periodic (GOP) one at most every `KEYFRAME_LOG_EVERY`.
+    let (mut key_logged, mut config_key) = (None::<std::time::Instant>, true);
     // Amendment 85: whether this connection is sent repairs, so the session's windows carry
     // the FEC keys (0 repair) exactly while it is. The publish refuses a client the session
     // no longer has, under the lock that replaces it: a displaced connection's attach lands
@@ -1982,12 +1994,20 @@ async fn stream(
                         congestion::Admit::GiveUp => break stalled(),
                         _ => continue,
                     }
-                    if unit.keyframe && !unit.pyrowave {
+                    let asked = unit.keyframe
+                        && (std::mem::take(&mut config_key)
+                            || media.last_forced().is_some_and(|at| at.elapsed() < KEYFRAME_ASKED));
+                    let periodic = key_logged.is_none_or(|at: std::time::Instant| at.elapsed() >= KEYFRAME_LOG_EVERY);
+                    if unit.keyframe && !unit.pyrowave && (asked || periodic) {
+                        if !asked {
+                            key_logged = Some(std::time::Instant::now());
+                        }
                         // The keyframe-to-average-frame ratio the capacity sim assumes (#1433).
                         let setpoint = media.rate().map_or(0.0, |r| (r.setpoint_kbps)());
                         let frame = setpoint * 1000.0 / 8.0 / f64::from(current.fps.max(1));
                         tracing::info!(
                             token = "webtransport-keyframe-sent",
+                            asked,
                             bytes = unit.data.len(),
                             width = current.width,
                             height = current.height,
@@ -2083,6 +2103,7 @@ async fn stream(
                     // The client drops a datagram of a configuration it has left: none goes
                     // ahead of the new one's keyframe.
                     video.clear();
+                    config_key = true;
                     if config.codec != "pyrowave" {
                         pyrowave_frames.forget();
                     }
