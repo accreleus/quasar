@@ -17,17 +17,23 @@ pub(crate) const SIGNATURE_ALGORITHM: &str = "ed25519";
 /// The version of the `.sig` envelope, not of the manifest or the release.
 pub(crate) const SIGNATURE_DOCUMENT_FORMAT_VERSION: i64 = 1;
 
+/// The org's release key (ADR 0003), trusted when `QUASAR_UPDATER_TRUSTED_KEYS` is blank.
+/// Pinned by `testdata/recovery/trust-vectors/config.json`; a rotation edits both.
+pub(crate) const DEFAULT_TRUSTED_KEYS: &str =
+    "quasar-release-2026:dvZHzSFv+4+++Ci+XrbakCozOv/13bsAGEo8nyemhZg=";
+
 const PUBLIC_KEY_LEN: usize = 32;
 const SIGNATURE_LEN: usize = 64;
 
-/// `QUASAR_UPDATER_SIGNATURE_MODE`.
+/// `QUASAR_UPDATER_SIGNATURE_MODE`. The operator default is `Verify`
+/// ([`parse_signature_mode`]); the derived `Default` is a library and test convenience.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SignatureMode {
     /// Fetches and grades nothing: ADR 0001 trust, digest and namespace.
     #[default]
     Off,
-    /// Refuses a bad signature, applies a release that definitively has none (and warns).
-    /// Not an enforcement boundary: the requester chooses the version looked up.
+    /// Refuses a bad signature and a named release that publishes none; applies a request
+    /// that names no version (and warns). The requester chooses whether to name one.
     Verify,
     /// Also refuses a release with no signature.
     Require,
@@ -128,6 +134,11 @@ pub(super) fn check(
             Reason::SignatureMissing,
             format!("this host requires a signed release and this one carries no signature: {why}"),
         )),
+        // A deleted `.sig` must not downgrade a named release to unverified (#621).
+        SignatureEvidence::Absent { why } if names_version(req) => Err(reject(
+            Reason::SignatureMissing,
+            format!("this host verifies named releases and this one carries no signature: {why} (mode=off would apply it)"),
+        )),
         SignatureEvidence::Absent { why } => {
             // The verify bypass (ADR 0003): logged every time, naming the version via `why`.
             let msg = format!(
@@ -162,6 +173,11 @@ pub(super) fn check(
             Ok(Admitted { unverified: None })
         }
     }
+}
+
+/// Whether the request names a release version, as the probe reads it.
+fn names_version(req: &Request) -> bool {
+    !trim_space(req.release.version.as_deref().unwrap_or("")).is_empty()
 }
 
 /// Checks the detached document over the manifest bytes and returns the id of the
@@ -277,12 +293,12 @@ fn bind_manifest(raw: &[u8], req: &Request) -> Result<(), String> {
     Ok(())
 }
 
-/// `QUASAR_UPDATER_SIGNATURE_MODE`. Blank is off; anything unrecognised is an error,
+/// `QUASAR_UPDATER_SIGNATURE_MODE`. Blank is verify; anything unrecognised is an error,
 /// never a fallback to off.
 pub fn parse_signature_mode(raw: &str) -> Result<SignatureMode, String> {
     match to_lower_ascii_keyword(trim_space(raw)).as_str() {
-        "" | "off" => Ok(SignatureMode::Off),
-        "verify" => Ok(SignatureMode::Verify),
+        "off" => Ok(SignatureMode::Off),
+        "" | "verify" => Ok(SignatureMode::Verify),
         "require" => Ok(SignatureMode::Require),
         _ => Err(format!(
             "{} is not a signature mode (want off, verify or require)",
@@ -294,7 +310,16 @@ pub fn parse_signature_mode(raw: &str) -> Result<SignatureMode, String> {
 /// `QUASAR_UPDATER_TRUSTED_KEYS`: comma-separated `key-id:base64key` or bare `base64key`,
 /// each the raw 32 bytes of an ed25519 public key. The first colon separates. One bad
 /// entry fails the whole list; the same key twice is kept once, with its first label.
+/// Blank is [`DEFAULT_TRUSTED_KEYS`], never an empty list.
 pub fn parse_trusted_keys(raw: &str) -> Result<Vec<TrustedKey>, String> {
+    let keys = parse_key_list(raw)?;
+    if keys.is_empty() {
+        return parse_key_list(DEFAULT_TRUSTED_KEYS);
+    }
+    Ok(keys)
+}
+
+fn parse_key_list(raw: &str) -> Result<Vec<TrustedKey>, String> {
     let mut out: Vec<TrustedKey> = Vec::new();
     for part in raw.split(',') {
         let part = trim_space(part);

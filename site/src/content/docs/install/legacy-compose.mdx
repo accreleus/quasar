@@ -57,13 +57,15 @@ Nothing ships the updater any more, so it can't be added later.
 
 ### Verify release signatures
 
-Optional, off by default. The installed digest is always the one the release
-manifest pins. To also check the manifest's signature, set these in that host's
-`deploy/.env` and recreate the updater:
+Off by default on this updater. Its image no longer changes, so it keeps the
+old default; the recovery actor of a current install checks signatures by
+default. The installed digest is always the one the release manifest pins.
+Releases are signed with the project's key, so to also check the manifest's
+signature, set these in that host's `deploy/.env` and recreate the updater:
 
 ```bash
 QUASAR_UPDATER_SIGNATURE_MODE=verify
-QUASAR_UPDATER_TRUSTED_KEYS=<key-id>:<base64 public key>
+QUASAR_UPDATER_TRUSTED_KEYS=quasar-release-2026:dvZHzSFv+4+++Ci+XrbakCozOv/13bsAGEo8nyemhZg=
 docker compose -f deploy/docker-compose.yml up -d --no-deps quasar-updater
 ```
 

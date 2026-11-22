@@ -13,6 +13,16 @@
       }
     },
     {
+      "name": "a blank mode fetches",
+      "source": "added: #621 option B (signed releases by default)",
+      "signature_mode": "",
+      "in_flight_request_id": "",
+      "request_id": "7a1f6f1e-2c33-4a58-9a5e-0b6b0f7a1c22",
+      "expect": {
+        "fetches": true
+      }
+    },
+    {
       "name": "verify fetches",
       "source": "go:control-plane/internal/updater/signature_server_test.go:TestServerAcceptsAMissingSignatureUnderVerify",
       "signature_mode": "verify",

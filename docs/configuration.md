@@ -1966,7 +1966,7 @@ registers as `seed_version`.
 | `QUASAR_MACHINE_DIR_HOST_PATH` | learned from the actor's own mount | Only when the actor cannot inspect its own container: the daemon-host path of the machine-state directory, whose `dumps/` the pre-update dump helper binds (#364). Normally the `quasar-machine` volume's mount point, which needs the engine's `local` volume driver. |
 | `DOCKER_HOST` | `unix:///var/run/docker.sock` | The engine, with the same refusals as the agent (`DOCKER_CONTEXT`, TLS and API-version selectors are refused). |
 | `QUASAR_UPDATER_ALLOWED_NAMESPACES` | `ghcr.io/accreleus/quasar` | The registry namespaces this machine's actor will pull platform images from ("Release trust" below). **A seed input** (#361): read from the seed's container at first install like the other inputs, checked, and recorded in machine state (`machine.json` `inputs.trust`), which the actor uses from then on; the seed-created actor's own environment holds none (ADR 0007's frozen profile). A developer apply from a test registry needs that registry's namespace here, set on the seed before the first install; `reconfigure` (#366) changes it later. On a control-plane machine the control plane is given the same list (its developer-apply check). A machine installed before these were recorded uses the actor's own environment, as before. |
-| `QUASAR_UPDATER_SIGNATURE_MODE`, `QUASAR_UPDATER_TRUSTED_KEYS`, `QUASAR_UPDATER_MANIFEST_BASE_URL`, `QUASAR_UPDATER_MANIFEST_TIMEOUT_S` | `off`, none, the org's GitHub Releases, `15` | ADR 0003 release signatures, verified by the actor ("Release trust" below). Seed inputs recorded at first install, exactly as the allowlist above (machine state wins over the actor's own environment once recorded). A developer apply names no release version, so `require` refuses it `signature_missing`. An invalid value refuses the install before anything is created (`token="seed-inputs-invalid"`), or stops a hand-started actor (`token="actor-trust-config-invalid"`). |
+| `QUASAR_UPDATER_SIGNATURE_MODE`, `QUASAR_UPDATER_TRUSTED_KEYS`, `QUASAR_UPDATER_MANIFEST_BASE_URL`, `QUASAR_UPDATER_MANIFEST_TIMEOUT_S` | `verify`, the org's release key, the org's GitHub Releases, `15` | ADR 0003 release signatures, verified by the actor ("Release trust" below). Seed inputs recorded at first install, exactly as the allowlist above (machine state wins over the actor's own environment once recorded). A developer apply names no release version, so `require` refuses it `signature_missing`. An invalid value refuses the install before anything is created (`token="seed-inputs-invalid"`), or stops a hand-started actor (`token="actor-trust-config-invalid"`). |
 | `QUASAR_PLATFORM_INSECURE_REGISTRIES` | unset | A combined or control-only machine: the plain-HTTP registries (`host[:port]`, comma-separated) its control plane may read a developer apply's image identity from, for a test registry. A seed input, recorded like the allowlist and passed to the control plane. The engine pulling from such a registry needs it in its own `insecure-registries`. |
 | `RUST_LOG` | `info` | Every WARN/ERROR carries a `token=`. |
 
@@ -2354,8 +2354,8 @@ not affected.
 
 ### Release trust
 
-What a machine's recovery actor admits a replacement under: the namespace allowlist and,
-optionally, ADR 0003 release signatures. The four `QUASAR_UPDATER_*` names are kept from the
+What a machine's recovery actor admits a replacement under: the namespace allowlist and
+ADR 0003 release signatures. The four `QUASAR_UPDATER_*` names are kept from the
 retired Compose updater, whose rules the actor ported (`testdata/recovery/trust-vectors`); they
 are seed inputs recorded in machine state at first install ("Recovery actor" table above) and
 changed later with `reconfigure`.
@@ -2363,8 +2363,8 @@ changed later with `reconfigure`.
 | Variable | Default | Notes |
 |---|---|---|
 | `QUASAR_UPDATER_ALLOWED_NAMESPACES` | `ghcr.io/accreleus/quasar` | Comma-separated registry namespaces this machine will pull platform images from. Matched on `host/path/` segment boundaries, so `ghcr.io/accreleus/quasar` does not admit `ghcr.io/accreleus/quasar-evil/x`. Anything outside is refused `namespace_rejected` before a byte is pulled. **Unset or blank is the org default, never "allow nothing" and never "allow everything".** To lock a machine down, name a namespace nothing matches. |
-| `QUASAR_UPDATER_SIGNATURE_MODE` | `off` | `off` · `verify` · `require`. An unrecognised value refuses the install (`token="seed-inputs-invalid"`), never a silent fall back to `off`. **`verify` is a migration rung, not an enforcement boundary**: it catches a signed release that has been tampered with, but the apply request chooses which version's signature is looked for, so a request naming no version — or one never published — reads as "unsigned" and is applied. Only `require` refuses that. Each such apply logs a WARN naming the version. |
-| `QUASAR_UPDATER_TRUSTED_KEYS` | *(none)* | Comma-separated `key-id:base64`, each the raw 32 bytes of an ed25519 **public** key; a bare `base64` with no label is accepted. Several at once is how a key rotation avoids a flag day. A malformed entry refuses the install. |
+| `QUASAR_UPDATER_SIGNATURE_MODE` | `verify` | `off` · `verify` · `require`. Unset or blank is `verify`. An unrecognised value refuses the install (`token="seed-inputs-invalid"`), never a silent fall back to `off`. Under `verify` a request that names a release version must find a good signature; a request that names none (a developer apply, an edge build, a revert to an unnamed build) has no published manifest to check and is applied with a WARN. Only `require` refuses that too. A machine that recorded a mode keeps it. |
+| `QUASAR_UPDATER_TRUSTED_KEYS` | the org's release key | Comma-separated `key-id:base64`, each the raw 32 bytes of an ed25519 **public** key; a bare `base64` with no label is accepted. Unset or blank is the org's key, `quasar-release-2026:dvZHzSFv+4+++Ci+XrbakCozOv/13bsAGEo8nyemhZg=`, compiled into the actor; a value replaces it (a fork names its own key). Several at once is how a key rotation avoids a flag day. A malformed entry refuses the install. |
 | `QUASAR_UPDATER_MANIFEST_BASE_URL` | `https://github.com/accreleus/quasar/releases/download/v{version}/` | Where the release manifest and its signature are fetched from. Must be **https** and must contain `{version}`; a trailing `/` is added if absent. A fork or an internal mirror points this at its own. |
 | `QUASAR_UPDATER_MANIFEST_TIMEOUT_S` | `15` | Wall-clock bound on **both** asset fetches together, well under the agent's 30 s socket call. |
 
@@ -2373,40 +2373,46 @@ A platform release may publish a detached signature over its manifest
 the manifest and the signature from `QUASAR_UPDATER_MANIFEST_BASE_URL` for the release's
 version, checks the signature against `QUASAR_UPDATER_TRUSTED_KEYS`, and checks that the signed
 manifest names the very images and digests the apply is asking for. It is a second gate beside
-the namespace allowlist, and it refuses in the same way. **Off by default**: nothing is fetched
-and nothing is checked, which is ADR 0001 trust (the pinned digest plus the namespace
-allowlist). Turning it on also needs a signing key in the release pipeline (`docs/upgrading.md`
-"Signing platform releases").
+the namespace allowlist, and it refuses in the same way. **On by default** (`verify` against the
+org's key). `off` fetches and checks nothing, which is ADR 0001 trust (the pinned digest plus the
+namespace allowlist); a machine that cannot reach the release host directly over HTTPS runs it
+(below). The release pipeline signs every release (`docs/upgrading.md` "Signing platform
+releases").
 
 | Mode | What the release publishes | Outcome |
 |---|---|---|
 | `off` | anything | Applied. Nothing is fetched. |
 | `verify` | a good signature | Applied. |
-| `verify` | no signature (the asset is a definitive 404) | Applied. This is the transition rung: turn it on before the first signed release exists and nothing breaks. |
+| `verify` | no signature (the asset is a definitive 404), and the request names a version | Refused, `signature_missing`. Deleting the `.sig` does not downgrade a release to unverified. |
+| `verify` | — the request names no version | Applied, with a WARN (`token="release-apply-unverified"`): nothing was published to check. |
 | `verify` | a bad signature, an untrusted key, or a manifest that does not name this request's digests | Refused, `signature_invalid`. |
 | `verify` | a signature that could **not be fetched** (network, proxy, 5xx) | Refused, `signature_invalid`. "Could not tell" is never read as "unsigned". |
 | `require` | no signature | Refused, `signature_missing`. |
 | `require` | otherwise | As `verify`. |
-| `verify` or `require` | — with no `QUASAR_UPDATER_TRUSTED_KEYS` | Every apply refused, `signature_invalid`. Fail closed: a gate that is on but checking nothing is worse than one that is off. |
+| `verify` or `require` | — with `QUASAR_UPDATER_TRUSTED_KEYS` unset or blank | Checked against the org's key compiled into the actor. A blank list is never "trust nothing" (#621); to trust only your own key, name it, since a list replaces the default. |
 
-Before setting `require`:
+Under `require`, **a request with no release version is refused** too: a developer apply, an
+edge-channel build, or a revert to a build the instance can no longer name by release carries no
+version, so no published manifest signed it. Drop the machine to `verify` for those.
 
-- **A request with no release version is refused**: a developer apply, an edge-channel build,
-  or a revert to a build the instance can no longer name by release carries no version, so no
-  published manifest signed it. Drop the machine to `verify` for those.
-- **The actor needs outbound HTTPS** to the manifest base URL (not with `off`).
+`verify` and `require` both need:
+
+- **Outbound HTTPS from the actor** to the manifest base URL (not with `off`).
 - **No proxy.** The fetch has no proxy client: a request that `HTTPS_PROXY` (honouring
   `NO_PROXY`) would route through a proxy is refused, so a machine that reaches the release host
-  only through a proxy cannot run `verify` or `require`; it runs `off`.
+  only through a proxy cannot run `verify` or `require`; it runs `off`. The console still offers
+  releases there (the control plane's own egress uses the proxy), and every stable apply is
+  refused `signature_invalid` until the machine runs
+  `docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_UPDATER_SIGNATURE_MODE=off`.
+  An offline machine is the same.
 - **Public trust roots only.** The fetch trusts the public web roots (Mozilla's set) and ignores
   `SSL_CERT_FILE` / `SSL_CERT_DIR`, so a mirror behind a private certificate authority is
   refused. Point `QUASAR_UPDATER_MANIFEST_BASE_URL` at a host with a publicly trusted
   certificate.
 
-One hole `verify` cannot close: the fetch is unauthenticated, so on a **private** release
-repository every asset answers 404 and a machine reads a signed release as an unsigned one. A
-fork publishing privately should run `require`, which refuses that case, or point
-`QUASAR_UPDATER_MANIFEST_BASE_URL` at a mirror its machines can read. What a machine records is
+The fetch is unauthenticated, so on a **private** release repository every asset answers 404:
+a named release is refused `signature_missing`. A fork publishing privately points
+`QUASAR_UPDATER_MANIFEST_BASE_URL` at a mirror its machines can read, or runs `off`. What a machine records is
 in machine state (`machine.json`, `inputs.trust`): key labels and public keys, never private key
 material.
 

@@ -59,8 +59,8 @@ Also seed inputs.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `QUASAR_UPDATER_ALLOWED_NAMESPACES` | `ghcr.io/accreleus/quasar` | Registry namespaces platform images may come from, comma-separated. Blank means the default. The first machine also checks developer applies against it. |
-| `QUASAR_UPDATER_SIGNATURE_MODE` | `off` | `off`, `verify` or `require`. See [Release signatures](/quasar/operations/upgrading/#release-signatures). |
-| `QUASAR_UPDATER_TRUSTED_KEYS` | none | `<key-id>:<base64 public key>`, comma-separated. |
+| `QUASAR_UPDATER_SIGNATURE_MODE` | `verify` | `off`, `verify` or `require`. Behind a proxy or private CA, or offline, set `off`. See [Release signatures](/quasar/operations/upgrading/#release-signatures). |
+| `QUASAR_UPDATER_TRUSTED_KEYS` | the project's release key | `<key-id>:<base64 public key>`, comma-separated. Blank means the default; a list replaces it. |
 | `QUASAR_UPDATER_MANIFEST_BASE_URL` | the project's GitHub Releases | Where signatures are fetched from. |
 | `QUASAR_UPDATER_MANIFEST_TIMEOUT_S` | `15` | Timeout for that fetch. |
 | `QUASAR_PLATFORM_INSECURE_REGISTRIES` | unset | First machine: plain-HTTP registries allowed for a developer apply. |
@@ -82,7 +82,7 @@ the enrollment file, is refused.
 To change an input later:
 
 ```bash
-docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_UPDATER_SIGNATURE_MODE=verify
+docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_UPDATER_SIGNATURE_MODE=off
 ```
 
 `reconfigure` accepts the trust settings, `QUASAR_HOME_ROOT`,

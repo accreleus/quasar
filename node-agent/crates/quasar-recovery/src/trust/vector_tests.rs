@@ -537,12 +537,13 @@ fn run_config(v: &ConfigVector) {
                 Ok(keys) => {
                     let keys: Vec<Value> = keys
                         .iter()
-                        .map(|k| {
-                            let label = labels
-                                .get(&k.key)
-                                .cloned()
-                                .unwrap_or_else(|| "(not a vector key)".into());
-                            json!({"id": k.id, "public_key_of": label})
+                        .map(|k| match labels.get(&k.key) {
+                            Some(label) => json!({"id": k.id, "public_key_of": label}),
+                            // A real key (the org default): the vector pins its bytes.
+                            None => json!({
+                                "id": k.id,
+                                "base64": base64::engine::general_purpose::STANDARD.encode(k.key),
+                            }),
                         })
                         .collect();
                     json!({"ok": true, "keys": keys})

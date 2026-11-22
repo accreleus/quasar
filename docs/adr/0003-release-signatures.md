@@ -9,6 +9,24 @@ date: 2026-09-08
 > `testdata/recovery/trust-vectors`); the Go updater that implemented it is retired. The
 > decision below is unchanged.
 
+> *#621 (0.6.4), amending "Default off" and "`verify` is the transition rung" under
+> Consequences:* signing is now **on by default**. Every release is signed by the org key
+> `quasar-release-2026`, held as a secret of the `release` GitHub environment, which only a
+> run on a `v*` tag can use; the recovery actor compiles in its public half as the default
+> `QUASAR_UPDATER_TRUSTED_KEYS` and defaults `QUASAR_UPDATER_SIGNATURE_MODE` to `verify`.
+> One rule changes in `verify`: a request that names a version and finds no signature (a 404)
+> is refused `signature_missing`, so deleting a release's `.sig` no longer
+> downgrades it to unverified. A request that names no version is still applied with the WARN,
+> and the rest of the "not an enforcement boundary" consequence stands for it. A machine that
+> recorded a mode keeps it; one that cannot reach the release host directly over HTTPS runs
+> `off` (`docs/upgrading.md` "Signing platform releases"). A blank
+> `QUASAR_UPDATER_TRUSTED_KEYS` now means the org key, never an empty list, so the "no trusted
+> keys refuses every apply" consequence below can no longer arise; an explicit list replaces the
+> default. `signature_missing` and `signature_invalid` are now emitted on a default machine, not
+> only after an operator turns verification on. Only a run on a `v*` tag can use the `release`
+> environment, and a tag release of the org repository with no key fails rather than publishing
+> unsigned.
+
 ADR 0001 chose digest pinning alone and filed signatures as a follow-up, noting
 that "the manifest already carries the digests a signature would cover" and that
 adding them later "changes the verifier, not the shape". This is that follow-up.
@@ -109,7 +127,8 @@ verifies, because whoever writes the document chooses the label.
   what signing alone buys.
 - Fail closed on ambiguity. A fetch that could not be completed is never read as
   "unsigned", and a host told to verify with no trusted keys refuses every apply
-  rather than checking nothing.
+  rather than checking nothing. (Since #621 a blank key list is the org key, so a
+  host can no longer be left with no trusted keys.)
 - Under `require`, a release with no `version` — an edge build, or a revert to a
   build the instance can no longer name — is refused. Reverting to such a build
   needs the manual recipe or a temporary drop to `verify`.

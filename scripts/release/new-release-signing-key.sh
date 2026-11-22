@@ -86,10 +86,11 @@ machine run, inside its recovery actor:
 
   $key_id:$public_key
 
-Release pipeline — create the repository secret holding the PRIVATE key:
+Release pipeline — store the PRIVATE key as a secret of the \`release\` environment
+(deployment policy: tags v*), never as a repository secret:
 
-  gh secret set QUASAR_RELEASE_SIGNING_KEY --repo <owner/name> < $out
-  gh variable set QUASAR_RELEASE_SIGNING_KEY_ID --repo <owner/name> --body '$key_id'
+  gh secret set QUASAR_RELEASE_SIGNING_KEY --env release --repo <owner/name> < $out
+  gh variable set QUASAR_RELEASE_SIGNING_KEY_ID --env release --repo <owner/name> --body '$key_id'
 
 Then delete nothing from your backup, and never paste the private key into an
 issue, a log, or this repository.
