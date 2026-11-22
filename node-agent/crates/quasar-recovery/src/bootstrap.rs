@@ -545,3 +545,28 @@ impl std::fmt::Debug for Checked {
             .finish_non_exhaustive()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trust::SignatureMode;
+
+    #[test]
+    fn unset_trust_verifies_against_the_org_key_and_recorded_trust_is_kept() {
+        let unset = trust_config(&TrustInputs::default()).unwrap().signature;
+        assert_eq!(unset.mode, SignatureMode::Verify);
+        let ids: Vec<&str> = unset.keys.iter().map(|k| k.id.as_str()).collect();
+        assert_eq!(ids, ["quasar-release-2026"]);
+
+        let recorded = trust_config(&TrustInputs {
+            signature_mode: Some("off".into()),
+            trusted_keys: Some("fork:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into()),
+            ..TrustInputs::default()
+        })
+        .unwrap()
+        .signature;
+        assert_eq!(recorded.mode, SignatureMode::Off);
+        let ids: Vec<&str> = recorded.keys.iter().map(|k| k.id.as_str()).collect();
+        assert_eq!(ids, ["fork"]);
+    }
+}

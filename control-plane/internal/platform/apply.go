@@ -77,7 +77,7 @@ const (
 	ReasonTimeout              = "timeout"
 	ReasonUnsupported          = "unsupported"
 
-	// Emitted with QUASAR_UPDATER_SIGNATURE_MODE on, which is off by default.
+	// Emitted under QUASAR_UPDATER_SIGNATURE_MODE verify (the default) or require.
 	// Client copy: web/src/pages/admin/fleet/releasesCopy.ts.
 	ReasonSignatureMissing = "signature_missing"
 	ReasonSignatureInvalid = "signature_invalid"

@@ -94,6 +94,7 @@ qdiag-runs/
 # apitest builds via `go run` (scripts/harness/run-apitest.sh); never commit the binary
 scripts/harness/apitest/quasar-apitest
 scripts/harness/apitest/results.json
+scripts/harness/udprelay/udprelay
 
 # build-images.sh writes a per-run build report (image ids, resolved pins, verdicts)
 deploy/.build-report.json

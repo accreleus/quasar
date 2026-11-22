@@ -59,25 +59,26 @@ recipe.
 
 ## Release signatures
 
-**Optional, off by default.** Quasar always installs the digests the release
-manifest pins. If you also want each machine to check the manifest's signature,
-set these seed inputs (recorded at first install):
+**On by default.** Quasar always installs the digests the release manifest pins.
+Each machine's recovery actor also checks the manifest's signature against the
+project's release key before it applies a named release. These seed inputs
+control it (recorded at first install):
 
 | Variable | Values |
 | --- | --- |
-| `QUASAR_UPDATER_SIGNATURE_MODE` | `off` (default); `verify` refuses a bad signature but accepts unsigned; `require` also refuses unsigned releases, edge builds and developer applies. |
-| `QUASAR_UPDATER_TRUSTED_KEYS` | `<key-id>:<base64 public key>`, comma-separated. |
+| `QUASAR_UPDATER_SIGNATURE_MODE` | `verify` (default) refuses a named release with a bad or missing signature, and applies a developer apply, edge build or unnamed revert with a warning; `require` refuses those too; `off` checks nothing. |
+| `QUASAR_UPDATER_TRUSTED_KEYS` | `<key-id>:<base64 public key>`, comma-separated. Blank means the project's key, built into the actor. A list you set replaces it. |
 
-Change them later on each machine:
-
-```bash
-docker exec -it quasar-recovery quasar-recovery reconfigure --yes \
-  QUASAR_UPDATER_SIGNATURE_MODE=verify QUASAR_UPDATER_TRUSTED_KEYS=<key-id>:<base64 public key>
-```
-
-- A mode with no trusted keys refuses every update.
 - The signature is fetched from GitHub directly, without a proxy or private CA.
-  Behind either, leave the mode `off`.
+  A machine that reaches GitHub only through a proxy, a private-CA mirror, or not
+  at all refuses every update until you turn checking off on it:
+
+  ```bash
+  docker exec -it quasar-recovery quasar-recovery reconfigure --yes \
+    QUASAR_UPDATER_SIGNATURE_MODE=off
+  ```
+
+- A machine that recorded a mode or keys keeps them.
 - Legacy Compose: see [Legacy Compose
   installs](/quasar/install/legacy-compose/#verify-release-signatures).
 
