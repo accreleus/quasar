@@ -19,8 +19,8 @@ Drops the capture's lost frames and checks, with ffmpeg as the reference decoder
   - the references each kept frame names are the pictures the encoder meant
     (AV1: VBI slots simulated from refresh_frame_flags; HEVC: no RPS entry is a lost
     picture; H.264: the recovery frame names the anchor's LongTermFrameIdx);
-  - the pruned stream decodes without an error and every kept frame is bit-identical
-    to the full stream's decode;
+  - the full and the pruned stream decode without an error, and every kept frame is
+    bit-identical to the full stream's decode;
   - the full decode stays close to the source, and no recovery frame is more than
     NEAR_DB below the frames before it (a picture coded from another reference
     than its header names decodes wrong without an error, and a near miss can
@@ -214,8 +214,9 @@ def main(d, codec):
     else:
         check_h265(pk, frames, kept, lost, recov, nvenc)
 
-    a, _ = md5s(d, full, codec)
+    a, full_err = md5s(d, full, codec)
     b, err = md5s(d, pruned, codec)
+    check(not full_err, f"full decode reported: {full_err[:400]}")
     check(len(a) == len(aus), f"full decode gave {len(a)} frames")
     check(len(b) == len(kept), f"pruned decode gave {len(b)} frames for {len(kept)} kept")
     check(not err, f"pruned decode reported: {err[:400]}")
