@@ -242,6 +242,8 @@ struct Slot {
     sent_us: u64,
     bytes: u16,
     resend: bool,
+    /// A keyframe's, or sent `KEY_SPILL` or less after one (`Run::key`).
+    key: bool,
     status: Status,
 }
 
@@ -259,6 +261,8 @@ pub(crate) struct SendLog {
     unanswered_seq: Option<u32>,
     /// The `pkt_seq` after the last one recorded.
     next_seq: u32,
+    /// The stamp of the last keyframe datagram, µs.
+    key_us: Option<u64>,
     /// The last stamp, µs: stamps never go back in `pkt_seq` (send) order, whatever stamped
     /// them (a paced release, a queue time, a resend), or the delay detector reads a send
     /// that went back in time.
@@ -273,6 +277,7 @@ impl SendLog {
             unanswered_since: None,
             unanswered_seq: None,
             next_seq: 0,
+            key_us: None,
             last_us: 0,
         }
     }
@@ -280,7 +285,7 @@ impl SendLog {
     /// [`Self::record_handed`] for a datagram stamped when it was handed to QUIC.
     #[cfg(test)]
     pub(crate) fn record(&mut self, datagram: &[u8], at: Instant, resend: bool) {
-        self.record_handed(datagram, at, at, resend);
+        self.record_handed(datagram, at, at, resend, false);
     }
 
     /// `pkt_seq` is bytes 1..5 of every datagram (§Channels). A `resend` (a NACK answer)
@@ -292,6 +297,7 @@ impl SendLog {
         at: Instant,
         handed: Instant,
         resend: bool,
+        key: bool,
     ) {
         let Some(seq) = datagram.get(1..5) else {
             return;
@@ -300,11 +306,18 @@ impl SendLog {
         self.last_us = self
             .last_us
             .max(at.saturating_duration_since(self.start).as_micros() as u64);
+        if key {
+            self.key_us = Some(self.last_us);
+        }
+        let key = self
+            .key_us
+            .is_some_and(|k| self.last_us - k <= KEY_SPILL.as_micros() as u64);
         self.slots[seq as usize % LOG] = Slot {
             seq,
             sent_us: self.last_us,
             bytes: datagram.len().min(u16::MAX as usize) as u16,
             resend,
+            key,
             status: Status::Unreported,
         };
         // The hand-off, not the stamp: unpaced held video is stamped with its queue time,
@@ -618,6 +631,8 @@ pub(crate) struct Estimator {
     /// The lossy run going on, and the datagrams the last message counted (`measure`).
     episode: Option<Run>,
     counted: (i64, i64),
+    /// The first loss `counted` was a keyframe's (`Slot::key`).
+    key_lost: Option<bool>,
     /// Since when every window with enough datagrams has lost over `LOSS_HIGH`.
     heavy_since: Option<Instant>,
     /// When a burst last showed its loss did not fall with the sender's rate: loss bursts set no
@@ -685,11 +700,18 @@ struct Run {
     asked: Option<f64>,
     /// The most its loss so far reached.
     peak: f64,
+    /// It began with a keyframe's loss (`Slot::key`): a policer the line sits just under
+    /// overflows on a keyframe, a short burst at a constant rate that ends on its own, as Wi-Fi's
+    /// does. A Wi-Fi burst does not begin on keyframes.
+    key: bool,
 }
 
 /// A congested window this long after the line last stepped down shows the step did not cure
 /// it: the line steps again. Shorter, it is the same burst (the loss window is 500 ms).
 const HOLD_STEP_GAP: Duration = Duration::from_secs(1);
+/// A loss this soon after a keyframe datagram was sent is the keyframe's (`Run::key`): seat B's
+/// M1' rows lost first 13 and 27 ms after one (3800, 4000 under the lab encoder).
+const KEY_SPILL: Duration = Duration::from_millis(50);
 
 /// What one message measured, for the tests.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -745,6 +767,7 @@ impl Estimator {
             read_last: false,
             episode: None,
             counted: (0, 0),
+            key_lost: None,
             heavy_since: None,
             random_burst: None,
             encoder_kbps: None,
@@ -1072,6 +1095,7 @@ impl Estimator {
         // do not end it, and its loss is counted over it (a loss cut restarts the window, so one
         // window's loss is noise).
         let (r, l) = std::mem::take(&mut self.counted);
+        let key_lost = std::mem::take(&mut self.key_lost);
         let prev = self.episode;
         self.episode = match self.episode {
             Some(run) if m.loss.is_none_or(|l| l >= LOSS_LOW) => Some(Run {
@@ -1084,6 +1108,7 @@ impl Estimator {
                 from: sent,
                 asked: self.encoder_kbps,
                 peak: 0.0,
+                key: key_lost == Some(true),
             }),
             _ => None,
         };
@@ -1112,12 +1137,14 @@ impl Estimator {
         // rate (a later run's tail is longer: the sender no longer drops inside it), and it ended
         // with the line where it was and the encoder asked as much, so nothing the sender did
         // ended it (Wi-Fi). Capacity loses as much at a lower rate too, but until the sender drops
-        // (seat B M1: a second cap step). Only a hold set by loss: readings lost nothing.
+        // (seat B M1: a second cap step), or only on keyframes (M1', `Run::key`). Only a hold set
+        // by loss: readings lost nothing.
         let released = prev
             .filter(|_| self.episode.is_none())
             .zip(self.held)
             .is_some_and(|(run, h)| {
                 h.dropped
+                    && !run.key
                     && h.cause.1 >= LOSS_HIGH
                     && run.at.saturating_duration_since(h.stepped) >= HOLD_STEP_GAP
                     && run.peak >= FLOOR_FLAT * h.cause.1
@@ -1131,9 +1158,14 @@ impl Estimator {
             self.random_burst = Some(now);
             self.end_hold("burst-not-capacity");
         }
+        // The burst memory never blocks loss lasting `HOLD_STEP_GAP`: a release it got wrong (seat B
+        // M1': 3800 under the lab encoder's keyframes) otherwise cost 61 s with no frame.
         let random = self
             .random_burst
-            .is_some_and(|at| now.saturating_duration_since(at) < HOLD);
+            .is_some_and(|at| now.saturating_duration_since(at) < HOLD)
+            && self
+                .episode
+                .is_none_or(|run| now.saturating_duration_since(run.at) < HOLD_STEP_GAP);
         let settled =
             later.is_none_or(|(run, _)| now.saturating_duration_since(run.at) >= LOSS_WINDOW);
         let burst = m
@@ -1606,6 +1638,7 @@ impl Estimator {
             } else {
                 slot.status = Status::Lost;
                 lost += 1;
+                self.key_lost.get_or_insert(slot.key);
             }
         }
         lost
@@ -2608,12 +2641,13 @@ impl VideoQueue {
             // it was in QUIC's queue before #1321. `SendLog::record` keeps the mix monotone.
             let (resend, queued_at) = (held.resend, self.counted.unwrap_or(held.queued_at));
             let started = (held.keyframe && !resend).then_some(held.queued_at);
+            let key = started.is_some();
             let logged = log.as_mut().filter(|_| held.logged);
             let record = logged.map(|log| (log, held.datagram.clone()));
             match send(held) {
                 Handed::Sent => {
                     if let Some((log, d)) = record {
-                        log.record_handed(&d, queued_at, now, resend);
+                        log.record_handed(&d, queued_at, now, resend, key);
                     }
                     if started.is_some() {
                         self.keyframe_started = started;

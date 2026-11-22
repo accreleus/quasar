@@ -5492,6 +5492,86 @@ fn a_burst_losing_as_much_at_a_lower_rate_releases_the_hold() {
     );
 }
 
+/// The hold of `a_burst_losing_as_much_at_a_lower_rate_releases_the_hold` up to its later burst at
+/// 4000, with `key` marking that burst's losses as a keyframe's; `asked` is what the encoder is
+/// asked through it.
+fn later_burst(key: bool, asked: f64) -> (Estimator, impl Fn(u64) -> Instant) {
+    let start = Instant::now();
+    let mut est = Estimator::new(CEILING, start);
+    let at = move |ms: u64| start + Duration::from_millis(ms);
+    est.encoder_kbps = Some(7000.0);
+    est.apply(received(7000.0, 0.3), at(100), NO_QUIC);
+    for ms in (200..4000).step_by(100) {
+        est.apply(received(5000.0, 0.0), at(ms), NO_QUIC);
+    }
+    est.key_lost = Some(key);
+    est.apply(received(4000.0, 0.3), at(4000), NO_QUIC);
+    est.encoder_kbps = Some(asked);
+    est.apply(received(5700.0, 0.0), at(4100), NO_QUIC);
+    (est, at)
+}
+
+/// Seat B, hold round 4 (#1433 M1'): a held line just under a policer overflows it only with a
+/// keyframe, a short burst at a constant rate that ends on its own, as Wi-Fi's does. A burst that
+/// began on a keyframe never releases the hold; the same burst otherwise does.
+#[test]
+fn a_burst_that_began_on_a_keyframe_never_releases_the_hold() {
+    assert!(
+        later_burst(true, 7000.0).0.held_kbps().is_some(),
+        "released"
+    );
+    assert_eq!(later_burst(false, 7000.0).0.held_kbps(), None);
+}
+
+/// Seat B, hold round 4 (#1433 N4): a burst that ended because the encoder was asked for less (a
+/// rung step) may have ended because the sender dropped: it releases nothing.
+#[test]
+fn a_burst_that_ended_with_the_encoder_asked_less_never_releases_the_hold() {
+    assert!(
+        later_burst(false, 0.8 * 7000.0).0.held_kbps().is_some(),
+        "released"
+    );
+}
+
+/// Seat B, hold round 4 (#1433 M1'): the burst memory never blocks loss lasting `HOLD_STEP_GAP`.
+/// A release it got wrong otherwise left a policer unheld for 60 s.
+#[test]
+fn the_burst_memory_never_blocks_loss_lasting_a_second() {
+    let (mut est, at) = later_burst(false, 7000.0);
+    assert!(est.random_burst.is_some());
+    est.apply(received(7000.0, 0.3), at(4500), NO_QUIC);
+    assert_eq!(est.held_kbps(), None, "a burst inside the memory");
+    est.apply(received(7000.0, 0.3), at(5000), NO_QUIC);
+    est.apply(received(7000.0, 0.3), at(5400), NO_QUIC);
+    assert_eq!(est.held_kbps(), None, "under a second");
+    est.apply(received(6000.0, 0.3), at(5500), NO_QUIC);
+    assert_eq!(est.held_kbps(), Some(BETA * 6000.0));
+}
+
+/// A burst begins on a keyframe (`Run::key`) when its first loss is a keyframe datagram or one sent
+/// `KEY_SPILL` or less after one; later, or with no keyframe, it does not.
+#[test]
+fn a_first_loss_on_or_just_after_a_keyframe_marks_the_report() {
+    for (key, lost, want) in [
+        (false, 30, false),
+        (true, 12, true),
+        (true, 30, true),
+        (true, 100, false),
+    ] {
+        let start = Instant::now();
+        let (mut log, mut est) = (SendLog::new(start), Estimator::new(CEILING, start));
+        for i in 0..120u32 {
+            let mut d = vec![0u8; SIZE];
+            d[1..5].copy_from_slice(&i.to_le_bytes());
+            let t = start + Duration::from_millis(u64::from(i));
+            log.record_handed(&d, t, t, false, key && (10..14).contains(&i));
+        }
+        let fb = report_nth(0, 0, 119, u64::from, |i| i != lost && i != lost + 5);
+        est.measure(&fb, &mut log, start + Duration::from_millis(140));
+        assert_eq!(est.key_lost, Some(want), "keyframe {key}, lost {lost}");
+    }
+}
+
 /// A probe that meets loss (`LOSS_LOW` or more) found the link: the line backs off to `BETA` ×
 /// what it delivered then, as from a burst.
 #[test]
@@ -5570,9 +5650,15 @@ fn random_loss_gives_no_reading() {
 }
 
 /// The lab session on an uncapped 50 Mbit/s link (Wi-Fi) with a 300 ms burst losing `loss` every
-/// `every_s` from 10 s, for 240 s: (the deepest rung, the mean setpoint after 30 s, freezes).
-fn wifi_bursts(legacy: bool, every_s: f64, loss: f64) -> (usize, f64, usize) {
-    let mut s = Sim::lab(legacy);
+/// `every_s` from 10 s, for 240 s: (the deepest rung, the mean setpoint after 30 s, freezes, seconds
+/// under 1080p).
+fn wifi_bursts(
+    sim: fn(bool) -> Sim,
+    legacy: bool,
+    every_s: f64,
+    loss: f64,
+) -> (usize, f64, usize, f64) {
+    let mut s = sim(legacy);
     let every = (every_s * 1e6) as u64;
     s.loss_at = Box::new(
         move |t| match t >= 10_000_000 && (t - 10_000_000) % every < 300_000 {
@@ -5589,40 +5675,60 @@ fn wifi_bursts(legacy: bool, every_s: f64, loss: f64) -> (usize, f64, usize) {
         .collect();
     let deepest = s.rungs.iter().map(|r| r.1).max().unwrap_or(0);
     let freezes = s.client.as_ref().unwrap().freezes().len();
+    let mut under = s.rungs.clone();
+    under.push((240.0, 0));
+    let under = under
+        .windows(2)
+        .filter(|w| w[0].1 > 0)
+        .map(|w| w[1].0 - w[0].0)
+        .sum();
     (
         deepest,
         late.iter().sum::<f64>() / late.len() as f64,
         freezes,
+        under,
     )
 }
 
 /// Seat B's hold round finding (#1433): burst loss on a link the sender does not fill is not its
 /// capacity, it does not fall with the sender's rate (Wi-Fi). Bursts every 2.5 or 4 s on an
-/// uncapped link keep 1080p and at least 0.9 × the setpoint 0.6.3 holds there. The ratchet took
-/// them to 360p (setpoint 462 at 4 s); 10 and 40 s apart are printed (one hold, then released).
+/// uncapped link never freeze and keep at least 0.9 × the setpoint 0.6.3 holds there, and under
+/// `Sim::lab` keep 1080p. The ratchet took them to 360p (setpoint 462 at 4 s); 10 and 40 s apart are
+/// printed (one hold, then released). Under `Sim::lab_hw` (seat B round 4, S3) a burst after the
+/// hold that outlasts `LOSS_WINDOW` steps the line down, as a second cap step must, and the release
+/// waits for the next burst: 10 s (4 s apart, 720p) to 20 s (2.5 s apart, 540p) under 1080p in
+/// 240 s, no freeze. A 1 s settle instead kept the 4 s row at 1080p but froze 23 times on a second
+/// cap step to 4200.
 #[test]
 fn burst_loss_on_an_uncapped_link_keeps_the_rung_and_the_setpoint() {
     let mut bad = Vec::new();
-    for (every, loss) in [
-        (2.5, 0.3),
-        (4.0, 0.3),
-        (10.0, 0.3),
-        (40.0, 0.3),
-        (4.0, 0.15),
+    for (name, sim) in [
+        ("lab", Sim::lab as fn(bool) -> Sim),
+        ("lab_hw", Sim::lab_hw),
     ] {
-        let (a_rung, a_sp, a_fr) = wifi_bursts(true, every, loss);
-        let (rung, sp, fr) = wifi_bursts(false, every, loss);
-        eprintln!(
-            "every {every} s at {loss}: legacy deepest rung {a_rung} setpoint {a_sp:.0} freezes \
-             {a_fr}; v2 deepest rung {rung} setpoint {sp:.0} freezes {fr}"
-        );
-        if every <= 4.0 && (rung != 0 || sp < 0.9 * a_sp) {
-            bad.push((every, loss, rung, sp as u32, a_sp as u32));
+        for (every, loss) in [
+            (2.5, 0.3),
+            (4.0, 0.3),
+            (10.0, 0.3),
+            (40.0, 0.3),
+            (4.0, 0.15),
+        ] {
+            let (a_rung, a_sp, a_fr, _) = wifi_bursts(sim, true, every, loss);
+            let (rung, sp, fr, under) = wifi_bursts(sim, false, every, loss);
+            eprintln!(
+                "{name} every {every} s at {loss}: legacy deepest rung {a_rung} setpoint {a_sp:.0} \
+                 freezes {a_fr}; v2 deepest rung {rung} setpoint {sp:.0} freezes {fr}, {under:.1} s \
+                 under 1080p"
+            );
+            let rung_kept = rung == 0 || name == "lab_hw";
+            if every <= 4.0 && (!rung_kept || fr > 0 || sp < 0.9 * a_sp) {
+                bad.push((name, every, loss, rung, fr, sp as u32, a_sp as u32));
+            }
         }
     }
     assert!(
         bad.is_empty(),
-        "(every, loss, rung, setpoint, legacy's): {bad:?}"
+        "(sim, every, loss, rung, freezes, setpoint, legacy's): {bad:?}"
     );
 }
 
@@ -5691,8 +5797,8 @@ fn a_policer_over_a_random_loss_floor_still_sets_the_hold() {
 }
 
 /// R4 with the policer stepping down again under the hold at 90 s.
-fn second_cap_step(second_kbps: f64, content: f64) -> Sim {
-    let mut s = Sim::lab(false);
+fn second_cap_step(sim: fn(bool) -> Sim, second_kbps: f64, content: f64) -> Sim {
+    let mut s = sim(false);
     s.content_gain = Box::new(move |t| content * lab_content(t));
     s.run(30.0);
     policer(&mut s);
@@ -5707,12 +5813,25 @@ fn second_cap_step(second_kbps: f64, content: f64) -> Sim {
 /// 3000 at 90 s) loses as much at the lower rate as a Wi-Fi burst does, but the loss lasts until
 /// the sender drops: the hold stays, the line and the rung step down, and the client is never
 /// left 2 s without a frame. Old code: released at 90.6 s, back to 1080p, 69.5 % loss after 95 s
-/// and no frame from 90.6 to 156 s (2500); 60 % loss (3000).
+/// and no frame from 90.6 to 156 s (2500); 60 % loss (3000). Round 4 (M1'): with the lab encoder's
+/// keyframes, 3800 and 4000 put the line just under the policer, so only keyframes overflow it:
+/// that burst ended on its own and released the hold at 90.8 s, then no frame for 61 s.
 #[test]
 fn a_second_cap_step_under_a_hold_keeps_it_and_steps_down() {
-    for second in [2500.0, 3000.0] {
-        let s = second_cap_step(second, 1.0);
-        let (freezes, rungs) = lab_summary(&format!("5000 → {second}"), &s);
+    let rows = [
+        ("lab", Sim::lab as fn(bool) -> Sim, 2500.0),
+        ("lab", Sim::lab, 3000.0),
+        ("lab_hw", Sim::lab_hw, 2500.0),
+        ("lab_hw", Sim::lab_hw, 3000.0),
+        ("lab_hw", Sim::lab_hw, 3800.0),
+        ("lab_hw", Sim::lab_hw, 4000.0),
+        ("lab_hw", Sim::lab_hw, 4200.0),
+        ("lab_hw", Sim::lab_hw, 4500.0),
+    ];
+    let mut bad = Vec::new();
+    for (name, sim, second) in rows {
+        let s = second_cap_step(sim, second, 1.0);
+        let (freezes, rungs) = lab_summary(&format!("{name} 5000 → {second}"), &s);
         let longest = s.client.as_ref().unwrap().longest;
         let off: Vec<f64> = s
             .lines
@@ -5730,20 +5849,25 @@ fn a_second_cap_step_under_a_hold_keeps_it_and_steps_down() {
             s.rung_at(105.0),
             freezes.len()
         );
-        assert!(off.is_empty(), "{second}: hold off at {off:?}");
-        assert!(
-            s.loss_after(95.0) <= 0.05 || s.rung_at(105.0) >= 4,
-            "{second}: loss after 95 s {:.3}, rung {} at 105 s",
-            s.loss_after(95.0),
-            s.rung_at(105.0)
-        );
-        assert!(
-            longest.0 < 2_000_000,
-            "{second}: no frame for {:.2} s up to {:.1} s",
-            longest.0 as f64 / 1e6,
-            longest.1 as f64 / 1e6
-        );
+        if !off.is_empty() {
+            bad.push(format!("{name} {second}: hold off at {off:?}"));
+        }
+        if s.loss_after(95.0) > 0.05 && s.rung_at(105.0) < 4 {
+            bad.push(format!(
+                "{name} {second}: loss after 95 s {:.3}, rung {} at 105 s",
+                s.loss_after(95.0),
+                s.rung_at(105.0)
+            ));
+        }
+        if longest.0 >= 2_000_000 {
+            bad.push(format!(
+                "{name} {second}: no frame for {:.2} s up to {:.1} s",
+                longest.0 as f64 / 1e6,
+                longest.1 as f64 / 1e6
+            ));
+        }
     }
+    assert!(bad.is_empty(), "{bad:#?}");
 }
 
 /// Two stretched readings in a row at a 7000 send rate: a hold set by readings (a queue).
@@ -5902,6 +6026,43 @@ fn lab_rows_with_the_lab_encoders_keyframes_hold_and_recover() {
                 s.rung_at(209.0),
                 loss_between(&s, 50.0, 210.0)
             ),
+        }
+    }
+}
+
+/// R3 and R4 over a random-loss floor (a Wi-Fi viewer behind the lab's shaper): 2 % and 4 % from
+/// the start.
+fn shallow_2(s: &mut Sim) {
+    shallow(s);
+    s.loss_at = Box::new(|_| 0.02);
+}
+fn policer_2(s: &mut Sim) {
+    policer(s);
+    s.loss_at = Box::new(|_| 0.02);
+}
+fn policer_4(s: &mut Sim) {
+    policer(s);
+    s.loss_at = Box::new(|_| 0.04);
+}
+
+/// Seat B, hold round 4 (#1433 M1'): R4 with the lab encoder over a 4 % random-loss floor freezes
+/// at most 3 times while shaped. Old code: 42 freezes, the burst memory blocking every hold for
+/// 60 s after a release. The 2 % rows are printed (S2, open: each `loss-floor` end puts the
+/// pre-hold rate back and costs a freeze; probing from the line instead, or restoring at the
+/// governor's slew, stranded the hold after the lift and took a lab Wi-Fi row to 540p).
+#[test]
+fn lab_rows_over_a_random_loss_floor_keep_the_hold() {
+    for (name, shape) in [
+        ("R3 + 2 %", shallow_2 as fn(&mut Sim)),
+        ("R4 + 2 %", policer_2),
+        ("R4 + 4 %", policer_4),
+    ] {
+        hw_summary(&format!("{name} legacy"), &lab_hw_row(true, shape, 120.0));
+        let s = lab_hw_row(false, shape, 120.0);
+        let (freezes, _) = hw_summary(&format!("{name} v2"), &s);
+        let shaped: Vec<_> = freezes.iter().filter(|&&t| t < 210.0).collect();
+        if name == "R4 + 4 %" {
+            assert!(shaped.len() <= 3, "{name}: freezes while shaped {shaped:?}");
         }
     }
 }
