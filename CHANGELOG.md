@@ -33,6 +33,7 @@ own; the two do not move together, and that is deliberate.
 ### Changed
 - **A user-space UDP impairment relay for lab rows where the kernel has no netem (`scripts/harness/udprelay`).** It relays one WebTransport flow and applies a rate cap with a queue limit, a policer, delay and jitter, random loss, outages, burst drops and reordering, changed at run time over a loopback control and logged per second; `redirect.sh` routes one local user's UDP through it. Test tooling only ([guide](docs/testing-e2e-suite.md#shaping-without-kernel-netem-the-udp-relay)).
 - The app editor warns, under the Steam library switch, when no (or more than one) enabled Steam provider app exists, so sharing launches would not share the library (#1631).
+- **Release signing follow-ups (#1646):** the release job treats a repository owned by `accreleus` as the org repository by owner rather than by name, so a rename inside the org still fails closed on an unsigned release instead of silently taking the fork path, and the Upgrading page now says a verifying machine refuses every stable (named) apply, while a developer apply or edge build applies with a warning.
 
 ### Fixed
 - PyroWave over WebTransport counts far fewer packets lost when the page stalls briefly (53–83 % fewer on the lab): a frame's deadline timer that fires late now waits four more frames for the datagram reads queued behind the stall (#1635).
