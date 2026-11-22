@@ -430,6 +430,10 @@ pub struct Governor {
     last_report: Option<Instant>,
     /// Per-report loop: the first reading of a run under the rate.
     under: Option<f64>,
+    /// Per-report loop: the rate before WebTransport's hold (`hold_to`) while it is on, and a hold
+    /// ended whose setpoint has not climbed back to that rate yet.
+    hold_from: Option<f64>,
+    back: bool,
 }
 
 impl Governor {
@@ -447,6 +451,8 @@ impl Governor {
             fed: None,
             last_report: None,
             under: None,
+            hold_from: None,
+            back: false,
         }
     }
 
@@ -564,11 +570,15 @@ impl Governor {
                 .min(self.cfg.ceiling_kbps as f64);
         }
         let target = self.clamp(self.rate.min(estimate).floor());
+        let back = self.back && target as f64 >= estimate.floor();
         let up = target > self.setpoint
-            && (target as f64 >= sp * (1.0 + self.cfg.deadband) || target == self.cfg.ceiling_kbps);
+            && (target as f64 >= sp * (1.0 + self.cfg.deadband)
+                || target == self.cfg.ceiling_kbps
+                || back);
         if !up || !self.write_due(now) {
             return None;
         }
+        self.back &= (target as f64) < self.rate.floor();
         self.setpoint = target;
         self.last_retarget = now;
         Some(target)
@@ -615,6 +625,8 @@ impl Governor {
     /// congested link is never sent more than the hold allows (#1433, sim row R3 at a rung step).
     pub fn hold_to(&mut self, kbps: f64, now: Instant) -> Option<u32> {
         self.cfg.per_report?;
+        self.hold_from.get_or_insert(self.rate);
+        self.back = false;
         self.rate = self.rate.min(kbps);
         let sp = self.clamp(kbps);
         if sp >= self.setpoint {
@@ -623,6 +635,17 @@ impl Governor {
         self.setpoint = sp;
         self.last_retarget = now;
         Some(sp)
+    }
+
+    /// Per-report loop, every report with no hold. A hold that ended was not the link (a random
+    /// burst) or the link lifted: the rate, which the rung reads, is back where the hold found it,
+    /// and the setpoint follows the estimate up to it past the deadband (with FEC charged the
+    /// estimate tops out under the ceiling, so a held setpoint parked up to 15 % low for good).
+    pub fn hold_off(&mut self) {
+        if let Some(rate) = self.hold_from.take() {
+            self.rate = self.rate.max(rate);
+            self.back = true;
+        }
     }
 
     fn clamp(&self, kbps: f64) -> u32 {
@@ -1305,6 +1328,31 @@ mod tests {
         assert_eq!(g.rate_kbps(), 500.0, "the rate is not");
         let mut w = Governor::new(AbrConfig::new_smooth(1000, 10_000, 60), base);
         assert_eq!(w.hold_to(3000.0, ms(base, 10)), None);
+    }
+
+    /// #1433 hold round: a hold that ends puts the rate, which the rung reads, back where the hold
+    /// found it, and the setpoint climbs to the estimate past the deadband once (with FEC charged
+    /// the estimate tops out under the ceiling: the deadband parked it up to 15 % low for good).
+    #[test]
+    fn per_report_a_hold_that_ends_climbs_all_the_way_back() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        g.hold_to(8000.0, ms(base, 10));
+        assert_eq!(
+            g.observe(9000.0, ms(base, 20)),
+            None,
+            "inside the deadband while held"
+        );
+        g.hold_off();
+        assert_eq!(g.rate_kbps(), 10_000.0);
+        assert_eq!(g.observe(9000.0, ms(base, 30)), Some(9000));
+        assert_eq!(
+            g.observe(9500.0, ms(base, 40)),
+            Some(9500),
+            "until it reaches the rate"
+        );
+        g.hold_off();
+        assert_eq!(g.rate_kbps(), 10_000.0, "no hold, nothing to restore");
     }
 
     /// A report with no reading between two low ones breaks the run.

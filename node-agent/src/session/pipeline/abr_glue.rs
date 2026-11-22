@@ -320,7 +320,7 @@ impl AbrLoop {
 
     /// Per-report loop, once per WebTransport receiver report before its reading: the hold's line
     /// (`webtransport::Rate::held`) bounds the governor's rate and setpoint at once, settling or
-    /// not, and holds the resolution rung from stepping up.
+    /// not, and holds the resolution rung (`LadderPlanner::set_held`).
     fn hold(&self, line: Option<f64>, now: std::time::Instant) {
         if !self.per_report || self.mode == AbrMode::Off || !self.owns_encoder() {
             return;
@@ -332,9 +332,10 @@ impl AbrLoop {
                 .lock()
                 .unwrap()
                 .planner
-                .set_up_held(line.is_some());
+                .set_held(line.is_some(), now);
         }
         let Some(line) = line else {
+            self.governor.lock().unwrap().hold_off();
             return;
         };
         let (prev, cut) = {

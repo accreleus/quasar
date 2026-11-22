@@ -220,6 +220,7 @@ impl<'a> Control<'a> {
                 return;
             }
         };
+        self.estimator.encoder_kbps = Some((self.rate.setpoint_kbps)() * (1.0 + self.charged));
         let estimate = self.estimator.on_feedback(&fb, &mut self.log, now, path);
         // Before the estimate is fed: the encoder's share follows the level this loss sets.
         if let (Some(fec), Some(loss)) = (self.fec.as_mut(), self.estimator.loss()) {
@@ -1414,6 +1415,9 @@ fn feed(
     let rates = control.as_ref().map_or((None, None), |c| {
         congestion::video_rates(&c.governor, &c.estimator, pyrowave)
     });
+    video.on_hold = control
+        .as_ref()
+        .is_some_and(|c| !pyrowave && c.estimator.drop_held());
     let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
     let now = std::time::Instant::now();
     let (room, frame) = video.budget(rates, queued, DATAGRAM_BUFFER, now);
@@ -1926,6 +1930,25 @@ async fn stream(
                         congestion::Admit::Send => {}
                         congestion::Admit::GiveUp => break stalled(),
                         _ => continue,
+                    }
+                    if unit.keyframe && !unit.pyrowave {
+                        // The keyframe-to-average-frame ratio the capacity sim assumes (#1433).
+                        let setpoint = media.rate().map_or(0.0, |r| (r.setpoint_kbps)());
+                        let frame = setpoint * 1000.0 / 8.0 / f64::from(current.fps.max(1));
+                        tracing::info!(
+                            token = "webtransport-keyframe-sent",
+                            bytes = unit.data.len(),
+                            width = current.width,
+                            height = current.height,
+                            codec = current.codec,
+                            setpoint_kbps = setpoint as u64,
+                            key_ratio = unit.data.len() as f64 / frame.max(1.0),
+                            "WebTransport keyframe {} bytes at {}x{}, {:.0} kbps",
+                            unit.data.len(),
+                            current.width,
+                            current.height,
+                            setpoint
+                        );
                     }
                     let now = std::time::Instant::now();
                     let max = session.max_datagram_size().min(media::MAX_DATAGRAM);

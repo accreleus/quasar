@@ -106,12 +106,14 @@ const REDUCE_MAX: Duration = Duration::from_millis(200);
 const LOSS_LOW: f64 = 0.02;
 const LOSS_HIGH: f64 = 0.10;
 const LOSS_DECREASE_GAP: Duration = Duration::from_millis(300);
-/// v2's hold (#1433, lab rows R3/R4): after a window that loses over `LOSS_HIGH` over the loss
-/// floor, or a second shortfall reading in a row, nothing the sender emits goes over `BETA` × what
-/// that window delivered until this long has passed with no report losing `LOSS_LOW` (over the
-/// floor). The probe that ends a hold on a link still shaped meets its edge, and that can freeze
-/// (`a_shallow_buffer_keeps_its_frames_and_reaches_540p_in_15_s`, 180 s shaped: 30 s, two probe
-/// freezes; 60 s, none); the lab's R4 climb came 70 s after its last step. Longer only delays
+/// v2's hold (#1433, lab rows R3/R4): after a window that loses over `LOSS_HIGH` while the encoder
+/// fills its setpoint, or a second shortfall reading in a row, nothing the sender emits goes over
+/// `BETA` × what that window delivered until this long has passed with no busy report losing
+/// `LOSS_LOW` over the loss floor. A later burst losing as much at a lower rate ends it
+/// (`Estimator::apply`, the per-burst discriminator), and while it holds the pacer keeps a keyframe
+/// paced (`PACE_MAX_WAIT_HELD`). The probe that ends a hold on a link still shaped meets its
+/// edge, and that can freeze (`a_shallow_buffer_keeps_its_frames_and_reaches_540p_in_15_s`, 180 s
+/// shaped: 30 s, two probe freezes; 60 s, none); the lab's R4 climb came 70 s after its last step. Longer only delays
 /// recovery after a cap lifts (`a_shallow_cap_then_a_lift_bounds_the_abr_and_recovers_it`: 8 s at
 /// 30 s, 36 s at 60 s), which costs resolution, not frames.
 const HOLD: Duration = Duration::from_secs(60);
@@ -609,6 +611,16 @@ pub(crate) struct Estimator {
     held: Option<HoldLine>,
     /// The last report gave a shortfall reading: a second in a row sets the hold.
     read_last: bool,
+    /// The lossy run going on: (began, datagrams received and lost in it, the send rate it began
+    /// at), and the datagrams the last message counted (`measure`).
+    episode: Option<(Instant, (i64, i64), f64)>,
+    counted: (i64, i64),
+    /// When a burst last showed its loss did not fall with the sender's rate: loss bursts set no
+    /// line for `HOLD` after it.
+    random_burst: Option<Instant>,
+    /// What the encoder is asked to send now, setpoint plus FEC, kbit/s on the wire; `None`
+    /// counts every window busy. Only a busy window sets or renews the hold.
+    pub(crate) encoder_kbps: Option<f64>,
     /// v2: the open loss-floor bin (start, received, lost), the closed ones (datagrams a
     /// second, loss), and the loss floor ([`Self::loss_floor`]).
     floor_bin: Option<(Instant, i64, i64)>,
@@ -650,6 +662,10 @@ struct HoldLine {
     stepped: Instant,
     /// The most the link delivered while dropping since the hold began.
     trouble: f64,
+    /// The lossy run that last lowered the line: (began, its loss, the send rate it began at).
+    cause: (Instant, f64, f64),
+    /// Loss lowered the line (a burst, or a probe meeting loss): the link drops what overflows.
+    dropped: bool,
 }
 
 /// A congested window this long after the line last stepped down shows the step did not cure
@@ -708,6 +724,10 @@ impl Estimator {
             last_loss_decrease: None,
             held: None,
             read_last: false,
+            episode: None,
+            counted: (0, 0),
+            random_burst: None,
+            encoder_kbps: None,
             floor_bin: None,
             floor_bins: VecDeque::new(),
             floor: 0.0,
@@ -744,6 +764,13 @@ impl Estimator {
         self.held.map(|h| h.kbps.max(MIN_KBPS))
     }
 
+    /// The hold is on and the link drops what overflows it: `VideoQueue::on_hold`. A hold from
+    /// stretched readings alone is a queue, which keeps a keyframe, and where held video must
+    /// still drain past the pace to give the readings that ratchet the line.
+    pub(crate) fn drop_held(&self) -> bool {
+        self.held.is_some_and(|h| h.dropped)
+    }
+
     /// `kbps`, never over the hold's line (`HOLD`): what governs the sender and feeds the ABR.
     pub(crate) fn hold(&self, kbps: f64) -> f64 {
         self.held.map_or(kbps, |h| kbps.min(h.kbps.max(MIN_KBPS)))
@@ -754,6 +781,7 @@ impl Estimator {
     pub(crate) fn resume_at(&mut self, kbps: f64) {
         self.delay_kbps = kbps;
         self.loss_kbps = kbps;
+        (self.held, self.read_last) = (None, false);
         self.stop_regrow("codec switch");
         self.settle();
     }
@@ -983,11 +1011,60 @@ impl Estimator {
             .zip(m.arrived_sent_kbps)
             .filter(|&(d, s)| m.fresh && !app_limited && d < LINK_LIMITED * s)
             .map(|(d, _)| BETA * d);
-        // The hold (`HOLD`): what a congested window delivered, or a confirmed reading.
+        // The hold (`HOLD`): what a congested window delivered, or a confirmed reading. Only while
+        // the encoder fills what it is asked: a quiet scene's rate is not the link's.
         let holds = self.holds && !self.legacy;
+        let busy = self
+            .encoder_kbps
+            .is_none_or(|e| m.sent_kbps.is_some_and(|s| s >= APP_LIMITED * e));
+        let congested = holds && busy && m.loss.is_some_and(|l| l > LOSS_HIGH);
+        let sent = m.sent_kbps.unwrap_or(0.0);
+        let loss = m.loss.unwrap_or(0.0);
+        // The lossy run going on (a burst, ramp and tail): reports with too few datagrams to judge
+        // do not end it, and its loss is counted over it (a loss cut restarts the window, so one
+        // window's loss is noise).
+        let (r, l) = std::mem::take(&mut self.counted);
+        self.episode = match self.episode {
+            Some((at, n, from)) if m.loss.is_none_or(|l| l >= LOSS_LOW) => {
+                Some((at, (n.0 + r, n.1 + l), from))
+            }
+            _ if holds && busy && loss >= LOSS_LOW => Some((now, (r, l), sent)),
+            _ => None,
+        };
+        // Direct `apply` (tests) counts nothing: the window's loss stands in.
+        let run_loss =
+            self.episode
+                .map_or(loss, |(_, (r, l), _)| match r + l >= LOSS_MIN_SAMPLES {
+                    true => l.max(0) as f64 / (r + l) as f64,
+                    false => loss,
+                });
+        if let (Some(h), Some((at, _, _))) = (self.held.as_mut(), self.episode) {
+            if h.cause.0 == at {
+                h.cause.1 = run_loss;
+            }
+        }
+        // A run that began a step after the line last came down is a new burst. W2e's
+        // discriminator per burst: losing as much at a rate under the one the line's run began
+        // at, the loss did not fall with the rate (Wi-Fi), so it is not the link. A new burst
+        // lowers the line only once its window holds it (`LOSS_WINDOW`).
+        let later = self
+            .episode
+            .zip(self.held)
+            .filter(|&((at, _, _), h)| at.saturating_duration_since(h.stepped) >= HOLD_STEP_GAP);
+        let released = later.is_some_and(|((_, _, from), h)| {
+            run_loss >= FLOOR_FLAT * h.cause.1 && from <= FLOOR_SPREAD * h.cause.2
+        });
+        if released {
+            (self.held, self.random_burst) = (None, Some(now));
+        }
+        let random = self
+            .random_burst
+            .is_some_and(|at| now.saturating_duration_since(at) < HOLD);
+        let settled =
+            later.is_none_or(|((at, _, _), _)| now.saturating_duration_since(at) >= LOSS_WINDOW);
         let burst = m
             .rate_kbps
-            .filter(|_| holds && excess.is_some_and(|l| l > LOSS_HIGH))
+            .filter(|_| congested && !released && !random && settled)
             .map(|r| BETA * r);
         // A probe that meets loss found the link: back off from it, as from a burst.
         let probing = self
@@ -995,7 +1072,7 @@ impl Estimator {
             .is_some_and(|h| now.saturating_duration_since(h.since) >= HOLD);
         let met = m
             .rate_kbps
-            .filter(|_| probing && excess.is_some_and(|l| l >= LOSS_LOW))
+            .filter(|_| probing && busy && excess.is_some_and(|l| l >= LOSS_LOW))
             .map(|r| BETA * r);
         let confirmed = read.filter(|_| self.read_last && holds);
         self.read_last = read.is_some();
@@ -1004,22 +1081,31 @@ impl Estimator {
             .flatten()
             .reduce(f64::min)
         {
+            let cause = self
+                .episode
+                .map_or((now, loss, sent), |(at, _, from)| (at, run_loss, from));
             let mut h = self.held.unwrap_or(HoldLine {
-                kbps: line,
+                kbps: f64::INFINITY,
                 since: now,
                 stepped: now,
                 trouble: 0.0,
+                cause,
+                dropped: false,
             });
-            // Still congested a step after the line came down: that line did not cure it.
-            let again = now.saturating_duration_since(h.stepped) >= HOLD_STEP_GAP;
+            // Still congested a step after the line came down, with the sender under what the link
+            // then delivered or the link now delivering under the line: that line did not cure it.
+            // A sender over the line (its floor) delivering as much as before compounds nothing.
+            let again = now.saturating_duration_since(h.stepped) >= HOLD_STEP_GAP
+                && (line / BETA < h.kbps || sent <= h.kbps / BETA);
             let to = line.min(if again { BETA * h.kbps } else { h.kbps });
             if to < h.kbps {
-                (h.kbps, h.stepped) = (to, now);
+                (h.kbps, h.stepped, h.cause) = (to, now, cause);
             }
             (h.since, h.trouble) = (now, h.trouble.max(line / BETA));
+            h.dropped |= burst.or(met).is_some();
             self.held = Some(h);
         } else if let Some(h) = self.held.as_mut() {
-            if excess.is_some_and(|l| l >= LOSS_LOW) {
+            if busy && excess.is_some_and(|l| l >= LOSS_LOW) {
                 h.since = now;
             } else if probing {
                 // Gently up to where the link dropped, at the estimate's pace past it.
@@ -1367,6 +1453,7 @@ impl Estimator {
                 let n = (r + l) as f64;
                 self.floor_bin_closed(n / span.as_secs_f64(), l.max(0) as f64 / n);
             }
+            self.counted = (received, lost);
             self.losses.push_back((now, received, lost));
             if self.losses.len() > MAX_LOSS_ENTRIES {
                 self.losses.pop_front();
@@ -2159,6 +2246,14 @@ const PACE_BURST_MS: f64 = 5.0;
 /// at most 5 / (60 fps × `PACE_GAIN`), 67 ms, so this is a path back from an outage, or a
 /// source over the pace, and it drains at QUIC's own pace as before #1433.
 const PACE_MAX_WAIT: Duration = Duration::from_millis(100);
+/// `PACE_MAX_WAIT` while a link that drops what overflows it holds the sender
+/// (`VideoQueue::on_hold`): a keyframe of 15 average frames drains at the pace in 200 ms. Into
+/// that link unpaced its tail is lost, and so are the frames held behind it (sim R4 at 10 ×
+/// keyframes: 3 freezes, 23 % loss and the rung back up mid-shape, paced 1 freeze; R3 at 15 ×: 9
+/// freezes, paced 1). More held than the pace drains in this long (a
+/// source over the pace) still goes after `PACE_MAX_WAIT`. Under the NACK hold
+/// (`retransmit::WINDOW`, 250 ms), or held video expires instead of draining.
+const PACE_MAX_WAIT_HELD: Duration = Duration::from_millis(200);
 
 /// Video, FEC and `nack` answers waiting for room in QUIC's datagram queue, so audio, which
 /// goes straight to QUIC, never queues behind more than [`VideoQueue::room`] of video and
@@ -2189,6 +2284,9 @@ pub(crate) struct VideoQueue {
     keyframe_started: Option<Instant>,
     /// Held datagrams dropped as older than the hold (`Self::feed`).
     pub(crate) stale: u64,
+    /// A link that drops what overflows it holds the sender ([`Estimator::drop_held`]): video
+    /// the pace drains within `PACE_MAX_WAIT_HELD` waits that long for it.
+    pub(crate) on_hold: bool,
     /// Video was dropped as stale with no keyframe held: units are skipped to the next one
     /// ([`Self::orphaned`]).
     orphaned: bool,
@@ -2236,11 +2334,19 @@ impl VideoQueue {
     /// `None` paces nothing.
     pub(crate) fn pace(&mut self, kbps: Option<u64>, now: Instant) -> usize {
         // Not a `nack` answer: those go ahead of older video (`push`).
+        // What the pace drains in `PACE_MAX_WAIT_HELD` waits that long; more cannot drain in time.
+        let drains = kbps.is_some_and(|k| {
+            self.bytes as f64 <= k as f64 * PACE_GAIN / 8.0 * PACE_MAX_WAIT_HELD.as_millis() as f64
+        });
+        let wait = match self.on_hold && drains {
+            true => PACE_MAX_WAIT_HELD,
+            false => PACE_MAX_WAIT,
+        };
         let stale = self
             .held
             .iter()
             .find(|h| !h.resend)
-            .is_some_and(|h| now.saturating_duration_since(h.queued_at) >= PACE_MAX_WAIT);
+            .is_some_and(|h| now.saturating_duration_since(h.queued_at) >= wait);
         let Some(kbps) = kbps.filter(|_| !stale) else {
             self.counted = None;
             return usize::MAX;

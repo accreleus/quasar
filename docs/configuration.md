@@ -744,7 +744,7 @@ flag are set, `QUASAR_ABR_MODE` wins (it is checked first and short-circuits).
 
 | Variable | Default | Values / notes |
 |---|---|---|
-| `QUASAR_WT_CAPACITY` | `v2` | `v2` → the host paces video and sizes QUIC's window at no less than what the encoder sends (setpoint plus FEC), reads a shortfall only when the datagrams that arrived came slower than 0.95 × the rate they were sent at (the two largest arrival-gap excesses over their send gaps taken out), counts every loss but short blackouts and outages, and after a window that loses over 10 % holds the sender under 0.85 × what that window delivered until 60 s pass with no 2 % loss, then probes back up at 2 % a second; the resolution rung does not step up during the hold. `legacy` → 0.6.3's sender and reading: no pacing and no audio room, the reading is the estimate or 0.85 × the receive rate with no gap taken out and filtered by `abr_deadband`, blackouts count as loss, and the window follows the smoothed RTT. Anything else warns (`token="wt-capacity-unrecognised"`) and stays `v2`. Read once at agent start; it applies to every WebTransport session, the native client's included. The bug fixes of the same release (send stamps, the outage mark, audio ahead of held video) stay on in both. |
+| `QUASAR_WT_CAPACITY` | `v2` | `v2` → the host paces video and sizes QUIC's window at no less than what the encoder sends (setpoint plus FEC), reads a shortfall only when the datagrams that arrived came slower than 0.95 × the rate they were sent at (the two largest arrival-gap excesses over their send gaps taken out), counts every loss but short blackouts and outages, and after a window that loses over 10 % while the encoder fills its bitrate holds the sender under 0.85 × what that window delivered until 60 s pass with no 2 % loss, then probes back up at 2 % a second; a later burst that loses as much at a lower bitrate (Wi-Fi) ends the hold; the resolution rung does not step up during the hold, nor down in its first 5 s. `legacy` → 0.6.3's sender and reading: no pacing and no audio room, the reading is the estimate or 0.85 × the receive rate with no gap taken out and filtered by `abr_deadband`, blackouts count as loss, and the window follows the smoothed RTT. Anything else warns (`token="wt-capacity-unrecognised"`) and stays `v2`. Read once at agent start; it applies to every WebTransport session, the native client's included. The bug fixes of the same release (send stamps, the outage mark, audio ahead of held video) stay on in both. |
 
 #### WebTransport in `smooth`: the per-report loop (#1376)
 
@@ -769,15 +769,24 @@ WebTransport in `protective`, keep the window loop the rest of this section desc
   2.5 % per 100 ms report by default, which compounds to 28 % a second. The setpoint follows
   in moves of more than `abr_deadband`, and to the ceiling once the estimate is there. No
   timer and no EWMA.
-- **Hold** (not `legacy`). A window that loses over 10 % (over the level of loss that does not
-  fall with the bitrate), or a second reading in a row, sets a line at 0.85 × what that window
-  delivered: the rate and the setpoint drop to it at once, a rung step's settle or not, and
-  neither the up path, the pacer nor QUIC's window goes over it. A further such window 1 s
-  after the line last came down lowers it by 0.85 again. Each report losing 2 % or more renews
-  it; after 60 s with none the line rises 2 % a second up to the most the link delivered while
-  dropping, then 8 % a second, and goes once it reaches the ceiling; a probe that meets 2 %
-  loss drops it to 0.85 × what that window delivered. The resolution rung does not step up
-  while the line is held. Loss shown not to fall when the bitrate falls (random loss) ends it.
+- **Hold** (not `legacy`). A window that loses over 10 % while the encoder sends at least 0.8 ×
+  its bitrate (a quiet scene's rate is not the link's), or a second reading in a row, sets a
+  line at 0.85 × what that window delivered: the rate and the setpoint drop to it at once, a
+  rung step's settle or not, and neither the up path, the pacer nor QUIC's window goes over it.
+  A further such window 1 s after the line last came down lowers it by 0.85 again when the
+  sender kept under what the link then delivered or the link now delivers less. Each busy
+  report losing 2 % or more (over the level of loss that does not fall with the bitrate)
+  renews it; after 60 s with none the line rises 2 % a second up to the most the link
+  delivered while dropping, then 8 % a second, and goes once it reaches the ceiling; a probe
+  that meets 2 % loss drops it to 0.85 × what that window delivered. A later lossy burst that
+  loses at least 0.8 × as much as the one that set the line, at 0.9 × its bitrate or less, did
+  not fall with the bitrate (Wi-Fi): the hold ends, the rate goes back where the hold found it,
+  and loss bursts set no line for 60 s. Loss shown not to fall when the bitrate falls over
+  16 s (random loss) ends it too. The resolution rung does not step up while the line is held,
+  and does not step down in its first 5 s (a burst the next one releases). While a hold set
+  by loss is on, the pacer keeps video that it drains within 200 ms paced that long (a
+  keyframe into a link that drops what overflows it loses its tail unpaced), instead of
+  100 ms.
 - **Silence.** With no report for 500 ms (a hidden tab, a Wi-Fi roam) the silence decay
   still lowers the setpoint the window loop's way (capped and dwelled), but never the rate
   the resolution rung reads, so an outage never steps the rung.
