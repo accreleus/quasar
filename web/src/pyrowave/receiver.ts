@@ -66,7 +66,7 @@ export class PyroWaveReceiver {
   constructor(
     readonly configId: number,
     private readonly n: number,
-    private readonly frameMs: number,
+    readonly frameMs: number,
   ) {}
 
   /** Takes one video fragment of this configuration; returns the frame it completed, if any. */
