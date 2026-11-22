@@ -28,7 +28,7 @@ own; the two do not move together, and that is deliberate.
 - The app editor warns, under the Steam library switch, when no (or more than one) enabled Steam provider app exists, so sharing launches would not share the library (#1631).
 
 ### Fixed
-- PyroWave over WebTransport no longer counts packets lost when the page stalls briefly: a frame's deadline timer that fires late now waits as long as the stall (one to four frames) for the datagram reads queued behind it (#1635).
+- PyroWave over WebTransport no longer counts packets lost when the page stalls briefly: a frame's deadline timer that fires late now waits four more frames for the datagram reads queued behind the stall (#1635).
 - Warm Steam: when an adopting session's start ack is lost, the old runtime's cleanup proof can no longer release the managed-home hold while that session's stop is still in flight; the hold passes to the failed session and clears at its own proof (#1615).
 
 ## 0.6.3 — 2026-11-21

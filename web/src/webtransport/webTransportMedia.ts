@@ -668,13 +668,11 @@ export class WebTransportMedia implements MediaTransport {
         timer = null;
         armedAt = null;
         // Reads queued behind a stall have not run yet: closing now would count datagrams the
-        // page is about to read as lost. Wait once more, as long as the stall (at least a frame):
-        // a timer due in the future runs after reads already posted, whatever order the browser
-        // gives timer and network tasks, which a 0 ms re-arm would not ensure. Capped at four
-        // frames so a throttled (hidden) tab's 1 s clamp does not double the loss accounting.
-        const late = this.now() - at;
+        // page is about to read as lost. Wait once more, four frames: a timer due in the future
+        // runs after reads already posted, and the lab needed four frames for the backlog to drain
+        // (#1635; one frame left 20-45 % of the loss). Only a stalled frame pays it.
         const frame = pyro?.frameMs ?? 0;
-        if (deferBy === undefined && late > STALL_MS) return arm(Math.min(Math.max(late, frame), 4 * frame));
+        if (deferBy === undefined && this.now() - at > STALL_MS) return arm(4 * frame);
         const closed = live.on ? pyro?.due(this.now()) : null;
         if (closed) sink.pyrowave(closed);
         reportLost();

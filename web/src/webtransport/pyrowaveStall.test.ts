@@ -77,15 +77,14 @@ describe("PyroWave deadline across a page stall (#1635)", () => {
     expect(lost()).toBe(frags(1).length - 2);
   });
 
-  it("after a stall, a really lost tail is concealed max(lateness, one frame) later, once", () => {
+  it("after a stall, a really lost tail is concealed four frames later, once", () => {
     const { out, router, stall, run } = setup();
     frags(1).slice(0, 2).forEach((x) => router.datagram(x));
     stall(30);
     expect(out, "the first fire only defers").toEqual([]);
-    // 13 ms late, so the fire waits max(13, one frame) = one frame more.
-    run(15);
-    expect(out, "deferred by at least a frame").toEqual([]);
-    run(3);
+    run(Math.floor(4 * FRAME_MS) - 2);
+    expect(out, "deferred by four frames").toEqual([]);
+    run(4);
     expect(out.map((x) => x.complete)).toEqual([false]);
   });
 
