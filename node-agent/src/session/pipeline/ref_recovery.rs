@@ -1,6 +1,6 @@
-//! Reference recovery control of the patched Vulkan encoders (#1348): ask for an anchor,
-//! ask for the next frame to code from one, read which frames did. The encoder half is
-//! `gstrefrecovery.h` in `deploy/patches/vulkan/*-ref-recovery.patch`; the names and
+//! Reference recovery control of the patched Vulkan and NVENC encoders (#1348): ask for an
+//! anchor, ask for the next frame to code from one, read which frames did. The encoder half
+//! is `gstrefrecovery.h` in `deploy/patches/vulkan/*-ref-recovery.patch`; the names and
 //! field types here must match it.
 // The WebTransport repair loop that uses these lands with the next #1348 unit.
 #![allow(dead_code)]
@@ -165,8 +165,9 @@ mod tests {
     /// What the encoder must make of [`SCRIPT`], by input frame: the anchors, the
     /// recoveries (frame, anchor) and the key frames. An anchor request waits out a
     /// key frame and, on H.264, a recovery frame or the frame after an anchor
-    /// (`gstrefrecovery.h`). The checker requires exactly this.
-    fn expected(codec: &str) -> serde_json::Value {
+    /// (`gstrefrecovery.h`). An encoder that holds no anchors (`held` false: NVENC AV1)
+    /// answers every recovery with a key frame. The checker requires exactly this.
+    fn expected(codec: &str, held: bool) -> serde_json::Value {
         let (mut anchors, mut recoveries, mut keys) = (Vec::new(), Vec::new(), vec![0]);
         let mut pending = false;
         for at in 1..FRAMES {
@@ -174,6 +175,7 @@ mod tests {
             for (_, step) in SCRIPT.iter().filter(|(i, _)| *i == at) {
                 match step {
                     Step::Anchor => pending = true,
+                    _ if !held => key = true,
                     Step::From(i) => from = Some(*i),
                     Step::FromNewest => from = anchors.last().copied(),
                     Step::Gone(_) => key = true,
@@ -181,6 +183,10 @@ mod tests {
             }
             if key {
                 keys.push(at);
+                continue;
+            }
+            if !held {
+                pending = false;
                 continue;
             }
             if let Some(a) = from {
@@ -210,7 +216,7 @@ mod tests {
         };
         for codec in ["av1", "h265"] {
             assert_eq!(
-                expected(codec),
+                expected(codec, true),
                 serde_json::json!({
                     "anchors": [10, 20, 30, 40, 58, 70, 88, 92, 96, 100],
                     "recoveries": recoveries(70),
@@ -219,11 +225,19 @@ mod tests {
             );
         }
         assert_eq!(
-            expected("h264"),
+            expected("h264", true),
             serde_json::json!({
                 "anchors": [10, 20, 30, 40, 58, 71, 88, 92, 96, 100],
                 "recoveries": recoveries(71),
                 "keys": [0, 85, 105],
+            })
+        );
+        assert_eq!(
+            expected("av1", false),
+            serde_json::json!({
+                "anchors": [],
+                "recoveries": [],
+                "keys": [0, 35, 50, 55, 63, 66, 70, 80, 85, 105],
             })
         );
     }
@@ -231,14 +245,16 @@ mod tests {
     /// Hardware capture for `scripts/harness/run-ref-recovery.sh`: encodes a moving test
     /// pattern with `num-anchors=3`, sends [`SCRIPT`], and writes the access units, the
     /// raw input and the encoder's reports to `$QUASAR_REF_RECOVERY_OUT`.
+    /// `$QUASAR_REF_RECOVERY_ENCODER` is `vulkan` (default) or `nvenc`.
     #[test]
-    #[ignore = "needs a Vulkan encode GPU: scripts/harness/run-ref-recovery.sh"]
+    #[ignore = "needs an encode GPU: scripts/harness/run-ref-recovery.sh"]
     fn capture_for_harness() {
         use std::io::Write;
         use std::sync::{Arc, Mutex};
 
         let out = std::path::PathBuf::from(std::env::var("QUASAR_REF_RECOVERY_OUT").unwrap());
         let codec = std::env::var("QUASAR_REF_RECOVERY_CODEC").unwrap();
+        let encoder = std::env::var("QUASAR_REF_RECOVERY_ENCODER").unwrap_or("vulkan".into());
         let (enc_name, caps, parser, out_caps) = match codec.as_str() {
             "h264" => (
                 "vulkanh264enc",
@@ -260,12 +276,24 @@ mod tests {
             ),
             other => panic!("QUASAR_REF_RECOVERY_CODEC={other}"),
         };
+        // the NVENC encoder settings the agent uses (encoders.rs), less bitrate
+        let (upload, enc_name, gop) = match encoder.as_str() {
+            "vulkan" => ("vulkanupload !", enc_name.to_string(), "idr-period=1000"),
+            "nvenc" => (
+                "",
+                enc_name.replace("vulkan", "nvcuda"),
+                "gop-size=1000 preset=p4 tune=ultra-low-latency rc-mode=cbr rc-lookahead=0",
+            ),
+            other => panic!("QUASAR_REF_RECOVERY_ENCODER={other}"),
+        };
+        // NVENC API 12.0 has no AV1 long-term references (gstreamer-nvenc-ref-recovery.patch)
+        let held = !(encoder == "nvenc" && codec == "av1");
         gst::init().unwrap();
         let desc = format!(
             "videotestsrc is-live=true pattern=smpte horizontal-speed=3 num-buffers={FRAMES} \
              ! video/x-raw,format=NV12,width=640,height=360,framerate=60/1 ! tee name=t \
              t. ! queue ! appsink name=raw sync=false \
-             t. ! queue ! vulkanupload ! {enc_name} name=enc num-anchors=3 idr-period=1000 \
+             t. ! queue ! {upload} {enc_name} name=enc num-anchors=3 {gop} \
              ! {caps} ! {parser} name=parse config-interval=-1 ! {out_caps} \
              ! appsink name=enc_out sync=false"
         );
@@ -318,6 +346,9 @@ mod tests {
                     for (_, step) in SCRIPT.iter().filter(|(i, _)| *i == at) {
                         let event = match step {
                             Step::Anchor => anchor_event(),
+                            // no anchor reports to name one by: any pts is not held
+                            Step::From(i) | Step::Gone(i) if !held => recover_event(seen[*i]),
+                            Step::FromNewest if !held => recover_event(seen[at - 1]),
                             Step::From(i) | Step::Gone(i) => {
                                 // the pts the anchor's report carried, not its input
                                 // pts: the H.264 and HEVC encoders offset theirs
@@ -388,11 +419,12 @@ mod tests {
             .collect();
         let meta = serde_json::json!({
             "codec": codec,
+            "encoder": encoder,
             "width": 640,
             "height": 360,
             "input_pts": input_pts.lock().unwrap().iter().map(|p| p.nseconds()).collect::<Vec<_>>(),
             "lost": LOST,
-            "expect": expected(&codec),
+            "expect": expected(&codec, held),
             "frames": frames,
             "reports": reports,
         });

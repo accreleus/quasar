@@ -50,6 +50,7 @@ The remaining GStreamer patches are **Quasar-authored** (not from gst-wayland-di
 - `vulkanav1enc-exact-frame-size.patch`
 - `vulkanav1enc-min-qindex.patch`
 - `vulkanav1enc-ref-recovery.patch`, `vkh264enc-ref-recovery.patch`, `vulkanh265enc-ref-recovery.patch` (#1348)
+- `gstreamer-nvenc-ref-recovery.patch` (not a Vulkan patch: the NVENC encoders, #1348)
 - `gstreamer-webrtc-stats-rtpsession-leak.patch` (not a Vulkan patch: `webrtcbin`, #564)
 - `vkh265enc-profile-template.patch` (**candidate — not applied**, see below)
 
@@ -82,15 +83,17 @@ The three `*-ref-recovery.patch` files apply **thirteenth to fifteenth**, AV1, H
 that order: the AV1 one creates `ext/vulkan/base/gstrefrecovery.h`, which the other two include,
 and each adds its check test after the previous one's in `tests/check/meson.build`. They were
 diffed with the twelve patches above applied.
-`gstreamer-webrtc-stats-rtpsession-leak.patch` applies **sixteenth (last)**. It touches only
+`gstreamer-nvenc-ref-recovery.patch` applies **sixteenth**: it touches only `sys/nvcodec`, but
+includes `gstrefrecovery.h`, which the thirteenth creates.
+`gstreamer-webrtc-stats-rtpsession-leak.patch` applies **seventeenth (last)**. It touches only
 `ext/webrtc/gstwebrtcstats.c`, which no other patch here does, so its place in the order is free.
-None of the sixteen are upstreamed into GStreamer itself yet.
+None of the seventeen are upstreamed into GStreamer itself yet.
 
 `vkh265enc-profile-template.patch` is a **candidate that is NOT wired into
 `deploy/Dockerfile.vulkan` and is therefore NOT applied to any image today.** It is a
 correctness fix for an upstream defect the Quasar encode path already sidesteps by pinning
 `profile=main` in its capsfilter, so it buys nothing for a Quasar image and everything for
-anyone driving `vulkanh265enc` by hand. When it is wired up it would apply **seventeenth (last)**: it
+anyone driving `vulkanh265enc` by hand. When it is wired up it would apply **eighteenth (last)**: it
 edits `gst_vulkan_h265_encoder_register()` in `vkh265enc.c`, a region no earlier patch
 touches, so its position is a convention rather than a constraint. See its section below.
 
@@ -1576,5 +1579,30 @@ Tests without a GPU: `tests/check/libs/vkvideoencodeav1refs.c` (new cases),
 recoveries and key frames are exactly what the script asked for, the references, the decode and
 the PSNR with ffmpeg; `ref_recovery_check.py --self-test` checks the checker).
 
-Not built: the NVENC fallback (`nvcuda*enc`; the SDK has `ltrMarkFrame`/`ltrUseFrames` and
-`NvEncInvalidateRefFrames`), VA and openh264.
+The NVENC encoders have the same control: `gstreamer-nvenc-ref-recovery.patch`, below. Not built:
+VA and openh264.
+
+### `gstreamer-nvenc-ref-recovery.patch`
+
+Quasar-authored (#1348). The control above on the NVENC encoders (`nvcudah264enc`,
+`nvcudah265enc`, `nvcudaav1enc`, all subclasses of `GstNvEncoder`), implemented once in the base
+class `sys/nvcodec/gstnvencoder.cpp` with NVENC's per-picture long-term references:
+
+- `num-anchors` > 0 turns on `enableLTR` (per-picture mode, `ltrTrustMode` 0) with
+  `ltrNumFrames = num-anchors` and a DPB of at least `num-anchors + 1`. Clamped, with a warning,
+  to `NV_ENC_CAPS_NUM_MAX_LTR_FRAMES`; 0 with B frames, and 0 on AV1: the NVENC API GStreamer
+  speaks (12.0) has no AV1 long-term references, so on `nvcudaav1enc` every recovery is a key frame.
+- An anchor is marked long-term (`ltrMarkFrame`, `ltrMarkFrameIdx`): a free index, else the oldest
+  anchor's. A recovery frame codes from that index only (`ltrUseFrames`, `ltrUseFrameBitmap`), and
+  first invalidates (`NvEncInvalidateRefFrames`) the last eight pictures newer than its anchor, so no
+  short-term reference from the lost chain stays usable. Newer anchors are forgotten.
+- The held set is tracked in the element: an IDR (the first frame, a forced key frame, every
+  `gop-size` frames) drops all of them. The anchor waits follow the Vulkan encoders, H.264's
+  included, so the agent and the harness see one behaviour per codec.
+- The pts the reports carry is the frame's pts as `GstVideoEncoder` hands it to the element, which
+  NVENC returns as `outputTimeStamp` (the base class sets a 1000 h min-pts, as the Vulkan
+  H.264/HEVC encoders do).
+
+Unlike the Vulkan H.264/HEVC encoders, NVENC picks the level itself, and anchors are not clamped
+to the level the stream gets without them. Hardware check: `scripts/harness/run-ref-recovery.sh
+--encoder nvenc` on the NVIDIA host.

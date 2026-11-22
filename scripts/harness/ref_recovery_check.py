@@ -5,6 +5,11 @@
     ref_recovery_check.py <dir> <h264|h265|av1>
     ref_recovery_check.py --self-test
 
+The capture's "encoder" (vulkan or nvenc) picks the reference checks: the
+Vulkan encoders' syntax is ours and checked exactly, NVENC's is the driver's,
+so for it only the long-term marking (H.264) and the lost-picture RPS rule
+(HEVC) are checked, and the decode checks carry the rest.
+
 Drops the capture's lost frames and checks, with ffmpeg as the reference decoder:
   - the anchors, recovery frames and key frames are exactly what the capture
     script asked for (the capture's "expect" block), so an encoder that answers
@@ -92,6 +97,21 @@ def all_of(fields, prefix):
     return [v for k, v in fields if k == name or k.startswith(name + "[")]
 
 
+def read_reports(reports, idx):
+    """Anchors and {recovery: anchor} by frame index; @idx maps output pts to it."""
+    by_frame = {}
+    for r in reports:
+        if check(r["pts"] in idx, f"report {r} names no output frame"):
+            by_frame[idx[r["pts"]]] = r
+    anchors = sorted(i for i, r in by_frame.items() if r["anchor"])
+    recov = {}
+    for i, r in by_frame.items():
+        if r["recover_from"] is not None and check(
+                r["recover_from"] in idx, f"frame {i} recovers from a pts no frame has: {r}"):
+            recov[i] = idx[r["recover_from"]]
+    return anchors, recov
+
+
 def check_expect(expect, anchors, recov, keys):
     """The capture script's outcome, exactly (input frame indexes)."""
     want_recov = {a: b for a, b in expect["recoveries"]}
@@ -132,6 +152,11 @@ def self_test():
         # wrong but close: above the 20 dB floor, 14 dB below the frames before
         ("wrong-reference recovery",
          lambda: check_recovery_psnr([38.0] * 34 + [24.0] + [25.0] * 5, {34: 20}, [0]), 1),
+        # input pts instead of output pts: a FAIL line each, not a KeyError
+        ("reports name no output frame",
+         lambda: read_reports([{"pts": 7, "anchor": True, "recover_from": None},
+                               {"pts": 20, "anchor": False, "recover_from": 9}],
+                              {10: 0, 20: 1}), 2),
     ]
     bad = 0
     for name, run, want in cases:
@@ -157,9 +182,7 @@ def main(d, codec):
     lost = {i for a, b in meta["lost"] for i in range(a, b + 1)}
     kept = [i for i in range(len(aus)) if i not in lost]
     idx = {f["pts"]: i for i, f in enumerate(frames)}
-    reports = {idx[r["pts"]]: r for r in meta["reports"]}
-    anchors = sorted(i for i, r in reports.items() if r["anchor"])
-    recov = {i: idx[r["recover_from"]] for i, r in reports.items() if r["recover_from"] is not None}
+    anchors, recov = read_reports(meta["reports"], idx)
     keys = [i for i, f in enumerate(frames) if f["key"]]
     print(f"{codec}: {len(frames)} frames, {len(lost)} lost, anchors {anchors}, "
           f"recoveries {sorted(recov.items())}, key frames {keys}")
@@ -182,12 +205,14 @@ def main(d, codec):
 
     pk = trace(d, full, codec)
     check(len(pk) == len(aus), f"trace_headers saw {len(pk)} packets for {len(aus)}")
+    nvenc = meta.get("encoder", "vulkan") == "nvenc"
     if codec == "av1":
-        check_av1(pk, frames, kept, lost, recov, anchors)
+        if not nvenc:
+            check_av1(pk, frames, kept, lost, recov, anchors)
     elif codec == "h264":
-        check_h264(pk, recov, anchors)
+        check_h264(pk, recov, anchors, nvenc)
     else:
-        check_h265(pk, frames, kept, lost, recov)
+        check_h265(pk, frames, kept, lost, recov, nvenc)
 
     a, _ = md5s(d, full, codec)
     b, err = md5s(d, pruned, codec)
@@ -264,7 +289,12 @@ def check_av1(pk, frames, kept, lost, recov, anchors):
         check(bin(flags).count("1") == 2, f"anchor {i} refreshes {flags:#04x}")
 
 
-def check_h264(pk, recov, anchors):
+def check_h264(pk, recov, anchors, nvenc=False):
+    if nvenc:
+        for i in anchors:
+            ops = all_of(pk[i], "memory_management_control_operation[")
+            check(6 in ops, f"anchor {i} is not marked long-term: {ops}")
+        return
     check(first(pk[0], "gaps_in_frame_num_allowed_flag") == 1,
           "SPS does not allow frame_num gaps")
     lt_idx = {}
@@ -282,7 +312,7 @@ def check_h264(pk, recov, anchors):
               f"recovery frame {i} has more than one active reference")
 
 
-def check_h265(pk, frames, kept, lost, recov):
+def check_h265(pk, frames, kept, lost, recov, nvenc=False):
     # the capture's GOP is longer than the stream, and MaxPicOrderCntLsb covers
     # it, so a POC is its LSB
     poc, keyof, poc_of, k = {}, {}, {}, 0
@@ -307,6 +337,8 @@ def check_h265(pk, frames, kept, lost, recov):
         check(None not in listed, f"frame {i} RPS lists a POC that is no frame: {listed}")
         gone = [j for j in listed if j in lost]
         check(not gone, f"frame {i} RPS lists lost pictures {gone}")
+        if nvenc:
+            continue
         want = recov.get(i, i - 1)
         check(listed[:1] == [want] and used[:1] == [1] and not any(used[1:]),
               f"frame {i} uses {listed} {used}, expected only {want}")
