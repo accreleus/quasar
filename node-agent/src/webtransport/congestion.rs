@@ -1711,8 +1711,13 @@ impl PyroRate {
             self.climb = match self.climb {
                 _ if kbps < uncapped && kbps >= self.floor_kbps => Some((kbps, now)),
                 Some((from, at)) if kbps >= uncapped => {
-                    let rate = from
-                        * PYRO_CLIMB_PER_S.powf(now.saturating_duration_since(at).as_secs_f64());
+                    // Only while the encoder fills its budget: a still picture says nothing of the link.
+                    let dt = now.saturating_duration_since(at).as_secs_f64();
+                    let rate = if fills {
+                        from * PYRO_CLIMB_PER_S.powf(dt)
+                    } else {
+                        from
+                    };
                     (rate < kbps).then(|| {
                         kbps = rate;
                         (rate, now)

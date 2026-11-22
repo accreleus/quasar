@@ -5734,6 +5734,14 @@ fn frame_of(bytes: usize) -> Vec<Bytes> {
     vec![Bytes::from(vec![0u8; 1200]); bytes.div_ceil(1200)]
 }
 
+/// The bytes of each slice of `plan` over `frame`.
+fn slice_bytes(frame: &[Bytes], plan: &[(usize, Duration)]) -> Vec<usize> {
+    let mut rest = frame.iter();
+    plan.iter()
+        .map(|(n, _)| rest.by_ref().take(*n).map(Bytes::len).sum())
+        .collect()
+}
+
 /// The time from a frame's first slice to its last, with the send loop's own timer arm
 /// (`sleep_until` the pacing deadline, then `pop`) on a paused clock, whose timer wheel rounds
 /// a deadline up to the millisecond as the live one does. `late` is how long after its tick the
@@ -5775,6 +5783,8 @@ async fn a_4k120_pyrowave_frame_is_spread_over_no_more_than_half_a_frame_interva
         plan.len()
     );
     assert_eq!(plan.iter().map(|(n, _)| n).sum::<usize>(), frame.len());
+    let most = *slice_bytes(&frame, &plan).iter().max().unwrap();
+    assert!(most <= PYRO_BURST_CLEAN_BYTES, "{most} B in one slice");
     for late in [0, 200, 450] {
         let spread = spread_of(&frame, 120, Duration::from_micros(late)).await;
         assert!(spread <= half, "{late} us late: {spread:?} over {half:?}");
@@ -5787,14 +5797,40 @@ async fn pyrowave_frames_of_every_size_and_rate_are_spread_inside_half_a_frame_i
         let half = Duration::from_secs(1) / fps as u32 / 2;
         for mbit in [50, 100, 200, 400, 800, 1000] {
             let frame = frame_of(mbit * 1_000_000 / 8 / fps as usize);
-            let spread = spread_of(&frame, fps, Duration::from_micros(200)).await;
+            let plan = burst_plan(&frame, true, fps);
+            let most = *slice_bytes(&frame, &plan).iter().max().unwrap();
             assert!(
-                spread <= half,
-                "{fps} fps {mbit} Mbit/s: {spread:?} over {half:?}"
+                most <= PYRO_BURST_CLEAN_BYTES,
+                "{fps} fps {mbit} Mbit/s: {most} B in one slice"
+            );
+            let spread = spread_of(&frame, fps, Duration::from_micros(200)).await;
+            // Where the clean bound alone needs more slices than fit, it wins over the spread.
+            let fewest = frame.len().div_ceil(PYRO_BURST_CLEAN_BYTES / 1200);
+            assert!(
+                spread <= half || plan.len() == fewest,
+                "{fps} fps {mbit} Mbit/s: {spread:?} over {half:?}, {} slices of {fewest}",
+                plan.len()
             );
         }
     }
 }
+/// 4K at the contract's 400 Mbit/s per 60 fps: the slice counts the timer and the clean bound
+/// leave, pinned so a change to either shows.
+#[test]
+fn a_4k_pyrowave_frame_is_cut_in_the_pinned_number_of_slices() {
+    let cut = |fps: i32, mbit: usize| {
+        let frame = frame_of(mbit * 1_000_000 / 8 / fps as usize);
+        let plan = burst_plan(&frame, true, fps);
+        let most = *slice_bytes(&frame, &plan).iter().max().unwrap();
+        assert!(
+            most <= PYRO_BURST_CLEAN_BYTES,
+            "{fps} fps: {most} B in one slice"
+        );
+        plan.len()
+    };
+    assert_eq!([cut(60, 400), cut(90, 600), cut(120, 800)], [7, 6, 5]);
+}
+
 #[test]
 fn a_frame_under_the_burst_limit_and_every_other_codec_go_as_one_slice() {
     assert_eq!(
@@ -5918,6 +5954,69 @@ fn a_frame_queues_behind_one_older_frame_and_a_third_drops_the_oldests_tail() {
         [20, 21, 30],
         "the oldest frame's unsent tail is dropped"
     );
+}
+
+/// #1633: a frame tail the pacing drops is warned about once, and the rest is counted into the
+/// summary at disconnect.
+#[tokio::test]
+async fn a_dropped_pyrowave_frame_tail_is_warned_once_and_counted_at_disconnect() {
+    let agent = agent_with_plan(Limits::default(), audio::Plan::default()).await;
+    let media = agent.listener.registry().lock()[SESSION]
+        .media
+        .clone()
+        .unwrap();
+    let grant = PyroWaveGrant {
+        wanted: true,
+        target_kbps: 200_000,
+        floor_kbps: 100_000,
+        max_rtt_ms: 1_000,
+    };
+    // 1 fps: the slices of one frame take 250 ms, so the frames below pile up behind it.
+    media.grant_pyrowave(grant, (320, 192, 1), true);
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_writer(captured.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
+    let (_session, mut send, _recv, _reply) =
+        agent.hello_with(TOKEN, json!({"pyrowave": true})).await;
+    let n = pyrowave::block_count(320, 192);
+    let blocks: Vec<(u32, u32)> = (0..n.min(40)).map(|i| (i, 3000)).collect();
+    for _ in 0..5 {
+        let frame = pyrowave::tests::frame(320, 192, &blocks);
+        media.on_pyrowave_frame(&gst::Buffer::from_slice(frame));
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    write_message(&mut send, &json!({"type": "bye"}))
+        .await
+        .unwrap();
+    let dropped = |line: &str| -> u64 {
+        let rest = line.split("dropped=").nth(1).expect("a dropped field");
+        rest.split(' ').next().unwrap().parse().unwrap()
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = logs
+            .lines()
+            .filter(|l| l.contains("pyrowave-pacing-tail-dropped"))
+            .collect();
+        if let [warn, summary] = lines[..] {
+            assert!(warn.contains("WARN"), "{warn}");
+            assert!(summary.contains("DEBUG"), "{summary}");
+            assert!(
+                dropped(summary) > dropped(warn),
+                "the later drops are counted: {lines:?}"
+            );
+            return;
+        }
+        assert!(Instant::now() < deadline, "{lines:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// #1606: the send loop keeps serving audio and the control stream between the slices of one big

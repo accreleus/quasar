@@ -2734,12 +2734,12 @@ fn pyrowave_quic_cap_applies_from_the_first_feedback_and_never_lifts_the_target(
     };
     assert_eq!(
         rate.on_tick(at + Duration::from_millis(600), lossier),
-        climbed(150_000.0, 0.3),
+        PyroVerdict::Hold,
         "a congestion rise with an encoder under its budget: the picture sets the rate"
     );
     assert_eq!(
         rate.on_tick(at + Duration::from_millis(700), backed_up(150_000.0)),
-        climbed(150_000.0, 0.4),
+        PyroVerdict::Hold,
         "one judgement of a waiting queue is a burst in flight"
     );
     assert_eq!(
@@ -3165,7 +3165,7 @@ fn pyrowave_a_link_under_the_floor_steps_down_with_feedback_withheld_and_the_bud
 /// #1430: on a link between the floor and the target the cap held the budget at the link, the
 /// queue drained, and the release handed back the whole target: the budget swung between the two
 /// every ~400 ms, 200 ms of each a third over the link. It climbs back instead, so it stays
-/// within a small band over the rate it was capped at.
+/// within +13 % of the rate it was capped at (the sim shows +12.9 %).
 #[test]
 fn pyrowave_on_a_link_between_the_floor_and_the_target_the_budget_stays_near_the_link() {
     for link in [150_000.0, 120_000.0] {
@@ -3184,7 +3184,7 @@ fn pyrowave_on_a_link_between_the_floor_and_the_target_the_budget_stays_near_the
         let after_cap = &budgets[1..];
         let peak = after_cap.iter().copied().max().unwrap();
         assert!(
-            f64::from(peak) <= f64::from(capped) * 1.2,
+            f64::from(peak) <= f64::from(capped) * 1.13,
             "link {link}: cap {capped}, peak {peak}: {verdicts:?}"
         );
         assert!(
@@ -3213,6 +3213,7 @@ fn pyrowave_a_released_cap_climbs_back_to_the_target_not_in_one_step() {
     let mut ms = 1_100;
     while last < target {
         ms += 100;
+        fill(&mut rate, 100);
         match rate.on_tick(at(ms), quic_at(8_000_000.0)) {
             PyroVerdict::Budget(b) => {
                 assert!(
@@ -3229,6 +3230,35 @@ fn pyrowave_a_released_cap_climbs_back_to_the_target_not_in_one_step() {
         );
     }
     assert_eq!(last, target);
+}
+
+/// #1430: a still picture after a cap is no proof the link lifted: the budget stays at the cap
+/// while the encoder gives less than it, and climbs once the picture fills it again.
+#[test]
+fn pyrowave_a_still_picture_after_a_cap_keeps_the_budget_at_the_cap() {
+    let on = Instant::now();
+    let at = |ms: u64| on + Duration::from_millis(ms);
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on, false);
+    let capped = budget_of(150_000.0);
+    rate.on_tick(at(1_000), backed_up(150_000.0));
+    assert_eq!(
+        rate.on_tick(at(1_100), backed_up(150_000.0)),
+        PyroVerdict::Budget(capped)
+    );
+    // A second of nothing offered, the window wide open.
+    for ms in (1_200..=2_100).step_by(100) {
+        assert_eq!(
+            rate.on_tick(at(ms), quic_at(8_000_000.0)),
+            PyroVerdict::Hold,
+            "{ms} ms"
+        );
+    }
+    assert_eq!(rate.budget, capped);
+    fill(&mut rate, 100);
+    assert!(matches!(
+        rate.on_tick(at(2_200), quic_at(8_000_000.0)),
+        PyroVerdict::Budget(b) if b > capped
+    ));
 }
 
 /// #1633: video the agent holds for room in QUIC's queue waits on QUIC too.

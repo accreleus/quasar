@@ -1276,6 +1276,10 @@ fn stalled() -> (Option<Value>, u32, &'static str) {
 /// slices of that frame) sits well under the clean burst and is a round number.
 const PYRO_BURST_BYTES: usize = 128 * 1024;
 
+/// The most bytes a PyroWave slice may reach when the timer's ticks force fewer, larger slices
+/// (#1633). Under the ~215 KB burst the #1606/#1628 lab runs measured clean at 1080p60.
+const PYRO_BURST_CLEAN_BYTES: usize = 200_000;
+
 /// The frame rate the slice spacing assumes when the configuration carries none.
 const PACING_FALLBACK_FPS: u32 = 60;
 
@@ -1307,7 +1311,8 @@ fn pacing_target(fps: i32, slices: usize) -> std::time::Duration {
 
 /// The gap `Pacing` is given. Asked for half a tick under the whole ticks it should take: the
 /// send loop wakes a little after its tick, and a deadline a whole number of ticks after that
-/// wake-up would round up to one more.
+/// wake-up would round up to one more. That covers a wake-up less than half a tick (0.5 ms)
+/// late; the hardware row measures first to last slice time on a loaded host.
 fn pacing_gap(fps: i32, slices: usize) -> std::time::Duration {
     pacing_target(fps, slices) - TIMER_TICK / 2
 }
@@ -1317,7 +1322,9 @@ fn pacing_gap(fps: i32, slices: usize) -> std::time::Duration {
 /// over a quarter of the frame interval (a target: `Pacing` keeps the spacing, not the
 /// frame-relative offsets). When the timer's ticks make that spread take longer than half the
 /// interval (`codec-pyrowave.md` §Rate's limit), the frame is cut in fewer, larger slices that
-/// do fit (#1633). Every other codec is one slice at once.
+/// do fit (#1633), but never past `PYRO_BURST_CLEAN_BYTES`: where that bound binds the spread
+/// may exceed half the interval (the contract's SHOULD gives way to the clean burst). Every
+/// other codec is one slice at once.
 fn burst_plan(
     datagrams: &[bytes::Bytes],
     pyrowave: bool,
@@ -1337,10 +1344,14 @@ fn burst_plan(
         return vec![(counts[0], std::time::Duration::ZERO)];
     }
     let spread = |n: usize| pacing_target(fps, n) * (n as u32 - 1);
-    let n = (2..=counts.len())
+    // Fewest slices that keep each (an even split by count) under the clean bound.
+    let widest = datagrams.iter().map(bytes::Bytes::len).max().unwrap_or(1);
+    let per_clean = (PYRO_BURST_CLEAN_BYTES / widest).max(1);
+    let fewest = datagrams.len().div_ceil(per_clean).clamp(2, counts.len());
+    let n = (fewest..=counts.len())
         .rev()
         .find(|&n| spread(n) <= frame_interval(fps) / 2)
-        .unwrap_or(2);
+        .unwrap_or(fewest);
     if n < counts.len() {
         // Frames are whole datagrams but for the last: an even split by count is an even one by size.
         let per = datagrams.len().div_ceil(n);
