@@ -601,6 +601,66 @@ with no known extension in the directory (a `.DS_Store` from a Mac) refuses the 
 pack for a remote tester takes the same variable in its environment (`QUASAR_E2E_WEB_DIST`); it has
 no flag for it.
 
+### Shaping without kernel netem: the UDP relay
+
+Where the viewer's machine has no `sch_netem`, `sch_tbf`, `ifb` or `u32` (the lab GPU hosts' kernel has none,
+and a container cannot load them), `scripts/harness/udprelay` impairs the stream in user space instead. It is
+one static Go binary with no dependencies. It relays the UDP of one WebTransport/QUIC flow between the
+viewer and the agent, so TLS stays end to end, and it impairs each direction: **down** (agent to viewer, the
+media; the default) and **up**. Everything is wired; there is no Wi-Fi in the path.
+
+```
+cd scripts/harness/udprelay
+docker run --rm -v "$PWD":/w -w /w -e CGO_ENABLED=0 golang:1.25 go build -o udprelay .   # or: go test ./...
+./udprelay -upstream <agent-ip>:<wt-port> > relay.jsonl &         # listens on 127.0.0.1:9443, control on 127.0.0.1:9199
+sudo -n ./redirect.sh up <agent-ip> <wt-port> 9443 <viewer-user>     # the viewer's UDP to the agent now goes through it
+curl -fsS -d '{"rate_bps":5000000,"burst_bytes":15360,"latency_ms":10}' localhost:9199/shape   # shape
+curl -fsS -X POST localhost:9199/clear                                                          # clear
+./redirect.sh down <agent-ip> <wt-port> 9443 <viewer-user>; kill %1                             # when done
+```
+
+**How the viewer's packets reach it.** `redirect.sh` adds one `iptables -t nat -A OUTPUT -p udp -d <agent-ip>
+--dport <port> -m owner --uid-owner <viewer> -j REDIRECT` rule. The viewer is a separate user (a throwaway
+one on the lab), so the rule touches only its traffic: the relay's own packets to the agent, the control
+plane's HTTPS and everything else go straight out. Conntrack rewrites the replies, so the browser still sees
+the agent's address and needs no flag; the relay must listen on `127.0.0.1`. It needs the `nat` table and
+`xt_owner`, which the lab hosts have. `down` removes the rule, and `status` shows what is installed; leave no
+rule behind. The relay keeps one upstream socket per viewer source port and never reaps it (one browser per
+run).
+
+**Shapes.** `POST /shape?dir=down|up|both` takes JSON; unknown fields are refused and a new shape replaces the
+old one whole (the counters keep running). Stages run in this order: blackout, loss, policer, rate cap, delay.
+
+| Field | Meaning |
+|---|---|
+| `rate_bps`, `burst_bytes`, `latency_ms` or `limit_bytes` | `tbf`: bucket of `burst_bytes` refilled at `rate_bps`, a FIFO behind it, tail drop when it is full. The limit is `limit_bytes`, or tc's `rate*latency_ms + burst` |
+| `police_bps`, `police_burst_bytes` | `police ... drop`: the same bucket with no queue; a packet without tokens is dropped |
+| `delay_ms`, `jitter_ms`, `reorder` | fixed delay plus uniform jitter; releases never go backwards unless `reorder` is true. A delay step compresses, it does not reorder |
+| `loss_pct` | independent random loss |
+| `outage_ms` | silent drop of everything, starting now |
+| `bursts` | `{"drop_ms","count","every_ms"}`: `count` full-drop windows, the first at apply time |
+
+tc's `15kb` is 15360 bytes. The rows of the capacity campaign:
+
+| Row | Body |
+|---|---|
+| R3 shallow buffer | `{"rate_bps":5000000,"burst_bytes":15360,"latency_ms":10}` |
+| R4 policer | `{"police_bps":5000000,"police_burst_bytes":15360}` |
+| R1 / R2 deep buffer | `{"rate_bps":5000000,"burst_bytes":15360,"latency_ms":500,"delay_ms":20}`, and `2000000` for R2 |
+| R8 delay step | `{"delay_ms":20,"jitter_ms":2,"rate_bps":50000000,"burst_bytes":15360,"limit_bytes":1000000}`, then `delay_ms` 80, then 20 again |
+| RB burst loss | `{"bursts":{"drop_ms":60,"count":6,"every_ms":10000}}`, then 150 and 300 |
+| G1 outage | `{"outage_ms":1000}`, then `2000` |
+| G2 Wi-Fi-like loss | `{"loss_pct":3}` to `6` |
+| Reorder | `{"delay_ms":10,"jitter_ms":5,"reorder":true,"rate_bps":50000000,"burst_bytes":15360,"limit_bytes":1000000}` |
+
+A row script is an ordinary [hook](#hooks): `apply` does the `curl .../shape`, `clear` does the `curl .../clear`
+(and is safe when nothing was applied). `relay.jsonl` has one line per second per direction (`in`, `out`, `drop`
+by reason `blackout|loss|police|queue`, all cumulative as packets and bytes, plus `queue_bytes`, `queue_ms` and
+`inflight_pkts`) and a `shape` event line with the full body each time a shape is applied, so a row can be
+cut at the exact apply times. Limits: a user-space relay adds a little scheduling jitter (well under a
+millisecond at stream rates), it shapes one flow, and it shapes the agent's UDP only: a WebRTC session's TCP
+and the fallback path are not covered.
+
 ### The fallback and keyboard-and-mouse scenarios
 
 ```

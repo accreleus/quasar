@@ -25,6 +25,7 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Changed
+- **A user-space UDP impairment relay for lab rows where the kernel has no netem (`scripts/harness/udprelay`).** It relays one WebTransport flow and applies a rate cap with a queue limit, a policer, delay and jitter, random loss, outages, burst drops and reordering, changed at run time over a loopback control and logged per second; `redirect.sh` routes one local user's UDP through it. Test tooling only ([guide](docs/testing-e2e-suite.md#shaping-without-kernel-netem-the-udp-relay)).
 - The app editor warns, under the Steam library switch, when no (or more than one) enabled Steam provider app exists, so sharing launches would not share the library (#1631).
 
 ### Fixed
