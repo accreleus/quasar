@@ -55,6 +55,18 @@ describe("PyroWave deadline across a page stall (#1635)", () => {
     expect(lost()).toBe(0);
   });
 
+  it("the deferred fire is not a 0 ms turn: a tail read after other due timers still lands", () => {
+    const { out, router, lost, stall } = setup();
+    const f = frags(1);
+    f.slice(0, 2).forEach((x) => router.datagram(x));
+    stall(30);
+    // The browser may run every timer already due before the reads the stall queued.
+    vi.advanceTimersByTime(1); // a 0 ms timer runs no later than this (browsers clamp it to 1-4 ms)
+    f.slice(2).forEach((x) => router.datagram(x));
+    expect(out.map((x) => [x.frameSeq, x.complete])).toEqual([[1, true]]);
+    expect(lost()).toBe(0);
+  });
+
   it("a tail that is really lost is concealed at the one-frame deadline, no later", () => {
     const { out, router, lost, run } = setup();
     frags(1).slice(0, 2).forEach((x) => router.datagram(x));
@@ -65,12 +77,15 @@ describe("PyroWave deadline across a page stall (#1635)", () => {
     expect(lost()).toBe(frags(1).length - 2);
   });
 
-  it("after a stall, a really lost tail is concealed one timer turn later", () => {
+  it("after a stall, a really lost tail is concealed max(lateness, one frame) later, once", () => {
     const { out, router, stall, run } = setup();
     frags(1).slice(0, 2).forEach((x) => router.datagram(x));
     stall(30);
     expect(out, "the first fire only defers").toEqual([]);
-    run(1);
+    // 13 ms late, so the fire waits max(13, one frame) = one frame more.
+    run(15);
+    expect(out, "deferred by at least a frame").toEqual([]);
+    run(3);
     expect(out.map((x) => x.complete)).toEqual([false]);
   });
 

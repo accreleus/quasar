@@ -36,9 +36,9 @@ import {
 } from "./transport";
 
 const WT_PROTO = 1;
-/** `session_not_ready`: retry the same token after this long (§Hello). */
 /** A PyroWave deadline timer later than this means the page was stalled (#1635). */
 const STALL_MS = 3;
+/** `session_not_ready`: retry the same token after this long (§Hello). */
 const NOT_READY_RETRY_MS = 250;
 /** How long connect keeps retrying an agent that says it is not ready. */
 export const CONNECT_DEADLINE_MS = 60_000;
@@ -658,7 +658,7 @@ export class WebTransportMedia implements MediaTransport {
     };
     // One timer, at the PyroWave receiver's next frame deadline; re-armed only when that moves,
     // not per datagram (a 1080p frame is ~380 of them).
-    const arm = (deferred = false) => {
+    const arm = (deferBy?: number) => {
       const at = pyro?.nextDeadline() ?? null;
       if (at === armedAt) return;
       stop();
@@ -668,13 +668,16 @@ export class WebTransportMedia implements MediaTransport {
         timer = null;
         armedAt = null;
         // Reads queued behind a stall have not run yet: closing now would count datagrams the
-        // page is about to read as lost. One more turn lets them in first, once.
-        if (!deferred && this.now() - at > STALL_MS) return arm(true);
+        // page is about to read as lost. Wait once more, as long as the stall (at least a frame):
+        // a timer due in the future runs after reads already posted, whatever order the browser
+        // gives timer and network tasks, which a 0 ms re-arm would not ensure.
+        const late = this.now() - at;
+        if (deferBy === undefined && late > STALL_MS) return arm(Math.max(late, pyro?.frameMs ?? 0));
         const frame = live.on ? pyro?.due(this.now()) : null;
         if (frame) sink.pyrowave(frame);
         reportLost();
         arm();
-      }, Math.max(0, at - this.now()));
+      }, deferBy ?? Math.max(0, at - this.now()));
     };
     // codec-pyrowave.md §Loss: a PyroWave frame never reaches the assembler, so it is never
     // NACKed or declared late; its losses are concealed by the decoder.
