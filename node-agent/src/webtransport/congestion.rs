@@ -796,12 +796,28 @@ impl Estimator {
         self.held.map_or(kbps, |h| kbps.min(h.kbps.max(MIN_KBPS)))
     }
 
+    /// Ends the hold (`HOLD`), naming the path that ended it for the lab.
+    fn end_hold(&mut self, reason: &'static str) {
+        if let Some(h) = self.held.take() {
+            tracing::info!(
+                token = "webtransport-hold-ended",
+                reason,
+                held_kbps = h.kbps as u64,
+                cause_loss_pct = h.cause.1 * 100.0,
+                set_by_loss = h.dropped,
+                "WebTransport capacity hold at {:.0} kbps ended ({reason})",
+                h.kbps
+            );
+        }
+    }
+
     /// Start again from `kbps` (never above the ceiling): codec-pyrowave.md §Rate, the ABR
     /// resumes from the estimate after a switch back.
     pub(crate) fn resume_at(&mut self, kbps: f64) {
         self.delay_kbps = kbps;
         self.loss_kbps = kbps;
-        (self.held, self.read_last) = (None, false);
+        self.read_last = false;
+        self.end_hold("codec-switch");
         self.stop_regrow("codec switch");
         self.settle();
     }
@@ -858,7 +874,7 @@ impl Estimator {
                 // Backing off did not stop the loss: it is not the link's capacity. Under half the
                 // hold's renewal line it is too little to keep a hold alive anyway.
                 if least >= LOSS_LOW / 2.0 {
-                    self.held = None;
+                    self.end_hold("loss-floor");
                 }
             }
         }
@@ -898,6 +914,7 @@ impl Estimator {
     /// Act on what one message measured.
     fn apply(&mut self, m: Measured, now: Instant, path: QuicPath) -> Option<f64> {
         self.loss = m.loss;
+        let was_held = self.held.is_some();
         let dt = now
             .saturating_duration_since(self.last_update)
             .as_secs_f64()
@@ -1111,7 +1128,8 @@ impl Estimator {
                         .is_none_or(|(was, now)| now >= FLOOR_SPREAD * was)
             });
         if released {
-            (self.held, self.random_burst) = (None, Some(now));
+            self.random_burst = Some(now);
+            self.end_hold("burst-not-capacity");
         }
         let random = self
             .random_burst
@@ -1172,7 +1190,7 @@ impl Estimator {
                 };
                 h.kbps *= per_s.powf(dt);
                 if h.kbps >= self.ceiling_kbps {
-                    self.held = None;
+                    self.end_hold("probe-reached-ceiling");
                 }
             }
         }
@@ -1196,7 +1214,8 @@ impl Estimator {
         };
         let due = self.log_due(now)
             && (self.unlogged.is_some() || self.bound != self.logged.0 || self.measured.is_some());
-        if !cut_by.is_empty() || due {
+        let hold_began = self.held.is_some() && !was_held;
+        if !cut_by.is_empty() || due || hold_began {
             // A silence fall not logged yet is part of this line's "from → to".
             let from = match self.unlogged.take() {
                 Some(from) => {

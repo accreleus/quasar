@@ -434,7 +434,13 @@ pub struct Governor {
     /// ended whose setpoint has not climbed back to that rate yet.
     hold_from: Option<f64>,
     back: bool,
+    /// When `hold_to` last ran.
+    held_at: Option<Instant>,
 }
+
+/// `Governor::hold_off`: a hold refreshed within this is seen ending (WebTransport refreshes it every
+/// report, 50 ms apart; the rung's lease is the same, `LadderPlanner::set_held`).
+const HOLD_SEEN: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl Governor {
     /// Start at the tier ceiling. `start` seeds the min-interval clock so the governor
@@ -452,6 +458,7 @@ impl Governor {
             last_report: None,
             under: None,
             hold_from: None,
+            held_at: None,
             back: false,
         }
     }
@@ -626,6 +633,7 @@ impl Governor {
     pub fn hold_to(&mut self, kbps: f64, now: Instant) -> Option<u32> {
         self.cfg.per_report?;
         self.hold_from.get_or_insert(self.rate);
+        self.held_at = Some(now);
         self.back = false;
         self.rate = self.rate.min(kbps);
         let sp = self.clamp(kbps);
@@ -641,8 +649,13 @@ impl Governor {
     /// burst) or the link lifted: the rate, which the rung reads, is back where the hold found it,
     /// and the setpoint follows the estimate up to it past the deadband (with FEC charged the
     /// estimate tops out under the ceiling, so a held setpoint parked up to 15 % low for good).
-    pub fn hold_off(&mut self) {
-        if let Some(rate) = self.hold_from.take() {
+    /// Only a hold seen ending: after a second with no report (PyroWave held the encoder, then
+    /// `Estimator::resume_at`, or another client) the rate before it is stale (#1433 seat B N1).
+    pub fn hold_off(&mut self, now: Instant) {
+        let seen = self
+            .held_at
+            .is_some_and(|at| now.saturating_duration_since(at) < HOLD_SEEN);
+        if let Some(rate) = self.hold_from.take().filter(|_| seen) {
             self.rate = self.rate.max(rate);
             self.back = true;
         }
@@ -1343,7 +1356,7 @@ mod tests {
             None,
             "inside the deadband while held"
         );
-        g.hold_off();
+        g.hold_off(ms(base, 20));
         assert_eq!(g.rate_kbps(), 10_000.0);
         assert_eq!(g.observe(9000.0, ms(base, 30)), Some(9000));
         assert_eq!(
@@ -1351,8 +1364,23 @@ mod tests {
             Some(9500),
             "until it reaches the rate"
         );
-        g.hold_off();
+        g.hold_off(ms(base, 50));
         assert_eq!(g.rate_kbps(), 10_000.0, "no hold, nothing to restore");
+    }
+
+    /// #1433 seat B N1: a hold last refreshed over a second ago (PyroWave took the encoder, and its
+    /// step-down resumed the estimator with no hold) is not seen ending: the rate before it is
+    /// stale and stays where the resume put it. Old code: back to 10 000.
+    #[test]
+    fn per_report_a_hold_not_seen_ending_restores_nothing() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        g.hold_to(3000.0, ms(base, 10));
+        g.hold_off(ms(base, 1010));
+        assert_eq!(g.rate_kbps(), 3000.0);
+        g.hold_to(2000.0, ms(base, 1100));
+        g.hold_off(ms(base, 1150));
+        assert_eq!(g.rate_kbps(), 3000.0, "the next hold restores its own rate");
     }
 
     /// A report with no reading between two low ones breaks the run.

@@ -824,6 +824,11 @@ impl Media {
         );
     }
 
+    /// When a keyframe was last forced ([`Self::keyframe`]).
+    pub(crate) fn last_forced(&self) -> Option<Instant> {
+        self.lock().last_forced
+    }
+
     pub(super) fn on_caps(&self, caps: &gst::CapsRef, session_id: &str) {
         let mut st = self.lock();
         // A `hand_over`'d chain is at NULL and this media is on its way out (a rebuild's old
