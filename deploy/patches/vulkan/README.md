@@ -1589,11 +1589,12 @@ Quasar-authored (#1348). The control above on the NVENC encoders (`nvh264enc`,
 `nvautogpu*enc` variants: all subclasses of `GstNvEncoder`), implemented once in the base
 class `sys/nvcodec/gstnvencoder.cpp` with NVENC's per-picture long-term references:
 
-- `num-anchors` > 0 turns on `enableLTR` (per-picture mode, `ltrTrustMode` 0) with
-  `ltrNumFrames = num-anchors`, and `num-anchors + 2` DPB pictures: on H.264 `max_num_ref_frames =
-  num-anchors + 2`, on HEVC `num-anchors + 1` references and the current picture. Clamped, with a
+- `num-anchors` > 0 turns on `enableLTR` (per-picture mode, `ltrTrustMode` 0). HEVC gets
+  `ltrNumFrames = num-anchors` and `num-anchors + 1` references. H.264 gets every long-term index
+  the level leaves (`ltrNumFrames` = MaxDpbFrames - 1, at most the device's) and
+  `max_num_ref_frames` one more. Clamped, with a
   warning, to `NV_ENC_CAPS_NUM_MAX_LTR_FRAMES` and to the level, as on the Vulkan encoders (the
-  same table, same results): the DPB must fit MaxDpbFrames (H.264) or MaxDpbSize (HEVC) of the
+  same table, same results; `num-anchors + 2` DPB pictures): the DPB must fit MaxDpbFrames (H.264) or MaxDpbSize (HEVC) of the
   configured level, else of the lowest level that fits the size and rate, so anchors never raise
   it. 0 with B frames, and 0 on AV1: the NVENC API GStreamer speaks (12.0) has no AV1 long-term
   references, so on `nvav1enc` every recovery is a key frame.
@@ -1601,6 +1602,12 @@ class `sys/nvcodec/gstnvencoder.cpp` with NVENC's per-picture long-term referenc
   anchor's. A recovery frame codes from that index only (`ltrUseFrames`, `ltrUseFrameBitmap`), and
   first invalidates (`NvEncInvalidateRefFrames`) the last eight pictures newer than its anchor, so no
   short-term reference from the lost chain stays usable. Newer anchors are forgotten.
+- H.264: an index whose anchor a recovery forgot is retired until the next IDR. Overwriting it
+  would send MMCO 6 with no MMCO 1, so a decoder that lost that anchor (its sliding window holds one
+  more short-term picture instead) would end one reference over `max_num_ref_frames`; measured,
+  ffmpeg drops a picture there. A new anchor takes an unused index, whose MMCO 6 comes with the
+  MMCO 1 that frees a short-term picture in every decoder. With none left, it replaces the oldest
+  held anchor, which every decoder holds. HEVC names its references explicitly and reuses indices.
 - The held set is tracked in the element: an IDR (the first frame, a forced key frame, every
   `gop-size` frames) drops all of them. The anchor waits follow the Vulkan encoders, H.264's
   included, so the agent and the harness see one behaviour per codec.
