@@ -1,0 +1,911 @@
+diff --git a/subprojects/gst-plugins-bad/ext/vulkan/base/gstav1encoder.c b/subprojects/gst-plugins-bad/ext/vulkan/base/gstav1encoder.c
+index 4eb9639..bf5ab01 100644
+--- a/subprojects/gst-plugins-bad/ext/vulkan/base/gstav1encoder.c
++++ b/subprojects/gst-plugins-bad/ext/vulkan/base/gstav1encoder.c
+@@ -40,6 +40,7 @@
+ #endif
+ 
+ #include "gstav1encoder.h"
++#include "gstrefrecovery.h"
+ 
+ GST_DEBUG_CATEGORY (gst_av1_encoder_debug);
+ #define GST_CAT_DEFAULT gst_av1_encoder_debug
+@@ -47,6 +48,9 @@ GST_DEBUG_CATEGORY (gst_av1_encoder_debug);
+ #define AV1ENC_KEYFRAME_PERIOD_DEFAULT    0
+ #define AV1ENC_NUM_REF_FRAMES_DEFAULT     3
+ #define AV1ENC_GF_GROUP_SIZE_DEFAULT      8
++#define AV1ENC_NUM_ANCHORS_DEFAULT        0
++/* One VBI slot carries the chain (LAST); the other seven can hold anchors. */
++#define AV1ENC_NUM_ANCHORS_MAX            7
+ 
+ /* The AV1 order_hint field cannot exceed 8 bits (order_hint_bits_minus_1 is
+  * a 3-bit field capped at 7). The base class always operates with
+@@ -61,6 +65,7 @@ enum
+   PROP_KEYFRAME_PERIOD = 1,     /* aka idr-period, mirroring the h26x siblings */
+   PROP_NUM_REF_FRAMES,
+   PROP_GF_GROUP_SIZE,
++  PROP_NUM_ANCHORS,
+   N_PROPERTIES
+ };
+ 
+@@ -73,6 +78,7 @@ struct _GstAV1EncoderPrivate
+   struct
+   {
+     guint max_num_references;
++    guint max_num_anchors;
+     guint preferred_output_delay;
+   } config;
+ 
+@@ -81,6 +87,7 @@ struct _GstAV1EncoderPrivate
+     guint32 keyframe_period;
+     guint num_ref_frames;
+     guint gf_group_size;
++    guint num_anchors;
+   } prop;
+ 
+   struct
+@@ -99,8 +106,15 @@ struct _GstAV1EncoderPrivate
+     /* The AV1 virtual buffer index: 8 reference slots. Entries hold an
+      * owned reference on the #GstVideoCodecFrame. */
+     GstVideoCodecFrame *ref_list[GST_AV1_NUM_REF_FRAMES];
++
++    /* reference recovery: fixed per sequence, 0 = off */
++    guint num_anchors;
++    GstAV1EncoderAnchorState anchors;
+   } gop;
+ 
++  /* reference recovery requests from upstream events, under the object lock */
++  GstRefRecoveryRequest req;
++
+   guint fps_n;
+   guint fps_d;
+ 
+@@ -158,6 +172,8 @@ gst_av1_encoder_frame_new (void)
+   frame = g_new0 (GstAV1EncoderFrame, 1);
+   frame->type = GST_AV1_INTER_FRAME;
+   frame->update_index = -1;
++  frame->pts = GST_CLOCK_TIME_NONE;
++  frame->recover_from = GST_CLOCK_TIME_NONE;
+   for (i = 0; i < GST_AV1_NUM_REF_FRAMES; i++) {
+     frame->ref_frame_idx[i] = -1;
+     /* the resolved view (bug A2) starts out empty too; g_new0 covers
+@@ -252,10 +268,13 @@ gst_av1_encoder_reset (GstAV1Encoder * self)
+   priv->gop.keyframe_period = priv->prop.keyframe_period;
+   priv->gop.num_ref_frames = priv->prop.num_ref_frames;
+   priv->gop.gf_group_size = priv->prop.gf_group_size;
++  priv->gop.num_anchors = priv->prop.num_anchors;
++  priv->req = (GstRefRecoveryRequest) { FALSE, FALSE, GST_CLOCK_TIME_NONE };
+   GST_OBJECT_UNLOCK (self);
+ 
+   priv->gop.frame_num = 0;
+   priv->gop.frames_since_gf = 0;
++  priv->gop.anchors = (GstAV1EncoderAnchorState) { -1, 0 };
+ 
+   gst_av1_encoder_clear_ref_list (self);
+ 
+@@ -735,6 +754,121 @@ gst_av1_encoder_demote_golden (GstAV1EncoderFrame ** ref_frames,
+   }
+ }
+ 
++/* Reference recovery: the slot of the live anchor whose PTS is @pts, or -1
++ * when none is held or it is too old to name. Relative order-hint distances
++ * are only defined below 1 << (OrderHintBits - 1) frames, so an older anchor
++ * counts as gone. @frame_num is the frame about to be coded. */
++gint
++gst_av1_encoder_find_anchor (GstAV1EncoderFrame ** ref_frames,
++    const GstAV1EncoderAnchorState * state, GstClockTime pts,
++    guint32 frame_num)
++{
++  gint i;
++
++  if (!GST_CLOCK_TIME_IS_VALID (pts))
++    return -1;
++
++  for (i = 0; i < GST_AV1_NUM_REF_FRAMES; i++) {
++    if (!(state->anchor_mask & (1 << i)) || !ref_frames[i])
++      continue;
++    if (ref_frames[i]->pts != pts)
++      continue;
++    if (frame_num - ref_frames[i]->frame_num >=
++        (1 << (AV1ENC_ORDER_HINT_BITS - 1)))
++      return -1;
++    return i;
++  }
++
++  return -1;
++}
++
++/* Reference recovery replaces name assignment and slot selection while
++ * num-anchors > 0. Every name points at one picture: LAST (the chain slot),
++ * or the anchor in @recover_slot. A frame refreshes the chain slot, plus a
++ * free (or the oldest) anchor slot when @want_anchor. A recovery frame
++ * refreshes the chain slot too, so the slot the decoder may hold stale is
++ * overwritten by the first frame it receives, and the anchor stays held for
++ * a second recovery. Anchors newer than the recovery anchor may be missing
++ * in the decoder: they are forgotten, and their slots returned to be cleared
++ * from the VBI before the frame is coded.
++ *
++ * @ref_frames is read, never written. */
++guint8
++gst_av1_encoder_assign_anchor_refs (GstAV1EncoderFrame ** ref_frames,
++    guint num_anchors, GstAV1EncoderAnchorState * state, gint recover_slot,
++    gboolean want_anchor, GstAV1EncoderFrame * av1_frame)
++{
++  guint8 drop = 0;
++  gint i, src, slot = -1;
++
++  for (i = 0; i < GST_AV1_NUM_REF_FRAMES; i++)
++    av1_frame->ref_frame_idx[i] = -1;
++  av1_frame->is_anchor = FALSE;
++  av1_frame->error_resilient = FALSE;
++
++  if (av1_frame->type == GST_AV1_KEY_FRAME) {
++    av1_frame->update_index = 0;
++    av1_frame->refresh_frame_flags = 0xff;
++    state->chain_slot = 0;
++    state->anchor_mask = 0;
++    return 0;
++  }
++
++  src = recover_slot >= 0 ? recover_slot : state->chain_slot;
++  g_assert (src >= 0 && src < GST_AV1_NUM_REF_FRAMES && ref_frames[src]);
++
++  for (i = GST_AV1_REF_LAST_FRAME; i <= GST_AV1_REF_ALTREF_FRAME; i++)
++    av1_frame->ref_frame_idx[i] = src;
++
++  if (recover_slot >= 0) {
++    guint32 anchor_num = ref_frames[recover_slot]->frame_num;
++
++    g_assert (state->anchor_mask & (1 << recover_slot));
++    av1_frame->error_resilient = TRUE;
++    for (i = 0; i < GST_AV1_NUM_REF_FRAMES; i++) {
++      if ((state->anchor_mask & (1 << i)) && ref_frames[i]
++          && ref_frames[i]->frame_num > anchor_num)
++        drop |= 1 << i;
++    }
++    state->anchor_mask &= ~drop;
++  }
++
++  av1_frame->update_index = state->chain_slot;
++  av1_frame->refresh_frame_flags = 1 << state->chain_slot;
++
++  if (want_anchor && num_anchors > 0) {
++    guint held = 0;
++    guint32 oldest = G_MAXUINT32;
++    gint oldest_slot = -1;
++
++    for (i = 0; i < GST_AV1_NUM_REF_FRAMES; i++) {
++      if (!(state->anchor_mask & (1 << i)))
++        continue;
++      held++;
++      if (ref_frames[i]->frame_num < oldest) {
++        oldest = ref_frames[i]->frame_num;
++        oldest_slot = i;
++      }
++    }
++
++    if (held >= num_anchors) {
++      slot = oldest_slot;
++    } else {
++      for (i = 0; i < GST_AV1_NUM_REF_FRAMES && slot < 0; i++) {
++        if (i != state->chain_slot && !(state->anchor_mask & (1 << i)))
++          slot = i;
++      }
++    }
++
++    g_assert (slot >= 0 && slot != state->chain_slot);
++    av1_frame->refresh_frame_flags |= 1 << slot;
++    state->anchor_mask |= 1 << slot;
++    av1_frame->is_anchor = TRUE;
++  }
++
++  return drop;
++}
++
+ /* The AV1 order_hint field: frame_num masked to OrderHintBits. Wraps every
+  * 1 << AV1ENC_ORDER_HINT_BITS frames, which is why the reference model keys
+  * every temporal comparison on frame_num and never on order_hint. */
+@@ -780,17 +914,24 @@ gst_av1_encoder_update_ref_list (GstAV1Encoder * self,
+     return;
+   }
+ 
+-  if (av1_frame->update_index < 0) {
++  if (av1_frame->refresh_frame_flags == 0) {
+     GST_LOG_OBJECT (self, "Frame %d not kept as reference",
+         av1_frame->frame_num);
+     return;
+   }
+ 
+-  if (priv->gop.ref_list[av1_frame->update_index])
+-    gst_video_codec_frame_unref (priv->gop.ref_list[av1_frame->update_index]);
++  /* An anchor refreshes two slots; mirror every bit the decoder applies. */
++  {
++    gint i;
+ 
+-  priv->gop.ref_list[av1_frame->update_index] =
+-      gst_video_codec_frame_ref (frame);
++    for (i = 0; i < GST_AV1_NUM_REF_FRAMES; i++) {
++      if (!(av1_frame->refresh_frame_flags & (1 << i)))
++        continue;
++      if (priv->gop.ref_list[i])
++        gst_video_codec_frame_unref (priv->gop.ref_list[i]);
++      priv->gop.ref_list[i] = gst_video_codec_frame_ref (frame);
++    }
++  }
+ 
+   gst_av1_encoder_ref_frames_view (priv->gop.ref_list, ref_frames);
+   gst_av1_encoder_demote_golden (ref_frames, av1_frame);
+@@ -798,7 +939,7 @@ gst_av1_encoder_update_ref_list (GstAV1Encoder * self,
+ 
+ static GstFlowReturn
+ gst_av1_encoder_encode_frame (GstAV1Encoder * self, GstVideoCodecFrame * frame,
+-    gboolean is_last)
++    gboolean is_last, gint recover_slot, gboolean want_anchor)
+ {
+   GstAV1EncoderPrivate *priv = _GET_PRIV (self);
+   GstAV1EncoderClass *klass = GST_AV1_ENCODER_GET_CLASS (self);
+@@ -810,6 +951,27 @@ gst_av1_encoder_encode_frame (GstAV1Encoder * self, GstVideoCodecFrame * frame,
+ 
+   gst_av1_encoder_ref_frames_view (priv->gop.ref_list, ref_frames);
+ 
++  if (priv->gop.num_anchors > 0) {
++    guint8 drop;
++    gint i;
++
++    if (recover_slot >= 0)
++      av1_frame->recover_from = ref_frames[recover_slot]->pts;
++
++    drop = gst_av1_encoder_assign_anchor_refs (ref_frames,
++        priv->gop.num_anchors, &priv->gop.anchors, recover_slot, want_anchor,
++        av1_frame);
++
++    for (i = 0; i < GST_AV1_NUM_REF_FRAMES; i++) {
++      if (drop & (1 << i))
++        g_clear_pointer (&priv->gop.ref_list[i], gst_video_codec_frame_unref);
++    }
++    gst_av1_encoder_ref_frames_view (priv->gop.ref_list, ref_frames);
++
++    gst_av1_encoder_resolve_refs (ref_frames, av1_frame);
++    goto encode;
++  }
++
+   if (!gst_av1_encoder_assign_ref_index (self, ref_frames,
+           priv->gop.num_ref_frames, priv->config.max_num_references,
+           av1_frame))
+@@ -824,6 +986,7 @@ gst_av1_encoder_encode_frame (GstAV1Encoder * self, GstVideoCodecFrame * frame,
+   gst_av1_encoder_find_ref_to_update (ref_frames, priv->gop.num_ref_frames,
+       priv->config.max_num_references, av1_frame);
+ 
++encode:
+   g_assert (klass->encode_frame);
+   ret = klass->encode_frame (self, frame, av1_frame, priv->gop.ref_list);
+   if (ret != GST_FLOW_OK) {
+@@ -905,6 +1068,12 @@ gst_av1_encoder_configure (GstAV1Encoder * self)
+     return ret;
+ 
+   /* the accelerator limits are known now */
++  if (priv->gop.num_anchors > priv->config.max_num_anchors) {
++    GST_WARNING_OBJECT (self, "Lowering num-anchors from %u to %u (DPB size)",
++        priv->gop.num_anchors, priv->config.max_num_anchors);
++    priv->gop.num_anchors = priv->config.max_num_anchors;
++  }
++
+   if (priv->gop.num_ref_frames > priv->config.max_num_references) {
+     priv->gop.num_ref_frames = MAX (priv->config.max_num_references, 1);
+     GST_INFO_OBJECT (self, "Lowering num-ref-frames to %d",
+@@ -932,7 +1101,9 @@ gst_av1_encoder_handle_frame (GstVideoEncoder * encoder,
+   GstAV1EncoderClass *klass = GST_AV1_ENCODER_GET_CLASS (self);
+   GstFlowReturn ret = GST_FLOW_ERROR;
+   GstAV1EncoderFrame *av1_frame;
+-  gboolean force_key;
++  gboolean force_key, want_anchor, want_recover;
++  GstClockTime recover_pts;
++  gint recover_slot = -1;
+ 
+   GST_LOG_OBJECT (encoder, "handle frame id %d, dts %" GST_TIME_FORMAT
+       ", pts %" GST_TIME_FORMAT, frame->system_frame_number,
+@@ -956,6 +1127,10 @@ gst_av1_encoder_handle_frame (GstVideoEncoder * encoder,
+   priv->gop.gf_group_size = priv->prop.gf_group_size;
+   priv->gop.num_ref_frames = MIN (priv->prop.num_ref_frames,
+       MAX (priv->config.max_num_references, 1));
++  want_anchor = priv->req.anchor;
++  want_recover = priv->req.recover;
++  recover_pts = priv->req.recover_pts;
++  priv->req.recover = FALSE;
+   GST_OBJECT_UNLOCK (self);
+ 
+   /* 0 means auto: one key frame per second (bug A4: routed through the
+@@ -974,10 +1149,29 @@ gst_av1_encoder_handle_frame (GstVideoEncoder * encoder,
+   }
+ 
+   force_key = GST_VIDEO_CODEC_FRAME_IS_FORCE_KEYFRAME (frame);
++  av1_frame->pts = frame->pts;
++
++  if (want_recover && !force_key && priv->gop.frame_num > 0
++      && priv->gop.frame_num < priv->gop.keyframe_period) {
++    GstAV1EncoderFrame *ref_frames[GST_AV1_NUM_REF_FRAMES];
++
++    gst_av1_encoder_ref_frames_view (priv->gop.ref_list, ref_frames);
++    recover_slot = gst_av1_encoder_find_anchor (ref_frames,
++        &priv->gop.anchors, recover_pts, priv->gop.frame_num);
++    if (recover_slot < 0) {
++      GST_INFO_OBJECT (self, "No anchor with pts %" GST_TIME_FORMAT
++          ", key frame instead", GST_TIME_ARGS (recover_pts));
++      force_key = TRUE;
++    }
++  }
+ 
+   if (force_key || priv->gop.frame_num >= priv->gop.keyframe_period)
+     priv->gop.frame_num = 0;
+ 
++  /* an anchor is always an inter frame: a pending request waits out a key */
++  if (priv->gop.frame_num == 0)
++    want_anchor = FALSE;
++
+   av1_frame->frame_num = priv->gop.frame_num;
+   av1_frame->force_keyframe = force_key;
+   av1_frame->type = priv->gop.frame_num == 0 ?
+@@ -999,10 +1193,20 @@ gst_av1_encoder_handle_frame (GstVideoEncoder * encoder,
+       av1_frame->type == GST_AV1_KEY_FRAME ? "key" : "inter",
+       av1_frame->order_hint, av1_frame->is_golden ? " (golden)" : "");
+ 
+-  ret = gst_av1_encoder_encode_frame (self, frame, FALSE);
++  ret = gst_av1_encoder_encode_frame (self, frame, FALSE, recover_slot,
++      want_anchor);
+   if (ret != GST_FLOW_OK)
+     goto error_encode;
+ 
++  if (av1_frame->is_anchor) {
++    GST_OBJECT_LOCK (self);
++    priv->req.anchor = FALSE;
++    GST_OBJECT_UNLOCK (self);
++  }
++  if (av1_frame->is_anchor || recover_slot >= 0)
++    gst_ref_recovery_report (frame, av1_frame->is_anchor,
++        av1_frame->recover_from);
++
+   priv->gop.frame_num++;
+   priv->gop.frames_since_gf++;
+ 
+@@ -1042,6 +1246,24 @@ error_push_buffer:
+   }
+ }
+ 
++static gboolean
++gst_av1_encoder_src_event (GstVideoEncoder * encoder, GstEvent * event)
++{
++  GstAV1EncoderPrivate *priv = _GET_PRIV (GST_AV1_ENCODER (encoder));
++  gboolean ours;
++
++  GST_OBJECT_LOCK (encoder);
++  ours = gst_ref_recovery_take_event (event, &priv->req);
++  GST_OBJECT_UNLOCK (encoder);
++
++  if (ours) {
++    gst_event_unref (event);
++    return TRUE;
++  }
++
++  return GST_VIDEO_ENCODER_CLASS (parent_class)->src_event (encoder, event);
++}
++
+ static gboolean
+ gst_av1_encoder_flush (GstVideoEncoder * encoder)
+ {
+@@ -1071,12 +1293,14 @@ gst_av1_encoder_init (GstAV1Encoder * self)
+   g_queue_init (&priv->output_list);
+ 
+   priv->config.max_num_references = 1;
++  priv->config.max_num_anchors = AV1ENC_NUM_ANCHORS_MAX;
+   priv->config.preferred_output_delay = 0;
+ 
+   /* default values */
+   priv->prop.keyframe_period = AV1ENC_KEYFRAME_PERIOD_DEFAULT;
+   priv->prop.num_ref_frames = AV1ENC_NUM_REF_FRAMES_DEFAULT;
+   priv->prop.gf_group_size = AV1ENC_GF_GROUP_SIZE_DEFAULT;
++  priv->prop.num_anchors = AV1ENC_NUM_ANCHORS_DEFAULT;
+ }
+ 
+ static void
+@@ -1105,6 +1329,9 @@ gst_av1_encoder_get_property (GObject * object, guint property_id,
+     case PROP_GF_GROUP_SIZE:
+       g_value_set_uint (value, priv->prop.gf_group_size);
+       break;
++    case PROP_NUM_ANCHORS:
++      g_value_set_uint (value, priv->prop.num_anchors);
++      break;
+     default:
+       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
+       break;
+@@ -1135,6 +1362,9 @@ gst_av1_encoder_set_property (GObject * object, guint property_id,
+     case PROP_GF_GROUP_SIZE:
+       priv->prop.gf_group_size = g_value_get_uint (value);
+       break;
++    case PROP_NUM_ANCHORS:
++      priv->prop.num_anchors = g_value_get_uint (value);
++      break;
+     default:
+       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
+       break;
+@@ -1160,6 +1390,7 @@ gst_av1_encoder_class_init (GstAV1EncoderClass * klass)
+   encoder_class->handle_frame =
+       GST_DEBUG_FUNCPTR (gst_av1_encoder_handle_frame);
+   encoder_class->flush = GST_DEBUG_FUNCPTR (gst_av1_encoder_flush);
++  encoder_class->src_event = GST_DEBUG_FUNCPTR (gst_av1_encoder_src_event);
+   encoder_class->finish = GST_DEBUG_FUNCPTR (gst_av1_encoder_finish);
+ 
+   /**
+@@ -1205,6 +1436,21 @@ gst_av1_encoder_class_init (GstAV1EncoderClass * klass)
+       "Number of frames between two golden-frame anchors", 1, 32,
+       AV1ENC_GF_GROUP_SIZE_DEFAULT, param_flags);
+ 
++  /**
++   * GstAV1Encoder:num-anchors:
++   *
++   * Reference recovery: how many anchor frames (requested with the
++   * "quasar-ref-anchor" upstream event) are held for "quasar-ref-recover".
++   * 0 disables it. While on, every inter frame codes from one picture only
++   * and num-ref-frames / gf-group-size are ignored. Read at stream start.
++   */
++  properties[PROP_NUM_ANCHORS] = g_param_spec_uint ("num-anchors",
++      "Number of anchors",
++      "Anchor frames held for reference recovery (0 = off)", 0,
++      AV1ENC_NUM_ANCHORS_MAX, AV1ENC_NUM_ANCHORS_DEFAULT,
++      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT
++      | GST_PARAM_MUTABLE_READY);
++
+   g_object_class_install_properties (object_class, N_PROPERTIES, properties);
+ 
+   gst_type_mark_as_plugin_api (GST_TYPE_AV1_ENCODER, 0);
+@@ -1230,6 +1476,25 @@ gst_av1_encoder_set_max_num_references (GstAV1Encoder * self, guint max_refs)
+   priv->config.max_num_references = max_refs;
+ }
+ 
++/**
++ * gst_av1_encoder_set_max_num_anchors:
++ * @self: A #GstAV1Encoder
++ * @max_anchors: how many anchors the accelerator's DPB can hold besides the
++ *   chain picture and the picture being coded
++ *
++ * Call from new_sequence(); num-anchors is clamped to it.
++ */
++void
++gst_av1_encoder_set_max_num_anchors (GstAV1Encoder * self, guint max_anchors)
++{
++  GstAV1EncoderPrivate *priv;
++
++  g_return_if_fail (GST_IS_AV1_ENCODER (self));
++
++  priv = _GET_PRIV (self);
++  priv->config.max_num_anchors = MIN (max_anchors, AV1ENC_NUM_ANCHORS_MAX);
++}
++
+ /**
+  * gst_av1_encoder_set_preferred_output_delay:
+  * @self: a #GstAV1Encoder
+diff --git a/subprojects/gst-plugins-bad/ext/vulkan/base/gstav1encoder.h b/subprojects/gst-plugins-bad/ext/vulkan/base/gstav1encoder.h
+index 2387e1f..7fe2c2d 100644
+--- a/subprojects/gst-plugins-bad/ext/vulkan/base/gstav1encoder.h
++++ b/subprojects/gst-plugins-bad/ext/vulkan/base/gstav1encoder.h
+@@ -169,6 +169,9 @@ GType                gst_av1_encoder_get_type                (void);
+ void                 gst_av1_encoder_set_max_num_references  (GstAV1Encoder * self,
+                                                               guint max_refs);
+ 
++void                 gst_av1_encoder_set_max_num_anchors     (GstAV1Encoder * self,
++                                                              guint max_anchors);
++
+ void                 gst_av1_encoder_set_preferred_output_delay
+                                                              (GstAV1Encoder * self,
+                                                               guint delay);
+@@ -251,6 +254,15 @@ struct _GstAV1EncoderFrame
+    * 0 for an empty slot. */
+   guint8 ref_order_hint[GST_AV1_NUM_REF_FRAMES];
+ 
++  /* Reference recovery (num-anchors > 0): the input PTS that names this frame
++   * as an anchor, whether it is kept as one, and whether it codes from one
++   * anchor only (a recovery frame, sent error resilient). */
++  GstClockTime pts;
++  gboolean is_anchor;
++  gboolean error_resilient;
++  /* PTS of the anchor a recovery frame codes from, else GST_CLOCK_TIME_NONE. */
++  GstClockTime recover_from;
++
+   gpointer user_data;
+   GDestroyNotify user_data_destroy_notify;
+ };
+@@ -300,6 +312,27 @@ G_GNUC_INTERNAL
+ void                 gst_av1_encoder_demote_golden           (GstAV1EncoderFrame ** ref_frames,
+                                                               GstAV1EncoderFrame * av1_frame);
+ 
++/* Reference recovery state: the VBI slot holding LAST (-1 before the first
++ * key frame) and the slots holding a live anchor. */
++typedef struct
++{
++  gint chain_slot;
++  guint8 anchor_mask;
++} GstAV1EncoderAnchorState;
++
++G_GNUC_INTERNAL
++gint                 gst_av1_encoder_find_anchor             (GstAV1EncoderFrame ** ref_frames,
++                                                              const GstAV1EncoderAnchorState * state,
++                                                              GstClockTime pts,
++                                                              guint32 frame_num);
++G_GNUC_INTERNAL
++guint8               gst_av1_encoder_assign_anchor_refs      (GstAV1EncoderFrame ** ref_frames,
++                                                              guint num_anchors,
++                                                              GstAV1EncoderAnchorState * state,
++                                                              gint recover_slot,
++                                                              gboolean want_anchor,
++                                                              GstAV1EncoderFrame * av1_frame);
++
+ G_GNUC_INTERNAL
+ guint32              gst_av1_encoder_order_hint              (guint32 frame_num);
+ 
+diff --git a/subprojects/gst-plugins-bad/ext/vulkan/base/gstrefrecovery.h b/subprojects/gst-plugins-bad/ext/vulkan/base/gstrefrecovery.h
+new file mode 100644
+index 0000000..32eea6d
+--- /dev/null
++++ b/subprojects/gst-plugins-bad/ext/vulkan/base/gstrefrecovery.h
+@@ -0,0 +1,86 @@
++/* GStreamer
++ * Copyright (C) 2026 Quasar contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ */
++
++/* Reference recovery control (Quasar), shared by the Vulkan encoders.
++ *
++ * Upstream, sent to the encoder's src pad:
++ *   "quasar-ref-anchor"                keep the next inter frame as an anchor
++ *   "quasar-ref-recover", pts=guint64  code the next frame from the anchor with
++ *                                      that PTS only, and forget every anchor
++ *                                      newer than it; a key frame when no held
++ *                                      anchor has that PTS
++ * Downstream, serialized just before the frame's buffer:
++ *   "quasar-ref-frame", pts=guint64, anchor=boolean[, recover-from=guint64]
++ *   for every anchor and every recovery frame.
++ * The other half is node-agent/src/session/pipeline/ref_recovery.rs. */
++
++#pragma once
++
++#include <gst/video/gstvideoencoder.h>
++
++G_BEGIN_DECLS
++
++#define GST_REF_RECOVERY_ANCHOR  "quasar-ref-anchor"
++#define GST_REF_RECOVERY_RECOVER "quasar-ref-recover"
++#define GST_REF_RECOVERY_FRAME   "quasar-ref-frame"
++
++typedef struct
++{
++  gboolean anchor;
++  gboolean recover;
++  GstClockTime recover_pts;
++} GstRefRecoveryRequest;
++
++/* TRUE when @event is ours (the caller then owns and drops it). Merges it into
++ * @req; call with the object lock held. A later recover replaces an earlier one. */
++static inline gboolean
++gst_ref_recovery_take_event (GstEvent * event, GstRefRecoveryRequest * req)
++{
++  const GstStructure *s;
++  guint64 pts;
++
++  if (GST_EVENT_TYPE (event) != GST_EVENT_CUSTOM_UPSTREAM)
++    return FALSE;
++
++  s = gst_event_get_structure (event);
++  if (gst_structure_has_name (s, GST_REF_RECOVERY_ANCHOR)) {
++    req->anchor = TRUE;
++    return TRUE;
++  }
++  if (gst_structure_has_name (s, GST_REF_RECOVERY_RECOVER)) {
++    if (gst_structure_get_uint64 (s, "pts", &pts)) {
++      req->recover = TRUE;
++      req->recover_pts = pts;
++    } else {
++      GST_WARNING ("%s without a guint64 pts, ignored", GST_REF_RECOVERY_RECOVER);
++    }
++    return TRUE;
++  }
++  return FALSE;
++}
++
++/* Queue the downstream report on @frame; GstVideoEncoder pushes frame->events
++ * (newest first) right before the frame's buffer. */
++static inline void
++gst_ref_recovery_report (GstVideoCodecFrame * frame, gboolean anchor,
++    GstClockTime recover_from)
++{
++  GstStructure *s = gst_structure_new (GST_REF_RECOVERY_FRAME,
++      "pts", G_TYPE_UINT64, (guint64) frame->pts,
++      "anchor", G_TYPE_BOOLEAN, anchor, NULL);
++
++  if (GST_CLOCK_TIME_IS_VALID (recover_from))
++    gst_structure_set (s, "recover-from", G_TYPE_UINT64,
++        (guint64) recover_from, NULL);
++
++  frame->events = g_list_prepend (frame->events,
++      gst_event_new_custom (GST_EVENT_CUSTOM_DOWNSTREAM, s));
++}
++
++G_END_DECLS
+diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c
+index 46d2593..3dc8974 100644
+--- a/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c
++++ b/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c
+@@ -123,6 +123,7 @@ struct _GstVulkanAV1Encoder
+   struct
+   {
+     guint max_refs;
++    guint max_anchors;
+     gboolean unidir_compound;
+     gboolean per_group_qindex;
+     gboolean primary_ref_frame;
+@@ -746,6 +747,8 @@ _publish_sequence_state (GstVulkanAV1Encoder * self,
+ 
+   gst_av1_encoder_set_max_num_references (GST_AV1_ENCODER (self),
+       self->hw.max_refs);
++  gst_av1_encoder_set_max_num_anchors (GST_AV1_ENCODER (self),
++      self->hw.max_anchors);
+ 
+   if (self->in_state)
+     gst_video_codec_state_unref (self->in_state);
+@@ -984,6 +987,10 @@ gst_vulkan_av1_encoder_new_sequence (GstAV1Encoder * encoder,
+       vk_av1_caps->maxUnidirectionalCompoundReferenceCount > 0;
+   self->hw.max_refs = self->hw.unidir_compound ?
+       MIN (vk_av1_caps->maxUnidirectionalCompoundReferenceCount, 4) : 1;
++  /* reference recovery holds the chain picture, the anchors and the picture
++   * being coded */
++  self->hw.max_anchors = vk_caps.caps.maxDpbSlots > 2 ?
++      vk_caps.caps.maxDpbSlots - 2 : 0;
+   self->hw.per_group_qindex = (vk_av1_caps->flags &
+       VK_VIDEO_ENCODE_AV1_CAPABILITY_PER_RATE_CONTROL_GROUP_MIN_MAX_Q_INDEX_BIT_KHR)
+       != 0;
+@@ -1420,7 +1427,8 @@ gst_vulkan_av1_encoder_encode_frame (GstAV1Encoder * base,
+   /* *INDENT-OFF* */
+   vk_frame->pic_info = (StdVideoEncodeAV1PictureInfo) {
+     .flags = (StdVideoEncodeAV1PictureInfoFlags) {
+-      .error_resilient_mode = is_key,
++      /* a recovery frame codes from one anchor only (#1348) */
++      .error_resilient_mode = is_key || av1_frame->error_resilient,
+       .disable_cdf_update = 0,
+       .use_superres = 0,
+       .render_and_frame_size_different =
+@@ -1459,7 +1467,8 @@ gst_vulkan_av1_encoder_encode_frame (GstAV1Encoder * base,
+     /* quality: inherit the CDF/context state from LAST rather than
+      * resetting it every frame, when the driver supports the
+      * primary_ref_frame syntax (stdSyntaxFlags bit) */
+-    .primary_ref_frame = (!is_key && self->hw.primary_ref_frame) ?
++    .primary_ref_frame = (!is_key && !av1_frame->error_resilient
++        && self->hw.primary_ref_frame) ?
+         0 /* LAST */ : STD_VIDEO_AV1_PRIMARY_REF_NONE,
+     .refresh_frame_flags = av1_frame->refresh_frame_flags,
+     .coded_denom = 0,
+diff --git a/subprojects/gst-plugins-bad/tests/check/libs/vkvideoencodeav1refs.c b/subprojects/gst-plugins-bad/tests/check/libs/vkvideoencodeav1refs.c
+index 4813c37..b397510 100644
+--- a/subprojects/gst-plugins-bad/tests/check/libs/vkvideoencodeav1refs.c
++++ b/subprojects/gst-plugins-bad/tests/check/libs/vkvideoencodeav1refs.c
+@@ -1139,6 +1139,208 @@ GST_START_TEST (test_av1_refs_occupancy_cap)
+ 
+ GST_END_TEST;
+ 
++/* ------------------------------------------------------------------ */
++/* reference recovery (num-anchors > 0)                                */
++/* ------------------------------------------------------------------ */
++
++/* One frame through the anchor model, as gst_av1_encoder_encode_frame() and
++ * update_ref_list() run it: decide, clear the forgotten anchors, then every
++ * refresh bit. The frame's PTS is its frame_num in ms. */
++static GstAV1EncoderFrame *
++anchor_step (GstAV1EncoderFrame ** refs, GstAV1EncoderAnchorState * st,
++    guint num_anchors, GstAV1FrameType type, guint32 frame_num,
++    gint recover_slot, gboolean want_anchor, guint8 * drop_out)
++{
++  GstAV1EncoderFrame *f = make_frame (type, frame_num, FALSE);
++  guint8 drop;
++  gint i;
++
++  f->pts = frame_num * GST_MSECOND;
++  if (type == GST_AV1_KEY_FRAME)
++    clear_refs (refs);
++
++  drop = gst_av1_encoder_assign_anchor_refs (refs, num_anchors, st,
++      recover_slot, want_anchor, f);
++  for (i = 0; i < GST_AV1_NUM_REF_FRAMES; i++) {
++    if (drop & (1 << i))
++      refs[i] = NULL;
++  }
++  for (i = 0; i < GST_AV1_NUM_REF_FRAMES; i++) {
++    if (f->refresh_frame_flags & (1 << i))
++      refs[i] = f;
++  }
++  if (drop_out)
++    *drop_out = drop;
++
++  return f;
++}
++
++static void
++assert_all_names (GstAV1EncoderFrame * f, gint slot)
++{
++  gint i;
++
++  for (i = GST_AV1_REF_LAST_FRAME; i <= GST_AV1_REF_ALTREF_FRAME; i++)
++    assert_equals_int (f->ref_frame_idx[i], slot);
++}
++
++static gint
++slot_of (GstAV1EncoderFrame ** refs, GstAV1EncoderAnchorState * st,
++    GstAV1EncoderFrame * f)
++{
++  gint i;
++
++  for (i = 0; i < GST_AV1_NUM_REF_FRAMES; i++) {
++    if ((st->anchor_mask & (1 << i)) && refs[i] == f)
++      return i;
++  }
++  return -1;
++}
++
++GST_START_TEST (test_av1_anchor_chain_and_mark)
++{
++  GstAV1EncoderFrame *refs[GST_AV1_NUM_REF_FRAMES];
++  GstAV1EncoderAnchorState st = { -1, 0 };
++  GstAV1EncoderFrame *f;
++
++  clear_refs (refs);
++  f = anchor_step (refs, &st, 3, GST_AV1_KEY_FRAME, 0, -1, TRUE, NULL);
++  assert_equals_int (f->refresh_frame_flags, 0xff);
++  /* a key frame is never an anchor: the request waits for an inter frame */
++  fail_if (f->is_anchor);
++  assert_equals_int (st.chain_slot, 0);
++  assert_equals_int (st.anchor_mask, 0);
++
++  f = anchor_step (refs, &st, 3, GST_AV1_INTER_FRAME, 1, -1, TRUE, NULL);
++  fail_unless (f->is_anchor);
++  fail_if (f->error_resilient);
++  assert_all_names (f, 0);
++  /* the chain slot plus its own anchor slot */
++  assert_equals_int (f->refresh_frame_flags, 0x03);
++  assert_equals_int (st.anchor_mask, 0x02);
++
++  /* the next frame codes from the chain (which holds the anchor too), and
++   * leaves the anchor slot alone */
++  f = anchor_step (refs, &st, 3, GST_AV1_INTER_FRAME, 2, -1, FALSE, NULL);
++  fail_if (f->is_anchor);
++  assert_all_names (f, 0);
++  assert_equals_int (f->refresh_frame_flags, 0x01);
++  assert_equals_int (refs[1]->frame_num, 1);
++}
++
++GST_END_TEST;
++
++GST_START_TEST (test_av1_anchor_recover)
++{
++  GstAV1EncoderFrame *refs[GST_AV1_NUM_REF_FRAMES];
++  GstAV1EncoderAnchorState st = { -1, 0 };
++  GstAV1EncoderFrame *a1, *a3, *f;
++  guint8 drop;
++  gint s1, s3, i;
++
++  clear_refs (refs);
++  anchor_step (refs, &st, 3, GST_AV1_KEY_FRAME, 0, -1, FALSE, NULL);
++  a1 = anchor_step (refs, &st, 3, GST_AV1_INTER_FRAME, 1, -1, TRUE, NULL);
++  anchor_step (refs, &st, 3, GST_AV1_INTER_FRAME, 2, -1, FALSE, NULL);
++  a3 = anchor_step (refs, &st, 3, GST_AV1_INTER_FRAME, 3, -1, TRUE, NULL);
++  anchor_step (refs, &st, 3, GST_AV1_INTER_FRAME, 4, -1, FALSE, NULL);
++  s1 = slot_of (refs, &st, a1);
++  s3 = slot_of (refs, &st, a3);
++  fail_unless (s1 > 0 && s3 > 0 && s1 != s3);
++
++  assert_equals_int (gst_av1_encoder_find_anchor (refs, &st, 1 * GST_MSECOND,
++          5), s1);
++  /* a chain picture is no anchor */
++  assert_equals_int (gst_av1_encoder_find_anchor (refs, &st, 4 * GST_MSECOND,
++          5), -1);
++
++  /* frames 2..4 lost: frame 5 codes from anchor 1 only */
++  f = anchor_step (refs, &st, 3, GST_AV1_INTER_FRAME, 5, s1, FALSE, &drop);
++  fail_unless (f->error_resilient);
++  assert_all_names (f, s1);
++  /* the newer anchor may be missing in the decoder: forgotten */
++  assert_equals_int (drop, 1 << s3);
++  assert_equals_int (st.anchor_mask, 1 << s1);
++  fail_unless (refs[s3] == NULL);
++  /* it overwrites the chain slot, the one the decoder may hold stale */
++  assert_equals_int (f->refresh_frame_flags, 1 << st.chain_slot);
++  fail_unless (refs[s1] == a1);
++
++  /* no later frame names anything but the chain */
++  f = anchor_step (refs, &st, 3, GST_AV1_INTER_FRAME, 6, -1, FALSE, NULL);
++  fail_if (f->error_resilient);
++  assert_all_names (f, st.chain_slot);
++  for (i = 0; i < GST_AV1_NUM_REF_FRAMES; i++)
++    fail_if (i != st.chain_slot && i != s1 && refs[i] && refs[i]->frame_num > 0,
++        "slot %d holds frame %u", i, refs[i]->frame_num);
++
++  /* the recovery frame was lost too: the anchor is still there */
++  f = anchor_step (refs, &st, 3, GST_AV1_INTER_FRAME, 7, s1, FALSE, &drop);
++  assert_all_names (f, s1);
++  assert_equals_int (drop, 0);
++}
++
++GST_END_TEST;
++
++GST_START_TEST (test_av1_anchor_eviction)
++{
++  GstAV1EncoderFrame *refs[GST_AV1_NUM_REF_FRAMES];
++  GstAV1EncoderAnchorState st = { -1, 0 };
++  GstAV1EncoderFrame *a[4];
++  gint i, s0;
++
++  clear_refs (refs);
++  anchor_step (refs, &st, 2, GST_AV1_KEY_FRAME, 0, -1, FALSE, NULL);
++  for (i = 0; i < 2; i++)
++    a[i] = anchor_step (refs, &st, 2, GST_AV1_INTER_FRAME, i + 1, -1, TRUE,
++        NULL);
++  s0 = slot_of (refs, &st, a[0]);
++
++  /* the third anchor takes the oldest one's slot */
++  a[2] = anchor_step (refs, &st, 2, GST_AV1_INTER_FRAME, 3, -1, TRUE, NULL);
++  assert_equals_int (slot_of (refs, &st, a[2]), s0);
++  assert_equals_int (gst_av1_encoder_find_anchor (refs, &st, 1 * GST_MSECOND,
++          4), -1);
++  fail_unless (slot_of (refs, &st, a[1]) > 0);
++  assert_equals_int (__builtin_popcount (st.anchor_mask), 2);
++
++  /* seven anchors fill the VBI around the chain slot */
++  clear_refs (refs);
++  st = (GstAV1EncoderAnchorState) { -1, 0 };
++  anchor_step (refs, &st, 7, GST_AV1_KEY_FRAME, 0, -1, FALSE, NULL);
++  for (i = 1; i <= 9; i++)
++    anchor_step (refs, &st, 7, GST_AV1_INTER_FRAME, i, -1, TRUE, NULL);
++  assert_equals_int (st.anchor_mask | (1 << st.chain_slot), 0xff);
++  /* the chain slot holds the newest anchor as well */
++  assert_equals_int (distinct_refs_held (refs), 7);
++}
++
++GST_END_TEST;
++
++GST_START_TEST (test_av1_anchor_too_old)
++{
++  GstAV1EncoderFrame *refs[GST_AV1_NUM_REF_FRAMES];
++  GstAV1EncoderAnchorState st = { -1, 0 };
++
++  clear_refs (refs);
++  anchor_step (refs, &st, 1, GST_AV1_KEY_FRAME, 0, -1, FALSE, NULL);
++  anchor_step (refs, &st, 1, GST_AV1_INTER_FRAME, 1, -1, TRUE, NULL);
++
++  /* order-hint distance must stay below 128 */
++  fail_unless (gst_av1_encoder_find_anchor (refs, &st, GST_MSECOND, 128) > 0);
++  assert_equals_int (gst_av1_encoder_find_anchor (refs, &st, GST_MSECOND, 129),
++      -1);
++  assert_equals_int (gst_av1_encoder_find_anchor (refs, &st,
++          GST_CLOCK_TIME_NONE, 2), -1);
++
++  /* a key frame forgets every anchor */
++  anchor_step (refs, &st, 1, GST_AV1_KEY_FRAME, 0, -1, FALSE, NULL);
++  assert_equals_int (gst_av1_encoder_find_anchor (refs, &st, GST_MSECOND, 1),
++      -1);
++}
++
++GST_END_TEST;
++
+ static Suite *
+ av1refs_suite (void)
+ {
+@@ -1162,6 +1364,10 @@ av1refs_suite (void)
+   tcase_add_test (tc_basic, test_av1_refs_recency_survives_wraparound);
+   tcase_add_test (tc_basic, test_av1_refs_gop_walk);
+   tcase_add_test (tc_basic, test_av1_refs_occupancy_cap);
++  tcase_add_test (tc_basic, test_av1_anchor_chain_and_mark);
++  tcase_add_test (tc_basic, test_av1_anchor_recover);
++  tcase_add_test (tc_basic, test_av1_anchor_eviction);
++  tcase_add_test (tc_basic, test_av1_anchor_too_old);
+ 
+   return s;
+ }
