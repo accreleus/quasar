@@ -2324,9 +2324,10 @@ fn the_hold_line_reaches_the_abr_under_the_fec_its_loss_called_for() {
     );
 }
 
-/// #1301 with #1433's v2 hold: while a hold is on with 25 % FEC, video plus repairs stays under
-/// the configured maximum. The hold's line is under the ceiling (`congestion::Estimator` ends a
-/// hold whose line reaches it) and `Control::feed` gives the governor that line less the share.
+/// #1301 with #1433's v2 hold, the one bound v2 has on FEC (#1660): while a hold is on with 25 %
+/// FEC, video plus repairs stays under its line, which is under the configured maximum
+/// (`congestion::Estimator` ends a hold whose line reaches it; `Control::feed` gives the governor
+/// that line less the share).
 #[test]
 fn a_v2_hold_with_fec_keeps_video_plus_repairs_under_the_ceiling() {
     use crate::session::abr::{AbrConfig, Governor};
@@ -2373,11 +2374,30 @@ fn a_v2_hold_with_fec_keeps_video_plus_repairs_under_the_ceiling() {
             200 * k,
             base + Duration::from_millis(250 * u64::from(k)),
         );
-        let sent = total(&control);
+        if let Some(line) = control.estimator.held_kbps() {
+            let sent = total(&control);
+            assert!(
+                line < 8000.0 && sent <= line,
+                "report {k}: {sent:.0} over {line:.0}"
+            );
+        }
+    }
+}
+
+/// #1301 bounds legacy (the default) and WebRTC; v2 keeps the share off the governor's ceiling,
+/// as before (#1660). At the ceiling with 15 % FEC (inside the deadband) a legacy session's
+/// setpoint is the ceiling over 1.15, a v2 session's stays at the ceiling.
+#[test]
+fn v2_keeps_the_fec_share_off_the_governors_ceiling() {
+    use crate::session::settings::WtCapacity;
+    for (capacity, want) in [
+        (WtCapacity::Legacy, video_ceiling(3)),
+        (WtCapacity::V2, 8000),
+    ] {
+        let sent = governed_by(smooth_per_report(), capacity, |_| 3, 8000.0, 5);
         assert!(
-            sent <= 8000.0,
-            "report {k}: {sent:.0} kbit/s at {:.2}",
-            control.charged
+            sent.iter().all(|&(sp, _)| sp == want),
+            "{capacity:?}: {sent:?}"
         );
     }
 }
@@ -2895,7 +2915,8 @@ fn repairs_spend_only_what_the_estimate_leaves_above_the_abr_floor() {
 /// `Control::protect` makes for a second of 60 fps video at it, in kbit/s. The clock is the
 /// test's, one estimate a second.
 fn governed(level: u8, estimate_kbps: f64, seconds: u64) -> Vec<(u32, f64)> {
-    governed_by(smooth_window(), |_| level, estimate_kbps, seconds)
+    let v2 = crate::session::settings::WtCapacity::V2;
+    governed_by(smooth_window(), v2, |_| level, estimate_kbps, seconds)
 }
 
 fn smooth_window() -> crate::session::abr::AbrConfig {
@@ -2914,6 +2935,7 @@ fn smooth_per_report() -> crate::session::abr::AbrConfig {
 /// `level(s)`.
 fn governed_by(
     cfg: crate::session::abr::AbrConfig,
+    capacity: crate::session::settings::WtCapacity,
     level: impl Fn(u64) -> u8,
     estimate_kbps: f64,
     seconds: u64,
@@ -2927,7 +2949,7 @@ fn governed_by(
         ceiling_kbps: 8000.0,
         floor_kbps: Box::new(move || f64::from(floor.lock().unwrap().0.floor_kbps())),
         setpoint_kbps: Box::new(move || f64::from(setpoint.lock().unwrap().0.setpoint_kbps())),
-        capacity: crate::session::settings::WtCapacity::V2,
+        capacity,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -3042,7 +3064,13 @@ fn fec_never_takes_a_session_over_its_configured_maximum() {
     let banked = (media::MAX_DATAGRAM * 8) as f64 / 1000.0;
     for cfg in [smooth_window(), smooth_per_report()] {
         for level in 0..=5 {
-            for (setpoint, sent) in governed_by(cfg, |_| level, 8000.0, 30) {
+            for (setpoint, sent) in governed_by(
+                cfg,
+                crate::session::settings::WtCapacity::Legacy,
+                |_| level,
+                8000.0,
+                30,
+            ) {
                 assert_eq!(setpoint, video_ceiling(level), "level {level}");
                 assert!(sent <= 8000.0 + banked, "level {level}: {sent:.0} kbit/s");
             }
@@ -3058,7 +3086,13 @@ fn a_step_down_with_fec_is_no_slower_than_without() {
     for cfg in [smooth_window(), protective] {
         // The second the setpoint last moved.
         let settled = |level| {
-            let sent = governed_by(cfg, |_| level, 5000.0, 60);
+            let sent = governed_by(
+                cfg,
+                crate::session::settings::WtCapacity::Legacy,
+                |_| level,
+                5000.0,
+                60,
+            );
             let last = sent[sent.len() - 1].0;
             sent.iter()
                 .rposition(|&(sp, _)| sp != last)
@@ -3096,7 +3130,13 @@ fn a_share_change_mid_session_applies_at_once() {
             12 => 5,
             _ => 0,
         };
-        let sent = governed_by(cfg, level, 8000.0, 40);
+        let sent = governed_by(
+            cfg,
+            crate::session::settings::WtCapacity::Legacy,
+            level,
+            8000.0,
+            40,
+        );
         let setpoints: Vec<u32> = sent.iter().map(|&(sp, _)| sp).collect();
         assert_eq!(setpoints[9], 8000, "{:?}", cfg.per_report);
         assert_eq!(setpoints[10], video_ceiling(3), "{:?}", cfg.per_report);

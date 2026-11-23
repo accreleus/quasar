@@ -1010,7 +1010,7 @@ impl Sim {
                     .map(|l| l / share.max(1.0 + self.hold_fec));
                 match line {
                     Some(line) => drop(abr.hold_to(line, at)),
-                    None => drop(abr.hold_off(at)),
+                    None => abr.hold_off(at),
                 }
                 if let Some((planner, _)) = self.ladder.as_mut() {
                     planner.set_held(line.is_some(), at);
@@ -1022,8 +1022,9 @@ impl Sim {
             }
             self.step_rung(at);
             if let Some(abr) = self.abr.as_mut() {
-                // `abr_glue`'s `Rate::observe`: the share, then the estimate.
-                abr.set_share(self.fec_share, at);
+                // `Control::feed` and `abr_glue`'s `Rate::observe`: the share (legacy only), then
+                // the estimate.
+                abr.set_share(if legacy { self.fec_share } else { 0.0 }, at);
                 abr.observe(abr_estimate(kbps, self.fec_share), at);
             }
             let setpoint = self
