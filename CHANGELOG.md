@@ -46,8 +46,7 @@ own; the two do not move together, and that is deliberate.
 - **WebTransport: the first receiver report after an outage no longer cuts the bitrate (#1433).** The losses of an outage are read from what the client's reports covered. On in both `QUASAR_WT_CAPACITY` modes.
 - PyroWave over WebTransport counts far fewer packets lost when the page stalls briefly (53–83 % fewer on the lab): a frame's deadline timer that fires late now waits four more frames for the datagram reads queued behind the stall (#1635).
 - Warm Steam: when an adopting session's start ack is lost, the old runtime's cleanup proof can no longer release the managed-home hold while that session's stop is still in flight; the hold passes to the failed session and clears at its own proof (#1615).
-- **A node-agent test that captured its log lines could capture none the next run (#1650).** Each test installed its own scoped `tracing` subscriber and then rebuilt the callsite interest cache, and under the parallel runner that raced another thread's rebuild, leaving some callsites cached disabled for the rest of the process. The lib test binary now installs one process-wide subscriber once (a routed capture layer plus the browser-host stderr and warning layers) and every scoped capture reads it, so the lines are captured deterministically. Test-only: the agent's logging is unchanged.
-- **The node-agent log capture no longer formats every debug line on every thread (#1650).** The one process-wide routed capture layer now does no work on a thread that is not capturing (a per-thread sink check), so the throughput tests pay nothing for it, and a scoped capture can end without ending an outer one. The capture is calling-thread-only, as documented. Test-only: the agent's logging is unchanged.
+- Node-agent tests that read their own log lines no longer fail at random under the parallel test runner (#1650).
 
 ## 0.6.3 — 2026-11-21
 
