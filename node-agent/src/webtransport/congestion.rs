@@ -2760,6 +2760,22 @@ impl VideoQueue {
     /// Bytes the pacer lets go now: [`PACE_GAIN`] × `kbps`, in bursts of [`PACE_BURST_MS`];
     /// `None` paces nothing.
     pub(crate) fn pace(&mut self, kbps: Option<u64>, now: Instant) -> usize {
+        if self.paced_kbps.is_none() && kbps.is_some() {
+            // Pacing just began: what is held was pushed with no due time. It is due as the pacer
+            // would now let it go, from now.
+            self.due.clear();
+            self.finish = None;
+            self.paced_kbps = kbps;
+            let held: Vec<_> = self
+                .held
+                .iter()
+                .filter(|h| !h.resend)
+                .map(|h| (h.queued_at, h.datagram.len()))
+                .collect();
+            for (queued_at, len) in held {
+                self.schedule(queued_at, len, now);
+            }
+        }
         self.paced_kbps = kbps;
         // Not a `nack` answer: those go ahead of older video (`push`).
         // What the pace drains in `PACE_MAX_WAIT_HELD` waits that long; more cannot drain in time.
@@ -2818,6 +2834,25 @@ impl VideoQueue {
 
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// A pacer at `paced_kbps` lets `len` bytes of the frame queued at `queued_at` go after what
+    /// was pushed before it, and not before `floor`; the frame is due then (`due`).
+    fn schedule(&mut self, queued_at: Instant, len: usize, floor: Instant) {
+        let Some(kbps) = self.paced_kbps else {
+            return;
+        };
+        let start = self.finish.map_or(floor, |f| f.max(floor));
+        let finish =
+            start + Duration::from_secs_f64(len as f64 / (kbps as f64 * PACE_GAIN * 125.0));
+        self.finish = Some(finish);
+        match self.due.back_mut().filter(|(at, _)| *at == queued_at) {
+            Some(frame) => frame.1 = finish,
+            None => self.due.push_back((queued_at, finish)),
+        }
+        while self.due.len() > 64 {
+            self.due.pop_front();
+        }
     }
 
     /// Whether a discardable unit arriving now is late: the oldest held video (a resend goes
@@ -2923,20 +2958,8 @@ impl VideoQueue {
             self.finish = None;
         }
         self.bytes += held.datagram.len();
-        if let Some(kbps) = self.paced_kbps.filter(|_| !held.resend) {
-            let start = self
-                .finish
-                .map_or(held.queued_at, |f| f.max(held.queued_at));
-            let len = held.datagram.len() as f64;
-            let finish = start + Duration::from_secs_f64(len / (kbps as f64 * PACE_GAIN * 125.0));
-            self.finish = Some(finish);
-            match self.due.back_mut().filter(|(at, _)| *at == held.queued_at) {
-                Some(frame) => frame.1 = finish,
-                None => self.due.push_back((held.queued_at, finish)),
-            }
-            while self.due.len() > 64 {
-                self.due.pop_front();
-            }
+        if !held.resend {
+            self.schedule(held.queued_at, held.datagram.len(), held.queued_at);
         }
         if !held.resend && self.frame.is_none_or(|(at, _)| at != held.queued_at) {
             self.frame = Some((held.queued_at, self.held.is_empty()));

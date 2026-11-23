@@ -81,8 +81,8 @@ pub(crate) struct Unit {
     pub(crate) data: Bytes,
     pub(crate) keyframe: bool,
     pub(crate) config_id: u8,
-    /// Taken by the sender once the unit is to be sent ([`Media::number`]); a PyroWave
-    /// frame's is taken at the tap.
+    /// Taken by the sender once the unit is to be sent ([`Media::number`], the one place a
+    /// number is taken).
     pub(crate) frame_seq: u16,
     pub(crate) ts_90khz: u32,
     pub(crate) capture_us: u64,
@@ -152,7 +152,7 @@ struct State {
     /// configuration changed.
     want_key: bool,
     frame_seq: u16,
-    /// The encoder was told to emit non-reference P frames (`non-ref-p`).
+    /// The encoder was told to emit non-reference P frames (`non-ref-p`, `nonref-p` on NVENC).
     non_ref: bool,
     /// Tests only: number each unit as the tap queues it, as a stream loop with no wait would.
     #[cfg(test)]
@@ -416,8 +416,8 @@ impl Media {
         if k > 0 {
             encoder.set_property(ref_recovery::NUM_ANCHORS, k);
         }
-        let non_ref =
-            encoder.find_property("non-ref-p").is_some() && encoder.property::<bool>("non-ref-p");
+        let non_ref = crate::session::pipeline::non_ref_p_property(encoder)
+            .is_some_and(|name| encoder.property::<bool>(name));
         let state = State {
             non_ref,
             refs: Refs {
@@ -1144,8 +1144,11 @@ impl Media {
             return;
         }
         st.want_key = false;
-        let discardable =
-            st.non_ref && !keyframe && config.codec == "h264" && h264_discardable(&data);
+        let discardable = st.non_ref
+            && !keyframe
+            && from_seq.is_none()
+            && config.codec == "h264"
+            && h264_discardable(&data);
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut unit = Unit {
             data: Bytes::copy_from_slice(&data),
@@ -1334,8 +1337,6 @@ impl Media {
         let Some(config) = st.client.as_ref().and_then(|c| c.pyrowave.clone()) else {
             return;
         };
-        let frame_seq = st.frame_seq;
-        st.frame_seq = frame_seq.wrapping_add(1);
         let ts_90khz = buffer.pts().map_or(st.last_ts, |pts| {
             (pts.nseconds() as u128 * 90_000 / 1_000_000_000) as u32
         });
@@ -1346,7 +1347,7 @@ impl Media {
             data: Bytes::copy_from_slice(&map),
             keyframe: true,
             config_id: config.config_id,
-            frame_seq,
+            frame_seq: 0,
             ts_90khz,
             capture_us: now_us(),
             discardable: false,
@@ -1946,6 +1947,54 @@ mod tests {
             [(true, false), (false, false)],
             "knob off: output as before"
         );
+    }
+
+    /// A recovery frame is never discardable, whatever the encoder's `nal_ref_idc` says: the
+    /// frames after it are coded from it.
+    #[test]
+    fn a_recovery_frame_is_never_discardable() {
+        let (media, _encoder, _events, mut client) = recovering(2);
+        media.lock().non_ref = true;
+        media.on_unit(&frame(0, true));
+        report(&media, 1, true, None);
+        media.on_unit(&frame(1, false));
+        media.decoded(client.id, Some(1));
+        media.repair(client.id, Some(1));
+        report(&media, 2, false, Some(1));
+        let mut recovery = gst::Buffer::from_slice(au(&[0x01]));
+        {
+            let b = recovery.get_mut().unwrap();
+            b.set_flags(gst::BufferFlags::DELTA_UNIT);
+            b.set_pts(pts(2));
+        }
+        media.on_unit(&recovery);
+        let mut last = None;
+        while let Ok(Out::Unit(u)) = client.rx.try_recv() {
+            last = Some(u);
+        }
+        let u = last.expect("the recovery frame was queued");
+        assert!(u.recovery && !u.discardable);
+    }
+
+    /// PyroWave takes its number in the stream loop like every other unit: a unit tapped
+    /// before a switch is numbered before a PyroWave frame tapped after it.
+    #[test]
+    fn a_pyrowave_frame_takes_no_number_at_the_tap() {
+        let (media, _encoder, _) = granted();
+        let mut client = media.attach(true, LAN).unwrap();
+        media.on_pyrowave_frame(&pyro_frame());
+        media.on_pyrowave_frame(&pyro_frame());
+        let mut units = Vec::new();
+        while let Ok(Out::Unit(u)) = client.rx.try_recv() {
+            units.push(u);
+        }
+        assert_eq!(units.len(), 2);
+        assert!(units.iter().all(|u| u.pyrowave && u.frame_seq == 0));
+        assert_eq!(media.lock().frame_seq, 0, "the tap spent no number");
+        for (i, u) in units.iter_mut().enumerate() {
+            assert!(media.number(u, client.id));
+            assert_eq!(usize::from(u.frame_seq), i);
+        }
     }
 
     #[test]

@@ -1516,8 +1516,8 @@ The fix is absent upstream: checked through 1.28.8, 1.29.2 and `main` on 2026-10
 
 ### `vkh264enc-non-ref-p.patch`
 
-Quasar-authored (#1322). `vulkanh264enc` gets `non-ref-p` (boolean, default off, the name
-`nvh264enc` uses): every second P frame is a non-reference picture (`nal_ref_idc` 0), so nothing
+Quasar-authored (#1322). `vulkanh264enc` gets `non-ref-p` (boolean, default off; NVENC's
+is spelled `nonref-p`): every second P frame is a non-reference picture (`nal_ref_idc` 0), so nothing
 is coded from it and a receiver that never gets it needs no key frame. The Quasar sender flags
 such a unit `discardable` and may drop it late (`QUASAR_NON_REF_P`, `docs/configuration.md`).
 

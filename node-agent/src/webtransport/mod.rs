@@ -2034,7 +2034,7 @@ async fn stream(
                         continue;
                     }
                     // Not for a client that was taken over: the number is its successor's.
-                    if !unit.pyrowave && !media.number(&mut unit, client.id) {
+                    if !media.number(&mut unit, client.id) {
                         continue;
                     }
                     if let Some(rate) = pyro.as_mut().filter(|_| unit.pyrowave) {

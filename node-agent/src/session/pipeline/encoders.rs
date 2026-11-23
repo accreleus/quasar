@@ -918,7 +918,7 @@ pub(super) fn make_nvenc_encoder(
     props.set_first(&["bframes", "b-frames"], "0"); // no reordering — latency + simple decode
     props.set("aud", "false"); // skip AU-delimiter NAL — a few bytes off every frame
     if non_ref_p_applies(non_ref_p, codec, false) {
-        props.set("non-ref-p", "true");
+        set_non_ref_p(&props);
     }
 
     // Single-frame VBV cap (SO-02): smooth the bitstream into the WebRTC pacer so an
@@ -1078,7 +1078,7 @@ pub(super) fn make_vulkan_encoder(
     // `QUASAR_NON_REF_P`: needs the vendored `vkh264enc-non-ref-p.patch` (the guarded set warns
     // on an unpatched build).
     if non_ref_p_applies(non_ref_p, codec, intra_refresh) {
-        props.set("non-ref-p", "true");
+        set_non_ref_p(&props);
     }
 
     let effective_rc = props.readback(&["rate-control"]);
@@ -1098,6 +1098,36 @@ pub(super) fn make_vulkan_encoder(
          idr-period={gop}, num-slices={num_slices}, {intra_refresh_summary}, VulkanImage NV12 in)"
     );
     Ok(enc)
+}
+
+/// The encoders' non-reference P property: `non-ref-p` on `vulkanh264enc` (the vendored patch),
+/// `nonref-p` on the NVENC encoders (GStreamer 1.28.8).
+pub(crate) const NON_REF_P: [&str; 2] = ["non-ref-p", "nonref-p"];
+
+/// The name of `enc`'s non-reference P property, if it has one.
+pub(crate) fn non_ref_p_property(enc: &gst::Element) -> Option<&'static str> {
+    first_property(enc, &NON_REF_P)
+}
+
+fn first_property(enc: &gst::Element, names: &[&'static str]) -> Option<&'static str> {
+    names
+        .iter()
+        .copied()
+        .find(|n| enc.find_property(n).is_some())
+}
+
+/// Turns on whichever of [`NON_REF_P`] the encoder has; an encoder with neither streams as
+/// before, with a warning.
+fn set_non_ref_p(props: &GuardedProps) {
+    props.set_first(&NON_REF_P, "true");
+    if non_ref_p_property(props.element).is_none() {
+        tracing::warn!(
+            token = "knob-non-ref-p-absent",
+            "QUASAR_NON_REF_P is set but {} has no {NON_REF_P:?} property (an unpatched \
+             image?); the stream is as before",
+            props.factory
+        );
+    }
 }
 
 /// Whether `QUASAR_NON_REF_P` takes effect on this session's encoder: H.264 only (the
@@ -1214,14 +1244,17 @@ pub(super) fn required_source_ring_depth(knobs: EncoderKnobs) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    use super::NON_REF_P;
     use super::{
         codec_plan_with, cpb_size_kbits, effective_encoder_with, effective_gop, encoder_candidates,
-        non_ref_p_applies, nvenc_encoder_candidates, nvenc_h264_encoder_candidates,
-        openh264_supports, plan_has_vendor_fallback, plan_is_degraded, required_source_ring_depth,
-        va_device_element_prefix, va_encoder_candidates, va_h264_encoder_candidates,
-        vulkan_element, CodecKnob, CodecPlan, EncoderKnobs, ResolvedEncoder,
+        first_property, non_ref_p_applies, non_ref_p_property, nvenc_encoder_candidates,
+        nvenc_h264_encoder_candidates, openh264_supports, plan_has_vendor_fallback,
+        plan_is_degraded, required_source_ring_depth, va_device_element_prefix,
+        va_encoder_candidates, va_h264_encoder_candidates, vulkan_element, CodecKnob, CodecPlan,
+        EncoderKnobs, ResolvedEncoder,
     };
     use crate::session::{Codec, EncoderChoice};
+    use gstreamer as gst;
 
     /// Knobs with exactly `codec` disabled (`QUASAR_VULKAN_*=0`), the rest default.
     fn disabled(codec: Codec) -> EncoderKnobs {
@@ -1259,6 +1292,20 @@ mod tests {
             va_encoder_candidates(Codec::H264, "/dev/dri/renderD129"),
             va_h264_encoder_candidates("/dev/dri/renderD129")
         );
+    }
+
+    #[test]
+    fn the_non_reference_p_property_is_found_under_either_name() {
+        gst::init().unwrap();
+        let enc = gst::ElementFactory::make("identity").build().unwrap();
+        assert_eq!(non_ref_p_property(&enc), None, "identity has neither");
+        // `identity` has a boolean `silent`: it stands in for an encoder that has only the
+        // second name, as NVENC does with `nonref-p`.
+        assert_eq!(
+            first_property(&enc, &["non-ref-p", "silent"]),
+            Some("silent")
+        );
+        assert_eq!(NON_REF_P, ["non-ref-p", "nonref-p"]);
     }
 
     #[test]

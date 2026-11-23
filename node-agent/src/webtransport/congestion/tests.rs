@@ -3536,7 +3536,12 @@ fn a_discardable_unit_is_late_behind_video_held_over_two_frame_intervals() {
 /// 1/60 s, a keyframe `key_ratio` times an average frame every 60 frames. `queued`: what QUIC's
 /// datagram queue stands at (0 = it takes everything). Returns the queue, the late verdicts
 /// asked of each odd frame (a discardable one) and the longest the head waited.
-fn paced_stream(key_ratio: usize, queued: usize, frames: u64) -> (VideoQueue, Vec<bool>, Duration) {
+fn paced_stream(
+    key_ratio: usize,
+    queued: usize,
+    frames: u64,
+    running: bool,
+) -> (VideoQueue, Vec<bool>, Duration) {
     const FPS: u64 = 60;
     let avg = 16_000; // 7.7 Mbit/s at 60 fps
     let rates = (Some(8000), Some(8000));
@@ -3547,8 +3552,11 @@ fn paced_stream(key_ratio: usize, queued: usize, frames: u64) -> (VideoQueue, Ve
         Duration::ZERO,
         Vec::new(),
     );
-    // The pacer has been running (a drain tick) before the first frame.
-    video.budget(rates, queued, BUFFER, t0);
+    // `running`: the pacer has been running (a drain tick) before the first frame; else pacing
+    // begins with the first keyframe held.
+    if running {
+        video.budget(rates, queued, BUFFER, t0);
+    }
     for ms in 0..frames * 1000 / FPS {
         let now = t0 + Duration::from_millis(ms);
         longest = longest.max(video.oldest().map_or(Duration::ZERO, |at| now - at));
@@ -3585,7 +3593,7 @@ fn paced_stream(key_ratio: usize, queued: usize, frames: u64) -> (VideoQueue, Ve
 #[test]
 fn a_paced_keyframe_and_the_frames_behind_it_are_not_late_on_a_clean_link() {
     for ratio in [5, 10] {
-        let (video, late, longest) = paced_stream(ratio, 0, 600);
+        let (video, late, longest) = paced_stream(ratio, 0, 600, true);
         assert!(
             longest > Duration::from_millis(33),
             "x{ratio}: the keyframe was held over two frame intervals ({longest:?}), or this proves nothing"
@@ -3600,11 +3608,21 @@ fn a_paced_keyframe_and_the_frames_behind_it_are_not_late_on_a_clean_link() {
     }
 }
 
+/// A frame held when pacing turns on (`found_link`) is due as the pacer lets it go from then,
+/// not judged from its arrival.
+#[test]
+fn a_keyframe_held_when_pacing_begins_is_not_late() {
+    for ratio in [5, 10] {
+        let (video, _, _) = paced_stream(ratio, 0, 600, false);
+        assert_eq!(video.late, 0, "x{ratio}");
+    }
+}
+
 /// The same stream into a queue QUIC never drains: held video does not leave, so a discardable
 /// unit behind it is late once the drain time it was allowed has passed.
 #[test]
 fn paced_video_that_never_drains_is_late() {
-    let (video, late, _) = paced_stream(5, BUFFER, 30);
+    let (video, late, _) = paced_stream(5, BUFFER, 30, true);
     assert!(
         late.iter().any(|l| *l),
         "a stalled queue drops discardable units"

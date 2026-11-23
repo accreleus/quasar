@@ -1052,8 +1052,8 @@ async fn late_dropped_at_leave(mut send: SendStream, captured: &Captured) -> u64
 }
 
 /// A stalled path holds video; a discardable unit arriving behind it is dropped before it takes
-/// a `frame_seq`, so the numbers the sender used stay in step with what it sent. A clean path
-/// drops none.
+/// a `frame_seq`, so the numbers the sender used stay in step with what it sent. (A clean path drops
+/// none: `a_paced_keyframe_and_the_frames_behind_it_are_not_late_on_a_clean_link`.)
 #[tokio::test]
 async fn a_discardable_unit_behind_held_video_is_dropped_late() {
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
