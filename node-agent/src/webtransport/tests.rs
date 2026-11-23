@@ -6071,13 +6071,7 @@ async fn a_rushed_pyrowave_frame_tail_is_warned_once_and_counted_at_disconnect()
     // 1 fps: the slices of one frame take 250 ms, so the frames below pile up behind it.
     media.grant_pyrowave(grant, (320, 192, 1), true);
     let captured = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_ansi(false)
-        .with_writer(captured.clone())
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
-    tracing::callsite::rebuild_interest_cache();
+    let _guard = crate::test_log::begin(&captured.0);
     let (_session, mut send, _recv, _reply) =
         agent.hello_with(TOKEN, json!({"pyrowave": true})).await;
     let n = pyrowave::block_count(320, 192);

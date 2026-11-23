@@ -6616,7 +6616,7 @@ fn a_loss_floor_under_a_probing_hold_keeps_the_line() {
 fn the_pacing_judgement_is_traced_twice_a_second_and_at_once_when_the_cap_changes() {
     let on = Instant::now();
     let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on, false);
-    let lines = logged(|| {
+    let lines = crate::test_log::logged(|| {
         // Judged from 1 s; a 80 Mbit/s window backed up under a 200 Mbit/s target: capped, latched.
         for ms in (1000..=1600u64).step_by(50) {
             fill(&mut rate, 50);
