@@ -643,7 +643,7 @@ repository secret would be readable by every workflow run.
    ```
 
 3. **A release published unsigned** is signed by hand, by the key holder:
-   `scripts/release/sign-platform-release-manifest.sh --manifest platform-release-manifest.v2.json --output platform-release-manifest.v2.json.sig --key-id quasar-release-2026`,
+   `scripts/release/sign-platform-release-manifest.sh --manifest platform-release-manifest.v2.json --output platform-release-manifest.v2.json.sig --key-id quasar-release-2026 --key-file <private key PEM, outside the tree>`,
    then `gh release upload vX.Y.Z platform-release-manifest.v2.json.sig --clobber`. The releases
    published before signing was on (v0.4.0 to v0.6.3) get their `.sig` this way, by the
    maintainer. A named apply or revert to a release with no `.sig` is refused
@@ -686,7 +686,7 @@ trusts the keys compiled into its running actor, and the actor that applies a re
 already running, so a new key reaches the default one release before anything is signed with it
 alone.
 
-1. **Generate the new key** (`scripts/release/new-release-signing-key.sh --key-id quasar-release-2027`)
+1. **Generate the new key** (`scripts/release/new-release-signing-key.sh --out <path outside the tree> --key-id quasar-release-2027`)
    and ship a release whose actor trusts both (`DEFAULT_TRUSTED_KEYS` in
    `node-agent/crates/quasar-recovery/src/trust/signature.rs`, with its pinning vector in
    `testdata/recovery/trust-vectors/config.json`). A machine that set its own
