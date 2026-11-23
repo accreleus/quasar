@@ -1252,6 +1252,12 @@ fn nack_of(message: &Value) -> Option<(u16, Vec<[u16; 2]>)> {
     Some((frame_seq, ranges))
 }
 
+/// §Feedback `decoded`: absent, or anything but a u16, is none.
+pub(crate) fn decoded_of(message: &Value) -> Option<u16> {
+    let decoded = message.get("decoded")?.as_u64()?;
+    u16::try_from(decoded).ok()
+}
+
 /// How long sent video is held for a `nack`: [`retransmit::WINDOW`], or twice the
 /// smoothed RTT when that is longer (§Loss recovery).
 fn retransmit_window(session: &Session) -> Duration {
@@ -2167,7 +2173,17 @@ async fn stream(
                     idle.as_mut().reset(Instant::now() + CONTROL_IDLE);
                     match message.get("type").and_then(Value::as_str) {
                         // codec-pyrowave.md §Loss: no keyframe request for a PyroWave frame.
-                        Some("keyframe_request") if current.codec != "pyrowave" => media.keyframe(),
+                        Some("keyframe_request") if current.codec != "pyrowave" => {
+                            let decoded = decoded_of(&message);
+                            // §Loss recovery 6: only a late frame is repaired from the request's
+                            // own `decoded`; every other reason restarts the client's decoder.
+                            if message.get("reason").and_then(Value::as_str) == Some("late") {
+                                media.repair(client.id, decoded);
+                            } else {
+                                media.decoded(client.id, decoded);
+                                media.keyframe();
+                            }
+                        }
                         Some("codec_fallback") => media.switch_off(Some(client.id), "client_decode_error"),
                         // codec-pyrowave.md §Loss: a NACK for a PyroWave frame is ignored: no
                         // retransmission and no nack_miss.
@@ -2222,6 +2238,7 @@ async fn stream(
                             }
                         }
                         Some("feedback") => {
+                            media.decoded(client.id, decoded_of(&message));
                             if let Some(control) = control.as_mut() {
                                 let now = std::time::Instant::now();
                                 control.feedback(&message, quic_path(session), now);

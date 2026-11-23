@@ -82,6 +82,9 @@ export class DecodeStage {
   /** Deltas are useless until a keyframe: after a (re)configure, a decoder restart or a skip. */
   private needKey = true;
   private askedKey = false;
+  /** §Feedback `decoded`. Every wait for a keyframe here follows a configure, a restart or a skip,
+   *  which clear it, so a recovery frame never ends one: only FrameAssembler's loss wait. */
+  private decodedSeq: number | null = null;
   /** Set by leave(): the picture has left for PyroWave, so units and the keyframe wait are inert
    *  until the next config() re-arms the stage. Without this a stale delta of the old configuration
    *  reaches a decoder that rejects it and ends the connection as a lost stream (#1436). */
@@ -136,6 +139,12 @@ export class DecodeStage {
     return !this.left && this.needKey && this.current !== null && (this.decoder?.decodeQueueSize ?? 0) < MAX_DECODE_QUEUE_HARD;
   }
 
+  /** The newest `frame_seq` this decoder was given with its whole chain; null after a configure,
+   *  restart, skip or leave() until a keyframe is given. */
+  get decoded(): number | null {
+    return this.decodedSeq;
+  }
+
   /** The picture leaves this stage: PyroWave takes it over mid-session, so the keyframe wait here
    *  is not this connection's and must not end it (#1436). Units held for the old configuration
    *  cannot follow either, and neither may a stale one arrive: the stage drops units and reports no
@@ -143,6 +152,7 @@ export class DecodeStage {
   leave(): void {
     if (this.stopped) return;
     this.left = true;
+    this.decodedSeq = null;
     this.needKey = false;
     this.askedKey = false;
     this.held = [];
@@ -202,6 +212,7 @@ export class DecodeStage {
         transfer: [unit.data.buffer],
       };
       this.decoder.decode(new EncodedVideoChunk(init as EncodedVideoChunkInit));
+      this.decodedSeq = unit.frameSeq;
     } catch {
       this.restart();
     }
@@ -217,6 +228,7 @@ export class DecodeStage {
   /** Skip to the next keyframe; with a `reason`, ask the agent for it now. */
   private wantKey(reason?: KeyframeReason): void {
     this.needKey = true;
+    this.decodedSeq = null;
     this.askedKey = reason !== undefined;
     if (reason) this.opts.requestKeyframe(reason);
   }

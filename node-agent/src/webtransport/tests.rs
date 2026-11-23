@@ -1632,15 +1632,8 @@ async fn reordered_delivery_does_not_stall_the_datagram_path() {
 }
 
 /// Logs `webtransport-client-quic-stats` lines into `captured` on this thread.
-fn capture_info(captured: &Captured) -> tracing::subscriber::DefaultGuard {
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_ansi(false)
-        .with_writer(captured.clone())
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
-    tracing::callsite::rebuild_interest_cache();
-    guard
+fn capture_info(captured: &Captured) -> crate::test_log::EndCapture {
+    crate::test_log::begin(&captured.0)
 }
 
 /// Says `bye` and waits for the agent's line on the client's leave: whether QUIC's window
@@ -2265,6 +2258,17 @@ fn answered_but(
     at: std::time::Instant,
     lost: impl Fn(u32) -> bool,
 ) {
+    answered_with(control, first, at, lost, None);
+}
+
+/// [`answered_but`], the feedback carrying `decoded` when given (#1348).
+fn answered_with(
+    control: &mut Control,
+    first: u32,
+    at: std::time::Instant,
+    lost: impl Fn(u32) -> bool,
+    decoded: Option<u16>,
+) {
     let mut arrivals = Vec::new();
     for i in 0..200u32 {
         let mut d = vec![0u8; media::MAX_DATAGRAM];
@@ -2275,13 +2279,16 @@ fn answered_but(
         let arrival = if lost(i) { u16::MAX } else { (i * 20) as u16 };
         arrivals.extend_from_slice(&arrival.to_le_bytes());
     }
-    let fb = json!({
+    let mut fb = json!({
         "type": "feedback", "seq": first / 200 + 1,
         "first_pkt_seq": first, "count": 200,
         "ref_us": u64::from(first) * 1000,
         "arrivals_b64": base64::engine::general_purpose::STANDARD.encode(&arrivals),
         "recv_kbps": 0, "lost": 0, "interval_ms": 50,
     });
+    if let Some(d) = decoded {
+        fb["decoded"] = json!(d);
+    }
     let path = congestion::QuicPath {
         rtt: Duration::from_millis(20),
         cwnd_bytes: 0,
@@ -2289,6 +2296,39 @@ fn answered_but(
         queued_bytes: 0,
     };
     control.feedback(&fb, path, at + Duration::from_millis(250));
+}
+
+/// #1348: `decoded` rides on feedback without changing what either capacity estimator reads.
+#[test]
+fn feedback_carrying_decoded_reads_the_same_in_both_capacity_modes() {
+    for capacity in [
+        crate::session::settings::WtCapacity::V2,
+        crate::session::settings::WtCapacity::Legacy,
+    ] {
+        let rate = Rate {
+            capacity,
+            ..rate(true)
+        };
+        let base = std::time::Instant::now();
+        let run = |decoded: Option<u16>| {
+            let mut c = Control::new(&rate, Arc::default(), true, congestion::Governor::default());
+            for k in 0..8u32 {
+                let at = base + Duration::from_millis(250 * u64::from(k));
+                answered_with(&mut c, 200 * k, at, |i| i % 9 == 4, decoded);
+            }
+            let e = &c.estimator;
+            (
+                c.refused,
+                e.estimate_kbps(),
+                e.loss(),
+                e.measured(),
+                e.held_kbps(),
+            )
+        };
+        let with = run(Some(4711));
+        assert_eq!(with.0, 0, "{capacity:?}: refused");
+        assert_eq!(with, run(None), "{capacity:?}");
+    }
 }
 
 /// #1433 lab R3 (NVIDIA lab host, 2026-11-22): the hold's line reaches the ABR as video under the
@@ -4621,18 +4661,13 @@ async fn a_64_kib_session_id_is_refused_and_logged_bounded() {
         "session_not_ready"
     );
 
-    // The refusal's own log call, captured on this thread (a scoped subscriber does not
-    // reach tasks other tests' subscribers race with).
+    // The refusal's own log call, captured on this thread through the shared
+    // process-wide subscriber (no scoped dispatcher to race its interest cache).
     let captured = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_ansi(false)
-        .with_writer(captured.clone())
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
-        tracing::callsite::rebuild_interest_cache();
+    {
+        let _guard = crate::test_log::begin(&captured.0);
         log_refusal(&huge, "session_not_ready");
-    });
+    }
     let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
     assert_eq!(logs.lines().count(), 1, "one line: {logs}");
     assert!(logs.len() < 400, "a {} byte log line", logs.len());
@@ -4881,17 +4916,12 @@ async fn a_failed_swap_keeps_serving_and_listing_the_old_certificate_first() {
     };
 
     let captured = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_ansi(false)
-        .with_writer(captured.clone())
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
-        tracing::callsite::rebuild_interest_cache();
+    {
+        let _guard = crate::test_log::begin(&captured.0);
         agent.listener.rotate_with(expires - 48 * HOUR, broken);
         agent.listener.rotate_at(expires - 12 * HOUR);
         agent.listener.rotate_at(expires - 11 * HOUR);
-    });
+    }
     let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
     assert_eq!(
         logs.matches("webtransport-cert-reload-failed").count(),

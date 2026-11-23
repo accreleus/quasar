@@ -262,6 +262,7 @@ impl RuntimeSettings {
     pub fn baseline() -> Self {
         // Read here so an unrecognised value warns at agent start.
         wt_capacity();
+        wt_ref_recovery();
         Self::baseline_with(&|k| std::env::var(k).ok())
     }
 
@@ -578,6 +579,30 @@ pub fn wt_capacity() -> WtCapacity {
     *CAPACITY.get_or_init(|| WtCapacity::parse(std::env::var("QUASAR_WT_CAPACITY").ok().as_deref()))
 }
 
+/// `QUASAR_WT_REF_RECOVERY` (#1348, `docs/configuration.md`): `1`, `true` or `on` turns
+/// reference recovery on; anything else is off, and anything but `0`, `false`, `off` or empty warns.
+pub fn parse_wt_ref_recovery(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        Some("1" | "true" | "on") => true,
+        None | Some("" | "0" | "false" | "off") => false,
+        Some(other) => {
+            tracing::warn!(
+                token = "wt-ref-recovery-unrecognised",
+                "QUASAR_WT_REF_RECOVERY={other:?} is not 1|true|on|0|false|off; reference recovery stays off"
+            );
+            false
+        }
+    }
+}
+
+/// The agent's `QUASAR_WT_REF_RECOVERY`, read once for the life of the process.
+pub fn wt_ref_recovery() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_wt_ref_recovery(std::env::var("QUASAR_WT_REF_RECOVERY").ok().as_deref())
+    })
+}
+
 fn env_bool(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
     matches!(
         lookup(var).as_deref(),
@@ -603,6 +628,23 @@ mod tests {
             (Some("0.6.3"), WtCapacity::Legacy),
         ] {
             assert_eq!(WtCapacity::parse(raw), want, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn ref_recovery_knob_is_off_unless_turned_on() {
+        for (raw, want) in [
+            (None, false),
+            (Some(""), false),
+            (Some("off"), false),
+            (Some("0"), false),
+            (Some("yes"), false),
+            (Some("ON"), false),
+            (Some(" on "), true),
+            (Some("1"), true),
+            (Some("true"), true),
+        ] {
+            assert_eq!(parse_wt_ref_recovery(raw), want, "{raw:?}");
         }
     }
 
