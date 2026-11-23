@@ -3027,8 +3027,9 @@ fn a_step_down_with_fec_is_no_slower_than_without() {
 }
 
 /// #1301: a share that rises mid-session takes the setpoint under the new ceiling at the
-/// estimate it came with, inside the smooth governor's 7 s dwell for the second rise; one that
-/// falls lifts the ceiling, and the setpoint climbs back to the configured one.
+/// estimate it came with, inside the smooth governor's 7 s dwell for the second rise. One that
+/// falls (a step per 2 s from 15 s) lifts the ceiling only once lower for 10 s
+/// (`abr::SHARE_STICKY`), and the setpoint climbs back to the configured one.
 #[test]
 fn a_share_change_mid_session_applies_at_once() {
     for cfg in [smooth_window(), smooth_per_report()] {
@@ -3042,6 +3043,11 @@ fn a_share_change_mid_session_applies_at_once() {
         assert_eq!(setpoints[9], 8000, "{:?}", cfg.per_report);
         assert_eq!(setpoints[10], video_ceiling(3), "{:?}", cfg.per_report);
         assert_eq!(setpoints[11], video_ceiling(5), "{:?}", cfg.per_report);
+        assert!(
+            setpoints[12..24].iter().all(|&sp| sp == video_ceiling(5)),
+            "{:?}: held to 24 s {setpoints:?}",
+            cfg.per_report
+        );
         assert_eq!(setpoints[39], 8000, "{:?}: {setpoints:?}", cfg.per_report);
     }
 }

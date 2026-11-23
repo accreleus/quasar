@@ -436,9 +436,18 @@ pub struct Governor {
     back: bool,
     /// When `hold_to` last ran.
     held_at: Option<Instant>,
-    /// The FEC repair share on top of the video (`set_share`); 0 on WebRTC.
+    /// The FEC repair share the ceiling is bound by (`set_share`): the highest since the share
+    /// last stayed lower for `SHARE_STICKY`; 0 on WebRTC. And since when it has been lower.
     share: f64,
+    share_lower_since: Option<Instant>,
 }
+
+/// `Governor::set_share`: a share that falls lowers the ceiling only after staying lower this
+/// long. 10 s is FEC's full decay (5 levels, one per 2 s calm, `webtransport::fec`) and longer
+/// than the burst cycles a bursty link keeps 1080p through (every 2.5 to 4 s, and 10 s: sim
+/// `burst_loss_on_an_uncapped_link_keeps_the_rung_and_the_setpoint`). Following each step of
+/// the decay saw-toothed the setpoint, which v2's hold read as the sender's rate falling.
+const SHARE_STICKY: Duration = Duration::from_secs(10);
 
 /// `Governor::hold_off`: a hold refreshed within this is seen ending (WebTransport refreshes it every
 /// report, 50 ms apart; the rung's lease is the same, `LadderPlanner::set_held`).
@@ -463,6 +472,7 @@ impl Governor {
             held_at: None,
             back: false,
             share: 0.0,
+            share_lower_since: None,
         }
     }
 
@@ -474,11 +484,18 @@ impl Governor {
     }
 
     /// WebTransport FEC's repair share (`webtransport::Rate::observe`): the ceiling and the
-    /// reading line over `1 + share`. Every input is already video and every gate relative, so
+    /// reading line over `1 + share`, the share rising at once and falling after `SHARE_STICKY`. Every input is already video and every gate relative, so
     /// a descent with FEC is the one without, scaled. A setpoint over the new ceiling is returned to write
     /// once `write_due`; a bound change, so the window loop's anti-thrash clock is not stamped.
     pub fn set_share(&mut self, share: f64, now: Instant) -> Option<u32> {
-        self.share = share.max(0.0);
+        let share = share.max(0.0);
+        if share >= self.share {
+            (self.share, self.share_lower_since) = (share, None);
+        } else if now.saturating_duration_since(*self.share_lower_since.get_or_insert(now))
+            >= SHARE_STICKY
+        {
+            (self.share, self.share_lower_since) = (share, Some(now));
+        }
         let ceiling = self.ceiling();
         if self.setpoint <= ceiling || !self.write_due(now) {
             return None;
