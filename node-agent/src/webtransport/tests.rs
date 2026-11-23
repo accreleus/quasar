@@ -5973,3 +5973,92 @@ async fn audio_and_a_ping_are_served_between_the_slices_of_one_big_pyrowave_fram
         "one pkt_seq in handoff order: {seqs:?}"
     );
 }
+
+/// Probe round 2 (#1433, seat B S2): the production probe fill hands QUIC repairs of the last frame
+/// only with QUIC's datagram queue empty and no video held (a NACK answer is held video), so never
+/// ahead of audio, video or a resend, and in one burst per frame. The sim's QUIC sends at once, so
+/// only this test turns red without the queue check.
+#[test]
+fn the_probe_fills_an_empty_quic_queue_once_per_frame_behind_video() {
+    let start = std::time::Instant::now();
+    let at = |us: u64| start + Duration::from_micros(us);
+    let mut log = congestion::SendLog::new(start);
+    let mut video = congestion::VideoQueue::default();
+    let kbps = Some(20_000.0);
+    let frame: Vec<Bytes> = (0..10)
+        .map(|_| {
+            let mut d = vec![0x01];
+            d.extend_from_slice(&video.take_seq().to_le_bytes());
+            d.resize(1200, 0);
+            Bytes::from(d)
+        })
+        .collect();
+    let mut probe_frame = Some((frame.clone(), 0));
+    let mut fill = |log: &mut congestion::SendLog,
+                    video: &mut congestion::VideoQueue,
+                    queued: usize,
+                    now: std::time::Instant| {
+        let mut sent = Vec::new();
+        assert!(fill_probe(
+            log,
+            kbps,
+            &mut probe_frame,
+            video,
+            queued,
+            now,
+            |d| {
+                sent.push(d);
+                true
+            }
+        ));
+        sent
+    };
+    // The probe banks from the frame interval before the frame; nothing goes ahead of it.
+    assert!(
+        fill(&mut log, &mut video, 0, at(0)).is_empty(),
+        "before the frame"
+    );
+    for d in &frame {
+        log.record(d, at(16_000), false);
+    }
+    // Audio or video still in QUIC's queue: nothing.
+    assert!(
+        fill(&mut log, &mut video, 300, at(16_500)).is_empty(),
+        "ahead of QUIC's queue"
+    );
+    // A NACK answer held behind the pacer: nothing.
+    let resend = congestion::Held {
+        datagram: frame[3].clone(),
+        logged: true,
+        resend: true,
+        queued_at: at(16_500),
+        keyframe: false,
+    };
+    video.push(resend, usize::MAX);
+    assert!(
+        fill(&mut log, &mut video, 0, at(16_600)).is_empty(),
+        "ahead of a resend"
+    );
+    video.clear();
+    // Both empty: one burst within `PROBE_TAIL` of the frame, at most what a frame interval at the
+    // probe's rate leaves past it.
+    let mut burst = fill(&mut log, &mut video, 0, at(16_700));
+    assert!(!burst.is_empty(), "no burst");
+    burst.extend(fill(&mut log, &mut video, 0, at(17_500)));
+    let room = 20_000.0 * 125.0 * 0.016_667 - 10.0 * 1200.0;
+    let bytes: usize = burst.iter().map(Bytes::len).sum();
+    assert!(bytes as f64 <= room + 1300.0, "{bytes} bytes for {room:.0}");
+    // Each repair takes the next `pkt_seq`, after the frame's.
+    let seqs: Vec<u32> = burst
+        .iter()
+        .map(|d| u32::from_le_bytes(d[1..5].try_into().unwrap()))
+        .collect();
+    assert_eq!(seqs, (10..10 + burst.len() as u32).collect::<Vec<_>>());
+    // Nothing more until the next frame.
+    for us in [18_500, 25_000, 32_000] {
+        assert!(
+            fill(&mut log, &mut video, 0, at(us)).is_empty(),
+            "at {us} us"
+        );
+    }
+}

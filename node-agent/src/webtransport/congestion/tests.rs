@@ -5993,7 +5993,7 @@ fn an_underfilling_encoder_on_a_policer_still_sets_the_hold() {
 
 /// A lab row with the lab encoder's keyframes and FEC (`Sim::lab_hw`): 30 s clean, `shape` for
 /// 180 s, then clean again for `after` seconds.
-fn lab_hw_row(legacy: bool, shape: fn(&mut Sim), after: f64) -> Sim {
+fn lab_hw_row(legacy: bool, shape: impl Fn(&mut Sim), after: f64) -> Sim {
     let mut s = Sim::lab_hw(legacy);
     s.run(30.0);
     shape(&mut s);
@@ -6114,14 +6114,58 @@ fn lab_rows_over_a_random_loss_floor_keep_the_hold() {
     }
 }
 
+/// Seat B, probe round 2 (#1433 M1): a bucket holding 0.5-0.7 s of the policer's rate (a cable
+/// modem's burst, a carrier policer) passed a whole probe step clean, so the line went over the
+/// policer; video then drained the bucket and froze, again each probe. d463755b: 1 MB froze 14 times
+/// while shaped at 4.2 % loss, 750 kB 16 times, lines up to 6384. Each bucket to 1 MB freezes at
+/// most twice while shaped (to 500 kB once), no line is over the policer after onset + 20 s, and the
+/// row is back at 1080p within 15 s of the clear. 2 MB, past `PROBE_BUCKET_S`, is printed.
+#[test]
+fn a_deep_bucket_policer_never_lets_the_probe_raise_the_line_over_it() {
+    let mut failed = Vec::new();
+    for (name, bytes, most) in [
+        ("15 kB", 15_000.0, Some(1)),
+        ("150 kB", 150_000.0, Some(1)),
+        ("500 kB", 500_000.0, Some(1)),
+        ("750 kB", 750_000.0, Some(2)),
+        ("1 MB", 1_000_000.0, Some(2)),
+        ("2 MB", 2_000_000.0, None),
+    ] {
+        let shape = |s: &mut Sim| {
+            policer(s);
+            s.bucket_bytes = Some(bytes);
+        };
+        let s = lab_hw_row(false, shape, 120.0);
+        let (freezes, _) = hw_summary(&format!("R4 {name} v2"), &s);
+        let shaped: Vec<_> = freezes.iter().filter(|&&t| t < 210.0).collect();
+        let lines = s.lines.iter().filter(|&&(t, _)| (50.0..210.0).contains(&t));
+        let top = lines.clone().filter_map(|&(_, l)| l).fold(0.0, f64::max);
+        let over: Vec<_> = lines.filter(|l| l.1 > Some(5000.0)).take(5).collect();
+        let back = back_after_clear(&s);
+        eprintln!(
+            "  loss while shaped {:.3}, top line after onset + 20 s {top:.0}",
+            loss_between(&s, 30.0, 210.0)
+        );
+        let Some(most) = most else { continue };
+        if shaped.len() > most || !over.is_empty() || back.is_none_or(|b| b > 15.0) {
+            failed.push(format!(
+                "{name}: freezes while shaped {shaped:?}, lines over the policer {over:?}, back \
+                 {back:?}"
+            ));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
 /// Probe round (#1433): a hold that can probe sends repair datagrams at `PROBE_GAIN` × the line
 /// `PROBE_WAIT` after the line stepped down. A step carried clean raises the line to `BETA`² × what
 /// it carried and doubles again; a report that loses the probe's datagrams stops it at once and the
-/// line stays.
+/// line stays. Probe round 2 (seat B M1): the first step raises only once it has sent
+/// `PROBE_BUCKET_S` of what the link delivered over that rate.
 #[test]
 fn a_probe_raises_the_line_only_on_a_step_carried_clean() {
     let start = Instant::now();
-    let mut est = Estimator::new(CEILING, start);
+    let mut est = Estimator::new(4.0 * CEILING, start);
     est.probes = true;
     let at = |ms: u64| start + Duration::from_millis(ms);
     est.apply(received(6000.0, 0.3), at(100), NO_QUIC);
@@ -6137,19 +6181,39 @@ fn a_probe_raises_the_line_only_on_a_step_carried_clean() {
         probe_sent_kbps: line,
         ..received(2.0 * line, 0.0)
     };
-    for ms in (5150..=6100).step_by(50) {
+    // The first step proves `PROBE_BUCKET_S` of what the link delivered (6000) past it: 2.86 s.
+    for ms in (5150..=7950).step_by(50) {
         est.probe_counted = (10, 0);
         est.apply(carried, at(ms), NO_QUIC);
+        assert!(est.held_kbps() == Some(line), "raised at {ms} ms");
     }
+    est.probe_counted = (10, 0);
+    est.apply(carried, at(8000), NO_QUIC);
     let raised = BETA * BETA * PROBE_GAIN * line;
     assert!(
         est.held_kbps().is_some_and(|l| (l - raised).abs() < 1.0),
         "line {:?}, want {raised:.0}",
         est.held_kbps()
     );
-    assert!(est.probe_kbps().is_some(), "the next step starts at once");
+    // The next step, chained to it, takes `PROBE_STEP`: the first one emptied any bucket.
+    assert_eq!(est.probe_kbps(), Some(PROBE_GAIN * raised), "next step");
+    let carried = Measured {
+        sent_kbps: Some(raised),
+        probe_sent_kbps: raised,
+        ..received(2.0 * raised, 0.0)
+    };
+    for ms in (8050..=9000).step_by(50) {
+        est.probe_counted = (10, 0);
+        est.apply(carried, at(ms), NO_QUIC);
+    }
+    let raised = BETA * BETA * PROBE_GAIN * raised;
+    assert!(
+        est.held_kbps().is_some_and(|l| (l - raised).abs() < 1.0),
+        "line {:?}, want {raised:.0}",
+        est.held_kbps()
+    );
     est.probe_counted = (5, 10);
-    est.apply(received(raised, 0.0), at(6150), NO_QUIC);
+    est.apply(received(raised, 0.0), at(9050), NO_QUIC);
     assert_eq!(
         est.probe_kbps(),
         None,

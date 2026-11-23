@@ -1783,6 +1783,39 @@ fn pyro_act(
     }
 }
 
+/// One `PROBE_EVERY` tick of the capacity probe: repairs of the last frame (`fec::probe`) in one
+/// burst right behind it, only with no video held (NACK answers included) and nothing in QUIC's
+/// datagram queue (`quic_queued` bytes: audio, video handed earlier). `send` hands one to QUIC and
+/// says whether the connection took it; `false` when it did not.
+fn fill_probe(
+    log: &mut congestion::SendLog,
+    kbps: Option<f64>,
+    probe_frame: &mut Option<(Vec<bytes::Bytes>, usize)>,
+    video: &mut congestion::VideoQueue,
+    quic_queued: usize,
+    now: std::time::Instant,
+    mut send: impl FnMut(bytes::Bytes) -> bool,
+) -> bool {
+    let Some((frame, next)) = probe_frame
+        .as_mut()
+        .filter(|_| video.is_empty() && quic_queued == 0)
+    else {
+        return true;
+    };
+    let size = frame.first().map_or(f64::MAX, |d| d.len() as f64);
+    // One burst: the frame takes a policer's refill before the probe does.
+    while log.probe_room(kbps, now) >= size {
+        let Some(d) = fec::probe(frame, next, video.take_seq()) else {
+            break;
+        };
+        log.record_probe(&d, now);
+        if !send(d) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Hand the client its video until it leaves, is displaced or the session ends.
 #[allow(clippy::too_many_arguments)]
 async fn stream(
@@ -1866,19 +1899,16 @@ async fn stream(
             // Lowest priority: only with no video held and nothing in QUIC's datagram queue.
             _ = fill_tick.tick(), if probing => {
                 let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
-                if let (Some(c), Some((frame, next)), true) = (control.as_mut(), probe_frame.as_mut(), video.is_empty() && queued == 0) {
+                if let Some(c) = control.as_mut() {
+                    let kbps = c.estimator.probe_kbps();
                     let now = std::time::Instant::now();
-                    let size = frame.first().map_or(f64::MAX, |d| d.len() as f64);
-                    // One burst: the frame takes a policer's refill before the probe does.
-                    while c.log.probe_room(c.estimator.probe_kbps(), now) >= size {
-                        let Some(d) = fec::probe(frame, next, video.take_seq()) else {
-                            break;
-                        };
+                    let frame = &mut probe_frame;
+                    let sent = fill_probe(&mut c.log, kbps, frame, &mut video, queued, now, |d| {
                         handed += 1;
-                        c.log.record_probe(&d, now);
-                        if session.send_datagram(d).is_err() {
-                            break 'stream QUIET;
-                        }
+                        session.send_datagram(d).is_ok()
+                    });
+                    if !sent {
+                        break 'stream QUIET;
                     }
                 }
             }
