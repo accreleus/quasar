@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 
 use super::*;
-use crate::webtransport::tests::Captured;
 
 const SIZE: usize = 1148;
 const CEILING: f64 = 8000.0;
@@ -1237,7 +1236,7 @@ fn feedback_silence_while_media_is_sent_decays_the_estimate() {
     let sent_until = s.t;
     // The agent keeps sending; nothing comes back.
     let mut fed_abr = Vec::new();
-    let lines = logged(|| {
+    let lines = crate::test_log::logged(|| {
         for step in 1..=30u64 {
             s.t = sent_until + step * 100_000;
             s.frame();
@@ -1606,7 +1605,7 @@ fn a_congestion_burst_right_after_recovery_still_cuts() {
     // The link is back, but the first frames after it lose a burst: the report shows a
     // received packet behind the gap, so the mark ends before those losses.
     s.drop_every = 4;
-    let lines = logged(|| s.run(0.05));
+    let lines = crate::test_log::logged(|| s.run(0.05));
     let labels: Vec<String> = cuts(&lines).into_iter().map(|c| c.0).collect();
     assert!(
         labels.iter().any(|l| l.contains("loss")),
@@ -1728,7 +1727,7 @@ fn a_delay_cut_ends_the_regrow() {
     // enough that it never drops: the delay signal is the only one this link gives.
     s.cap_kbps = carried / 4.0;
     s.queue_bytes = 4.0 * 1024.0 * 1024.0;
-    let lines = logged(|| s.run(15.0));
+    let lines = crate::test_log::logged(|| s.run(15.0));
     let labels: Vec<String> = cuts(&lines).into_iter().map(|c| c.0).collect();
     assert!(
         labels.iter().any(|l| l.contains("delay")),
@@ -1761,7 +1760,7 @@ fn a_loss_cut_ends_the_regrow() {
     s.cap_kbps = 1500.0;
     s.queue_bytes = 2.0 * SIZE as f64;
     s.send_kbps = None;
-    let lines = logged(|| s.run(15.0));
+    let lines = crate::test_log::logged(|| s.run(15.0));
     let labels: Vec<String> = cuts(&lines).into_iter().map(|c| c.0).collect();
     let first = labels
         .iter()
@@ -2637,21 +2636,6 @@ fn a_busy_sender_under_heavy_loss_is_still_a_throughput_sample() {
     assert_eq!(est.throughput.len(), 1, "the lost datagrams were sent too");
 }
 
-/// The lines `run` logs at INFO and above, on this thread.
-fn logged(run: impl FnOnce()) -> Vec<String> {
-    let captured = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_writer(captured.clone())
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
-        tracing::callsite::rebuild_interest_cache();
-        run();
-    });
-    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
-    logs.lines().map(String::from).collect()
-}
-
 #[test]
 fn a_bound_flipping_at_the_feedback_rate_is_logged_at_most_once_a_second() {
     let start = Instant::now();
@@ -2661,7 +2645,7 @@ fn a_bound_flipping_at_the_feedback_rate_is_logged_at_most_once_a_second() {
     est.settle();
     // For 2 s, a message every 50 ms grows the delay bound and the next the loss bound,
     // so the lower one, the estimate's bound, flips at every message.
-    let lines = logged(|| {
+    let lines = crate::test_log::logged(|| {
         for i in 1..=40u32 {
             let delay_grows = i % 2 == 1;
             let m = Measured {
@@ -2732,7 +2716,7 @@ fn each_line_names_every_cause_of_the_fall_it_covers() {
         d[1..5].copy_from_slice(&seq.to_le_bytes());
         log.record(&d, when, false);
     };
-    let lines = logged(|| {
+    let lines = crate::test_log::logged(|| {
         est.on_feedback(&empty, &mut log, at(0), NO_QUIC);
         // Feedback stops: the first decay is logged, the next waits out the second.
         send(&mut log, 0, at(0));
@@ -4018,7 +4002,7 @@ fn after_a_cap_lifts_the_estimate_climbs_back_to_the_ceiling_promptly() {
     assert!(s.est.found_link(), "the 5 Mbit/s cap was found");
     s.cap_kbps = 50_000.0;
     let lifted = s.t as f64 / 1e6;
-    let lines = logged(|| s.run(30.0));
+    let lines = crate::test_log::logged(|| s.run(30.0));
     let back = s
         .trace
         .iter()
@@ -4049,14 +4033,14 @@ fn the_pacer_stays_off_while_the_outage_regrow_runs() {
     s.outage(10.0);
     assert!(s.est.estimate_kbps() < CEILING && s.est.recover_to.is_some());
     let resumed = s.t as f64 / 1e6;
-    let lines = logged(|| s.run(0.5));
+    let lines = crate::test_log::logged(|| s.run(0.5));
     assert!(s.governor.governs(), "feedback governs again");
     assert_eq!(
         video_rates(&s.governor, &s.est, false).1,
         None,
         "paced during the regrow"
     );
-    let lines = [lines, logged(|| s.run(14.5))].concat();
+    let lines = [lines, crate::test_log::logged(|| s.run(14.5))].concat();
     let back = s
         .trace
         .iter()

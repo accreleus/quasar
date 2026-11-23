@@ -48,6 +48,7 @@ own; the two do not move together, and that is deliberate.
 - **WebTransport: the first receiver report after an outage no longer cuts the bitrate (#1433).** The losses of an outage are read from what the client's reports covered. On in both `QUASAR_WT_CAPACITY` modes.
 - PyroWave over WebTransport counts far fewer packets lost when the page stalls briefly (53–83 % fewer on the lab): a frame's deadline timer that fires late now waits four more frames for the datagram reads queued behind the stall (#1635).
 - Warm Steam: when an adopting session's start ack is lost, the old runtime's cleanup proof can no longer release the managed-home hold while that session's stop is still in flight; the hold passes to the failed session and clears at its own proof (#1615).
+- Node-agent tests that read their own log lines no longer fail at random under the parallel test runner (#1650).
 
 ## 0.6.3 — 2026-11-21
 
