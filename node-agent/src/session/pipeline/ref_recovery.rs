@@ -8,12 +8,17 @@ use gstreamer as gst;
 /// Encoder property: anchors held, 0 = off. Present only on a patched encoder.
 pub(crate) const NUM_ANCHORS: &str = "num-anchors";
 
-/// The `num-anchors` the agent gives encoder `factory`: the most the level leaves at 1080p60,
-/// the smallest of the common sizes (H.264 2, HEVC 4; `deploy/patches/vulkan/README.md`), so the
-/// encoder holds exactly what the agent counts. AV1 takes HEVC's 4: its levels bound no
-/// reference. NVENC H.264 stays 0 (key frame repair) until a real-Chrome hardware row proves
-/// its gaps-flag-0 recovery; NVENC AV1 has no long-term references.
-pub(crate) fn anchors_for(factory: &str) -> u32 {
+/// The `num-anchors` the agent gives encoder `factory`, 0 unless `on`
+/// (`QUASAR_WT_REF_RECOVERY`): the most the level leaves at 1080p60, the smallest of the common
+/// sizes (H.264 2, HEVC 4; `deploy/patches/vulkan/README.md`). An encoder that clamps lower
+/// holds fewer than the agent mirrors: a wrong mirror costs a key frame, never a wrong
+/// reference. AV1 takes HEVC's 4: its levels bound no reference. NVENC H.264 stays 0 (key
+/// frame repair) until a real-Chrome hardware row proves its gaps-flag-0 recovery; NVENC AV1
+/// has no long-term references.
+pub(crate) fn anchors_for(factory: &str, on: bool) -> u32 {
+    if !on {
+        return 0;
+    }
     let vulkan = factory.starts_with("vulkan");
     let nvenc = factory.starts_with("nv");
     match ["h264", "h265", "av1"]
@@ -94,7 +99,8 @@ mod tests {
             ("vah265enc", 0),
             ("openh264enc", 0),
         ] {
-            assert_eq!(anchors_for(factory), k, "{factory}");
+            assert_eq!(anchors_for(factory, true), k, "{factory}");
+            assert_eq!(anchors_for(factory, false), 0, "{factory}, switch off");
         }
     }
 

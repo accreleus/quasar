@@ -1245,14 +1245,14 @@ fn nack_of(message: &Value) -> Option<(u16, Vec<[u16; 2]>)> {
     Some((frame_seq, ranges))
 }
 
-/// How long sent video is held for a `nack`: [`retransmit::WINDOW`], or twice the
-/// smoothed RTT when that is longer (§Loss recovery).
 /// §Feedback `decoded`: absent, or anything but a u16, is none.
 pub(crate) fn decoded_of(message: &Value) -> Option<u16> {
     let decoded = message.get("decoded")?.as_u64()?;
     u16::try_from(decoded).ok()
 }
 
+/// How long sent video is held for a `nack`: [`retransmit::WINDOW`], or twice the
+/// smoothed RTT when that is longer (§Loss recovery).
 fn retransmit_window(session: &Session) -> Duration {
     retransmit::WINDOW.max(quinn::Connection::rtt(session) * 2)
 }
@@ -2167,12 +2167,13 @@ async fn stream(
                     match message.get("type").and_then(Value::as_str) {
                         // codec-pyrowave.md §Loss: no keyframe request for a PyroWave frame.
                         Some("keyframe_request") if current.codec != "pyrowave" => {
-                            media.decoded(client.id, decoded_of(&message));
-                            // §Loss recovery 6: only a late frame is repaired from what the
-                            // client decoded; every other reason restarts its decoder.
+                            let decoded = decoded_of(&message);
+                            // §Loss recovery 6: only a late frame is repaired from the request's
+                            // own `decoded`; every other reason restarts the client's decoder.
                             if message.get("reason").and_then(Value::as_str) == Some("late") {
-                                media.repair();
+                                media.repair(client.id, decoded);
                             } else {
+                                media.decoded(client.id, decoded);
                                 media.keyframe();
                             }
                         }

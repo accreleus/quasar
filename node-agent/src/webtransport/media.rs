@@ -171,8 +171,7 @@ struct Refs {
     reports: VecDeque<RefFrame>,
     /// `(frame_seq, report pts)` of each anchor the client was sent, oldest first.
     anchors: VecDeque<(u16, gst::ClockTime)>,
-    /// The client's latest `decoded` (§Feedback); `opted` once it has sent one.
-    decoded: Option<u16>,
+    /// The client has sent a `decoded` (§Feedback): anchors are asked for from then on.
     opted: bool,
     /// A recovery was asked for and no recovery frame or key frame has come since.
     asked: Option<u16>,
@@ -181,7 +180,20 @@ struct Refs {
 impl Refs {
     fn forget(&mut self) {
         self.anchors.clear();
+        self.reports.clear();
+        self.asked = None;
         self.since = 0;
+    }
+
+    /// The unit the encoder reported as `report` went to the client as `frame_seq`: the one
+    /// place an anchor gets its number.
+    fn record(&mut self, frame_seq: u16, report: Option<RefFrame>) {
+        if let Some(r) = report.filter(|r| r.anchor) {
+            self.anchors.push_back((frame_seq, r.pts));
+            while self.anchors.len() > self.k {
+                self.anchors.pop_front();
+            }
+        }
     }
 
     /// The report for the buffer at `pts`; older unmatched reports go with it.
@@ -373,7 +385,9 @@ impl Media {
         let k = encoder
             .find_property(ref_recovery::NUM_ANCHORS)
             .and(encoder.factory())
-            .map_or(0, |f| ref_recovery::anchors_for(&f.name()));
+            .map_or(0, |f| {
+                ref_recovery::anchors_for(&f.name(), crate::session::settings::wt_ref_recovery())
+            });
         if k > 0 {
             encoder.set_property(ref_recovery::NUM_ANCHORS, k);
         }
@@ -999,6 +1013,7 @@ impl Media {
         // The encoder mirror runs for every unit, sent or not: a key frame drops every anchor,
         // a recovery frame every anchor newer than its own (`gstrefrecovery.h`).
         let report = st.refs.take(buffer.pts());
+        let answered = st.refs.asked.filter(|_| flagged);
         if flagged {
             st.refs.forget();
         }
@@ -1132,12 +1147,7 @@ impl Media {
             }
             None => return,
         }
-        if let Some(r) = report.filter(|r| r.anchor) {
-            st.refs.anchors.push_back((frame_seq, r.pts));
-            while st.refs.anchors.len() > st.refs.k {
-                st.refs.anchors.pop_front();
-            }
-        }
+        st.refs.record(frame_seq, report);
         if let Some(anchor) = from_seq {
             st.refs.asked = None;
             tracing::info!(
@@ -1149,7 +1159,7 @@ impl Media {
                 bytes,
                 "WebTransport recovery frame {frame_seq} from frame {anchor}, {bytes} bytes"
             );
-        } else if let Some(anchor) = st.refs.asked.take_if(|_| flagged) {
+        } else if let Some(anchor) = answered {
             tracing::info!(
                 token = "webtransport-ref-recovery",
                 session_id = %st.session_id,
@@ -1190,23 +1200,27 @@ impl Media {
     pub(crate) fn decoded(&self, client: u64, decoded: Option<u16>) {
         let mut st = self.lock();
         if st.client.as_ref().is_some_and(|c| c.id == client) {
-            st.refs.decoded = decoded;
             st.refs.opted |= decoded.is_some();
         }
     }
 
-    /// `keyframe_request {reason: "late"}`: the next frame codes from the newest anchor at or
-    /// before the client's `decoded`, or is a key frame when none is (§Loss recovery 6).
-    pub(crate) fn repair(&self) {
-        let (pick, k, decoded) = {
+    /// `client`'s `keyframe_request {reason: "late"}` carrying `decoded`: the next frame codes
+    /// from the newest anchor at or before it, or is a key frame when none is (§Loss recovery
+    /// 6). A client no longer attached is ignored.
+    pub(crate) fn repair(&self, client: u64, decoded: Option<u16>) {
+        let (pick, log, session_id) = {
             let mut st = self.lock();
+            if st.client.as_ref().is_none_or(|c| c.id != client) {
+                return;
+            }
             let refs = &mut st.refs;
-            let pick = refs.decoded.and_then(|d| {
+            refs.opted |= decoded.is_some();
+            let pick = decoded.and_then(|d| {
                 let mut held = refs.anchors.iter().rev();
                 held.find(|(seq, _)| seq_at_or_before(*seq, d)).copied()
             });
             refs.asked = pick.map(|(seq, _)| seq);
-            (pick, refs.k, refs.decoded)
+            (pick, refs.k > 0 && refs.opted, st.session_id.clone())
         };
         let asked = pick.is_some_and(|(_, pts)| {
             let pad = self.encoder.upgrade().and_then(|e| e.static_pad("src"));
@@ -1220,9 +1234,10 @@ impl Media {
             );
             return;
         }
-        if k > 0 {
+        if log {
             tracing::info!(
                 token = "webtransport-ref-recovery",
+                session_id = %session_id,
                 outcome = "keyframe",
                 decoded,
                 held = ?pick,
@@ -1757,7 +1772,7 @@ mod tests {
     /// requested every `24 / k` units at 60 fps), with a client attached. `events` names each
     /// upstream event: `anchor`, `recover <n>` (the frame its pts names), `key`.
     #[allow(clippy::type_complexity)]
-    fn recovering(k: usize) -> (Arc<Media>, gst::Element, Arc<Mutex<Vec<String>>>, Attached) {
+    fn recovering(k: usize) -> (Arc<Media>, Stop, Arc<Mutex<Vec<String>>>, Attached) {
         gst::init().unwrap();
         let encoder = gst::ElementFactory::make("identity").build().unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -1795,7 +1810,16 @@ mod tests {
         let client = media.attach(false, Duration::ZERO).unwrap();
         media.lock().last_forced = None;
         events.lock().unwrap().clear();
-        (media, encoder, events, client)
+        (media, Stop(encoder), events, client)
+    }
+
+    /// The stand-in encoder, taken to NULL when the test ends.
+    struct Stop(gst::Element);
+
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            let _ = self.0.set_state(gst::State::Null);
+        }
     }
 
     fn taken(events: &Mutex<Vec<String>>) -> Vec<String> {
@@ -1844,8 +1868,7 @@ mod tests {
         deltas(&media, 26, 30);
         media.decoded(client.id, Some(26)); // feedback
                                             // Frame 28 turned late at the client: its keyframe_request says it decoded 27.
-        media.decoded(client.id, Some(27));
-        media.repair();
+        media.repair(client.id, Some(27));
         assert_eq!(
             taken(&events),
             ["anchor", "recover 25"],
@@ -1887,8 +1910,7 @@ mod tests {
             media.on_unit(&frame(a, false));
         }
         deltas(&media, 21, 24);
-        media.decoded(id, Some(15));
-        media.repair();
+        media.repair(id, Some(15));
         assert_eq!(
             taken(&events).last().map(String::as_str),
             Some("recover 10")
@@ -1897,8 +1919,7 @@ mod tests {
         media.on_unit(&frame(24, false));
         // The encoder forgot 20 at 24: a client that decoded past 20 still recovers from 10.
         deltas(&media, 25, 30);
-        media.decoded(id, Some(29));
-        media.repair();
+        media.repair(id, Some(29));
         assert_eq!(
             taken(&events).last().map(String::as_str),
             Some("recover 10")
@@ -1908,22 +1929,23 @@ mod tests {
     #[test]
     fn a_repair_is_a_key_frame_with_no_decoded_no_anchor_before_it_or_after_a_key_frame() {
         let (media, _encoder, events, client) = recovering(2);
-        let key = || {
+        let key = |decoded| {
             std::thread::sleep(KEYFRAME_SPACING);
-            media.repair();
+            media.repair(client.id, decoded);
             taken(&events)
         };
         media.on_unit(&frame(0, true));
         report(&media, 1, true, None);
         media.on_unit(&frame(1, false));
-        assert_eq!(key(), ["key"], "an old client sends no decoded");
-        media.decoded(client.id, Some(1));
-        assert_eq!(key(), ["recover 1"]);
-        media.decoded(client.id, Some(0));
-        assert_eq!(key(), ["key"], "the anchor is past what the client decoded");
+        assert_eq!(key(None), ["key"], "an old client sends no decoded");
+        assert_eq!(key(Some(1)), ["recover 1"]);
+        assert_eq!(
+            key(Some(0)),
+            ["key"],
+            "the anchor is past what the client decoded"
+        );
         media.on_unit(&frame(2, true));
-        media.decoded(client.id, Some(2));
-        assert_eq!(key(), ["key"], "a key frame dropped every anchor");
+        assert_eq!(key(Some(2)), ["key"], "a key frame dropped every anchor");
     }
 
     #[test]
@@ -1935,17 +1957,14 @@ mod tests {
             report(&media, a, true, None);
             media.on_unit(&frame(a, false));
         }
-        media.decoded(client.id, Some(1));
-        media.repair();
+        media.repair(client.id, Some(1));
         assert_eq!(taken(&events), ["key"], "anchor 1 was evicted by 3 at k=2");
-        media.decoded(client.id, Some(3));
-        media.repair();
+        media.repair(client.id, Some(3));
         assert_eq!(taken(&events), ["recover 3"]);
         // It held none (as NVENC H.264 may drop one early): a key frame, and nothing is left.
         media.on_unit(&frame(4, true));
         std::thread::sleep(KEYFRAME_SPACING);
-        media.decoded(client.id, Some(4));
-        media.repair();
+        media.repair(client.id, Some(4));
         assert_eq!(taken(&events), ["key"]);
         assert_eq!(sent_units(&mut client.rx).last(), Some(&(4, true, false)));
     }
@@ -1968,9 +1987,13 @@ mod tests {
         media.on_unit(&frame(0, true));
         report(&media, 1, true, None);
         media.on_unit(&frame(1, false));
-        media.decoded(client.id + 1, Some(1));
-        media.repair();
-        assert_eq!(taken(&events), ["key"]);
+        media.repair(client.id + 1, Some(1));
+        assert!(
+            taken(&events).is_empty(),
+            "a displaced client's request asks nothing"
+        );
+        media.repair(client.id, Some(1));
+        assert_eq!(taken(&events), ["recover 1"]);
         assert_eq!(
             crate::webtransport::decoded_of(&serde_json::json!({"decoded": 70_000})),
             None
@@ -1979,6 +2002,60 @@ mod tests {
             crate::webtransport::decoded_of(&serde_json::json!({"decoded": 65_535})),
             Some(65_535)
         );
+    }
+
+    #[test]
+    fn with_the_switch_off_no_anchor_is_held_or_asked_and_every_repair_is_a_key_frame() {
+        let (media, _encoder, events, mut client) = recovering(0);
+        media.on_unit(&frame(0, true));
+        media.decoded(client.id, Some(0));
+        deltas(&media, 1, 40);
+        report(&media, 40, true, None);
+        media.on_unit(&frame(40, false));
+        media.repair(client.id, Some(40));
+        assert_eq!(taken(&events), ["key"]);
+        report(&media, 41, false, Some(40));
+        media.on_unit(&frame(41, false));
+        assert!(sent_units(&mut client.rx).iter().all(|u| !u.2));
+    }
+
+    #[test]
+    fn a_key_frame_forgets_held_reports_and_an_asked_recovery() {
+        let mut refs = Refs {
+            k: 2,
+            asked: Some(3),
+            ..Refs::default()
+        };
+        refs.reports.push_back(RefFrame {
+            pts: pts(9),
+            anchor: true,
+            recover_from: None,
+        });
+        refs.record(
+            3,
+            Some(RefFrame {
+                pts: pts(3),
+                anchor: true,
+                recover_from: None,
+            }),
+        );
+        refs.forget();
+        assert!(refs.reports.is_empty() && refs.anchors.is_empty() && refs.asked.is_none());
+    }
+
+    #[test]
+    fn an_anchor_at_or_before_decoded_is_found_across_the_frame_seq_wrap() {
+        assert!(seq_at_or_before(65_534, 1));
+        assert!(seq_at_or_before(1, 1));
+        assert!(!seq_at_or_before(1, 65_534));
+        let (media, _encoder, events, client) = recovering(2);
+        media.lock().frame_seq = 65_534;
+        media.on_unit(&frame(0, true)); // frame_seq 65534
+        report(&media, 1, true, None);
+        media.on_unit(&frame(1, false)); // the anchor, 65535
+        deltas(&media, 2, 4); // 0, 1
+        media.repair(client.id, Some(1));
+        assert_eq!(taken(&events), ["recover 1"]);
     }
 
     #[test]

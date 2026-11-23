@@ -532,6 +532,21 @@ describe("FrameAssembler", () => {
     expect(seqs(a.push(unitOf(6, false)[0]))).toEqual([6]);
   });
 
+  it("NACKs a recovery frame's missing fragment during a loss wait, as a keyframe's, and drops a delta's (#1348)", () => {
+    const a = new FrameAssembler(() => 0);
+    a.push(unitOf(1, true)[0]);
+    a.push(unitOf(2, false, 2000)[0]);
+    a.push(unitOf(3, false)[0]);
+    expect(a.miss(2, [[1, 1]]).needKeyframe).toBe(true);
+    const delta = unitOf(4, false, 3000);
+    a.push(delta[0]);
+    expect(a.push(delta[2]).nacks).toEqual([]);
+    const recovery = unitOf(5, false, 3000, { recovery: true });
+    a.push(recovery[0]);
+    expect(a.push(recovery[2]).nacks).toEqual([{ frameSeq: 5, frags: [[1, 1]] }]);
+    expect(seqs(a.push(recovery[1]))).toEqual([5]);
+  });
+
   it("gives a frame up at once on a nack_miss for a fragment it lacks", () => {
     const a = new FrameAssembler(() => 0);
     a.push(unitOf(1, true)[0]);

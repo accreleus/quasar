@@ -357,8 +357,8 @@ export class FrameAssembler {
     const nacks: Nack[] = [];
     this.wakeAt = null;
     for (const [seq, p] of this.pending) {
-      // Waiting for a keyframe, a delta is dropped whatever happens to it.
-      if (p.late || (this.waitingForKey && p.first && !p.first.keyframe)) continue;
+      // Waiting for a keyframe, a delta is dropped whatever happens to it; a recovery frame ends the wait as a keyframe does.
+      if (p.late || (this.waitingForKey && p.first && !p.first.keyframe && !p.first.recovery)) continue;
       const later = this.highest !== null && serialAfter(this.highest, seq, 16);
       const known = later ? (p.first ? p.first.fragCount : 1) : p.top;
       const frags: [number, number][] = [];
