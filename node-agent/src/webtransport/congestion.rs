@@ -151,6 +151,10 @@ const UNPROBED_DECAY: f64 = 0.98;
 const PROBE_LOST_MIN: f64 = 4.0;
 /// A step counts only once this many of the probe's own datagrams are in it.
 const PROBE_MIN: i64 = 20;
+/// A probe that has not counted `PROBE_MIN` of its datagrams in this long is starved (it never got an
+/// idle QUIC queue: lab V3, the session header; a deep buffer's pacing). The hold then climbs at
+/// `PROBE_PER_S` after `HOLD`, as with no FEC, instead of holding for good.
+const PROBE_STARVED: Duration = Duration::from_secs(3);
 /// The probe's bytes go in one burst right behind a frame's (`SendLog::probe_room`): what a frame
 /// interval at the probe's rate leaves, at most, within this long of the frame's last datagram. A
 /// policer refills over the whole interval and a queue drains over it, and the frame takes that
@@ -789,6 +793,9 @@ struct HoldLine {
     /// (`PROBE_WAIT`).
     probe: Option<Probe>,
     probe_wait: Instant,
+    /// A probe sent under `PROBE_MIN` datagrams in `PROBE_STARVED`: this hold climbs as one with no
+    /// FEC does.
+    starved: bool,
 }
 
 /// One probe step: the total on the wire it fills to, since when, and what the reports since then
@@ -940,6 +947,11 @@ impl Estimator {
         self.held.map_or(kbps, |h| kbps.min(h.kbps.max(MIN_KBPS)))
     }
 
+    /// The hold climbs by repair-datagram probes (`PROBE_GAIN`), not at `PROBE_PER_S` after `HOLD`.
+    fn probing_hold(&self) -> bool {
+        self.probes && !self.held.is_some_and(|h| h.starved)
+    }
+
     /// The total the repair-datagram probe fills the wire to (`PROBE_GAIN`), kbit/s, while one runs.
     pub(crate) fn probe_kbps(&self) -> Option<f64> {
         self.held.and_then(|h| h.probe).map(|p| p.kbps)
@@ -966,7 +978,7 @@ impl Estimator {
         }
         let (r, l) = self.unprobed;
         let floor = self.loss_floor().max(l.max(0.0) / (r + l).max(1.0));
-        let Some(h) = self.held.as_mut().filter(|_| self.probes) else {
+        let Some(h) = self.held.as_mut().filter(|h| self.probes && !h.starved) else {
             return;
         };
         if let Some(mut p) = h.probe.take() {
@@ -998,6 +1010,10 @@ impl Estimator {
                     self.probed_at = Some(now);
                 }
                 "stopped"
+            } else if p.probes < PROBE_MIN && now.saturating_duration_since(p.since) >= PROBE_STARVED
+            {
+                h.starved = true;
+                "starved"
             } else if now.saturating_duration_since(p.since) >= PROBE_STEP && p.probes >= PROBE_MIN
             {
                 let carried = p.kbps.min(p.sent.0 / f64::from(p.sent.1.max(1)));
@@ -1023,6 +1039,7 @@ impl Estimator {
                 result,
                 probe_kbps = p.kbps as u64,
                 held_kbps = h.kbps as u64,
+                probes = p.probes,
                 loss_pct = loss * 100.0,
                 floor_pct = floor * 100.0,
                 "WebTransport capacity probe at {:.0} kbps {result}; line {:.0} kbps",
@@ -1031,9 +1048,18 @@ impl Estimator {
             );
         }
         let since = h.stepped.max(h.probe_wait);
-        if !stopped && now.saturating_duration_since(since) >= PROBE_WAIT {
+        if !stopped && !h.starved && now.saturating_duration_since(since) >= PROBE_WAIT {
+            let kbps = (h.kbps * PROBE_GAIN).min(self.ceiling_kbps / BETA / BETA);
+            tracing::info!(
+                token = "webtransport-hold-probe",
+                result = "started",
+                probe_kbps = kbps as u64,
+                held_kbps = h.kbps as u64,
+                "WebTransport capacity probe at {kbps:.0} kbps started; line {:.0} kbps",
+                h.kbps
+            );
             h.probe = Some(Probe {
-                kbps: (h.kbps * PROBE_GAIN).min(self.ceiling_kbps / BETA / BETA),
+                kbps,
                 since: now,
                 counted: (0, 0),
                 probes: 0,
@@ -1125,7 +1151,7 @@ impl Estimator {
                 // hold's renewal line it is too little to keep a hold alive anyway.
                 // A hold that probes with repair datagrams keeps its line and climbs over the floor
                 // instead: putting the pre-hold rate back cost a freeze each time (seat B S2).
-                if least >= LOSS_LOW / 2.0 && !self.probes {
+                if least >= LOSS_LOW / 2.0 && !self.probing_hold() {
                     self.end_hold("loss-floor");
                 }
             }
@@ -1390,6 +1416,16 @@ impl Estimator {
         if released {
             self.random_burst = Some(now);
             self.end_hold("burst-not-capacity");
+        } else if prev.filter(|_| self.episode.is_none()).is_some_and(|run| {
+            !run.key
+                && now.saturating_duration_since(run.at) < HOLD_STEP_GAP
+                && self
+                    .random_burst
+                    .is_some_and(|at| now.saturating_duration_since(at) < HOLD)
+        }) {
+            // A steady Wi-Fi pattern keeps its memory: expiring, it let the next burst set a hold
+            // and step the rung down every 60 s (lab V3, bursts every 4 and 10 s).
+            self.random_burst = Some(now);
         }
         // The burst memory never blocks loss lasting `HOLD_STEP_GAP`: a release it got wrong (seat B
         // M1': 3800 under the lab encoder's keyframes) otherwise cost 61 s with no frame.
@@ -1406,7 +1442,7 @@ impl Estimator {
             .filter(|_| congested && !random && settled)
             .map(|r| BETA * r);
         // A probe that meets loss found the link: back off from it, as from a burst.
-        let probing = !self.probes
+        let probing = !self.probing_hold()
             && self
                 .held
                 .is_some_and(|h| now.saturating_duration_since(h.since) >= HOLD);
@@ -1433,6 +1469,7 @@ impl Estimator {
                 dropped: false,
                 probe: None,
                 probe_wait: now,
+                starved: false,
             });
             // Still congested a step after the line came down, with the sender under what the link
             // then delivered or the link now delivering under the line: that line did not cure it.
@@ -2479,6 +2516,12 @@ pub(crate) struct Backlog {
     asks: Holds,
     /// Video units and `nack` answers skipped over the connection.
     pub(crate) skipped: u64,
+    /// The pacer holds video (`video_rates`): QUIC's queue stands at its room on a path the window
+    /// limits, so only a queue that stood with no ACK is stalled. The ACK count at the last
+    /// `acknowledge`, and when the queue began to stand.
+    pub(crate) paced: bool,
+    acks: u64,
+    growing_acks: u64,
 }
 
 impl Backlog {
@@ -2487,6 +2530,7 @@ impl Backlog {
     }
 
     pub(crate) fn acknowledge(&mut self, acks: u64) {
+        self.acks = acks;
         if self.probe_acks.is_some_and(|before| before != acks) {
             self.probe_acks = None;
         }
@@ -2540,10 +2584,11 @@ impl Backlog {
         // Sending a probe can empty a small queue even while the path is down. Only
         // an ACK proves recovery; otherwise the original give-up clock must keep running.
         let empty = queued < BACKLOG_EMPTY && self.probe_acks.is_none();
-        if empty || queued < self.last {
+        let acked = self.paced && self.growing_since.is_some() && self.acks != self.growing_acks;
+        if empty || queued < self.last || acked {
             self.growing_since = None;
-        } else {
-            self.growing_since.get_or_insert(now);
+        } else if self.growing_since.is_none() {
+            (self.growing_since, self.growing_acks) = (Some(now), self.acks);
         }
         self.last = queued;
         if !self.skipping {
@@ -2644,6 +2689,8 @@ pub(crate) struct VideoQueue {
     /// Video and resent datagrams over the path's datagram size, skipped.
     pub(crate) too_large: u64,
     pub(crate) resends_too_large: u64,
+    /// Capacity-probe repairs over it: that frame's probe ended (`fill_probe`).
+    pub(crate) probes_too_large: u64,
     /// The keyframe (its `queued_at`) whose first datagram was handed within the hold: the
     /// rest of it may still go however old (`Self::feed`).
     keyframe_started: Option<Instant>,
