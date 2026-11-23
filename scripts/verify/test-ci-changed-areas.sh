@@ -24,6 +24,9 @@ expect - CHANGELOG.md README.md docs/architecture-and-plan.md design_handoff_v3/
 expect go control-plane/internal/session/launcher.go
 expect go control-plane/migrations/0108_x.up.sql
 expect go scripts/verify/go-test-parallel.sh
+expect go scripts/harness/udprelay/shape_test.go
+expect go scripts/harness/udprelay/main.go
+expect go scripts/harness/udprelay/redirect.sh
 expect web web/src/App.tsx
 expect web docs/upgrading.md
 expect rust node-agent/src/main.rs
