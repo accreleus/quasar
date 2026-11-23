@@ -2347,10 +2347,12 @@ fn a_v2_hold_with_fec_keeps_video_plus_repairs_under_the_ceiling() {
             let mut g = g2.lock().unwrap();
             match line {
                 Some(line) => drop(g.hold_to(line, now())),
-                None => drop(g.hold_off(now())),
+                None => g.hold_off(now()),
             }
         }),
-        measured: Box::new(move |reading| drop(g3.lock().unwrap().observe_report(reading, now()))),
+        measured: Box::new(move |reading| {
+            g3.lock().unwrap().observe_report(reading, now());
+        }),
         observe: Box::new(move |kbps, share| {
             let mut g = g4.lock().unwrap();
             g.set_share(share, now());
