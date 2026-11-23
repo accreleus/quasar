@@ -6098,10 +6098,18 @@ fn a_probe_repair_over_a_shrunk_datagram_size_ends_the_probe_not_the_stream() {
         log.record(d, at(16_000), false);
     }
     let mut tries = 0;
-    let alive = fill_probe(&mut log, Some(20_000.0), &mut probe_frame, &mut video, 1, at(16_700), |_| {
-        tries += 1;
-        congestion::Handed::TooLarge
-    });
+    let alive = fill_probe(
+        &mut log,
+        Some(20_000.0),
+        &mut probe_frame,
+        &mut video,
+        1,
+        at(16_700),
+        |_| {
+            tries += 1;
+            congestion::Handed::TooLarge
+        },
+    );
     assert!(alive, "a refused repair ended the stream");
     assert_eq!((tries, video.probes_too_large), (1, 1));
     assert!(probe_frame.is_none(), "the frame still probes");

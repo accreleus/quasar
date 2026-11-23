@@ -826,12 +826,20 @@ impl Sim {
             let read = quic.read();
             let (queue, queued, seqs) = (&mut quic.queue, &mut quic.queued, &mut self.probe_seqs);
             let frame = &mut self.probe_frame;
-            super::super::fill_probe(&mut self.log, probe, frame, &mut quic.video, read, at, |d| {
-                seqs.insert(wire_seq(&d));
-                *queued += d.len();
-                queue.push_back(d);
-                Handed::Sent
-            });
+            super::super::fill_probe(
+                &mut self.log,
+                probe,
+                frame,
+                &mut quic.video,
+                read,
+                at,
+                |d| {
+                    seqs.insert(wire_seq(&d));
+                    *queued += d.len();
+                    queue.push_back(d);
+                    Handed::Sent
+                },
+            );
         }
         if quic.video.bytes() > self.held_max.0 {
             self.held_max = (quic.video.bytes(), self.t as f64 / 1e6);
@@ -2289,10 +2297,9 @@ fn paced_a_queue_standing_with_acks_is_no_stall_and_without_them_is_one() {
             paced: true,
             ..Default::default()
         };
-        (1..60u32).find_map(|n| {
+        (1..60u32).find(|&n| {
             b.acknowledge(if acking { u64::from(n) } else { 0 });
-            let admit = b.admit(4 * SIZE, false, start + FRAME * n, HOLD);
-            (admit != Admit::Send).then_some(n)
+            b.admit(4 * SIZE, false, start + FRAME * n, HOLD) != Admit::Send
         })
     };
     assert_eq!(standing(true), None, "a path that acknowledges");

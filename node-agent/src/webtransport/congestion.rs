@@ -1010,7 +1010,8 @@ impl Estimator {
                     self.probed_at = Some(now);
                 }
                 "stopped"
-            } else if p.probes < PROBE_MIN && now.saturating_duration_since(p.since) >= PROBE_STARVED
+            } else if p.probes < PROBE_MIN
+                && now.saturating_duration_since(p.since) >= PROBE_STARVED
             {
                 h.starved = true;
                 "starved"
