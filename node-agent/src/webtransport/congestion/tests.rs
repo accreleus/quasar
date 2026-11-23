@@ -6038,9 +6038,9 @@ fn loss_between(s: &Sim, from: f64, to: f64) -> f64 {
 /// measured per-rung ratios and production's adaptive FEC. R3 reaches 540p within 15 s of the onset
 /// (lab run 1: 720p until onset + 37 s, the FEC charge capped at 3 % by 1080p's floor), R4 reaches
 /// 360p or loses at most 2 % while shaped, neither freezes over twice or steps the rung up while
-/// shaped, the guard never stalls after onset + 15 s, and both are back at 1080p within 20 s of the
-/// clear (probe round: the repair-datagram probe; with the video line probing after a 60 s hold, 26
-/// and 69 s). Legacy is printed.
+/// shaped, the guard never stalls after onset + 15 s, and both are back at 1080p within 25 s of the
+/// clear (probe round 3: three 5.2 s proving steps and the ladder's 4 s; with the video line probing
+/// after a 60 s hold, 26 and 69 s). Legacy is printed.
 #[test]
 fn lab_rows_with_the_lab_encoders_keyframes_hold_and_recover() {
     for (name, shape) in [("R3", shallow as fn(&mut Sim)), ("R4", policer)] {
@@ -6059,7 +6059,7 @@ fn lab_rows_with_the_lab_encoders_keyframes_hold_and_recover() {
             .collect();
         assert!(ups.is_empty(), "{name}: rung up while shaped {ups:?}");
         assert!(stalls.is_empty(), "{name}: stalls {stalls:?}");
-        assert!(back.is_some_and(|b| b <= 20.0), "{name}: back {back:?}");
+        assert!(back.is_some_and(|b| b <= 25.0), "{name}: back {back:?}");
         match name {
             "R3" => assert!(s.rung_at(45.0) >= 3, "R3: rung {} at 45 s", s.rung_at(45.0)),
             _ => assert!(
@@ -6090,7 +6090,7 @@ fn policer_4(s: &mut Sim) {
 /// Seat B, hold round 4 (#1433 M1'): R4 with the lab encoder over a 4 % random-loss floor freezes
 /// at most 3 times while shaped. Old code: 42 freezes, the burst memory blocking every hold for
 /// 60 s after a release. Seat B S2 (probe round): the 2 % rows freeze at most once while shaped,
-/// and every row is back at 1080p within 20 s of the clear (the random loss stays). bdf82c12: 7
+/// and every row is back at 1080p within 35 s of the clear (the random loss stays). bdf82c12: 7
 /// (R3) and 4 (R4) freezes, each `loss-floor` end putting the pre-hold rate back; R4 + 4 % never
 /// back.
 #[test]
@@ -6109,45 +6109,99 @@ fn lab_rows_over_a_random_loss_floor_keep_the_hold() {
             shaped.len() <= most,
             "{name}: freezes while shaped {shaped:?}"
         );
+        // A random loss that stops a 5.2 s proving step costs `PROBE_WAIT` and the step again.
         let back = back_after_clear(&s);
-        assert!(back.is_some_and(|b| b <= 20.0), "{name}: back {back:?}");
+        assert!(back.is_some_and(|b| b <= 35.0), "{name}: back {back:?}");
     }
 }
 
-/// Seat B, probe round 2 (#1433 M1): a bucket holding 0.5-0.7 s of the policer's rate (a cable
-/// modem's burst, a carrier policer) passed a whole probe step clean, so the line went over the
-/// policer; video then drained the bucket and froze, again each probe. d463755b: 1 MB froze 14 times
-/// while shaped at 4.2 % loss, 750 kB 16 times, lines up to 6384. Each bucket to 1 MB freezes at
-/// most twice while shaped (to 500 kB once), no line is over the policer after onset + 20 s, and the
-/// row is back at 1080p within 15 s of the clear. 2 MB, past `PROBE_BUCKET_S`, is printed.
+/// Seat B, probe rounds 2 and 3 (#1433 M1, M1'): a policer's bucket passes a probe step clean until
+/// it drains, and a raise past the policer's rate then drains it under video and freezes. Under
+/// `Sim::lab_hw`, a 5000 kbit/s policer with buckets to 2 MB (3.2 s at its rate), the same after 60 s
+/// at 2500, and Wi-Fi bursts over a 1 MB bucket: no line over the policer 20 s after the onset or
+/// the switch. Past the onset's cut, a plain policer freezes at most once and the switch twice, and
+/// both are back at 1080p within 25 s of the clear. d463755b: 1 MB froze 14 times; 0bf22755: 1.25 MB
+/// 12, the switch 11 at 750 kB. The Wi-Fi row's freezes follow its Wi-Fi releases (the hold ends and
+/// the estimate climbs into the bucket), which no probe governs: printed.
 #[test]
 fn a_deep_bucket_policer_never_lets_the_probe_raise_the_line_over_it() {
     let mut failed = Vec::new();
-    for (name, bytes, most) in [
-        ("15 kB", 15_000.0, Some(1)),
-        ("150 kB", 150_000.0, Some(1)),
-        ("500 kB", 500_000.0, Some(1)),
-        ("750 kB", 750_000.0, Some(2)),
-        ("1 MB", 1_000_000.0, Some(2)),
-        ("2 MB", 2_000_000.0, None),
+    // (name, bucket, 2500 for 60 s first, Wi-Fi bursts, most freezes past the onset's cut)
+    for (name, bytes, switch, wifi, most) in [
+        ("15 kB", 15_000.0, false, false, Some(1)),
+        ("150 kB", 150_000.0, false, false, Some(1)),
+        ("500 kB", 500_000.0, false, false, Some(1)),
+        ("750 kB", 750_000.0, false, false, Some(1)),
+        ("1 MB", 1_000_000.0, false, false, Some(1)),
+        ("1.25 MB", 1_250_000.0, false, false, Some(1)),
+        ("1.5 MB", 1_500_000.0, false, false, Some(1)),
+        ("2 MB", 2_000_000.0, false, false, Some(1)),
+        ("2500 then 750 kB", 750_000.0, true, false, Some(2)),
+        ("2500 then 1 MB", 1_000_000.0, true, false, Some(2)),
+        ("2500 then 1.5 MB", 1_500_000.0, true, false, Some(2)),
+        ("1 MB + Wi-Fi", 1_000_000.0, false, true, None),
     ] {
-        let shape = |s: &mut Sim| {
-            policer(s);
-            s.bucket_bytes = Some(bytes);
+        let mut s = Sim::lab_hw(false);
+        if wifi {
+            // 40 % for 300 ms every 7 s from 10 s (`wifi_bursts`).
+            s.loss_at =
+                Box::new(
+                    |t| match t >= 10_000_000 && (t - 10_000_000) % 7_000_000 < 300_000 {
+                        true => 0.4,
+                        false => 0.0,
+                    },
+                );
+        }
+        s.run(30.0);
+        policer(&mut s);
+        s.bucket_bytes = Some(bytes);
+        (s.tokens, s.tokens_at) = (15_000.0, s.t);
+        let caps: &[(f64, f64)] = match switch {
+            true => {
+                s.cap_kbps = 2500.0;
+                s.run(60.0);
+                s.cap_kbps = 5000.0;
+                s.run(120.0);
+                &[(30.0, 2500.0), (90.0, 5000.0)]
+            }
+            false => {
+                s.run(180.0);
+                &[(30.0, 5000.0)]
+            }
         };
-        let s = lab_hw_row(false, shape, 120.0);
+        s.clear();
+        s.loss_at = Box::new(|_| 0.0);
+        s.run(120.0);
         let (freezes, _) = hw_summary(&format!("R4 {name} v2"), &s);
-        let shaped: Vec<_> = freezes.iter().filter(|&&t| t < 210.0).collect();
-        let lines = s.lines.iter().filter(|&&(t, _)| (50.0..210.0).contains(&t));
-        let top = lines.clone().filter_map(|&(_, l)| l).fold(0.0, f64::max);
-        let over: Vec<_> = lines.filter(|l| l.1 > Some(5000.0)).take(5).collect();
+        // The cut at the onset (three freezes to 2500, before any probe) is not the probe's.
+        let shaped: Vec<_> = freezes
+            .iter()
+            .filter(|&&t| (35.0..210.0).contains(&t))
+            .collect();
+        let mut top = 0.0_f64;
+        let mut over = Vec::new();
+        for (i, &(from, cap)) in caps.iter().enumerate() {
+            let to = caps.get(i + 1).map_or(210.0, |c| c.0);
+            for &(t, l) in &s.lines {
+                if let Some(l) = l.filter(|_| (from + 20.0..to).contains(&t)) {
+                    top = top.max(l / cap);
+                    if l > cap && over.len() < 5 {
+                        over.push((t, l));
+                    }
+                }
+            }
+        }
         let back = back_after_clear(&s);
         eprintln!(
-            "  loss while shaped {:.3}, top line after onset + 20 s {top:.0}",
-            loss_between(&s, 30.0, 210.0)
+            "  loss while shaped {:.3}, top line 20 s after a cap {:.2} x it",
+            loss_between(&s, 30.0, 210.0),
+            top
         );
-        let Some(most) = most else { continue };
-        if shaped.len() > most || !over.is_empty() || back.is_none_or(|b| b > 15.0) {
+        let late = match most {
+            Some(most) => shaped.len() > most || back.is_none_or(|b| b > 25.0),
+            None => false,
+        };
+        if late || !over.is_empty() {
             failed.push(format!(
                 "{name}: freezes while shaped {shaped:?}, lines over the policer {over:?}, back \
                  {back:?}"
@@ -6160,8 +6214,8 @@ fn a_deep_bucket_policer_never_lets_the_probe_raise_the_line_over_it() {
 /// Probe round (#1433): a hold that can probe sends repair datagrams at `PROBE_GAIN` × the line
 /// `PROBE_WAIT` after the line stepped down. A step carried clean raises the line to `BETA`² × what
 /// it carried and doubles again; a report that loses the probe's datagrams stops it at once and the
-/// line stays. Probe round 2 (seat B M1): the first step raises only once it has sent
-/// `PROBE_BUCKET_S` of what the link delivered over that rate.
+/// line stays. Probe round 3 (seat B M1'): every raise first sends `PROBE_BUCKET_S` of its landing
+/// past it, 5.2 s at `PROBE_GAIN`.
 #[test]
 fn a_probe_raises_the_line_only_on_a_step_carried_clean() {
     let start = Instant::now();
@@ -6169,57 +6223,47 @@ fn a_probe_raises_the_line_only_on_a_step_carried_clean() {
     est.probes = true;
     let at = |ms: u64| start + Duration::from_millis(ms);
     est.apply(received(6000.0, 0.3), at(100), NO_QUIC);
-    let line = BETA * 6000.0;
+    let mut line = BETA * 6000.0;
     for ms in (200..5100).step_by(50) {
         est.apply(received(5000.0, 0.0), at(ms), NO_QUIC);
         assert_eq!(est.probe_kbps(), None, "probing at {ms} ms");
     }
     est.apply(received(5000.0, 0.0), at(5100), NO_QUIC);
-    assert_eq!(est.probe_kbps(), Some(PROBE_GAIN * line));
-    let carried = Measured {
-        sent_kbps: Some(line),
-        probe_sent_kbps: line,
-        ..received(2.0 * line, 0.0)
-    };
-    // The first step proves `PROBE_BUCKET_S` of what the link delivered (6000) past it: 2.86 s.
-    for ms in (5150..=7950).step_by(50) {
+    let mut since = 5100;
+    for step in 0..2 {
+        assert_eq!(est.probe_kbps(), Some(PROBE_GAIN * line), "step {step}");
+        let carried = Measured {
+            sent_kbps: Some(line),
+            probe_sent_kbps: line,
+            ..received(2.0 * line, 0.0)
+        };
+        // Raised once (2 × line − landing) × t ≥ 2 s × landing: 5.207 s.
+        for ms in (since + 50..=since + 5200).step_by(50) {
+            est.probe_counted = (10, 0);
+            est.apply(carried, at(ms), NO_QUIC);
+            assert!(
+                est.held_kbps() == Some(line),
+                "step {step} raised at {ms} ms"
+            );
+        }
+        since += 5250;
         est.probe_counted = (10, 0);
-        est.apply(carried, at(ms), NO_QUIC);
-        assert!(est.held_kbps() == Some(line), "raised at {ms} ms");
+        est.apply(carried, at(since), NO_QUIC);
+        line *= BETA * BETA * PROBE_GAIN;
+        assert!(
+            est.held_kbps().is_some_and(|l| (l - line).abs() < 1.0),
+            "step {step}: line {:?}, want {line:.0}",
+            est.held_kbps()
+        );
     }
-    est.probe_counted = (10, 0);
-    est.apply(carried, at(8000), NO_QUIC);
-    let raised = BETA * BETA * PROBE_GAIN * line;
-    assert!(
-        est.held_kbps().is_some_and(|l| (l - raised).abs() < 1.0),
-        "line {:?}, want {raised:.0}",
-        est.held_kbps()
-    );
-    // The next step, chained to it, takes `PROBE_STEP`: the first one emptied any bucket.
-    assert_eq!(est.probe_kbps(), Some(PROBE_GAIN * raised), "next step");
-    let carried = Measured {
-        sent_kbps: Some(raised),
-        probe_sent_kbps: raised,
-        ..received(2.0 * raised, 0.0)
-    };
-    for ms in (8050..=9000).step_by(50) {
-        est.probe_counted = (10, 0);
-        est.apply(carried, at(ms), NO_QUIC);
-    }
-    let raised = BETA * BETA * PROBE_GAIN * raised;
-    assert!(
-        est.held_kbps().is_some_and(|l| (l - raised).abs() < 1.0),
-        "line {:?}, want {raised:.0}",
-        est.held_kbps()
-    );
     est.probe_counted = (5, 10);
-    est.apply(received(raised, 0.0), at(9050), NO_QUIC);
+    est.apply(received(line, 0.0), at(since + 50), NO_QUIC);
     assert_eq!(
         est.probe_kbps(),
         None,
         "a probe losing its datagrams goes on"
     );
-    assert!(est.held_kbps().is_some_and(|l| (l - raised).abs() < 1.0));
+    assert!(est.held_kbps().is_some_and(|l| (l - line).abs() < 1.0));
 }
 
 /// Probe round (#1433): the probe's datagrams are counted apart. Losing them is no video loss (the

@@ -132,10 +132,10 @@ const PROBE_WAIT: Duration = Duration::from_secs(5);
 /// and over 200 datagrams at 2.4 Mbit/s to judge 2 % loss on.
 const PROBE_STEP: Duration = Duration::from_secs(1);
 /// A policer's bucket passes a step clean until it drains, and a deep one (a cable modem's burst,
-/// a carrier policer: 1-2 s at its rate) outlasts `PROBE_STEP`, so the line went over it and video
-/// froze each probe. The first step after a stop raises only once it has sent this many seconds of
-/// `HoldLine::seen` over that rate; the steps chained after it take `PROBE_STEP`, as it drained any
-/// bucket. A bucket over about 3 s at the rate still passes it.
+/// a carrier policer: 1-2 s at its rate) outlasts `PROBE_STEP`. A step therefore raises the line to
+/// `BETA`² × what it carried only once it has sent this many seconds of that landing past it: were
+/// the link's rate under the landing, the step drained more than that many seconds of the rate. A
+/// bucket under about 2 s at the rate cannot pass it; each raise takes about 5.2 s.
 const PROBE_BUCKET_S: f64 = 2.0;
 /// The probe's total, a multiple of the line: on a link still shaped (a line at 0.7-0.85 × it) the
 /// probe is far over it, so its loss shows in the first report and it stops at once. A probe just
@@ -789,10 +789,6 @@ struct HoldLine {
     /// (`PROBE_WAIT`).
     probe: Option<Probe>,
     probe_wait: Instant,
-    /// What the link delivered when the line last came down (`PROBE_BUCKET_S`), and whether the
-    /// last step raised the line, so the next one is chained to it.
-    seen: f64,
-    chained: bool,
 }
 
 /// One probe step: the total on the wire it fills to, since when, and what the reports since then
@@ -992,7 +988,7 @@ impl Estimator {
             };
             let over = excess(n, loss, LOSS_LOW) || excess(now_n, now_loss, LOSS_HIGH);
             let result = if stopped || over {
-                (h.probe_wait, h.chained) = (now, false);
+                h.probe_wait = now;
                 // Behind each frame the probe's own datagrams overflow first; a Wi-Fi burst drops
                 // video and probe alike.
                 let probe_loss = p.probe_lost.max(0) as f64 / p.probes.max(1) as f64;
@@ -1006,15 +1002,13 @@ impl Estimator {
             {
                 let carried = p.kbps.min(p.sent.0 / f64::from(p.sent.1.max(1)));
                 let secs = now.saturating_duration_since(p.since).as_secs_f64();
-                if !h.chained
-                    && carried > h.seen
-                    && (carried - h.seen) * secs < PROBE_BUCKET_S * h.seen
-                {
+                let to = BETA * BETA * carried;
+                // Only to a rate the step drained a `PROBE_BUCKET_S` bucket past.
+                if to > h.kbps && carried * secs < to * (secs + PROBE_BUCKET_S) {
                     h.probe = Some(p);
                     return;
                 }
-                h.kbps = h.kbps.max(BETA * BETA * carried);
-                h.chained = true;
+                h.kbps = h.kbps.max(to);
                 // Carried at the most a probe tries: nothing left to hold.
                 if p.kbps >= 0.999 * self.ceiling_kbps / BETA / BETA {
                     h.kbps = self.ceiling_kbps;
@@ -1439,8 +1433,6 @@ impl Estimator {
                 dropped: false,
                 probe: None,
                 probe_wait: now,
-                seen: 0.0,
-                chained: false,
             });
             // Still congested a step after the line came down, with the sender under what the link
             // then delivered or the link now delivering under the line: that line did not cure it.
@@ -1449,7 +1441,7 @@ impl Estimator {
                 && (line / BETA < h.kbps || sent <= h.kbps / BETA);
             let to = line.min(if again { BETA * h.kbps } else { h.kbps });
             if to < h.kbps {
-                (h.kbps, h.stepped, h.cause, h.seen) = (to, now, cause, to / BETA);
+                (h.kbps, h.stepped, h.cause) = (to, now, cause);
             }
             (h.since, h.trouble) = (now, h.trouble.max(line / BETA));
             h.dropped |= burst.or(met).is_some();

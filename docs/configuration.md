@@ -783,17 +783,17 @@ WebTransport in `protective`, keep the window loop the rest of this section desc
   the last frame (two neighbouring fragments each), in one burst right behind each frame, so video
   plus repairs fill the wire to 2 × the line; video stays at the line. A policer refills, and a
   queue drains, over the whole frame interval, and the frame takes that room first, so at the
-  link's edge it is the repairs that overflow. A second of it with the loss of everything sent
-  under 2 % (and 4 datagrams) over what the link lost with no probe running, no reading and no
-  delay overuse raises the line to 0.72 × (0.85²) what was carried, and the next probe doubles
-  the new line at once; a probe at the most it tries (the ceiling ÷ 0.72) ends the hold. The
-  first step after a stop raises only once it has sent 2 s of what the link delivered when the
-  line last came down over that rate (about 3 s at twice the line), so a policer's bucket of up
-  to about 3 s at its rate cannot pass it clean; the steps chained after it take a second each.
+  link's edge it is the repairs that overflow. A step with the loss of everything sent under 2 %
+  (and 4 datagrams) over what the link lost with no probe running, no reading and no delay
+  overuse raises the line to 0.72 × (0.85²) what was carried, and the next probe doubles the new
+  line at once; a probe at the most it tries (the ceiling ÷ 0.72) ends the hold. A step raises
+  only once it has sent 2 s of its new line past that line (about 5.2 s at twice the line): were
+  the link's rate under the new line, the step drained more than 2 s of it, so a policer's bucket
+  of up to about 2 s at its rate cannot pass it clean and the line never lands over the policer.
   A report losing 10 % (and 4 datagrams) over that, a new line, a reading or overuse stops the
   probe at once and the line stays. A lost repair datagram is not video loss: the hold, the loss
-  bound and FEC read video's. A link that lifted is back at 1080p in 12-15 s (sim, lab rows
-  R3/R4), where the line probing at 2 % a second took 26-69 s.
+  bound and FEC read video's. A link that lifted is back at 1080p in about 24 s (sim, lab rows
+  R3/R4; up to 32 s over 2 % random loss), where the line probing at 2 % a second took 26-69 s.
   With no FEC, after 60 s with no renewal the line rises 2 % a second up to the most the link
   delivered while dropping, then 8 % a second, and goes once it reaches the ceiling; a probe
   that meets 2 % loss drops it to 0.85 × what that window delivered. The line reaches the ABR as
