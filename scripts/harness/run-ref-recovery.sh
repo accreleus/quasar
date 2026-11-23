@@ -14,6 +14,7 @@
 #   GPU_ARGS  docker device args (default: --device /dev/dri;
 #             NVIDIA: "--gpus all -e NVIDIA_DRIVER_CAPABILITIES=all")
 #   FFMPEG    ffmpeg command for the checker (default: the linuxserver/ffmpeg image)
+#   QUASAR_REF_RECOVERY_{ANCHORS,GOP,SIZE,SLOTS}  passed to the capture (its doc comment)
 set -euo pipefail
 
 encoder=vulkan
@@ -34,6 +35,12 @@ image=${IMAGE:-quasar-agent-dev:latest}
 read -r -a gpu <<<"${GPU_ARGS:---device /dev/dri}"
 mkdir -p "$out"
 
+knobs=()
+for k in ANCHORS GOP SIZE SLOTS; do
+  v=QUASAR_REF_RECOVERY_$k
+  [ -z "${!v:-}" ] || knobs+=(-e "$v=${!v}")
+done
+
 captured=()
 for c in "${codecs[@]}"; do
   el=$prefix${c}enc
@@ -43,7 +50,7 @@ for c in "${codecs[@]}"; do
   docker run --rm "${gpu[@]}" \
     -v "$PWD":/workspace -v "$out":/out -w /workspace/node-agent \
     -e QUASAR_REF_RECOVERY_OUT=/out -e QUASAR_REF_RECOVERY_CODEC="$c" \
-    -e QUASAR_REF_RECOVERY_ENCODER="$encoder" \
+    -e QUASAR_REF_RECOVERY_ENCODER="$encoder" "${knobs[@]}" \
     "$image" sh -c "gst-inspect-1.0 --exists $el || exit 77; \
       cargo test --lib session::pipeline::ref_recovery::tests::capture_for_harness \
       -- --ignored --exact --nocapture && chown -R $(id -u):$(id -g) /out" || rc=$?
