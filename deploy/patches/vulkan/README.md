@@ -1592,31 +1592,35 @@ class `sys/nvcodec/gstnvencoder.cpp` with NVENC's per-picture long-term referenc
 - `num-anchors` > 0 turns on `enableLTR` (per-picture mode, `ltrTrustMode` 0). HEVC gets
   `ltrNumFrames = num-anchors` and `num-anchors + 1` references. H.264 gets every long-term index
   the level leaves (`ltrNumFrames` = MaxDpbFrames - 1, at most the device's) and
-  `max_num_ref_frames` one more. Clamped, with a
-  warning, to `NV_ENC_CAPS_NUM_MAX_LTR_FRAMES` and to the level, as on the Vulkan encoders (the
-  same table, same results; `num-anchors + 2` DPB pictures): the DPB must fit MaxDpbFrames (H.264) or MaxDpbSize (HEVC) of the
-  configured level, else of the lowest level that fits the size and rate, so anchors never raise
-  it. 0 with B frames, and 0 on AV1: the NVENC API GStreamer speaks (12.0) has no AV1 long-term
-  references, so on `nvav1enc` every recovery is a key frame.
-- An anchor is marked long-term (`ltrMarkFrame`, `ltrMarkFrameIdx`): a free index, else the oldest
-  anchor's. A recovery frame codes from that index only (`ltrUseFrames`, `ltrUseFrameBitmap`): its
-  one reference is the anchor, named long-term. Newer anchors are forgotten. On HEVC the recovery
-  frame first invalidates (`NvEncInvalidateRefFrames`) the last eight pictures newer than its
-  anchor, or NVENC keeps the lost ones in its RPS. Never on H.264: invalidation drops pictures from
-  NVENC's own DPB that the sliding window still holds, and NVENC then leaves out the MMCO 1 a later
-  long-term marking needs, so every decoder ends one reference over `max_num_ref_frames`. Both were
-  measured.
-- H.264: an index whose anchor a recovery forgot is retired until the next IDR. Overwriting it
-  would send MMCO 6 with no MMCO 1, so a decoder that lost that anchor (its sliding window holds one
-  more short-term picture instead) would end one reference over `max_num_ref_frames`; measured,
-  ffmpeg drops a picture there. A new anchor takes an unused index, whose MMCO 6 comes with the
-  MMCO 1 that frees a short-term picture in every decoder. With none left, it replaces the oldest
-  held anchor, which every decoder holds. HEVC names its references explicitly and reuses indices.
-- The held set is tracked in the element: an IDR (the first frame, a forced key frame, every
-  `gop-size` frames) drops all of them. The anchor waits follow the Vulkan encoders, H.264's
-  included, so the agent and the harness see one behaviour per codec.
-- The pts the reports carry is the frame's pts as `GstVideoEncoder` hands it to the element, which
-  NVENC returns as `outputTimeStamp` (the base class sets a 1000 h min-pts, as the Vulkan
-  H.264/HEVC encoders do).
+  `max_num_ref_frames` one more. Clamped, with a warning, to `NV_ENC_CAPS_NUM_MAX_LTR_FRAMES` and
+  so that `num-anchors + 2` DPB pictures fit MaxDpbFrames (H.264) or MaxDpbSize (HEVC, on the size
+  rounded up to 8) of the level the stream gets without anchors: anchors never raise the level.
+  The table is the Vulkan encoders' (`sys/nvcodec/gstnvenclevel.h`, tested GPU-free by
+  `tests/check/libs/nvenclevel.c`). 0 with B frames, and 0 on AV1: the NVENC API GStreamer speaks
+  (12.0) has no AV1 long-term references, so on `nvav1enc` every recovery is a key frame.
+- While anchors are on, the element places every IDR: NVENC's own cadence is off (`gopLength`,
+  `idrPeriod` infinite) and the element forces a key frame every `gop-size` frames, so its held set
+  matches NVENC's by construction. A key frame (also the first, and any forced one) drops every
+  anchor.
+- An anchor is marked long-term (`ltrMarkFrame`, `ltrMarkFrameIdx`). A recovery frame codes from
+  that index only (`ltrUseFrames`, `ltrUseFrameBitmap`): its one reference is the anchor, named
+  long-term. Newer anchors are forgotten.
+- HEVC: the recovery frame first invalidates (`NvEncInvalidateRefFrames`) the last eight pictures
+  newer than its anchor and every anchor it forgets, or NVENC keeps the lost ones in its RPS.
+- H.264: never invalidates. Invalidation drops pictures from NVENC's own DPB that the sliding window
+  still holds, and NVENC then leaves out the MMCO 1 a later long-term marking needs, so every
+  decoder ends one reference over `max_num_ref_frames`. An index whose anchor a recovery forgot is
+  retired until the next IDR: overwriting it would send MMCO 6 with no MMCO 1, and a decoder that
+  lost that anchor would end one reference over. A new anchor takes an unused index, whose MMCO 6
+  comes with the MMCO 1 that frees a short-term picture in every decoder. With none left it
+  replaces the oldest held anchor, which every decoder holds, so after recoveries NVENC H.264 can
+  drop an older anchor before `num-anchors` are held, until the next key frame; a recovery from it
+  is then a key frame, which the agent's loop must expect. All of this was measured.
+- H.264's SPS has `gaps_in_frame_num_value_allowed_flag` 0 and NVENC has no setting for it, so a
+  decoder sees a lost frame as a frame_num gap it conceals; the pruned decode stays bit-identical.
+- The anchor waits follow the Vulkan encoders, H.264's included, so the agent and the harness see
+  one behaviour per codec. The pts the reports carry is the frame's pts as `GstVideoEncoder` hands
+  it to the element, which NVENC returns as `outputTimeStamp` (the base class sets a 1000 h
+  min-pts, as the Vulkan H.264/HEVC encoders do).
 
 Hardware check: `scripts/harness/run-ref-recovery.sh --encoder nvenc` on the NVIDIA host.

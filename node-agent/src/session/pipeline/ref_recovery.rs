@@ -120,11 +120,13 @@ mod tests {
         /// Recover from the frame taken at this input frame, which the encoder no
         /// longer holds as an anchor: it must send a key frame.
         Gone(usize),
+        /// Force a key frame (GstForceKeyUnit, as the agent's `force_idr`).
+        Key,
     }
 
     /// Input frames the harness's checker treats as lost, inclusive ranges. Every
     /// recovery below follows a loss of the frames since its anchor's chain.
-    const LOST: [(usize, usize); 7] = [
+    const LOST: [(usize, usize); 8] = [
         (21, 34),
         (41, 49),
         (59, 65),
@@ -132,8 +134,10 @@ mod tests {
         (72, 79),
         (81, 84),
         (101, 104),
+        // anchor 112 lost, 14 frames before the recovery that forgets it
+        (109, 125),
     ];
-    const SCRIPT: [(usize, Step); 19] = [
+    const SCRIPT: [(usize, Step); 23] = [
         (10, Step::Anchor),
         (20, Step::Anchor),
         (30, Step::Anchor),
@@ -159,41 +163,77 @@ mod tests {
         (96, Step::Anchor),
         (100, Step::Anchor),
         (105, Step::Gone(88)),
+        (108, Step::Anchor),
+        (112, Step::Anchor),
+        // forgets 112, older than the last eight frames
+        (126, Step::From(108)),
+        (130, Step::Key),
     ];
-    const FRAMES: usize = 110;
+    const FRAMES: usize = 136;
+
+    /// How the encoder under test holds anchors.
+    #[derive(Clone, Copy)]
+    struct Model {
+        /// num-anchors in effect; 0 holds none, so every recovery is a key frame.
+        k: usize,
+        /// A key frame `gop` frames after the last one.
+        gop: usize,
+        /// The H.264 anchor waits.
+        h264: bool,
+        /// NVENC H.264's long-term indices: an index whose anchor a recovery forgot
+        /// is retired until the next key frame (`gstreamer-nvenc-ref-recovery.patch`).
+        slots: Option<usize>,
+    }
 
     /// What the encoder must make of [`SCRIPT`], by input frame: the anchors, the
     /// recoveries (frame, anchor) and the key frames. An anchor request waits out a
-    /// key frame and, on H.264, a recovery frame or the frame after an anchor
-    /// (`gstrefrecovery.h`). An encoder that holds no anchors (`held` false: NVENC AV1)
-    /// answers every recovery with a key frame. The checker requires exactly this.
-    fn expected(codec: &str, held: bool) -> serde_json::Value {
+    /// key frame and, on H.264, a recovery frame or the frame after an anchor; a
+    /// recovery from an anchor not held is a key frame; a key frame drops every
+    /// anchor (`gstrefrecovery.h`). The checker requires exactly this.
+    fn expected(m: Model) -> serde_json::Value {
         let (mut anchors, mut recoveries, mut keys) = (Vec::new(), Vec::new(), vec![0]);
-        let mut pending = false;
+        let (mut held, mut retired, mut pending, mut last_key) = (Vec::new(), 0, false, 0);
         for at in 1..FRAMES {
-            let (mut from, mut key) = (None, false);
+            let (mut key, mut asked) = (at - last_key >= m.gop, None);
             for (_, step) in SCRIPT.iter().filter(|(i, _)| *i == at) {
                 match step {
                     Step::Anchor => pending = true,
-                    _ if !held => key = true,
-                    Step::From(i) => from = Some(*i),
-                    Step::FromNewest => from = anchors.last().copied(),
-                    Step::Gone(_) => key = true,
+                    Step::Key => key = true,
+                    Step::From(i) | Step::Gone(i) => asked = Some(Some(*i)),
+                    Step::FromNewest => asked = Some(anchors.last().copied()),
+                }
+            }
+            let mut from = None;
+            if let (Some(target), false) = (asked, key) {
+                match target.filter(|a| held.contains(a)) {
+                    Some(a) => {
+                        let before = held.len();
+                        held.retain(|h| *h <= a);
+                        if m.slots.is_some() {
+                            retired += before - held.len();
+                        }
+                        from = Some(a);
+                    }
+                    None => key = true,
                 }
             }
             if key {
                 keys.push(at);
-                continue;
-            }
-            if !held {
-                pending = false;
+                (held, retired, last_key) = (Vec::new(), 0, at);
                 continue;
             }
             if let Some(a) = from {
                 recoveries.push((at, a));
             }
-            let waits = codec == "h264" && (from.is_some() || anchors.last() == Some(&(at - 1)));
-            if pending && !waits {
+            let waits = m.h264 && (from.is_some() || anchors.last() == Some(&(at - 1)));
+            if pending && m.k == 0 {
+                pending = false;
+            } else if pending && !waits {
+                let free = m.slots.is_none_or(|s| held.len() + retired < s);
+                if held.len() >= m.k || !free {
+                    held.remove(0);
+                }
+                held.push(at);
                 anchors.push(at);
                 pending = false;
             }
@@ -203,6 +243,12 @@ mod tests {
 
     #[test]
     fn expected_follows_the_script() {
+        let m = |k, gop, h264, slots| Model {
+            k,
+            gop,
+            h264,
+            slots,
+        };
         let recoveries = |newest: usize| {
             serde_json::json!([
                 [35, 20],
@@ -211,33 +257,50 @@ mod tests {
                 [63, 58],
                 [66, 58],
                 [70, 58],
-                [80, newest]
+                [80, newest],
+                [126, 108]
             ])
         };
-        for codec in ["av1", "h265"] {
+        let tail = [88, 92, 96, 100, 108, 112];
+        for model in [m(3, 1000, false, None), m(3, 1000, true, Some(8))] {
+            let newest = if model.h264 { 71 } else { 70 };
+            let mut want_anchors = vec![10, 20, 30, 40, 58, newest];
+            want_anchors.extend(tail);
             assert_eq!(
-                expected(codec, true),
+                expected(model),
                 serde_json::json!({
-                    "anchors": [10, 20, 30, 40, 58, 70, 88, 92, 96, 100],
-                    "recoveries": recoveries(70),
-                    "keys": [0, 85, 105],
+                    "anchors": want_anchors,
+                    "recoveries": recoveries(newest),
+                    "keys": [0, 85, 105, 130],
                 })
             );
         }
+        // nothing held: every recovery a key frame
         assert_eq!(
-            expected("h264", true),
-            serde_json::json!({
-                "anchors": [10, 20, 30, 40, 58, 71, 88, 92, 96, 100],
-                "recoveries": recoveries(71),
-                "keys": [0, 85, 105],
-            })
-        );
-        assert_eq!(
-            expected("av1", false),
+            expected(m(0, 1000, false, None)),
             serde_json::json!({
                 "anchors": [],
                 "recoveries": [],
-                "keys": [0, 35, 50, 55, 63, 66, 70, 80, 85, 105],
+                "keys": [0, 35, 50, 55, 63, 66, 70, 80, 85, 105, 126, 130],
+            })
+        );
+        // three indices, two anchors: 35 retires 30's index, so 40 replaces 10 (held
+        // 20) and 55 finds 10 gone
+        assert_eq!(
+            expected(m(2, 1000, true, Some(3))),
+            serde_json::json!({
+                "anchors": [10, 20, 30, 40, 58, 71, 88, 92, 96, 100, 108, 112],
+                "recoveries": [[35, 20], [50, 40], [63, 58], [66, 58], [70, 58], [80, 71], [126, 108]],
+                "keys": [0, 55, 85, 105, 130],
+            })
+        );
+        // the agent's GOP: the key frame at 60 drops 58
+        assert_eq!(
+            expected(m(3, 60, true, Some(8))),
+            serde_json::json!({
+                "anchors": [10, 20, 30, 40, 58, 71, 88, 92, 96, 100, 108, 112],
+                "recoveries": [[35, 20], [50, 40], [55, 10], [80, 71], [126, 108]],
+                "keys": [0, 60, 63, 66, 70, 85, 105, 130],
             })
         );
     }
@@ -245,7 +308,9 @@ mod tests {
     /// Hardware capture for `scripts/harness/run-ref-recovery.sh`: encodes a moving test
     /// pattern with `num-anchors=3`, sends [`SCRIPT`], and writes the access units, the
     /// raw input and the encoder's reports to `$QUASAR_REF_RECOVERY_OUT`.
-    /// `$QUASAR_REF_RECOVERY_ENCODER` is `vulkan` (default) or `nvenc`.
+    /// `$QUASAR_REF_RECOVERY_ENCODER` is `vulkan` (default) or `nvenc`; `_ANCHORS`
+    /// (default 3), `_GOP` (1000), `_SIZE` (640x360) and `_SLOTS` (NVENC H.264's
+    /// long-term indices at that size, when fewer than the script uses) set the run.
     #[test]
     #[ignore = "needs an encode GPU: scripts/harness/run-ref-recovery.sh"]
     fn capture_for_harness() {
@@ -255,6 +320,16 @@ mod tests {
         let out = std::path::PathBuf::from(std::env::var("QUASAR_REF_RECOVERY_OUT").unwrap());
         let codec = std::env::var("QUASAR_REF_RECOVERY_CODEC").unwrap();
         let encoder = std::env::var("QUASAR_REF_RECOVERY_ENCODER").unwrap_or("vulkan".into());
+        let env = |name: &str, default: &str| {
+            std::env::var(format!("QUASAR_REF_RECOVERY_{name}")).unwrap_or(default.into())
+        };
+        let k: usize = env("ANCHORS", "3").parse().unwrap();
+        let gop: usize = env("GOP", "1000").parse().unwrap();
+        let size = env("SIZE", "640x360");
+        let (width, height) = size.split_once('x').unwrap();
+        let slots = std::env::var("QUASAR_REF_RECOVERY_SLOTS")
+            .ok()
+            .map(|s| s.parse().unwrap());
         let (enc_name, caps, parser, out_caps) = match codec.as_str() {
             "h264" => (
                 "vulkanh264enc",
@@ -277,24 +352,40 @@ mod tests {
             other => panic!("QUASAR_REF_RECOVERY_CODEC={other}"),
         };
         // the NVENC encoder settings the agent uses (encoders.rs), less bitrate
-        let (upload, enc_name, gop) = match encoder.as_str() {
-            "vulkan" => ("vulkanupload !", enc_name.to_string(), "idr-period=1000"),
+        let (upload, enc_name, gop_prop) = match encoder.as_str() {
+            "vulkan" => (
+                "vulkanupload !",
+                enc_name.to_string(),
+                format!("idr-period={gop}"),
+            ),
             "nvenc" => (
                 "",
                 // the CUDA-mode elements are nv<codec>enc on GStreamer 1.28
                 enc_name.replace("vulkan", "nv"),
-                "gop-size=1000 preset=p4 tune=ultra-low-latency rc-mode=cbr rc-lookahead=0",
+                format!(
+                    "gop-size={gop} preset=p4 tune=ultra-low-latency rc-mode=cbr rc-lookahead=0"
+                ),
             ),
             other => panic!("QUASAR_REF_RECOVERY_ENCODER={other}"),
         };
         // NVENC API 12.0 has no AV1 long-term references (gstreamer-nvenc-ref-recovery.patch)
-        let held = !(encoder == "nvenc" && codec == "av1");
+        let model = Model {
+            k: if encoder == "nvenc" && codec == "av1" {
+                0
+            } else {
+                k
+            },
+            gop,
+            h264: codec == "h264",
+            slots,
+        };
+        let held = model.k > 0;
         gst::init().unwrap();
         let desc = format!(
             "videotestsrc is-live=true pattern=smpte horizontal-speed=3 num-buffers={FRAMES} \
-             ! video/x-raw,format=NV12,width=640,height=360,framerate=60/1 ! tee name=t \
+             ! video/x-raw,format=NV12,width={width},height={height},framerate=60/1 ! tee name=t \
              t. ! queue ! appsink name=raw sync=false \
-             t. ! queue ! {upload} {enc_name} name=enc num-anchors=3 {gop} \
+             t. ! queue ! {upload} {enc_name} name=enc num-anchors={k} {gop_prop} \
              ! {caps} ! {parser} name=parse config-interval=-1 ! {out_caps} \
              ! appsink name=enc_out sync=false"
         );
@@ -347,6 +438,9 @@ mod tests {
                     for (_, step) in SCRIPT.iter().filter(|(i, _)| *i == at) {
                         let event = match step {
                             Step::Anchor => anchor_event(),
+                            Step::Key => gstreamer_video::UpstreamForceKeyUnitEvent::builder()
+                                .all_headers(true)
+                                .build(),
                             // no anchor reports to name one by: any pts is not held
                             Step::From(i) | Step::Gone(i) if !held => recover_event(seen[*i]),
                             Step::FromNewest if !held => recover_event(seen[at - 1]),
@@ -421,11 +515,13 @@ mod tests {
         let meta = serde_json::json!({
             "codec": codec,
             "encoder": encoder,
-            "width": 640,
-            "height": 360,
+            "num_anchors": k,
+            "gop": gop,
+            "width": width.parse::<u32>().unwrap(),
+            "height": height.parse::<u32>().unwrap(),
             "input_pts": input_pts.lock().unwrap().iter().map(|p| p.nseconds()).collect::<Vec<_>>(),
             "lost": LOST,
-            "expect": expected(&codec, held),
+            "expect": expected(model),
             "frames": frames,
             "reports": reports,
         });

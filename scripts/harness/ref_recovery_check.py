@@ -6,9 +6,11 @@
     ref_recovery_check.py --self-test
 
 The capture's "encoder" (vulkan or nvenc) picks the reference checks: the
-Vulkan encoders' syntax is ours and checked exactly, NVENC's is the driver's,
-so for it only the long-term marking (H.264) and the lost-picture RPS rule
-(HEVC) are checked, and the decode checks carry the rest.
+Vulkan encoders' syntax is ours and checked exactly. NVENC's is the driver's,
+so for it each recovery frame must name its anchor as its one reference
+(H.264: long_term_pic_num; HEVC: list0 from the RPS and list_entry_l0), and no
+HEVC RPS may list a lost picture, short- or long-term. A capture with
+num_anchors 0 must carry no long-term syntax at all.
 
 Drops the capture's lost frames and checks, with ffmpeg as the reference decoder:
   - the anchors, recovery frames and key frames are exactly what the capture
@@ -136,6 +138,44 @@ def check_recovery_psnr(psnr, recov, keys):
                   f"{med - psnr[i]:.1f} dB below the frames before it ({med:.1f})")
 
 
+def swap(pk, i, name, value):
+    """@pk with field @name of packet @i set to @value."""
+    out = [list(f) for f in pk]
+    out[i] = [(k, value if k == name else v) for k, v in out[i]]
+    return out
+
+
+def add(pk, i, fields):
+    out = [list(f) for f in pk]
+    out[i] = out[i] + fields
+    return out
+
+
+# NVENC-shaped packets: anchors 10 and 20 (H.264 long-term 0 and 1), frames 21-34
+# lost, frame 35 recovers from 20.
+H264 = [[("gaps_in_frame_num_allowed_flag", 0), ("num_ref_idx_l0_default_active_minus1", 0)]] + \
+    [[] for _ in range(39)]
+for _i, _lt in ((10, 0), (20, 1)):
+    H264[_i] = [("memory_management_control_operation", 1),
+                ("memory_management_control_operation", 6), ("long_term_frame_idx", _lt),
+                ("memory_management_control_operation", 0)]
+H264[35] = [("num_ref_idx_active_override_flag", 0), ("modification_of_pic_nums_idc", 2),
+            ("long_term_pic_num", 1), ("modification_of_pic_nums_idc", 3)]
+H265_FRAMES = [{"key": i == 0} for i in range(40)]
+H265_LOST = set(range(21, 35))
+H265_KEPT = [i for i in range(40) if i not in H265_LOST]
+H265 = [[("num_negative_pics", 1), ("delta_poc_s0_minus1[0]", 0),
+         ("used_by_curr_pic_s0_flag[0]", 1), ("num_ref_idx_l0_default_active_minus1", 3)]] + \
+    [[("slice_pic_order_cnt_lsb", i), ("short_term_ref_pic_set_sps_flag", 1)]
+     for i in range(1, 40)]
+H265[35] = [("slice_pic_order_cnt_lsb", 35), ("short_term_ref_pic_set_sps_flag", 0),
+            ("num_negative_pics", 0), ("num_long_term_pics", 2),
+            ("poc_lsb_lt[0]", 10), ("used_by_curr_pic_lt_flag[0]", 1),
+            ("poc_lsb_lt[1]", 20), ("used_by_curr_pic_lt_flag[1]", 1),
+            ("num_ref_idx_active_override_flag", 1), ("num_ref_idx_l0_active_minus1", 0),
+            ("ref_pic_list_modification_flag_l0", 1), ("list_entry_l0[0]", 1)]
+
+
 def self_test():
     """The checks that judge the encoder, on streams that must fail them."""
     global fails
@@ -152,6 +192,25 @@ def self_test():
         # wrong but close: above the 20 dB floor, 14 dB below the frames before
         ("wrong-reference recovery",
          lambda: check_recovery_psnr([38.0] * 34 + [24.0] + [25.0] * 5, {34: 20}, [0]), 1),
+        # NVENC: each recovery frame must name the anchor the agent asked for
+        ("nvenc h264 named anchor", lambda: check_h264(H264, {35: 20}, [10, 20], True), 0),
+        ("nvenc h264 wrong held anchor",
+         lambda: check_h264(swap(H264, 35, "long_term_pic_num", 0), {35: 20}, [10, 20], True), 1),
+        ("nvenc h264 two active references",
+         lambda: check_h264(add(swap(H264, 35, "num_ref_idx_active_override_flag", 1), 35,
+                                [("num_ref_idx_l0_active_minus1", 1)]), {35: 20}, [10, 20], True),
+         1),
+        ("nvenc hevc named anchor", lambda: check_h265(H265, H265_FRAMES, H265_KEPT,
+                                                       H265_LOST, {35: 20}, True), 0),
+        ("nvenc hevc wrong held anchor",
+         lambda: check_h265(swap(H265, 35, "list_entry_l0[0]", 0), H265_FRAMES, H265_KEPT,
+                            H265_LOST, {35: 20}, True), 1),
+        # a forgotten anchor that was lost, still listed long-term after the recovery
+        ("nvenc hevc lost long-term picture listed",
+         lambda: check_h265(add(H265, 36, [("num_long_term_pics", 1), ("poc_lsb_lt[0]", 30),
+                                           ("used_by_curr_pic_lt_flag[0]", 0)]),
+                            H265_FRAMES, H265_KEPT, H265_LOST, {35: 20}, True), 1),
+        ("num-anchors 0 with long-term syntax", lambda: check_no_long_term(H264, "h264"), 1),
         # input pts instead of output pts: a FAIL line each, not a KeyError
         ("reports name no output frame",
          lambda: read_reports([{"pts": 7, "anchor": True, "recover_from": None},
@@ -213,6 +272,8 @@ def main(d, codec):
         check_h264(pk, recov, anchors, nvenc)
     else:
         check_h265(pk, frames, kept, lost, recov, nvenc)
+    if meta.get("num_anchors") == 0 and codec != "av1":
+        check_no_long_term(pk, codec)
 
     a, full_err = md5s(d, full, codec)
     b, err = md5s(d, pruned, codec)
@@ -290,11 +351,30 @@ def check_av1(pk, frames, kept, lost, recov, anchors):
         check(bin(flags).count("1") == 2, f"anchor {i} refreshes {flags:#04x}")
 
 
+def active_l0(f, ps):
+    """Active list-0 references of a slice; @ps holds the PPS."""
+    if first(f, "num_ref_idx_active_override_flag", 0):
+        return first(f, "num_ref_idx_l0_active_minus1", 0) + 1
+    return first(ps, "num_ref_idx_l0_default_active_minus1", 0) + 1
+
+
 def check_h264(pk, recov, anchors, nvenc=False):
     if nvenc:
+        # NVENC has no setting for it; the agent loop must not rely on it
+        print(f"h264: note: SPS gaps_in_frame_num_allowed_flag="
+              f"{first(pk[0], 'gaps_in_frame_num_allowed_flag')}")
+        lt_idx = {}
         for i in anchors:
             ops = all_of(pk[i], "memory_management_control_operation[")
             check(6 in ops, f"anchor {i} is not marked long-term: {ops}")
+            lt_idx[i] = first(pk[i], "long_term_frame_idx")
+        for i, a in recov.items():
+            idc = all_of(pk[i], "modification_of_pic_nums_idc[")
+            check(idc[:1] == [2] and first(pk[i], "long_term_pic_num") == lt_idx.get(a),
+                  f"recovery frame {i} names {idc} long-term "
+                  f"{first(pk[i], 'long_term_pic_num')}, anchor {a} is {lt_idx.get(a)}")
+            check(active_l0(pk[i], pk[0]) == 1,
+                  f"recovery frame {i} has {active_l0(pk[i], pk[0])} active references")
         return
     check(first(pk[0], "gaps_in_frame_num_allowed_flag") == 1,
           "SPS does not allow frame_num gaps")
@@ -313,9 +393,37 @@ def check_h264(pk, recov, anchors, nvenc=False):
               f"recovery frame {i} has more than one active reference")
 
 
+def h265_rps(f, sps):
+    """A slice's short-term RPS [(delta_poc_s0_minus1, used)] (its own, or the SPS
+    set it names: NVENC's SPS carries one) and long-term [(poc_lsb_lt, used)]."""
+    src = sps if first(f, "short_term_ref_pic_set_sps_flag", 0) else f
+    n = first(src, "num_negative_pics", 0)
+    st = list(zip(all_of(src, "delta_poc_s0_minus1[")[:n],
+                  all_of(src, "used_by_curr_pic_s0_flag[")[:n]))
+    lt = list(zip(all_of(f, "poc_lsb_lt["), all_of(f, "used_by_curr_pic_lt_flag[")))
+    return st, lt
+
+
+def h265_list0(f, ps, cur, st, lt):
+    """The POCs in a P slice's list 0 (H.265 8.3.4); POCs are their LSBs here."""
+    before, p = [], cur
+    for dlt, used in st:
+        p -= dlt + 1
+        if used:
+            before.append(p)
+    temp = before + [lsb for lsb, used in lt if used]
+    n = active_l0(f, ps)
+    if not temp:
+        return []
+    cyc = [temp[k % len(temp)] for k in range(max(n, len(temp)))]
+    if first(f, "ref_pic_list_modification_flag_l0", 0):
+        return [cyc[e] for e in all_of(f, "list_entry_l0[")[:n]]
+    return cyc[:n]
+
+
 def check_h265(pk, frames, kept, lost, recov, nvenc=False):
-    # the capture's GOP is longer than the stream, and MaxPicOrderCntLsb covers
-    # it, so a POC is its LSB
+    # every key frame's POC is 0, and MaxPicOrderCntLsb covers the frames up to
+    # the next one, so a POC is its LSB
     poc, keyof, poc_of, k = {}, {}, {}, 0
     for i, f in enumerate(pk):
         if frames[i]["key"]:
@@ -328,21 +436,38 @@ def check_h265(pk, frames, kept, lost, recov, nvenc=False):
         if frames[i]["key"]:
             continue
         f = pk[i]
-        n = first(f, "num_negative_pics", 0)
-        deltas = all_of(f, "delta_poc_s0_minus1[")[:n]
-        used = all_of(f, "used_by_curr_pic_s0_flag[")[:n]
+        st, lt = h265_rps(f, pk[0])
+        used = [u for _, u in st]
         p, listed = poc[i], []
-        for dlt in deltas:
+        for dlt, _ in st:
             p -= dlt + 1
             listed.append(poc_of.get((keyof[i], p)))
-        check(None not in listed, f"frame {i} RPS lists a POC that is no frame: {listed}")
-        gone = [j for j in listed if j in lost]
+        lt_listed = [poc_of.get((keyof[i], lsb)) for lsb, _ in lt]
+        check(None not in listed + lt_listed,
+              f"frame {i} RPS lists a POC that is no frame: {listed} {lt_listed}")
+        gone = [j for j in listed + lt_listed if j in lost]
         check(not gone, f"frame {i} RPS lists lost pictures {gone}")
         if nvenc:
+            if i in recov:
+                l0 = h265_list0(f, pk[0], poc[i], st, lt)
+                check(l0 == [poc[recov[i]]],
+                      f"recovery frame {i} codes from POCs {l0}, its anchor "
+                      f"{recov[i]} is POC {poc[recov[i]]}")
             continue
         want = recov.get(i, i - 1)
         check(listed[:1] == [want] and used[:1] == [1] and not any(used[1:]),
               f"frame {i} uses {listed} {used}, expected only {want}")
+
+
+def check_no_long_term(pk, codec):
+    """num-anchors 0: the stream an unpatched encoder writes, no long-term syntax."""
+    if codec == "h264":
+        lt = [i for i, f in enumerate(pk) if all_of(f, "memory_management_control_operation[")
+              or 2 in all_of(f, "modification_of_pic_nums_idc[")]
+        check(not lt, f"num-anchors 0, yet frames {lt[:10]} carry long-term syntax")
+    else:
+        check(first(pk[0], "long_term_ref_pics_present_flag", 0) == 0,
+              "num-anchors 0, yet the SPS has long_term_ref_pics_present_flag")
 
 
 if __name__ == "__main__":
