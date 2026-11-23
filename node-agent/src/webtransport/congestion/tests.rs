@@ -6182,8 +6182,11 @@ fn a_deep_bucket_policer_never_lets_the_probe_raise_the_line_over_it() {
         let mut over = Vec::new();
         for (i, &(from, cap)) in caps.iter().enumerate() {
             let to = caps.get(i + 1).map_or(210.0, |c| c.0);
+            // A later, higher cap is watched from the switch: a line coming up from under the
+            // earlier cap has no reason to pass it, so no settling time is owed there.
+            let start = if i == 0 { from + 20.0 } else { from };
             for &(t, l) in &s.lines {
-                if let Some(l) = l.filter(|_| (from + 20.0..to).contains(&t)) {
+                if let Some(l) = l.filter(|_| (start..to).contains(&t)) {
                     top = top.max(l / cap);
                     if l > cap && over.len() < 5 {
                         over.push((t, l));
