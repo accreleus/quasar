@@ -47,6 +47,17 @@ describe("listAllSessions", () => {
   });
 });
 
+describe("listAllAdminApps", () => {
+  it("follows next_cursor past the first page, so an app on page 2 is counted", async () => {
+    mockFetch
+      .mockResolvedValueOnce({ items: [{ id: "a" }], next_cursor: "50" } as never)
+      .mockResolvedValueOnce({ items: [{ id: "b" }], next_cursor: null } as never);
+    const apps = await adminApi.listAllAdminApps("tok");
+    expect(apps.map((a) => a.id)).toEqual(["a", "b"]);
+    expect(mockFetch.mock.calls.map((c) => c[0])).toEqual(["/admin/apps", "/admin/apps?cursor=50"]);
+  });
+});
+
 describe("listAdminActivity", () => {
   it("encodes every filter and omits the undefined ones", async () => {
     await adminApi.listAdminActivity("tok", {
