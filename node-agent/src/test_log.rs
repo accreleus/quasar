@@ -99,16 +99,13 @@ fn install() {
                 tracing_subscriber::fmt::layer()
                     .with_ansi(false)
                     .with_writer(|| Routed)
-                    // DEBUG, not INFO: one capture asserts on a debug-level log
-                    // line (a refused hello's bounded log). INFO and above is
-                    // what the stderr and WarningLog layers keep. The filter is
-                    // the DEBUG level combined with a per-thread sink check, so
-                    // the layer does no formatting work on a thread that is not
-                    // capturing; as a dynamic per-event filter it keeps callsite
-                    // interest "sometimes", so a callsite is never cached as
-                    // disabled (never).
+                    // DEBUG, not INFO: one capture asserts on a debug-level line.
+                    // `dynamic_filter_fn`, never `filter_fn`: a `filter_fn` answer is
+                    // cached per callsite and is re-asked only while another layer
+                    // keeps the callsite live (the unfiltered WarningLog does today).
+                    // Guarded by `a_line_first_seen_uncaptured_is_still_captured`.
                     .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG.and(
-                        tracing_subscriber::filter::filter_fn(|_| {
+                        tracing_subscriber::filter::dynamic_filter_fn(|_, _| {
                             SINK.with(|s| s.borrow().is_some())
                         }),
                     )),
@@ -179,6 +176,24 @@ pub fn trace_to_stderr() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A callsite first hit on a thread that is not capturing must still be
+    /// captured later on another thread: a per-callsite cached filter would have
+    /// disabled it for the rest of the process (#1650).
+    #[test]
+    fn a_line_first_seen_uncaptured_is_still_captured() {
+        fn fire() {
+            tracing::debug!("first-seen-uncaptured");
+        }
+        install();
+        std::thread::spawn(fire).join().unwrap();
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let guard = begin(&sink);
+        fire();
+        drop(guard);
+        let got = String::from_utf8_lossy(&sink.lock().unwrap()).into_owned();
+        assert!(got.contains("first-seen-uncaptured"), "the line was not captured: {got:?}");
+    }
 
     /// Ending an inner capture must leave an outer one running. Before the
     /// guard stored the previous sink, dropping the inner capture reset the
