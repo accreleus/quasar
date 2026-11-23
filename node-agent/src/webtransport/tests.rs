@@ -1556,7 +1556,7 @@ async fn governed_agent(stream: Stream) -> Agent {
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
-                observe: Box::new(|_| {}),
+                observe: Box::new(|_, _| {}),
                 held: Box::new(|_| {}),
                 fec: Box::new(|_| {}),
             })
@@ -2098,7 +2098,7 @@ async fn feedback_while_pyrowave_is_active_feeds_no_estimate() {
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
-                observe: Box::new(move |_| {
+                observe: Box::new(move |_, _| {
                     count.fetch_add(1, Ordering::SeqCst);
                 }),
                 held: Box::new(|_| {}),
@@ -2198,7 +2198,7 @@ async fn audio_alone_never_moves_the_video_estimate() {
             start: Box::new(|| {}),
             owns: Box::new(|| false),
             displaced: Box::new(|| {}),
-            observe: Box::new(move |kbps| seen.lock().unwrap().push(kbps)),
+            observe: Box::new(move |kbps, _| seen.lock().unwrap().push(kbps)),
             held: Box::new(|_| {}),
             fec: Box::new(|_| {}),
         })
@@ -2246,7 +2246,7 @@ fn rate(retargets: bool) -> Rate {
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(|_| {}),
+        observe: Box::new(|_, _| {}),
         held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     }
@@ -2380,7 +2380,7 @@ fn the_silence_decay_is_never_fed_to_the_collapse_as_a_measured_link() {
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(move |_| {
+        observe: Box::new(move |_, _| {
             f.fetch_add(1, SeqCst);
         }),
         held: Box::new(|_| {}),
@@ -2429,7 +2429,7 @@ fn a_report_gives_the_abr_its_reading_before_its_estimate() {
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(move |_| o.lock().unwrap().push("observe")),
+        observe: Box::new(move |_, _| o.lock().unwrap().push("observe")),
         held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
@@ -2458,7 +2458,7 @@ fn a_client_that_is_gone_neither_starts_nor_feeds_the_abr() {
         }),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(move |_| {
+        observe: Box::new(move |_, _| {
             fed.fetch_add(1, SeqCst);
         }),
         held: Box::new(|_| {}),
@@ -2522,7 +2522,7 @@ fn the_abr_is_fed_the_estimate_less_the_fec_share() {
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(move |kbps: f64| seen.lock().unwrap().push(kbps.round())),
+        observe: Box::new(move |kbps: f64, _| seen.lock().unwrap().push(kbps.round())),
         held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
@@ -2558,7 +2558,7 @@ async fn lossy_session(retargets: bool) -> (Agent, Arc<crate::session::metrics::
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
-                observe: Box::new(|_| {}),
+                observe: Box::new(|_, _| {}),
                 held: Box::new(|_| {}),
                 fec: Box::new(move |event| match event {
                     crate::webtransport::FecEvent::Attached { client, fec } => {
@@ -2812,7 +2812,7 @@ fn repairs_spend_only_what_the_estimate_leaves_above_the_abr_floor() {
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(move |kbps: f64| seen.lock().unwrap().push(kbps.round())),
+        observe: Box::new(move |kbps: f64, _| seen.lock().unwrap().push(kbps.round())),
         held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
@@ -2837,12 +2837,32 @@ fn repairs_spend_only_what_the_estimate_leaves_above_the_abr_floor() {
 /// `Control::protect` makes for a second of 60 fps video at it, in kbit/s. The clock is the
 /// test's, one estimate a second.
 fn governed(level: u8, estimate_kbps: f64, seconds: u64) -> Vec<(u32, f64)> {
-    use crate::session::abr::{AbrConfig, Governor};
+    governed_by(smooth_window(), |_| level, estimate_kbps, seconds)
+}
+
+fn smooth_window() -> crate::session::abr::AbrConfig {
+    crate::session::abr::AbrConfig::new_smooth(2500, 8000, 60)
+}
+
+/// WebTransport's `smooth` loop (`abr_glue::arm`) on an encoder whose writes cost no keyframe.
+fn smooth_per_report() -> crate::session::abr::AbrConfig {
+    crate::session::abr::AbrConfig {
+        per_report: Some(Duration::ZERO),
+        ..smooth_window()
+    }
+}
+
+/// [`governed`] on a governor built from `cfg`, the loss in second `s` calling for FEC level
+/// `level(s)`.
+fn governed_by(
+    cfg: crate::session::abr::AbrConfig,
+    level: impl Fn(u64) -> u8,
+    estimate_kbps: f64,
+    seconds: u64,
+) -> Vec<(u32, f64)> {
+    use crate::session::abr::Governor;
     let base = std::time::Instant::now();
-    let governor = Arc::new(Mutex::new((
-        Governor::new(AbrConfig::new_smooth(2500, 8000, 60), base),
-        base,
-    )));
+    let governor = Arc::new(Mutex::new((Governor::new(cfg, base), base)));
     let (floor, setpoint, observed) = (governor.clone(), governor.clone(), governor.clone());
     let rate = Rate {
         measured: Box::new(|_| {}),
@@ -2854,21 +2874,23 @@ fn governed(level: u8, estimate_kbps: f64, seconds: u64) -> Vec<(u32, f64)> {
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(move |kbps| {
+        // As `abr_glue::feedback_abr`: the share, then the estimate.
+        observe: Box::new(move |kbps, share| {
             let mut governor = observed.lock().unwrap();
             let now = governor.1;
+            governor.0.set_share(share, now);
             governor.0.observe(kbps, now);
         }),
         held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), true, Default::default());
-    let fec = control.fec.as_mut().unwrap();
-    fec.observe(f64::from(level) / 100.0, base);
-    assert_eq!(fec.overhead(), f64::from(level) * 0.05);
     (1..=seconds)
         .map(|second| {
-            governor.lock().unwrap().1 = base + Duration::from_secs(second);
+            let now = base + Duration::from_secs(second);
+            governor.lock().unwrap().1 = now;
+            let fec = control.fec.as_mut().unwrap();
+            fec.observe(f64::from(level(second)) / 100.0, now);
             control.feed(estimate_kbps, false);
             let setpoint = governor.lock().unwrap().0.setpoint_kbps();
             let fragments = (setpoint as usize * 125 / 60).div_ceil(media::MAX_DATAGRAM);
@@ -2935,7 +2957,7 @@ fn governed_after_a_report(capacity: crate::session::settings::WtCapacity) -> (f
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(|_| {}),
+        observe: Box::new(|_, _| {}),
         held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
@@ -2948,34 +2970,79 @@ fn governed_after_a_report(capacity: crate::session::settings::WtCapacity) -> (f
     (control.estimator.estimate_kbps(), governor.kbps())
 }
 
-/// #1046: a FEC share inside the governor's deadband (levels 1 to 3, up to 15 %) does not
-/// move the encoder. At the ceiling the repairs go on top of it, so the session sends more
-/// than its ceiling, and no more than the governor's own bound.
+/// The setpoint the governor's ceiling allows video with FEC `level` on top (#1301).
+fn video_ceiling(level: u8) -> u32 {
+    (8000.0 / (1.0 + f64::from(level) * 0.05)).floor() as u32
+}
+
+/// #1301: with FEC the governor's ceiling is the configured one over 1 + share, from the first
+/// estimate, so video plus repairs never exceeds the configured maximum: shares 0 to 25 %, on
+/// the window loop and the per-report one. A second may carry the one repair datagram `fec`
+/// banks from the one before. Old code: 8000 plus the share, up to 8% over at level 3.
 #[test]
-fn a_fec_share_inside_the_deadband_rides_on_top_of_the_ceiling() {
-    for level in 1..=3 {
-        for (setpoint, sent) in governed(level, 8000.0, 30) {
-            assert_eq!(setpoint, 8000, "level {level}");
-            assert!(
-                sent > 8000.0 && sent <= governor_bound(8000.0),
-                "level {level}: {sent:.0} kbit/s"
-            );
+fn fec_never_takes_a_session_over_its_configured_maximum() {
+    let banked = (media::MAX_DATAGRAM * 8) as f64 / 1000.0;
+    for cfg in [smooth_window(), smooth_per_report()] {
+        for level in 0..=5 {
+            for (setpoint, sent) in governed_by(cfg, |_| level, 8000.0, 30) {
+                assert_eq!(setpoint, video_ceiling(level), "level {level}");
+                assert!(sent <= 8000.0 + banked, "level {level}: {sent:.0} kbit/s");
+            }
         }
     }
 }
 
-/// Levels 4 and 5 are outside the deadband: from the ceiling a smooth governor takes its
-/// one 12.5 % step and holds there, the total back inside the bound.
+/// #1301: from the ceiling onto a link of 5000 kbit/s a governor with FEC settles no later than
+/// one without (smooth: 15 s; old code took 22 s at level 5, one step more).
 #[test]
-fn a_fec_share_outside_the_deadband_steps_the_setpoint_down() {
-    for level in 4..=5 {
-        for (setpoint, sent) in governed(level, 8000.0, 30) {
-            assert_eq!(setpoint, 7000, "level {level}");
+fn a_step_down_with_fec_is_no_slower_than_without() {
+    let protective = crate::session::abr::AbrConfig::new(2500, 8000, 60);
+    for cfg in [smooth_window(), protective] {
+        // The second the setpoint last moved.
+        let settled = |level| {
+            let sent = governed_by(cfg, |_| level, 5000.0, 60);
+            let last = sent[sent.len() - 1].0;
+            sent.iter()
+                .rposition(|&(sp, _)| sp != last)
+                .map_or(0, |i| i + 1)
+                + 1
+        };
+        let without = settled(0);
+        for level in 1..=5 {
             assert!(
-                sent > 8000.0 && sent <= governor_bound(8000.0),
-                "level {level}: {sent:.0} kbit/s"
+                settled(level) <= without,
+                "{:?} level {level}: {} s, {without} s without FEC",
+                cfg.down_policy,
+                settled(level)
             );
         }
+    }
+    assert_eq!(
+        governed(0, 5000.0, 20)
+            .iter()
+            .position(|&(sp, _)| sp == governed(0, 5000.0, 60)[59].0),
+        Some(14),
+        "smooth without FEC settles at 15 s"
+    );
+}
+
+/// #1301: a share that rises mid-session takes the setpoint under the new ceiling at the
+/// estimate it came with, inside the smooth governor's 7 s dwell for the second rise; one that
+/// falls lifts the ceiling, and the setpoint climbs back to the configured one.
+#[test]
+fn a_share_change_mid_session_applies_at_once() {
+    for cfg in [smooth_window(), smooth_per_report()] {
+        let level = |second| match second {
+            11 => 3,
+            12 => 5,
+            _ => 0,
+        };
+        let sent = governed_by(cfg, level, 8000.0, 40);
+        let setpoints: Vec<u32> = sent.iter().map(|&(sp, _)| sp).collect();
+        assert_eq!(setpoints[9], 8000, "{:?}", cfg.per_report);
+        assert_eq!(setpoints[10], video_ceiling(3), "{:?}", cfg.per_report);
+        assert_eq!(setpoints[11], video_ceiling(5), "{:?}", cfg.per_report);
+        assert_eq!(setpoints[39], 8000, "{:?}: {setpoints:?}", cfg.per_report);
     }
 }
 
@@ -3015,7 +3082,7 @@ fn a_pyrowave_frame_gets_no_repair_at_any_overhead() {
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(|_| {}),
+        observe: Box::new(|_, _| {}),
         held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
@@ -3815,7 +3882,7 @@ async fn a_webtransport_takeover_displaces_a_loop_its_peer_left_owning_the_encod
     .expect("this encoder takes live writes");
     (peer.start)();
     pause();
-    (peer.observe)(2000.0);
+    (peer.observe)(2000.0, 0.0);
     pause();
     let driven = kbps();
     assert!(
@@ -5332,7 +5399,7 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
-                observe: Box::new(move |kbps| {
+                observe: Box::new(move |kbps, _| {
                     if active.get().is_some_and(|m| m.pyrowave_active()) {
                         pyro_fed.lock().unwrap().push(kbps);
                     }

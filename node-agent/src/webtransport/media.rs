@@ -1553,7 +1553,7 @@ mod tests {
             start: Box::new(|| {}),
             owns: Box::new(|| false),
             displaced: Box::new(|| {}),
-            observe: Box::new(|_| {}),
+            observe: Box::new(|_, _| {}),
             held: Box::new(|_| {}),
             fec: Box::new(move |event| {
                 if let crate::webtransport::FecEvent::Attached { client, fec } = event {

@@ -1142,9 +1142,9 @@ fn a_webtransport_client_keeps_its_abr_through_an_abandoned_webrtc_takeover() {
     // As `webtransport::Control` feeds it: one start per client, then its estimates.
     let rate = media.rate().expect("the session's ABR is armed");
     let congested = || {
-        (rate.observe)(f64::from(launch) / 4.0);
+        (rate.observe)(f64::from(launch) / 4.0, 0.0);
         std::thread::sleep(Duration::from_millis(5));
-        (rate.observe)(f64::from(launch) / 4.0);
+        (rate.observe)(f64::from(launch) / 4.0, 0.0);
     };
     (rate.start)();
     congested();

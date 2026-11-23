@@ -234,6 +234,21 @@ impl AbrLoop {
         }
     }
 
+    /// WebTransport FEC's repair share (`abr::Governor::set_share`), written at once when it
+    /// takes the ceiling under the setpoint.
+    fn share(&self, share: f64, now: std::time::Instant) {
+        if !self.owns_encoder() {
+            return;
+        }
+        let (prev, cut) = {
+            let mut gov = self.governor.lock().unwrap();
+            (gov.setpoint_kbps(), gov.set_share(share, now))
+        };
+        if let Some(kbps) = cut.filter(|_| self.mode != AbrMode::Off) {
+            self.retarget(prev, kbps, kbps as f64);
+        }
+    }
+
     /// Write a new setpoint to the encoder and publish it (log, metric, `abr.retarget`).
     /// Writes only while this loop still owns the encoder, with the check inside the ABR
     /// write lock: an observe that passed `owns_encoder` before a takeover cleared it must
@@ -1672,7 +1687,7 @@ fn feedback_abr_armed(
                     );
                 }
             }),
-            observe: Box::new(move |kbps| {
+            observe: Box::new(move |kbps, share| {
                 observed.store(kbps.to_bits(), std::sync::atomic::Ordering::Relaxed);
                 // One ABR owner per encoder; an owner that lost the encoder re-takes it from
                 // the launch point on its next estimate. Lost to nobody, that is: a WebRTC
@@ -1681,7 +1696,10 @@ fn feedback_abr_armed(
                 if observe_loop.orphaned() {
                     retake();
                 }
-                observe_loop.observe(kbps, true, std::time::Instant::now());
+                // After the re-take, which starts a fresh governor with no share.
+                let now = std::time::Instant::now();
+                observe_loop.share(share, now);
+                observe_loop.observe(kbps, true, now);
             }),
             measured: Box::new(move |reading| {
                 report_loop.report(reading, std::time::Instant::now())
@@ -2209,18 +2227,44 @@ mod tests {
         let (first, second) = (rate(), rate());
         (first.start)();
         (second.start)();
-        (first.observe)(1234.0);
+        (first.observe)(1234.0, 0.0);
         assert_eq!(estimate(), None, "the loop started first no longer writes");
-        (second.observe)(2345.0);
+        (second.observe)(2345.0, 0.0);
         assert_eq!(estimate(), Some(2345.0));
         (first.start)();
-        (second.observe)(3456.0);
-        (first.observe)(1111.0);
+        (second.observe)(3456.0, 0.0);
+        (first.observe)(1111.0, 0.0);
         assert_eq!(
             estimate(),
             Some(1111.0),
             "a new client on the first transport took it back"
         );
+    }
+
+    /// #1301: an estimate at the ceiling that comes with a FEC share writes the encoder under
+    /// the ceiling over 1 + share at once, and a higher share lowers it again at once.
+    #[test]
+    fn a_fec_share_writes_the_encoder_under_the_ceiling_at_once() {
+        init();
+        let metrics = Arc::new(SessionMetrics::new("smooth", 60));
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let trace =
+            crate::session::runner::DiagnosticEventTx::new(tx, Arc::default(), Arc::default());
+        let cfg = cfg_with_floors(0, None);
+        let encoder = gst::ElementFactory::make("openh264enc").build().unwrap();
+        let client =
+            feedback_abr(&encoder, &cfg, metrics.clone(), trace, "s".into(), None).unwrap();
+        let bitrate = || encoder.property::<u32>("bitrate") / 1000;
+        (client.start)();
+        (client.observe)(11_500.0, 0.0);
+        for share in [0.15, 0.25] {
+            (client.observe)(11_500.0 / (1.0 + share), share);
+            assert_eq!(
+                bitrate(),
+                (11_500.0 / (1.0 + share)).floor() as u32,
+                "{share}"
+            );
+        }
     }
 
     /// A takeover across transports: loop A drove the encoder down, then B claims it. B's
@@ -2250,7 +2294,7 @@ mod tests {
         let (a, b) = (rate(), rate());
         (a.start)();
         std::thread::sleep(std::time::Duration::from_millis(5));
-        (a.observe)(2000.0);
+        (a.observe)(2000.0, 0.0);
         let driven = bitrate();
         assert!(
             driven < 11_500,
@@ -2258,7 +2302,7 @@ mod tests {
         );
         (b.start)();
         assert_eq!(bitrate(), 11_500, "back at launch under its new owner");
-        (b.observe)(11_500.0);
+        (b.observe)(11_500.0, 0.0);
         assert_eq!(bitrate(), 11_500);
     }
 
@@ -2296,7 +2340,7 @@ mod tests {
         // (which is after the check), then blocks here — before the retarget write.
         let governor = abr.governor.lock().unwrap();
         let seen = metrics.clone();
-        let observe = std::thread::spawn(move || (client.observe)(2000.0));
+        let observe = std::thread::spawn(move || (client.observe)(2000.0, 0.0));
         let mut reached = false;
         for _ in 0..2000 {
             if seen.gcc_estimate_kbps() == 2000.0 {
@@ -2587,7 +2631,7 @@ mod tests {
         let pause = || std::thread::sleep(std::time::Duration::from_millis(5));
         (client.start)();
         pause();
-        (client.observe)(2000.0);
+        (client.observe)(2000.0, 0.0);
         assert!(
             bitrate() < 11_500,
             "the client's loop drove the encoder down"
@@ -2597,9 +2641,9 @@ mod tests {
         assert_eq!(bitrate(), 11_500, "the replacement put it back at launch");
 
         // Its governor starts again too: the old one would sit out its down dwell here.
-        (client.observe)(2000.0);
+        (client.observe)(2000.0, 0.0);
         pause();
-        (client.observe)(2000.0);
+        (client.observe)(2000.0, 0.0);
         let driven = bitrate();
         assert!(
             driven < 11_500,
@@ -2635,7 +2679,7 @@ mod tests {
         let pause = || std::thread::sleep(std::time::Duration::from_millis(5));
         (client.start)();
         pause();
-        (client.observe)(2000.0);
+        (client.observe)(2000.0, 0.0);
         pause();
         assert!(
             bitrate() < 11_500,
@@ -2655,7 +2699,7 @@ mod tests {
             hook_metrics.claim_abr(OTHER);
             write_encoder_bitrate(&hook_encoder, choice, 3000, 60);
         });
-        (client.observe)(2000.0);
+        (client.observe)(2000.0, 0.0);
         pause();
 
         assert_eq!(
@@ -2762,7 +2806,7 @@ mod tests {
 
         // The session ends, then the client's in-flight estimate arrives.
         metrics.end_hooks();
-        (client.observe)(5000.0);
+        (client.observe)(5000.0, 0.0);
 
         assert_eq!(
             metrics.hooks_armed(),
@@ -2837,7 +2881,7 @@ mod tests {
         // 1000 kbit/s. The closures read the wall clock, so this test waits out
         // `RATE_CONFIRM` for real.
         for _ in 0..15 {
-            (client.observe)(1000.0);
+            (client.observe)(1000.0, 0.0);
             (client.measured)(Some(1000.0));
             std::thread::sleep(std::time::Duration::from_millis(100));
         }

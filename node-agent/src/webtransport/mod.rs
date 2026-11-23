@@ -141,7 +141,9 @@ pub(crate) struct Rate {
     /// encoder back at its launch point, no owner — not at this client's first estimate,
     /// which a client that sends no feedback (§Feedback) never sends.
     pub(crate) displaced: Box<dyn Fn() + Send + Sync>,
-    pub(crate) observe: Box<dyn Fn(f64) + Send + Sync>,
+    /// Every estimate, in kbit/s of video, with the FEC share charged on top of it
+    /// (`abr::Governor::set_share`).
+    pub(crate) observe: Box<dyn Fn(f64, f64) + Send + Sync>,
     /// After `observe`, for every estimate that came from a receiver report, never for the
     /// silence decay: what the report showed the link carrying when the link held the
     /// sender back (`congestion::Estimator::measured`), `None` when it did not.
@@ -292,9 +294,8 @@ impl<'a> Control<'a> {
         if !std::mem::replace(&mut self.started, true) {
             (self.rate.start)();
         }
-        // Fed estimate / (1 + share). The governor holds while that is at least (1 − deadband)
-        // × its setpoint, so a share inside the deadband moves nothing and video plus FEC is
-        // at most estimate / (1 − deadband), the bound video alone has (tests: `governed`).
+        // Fed estimate / (1 + share), with the share: the governor's ceiling is the configured
+        // one over 1 + share, so video plus FEC never exceeds it (#1301, tests: `governed`).
         // The ABR never goes under its floor: the share is at most what the estimate leaves
         // above that.
         self.charged = self.fec.as_ref().map_or(0.0, |fec| {
@@ -315,7 +316,7 @@ impl<'a> Control<'a> {
                     .map(|link| link / (1.0 + self.charged)),
             );
         }
-        (self.rate.observe)(congestion::abr_estimate(kbps, self.charged));
+        (self.rate.observe)(congestion::abr_estimate(kbps, self.charged), self.charged);
     }
 
     /// The repair datagrams that follow one frame's video datagrams. A PyroWave frame gets

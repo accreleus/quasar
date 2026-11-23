@@ -944,6 +944,8 @@ impl Sim {
             }
             self.step_rung(at);
             if let Some(abr) = self.abr.as_mut() {
+                // `abr_glue`'s `Rate::observe`: the share, then the estimate.
+                abr.set_share(self.fec_share, at);
                 abr.observe(abr_estimate(kbps, self.fec_share), at);
             }
             let setpoint = self
