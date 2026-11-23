@@ -687,6 +687,8 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       .loadBench()
       .then(({ BenchController: Ctor }) => {
         if (destroyed || failed || bench !== null) return;
+        // Every other bench.window counter is per-window, so diff the running totals per window.
+        let lastBenchDrops = { pending: 0, decode: 0 };
         const b = new Ctor({
           source: () => (benchFrame ? { image: benchFrame, width: benchFrame.displayWidth, height: benchFrame.displayHeight } : null),
           sendInput: (msg) => inputSender?.send(msg),
@@ -694,7 +696,11 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
           getClockOffsetMs: () => telemetry.clockOffsetMs(),
           extraWindowFields: () => {
             const drops = telemetry.pyroWaveDrops();
-            return drops ? { pyrowave_pending_drops: drops.pending, pyrowave_decode_drops: drops.decode } : null;
+            if (!drops) return null;
+            const pending = drops.pending - lastBenchDrops.pending;
+            const decode = drops.decode - lastBenchDrops.decode;
+            lastBenchDrops = drops;
+            return { pyrowave_pending_drops: pending, pyrowave_decode_drops: decode };
           },
         });
         b.start();

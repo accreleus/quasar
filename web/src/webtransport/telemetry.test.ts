@@ -399,9 +399,9 @@ describe("WtTelemetry", () => {
     expect(samples.map((s) => s.metrics.packets_lost)).toEqual([3, 5, 6]);
   });
 
-  it("tracks PyroWave pending-cap and decode-gate drops separately client-side and sums them into frames_dropped (#1635)", async () => {
+  it("tracks PyroWave pending-cap and decode-gate drops separately client-side without touching frames_dropped (#1635)", async () => {
     const h = harness();
-    // Before PyroWave is active, neither client counter nor frames_dropped is emitted.
+    // Before PyroWave is active, neither client counter is emitted.
     expect(h.t.pyroWaveDrops()).toBeNull();
     const before = h.t.tick();
     expect(before.pyrowavePendingDrops).toBeUndefined();
@@ -411,12 +411,13 @@ describe("WtTelemetry", () => {
     h.t.addPyroWavePendingDrops(2);
     h.t.addPyroWaveDecodeDrops(3);
     const s1 = h.t.tick();
-    expect(s1).toMatchObject({ framesDropped: 5, pyrowavePendingDrops: 2, pyrowaveDecodeDrops: 3 });
+    // Amendment 63: WebTransport leaves framesDropped at 0 (no presentation-drop counter) so HUD drops and display-Hz warning stay unchanged.
+    expect(s1).toMatchObject({ framesDropped: 0, pyrowavePendingDrops: 2, pyrowaveDecodeDrops: 3 });
 
     h.t.addPyroWavePendingDrops(1);
     h.t.addPyroWaveDecodeDrops(0);
     const s2 = h.t.tick();
-    expect(s2).toMatchObject({ framesDropped: 1, pyrowavePendingDrops: 3, pyrowaveDecodeDrops: 3 });
+    expect(s2).toMatchObject({ framesDropped: 0, pyrowavePendingDrops: 3, pyrowaveDecodeDrops: 3 });
 
     const s3 = h.t.tick();
     expect(s3).toMatchObject({ framesDropped: 0, pyrowavePendingDrops: 3, pyrowaveDecodeDrops: 3 });
@@ -424,9 +425,9 @@ describe("WtTelemetry", () => {
 
     await h.t.flush();
     const metrics = (h.posts[0].body.samples as { metrics: Record<string, number> }[]).map((s) => s.metrics);
-    expect(metrics[0]).not.toHaveProperty("frames_dropped");
-    expect(metrics.slice(1).map((m) => m.frames_dropped)).toEqual([5, 6, 6]);
     for (const m of metrics) {
+      // Amendment 63: frames_dropped must stay absent on WebTransport even after PyroWave drops.
+      expect(m).not.toHaveProperty("frames_dropped");
       expect(m).not.toHaveProperty("pyrowave_pending_drops");
       expect(m).not.toHaveProperty("pyrowave_decode_drops");
     }

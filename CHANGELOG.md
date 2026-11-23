@@ -33,7 +33,7 @@ own; the two do not move together, and that is deliberate.
 ### Added
 - The Vulkan H.264, HEVC and AV1 encoders can hold anchor frames and code the next frame from one after a loss instead of sending a key frame (the encoder half of #1348; off until the agent uses it).
 - The NVENC H.264 and HEVC encoders get the same anchor control; NVENC AV1 answers every recovery with a key frame (#1348).
-- PyroWave over WebTransport counts frames dropped by the receiver's pending-frame cap (`dropOldest`) and frames skipped by the in-flight decode gate separately in client diagnostics (`TelemetrySnapshot`, canvas `data-pyrowave-*-drops`, and `bench.window` trace payloads) and includes their sum in the existing `frames_dropped` stats counter (#1635).
+- PyroWave over WebTransport counts frames dropped by the receiver's pending-frame cap (`dropOldest`) and frames skipped by the in-flight decode gate separately in client diagnostics (`TelemetrySnapshot`, canvas `data-pyrowave-*-drops`, and per-window `bench.window` trace payloads) (#1635).
 
 ### Changed
 - **The `scripts/harness/udprelay` UDP-relay module now runs `go vet ./...` and `go test ./...` in CI** — a step on the existing control-plane Go job (`go-tests` in `.github/workflows/ci.yml`), and a change under the module now triggers that job on pull requests through `scripts/verify/ci-changed-areas.sh`, so `shape_test.go` runs on the `integration/0.6.4` CI instead of only by hand.

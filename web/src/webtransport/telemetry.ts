@@ -79,10 +79,9 @@ export class WtTelemetry {
   private fecOn = false;
   private readonly counters: PostedCounters;
   private lostAtTick: number;
-  private framesDroppedAtTick: number;
   /** PyroWave frame drops counted separately, cumulative for the page view (#1635).
-   *  Their sum also feeds the existing `frames_dropped` wire/HUD counter; separate
-   *  wire keys would need a `protocol/` contract change and stay client-side. */
+   *  Client-side diagnostics only: amendment 63 leaves `frames_dropped` absent on WebTransport,
+   *  and separate wire keys would need a `quasar-protocol` amendment. */
   private pyroPendingDrops = 0;
   private pyroDecodeDrops = 0;
   private pyroMeasured = false;
@@ -114,7 +113,6 @@ export class WtTelemetry {
     this.lastTickMs = this.nowMs();
     this.counters = opts.counters ?? newPostedCounters();
     this.lostAtTick = this.counters.packetsLost;
-    this.framesDroppedAtTick = this.counters.framesDropped;
   }
 
   /** The first window opens here, when the ticks start: connecting is not part of it. */
@@ -177,7 +175,6 @@ export class WtTelemetry {
     if (frames <= 0) return;
     this.pyroMeasured = true;
     this.pyroPendingDrops += frames;
-    this.counters.framesDropped += frames;
   }
 
   /** PyroWave frames skipped by the in-flight decode gate, as increments since the last call (#1635). */
@@ -185,7 +182,6 @@ export class WtTelemetry {
     if (frames <= 0) return;
     this.pyroMeasured = true;
     this.pyroDecodeDrops += frames;
-    this.counters.framesDropped += frames;
   }
 
   /** Separate cumulative PyroWave frame-drop counts, or null when PyroWave has not run (#1635). */
@@ -312,7 +308,6 @@ export class WtTelemetry {
       rttMs: this.rttMs,
       decodeMs,
       packetsLost: this.counters.packetsLost - this.lostAtTick,
-      framesDropped: this.counters.framesDropped - this.framesDroppedAtTick,
       freezeCount,
       presentFps: cadence.fpsFromMean,
       presentSdMs: cadence.sdMs,
@@ -368,8 +363,6 @@ export class WtTelemetry {
     put("wt_audio_underruns", this.counters.audioUnderruns);
     // Amendment 85: only while this connection is sent repairs (0 until the first rebuild).
     put("wt_fec_repaired", this.fecOn ? this.fecRepaired : null);
-    // Existing BrowserMetrics.frames_dropped key: sum of PyroWave pending-cap + decode-gate drops (#1635).
-    put("frames_dropped", this.pyroMeasured ? this.counters.framesDropped : null);
     // A thin window has no σ: "smooth" there is unmeasured, and posting it would record a pass.
     // Bench mode never posts a class: its readback costs presentations (see the WebRTC twin).
     const unmeasured = health.health === "smooth" && cadence.n < PRESENT_MIN_SAMPLES;
@@ -388,7 +381,6 @@ export class WtTelemetry {
     this.bytesInWindow = 0;
     this.keyframeRequests = 0;
     this.lostAtTick = this.counters.packetsLost;
-    this.framesDroppedAtTick = this.counters.framesDropped;
     return snap;
   }
 

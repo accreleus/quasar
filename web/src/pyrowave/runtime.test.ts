@@ -390,27 +390,34 @@ describe("a PyroWave session in the WebTransport runtime", () => {
     for (const seq of [6, 7, 8, 9]) agent.last.datagrams(datagrams(0, seq));
     await vi.advanceTimersByTimeAsync(5);
 
-    // Advance one 1 s telemetry tick so snapshot and canvas.dataset populate.
+    // Advance one 1 s telemetry tick so snapshot, canvas.dataset, and the first bench.window populate.
     clock.now += 1_000;
     await vi.advanceTimersByTimeAsync(1_000);
 
     expect(snaps.at(-1)).toMatchObject({
-      framesDropped: 3,
+      framesDropped: 0,
       pyrowavePendingDrops: 2,
       pyrowaveDecodeDrops: 1,
     });
     expect(canvas.dataset.pyrowavePendingDrops).toBe("2");
     expect(canvas.dataset.pyrowaveDecodeDrops).toBe("1");
-
-    // Teardown flushes the final bench.window and stats batch.
-    rt.destroy();
-    await Promise.resolve();
     expect(emittedWindows.at(-1)).toMatchObject({
       pyrowave_pending_drops: 2,
       pyrowave_decode_drops: 1,
     });
+
+    // Teardown flushes a final bench.window (per-window delta: 0 new drops) and the stats batch.
+    rt.destroy();
+    await Promise.resolve();
+    expect(emittedWindows.at(-1)).toMatchObject({
+      pyrowave_pending_drops: 0,
+      pyrowave_decode_drops: 0,
+    });
     const postedSamples = statsPosts.flatMap((b) => (b.samples as { metrics: Record<string, number> }[]));
-    expect(postedSamples.at(-1)?.metrics.frames_dropped).toBe(3);
+    expect(postedSamples.length).toBeGreaterThan(0);
+    for (const s of postedSamples) {
+      expect(s.metrics).not.toHaveProperty("frames_dropped");
+    }
     delete (window as unknown as Record<string, unknown>).__qBench;
   });
 });

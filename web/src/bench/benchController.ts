@@ -630,6 +630,8 @@ export class BenchController {
     // (counts+g2g vs stage_* split); dependency runs stages.ts → aggregate.ts only.
     const extra = this.deps.extraWindowFields?.();
     const payload: BenchWindowPayload = {
+      // Spread extra fields first so they can never overwrite a summarizer key.
+      ...(extra ?? {}),
       ...summarizeWindow(this.windowFrames, this.windowDeltas, this.windowI2p, {
         t_start_ms: this.windowStartMs,
         t_end_ms: nowMs,
@@ -638,7 +640,6 @@ export class BenchController {
         i2p_missed: this.windowI2pMissed,
       }),
       ...summarizeStages(this.windowFrames, this.timeOriginMs, this.inboundDelta),
-      ...(extra ?? {}),
     };
     this.windowFrames = [];
     this.windowDeltas = { missing: 0, duplicated: 0, reordered: 0 };
