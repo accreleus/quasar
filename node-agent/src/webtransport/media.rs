@@ -824,6 +824,11 @@ impl Media {
         );
     }
 
+    /// When a keyframe was last forced ([`Self::keyframe`]).
+    pub(crate) fn last_forced(&self) -> Option<Instant> {
+        self.lock().last_forced
+    }
+
     pub(super) fn on_caps(&self, caps: &gst::CapsRef, session_id: &str) {
         let mut st = self.lock();
         // A `hand_over`'d chain is at NULL and this media is on its way out (a rebuild's old
@@ -1542,11 +1547,14 @@ mod tests {
             measured: Box::new(|_| {}),
             ceiling_kbps: 8000.0,
             floor_kbps: Box::new(|| 4000.0),
+            setpoint_kbps: Box::new(|| 0.0),
+            capacity: crate::session::settings::WtCapacity::V2,
             retargets: true,
             start: Box::new(|| {}),
             owns: Box::new(|| false),
             displaced: Box::new(|| {}),
             observe: Box::new(|_| {}),
+            held: Box::new(|_| {}),
             fec: Box::new(move |event| {
                 if let crate::webtransport::FecEvent::Attached { client, fec } = event {
                     log.lock().unwrap().push((client, fec));

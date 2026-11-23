@@ -260,6 +260,8 @@ impl RuntimeSettings {
     /// Resolve from the environment (the historical defaults). This is the agent's
     /// starting point before any `config_update` arrives.
     pub fn baseline() -> Self {
+        // Read here so an unrecognised value warns at agent start.
+        wt_capacity();
         Self::baseline_with(&|k| std::env::var(k).ok())
     }
 
@@ -542,6 +544,40 @@ fn env_pos_u32(var: &str, default: u32, lookup: &dyn Fn(&str) -> Option<String>)
         .unwrap_or(default)
 }
 
+/// WebTransport capacity detection (`QUASAR_WT_CAPACITY`, `docs/configuration.md`): 0.6.3's
+/// sender and ABR reading (`legacy`, the default) or `v2` (#1433, opt-in).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WtCapacity {
+    V2,
+    #[default]
+    Legacy,
+}
+
+impl WtCapacity {
+    /// Anything but `v2` or `legacy` warns and takes the default.
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
+            None | Some("") => Self::default(),
+            Some("v2") => Self::V2,
+            Some("legacy") => Self::Legacy,
+            Some(other) => {
+                tracing::warn!(
+                    token = "wt-capacity-unrecognised",
+                    "QUASAR_WT_CAPACITY={other:?} is not v2|legacy; using {:?}",
+                    Self::default()
+                );
+                Self::default()
+            }
+        }
+    }
+}
+
+/// The agent's `QUASAR_WT_CAPACITY`, read once for the life of the process.
+pub fn wt_capacity() -> WtCapacity {
+    static CAPACITY: std::sync::OnceLock<WtCapacity> = std::sync::OnceLock::new();
+    *CAPACITY.get_or_init(|| WtCapacity::parse(std::env::var("QUASAR_WT_CAPACITY").ok().as_deref()))
+}
+
 fn env_bool(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
     matches!(
         lookup(var).as_deref(),
@@ -552,6 +588,23 @@ fn env_bool(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `QUASAR_WT_CAPACITY`: `legacy` by default (0.6.4, lab V3), `v2` on request, anything else
+    /// the default.
+    #[test]
+    fn capacity_knob_parses() {
+        assert_eq!(WtCapacity::default(), WtCapacity::Legacy);
+        for (raw, want) in [
+            (None, WtCapacity::Legacy),
+            (Some(""), WtCapacity::Legacy),
+            (Some(" v2 "), WtCapacity::V2),
+            (Some(" legacy "), WtCapacity::Legacy),
+            (Some("V2"), WtCapacity::Legacy),
+            (Some("0.6.3"), WtCapacity::Legacy),
+        ] {
+            assert_eq!(WtCapacity::parse(raw), want, "{raw:?}");
+        }
+    }
 
     #[test]
     fn resolve_explicit_env_wins_over_detection() {
