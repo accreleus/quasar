@@ -76,6 +76,12 @@ merges or touches `develop`.
 --dry-run runs every check, then prints the changelog diff and the git
 commands that would run — nothing is written, committed, tagged or pushed.
 
+QUASAR_RELEASE_TAG_SIGNING_KEY, when set, is the path of an OpenSSH private key
+(outside the repository) registered on the releasing GitHub account as a
+signing key: the release commit and the tag are then SSH-signed, and the tag's
+signature is checked before anything is pushed, so GitHub shows both as
+Verified. Unset, both are unsigned, as before.
+
 --transform is the pure changelog rewrite with no git involved: it reads a
 changelog on stdin and writes the rewritten changelog on stdout, so it is
 fixture-testable. --date defaults to today (UTC) if omitted.
@@ -294,6 +300,22 @@ fi
 commit_msg="chore(release): $version"
 tag="v$version"
 
+# Optional SSH signing of the release commit and tag. The key is checked before
+# anything is written, so an unusable key refuses the cut instead of leaving a
+# local commit behind.
+sign_key="${QUASAR_RELEASE_TAG_SIGNING_KEY:-}"
+sign=()
+commit_sign=()
+tag_kind=(-a)
+if [[ -n "$sign_key" ]]; then
+  [[ -f "$sign_key" ]] || fail "QUASAR_RELEASE_TAG_SIGNING_KEY: no file at $sign_key"
+  sign_pub="$(ssh-keygen -y -f "$sign_key" 2>/dev/null)" ||
+    fail "QUASAR_RELEASE_TAG_SIGNING_KEY: $sign_key is not a usable OpenSSH private key (or it has a passphrase)"
+  sign=(-c gpg.format=ssh -c "user.signingkey=$sign_key")
+  commit_sign=(-S)
+  tag_kind=(-s)
+fi
+
 if "$dry_run"; then
   echo "release-cut: --dry-run — nothing below is executed"
   echo
@@ -302,16 +324,28 @@ if "$dry_run"; then
   echo
   echo "── commands ──"
   echo "git -C '$root' add CHANGELOG.md"
-  echo "git -C '$root' commit -m '$commit_msg'"
-  echo "git -C '$root' tag -a '$tag' -m '$commit_msg'"
+  echo "git -C '$root' ${sign[*]} commit ${commit_sign[*]} -m '$commit_msg'"
+  echo "git -C '$root' ${sign[*]} tag ${tag_kind[*]} '$tag' -m '$commit_msg'"
+  [[ -z "$sign_key" ]] || echo "git -C '$root' tag -v '$tag'   (against the key's public half)"
   echo "git -C '$root' push origin HEAD:refs/heads/main '$tag'"
   exit 0
 fi
 
 printf '%s\n' "$new_content" > "$changelog"
 git -C "$root" add CHANGELOG.md
-git -C "$root" commit --quiet -m "$commit_msg"
-git -C "$root" tag -a "$tag" -m "$commit_msg"
+git -C "$root" "${sign[@]}" commit --quiet "${commit_sign[@]}" -m "$commit_msg"
+git -C "$root" "${sign[@]}" tag "${tag_kind[@]}" "$tag" -m "$commit_msg"
+if [[ -n "$sign_key" ]]; then
+  # Verify against the key's own public half before pushing: a signature that
+  # does not verify here would not show as Verified on GitHub either.
+  signers="$(mktemp)"
+  printf '%s %s\n' "$(git -C "$root" config user.email)" "$sign_pub" > "$signers"
+  if ! git -C "$root" -c "gpg.ssh.allowedSignersFile=$signers" tag -v "$tag" >/dev/null 2>&1; then
+    rm -f "$signers"
+    fail "the signed tag $tag did not verify; nothing was pushed (undo with: git tag -d $tag && git reset --hard HEAD~1)"
+  fi
+  rm -f "$signers"
+fi
 git -C "$root" push origin HEAD:refs/heads/main "$tag"
 
 echo "release-cut: cut and pushed $tag"

@@ -593,6 +593,13 @@ It refuses — with a one-line reason, before touching anything — unless:
   tag
 - the `## Unreleased` section is non-empty
 
+**Signed tags (GitHub's "Verified").** Set `QUASAR_RELEASE_TAG_SIGNING_KEY` to the path of an
+OpenSSH private key, kept outside the repository and registered on the releasing GitHub account
+as a *signing* key (Settings › SSH and GPG keys). The cut then SSH-signs the release commit and
+the tag and verifies the tag against that key before it pushes anything; an unusable key refuses
+the cut before anything is written. This key is not the release-manifest key of "Signing platform
+releases": keep the two separate. Unset, the commit and tag are unsigned.
+
 It never merges `develop` into `main` for you — that merge, and the operator sign-off it requires
 (`CLAUDE.md`, "Git branching & environments"), happens first, by hand. Add `DRY_RUN=1` to see the
 changelog diff and the exact git commands it would run without executing any of them:
