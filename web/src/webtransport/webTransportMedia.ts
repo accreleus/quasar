@@ -636,7 +636,10 @@ export class WebTransportMedia implements MediaTransport {
     let pyro: PyroWaveReceiver | null = null;
     /** What the PyroWave receivers already replaced counted lost. */
     let pyroLost = 0;
+    /** Pending-cap drops the PyroWave receivers already replaced counted (#1635). */
+    let pyroPendingDrops = 0;
     let reported = 0;
+    let reportedPendingDrops = 0;
     /** Amendment 85: the fragments FEC has rebuilt so far, as last reported. */
     let reportedRepaired = 0;
     const reportRepaired = () => {
@@ -647,6 +650,10 @@ export class WebTransportMedia implements MediaTransport {
     const reportLost = () => {
       const n = this.lostSoFar();
       if (n !== reported) sink.lost?.((reported = n));
+    };
+    const reportPendingDrops = () => {
+      const n = pyroPendingDrops + (pyro?.pendingDrops ?? 0);
+      if (n !== reportedPendingDrops) sink.pyrowavePendingDrops?.((reportedPendingDrops = n));
     };
     let held: { f: VideoFragment; at: number }[] = [];
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -688,11 +695,13 @@ export class WebTransportMedia implements MediaTransport {
           pyro?.configId === c.configId
             ? pyro
             : ((pyroLost += pyro?.lost ?? 0),
+              (pyroPendingDrops += pyro?.pendingDrops ?? 0),
               (pyro = new PyroWaveReceiver(c.configId, blockLayout(c.width, c.height).totalBlocks, 1000 / (c.fps || 60))));
         // No `due` here: the timer closes frames and defers after a stall, so a tail read late lands.
         const done = r.push(f, this.now());
         if (done) sink.pyrowave(done);
         reportLost();
+        reportPendingDrops();
         arm();
         return;
       }

@@ -79,6 +79,13 @@ export class WtTelemetry {
   private fecOn = false;
   private readonly counters: PostedCounters;
   private lostAtTick: number;
+  private framesDroppedAtTick: number;
+  /** PyroWave frame drops counted separately, cumulative for the page view (#1635).
+   *  Their sum also feeds the existing `frames_dropped` wire/HUD counter; separate
+   *  wire keys would need a `protocol/` contract change and stay client-side. */
+  private pyroPendingDrops = 0;
+  private pyroDecodeDrops = 0;
+  private pyroMeasured = false;
   /** The last window's median interval: what a thin window's freezes are judged against. */
   private typicalMs: number | null = null;
   private decodeMsInWindow: number[] = [];
@@ -107,6 +114,7 @@ export class WtTelemetry {
     this.lastTickMs = this.nowMs();
     this.counters = opts.counters ?? newPostedCounters();
     this.lostAtTick = this.counters.packetsLost;
+    this.framesDroppedAtTick = this.counters.framesDropped;
   }
 
   /** The first window opens here, when the ticks start: connecting is not part of it. */
@@ -116,6 +124,7 @@ export class WtTelemetry {
 
   setCodec(mime: string | null): void {
     this.codec = mime;
+    if (mime === "video/pyrowave") this.pyroMeasured = true;
   }
 
   setDecodeFailed(failed: boolean): void {
@@ -161,6 +170,27 @@ export class WtTelemetry {
    *  count into additions. */
   addLost(fragments: number): void {
     if (fragments > 0) this.counters.packetsLost += fragments;
+  }
+
+  /** PyroWave frames evicted by the receiver's pending-frame cap, as increments since the last call (#1635). */
+  addPyroWavePendingDrops(frames: number): void {
+    if (frames <= 0) return;
+    this.pyroMeasured = true;
+    this.pyroPendingDrops += frames;
+    this.counters.framesDropped += frames;
+  }
+
+  /** PyroWave frames skipped by the in-flight decode gate, as increments since the last call (#1635). */
+  addPyroWaveDecodeDrops(frames: number): void {
+    if (frames <= 0) return;
+    this.pyroMeasured = true;
+    this.pyroDecodeDrops += frames;
+    this.counters.framesDropped += frames;
+  }
+
+  /** Separate cumulative PyroWave frame-drop counts, or null when PyroWave has not run (#1635). */
+  pyroWaveDrops(): { pending: number; decode: number } | null {
+    return this.pyroMeasured ? { pending: this.pyroPendingDrops, decode: this.pyroDecodeDrops } : null;
   }
 
   /** Amendment 85: whether the live connection's `hello_ack.fec` named a scheme. The FEC
@@ -282,6 +312,7 @@ export class WtTelemetry {
       rttMs: this.rttMs,
       decodeMs,
       packetsLost: this.counters.packetsLost - this.lostAtTick,
+      framesDropped: this.counters.framesDropped - this.framesDroppedAtTick,
       freezeCount,
       presentFps: cadence.fpsFromMean,
       presentSdMs: cadence.sdMs,
@@ -299,6 +330,7 @@ export class WtTelemetry {
       audioConcealmentEvents: this.counters.audioConcealmentEvents,
       audioBufferMs: this.audioBufferMs,
       audioTargetMs: this.audioTargetMs,
+      ...(this.pyroMeasured ? { pyrowavePendingDrops: this.pyroPendingDrops, pyrowaveDecodeDrops: this.pyroDecodeDrops } : {}),
     };
 
     // The keys are the metric manifest's (docs/session-trace/metrics.json): the shared
@@ -336,6 +368,8 @@ export class WtTelemetry {
     put("wt_audio_underruns", this.counters.audioUnderruns);
     // Amendment 85: only while this connection is sent repairs (0 until the first rebuild).
     put("wt_fec_repaired", this.fecOn ? this.fecRepaired : null);
+    // Existing BrowserMetrics.frames_dropped key: sum of PyroWave pending-cap + decode-gate drops (#1635).
+    put("frames_dropped", this.pyroMeasured ? this.counters.framesDropped : null);
     // A thin window has no σ: "smooth" there is unmeasured, and posting it would record a pass.
     // Bench mode never posts a class: its readback costs presentations (see the WebRTC twin).
     const unmeasured = health.health === "smooth" && cadence.n < PRESENT_MIN_SAMPLES;
@@ -354,6 +388,7 @@ export class WtTelemetry {
     this.bytesInWindow = 0;
     this.keyframeRequests = 0;
     this.lostAtTick = this.counters.packetsLost;
+    this.framesDroppedAtTick = this.counters.framesDropped;
     return snap;
   }
 

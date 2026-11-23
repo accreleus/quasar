@@ -85,6 +85,8 @@ export interface MediaSink {
    *  when it is first NACKed, whether or not the resend then arrives. PyroWave: the datagrams
    *  missing from each frame closed or dropped incomplete. */
   lost?(fragments: number): void;
+  /** PyroWave frames evicted by the receiver's pending-frame cap since connect, cumulative (#1635). */
+  pyrowavePendingDrops?(frames: number): void;
   /** Video fragments REBUILT from FEC repair datagrams since connect, cumulative (amendment
    *  85). A repaired fragment is never NACKed, so it is never in `lost`. */
   repaired?(fragments: number): void;

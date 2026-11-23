@@ -112,6 +112,8 @@ export interface BenchDeps {
   getStats?: () => Promise<RTCStatsReport>;
   /** `performance.timeOrigin` override for tests; production reads the real one. */
   timeOriginMs?: number;
+  /** Optional extra numeric diagnostic counters merged into each `bench.window` payload. */
+  extraWindowFields?: () => Record<string, number> | null;
 }
 
 /** The `window.__qBench` surface the harness drives. */
@@ -626,6 +628,7 @@ export class BenchController {
     // Empty windows are emitted, not skipped: a freeze must read as frameless
     // windows, never as a hole compressing the timeline. Two summarizers merged
     // (counts+g2g vs stage_* split); dependency runs stages.ts → aggregate.ts only.
+    const extra = this.deps.extraWindowFields?.();
     const payload: BenchWindowPayload = {
       ...summarizeWindow(this.windowFrames, this.windowDeltas, this.windowI2p, {
         t_start_ms: this.windowStartMs,
@@ -635,6 +638,7 @@ export class BenchController {
         i2p_missed: this.windowI2pMissed,
       }),
       ...summarizeStages(this.windowFrames, this.timeOriginMs, this.inboundDelta),
+      ...(extra ?? {}),
     };
     this.windowFrames = [];
     this.windowDeltas = { missing: 0, duplicated: 0, reordered: 0 };

@@ -133,6 +133,32 @@ describe("PyroWave loss over the transport (#1298)", () => {
     expect(agent.sent("nack")).toEqual([]);
     await t.close();
   });
+
+  it("reports PyroWave pending-cap frame drops cumulative across configurations (#1635)", async () => {
+    const agent = new FakeAgent();
+    agent.replies = [[pyroAck(0)]];
+    const clock = { now: 1_000 };
+    const pyrowavePendingDrops = vi.fn();
+    const t = new WebTransportMedia({
+      sessionId: "s1",
+      coords: COORDS,
+      mintToken: async () => COORDS,
+      pyrowave: true,
+      createWebTransport: agent.create,
+      sleep: async () => {},
+      now: () => clock.now,
+      ticker: () => () => {},
+    });
+    await t.connect({ config: () => {}, unit: () => {}, pyrowave: () => {}, end: () => {}, pyrowavePendingDrops });
+    // Five incomplete frames on config 0 evict the oldest once.
+    for (const seq of [1, 2, 3, 4, 5]) agent.last.datagrams(datagrams(0, seq).slice(1));
+    await vi.waitFor(() => expect(pyrowavePendingDrops).toHaveBeenLastCalledWith(1));
+    // Switching to config 1 starts a fresh receiver whose evictions add to the connection total.
+    agent.last.control(pyroAck(1, "reconnect"));
+    for (const seq of [6, 7, 8, 9, 10]) agent.last.datagrams(datagrams(1, seq).slice(1));
+    await vi.waitFor(() => expect(pyrowavePendingDrops).toHaveBeenLastCalledWith(2));
+    await t.close();
+  });
 });
 
 describe("a PyroWave session in the WebTransport runtime", () => {
@@ -280,5 +306,111 @@ describe("a PyroWave session in the WebTransport runtime", () => {
     expect(agent.sent("hello")).toHaveLength(1);
     expect(agent.sent("codec_fallback")).toEqual([]);
     rt.destroy();
+  });
+
+  it("surfaces PyroWave pending-cap and in-flight decode drops separately on snapshot, canvas dataset, and bench.window (#1635)", async () => {
+    vi.useFakeTimers();
+    const gates: (() => void)[] = [];
+    const emittedWindows: Record<string, unknown>[] = [];
+    const statsPosts: Record<string, unknown>[] = [];
+    const snaps: { framesDropped: number; pyrowavePendingDrops?: number; pyrowaveDecodeDrops?: number }[] = [];
+    const canvas = document.createElement("canvas");
+    const { BenchController } = await import("../bench/benchController");
+    const agent = new FakeAgent();
+    agent.replies = [[pyroAck(0)]];
+    const texture = { width: 320, height: 192 } as GPUTexture;
+    const fakeModule = {
+      PyroWaveDecoder: {
+        create: vi.fn(async () => ({
+          texture,
+          decode: () => ({ received: 0, zero: 0, lost: 0 }),
+          destroy: () => {},
+        })),
+      },
+    };
+    const presenter: Presenter = {
+      present: () => true,
+      device: {
+        queue: {
+          onSubmittedWorkDone: () => new Promise<void>((res) => gates.push(res)),
+          submit: () => {},
+        },
+        pushErrorScope: () => {},
+        popErrorScope: async () => null,
+        createBuffer: () => ({ size: 0, mapAsync: async () => {}, getMappedRange: () => new ArrayBuffer(0), unmap: () => {}, destroy: () => {} }),
+        createCommandEncoder: () => ({ copyTextureToBuffer: () => {}, finish: () => ({}) }),
+      } as unknown as GPUDevice,
+      presentTexture: () => true,
+      destroy: () => {},
+    };
+    const clock = { now: 1_000 };
+    const rt = createWebTransportRuntime({
+      sessionId: "s1",
+      authToken: "auth",
+      coords: COORDS,
+      canvas,
+      pyrowave: true,
+      callbacks: { onDisconnectSuspected: vi.fn(), onSessionTakenOver: vi.fn(), onTransportFailed: vi.fn(), onFallback: vi.fn() },
+      deps: {
+        createTransport: (o) =>
+          new WebTransportMedia({ ...o, createWebTransport: agent.create, sleep: async () => {}, now: () => clock.now, ticker: () => () => {} }),
+        createPresenter: async () => presenter,
+        warmPyroWave: async () => true,
+        loadPyroWave: async () => fakeModule as never,
+        isBenchModeEnabled: () => true,
+        loadBench: async () => ({ BenchController }),
+        createTracer: () => ({
+          start() {},
+          stop() {},
+          emitBenchWindow: (payload) => emittedWindows.push(payload),
+        }),
+        telemetry: {
+          nowMs: () => clock.now,
+          nowEpochMs: () => 1_700_000_000_000 + clock.now,
+          fetch: (async (url: string, init: RequestInit) => {
+            if (url.endsWith("/stats")) statsPosts.push(JSON.parse(init.body as string));
+            return new Response("{}");
+          }) as unknown as typeof fetch,
+        },
+      },
+    });
+    rt.registerTelemetry((s) => snaps.push(s));
+    rt.start();
+    await vi.advanceTimersByTimeAsync(20);
+    expect(rt.getSnapshot().channelOpen).toBe(true);
+
+    // 1) Trigger 2 receiver pending-cap drops: 5 incomplete frames (seqs 1..5) fill the 4-frame
+    //    cap and evict seq 1 (drop #1); seq 6's first datagram arrives while seqs 2..5 are still
+    //    pending and evicts seq 2 (drop #2), then seq 6 completes and clears seqs 3..5.
+    for (const seq of [1, 2, 3, 4, 5]) agent.last.datagrams(datagrams(0, seq).slice(1));
+    await vi.advanceTimersByTimeAsync(5);
+
+    // 2) Trigger 1 in-flight decode-gate drop (4 complete frames while GPU work gates stay open:
+    //    seqs 6 and 7 occupy the 2 slots, seq 8 sits pending, seq 9 replaces seq 8 -> 1 drop).
+    for (const seq of [6, 7, 8, 9]) agent.last.datagrams(datagrams(0, seq));
+    await vi.advanceTimersByTimeAsync(5);
+
+    // Advance one 1 s telemetry tick so snapshot and canvas.dataset populate.
+    clock.now += 1_000;
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(snaps.at(-1)).toMatchObject({
+      framesDropped: 3,
+      pyrowavePendingDrops: 2,
+      pyrowaveDecodeDrops: 1,
+    });
+    expect(canvas.dataset.pyrowavePendingDrops).toBe("2");
+    expect(canvas.dataset.pyrowaveDecodeDrops).toBe("1");
+
+    // Teardown flushes the final bench.window and stats batch.
+    rt.destroy();
+    await Promise.resolve();
+    expect(emittedWindows.at(-1)).toMatchObject({
+      pyrowave_pending_drops: 2,
+      pyrowave_decode_drops: 1,
+    });
+    const postedSamples = statsPosts.flatMap((b) => (b.samples as { metrics: Record<string, number> }[]));
+    expect(postedSamples.at(-1)?.metrics.frames_dropped).toBe(3);
+    delete (window as unknown as Record<string, unknown>).__qBench;
   });
 });
