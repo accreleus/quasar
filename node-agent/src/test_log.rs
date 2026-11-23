@@ -25,10 +25,12 @@
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex, Once};
 
+use tracing_subscriber::filter::FilterExt;
 use tracing_subscriber::prelude::*;
 
-// The bytes one capture collects for the calling thread (and any thread it
-// spawns, which share this thread-local sink).
+// The bytes one capture collects on the calling thread. The sink is
+// thread-local, so a task spawned on another thread does not share it —
+// capture is calling-thread-only, like the old `with_default`.
 thread_local! {
     static SINK: RefCell<Option<Arc<Mutex<Vec<u8>>>>> = const {
         RefCell::new(None)
@@ -97,10 +99,19 @@ fn install() {
                 tracing_subscriber::fmt::layer()
                     .with_ansi(false)
                     .with_writer(|| Routed)
-                    // DEBUG, not INFO: one capture asserts on a debug-level
-                    // log line (a refused hello's bounded log). INFO and above
-                    // is what the stderr and WarningLog layers keep.
-                    .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+                    // DEBUG, not INFO: one capture asserts on a debug-level log
+                    // line (a refused hello's bounded log). INFO and above is
+                    // what the stderr and WarningLog layers keep. The filter is
+                    // the DEBUG level combined with a per-thread sink check, so
+                    // the layer does no formatting work on a thread that is not
+                    // capturing; as a dynamic per-event filter it keeps callsite
+                    // interest "sometimes", so a callsite is never cached as
+                    // disabled (never).
+                    .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG.and(
+                        tracing_subscriber::filter::filter_fn(|_| {
+                            SINK.with(|s| s.borrow().is_some())
+                        }),
+                    )),
             )
             .with(
                 tracing_subscriber::fmt::layer()
@@ -113,21 +124,26 @@ fn install() {
 }
 
 /// Stops the active capture on this thread when dropped.
-pub struct EndCapture;
+///
+/// Nest-safe: the guard remembers the sink that was active before [`begin`] and
+/// restores it on drop, so ending an inner capture leaves an outer one running.
+pub struct EndCapture {
+    previous: Option<Arc<Mutex<Vec<u8>>>>,
+}
 
 impl Drop for EndCapture {
     fn drop(&mut self) {
         SINK.with(|s| {
-            *s.borrow_mut() = None;
+            *s.borrow_mut() = self.previous.clone();
         });
     }
 }
 
 /// The lines `run` logs (DEBUG and above) on this thread, one per element.
 ///
-/// Scoped to this thread and every thread it spawns: the sink is thread-local,
-/// so a task spawned inside `run` writes to the same sink. (A per-test scoped
-/// subscriber had exactly this scope; nothing reaches deeper.)
+/// Scoped to the calling thread only: the sink is thread-local, so a task
+/// spawned on another thread does not write to it. Like the old `with_default`,
+/// capture reaches no deeper than the calling thread.
 pub fn logged(run: impl FnOnce()) -> Vec<String> {
     let sink = Arc::new(Mutex::new(Vec::new()));
     let _guard = begin(&sink);
@@ -141,13 +157,16 @@ pub fn logged(run: impl FnOnce()) -> Vec<String> {
 
 /// Sets this thread's sink to `sink` until the returned guard drops, so a
 /// capture handle can be read mid-flight (e.g. while a session is still
-/// running). Installs the shared subscriber if it is not already installed.
+/// running). Nest-safe: an inner `begin` restores the previous sink on drop,
+/// leaving an outer capture running. Installs the shared subscriber if it is
+/// not already installed.
 pub fn begin(sink: &Arc<Mutex<Vec<u8>>>) -> EndCapture {
     install();
     SINK.with(|s| {
+        let previous = s.borrow().clone();
         *s.borrow_mut() = Some(sink.clone());
-    });
-    EndCapture
+        EndCapture { previous }
+    })
 }
 
 /// Agent log lines on stderr (for the browser host) plus warnings in
@@ -155,4 +174,58 @@ pub fn begin(sink: &Arc<Mutex<Vec<u8>>>) -> EndCapture {
 /// test, any thread. Replaces the takeover tests' per-call `try_init`.
 pub fn trace_to_stderr() {
     install();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ending an inner capture must leave an outer one running. Before the
+    /// guard stored the previous sink, dropping the inner capture reset the
+    /// thread's sink to `None`, ending the outer capture too.
+    #[test]
+    fn nested_capture_ends_without_ending_the_outer() {
+        let outer = Arc::new(Mutex::new(Vec::new()));
+        let outer_guard = begin(&outer);
+        let inner = Arc::new(Mutex::new(Vec::new()));
+        let inner_guard = begin(&inner);
+
+        // With both active, a line lands in the inner (most recent) sink only.
+        tracing::debug!("to-inner");
+        assert_eq!(
+            String::from_utf8_lossy(&inner.lock().unwrap())
+                .lines()
+                .count(),
+            1,
+            "a line logged with the inner capture active lands in the inner sink"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&outer.lock().unwrap())
+                .lines()
+                .count(),
+            0,
+            "it does not also land in the outer sink"
+        );
+
+        // Dropping the inner capture ends only the inner one; the outer is still
+        // active, so the next line lands in the outer sink.
+        drop(inner_guard);
+        tracing::debug!("to-outer");
+        assert_eq!(
+            String::from_utf8_lossy(&inner.lock().unwrap())
+                .lines()
+                .count(),
+            1,
+            "the ended inner sink collects nothing more"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&outer.lock().unwrap())
+                .lines()
+                .count(),
+            1,
+            "the outer sink is still active after the inner one drops"
+        );
+
+        drop(outer_guard);
+    }
 }
