@@ -192,7 +192,10 @@ mod tests {
         fire();
         drop(guard);
         let got = String::from_utf8_lossy(&sink.lock().unwrap()).into_owned();
-        assert!(got.contains("first-seen-uncaptured"), "the line was not captured: {got:?}");
+        assert!(
+            got.contains("first-seen-uncaptured"),
+            "the line was not captured: {got:?}"
+        );
     }
 
     /// Ending an inner capture must leave an outer one running. Before the
