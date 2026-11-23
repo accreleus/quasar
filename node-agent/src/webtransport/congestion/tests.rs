@@ -137,6 +137,11 @@ struct Sim {
     /// `tbf burst`: a token bucket of this many bytes at `cap_kbps` in front of the `queue_bytes`
     /// queue (the lab's `tbf rate 5mbit burst 15kb latency 10ms`).
     tbf_burst: Option<f64>,
+    /// The capacity probe's repair datagrams (`Estimator::probe_kbps`): the client drops them (a
+    /// frame already whole) and never asks for one again (§FEC: repairs are never retransmitted).
+    probe_seqs: std::collections::HashSet<u32>,
+    /// (seconds, the probe's total) after each message.
+    probes: Vec<(f64, Option<f64>)>,
 }
 
 /// The browser's reassembly (`web/src/webtransport/reassembly.ts`) and decoder, simulated: a
@@ -384,6 +389,8 @@ impl Sim {
             audio: false,
             next_audio: 0,
             tbf_burst: None,
+            probe_seqs: std::collections::HashSet::new(),
+            probes: Vec::new(),
         }
     }
 
@@ -429,6 +436,7 @@ impl Sim {
         s.client = Some(Client::default());
         s.audio = true;
         s.fec_share = 0.24;
+        s.est.probes = !legacy;
         s.key_ratio = LAB_KEY_RATIO;
         s.content_gain = Box::new(lab_content);
         s
@@ -618,7 +626,7 @@ impl Sim {
         self.pending.push_back((seq, arrival));
         if let Some(client) = self.client.as_mut() {
             client.arrived.insert(seq, arrival);
-            if arrival.is_none() {
+            if arrival.is_none() && !self.probe_seqs.contains(&seq) {
                 client.nacks.push_back((self.t + NACK_US, seq));
             }
         }
@@ -740,6 +748,19 @@ impl Sim {
         }
         if key {
             self.keys_handed.push(self.t as f64 / 1e6);
+        }
+        // The production probe arm: one burst into an idle queue, under the probe's fill.
+        let probe = self.est.probe_kbps();
+        let idle = probe.is_some() && quic.video.is_empty() && quic.queue.is_empty();
+        let mut room = self.log.probe_room(probe, at);
+        while idle && room >= SIZE as f64 {
+            let mut d = video_datagram(quic.video.take_seq()).to_vec();
+            d[0] = 0x04;
+            self.log.record_probe(&d, at);
+            self.probe_seqs.insert(wire_seq(&d));
+            quic.queued += d.len();
+            quic.queue.push_back(d.into());
+            room = self.log.probe_room(probe, at);
         }
         if quic.video.bytes() > self.held_max.0 {
             self.held_max = (quic.video.bytes(), self.t as f64 / 1e6);
@@ -941,6 +962,7 @@ impl Sim {
         self.loss_bounds
             .push((now as f64 / 1e6, self.est.loss_kbps));
         self.lines.push((now as f64 / 1e6, self.est.held_kbps()));
+        self.probes.push((now as f64 / 1e6, self.est.probe_kbps()));
         if let Some(abr) = self.abr.as_ref() {
             self.setpoints.push((now as f64 / 1e6, abr.setpoint_kbps()));
             self.rates.push((now as f64 / 1e6, abr.rate_kbps()));
@@ -1735,6 +1757,7 @@ fn the_regrow_caps_each_bound_at_the_pre_outage_rate() {
         gap_us: 0,
         sent_kbps: None,
         arrived_sent_kbps: None,
+        probe_sent_kbps: 0.0,
         fresh: true,
         loss: None,
     };
@@ -1771,6 +1794,7 @@ fn the_loss_bound_grows_within_the_receive_rate_cap() {
         gap_us: 0,
         sent_kbps: None,
         arrived_sent_kbps: None,
+        probe_sent_kbps: 0.0,
         fresh: true,
         loss: None,
     };
@@ -2553,6 +2577,7 @@ fn a_bound_flipping_at_the_feedback_rate_is_logged_at_most_once_a_second() {
                 gap_us: 0,
                 sent_kbps: None,
                 arrived_sent_kbps: None,
+                probe_sent_kbps: 0.0,
                 fresh: false,
                 loss: delay_grows.then_some(0.05),
             };
@@ -2631,6 +2656,7 @@ fn each_line_names_every_cause_of_the_fall_it_covers() {
             gap_us: 0,
             sent_kbps: None,
             arrived_sent_kbps: None,
+            probe_sent_kbps: 0.0,
             fresh: false,
             loss: Some(0.5),
         };
@@ -4055,6 +4081,7 @@ fn a_report_is_a_reading_only_when_the_link_delivered_under_what_was_sent() {
         gap_us: 0,
         sent_kbps,
         arrived_sent_kbps: sent_kbps,
+        probe_sent_kbps: 0.0,
         fresh: true,
         loss: None,
     };
@@ -4083,6 +4110,7 @@ fn capacity_evidence_paces_nothing_at_the_ceiling() {
         gap_us: 0,
         sent_kbps: Some(8000.0),
         arrived_sent_kbps: Some(8000.0),
+        probe_sent_kbps: 0.0,
         fresh: true,
         loss: None,
     };
@@ -4398,6 +4426,7 @@ fn a_report_with_no_fresh_video_is_no_reading() {
         gap_us: 0,
         sent_kbps: None,
         arrived_sent_kbps: None,
+        probe_sent_kbps: 0.0,
         fresh: false,
         loss: None,
     };
@@ -5066,6 +5095,7 @@ fn legacy_capacity_is_the_0_6_3_sender() {
         gap_us: 60_000,
         sent_kbps: Some(8000.0),
         arrived_sent_kbps: Some(8000.0),
+        probe_sent_kbps: 0.0,
         fresh: true,
         loss: None,
     };
@@ -5395,6 +5425,7 @@ fn received(kbps: f64, loss: f64) -> Measured {
         gap_us: 0,
         sent_kbps: Some(kbps / (1.0 - loss)),
         arrived_sent_kbps: Some(kbps),
+        probe_sent_kbps: 0.0,
         fresh: true,
         loss: Some(loss),
     }
@@ -5598,6 +5629,7 @@ fn a_second_stretched_reading_in_a_row_sets_the_hold() {
     let stretched = |delivered: f64| Measured {
         delivered_kbps: Some(delivered),
         arrived_sent_kbps: Some(7000.0),
+        probe_sent_kbps: 0.0,
         sent_kbps: Some(7000.0),
         ..received(delivered, 0.0)
     };
@@ -5818,18 +5850,20 @@ fn second_cap_step(sim: fn(bool) -> Sim, second_kbps: f64, content: f64) -> Sim 
 /// that burst ended on its own and released the hold at 90.8 s, then no frame for 61 s.
 #[test]
 fn a_second_cap_step_under_a_hold_keeps_it_and_steps_down() {
+    // The most freezes each row had before the probe round (bdf82c12): a probe crossing a link
+    // still shaped must cost none.
     let rows = [
-        ("lab", Sim::lab as fn(bool) -> Sim, 2500.0),
-        ("lab", Sim::lab, 3000.0),
-        ("lab_hw", Sim::lab_hw, 2500.0),
-        ("lab_hw", Sim::lab_hw, 3000.0),
-        ("lab_hw", Sim::lab_hw, 3800.0),
-        ("lab_hw", Sim::lab_hw, 4000.0),
-        ("lab_hw", Sim::lab_hw, 4200.0),
-        ("lab_hw", Sim::lab_hw, 4500.0),
+        ("lab", Sim::lab as fn(bool) -> Sim, 2500.0, 2),
+        ("lab", Sim::lab, 3000.0, 2),
+        ("lab_hw", Sim::lab_hw, 2500.0, 2),
+        ("lab_hw", Sim::lab_hw, 3000.0, 2),
+        ("lab_hw", Sim::lab_hw, 3800.0, 4),
+        ("lab_hw", Sim::lab_hw, 4000.0, 4),
+        ("lab_hw", Sim::lab_hw, 4200.0, 3),
+        ("lab_hw", Sim::lab_hw, 4500.0, 1),
     ];
     let mut bad = Vec::new();
-    for (name, sim, second) in rows {
+    for (name, sim, second, most) in rows {
         let s = second_cap_step(sim, second, 1.0);
         let (freezes, rungs) = lab_summary(&format!("{name} 5000 → {second}"), &s);
         let longest = s.client.as_ref().unwrap().longest;
@@ -5859,6 +5893,12 @@ fn a_second_cap_step_under_a_hold_keeps_it_and_steps_down() {
                 s.rung_at(105.0)
             ));
         }
+        if freezes.len() > most {
+            bad.push(format!(
+                "{name} {second}: {} freezes, before {most}",
+                freezes.len()
+            ));
+        }
         if longest.0 >= 2_000_000 {
             bad.push(format!(
                 "{name} {second}: no frame for {:.2} s up to {:.1} s",
@@ -5875,6 +5915,7 @@ fn read_hold(est: &mut Estimator, at: impl Fn(u64) -> Instant) {
     let stretched = |delivered: f64| Measured {
         delivered_kbps: Some(delivered),
         arrived_sent_kbps: Some(7000.0),
+        probe_sent_kbps: 0.0,
         sent_kbps: Some(7000.0),
         ..received(delivered, 0.0)
     };
@@ -5997,8 +6038,9 @@ fn loss_between(s: &Sim, from: f64, to: f64) -> f64 {
 /// measured per-rung ratios and production's adaptive FEC. R3 reaches 540p within 15 s of the onset
 /// (lab run 1: 720p until onset + 37 s, the FEC charge capped at 3 % by 1080p's floor), R4 reaches
 /// 360p or loses at most 2 % while shaped, neither freezes over twice or steps the rung up while
-/// shaped, the guard never stalls after onset + 15 s, and both are back at 1080p within 120 s of
-/// the clear. Legacy is printed.
+/// shaped, the guard never stalls after onset + 15 s, and both are back at 1080p within 20 s of the
+/// clear (probe round: the repair-datagram probe; with the video line probing after a 60 s hold, 26
+/// and 69 s). Legacy is printed.
 #[test]
 fn lab_rows_with_the_lab_encoders_keyframes_hold_and_recover() {
     for (name, shape) in [("R3", shallow as fn(&mut Sim)), ("R4", policer)] {
@@ -6017,7 +6059,7 @@ fn lab_rows_with_the_lab_encoders_keyframes_hold_and_recover() {
             .collect();
         assert!(ups.is_empty(), "{name}: rung up while shaped {ups:?}");
         assert!(stalls.is_empty(), "{name}: stalls {stalls:?}");
-        assert!(back.is_some_and(|b| b <= 120.0), "{name}: back {back:?}");
+        assert!(back.is_some_and(|b| b <= 20.0), "{name}: back {back:?}");
         match name {
             "R3" => assert!(s.rung_at(45.0) >= 3, "R3: rung {} at 45 s", s.rung_at(45.0)),
             _ => assert!(
@@ -6047,9 +6089,10 @@ fn policer_4(s: &mut Sim) {
 
 /// Seat B, hold round 4 (#1433 M1'): R4 with the lab encoder over a 4 % random-loss floor freezes
 /// at most 3 times while shaped. Old code: 42 freezes, the burst memory blocking every hold for
-/// 60 s after a release. The 2 % rows are printed (S2, open: each `loss-floor` end puts the
-/// pre-hold rate back and costs a freeze; probing from the line instead, or restoring at the
-/// governor's slew, stranded the hold after the lift and took a lab Wi-Fi row to 540p).
+/// 60 s after a release. Seat B S2 (probe round): the 2 % rows freeze at most once while shaped,
+/// and every row is back at 1080p within 20 s of the clear (the random loss stays). bdf82c12: 7
+/// (R3) and 4 (R4) freezes, each `loss-floor` end putting the pre-hold rate back; R4 + 4 % never
+/// back.
 #[test]
 fn lab_rows_over_a_random_loss_floor_keep_the_hold() {
     for (name, shape) in [
@@ -6061,8 +6104,143 @@ fn lab_rows_over_a_random_loss_floor_keep_the_hold() {
         let s = lab_hw_row(false, shape, 120.0);
         let (freezes, _) = hw_summary(&format!("{name} v2"), &s);
         let shaped: Vec<_> = freezes.iter().filter(|&&t| t < 210.0).collect();
-        if name == "R4 + 4 %" {
-            assert!(shaped.len() <= 3, "{name}: freezes while shaped {shaped:?}");
+        let most = if name == "R4 + 4 %" { 3 } else { 1 };
+        assert!(
+            shaped.len() <= most,
+            "{name}: freezes while shaped {shaped:?}"
+        );
+        let back = back_after_clear(&s);
+        assert!(back.is_some_and(|b| b <= 20.0), "{name}: back {back:?}");
+    }
+}
+
+/// Probe round (#1433): a hold that can probe sends repair datagrams at `PROBE_GAIN` × the line
+/// `PROBE_WAIT` after the line stepped down. A step carried clean raises the line to `BETA`² × what
+/// it carried and doubles again; a report that loses the probe's datagrams stops it at once and the
+/// line stays.
+#[test]
+fn a_probe_raises_the_line_only_on_a_step_carried_clean() {
+    let start = Instant::now();
+    let mut est = Estimator::new(CEILING, start);
+    est.probes = true;
+    let at = |ms: u64| start + Duration::from_millis(ms);
+    est.apply(received(6000.0, 0.3), at(100), NO_QUIC);
+    let line = BETA * 6000.0;
+    for ms in (200..5100).step_by(50) {
+        est.apply(received(5000.0, 0.0), at(ms), NO_QUIC);
+        assert_eq!(est.probe_kbps(), None, "probing at {ms} ms");
+    }
+    est.apply(received(5000.0, 0.0), at(5100), NO_QUIC);
+    assert_eq!(est.probe_kbps(), Some(PROBE_GAIN * line));
+    let carried = Measured {
+        sent_kbps: Some(line),
+        probe_sent_kbps: line,
+        ..received(2.0 * line, 0.0)
+    };
+    for ms in (5150..=6100).step_by(50) {
+        est.probe_counted = (10, 0);
+        est.apply(carried, at(ms), NO_QUIC);
+    }
+    let raised = BETA * BETA * PROBE_GAIN * line;
+    assert!(
+        est.held_kbps().is_some_and(|l| (l - raised).abs() < 1.0),
+        "line {:?}, want {raised:.0}",
+        est.held_kbps()
+    );
+    assert!(est.probe_kbps().is_some(), "the next step starts at once");
+    est.probe_counted = (5, 10);
+    est.apply(received(raised, 0.0), at(6150), NO_QUIC);
+    assert_eq!(
+        est.probe_kbps(),
+        None,
+        "a probe losing its datagrams goes on"
+    );
+    assert!(est.held_kbps().is_some_and(|l| (l - raised).abs() < 1.0));
+}
+
+/// Probe round (#1433): the probe's datagrams are counted apart. Losing them is no video loss (the
+/// hold, the loss bound and FEC read video's), and their bytes are out of the encoder's send rate.
+#[test]
+fn a_probes_lost_datagrams_are_not_video_loss() {
+    let start = Instant::now();
+    let mut est = Estimator::new(CEILING, start);
+    let mut log = SendLog::new(start);
+    for i in 0..70u32 {
+        let mut d = vec![0u8; SIZE];
+        d[1..5].copy_from_slice(&i.to_le_bytes());
+        let sent = start + Duration::from_millis(2 * u64::from(i));
+        match (40..60).contains(&i) {
+            true => log.record_probe(&d, sent),
+            false => log.record(&d, sent, false),
         }
+    }
+    let fb = report_nth(0, 0, 69, |i| 2 * u64::from(i), |i| !(40..50).contains(&i));
+    let m = est.measure(&fb, &mut log, start + Duration::from_millis(200));
+    assert_eq!(m.loss, Some(0.0));
+    assert_eq!(est.probe_counted, (10, 10));
+    assert!(m.probe_sent_kbps > 0.0);
+    let all = m.sent_kbps.unwrap() + m.probe_sent_kbps;
+    assert!(
+        (m.probe_sent_kbps / all - 20.0 / 70.0).abs() < 0.02,
+        "probe {:.0} of {all:.0} kbps",
+        m.probe_sent_kbps
+    );
+}
+
+/// Probe round (#1433): the probe's bytes go in one burst right behind a frame's, never between
+/// frames, at the probe's rate less what the frame sent.
+#[test]
+fn the_probe_fills_right_behind_a_frame_less_what_it_sent() {
+    let start = Instant::now();
+    let at = |ms: u64| start + Duration::from_millis(ms);
+    let mut log = SendLog::new(start);
+    assert_eq!(log.probe_room(Some(4800.0), at(0)), 0.0);
+    send_nth(&mut log, start, 0, 0, 10);
+    let room = log.probe_room(Some(4800.0), at(10));
+    assert!(
+        (room - (4800.0 * 125.0 * 0.010 - SIZE as f64)).abs() < 1.0,
+        "room {room:.0}"
+    );
+    assert_eq!(log.probe_room(Some(4800.0), at(13)), 0.0, "between frames");
+    assert_eq!(log.probe_room(None, at(14)), 0.0);
+}
+
+/// Probe round (#1433): a probe that met the link's edge (its own datagrams lost, video's not) keeps
+/// a burst near it from releasing the hold as Wi-Fi (sim, second step to 3800 under the lab encoder:
+/// the line just over the policer was released 2 s after a probe, back to 1080p).
+#[test]
+fn a_probe_at_the_links_edge_keeps_a_burst_near_it_from_releasing_the_hold() {
+    let start = Instant::now();
+    let mut est = Estimator::new(CEILING, start);
+    est.probes = true;
+    let at = |ms: u64| start + Duration::from_millis(ms);
+    est.apply(received(7000.0, 0.3), at(100), NO_QUIC);
+    for ms in (200..=5100).step_by(100) {
+        est.apply(received(5000.0, 0.0), at(ms), NO_QUIC);
+    }
+    assert!(est.probe_kbps().is_some());
+    est.probe_counted = (5, 10);
+    est.apply(received(5000.0, 0.0), at(5150), NO_QUIC);
+    assert_eq!(est.probe_kbps(), None);
+    est.apply(received(4000.0, 0.3), at(6000), NO_QUIC);
+    est.apply(received(5700.0, 0.0), at(6100), NO_QUIC);
+    assert!(est.held_kbps().is_some(), "released");
+}
+
+/// Probe round (#1433, seat B S2): with repair-datagram probes the loss-floor exit keeps the hold's
+/// line and raises the floor; it no longer puts the pre-hold rate back (a freeze each time on R4 +
+/// 2 %).
+#[test]
+fn a_loss_floor_under_a_probing_hold_keeps_the_line() {
+    let start = Instant::now();
+    for probes in [false, true] {
+        let mut est = Estimator::new(CEILING, start);
+        est.probes = probes;
+        est.apply(received(6000.0, 0.3), start, NO_QUIC);
+        for rate in [400.0, 400.0, 400.0, 400.0, 300.0, 300.0, 300.0, 300.0] {
+            est.floor_bin_closed(rate, 0.02);
+        }
+        assert_eq!(est.floor, 0.02);
+        assert_eq!(est.held_kbps().is_some(), probes, "probes {probes}");
     }
 }
