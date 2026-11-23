@@ -337,7 +337,13 @@ impl AbrLoop {
                 .set_held(line.is_some(), now);
         }
         let Some(line) = line else {
-            self.governor.lock().unwrap().hold_off(now);
+            let (prev, cut) = {
+                let mut gov = self.governor.lock().unwrap();
+                (gov.setpoint_kbps(), gov.hold_off(now))
+            };
+            if let Some(kbps) = cut {
+                self.retarget(prev, kbps, kbps as f64);
+            }
             return;
         };
         let (prev, cut) = {

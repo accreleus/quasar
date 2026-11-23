@@ -477,25 +477,22 @@ impl Governor {
     }
 
     /// The ceiling on video: the configured one less the FEC share, so video plus repairs
-    /// never exceeds the configured maximum (#1301). Never under the floor.
+    /// never exceeds the configured maximum (#1301). Never under the floor. Not while
+    /// WebTransport's hold is on (`hold_to`): its line, under the ceiling, already bounds video
+    /// plus FEC (`webtransport::Control::feed`), and the share moving under it reads to v2's hold
+    /// as the sender's rate moving.
     fn ceiling(&self) -> u32 {
-        ((self.cfg.ceiling_kbps as f64 / (1.0 + self.share)).floor() as u32)
-            .max(self.cfg.floor_kbps)
+        let share = if self.hold_from.is_some() {
+            0.0
+        } else {
+            self.share
+        };
+        ((self.cfg.ceiling_kbps as f64 / (1.0 + share)).floor() as u32).max(self.cfg.floor_kbps)
     }
 
-    /// WebTransport FEC's repair share (`webtransport::Rate::observe`): the ceiling and the
-    /// reading line over `1 + share`, the share rising at once and falling after `SHARE_STICKY`. Every input is already video and every gate relative, so
-    /// a descent with FEC is the one without, scaled. A setpoint over the new ceiling is returned to write
-    /// once `write_due`; a bound change, so the window loop's anti-thrash clock is not stamped.
-    pub fn set_share(&mut self, share: f64, now: Instant) -> Option<u32> {
-        let share = share.max(0.0);
-        if share >= self.share {
-            (self.share, self.share_lower_since) = (share, None);
-        } else if now.saturating_duration_since(*self.share_lower_since.get_or_insert(now))
-            >= SHARE_STICKY
-        {
-            (self.share, self.share_lower_since) = (share, Some(now));
-        }
+    /// A setpoint over the ceiling, to write now (once `write_due`). A bound change: the window
+    /// loop's anti-thrash clock is not stamped, the per-report write clock is.
+    fn bound(&mut self, now: Instant) -> Option<u32> {
         let ceiling = self.ceiling();
         if self.setpoint <= ceiling || !self.write_due(now) {
             return None;
@@ -505,6 +502,22 @@ impl Governor {
             self.last_retarget = now;
         }
         Some(ceiling)
+    }
+
+    /// WebTransport FEC's repair share (`webtransport::Rate::observe`): the ceiling and the
+    /// reading line over `1 + share`, the share rising at once and falling after `SHARE_STICKY`.
+    /// Every input is already video and every gate relative, so a descent with FEC is the one
+    /// without, scaled. Returns a setpoint over the new ceiling to write (`bound`).
+    pub fn set_share(&mut self, share: f64, now: Instant) -> Option<u32> {
+        let share = share.max(0.0);
+        if share >= self.share {
+            (self.share, self.share_lower_since) = (share, None);
+        } else if now.saturating_duration_since(*self.share_lower_since.get_or_insert(now))
+            >= SHARE_STICKY
+        {
+            (self.share, self.share_lower_since) = (share, Some(now));
+        }
+        self.bound(now)
     }
 
     /// Per-report loop: what the link allows, unclamped by the floor. The ceiling
@@ -695,7 +708,8 @@ impl Governor {
     /// estimate tops out under the ceiling, so a held setpoint parked up to 15 % low for good).
     /// Only a hold seen ending: after a second with no report (PyroWave held the encoder, then
     /// `Estimator::resume_at`, or another client) the rate before it is stale (#1433 seat B N1).
-    pub fn hold_off(&mut self, now: Instant) {
+    /// The share's ceiling is back: a setpoint over it is returned to write (`bound`).
+    pub fn hold_off(&mut self, now: Instant) -> Option<u32> {
         let seen = self
             .held_at
             .is_some_and(|at| now.saturating_duration_since(at) < HOLD_SEEN);
@@ -703,6 +717,7 @@ impl Governor {
             self.rate = self.rate.max(rate);
             self.back = true;
         }
+        self.bound(now)
     }
 
     fn clamp(&self, kbps: f64) -> u32 {
@@ -1636,7 +1651,7 @@ mod tests {
         let video = link / (1.0 + share.unwrap_or(0.0));
         match link <= 5000.0 {
             true => drop(g.hold_to(video, at)),
-            false => g.hold_off(at),
+            false => drop(g.hold_off(at)),
         }
         g.observe_report((link < 8000.0).then_some(video * 0.97), at);
         if let Some(share) = share {
@@ -1655,6 +1670,19 @@ mod tests {
             9000..15000 => 7000.0,
             _ => 8000.0,
         }
+    }
+
+    /// #1301 with #1433's hold: while the hold is on, its line bounds video plus FEC, so the share
+    /// does not clamp the ceiling; once the hold ends, the share's ceiling is written at once.
+    #[test]
+    fn a_hold_suspends_the_share_ceiling_and_its_end_writes_it() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report_fec(false), base);
+        assert_eq!(g.hold_to(7000.0, ms(base, 0)), Some(7000));
+        assert_eq!(g.set_share(0.25, ms(base, 50)), None, "inside the hold");
+        assert_eq!(g.setpoint_kbps(), 7000);
+        assert_eq!(g.hold_off(ms(base, 100)), Some(6400), "the hold ended");
+        assert_eq!(g.setpoint_kbps(), 6400);
     }
 
     /// #1301: with no FEC (`set_share(0)`, and WebRTC, which never calls it) every loop moves as

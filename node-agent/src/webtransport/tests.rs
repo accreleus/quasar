@@ -2324,6 +2324,64 @@ fn the_hold_line_reaches_the_abr_under_the_fec_its_loss_called_for() {
     );
 }
 
+/// #1301 with #1433's v2 hold: while a hold is on with 25 % FEC, video plus repairs stays under
+/// the configured maximum. The hold's line is under the ceiling (`congestion::Estimator` ends a
+/// hold whose line reaches it) and `Control::feed` gives the governor that line less the share.
+#[test]
+fn a_v2_hold_with_fec_keeps_video_plus_repairs_under_the_ceiling() {
+    use crate::session::abr::{AbrConfig, Governor};
+    let cfg = AbrConfig {
+        per_report: Some(Duration::ZERO),
+        ..AbrConfig::new_smooth(1000, 8000, 60)
+    };
+    let base = std::time::Instant::now();
+    let gov = Arc::new(Mutex::new(Governor::new(cfg, base)));
+    let (g1, g2, g3, g4) = (gov.clone(), gov.clone(), gov.clone(), gov.clone());
+    let now = std::time::Instant::now;
+    let rate = Rate {
+        floor_kbps: Box::new(|| 1000.0),
+        setpoint_kbps: Box::new(move || f64::from(g1.lock().unwrap().setpoint_kbps())),
+        // As `abr_glue::feedback_abr` wires the governor.
+        held: Box::new(move |line| {
+            let mut g = g2.lock().unwrap();
+            match line {
+                Some(line) => drop(g.hold_to(line, now())),
+                None => drop(g.hold_off(now())),
+            }
+        }),
+        measured: Box::new(move |reading| drop(g3.lock().unwrap().observe_report(reading, now()))),
+        observe: Box::new(move |kbps, share| {
+            let mut g = g4.lock().unwrap();
+            g.set_share(share, now());
+            g.observe(kbps, now());
+        }),
+        ..rate(true)
+    };
+    let mut control = Control::new(&rate, Arc::default(), true, congestion::Governor::default());
+    let total = |c: &Control| f64::from(gov.lock().unwrap().setpoint_kbps()) * (1.0 + c.charged);
+    answered_but(&mut control, 0, base, |i| i % 5 == 0);
+    let line = control.estimator.held_kbps().expect("a hold");
+    assert_eq!(control.charged, 0.25);
+    assert!(
+        line < 8000.0 && total(&control) <= line,
+        "line {line:.0}, sent {:.0}",
+        total(&control)
+    );
+    for k in 1..80u32 {
+        answered(
+            &mut control,
+            200 * k,
+            base + Duration::from_millis(250 * u64::from(k)),
+        );
+        let sent = total(&control);
+        assert!(
+            sent <= 8000.0,
+            "report {k}: {sent:.0} kbit/s at {:.2}",
+            control.charged
+        );
+    }
+}
+
 /// §Feedback: with the ABR off the estimate never reaches the encoder, so QUIC keeps its
 /// own congestion control.
 #[test]

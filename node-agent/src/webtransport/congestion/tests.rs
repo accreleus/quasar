@@ -1010,7 +1010,7 @@ impl Sim {
                     .map(|l| l / share.max(1.0 + self.hold_fec));
                 match line {
                     Some(line) => drop(abr.hold_to(line, at)),
-                    None => abr.hold_off(at),
+                    None => drop(abr.hold_off(at)),
                 }
                 if let Some((planner, _)) = self.ladder.as_mut() {
                     planner.set_held(line.is_some(), at);
