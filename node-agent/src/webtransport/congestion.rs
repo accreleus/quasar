@@ -1364,7 +1364,7 @@ impl Estimator {
             .is_some_and(|(run, h)| {
                 h.dropped
                     && !run.key
-                    && !edge.is_some_and(|at| at + PROBE_WAIT > run.at)
+                    && edge.is_none_or(|at| at + PROBE_WAIT <= run.at)
                     && h.cause.1 >= LOSS_HIGH
                     && run.at.saturating_duration_since(h.stepped) >= HOLD_STEP_GAP
                     && run.peak >= FLOOR_FLAT * h.cause.1
