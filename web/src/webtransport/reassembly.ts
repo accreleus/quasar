@@ -386,7 +386,8 @@ export class FrameAssembler {
     for (;;) {
       if (this.waitingForKey) {
         let key: number | null = null;
-        for (const [s, u] of this.ready) if (u.keyframe && (key === null || serialAfter(key, s, 16))) key = s;
+        // A recovery frame codes only from a frame this client decoded: it ends the wait as a keyframe would.
+        for (const [s, u] of this.ready) if ((u.keyframe || u.recovery) && (key === null || serialAfter(key, s, 16))) key = s;
         if (key === null) return;
         this.dropBefore(key);
         this.waitingForKey = false;
@@ -429,8 +430,8 @@ export class FrameAssembler {
       data.set(part, offset);
       offset += part.length;
     }
-    const { keyframe, configId, ts90k, captureUs } = first;
-    this.ready.set(seq, { keyframe, configId, frameSeq: seq, ts90k, captureUs, data });
+    const { keyframe, recovery, configId, ts90k, captureUs } = first;
+    this.ready.set(seq, { keyframe, recovery, configId, frameSeq: seq, ts90k, captureUs, data });
   }
 
   /** Forget a frame as lost; one later frames reference starts the keyframe wait. */
@@ -506,6 +507,7 @@ function sameFrame(a: VideoFragment, b: VideoFragment): boolean {
     a.fragCount === b.fragCount &&
     a.configId === b.configId &&
     a.keyframe === b.keyframe &&
+    a.recovery === b.recovery &&
     a.ts90k === b.ts90k
   );
 }

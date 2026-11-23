@@ -1,14 +1,31 @@
 //! Reference recovery control of the patched Vulkan and NVENC encoders (#1348): ask for an
 //! anchor, ask for the next frame to code from one, read which frames did. The encoder half
 //! is `gstrefrecovery.h` in `deploy/patches/vulkan/*-ref-recovery.patch`; the names and
-//! field types here must match it.
-// The WebTransport repair loop that uses these lands with the next #1348 unit.
-#![allow(dead_code)]
+//! field types here must match it. The WebTransport repair loop is `webtransport::media`.
 
 use gstreamer as gst;
 
 /// Encoder property: anchors held, 0 = off. Present only on a patched encoder.
 pub(crate) const NUM_ANCHORS: &str = "num-anchors";
+
+/// The `num-anchors` the agent gives encoder `factory`: the most the level leaves at 1080p60,
+/// the smallest of the common sizes (H.264 2, HEVC 4; `deploy/patches/vulkan/README.md`), so the
+/// encoder holds exactly what the agent counts. AV1 takes HEVC's 4: its levels bound no
+/// reference. NVENC H.264 stays 0 (key frame repair) until a real-Chrome hardware row proves
+/// its gaps-flag-0 recovery; NVENC AV1 has no long-term references.
+pub(crate) fn anchors_for(factory: &str) -> u32 {
+    let vulkan = factory.starts_with("vulkan");
+    let nvenc = factory.starts_with("nv");
+    match ["h264", "h265", "av1"]
+        .into_iter()
+        .find(|c| factory.contains(c))
+    {
+        Some("h264") if vulkan => 2,
+        Some("h265") if vulkan || nvenc => 4,
+        Some("av1") if vulkan => 4,
+        _ => 0,
+    }
+}
 const ANCHOR: &str = "quasar-ref-anchor";
 const RECOVER: &str = "quasar-ref-recover";
 const FRAME: &str = "quasar-ref-frame";
@@ -61,6 +78,25 @@ pub(crate) fn ref_frame(event: &gst::EventRef) -> Option<RefFrame> {
 mod tests {
     use super::*;
     use gstreamer::prelude::*;
+
+    #[test]
+    fn anchors_follow_the_codec_and_nvenc_h264_and_av1_stay_off() {
+        for (factory, k) in [
+            ("vulkanh264enc", 2),
+            ("vulkanh265enc", 4),
+            ("vulkanav1enc", 4),
+            ("nvh264enc", 0),
+            ("nvcudah264enc", 0),
+            ("nvautogpuh265enc", 4),
+            ("nvh265enc", 4),
+            ("nvav1enc", 0),
+            ("vah264enc", 0),
+            ("vah265enc", 0),
+            ("openh264enc", 0),
+        ] {
+            assert_eq!(anchors_for(factory), k, "{factory}");
+        }
+    }
 
     // The C side reads `pts` with gst_structure_get_uint64: any other type is ignored there.
     #[test]

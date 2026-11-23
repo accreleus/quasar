@@ -19,6 +19,8 @@ const AUDIO_HEADER = 19;
 const FLAG_KEYFRAME = 1;
 const FLAG_DISCARDABLE = 2;
 const FLAG_RETRANSMIT = 4;
+/** Codes only from a frame this client reported in `decoded` (§Loss recovery 6). */
+const FLAG_RECOVERY = 8;
 
 /** u32 LE length, then UTF-8 JSON. */
 export function encodeControl(message: object): Uint8Array {
@@ -70,6 +72,7 @@ export interface VideoFragment {
   discardable: boolean;
   /** Re-sent in answer to a `nack` (§NACK). */
   retransmit: boolean;
+  recovery: boolean;
   configId: number;
   frameSeq: number;
   fragIndex: number;
@@ -93,6 +96,7 @@ export function parseVideoDatagram(d: Uint8Array): VideoFragment | null {
     keyframe: (flags & FLAG_KEYFRAME) !== 0,
     discardable: (flags & FLAG_DISCARDABLE) !== 0,
     retransmit: (flags & FLAG_RETRANSMIT) !== 0,
+    recovery: (flags & FLAG_RECOVERY) !== 0,
     configId: d[6],
     frameSeq: v.getUint16(7, true),
     fragIndex,

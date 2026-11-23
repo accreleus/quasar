@@ -1522,7 +1522,7 @@ the same on `vulkanav1enc`, `vulkanh264enc` and `vulkanh265enc`, defined once in
 |---|---|---|
 | property | `num-anchors` (0-7, default 0 = off, read at stream start) | anchors held; clamped to the DPB and, on H.264 and HEVC, to the level (table below), with a warning in the log |
 | upstream event on the encoder's src pad | `quasar-ref-anchor` | keep the next inter frame as an anchor (waits out a key frame; on H.264 also out a frame right after another anchor or a recovery frame); at `num-anchors` held the oldest is dropped. A second request before a frame takes the first is the same request |
-| upstream event | `quasar-ref-recover`, `pts` (guint64) | code the next frame from the anchor with that input PTS only, and forget every newer anchor; a key frame when that anchor is not held (on AV1 also when it is 128 or more frames old) |
+| upstream event | `quasar-ref-recover`, `pts` (guint64) | code the next frame from the anchor with that input PTS only, and forget every newer anchor; a key frame when that anchor is not held (on AV1 also when it is 128 or more frames old). A later one before a frame takes it replaces it |
 | downstream event, before the frame's buffer | `quasar-ref-frame`, `pts` (guint64), `anchor` (boolean), `recover-from` (guint64, recovery frames only) | sent for every anchor and every recovery frame; match it to its buffer by `pts` |
 
 While `num-anchors > 0` every inter frame codes from exactly one picture (the previous frame,
@@ -1617,7 +1617,9 @@ class `sys/nvcodec/gstnvencoder.cpp` with NVENC's per-picture long-term referenc
   drop an older anchor before `num-anchors` are held, until the next key frame; a recovery from it
   is then a key frame, which the agent's loop must expect. All of this was measured.
 - H.264's SPS has `gaps_in_frame_num_value_allowed_flag` 0 and NVENC has no setting for it, so a
-  decoder sees a lost frame as a frame_num gap it conceals; the pruned decode stays bit-identical.
+  decoder sees a lost frame as a frame_num gap. ffmpeg conceals it by inventing frames, and its
+  pruned decode stays bit-identical; Chromium's hardware decoder invents none, so the agent keeps
+  NVENC H.264 at `num-anchors` 0 until a real-Chrome hardware row proves it.
 - The anchor waits follow the Vulkan encoders, H.264's included, so the agent and the harness see
   one behaviour per codec. The pts the reports carry is the frame's pts as `GstVideoEncoder` hands
   it to the element, which NVENC returns as `outputTimeStamp` (the base class sets a 1000 h

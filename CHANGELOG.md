@@ -33,6 +33,7 @@ own; the two do not move together, and that is deliberate.
 ### Added
 - The Vulkan H.264, HEVC and AV1 encoders can hold anchor frames and code the next frame from one after a loss instead of sending a key frame (the encoder half of #1348; off until the agent uses it).
 - The NVENC H.264 and HEVC encoders get the same anchor control; NVENC AV1 answers every recovery with a key frame (#1348).
+- **WebTransport repairs a late frame from the last frame the browser decoded instead of sending a key frame (#1348).** The browser reports that frame (`decoded`) in feedback and keyframe requests and resumes at the agent's recovery frame without resetting its decoder; the agent holds anchors on Vulkan H.264/HEVC/AV1 and NVENC HEVC and falls back to a key frame when none qualifies. NVENC H.264 and AV1 keep key frame repair.
 
 ### Changed
 - **A user-space UDP impairment relay for lab rows where the kernel has no netem (`scripts/harness/udprelay`).** It relays one WebTransport flow and applies a rate cap with a queue limit, a policer, delay and jitter, random loss, outages, burst drops and reordering, changed at run time over a loopback control and logged per second; `redirect.sh` routes one local user's UDP through it. Test tooling only ([guide](docs/testing-e2e-suite.md#shaping-without-kernel-netem-the-udp-relay)).
