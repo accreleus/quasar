@@ -1551,7 +1551,7 @@ async fn governed_agent(stream: Stream) -> Agent {
                 ceiling_kbps: 8000.0,
                 floor_kbps: Box::new(|| 4000.0),
                 setpoint_kbps: Box::new(|| 0.0),
-                capacity: Default::default(),
+                capacity: crate::session::settings::WtCapacity::V2,
                 retargets: true,
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
@@ -2093,7 +2093,7 @@ async fn feedback_while_pyrowave_is_active_feeds_no_estimate() {
                 ceiling_kbps: 4000.0,
                 floor_kbps: Box::new(|| 500.0),
                 setpoint_kbps: Box::new(|| 0.0),
-                capacity: Default::default(),
+                capacity: crate::session::settings::WtCapacity::V2,
                 retargets: true,
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
@@ -2193,7 +2193,7 @@ async fn audio_alone_never_moves_the_video_estimate() {
             ceiling_kbps: 4000.0,
             floor_kbps: Box::new(|| 500.0),
             setpoint_kbps: Box::new(|| 0.0),
-            capacity: Default::default(),
+            capacity: crate::session::settings::WtCapacity::V2,
             retargets: true,
             start: Box::new(|| {}),
             owns: Box::new(|| false),
@@ -2241,7 +2241,7 @@ fn rate(retargets: bool) -> Rate {
         ceiling_kbps: 8000.0,
         floor_kbps: Box::new(|| 4000.0),
         setpoint_kbps: Box::new(|| 0.0),
-        capacity: Default::default(),
+        capacity: crate::session::settings::WtCapacity::V2,
         retargets,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -2375,7 +2375,7 @@ fn the_silence_decay_is_never_fed_to_the_collapse_as_a_measured_link() {
         ceiling_kbps: 8000.0,
         floor_kbps: Box::new(|| 4000.0),
         setpoint_kbps: Box::new(|| 0.0),
-        capacity: Default::default(),
+        capacity: crate::session::settings::WtCapacity::V2,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -2424,7 +2424,7 @@ fn a_report_gives_the_abr_its_reading_before_its_estimate() {
         ceiling_kbps: 8000.0,
         floor_kbps: Box::new(|| 4000.0),
         setpoint_kbps: Box::new(|| 0.0),
-        capacity: Default::default(),
+        capacity: crate::session::settings::WtCapacity::V2,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -2451,7 +2451,7 @@ fn a_client_that_is_gone_neither_starts_nor_feeds_the_abr() {
         ceiling_kbps: 4000.0,
         floor_kbps: Box::new(|| 500.0),
         setpoint_kbps: Box::new(|| 0.0),
-        capacity: Default::default(),
+        capacity: crate::session::settings::WtCapacity::V2,
         retargets: true,
         start: Box::new(move || {
             started.fetch_add(1, SeqCst);
@@ -2517,7 +2517,7 @@ fn the_abr_is_fed_the_estimate_less_the_fec_share() {
         ceiling_kbps: 6000.0,
         floor_kbps: Box::new(|| 500.0),
         setpoint_kbps: Box::new(|| 0.0),
-        capacity: Default::default(),
+        capacity: crate::session::settings::WtCapacity::V2,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -2553,7 +2553,7 @@ async fn lossy_session(retargets: bool) -> (Agent, Arc<crate::session::metrics::
                 ceiling_kbps: 4000.0,
                 floor_kbps: Box::new(|| 500.0),
                 setpoint_kbps: Box::new(|| 0.0),
-                capacity: Default::default(),
+                capacity: crate::session::settings::WtCapacity::V2,
                 retargets,
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
@@ -2807,7 +2807,7 @@ fn repairs_spend_only_what_the_estimate_leaves_above_the_abr_floor() {
         ceiling_kbps: 6000.0,
         floor_kbps: Box::new(|| 2500.0),
         setpoint_kbps: Box::new(|| 0.0),
-        capacity: Default::default(),
+        capacity: crate::session::settings::WtCapacity::V2,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -2869,7 +2869,7 @@ fn governed_by(
         ceiling_kbps: 8000.0,
         floor_kbps: Box::new(move || f64::from(floor.lock().unwrap().0.floor_kbps())),
         setpoint_kbps: Box::new(move || f64::from(setpoint.lock().unwrap().0.setpoint_kbps())),
-        capacity: Default::default(),
+        capacity: crate::session::settings::WtCapacity::V2,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -2919,7 +2919,7 @@ fn governor_bound(estimate_kbps: f64) -> f64 {
 /// the estimate, 3500.
 #[test]
 fn the_pacer_never_holds_video_under_the_setpoint() {
-    let (estimate, governed) = governed_after_a_report(Default::default());
+    let (estimate, governed) = governed_after_a_report(crate::session::settings::WtCapacity::V2);
     assert!(
         (3400.0..3700.0).contains(&estimate),
         "the estimate is {estimate:.0}"
@@ -3077,7 +3077,7 @@ fn a_pyrowave_frame_gets_no_repair_at_any_overhead() {
         ceiling_kbps: 6000.0,
         floor_kbps: Box::new(|| 500.0),
         setpoint_kbps: Box::new(|| 0.0),
-        capacity: Default::default(),
+        capacity: crate::session::settings::WtCapacity::V2,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -5394,7 +5394,7 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
                 ceiling_kbps: 1_000_000.0,
                 floor_kbps: Box::new(|| 500.0),
                 setpoint_kbps: Box::new(|| 0.0),
-                capacity: Default::default(),
+                capacity: crate::session::settings::WtCapacity::V2,
                 retargets: true,
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
@@ -6047,6 +6047,7 @@ async fn audio_and_a_ping_are_served_between_the_slices_of_one_big_pyrowave_fram
 /// only this test turns red without the queue check.
 #[test]
 fn the_probe_fills_an_empty_quic_queue_once_per_frame_behind_video() {
+    const IDLE: usize = 1;
     let start = std::time::Instant::now();
     let at = |us: u64| start + Duration::from_micros(us);
     let mut log = congestion::SendLog::new(start);
@@ -6075,22 +6076,23 @@ fn the_probe_fills_an_empty_quic_queue_once_per_frame_behind_video() {
             now,
             |d| {
                 sent.push(d);
-                true
+                congestion::Handed::Sent
             }
         ));
         sent
     };
+    // QUIC's queue as an idle session reads it: the session-id header (`IDLE`).
     // The probe banks from the frame interval before the frame; nothing goes ahead of it.
     assert!(
-        fill(&mut log, &mut video, 0, at(0)).is_empty(),
+        fill(&mut log, &mut video, IDLE, at(0)).is_empty(),
         "before the frame"
     );
     for d in &frame {
         log.record(d, at(16_000), false);
     }
-    // Audio or video still in QUIC's queue: nothing.
+    // A datagram still in QUIC's queue: nothing.
     assert!(
-        fill(&mut log, &mut video, 300, at(16_500)).is_empty(),
+        fill(&mut log, &mut video, media::MAX_DATAGRAM + IDLE, at(16_500)).is_empty(),
         "ahead of QUIC's queue"
     );
     // A NACK answer held behind the pacer: nothing.
@@ -6103,15 +6105,15 @@ fn the_probe_fills_an_empty_quic_queue_once_per_frame_behind_video() {
     };
     video.push(resend, usize::MAX);
     assert!(
-        fill(&mut log, &mut video, 0, at(16_600)).is_empty(),
+        fill(&mut log, &mut video, IDLE, at(16_600)).is_empty(),
         "ahead of a resend"
     );
     video.clear();
     // Both empty: one burst within `PROBE_TAIL` of the frame, at most what a frame interval at the
     // probe's rate leaves past it.
-    let mut burst = fill(&mut log, &mut video, 0, at(16_700));
+    let mut burst = fill(&mut log, &mut video, IDLE, at(16_700));
     assert!(!burst.is_empty(), "no burst");
-    burst.extend(fill(&mut log, &mut video, 0, at(17_500)));
+    burst.extend(fill(&mut log, &mut video, IDLE, at(17_500)));
     let room = 20_000.0 * 125.0 * 0.016_667 - 10.0 * 1200.0;
     let bytes: usize = burst.iter().map(Bytes::len).sum();
     assert!(bytes as f64 <= room + 1300.0, "{bytes} bytes for {room:.0}");
@@ -6124,8 +6126,68 @@ fn the_probe_fills_an_empty_quic_queue_once_per_frame_behind_video() {
     // Nothing more until the next frame.
     for us in [18_500, 25_000, 32_000] {
         assert!(
-            fill(&mut log, &mut video, 0, at(us)).is_empty(),
+            fill(&mut log, &mut video, IDLE, at(us)).is_empty(),
             "at {us} us"
         );
     }
+}
+
+/// Lab V3 (#1433): web-transport-quinn 0.13 counts the session-id header in the datagram queue, so
+/// an idle session reads at least 1 byte queued; a probe gated on 0 never sent on hardware.
+#[tokio::test]
+async fn an_idle_session_reads_the_header_queued() {
+    let agent = agent().await;
+    let session = agent.connect().await;
+    let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
+    assert!((1..media::MAX_DATAGRAM).contains(&queued), "{queued} bytes");
+}
+
+/// DeepSeek seat A1 (#1433): a probe repair is cut to the last frame's fragment size; once quinn's
+/// datagram size shrinks under it, QUIC refuses it `TooLarge`. That ends the frame's probe and is
+/// counted; the stream goes on. Only a gone connection ends it.
+#[test]
+fn a_probe_repair_over_a_shrunk_datagram_size_ends_the_probe_not_the_stream() {
+    let start = std::time::Instant::now();
+    let at = |us: u64| start + Duration::from_micros(us);
+    let mut log = congestion::SendLog::new(start);
+    let mut video = congestion::VideoQueue::default();
+    let frame: Vec<Bytes> = (0..10)
+        .map(|_| {
+            let mut d = vec![0x01];
+            d.extend_from_slice(&video.take_seq().to_le_bytes());
+            d.resize(1200, 0);
+            Bytes::from(d)
+        })
+        .collect();
+    let mut probe_frame = Some((frame.clone(), 0));
+    log.probe_room(Some(20_000.0), at(0));
+    for d in &frame {
+        log.record(d, at(16_000), false);
+    }
+    let mut tries = 0;
+    let alive = fill_probe(
+        &mut log,
+        Some(20_000.0),
+        &mut probe_frame,
+        &mut video,
+        1,
+        at(16_700),
+        |_| {
+            tries += 1;
+            congestion::Handed::TooLarge
+        },
+    );
+    assert!(alive, "a refused repair ended the stream");
+    assert_eq!((tries, video.probes_too_large), (1, 1));
+    assert!(probe_frame.is_none(), "the frame still probes");
+    let gone = fill_probe(
+        &mut log,
+        Some(20_000.0),
+        &mut Some((frame, 0)),
+        &mut video,
+        1,
+        at(16_800),
+        |_| congestion::Handed::Gone,
+    );
+    assert!(!gone, "a gone connection goes on");
 }

@@ -172,6 +172,15 @@ jobs:
       - name: Vet
         if: matrix.static
         run: go vet ./...
+      # The udprelay UDP-relay (scripts/harness/udprelay) is its own Go module (separate
+      # go.mod, stdlib only, no go.sum), so control-plane's working-directory cannot reach
+      # it: vet + test it here, in the static part, before the DB-dependent session part.
+      # setup-go already installed the toolchain (1.26.x >= the module's 1.25.7 directive),
+      # so no second setup-go is needed. Its shape_test.go was never run by CI.
+      - name: Vet + test the udprelay module
+        if: matrix.static
+        working-directory: scripts/harness/udprelay
+        run: go vet ./... && go test ./...
       # The database is thrown away with the job, so crash safety buys nothing: without
       # fsync the DB-heavy packages run about twice as fast. These settings need only a reload.
       - name: Postgres without durability
