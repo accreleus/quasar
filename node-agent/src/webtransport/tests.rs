@@ -1607,6 +1607,11 @@ async fn reordered_delivery_does_not_stall_the_datagram_path() {
         tokio::select! {
             d = session.read_datagram() => {
                 let d = d.unwrap();
+                // The outage probe fires when reordering stalls the queue for a tick.
+                if d.len() < 5 {
+                    assert_eq!(d[..], *STARVED_PROBE);
+                    continue;
+                }
                 if Instant::now() >= measure_from {
                     got.push(u32::from_le_bytes(d[1..5].try_into().unwrap()));
                 }
@@ -5758,18 +5763,14 @@ fn big_frame() -> Vec<Bytes> {
 fn a_big_pyrowave_frame_is_handed_over_in_bounded_slices_inside_the_frame_interval() {
     let frame = big_frame();
     for fps in [60, 120] {
-        let plan = burst_plan(&frame, true, fps);
-        assert_eq!(plan.iter().map(|(n, _)| n).sum::<usize>(), frame.len());
+        let (plan, gap) = burst_plan(&frame, true, fps, true);
+        assert_eq!(plan.iter().sum::<usize>(), frame.len());
         assert!(plan.len() > 1);
         assert!(
-            plan.iter().all(|(n, _)| n * 1200 <= PYRO_BURST_BYTES),
+            plan.iter().all(|n| n * 1200 <= PYRO_BURST_BYTES),
             "{plan:?}"
         );
-        assert_eq!(plan[0].1, Duration::ZERO);
-        assert!(
-            plan.windows(2).all(|w| w[0].1 < w[1].1),
-            "slices are spread out in time"
-        );
+        assert!(gap > Duration::ZERO, "slices are spread out in time");
     }
 }
 
@@ -5778,21 +5779,37 @@ fn frame_of(bytes: usize) -> Vec<Bytes> {
     vec![Bytes::from(vec![0u8; 1200]); bytes.div_ceil(1200)]
 }
 
+/// What [`paced`] saw: each frame's first-to-last spread as a fraction of the interval (sorted),
+/// the datagrams rushed and dropped, and the most bytes handed over in one frame's turn.
+struct Paced {
+    spreads: Vec<f64>,
+    rushed: usize,
+    dropped: usize,
+    most: usize,
+}
+
 /// A model of the send loop: a frame of `bytes` arrives every interval at `fps` for one second,
-/// is planned (`burst_plan`, `pacing_gap`) and queued, and each pacing deadline wakes `late(i)`
-/// after it, as the timer driving the pacing arm would. Returns each frame's first-to-last
-/// spread as a fraction of the interval, sorted, and the datagrams rushed.
-fn paced(bytes: usize, fps: i32, late: impl Fn(usize) -> Duration) -> (Vec<f64>, usize) {
+/// is planned (`burst_plan` for the timerfd) and queued, and each pacing deadline wakes `late(i)`
+/// after it, as the timer driving the pacing arm would.
+fn paced(bytes: usize, fps: i32, late: impl Fn(usize) -> Duration) -> Paced {
     let frame = frame_of(bytes);
     let interval = Duration::from_secs(1) / fps as u32;
     let t0 = Instant::now();
     let mut pacing = Pacing::default();
-    let (mut spreads, mut rushed, mut wakes) = (Vec::new(), 0, 0);
-    let mut take = |pacing: &mut Pacing| {
+    let mut seen = Paced {
+        spreads: Vec::new(),
+        rushed: 0,
+        dropped: 0,
+        most: 0,
+    };
+    let mut wakes = 0;
+    let take = |pacing: &mut Pacing, seen: &mut Paced| {
         if let Some(took) = pacing.finished.take() {
-            spreads.push(took.as_secs_f64() / interval.as_secs_f64());
+            seen.spreads
+                .push(took.as_secs_f64() / interval.as_secs_f64());
         }
     };
+    let size = |d: &[Bytes]| d.iter().map(Bytes::len).sum::<usize>();
     for k in 0..fps as u32 {
         let arrives = t0 + interval * k;
         while let Some(due) = pacing.deadline() {
@@ -5802,22 +5819,23 @@ fn paced(bytes: usize, fps: i32, late: impl Fn(usize) -> Duration) -> (Vec<f64>,
             }
             wakes += 1;
             pacing.pop(wake);
-            take(&mut pacing);
+            take(&mut pacing, &mut seen);
         }
-        let plan = burst_plan(&frame, true, fps);
+        let (plan, gap) = burst_plan(&frame, true, fps, true);
         let mut rest = frame.iter().cloned();
         let slices = plan
             .iter()
-            .map(|(n, _)| rest.by_ref().take(*n).collect())
+            .map(|n| rest.by_ref().take(*n).collect())
             .collect();
-        rushed += pacing
-            .push(k as u16, pacing_gap(fps, plan.len()), slices, arrives)
-            .len();
-        pacing.pop(arrives);
-        take(&mut pacing);
+        let (rushed, dropped) = pacing.push(k as u16, gap, slices, arrives);
+        let first = pacing.pop(arrives).unwrap_or_default();
+        seen.most = seen.most.max(size(&rushed) + size(&first));
+        seen.rushed += rushed.len();
+        seen.dropped += dropped;
+        take(&mut pacing, &mut seen);
     }
-    spreads.sort_unstable_by(f64::total_cmp);
-    (spreads, rushed)
+    seen.spreads.sort_unstable_by(f64::total_cmp);
+    seen
 }
 
 /// #1633: with a wake 50-150 us late (the timerfd's measured lateness plus the slice hand-off),
@@ -5829,61 +5847,107 @@ fn lab_rows_are_paced_inside_half_an_interval_with_no_tail_rushed() {
     let precise = |i: usize| Duration::from_micros(50 + (i as u64 * 37) % 101);
     // (fps, Mbit/s): 4K120, 4K60, 1080p120, 1080p60 at their lab budgets.
     for (fps, mbit) in [(120, 800), (60, 400), (120, 400), (60, 200)] {
-        let (spreads, rushed) = paced(mbit * 1_000_000 / 8 / fps as usize, fps, precise);
-        let p95 = spreads[(spreads.len() - 1) * 95 / 100];
+        let seen = paced(mbit * 1_000_000 / 8 / fps as usize, fps, precise);
+        let p95 = seen.spreads[(seen.spreads.len() - 1) * 95 / 100];
         eprintln!(
-            "{fps} fps {mbit} Mbit/s: {} frames, spread p95 {p95:.3}, rushed {rushed}",
-            spreads.len()
+            "{fps} fps {mbit} Mbit/s: {} frames, spread p95 {p95:.3}, rushed {}",
+            seen.spreads.len(),
+            seen.rushed
         );
         assert_eq!(
-            spreads.len(),
+            seen.spreads.len(),
             fps as usize - 1,
             "{fps} fps {mbit} Mbit/s: every frame but the last closes"
         );
         assert!(p95 <= 0.5, "{fps} fps {mbit} Mbit/s: spread p95 {p95:.3}");
-        assert_eq!(rushed, 0, "{fps} fps {mbit} Mbit/s");
+        assert_eq!(
+            (seen.rushed, seen.dropped),
+            (0, 0),
+            "{fps} fps {mbit} Mbit/s"
+        );
     }
 }
 
 /// A pacer that falls behind (here a timer 3 ms late on every wake at 4K120) never builds a
-/// backlog: each frame's unsent tail goes when the next frame arrives, and is counted.
+/// backlog: each frame's unsent tail goes when the next frame arrives, but no more of it than
+/// one clean burst (the #1606 whole-frame loss); the rest is dropped and counted.
 #[test]
-fn a_pacer_behind_its_slices_rushes_each_tail_instead_of_falling_behind() {
-    let (spreads, rushed) = paced(800_000_000 / 8 / 120, 120, |_| Duration::from_millis(3));
-    assert!(rushed > 0);
+fn a_pacer_behind_its_slices_rushes_one_clean_burst_of_each_tail_and_drops_the_rest() {
+    let seen = paced(800_000_000 / 8 / 120, 120, |_| Duration::from_millis(3));
     assert!(
-        spreads.iter().all(|f| *f <= 1.0 + 1e-9),
-        "no frame waits past the next one: {spreads:?}"
+        seen.rushed > 0 && seen.dropped > 0,
+        "{} {}",
+        seen.rushed,
+        seen.dropped
     );
+    assert!(
+        seen.most <= PYRO_BURST_CLEAN_BYTES,
+        "{} B handed to QUIC in one turn",
+        seen.most
+    );
+    assert!(
+        seen.spreads.iter().all(|f| *f <= 1.0 + 1e-9),
+        "no frame waits past the next one: {:?}",
+        seen.spreads
+    );
+}
+
+/// #1633: on tokio's timer (no timerfd) a wake can take a tick more than asked, so the plan cuts
+/// the frame until those ticks fit: at 4K120 the pacer keeps up instead of rushing every frame.
+/// Real clock.
+#[tokio::test]
+async fn on_the_coarse_timer_a_4k120_pacer_keeps_up_with_the_encoder() {
+    let frame = frame_of(800_000_000 / 8 / 120);
+    let (plan, gap) = burst_plan(&frame, true, 120, false);
+    let mut timer = super::pacing_timer::PacingTimer::coarse();
+    let mut pacing = Pacing::default();
+    let mut frames = tokio::time::interval(Duration::from_secs(1) / 120);
+    let mut rushed = 0;
+    for k in 0..120u16 {
+        loop {
+            tokio::select! {
+                _ = frames.tick() => break,
+                () = timer.sleep_until(pacing.deadline().unwrap_or_else(Instant::now)), if pacing.deadline().is_some() => {
+                    pacing.pop(Instant::now());
+                }
+            }
+        }
+        let mut rest = frame.iter().cloned();
+        let slices = plan
+            .iter()
+            .map(|n| rest.by_ref().take(*n).collect())
+            .collect();
+        if !pacing.push(k, gap, slices, Instant::now()).0.is_empty() {
+            rushed += 1;
+        }
+        pacing.pop(Instant::now());
+    }
+    eprintln!(
+        "coarse timer, 4K120: {} slices, gap {gap:?}, {rushed} of 120 frames rushed",
+        plan.len()
+    );
+    assert!(rushed < 30, "{rushed} of 120 frames rushed");
 }
 
 #[test]
 fn a_frame_under_the_burst_limit_and_every_other_codec_go_as_one_slice() {
-    assert_eq!(
-        burst_plan(&big_frame(), false, 60),
-        vec![(363, Duration::ZERO)]
-    );
-    assert_eq!(
-        burst_plan(&big_frame()[..50], true, 60),
-        vec![(50, Duration::ZERO)]
-    );
-    assert_eq!(burst_plan(&[], true, 60), vec![(0, Duration::ZERO)]);
+    for precise in [true, false] {
+        assert_eq!(burst_plan(&big_frame(), false, 60, precise).0, [363]);
+        assert_eq!(burst_plan(&big_frame()[..50], true, 60, precise).0, [50]);
+        assert_eq!(burst_plan(&[], true, 60, precise).0, [0]);
+    }
 }
 
 #[test]
 fn an_unusable_frame_rate_still_plans_a_bounded_spread() {
     for fps in [0, -1, i32::MIN, i32::MAX] {
-        let plan = burst_plan(&big_frame(), true, fps);
-        let last = plan.last().unwrap().1;
+        let (plan, gap) = burst_plan(&big_frame(), true, fps, true);
         assert!(
-            plan.len() > 1 && last <= Duration::from_secs(1) / 4,
+            plan.len() > 1 && gap * (plan.len() as u32 - 1) <= Duration::from_secs(1) / 4,
             "{fps}: {plan:?}"
         );
     }
-    assert_eq!(
-        burst_plan(&big_frame()[..50], true, 0),
-        vec![(50, Duration::ZERO)]
-    );
+    assert_eq!(burst_plan(&big_frame()[..50], true, 0, true).0, [50]);
 }
 
 /// A slice of `n` datagrams that each carry `tag`, to tell slices apart.
@@ -5932,6 +5996,7 @@ fn a_late_final_slice_does_not_let_the_next_frame_follow_it_inside_one_gap() {
     assert_eq!(pacing.pop(late).unwrap()[0][0], 1);
     assert!(pacing
         .push(2, gap, vec![tagged(20, 1), tagged(21, 1)], late)
+        .0
         .is_empty());
     assert!(pacing.pop(late).is_none(), "two slices inside one gap");
     assert_eq!(pacing.deadline(), Some(late + gap));
@@ -5967,7 +6032,8 @@ fn a_frame_arriving_before_the_last_ones_slices_are_out_sends_their_tail_at_once
     );
     assert_eq!(pacing.pop(t0).unwrap()[0][0], 10);
     let t1 = t0 + Duration::from_millis(1);
-    let rushed = pacing.push(2, gap, vec![tagged(20, 1), tagged(21, 1)], t1);
+    let (rushed, dropped) = pacing.push(2, gap, vec![tagged(20, 1), tagged(21, 1)], t1);
+    assert_eq!(dropped, 0);
     assert_eq!(
         rushed.iter().map(|d| d[0]).collect::<Vec<_>>(),
         [11, 12, 12],
@@ -5980,6 +6046,28 @@ fn a_frame_arriving_before_the_last_ones_slices_are_out_sends_their_tail_at_once
         "its first slice waits a gap after the tail"
     );
     assert_eq!(pacing.pop(t1 + gap).unwrap()[0][0], 20);
+}
+
+#[test]
+fn a_rushed_tail_stops_at_one_clean_burst_and_a_frame_never_started_records_no_spread() {
+    let gap = Duration::from_millis(5);
+    let t0 = Instant::now();
+    let slice = |tag: u8| vec![Bytes::from(vec![tag; 90_000])];
+    let mut pacing = Pacing::default();
+    pacing.push(1, gap, vec![slice(1), slice(2), slice(3), slice(4)], t0);
+    assert_eq!(pacing.pop(t0).unwrap()[0][0], 1);
+    let (rushed, dropped) = pacing.push(2, gap, vec![slice(5), slice(6)], t0 + gap);
+    assert_eq!(
+        rushed.iter().map(|d| d[0]).collect::<Vec<_>>(),
+        [2, 3],
+        "180 kB fit; a third slice would pass 200 kB"
+    );
+    assert_eq!(dropped, 1);
+    assert_eq!(pacing.finished.take(), Some(gap));
+    // Frame 2 has sent nothing when frame 3 arrives: it is rushed, but has no spread.
+    let (rushed, _) = pacing.push(3, gap, vec![slice(7)], t0 + gap + gap / 2);
+    assert_eq!(rushed[0][0], 5);
+    assert_eq!(pacing.finished.take(), None);
 }
 
 /// #1633: a frame tail the pacing sends at once is warned about once, and the rest is counted

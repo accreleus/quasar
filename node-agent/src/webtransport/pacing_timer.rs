@@ -39,6 +39,11 @@ impl PacingTimer {
         Self(None)
     }
 
+    /// Wakes within tens of microseconds; otherwise a wake may come up to a tick late.
+    pub(super) fn precise(&self) -> bool {
+        self.0.is_some()
+    }
+
     pub(super) async fn sleep_until(&mut self, at: Instant) {
         let Some(timer) = self.0.as_mut() else {
             return tokio::time::sleep_until(at).await;
@@ -135,7 +140,8 @@ fn open() -> io::Result<Fd> {
     // Read after `at`, so a mapped expiry is never early.
     let mono = Duration::new(now.tv_sec as u64, now.tv_nsec as u32);
     Ok(Fd {
-        // SAFETY: `OwnedFd` keeps the fd open and returns the same one until the `AsyncFd` drops.
+        // SAFETY: the fd is owned here, never duplicated or handed out, and closed only when the
+        // `AsyncFd` drops; only this module's own syscalls touch it.
         fd: unsafe { AsyncFd::register_with_interest(fd, Interest::READABLE) }?,
         epoch: (at, mono),
         armed: None,
@@ -198,5 +204,25 @@ mod tests {
         let next = Instant::now() + Duration::from_millis(2);
         timer.sleep_until(next).await;
         assert!(Instant::now() >= next);
+    }
+
+    /// The send loop's hot path: every turn drops the sleep and polls the same deadline again,
+    /// which takes the timer as it is armed. 21 rounds; the median holds the < 1 ms bound (a
+    /// single round can wait for a CPU under the parallel suite).
+    #[tokio::test]
+    async fn a_deadline_polled_again_after_a_drop_wakes_on_time() {
+        let mut timer = PacingTimer::new();
+        let mut late = Vec::new();
+        for _ in 0..21 {
+            let at = Instant::now() + Duration::from_millis(2);
+            let dropped = tokio::time::timeout(Duration::from_micros(500), timer.sleep_until(at));
+            assert!(dropped.await.is_err(), "woke 1.5 ms early");
+            timer.sleep_until(at).await;
+            let woke = Instant::now();
+            assert!(woke >= at, "woke early");
+            late.push(woke - at);
+        }
+        late.sort_unstable();
+        assert!(late[10] < Duration::from_millis(1), "{late:?}");
     }
 }
