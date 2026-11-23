@@ -473,14 +473,13 @@ impl Governor {
             .max(self.cfg.floor_kbps)
     }
 
-    /// WebTransport FEC's repair share (`webtransport::Rate::observe`): ceiling and rate over
-    /// `1 + share`. Every input is already video and every gate relative, so a descent with
-    /// FEC is the one without, scaled. A setpoint over the new ceiling is returned to write
+    /// WebTransport FEC's repair share (`webtransport::Rate::observe`): the ceiling and the
+    /// reading line over `1 + share`. Every input is already video and every gate relative, so
+    /// a descent with FEC is the one without, scaled. A setpoint over the new ceiling is returned to write
     /// once `write_due`; a bound change, so the window loop's anti-thrash clock is not stamped.
     pub fn set_share(&mut self, share: f64, now: Instant) -> Option<u32> {
         self.share = share.max(0.0);
         let ceiling = self.ceiling();
-        self.rate = self.rate.min(ceiling as f64);
         if self.setpoint <= ceiling || !self.write_due(now) {
             return None;
         }
@@ -600,7 +599,7 @@ impl Governor {
         if estimate > self.rate {
             self.rate = estimate
                 .min(self.rate * (1.0 + slew * dt))
-                .min(self.ceiling() as f64);
+                .min(self.cfg.ceiling_kbps as f64);
         }
         let target = self.clamp(self.rate.min(estimate).floor());
         let back = self.back && target as f64 >= estimate.floor();
@@ -628,9 +627,11 @@ impl Governor {
         self.cfg.per_report?;
         self.last_report = Some(now);
         // Not positive (or NaN) is no capacity sample: a zero rate would never grow again.
+        // The rate is the link's, for the rung; the line is video's, so it scales with the share.
+        let rate = self.rate.min(self.ceiling() as f64);
         let line = match self.cfg.legacy_readings {
-            true => self.rate * (1.0 - self.cfg.deadband),
-            false => self.rate,
+            true => rate * (1.0 - self.cfg.deadband),
+            false => rate,
         };
         let Some(reading) = reading.filter(|&r| r > 0.0 && r < line) else {
             self.under = None;
@@ -682,7 +683,7 @@ impl Governor {
             .held_at
             .is_some_and(|at| now.saturating_duration_since(at) < HOLD_SEEN);
         if let Some(rate) = self.hold_from.take().filter(|_| seen) {
-            self.rate = self.rate.max(rate).min(self.ceiling() as f64);
+            self.rate = self.rate.max(rate);
             self.back = true;
         }
     }

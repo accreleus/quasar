@@ -200,7 +200,8 @@ impl AbrLoop {
 
     /// Feed one estimate (kbps) through the governor; apply any retarget to the encoder
     /// and publish it. `from_notify` marks real-feedback observations vs tick re-observes.
-    fn observe(&self, est_kbps: f64, from_notify: bool, now: std::time::Instant) {
+    /// `share`: WebTransport FEC's repair share (`abr::Governor::set_share`), 0 on WebRTC.
+    fn observe(&self, est_kbps: f64, share: f64, from_notify: bool, now: std::time::Instant) {
         if !self.owns_encoder() {
             return;
         }
@@ -224,28 +225,14 @@ impl AbrLoop {
         let (prev_setpoint, retarget) = {
             let mut gov = self.governor.lock().unwrap();
             let prev = gov.setpoint_kbps();
-            let r = gov.observe(est_kbps, now);
-            (prev, r)
+            // One write: a share that lowered the ceiling, or the estimate's move after it.
+            let cut = gov.set_share(share, now);
+            (prev, gov.observe(est_kbps, now).or(cut))
         };
         // In `Off` the governor still tracks, but its output is discarded. `Protective`
         // and `Smooth` both retarget; they differ only in the pure governor's down policy.
         if let Some(new_kbps) = retarget.filter(|_| self.mode != AbrMode::Off) {
             self.retarget(prev_setpoint, new_kbps, est_kbps);
-        }
-    }
-
-    /// WebTransport FEC's repair share (`abr::Governor::set_share`), written at once when it
-    /// takes the ceiling under the setpoint.
-    fn share(&self, share: f64, now: std::time::Instant) {
-        if !self.owns_encoder() {
-            return;
-        }
-        let (prev, cut) = {
-            let mut gov = self.governor.lock().unwrap();
-            (gov.setpoint_kbps(), gov.set_share(share, now))
-        };
-        if let Some(kbps) = cut.filter(|_| self.mode != AbrMode::Off) {
-            self.retarget(prev, kbps, kbps as f64);
         }
     }
 
@@ -926,7 +913,7 @@ pub(super) fn enable_abr(
         bwe.connect_notify(Some("estimated-bitrate"), move |bwe, _pspec| {
             // `estimated-bitrate` is bits/s; the governor works in kbps.
             let est_bps: u32 = bwe.property("estimated-bitrate");
-            notify_loop.observe(est_bps as f64 / 1000.0, true, std::time::Instant::now());
+            notify_loop.observe(est_bps as f64 / 1000.0, 0.0, true, std::time::Instant::now());
         });
         let tick_bwe = bwe.clone();
         let armed = start(
@@ -1271,7 +1258,7 @@ fn start(
     let tick_loop = abr_loop.clone();
     if !m.set_on_drain(
         abr_loop.id,
-        Box::new(move || tick_loop.observe(estimate(), false, std::time::Instant::now())),
+        Box::new(move || tick_loop.observe(estimate(), 0.0, false, std::time::Instant::now())),
     ) {
         // Refused only when a teardown (or another loop) took the encoder while this one was
         // claiming it: the hooks were already cleared, and one installed now would rebuild
@@ -1696,10 +1683,7 @@ fn feedback_abr_armed(
                 if observe_loop.orphaned() {
                     retake();
                 }
-                // After the re-take, which starts a fresh governor with no share.
-                let now = std::time::Instant::now();
-                observe_loop.share(share, now);
-                observe_loop.observe(kbps, true, now);
+                observe_loop.observe(kbps, share, true, std::time::Instant::now());
             }),
             measured: Box::new(move |reading| {
                 report_loop.report(reading, std::time::Instant::now())
@@ -3024,7 +3008,7 @@ mod tests {
         fn feed(&mut self, ms: u64, est: f64, reading: Option<f64>) {
             let now = self.t0 + std::time::Duration::from_millis(ms);
             self.abr_loop.report(reading, now);
-            self.abr_loop.observe(est, true, now);
+            self.abr_loop.observe(est, 0.0, true, now);
             while let Ok((_, e)) = self.traces.try_recv() {
                 self.seen.push(e);
             }
