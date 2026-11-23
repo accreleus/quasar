@@ -225,8 +225,9 @@ impl AbrLoop {
         let (prev_setpoint, retarget) = {
             let mut gov = self.governor.lock().unwrap();
             let prev = gov.setpoint_kbps();
-            // One write: a share that lowered the ceiling, or the estimate's move after it.
-            let cut = gov.set_share(share, now);
+            // One write: a share that lowered the ceiling, or the estimate's move after it. Only
+            // a real estimate carries the share; the stall-rescue tick's 0 is none.
+            let cut = from_notify.then(|| gov.set_share(share, now)).flatten();
             (prev, gov.observe(est_kbps, now).or(cut))
         };
         // In `Off` the governor still tracks, but its output is discarded. `Protective`
@@ -2249,6 +2250,35 @@ mod tests {
                 "{share}"
             );
         }
+    }
+
+    /// #1301 review S1: the stall-rescue tick re-observes with no share; it must not end the
+    /// sticky share, or the ceiling springs back to the configured one and the climb writes it.
+    #[test]
+    fn the_stall_rescue_tick_keeps_the_fec_ceiling() {
+        init();
+        let metrics = Arc::new(SessionMetrics::new("smooth", 60));
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let trace =
+            crate::session::runner::DiagnosticEventTx::new(tx, Arc::default(), Arc::default());
+        let cfg = cfg_with_floors(0, None);
+        let encoder = gst::ElementFactory::make("openh264enc").build().unwrap();
+        let (client, abr) =
+            feedback_abr_armed(&encoder, &cfg, metrics, trace, "s".into(), None).unwrap();
+        let bitrate = || encoder.property::<u32>("bitrate") / 1000;
+        (client.start)();
+        (client.observe)(9200.0, 0.25);
+        assert_eq!(bitrate(), 9200);
+        let now = std::time::Instant::now();
+        for s in [11, 22] {
+            abr.observe(
+                11_500.0,
+                0.0,
+                false,
+                now + std::time::Duration::from_secs(s),
+            );
+        }
+        assert_eq!(bitrate(), 9200, "the tick ended the share");
     }
 
     /// A takeover across transports: loop A drove the encoder down, then B claims it. B's

@@ -441,6 +441,10 @@ pub struct Governor {
     /// been lower.
     share: f64,
     share_lower_since: Option<Instant>,
+    /// The share of the last estimate, which the reading line follows (`observe_report`).
+    share_now: f64,
+    /// When `set_share` last wrote: a step at the same estimate is that same write.
+    bound_at: Option<Instant>,
 }
 
 /// `Governor::set_share`: a share that falls lowers the ceiling only after staying lower this
@@ -474,6 +478,8 @@ impl Governor {
             back: false,
             share: 0.0,
             share_lower_since: None,
+            share_now: 0.0,
+            bound_at: None,
         }
     }
 
@@ -487,10 +493,11 @@ impl Governor {
     /// WebTransport FEC's repair share (`webtransport::Rate::observe`): the ceiling and the
     /// reading line over `1 + share`, the share rising at once and falling after `SHARE_STICKY`.
     /// Every input is already video and every gate relative, so a descent with FEC is the one
-    /// without, scaled. A setpoint over the new ceiling is returned to write once `write_due`;
-    /// a bound change, so the window loop's anti-thrash clock is not stamped.
+    /// without, scaled. A setpoint over the new ceiling is returned to write, at most once per
+    /// write gap (`min_interval`, or `per_report`): each write may cost a keyframe.
     pub fn set_share(&mut self, share: f64, now: Instant) -> Option<u32> {
         let share = share.max(0.0);
+        self.share_now = share;
         if share >= self.share {
             (self.share, self.share_lower_since) = (share, None);
         } else if now.saturating_duration_since(*self.share_lower_since.get_or_insert(now))
@@ -499,13 +506,12 @@ impl Governor {
             (self.share, self.share_lower_since) = (share, Some(now));
         }
         let ceiling = self.ceiling();
-        if self.setpoint <= ceiling || !self.write_due(now) {
+        let gap = self.cfg.per_report.unwrap_or(self.cfg.min_interval);
+        if self.setpoint <= ceiling || now.saturating_duration_since(self.last_retarget) < gap {
             return None;
         }
         self.setpoint = ceiling;
-        if self.cfg.per_report.is_some() {
-            self.last_retarget = now;
-        }
+        (self.last_retarget, self.bound_at) = (now, Some(now));
         Some(ceiling)
     }
 
@@ -646,8 +652,11 @@ impl Governor {
         self.cfg.per_report?;
         self.last_report = Some(now);
         // Not positive (or NaN) is no capacity sample: a zero rate would never grow again.
-        // The rate is the link's, for the rung; the line is video's, so it scales with the share.
-        let rate = self.rate.min(self.ceiling() as f64);
+        // The rate is the link's, for the rung; the line is video's, under the share now (the
+        // sticky one bounds only the ceiling).
+        let rate = self
+            .rate
+            .min(self.cfg.ceiling_kbps as f64 / (1.0 + self.share_now));
         let line = match self.cfg.legacy_readings {
             true => rate * (1.0 - self.cfg.deadband),
             false => rate,
@@ -736,8 +745,11 @@ impl Governor {
         };
         self.ewma = Some(smoothed);
 
-        // Anti-thrash: at most one retarget per min_interval (both directions).
-        if now.saturating_duration_since(self.last_retarget) < self.cfg.min_interval {
+        // Anti-thrash: at most one retarget per min_interval (both directions). A bound written
+        // at this estimate is the same write.
+        if self.bound_at != Some(now)
+            && now.saturating_duration_since(self.last_retarget) < self.cfg.min_interval
+        {
             return None;
         }
 
@@ -1657,6 +1669,46 @@ mod tests {
             9000..15000 => 7000.0,
             _ => 8000.0,
         }
+    }
+
+    /// #1301 review M1: on the window loop a bound write is an encoder write like any other (a
+    /// keyframe on NVENC and VA), so a share rising a level per report writes once per interval.
+    #[test]
+    fn a_share_rising_per_report_writes_once_per_interval() {
+        let base = Instant::now();
+        let mut g = Governor::new(cfg(), base);
+        let mut writes = Vec::new();
+        for level in 1..=5u64 {
+            let now = ms(base, 2000 + 50 * level);
+            let share = level as f64 * 0.05;
+            let cut = g.set_share(share, now);
+            writes.extend(g.observe(8000.0 / (1.0 + share), now).or(cut));
+        }
+        assert_eq!(writes, [7619], "one write in the interval");
+        let now = ms(base, 3100);
+        let cut = g.set_share(0.25, now);
+        assert_eq!(
+            g.observe(6400.0, now).or(cut),
+            Some(6400),
+            "the next interval"
+        );
+    }
+
+    /// #1301 review S2: the reading line follows the share now; the sticky share bounds only the
+    /// ceiling. With the share fallen to 0, a legacy session over a 6000 link cuts in two
+    /// readings, as with no FEC.
+    #[test]
+    fn a_fallen_share_reads_the_link_as_without_fec() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report_fec(true), base);
+        assert_eq!(g.set_share(0.25, ms(base, 0)), Some(6400));
+        assert_eq!(
+            g.set_share(0.0, ms(base, 50)),
+            None,
+            "the ceiling stays sticky"
+        );
+        assert_eq!(g.observe_report(Some(5820.0), ms(base, 100)), None);
+        assert_eq!(g.observe_report(Some(5820.0), ms(base, 150)), Some(5820));
     }
 
     /// #1301: with no FEC (`set_share(0)`, and WebRTC, which never calls it) every loop moves as
