@@ -80,7 +80,9 @@ QUASAR_RELEASE_TAG_SIGNING_KEY, when set, is the path of an OpenSSH private key
 (outside the repository) registered on the releasing GitHub account as a
 signing key: the release commit and the tag are then SSH-signed, and the tag's
 signature is checked before anything is pushed, so GitHub shows both as
-Verified. Unset, both are unsigned, as before.
+Verified. QUASAR_RELEASE_TAG_SIGNING_PUB may name the public key the tag must
+verify against (default: the key's own public half). Needs git 2.34 or newer.
+Unset, both are unsigned, as before.
 
 --transform is the pure changelog rewrite with no git involved: it reads a
 changelog on stdin and writes the rewritten changelog on stdout, so it is
@@ -309,8 +311,16 @@ commit_sign=()
 tag_kind=(-a)
 if [[ -n "$sign_key" ]]; then
   [[ -f "$sign_key" ]] || fail "QUASAR_RELEASE_TAG_SIGNING_KEY: no file at $sign_key"
-  sign_pub="$(ssh-keygen -y -f "$sign_key" 2>/dev/null)" ||
-    fail "QUASAR_RELEASE_TAG_SIGNING_KEY: $sign_key is not a usable OpenSSH private key (or it has a passphrase)"
+  # -P "": never prompt, so a passphrase-protected key is refused here rather
+  # than asking on the terminal (the cut runs unattended).
+  sign_pub="$(ssh-keygen -y -P "" -f "$sign_key" 2>/dev/null </dev/null)" ||
+    fail "QUASAR_RELEASE_TAG_SIGNING_KEY: $sign_key is not a usable OpenSSH private key without a passphrase"
+  # Optional: the public key the tag must verify against (the one registered on
+  # GitHub). Default: the key's own public half.
+  if [[ -n "${QUASAR_RELEASE_TAG_SIGNING_PUB:-}" ]]; then
+    [[ -f "$QUASAR_RELEASE_TAG_SIGNING_PUB" ]] || fail "QUASAR_RELEASE_TAG_SIGNING_PUB: no file at $QUASAR_RELEASE_TAG_SIGNING_PUB"
+    sign_pub="$(cat "$QUASAR_RELEASE_TAG_SIGNING_PUB")"
+  fi
   sign=(-c gpg.format=ssh -c "user.signingkey=$sign_key")
   commit_sign=(-S)
   tag_kind=(-s)
@@ -324,8 +334,8 @@ if "$dry_run"; then
   echo
   echo "── commands ──"
   echo "git -C '$root' add CHANGELOG.md"
-  echo "git -C '$root' ${sign[*]} commit ${commit_sign[*]} -m '$commit_msg'"
-  echo "git -C '$root' ${sign[*]} tag ${tag_kind[*]} '$tag' -m '$commit_msg'"
+  echo "git -C '$root'${sign[*]:+ ${sign[*]}} commit${commit_sign[*]:+ ${commit_sign[*]}} -m '$commit_msg'"
+  echo "git -C '$root'${sign[*]:+ ${sign[*]}} tag ${tag_kind[*]} '$tag' -m '$commit_msg'"
   [[ -z "$sign_key" ]] || echo "git -C '$root' tag -v '$tag'   (against the key's public half)"
   echo "git -C '$root' push origin HEAD:refs/heads/main '$tag'"
   exit 0
@@ -333,13 +343,14 @@ fi
 
 printf '%s\n' "$new_content" > "$changelog"
 git -C "$root" add CHANGELOG.md
-git -C "$root" "${sign[@]}" commit --quiet "${commit_sign[@]}" -m "$commit_msg"
-git -C "$root" "${sign[@]}" tag "${tag_kind[@]}" "$tag" -m "$commit_msg"
+git -C "$root" ${sign[@]+"${sign[@]}"} commit --quiet ${commit_sign[@]+"${commit_sign[@]}"} -m "$commit_msg"
+git -C "$root" ${sign[@]+"${sign[@]}"} tag "${tag_kind[@]}" "$tag" -m "$commit_msg"
 if [[ -n "$sign_key" ]]; then
   # Verify against the key's own public half before pushing: a signature that
   # does not verify here would not show as Verified on GitHub either.
   signers="$(mktemp)"
-  printf '%s %s\n' "$(git -C "$root" config user.email)" "$sign_pub" > "$signers"
+  # The principal is only a label: git matches the signing key, not an email.
+  printf 'release-signer %s\n' "$sign_pub" > "$signers"
   if ! git -C "$root" -c "gpg.ssh.allowedSignersFile=$signers" tag -v "$tag" >/dev/null 2>&1; then
     rm -f "$signers"
     fail "the signed tag $tag did not verify; nothing was pushed (undo with: git tag -d $tag && git reset --hard HEAD~1)"

@@ -204,10 +204,30 @@ if out=$(signed "$keydir/missing" --version 0.3.0 --dry-run 2>&1); then fail "a 
 [[ "$out" == *"no file at"* ]] || fail "missing-key refusal must say so: $out"
 if out=$(signed "$keydir/bad" --version 0.3.0 --dry-run 2>&1); then fail "an unusable signing key must refuse the cut: $out"; fi
 [[ "$out" == *"not a usable OpenSSH private key"* ]] || fail "bad-key refusal must say so: $out"
+ssh-keygen -q -t ed25519 -N "secret" -C pass -f "$keydir/pass" >/dev/null
+if out=$(signed "$keydir/pass" --version 0.3.0 --dry-run 2>&1 </dev/null); then fail "a passphrase key must refuse the cut: $out"; fi
+[[ "$out" == *"without a passphrase"* ]] || fail "passphrase-key refusal must say so: $out"
+# A refused key writes nothing, in a real (not dry) run too.
+before="$(git -C "$gitwork" rev-parse HEAD)"
+if out=$(signed "$keydir/missing" --version 0.3.0 2>&1); then fail "a missing key must refuse a real cut: $out"; fi
+[[ "$(git -C "$gitwork" rev-parse HEAD)" == "$before" && -z "$(git -C "$gitwork" tag -l v0.3.0)" && -z "$(git -C "$gitwork" status --porcelain)" ]] ||
+  fail "a refused key must leave no commit, tag or change"
 
 dry_out="$(signed "$keydir/sign" --version 0.3.0 --dry-run)"
 [[ "$dry_out" == *"tag -s 'v0.3.0'"* ]] || fail "a signed dry-run must print tag -s: $dry_out"
-signed "$keydir/sign" --version 0.3.0 >/dev/null
+# The tag must verify before anything is pushed: against a different expected
+# public key the cut stops with the undo hint, origin untouched.
+ssh-keygen -q -t ed25519 -N "" -C other -f "$keydir/other" >/dev/null
+origin_before="$(git -C "$gitremote" rev-parse main)"
+if out=$(cd "$gitwork" && QUASAR_RELEASE_TAG_SIGNING_KEY="$keydir/sign" QUASAR_RELEASE_TAG_SIGNING_PUB="$keydir/other.pub" bash scripts/release/release-cut.sh --version 0.3.0 2>&1); then
+  fail "a tag that does not verify must stop the cut: $out"
+fi
+[[ "$out" == *"did not verify; nothing was pushed"* ]] || fail "verify refusal must say so: $out"
+[[ "$(git -C "$gitremote" rev-parse main)" == "$origin_before" && -z "$(git -C "$gitremote" tag -l v0.3.0)" ]] || fail "nothing may be pushed when the tag does not verify"
+git -C "$gitwork" tag -d v0.3.0 >/dev/null && git -C "$gitwork" reset --quiet --hard HEAD~1
+[[ "$(git -C "$gitwork" rev-parse HEAD)" == "$before" ]] || fail "the undo hint must restore the pre-cut HEAD"
+# With the matching expected key the same cut goes through.
+(cd "$gitwork" && QUASAR_RELEASE_TAG_SIGNING_KEY="$keydir/sign" QUASAR_RELEASE_TAG_SIGNING_PUB="$keydir/sign.pub" bash scripts/release/release-cut.sh --version 0.3.0 >/dev/null)
 git -C "$gitwork" cat-file tag v0.3.0 | grep -q -- "-----BEGIN SSH SIGNATURE-----" || fail "v0.3.0 must carry an SSH signature"
 git -C "$gitwork" cat-file commit "v0.3.0^{commit}" | grep -q "^gpgsig " || fail "the release commit must be signed"
 printf '%s %s\n' "release-cut-test@example.invalid" "$(cat "$keydir/sign.pub")" > "$keydir/allowed"

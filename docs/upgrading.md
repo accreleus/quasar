@@ -597,7 +597,9 @@ It refuses — with a one-line reason, before touching anything — unless:
 OpenSSH private key, kept outside the repository and registered on the releasing GitHub account
 as a *signing* key (Settings › SSH and GPG keys). The cut then SSH-signs the release commit and
 the tag and verifies the tag against that key before it pushes anything; an unusable key refuses
-the cut before anything is written. This key is not the release-manifest key of "Signing platform
+the cut before anything is written; a key with a passphrase is refused, since the cut never
+prompts. Set `QUASAR_RELEASE_TAG_SIGNING_PUB` to the public key registered on GitHub to make the
+cut check it is signing with that key. Needs git 2.34 or newer and `ssh-keygen`. This key is not the release-manifest key of "Signing platform
 releases": keep the two separate. Unset, the commit and tag are unsigned.
 
 It never merges `develop` into `main` for you — that merge, and the operator sign-off it requires
