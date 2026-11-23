@@ -68,3 +68,7 @@ pub mod source_policy;
 pub(crate) mod test_env;
 #[cfg(test)]
 pub(crate) mod test_lease;
+/// Shared test-only log capture: one process-wide subscriber, one thread-local
+/// sink (see `test_log.rs`).
+#[cfg(test)]
+pub(crate) mod test_log;
