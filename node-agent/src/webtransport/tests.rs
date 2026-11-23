@@ -2897,7 +2897,7 @@ fn governor_bound(estimate_kbps: f64) -> f64 {
 /// the estimate, 3500.
 #[test]
 fn the_pacer_never_holds_video_under_the_setpoint() {
-    let (estimate, governed) = governed_after_a_report(Default::default());
+    let (estimate, governed) = governed_after_a_report(crate::session::settings::WtCapacity::V2);
     assert!(
         (3400.0..3700.0).contains(&estimate),
         "the estimate is {estimate:.0}"
