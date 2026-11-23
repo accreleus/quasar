@@ -58,7 +58,7 @@ export function useSourcesData(artworkSecretName: string): UseSourcesDataResult 
     {
       label: "apps",
       initialData: [],
-      fetch: async (ctx) => (await adminApi.listAdminApps(ctx.token)).items,
+      fetch: (ctx) => adminApi.listAllAdminApps(ctx.token),
     },
     [],
   );
