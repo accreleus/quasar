@@ -6288,3 +6288,74 @@ fn a_probe_repair_over_a_shrunk_datagram_size_ends_the_probe_not_the_stream() {
     );
     assert!(!gone, "a gone connection goes on");
 }
+
+#[test]
+fn pacing_reports_a_frames_first_to_last_slice_release_and_skips_a_frame_whose_tail_was_dropped() {
+    let gap = Duration::from_millis(5);
+    let t0 = Instant::now();
+    let mut pacing = Pacing::default();
+    pacing.push(1, gap, vec![tagged(10, 1), tagged(11, 1), tagged(12, 1)]);
+    pacing.pop(t0).unwrap();
+    assert_eq!(pacing.finished.take(), None, "the frame is not done");
+    // The last slice wakes 2 ms late: the spread is what the slices took, not the plan.
+    pacing.pop(t0 + gap).unwrap();
+    pacing.pop(t0 + gap * 2 + Duration::from_millis(2)).unwrap();
+    assert_eq!(
+        pacing.finished.take(),
+        Some(gap * 2 + Duration::from_millis(2))
+    );
+    // A one-slice frame spreads over nothing.
+    pacing.push(2, gap, vec![tagged(20, 1)]);
+    pacing.pop(t0 + gap * 5).unwrap();
+    assert_eq!(pacing.finished.take(), Some(Duration::ZERO));
+    // Frame 3 loses its tail to frame 5; frame 4's spread starts at its own first slice.
+    let t1 = t0 + gap * 10;
+    pacing.push(3, gap, vec![tagged(30, 1), tagged(31, 1)]);
+    pacing.pop(t1).unwrap();
+    pacing.push(4, gap, vec![tagged(40, 1), tagged(41, 1)]);
+    pacing.push(5, gap, vec![tagged(50, 1)]);
+    assert_eq!(pacing.pop(t1 + gap).unwrap()[0][0], 40);
+    assert_eq!(pacing.pop(t1 + gap * 2).unwrap()[0][0], 41);
+    assert_eq!(pacing.finished.take(), Some(gap));
+}
+
+#[test]
+fn slice_spread_summarises_a_second_of_frames_as_fractions_of_the_interval() {
+    let t0 = Instant::now();
+    let interval = Duration::from_millis(10);
+    let mut spread = SliceSpread::default();
+    // Frames spread 1..=21 ms: 0.1..=2.1 of the interval, one every 50 ms.
+    let summaries: Vec<_> = (1..=21u64)
+        .map(|i| {
+            spread.add(
+                t0 + Duration::from_millis((i - 1) * 50),
+                Duration::from_millis(i),
+                interval,
+            )
+        })
+        .collect();
+    assert!(
+        summaries[..20].iter().all(Option::is_none),
+        "nothing before the second is up"
+    );
+    let s = summaries[20]
+        .as_ref()
+        .expect("the 21st frame closes the second");
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+    assert_eq!(s.frames, 21);
+    assert!(
+        near(s.p50, 1.1) && near(s.p95, 2.0) && near(s.max, 2.1),
+        "{s:?}"
+    );
+    // 0.1..=0.5 are not over half an interval (0.5 itself is not).
+    assert_eq!(s.over_half, 16);
+    // The next window starts empty.
+    assert_eq!(
+        spread.add(
+            t0 + Duration::from_millis(1010),
+            Duration::from_millis(1),
+            interval
+        ),
+        None
+    );
+}

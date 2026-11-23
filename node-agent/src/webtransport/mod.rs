@@ -1382,6 +1382,8 @@ fn burst_plan(
 /// One slice of a PyroWave frame, with the spacing that follows it.
 struct Slice {
     frame: u16,
+    /// The frame's final slice: its release closes the frame's first-to-last spread.
+    last: bool,
     gap: Duration,
     datagrams: Vec<bytes::Bytes>,
 }
@@ -1400,14 +1402,20 @@ struct Pacing {
     /// empty queue so no two slices are closer than a gap. Past (or `None`) when idle: a slice
     /// goes at once.
     ready: Option<Instant>,
+    /// The frame whose slices are going out, and when its first one went.
+    open: Option<(u16, Instant)>,
+    /// First to last slice release of the frame the last `pop` completed; taken by the caller.
+    finished: Option<Duration>,
 }
 
 impl Pacing {
     /// Queues a frame's slices; the datagrams of an older frame's unsent tail it dropped.
     fn push(&mut self, frame: u16, gap: Duration, slices: Vec<Vec<bytes::Bytes>>) -> usize {
         let mut dropped = 0;
-        let frame_slices = slices.into_iter().map(|datagrams| Slice {
+        let count = slices.len();
+        let frame_slices = slices.into_iter().enumerate().map(|(i, datagrams)| Slice {
             frame,
+            last: i + 1 == count,
             gap,
             datagrams,
         });
@@ -1443,8 +1451,77 @@ impl Pacing {
         }
         let slice = self.queue.pop_front()?;
         self.ready = Some(now + slice.gap);
+        // A frame whose tail was dropped never closes; the next frame's first slice replaces it.
+        let first = match self.open {
+            Some((frame, at)) if frame == slice.frame => at,
+            _ => now,
+        };
+        self.open = (!slice.last).then_some((slice.frame, first));
+        if slice.last {
+            self.finished = Some(now.saturating_duration_since(first));
+        }
         Some(slice.datagrams)
     }
+}
+
+/// How often the slice-spread summary is logged: a line per frame is 144 a second at 4K144.
+const SPREAD_EVERY: Duration = Duration::from_secs(1);
+
+/// The window's frames' first-to-last slice release, each as a fraction of the frame interval
+/// (`codec-pyrowave.md` §Rate: a frame's slices SHOULD leave within half of it).
+#[derive(Default)]
+struct SliceSpread {
+    since: Option<Instant>,
+    fractions: Vec<f64>,
+}
+
+/// One window of [`SliceSpread`]: the frames, the fractions' p50, p95 and max, and how many
+/// frames took over half an interval.
+#[derive(Debug, PartialEq)]
+struct SpreadSummary {
+    frames: usize,
+    p50: f64,
+    p95: f64,
+    max: f64,
+    over_half: usize,
+}
+
+impl SliceSpread {
+    /// Adds a frame's `spread` against its `interval`; once [`SPREAD_EVERY`] has passed since
+    /// the window began, returns it summarised and starts the next.
+    fn add(&mut self, now: Instant, spread: Duration, interval: Duration) -> Option<SpreadSummary> {
+        self.fractions
+            .push(spread.as_secs_f64() / interval.as_secs_f64());
+        let since = *self.since.get_or_insert(now);
+        if now.saturating_duration_since(since) < SPREAD_EVERY {
+            return None;
+        }
+        self.since = Some(now);
+        let mut f = std::mem::take(&mut self.fractions);
+        f.sort_unstable_by(f64::total_cmp);
+        // Nearest rank below: the value at floor((n - 1) * q), as `pyrowave-encode-stats` reads it.
+        let at = |q: f64| f[((f.len() - 1) as f64 * q) as usize];
+        Some(SpreadSummary {
+            frames: f.len(),
+            p50: at(0.5),
+            p95: at(0.95),
+            max: at(1.0),
+            over_half: f.iter().filter(|x| **x > 0.5).count(),
+        })
+    }
+}
+
+fn log_spread(s: &SpreadSummary, fps: i32) {
+    tracing::info!(
+        token = "pyrowave-slice-spread",
+        frames = s.frames,
+        interval_us = frame_interval(fps).as_micros() as u64,
+        p50 = format!("{:.3}", s.p50),
+        p95 = format!("{:.3}", s.p95),
+        max = format!("{:.3}", s.max),
+        over_half = s.over_half,
+        "PyroWave first-to-last slice release, as a fraction of the frame interval"
+    );
 }
 
 /// The payload bytes of video datagrams: what amendment 85's FEC share is measured against.
@@ -1945,6 +2022,7 @@ async fn stream(
     // Datagrams of PyroWave frame tails dropped unsent by `Pacing`.
     let mut pacing_dropped = 0u64;
     let mut pacing = Pacing::default();
+    let mut slice_spread = SliceSpread::default();
     // What ends the stream: an optional last message, the close code and its reason.
     const QUIET: (Option<Value>, u32, &str) = (None, CLOSE_NORMAL, "");
     let mut idle = pin!(tokio::time::sleep(CONTROL_IDLE));
@@ -2021,6 +2099,11 @@ async fn stream(
             // #1606: the next PyroWave slice, one at a time so the arms around it keep running.
             _ = tokio::time::sleep_until(pacing.deadline().unwrap_or_else(Instant::now)), if pacing.deadline().is_some() => {
                 if let Some(slice) = pacing.pop(Instant::now()) {
+                    if let Some(spread) = pacing.finished.take() {
+                        if let Some(summary) = slice_spread.add(Instant::now(), spread, frame_interval(current.fps)) {
+                            log_spread(&summary, current.fps);
+                        }
+                    }
                     let now = std::time::Instant::now();
                     for datagram in slice {
                         video.push(congestion::Held { datagram, logged: pyro.is_some(), resend: false, queued_at: now, keyframe: true }, DATAGRAM_BUFFER);

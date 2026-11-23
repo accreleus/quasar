@@ -6627,3 +6627,58 @@ fn a_loss_floor_under_a_probing_hold_keeps_the_line() {
         assert_eq!(est.held_kbps().is_some(), probes, "probes {probes}");
     }
 }
+
+#[test]
+fn the_pacing_judgement_is_traced_twice_a_second_and_at_once_when_the_cap_changes() {
+    let on = Instant::now();
+    let mut rate = PyroRate::new(PYRO_TARGET, PYRO_FLOOR, on, false);
+    let lines = logged(|| {
+        // Judged from 1 s; a 80 Mbit/s window backed up under a 200 Mbit/s target: capped, latched.
+        for ms in (1000..=1600u64).step_by(50) {
+            fill(&mut rate, 50);
+            rate.on_tick(on + Duration::from_millis(ms), backed_up(80_000.0));
+        }
+        // The window opens 150 ms after the last line: the cap lets go, logged at once.
+        fill(&mut rate, 50);
+        rate.on_tick(on + Duration::from_millis(1650), quic_at(190_000.0));
+    });
+    let lines: Vec<_> = lines
+        .into_iter()
+        .filter(|l| l.contains("pyrowave-pacing-judgement"))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        4,
+        "1000 ms, the cap at 1050 (100 ms of waiting), 1500 ms, the release at 1650: {lines:#?}"
+    );
+    for want in [
+        "rtt_us=1000",
+        "cwnd_bytes=10000",
+        "queued_bytes=65536",
+        "quic_kbps=80000",
+        "capped=false",
+        "latched=false",
+        "verdict=\"budget\"",
+    ] {
+        assert!(lines[0].contains(want), "{want}: {}", lines[0]);
+    }
+    for want in [
+        "capped=true",
+        "latched=true",
+        "kbps=80000",
+        "climb_from_kbps=0",
+    ] {
+        assert!(
+            lines[1].contains(want) && lines[2].contains(want),
+            "{want}: {lines:#?}"
+        );
+    }
+    for want in [
+        "quic_kbps=190000",
+        "capped=true",
+        "latched=false",
+        "climb_from_kbps=190000",
+    ] {
+        assert!(lines[3].contains(want), "{want}: {}", lines[3]);
+    }
+}

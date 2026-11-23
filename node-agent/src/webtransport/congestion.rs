@@ -2025,6 +2025,31 @@ pub(crate) struct PyroRate {
     /// A cap at or over the floor has let go: the rate it held and when that was last set. The
     /// budget climbs back from it at `PYRO_CLIMB_PER_S`, not straight to the target (#1430).
     climb: Option<(f64, Instant)>,
+    /// The inputs and result of the last judgement, for the trace.
+    judged: Judged,
+    /// When the trace last logged, and the (capped, latched, climbing) it logged.
+    traced: Option<(Instant, (bool, bool, bool))>,
+}
+
+/// How often `pyrowave-pacing-judgement` logs at most, apart from a change of state: the
+/// judgement runs on every feedback report and tick, tens of times a second.
+const PYRO_TRACE_EVERY: Duration = Duration::from_millis(500);
+
+/// One judgement's inputs and result (rates in kbit/s), as `pyrowave-pacing-judgement` logs them.
+#[derive(Clone, Copy, Default)]
+struct Judged {
+    /// The estimate (never above the target) before QUIC's cap.
+    uncapped: f64,
+    /// The encoder's output over the last 100-200 ms.
+    offered: f64,
+    fills: bool,
+    waiting: bool,
+    sustained: bool,
+    rose: bool,
+    /// The QUIC cap applied to this judgement.
+    capped: bool,
+    /// The rate the budget is made from, after the cap and the climb.
+    kbps: f64,
 }
 
 impl PyroRate {
@@ -2050,6 +2075,8 @@ impl PyroRate {
             offered: 0,
             marks: [(now, 0); 2],
             climb: None,
+            judged: Judged::default(),
+            traced: None,
         }
     }
 
@@ -2091,6 +2118,60 @@ impl PyroRate {
     }
 
     fn judge(&mut self, now: Instant, path: QuicPath) -> PyroVerdict {
+        let verdict = self.decide(now, path);
+        self.trace(now, path, verdict);
+        verdict
+    }
+
+    /// One line per `PYRO_TRACE_EVERY`, and at once when the cap, the latch or the climb turns
+    /// on or off: what the judgement saw and what it decided, to read whether the cap rises
+    /// (cwnd flat, RTT falling) while the encoder fills its budget.
+    fn trace(&mut self, now: Instant, path: QuicPath, verdict: PyroVerdict) {
+        if self.judged_from.is_none() {
+            return;
+        }
+        let state = (self.judged.capped, self.latched, self.climb.is_some());
+        if let Some((at, was)) = self.traced {
+            if was == state && now.saturating_duration_since(at) < PYRO_TRACE_EVERY {
+                return;
+            }
+        }
+        self.traced = Some((now, state));
+        let j = self.judged;
+        let cap = quic_kbps(path);
+        tracing::info!(
+            token = "pyrowave-pacing-judgement",
+            rtt_us = path.rtt.as_micros() as u64,
+            cwnd_bytes = path.cwnd_bytes,
+            queued_bytes = path.queued_bytes,
+            congestion_events = path.congestion_events,
+            // 0 when the window or RTT is unknown (no cap).
+            quic_kbps = if cap.is_finite() { cap as u64 } else { 0 },
+            estimate_kbps = j.uncapped as u64,
+            offered_kbps = if j.offered.is_finite() {
+                j.offered as u64
+            } else {
+                0
+            },
+            fills = j.fills,
+            waiting = j.waiting,
+            sustained = j.sustained,
+            rose = j.rose,
+            latched = self.latched,
+            capped = j.capped,
+            climb_from_kbps = self.climb.map_or(0, |(from, _)| from as u64),
+            kbps = j.kbps as u64,
+            budget = self.budget,
+            verdict = match verdict {
+                PyroVerdict::Hold => "hold",
+                PyroVerdict::Budget(_) => "budget",
+                PyroVerdict::StepDown { .. } => "step-down",
+            },
+            "PyroWave pacing judgement"
+        );
+    }
+
+    fn decide(&mut self, now: Instant, path: QuicPath) -> PyroVerdict {
         let mut kbps = self.estimator.estimate_kbps.min(self.target_kbps);
         let events = self.events.replace(path.congestion_events);
         // A frame smaller than the window waits only while quinn flushes it.
@@ -2102,10 +2183,22 @@ impl PyroRate {
             && now.saturating_duration_since(*self.waiting_since.get_or_insert(now))
                 >= PYRO_FILL_WINDOW;
         let rose = events.is_some_and(|was| path.congestion_events > was);
-        let fills = self.offered_kbps(now) >= APP_LIMITED * f64::from(self.budget);
+        let offered = self.offered_kbps(now);
+        let fills = offered >= APP_LIMITED * f64::from(self.budget);
+        self.judged = Judged {
+            uncapped: kbps,
+            offered,
+            fills,
+            waiting,
+            sustained,
+            rose,
+            capped: false,
+            kbps,
+        };
         if self.judged_from.is_some() {
             let uncapped = kbps;
-            if sustained || ((rose || self.latched) && fills) {
+            self.judged.capped = sustained || ((rose || self.latched) && fills);
+            if self.judged.capped {
                 kbps = kbps.min(quic_kbps(path));
             }
             // A link between the floor and the target: a release straight to the target
@@ -2128,6 +2221,7 @@ impl PyroRate {
                 }
                 _ => None,
             };
+            self.judged.kbps = kbps;
             if kbps < self.floor_kbps {
                 // A single loss (`rose`) never latches: it buys this judgement only.
                 self.latched = sustained || (self.latched && fills);
