@@ -33,14 +33,14 @@ own; the two do not move together, and that is deliberate.
 ### Added
 - The Vulkan H.264, HEVC and AV1 encoders can hold anchor frames and code the next frame from one after a loss instead of sending a key frame (the encoder half of #1348; off until the agent uses it).
 - The NVENC H.264 and HEVC encoders get the same anchor control; NVENC AV1 answers every recovery with a key frame (#1348).
+- **A user-space UDP impairment relay for lab rows where the kernel has no netem (`scripts/harness/udprelay`, #1644).** It relays one WebTransport flow and applies a rate cap with a queue limit, a policer, delay and jitter, random loss, outages, burst drops and reordering, changed at run time over a loopback control and logged per second; `redirect.sh` routes one local user's UDP through it. Test tooling only ([guide](docs/testing-e2e-suite.md#shaping-without-kernel-netem-the-udp-relay)).
+- The app editor warns, under the Steam library switch, when no (or more than one) enabled Steam provider app exists, so sharing launches would not share the library (#1631).
 
 ### Changed
-- **The `scripts/harness/udprelay` UDP-relay module now runs `go vet ./...` and `go test ./...` in CI** — a step on the existing control-plane Go job (`go-tests` in `.github/workflows/ci.yml`), and a change under the module now triggers that job on pull requests through `scripts/verify/ci-changed-areas.sh`, so `shape_test.go` runs on the `integration/0.6.4` CI instead of only by hand.
-- **A user-space UDP impairment relay for lab rows where the kernel has no netem (`scripts/harness/udprelay`).** It relays one WebTransport flow and applies a rate cap with a queue limit, a policer, delay and jitter, random loss, outages, burst drops and reordering, changed at run time over a loopback control and logged per second; `redirect.sh` routes one local user's UDP through it. Test tooling only ([guide](docs/testing-e2e-suite.md#shaping-without-kernel-netem-the-udp-relay)).
-- The app editor warns, under the Steam library switch, when no (or more than one) enabled Steam provider app exists, so sharing launches would not share the library (#1631).
-- **Release signing follow-ups (#1646):** the release job treats a repository owned by `accreleus` as the org repository by owner rather than by name, so a rename inside the org still fails closed on an unsigned release instead of silently taking the fork path, and the Upgrading page now says a verifying machine refuses every stable (named) apply, while a developer apply or edge build applies with a warning.
+- CI vets and tests the UDP relay module (`scripts/harness/udprelay`) (#1653).
 
 ### Fixed
+- **Release signing follow-ups (#1646):** the release job treats a repository owned by `accreleus` as the org repository by owner rather than by name, so a rename inside the org still fails closed on an unsigned release instead of silently taking the fork path, and the Upgrading page now says a verifying machine refuses every stable (named) apply, while a developer apply or edge build applies with a warning.
 - PyroWave over WebTransport counts far fewer packets lost when the page stalls briefly (53–83 % fewer on the lab): a frame's deadline timer that fires late now waits four more frames for the datagram reads queued behind the stall (#1635).
 - Warm Steam: when an adopting session's start ack is lost, the old runtime's cleanup proof can no longer release the managed-home hold while that session's stop is still in flight; the hold passes to the failed session and clears at its own proof (#1615).
 

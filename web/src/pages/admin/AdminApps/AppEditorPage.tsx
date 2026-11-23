@@ -138,7 +138,7 @@ export function AppEditorPage() {
     {
       label: "Steam providers",
       fetch: async (ctx) =>
-        (await adminApi.listAdminApps(ctx.token)).items.filter(
+        (await adminApi.listAllAdminApps(ctx.token)).filter(
           (a) => a.library_provider === "steam" && a.enabled && !a.parent_app_id,
         ).length,
     },
