@@ -2145,8 +2145,13 @@ impl PyroRate {
             cwnd_bytes = path.cwnd_bytes,
             queued_bytes = path.queued_bytes,
             congestion_events = path.congestion_events,
-            // 0 when the window or RTT is unknown (no cap).
-            quic_kbps = if cap.is_finite() { cap as u64 } else { 0 },
+            // Only while it caps: uncapped on a LAN, cwnd grows unbounded and cwnd/rtt means
+            // nothing. 0 too when the window or RTT is unknown.
+            quic_kbps = if j.capped && cap.is_finite() {
+                cap as u64
+            } else {
+                0
+            },
             estimate_kbps = j.uncapped as u64,
             offered_kbps = if j.offered.is_finite() {
                 j.offered as u64

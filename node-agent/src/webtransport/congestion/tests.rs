@@ -6655,7 +6655,7 @@ fn the_pacing_judgement_is_traced_twice_a_second_and_at_once_when_the_cap_change
         "rtt_us=1000",
         "cwnd_bytes=10000",
         "queued_bytes=65536",
-        "quic_kbps=80000",
+        "quic_kbps=0 ",
         "capped=false",
         "latched=false",
         "verdict=\"budget\"",
@@ -6665,6 +6665,7 @@ fn the_pacing_judgement_is_traced_twice_a_second_and_at_once_when_the_cap_change
     for want in [
         "capped=true",
         "latched=true",
+        "quic_kbps=80000",
         "kbps=80000",
         "climb_from_kbps=0",
     ] {

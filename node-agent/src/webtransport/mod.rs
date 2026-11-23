@@ -9,6 +9,7 @@ mod congestion;
 mod fec;
 mod media;
 mod mic_jitter;
+mod pacing_timer;
 mod pyrowave;
 mod retransmit;
 #[cfg(test)]
@@ -1290,22 +1291,8 @@ fn stalled() -> (Option<Value>, u32, &'static str) {
 /// slices of that frame) sits well under the clean burst and is a round number.
 const PYRO_BURST_BYTES: usize = 128 * 1024;
 
-/// The most bytes a PyroWave slice may reach when the timer's ticks force fewer, larger slices
-/// (#1633). Under the ~215 KB burst the #1606/#1628 lab runs measured clean at 1080p60.
-const PYRO_BURST_CLEAN_BYTES: usize = 200_000;
-
 /// The frame rate the slice spacing assumes when the configuration carries none.
 const PACING_FALLBACK_FPS: u32 = 60;
-
-/// The timer's resolution: tokio's wheel rounds a deadline up to a whole millisecond, so a gap
-/// between slices takes at least this and a fraction of it costs a whole one (#1633: at 4K120
-/// the planned 2 ms spread took 6).
-const TIMER_TICK: std::time::Duration = std::time::Duration::from_millis(1);
-
-/// What a gap of `gap` takes in practice: whole timer ticks, at least one.
-fn timer_gap(gap: std::time::Duration) -> std::time::Duration {
-    TIMER_TICK * gap.as_micros().div_ceil(TIMER_TICK.as_micros()).max(1) as u32
-}
 
 /// The frame interval at `fps`, which falls back to [`PACING_FALLBACK_FPS`] when unusable.
 fn frame_interval(fps: i32) -> std::time::Duration {
@@ -1316,29 +1303,16 @@ fn frame_interval(fps: i32) -> std::time::Duration {
     std::time::Duration::from_secs(1) / fps
 }
 
-/// The spacing a frame of `slices` is aimed at: a quarter of the frame interval over its gaps,
-/// whole ticks. A one-slice frame gets the same quarter, so the next frame's first slice still
-/// waits it out.
-fn pacing_target(fps: i32, slices: usize) -> std::time::Duration {
-    timer_gap(frame_interval(fps) / 4 / (slices.max(2) as u32 - 1))
-}
-
-/// The gap `Pacing` is given. Asked for half a tick under the whole ticks it should take: the
-/// send loop wakes a little after its tick, and a deadline a whole number of ticks after that
-/// wake-up would round up to one more. That covers a wake-up less than half a tick (0.5 ms)
-/// late; the hardware row measures first to last slice time on a loaded host.
+/// The spacing between a frame's slices: a quarter of the frame interval over its gaps. A
+/// one-slice frame gets the same quarter, so the next frame's first slice still waits it out.
 fn pacing_gap(fps: i32, slices: usize) -> std::time::Duration {
-    pacing_target(fps, slices) - TIMER_TICK / 2
+    frame_interval(fps) / 4 / (slices.max(2) as u32 - 1)
 }
 
 /// The slices a frame's datagrams are handed over in: each a datagram count and its offset from
-/// the frame's start. PyroWave is first cut so no slice passes `PYRO_BURST_BYTES`, the slices spread
-/// over a quarter of the frame interval (a target: `Pacing` keeps the spacing, not the
-/// frame-relative offsets). When the timer's ticks make that spread take longer than half the
-/// interval (`codec-pyrowave.md` §Rate's limit), the frame is cut in fewer, larger slices that
-/// do fit (#1633), but never past `PYRO_BURST_CLEAN_BYTES`: where that bound binds the spread
-/// may exceed half the interval (the contract's SHOULD gives way to the clean burst). Every
-/// other codec is one slice at once.
+/// the frame's start. PyroWave is cut so no slice passes `PYRO_BURST_BYTES`, the slices spread
+/// evenly over a quarter of the frame interval (a target: `Pacing` keeps the spacing, not the
+/// frame-relative offsets). Every other codec is one slice at once.
 fn burst_plan(
     datagrams: &[bytes::Bytes],
     pyrowave: bool,
@@ -1357,20 +1331,6 @@ fn burst_plan(
     if counts.len() == 1 {
         return vec![(counts[0], std::time::Duration::ZERO)];
     }
-    let spread = |n: usize| pacing_target(fps, n) * (n as u32 - 1);
-    // Fewest slices that keep each (an even split by count) under the clean bound.
-    let widest = datagrams.iter().map(bytes::Bytes::len).max().unwrap_or(1);
-    let per_clean = (PYRO_BURST_CLEAN_BYTES / widest).max(1);
-    let fewest = datagrams.len().div_ceil(per_clean).clamp(2, counts.len());
-    let n = (fewest..=counts.len())
-        .rev()
-        .find(|&n| spread(n) <= frame_interval(fps) / 2)
-        .unwrap_or(fewest);
-    if n < counts.len() {
-        // Frames are whole datagrams but for the last: an even split by count is an even one by size.
-        let per = datagrams.len().div_ceil(n);
-        counts = datagrams.chunks(per).map(<[_]>::len).collect();
-    }
     let gap = pacing_gap(fps, counts.len());
     counts
         .into_iter()
@@ -1388,13 +1348,10 @@ struct Slice {
     datagrams: Vec<bytes::Bytes>,
 }
 
-/// The most frames `Pacing` holds: a frame never waits behind more than one older frame.
-const PACING_FRAMES: usize = 2;
-
 /// PyroWave slices not yet handed to QUIC, released one per `gap` by the send loop's own
-/// deadline arm so audio, input, feedback and pongs run between them. Slices keep their order
-/// across frames (a frame arriving mid-way queues behind the older one); a third frame drops the
-/// oldest frame's unsent tail, which the next frame repairs (codec-pyrowave.md §Loss).
+/// deadline arm so audio, input, feedback and pongs run between them. It holds one frame: a
+/// frame arriving before the last one's slices are all out releases that tail at once, so the
+/// pacer never falls behind the encoder (#1633).
 #[derive(Default)]
 struct Pacing {
     queue: std::collections::VecDeque<Slice>,
@@ -1404,37 +1361,36 @@ struct Pacing {
     ready: Option<Instant>,
     /// The frame whose slices are going out, and when its first one went.
     open: Option<(u16, Instant)>,
-    /// First to last slice release of the frame the last `pop` completed; taken by the caller.
+    /// First to last slice release of the frame the last `pop` (or a `push` rushing its tail)
+    /// completed; taken by the caller.
     finished: Option<Duration>,
 }
 
 impl Pacing {
-    /// Queues a frame's slices; the datagrams of an older frame's unsent tail it dropped.
-    fn push(&mut self, frame: u16, gap: Duration, slices: Vec<Vec<bytes::Bytes>>) -> usize {
-        let mut dropped = 0;
-        let count = slices.len();
-        let frame_slices = slices.into_iter().enumerate().map(|(i, datagrams)| Slice {
-            frame,
-            last: i + 1 == count,
-            gap,
-            datagrams,
-        });
-        self.queue.extend(frame_slices);
-        while self
-            .queue
-            .iter()
-            .map(|s| s.frame)
-            .collect::<Vec<_>>()
-            .chunk_by(|a, b| a == b)
-            .count()
-            > PACING_FRAMES
-        {
-            let oldest = self.queue[0].frame;
-            while self.queue.front().is_some_and(|s| s.frame == oldest) {
-                dropped += self.queue.pop_front().map_or(0, |s| s.datagrams.len());
-            }
+    /// Queues a frame's slices, and returns the older frame's unsent tail for the caller to send
+    /// at once. The next slice then waits a gap after that tail.
+    fn push(
+        &mut self,
+        frame: u16,
+        gap: Duration,
+        slices: Vec<Vec<bytes::Bytes>>,
+        now: Instant,
+    ) -> Vec<bytes::Bytes> {
+        let rushed: Vec<_> = self.queue.drain(..).flat_map(|s| s.datagrams).collect();
+        if !rushed.is_empty() {
+            let first = self.open.take().map_or(now, |(_, at)| at);
+            self.finished = Some(now.saturating_duration_since(first));
+            self.ready = Some(now + gap);
         }
-        dropped
+        let count = slices.len();
+        self.queue
+            .extend(slices.into_iter().enumerate().map(|(i, datagrams)| Slice {
+                frame,
+                last: i + 1 == count,
+                gap,
+                datagrams,
+            }));
+        rushed
     }
 
     /// When the next slice is due; `None` with nothing queued.
@@ -1451,7 +1407,6 @@ impl Pacing {
         }
         let slice = self.queue.pop_front()?;
         self.ready = Some(now + slice.gap);
-        // A frame whose tail was dropped never closes; the next frame's first slice replaces it.
         let first = match self.open {
             Some((frame, at)) if frame == slice.frame => at,
             _ => now,
@@ -1511,7 +1466,15 @@ impl SliceSpread {
     }
 }
 
-fn log_spread(s: &SpreadSummary, fps: i32) {
+/// Takes the frame `pacing` last completed into the spread window, and logs the window when it
+/// closes, with the session's rushed-tail datagrams so far.
+fn note_spread(pacing: &mut Pacing, spread: &mut SliceSpread, fps: i32, rushed: u64) {
+    let Some(took) = pacing.finished.take() else {
+        return;
+    };
+    let Some(s) = spread.add(Instant::now(), took, frame_interval(fps)) else {
+        return;
+    };
     tracing::info!(
         token = "pyrowave-slice-spread",
         frames = s.frames,
@@ -1520,6 +1483,7 @@ fn log_spread(s: &SpreadSummary, fps: i32) {
         p95 = format!("{:.3}", s.p95),
         max = format!("{:.3}", s.max),
         over_half = s.over_half,
+        tail_rushed = rushed,
         "PyroWave first-to-last slice release, as a fraction of the frame interval"
     );
 }
@@ -2019,9 +1983,13 @@ async fn stream(
     let mut current = client.config.clone();
     let mut pyro = pyro_rate(media, &current, None);
     let mut pyro_refused = 0u64;
-    // Datagrams of PyroWave frame tails dropped unsent by `Pacing`.
-    let mut pacing_dropped = 0u64;
+    // Datagrams of PyroWave frame tails `Pacing` released at once, behind on its slices.
+    let mut pacing_rushed = 0u64;
     let mut pacing = Pacing::default();
+    #[cfg(not(test))]
+    let mut pacing_timer = pacing_timer::PacingTimer::new();
+    #[cfg(test)]
+    let mut pacing_timer = pacing_timer::PacingTimer::coarse();
     let mut slice_spread = SliceSpread::default();
     // What ends the stream: an optional last message, the close code and its reason.
     const QUIET: (Option<Value>, u32, &str) = (None, CLOSE_NORMAL, "");
@@ -2097,13 +2065,9 @@ async fn stream(
                 }
             }
             // #1606: the next PyroWave slice, one at a time so the arms around it keep running.
-            _ = tokio::time::sleep_until(pacing.deadline().unwrap_or_else(Instant::now)), if pacing.deadline().is_some() => {
+            _ = pacing_timer.sleep_until(pacing.deadline().unwrap_or_else(Instant::now)), if pacing.deadline().is_some() => {
                 if let Some(slice) = pacing.pop(Instant::now()) {
-                    if let Some(spread) = pacing.finished.take() {
-                        if let Some(summary) = slice_spread.add(Instant::now(), spread, frame_interval(current.fps)) {
-                            log_spread(&summary, current.fps);
-                        }
-                    }
+                    note_spread(&mut pacing, &mut slice_spread, current.fps, pacing_rushed);
                     let now = std::time::Instant::now();
                     for datagram in slice {
                         video.push(congestion::Held { datagram, logged: pyro.is_some(), resend: false, queued_at: now, keyframe: true }, DATAGRAM_BUFFER);
@@ -2246,21 +2210,22 @@ async fn stream(
                         let gap = pacing_gap(current.fps, plan.len());
                         let mut rest = datagrams.into_iter();
                         let slices = plan.iter().map(|(n, _)| rest.by_ref().take(*n).collect()).collect();
-                        let dropped = pacing.push(unit.frame_seq, gap, slices);
-                        if dropped > 0 {
-                            // The next frame repairs it (§Loss), but a sender that falls this far
-                            // behind is the pacing's or QUIC's doing: say so once, count the rest.
-                            if pacing_dropped == 0 {
+                        datagrams = pacing.push(unit.frame_seq, gap, slices, Instant::now());
+                        if !datagrams.is_empty() {
+                            // A pacer this far behind is the timer's or the send loop's doing: say
+                            // so once, count the rest.
+                            if pacing_rushed == 0 {
                                 tracing::warn!(
-                                    token = "pyrowave-pacing-tail-dropped",
-                                    dropped,
-                                    "PyroWave frame tail dropped unsent: the slices of an older frame \
-                                     were still waiting when a third frame arrived; later ones are counted, not logged"
+                                    token = "pyrowave-pacing-tail-rushed",
+                                    rushed = datagrams.len(),
+                                    "PyroWave frame tail sent at once: its slices were still waiting \
+                                     when the next frame arrived; later ones are counted, not logged"
                                 );
                             }
-                            pacing_dropped += dropped as u64;
+                            pacing_rushed += datagrams.len() as u64;
                         }
-                        datagrams = pacing.pop(Instant::now()).unwrap_or_default();
+                        datagrams.extend(pacing.pop(Instant::now()).unwrap_or_default());
+                        note_spread(&mut pacing, &mut slice_spread, current.fps, pacing_rushed);
                     }
                     for datagram in datagrams {
                         video.push(congestion::Held { datagram, logged, resend: false, queued_at: now, keyframe }, DATAGRAM_BUFFER);
@@ -2430,11 +2395,11 @@ async fn stream(
             "PyroWave feedback messages ignored as out of contract"
         );
     }
-    if pacing_dropped > 0 {
-        tracing::debug!(
-            token = "pyrowave-pacing-tail-dropped",
-            dropped = pacing_dropped,
-            "PyroWave datagrams dropped unsent from frame tails by the slice pacing"
+    if pacing_rushed > 0 {
+        tracing::info!(
+            token = "pyrowave-pacing-tail-rushed",
+            rushed = pacing_rushed,
+            "PyroWave datagrams of frame tails the slice pacing sent at once"
         );
     }
     if let Some(refused) = control.as_ref().map(|c| c.refused).filter(|&n| n > 0) {
