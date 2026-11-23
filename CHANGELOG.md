@@ -31,6 +31,7 @@ own; the two do not move together, and that is deliberate.
 - The recovery actor verifies release signatures by default: `QUASAR_UPDATER_SIGNATURE_MODE` defaults to `verify` and `QUASAR_UPDATER_TRUSTED_KEYS` to the org's release key, and under `verify` a release that names a version but publishes no signature is now refused `signature_missing`, so deleting a release's `.sig` no longer downgrades it to unverified. Requests that name no version (developer apply, edge, an unnamed revert) still apply with a WARN. The release signing key is a secret of the `release` environment, which only a run on a `v*` tag can use; the release job checks every signature against the org key compiled into the actor, and a tag release with no key fails instead of publishing unsigned (#621).
 
 ### Added
+- `make release` can sign the release commit and tag with an SSH key (`QUASAR_RELEASE_TAG_SIGNING_KEY`), so GitHub shows them as Verified.
 - The Vulkan H.264, HEVC and AV1 encoders can hold anchor frames and code the next frame from one after a loss instead of sending a key frame (the encoder half of #1348; off until the agent uses it).
 - The NVENC H.264 and HEVC encoders get the same anchor control; NVENC AV1 answers every recovery with a key frame (#1348).
 - **A user-space UDP impairment relay for lab rows where the kernel has no netem (`scripts/harness/udprelay`, #1644).** It relays one WebTransport flow and applies a rate cap with a queue limit, a policer, delay and jitter, random loss, outages, burst drops and reordering, changed at run time over a loopback control and logged per second; `redirect.sh` routes one local user's UDP through it. Test tooling only ([guide](docs/testing-e2e-suite.md#shaping-without-kernel-netem-the-udp-relay)).
@@ -48,6 +49,7 @@ own; the two do not move together, and that is deliberate.
 - **WebTransport: the first receiver report after an outage no longer cuts the bitrate (#1433).** The losses of an outage are read from what the client's reports covered. On in both `QUASAR_WT_CAPACITY` modes.
 - PyroWave over WebTransport counts far fewer packets lost when the page stalls briefly (53–83 % fewer on the lab): a frame's deadline timer that fires late now waits four more frames for the datagram reads queued behind the stall (#1635).
 - Warm Steam: when an adopting session's start ack is lost, the old runtime's cleanup proof can no longer release the managed-home hold while that session's stop is still in flight; the hold passes to the failed session and clears at its own proof (#1615).
+- Node-agent tests that read their own log lines no longer fail at random under the parallel test runner (#1650).
 
 ## 0.6.3 — 2026-11-21
 

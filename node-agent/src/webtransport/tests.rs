@@ -1813,15 +1813,8 @@ async fn reordered_delivery_does_not_stall_the_datagram_path() {
 }
 
 /// Logs `webtransport-client-quic-stats` lines into `captured` on this thread.
-fn capture_info(captured: &Captured) -> tracing::subscriber::DefaultGuard {
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_ansi(false)
-        .with_writer(captured.clone())
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
-    tracing::callsite::rebuild_interest_cache();
-    guard
+fn capture_info(captured: &Captured) -> crate::test_log::EndCapture {
+    crate::test_log::begin(&captured.0)
 }
 
 /// Says `bye` and waits for the agent's line on the client's leave: whether QUIC's window
@@ -4676,18 +4669,13 @@ async fn a_64_kib_session_id_is_refused_and_logged_bounded() {
         "session_not_ready"
     );
 
-    // The refusal's own log call, captured on this thread (a scoped subscriber does not
-    // reach tasks other tests' subscribers race with).
+    // The refusal's own log call, captured on this thread through the shared
+    // process-wide subscriber (no scoped dispatcher to race its interest cache).
     let captured = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_ansi(false)
-        .with_writer(captured.clone())
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
-        tracing::callsite::rebuild_interest_cache();
+    {
+        let _guard = crate::test_log::begin(&captured.0);
         log_refusal(&huge, "session_not_ready");
-    });
+    }
     let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
     assert_eq!(logs.lines().count(), 1, "one line: {logs}");
     assert!(logs.len() < 400, "a {} byte log line", logs.len());
@@ -4936,17 +4924,12 @@ async fn a_failed_swap_keeps_serving_and_listing_the_old_certificate_first() {
     };
 
     let captured = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_ansi(false)
-        .with_writer(captured.clone())
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
-        tracing::callsite::rebuild_interest_cache();
+    {
+        let _guard = crate::test_log::begin(&captured.0);
         agent.listener.rotate_with(expires - 48 * HOUR, broken);
         agent.listener.rotate_at(expires - 12 * HOUR);
         agent.listener.rotate_at(expires - 11 * HOUR);
-    });
+    }
     let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
     assert_eq!(
         logs.matches("webtransport-cert-reload-failed").count(),

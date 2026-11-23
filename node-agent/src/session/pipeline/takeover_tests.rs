@@ -141,7 +141,7 @@ impl Host {
     }
 
     fn start_cfg(tag: &str, mut cfg: SessionConfig) -> Host {
-        trace_to_stderr();
+        crate::test_log::trace_to_stderr();
         let resolved = resolve_effective_encoder(&mut cfg).expect("resolve encoder");
         let sink = format!("takeover-{tag}-{}", std::process::id());
         let source = build_source_pipeline(&cfg, None, &sink).expect("source pipeline");
@@ -677,47 +677,11 @@ fn pump_with(
     }
 }
 
-/// Every WARN and ERROR line this process logged, as `field=value ` pairs.
-static WARNINGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-struct WarningLog;
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarningLog {
-    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
-        struct Line(String);
-        impl tracing::field::Visit for Line {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                self.0 += &format!("{}={value:?} ", field.name());
-            }
-        }
-        if *event.metadata().level() <= tracing::Level::WARN {
-            let mut line = Line(String::new());
-            event.record(&mut line);
-            WARNINGS.lock().unwrap().push(line.0);
-        }
-    }
-}
-
-/// Agent log lines on stderr, for the browser host, and its warnings kept in
-/// [`WARNINGS`]. Process-wide: `webrtcbin`'s threads carry no span, so a subscriber set
-/// for the test's thread never sees what they log.
-fn trace_to_stderr() {
-    use tracing_subscriber::prelude::*;
-    let _ = tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_test_writer()
-                .with_filter(tracing_subscriber::EnvFilter::new("quasar_node_agent=info")),
-        )
-        .with(WarningLog)
-        .try_init();
-}
-
 /// The PCs of session `tag` that warned their peer failed the fingerprint check, one
 /// entry per line logged.
 fn fingerprint_warnings(tag: &str) -> Vec<&'static str> {
     let session = format!("session_id=takeover-{tag} ");
-    let lines = WARNINGS.lock().unwrap();
+    let lines = crate::test_log::warnings();
     let said = |pc: &str| {
         lines
             .iter()
@@ -1937,26 +1901,7 @@ fn sound_server_lost(capture: &gst::Element) {
 
 /// What `f` logs on this thread. The audio bus handler logs on the thread that posts.
 fn logged(f: impl FnOnce()) -> String {
-    #[derive(Clone, Default)]
-    struct Lines(Arc<Mutex<Vec<u8>>>);
-    impl std::io::Write for Lines {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let lines = Lines::default();
-    let writer = lines.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || writer.clone())
-        .with_ansi(false)
-        .finish();
-    tracing::subscriber::with_default(subscriber, f);
-    let bytes = lines.0.lock().unwrap().clone();
-    String::from_utf8_lossy(&bytes).into_owned()
+    crate::test_log::logged(f).join("\n")
 }
 
 /// The session's sound server as its end sees it. Nothing here can count on a
@@ -2625,7 +2570,7 @@ impl Session {
         idle_timeout: Duration,
         edit: impl FnOnce(&mut SessionConfig),
     ) -> Session {
-        trace_to_stderr();
+        crate::test_log::trace_to_stderr();
         let mut cfg = host_cfg(false);
         cfg.idle_timeout = idle_timeout;
         edit(&mut cfg);
@@ -3726,7 +3671,7 @@ fn browser_host() {
     if !live_webrtc_available() {
         return;
     }
-    trace_to_stderr();
+    crate::test_log::trace_to_stderr();
     let secs: u64 = std::env::var("QUASAR_TAKEOVER_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
