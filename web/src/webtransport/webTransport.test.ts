@@ -430,6 +430,26 @@ describe("WebTransportMedia keyframe requests", () => {
   });
 });
 
+describe("WebTransportMedia decoded (§Feedback, #1348)", () => {
+  it("carries the sink's decoded on keyframe_request and feedback, read when each is sent, and leaves it out while there is none", async () => {
+    const agent = new FakeAgent();
+    agent.replies = [[helloAck(0, avcC())]];
+    let decoded: number | null = 41;
+    const t = transport(agent);
+    await t.connect({ ...NO_SINK, decoded: () => decoded });
+    t.requestKeyframe("late");
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 0, keyframe: true, data: bytes(10, 0) }, { n: 0 }));
+    await vi.waitFor(() => expect(agent.sent("feedback")).toHaveLength(1));
+    expect(agent.sent("keyframe_request")).toEqual([{ type: "keyframe_request", reason: "late", decoded: 41 }]);
+    expect(agent.sent("feedback")[0].decoded).toBe(41);
+    decoded = null;
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 1, keyframe: false, data: bytes(10, 1) }, { n: 1 }));
+    await vi.waitFor(() => expect(agent.sent("feedback")).toHaveLength(2));
+    expect("decoded" in agent.sent("feedback")[1]).toBe(false);
+    t.close();
+  });
+});
+
 describe("WebTransportMedia loss recovery", () => {
   it("repeats a NACK and gives the frame up on its timer when no datagram follows", async () => {
     const agent = new FakeAgent();
@@ -1016,8 +1036,34 @@ describe("createWebTransportRuntime", () => {
     agent.last.datagrams(packetize({ configId: 0, frameSeq: 4, keyframe: false, data: bytes(10, 4) }, pkt));
     await vi.waitFor(() => expect(agent.sent("nack")).toHaveLength(2));
     agent.last.control({ type: "nack_miss", frame_seq: 3, frags: [[1, 1]] });
-    await vi.waitFor(() => expect(agent.sent("keyframe_request")).toEqual([{ type: "keyframe_request", reason: "late" }]));
+    // The last frame decoded before the loss, the agent's restart point (#1348).
+    await vi.waitFor(() => expect(agent.sent("keyframe_request")).toEqual([{ type: "keyframe_request", reason: "late", decoded: 2 }]));
     expect(presented).toHaveLength(3);
+  });
+
+  it("resumes at a recovery frame after a late frame, on the same decoder with no reset or keyframe (#1348)", async () => {
+    const { agent, decoders, presented, rt } = setup();
+    rt.start();
+    await vi.waitFor(() => expect(rt.getSnapshot().channelOpen).toBe(true));
+    const pkt = { n: 0 };
+    for (let i = 0; i < 2; i++) {
+      agent.last.datagrams(packetize({ configId: 0, frameSeq: i, keyframe: i === 0, data: bytes(10, i) }, pkt));
+      await vi.waitFor(() => expect(presented).toHaveLength(i + 1));
+    }
+    const lost = packetize({ configId: 0, frameSeq: 2, keyframe: false, data: bytes(2000, 2) }, pkt);
+    agent.last.datagrams(lost.slice(0, 1));
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 3, keyframe: false, data: bytes(10, 3) }, pkt));
+    await vi.waitFor(() => expect(agent.sent("nack")).toHaveLength(1));
+    agent.last.control({ type: "nack_miss", frame_seq: 2, frags: [[1, 1]] });
+    await vi.waitFor(() => expect(agent.sent("keyframe_request")).toEqual([{ type: "keyframe_request", reason: "late", decoded: 1 }]));
+    // Frame 4 codes from frame 1 only, which this client reported decoded.
+    agent.last.datagrams(packetize({ configId: 0, frameSeq: 4, keyframe: false, recovery: true, data: bytes(10, 4) }, pkt));
+    await vi.waitFor(() => expect(presented).toHaveLength(3));
+    expect(decoders).toHaveLength(1);
+    expect(decoders[0].configs).toHaveLength(1);
+    expect(decoders[0].chunks.map((c) => c.type)).toEqual(["key", "delta", "delta"]);
+    expect(agent.sent("keyframe_request")).toHaveLength(1);
+    rt.destroy();
   });
 
   it("treats close 4410 as a takeover", async () => {

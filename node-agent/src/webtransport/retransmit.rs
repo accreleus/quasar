@@ -222,6 +222,7 @@ mod tests {
             ts_90khz: 0,
             capture_us: 0,
             pyrowave: false,
+            recovery: false,
         };
         let config = VideoConfig {
             config_id: 0,

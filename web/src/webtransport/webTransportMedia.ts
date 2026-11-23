@@ -181,6 +181,12 @@ interface Datagrams {
   createWritable?: () => WritableStream<Uint8Array>;
 }
 
+/** `message` with the sink's `decoded`, when it has one (§Feedback). */
+function withDecoded<T extends object>(message: T, sink: MediaSink | null): T | (T & { decoded: number }) {
+  const decoded = sink?.decoded?.() ?? null;
+  return decoded === null ? message : { ...message, decoded };
+}
+
 /** The cause a browser with no datagram API at all reports (#1412). */
 const NO_DATAGRAMS = "datagrams: this browser's WebTransport has no datagram API";
 
@@ -263,7 +269,7 @@ export class WebTransportMedia implements MediaTransport {
     const wait = this.lastKeyAt + KEYFRAME_SPACING_MS - this.now();
     if (wait <= 0) {
       this.lastKeyAt = this.now();
-      this.send({ type: "keyframe_request", reason });
+      this.send(withDecoded({ type: "keyframe_request", reason }, this.sink));
       this.sink?.keyframeRequested?.(reason);
       return;
     }
@@ -510,7 +516,7 @@ export class WebTransportMedia implements MediaTransport {
     // congestion, so a hidden tab must keep reporting.
     const report = () => {
       const message = live.on ? feedback.take(this.now()) : null;
-      if (message) this.send(message);
+      if (message) this.send(withDecoded(message, sink));
     };
     const second = () => {
       ping();
