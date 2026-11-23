@@ -584,9 +584,9 @@ index 0000000..c848d88
 + *                                      anchor has that PTS (on AV1 also when
 + *                                      the anchor is 128 or more frames old:
 + *                                      order hints cannot name it)
-+ * A second request of a kind before a frame takes it is the same request; an
-+ * anchor request a frame cannot take (a key frame, and on H.264 a recovery
-+ * frame or the frame after an anchor) waits for the next frame.
++ * Before a frame takes them, a second anchor request is the same request and
++ * a later recover replaces an earlier one. An anchor request a frame cannot
++ * take (a key frame; on H.264 a recovery frame or one after an anchor) waits.
 + * Downstream, serialized before the frame's buffer:
 + *   "quasar-ref-frame", pts=guint64, anchor=boolean[, recover-from=guint64]
 + *   for every anchor and every recovery frame. Match a report to its buffer by

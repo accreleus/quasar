@@ -58,7 +58,7 @@ export function AppsTab() {
   const appsRes = useResource({
     label: "apps",
     initialData: [] as AdminApp[],
-    fetch: async (ctx) => (await adminApi.listAdminApps(ctx.token)).items,
+    fetch: (ctx) => adminApi.listAllAdminApps(ctx.token),
   });
   const apps = appsRes.data ?? [];
 

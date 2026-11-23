@@ -106,8 +106,10 @@ verifies, because whoever writes the document chooses the label.
 ## Consequences
 
 - Default off. An existing install applies releases exactly as it did.
+  *(Superseded by the #621 amendment at the top: on by default.)*
 - `verify` is the transition rung: a bad signature is refused, a release that
   publishes none is not. `require` closes it.
+  *(Superseded by the #621 amendment at the top: a named release with no signature is now refused.)*
 - **`verify` is not an enforcement boundary, and must not be described as one.**
   The version whose signature the updater goes looking for comes from the apply
   request, so the party being constrained chooses it. A request naming no

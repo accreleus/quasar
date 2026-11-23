@@ -151,6 +151,10 @@ const UNPROBED_DECAY: f64 = 0.98;
 const PROBE_LOST_MIN: f64 = 4.0;
 /// A step counts only once this many of the probe's own datagrams are in it.
 const PROBE_MIN: i64 = 20;
+/// A probe that has not counted `PROBE_MIN` of its datagrams in this long is starved (it never got an
+/// idle QUIC queue: lab V3, the session header; a deep buffer's pacing). The hold then climbs at
+/// `PROBE_PER_S` after `HOLD`, as with no FEC, instead of holding for good.
+const PROBE_STARVED: Duration = Duration::from_secs(3);
 /// The probe's bytes go in one burst right behind a frame's (`SendLog::probe_room`): what a frame
 /// interval at the probe's rate leaves, at most, within this long of the frame's last datagram. A
 /// policer refills over the whole interval and a queue drains over it, and the frame takes that
@@ -789,6 +793,9 @@ struct HoldLine {
     /// (`PROBE_WAIT`).
     probe: Option<Probe>,
     probe_wait: Instant,
+    /// A probe sent under `PROBE_MIN` datagrams in `PROBE_STARVED`: this hold climbs as one with no
+    /// FEC does.
+    starved: bool,
 }
 
 /// One probe step: the total on the wire it fills to, since when, and what the reports since then
@@ -940,6 +947,11 @@ impl Estimator {
         self.held.map_or(kbps, |h| kbps.min(h.kbps.max(MIN_KBPS)))
     }
 
+    /// The hold climbs by repair-datagram probes (`PROBE_GAIN`), not at `PROBE_PER_S` after `HOLD`.
+    fn probing_hold(&self) -> bool {
+        self.probes && !self.held.is_some_and(|h| h.starved)
+    }
+
     /// The total the repair-datagram probe fills the wire to (`PROBE_GAIN`), kbit/s, while one runs.
     pub(crate) fn probe_kbps(&self) -> Option<f64> {
         self.held.and_then(|h| h.probe).map(|p| p.kbps)
@@ -966,7 +978,7 @@ impl Estimator {
         }
         let (r, l) = self.unprobed;
         let floor = self.loss_floor().max(l.max(0.0) / (r + l).max(1.0));
-        let Some(h) = self.held.as_mut().filter(|_| self.probes) else {
+        let Some(h) = self.held.as_mut().filter(|h| self.probes && !h.starved) else {
             return;
         };
         if let Some(mut p) = h.probe.take() {
@@ -998,6 +1010,11 @@ impl Estimator {
                     self.probed_at = Some(now);
                 }
                 "stopped"
+            } else if p.probes < PROBE_MIN
+                && now.saturating_duration_since(p.since) >= PROBE_STARVED
+            {
+                h.starved = true;
+                "starved"
             } else if now.saturating_duration_since(p.since) >= PROBE_STEP && p.probes >= PROBE_MIN
             {
                 let carried = p.kbps.min(p.sent.0 / f64::from(p.sent.1.max(1)));
@@ -1023,6 +1040,7 @@ impl Estimator {
                 result,
                 probe_kbps = p.kbps as u64,
                 held_kbps = h.kbps as u64,
+                probes = p.probes,
                 loss_pct = loss * 100.0,
                 floor_pct = floor * 100.0,
                 "WebTransport capacity probe at {:.0} kbps {result}; line {:.0} kbps",
@@ -1031,9 +1049,18 @@ impl Estimator {
             );
         }
         let since = h.stepped.max(h.probe_wait);
-        if !stopped && now.saturating_duration_since(since) >= PROBE_WAIT {
+        if !stopped && !h.starved && now.saturating_duration_since(since) >= PROBE_WAIT {
+            let kbps = (h.kbps * PROBE_GAIN).min(self.ceiling_kbps / BETA / BETA);
+            tracing::info!(
+                token = "webtransport-hold-probe",
+                result = "started",
+                probe_kbps = kbps as u64,
+                held_kbps = h.kbps as u64,
+                "WebTransport capacity probe at {kbps:.0} kbps started; line {:.0} kbps",
+                h.kbps
+            );
             h.probe = Some(Probe {
-                kbps: (h.kbps * PROBE_GAIN).min(self.ceiling_kbps / BETA / BETA),
+                kbps,
                 since: now,
                 counted: (0, 0),
                 probes: 0,
@@ -1125,7 +1152,7 @@ impl Estimator {
                 // hold's renewal line it is too little to keep a hold alive anyway.
                 // A hold that probes with repair datagrams keeps its line and climbs over the floor
                 // instead: putting the pre-hold rate back cost a freeze each time (seat B S2).
-                if least >= LOSS_LOW / 2.0 && !self.probes {
+                if least >= LOSS_LOW / 2.0 && !self.probing_hold() {
                     self.end_hold("loss-floor");
                 }
             }
@@ -1390,6 +1417,16 @@ impl Estimator {
         if released {
             self.random_burst = Some(now);
             self.end_hold("burst-not-capacity");
+        } else if prev.filter(|_| self.episode.is_none()).is_some_and(|run| {
+            !run.key
+                && now.saturating_duration_since(run.at) < HOLD_STEP_GAP
+                && self
+                    .random_burst
+                    .is_some_and(|at| now.saturating_duration_since(at) < HOLD)
+        }) {
+            // A steady Wi-Fi pattern keeps its memory: expiring, it let the next burst set a hold
+            // and step the rung down every 60 s (lab V3, bursts every 4 and 10 s).
+            self.random_burst = Some(now);
         }
         // The burst memory never blocks loss lasting `HOLD_STEP_GAP`: a release it got wrong (seat B
         // M1': 3800 under the lab encoder's keyframes) otherwise cost 61 s with no frame.
@@ -1406,7 +1443,7 @@ impl Estimator {
             .filter(|_| congested && !random && settled)
             .map(|r| BETA * r);
         // A probe that meets loss found the link: back off from it, as from a burst.
-        let probing = !self.probes
+        let probing = !self.probing_hold()
             && self
                 .held
                 .is_some_and(|h| now.saturating_duration_since(h.since) >= HOLD);
@@ -1433,6 +1470,7 @@ impl Estimator {
                 dropped: false,
                 probe: None,
                 probe_wait: now,
+                starved: false,
             });
             // Still congested a step after the line came down, with the sender under what the link
             // then delivered or the link now delivering under the line: that line did not cure it.
@@ -2479,6 +2517,12 @@ pub(crate) struct Backlog {
     asks: Holds,
     /// Video units and `nack` answers skipped over the connection.
     pub(crate) skipped: u64,
+    /// The pacer holds video (`video_rates`): QUIC's queue stands at its room on a path the window
+    /// limits, so only a queue that stood with no ACK is stalled. The ACK count at the last
+    /// `acknowledge`, and when the queue began to stand.
+    pub(crate) paced: bool,
+    acks: u64,
+    growing_acks: u64,
 }
 
 impl Backlog {
@@ -2487,6 +2531,7 @@ impl Backlog {
     }
 
     pub(crate) fn acknowledge(&mut self, acks: u64) {
+        self.acks = acks;
         if self.probe_acks.is_some_and(|before| before != acks) {
             self.probe_acks = None;
         }
@@ -2540,10 +2585,11 @@ impl Backlog {
         // Sending a probe can empty a small queue even while the path is down. Only
         // an ACK proves recovery; otherwise the original give-up clock must keep running.
         let empty = queued < BACKLOG_EMPTY && self.probe_acks.is_none();
-        if empty || queued < self.last {
+        let acked = self.paced && self.growing_since.is_some() && self.acks != self.growing_acks;
+        if empty || queued < self.last || acked {
             self.growing_since = None;
-        } else {
-            self.growing_since.get_or_insert(now);
+        } else if self.growing_since.is_none() {
+            (self.growing_since, self.growing_acks) = (Some(now), self.acks);
         }
         self.last = queued;
         if !self.skipping {
@@ -2607,9 +2653,9 @@ const AUDIO_AHEAD_MS: u64 = 40;
 const PACE_GAIN: f64 = 1.25;
 /// The pacer's burst: this long at the pace, at least two datagrams.
 const PACE_BURST_MS: f64 = 5.0;
-/// Held video older than this many frame intervals is late: a discardable unit queued behind it
-/// would only add to the delay, and dropping it costs no keyframe ([`VideoQueue::drop_late`]).
-/// Two, so the one-frame wait a paced keyframe or a burst causes on a clean link drops nothing.
+/// Held video is late once it has waited this many frame intervals beyond the time the pacer
+/// needs to drain what is held: a discardable unit queued behind it would only add to the delay,
+/// and dropping it costs no keyframe ([`VideoQueue::drop_late`]).
 const LATE_FRAMES: u32 = 2;
 /// Video that has waited this long is not paced: a paced keyframe of five frames' bytes waits
 /// at most 5 / (60 fps × `PACE_GAIN`), 67 ms, so this is a path back from an outage, or a
@@ -2648,6 +2694,8 @@ pub(crate) struct VideoQueue {
     /// Video and resent datagrams over the path's datagram size, skipped.
     pub(crate) too_large: u64,
     pub(crate) resends_too_large: u64,
+    /// Capacity-probe repairs over it: that frame's probe ended (`fill_probe`).
+    pub(crate) probes_too_large: u64,
     /// The keyframe (its `queued_at`) whose first datagram was handed within the hold: the
     /// rest of it may still go however old (`Self::feed`).
     keyframe_started: Option<Instant>,
@@ -2655,6 +2703,14 @@ pub(crate) struct VideoQueue {
     pub(crate) stale: u64,
     /// Discardable units dropped as late, before taking a `frame_seq` (`Self::drop_late`).
     pub(crate) late: u64,
+    /// The pacer's rate at the last `pace`, kbit/s; `None` while it paces nothing.
+    paced_kbps: Option<u64>,
+    /// When a pacer at `paced_kbps` would finish the video pushed so far, in push order.
+    finish: Option<Instant>,
+    /// Per frame held, `(queued_at, finish after its last datagram)`: when the pacer should have
+    /// let it all go. A paced keyframe and the frames behind it wait that long on a clean link,
+    /// so that is not late; a stalled queue is overdue by more every frame.
+    due: VecDeque<(Instant, Instant)>,
     /// A link that drops what overflows it holds the sender ([`Estimator::drop_held`]): video
     /// the pace drains within `PACE_MAX_WAIT_HELD` waits that long for it.
     pub(crate) on_hold: bool,
@@ -2704,6 +2760,7 @@ impl VideoQueue {
     /// Bytes the pacer lets go now: [`PACE_GAIN`] × `kbps`, in bursts of [`PACE_BURST_MS`];
     /// `None` paces nothing.
     pub(crate) fn pace(&mut self, kbps: Option<u64>, now: Instant) -> usize {
+        self.paced_kbps = kbps;
         // Not a `nack` answer: those go ahead of older video (`push`).
         // What the pace drains in `PACE_MAX_WAIT_HELD` waits that long; more cannot drain in time.
         let drains = kbps.is_some_and(|k| {
@@ -2764,16 +2821,20 @@ impl VideoQueue {
     }
 
     /// Whether a discardable unit arriving now is late: the oldest held video (a resend goes
-    /// ahead of it, so it is not the measure) has waited over [`LATE_FRAMES`] frame intervals at
-    /// `fps`, so the unit would leave later than that. Counted when it is. Never for a unit a
+    /// ahead of it, so it is not the measure) is over [`LATE_FRAMES`] frame intervals at `fps`
+    /// past when the pacer should have let its frame go (`due`; its arrival when nothing is
+    /// paced), so the unit would leave later than that. Counted when it is. Never for a unit a
     /// later one is coded from: the caller asks only for a `discardable` one.
     pub(crate) fn drop_late(&mut self, now: Instant, fps: u32) -> bool {
         let limit = Duration::from_secs_f64(f64::from(LATE_FRAMES) / f64::from(fps.max(1)));
-        let late = self
-            .held
-            .iter()
-            .find(|h| !h.resend)
-            .is_some_and(|h| now.saturating_duration_since(h.queued_at) > limit);
+        let late = self.held.iter().find(|h| !h.resend).is_some_and(|h| {
+            let due = self
+                .due
+                .iter()
+                .find(|(at, _)| *at == h.queued_at)
+                .map_or(h.queued_at, |(_, d)| *d);
+            now.saturating_duration_since(due.max(h.queued_at)) > limit
+        });
         self.late += u64::from(late);
         late
     }
@@ -2829,6 +2890,8 @@ impl VideoQueue {
         self.frame = None;
         self.keyframe_started = None;
         self.orphaned = false;
+        self.finish = None;
+        self.due.clear();
     }
 
     /// The `pkt_seq` new video is numbered from, a guess `feed` corrects: after everything
@@ -2855,7 +2918,26 @@ impl VideoQueue {
             self.bytes -= old.datagram.len();
             self.dropped += 1;
         }
+        if self.held.is_empty() {
+            self.due.clear();
+            self.finish = None;
+        }
         self.bytes += held.datagram.len();
+        if let Some(kbps) = self.paced_kbps.filter(|_| !held.resend) {
+            let start = self
+                .finish
+                .map_or(held.queued_at, |f| f.max(held.queued_at));
+            let len = held.datagram.len() as f64;
+            let finish = start + Duration::from_secs_f64(len / (kbps as f64 * PACE_GAIN * 125.0));
+            self.finish = Some(finish);
+            match self.due.back_mut().filter(|(at, _)| *at == held.queued_at) {
+                Some(frame) => frame.1 = finish,
+                None => self.due.push_back((held.queued_at, finish)),
+            }
+            while self.due.len() > 64 {
+                self.due.pop_front();
+            }
+        }
         if !held.resend && self.frame.is_none_or(|(at, _)| at != held.queued_at) {
             self.frame = Some((held.queued_at, self.held.is_empty()));
         }
