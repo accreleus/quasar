@@ -319,7 +319,7 @@ ARG CARGO_C_VERSION
 RUN cargo install cargo-c --version "${CARGO_C_VERSION}" --locked \
     && rm -rf /opt/cargo/registry/src
 
-# Patched GStreamer 1.28.8 -> /opt/gst. Thirteen vendored patches, applied in the order below; the
+# Patched GStreamer 1.28.8 -> /opt/gst. Seventeen vendored patches, applied in the order below; the
 # order is load-bearing (each was diffed against the tree with its predecessors applied) and is
 # documented per patch in deploy/patches/vulkan/README.md. The fifth (gst-wayland-display's own)
 # shares one GstVulkanQueue per VkQueue, so every submitter on a queue takes one submit lock.
@@ -359,6 +359,10 @@ RUN git clone --depth 1 --branch "${GST_VERSION}" \
     && git apply /tmp/vulkanh265enc-radv-coded-height.patch \
     && git apply /tmp/vulkanav1enc-exact-frame-size.patch \
     && git apply /tmp/vulkanav1enc-min-qindex.patch \
+    && git apply /tmp/vulkanav1enc-ref-recovery.patch \
+    && git apply /tmp/vkh264enc-ref-recovery.patch \
+    && git apply /tmp/vulkanh265enc-ref-recovery.patch \
+    && git apply /tmp/gstreamer-nvenc-ref-recovery.patch \
     && git apply /tmp/gstreamer-webrtc-stats-rtpsession-leak.patch \
 # Upstream's docs/meson.build subdir_done() workaround (carried verbatim from
 # games-on-whales/gst-wayland-display's build recipe at the same pin) — with -Ddoc=disabled,

@@ -181,24 +181,27 @@ for l in lines[run + 1:]:
         break
     print(l[indent:])
 PY
-grep -q 'org-release-keys.sh' "$step" || fail "could not extract the signing step from images.yml"
-run_step() { # run_step <repo> [key pem file]; prints the step's output, returns its status
+# The extraction must have found the step, whether or not it still has an org branch.
+grep -q 'sign-platform-release-manifest.sh' "$step" || fail "could not extract the signing step from images.yml"
+run_step() { # run_step <repository-owner> [key pem file]; prints the step's output, returns its status
   local pem="" out="$work/gh-output"
   [[ -n "${2:-}" ]] && pem="$(cat "$2")"
   : > "$out"
   (cd "$repo" && env -i PATH="$PATH" HOME="$HOME" RUNNER_TEMP="$work" GITHUB_OUTPUT="$out" \
-    GITHUB_STEP_SUMMARY="$work/summary" MANIFEST="$work/step-manifest.json" REPO="$1" \
+    GITHUB_STEP_SUMMARY="$work/summary" MANIFEST="$work/step-manifest.json" REPO_OWNER="$1" \
     KEY_ID=quasar-test-a QUASAR_RELEASE_SIGNING_KEY="$pem" bash -euo pipefail "$step" 2>&1)
 }
 cp "$manifest" "$work/step-manifest.json"
+# The step keys on the OWNER, not the repository name: a rename inside the org
+# still fails here rather than silently taking the fork path.
 # An org tag release with no key fails; a fork's publishes unsigned with a warning.
-reject "no QUASAR_RELEASE_SIGNING_KEY secret in the release environment" run_step accreleus/quasar
-out="$(run_step someone/fork)" || fail "a fork's release with no key must still publish: $out"
+reject "no QUASAR_RELEASE_SIGNING_KEY secret in the release environment" run_step accreleus
+out="$(run_step someone)" || fail "a fork's release with no key must still publish: $out"
 [[ "$out" == *"::warning::"* ]] && grep -qx 'path=' "$work/gh-output" \
   || fail "a fork with no key must warn and output no signature"
 # An org release signed by a key the actor does not compile in fails the pin; a fork's passes.
-reject "does not verify under DEFAULT_TRUSTED_KEYS" run_step accreleus/quasar "$work/a.pem"
-out="$(run_step someone/fork "$work/a.pem")" || fail "a fork signing with its own key must publish: $out"
+reject "does not verify under DEFAULT_TRUSTED_KEYS" run_step accreleus "$work/a.pem"
+out="$(run_step someone "$work/a.pem")" || fail "a fork signing with its own key must publish: $out"
 grep -qx "path=$work/step-manifest.json.sig" "$work/gh-output" || fail "a signed fork release must output its .sig"
 
 echo "PASS release signature contract (keygen, sign, verify, rotation, refusals)"

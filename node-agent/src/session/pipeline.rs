@@ -56,6 +56,7 @@ use encoders::{
     effective_encoder, make_nvenc_encoder, make_openh264_encoder, make_va_encoder,
     make_vulkan_encoder,
 };
+mod ref_recovery;
 mod resize;
 // Adaptive external resolution: the keyframe half of a live resize, exported alongside
 // `ScaleStage` so the runner's `session_display_update.stream_*` handler has both halves.

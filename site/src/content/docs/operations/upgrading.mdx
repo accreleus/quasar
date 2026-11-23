@@ -71,7 +71,9 @@ control it (recorded at first install):
 
 - The signature is fetched from GitHub directly, without a proxy or private CA.
   A machine that reaches GitHub only through a proxy, a private-CA mirror, or not
-  at all refuses every update until you turn checking off on it:
+  at all refuses every stable (named) apply; a developer apply or an edge build
+  still goes through with a warning. Turn checking off on it to apply a named
+  release:
 
   ```bash
   docker exec -it quasar-recovery quasar-recovery reconfigure --yes \

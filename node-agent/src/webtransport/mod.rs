@@ -73,6 +73,10 @@ const STARVED_PROBE_INTERVAL: Duration = Duration::from_millis(100);
 const STARVED_PROBE: &[u8] = &[0x00];
 /// How often held video is offered to QUIC again (`congestion::VideoQueue`).
 const DRAIN_EVERY: Duration = Duration::from_millis(1);
+/// How often a capacity probe (`congestion::PROBE_GAIN`) may hand QUIC its repair datagrams: one
+/// burst behind a frame, only into an empty datagram queue, so never ahead of video and ahead of
+/// audio by at most a frame interval's share of the probe.
+const PROBE_EVERY: Duration = Duration::from_millis(1);
 
 const CLOSE_NORMAL: u32 = 0;
 const CLOSE_PROTOCOL: u32 = 4400;
@@ -197,6 +201,7 @@ impl<'a> Control<'a> {
         governor.legacy(legacy);
         let mut estimator = congestion::Estimator::new(rate.ceiling_kbps, now);
         estimator.legacy = legacy;
+        estimator.probes = fec && !legacy;
         Self {
             rate,
             estimator,
@@ -1247,17 +1252,17 @@ fn retransmit_window(session: &Session) -> Duration {
 }
 
 /// The backlog guard's verdict on the next video unit or `nack` answer; a skip that wants a
-/// keyframe has asked for it. `held`: video bytes not yet handed to QUIC; `acks`:
-/// [`congestion::Governor::acks`].
+/// keyframe has asked for it. `acks`: [`congestion::Governor::acks`]. It reads QUIC's queue only:
+/// video the pacer holds is bounded by `VideoQueue::feed`, and counted here, the NACK answers, FEC
+/// and keyframe after a Wi-Fi burst outgrew the pacer's headroom and read as a dead path (lab V3).
 fn admit(
     backlog: &mut congestion::Backlog,
     session: &Session,
     media: &Media,
     keyframe: bool,
-    held: usize,
     acks: u64,
 ) -> congestion::Admit {
-    let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space()) + held;
+    let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
     let hold = retransmit_window(session);
     backlog.acknowledge(acks);
     let admit = backlog.admit(queued, keyframe, std::time::Instant::now(), hold);
@@ -1473,6 +1478,7 @@ fn feed(
     let rates = control.as_ref().map_or((None, None), |c| {
         congestion::video_rates(&c.governor, &c.estimator, pyrowave)
     });
+    backlog.paced = rates.0.is_some();
     video.on_hold = control
         .as_ref()
         .is_some_and(|c| !pyrowave && c.estimator.drop_held());
@@ -1827,6 +1833,50 @@ fn pyro_act(
     }
 }
 
+/// One `PROBE_EVERY` tick of the capacity probe: repairs of the last frame (`fec::probe`) in one
+/// burst right behind it, only with no video held (NACK answers included) and under one datagram in
+/// QUIC's datagram queue (`quic_queued` bytes: audio, video handed earlier). An idle session never
+/// reads 0: web-transport-quinn counts its session-id header (`an_idle_session_reads_the_header_queued`).
+/// `send` hands one to QUIC; `false` when the connection is gone. A repair over the path's datagram
+/// size now (it shrank since the frame was cut) ends that frame's probe, never the stream.
+fn fill_probe(
+    log: &mut congestion::SendLog,
+    kbps: Option<f64>,
+    probe_frame: &mut Option<(Vec<bytes::Bytes>, usize)>,
+    video: &mut congestion::VideoQueue,
+    quic_queued: usize,
+    now: std::time::Instant,
+    mut send: impl FnMut(bytes::Bytes) -> congestion::Handed,
+) -> bool {
+    let Some((frame, next)) = probe_frame
+        .as_mut()
+        .filter(|_| video.is_empty() && quic_queued < media::MAX_DATAGRAM)
+    else {
+        return true;
+    };
+    let size = frame.first().map_or(f64::MAX, |d| d.len() as f64);
+    // One burst: the frame takes a policer's refill before the probe does.
+    let mut too_large = false;
+    while log.probe_room(kbps, now) >= size {
+        let Some(d) = fec::probe(frame, next, video.take_seq()) else {
+            break;
+        };
+        match send(d.clone()) {
+            congestion::Handed::Sent => log.record_probe(&d, now),
+            congestion::Handed::Gone => return false,
+            congestion::Handed::TooLarge | congestion::Handed::Skipped => {
+                too_large = true;
+                break;
+            }
+        }
+    }
+    if too_large {
+        video.probes_too_large += 1;
+        *probe_frame = None;
+    }
+    true
+}
+
 /// Hand the client its video until it leaves, is displaced or the session ends.
 #[allow(clippy::too_many_arguments)]
 async fn stream(
@@ -1879,6 +1929,10 @@ async fn stream(
     probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut control_tick = tokio::time::interval(congestion::REPORT_EVERY);
     control_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The capacity probe's repairs: the last frame's video datagrams, and the pair repaired next.
+    let mut probe_frame: Option<(Vec<bytes::Bytes>, usize)> = None;
+    let mut fill_tick = tokio::time::interval(PROBE_EVERY);
+    fill_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Nothing is sent before `hello_ack`: what queued up behind it is stale.
     while client.audio.try_recv().is_ok() {}
     let mut audio_open = true;
@@ -1894,8 +1948,41 @@ async fn stream(
     // What ends the stream: an optional last message, the close code and its reason.
     const QUIET: (Option<Value>, u32, &str) = (None, CLOSE_NORMAL, "");
     let mut idle = pin!(tokio::time::sleep(CONTROL_IDLE));
-    let (message, code, why) = loop {
+    let (message, code, why) = 'stream: loop {
+        let probing = current.codec != "pyrowave"
+            && control
+                .as_ref()
+                .is_some_and(|c| c.estimator.probe_kbps().is_some());
+        if !probing {
+            if let Some(c) = control.as_mut() {
+                c.log.probe_room(None, std::time::Instant::now());
+            }
+        }
         tokio::select! {
+            // Lowest priority: only with no video held and nothing in QUIC's datagram queue.
+            _ = fill_tick.tick(), if probing => {
+                let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
+                if let Some(c) = control.as_mut() {
+                    let kbps = c.estimator.probe_kbps();
+                    let now = std::time::Instant::now();
+                    let frame = &mut probe_frame;
+                    let sent = fill_probe(&mut c.log, kbps, frame, &mut video, queued, now, |d| {
+                        match session.send_datagram(d) {
+                            Ok(()) => {
+                                handed += 1;
+                                congestion::Handed::Sent
+                            }
+                            Err(web_transport_quinn::SessionError::SendDatagramError(
+                                quinn::SendDatagramError::TooLarge,
+                            )) => congestion::Handed::TooLarge,
+                            Err(_) => congestion::Handed::Gone,
+                        }
+                    });
+                    if !sent {
+                        break 'stream QUIET;
+                    }
+                }
+            }
             _ = probe_tick.tick() => {
                 let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space())
                     + video.bytes();
@@ -1989,7 +2076,7 @@ async fn stream(
                     if let Some(rate) = pyro.as_mut().filter(|_| unit.pyrowave) {
                         rate.offer(unit.data.len());
                     }
-                    match admit(&mut backlog, session, media, unit.keyframe || unit.pyrowave, video.bytes(), governor.acks()) {
+                    match admit(&mut backlog, session, media, unit.keyframe || unit.pyrowave, governor.acks()) {
                         congestion::Admit::Send => {}
                         congestion::Admit::GiveUp => break stalled(),
                         _ => continue,
@@ -2048,6 +2135,7 @@ async fn stream(
                     } else {
                         sent.keep(unit.frame_seq, &datagrams, now, retransmit_window(session));
                     }
+                    probe_frame = (!unit.pyrowave).then(|| (datagrams.clone(), 0));
                     // shortcut: repairs follow the whole frame, so past 48 fragments they can
                     // arrive after the client's NACK hold; send them per block if keyframe
                     // loss shows in the bench.
@@ -2103,6 +2191,7 @@ async fn stream(
                     // The client drops a datagram of a configuration it has left: none goes
                     // ahead of the new one's keyframe.
                     video.clear();
+                    probe_frame = None;
                     config_key = true;
                     if config.codec != "pyrowave" {
                         pyrowave_frames.forget();
@@ -2141,7 +2230,7 @@ async fn stream(
                         // retransmission and no nack_miss.
                         Some("nack") if nack_of(&message).is_some_and(|(seq, _)| pyrowave_frames.ignores(seq)) => {}
                         Some("nack") if !nack_budget.take(std::time::Instant::now()) => nacks_capped += 1,
-                        Some("nack") => match admit(&mut backlog, session, media, false, video.bytes(), governor.acks()) {
+                        Some("nack") => match admit(&mut backlog, session, media, false, governor.acks()) {
                             congestion::Admit::GiveUp => break stalled(),
                             // Behind a stalled queue a resend is as stale as new video.
                             congestion::Admit::Skip | congestion::Admit::SkipForKeyframe => {}
@@ -2232,6 +2321,7 @@ async fn stream(
         held_video_dropped = video.dropped,
         held_video_stale = video.stale,
         video_datagrams_too_large = video.too_large,
+        probe_datagrams_too_large = video.probes_too_large,
         starved_probes,
         governed = governor.governs(),
         governed_kbps = governor.kbps(),

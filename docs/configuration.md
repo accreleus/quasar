@@ -744,7 +744,7 @@ flag are set, `QUASAR_ABR_MODE` wins (it is checked first and short-circuits).
 
 | Variable | Default | Values / notes |
 |---|---|---|
-| `QUASAR_WT_CAPACITY` | `v2` | `v2` → the host paces video and sizes QUIC's window at no less than what the encoder sends (setpoint plus FEC), reads a shortfall only when the datagrams that arrived came slower than 0.95 × the rate they were sent at (the two largest arrival-gap excesses over their send gaps taken out), counts every loss but short blackouts and outages, and after a window that loses over 10 % while the encoder fills its bitrate (or half its bitrate, once the loss has lasted 500 ms) holds the sender under 0.85 × what that window delivered until 60 s pass with no 2 % loss, then probes back up at 2 % a second; a later burst that loses as much at a lower bitrate and is over with the bitrate and the line unchanged (Wi-Fi) ends a hold set by loss; the resolution rung does not step up during the hold, nor down in its first 5 s. `legacy` → 0.6.3's sender and reading: no pacing and no audio room, the reading is the estimate or 0.85 × the receive rate with no gap taken out and filtered by `abr_deadband`, blackouts count as loss, and the window follows the smoothed RTT. Anything else warns (`token="wt-capacity-unrecognised"`) and stays `v2`. Read once at agent start; it applies to every WebTransport session, the native client's included. The bug fixes of the same release (send stamps, the outage mark, audio ahead of held video) stay on in both. |
+| `QUASAR_WT_CAPACITY` | `legacy` | `legacy` (the default) → 0.6.3's sender and reading: no pacing and no audio room (audio queues behind video in QUIC under a cap), the reading is the estimate or 0.85 × the receive rate with no gap taken out and filtered by `abr_deadband`, blackouts count as loss, the window follows the smoothed RTT, and there is no hold, loss floor or probe. The fixes of the same release stay on: the outage mark (the first report after an outage does not cut the rate) and PyroWave's paced slices (#1606). `v2` (opt-in, not yet proven on the lab) → the host paces video and sizes QUIC's window at no less than what the encoder sends (setpoint plus FEC), reads a shortfall only when the datagrams that arrived came slower than 0.95 × the rate they were sent at (the two largest arrival-gap excesses over their send gaps taken out), counts every loss but short blackouts and outages, and after a window that loses over 10 % while the encoder fills its bitrate (or half its bitrate, once the loss has lasted 500 ms) holds the sender under 0.85 × what that window delivered and probes the link with extra FEC repair datagrams (a client that decodes FEC: video stays at the line, a lost repair costs no frame), raising the line only on a second carried clean, or with no FEC (or a probe that got none of its datagrams out in 3 s) until 60 s pass with no 2 % loss, then 2 % a second; a later burst that loses as much at a lower bitrate and is over with the bitrate and the line unchanged (Wi-Fi) ends a hold set by loss, unless it began on a keyframe, and loss lasting 1 s sets a hold even right after such an end; the resolution rung does not step up during the hold, nor down in its first 5 s. Its stall guard reads QUIC's queue only, and while video is paced a queue that stands with ACKs arriving is a path the window limits, not a stall. Anything else warns (`token="wt-capacity-unrecognised"`) and takes `legacy`. Read once at agent start; it applies to every WebTransport session, the native client's included. |
 
 #### WebTransport in `smooth`: the per-report loop (#1376)
 
@@ -777,7 +777,24 @@ WebTransport in `protective`, keep the window loop the rest of this section desc
   A further such window 1 s after the line last came down lowers it by 0.85 again when the
   sender kept under what the link then delivered or the link now delivers less. Each busy
   report losing 2 % or more (over the level of loss that does not fall with the bitrate)
-  renews it; after 60 s with none the line rises 2 % a second up to the most the link
+  renews it.
+  **Probe** (a client whose `hello` names FEC, the browser's always does). 5 s after the line last
+  stepped down, or after the last probe stopped, the host sends extra `xor` repair datagrams for
+  the last frame (two neighbouring fragments each), in one burst right behind each frame, so video
+  plus repairs fill the wire to 2 × the line; video stays at the line. A policer refills, and a
+  queue drains, over the whole frame interval, and the frame takes that room first, so at the
+  link's edge it is the repairs that overflow. A step with the loss of everything sent under 2 %
+  (and 4 datagrams) over what the link lost with no probe running, no reading and no delay
+  overuse raises the line to 0.72 × (0.85²) what was carried, and the next probe doubles the new
+  line at once; a probe at the most it tries (the ceiling ÷ 0.72) ends the hold. A step raises
+  only once it has sent 2 s of its new line past that line (about 5.2 s at twice the line): were
+  the link's rate under the new line, the step drained more than 2 s of it, so a policer's bucket
+  of up to about 2 s at its rate cannot pass it clean and the line never lands over the policer.
+  A report losing 10 % (and 4 datagrams) over that, a new line, a reading or overuse stops the
+  probe at once and the line stays. A lost repair datagram is not video loss: the hold, the loss
+  bound and FEC read video's. A link that lifted is back at 1080p in about 24 s (sim, lab rows
+  R3/R4; up to 32 s over 2 % random loss), where the line probing at 2 % a second took 26-69 s.
+  With no FEC, after 60 s with no renewal the line rises 2 % a second up to the most the link
   delivered while dropping, then 8 % a second, and goes once it reaches the ceiling; a probe
   that meets 2 % loss drops it to 0.85 × what that window delivered. The line reaches the ABR as
   video under the most FEC the hold's loss called for, not the share the rung's floor leaves. A
@@ -786,8 +803,11 @@ WebTransport in `protective`, keep the window loop the rest of this section desc
   with the line unmoved and the encoder asked at least 0.9 × as much, did not fall with the
   bitrate (Wi-Fi): the hold ends, the rate goes back where the hold found it (only a hold seen
   ending within a second), and loss bursts set no line for 60 s. Only a hold set by loss ends
-  this way; capacity loses as much at a lower bitrate too, but until the sender drops. Loss shown not to fall when the bitrate falls over
-  16 s (random loss) ends it too. The resolution rung does not step up while the line is held,
+  this way; capacity loses as much at a lower bitrate too, but until the sender drops. A burst
+  within 5 s of a probe that lost its repairs while video lost little (the link's edge) does not
+  end it either. Loss shown not to fall when the bitrate falls over 16 s (random loss) raises the
+  floor and, with no FEC, ends it too; with the probe the line stays and the probe climbs over
+  the floor (ending it put the pre-hold rate back and froze each time). The resolution rung does not step up while the line is held,
   and does not step down in its first 5 s (a burst the next one releases). While a hold set
   by loss is on, the pacer keeps video that it drains within 200 ms paced that long (a
   keyframe into a link that drops what overflows it loses its tail unpaced), instead of

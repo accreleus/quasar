@@ -93,6 +93,22 @@ fn repair(group: Group, fragments: &[Bytes], pkt_seq: u32) -> Bytes {
     d.freeze()
 }
 
+/// A capacity probe's repair datagram (`congestion::PROBE_GAIN`) for the last frame sent: two
+/// neighbouring fragments, the pair after `*next`. §FEC lets the agent send as many repairs as it
+/// chooses; a client drops one for a frame already whole, and one for a frame missing a fragment
+/// may rebuild it. `None` for a frame of one fragment (§FEC: a group has two at least).
+pub(crate) fn probe(fragments: &[Bytes], next: &mut usize, pkt_seq: u32) -> Option<Bytes> {
+    let pairs = fragments.len().checked_sub(1).filter(|&n| n > 0)?;
+    let first = *next % pairs;
+    *next = first + 1;
+    let group = Group {
+        first: first as u16,
+        count: 2,
+        stride: 1,
+    };
+    Some(repair(group, fragments, pkt_seq))
+}
+
 /// How much FEC one client is sent, from the loss its feedback reports.
 #[derive(Default)]
 pub(crate) struct Policy {
@@ -340,6 +356,27 @@ mod tests {
     /// The vectors the web client's decoder is held to (`pipeline.test.ts`, "the agent's
     /// vectors"): one frame and its repair datagrams at three overheads, as hex.
     /// `QUASAR_UPDATE_GOLDEN=1` rewrites the file.
+    #[test]
+    fn a_probe_repairs_each_neighbouring_pair_in_turn() {
+        let fragments = frame(9, 4, 1000, 300);
+        let mut next = 0;
+        let groups: Vec<Group> = (0..4)
+            .map(|i| group_of(&probe(&fragments, &mut next, i).expect("a repair")))
+            .collect();
+        let pair = |first| Group {
+            first,
+            count: 2,
+            stride: 1,
+        };
+        assert_eq!(groups, [pair(0), pair(1), pair(2), pair(0)]);
+        let d = probe(&fragments, &mut next, 7).expect("a repair");
+        assert_eq!(
+            rebuild(&d, &fragments, 2),
+            fragments[2][VIDEO_HEADER..].to_vec()
+        );
+        assert!(probe(&fragments[..1], &mut next, 8).is_none());
+    }
+
     #[test]
     fn the_shared_vectors_are_what_this_module_sends() {
         let hex = |d: &Bytes| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
