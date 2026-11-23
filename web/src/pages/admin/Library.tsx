@@ -28,12 +28,12 @@ function useLibraryCounts(): Record<string, number> {
     pollMs: COUNTS_POLL_MS,
     fetch: async (ctx) => {
       const [apps, presets, images] = await Promise.all([
-        adminApi.listAdminApps(ctx.token),
+        adminApi.listAllAdminApps(ctx.token),
         adminApi.listRuntimePresets(ctx.token),
         adminApi.listImages(ctx.token),
       ]);
       return {
-        apps: apps.items.length,
+        apps: apps.length,
         presets: presets.items.length,
         images: images.images.length,
         sources: SOURCES_COUNT,
