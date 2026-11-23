@@ -309,6 +309,7 @@ fn build_encoder_element(
             cfg.stream.fps as u32,
             gop,
             cfg.cuda_device_id,
+            cfg.non_ref_p,
             factory,
         ),
         EncoderBuilderKind::Vulkan => make_vulkan_encoder(
@@ -319,6 +320,7 @@ fn build_encoder_element(
             cfg.num_slices,
             cfg.intra_refresh,
             cfg.intra_refresh_period,
+            cfg.non_ref_p,
             factory,
         ),
         EncoderBuilderKind::Openh264 => make_openh264_encoder(codec, cfg.stream.bitrate_kbps, gop),

@@ -519,6 +519,8 @@ pub struct SessionConfig {
     /// `vulkanh264enc` `intra-refresh-period` in frames (`QUASAR_INTRA_REFRESH_PERIOD`,
     /// 0 = continuous back-to-back cycles). Ignored unless `intra_refresh`.
     pub intra_refresh_period: u32,
+    /// `QUASAR_NON_REF_P` ([`settings::RuntimeSettings::non_ref_p`]).
+    pub non_ref_p: bool,
     /// Connection-scoped authorization for preparing and consuming Steam templates.
     pub source_policy: Option<std::sync::Arc<crate::source_policy::SourcePolicy>>,
     /// The `image_id` this session's container resolves to
@@ -618,6 +620,7 @@ impl SessionConfig {
             nvidia_lib32_path: std::env::var("QUASAR_NV_LIB32_PATH").unwrap_or_default(),
             intra_refresh: env_bool("QUASAR_INTRA_REFRESH"),
             intra_refresh_period: env_u64("QUASAR_INTRA_REFRESH_PERIOD", 0) as u32,
+            non_ref_p: env_bool("QUASAR_NON_REF_P"),
             // No connection-level agent state to snapshot here; callers that want
             // seeding set these explicitly after construction.
             source_policy: None,
@@ -876,6 +879,7 @@ impl SessionConfig {
             nvidia_lib32_path: settings.nvidia_lib32_path.clone(),
             intra_refresh: env_bool("QUASAR_INTRA_REFRESH"),
             intra_refresh_period: env_u64("QUASAR_INTRA_REFRESH_PERIOD", 0) as u32,
+            non_ref_p: settings.non_ref_p,
             // `agent.rs`'s SessionAssign handler sets these right after construction,
             // alongside `cfg.console_config` / `cfg.video_topology`.
             source_policy: None,

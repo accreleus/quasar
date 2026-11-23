@@ -3382,6 +3382,58 @@ fn audio_leaves_ahead_of_video_over_the_send_budget_and_video_waits() {
     assert!(video.is_empty());
 }
 
+/// A discardable unit is late once the oldest held video has waited over two frame
+/// intervals; a resend ahead of it is not the measure, and an empty queue is never late.
+#[test]
+fn a_discardable_unit_is_late_behind_video_held_over_two_frame_intervals() {
+    let mut video = VideoQueue::default();
+    let t0 = Instant::now();
+    let at = |ms| t0 + Duration::from_millis(ms);
+    assert!(!video.drop_late(at(500), 60), "nothing held");
+    video.push(
+        Held {
+            queued_at: t0,
+            ..held(0)
+        },
+        BUFFER,
+    );
+    // 60 fps: the limit is 33.3 ms.
+    assert!(!video.drop_late(at(33), 60), "within two frame intervals");
+    assert!(video.drop_late(at(34), 60), "over them");
+    assert!(
+        !video.drop_late(at(34), 30),
+        "the same wait is under two frames at 30 fps"
+    );
+    assert!(
+        !video.drop_late(at(34), 0),
+        "fps 0 reads as 1: no division by zero"
+    );
+    assert!(
+        video.drop_late(at(2100), 0),
+        "two seconds is two frames then"
+    );
+    assert_eq!(video.late, 2, "each drop is counted");
+
+    // An old resend at the head says nothing about the video behind it.
+    let mut video = VideoQueue::default();
+    video.push(
+        Held {
+            queued_at: t0,
+            resend: true,
+            ..held(0)
+        },
+        BUFFER,
+    );
+    video.push(
+        Held {
+            queued_at: at(90),
+            ..held(1)
+        },
+        BUFFER,
+    );
+    assert!(!video.drop_late(at(100), 60));
+}
+
 /// The clean-link racer regression (#1433): a frame over the room went out across 1 ms drain
 /// ticks. A frame that finds the agent's queue empty goes whole; the room gates its start.
 #[test]

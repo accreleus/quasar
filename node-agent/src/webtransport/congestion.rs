@@ -2607,6 +2607,10 @@ const AUDIO_AHEAD_MS: u64 = 40;
 const PACE_GAIN: f64 = 1.25;
 /// The pacer's burst: this long at the pace, at least two datagrams.
 const PACE_BURST_MS: f64 = 5.0;
+/// Held video older than this many frame intervals is late: a discardable unit queued behind it
+/// would only add to the delay, and dropping it costs no keyframe ([`VideoQueue::drop_late`]).
+/// Two, so the one-frame wait a paced keyframe or a burst causes on a clean link drops nothing.
+const LATE_FRAMES: u32 = 2;
 /// Video that has waited this long is not paced: a paced keyframe of five frames' bytes waits
 /// at most 5 / (60 fps × `PACE_GAIN`), 67 ms, so this is a path back from an outage, or a
 /// source over the pace, and it drains at QUIC's own pace as before #1433.
@@ -2649,6 +2653,8 @@ pub(crate) struct VideoQueue {
     keyframe_started: Option<Instant>,
     /// Held datagrams dropped as older than the hold (`Self::feed`).
     pub(crate) stale: u64,
+    /// Discardable units dropped as late, before taking a `frame_seq` (`Self::drop_late`).
+    pub(crate) late: u64,
     /// A link that drops what overflows it holds the sender ([`Estimator::drop_held`]): video
     /// the pace drains within `PACE_MAX_WAIT_HELD` waits that long for it.
     pub(crate) on_hold: bool,
@@ -2755,6 +2761,21 @@ impl VideoQueue {
 
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// Whether a discardable unit arriving now is late: the oldest held video (a resend goes
+    /// ahead of it, so it is not the measure) has waited over [`LATE_FRAMES`] frame intervals at
+    /// `fps`, so the unit would leave later than that. Counted when it is. Never for a unit a
+    /// later one is coded from: the caller asks only for a `discardable` one.
+    pub(crate) fn drop_late(&mut self, now: Instant, fps: u32) -> bool {
+        let limit = Duration::from_secs_f64(f64::from(LATE_FRAMES) / f64::from(fps.max(1)));
+        let late = self
+            .held
+            .iter()
+            .find(|h| !h.resend)
+            .is_some_and(|h| now.saturating_duration_since(h.queued_at) > limit);
+        self.late += u64::from(late);
+        late
     }
 
     /// Whether `held` is past the hold: older than `hold`, and not the rest of the keyframe

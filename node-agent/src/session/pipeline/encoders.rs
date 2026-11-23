@@ -879,6 +879,7 @@ pub(super) fn make_nvenc_encoder(
     fps: u32,
     gop: u32,
     cuda_device_id: i32,
+    non_ref_p: bool,
     factory: &str,
 ) -> Result<gst::Element> {
     let codec_str = codec.as_str();
@@ -916,6 +917,9 @@ pub(super) fn make_nvenc_encoder(
     props.set("gop-size", &gop.to_string()); // keyframe interval
     props.set_first(&["bframes", "b-frames"], "0"); // no reordering — latency + simple decode
     props.set("aud", "false"); // skip AU-delimiter NAL — a few bytes off every frame
+    if non_ref_p_applies(non_ref_p, codec, false) {
+        props.set("non-ref-p", "true");
+    }
 
     // Single-frame VBV cap (SO-02): smooth the bitstream into the WebRTC pacer so an
     // IDR/scene-cut frame can't spike and collapse congestion control (#68 family).
@@ -1002,6 +1006,7 @@ pub(super) fn make_vulkan_encoder(
     num_slices: u32,
     intra_refresh: bool,
     intra_refresh_period: u32,
+    non_ref_p: bool,
     factory: &str,
 ) -> Result<gst::Element> {
     let codec_str = codec.as_str();
@@ -1070,6 +1075,12 @@ pub(super) fn make_vulkan_encoder(
         }
     }
 
+    // `QUASAR_NON_REF_P`: needs the vendored `vkh264enc-non-ref-p.patch` (the guarded set warns
+    // on an unpatched build).
+    if non_ref_p_applies(non_ref_p, codec, intra_refresh) {
+        props.set("non-ref-p", "true");
+    }
+
     let effective_rc = props.readback(&["rate-control"]);
     // Derived from the element's actual property presence, not the requested flag:
     // on an unpatched build the guarded set silently no-ops, and reporting `true`
@@ -1087,6 +1098,32 @@ pub(super) fn make_vulkan_encoder(
          idr-period={gop}, num-slices={num_slices}, {intra_refresh_summary}, VulkanImage NV12 in)"
     );
     Ok(enc)
+}
+
+/// Whether `QUASAR_NON_REF_P` takes effect on this session's encoder: H.264 only (the
+/// sender reads `nal_ref_idc`), and not with intra refresh, whose refreshed strip would not
+/// persist in a non-reference frame. A refused knob warns and the session streams as before.
+fn non_ref_p_applies(non_ref_p: bool, codec: Codec, intra_refresh: bool) -> bool {
+    if !non_ref_p {
+        return false;
+    }
+    if codec != Codec::H264 {
+        tracing::warn!(
+            token = "knob-non-ref-p-unsupported-codec",
+            "QUASAR_NON_REF_P is set but non-reference P frames are H.264-only (codec={}); ignoring the knob",
+            codec.as_str()
+        );
+        return false;
+    }
+    if intra_refresh {
+        tracing::warn!(
+            token = "knob-non-ref-p-intra-refresh",
+            "QUASAR_NON_REF_P and QUASAR_INTRA_REFRESH are both set: a refreshed strip in a \
+             non-reference frame would not persist; ignoring QUASAR_NON_REF_P"
+        );
+        return false;
+    }
+    true
 }
 
 /// Whether `enc`'s `name` property is live-writable (`MUTABLE_PLAYING`). Callers
@@ -1179,8 +1216,8 @@ pub(super) fn required_source_ring_depth(knobs: EncoderKnobs) -> Option<u32> {
 mod tests {
     use super::{
         codec_plan_with, cpb_size_kbits, effective_encoder_with, effective_gop, encoder_candidates,
-        nvenc_encoder_candidates, nvenc_h264_encoder_candidates, openh264_supports,
-        plan_has_vendor_fallback, plan_is_degraded, required_source_ring_depth,
+        non_ref_p_applies, nvenc_encoder_candidates, nvenc_h264_encoder_candidates,
+        openh264_supports, plan_has_vendor_fallback, plan_is_degraded, required_source_ring_depth,
         va_device_element_prefix, va_encoder_candidates, va_h264_encoder_candidates,
         vulkan_element, CodecKnob, CodecPlan, EncoderKnobs, ResolvedEncoder,
     };
@@ -1222,6 +1259,15 @@ mod tests {
             va_encoder_candidates(Codec::H264, "/dev/dri/renderD129"),
             va_h264_encoder_candidates("/dev/dri/renderD129")
         );
+    }
+
+    #[test]
+    fn non_ref_p_applies_to_h264_without_intra_refresh_only() {
+        assert!(!non_ref_p_applies(false, Codec::H264, false), "default off");
+        assert!(non_ref_p_applies(true, Codec::H264, false));
+        assert!(!non_ref_p_applies(true, Codec::H264, true), "intra refresh");
+        assert!(!non_ref_p_applies(true, Codec::H265, false));
+        assert!(!non_ref_p_applies(true, Codec::Av1, false));
     }
 
     #[test]

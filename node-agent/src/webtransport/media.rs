@@ -73,9 +73,14 @@ pub(crate) struct Unit {
     pub(crate) data: Bytes,
     pub(crate) keyframe: bool,
     pub(crate) config_id: u8,
+    /// Taken by the sender once the unit is to be sent ([`Media::take_frame_seq`]); a PyroWave
+    /// frame's is taken at the tap.
     pub(crate) frame_seq: u16,
     pub(crate) ts_90khz: u32,
     pub(crate) capture_us: u64,
+    /// Nothing later is coded from it (every slice has `nal_ref_idc` 0), so the sender may drop
+    /// it late without a keyframe.
+    pub(crate) discardable: bool,
     /// A PyroWave frame: its payload is packed by `pyrowave::pack`, never cut into ranges.
     pub(crate) pyrowave: bool,
 }
@@ -131,6 +136,8 @@ struct State {
     /// configuration changed.
     want_key: bool,
     frame_seq: u16,
+    /// The encoder was told to emit non-reference P frames (`non-ref-p`).
+    non_ref: bool,
     last_ts: u32,
     warned_format: bool,
     warned_keyframe: bool,
@@ -313,8 +320,13 @@ impl Media {
         audio: Arc<Audio>,
         rate: Option<super::Rate>,
     ) -> Arc<Self> {
+        let non_ref =
+            encoder.find_property("non-ref-p").is_some() && encoder.property::<bool>("non-ref-p");
         Arc::new(Self {
-            state: Mutex::default(),
+            state: Mutex::new(State {
+                non_ref,
+                ..State::default()
+            }),
             audio,
             input,
             hold: Mutex::default(),
@@ -992,23 +1004,21 @@ impl Media {
             }
         }
         st.want_key = false;
-        // Only a unit the client is sent takes a number: a skipped one would read as a
-        // loss to NACK (§Loss recovery). A unit the full queue refuses gives it back.
-        let frame_seq = st.frame_seq;
-        st.frame_seq = frame_seq.wrapping_add(1);
+        let discardable =
+            st.non_ref && !keyframe && config.codec == "h264" && h264_discardable(&data);
         let unit = Unit {
             data: Bytes::copy_from_slice(&data),
             keyframe,
             config_id: config.config_id,
-            frame_seq,
+            frame_seq: 0,
             ts_90khz,
             capture_us: now_us(),
+            discardable,
             pyrowave: false,
         };
         let sent = st.client.as_ref().map(|c| c.tx.try_send(Out::Unit(unit)));
         match sent {
             Some(Err(mpsc::error::TrySendError::Full(_))) => {
-                st.frame_seq = frame_seq;
                 st.want_key = true;
                 drop(st);
                 self.keyframe();
@@ -1027,6 +1037,21 @@ fn now_us() -> u64 {
 }
 
 impl Media {
+    #[cfg(test)]
+    pub(crate) fn assume_non_ref(&self) {
+        self.lock().non_ref = true;
+    }
+
+    /// The next `frame_seq`, for a unit the sender is about to send. Only a unit the client is
+    /// sent takes a number: a skipped one would read as a loss to NACK (§Loss recovery), and a
+    /// client never given any fragment of a numbered frame asks for a keyframe.
+    pub(crate) fn take_frame_seq(&self) -> u16 {
+        let mut st = self.lock();
+        let frame_seq = st.frame_seq;
+        st.frame_seq = frame_seq.wrapping_add(1);
+        frame_seq
+    }
+
     /// One PyroWave frame off `pyrowaveenc`. A frame the client's queue has no room for is
     /// dropped: the next one repairs everything, so it needs no keyframe.
     pub(crate) fn on_pyrowave_frame(&self, buffer: &gst::BufferRef) {
@@ -1049,6 +1074,7 @@ impl Media {
             frame_seq,
             ts_90khz,
             capture_us: now_us(),
+            discardable: false,
             pyrowave: true,
         };
         let sent = st.client.as_ref().map(|c| c.tx.try_send(Out::Unit(unit)));
@@ -1139,9 +1165,8 @@ fn wire_unit<'a>(codec: &str, data: &'a [u8], flagged: bool) -> Option<(Cow<'a, 
     }
 }
 
-/// The type of each NAL in a 4-byte length-prefixed H.265 access unit, up to the first that
-/// does not fit.
-fn hevc_nal_types(data: &[u8]) -> impl Iterator<Item = u8> + '_ {
+/// Each NAL of a 4-byte length-prefixed access unit, up to the first that does not fit.
+fn nal_units(data: &[u8]) -> impl Iterator<Item = &[u8]> + '_ {
     let mut rest = data;
     std::iter::from_fn(move || {
         let len = u32::from_be_bytes(rest.get(..4)?.try_into().ok()?) as usize;
@@ -1149,8 +1174,21 @@ fn hevc_nal_types(data: &[u8]) -> impl Iterator<Item = u8> + '_ {
             .get(4..4usize.checked_add(len)?)
             .filter(|n| !n.is_empty())?;
         rest = &rest[4 + len..];
-        Some((nal[0] >> 1) & 0x3f)
+        Some(nal)
     })
+}
+
+/// The type of each NAL in a 4-byte length-prefixed H.265 access unit.
+fn hevc_nal_types(data: &[u8]) -> impl Iterator<Item = u8> + '_ {
+    nal_units(data).map(|nal| (nal[0] >> 1) & 0x3f)
+}
+
+/// An H.264 access unit nothing is coded from: it has a slice (types 1 to 5) and every slice
+/// has `nal_ref_idc` 0.
+fn h264_discardable(data: &[u8]) -> bool {
+    let mut slices = nal_units(data).filter(|nal| (1..=5).contains(&(nal[0] & 0x1f)));
+    let first = slices.next();
+    first.is_some_and(|nal| nal[0] & 0x60 == 0) && slices.all(|nal| nal[0] & 0x60 == 0)
 }
 
 /// A temporal unit without its temporal delimiters (the contract carries none), and whether
@@ -1209,7 +1247,13 @@ pub(crate) fn packetize(
     } else {
         unit.data.chunks(room).collect()
     };
-    let flags = if unit.keyframe { FLAG_KEYFRAME } else { 0 };
+    let flags = if unit.keyframe {
+        FLAG_KEYFRAME
+    } else if unit.discardable {
+        FLAG_DISCARDABLE
+    } else {
+        0
+    };
     datagrams(unit, flags, &frags, pkt_seq)
 }
 
@@ -1250,6 +1294,7 @@ mod tests {
             frame_seq: 0xfffe,
             ts_90khz: 0x0102_0304,
             capture_us: 0x1122_3344_5566_7788,
+            discardable: false,
             pyrowave: false,
         }
     }
@@ -1478,35 +1523,91 @@ mod tests {
     }
 
     #[test]
-    fn units_skipped_for_a_keyframe_or_refused_by_a_full_queue_take_no_frame_seq() {
+    fn the_tap_takes_no_frame_seq_the_sender_numbers_the_units_it_sends() {
         let (media, _encoder, _) = counted();
         media.on_caps(&caps(1280), "s");
         let mut client = media.attach(false, Duration::ZERO).unwrap();
         media.on_unit(&buffer(false)); // before the first keyframe: skipped
         media.on_unit(&buffer(true));
         media.on_unit(&buffer(false));
-        media.on_caps(&caps(960), "s");
-        media.on_unit(&buffer(false)); // under the new configuration, before its keyframe
-        media.on_unit(&buffer(true));
         assert_eq!(
             seqs(&mut client.rx),
+            [0, 0],
+            "the tap numbers nothing, so a unit the sender drops leaves no gap"
+        );
+        assert_eq!(
+            [
+                media.take_frame_seq(),
+                media.take_frame_seq(),
+                media.take_frame_seq()
+            ],
             [0, 1, 2],
-            "no gap for a unit never sent"
+            "the sender takes the numbers in the order it sends"
         );
+    }
 
-        for _ in 0..=CLIENT_QUEUE {
-            media.on_unit(&buffer(false)); // the last one finds the queue full
+    /// An access unit of length-prefixed NALs: SEI, then one slice whose header byte is `slice`.
+    fn au(slices: &[u8]) -> Vec<u8> {
+        let mut out = vec![0, 0, 0, 2, 0x06, 0x80];
+        for s in slices {
+            out.extend_from_slice(&[0, 0, 0, 2, *s, 0x88]);
         }
-        media.on_unit(&buffer(true));
-        let got = seqs(&mut client.rx);
-        assert_eq!(got.len(), CLIENT_QUEUE, "the queue held its fill");
-        assert_eq!(got.last(), Some(&(2 + CLIENT_QUEUE as u16)));
-        media.on_unit(&buffer(true));
-        assert_eq!(
-            seqs(&mut client.rx),
-            [3 + CLIENT_QUEUE as u16],
-            "the refused unit gave its number back"
+        out
+    }
+
+    #[test]
+    fn an_h264_unit_is_discardable_only_when_every_slice_is_non_reference() {
+        assert!(
+            h264_discardable(&au(&[0x01])),
+            "non-IDR slice, nal_ref_idc 0"
         );
+        assert!(h264_discardable(&au(&[0x01, 0x01])), "two slices");
+        assert!(!h264_discardable(&au(&[0x41])), "nal_ref_idc 2");
+        assert!(!h264_discardable(&au(&[0x01, 0x41])), "one reference slice");
+        assert!(!h264_discardable(&au(&[0x65])), "an IDR is a reference");
+        assert!(!h264_discardable(&au(&[])), "no slice");
+        assert!(!h264_discardable(&[0, 0, 0, 9, 1]), "a NAL past the end");
+        assert!(!h264_discardable(&[]));
+    }
+
+    #[test]
+    fn only_a_delta_unit_of_an_encoder_told_non_ref_p_is_flagged_discardable() {
+        let non_ref = || {
+            let mut b = gst::Buffer::from_slice(au(&[0x01]));
+            b.get_mut().unwrap().set_flags(gst::BufferFlags::DELTA_UNIT);
+            b
+        };
+        let flags = |on: bool| {
+            let (media, _encoder, _) = counted();
+            if on {
+                media.assume_non_ref();
+            }
+            media.on_caps(&caps(1280), "s");
+            let mut client = media.attach(false, Duration::ZERO).unwrap();
+            media.on_unit(&buffer(true));
+            media.on_unit(&non_ref());
+            let mut got = Vec::new();
+            while let Ok(Out::Unit(u)) = client.rx.try_recv() {
+                got.push((u.keyframe, u.discardable));
+            }
+            got
+        };
+        assert_eq!(flags(true), [(true, false), (false, true)]);
+        assert_eq!(
+            flags(false),
+            [(true, false), (false, false)],
+            "knob off: output as before"
+        );
+    }
+
+    #[test]
+    fn a_discardable_unit_is_sent_flagged_and_not_keyframe() {
+        let mut u = unit(100);
+        u.keyframe = false;
+        u.discardable = true;
+        let mut pkt_seq = 0;
+        let d = packetize(&u, &cfg_for(&u), MAX_DATAGRAM, &mut pkt_seq).unwrap();
+        assert_eq!(d[0][5], FLAG_DISCARDABLE);
     }
 
     #[test]

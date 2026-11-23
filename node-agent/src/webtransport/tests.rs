@@ -782,6 +782,7 @@ async fn close_code_within(session: &Session, within: Duration) -> Option<u32> {
 #[derive(Debug)]
 struct Frame {
     keyframe: bool,
+    discardable: bool,
     config_id: u8,
     frame_seq: u16,
     ts_90khz: u32,
@@ -820,6 +821,7 @@ async fn frames(session: &Session, n: usize, lossless: bool) -> Vec<Frame> {
             let frags = parts.remove(&frame_seq).unwrap();
             done.push(Frame {
                 keyframe: d[5] & 1 == 1,
+                discardable: d[5] & 2 == 2,
                 config_id: d[6],
                 frame_seq,
                 ts_90khz: u32::from_le_bytes(d[13..17].try_into().unwrap()),
@@ -933,6 +935,185 @@ struct AudioPacket {
     ts_48khz: u32,
     capture_us: u64,
     opus: Vec<u8>,
+}
+
+/// What the Vulkan encoder's `non-ref-p` makes of every second P: the units a probe on the
+/// encoder's output (Annex-B) gives `nal_ref_idc` 0, and the 90 kHz timestamps of those, so a
+/// test can tell which the sender flagged.
+fn make_every_second_delta_non_ref(encoder: &gst::Element) -> Arc<Mutex<Vec<u32>>> {
+    let cleared = Arc::new(Mutex::new(Vec::new()));
+    let (seen, deltas) = (cleared.clone(), std::sync::atomic::AtomicU32::new(0));
+    encoder
+        .static_pad("src")
+        .unwrap()
+        .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            let Some(gst::PadProbeData::Buffer(buffer)) = info.data.as_mut() else {
+                return gst::PadProbeReturn::Ok;
+            };
+            if buffer.flags().contains(gst::BufferFlags::DELTA_UNIT)
+                && deltas.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2 == 1
+            {
+                let buffer = buffer.make_mut();
+                let pts = buffer.pts().map_or(0, |p| {
+                    (p.nseconds() as u128 * 90_000 / 1_000_000_000) as u32
+                });
+                let mut map = buffer.map_writable().unwrap();
+                // A slice NAL (type 1) after a start code.
+                for at in 0..map.len().saturating_sub(4) {
+                    if map[at..at + 3] == [0, 0, 1] && map[at + 3] & 0x1f == 1 {
+                        map[at + 3] &= 0x9f;
+                    }
+                }
+                seen.lock().unwrap().push(pts);
+            }
+            gst::PadProbeReturn::Ok
+        });
+    cleared
+}
+
+/// `non-ref-p`: the sender flags a unit nothing is coded from, and numbers every unit it
+/// sends in order, as it did before.
+#[tokio::test]
+async fn a_non_reference_unit_is_sent_flagged_discardable_in_order() {
+    let cleared = Arc::new(Mutex::new(None));
+    let put = cleared.clone();
+    let agent = agent_built(
+        Stream::H264,
+        Limits::default(),
+        audio::Plan::default(),
+        "ball",
+        move |enc| {
+            *put.lock().unwrap() = Some(make_every_second_delta_non_ref(enc));
+            None
+        },
+    )
+    .await;
+    let media = agent.listener.registry().lock()[SESSION]
+        .media
+        .clone()
+        .unwrap();
+    media.assume_non_ref();
+    let (session, _send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+    let got = frames(&session, 40, true).await;
+    for pair in got.windows(2) {
+        assert_eq!(
+            pair[1].frame_seq,
+            pair[0].frame_seq.wrapping_add(1),
+            "units in order, none lost"
+        );
+    }
+    let cleared = cleared.lock().unwrap().take().unwrap();
+    let cleared = cleared.lock().unwrap().clone();
+    let flagged: Vec<u32> = got
+        .iter()
+        .filter(|f| f.discardable)
+        .map(|f| f.ts_90khz)
+        .collect();
+    assert!(flagged.len() >= 5, "{} of 40 flagged", flagged.len());
+    assert!(
+        flagged.iter().all(|ts| cleared.contains(ts)),
+        "only a non-reference unit is flagged"
+    );
+    assert!(got
+        .iter()
+        .filter(|f| cleared.contains(&f.ts_90khz))
+        .all(|f| f.discardable));
+    assert!(
+        got.iter().all(|f| !(f.keyframe && f.discardable)),
+        "a keyframe never is"
+    );
+}
+
+/// The `late_discardable_dropped` count the client's leave logged.
+async fn late_dropped_at_leave(mut send: SendStream, captured: &Captured) -> u64 {
+    write_message(&mut send, &json!({"type": "bye"}))
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        if let Some(line) = logs
+            .lines()
+            .find(|l| l.contains("webtransport-client-quic-stats"))
+        {
+            let n = line
+                .split("late_discardable_dropped=")
+                .nth(1)
+                .expect("logged");
+            return n.split(' ').next().unwrap().parse().unwrap();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the client's leave was not logged"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A stalled path holds video; a discardable unit arriving behind it is dropped before it takes
+/// a `frame_seq`, so the numbers the sender used stay in step with what it sent. A clean path
+/// drops none.
+#[tokio::test]
+async fn a_discardable_unit_behind_held_video_is_dropped_late() {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let captured = Captured::default();
+    let _logs = capture_info(&captured);
+    let mut agent = governed_agent_non_ref().await;
+    let down = Arc::new(AtomicBool::new(false));
+    let cut = down.clone();
+    let (session, mut send, _recv) = through(&mut agent, move || {
+        (!cut.load(Relaxed)).then_some(Duration::ZERO)
+    })
+    .await;
+    let mut path = Arrivals::default();
+    let mut report = tokio::time::interval(Duration::from_millis(50));
+    let t0 = Instant::now();
+    let (outage, up_at) = (
+        t0 + Duration::from_secs(1),
+        t0 + Duration::from_millis(2500),
+    );
+    let end = t0 + Duration::from_secs(4);
+    while Instant::now() < end {
+        down.store((outage..up_at).contains(&Instant::now()), Relaxed);
+        tokio::select! {
+            d = session.read_datagram() => {
+                let d = d.unwrap();
+                if d[..] != *STARVED_PROBE { path.receive(&d); }
+            }
+            _ = report.tick() => {
+                if let Some(fb) = path.feedback() { write_message(&mut send, &fb).await.unwrap(); }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+    let dropped = late_dropped_at_leave(send, &captured).await;
+    assert!(
+        dropped > 0,
+        "no discardable unit was dropped behind the stalled path"
+    );
+}
+
+/// [`governed_agent`] whose encoder's every second delta unit has `nal_ref_idc` 0, and whose
+/// tap was told `non-ref-p`.
+async fn governed_agent_non_ref() -> Agent {
+    let agent = agent_built(
+        Stream::H264,
+        Limits::default(),
+        audio::Plan::default(),
+        "snow",
+        |enc| {
+            make_every_second_delta_non_ref(enc);
+            Some(rate(true))
+        },
+    )
+    .await;
+    agent.listener.registry().lock()[SESSION]
+        .media
+        .clone()
+        .unwrap()
+        .assume_non_ref();
+    agent
 }
 
 /// Every datagram from `session` for `span`, in arrival order: audio parsed, and the video

@@ -2001,7 +2001,15 @@ async fn stream(
             }
             out = client.rx.recv() => match out {
                 Some(Out::Unit(unit)) if unit.config_id != current.config_id => {}
-                Some(Out::Unit(unit)) => {
+                Some(Out::Unit(mut unit)) => {
+                    // Before it takes a `frame_seq`: a numbered frame the client never gets any
+                    // of reads as loss and asks for a keyframe; nothing is coded from this one.
+                    if unit.discardable && video.drop_late(std::time::Instant::now(), current.fps.max(1) as u32) {
+                        continue;
+                    }
+                    if !unit.pyrowave {
+                        unit.frame_seq = media.take_frame_seq();
+                    }
                     if let Some(rate) = pyro.as_mut().filter(|_| unit.pyrowave) {
                         rate.offer(unit.data.len());
                     }
@@ -2236,6 +2244,7 @@ async fn stream(
         units_and_nack_answers_skipped_total = backlog.skipped,
         held_video_dropped = video.dropped,
         held_video_stale = video.stale,
+        late_discardable_dropped = video.late,
         video_datagrams_too_large = video.too_large,
         starved_probes,
         governed = governor.governs(),
