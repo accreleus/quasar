@@ -21,7 +21,7 @@
 > The **GStreamer** patches here (`vkh264enc-*`, `vulkanh265enc`, `gstreamer-vulkan-shared-queue-lock`)
 > ARE still applied at build time. Only the `gst-wayland-display-*` ones moved into the branch.
 
-These patches split across **two upstreams**: thirteen apply to a from-source **GStreamer**
+These patches split across **two upstreams**: sixteen apply to a from-source **GStreamer**
 `1.28.8` checkout (`gst-plugins-bad`), while the patches named `gst-wayland-display-*` apply to the
 **gst-wayland-display** compositor checkout itself (see their dedicated sections below). Both sets
 are applied inside `deploy/Dockerfile.vulkan`, each at its own upstream's build step.
@@ -49,6 +49,7 @@ The remaining GStreamer patches are **Quasar-authored** (not from gst-wayland-di
 - `vulkanh265enc-radv-coded-height.patch`
 - `vulkanav1enc-exact-frame-size.patch`
 - `vulkanav1enc-min-qindex.patch`
+- `vulkanav1enc-ref-recovery.patch`, `vkh264enc-ref-recovery.patch`, `vulkanh265enc-ref-recovery.patch` (#1348)
 - `gstreamer-webrtc-stats-rtpsession-leak.patch` (not a Vulkan patch: `webrtcbin`, #564)
 - `vkh265enc-profile-template.patch` (**candidate — not applied**, see below)
 
@@ -77,15 +78,19 @@ block of `new_sequence()` in `vkh265enc.c` that `vulkanh265enc.patch` and
 `vulkanav1enc-exact-frame-size.patch` (eleventh) and `vulkanav1enc-min-qindex.patch` (twelfth)
 both edit `vkav1enc.c`, which `vulkanav1enc.patch` creates; the second was diffed on top of
 the first.
-`gstreamer-webrtc-stats-rtpsession-leak.patch` applies **thirteenth (last)**. It touches only
+The three `*-ref-recovery.patch` files apply **thirteenth to fifteenth**, AV1, H.264, HEVC in
+that order: the AV1 one creates `ext/vulkan/base/gstrefrecovery.h`, which the other two include,
+and each adds its check test after the previous one's in `tests/check/meson.build`. They were
+diffed with the twelve patches above applied.
+`gstreamer-webrtc-stats-rtpsession-leak.patch` applies **sixteenth (last)**. It touches only
 `ext/webrtc/gstwebrtcstats.c`, which no other patch here does, so its place in the order is free.
-None of the thirteen are upstreamed into GStreamer itself yet.
+None of the sixteen are upstreamed into GStreamer itself yet.
 
 `vkh265enc-profile-template.patch` is a **candidate that is NOT wired into
 `deploy/Dockerfile.vulkan` and is therefore NOT applied to any image today.** It is a
 correctness fix for an upstream defect the Quasar encode path already sidesteps by pinning
 `profile=main` in its capsfilter, so it buys nothing for a Quasar image and everything for
-anyone driving `vulkanh265enc` by hand. When it is wired up it would apply **fourteenth (last)**: it
+anyone driving `vulkanh265enc` by hand. When it is wired up it would apply **seventeenth (last)**: it
 edits `gst_vulkan_h265_encoder_register()` in `vkh265enc.c`, a region no earlier patch
 touches, so its position is a convention rather than a constraint. See its section below.
 
@@ -1502,3 +1507,74 @@ Measured without it on the AMD lab host with the leaks tracer: after four stream
 (needs libnice and interpipe, so it runs in `quasar-agent-dev`).
 
 The fix is absent upstream: checked through 1.28.8, 1.29.2 and `main` on 2026-10-12 (the emit came in with upstream MR 8698), so a bump to 1.28.8 does not remove the need for this patch. Re-check at every GStreamer bump and drop the patch once a release drops the reference.
+
+### `vulkanav1enc-ref-recovery.patch`, `vkh264enc-ref-recovery.patch`, `vulkanh265enc-ref-recovery.patch`
+
+Quasar-authored (#1348). Reference recovery: after a loss the next frame is coded from a frame
+the browser is known to have decoded (an *anchor*) instead of being a key frame. One control,
+the same on `vulkanav1enc`, `vulkanh264enc` and `vulkanh265enc`, defined once in
+`ext/vulkan/base/gstrefrecovery.h`:
+
+| Direction | Name | Meaning |
+|---|---|---|
+| property | `num-anchors` (0-7, default 0 = off, read at stream start) | anchors held; clamped to the DPB and, on H.264 and HEVC, to the level (table below), with a warning in the log |
+| upstream event on the encoder's src pad | `quasar-ref-anchor` | keep the next inter frame as an anchor (waits out a key frame; on H.264 also out a frame right after another anchor or a recovery frame); at `num-anchors` held the oldest is dropped. A second request before a frame takes the first is the same request |
+| upstream event | `quasar-ref-recover`, `pts` (guint64) | code the next frame from the anchor with that input PTS only, and forget every newer anchor; a key frame when that anchor is not held (on AV1 also when it is 128 or more frames old) |
+| downstream event, before the frame's buffer | `quasar-ref-frame`, `pts` (guint64), `anchor` (boolean), `recover-from` (guint64, recovery frames only) | sent for every anchor and every recovery frame; match it to its buffer by `pts` |
+
+While `num-anchors > 0` every inter frame codes from exactly one picture (the previous frame,
+or the anchor on a recovery frame), there are no B frames, and `num-ref-frames` /
+`gf-group-size` are ignored. The agent half is `node-agent/src/session/pipeline/ref_recovery.rs`.
+
+Per codec, following what the Chrome decode spike found decodes correctly (a wrong reference
+decodes silently wrong on hardware):
+
+- **AV1** (base class `gstav1encoder.c`): an anchor refreshes the chain slot and a slot of its
+  own (two bits in `refresh_frame_flags`). A recovery frame points all seven `ref_frame_idx` at
+  the anchor's slot, is `error_resilient_mode` (so `primary_ref_frame` is NONE), and refreshes
+  the chain slot, so the slot the decoder may hold stale is overwritten by the first frame it
+  receives and the anchor stays held for a second recovery. Anchors 128 or more frames old count
+  as gone (relative order hints only reach 127 frames back), so a recovery from one is a key
+  frame.
+- **H.264** (`gsth264encoder.c`, `vkh264enc.c`): the SPS sets
+  `gaps_in_frame_num_value_allowed_flag`, `max_num_ref_frames = num-anchors + 1` and two more POC
+  LSB bits. An anchor marks itself long-term in its own slice header (MMCO 4, 1, 6); a reference
+  to a long-term picture is named by `ref_pic_list_modification` idc 2. A short-term picture is
+  never referenced across a `frame_num` gap. The patch also makes `vkh264enc.c` pass the MMCO
+  opcode, the list-modification flags and `long_term_pic_num` to Vulkan, which it dropped. That
+  fix changes the output with `num-anchors=0` too, correctly, wherever upstream sends an MMCO or
+  a list modification (B-pyramid, list reordering); with Quasar's settings (no B frames, one
+  reference) the output is unchanged. A non-IDR I frame (not used by Quasar) replaces the chain
+  picture and keeps the anchors.
+- **HEVC** (`gsth265encoder.c`, `vkh265enc.c`): anchors stay short-term, listed in every later
+  RPS unused; a recovery frame's RPS is its anchor (used) and older anchors only, so no lost
+  picture is ever listed. Two more POC LSB bits, as for H.264.
+
+How many anchors fit. The DPB holds the anchors, the chain picture and the picture being coded:
+on H.264 and HEVC that is `num-anchors + 2`, so at most `maxDpbSlots - 2`. On AV1 the last key
+frame stays held too until anchors overwrite all of its VBI slots, so at most `maxDpbSlots - 3`,
+or 7 from 9 slots up. On H.264 and HEVC the SPS also declares `num-anchors + 2` DPB pictures
+(`max_dec_frame_buffering`, `sps_max_dec_pic_buffering`), which must fit the level's MaxDpbFrames
+(H.264 Table A-1) or MaxDpbSize (HEVC A.4.2). Anchors never raise the level: the limit is taken at
+the level the stream gets without them (or the negotiated one), capped at the driver's
+`maxLevelIdc`. At 60 fps, before the DPB limit (`num-anchors` is at most 7 everywhere):
+
+| Size | H.264 level | H.264 max | HEVC level | HEVC max |
+|---|---|---|---|---|
+| 640x360 | 3.1 | 7 | 3 | 7 |
+| 1280x720 | 3.2 | 3 | 4 | 7 |
+| 1920x1080 | 4.2 | 2 | 4.1 | 4 |
+| 2560x1440 | 5.1 | 7 | 5 | 7 |
+| 3840x2160 | 5.2 | 3 | 5.1 | 4 |
+
+The level follows the frame rate too (1080p30: H.264 4, still 2; HEVC 4, still 4). AV1 levels do
+not bound references (eight VBI slots at every level). The encoder logs every clamp.
+
+Tests without a GPU: `tests/check/libs/vkvideoencodeav1refs.c` (new cases),
+`vkvideoencodeh264anchors.c`, `vkvideoencodeh265anchors.c`. With a GPU:
+`scripts/harness/run-ref-recovery.sh` (encode with losses, then check that the anchors,
+recoveries and key frames are exactly what the script asked for, the references, the decode and
+the PSNR with ffmpeg; `ref_recovery_check.py --self-test` checks the checker).
+
+Not built: the NVENC fallback (`nvcuda*enc`; the SDK has `ltrMarkFrame`/`ltrUseFrames` and
+`NvEncInvalidateRefFrames`), VA and openh264.
