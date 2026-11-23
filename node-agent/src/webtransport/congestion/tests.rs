@@ -2637,17 +2637,61 @@ fn a_busy_sender_under_heavy_loss_is_still_a_throughput_sample() {
     assert_eq!(est.throughput.len(), 1, "the lost datagrams were sent too");
 }
 
+// ----- log capture: the lines `run` logs at INFO and above -----
+
+// The lines one `logged` collects for the calling thread.
+thread_local! {
+    static SINK: std::cell::RefCell<Option<Captured>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Writes each line to the calling thread's `SINK`, or drops it.
+struct Routed;
+
+impl std::io::Write for Routed {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        SINK.with(|s| {
+            if let Some(c) = &*s.borrow() {
+                c.0.lock().unwrap().extend_from_slice(buf);
+            }
+        });
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// One process-wide subscriber, installed once, routing each line to the
+/// calling thread's `SINK`.
+///
+/// A per-test `with_default` subscriber loses events instead: `tracing` caches
+/// whether a callsite is enabled, and under the parallel test runner a scoped
+/// dispatcher one test thread installs races the interest cache another thread
+/// is rebuilding, leaving the callsite cached as disabled for the rest of the
+/// process (tracing#523). One global subscriber that is never re-created keeps
+/// that interest stable.
+fn install_capture() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_writer(|| Routed)
+                .with_ansi(false)
+                .finish(),
+        )
+        .expect("no other global subscriber in this test binary");
+    });
+}
+
 /// The lines `run` logs at INFO and above, on this thread.
 fn logged(run: impl FnOnce()) -> Vec<String> {
+    install_capture();
     let captured = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_writer(captured.clone())
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
-        tracing::callsite::rebuild_interest_cache();
-        run();
-    });
+    SINK.with(|s| *s.borrow_mut() = Some(captured.clone()));
+    run();
+    SINK.with(|s| *s.borrow_mut() = None);
     let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
     logs.lines().map(String::from).collect()
 }
