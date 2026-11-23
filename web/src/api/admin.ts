@@ -330,6 +330,18 @@ export function listAdminApps(token: string, cursor?: string): Promise<AdminApps
   return apiFetch<AdminAppsResponse>(`/admin/apps${params}`, { token });
 }
 
+/** Every catalogue app, following `next_cursor` (a page is 50, newest first). */
+export async function listAllAdminApps(token: string): Promise<AdminApp[]> {
+  const items: AdminApp[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await listAdminApps(token, cursor);
+    items.push(...page.items);
+    cursor = page.next_cursor ?? undefined;
+  } while (cursor);
+  return items;
+}
+
 export function getApp(token: string, id: string): Promise<{ app: AdminApp }> {
   return apiFetch<{ app: AdminApp }>(`/apps/${id}`, { token });
 }
