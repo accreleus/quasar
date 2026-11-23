@@ -615,6 +615,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
           for (const b of f.packets) telemetry.bytes(b.byteLength);
           pyroStage?.frame(f);
         },
+        decoded: () => stage?.decoded ?? null,
         keyframeRequested: () => {
           telemetry.keyframeRequested();
           if (t === transport) keyAsks++;

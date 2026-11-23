@@ -94,7 +94,8 @@ impl Retransmit {
     }
 
     /// Answer `nack {frame_seq, frags}`. Each held fragment goes again as a new datagram
-    /// numbered from `*pkt_seq` with `retransmit` set; out-of-range indices are ignored.
+    /// numbered from `*pkt_seq` with `retransmit` set; out-of-range indices are ignored. A
+    /// resend spends the fragment's budget only once it is sent ([`Retransmit::charge`]).
     pub(crate) fn answer(
         &mut self,
         frame_seq: u16,
@@ -125,7 +126,6 @@ impl Retransmit {
                     miss(&mut answer.missed, i as u16);
                     continue;
                 }
-                held.resent[i] += 1;
                 let mut d = BytesMut::from(&held.frags[i][..]);
                 d[1..5].copy_from_slice(&pkt_seq.to_le_bytes());
                 d[5] |= FLAG_RETRANSMIT;
@@ -134,6 +134,31 @@ impl Retransmit {
             }
         }
         answer
+    }
+
+    /// The budget left of the fragment `resend` repeats: false once it was sent
+    /// [`MAX_RESENDS`] times. A frame no longer held has none to spend.
+    pub(crate) fn allows(&mut self, resend: &[u8]) -> bool {
+        self.resent(resend).is_none_or(|n| *n < MAX_RESENDS)
+    }
+
+    /// Spends one resend of the fragment `resend` repeats: it was sent.
+    pub(crate) fn charge(&mut self, resend: &[u8]) {
+        if let Some(n) = self.resent(resend) {
+            *n += 1;
+        }
+    }
+
+    /// The resend count of the fragment a datagram carries (`frame_seq`, fragment index).
+    fn resent(&mut self, d: &[u8]) -> Option<&mut u8> {
+        let frame_seq = u16::from_le_bytes([*d.get(7)?, *d.get(8)?]);
+        let i = usize::from(u16::from_le_bytes([*d.get(9)?, *d.get(10)?]));
+        let held = self
+            .frames
+            .iter_mut()
+            .rev()
+            .find(|h| h.frame_seq == frame_seq)?;
+        held.resent.get_mut(i)
     }
 
     fn expire(&mut self, now: Instant, window: Duration) {
@@ -197,6 +222,7 @@ mod tests {
             ts_90khz: 0,
             capture_us: 0,
             pyrowave: false,
+            recovery: false,
         };
         let config = VideoConfig {
             config_id: 0,
@@ -236,12 +262,14 @@ mod tests {
         buf.keep(2, &frame(2, 3000, &mut pkt_seq), now + WINDOW, WINDOW);
 
         for _ in 0..MAX_RESENDS {
-            assert_eq!(
-                buf.answer(2, &[[0, 2]], &mut pkt_seq, now + WINDOW, WINDOW)
-                    .resend
-                    .len(),
-                3
-            );
+            let resend = buf
+                .answer(2, &[[0, 2]], &mut pkt_seq, now + WINDOW, WINDOW)
+                .resend;
+            assert_eq!(resend.len(), 3);
+            for d in &resend {
+                assert!(buf.allows(d));
+                buf.charge(d);
+            }
         }
         let spent = buf.answer(2, &[[0, 0], [2, 2]], &mut pkt_seq, now + WINDOW, WINDOW);
         assert_eq!(
@@ -260,6 +288,28 @@ mod tests {
                 .missed,
             [[0, 0]]
         );
+    }
+
+    /// #1321: a resend dropped or skipped before it reaches QUIC was never sent, so it must
+    /// not cost the client one of its attempts.
+    #[test]
+    fn a_resend_that_was_never_sent_spends_nothing() {
+        let (now, mut pkt_seq) = (Instant::now(), 0);
+        let mut buf = Retransmit::default();
+        buf.keep(3, &frame(3, 3000, &mut pkt_seq), now, WINDOW);
+        for _ in 0..5 {
+            let resend = buf.answer(3, &[[1, 1]], &mut pkt_seq, now, WINDOW).resend;
+            assert_eq!(resend.len(), 1, "an unsent resend leaves the budget whole");
+            assert!(buf.allows(&resend[0]));
+        }
+        let resend = buf.answer(3, &[[1, 1]], &mut pkt_seq, now, WINDOW).resend;
+        buf.charge(&resend[0]);
+        buf.charge(&resend[0]);
+        assert!(!buf.allows(&resend[0]), "two sent: spent");
+        assert!(buf
+            .answer(3, &[[1, 1]], &mut pkt_seq, now, WINDOW)
+            .resend
+            .is_empty());
     }
 
     #[test]

@@ -1391,6 +1391,9 @@ pub struct LadderPlanner {
     last_down_at: Option<Instant>,
     /// The last size change made outside the ladder (a manual resize), for the settle.
     resized: Option<Instant>,
+    /// WebTransport's hold (`webtransport::congestion::HOLD`): (since, last refreshed). A hold not
+    /// refreshed for `HELD_LEASE` has lapsed (its client stopped reporting, PyroWave took over).
+    held: Option<(Instant, Instant)>,
 }
 
 impl LadderPlanner {
@@ -1426,7 +1429,34 @@ impl LadderPlanner {
             run: None,
             last_down_at: None,
             resized: None,
+            held: None,
         }
+    }
+
+    /// A hold younger than this may be a random burst the next one releases (Wi-Fi bursts every
+    /// 2.5-4 s, `burst_loss_on_an_uncapped_link_keeps_the_rung_and_the_setpoint`): the rung does
+    /// not step down for it yet. Under `RATE_CONFIRM` later it would, which R3 needs by 15 s.
+    pub const HELD_DOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+    const HELD_LEASE: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// WebTransport (#1433), every report: while the sender is held under what a congested link
+    /// delivered, its rung never steps up into that link (lab row R4: a 720p keyframe into a
+    /// 5 Mbit/s policer), and for `HELD_DOWN_WAIT` after the hold began it does not step down.
+    pub fn set_held(&mut self, held: bool, now: Instant) {
+        // A hold released (a random burst) takes its down run with it: the rate it held climbs
+        // back, and only a rate still under the line `RATE_CONFIRM` from now steps.
+        if !held && self.held.is_some() && self.run.is_some_and(|r| r.1 == StepDir::Down) {
+            self.run = None;
+        }
+        // A report gap (a hidden tab) lapses the lease but ends no hold: seen again, it keeps its
+        // start, so the down wait does not begin again (#1433 seat B N3). Released, it is cleared.
+        self.held = held.then(|| (self.held.map_or(now, |(since, _)| since), now));
+    }
+
+    fn held_since(&self, now: Instant) -> Option<Instant> {
+        self.held
+            .filter(|&(_, last)| now.saturating_duration_since(last) < Self::HELD_LEASE)
+            .map(|(since, _)| since)
     }
 
     /// WebTransport: the resolution rung moves on [`Self::observe_rate`], never on a window.
@@ -1637,10 +1667,15 @@ impl LadderPlanner {
             _ => (now, dir, rate),
         };
         self.run = Some(run);
-        let held = dir == StepDir::Up
-            && self
+        let held = match (dir, self.held_since(now)) {
+            (StepDir::Up, Some(_)) => true,
+            (StepDir::Up, None) => self
                 .last_down_at
-                .is_some_and(|d| now.saturating_duration_since(d).as_secs() < policy.min_step_s);
+                .is_some_and(|d| now.saturating_duration_since(d).as_secs() < policy.min_step_s),
+            (StepDir::Down, since) => {
+                since.is_some_and(|s| now.saturating_duration_since(s) < Self::HELD_DOWN_WAIT)
+            }
+        };
         // A pin holds the step, not the run: released, it steps at once.
         if now.saturating_duration_since(run.0) < Self::RATE_CONFIRM || held || self.res.pinned {
             return None;
@@ -2853,6 +2888,82 @@ mod tests {
             }
         }
         steps
+    }
+
+    /// `rates`, with WebTransport's hold refreshed (`set_held`) before every report.
+    fn held_rates(
+        p: &mut LadderPlanner,
+        t: Instant,
+        from_ms: u64,
+        secs: u64,
+        rate: impl Fn(u64) -> f64,
+    ) -> Vec<(u64, String)> {
+        let mut steps = Vec::new();
+        for ms in (from_ms..from_ms + secs * 1000).step_by(100) {
+            let at = t + Duration::from_millis(ms);
+            p.set_held(true, at);
+            if let Some(s) = p.observe_rate(rate(ms), at) {
+                steps.push((ms, label(s)));
+            }
+        }
+        steps
+    }
+
+    /// #1433: while WebTransport's hold is on the rate never steps the rung up, however long it
+    /// sits over the recover line. Like a pin it holds the step, not the run: released, it steps.
+    /// A hold nobody refreshes lapses (#1433 seat B N1: a client displaced, or under PyroWave).
+    #[test]
+    fn a_held_rate_never_steps_the_rung_up() {
+        let t = Instant::now();
+        let mut p = rate_planner(LadderOrder::ResFirst, false, 120, t);
+        assert_eq!(
+            rates(&mut p, t, 0, 2, |_| 2500.0),
+            vec![(1000, "res->3".into())]
+        );
+        assert!(
+            held_rates(&mut p, t, 2000, 30, |_| 10_000.0).is_empty(),
+            "stepped up while held"
+        );
+        p.set_held(false, t + Duration::from_millis(32_000));
+        assert_eq!(
+            rates(&mut p, t, 32_000, 2, |_| 10_000.0),
+            vec![(32_000, "res->0".into())]
+        );
+        let mut q = rate_planner(LadderOrder::ResFirst, false, 120, t);
+        rates(&mut q, t, 0, 2, |_| 2500.0);
+        held_rates(&mut q, t, 2000, 20, |_| 10_000.0);
+        assert_eq!(
+            rates(&mut q, t, 22_000, 3, |_| 10_000.0),
+            vec![(22_900, "res->0".into())],
+            "a hold not refreshed for a second lapses"
+        );
+    }
+
+    /// #1433: for `HELD_DOWN_WAIT` after a hold began the rung does not step down (a random burst
+    /// the next one releases); then it steps at once, the run already confirmed.
+    /// #1433 seat B N3: reports that stop for 2 s (a hidden tab) under a hold do not start its down
+    /// wait again: the rung steps `HELD_DOWN_WAIT` after the hold began. Old code: 2 s later.
+    #[test]
+    fn a_report_gap_under_a_hold_keeps_its_down_wait() {
+        let t = Instant::now();
+        let mut p = rate_planner(LadderOrder::ResFirst, false, 120, t);
+        assert!(held_rates(&mut p, t, 0, 2, |_| 2500.0).is_empty());
+        let wait = LadderPlanner::HELD_DOWN_WAIT.as_millis() as u64;
+        assert_eq!(
+            held_rates(&mut p, t, 4000, 4, |_| 2500.0),
+            vec![(wait, "res->3".into())]
+        );
+    }
+
+    #[test]
+    fn a_new_hold_waits_before_it_steps_the_rung_down() {
+        let t = Instant::now();
+        let mut p = rate_planner(LadderOrder::ResFirst, false, 120, t);
+        let wait = LadderPlanner::HELD_DOWN_WAIT.as_millis() as u64;
+        assert_eq!(
+            held_rates(&mut p, t, 0, 10, |_| 2500.0),
+            vec![(wait, "res->3".into())]
+        );
     }
 
     /// Down goes straight to the rung the rate fits, in one step, `RATE_CONFIRM` after the

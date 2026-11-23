@@ -717,16 +717,24 @@ impl Agent {
         token: &str,
         extra: Value,
     ) -> (Session, SendStream, RecvStream, Value) {
-        let session = self.connect().await;
-        let (mut send, mut recv) = session.open_bi().await.unwrap();
-        let mut hello = json!({"type": "hello", "wt_proto": 1, "token": token,
-                               "session_id": SESSION, "client": "browser"});
-        let extra = extra.as_object().unwrap().clone();
-        hello.as_object_mut().unwrap().extend(extra);
-        write_message(&mut send, &hello).await.unwrap();
-        let reply = read_message(&mut recv).await.unwrap();
-        (session, send, recv, reply)
+        hello_over(self.connect().await, token, extra).await
     }
+}
+
+/// Opens the control stream on `session` and sends `hello`; the first reply.
+async fn hello_over(
+    session: Session,
+    token: &str,
+    extra: Value,
+) -> (Session, SendStream, RecvStream, Value) {
+    let (mut send, mut recv) = session.open_bi().await.unwrap();
+    let mut hello = json!({"type": "hello", "wt_proto": 1, "token": token,
+                           "session_id": SESSION, "client": "browser"});
+    let extra = extra.as_object().unwrap().clone();
+    hello.as_object_mut().unwrap().extend(extra);
+    write_message(&mut send, &hello).await.unwrap();
+    let reply = read_message(&mut recv).await.unwrap();
+    (session, send, recv, reply)
 }
 
 thread_local! {
@@ -1542,11 +1550,14 @@ async fn governed_agent(stream: Stream) -> Agent {
                 measured: Box::new(|_| {}),
                 ceiling_kbps: 8000.0,
                 floor_kbps: Box::new(|| 4000.0),
+                setpoint_kbps: Box::new(|| 0.0),
+                capacity: crate::session::settings::WtCapacity::V2,
                 retargets: true,
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
                 observe: Box::new(|_| {}),
+                held: Box::new(|_| {}),
                 fec: Box::new(|_| {}),
             })
         },
@@ -1561,7 +1572,11 @@ async fn through(
 ) -> (Session, SendStream, RecvStream) {
     let port = relay(agent.url.port().unwrap(), impair).await;
     agent.url.set_port(Some(port)).unwrap();
-    let (session, send, recv, reply) = agent.hello(TOKEN).await;
+    let session = client_with(|_| {})
+        .connect(agent.url.clone())
+        .await
+        .unwrap();
+    let (session, send, recv, reply) = hello_over(session, TOKEN, json!({"fec": []})).await;
     assert_eq!(reply["type"], "hello_ack");
     (session, send, recv)
 }
@@ -1617,15 +1632,8 @@ async fn reordered_delivery_does_not_stall_the_datagram_path() {
 }
 
 /// Logs `webtransport-client-quic-stats` lines into `captured` on this thread.
-fn capture_info(captured: &Captured) -> tracing::subscriber::DefaultGuard {
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_ansi(false)
-        .with_writer(captured.clone())
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
-    tracing::callsite::rebuild_interest_cache();
-    guard
+fn capture_info(captured: &Captured) -> crate::test_log::EndCapture {
+    crate::test_log::begin(&captured.0)
 }
 
 /// Says `bye` and waits for the agent's line on the client's leave: whether QUIC's window
@@ -2077,6 +2085,8 @@ async fn feedback_while_pyrowave_is_active_feeds_no_estimate() {
                 measured: Box::new(|_| {}),
                 ceiling_kbps: 4000.0,
                 floor_kbps: Box::new(|| 500.0),
+                setpoint_kbps: Box::new(|| 0.0),
+                capacity: crate::session::settings::WtCapacity::V2,
                 retargets: true,
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
@@ -2084,6 +2094,7 @@ async fn feedback_while_pyrowave_is_active_feeds_no_estimate() {
                 observe: Box::new(move |_| {
                     count.fetch_add(1, Ordering::SeqCst);
                 }),
+                held: Box::new(|_| {}),
                 fec: Box::new(|_| {}),
             })
         },
@@ -2174,11 +2185,14 @@ async fn audio_alone_never_moves_the_video_estimate() {
             measured: Box::new(|_| {}),
             ceiling_kbps: 4000.0,
             floor_kbps: Box::new(|| 500.0),
+            setpoint_kbps: Box::new(|| 0.0),
+            capacity: crate::session::settings::WtCapacity::V2,
             retargets: true,
             start: Box::new(|| {}),
             owns: Box::new(|| false),
             displaced: Box::new(|| {}),
             observe: Box::new(move |kbps| seen.lock().unwrap().push(kbps)),
+            held: Box::new(|_| {}),
             fec: Box::new(|_| {}),
         })
     })
@@ -2219,11 +2233,14 @@ fn rate(retargets: bool) -> Rate {
         measured: Box::new(|_| {}),
         ceiling_kbps: 8000.0,
         floor_kbps: Box::new(|| 4000.0),
+        setpoint_kbps: Box::new(|| 0.0),
+        capacity: crate::session::settings::WtCapacity::V2,
         retargets,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         observe: Box::new(|_| {}),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     }
 }
@@ -2231,6 +2248,27 @@ fn rate(retargets: bool) -> Rate {
 /// 200 video datagrams logged as sent 1 ms apart from `at`, then feedback that names them
 /// all as arrived 1 ms apart, read 250 ms after `at`.
 fn answered(control: &mut Control, first: u32, at: std::time::Instant) {
+    answered_but(control, first, at, |_| false);
+}
+
+/// [`answered`], with the datagrams `lost` names reported not received.
+fn answered_but(
+    control: &mut Control,
+    first: u32,
+    at: std::time::Instant,
+    lost: impl Fn(u32) -> bool,
+) {
+    answered_with(control, first, at, lost, None);
+}
+
+/// [`answered_but`], the feedback carrying `decoded` when given (#1348).
+fn answered_with(
+    control: &mut Control,
+    first: u32,
+    at: std::time::Instant,
+    lost: impl Fn(u32) -> bool,
+    decoded: Option<u16>,
+) {
     let mut arrivals = Vec::new();
     for i in 0..200u32 {
         let mut d = vec![0u8; media::MAX_DATAGRAM];
@@ -2238,15 +2276,19 @@ fn answered(control: &mut Control, first: u32, at: std::time::Instant) {
         control
             .log
             .record(&d, at + Duration::from_millis(i.into()), false);
-        arrivals.extend_from_slice(&((i * 20) as u16).to_le_bytes());
+        let arrival = if lost(i) { u16::MAX } else { (i * 20) as u16 };
+        arrivals.extend_from_slice(&arrival.to_le_bytes());
     }
-    let fb = json!({
+    let mut fb = json!({
         "type": "feedback", "seq": first / 200 + 1,
         "first_pkt_seq": first, "count": 200,
         "ref_us": u64::from(first) * 1000,
         "arrivals_b64": base64::engine::general_purpose::STANDARD.encode(&arrivals),
         "recv_kbps": 0, "lost": 0, "interval_ms": 50,
     });
+    if let Some(d) = decoded {
+        fb["decoded"] = json!(d);
+    }
     let path = congestion::QuicPath {
         rtt: Duration::from_millis(20),
         cwnd_bytes: 0,
@@ -2254,6 +2296,72 @@ fn answered(control: &mut Control, first: u32, at: std::time::Instant) {
         queued_bytes: 0,
     };
     control.feedback(&fb, path, at + Duration::from_millis(250));
+}
+
+/// #1348: `decoded` rides on feedback without changing what either capacity estimator reads.
+#[test]
+fn feedback_carrying_decoded_reads_the_same_in_both_capacity_modes() {
+    for capacity in [
+        crate::session::settings::WtCapacity::V2,
+        crate::session::settings::WtCapacity::Legacy,
+    ] {
+        let rate = Rate {
+            capacity,
+            ..rate(true)
+        };
+        let base = std::time::Instant::now();
+        let run = |decoded: Option<u16>| {
+            let mut c = Control::new(&rate, Arc::default(), true, congestion::Governor::default());
+            for k in 0..8u32 {
+                let at = base + Duration::from_millis(250 * u64::from(k));
+                answered_with(&mut c, 200 * k, at, |i| i % 9 == 4, decoded);
+            }
+            let e = &c.estimator;
+            (
+                c.refused,
+                e.estimate_kbps(),
+                e.loss(),
+                e.measured(),
+                e.held_kbps(),
+            )
+        };
+        let with = run(Some(4711));
+        assert_eq!(with.0, 0, "{capacity:?}: refused");
+        assert_eq!(with, run(None), "{capacity:?}");
+    }
+}
+
+/// #1433 lab R3 (NVIDIA lab host, 2026-11-22): the hold's line reaches the ABR as video under the
+/// FEC its loss called for, kept as the level calms, never the share the floor leaves. At 1080p's
+/// floor that share was 3 %, and the rung read the line as 720p video for 37 s.
+#[test]
+fn the_hold_line_reaches_the_abr_under_the_fec_its_loss_called_for() {
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let log = lines.clone();
+    let rate = Rate {
+        floor_kbps: Box::new(|| 6000.0),
+        held: Box::new(move |line| log.lock().unwrap().push(line)),
+        ..rate(true)
+    };
+    let mut control = Control::new(&rate, Arc::default(), true, congestion::Governor::default());
+    let base = std::time::Instant::now();
+    answered_but(&mut control, 0, base, |i| i % 4 == 1);
+    let line = control.estimator.held_kbps().expect("a hold");
+    assert!(control.charged < 0.25, "charged {}", control.charged);
+    for k in 1..20u32 {
+        answered(
+            &mut control,
+            200 * k,
+            base + Duration::from_millis(250 * u64::from(k)),
+        );
+    }
+    let got = lines.lock().unwrap().clone();
+    assert_eq!(got.first(), Some(&Some(line / 1.25)), "{got:?}");
+    assert_eq!(
+        got.last(),
+        Some(&Some(line / 1.25)),
+        "after the level calmed: {got:?}"
+    );
 }
 
 /// §Feedback: with the ABR off the estimate never reaches the encoder, so QUIC keeps its
@@ -2306,6 +2414,8 @@ fn the_silence_decay_is_never_fed_to_the_collapse_as_a_measured_link() {
         }),
         ceiling_kbps: 8000.0,
         floor_kbps: Box::new(|| 4000.0),
+        setpoint_kbps: Box::new(|| 0.0),
+        capacity: crate::session::settings::WtCapacity::V2,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -2313,6 +2423,7 @@ fn the_silence_decay_is_never_fed_to_the_collapse_as_a_measured_link() {
         observe: Box::new(move |_| {
             f.fetch_add(1, SeqCst);
         }),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), false, Default::default());
@@ -2352,11 +2463,14 @@ fn a_report_gives_the_abr_its_reading_before_its_estimate() {
         measured: Box::new(move |_| m.lock().unwrap().push("measured")),
         ceiling_kbps: 8000.0,
         floor_kbps: Box::new(|| 4000.0),
+        setpoint_kbps: Box::new(|| 0.0),
+        capacity: crate::session::settings::WtCapacity::V2,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         observe: Box::new(move |_| o.lock().unwrap().push("observe")),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), false, Default::default());
@@ -2376,6 +2490,8 @@ fn a_client_that_is_gone_neither_starts_nor_feeds_the_abr() {
         measured: Box::new(|_| {}),
         ceiling_kbps: 4000.0,
         floor_kbps: Box::new(|| 500.0),
+        setpoint_kbps: Box::new(|| 0.0),
+        capacity: crate::session::settings::WtCapacity::V2,
         retargets: true,
         start: Box::new(move || {
             started.fetch_add(1, SeqCst);
@@ -2385,6 +2501,7 @@ fn a_client_that_is_gone_neither_starts_nor_feeds_the_abr() {
         observe: Box::new(move |_| {
             fed.fetch_add(1, SeqCst);
         }),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
     let gone = Arc::new(OnceLock::new());
@@ -2439,11 +2556,14 @@ fn the_abr_is_fed_the_estimate_less_the_fec_share() {
         measured: Box::new(|_| {}),
         ceiling_kbps: 6000.0,
         floor_kbps: Box::new(|| 500.0),
+        setpoint_kbps: Box::new(|| 0.0),
+        capacity: crate::session::settings::WtCapacity::V2,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         observe: Box::new(move |kbps: f64| seen.lock().unwrap().push(kbps.round())),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), true, Default::default());
@@ -2472,11 +2592,14 @@ async fn lossy_session(retargets: bool) -> (Agent, Arc<crate::session::metrics::
                 measured: Box::new(|_| {}),
                 ceiling_kbps: 4000.0,
                 floor_kbps: Box::new(|| 500.0),
+                setpoint_kbps: Box::new(|| 0.0),
+                capacity: crate::session::settings::WtCapacity::V2,
                 retargets,
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
                 observe: Box::new(|_| {}),
+                held: Box::new(|_| {}),
                 fec: Box::new(move |event| match event {
                     crate::webtransport::FecEvent::Attached { client, fec } => {
                         m.attach_fec(client, fec);
@@ -2723,11 +2846,14 @@ fn repairs_spend_only_what_the_estimate_leaves_above_the_abr_floor() {
         measured: Box::new(|_| {}),
         ceiling_kbps: 6000.0,
         floor_kbps: Box::new(|| 2500.0),
+        setpoint_kbps: Box::new(|| 0.0),
+        capacity: crate::session::settings::WtCapacity::V2,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         observe: Box::new(move |kbps: f64| seen.lock().unwrap().push(kbps.round())),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), true, Default::default());
@@ -2757,11 +2883,13 @@ fn governed(level: u8, estimate_kbps: f64, seconds: u64) -> Vec<(u32, f64)> {
         Governor::new(AbrConfig::new_smooth(2500, 8000, 60), base),
         base,
     )));
-    let (floor, observed) = (governor.clone(), governor.clone());
+    let (floor, setpoint, observed) = (governor.clone(), governor.clone(), governor.clone());
     let rate = Rate {
         measured: Box::new(|_| {}),
         ceiling_kbps: 8000.0,
         floor_kbps: Box::new(move || f64::from(floor.lock().unwrap().0.floor_kbps())),
+        setpoint_kbps: Box::new(move || f64::from(setpoint.lock().unwrap().0.setpoint_kbps())),
+        capacity: crate::session::settings::WtCapacity::V2,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
@@ -2771,6 +2899,7 @@ fn governed(level: u8, estimate_kbps: f64, seconds: u64) -> Vec<(u32, f64)> {
             let now = governor.1;
             governor.0.observe(kbps, now);
         }),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), true, Default::default());
@@ -2799,6 +2928,64 @@ fn governed(level: u8, estimate_kbps: f64, seconds: u64) -> Vec<(u32, f64)> {
 /// 1 − its deadband. Video plus FEC is held to the same.
 fn governor_bound(estimate_kbps: f64) -> f64 {
     estimate_kbps / (1.0 - crate::session::abr::AbrConfig::DEFAULT_DEADBAND)
+}
+
+/// #1433 (R3, rule 1): the pacer and QUIC's window are governed at what the encoder sends, the
+/// ABR's setpoint plus its FEC share, when the estimate is under it: the average output of the
+/// encoder always leaves the agent, so an overload shows at the link and not as held video the
+/// stall guard reads as a dead path. Estimate 3500, setpoint 4500, 10 % FEC: 4950. Old code:
+/// the estimate, 3500.
+#[test]
+fn the_pacer_never_holds_video_under_the_setpoint() {
+    let (estimate, governed) = governed_after_a_report(crate::session::settings::WtCapacity::V2);
+    assert!(
+        (3400.0..3700.0).contains(&estimate),
+        "the estimate is {estimate:.0}"
+    );
+    assert!(governed >= 4950, "governed at {governed} kbit/s");
+}
+
+/// `QUASAR_WT_CAPACITY=legacy` governs at the estimate, as 0.6.3 did.
+#[test]
+fn legacy_capacity_governs_at_the_estimate() {
+    let (estimate, governed) =
+        governed_after_a_report(crate::session::settings::WtCapacity::Legacy);
+    assert_eq!(governed, estimate as u64);
+}
+
+/// The estimate and the governed rate, kbit/s, after one report: estimate 3500, setpoint 4500,
+/// 10 % FEC.
+fn governed_after_a_report(capacity: crate::session::settings::WtCapacity) -> (f64, u64) {
+    use crate::session::abr::{AbrConfig, Governor};
+    let base = std::time::Instant::now();
+    // A smooth governor whose ceiling is the setpoint, and so starts there.
+    let abr = Arc::new(Mutex::new(Governor::new(
+        AbrConfig::new_smooth(1000, 4500, 60),
+        base,
+    )));
+    assert_eq!(abr.lock().unwrap().setpoint_kbps(), 4500);
+    let setpoint = abr.clone();
+    let rate = Rate {
+        measured: Box::new(|_| {}),
+        ceiling_kbps: 4500.0,
+        floor_kbps: Box::new(|| 1000.0),
+        setpoint_kbps: Box::new(move || f64::from(setpoint.lock().unwrap().setpoint_kbps())),
+        capacity,
+        retargets: true,
+        start: Box::new(|| {}),
+        owns: Box::new(|| false),
+        displaced: Box::new(|| {}),
+        observe: Box::new(|_| {}),
+        held: Box::new(|_| {}),
+        fec: Box::new(|_| {}),
+    };
+    let governor = congestion::Governor::default();
+    let mut control = Control::new(&rate, Arc::default(), true, governor.clone());
+    control.fec.as_mut().unwrap().observe(0.02, base);
+    control.estimator.resume_at(3500.0);
+    answered(&mut control, 0, base);
+    assert_eq!(control.charged, 0.1);
+    (control.estimator.estimate_kbps(), governor.kbps())
 }
 
 /// #1046: a FEC share inside the governor's deadband (levels 1 to 3, up to 15 %) does not
@@ -2862,11 +3049,14 @@ fn a_pyrowave_frame_gets_no_repair_at_any_overhead() {
         measured: Box::new(|_| {}),
         ceiling_kbps: 6000.0,
         floor_kbps: Box::new(|| 500.0),
+        setpoint_kbps: Box::new(|| 0.0),
+        capacity: crate::session::settings::WtCapacity::V2,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         observe: Box::new(|_| {}),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), true, Default::default());
@@ -4298,18 +4488,13 @@ async fn a_64_kib_session_id_is_refused_and_logged_bounded() {
         "session_not_ready"
     );
 
-    // The refusal's own log call, captured on this thread (a scoped subscriber does not
-    // reach tasks other tests' subscribers race with).
+    // The refusal's own log call, captured on this thread through the shared
+    // process-wide subscriber (no scoped dispatcher to race its interest cache).
     let captured = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_ansi(false)
-        .with_writer(captured.clone())
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
-        tracing::callsite::rebuild_interest_cache();
+    {
+        let _guard = crate::test_log::begin(&captured.0);
         log_refusal(&huge, "session_not_ready");
-    });
+    }
     let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
     assert_eq!(logs.lines().count(), 1, "one line: {logs}");
     assert!(logs.len() < 400, "a {} byte log line", logs.len());
@@ -4339,6 +4524,23 @@ fn client_with(shape: impl FnOnce(&mut quinn::TransportConfig)) -> web_transport
     let mut config = quinn::ClientConfig::new(Arc::new(crypto));
     config.transport_config(Arc::new(transport));
     let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    // Chrome's QUIC asks for 1 MiB (`kQuicSocketReceiveBufferSize`). At the kernel default
+    // (212 992 bytes, 92 loopback datagrams) a keyframe of 95 lost its tail whenever the agent,
+    // on this test's one thread, sent it before the client read: no whole keyframe for seconds.
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let size: libc::c_int = 1 << 20;
+    // SAFETY: `socket` owns a valid fd, and the option is a c_int of its own size.
+    let set = unsafe {
+        libc::setsockopt(
+            std::os::fd::AsRawFd::as_raw_fd(&socket),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&size as *const libc::c_int).cast(),
+            std::mem::size_of_val(&size) as libc::socklen_t,
+        )
+    };
+    assert_eq!(set, 0, "SO_RCVBUF: {}", std::io::Error::last_os_error());
+    endpoint.rebind(socket).unwrap();
     web_transport_quinn::Client::new(endpoint, config)
 }
 
@@ -4541,17 +4743,12 @@ async fn a_failed_swap_keeps_serving_and_listing_the_old_certificate_first() {
     };
 
     let captured = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_ansi(false)
-        .with_writer(captured.clone())
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
-        tracing::callsite::rebuild_interest_cache();
+    {
+        let _guard = crate::test_log::begin(&captured.0);
         agent.listener.rotate_with(expires - 48 * HOUR, broken);
         agent.listener.rotate_at(expires - 12 * HOUR);
         agent.listener.rotate_at(expires - 11 * HOUR);
-    });
+    }
     let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
     assert_eq!(
         logs.matches("webtransport-cert-reload-failed").count(),
@@ -5159,6 +5356,8 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
                 measured: Box::new(|_| {}),
                 ceiling_kbps: 1_000_000.0,
                 floor_kbps: Box::new(|| 500.0),
+                setpoint_kbps: Box::new(|| 0.0),
+                capacity: crate::session::settings::WtCapacity::V2,
                 retargets: true,
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
@@ -5169,6 +5368,7 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
                     }
                     observed.lock().unwrap().push(kbps)
                 }),
+                held: Box::new(|_| {}),
                 fec: Box::new(|_| {}),
             })
         },
@@ -5225,13 +5425,16 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
                 };
                 seqs.clear();
                 let count = (last - first + 1) as usize;
-                let mut arrivals = vec![0xFFu8; count * 2];
-                arrivals[..2].fill(0);
+                // Every other one lost, ending at an arrival as a browser's report does.
+                let mut arrivals = vec![0u8; count * 2];
+                for i in (1..count.saturating_sub(1)).step_by(2) {
+                    arrivals[2 * i..2 * i + 2].fill(0xFF);
+                }
                 fb_seq += 1;
                 let fb = json!({"type": "feedback", "seq": fb_seq, "first_pkt_seq": first,
                     "count": count, "ref_us": 0,
                     "arrivals_b64": base64::engine::general_purpose::STANDARD.encode(&arrivals),
-                    "recv_kbps": 0, "lost": count - 1, "interval_ms": 50});
+                    "recv_kbps": 0, "lost": count.saturating_sub(1) / 2, "interval_ms": 50});
                 write_message(&mut send, &fb).await.unwrap();
             }
             m = read_message(&mut recv) => break m.unwrap(),
@@ -5461,6 +5664,121 @@ fn releasing_the_tap_stops_its_pyrowave_encoder_and_keeps_the_tap() {
     let _ = pipeline.set_state(gst::State::Null);
 }
 
+/// #1321: an outage stops every ACK, so QUIC's queue stalls and video waits in the agent.
+/// Audio still goes to QUIC ahead of it, also after feedback silence has released the
+/// governor; video held past the NACK hold is dropped, so when the path returns the outage's
+/// audio arrives before the picture, which resumes at a keyframe. The relay holds the
+/// outage's datagrams rather than dropping them, so the order QUIC sent them in is what the
+/// client sees.
+#[tokio::test]
+async fn audio_overtakes_video_held_behind_a_stalled_path() {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let plan = audio::Plan {
+        audio: true,
+        mic: false,
+        pulse_server: None,
+        jitter_ms: 40,
+    };
+    let mut agent = agent_built(Stream::Av1Heavy, Limits::default(), plan, "snow", |_| {
+        Some(rate(true))
+    })
+    .await;
+    tap_session_audio(&mut agent);
+    let t0 = Instant::now();
+    let (outage, up_at, end) = (
+        t0 + Duration::from_secs(2),
+        t0 + Duration::from_millis(3500),
+        t0 + Duration::from_millis(5500),
+    );
+    let down = Arc::new(AtomicBool::new(false));
+    let cut = down.clone();
+    let (session, mut send, _recv) = through(&mut agent, move || {
+        Some(if cut.load(Relaxed) {
+            up_at.saturating_duration_since(Instant::now())
+        } else {
+            Duration::ZERO
+        })
+    })
+    .await;
+    let wall_us = || {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64
+    };
+    let mut path = Arrivals::default();
+    let mut report = tokio::time::interval(Duration::from_millis(50));
+    // Audio captured from here on was captured after the governor let go (silence: 500 ms).
+    let mut late = None::<u64>;
+    // When the path came back.
+    let mut up_wall = None::<u64>;
+    // (arrival µs, capture µs, keyframe) of every audio and video datagram from the outage on.
+    let (mut audio, mut video) = (Vec::new(), Vec::new());
+    loop {
+        let now = Instant::now();
+        if now >= end {
+            break;
+        }
+        down.store((outage..up_at).contains(&now), Relaxed);
+        if up_wall.is_none() && now >= up_at {
+            up_wall = Some(wall_us());
+        }
+        if late.is_none() && now >= outage + Duration::from_millis(800) {
+            late = Some(wall_us());
+        }
+        tokio::select! {
+            d = session.read_datagram() => {
+                let d = d.unwrap();
+                // The starved-path probe (#1333) carries no `pkt_seq`.
+                if d.len() < 5 { continue; }
+                path.receive(&d);
+                if now < outage { continue; }
+                let n = wall_us();
+                let at = |r: std::ops::Range<usize>| u64::from_le_bytes(d[r].try_into().unwrap());
+                match d[0] {
+                    0x02 => audio.push((n, at(11..19), false)),
+                    0x01 => video.push((n, at(17..25), d[5] & 1 != 0)),
+                    _ => {}
+                }
+            }
+            _ = report.tick() => {
+                if let Some(fb) = path.feedback() {
+                    write_message(&mut send, &fb).await.unwrap();
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+    let late = late.unwrap();
+    let late_audio: Vec<_> = audio.iter().filter(|a| a.1 >= late).collect();
+    assert!(
+        !late_audio.is_empty(),
+        "no audio from late in the outage arrived"
+    );
+    // Nothing held past the NACK hold reaches QUIC (`VideoQueue::feed`), so the picture
+    // resumes at a keyframe, and the outage's audio is not behind any of it.
+    let up_wall = up_wall.unwrap();
+    let resumed = video
+        .iter()
+        .find(|v| v.1 >= up_wall)
+        .expect("video resumed");
+    let last_audio = late_audio
+        .iter()
+        .filter(|a| a.1 < up_wall)
+        .map(|a| a.0)
+        .max();
+    eprintln!(
+        "{} late audio datagrams; video resumed at a keyframe: {}",
+        late_audio.len(),
+        resumed.2
+    );
+    assert!(resumed.2, "video resumed on a delta frame");
+    assert!(
+        last_audio.is_some_and(|a| a <= resumed.0),
+        "the outage's audio arrived behind the video after it"
+    );
+}
+
 /// #1606: 363 datagrams of ~1200 B, the size of one 1080p60 PyroWave frame at 200 Mbit/s.
 fn big_frame() -> Vec<Bytes> {
     vec![Bytes::from(vec![0u8; 1200]); 363]
@@ -5684,4 +6002,155 @@ async fn audio_and_a_ping_are_served_between_the_slices_of_one_big_pyrowave_fram
         seqs.windows(2).all(|w| w[1] == w[0].wrapping_add(1)),
         "one pkt_seq in handoff order: {seqs:?}"
     );
+}
+
+/// Probe round 2 (#1433, seat B S2): the production probe fill hands QUIC repairs of the last frame
+/// only with QUIC's datagram queue empty and no video held (a NACK answer is held video), so never
+/// ahead of audio, video or a resend, and in one burst per frame. The sim's QUIC sends at once, so
+/// only this test turns red without the queue check.
+#[test]
+fn the_probe_fills_an_empty_quic_queue_once_per_frame_behind_video() {
+    const IDLE: usize = 1;
+    let start = std::time::Instant::now();
+    let at = |us: u64| start + Duration::from_micros(us);
+    let mut log = congestion::SendLog::new(start);
+    let mut video = congestion::VideoQueue::default();
+    let kbps = Some(20_000.0);
+    let frame: Vec<Bytes> = (0..10)
+        .map(|_| {
+            let mut d = vec![0x01];
+            d.extend_from_slice(&video.take_seq().to_le_bytes());
+            d.resize(1200, 0);
+            Bytes::from(d)
+        })
+        .collect();
+    let mut probe_frame = Some((frame.clone(), 0));
+    let mut fill = |log: &mut congestion::SendLog,
+                    video: &mut congestion::VideoQueue,
+                    queued: usize,
+                    now: std::time::Instant| {
+        let mut sent = Vec::new();
+        assert!(fill_probe(
+            log,
+            kbps,
+            &mut probe_frame,
+            video,
+            queued,
+            now,
+            |d| {
+                sent.push(d);
+                congestion::Handed::Sent
+            }
+        ));
+        sent
+    };
+    // QUIC's queue as an idle session reads it: the session-id header (`IDLE`).
+    // The probe banks from the frame interval before the frame; nothing goes ahead of it.
+    assert!(
+        fill(&mut log, &mut video, IDLE, at(0)).is_empty(),
+        "before the frame"
+    );
+    for d in &frame {
+        log.record(d, at(16_000), false);
+    }
+    // A datagram still in QUIC's queue: nothing.
+    assert!(
+        fill(&mut log, &mut video, media::MAX_DATAGRAM + IDLE, at(16_500)).is_empty(),
+        "ahead of QUIC's queue"
+    );
+    // A NACK answer held behind the pacer: nothing.
+    let resend = congestion::Held {
+        datagram: frame[3].clone(),
+        logged: true,
+        resend: true,
+        queued_at: at(16_500),
+        keyframe: false,
+    };
+    video.push(resend, usize::MAX);
+    assert!(
+        fill(&mut log, &mut video, IDLE, at(16_600)).is_empty(),
+        "ahead of a resend"
+    );
+    video.clear();
+    // Both empty: one burst within `PROBE_TAIL` of the frame, at most what a frame interval at the
+    // probe's rate leaves past it.
+    let mut burst = fill(&mut log, &mut video, IDLE, at(16_700));
+    assert!(!burst.is_empty(), "no burst");
+    burst.extend(fill(&mut log, &mut video, IDLE, at(17_500)));
+    let room = 20_000.0 * 125.0 * 0.016_667 - 10.0 * 1200.0;
+    let bytes: usize = burst.iter().map(Bytes::len).sum();
+    assert!(bytes as f64 <= room + 1300.0, "{bytes} bytes for {room:.0}");
+    // Each repair takes the next `pkt_seq`, after the frame's.
+    let seqs: Vec<u32> = burst
+        .iter()
+        .map(|d| u32::from_le_bytes(d[1..5].try_into().unwrap()))
+        .collect();
+    assert_eq!(seqs, (10..10 + burst.len() as u32).collect::<Vec<_>>());
+    // Nothing more until the next frame.
+    for us in [18_500, 25_000, 32_000] {
+        assert!(
+            fill(&mut log, &mut video, IDLE, at(us)).is_empty(),
+            "at {us} us"
+        );
+    }
+}
+
+/// Lab V3 (#1433): web-transport-quinn 0.13 counts the session-id header in the datagram queue, so
+/// an idle session reads at least 1 byte queued; a probe gated on 0 never sent on hardware.
+#[tokio::test]
+async fn an_idle_session_reads_the_header_queued() {
+    let agent = agent().await;
+    let session = agent.connect().await;
+    let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
+    assert!((1..media::MAX_DATAGRAM).contains(&queued), "{queued} bytes");
+}
+
+/// DeepSeek seat A1 (#1433): a probe repair is cut to the last frame's fragment size; once quinn's
+/// datagram size shrinks under it, QUIC refuses it `TooLarge`. That ends the frame's probe and is
+/// counted; the stream goes on. Only a gone connection ends it.
+#[test]
+fn a_probe_repair_over_a_shrunk_datagram_size_ends_the_probe_not_the_stream() {
+    let start = std::time::Instant::now();
+    let at = |us: u64| start + Duration::from_micros(us);
+    let mut log = congestion::SendLog::new(start);
+    let mut video = congestion::VideoQueue::default();
+    let frame: Vec<Bytes> = (0..10)
+        .map(|_| {
+            let mut d = vec![0x01];
+            d.extend_from_slice(&video.take_seq().to_le_bytes());
+            d.resize(1200, 0);
+            Bytes::from(d)
+        })
+        .collect();
+    let mut probe_frame = Some((frame.clone(), 0));
+    log.probe_room(Some(20_000.0), at(0));
+    for d in &frame {
+        log.record(d, at(16_000), false);
+    }
+    let mut tries = 0;
+    let alive = fill_probe(
+        &mut log,
+        Some(20_000.0),
+        &mut probe_frame,
+        &mut video,
+        1,
+        at(16_700),
+        |_| {
+            tries += 1;
+            congestion::Handed::TooLarge
+        },
+    );
+    assert!(alive, "a refused repair ended the stream");
+    assert_eq!((tries, video.probes_too_large), (1, 1));
+    assert!(probe_frame.is_none(), "the frame still probes");
+    let gone = fill_probe(
+        &mut log,
+        Some(20_000.0),
+        &mut Some((frame, 0)),
+        &mut video,
+        1,
+        at(16_800),
+        |_| congestion::Handed::Gone,
+    );
+    assert!(!gone, "a gone connection goes on");
 }

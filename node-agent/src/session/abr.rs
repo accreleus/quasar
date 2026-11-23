@@ -97,6 +97,9 @@ pub struct AbrConfig {
     /// ([`Governor::observe_report`]) instead of windows, the value being the least time
     /// between two encoder writes (zero where a write costs no keyframe).
     pub per_report: Option<Duration>,
+    /// Per-report loop: a reading must be under the rate by more than the deadband, as 0.6.3
+    /// filtered it (`QUASAR_WT_CAPACITY=legacy`).
+    pub legacy_readings: bool,
 }
 
 impl AbrConfig {
@@ -131,6 +134,7 @@ impl AbrConfig {
             down_dwell: Self::DEFAULT_DOWN_DWELL,
             cliff_guard_frac: Self::DEFAULT_CLIFF_GUARD_FRAC,
             per_report: None,
+            legacy_readings: false,
         }
     }
 
@@ -424,9 +428,19 @@ pub struct Governor {
     fed: Option<Instant>,
     /// Per-report loop: when the last receiver report came.
     last_report: Option<Instant>,
-    /// Per-report loop: the first reading of a run under the line.
+    /// Per-report loop: the first reading of a run under the rate.
     under: Option<f64>,
+    /// Per-report loop: the rate before WebTransport's hold (`hold_to`) while it is on, and a hold
+    /// ended whose setpoint has not climbed back to that rate yet.
+    hold_from: Option<f64>,
+    back: bool,
+    /// When `hold_to` last ran.
+    held_at: Option<Instant>,
 }
+
+/// `Governor::hold_off`: a hold refreshed within this is seen ending (WebTransport refreshes it every
+/// report, 50 ms apart; the rung's lease is the same, `LadderPlanner::set_held`).
+const HOLD_SEEN: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl Governor {
     /// Start at the tier ceiling. `start` seeds the min-interval clock so the governor
@@ -443,6 +457,9 @@ impl Governor {
             fed: None,
             last_report: None,
             under: None,
+            hold_from: None,
+            held_at: None,
+            back: false,
         }
     }
 
@@ -560,11 +577,15 @@ impl Governor {
                 .min(self.cfg.ceiling_kbps as f64);
         }
         let target = self.clamp(self.rate.min(estimate).floor());
+        let back = self.back && target as f64 >= estimate.floor();
         let up = target > self.setpoint
-            && (target as f64 >= sp * (1.0 + self.cfg.deadband) || target == self.cfg.ceiling_kbps);
+            && (target as f64 >= sp * (1.0 + self.cfg.deadband)
+                || target == self.cfg.ceiling_kbps
+                || back);
         if !up || !self.write_due(now) {
             return None;
         }
+        self.back &= (target as f64) < self.rate.floor();
         self.setpoint = target;
         self.last_retarget = now;
         Some(target)
@@ -574,12 +595,18 @@ impl Governor {
     /// link carrying when the link held the sender back (`webtransport::Rate::measured`),
     /// `None` when it did not. A link that delivers what it is sent gives no reading,
     /// whatever its delay detector says: that is the #68 guard. Two readings in a row under
-    /// the rate by more than the deadband take the rate and the setpoint to the higher of
-    /// them in one move, with no step cap and no dwell.
+    /// the rate take the rate and the setpoint to the higher of them in one move, with no step
+    /// cap, no dwell and no deadband: a reading is under what left the wire, so no dead zone
+    /// between the link and a deadband over it can hold the sender there (#1503).
     pub fn observe_report(&mut self, reading: Option<f64>, now: Instant) -> Option<u32> {
         self.cfg.per_report?;
         self.last_report = Some(now);
-        let Some(reading) = reading.filter(|&r| r < self.rate * (1.0 - self.cfg.deadband)) else {
+        // Not positive (or NaN) is no capacity sample: a zero rate would never grow again.
+        let line = match self.cfg.legacy_readings {
+            true => self.rate * (1.0 - self.cfg.deadband),
+            false => self.rate,
+        };
+        let Some(reading) = reading.filter(|&r| r > 0.0 && r < line) else {
             self.under = None;
             return None;
         };
@@ -598,6 +625,40 @@ impl Governor {
         self.setpoint = sp;
         self.last_retarget = now;
         Some(sp)
+    }
+
+    /// Per-report loop: WebTransport's hold (`webtransport::congestion::HOLD`) bounds the rate and
+    /// the setpoint at `kbps` at once: no reading run, interval or rung settle delays it, so a
+    /// congested link is never sent more than the hold allows (#1433, sim row R3 at a rung step).
+    pub fn hold_to(&mut self, kbps: f64, now: Instant) -> Option<u32> {
+        self.cfg.per_report?;
+        self.hold_from.get_or_insert(self.rate);
+        self.held_at = Some(now);
+        self.back = false;
+        self.rate = self.rate.min(kbps);
+        let sp = self.clamp(kbps);
+        if sp >= self.setpoint {
+            return None;
+        }
+        self.setpoint = sp;
+        self.last_retarget = now;
+        Some(sp)
+    }
+
+    /// Per-report loop, every report with no hold. A hold that ended was not the link (a random
+    /// burst) or the link lifted: the rate, which the rung reads, is back where the hold found it,
+    /// and the setpoint follows the estimate up to it past the deadband (with FEC charged the
+    /// estimate tops out under the ceiling, so a held setpoint parked up to 15 % low for good).
+    /// Only a hold seen ending: after a second with no report (PyroWave held the encoder, then
+    /// `Estimator::resume_at`, or another client) the rate before it is stale (#1433 seat B N1).
+    pub fn hold_off(&mut self, now: Instant) {
+        let seen = self
+            .held_at
+            .is_some_and(|at| now.saturating_duration_since(at) < HOLD_SEEN);
+        if let Some(rate) = self.hold_from.take().filter(|_| seen) {
+            self.rate = self.rate.max(rate);
+            self.back = true;
+        }
     }
 
     fn clamp(&self, kbps: f64) -> u32 {
@@ -1231,9 +1292,8 @@ mod tests {
         base + Duration::from_millis(ms)
     }
 
-    /// Down: two readings in a row under the rate by more than the deadband take the
-    /// setpoint to the higher of them at once, with no −12.5 % cap, and a deeper drop right
-    /// after is not held by a dwell. The window loop caps a step at −12.5 % and dwells 7 s.
+    /// Down: two readings in a row under the rate take the setpoint to the higher of them at
+    /// once, with no −12.5 % cap, and a deeper drop right after is not held by a dwell. The window loop caps a step at −12.5 % and dwells 7 s.
     #[test]
     fn per_report_down_takes_the_reading_in_one_move() {
         let base = Instant::now();
@@ -1264,24 +1324,122 @@ mod tests {
         assert_eq!(g.rate_kbps(), 800.0, "the rate does not");
     }
 
-    /// A report with no reading between two low ones breaks the run, and a reading inside
-    /// the deadband is none.
+    /// #1433: WebTransport's hold bounds the rate and the setpoint at once, with no reading run and
+    /// no write gap; a line over the setpoint moves neither, and the window loop has no hold.
     #[test]
-    fn per_report_a_broken_run_or_a_reading_in_the_deadband_holds() {
+    fn per_report_the_hold_bounds_the_rate_and_setpoint_at_once() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(1000), base);
+        assert_eq!(g.hold_to(3000.0, ms(base, 10)), Some(3000));
+        assert_eq!((g.rate_kbps(), g.setpoint_kbps()), (3000.0, 3000));
+        assert_eq!(g.hold_to(4000.0, ms(base, 20)), None);
+        assert_eq!(
+            g.hold_to(500.0, ms(base, 30)),
+            Some(1000),
+            "clamped to the floor"
+        );
+        assert_eq!(g.rate_kbps(), 500.0, "the rate is not");
+        let mut w = Governor::new(AbrConfig::new_smooth(1000, 10_000, 60), base);
+        assert_eq!(w.hold_to(3000.0, ms(base, 10)), None);
+    }
+
+    /// #1433 hold round: a hold that ends puts the rate, which the rung reads, back where the hold
+    /// found it, and the setpoint climbs to the estimate past the deadband once (with FEC charged
+    /// the estimate tops out under the ceiling: the deadband parked it up to 15 % low for good).
+    #[test]
+    fn per_report_a_hold_that_ends_climbs_all_the_way_back() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        g.hold_to(8000.0, ms(base, 10));
+        assert_eq!(
+            g.observe(9000.0, ms(base, 20)),
+            None,
+            "inside the deadband while held"
+        );
+        g.hold_off(ms(base, 20));
+        assert_eq!(g.rate_kbps(), 10_000.0);
+        assert_eq!(g.observe(9000.0, ms(base, 30)), Some(9000));
+        assert_eq!(
+            g.observe(9500.0, ms(base, 40)),
+            Some(9500),
+            "until it reaches the rate"
+        );
+        g.hold_off(ms(base, 50));
+        assert_eq!(g.rate_kbps(), 10_000.0, "no hold, nothing to restore");
+    }
+
+    /// #1433 seat B N1: a hold last refreshed over a second ago (PyroWave took the encoder, and its
+    /// step-down resumed the estimator with no hold) is not seen ending: the rate before it is
+    /// stale and stays where the resume put it. Old code: back to 10 000.
+    #[test]
+    fn per_report_a_hold_not_seen_ending_restores_nothing() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        g.hold_to(3000.0, ms(base, 10));
+        g.hold_off(ms(base, 1010));
+        assert_eq!(g.rate_kbps(), 3000.0);
+        g.hold_to(2000.0, ms(base, 1100));
+        g.hold_off(ms(base, 1150));
+        assert_eq!(g.rate_kbps(), 3000.0, "the next hold restores its own rate");
+    }
+
+    /// A report with no reading between two low ones breaks the run.
+    #[test]
+    fn per_report_a_broken_run_holds() {
         let base = Instant::now();
         let mut g = Governor::new(per_report(0), base);
         for i in 0..20 {
             let r = (i % 2 == 0).then_some(5000.0);
             assert_eq!(g.observe_report(r, ms(base, i * 100)), None);
         }
-        for i in 20..40 {
-            assert_eq!(
-                g.observe_report(Some(8600.0), ms(base, i * 100)),
-                None,
-                "inside 15 %"
-            );
-        }
         assert_eq!(g.setpoint_kbps(), 10_000);
+    }
+
+    /// #1503: a reading is under what left the wire, so it moves the setpoint however close
+    /// under the rate it is. With the 15 %
+    /// deadband a link at 0.86 × the setpoint held a sender 1.18–1.22× over its estimate
+    /// (lab 0.6.2, 2 Mbit/s), and RTT reached 1.5–3.6 s. Old code: no move.
+    #[test]
+    fn per_report_a_reading_inside_the_old_deadband_moves() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        g.observe_report(Some(8600.0), ms(base, 0));
+        assert_eq!(g.observe_report(Some(8600.0), ms(base, 100)), Some(8600));
+        assert_eq!(
+            g.observe_report(Some(8600.0), ms(base, 200)),
+            None,
+            "a reading at the rate is none"
+        );
+    }
+
+    /// #1433 review M4: a reading of 0 is no capacity
+    /// sample. Old code: the rate went to 0 and the up path, which multiplies it, never grew
+    /// again, whatever the estimate.
+    #[test]
+    fn per_report_a_zero_reading_is_no_reading() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        for i in 0..2 {
+            assert_eq!(g.observe_report(Some(0.0), ms(base, i * 100)), None);
+        }
+        assert_eq!(g.rate_kbps(), 10_000.0);
+        assert_eq!(g.setpoint_kbps(), 10_000);
+    }
+
+    /// `QUASAR_WT_CAPACITY=legacy`: a reading inside the deadband is none, as in 0.6.3.
+    #[test]
+    fn per_report_legacy_readings_keep_the_deadband() {
+        let base = Instant::now();
+        let cfg = AbrConfig {
+            legacy_readings: true,
+            ..per_report(0)
+        };
+        let mut g = Governor::new(cfg, base);
+        for i in 0..4 {
+            assert_eq!(g.observe_report(Some(8600.0), ms(base, i * 100)), None);
+        }
+        g.observe_report(Some(8400.0), ms(base, 400));
+        assert_eq!(g.observe_report(Some(8400.0), ms(base, 500)), Some(8400));
     }
 
     /// #68: with reports flowing, an estimate under the setpoint (a delay detector misreading

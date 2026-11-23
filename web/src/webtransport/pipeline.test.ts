@@ -52,6 +52,12 @@ describe("framing", () => {
     expect(Array.from(f.payload)).toEqual(Array.from(bytes(10, 1)));
   });
 
+  it("reads the recovery flag, bit 3 (#1348)", () => {
+    const [d] = packetize({ configId: 0, frameSeq: 9, keyframe: false, recovery: true, data: bytes(4, 0) });
+    expect(parseVideoDatagram(d)).toMatchObject({ keyframe: false, recovery: true, discardable: false });
+    expect(parseVideoDatagram(packetize({ configId: 0, frameSeq: 9, keyframe: false, data: bytes(4, 0) })[0])!.recovery).toBe(false);
+  });
+
   it("drops another channel and a frag_index past frag_count", () => {
     const [d] = packetize({ configId: 0, frameSeq: 1, keyframe: false, data: bytes(4, 0) });
     expect(parseVideoDatagram(Uint8Array.from([0x02, ...d.subarray(1)]))).toBeNull();
@@ -514,6 +520,33 @@ describe("FrameAssembler", () => {
     expect(a.miss(7, [[1, 1]]).needKeyframe).toBe(true); // a new wait asks at once
   });
 
+  it("ends a loss wait at a recovery frame, as at a keyframe, and drops the deltas before it (#1348)", () => {
+    const a = new FrameAssembler(() => 0);
+    a.push(unitOf(1, true)[0]);
+    a.push(unitOf(2, false, 2000)[0]);
+    a.push(unitOf(3, false)[0]);
+    expect(a.miss(2, [[1, 1]]).needKeyframe).toBe(true);
+    expect(seqs(a.push(unitOf(4, false)[0]))).toEqual([]);
+    const r = a.push(unitOf(5, false, 1, { recovery: true })[0]);
+    expect(r.units.map((u) => [u.frameSeq, u.keyframe, u.recovery])).toEqual([[5, false, true]]);
+    expect(seqs(a.push(unitOf(6, false)[0]))).toEqual([6]);
+  });
+
+  it("NACKs a recovery frame's missing fragment during a loss wait, as a keyframe's, and drops a delta's (#1348)", () => {
+    const a = new FrameAssembler(() => 0);
+    a.push(unitOf(1, true)[0]);
+    a.push(unitOf(2, false, 2000)[0]);
+    a.push(unitOf(3, false)[0]);
+    expect(a.miss(2, [[1, 1]]).needKeyframe).toBe(true);
+    const delta = unitOf(4, false, 3000);
+    a.push(delta[0]);
+    expect(a.push(delta[2]).nacks).toEqual([]);
+    const recovery = unitOf(5, false, 3000, { recovery: true });
+    a.push(recovery[0]);
+    expect(a.push(recovery[2]).nacks).toEqual([{ frameSeq: 5, frags: [[1, 1]] }]);
+    expect(seqs(a.push(recovery[1]))).toEqual([5]);
+  });
+
   it("gives a frame up at once on a nack_miss for a fragment it lacks", () => {
     const a = new FrameAssembler(() => 0);
     a.push(unitOf(1, true)[0]);
@@ -843,6 +876,71 @@ describe("DecodeStage", () => {
     expect(d.chunks.length).toBe(MAX_DECODE_QUEUE_HARD);
     expect(keyframes.every((k) => k === "late")).toBe(true);
     expect(keyframes.length).toBeGreaterThan(0);
+  });
+
+  describe("decoded, the newest frame given with its whole chain (§Feedback, #1348)", () => {
+    it("follows each unit given to the decoder, and a recovery frame decodes as a delta", async () => {
+      const { s, decoders } = stage();
+      expect(s.decoded).toBeNull();
+      s.config(config(0));
+      await flush();
+      s.unit(unit(0, 1, false)); // dropped: no keyframe yet
+      expect(s.decoded).toBeNull();
+      s.unit(unit(0, 2, true));
+      s.unit(unit(0, 3, false));
+      expect(s.decoded).toBe(3);
+      s.unit({ ...unit(0, 4, false), recovery: true });
+      expect(s.decoded).toBe(4);
+      expect(decoders[0].chunks.map((c) => c.type)).toEqual(["key", "delta", "delta"]);
+    });
+
+    it("is cleared by a new configuration, and a recovery frame does not end that wait", async () => {
+      const { s, decoders, keyframes } = stage();
+      s.config(config(0));
+      await flush();
+      s.unit(unit(0, 1, true));
+      s.config(config(1));
+      expect(s.decoded).toBeNull();
+      await flush();
+      s.unit({ ...unit(1, 2, false), recovery: true });
+      expect(s.decoded).toBeNull();
+      expect(keyframes).toEqual(["startup"]);
+      expect(decoders[0].configs).toHaveLength(2); // reconfigured once, for config 1 only
+      expect(decoders[0].chunks.map((c) => c.type)).toEqual(["key"]);
+    });
+
+    it("is cleared by a decoder error, until the restarted decoder takes a keyframe", async () => {
+      const { s, decoders } = stage();
+      s.config(config(0));
+      await flush();
+      s.unit(unit(0, 1, true));
+      decoders[0].fail();
+      expect(s.decoded).toBeNull();
+      await flush();
+      s.unit({ ...unit(0, 2, false), recovery: true });
+      expect(s.decoded).toBeNull();
+      s.unit(unit(0, 3, true));
+      expect(s.decoded).toBe(3);
+    });
+
+    it("is cleared by a skip to a keyframe and by leave()", async () => {
+      let t = 0;
+      const { s, decoders } = stage({ now: () => t });
+      s.config(config(0));
+      await flush();
+      s.unit(unit(0, 1, true));
+      decoders[0].holdOutput = true;
+      decoders[0].decodeQueueSize = MAX_DECODE_QUEUE + 1;
+      s.unit(unit(0, 2, false));
+      expect(s.decoded).toBe(2);
+      t = BACKLOG_MS + 1;
+      s.unit(unit(0, 3, false)); // the skip
+      expect(s.decoded).toBeNull();
+      s.unit(unit(0, 4, true));
+      expect(s.decoded).toBe(4);
+      s.leave();
+      expect(s.decoded).toBeNull();
+    });
   });
 
   it("re-creates a failed decoder and resumes at a keyframe", async () => {

@@ -171,7 +171,7 @@ index 7291766..bca461b 100644
 +{
 +  gint mark_idx = -1;           /* mark the picture long-term at this index */
 +  guint32 use_bitmap = 0;       /* code it from these long-term pictures */
-+  guint64 invalidate[16];       /* invalidate these input timestamps first */
++  guint64 invalidate[24];       /* anchor_pts[16] + recent[8]: cannot overflow */
 +  guint n_invalidate = 0;
 +};
 +
@@ -482,7 +482,7 @@ index ad2b5a0..b5e65dd 100644
 +      if (GST_CLOCK_TIME_IS_VALID (priv->anchor_pts[i]) &&
 +          priv->anchor_pts[i] > recover_from) {
 +        /* HEVC: the anchor may be older than recent[], so it goes too */
-+        if (!priv->anchor_h264)
++        if (!priv->anchor_h264 && ref->n_invalidate < G_N_ELEMENTS (ref->invalidate))
 +          ref->invalidate[ref->n_invalidate++] = priv->anchor_pts[i];
 +        priv->anchor_pts[i] = GST_CLOCK_TIME_NONE;
 +        if (priv->anchor_h264)
@@ -491,8 +491,8 @@ index ad2b5a0..b5e65dd 100644
 +    }
 +    for (guint i = 0; !priv->anchor_h264 && i < G_N_ELEMENTS (priv->recent);
 +        i++) {
-+      if (GST_CLOCK_TIME_IS_VALID (priv->recent[i]) &&
-+          priv->recent[i] > recover_from)
++      if (GST_CLOCK_TIME_IS_VALID (priv->recent[i]) && priv->recent[i] > recover_from
++          && ref->n_invalidate < G_N_ELEMENTS (ref->invalidate))
 +        ref->invalidate[ref->n_invalidate++] = priv->recent[i];
 +    }
 +  }
