@@ -25,8 +25,10 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Fixed
+
 - Reference recovery on H.264 (`QUASAR_WT_REF_RECOVERY=on`) works in Chrome with VA-API hardware decode: the Vulkan H.264 encoder no longer sets `gaps_in_frame_num_value_allowed_flag`, which made Mesa's VA-API decoder fail every recovery frame and Chrome restart the decoder and ask for a key frame.
 - The recovery actor skips an agent variable it does not know instead of refusing the machine (#1667): it logs `actor-agent-variable-unknown`, does not pass the variable to the agent, and `reconfigure` can unset it. A host that set a 0.6.4 variable can now be reverted to 0.6.5 or later without unsetting it first; reverting to 0.6.4 or older still needs the workaround in `docs/upgrading.md`.
+- **Flaky test: the PyroWave pacing timer's sub-millisecond wake test held an absolute 200 µs median, which a loaded CI runner missed (353 µs).** It now times the timerfd beside tokio's millisecond timer in the same run and asserts the timerfd wakes sooner and never early. Test-only.
 
 ## 0.6.4 — 2026-11-24
 
