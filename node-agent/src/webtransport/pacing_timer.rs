@@ -164,33 +164,47 @@ fn expirations(fd: &OwnedFd) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    /// Real clock: 200 waits of 300 µs, the lateness of each wake. tokio's timer wakes on the
-    /// next millisecond tick (p50 ~0.75 ms late here); the timerfd's p50 is ~3 µs alone and
-    /// ~14 µs beside the whole parallel suite. Only the median is held: under that suite the
-    /// p95 is the test thread waiting for a CPU (1.3 ms measured), not the timer.
+    /// Real clock: 200 waits of 300 µs on the timerfd, each beside one on tokio's timer, which
+    /// wakes on the next millisecond tick (p50 ~0.75 ms late on an idle machine; the timerfd's
+    /// ~3 µs). The two are interleaved and compared, not held to a fixed bound: on a loaded CI
+    /// runner both are late by the wait for a CPU (timerfd p50 353 µs seen), but the timerfd
+    /// still wakes before tokio's tick.
     #[tokio::test]
     async fn a_sub_millisecond_wait_wakes_close_to_its_deadline() {
         let mut timer = PacingTimer::new();
         assert!(timer.0.is_some(), "no timerfd");
-        let mut late: Vec<i64> = Vec::new();
-        for _ in 0..200 {
-            let at = Instant::now() + Duration::from_micros(300);
-            timer.sleep_until(at).await;
+        let lateness = |at: Instant| {
             let now = Instant::now();
-            late.push(if now >= at {
+            if now >= at {
                 (now - at).as_micros() as i64
             } else {
                 -((at - now).as_micros() as i64)
-            });
+            }
+        };
+        let (mut fd, mut tick): (Vec<i64>, Vec<i64>) = (Vec::new(), Vec::new());
+        for _ in 0..200 {
+            let at = Instant::now() + Duration::from_micros(300);
+            timer.sleep_until(at).await;
+            fd.push(lateness(at));
+            let at = Instant::now() + Duration::from_micros(300);
+            tokio::time::sleep_until(at).await;
+            tick.push(lateness(at));
         }
-        late.sort_unstable();
-        let (p50, p95) = (late[100], late[190]);
+        // A timerfd that fell back to tokio mid-run would make the comparison a coin flip.
+        assert!(timer.precise(), "the timerfd fell back during the run");
+        fd.sort_unstable();
+        tick.sort_unstable();
         eprintln!(
-            "timerfd wake late by: min {} p50 {p50} p95 {p95} max {} us",
-            late[0], late[199]
+            "wake late by (us): timerfd p50 {} p95 {} · tokio p50 {} p95 {}",
+            fd[100], fd[190], tick[100], tick[190]
         );
-        assert!(late[0] >= 0, "woke early: {late:?}");
-        assert!(p50 < 200, "p50 {p50} us, p95 {p95} us");
+        assert!(fd[0] >= 0, "woke early: {fd:?}");
+        assert!(
+            fd[100] < tick[100],
+            "timerfd p50 {} us is not under tokio's {} us",
+            fd[100],
+            tick[100]
+        );
     }
 
     /// A sleep the send loop drops mid-wait leaves the timer armed; the next one still waits
