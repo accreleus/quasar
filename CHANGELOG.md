@@ -24,6 +24,10 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Fixed
+
+- **Flaky test: the PyroWave pacing timer's sub-millisecond wake test held an absolute 200 µs median, which a loaded CI runner missed (353 µs).** It now times the timerfd beside tokio's millisecond timer in the same run and asserts the timerfd wakes sooner and never early. Test-only.
+
 ## 0.6.4 — 2026-11-24
 
 ### Upgrading
