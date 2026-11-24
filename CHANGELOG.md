@@ -26,6 +26,8 @@ own; the two do not move together, and that is deliberate.
 
 ### Fixed
 - **WebTransport capacity detection v2 (`QUASAR_WT_CAPACITY=v2`, opt-in) no longer climbs into a deep policer bucket after a Wi-Fi burst, and the browser leaves a reordering link sooner (#1652, #1446).** A burst that looks like Wi-Fi now releases the hold only after a probe proves the rate it was set from; a policer that drops only on the encoder's busy bursts no longer passes for Wi-Fi; a refused probe repair is no longer counted as sent and uses no sequence number. The keyframe the browser asks for after a Wi-Fi burst is no longer held back by the pacer, and a keyframe no longer stops a later burst from counting as Wi-Fi. The browser falls back to WebRTC when frames are given up in 3 of the last 5 seconds on a reordering link, not only 3 in a row.
+- The recovery actor skips an agent variable it does not know instead of refusing the machine (#1667): it logs `actor-agent-variable-unknown`, does not pass the variable to the agent, and `reconfigure` can unset it. A host that set a 0.6.4 variable can now be reverted to 0.6.5 or later without unsetting it first; reverting to 0.6.4 or older still needs the workaround in `docs/upgrading.md`.
+- **Flaky test: the PyroWave pacing timer's sub-millisecond wake test held an absolute 200 µs median, which a loaded CI runner missed (353 µs).** It now times the timerfd beside tokio's millisecond timer in the same run and asserts the timerfd wakes sooner and never early. Test-only.
 
 ## 0.6.4 — 2026-11-24
 

@@ -892,7 +892,13 @@ pub fn validate(inputs: &Inputs) -> Result<(), RenderError> {
             )));
         }
     }
-    for (name, value) in &inputs.agent_variables {
+    // A name this build does not know came from a later release's state (#1667): kept in the
+    // state, never validated or rendered, so a revert does not wedge the machine.
+    for (name, value) in inputs
+        .agent_variables
+        .iter()
+        .filter(|(n, _)| is_agent_variable(n))
+    {
         check_agent_variable(name, value)?;
     }
     if let Some(control) = &inputs.control {
@@ -1137,11 +1143,6 @@ pub fn is_agent_variable(name: &str) -> bool {
 }
 
 fn check_agent_variable(name: &str, value: &str) -> Result<(), RenderError> {
-    if !is_agent_variable(name) {
-        return Err(RenderError::Invalid(format!(
-            "{name} is not an agent variable"
-        )));
-    }
     if value.contains(['\n', '\r', '\0']) || value.len() > 4096 {
         return Err(RenderError::Invalid(format!(
             "{name} holds a line break or is longer than 4096 bytes"
@@ -1271,7 +1272,17 @@ fn node_agent_r1(inputs: &Inputs, image: &ImageRef, secrets: &SecretMounts) -> C
         gpus.push(GpuRequest::nvidia_all(GpuInjection::DeviceRequest));
     }
     // Last, so an operator's value wins over every default above.
-    env.extend(inputs.agent_variables.clone());
+    for (name, value) in &inputs.agent_variables {
+        if is_agent_variable(name) {
+            env.insert(name.clone(), value.clone());
+        } else {
+            tracing::warn!(
+                token = "actor-agent-variable-unknown",
+                variable = ?name,
+                "skipping an agent variable this actor does not know (set by a later release); not passed to the agent"
+            );
+        }
+    }
     binds.sort_by(|a, b| a.target.cmp(&b.target));
 
     ContainerSpec {
