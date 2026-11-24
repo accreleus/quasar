@@ -2,7 +2,8 @@
 # #1663: build PyroWave at the pinned refs the way deploy/Dockerfile.vulkan does, with the vendored
 # Granite patch (or without it: --unpatched), and run borrowed_wait.cpp on lavapipe in the dev image.
 # Passes when the library makes no vkDeviceWaitIdle call on a borrowed device and the Khronos
-# validation layer reports nothing (no object freed while Granite's own work is in flight).
+# validation layer reports nothing (no object freed while Granite's own work is in flight), in three
+# runs: plain, with every teardown submit failing (must not hang), and without timeline semaphores.
 # No GPU needed; needs network (clones PyroWave and Granite, installs the validation layer).
 #
 #   scripts/dev/pyrowave-borrowed-wait/check.sh [--unpatched]     IMAGE defaults to quasar-agent-dev:latest
@@ -27,9 +28,13 @@ cmake --build build --target pyrowave-shared pyrowave-device-validation >/dev/nu
 cmake --install build >/dev/null
 g++ -std=c++17 -O1 -I/tmp/pw/include /check/borrowed_wait.cpp -L/tmp/pw/lib64 -lpyrowave-shared -lvulkan -o /tmp/borrowed_wait
 dnf install -y -q vulkan-validation-layers >/dev/null
-rc=0; LD_LIBRARY_PATH=/tmp/pw/lib64 VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation /tmp/borrowed_wait >/tmp/out 2>&1 || rc=$?
-cat /tmp/out
-# VUID-vkCmdDraw-None-09600 is the decoder fragment path on lavapipe, unpatched too. Dropping the
-# wait in the patch shows as VUID-vkDestroyBuffer-buffer-00922 (destroyed while in use).
-if grep -o "Validation Error: \[ [^ ]*" /tmp/out | grep -v VUID-vkCmdDraw-None-09600; then echo "FAIL: validation errors"; exit 1; fi
-exit $rc'
+fail=0
+for mode in "" --fail-submits --no-timeline; do
+  rc=0; LD_LIBRARY_PATH=/tmp/pw/lib64 VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation timeout 120 /tmp/borrowed_wait $mode >/tmp/out 2>&1 || rc=$?
+  echo "== borrowed_wait ${mode:-(plain)}: exit $rc (124 = hung)"; cat /tmp/out
+  # VUID-vkCmdDraw-None-09600 is the decoder fragment path on lavapipe, unpatched too. Dropping the
+  # wait in the patch shows as VUID-vkDestroyBuffer-buffer-00922 (destroyed while in use).
+  if grep -o "Validation Error: \[ [^ ]*" /tmp/out | grep -v VUID-vkCmdDraw-None-09600; then echo "FAIL: validation errors"; rc=1; fi
+  [ "$rc" = 0 ] || fail=1
+done
+exit $fail'

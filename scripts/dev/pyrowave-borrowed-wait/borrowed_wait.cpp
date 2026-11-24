@@ -1,6 +1,8 @@
 // #1663: on a borrowed VkDevice PyroWave must never call vkDeviceWaitIdle (other users submit on
 // its queues without PyroWave's lock). Creates a device on lavapipe, lends it to PyroWave, submits
 // decode work, destroys everything at once, and counts vkDeviceWaitIdle calls from the library.
+// --fail-submits: every queue submit from teardown on fails (out of device memory); teardown must
+// not wait for work that was never submitted. --no-timeline: the device has no timeline semaphores.
 // Run by check.sh; validation errors (resources freed while in flight) are read from its output.
 #include <pyrowave/pyrowave.h>
 #include <cstdio>
@@ -9,8 +11,20 @@
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL: %s (line %d)\n", #x, __LINE__); return 2; } } while (0)
 
-static int wait_idle_calls, lock_depth, lock_calls;
+static int wait_idle_calls, lock_depth, lock_calls, failed_submits;
+static bool fail_submits;
 static PFN_vkGetDeviceProcAddr real_gdpa;
+static PFN_vkQueueSubmit2 real_submit2;
+
+static VKAPI_ATTR VkResult VKAPI_CALL failing_submit2(VkQueue queue, uint32_t count, const VkSubmitInfo2 *submits, VkFence fence)
+{
+	if (fail_submits)
+	{
+		failed_submits++;
+		return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+	}
+	return real_submit2(queue, count, submits, fence);
+}
 
 static VKAPI_ATTR VkResult VKAPI_CALL counting_wait_idle(VkDevice device)
 {
@@ -22,6 +36,15 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hooked_gdpa(VkDevice device, con
 {
 	if (!strcmp(name, "vkDeviceWaitIdle"))
 		return (PFN_vkVoidFunction)counting_wait_idle;
+	if (!strcmp(name, "vkQueueSubmit2") || !strcmp(name, "vkQueueSubmit2KHR"))
+	{
+		// The KHR alias is null unless its extension is enabled; keep the core entry point.
+		auto real = (PFN_vkQueueSubmit2)real_gdpa(device, name);
+		if (!real)
+			return nullptr;
+		real_submit2 = real;
+		return (PFN_vkVoidFunction)failing_submit2;
+	}
 	return real_gdpa(device, name);
 }
 
@@ -34,8 +57,15 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hooked_gipa(VkInstance instance,
 	return vkGetInstanceProcAddr(instance, name);
 }
 
-int main()
+int main(int argc, char **argv)
 {
+	bool arm_failure = false, no_timeline = false;
+	for (int i = 1; i < argc; i++)
+	{
+		arm_failure |= !strcmp(argv[i], "--fail-submits");
+		no_timeline |= !strcmp(argv[i], "--no-timeline");
+	}
+
 	VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
 	app.apiVersion = VK_API_VERSION_1_3;
 	VkInstanceCreateInfo ici = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
@@ -54,6 +84,8 @@ int main()
 	VkPhysicalDeviceVulkan11Features f11 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12 };
 	VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f11 };
 	vkGetPhysicalDeviceFeatures2(gpu, &f2);
+	if (no_timeline)
+		f12.timelineSemaphore = VK_FALSE;
 
 	float priority = 1.0f;
 	VkDeviceQueueCreateInfo qci = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
@@ -112,11 +144,14 @@ int main()
 	CHECK(pyrowave_decoder_decode_cpu_buffer_async(decoder, &buf, 0) == PYROWAVE_SUCCESS);
 
 	// Tear down with that work in flight: Granite must wait for it, not for the device.
+	fail_submits = arm_failure;
 	pyrowave_decoder_destroy(decoder);
 	pyrowave_device_destroy(pyro);
 
 	CHECK(lock_depth == 0);
-	printf("borrowed device: vkDeviceWaitIdle calls=%d, queue lock calls=%d\n", wait_idle_calls, lock_calls);
+	CHECK(!arm_failure || failed_submits > 0);
+	printf("borrowed device: vkDeviceWaitIdle calls=%d, queue lock calls=%d, failed submits=%d\n", wait_idle_calls,
+	       lock_calls, failed_submits);
 	vkDestroyDevice(device, nullptr);
 	vkDestroyInstance(instance, nullptr);
 	return wait_idle_calls == 0 ? 0 : 1;

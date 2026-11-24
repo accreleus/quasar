@@ -2,7 +2,7 @@
 
 Applied by `deploy/Dockerfile.vulkan` to the Granite checkout that PyroWave's
 `checkout_granite.sh` makes, after the `GRANITE_REF` check and before the CMake build.
-Every file here is a toolchain input (`deploy/toolchain-hash.sh`).
+Every patch here is a toolchain input (`deploy/toolchain-hash.sh`).
 
 | Patch | Why |
 |---|---|

@@ -12,9 +12,25 @@ waited forever with the GPU idle.
 On a borrowed device Granite now waits only for its own submissions: every one is
 recorded in a frame (a per-queue timeline value, or a fence without timeline
 semaphores), so waiting each frame covers all queues Granite submits to before it
-frees anything. The owned-device path is unchanged. Applied to Granite at
-GRANITE_REF by deploy/Dockerfile.vulkan; re-apply on every PyroWave/Granite bump.
-One vkDeviceWaitIdle stays reachable on a borrowed device: breadcrumbs.cpp
+frees anything. A frame now records a submit's timeline value only once
+vkQueueSubmit2 succeeded: a failed submit signals nothing, and waiting for its value
+would hang. Without timeline semaphores a failed fence submit still leaves its fence
+in the frame (unchanged upstream behaviour); Quasar never takes that path, since its
+device is Vulkan 1.3 with every supported feature enabled and timelineSemaphore is
+required from 1.2.
+
+Two assumptions this rests on:
+- Context::destroy_device skips its wait because Device::~Device already waited; that
+  holds only while the Device is destroyed before its Context (PyroWave's opaque
+  device declares the Context first, pyrowave_c.cpp).
+- Submits of a borrowed command buffer (submit_external) are not recorded in a frame;
+  they are safe only because Quasar waits each on its own fence before returning
+  (gst-pyrowave gpu.rs Shared::submit). Making that submit asynchronous needs this
+  patch revisited.
+
+The owned-device path is unchanged. Applied to Granite at GRANITE_REF by
+deploy/Dockerfile.vulkan; re-apply on every PyroWave/Granite bump. One
+vkDeviceWaitIdle stays reachable on a borrowed device: breadcrumbs.cpp
 notify_device_hung, only with Granite post-mortem on (off in Quasar) after a hang.
 
 diff --git a/vulkan/context.cpp b/vulkan/context.cpp
@@ -49,10 +65,48 @@ index b36a7dc7..ce16cafc 100644
  	{
  		return ext;
 diff --git a/vulkan/device.cpp b/vulkan/device.cpp
-index ee4298ce..5ca62ece 100644
+index ee4298ce..2e29adbf 100644
 --- a/vulkan/device.cpp
 +++ b/vulkan/device.cpp
-@@ -2655,7 +2655,16 @@ void Device::wait_idle_nolock()
+@@ -1445,7 +1445,6 @@ void Device::submit_empty_inner(QueueIndices physical_type, InternalFence *fence
+ 	VkSemaphore timeline_semaphore = data.timeline_semaphore;
+ 	uint64_t timeline_value = ++data.current_timeline;
+ 	VkQueue queue = queue_info.queues[physical_type];
+-	frame().timeline_fences[physical_type] = data.current_timeline;
+ 
+ 	// Add external wait semaphores.
+ 	Helper::WaitSemaphores wait_semaphores;
+@@ -1472,6 +1471,10 @@ void Device::submit_empty_inner(QueueIndices physical_type, InternalFence *fence
+ 
+ 	auto start_ts = write_calibrated_timestamp_nolock();
+ 	auto result = submit_batches(composer, queue, cleared_fence);
++	// Only a submit that succeeded will signal timeline_value; a frame waiting for a value
++	// nothing signals waits forever (no vkDeviceWaitIdle covers it on a borrowed device).
++	if (result == VK_SUCCESS)
++		frame().timeline_fences[physical_type] = timeline_value;
+ 	auto end_ts = write_calibrated_timestamp_nolock();
+ 	register_time_interval_nolock("CPU", std::move(start_ts), std::move(end_ts), "submit");
+ 
+@@ -1898,7 +1901,6 @@ void Device::submit_queue(QueueIndices physical_type, InternalFence *fence,
+ 	uint64_t timeline_value = ++data.current_timeline;
+ 
+ 	VkQueue queue = queue_info.queues[physical_type];
+-	frame().timeline_fences[physical_type] = data.current_timeline;
+ 
+ 	Helper::BatchComposer composer(get_device_features().supports_low_latency2_nv ? wsi.low_latency.present_id : 0);
+ 	Helper::WaitSemaphores wait_semaphores;
+@@ -1972,6 +1974,10 @@ void Device::submit_queue(QueueIndices physical_type, InternalFence *fence,
+ 
+ 	auto start_ts = write_calibrated_timestamp_nolock();
+ 	auto result = submit_batches(composer, queue, cleared_fence, profiling_iteration);
++	// Only a submit that succeeded will signal timeline_value; a frame waiting for a value
++	// nothing signals waits forever (no vkDeviceWaitIdle covers it on a borrowed device).
++	if (result == VK_SUCCESS)
++		frame().timeline_fences[physical_type] = timeline_value;
+ 	auto end_ts = write_calibrated_timestamp_nolock();
+ 	register_time_interval_nolock("CPU", std::move(start_ts), std::move(end_ts), "submit");
+ 
+@@ -2655,7 +2661,16 @@ void Device::wait_idle_nolock()
  	if (!per_frame.empty())
  		end_frame_nolock();
  
