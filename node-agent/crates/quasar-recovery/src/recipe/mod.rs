@@ -1278,7 +1278,7 @@ fn node_agent_r1(inputs: &Inputs, image: &ImageRef, secrets: &SecretMounts) -> C
         } else {
             tracing::warn!(
                 token = "actor-agent-variable-unknown",
-                variable = %name,
+                variable = ?name,
                 "skipping an agent variable this actor does not know (set by a later release); not passed to the agent"
             );
         }
