@@ -24,6 +24,8 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+## 0.6.4 — 2026-11-24
+
 ### Upgrading
 - **Platform releases are signed and verified by default (#621).** A machine whose recovery actor reaches GitHub only through an HTTPS proxy, through a mirror behind a private certificate authority, or not at all refuses every stable apply with `signature_invalid` (the console still offers the release) until it runs `docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_UPDATER_SIGNATURE_MODE=off`. A machine that recorded a signature mode keeps it. The releases published before this one (v0.4.0 to v0.6.3) get their signature uploaded by the maintainer; a named apply or revert to a release with no signature is refused `signature_missing`. See [Signing platform releases](docs/upgrading.md#signing-platform-releases).
 
