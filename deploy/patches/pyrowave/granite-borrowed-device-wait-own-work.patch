@@ -1,0 +1,70 @@
+Quasar-authored. Issue #1663: a PyroWave stop could hang the agent forever on NVIDIA.
+
+The pyrowaveenc element hands PyroWave the session's shared VkDevice (borrowed:
+Granite's Context has owned_device = false). Granite still called vkDeviceWaitIdle
+on it, in Device::wait_idle_nolock (device destroy, and init_frame_contexts at
+create) holding only the one queue lock it is given, and again in
+Context::destroy_device with no lock at all. vkDeviceWaitIdle needs every queue of
+the device externally synchronised; the compositor and the Vulkan video encoder keep
+submitting on that device while PyroWave is torn down, and NVIDIA 615.78.08 then
+waited forever with the GPU idle.
+
+On a borrowed device Granite now waits only for its own submissions: every one is
+recorded in a frame (a per-queue timeline value, or a fence without timeline
+semaphores), so waiting each frame covers all queues Granite submits to before it
+frees anything. The owned-device path is unchanged. Applied to Granite at
+GRANITE_REF by deploy/Dockerfile.vulkan; re-apply on every PyroWave/Granite bump.
+
+diff --git a/vulkan/context.cpp b/vulkan/context.cpp
+index ad9e9c8b..85856ecb 100644
+--- a/vulkan/context.cpp
++++ b/vulkan/context.cpp
+@@ -294,7 +294,9 @@ bool Context::init_device_from_instance(VkInstance instance_, VkPhysicalDevice g
+ 
+ void Context::destroy_device()
+ {
+-	if (device != VK_NULL_HANDLE)
++	// A borrowed device has other users submitting on its queues without our lock;
++	// Device::~Device already waited for Granite's own work.
++	if (owned_device && device != VK_NULL_HANDLE)
+ 		device_table.vkDeviceWaitIdle(device);
+ 
+ #if defined(ANDROID) && defined(HAVE_SWAPPY)
+diff --git a/vulkan/context.hpp b/vulkan/context.hpp
+index b36a7dc7..ce16cafc 100644
+--- a/vulkan/context.hpp
++++ b/vulkan/context.hpp
+@@ -355,6 +355,11 @@ public:
+ 		owned_device = false;
+ 	}
+ 
++	bool owns_device() const
++	{
++		return owned_device;
++	}
++
+ 	const DeviceFeatures &get_enabled_device_features() const
+ 	{
+ 		return ext;
+diff --git a/vulkan/device.cpp b/vulkan/device.cpp
+index ee4298ce..5ca62ece 100644
+--- a/vulkan/device.cpp
++++ b/vulkan/device.cpp
+@@ -2655,7 +2655,16 @@ void Device::wait_idle_nolock()
+ 	if (!per_frame.empty())
+ 		end_frame_nolock();
+ 
+-	if (device != VK_NULL_HANDLE)
++	if (device != VK_NULL_HANDLE && ctx && !ctx->owns_device())
++	{
++		// Borrowed device: other users submit on its queues without our queue lock, so
++		// vkDeviceWaitIdle would be externally unsynchronised. Every Granite submission is
++		// tracked by a frame (timeline value or fence), so waiting the frames covers our own work.
++		for (auto &frame : per_frame)
++			if (!frame->wait(UINT64_MAX))
++				LOGE("Waiting for own submissions on a borrowed device failed.\n");
++	}
++	else if (device != VK_NULL_HANDLE)
+ 	{
+ 		if (queue_lock_callback)
+ 			queue_lock_callback();
