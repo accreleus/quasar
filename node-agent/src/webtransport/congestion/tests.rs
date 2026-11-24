@@ -146,6 +146,13 @@ struct Sim {
     /// The `pkt_seq`s whose NACK reached the agent: answered through the agent's queue, as
     /// production answers a `nack`.
     nacked: Vec<u32>,
+    /// Chrome's QUIC (#1446): a datagram arriving over this long (µs) after one sent later is
+    /// discarded unread, as lost to the page as a drop. `None`: every arrival is read.
+    discard_us: Option<u64>,
+    /// (`pkt_seq`, arrival, the `pkt_seq` it resends) of datagrams a later one may still overtake.
+    in_air: VecDeque<(u32, u64, Option<u32>)>,
+    /// Datagrams `discard_us` threw away.
+    discarded: u32,
 }
 
 /// The browser's reassembly (`web/src/webtransport/reassembly.ts`) and decoder, simulated: a
@@ -413,6 +420,9 @@ impl Sim {
             probes: Vec::new(),
             probe_frame: None,
             nacked: Vec::new(),
+            discard_us: None,
+            in_air: VecDeque::new(),
+            discarded: 0,
         }
     }
 
@@ -651,6 +661,14 @@ impl Sim {
         let arrival = self.path(bytes, dropped, seq);
         self.tx.push((self.t, arrival.is_none()));
         self.pending.push_back((seq, arrival));
+        let of = self
+            .client
+            .as_ref()
+            .and_then(|c| c.resend_of.get(&seq).copied());
+        if let (Some(h), Some(a)) = (self.discard_us, arrival) {
+            self.discard_overtaken(a, h);
+            self.in_air.push_back((seq, a, of));
+        }
         if let Some(client) = self.client.as_mut() {
             match client.resend_of.remove(&seq) {
                 // The web client NACKs a fragment twice at most: a lost first resend is asked for
@@ -668,6 +686,43 @@ impl Sim {
             }
         }
         arrival
+    }
+
+    /// `discard_us`: what arrives over `h` after `overtaker` (an arrival just put on the path) is
+    /// lost, to the reports and to the client, which NACKs it as a drop.
+    fn discard_overtaken(&mut self, overtaker: u64, h: u64) {
+        let late: Vec<(u32, Option<u32>)> = self
+            .in_air
+            .iter()
+            .filter(|r| r.1 > overtaker + h)
+            .map(|r| (r.0, r.2))
+            .collect();
+        // Nothing sent from now on arrives before `last_arrival`: what lands by it plus `h` is safe.
+        let safe = self.last_arrival + h;
+        self.in_air.retain(|r| r.1 <= overtaker + h && r.1 > safe);
+        self.discarded += late.len() as u32;
+        for (seq, of) in late {
+            if let Some(p) = self.pending.iter_mut().find(|p| p.0 == seq) {
+                p.1 = None;
+            }
+            let Some(c) = self.client.as_mut() else {
+                continue;
+            };
+            match of {
+                Some(of) => {
+                    c.resent.insert(of, None);
+                    if c.renacked.insert(of) {
+                        c.nacks.push_back((self.t + 2 * NACK_US, of));
+                    }
+                }
+                None => {
+                    c.arrived.insert(seq, None);
+                    if !self.probe_seqs.contains(&seq) {
+                        c.nacks.push_back((self.t + NACK_US, seq));
+                    }
+                }
+            }
+        }
     }
 
     /// `bytes` onto the bottleneck now (unless `dropped` on the way); arrival on the agent's
@@ -6479,6 +6534,12 @@ fn lab_rows_over_a_random_loss_floor_keep_the_hold() {
         hw_summary(&format!("{name} legacy"), &lab_hw_row(true, shape, 120.0));
         let s = lab_hw_row(false, shape, 120.0);
         let (freezes, _) = hw_summary(&format!("{name} v2"), &s);
+        // #1652: R3 + 2 % stalled at 205.8 s (a stale drop with nothing held to skip to).
+        assert!(
+            late_stalls(&s).is_empty(),
+            "{name}: stalls {:?}",
+            late_stalls(&s)
+        );
         let shaped: Vec<_> = freezes.iter().filter(|&&t| t < 210.0).collect();
         // R3 + 2 %: 2 since NACK answers are paced and reported (lab V3 sim facts): a
         // `burst-not-capacity` release 5 s before the clear, then a stale drop. Lab check.
@@ -6819,4 +6880,185 @@ fn the_pacing_judgement_is_traced_twice_a_second_and_at_once_when_the_cap_change
     ] {
         assert!(lines[3].contains(want), "{want}: {}", lines[3]);
     }
+}
+
+/// #1652 rows: seconds a lab row spent at rung `rung` or deeper (1: under 1080p, 4: 360p) between
+/// `from` and `to`.
+fn time_at(s: &Sim, rung: usize, from: f64, to: f64) -> f64 {
+    let mut rungs = s.rungs.clone();
+    rungs.push((f64::MAX, 0));
+    rungs
+        .windows(2)
+        .filter(|w| w[0].1 >= rung)
+        .map(|w| (w[1].0.min(to) - w[0].0.max(from)).max(0.0))
+        .sum()
+}
+
+/// (freezes from `from` until `to`, seconds under 1080p over the same span, seconds after `to` until
+/// 1080p for good), printed beside `name`.
+fn row(name: &str, s: &Sim, from: f64, to: f64) -> (usize, f64, Option<f64>) {
+    let freezes = s.client.as_ref().unwrap().freezes();
+    let n = freezes.iter().filter(|&&t| (from..to).contains(&t)).count();
+    let under = time_at(s, 1, from, to);
+    let back = match s.rungs.last() {
+        Some(&(t, 0)) => Some((t - to).max(0.0)),
+        _ => None,
+    };
+    eprintln!(
+        "{name}: freezes {n}, {under:.1} s under 1080p, back {back:?} s after {to} s; stalls {:?}",
+        s.stalls
+    );
+    (n, under, back)
+}
+
+/// A policer with a bucket of `bucket_s` at `kbps` from 30 s for 180 s (at `first_kbps` for the
+/// first 60 s), then clean for 120 s, under `Sim::lab_hw`, with 300 ms Wi-Fi bursts losing 40 % every
+/// 7 s from 10 s to the end of the shaping when `wifi`.
+fn deep_bucket_row(legacy: bool, first_kbps: f64, kbps: f64, bucket_s: f64, wifi: bool) -> Sim {
+    let mut s = Sim::lab_hw(legacy);
+    if wifi {
+        s.loss_at = Box::new(|t| {
+            match (10_000_000..210_000_000).contains(&t) && (t - 10_000_000) % 7_000_000 < 300_000 {
+                true => 0.4,
+                false => 0.0,
+            }
+        });
+    }
+    s.run(30.0);
+    policer(&mut s);
+    s.cap_kbps = first_kbps;
+    s.bucket_bytes = Some(kbps * 125.0 * bucket_s);
+    (s.tokens, s.tokens_at) = (15_000.0, s.t);
+    s.run(60.0);
+    s.cap_kbps = kbps;
+    s.run(120.0);
+    s.clear();
+    s.run(120.0);
+    s
+}
+
+/// #1652 (1): Wi-Fi bursts over a 5000 kbit/s policer with a 1 MB bucket (1.6 s). A burst that ends
+/// the hold as "not capacity" lets the estimate climb unheld into the bucket, and the next hold
+/// comes only once the bucket has drained (base 8fc7478e: 25 freezes, legacy 13). #1652 (2): 2500
+/// kbit/s for 60 s, then 6600 with a 1.95 s bucket. A probe step under 1.37 × the policer passes
+/// clean on the bucket's credit and may land the line at up to (0.7225 + 0.139 × 1.95) = 0.993 × it.
+/// Not reproduced at the base: v2 0-2 freezes, legacy 6-8, top line at most 0.90 × the policer, for
+/// 1500-6600 first and 1.7-1.95 s buckets; kept as a guard. No more freezes past the onset's cut than
+/// legacy, and both back at 1080p within 30 s of the clear.
+#[test]
+fn deep_bucket_policers_freeze_no_more_than_legacy() {
+    let mut bad = Vec::new();
+    for (name, first, kbps, bucket_s, wifi) in [
+        ("5000, 1 MB + Wi-Fi", 5000.0, 5000.0, 1.6, true),
+        ("2500 then 6600, 1.95 s", 2500.0, 6600.0, 1.95, false),
+    ] {
+        let (a, _, a_back) = row(
+            &format!("{name} legacy"),
+            &deep_bucket_row(true, first, kbps, bucket_s, wifi),
+            35.0,
+            210.0,
+        );
+        let s = deep_bucket_row(false, first, kbps, bucket_s, wifi);
+        let (n, _, back) = row(&format!("{name} v2"), &s, 35.0, 210.0);
+        let top = s
+            .lines
+            .iter()
+            .filter(|l| (100.0..210.0).contains(&l.0))
+            .filter_map(|l| l.1)
+            .fold(0.0, f64::max);
+        eprintln!("  v2 top line from 100 s {:.2} x the policer", top / kbps);
+        if n > a || back.is_none_or(|b| b > 30.0) {
+            bad.push(format!(
+                "{name}: v2 {n} freezes back {back:?}, legacy {a} back {a_back:?}"
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// Seat A (#1652): the Wi-Fi memory is renewed by any short burst that is not a keyframe's. Wi-Fi
+/// bursts from 10 to 40 s set and release a hold (the memory is set), then from 45 s a 12000 kbit/s
+/// policer with a 40 kB bucket, over the 9920 sent on average (video and FEC), drops only during the
+/// content's busy bursts (2 × for 300 ms every 10 s). Each run is under a second and renewed the
+/// memory, so no hold was ever set: the policer must set one.
+#[test]
+fn an_encoder_burst_over_a_policer_does_not_renew_the_wifi_memory() {
+    let run = |legacy: bool| {
+        let mut s = Sim::lab(legacy);
+        s.loss_at = Box::new(|t| {
+            match (10_000_000..40_000_000).contains(&t) && (t - 10_000_000) % 4_000_000 < 300_000 {
+                true => 0.3,
+                false => 0.0,
+            }
+        });
+        s.content_gain = Box::new(|t| match t % 10_000_000 < 300_000 {
+            true => 2.0,
+            false => 1.0,
+        });
+        s.run(45.0);
+        s.cap_kbps = 12_000.0;
+        s.bucket_bytes = Some(40_000.0);
+        (s.tokens, s.tokens_at) = (40_000.0, s.t);
+        s.run(120.0);
+        s
+    };
+    row("legacy", &run(true), 45.0, 165.0);
+    let s = run(false);
+    row("v2", &s, 45.0, 165.0);
+    let released = s.lines.iter().any(|&(t, l)| t < 45.0 && l.is_some());
+    eprintln!(
+        "v2: a hold before 45 s {released}, the Wi-Fi memory at 45 s set; loss after 45 s {:.3}",
+        s.loss_after(45.0)
+    );
+    let held = s.lines.iter().any(|&(t, l)| t >= 45.0 && l.is_some());
+    assert!(held, "no hold over the policer");
+}
+
+/// A lab row on a clean 50 Mbit/s link that reorders from 30 s for 180 s: each datagram delayed
+/// 0 to 2 × `spread_ms` more (the lab's `delay 10ms 10ms`-style shape, #1446), and Chrome's QUIC
+/// discarding a datagram that arrives over `DISCARD_US` after a later one, then clean for 60 s.
+fn reorder_row(legacy: bool, spread_ms: u64) -> Sim {
+    let mut s = Sim::lab_hw(legacy);
+    s.discard_us = Some(DISCARD_US);
+    s.run(30.0);
+    let span = 2 * spread_ms * 1000;
+    s.reorder_us = Box::new(move |seq| u64::from(seq).wrapping_mul(2_654_435_761) % span);
+    s.hold_us = span + 5_000;
+    s.run(180.0);
+    s.reorder_us = Box::new(|_| 0);
+    s.run(60.0);
+    s
+}
+
+/// The overtaking Chrome's QUIC tolerates before it discards (#1446). Calibrated on legacy against
+/// the lab's reorder rows (both lab hosts, 0.6.0 and 0.6.4 campaigns: 10 ms spread at 360p, 20 ms at
+/// 360p with 12+ freezes): 12 ms gives 10 ms → 360p, 8 % discarded, 8 freezes; 20 ms → 360p, 22 %,
+/// 21 freezes. 8 ms put 5 ms at 360p too, 15 ms held 10 ms at 540p.
+const DISCARD_US: u64 = 12_000;
+
+/// #1446: Chrome's discards on a link that reorders are loss to the agent, isolated, with no delay
+/// rise and no queue. The link has capacity: v2 must not sit at 360p at 10 or 20 ms of spread. 5 ms
+/// is printed.
+#[test]
+fn a_link_that_reorders_does_not_sit_at_360p() {
+    let mut bad = Vec::new();
+    for spread in [5, 10, 20] {
+        let a = reorder_row(true, spread);
+        row(&format!("reorder {spread} ms legacy"), &a, 30.0, 210.0);
+        let s = reorder_row(false, spread);
+        let (_, under, _) = row(&format!("reorder {spread} ms v2"), &s, 30.0, 210.0);
+        let at_360 = time_at(&s, 4, 30.0, 210.0);
+        eprintln!(
+            "  v2 {at_360:.1} s at 360p, rung at 209 s {}; discarded: v2 {}, legacy {}",
+            s.rung_at(209.0),
+            s.discarded,
+            a.discarded
+        );
+        if spread >= 10 && at_360 > 30.0 {
+            bad.push(format!(
+                "{spread} ms: {at_360:.1} s at 360p, {under:.1} s under 1080p"
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
 }
