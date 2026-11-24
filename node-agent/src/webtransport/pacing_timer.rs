@@ -190,6 +190,8 @@ mod tests {
             tokio::time::sleep_until(at).await;
             tick.push(lateness(at));
         }
+        // A timerfd that fell back to tokio mid-run would make the comparison a coin flip.
+        assert!(timer.precise(), "the timerfd fell back during the run");
         fd.sort_unstable();
         tick.sort_unstable();
         eprintln!(
