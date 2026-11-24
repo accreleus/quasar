@@ -734,8 +734,10 @@ pub(crate) struct Estimator {
     held: Option<HoldLine>,
     /// The last report gave a shortfall reading: a second in a row sets the hold.
     read_last: bool,
-    /// The lossy run going on, and the datagrams the last message counted (`measure`).
+    /// The lossy run going on, when the last one ended (`recovering`), and the datagrams the last
+    /// message counted (`measure`).
     episode: Option<Run>,
+    episode_end: Option<Instant>,
     counted: (i64, i64),
     /// The probe's datagrams the last message counted, (received, lost), and when a probe last
     /// met the link's edge (its own datagrams lost, video's not).
@@ -744,13 +746,16 @@ pub(crate) struct Estimator {
     /// What the link lost with no probe running, (received, lost) decayed per report: a probe is
     /// judged on the loss it adds, so random loss under the floor's notice does not stop it.
     unprobed: (f64, f64),
-    /// The first loss `counted` was a keyframe's (`Slot::key`).
+    /// The first loss `counted` was a keyframe's (`Slot::key`), and the last rate window sent one.
     key_lost: Option<bool>,
+    key_sent: bool,
     /// Since when every window with enough datagrams has lost over `LOSS_HIGH`.
     heavy_since: Option<Instant>,
-    /// When a burst last showed its loss did not fall with the sender's rate: loss bursts set no
-    /// line for `HOLD` after it.
-    random_burst: Option<Instant>,
+    /// When a burst last showed its loss did not fall with the sender's rate, and the rate the hold
+    /// it released was set from: loss bursts set no line for `HOLD` after it. A burst renews it only
+    /// at no more than that rate over `FLOOR_SPREAD`: an encoder burst over a policer is not Wi-Fi
+    /// (seat A, #1652).
+    random_burst: Option<(Instant, f64)>,
     /// What the encoder is asked to send now, setpoint plus FEC, kbit/s on the wire; `None`
     /// counts every window busy. Only a busy window sets or renews the hold.
     pub(crate) encoder_kbps: Option<f64>,
@@ -802,6 +807,8 @@ struct HoldLine {
     cause: (Instant, f64, f64),
     /// Loss lowered the line (a burst, or a probe meeting loss): the link drops what overflows.
     dropped: bool,
+    /// The send rate the run that set the hold began at: what a release puts the line back to.
+    before: f64,
     /// The repair-datagram probe going on (`PROBE_GAIN`), and since when the next one waits
     /// (`PROBE_WAIT`).
     probe: Option<Probe>,
@@ -822,6 +829,24 @@ struct Probe {
     probe_lost: i64,
     /// The reports' send rates (sum, count): a step proves what was sent, at most its total.
     sent: (f64, u32),
+    /// A burst released the hold (`Estimator::apply`): the line went back to the rate the hold was
+    /// set from, and this step proves that rate before the hold ends. Only loss at the link's edge
+    /// stops it, and puts back this line (#1652: a release over a deep bucket climbed unheld into it).
+    release: Option<f64>,
+}
+
+impl Probe {
+    fn new(kbps: f64, since: Instant, release: Option<f64>) -> Self {
+        Self {
+            kbps,
+            since,
+            counted: (0, 0),
+            probes: 0,
+            probe_lost: 0,
+            sent: (0.0, 0),
+            release,
+        }
+    }
 }
 
 /// v2's lossy run: a burst, its ramp and tail (`Estimator::apply`).
@@ -833,8 +858,9 @@ struct Run {
     /// The send rate it began at, and what the encoder was asked then (`Estimator::encoder_kbps`).
     from: f64,
     asked: Option<f64>,
-    /// The most its loss so far reached.
+    /// The most its loss so far reached, and the most it was sent at.
     peak: f64,
+    top: f64,
     /// It began with a keyframe's loss (`Slot::key`): a policer the line sits just under
     /// overflows on a keyframe, a short burst at a constant rate that ends on its own, as Wi-Fi's
     /// does. A Wi-Fi burst does not begin on keyframes.
@@ -903,11 +929,13 @@ impl Estimator {
             held: None,
             read_last: false,
             episode: None,
+            episode_end: None,
             counted: (0, 0),
             probe_counted: (0, 0),
             probed_at: None,
             unprobed: (0.0, 0.0),
             key_lost: None,
+            key_sent: false,
             heavy_since: None,
             random_burst: None,
             encoder_kbps: None,
@@ -941,6 +969,21 @@ impl Estimator {
     /// carries less, and pacing a recovery keyframe at a decayed rate only delays it.
     pub(crate) fn found_link(&self) -> bool {
         (self.bound != Bound::Ceiling || self.held.is_some()) && self.recover_to.is_none()
+    }
+
+    /// A lossy run is on, or ended under `LOSS_WINDOW` ago: the keyframe the client asks for after
+    /// it is not paced (`VideoQueue::recovering`). Under a hold on a link that drops what overflows
+    /// it is, until a burst released the hold: unpaced into R3's cap, the onset's keyframe stepped
+    /// the rung deeper and the recovery took 38-48 s, not 30 (sim).
+    pub(crate) fn recovering(&self, now: Instant) -> bool {
+        let lossy = self.episode.is_some()
+            || self
+                .episode_end
+                .is_some_and(|at| now.saturating_duration_since(at) < LOSS_WINDOW);
+        lossy
+            && self
+                .held
+                .is_none_or(|h| !h.dropped || h.probe.is_some_and(|p| p.release.is_some()))
     }
 
     /// The hold's line (`HOLD`), kbit/s on the wire, while it is on.
@@ -994,6 +1037,7 @@ impl Estimator {
         let Some(h) = self.held.as_mut().filter(|h| self.probes && !h.starved) else {
             return;
         };
+        let mut ended = None;
         if let Some(mut p) = h.probe.take() {
             p.counted.0 += received + probed.0;
             p.counted.1 += lost + probed.1;
@@ -1011,22 +1055,38 @@ impl Estimator {
             let excess = |n: i64, loss: f64, share: f64| {
                 loss - floor >= share && (loss - floor) * n as f64 >= PROBE_LOST_MIN
             };
-            let over = excess(n, loss, LOSS_LOW) || excess(now_n, now_loss, LOSS_HIGH);
+            // Behind each frame the probe's own datagrams overflow first; a Wi-Fi burst drops
+            // video and probe alike.
+            let probe_loss = p.probe_lost.max(0) as f64 / p.probes.max(1) as f64;
+            let video = (n - p.probes, p.counted.1 - p.probe_lost);
+            let video_loss = video.1.max(0) as f64 / video.0.max(1) as f64;
+            let edge = probe_loss >= LOSS_LOW
+                && probe_loss >= 2.0 * video_loss
+                && p.probe_lost as f64 >= PROBE_LOST_MIN;
+            // Under Wi-Fi bursts (`random_burst`) only the edge stops a step: a burst every 7 s
+            // stopped each 5.2 s step, and the line stayed at 0.3 × a policer (#1652).
+            let wifi = self
+                .random_burst
+                .is_some_and(|(at, _)| now.saturating_duration_since(at) < HOLD);
+            let over = match p.release.is_some() || wifi {
+                true => edge,
+                false => excess(n, loss, LOSS_LOW) || excess(now_n, now_loss, LOSS_HIGH),
+            };
             let result = if stopped || over {
                 h.probe_wait = now;
-                // Behind each frame the probe's own datagrams overflow first; a Wi-Fi burst drops
-                // video and probe alike.
-                let probe_loss = p.probe_lost.max(0) as f64 / p.probes.max(1) as f64;
-                let video = (n - p.probes, p.counted.1 - p.probe_lost);
-                let video_loss = video.1.max(0) as f64 / video.0.max(1) as f64;
                 if probe_loss >= LOSS_LOW && probe_loss >= 2.0 * video_loss {
                     self.probed_at = Some(now);
+                }
+                // The release was wrong: the link drops what the hold kept off it.
+                if let Some(line) = p.release {
+                    h.kbps = h.kbps.min(line);
                 }
                 "stopped"
             } else if p.probes < PROBE_MIN
                 && now.saturating_duration_since(p.since) >= PROBE_STARVED
             {
                 h.starved = true;
+                ended = p.release.map(|_| "burst-not-capacity");
                 "starved"
             } else if now.saturating_duration_since(p.since) >= PROBE_STEP && p.probes >= PROBE_MIN
             {
@@ -1034,9 +1094,14 @@ impl Estimator {
                 let secs = now.saturating_duration_since(p.since).as_secs_f64();
                 let to = BETA * BETA * carried;
                 // Only to a rate the step drained a `PROBE_BUCKET_S` bucket past.
-                if to > h.kbps && carried * secs < to * (secs + PROBE_BUCKET_S) {
+                if (p.release.is_some() || to > h.kbps)
+                    && carried * secs < to * (secs + PROBE_BUCKET_S)
+                {
                     h.probe = Some(p);
                     return;
+                }
+                if p.release.is_some() {
+                    ended = Some("burst-not-capacity");
                 }
                 h.kbps = h.kbps.max(to);
                 // Carried at the most a probe tries: nothing left to hold.
@@ -1061,6 +1126,10 @@ impl Estimator {
                 h.kbps
             );
         }
+        if let Some(reason) = ended {
+            self.end_hold(reason);
+            return;
+        }
         let since = h.stepped.max(h.probe_wait);
         if !stopped && !h.starved && now.saturating_duration_since(since) >= PROBE_WAIT {
             let kbps = (h.kbps * PROBE_GAIN).min(self.ceiling_kbps / BETA / BETA);
@@ -1072,14 +1141,7 @@ impl Estimator {
                 "WebTransport capacity probe at {kbps:.0} kbps started; line {:.0} kbps",
                 h.kbps
             );
-            h.probe = Some(Probe {
-                kbps,
-                since: now,
-                counted: (0, 0),
-                probes: 0,
-                probe_lost: 0,
-                sent: (0.0, 0),
-            });
+            h.probe = Some(Probe::new(kbps, now, None));
         }
         if h.kbps >= self.ceiling_kbps {
             self.end_hold("probe-reached-ceiling");
@@ -1369,6 +1431,12 @@ impl Estimator {
         self.episode = match self.episode {
             Some(run) if m.loss.is_none_or(|l| l >= LOSS_LOW) => Some(Run {
                 counted: (run.counted.0 + r, run.counted.1 + l),
+                // A window with a keyframe is sent over the encoder's rate (lab encoder: 1.2-1.4 ×
+                // in 500 ms), not a burst over it: it kept the Wi-Fi memory from renewing.
+                top: match self.key_sent {
+                    true => run.top,
+                    false => run.top.max(sent),
+                },
                 ..run
             }),
             _ if holds && busy && loss >= LOSS_LOW => Some(Run {
@@ -1377,10 +1445,14 @@ impl Estimator {
                 from: sent,
                 asked: self.encoder_kbps,
                 peak: 0.0,
+                top: sent,
                 key: key_lost == Some(true),
             }),
             _ => None,
         };
+        if prev.is_some() && self.episode.is_none() {
+            self.episode_end = Some(now);
+        }
         // Direct `apply` (tests) counts nothing: the window's loss stands in.
         let run_loss = self.episode.map_or(loss, |run| {
             let (r, l) = run.counted;
@@ -1416,6 +1488,7 @@ impl Estimator {
             .zip(self.held)
             .is_some_and(|(run, h)| {
                 h.dropped
+                    && h.probe.is_none_or(|p| p.release.is_none())
                     && !run.key
                     && edge.is_none_or(|at| at + PROBE_WAIT <= run.at)
                     && h.cause.1 >= LOSS_HIGH
@@ -1427,28 +1500,51 @@ impl Estimator {
                         .zip(self.encoder_kbps)
                         .is_none_or(|(was, now)| now >= FLOOR_SPREAD * was)
             });
-        if released {
-            self.random_burst = Some(now);
-            self.end_hold("burst-not-capacity");
-        } else if prev.filter(|_| self.episode.is_none()).is_some_and(|run| {
-            !run.key
-                && now.saturating_duration_since(run.at) < HOLD_STEP_GAP
-                && self
-                    .random_burst
-                    .is_some_and(|at| now.saturating_duration_since(at) < HOLD)
-        }) {
+        if let (true, Some(rate)) = (released, self.held.map(|h| h.before)) {
+            self.random_burst = Some((now, rate));
+            if let Some(h) = self.held.as_mut().filter(|h| self.probes && !h.starved) {
+                // Proven at the rate the hold was set from before it ends: `BETA`² × the probe.
+                let kbps = (rate / (BETA * BETA)).min(self.ceiling_kbps / BETA / BETA);
+                h.probe = Some(Probe::new(kbps, now, Some(h.kbps)));
+                h.kbps = h.kbps.max(rate);
+                tracing::info!(
+                    token = "webtransport-hold-probe",
+                    result = "release",
+                    probe_kbps = kbps as u64,
+                    held_kbps = h.kbps as u64,
+                    "WebTransport capacity probe at {kbps:.0} kbps started to prove a release; \
+                     line {:.0} kbps",
+                    h.kbps
+                );
+            } else {
+                self.end_hold("burst-not-capacity");
+            }
+        } else if let Some(memory) = prev
+            .filter(|_| self.episode.is_none())
+            .zip(self.random_burst)
+            .filter(|&(run, (at, rate))| {
+                !run.key
+                    && now.saturating_duration_since(run.at) < HOLD_STEP_GAP
+                    && now.saturating_duration_since(at) < HOLD
+                    && run.top <= rate / FLOOR_SPREAD
+            })
+            .map(|(_, m)| m)
+        {
             // A steady Wi-Fi pattern keeps its memory: expiring, it let the next burst set a hold
             // and step the rung down every 60 s (lab V3, bursts every 4 and 10 s).
-            self.random_burst = Some(now);
+            self.random_burst = Some((now, memory.1));
         }
         // The burst memory never blocks loss lasting `HOLD_STEP_GAP`: a release it got wrong (seat B
-        // M1': 3800 under the lab encoder's keyframes) otherwise cost 61 s with no frame.
-        let random = self
-            .random_burst
-            .is_some_and(|at| now.saturating_duration_since(at) < HOLD)
-            && self
-                .episode
-                .is_none_or(|run| now.saturating_duration_since(run.at) < HOLD_STEP_GAP);
+        // M1': 3800 under the lab encoder's keyframes) otherwise cost 61 s with no frame. Nor a run
+        // sent over its rate, as it renews none (seat A A5: encoder bursts every second over a policer
+        // set no hold, and the loss bound took 8000 to 2850 on 12000).
+        let random = self.random_burst.is_some_and(|(at, rate)| {
+            now.saturating_duration_since(at) < HOLD
+                && self.episode.is_none_or(|run| {
+                    now.saturating_duration_since(run.at) < HOLD_STEP_GAP
+                        && run.top <= rate / FLOOR_SPREAD
+                })
+        });
         let settled =
             later.is_none_or(|(run, _)| now.saturating_duration_since(run.at) >= LOSS_WINDOW);
         let burst = m
@@ -1481,6 +1577,7 @@ impl Estimator {
                 trouble: 0.0,
                 cause,
                 dropped: false,
+                before: cause.2,
                 probe: None,
                 probe_wait: now,
                 starved: false,
@@ -1834,14 +1931,17 @@ impl Estimator {
         let first_sent = self.arrivals.iter().map(|a| a.2).min();
         let last_sent = self.arrivals.iter().map(|a| a.2).max();
         // The probe's bytes apart (`probe_sent_kbps`): the hold reads what the encoder sends.
+        self.key_sent = false;
         let (sent_kbps, probe_sent_kbps) = match (fresh, rate_kbps, first_sent, last_sent) {
             (true, Some(_), Some(lo), Some(hi)) if hi > lo => {
+                let window = |s: &&Slot| s.sent_us > lo && s.sent_us <= hi;
+                self.key_sent = log.slots.iter().filter(window).any(|s| s.key);
                 // A blackout's datagrams are out of delivered and sent alike.
                 let (sent, probe) = log
                     .slots
                     .iter()
                     .filter(|s| s.bytes > 0 && !s.resend && s.status != Status::Outage)
-                    .filter(|s| s.sent_us > lo && s.sent_us <= hi)
+                    .filter(window)
                     .fold((0u64, 0u64), |(v, p), s| match s.probe {
                         true => (v, p + u64::from(s.bytes)),
                         false => (v + u64::from(s.bytes), p),
@@ -2856,6 +2956,9 @@ pub(crate) struct VideoQueue {
     /// A link that drops what overflows it holds the sender ([`Estimator::drop_held`]): video
     /// the pace drains within `PACE_MAX_WAIT_HELD` waits that long for it.
     pub(crate) on_hold: bool,
+    /// A lossy run is on or just ended ([`Estimator::recovering`]): a held keyframe is not paced.
+    /// Paced at the encoder's rate, the one asked after a Wi-Fi burst waited 85-150 ms (#1652).
+    pub(crate) recovering: bool,
     /// Video was dropped as stale with no keyframe held: units are skipped to the next one
     /// ([`Self::orphaned`]).
     orphaned: bool,
@@ -2932,7 +3035,8 @@ impl VideoQueue {
             .held
             .iter()
             .find(|h| !h.resend)
-            .is_some_and(|h| now.saturating_duration_since(h.queued_at) >= wait);
+            .is_some_and(|h| now.saturating_duration_since(h.queued_at) >= wait)
+            || self.recovering && self.held.iter().any(|h| h.keyframe && !h.resend);
         let Some(kbps) = kbps.filter(|_| !stale) else {
             self.counted = None;
             return usize::MAX;
