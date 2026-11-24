@@ -81,13 +81,24 @@ pub(crate) struct Unit {
     pub(crate) data: Bytes,
     pub(crate) keyframe: bool,
     pub(crate) config_id: u8,
+    /// Taken by the sender once the unit is to be sent ([`Media::number`], the one place a
+    /// number is taken).
     pub(crate) frame_seq: u16,
     pub(crate) ts_90khz: u32,
     pub(crate) capture_us: u64,
+    /// Nothing later is coded from it (every slice has `nal_ref_idc` 0), so the sender may drop
+    /// it late without a keyframe.
+    pub(crate) discardable: bool,
     /// A PyroWave frame: its payload is packed by `pyrowave::pack`, never cut into ranges.
     pub(crate) pyrowave: bool,
     /// Coded only from an anchor this client reported decoded (`FLAG_RECOVERY`).
     pub(crate) recovery: bool,
+    /// The encoder reported this unit as an anchor, at this pts: [`Media::number`] gives the
+    /// anchor the number the client is sent.
+    pub(crate) anchor: Option<gst::ClockTime>,
+    /// The anchor's `frame_seq` this unit recovers from, or answers with a key frame (logged
+    /// with the unit's own number).
+    pub(crate) from: Option<u16>,
 }
 
 /// What the tap sends a connected client, in pad order: a configuration always precedes
@@ -141,6 +152,11 @@ struct State {
     /// configuration changed.
     want_key: bool,
     frame_seq: u16,
+    /// The encoder was told to emit non-reference P frames (`non-ref-p`, `nonref-p` on NVENC).
+    non_ref: bool,
+    /// Tests only: number each unit as the tap queues it, as a stream loop with no wait would.
+    #[cfg(test)]
+    eager: bool,
     last_ts: u32,
     warned_format: bool,
     warned_keyframe: bool,
@@ -170,7 +186,9 @@ struct Refs {
     /// Reports waiting for their buffer, matched by pts.
     reports: VecDeque<RefFrame>,
     /// `(frame_seq, report pts)` of each anchor the client was sent, oldest first.
-    anchors: VecDeque<(u16, gst::ClockTime)>,
+    /// `None` until the sender numbers the unit ([`Media::number`]); such an anchor is not yet
+    /// the client's.
+    anchors: VecDeque<(Option<u16>, gst::ClockTime)>,
     /// The client has sent a `decoded` (§Feedback): anchors are asked for from then on.
     opted: bool,
     /// A recovery was asked for and no recovery frame or key frame has come since.
@@ -185,14 +203,21 @@ impl Refs {
         self.since = 0;
     }
 
-    /// The unit the encoder reported as `report` went to the client as `frame_seq`: the one
-    /// place an anchor gets its number.
-    fn record(&mut self, frame_seq: u16, report: Option<RefFrame>) {
+    /// The unit the encoder reported as `report` was queued for the client; the sender gives
+    /// it its number ([`Media::number`]).
+    fn record(&mut self, report: Option<RefFrame>) {
         if let Some(r) = report.filter(|r| r.anchor) {
-            self.anchors.push_back((frame_seq, r.pts));
+            self.anchors.push_back((None, r.pts));
             while self.anchors.len() > self.k {
                 self.anchors.pop_front();
             }
+        }
+    }
+
+    /// The anchor reported at `pts` is the client's `frame_seq`.
+    fn number_anchor(&mut self, pts: gst::ClockTime, frame_seq: u16) {
+        if let Some(entry) = self.anchors.iter_mut().find(|(_, p)| *p == pts) {
+            entry.0 = Some(frame_seq);
         }
     }
 
@@ -391,7 +416,10 @@ impl Media {
         if k > 0 {
             encoder.set_property(ref_recovery::NUM_ANCHORS, k);
         }
+        let non_ref = crate::session::pipeline::non_ref_p_property(encoder)
+            .is_some_and(|name| encoder.property::<bool>(name));
         let state = State {
+            non_ref,
             refs: Refs {
                 k: k as usize,
                 ..Refs::default()
@@ -1023,7 +1051,7 @@ impl Media {
             anchors
                 .iter()
                 .find(|(_, p)| *p == from)
-                .map(|(seq, _)| *seq)
+                .and_then(|(seq, _)| *seq)
         });
         if let Some(from) = recover_from {
             st.refs.anchors.retain(|(_, p)| *p <= from);
@@ -1116,26 +1144,34 @@ impl Media {
             return;
         }
         st.want_key = false;
-        // Only a unit the client is sent takes a number: a skipped one would read as a
-        // loss to NACK (§Loss recovery). A unit the full queue refuses gives it back.
-        let frame_seq = st.frame_seq;
-        st.frame_seq = frame_seq.wrapping_add(1);
-        let unit = Unit {
+        let discardable = st.non_ref
+            && !keyframe
+            && from_seq.is_none()
+            && config.codec == "h264"
+            && h264_discardable(&data);
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut unit = Unit {
             data: Bytes::copy_from_slice(&data),
             keyframe,
             config_id: config.config_id,
-            frame_seq,
+            frame_seq: 0,
             ts_90khz,
             capture_us: now_us(),
+            discardable,
             pyrowave: false,
             recovery: from_seq.is_some(),
+            anchor: report.filter(|r| r.anchor).map(|r| r.pts),
+            from: from_seq.or(answered),
         };
-        let bytes = unit.data.len();
+        #[cfg(test)]
+        let eager = st.eager.then(|| {
+            Self::number_locked(&mut st, &mut unit);
+            (unit.frame_seq, unit.anchor)
+        });
         let sent = st.client.as_ref().map(|c| c.tx.try_send(Out::Unit(unit)));
         match sent {
             Some(Ok(())) => {}
             Some(Err(mpsc::error::TrySendError::Full(_))) => {
-                st.frame_seq = frame_seq;
                 st.want_key = true;
                 drop(st);
                 self.keyframe();
@@ -1147,29 +1183,13 @@ impl Media {
             }
             None => return,
         }
-        st.refs.record(frame_seq, report);
-        if let Some(anchor) = from_seq {
+        st.refs.record(report);
+        #[cfg(test)]
+        if let Some((seq, Some(pts))) = eager {
+            st.refs.number_anchor(pts, seq);
+        }
+        if from_seq.is_some() {
             st.refs.asked = None;
-            tracing::info!(
-                token = "webtransport-ref-recovery",
-                session_id = %st.session_id,
-                outcome = "recover",
-                frame_seq,
-                anchor,
-                bytes,
-                "WebTransport recovery frame {frame_seq} from frame {anchor}, {bytes} bytes"
-            );
-        } else if let Some(anchor) = answered {
-            tracing::info!(
-                token = "webtransport-ref-recovery",
-                session_id = %st.session_id,
-                outcome = "keyframe",
-                frame_seq,
-                anchor,
-                bytes,
-                "WebTransport recovery from frame {anchor} answered with key frame {frame_seq} \
-                 (the encoder no longer held it)"
-            );
         }
         let refs = &mut st.refs;
         refs.since = if flagged { 0 } else { refs.since + 1 };
@@ -1217,7 +1237,9 @@ impl Media {
             refs.opted |= decoded.is_some();
             let pick = decoded.and_then(|d| {
                 let mut held = refs.anchors.iter().rev();
-                held.find(|(seq, _)| seq_at_or_before(*seq, d)).copied()
+                held.find_map(|&(seq, pts)| {
+                    seq.filter(|s| seq_at_or_before(*s, d)).map(|s| (s, pts))
+                })
             });
             refs.asked = pick.map(|(seq, _)| seq);
             (pick, refs.k > 0 && refs.opted, st.session_id.clone())
@@ -1257,6 +1279,57 @@ fn now_us() -> u64 {
 }
 
 impl Media {
+    #[cfg(test)]
+    pub(crate) fn assume_non_ref(&self) {
+        self.lock().non_ref = true;
+    }
+
+    /// The next `frame_seq`, for a unit the sender is about to send. Only a unit the client is
+    /// sent takes a number: a skipped one would read as a loss to NACK (§Loss recovery), and a
+    /// client never given any fragment of a numbered frame asks for a keyframe.
+    /// False, and no number taken, when `client` no longer holds the session: a taken-over
+    /// client's queued units would number a gap into its successor's.
+    pub(crate) fn number(&self, unit: &mut Unit, client: u64) -> bool {
+        let mut st = self.lock();
+        if st.client.as_ref().is_none_or(|c| c.id != client) {
+            return false;
+        }
+        Self::number_locked(&mut st, unit);
+        true
+    }
+
+    fn number_locked(st: &mut State, unit: &mut Unit) {
+        let frame_seq = st.frame_seq;
+        st.frame_seq = frame_seq.wrapping_add(1);
+        unit.frame_seq = frame_seq;
+        if let Some(pts) = unit.anchor {
+            st.refs.number_anchor(pts, frame_seq);
+        }
+        let bytes = unit.data.len();
+        match (unit.from, unit.recovery) {
+            (Some(anchor), true) => tracing::info!(
+                token = "webtransport-ref-recovery",
+                session_id = %st.session_id,
+                outcome = "recover",
+                frame_seq,
+                anchor,
+                bytes,
+                "WebTransport recovery frame {frame_seq} from frame {anchor}, {bytes} bytes"
+            ),
+            (Some(anchor), false) => tracing::info!(
+                token = "webtransport-ref-recovery",
+                session_id = %st.session_id,
+                outcome = "keyframe",
+                frame_seq,
+                anchor,
+                bytes,
+                "WebTransport recovery from frame {anchor} answered with key frame {frame_seq} \
+                 (the encoder no longer held it)"
+            ),
+            (None, _) => {}
+        }
+    }
+
     /// One PyroWave frame off `pyrowaveenc`. A frame the client's queue has no room for is
     /// dropped: the next one repairs everything, so it needs no keyframe.
     pub(crate) fn on_pyrowave_frame(&self, buffer: &gst::BufferRef) {
@@ -1264,8 +1337,6 @@ impl Media {
         let Some(config) = st.client.as_ref().and_then(|c| c.pyrowave.clone()) else {
             return;
         };
-        let frame_seq = st.frame_seq;
-        st.frame_seq = frame_seq.wrapping_add(1);
         let ts_90khz = buffer.pts().map_or(st.last_ts, |pts| {
             (pts.nseconds() as u128 * 90_000 / 1_000_000_000) as u32
         });
@@ -1276,11 +1347,14 @@ impl Media {
             data: Bytes::copy_from_slice(&map),
             keyframe: true,
             config_id: config.config_id,
-            frame_seq,
+            frame_seq: 0,
             ts_90khz,
             capture_us: now_us(),
+            discardable: false,
             pyrowave: true,
             recovery: false,
+            anchor: None,
+            from: None,
         };
         let sent = st.client.as_ref().map(|c| c.tx.try_send(Out::Unit(unit)));
         if let Some(Err(mpsc::error::TrySendError::Closed(_))) = sent {
@@ -1372,9 +1446,8 @@ fn wire_unit<'a>(codec: &str, data: &'a [u8], flagged: bool) -> Option<(Cow<'a, 
     }
 }
 
-/// The type of each NAL in a 4-byte length-prefixed H.265 access unit, up to the first that
-/// does not fit.
-fn hevc_nal_types(data: &[u8]) -> impl Iterator<Item = u8> + '_ {
+/// Each NAL of a 4-byte length-prefixed access unit, up to the first that does not fit.
+fn nal_units(data: &[u8]) -> impl Iterator<Item = &[u8]> + '_ {
     let mut rest = data;
     std::iter::from_fn(move || {
         let len = u32::from_be_bytes(rest.get(..4)?.try_into().ok()?) as usize;
@@ -1382,8 +1455,21 @@ fn hevc_nal_types(data: &[u8]) -> impl Iterator<Item = u8> + '_ {
             .get(4..4usize.checked_add(len)?)
             .filter(|n| !n.is_empty())?;
         rest = &rest[4 + len..];
-        Some((nal[0] >> 1) & 0x3f)
+        Some(nal)
     })
+}
+
+/// The type of each NAL in a 4-byte length-prefixed H.265 access unit.
+fn hevc_nal_types(data: &[u8]) -> impl Iterator<Item = u8> + '_ {
+    nal_units(data).map(|nal| (nal[0] >> 1) & 0x3f)
+}
+
+/// An H.264 access unit nothing is coded from: it has a slice (types 1 to 5) and every slice
+/// has `nal_ref_idc` 0.
+fn h264_discardable(data: &[u8]) -> bool {
+    let mut slices = nal_units(data).filter(|nal| (1..=5).contains(&(nal[0] & 0x1f)));
+    let first = slices.next();
+    first.is_some_and(|nal| nal[0] & 0x60 == 0) && slices.all(|nal| nal[0] & 0x60 == 0)
 }
 
 /// A temporal unit without its temporal delimiters (the contract carries none), and whether
@@ -1442,10 +1528,11 @@ pub(crate) fn packetize(
     } else {
         unit.data.chunks(room).collect()
     };
-    let flags = match (unit.keyframe, unit.recovery) {
-        (true, _) => FLAG_KEYFRAME,
-        (false, true) => FLAG_RECOVERY,
-        (false, false) => 0,
+    let flags = match (unit.keyframe, unit.recovery, unit.discardable) {
+        (true, _, _) => FLAG_KEYFRAME,
+        (false, true, _) => FLAG_RECOVERY,
+        (false, false, true) => FLAG_DISCARDABLE,
+        (false, false, false) => 0,
     };
     datagrams(unit, flags, &frags, pkt_seq)
 }
@@ -1487,8 +1574,11 @@ mod tests {
             frame_seq: 0xfffe,
             ts_90khz: 0x0102_0304,
             capture_us: 0x1122_3344_5566_7788,
+            discardable: false,
             pyrowave: false,
             recovery: false,
+            anchor: None,
+            from: None,
         }
     }
 
@@ -1705,46 +1795,230 @@ mod tests {
         assert!(client.gone.get().is_none(), "the client is still attached");
     }
 
-    fn seqs(rx: &mut mpsc::Receiver<Out>) -> Vec<u16> {
-        let mut out = Vec::new();
-        while let Ok(o) = rx.try_recv() {
-            if let Out::Unit(u) = o {
-                out.push(u.frame_seq);
-            }
-        }
-        out
-    }
-
     #[test]
-    fn units_skipped_for_a_keyframe_or_refused_by_a_full_queue_take_no_frame_seq() {
+    fn the_tap_takes_no_frame_seq_the_sender_numbers_the_units_it_sends() {
         let (media, _encoder, _) = counted();
         media.on_caps(&caps(1280), "s");
         let mut client = media.attach(false, Duration::ZERO).unwrap();
         media.on_unit(&buffer(false)); // before the first keyframe: skipped
         media.on_unit(&buffer(true));
         media.on_unit(&buffer(false));
-        media.on_caps(&caps(960), "s");
-        media.on_unit(&buffer(false)); // under the new configuration, before its keyframe
-        media.on_unit(&buffer(true));
-        assert_eq!(
-            seqs(&mut client.rx),
-            [0, 1, 2],
-            "no gap for a unit never sent"
-        );
-
-        for _ in 0..=CLIENT_QUEUE {
-            media.on_unit(&buffer(false)); // the last one finds the queue full
+        let mut units = Vec::new();
+        while let Ok(Out::Unit(u)) = client.rx.try_recv() {
+            units.push(u);
         }
-        media.on_unit(&buffer(true));
-        let got = seqs(&mut client.rx);
-        assert_eq!(got.len(), CLIENT_QUEUE, "the queue held its fill");
-        assert_eq!(got.last(), Some(&(2 + CLIENT_QUEUE as u16)));
-        media.on_unit(&buffer(true));
         assert_eq!(
-            seqs(&mut client.rx),
-            [3 + CLIENT_QUEUE as u16],
-            "the refused unit gave its number back"
+            units.iter().map(|u| u.frame_seq).collect::<Vec<_>>(),
+            [0, 0],
+            "the tap numbers nothing, so a unit the sender drops leaves no gap"
         );
+        // The first is dropped late: the sender numbers only the second.
+        assert!(media.number(&mut units[1], client.id));
+        assert_eq!(
+            units[1].frame_seq, 0,
+            "no number was spent on the dropped unit"
+        );
+        assert!(media.number(&mut units[0], client.id));
+        assert_eq!(units[0].frame_seq, 1);
+    }
+
+    /// Item 2 (#1656 r2): a taken-over client's loop drains what was queued for it, and takes no
+    /// number from the counter its successor is numbered by.
+    #[test]
+    fn a_taken_over_clients_queued_units_take_no_number() {
+        let (media, _encoder, _) = counted();
+        media.on_caps(&caps(1280), "s");
+        let mut a = media.attach(false, Duration::ZERO).unwrap();
+        media.on_unit(&buffer(true));
+        media.on_unit(&buffer(false));
+        let mut b = media.attach(false, Duration::ZERO).unwrap();
+        media.on_unit(&buffer(true));
+        let mut queued = Vec::new();
+        while let Ok(Out::Unit(u)) = a.rx.try_recv() {
+            queued.push(u);
+        }
+        assert_eq!(queued.len(), 2);
+        for u in &mut queued {
+            assert!(!media.number(u, a.id), "the old client's unit is not sent");
+        }
+        let Ok(Out::Unit(mut first)) = b.rx.try_recv() else {
+            panic!("the successor got its keyframe");
+        };
+        assert!(media.number(&mut first, b.id));
+        assert_eq!(
+            first.frame_seq, 0,
+            "the successor's numbers start where they would"
+        );
+    }
+
+    /// #1657 records an anchor in one place: under the number the client was sent, not the tap's.
+    #[test]
+    fn an_anchor_is_recorded_under_the_number_the_client_got_when_a_unit_was_dropped_before_it() {
+        let (media, _encoder, events, mut client) = recovering(2);
+        media.lock().eager = false;
+        media.lock().non_ref = true;
+        media.on_unit(&frame(0, true));
+        report(&media, 1, true, None);
+        media.on_unit(&frame(1, false));
+        // A non-reference unit the sender drops late, between the anchor and the next.
+        let mut dropped = gst::Buffer::from_slice(au(&[0x01]));
+        {
+            let b = dropped.get_mut().unwrap();
+            b.set_flags(gst::BufferFlags::DELTA_UNIT);
+            b.set_pts(pts(2));
+        }
+        media.on_unit(&dropped);
+        media.on_unit(&frame(3, false));
+        media.decoded(client.id, Some(0));
+        let mut units = Vec::new();
+        while let Ok(Out::Unit(u)) = client.rx.try_recv() {
+            units.push(u);
+        }
+        assert_eq!(units.len(), 4);
+        assert!(units[2].discardable && !units[1].discardable);
+        // The sender numbers all but the dropped one: 0, 1, then the unit after it gets 2.
+        for (i, u) in units.iter_mut().enumerate() {
+            if i != 2 {
+                assert!(media.number(u, client.id));
+            }
+        }
+        assert_eq!(
+            units.iter().map(|u| u.frame_seq).collect::<Vec<_>>(),
+            [0, 1, 0, 2]
+        );
+        // Not yet in the client's decoded: nothing to recover from; at 2 the anchor (1) is.
+        media.repair(client.id, Some(2));
+        assert_eq!(
+            taken(&events).last().map(String::as_str),
+            Some("recover 1"),
+            "the anchor sits at the number the client got"
+        );
+    }
+
+    /// An access unit of length-prefixed NALs: SEI, then one slice whose header byte is `slice`.
+    fn au(slices: &[u8]) -> Vec<u8> {
+        let mut out = vec![0, 0, 0, 2, 0x06, 0x80];
+        for s in slices {
+            out.extend_from_slice(&[0, 0, 0, 2, *s, 0x88]);
+        }
+        out
+    }
+
+    #[test]
+    fn an_h264_unit_is_discardable_only_when_every_slice_is_non_reference() {
+        assert!(
+            h264_discardable(&au(&[0x01])),
+            "non-IDR slice, nal_ref_idc 0"
+        );
+        assert!(h264_discardable(&au(&[0x01, 0x01])), "two slices");
+        assert!(!h264_discardable(&au(&[0x41])), "nal_ref_idc 2");
+        assert!(!h264_discardable(&au(&[0x01, 0x41])), "one reference slice");
+        assert!(!h264_discardable(&au(&[0x65])), "an IDR is a reference");
+        assert!(!h264_discardable(&au(&[])), "no slice");
+        assert!(!h264_discardable(&[0, 0, 0, 9, 1]), "a NAL past the end");
+        assert!(!h264_discardable(&[]));
+    }
+
+    #[test]
+    fn only_a_delta_unit_of_an_encoder_told_non_ref_p_is_flagged_discardable() {
+        let non_ref = || {
+            let mut b = gst::Buffer::from_slice(au(&[0x01]));
+            b.get_mut().unwrap().set_flags(gst::BufferFlags::DELTA_UNIT);
+            b
+        };
+        let flags = |on: bool| {
+            let (media, _encoder, _) = counted();
+            if on {
+                media.assume_non_ref();
+            }
+            media.on_caps(&caps(1280), "s");
+            let mut client = media.attach(false, Duration::ZERO).unwrap();
+            media.on_unit(&buffer(true));
+            media.on_unit(&non_ref());
+            let mut got = Vec::new();
+            while let Ok(Out::Unit(u)) = client.rx.try_recv() {
+                got.push((u.keyframe, u.discardable));
+            }
+            got
+        };
+        assert_eq!(flags(true), [(true, false), (false, true)]);
+        assert_eq!(
+            flags(false),
+            [(true, false), (false, false)],
+            "knob off: output as before"
+        );
+    }
+
+    /// A recovery frame is never discardable, whatever the encoder's `nal_ref_idc` says: the
+    /// frames after it are coded from it.
+    #[test]
+    fn a_recovery_frame_is_never_discardable() {
+        let (media, _encoder, _events, mut client) = recovering(2);
+        media.lock().non_ref = true;
+        media.on_unit(&frame(0, true));
+        report(&media, 1, true, None);
+        media.on_unit(&frame(1, false));
+        media.decoded(client.id, Some(1));
+        media.repair(client.id, Some(1));
+        report(&media, 2, false, Some(1));
+        let mut recovery = gst::Buffer::from_slice(au(&[0x01]));
+        {
+            let b = recovery.get_mut().unwrap();
+            b.set_flags(gst::BufferFlags::DELTA_UNIT);
+            b.set_pts(pts(2));
+        }
+        media.on_unit(&recovery);
+        let mut last = None;
+        while let Ok(Out::Unit(u)) = client.rx.try_recv() {
+            last = Some(u);
+        }
+        let u = last.expect("the recovery frame was queued");
+        assert!(u.recovery && !u.discardable);
+    }
+
+    /// PyroWave takes its number in the stream loop like every other unit: a unit tapped
+    /// before a switch is numbered before a PyroWave frame tapped after it.
+    #[test]
+    fn a_pyrowave_frame_takes_no_number_at_the_tap() {
+        let (media, _encoder, _) = granted();
+        let mut client = media.attach(true, LAN).unwrap();
+        media.on_pyrowave_frame(&pyro_frame());
+        media.on_pyrowave_frame(&pyro_frame());
+        let mut units = Vec::new();
+        while let Ok(Out::Unit(u)) = client.rx.try_recv() {
+            units.push(u);
+        }
+        assert_eq!(units.len(), 2);
+        assert!(units.iter().all(|u| u.pyrowave && u.frame_seq == 0));
+        assert_eq!(media.lock().frame_seq, 0, "the tap spent no number");
+        for (i, u) in units.iter_mut().enumerate() {
+            assert!(media.number(u, client.id));
+            assert_eq!(usize::from(u.frame_seq), i);
+        }
+    }
+
+    #[test]
+    fn flags_take_keyframe_then_recovery_then_discardable() {
+        let flags = |key, recovery, discardable| {
+            let mut u = unit(10);
+            (u.keyframe, u.recovery, u.discardable) = (key, recovery, discardable);
+            let mut pkt_seq = 0;
+            packetize(&u, &cfg_for(&u), MAX_DATAGRAM, &mut pkt_seq).unwrap()[0][5]
+        };
+        assert_eq!(flags(true, true, true), FLAG_KEYFRAME);
+        assert_eq!(flags(false, true, true), FLAG_RECOVERY);
+        assert_eq!(flags(false, false, true), FLAG_DISCARDABLE);
+        assert_eq!(flags(false, false, false), 0);
+    }
+
+    #[test]
+    fn a_discardable_unit_is_sent_flagged_and_not_keyframe() {
+        let mut u = unit(100);
+        u.keyframe = false;
+        u.discardable = true;
+        let mut pkt_seq = 0;
+        let d = packetize(&u, &cfg_for(&u), MAX_DATAGRAM, &mut pkt_seq).unwrap();
+        assert_eq!(d[0][5], FLAG_DISCARDABLE);
     }
 
     /// The encoder's pts of input frame `n` at 60 fps, past the 1000 h min-pts the H.264 and HEVC
@@ -1806,6 +2080,7 @@ mod tests {
             None,
         );
         media.lock().refs.k = k;
+        media.lock().eager = true;
         media.on_caps(&caps(1280), "s");
         let client = media.attach(false, Duration::ZERO).unwrap();
         media.lock().last_forced = None;
@@ -2031,14 +2306,11 @@ mod tests {
             anchor: true,
             recover_from: None,
         });
-        refs.record(
-            3,
-            Some(RefFrame {
-                pts: pts(3),
-                anchor: true,
-                recover_from: None,
-            }),
-        );
+        refs.record(Some(RefFrame {
+            pts: pts(3),
+            anchor: true,
+            recover_from: None,
+        }));
         refs.forget();
         assert!(refs.reports.is_empty() && refs.anchors.is_empty() && refs.asked.is_none());
     }

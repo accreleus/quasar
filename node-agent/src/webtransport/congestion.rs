@@ -2653,6 +2653,10 @@ const AUDIO_AHEAD_MS: u64 = 40;
 const PACE_GAIN: f64 = 1.25;
 /// The pacer's burst: this long at the pace, at least two datagrams.
 const PACE_BURST_MS: f64 = 5.0;
+/// Held video is late once it has waited this many frame intervals beyond the time the pacer
+/// needs to drain what is held: a discardable unit queued behind it would only add to the delay,
+/// and dropping it costs no keyframe ([`VideoQueue::drop_late`]).
+const LATE_FRAMES: u32 = 2;
 /// Video that has waited this long is not paced: a paced keyframe of five frames' bytes waits
 /// at most 5 / (60 fps × `PACE_GAIN`), 67 ms, so this is a path back from an outage, or a
 /// source over the pace, and it drains at QUIC's own pace as before #1433.
@@ -2697,6 +2701,16 @@ pub(crate) struct VideoQueue {
     keyframe_started: Option<Instant>,
     /// Held datagrams dropped as older than the hold (`Self::feed`).
     pub(crate) stale: u64,
+    /// Discardable units dropped as late, before taking a `frame_seq` (`Self::drop_late`).
+    pub(crate) late: u64,
+    /// The pacer's rate at the last `pace`, kbit/s; `None` while it paces nothing.
+    paced_kbps: Option<u64>,
+    /// When a pacer at `paced_kbps` would finish the video pushed so far, in push order.
+    finish: Option<Instant>,
+    /// Per frame held, `(queued_at, finish after its last datagram)`: when the pacer should have
+    /// let it all go. A paced keyframe and the frames behind it wait that long on a clean link,
+    /// so that is not late; a stalled queue is overdue by more every frame.
+    due: VecDeque<(Instant, Instant)>,
     /// A link that drops what overflows it holds the sender ([`Estimator::drop_held`]): video
     /// the pace drains within `PACE_MAX_WAIT_HELD` waits that long for it.
     pub(crate) on_hold: bool,
@@ -2746,6 +2760,23 @@ impl VideoQueue {
     /// Bytes the pacer lets go now: [`PACE_GAIN`] × `kbps`, in bursts of [`PACE_BURST_MS`];
     /// `None` paces nothing.
     pub(crate) fn pace(&mut self, kbps: Option<u64>, now: Instant) -> usize {
+        if self.paced_kbps.is_none() && kbps.is_some() {
+            // Pacing just began: what is held was pushed with no due time. It is due as the pacer
+            // would now let it go, from now.
+            self.due.clear();
+            self.finish = None;
+            self.paced_kbps = kbps;
+            let held: Vec<_> = self
+                .held
+                .iter()
+                .filter(|h| !h.resend)
+                .map(|h| (h.queued_at, h.datagram.len()))
+                .collect();
+            for (queued_at, len) in held {
+                self.schedule(queued_at, len, now);
+            }
+        }
+        self.paced_kbps = kbps;
         // Not a `nack` answer: those go ahead of older video (`push`).
         // What the pace drains in `PACE_MAX_WAIT_HELD` waits that long; more cannot drain in time.
         let drains = kbps.is_some_and(|k| {
@@ -2805,6 +2836,44 @@ impl VideoQueue {
         self.bytes
     }
 
+    /// A pacer at `paced_kbps` lets `len` bytes of the frame queued at `queued_at` go after what
+    /// was pushed before it, and not before `floor`; the frame is due then (`due`).
+    fn schedule(&mut self, queued_at: Instant, len: usize, floor: Instant) {
+        let Some(kbps) = self.paced_kbps else {
+            return;
+        };
+        let start = self.finish.map_or(floor, |f| f.max(floor));
+        let finish =
+            start + Duration::from_secs_f64(len as f64 / (kbps as f64 * PACE_GAIN * 125.0));
+        self.finish = Some(finish);
+        match self.due.back_mut().filter(|(at, _)| *at == queued_at) {
+            Some(frame) => frame.1 = finish,
+            None => self.due.push_back((queued_at, finish)),
+        }
+        while self.due.len() > 64 {
+            self.due.pop_front();
+        }
+    }
+
+    /// Whether a discardable unit arriving now is late: the oldest held video (a resend goes
+    /// ahead of it, so it is not the measure) is over [`LATE_FRAMES`] frame intervals at `fps`
+    /// past when the pacer should have let its frame go (`due`; its arrival when nothing is
+    /// paced), so the unit would leave later than that. Counted when it is. Never for a unit a
+    /// later one is coded from: the caller asks only for a `discardable` one.
+    pub(crate) fn drop_late(&mut self, now: Instant, fps: u32) -> bool {
+        let limit = Duration::from_secs_f64(f64::from(LATE_FRAMES) / f64::from(fps.max(1)));
+        let late = self.held.iter().find(|h| !h.resend).is_some_and(|h| {
+            let due = self
+                .due
+                .iter()
+                .find(|(at, _)| *at == h.queued_at)
+                .map_or(h.queued_at, |(_, d)| *d);
+            now.saturating_duration_since(due.max(h.queued_at)) > limit
+        });
+        self.late += u64::from(late);
+        late
+    }
+
     /// Whether `held` is past the hold: older than `hold`, and not the rest of the keyframe
     /// whose first datagram was handed within it.
     fn expired(&self, held: &Held, now: Instant, hold: Duration) -> bool {
@@ -2856,6 +2925,8 @@ impl VideoQueue {
         self.frame = None;
         self.keyframe_started = None;
         self.orphaned = false;
+        self.finish = None;
+        self.due.clear();
     }
 
     /// The `pkt_seq` new video is numbered from, a guess `feed` corrects: after everything
@@ -2882,7 +2953,14 @@ impl VideoQueue {
             self.bytes -= old.datagram.len();
             self.dropped += 1;
         }
+        if self.held.is_empty() {
+            self.due.clear();
+            self.finish = None;
+        }
         self.bytes += held.datagram.len();
+        if !held.resend {
+            self.schedule(held.queued_at, held.datagram.len(), held.queued_at);
+        }
         if !held.resend && self.frame.is_none_or(|(at, _)| at != held.queued_at) {
             self.frame = Some((held.queued_at, self.held.is_empty()));
         }

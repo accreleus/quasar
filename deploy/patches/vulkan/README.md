@@ -51,6 +51,7 @@ The remaining GStreamer patches are **Quasar-authored** (not from gst-wayland-di
 - `vulkanav1enc-min-qindex.patch`
 - `vulkanav1enc-ref-recovery.patch`, `vkh264enc-ref-recovery.patch`, `vulkanh265enc-ref-recovery.patch` (#1348)
 - `gstreamer-nvenc-ref-recovery.patch` (not a Vulkan patch: the NVENC encoders, #1348)
+- `vkh264enc-non-ref-p.patch` (#1322)
 - `gstreamer-webrtc-stats-rtpsession-leak.patch` (not a Vulkan patch: `webrtcbin`, #564)
 - `vkh265enc-profile-template.patch` (**candidate — not applied**, see below)
 
@@ -85,15 +86,17 @@ and each adds its check test after the previous one's in `tests/check/meson.buil
 diffed with the twelve patches above applied.
 `gstreamer-nvenc-ref-recovery.patch` applies **sixteenth**: it touches only `sys/nvcodec`, but
 includes `gstrefrecovery.h`, which the thirteenth creates.
-`gstreamer-webrtc-stats-rtpsession-leak.patch` applies **seventeenth (last)**. It touches only
+`vkh264enc-non-ref-p.patch` applies **seventeenth**: it edits `gsth264encoder.c` and the H.264
+anchors check that the thirteenth to fifteenth create.
+`gstreamer-webrtc-stats-rtpsession-leak.patch` applies **eighteenth (last)**. It touches only
 `ext/webrtc/gstwebrtcstats.c`, which no other patch here does, so its place in the order is free.
-None of the seventeen are upstreamed into GStreamer itself yet.
+None of the eighteen are upstreamed into GStreamer itself yet.
 
 `vkh265enc-profile-template.patch` is a **candidate that is NOT wired into
 `deploy/Dockerfile.vulkan` and is therefore NOT applied to any image today.** It is a
 correctness fix for an upstream defect the Quasar encode path already sidesteps by pinning
 `profile=main` in its capsfilter, so it buys nothing for a Quasar image and everything for
-anyone driving `vulkanh265enc` by hand. When it is wired up it would apply **eighteenth (last)**: it
+anyone driving `vulkanh265enc` by hand. When it is wired up it would apply **nineteenth (last)**: it
 edits `gst_vulkan_h265_encoder_register()` in `vkh265enc.c`, a region no earlier patch
 touches, so its position is a convention rather than a constraint. See its section below.
 
@@ -1510,6 +1513,25 @@ Measured without it on the AMD lab host with the leaks tracer: after four stream
 (needs libnice and interpipe, so it runs in `quasar-agent-dev`).
 
 The fix is absent upstream: checked through 1.28.8, 1.29.2 and `main` on 2026-10-12 (the emit came in with upstream MR 8698), so a bump to 1.28.8 does not remove the need for this patch. Re-check at every GStreamer bump and drop the patch once a release drops the reference.
+
+### `vkh264enc-non-ref-p.patch`
+
+Quasar-authored (#1322). `vulkanh264enc` gets `non-ref-p` (boolean, default off; NVENC's
+is spelled `nonref-p`): every second P frame is a non-reference picture (`nal_ref_idc` 0), so nothing
+is coded from it and a receiver that never gets it needs no key frame. The Quasar sender flags
+such a unit `discardable` and may drop it late (`QUASAR_NON_REF_P`, `docs/configuration.md`).
+
+- Only in a GOP without B frames: the frame map marks `is_ref = FALSE` on every even-numbered P.
+  The base class already handles a non-reference picture (`frame_num` and the reference list
+  only move after a reference, the POC is type 0), so the next P codes from the last reference.
+- **With `num-anchors`:** a frame that carries an anchor or a recovery request is made a
+  reference when it is placed in the GOP, and `gst_h264_encoder_plan_anchor_refs` never marks a
+  non-reference frame as an anchor (MMCO needs a reference). Non-reference frames never enter
+  the held set, so they are never the chain picture, an anchor, or a recovery source.
+- Not with intra refresh: a refreshed strip in a non-reference frame never persists. The agent
+  refuses the pair (`knob-non-ref-p-intra-refresh`).
+- Check: `tests/check/libs/vkvideoencodeh264anchors.c` (`test_h264_anchor_non_ref`);
+  `scripts/harness/run-non-ref-p.sh` on hardware.
 
 ### `vulkanav1enc-ref-recovery.patch`, `vkh264enc-ref-recovery.patch`, `vulkanh265enc-ref-recovery.patch`
 

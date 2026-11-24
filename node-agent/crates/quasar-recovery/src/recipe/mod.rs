@@ -1096,6 +1096,7 @@ pub const AGENT_VARIABLES: &[&str] = &[
     "QUASAR_MIC",
     "QUASAR_MIC_DISABLED",
     "QUASAR_MIC_JITTER_MS",
+    "QUASAR_NON_REF_P",
     "QUASAR_NVENC_DEFER_TEARDOWN",
     "QUASAR_NVENC_MAX_SESSIONS",
     "QUASAR_NVIDIA_DRIVER_RUN",
@@ -1496,6 +1497,12 @@ fn recovery_actor_r1(inputs: &Inputs, image: &ImageRef) -> ContainerSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1322: `reconfigure` refuses a name that is not an agent variable.
+    #[test]
+    fn the_non_reference_p_knob_is_an_agent_variable() {
+        assert!(is_agent_variable("QUASAR_NON_REF_P"));
+    }
 
     #[test]
     fn windows_json_is_one_line_with_every_window() {

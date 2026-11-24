@@ -879,6 +879,7 @@ pub(super) fn make_nvenc_encoder(
     fps: u32,
     gop: u32,
     cuda_device_id: i32,
+    non_ref_p: bool,
     factory: &str,
 ) -> Result<gst::Element> {
     let codec_str = codec.as_str();
@@ -916,6 +917,9 @@ pub(super) fn make_nvenc_encoder(
     props.set("gop-size", &gop.to_string()); // keyframe interval
     props.set_first(&["bframes", "b-frames"], "0"); // no reordering — latency + simple decode
     props.set("aud", "false"); // skip AU-delimiter NAL — a few bytes off every frame
+    if non_ref_p_applies(non_ref_p, codec, false) {
+        set_non_ref_p(&props);
+    }
 
     // Single-frame VBV cap (SO-02): smooth the bitstream into the WebRTC pacer so an
     // IDR/scene-cut frame can't spike and collapse congestion control (#68 family).
@@ -1002,6 +1006,7 @@ pub(super) fn make_vulkan_encoder(
     num_slices: u32,
     intra_refresh: bool,
     intra_refresh_period: u32,
+    non_ref_p: bool,
     factory: &str,
 ) -> Result<gst::Element> {
     let codec_str = codec.as_str();
@@ -1070,6 +1075,12 @@ pub(super) fn make_vulkan_encoder(
         }
     }
 
+    // `QUASAR_NON_REF_P`: needs the vendored `vkh264enc-non-ref-p.patch` (the guarded set warns
+    // on an unpatched build).
+    if non_ref_p_applies(non_ref_p, codec, intra_refresh) {
+        set_non_ref_p(&props);
+    }
+
     let effective_rc = props.readback(&["rate-control"]);
     // Derived from the element's actual property presence, not the requested flag:
     // on an unpatched build the guarded set silently no-ops, and reporting `true`
@@ -1087,6 +1098,62 @@ pub(super) fn make_vulkan_encoder(
          idr-period={gop}, num-slices={num_slices}, {intra_refresh_summary}, VulkanImage NV12 in)"
     );
     Ok(enc)
+}
+
+/// The encoders' non-reference P property: `non-ref-p` on `vulkanh264enc` (the vendored patch),
+/// `nonref-p` on the NVENC encoders (GStreamer 1.28.8).
+pub(crate) const NON_REF_P: [&str; 2] = ["non-ref-p", "nonref-p"];
+
+/// The name of `enc`'s non-reference P property, if it has one.
+pub(crate) fn non_ref_p_property(enc: &gst::Element) -> Option<&'static str> {
+    first_property(enc, &NON_REF_P)
+}
+
+fn first_property(enc: &gst::Element, names: &[&'static str]) -> Option<&'static str> {
+    names
+        .iter()
+        .copied()
+        .find(|n| enc.find_property(n).is_some())
+}
+
+/// Turns on whichever of [`NON_REF_P`] the encoder has; an encoder with neither streams as
+/// before, with a warning.
+fn set_non_ref_p(props: &GuardedProps) {
+    props.set_first(&NON_REF_P, "true");
+    if non_ref_p_property(props.element).is_none() {
+        tracing::warn!(
+            token = "knob-non-ref-p-absent",
+            "QUASAR_NON_REF_P is set but {} has no {NON_REF_P:?} property (an unpatched \
+             image?); the stream is as before",
+            props.factory
+        );
+    }
+}
+
+/// Whether `QUASAR_NON_REF_P` takes effect on this session's encoder: H.264 only (the
+/// sender reads `nal_ref_idc`), and not with intra refresh, whose refreshed strip would not
+/// persist in a non-reference frame. A refused knob warns and the session streams as before.
+fn non_ref_p_applies(non_ref_p: bool, codec: Codec, intra_refresh: bool) -> bool {
+    if !non_ref_p {
+        return false;
+    }
+    if codec != Codec::H264 {
+        tracing::warn!(
+            token = "knob-non-ref-p-unsupported-codec",
+            "QUASAR_NON_REF_P is set but non-reference P frames are H.264-only (codec={}); ignoring the knob",
+            codec.as_str()
+        );
+        return false;
+    }
+    if intra_refresh {
+        tracing::warn!(
+            token = "knob-non-ref-p-intra-refresh",
+            "QUASAR_NON_REF_P and QUASAR_INTRA_REFRESH are both set: a refreshed strip in a \
+             non-reference frame would not persist; ignoring QUASAR_NON_REF_P"
+        );
+        return false;
+    }
+    true
 }
 
 /// Whether `enc`'s `name` property is live-writable (`MUTABLE_PLAYING`). Callers
@@ -1177,14 +1244,17 @@ pub(super) fn required_source_ring_depth(knobs: EncoderKnobs) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    use super::NON_REF_P;
     use super::{
         codec_plan_with, cpb_size_kbits, effective_encoder_with, effective_gop, encoder_candidates,
-        nvenc_encoder_candidates, nvenc_h264_encoder_candidates, openh264_supports,
-        plan_has_vendor_fallback, plan_is_degraded, required_source_ring_depth,
-        va_device_element_prefix, va_encoder_candidates, va_h264_encoder_candidates,
-        vulkan_element, CodecKnob, CodecPlan, EncoderKnobs, ResolvedEncoder,
+        first_property, non_ref_p_applies, non_ref_p_property, nvenc_encoder_candidates,
+        nvenc_h264_encoder_candidates, openh264_supports, plan_has_vendor_fallback,
+        plan_is_degraded, required_source_ring_depth, va_device_element_prefix,
+        va_encoder_candidates, va_h264_encoder_candidates, vulkan_element, CodecKnob, CodecPlan,
+        EncoderKnobs, ResolvedEncoder,
     };
     use crate::session::{Codec, EncoderChoice};
+    use gstreamer as gst;
 
     /// Knobs with exactly `codec` disabled (`QUASAR_VULKAN_*=0`), the rest default.
     fn disabled(codec: Codec) -> EncoderKnobs {
@@ -1222,6 +1292,29 @@ mod tests {
             va_encoder_candidates(Codec::H264, "/dev/dri/renderD129"),
             va_h264_encoder_candidates("/dev/dri/renderD129")
         );
+    }
+
+    #[test]
+    fn the_non_reference_p_property_is_found_under_either_name() {
+        gst::init().unwrap();
+        let enc = gst::ElementFactory::make("identity").build().unwrap();
+        assert_eq!(non_ref_p_property(&enc), None, "identity has neither");
+        // `identity` has a boolean `silent`: it stands in for an encoder that has only the
+        // second name, as NVENC does with `nonref-p`.
+        assert_eq!(
+            first_property(&enc, &["non-ref-p", "silent"]),
+            Some("silent")
+        );
+        assert_eq!(NON_REF_P, ["non-ref-p", "nonref-p"]);
+    }
+
+    #[test]
+    fn non_ref_p_applies_to_h264_without_intra_refresh_only() {
+        assert!(!non_ref_p_applies(false, Codec::H264, false), "default off");
+        assert!(non_ref_p_applies(true, Codec::H264, false));
+        assert!(!non_ref_p_applies(true, Codec::H264, true), "intra refresh");
+        assert!(!non_ref_p_applies(true, Codec::H265, false));
+        assert!(!non_ref_p_applies(true, Codec::Av1, false));
     }
 
     #[test]

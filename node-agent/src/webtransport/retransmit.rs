@@ -221,8 +221,11 @@ mod tests {
             frame_seq,
             ts_90khz: 0,
             capture_us: 0,
+            discardable: false,
             pyrowave: false,
             recovery: false,
+            anchor: None,
+            from: None,
         };
         let config = VideoConfig {
             config_id: 0,

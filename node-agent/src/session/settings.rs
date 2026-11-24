@@ -24,6 +24,9 @@ pub struct RuntimeSettings {
     pub cuda_device_id: i32,
     pub gop: u32,
     pub num_slices: u32,
+    /// `QUASAR_NON_REF_P`, default off: every second P frame of an H.264 session on the Vulkan
+    /// or NVENC encoder is a non-reference frame the sender may drop late without a keyframe.
+    pub non_ref_p: bool,
     pub target_usage: u32,
     pub queue_buffers: u32,
     pub zerocopy: bool,
@@ -282,6 +285,7 @@ impl RuntimeSettings {
                 .unwrap_or(0),
             gop: env_pos_u32("QUASAR_GOP", 60, lookup),
             num_slices: env_pos_u32("QUASAR_SLICES", 8, lookup),
+            non_ref_p: env_bool("QUASAR_NON_REF_P", lookup),
             target_usage: env_pos_u32("QUASAR_TARGET_USAGE", 6, lookup),
             queue_buffers: env_pos_u32("QUASAR_QUEUE_BUFFERS", 3, lookup),
             zerocopy: env_bool("QUASAR_ZEROCOPY", lookup),
@@ -613,6 +617,21 @@ fn env_bool(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_ref_p_knob_is_off_unless_set() {
+        let with = |v: Option<&'static str>| {
+            RuntimeSettings::baseline_with(&|k| match k {
+                "QUASAR_NON_REF_P" => v.map(String::from),
+                _ => None,
+            })
+            .non_ref_p
+        };
+        assert!(!with(None));
+        assert!(!with(Some("0")));
+        assert!(with(Some("1")));
+        assert!(with(Some("true")));
+    }
 
     /// `QUASAR_WT_CAPACITY`: `legacy` by default (0.6.4, lab V3), `v2` on request, anything else
     /// the default.
