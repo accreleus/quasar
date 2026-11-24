@@ -1566,8 +1566,9 @@ decodes silently wrong on hardware):
   decoder fills the lost run with invented frames (Chromium's stateless decoder does, as the
   spec says), and Mesa's VA-API decoder (radeonsi, measured on the AMD host) fails every
   recovery frame whose reference list holds one, so Chrome restarts the decoder and asks for a
-  key frame. With 0, Chromium ignores the gap and the recovery frame decodes; ffmpeg and
-  VideoToolbox decode the same stream bit-identically either way. An anchor marks itself long-term in its own slice header (MMCO 4, 1, 6); a reference
+  key frame. With 0, Chromium ignores the gap and the recovery frame decodes; software decode (ffmpeg) is
+  bit-identical either way (measured), and VideoToolbox decoded it in the 0.6.4 spike. ffmpeg's
+  own VA-API path fills gaps itself and fails on radeonsi with either value. An anchor marks itself long-term in its own slice header (MMCO 4, 1, 6); a reference
   to a long-term picture is named by `ref_pic_list_modification` idc 2. A short-term picture is
   never referenced across a `frame_num` gap. The patch also makes `vkh264enc.c` pass the MMCO
   opcode, the list-modification flags and `long_term_pic_num` to Vulkan, which it dropped. That
