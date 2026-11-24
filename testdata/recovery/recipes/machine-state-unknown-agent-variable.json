@@ -1,0 +1,7 @@
+{
+  "agent_variables": {
+    "QUASAR_ABR_MODE": "protective",
+    "QUASAR_FROM_A_LATER_RELEASE": "1",
+    "QUASAR_ALSO_FROM_A_LATER_RELEASE": "a\nb"
+  }
+}
