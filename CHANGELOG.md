@@ -32,7 +32,7 @@ own; the two do not move together, and that is deliberate.
 
 ### Added
 - `make release` can sign the release commit and tag with an SSH key (`QUASAR_RELEASE_TAG_SIGNING_KEY`), so GitHub shows them as Verified.
-- The Vulkan H.264, HEVC and AV1 encoders can hold anchor frames and code the next frame from one after a loss instead of sending a key frame (the encoder half of #1348; off until the agent uses it).
+- The Vulkan H.264, HEVC and AV1 encoders can hold anchor frames and code the next frame from one after a loss instead of sending a key frame (the encoder half of #1348; off unless `QUASAR_WT_REF_RECOVERY=on`).
 - The NVENC H.264 and HEVC encoders get the same anchor control; NVENC AV1 answers every recovery with a key frame (#1348).
 - **A user-space UDP impairment relay for lab rows where the kernel has no netem (`scripts/harness/udprelay`, #1644).** It relays one WebTransport flow and applies a rate cap with a queue limit, a policer, delay and jitter, random loss, outages, burst drops and reordering, changed at run time over a loopback control and logged per second; `redirect.sh` routes one local user's UDP through it. Test tooling only ([guide](docs/testing-e2e-suite.md#shaping-without-kernel-netem-the-udp-relay)).
 - The app editor warns, under the Steam library switch, when no (or more than one) enabled Steam provider app exists, so sharing launches would not share the library (#1631).
@@ -43,6 +43,7 @@ own; the two do not move together, and that is deliberate.
 - **`QUASAR_NON_REF_P` (off by default):** every second P frame of an H.264 session on the Vulkan encoder is a non-reference frame (NVENC's driver ignores the request), flagged `discardable`; over WebTransport the host drops such a frame without a keyframe when held video has waited too long (a stalled path, or the pacer under `QUASAR_WT_CAPACITY=v2`) (#1322).
 
 ### Changed
+- **WebTransport's default sender (`legacy`) changes in four small ways.** When QUIC's 1 MiB datagram buffer is full, video now waits at the host for up to the 250 ms resend window instead of QUIC dropping its oldest datagrams. A resend counts against its retry limit only once it is actually sent. Packet numbers follow send order for all video. A new `webtransport-keyframe-sent` log line records each keyframe. Everything else in `legacy` behaves as 0.6.3's sender.
 - CI vets and tests the UDP relay module (`scripts/harness/udprelay`) (#1653).
 
 ### Fixed
