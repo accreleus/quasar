@@ -1600,6 +1600,16 @@ the level the stream gets without them (or the negotiated one), capped at the dr
 The level follows the frame rate too (1080p30: H.264 4, still 2; HEVC 4, still 4). AV1 levels do
 not bound references (eight VBI slots at every level). The encoder logs every clamp.
 
+Input buffers. A held picture is referenced through its DPB slot, never its source image, so
+each encoder drops a frame's input buffer once it is encoded and finished (`vkh264enc.c` /
+`vkh265enc.c` after `gst_vulkan_encoder_encode()`, `gsth264encoder.c` / `gsth265encoder.c` in
+`finish_last_frame()`; `vulkanav1enc.patch` already did this for AV1). Held for as long as the
+picture was, the chain picture and the anchors pinned `num-anchors + 1` upstream buffers, and
+`vulkanscale`'s fixed 4-slot ring, which feeds the encoder after a resolution rung step, ran dry:
+the session failed within a second and a half of its first rung step (0.6.5, NVIDIA host).
+GPU test: `session::pipeline::ref_recovery::tests::anchors_hold_no_input_buffer` (ignored; run it
+in the dev image on a host with a Vulkan encoder).
+
 Tests without a GPU: `tests/check/libs/vkvideoencodeav1refs.c` (new cases),
 `vkvideoencodeh264anchors.c`, `vkvideoencodeh265anchors.c`. With a GPU:
 `scripts/harness/run-ref-recovery.sh` (encode with losses, then check that the anchors,

@@ -26,6 +26,7 @@ own; the two do not move together, and that is deliberate.
 
 ### Fixed
 
+- A session with reference recovery on (`QUASAR_WT_REF_RECOVERY=on`) no longer fails at its first resolution rung step on the Vulkan H.264 and HEVC encoders: they kept the input buffer of every frame they held as an anchor, which ran the scaler's four-slot ring in front of the encoder dry (`vulkanscale: output slot 1 still held by the encoder`). They now drop it once the frame is encoded, as the AV1 encoder already did; every Vulkan H.264 and HEVC session now releases it early, with reference recovery on or off (#1348).
 - The release manifest lists the five encoder patches 0.6.4 added (reference recovery and non-reference P frames), so the release preflight records their sha256 like every other vendored patch.
 - A race that could hang the node agent when a PyroWave stream stopped on NVIDIA (#1663) is removed: PyroWave's Vulkan library waited for the whole shared GPU device while the compositor and video encoder were still submitting on it; a vendored Granite patch makes it wait only for its own work.
 - Reference recovery on H.264 (`QUASAR_WT_REF_RECOVERY=on`) works in Chrome with VA-API hardware decode: the Vulkan H.264 encoder no longer sets `gaps_in_frame_num_value_allowed_flag`, which made Mesa's VA-API decoder fail every recovery frame and Chrome restart the decoder and ask for a key frame.
