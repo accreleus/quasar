@@ -1021,6 +1021,9 @@ impl Sim {
             }
             self.step_rung(at);
             if let Some(abr) = self.abr.as_mut() {
+                // `Control::feed` and `abr_glue`'s `Rate::observe`: the share (legacy only), then
+                // the estimate.
+                abr.set_share(if legacy { self.fec_share } else { 0.0 }, at);
                 abr.observe(abr_estimate(kbps, self.fec_share), at);
             }
             let setpoint = self

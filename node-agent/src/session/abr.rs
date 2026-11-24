@@ -436,7 +436,23 @@ pub struct Governor {
     back: bool,
     /// When `hold_to` last ran.
     held_at: Option<Instant>,
+    /// The FEC repair share the ceiling is bound by (`set_share`): the highest since the share
+    /// last stayed lower for `SHARE_STICKY`; 0 on WebRTC and v2 (#1660). And since when it has
+    /// been lower.
+    share: f64,
+    share_lower_since: Option<Instant>,
+    /// The share of the last estimate, which the reading line follows (`observe_report`).
+    share_now: f64,
+    /// When `set_share` last wrote: a step at the same estimate is that same write.
+    bound_at: Option<Instant>,
 }
+
+/// `Governor::set_share`: a share that falls lowers the ceiling only after staying lower this
+/// long. 10 s is FEC's full decay (5 levels, one per 2 s calm, `webtransport::fec`) and longer
+/// than the burst cycles a bursty link keeps 1080p through (every 2.5 to 4 s, and 10 s: sim
+/// `burst_loss_on_an_uncapped_link_keeps_the_rung_and_the_setpoint`). Following each step of
+/// the decay saw-toothed the setpoint on bursty loss.
+const SHARE_STICKY: Duration = Duration::from_secs(10);
 
 /// `Governor::hold_off`: a hold refreshed within this is seen ending (WebTransport refreshes it every
 /// report, 50 ms apart; the rung's lease is the same, `LadderPlanner::set_held`).
@@ -460,7 +476,43 @@ impl Governor {
             hold_from: None,
             held_at: None,
             back: false,
+            share: 0.0,
+            share_lower_since: None,
+            share_now: 0.0,
+            bound_at: None,
         }
+    }
+
+    /// The ceiling on video: the configured one less the FEC share, so video plus repairs
+    /// never exceeds the configured maximum (#1301). Never under the floor.
+    fn ceiling(&self) -> u32 {
+        ((self.cfg.ceiling_kbps as f64 / (1.0 + self.share)).floor() as u32)
+            .max(self.cfg.floor_kbps)
+    }
+
+    /// WebTransport FEC's repair share (`webtransport::Rate::observe`): the ceiling and the
+    /// reading line over `1 + share`, the share rising at once and falling after `SHARE_STICKY`.
+    /// Every input is already video and every gate relative, so a descent with FEC is the one
+    /// without, scaled. A setpoint over the new ceiling is returned to write, at most once per
+    /// write gap (`min_interval`, or `per_report`): each write may cost a keyframe.
+    pub fn set_share(&mut self, share: f64, now: Instant) -> Option<u32> {
+        let share = share.max(0.0);
+        self.share_now = share;
+        if share >= self.share {
+            (self.share, self.share_lower_since) = (share, None);
+        } else if now.saturating_duration_since(*self.share_lower_since.get_or_insert(now))
+            >= SHARE_STICKY
+        {
+            (self.share, self.share_lower_since) = (share, Some(now));
+        }
+        let ceiling = self.ceiling();
+        let gap = self.cfg.per_report.unwrap_or(self.cfg.min_interval);
+        if self.setpoint <= ceiling || now.saturating_duration_since(self.last_retarget) < gap {
+            return None;
+        }
+        self.setpoint = ceiling;
+        (self.last_retarget, self.bound_at) = (now, Some(now));
+        Some(ceiling)
     }
 
     /// Per-report loop: what the link allows, unclamped by the floor. The ceiling
@@ -521,9 +573,7 @@ impl Governor {
     /// estimate the link carried before the collapse cannot ramp it straight back, and an
     /// estimate under the floor cannot hold the climb back once the link returns.
     pub fn cut_to(&mut self, kbps: f64, now: Instant) -> Option<u32> {
-        let target = (kbps.round() as i64)
-            .clamp(self.cfg.floor_kbps as i64, self.cfg.ceiling_kbps as i64)
-            as u32;
+        let target = self.clamp(kbps);
         if target >= self.setpoint {
             return None;
         }
@@ -580,7 +630,7 @@ impl Governor {
         let back = self.back && target as f64 >= estimate.floor();
         let up = target > self.setpoint
             && (target as f64 >= sp * (1.0 + self.cfg.deadband)
-                || target == self.cfg.ceiling_kbps
+                || target == self.ceiling()
                 || back);
         if !up || !self.write_due(now) {
             return None;
@@ -602,9 +652,14 @@ impl Governor {
         self.cfg.per_report?;
         self.last_report = Some(now);
         // Not positive (or NaN) is no capacity sample: a zero rate would never grow again.
+        // The rate is the link's, for the rung; the line is video's, under the share now (the
+        // sticky one bounds only the ceiling).
+        let rate = self
+            .rate
+            .min(self.cfg.ceiling_kbps as f64 / (1.0 + self.share_now));
         let line = match self.cfg.legacy_readings {
-            true => self.rate * (1.0 - self.cfg.deadband),
-            false => self.rate,
+            true => rate * (1.0 - self.cfg.deadband),
+            false => rate,
         };
         let Some(reading) = reading.filter(|&r| r > 0.0 && r < line) else {
             self.under = None;
@@ -662,7 +717,7 @@ impl Governor {
     }
 
     fn clamp(&self, kbps: f64) -> u32 {
-        (kbps.round() as i64).clamp(self.cfg.floor_kbps as i64, self.cfg.ceiling_kbps as i64) as u32
+        (kbps.round() as i64).clamp(self.cfg.floor_kbps as i64, self.ceiling() as i64) as u32
     }
 
     /// Per-report loop: an encoder whose bitrate write costs a keyframe is written at most
@@ -690,23 +745,23 @@ impl Governor {
         };
         self.ewma = Some(smoothed);
 
-        // Anti-thrash: at most one retarget per min_interval (both directions).
-        if now.saturating_duration_since(self.last_retarget) < self.cfg.min_interval {
+        // Anti-thrash: at most one retarget per min_interval (both directions). A bound written
+        // at this estimate is the same write.
+        if self.bound_at != Some(now)
+            && now.saturating_duration_since(self.last_retarget) < self.cfg.min_interval
+        {
             return None;
         }
 
         let sp = self.setpoint as f64;
-        let clamp = |target: f64| -> u32 {
-            (target.round() as i64).clamp(self.cfg.floor_kbps as i64, self.cfg.ceiling_kbps as i64)
-                as u32
-        };
+        let clamp = |target: f64| self.clamp(target);
 
         // UP-gate ceiling override: once setpoint exceeds ceiling/(1+deadband), the
         // regular gate `smoothed > sp×1.15` sits above the ceiling and can never pass,
         // permanently stranding recovery ~4-13% below the configured rate (measured:
         // stuck at 7645/8000 with the estimate pinned at max). No churn risk finishing
         // the climb: the ceiling clamps further steps and the down path still rules.
-        let ceiling = self.cfg.ceiling_kbps as f64;
+        let ceiling = self.ceiling() as f64;
         let ceiling_headroom = estimate_kbps >= ceiling && sp < ceiling;
 
         // DOWN: raw estimate below the deadband ⇒ a downshift is warranted.
@@ -1578,5 +1633,134 @@ mod tests {
             assert_eq!(g.observe_report(Some(2000.0), ms(base, i * 100)), None);
         }
         assert_eq!(g.setpoint_kbps(), 10_000);
+    }
+
+    /// A per-report governor, 1000 to 8000 kbit/s, reading as `QUASAR_WT_CAPACITY` says.
+    fn per_report_fec(legacy_readings: bool) -> AbrConfig {
+        AbrConfig {
+            per_report: Some(Duration::ZERO),
+            legacy_readings,
+            ..AbrConfig::new_smooth(1000, 8000, 60)
+        }
+    }
+
+    /// One report on `link` kbit/s: a reading while the link is under the ceiling, the hold's
+    /// line under the cut, then the estimate, in `webtransport::Control::feed`'s order.
+    fn report(g: &mut Governor, link: f64, share: Option<f64>, at: Instant) -> u32 {
+        let video = link / (1.0 + share.unwrap_or(0.0));
+        match link <= 5000.0 {
+            true => drop(g.hold_to(video, at)),
+            false => g.hold_off(at),
+        }
+        g.observe_report((link < 8000.0).then_some(video * 0.97), at);
+        if let Some(share) = share {
+            g.set_share(share, at);
+        }
+        g.observe(video, at);
+        g.setpoint_kbps()
+    }
+
+    /// The link, kbit/s, `ms` into the run: just under the ceiling (inside the legacy reading
+    /// line without FEC), cut, partly back, full.
+    fn link_at(ms: u64) -> f64 {
+        match ms {
+            0..3000 => 7500.0,
+            3000..9000 => 5000.0,
+            9000..15000 => 7000.0,
+            _ => 8000.0,
+        }
+    }
+
+    /// #1301 review M1: on the window loop a bound write is an encoder write like any other (a
+    /// keyframe on NVENC and VA), so a share rising a level per report writes once per interval.
+    #[test]
+    fn a_share_rising_per_report_writes_once_per_interval() {
+        let base = Instant::now();
+        let mut g = Governor::new(cfg(), base);
+        let mut writes = Vec::new();
+        for level in 1..=5u64 {
+            let now = ms(base, 2000 + 50 * level);
+            let share = level as f64 * 0.05;
+            let cut = g.set_share(share, now);
+            writes.extend(g.observe(8000.0 / (1.0 + share), now).or(cut));
+        }
+        assert_eq!(writes, [7619], "one write in the interval");
+        let now = ms(base, 3100);
+        let cut = g.set_share(0.25, now);
+        assert_eq!(
+            g.observe(6400.0, now).or(cut),
+            Some(6400),
+            "the next interval"
+        );
+    }
+
+    /// #1301 review S2: the reading line follows the share now; the sticky share bounds only the
+    /// ceiling. With the share fallen to 0, a legacy session over a 6000 link cuts in two
+    /// readings, as with no FEC.
+    #[test]
+    fn a_fallen_share_reads_the_link_as_without_fec() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report_fec(true), base);
+        assert_eq!(g.set_share(0.25, ms(base, 0)), Some(6400));
+        assert_eq!(
+            g.set_share(0.0, ms(base, 50)),
+            None,
+            "the ceiling stays sticky"
+        );
+        assert_eq!(g.observe_report(Some(5820.0), ms(base, 100)), None);
+        assert_eq!(g.observe_report(Some(5820.0), ms(base, 150)), Some(5820));
+    }
+
+    /// #1301: with no FEC (`set_share(0)`, and WebRTC, which never calls it) every loop moves as
+    /// it did without the share: the same setpoint and rate after every call.
+    #[test]
+    fn a_zero_share_changes_nothing() {
+        let base = Instant::now();
+        for cfg in [
+            cfg(),
+            AbrConfig::new_smooth(2500, 8000, 60),
+            per_report_fec(false),
+            per_report_fec(true),
+        ] {
+            let (mut plain, mut shared) = (Governor::new(cfg, base), Governor::new(cfg, base));
+            for ms in (0..20_000).step_by(50) {
+                let now = base + Duration::from_millis(ms);
+                let (a, b) = (
+                    report(&mut plain, link_at(ms), None, now),
+                    report(&mut shared, link_at(ms), Some(0.0), now),
+                );
+                assert_eq!((a, plain.rate_kbps()), (b, shared.rate_kbps()), "{ms} ms");
+            }
+        }
+    }
+
+    /// #1301, the step-down rule: with FEC every input the per-report loop gets is video (the
+    /// link over 1 + share) and so are its ceiling and rate, so in both reading modes
+    /// (`QUASAR_WT_CAPACITY`) it moves when it would without FEC, to that setpoint over
+    /// 1 + share (to rounding): no slower, and the line it reads against is never looser.
+    #[test]
+    fn a_per_report_descent_with_fec_is_the_one_without_scaled() {
+        let base = Instant::now();
+        for legacy in [false, true] {
+            for share in [0.05, 0.10, 0.15, 0.25] {
+                let mut plain = Governor::new(per_report_fec(legacy), base);
+                let mut shared = Governor::new(per_report_fec(legacy), base);
+                for ms in (0..20_000).step_by(50) {
+                    let now = base + Duration::from_millis(ms);
+                    let was = (plain.setpoint_kbps(), shared.setpoint_kbps());
+                    let a = report(&mut plain, link_at(ms), None, now);
+                    let b = report(&mut shared, link_at(ms), Some(share), now);
+                    let scaled = f64::from(a) / (1.0 + share);
+                    assert!(
+                        (f64::from(b) - scaled).abs() <= 1.0,
+                        "legacy {legacy}, {share}: {ms} ms, {a} without, {b} with"
+                    );
+                    // The start, where the share first lowers the ceiling, aside.
+                    if ms > 0 {
+                        assert_eq!(a != was.0, b != was.1, "legacy {legacy}, {share}: {ms} ms");
+                    }
+                }
+            }
+        }
     }
 }
