@@ -1460,7 +1460,7 @@ impl Estimator {
             .zip(self.held)
             .is_some_and(|(run, h)| {
                 h.dropped
-                    && !h.probe.is_some_and(|p| p.release.is_some())
+                    && h.probe.is_none_or(|p| p.release.is_none())
                     && !run.key
                     && edge.is_none_or(|at| at + PROBE_WAIT <= run.at)
                     && h.cause.1 >= LOSS_HIGH
