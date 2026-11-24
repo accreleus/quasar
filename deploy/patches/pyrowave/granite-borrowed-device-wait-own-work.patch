@@ -14,6 +14,8 @@ recorded in a frame (a per-queue timeline value, or a fence without timeline
 semaphores), so waiting each frame covers all queues Granite submits to before it
 frees anything. The owned-device path is unchanged. Applied to Granite at
 GRANITE_REF by deploy/Dockerfile.vulkan; re-apply on every PyroWave/Granite bump.
+One vkDeviceWaitIdle stays reachable on a borrowed device: breadcrumbs.cpp
+notify_device_hung, only with Granite post-mortem on (off in Quasar) after a hang.
 
 diff --git a/vulkan/context.cpp b/vulkan/context.cpp
 index ad9e9c8b..85856ecb 100644

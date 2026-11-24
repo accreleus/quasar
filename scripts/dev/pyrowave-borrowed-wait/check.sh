@@ -31,5 +31,5 @@ rc=0; LD_LIBRARY_PATH=/tmp/pw/lib64 VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validati
 cat /tmp/out
 # VUID-vkCmdDraw-None-09600 is the decoder fragment path on lavapipe, unpatched too. Dropping the
 # wait in the patch shows as VUID-vkDestroyBuffer-buffer-00922 (destroyed while in use).
-if grep -o "Validation Error: \[ VUID-[^ ]*" /tmp/out | grep -v VUID-vkCmdDraw-None-09600; then echo "FAIL: validation errors"; exit 1; fi
+if grep -o "Validation Error: \[ [^ ]*" /tmp/out | grep -v VUID-vkCmdDraw-None-09600; then echo "FAIL: validation errors"; exit 1; fi
 exit $rc'
