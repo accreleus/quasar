@@ -6803,6 +6803,18 @@ fn a_probe_repair_over_a_shrunk_datagram_size_ends_the_probe_not_the_stream() {
     assert!(alive, "a refused repair ended the stream");
     assert_eq!((tries, video.probes_too_large), (1, 1));
     assert!(probe_frame.is_none(), "the frame still probes");
+    assert_eq!(video.next_seq(), 10, "a refused repair took a pkt_seq");
+    // A skip is no refusal for size (seat A nit, #1652).
+    assert!(fill_probe(
+        &mut log,
+        Some(20_000.0),
+        &mut Some((frame.clone(), 0)),
+        &mut video,
+        1,
+        at(16_750),
+        |_| congestion::Handed::Skipped,
+    ));
+    assert_eq!(video.probes_too_large, 1, "a skip counted as too large");
     let gone = fill_probe(
         &mut log,
         Some(20_000.0),
@@ -6813,6 +6825,58 @@ fn a_probe_repair_over_a_shrunk_datagram_size_ends_the_probe_not_the_stream() {
         |_| congestion::Handed::Gone,
     );
     assert!(!gone, "a gone connection goes on");
+}
+
+/// Seat A (#1652): the probe's sends through production's mapping (`hand_over`) on a real session. A
+/// repair QUIC takes is counted in `handed` and takes a `pkt_seq`; one refused for size is neither,
+/// and ends that frame's probe, not the stream; a closed connection ends the stream.
+#[tokio::test]
+async fn a_probe_repair_counts_as_handed_only_once_quic_takes_it() {
+    let agent = agent().await;
+    let session = agent.connect().await;
+    let start = std::time::Instant::now();
+    let at = |us: u64| start + Duration::from_micros(us);
+    let mut handed = 0;
+    // (alive, `pkt_seq`s the probe took, refused for size) for one frame of `len`-byte fragments.
+    let mut probe = |len: usize, us: u64| {
+        let mut log = congestion::SendLog::new(start);
+        let mut video = congestion::VideoQueue::default();
+        let frame: Vec<Bytes> = (0..10)
+            .map(|_| {
+                let mut d = vec![0x01];
+                d.extend_from_slice(&video.take_seq().to_le_bytes());
+                d.resize(len, 0);
+                Bytes::from(d)
+            })
+            .collect();
+        log.probe_room(Some(50_000.0), at(us));
+        for d in &frame {
+            log.record(d, at(us + 16_000), false);
+        }
+        let alive = fill_probe(
+            &mut log,
+            Some(50_000.0),
+            &mut Some((frame, 0)),
+            &mut video,
+            1,
+            at(us + 16_700),
+            |d| hand_over(session.send_datagram(d), &mut handed),
+        );
+        (alive, video.next_seq() - 10, video.probes_too_large)
+    };
+    let (alive, took, refused) = probe(1000, 0);
+    assert!(
+        alive && took > 0 && refused == 0,
+        "{took} taken, {refused} refused"
+    );
+    let (alive, none, refused) = probe(4 * media::MAX_DATAGRAM, 100_000);
+    assert!(alive, "a refusal for size ended the stream");
+    assert_eq!((none, refused), (0, 1));
+    session.close(0, b"done");
+    session.closed().await;
+    let (alive, ..) = probe(1000, 200_000);
+    assert!(!alive, "a closed connection goes on");
+    assert_eq!(handed, u64::from(took), "counted what QUIC refused");
 }
 
 #[test]

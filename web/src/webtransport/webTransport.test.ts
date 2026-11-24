@@ -1465,10 +1465,11 @@ describe("createWebTransportRuntime fallback", () => {
      *  60 fps, a keyframe every 30 frames: `swap` sends each pair of frames second one first; `lose`
      *  drops one delta in ten, which the client gives up and asks a keyframe for. Runs `ms` or until
      *  the connection closes; returns how long it ran. */
-    async function streamFor(s: ReturnType<typeof setup>, ms: number, o: { swap: boolean; lose: boolean }, from = { seq: 0, pkt: { n: 0 } }) {
+    async function streamFor(s: ReturnType<typeof setup>, ms: number, o: { swap: boolean; lose: boolean | ((ms: number) => boolean) }, from = { seq: 0, pkt: { n: 0 } }) {
       let ran = 0;
       for (; ran < ms && s.rt.getSnapshot().channelOpen; ran += 33) {
-        const pair = [from.seq, from.seq + 1].filter((q) => !(o.lose && q % 10 === 3));
+        const lose = typeof o.lose === "function" ? o.lose(ran) : o.lose;
+        const pair = [from.seq, from.seq + 1].filter((q) => !(lose && q % 10 === 3));
         from.seq += 2;
         const d = pair.flatMap((q) => packetize({ configId: 0, frameSeq: q & 0xffff, keyframe: q % 30 === 0, data: bytes(10, q) }, from.pkt));
         s.agent.last.datagrams(o.swap ? d.reverse() : d);
@@ -1495,6 +1496,16 @@ describe("createWebTransportRuntime fallback", () => {
       await vi.advanceTimersByTimeAsync(BYE_FLUSH_MS + 100);
       expect(s.callbacks.onFallback).toHaveBeenCalledWith("stream_lost", expect.stringMatching(/^stream_lost: reorder: \d+ late \d+ kf, /));
       expect(s.agent.sent("hello")).toHaveLength(1);
+      s.rt.destroy();
+    });
+
+    it("falls back once frames are given up in 3 of 5 seconds, never 3 in a row (#1446)", async () => {
+      const s = await up();
+      // Loss 300-700 ms into every second second: the reorder rule ticks each second from the connect.
+      const ran = await streamFor(s, 15_000, { swap: true, lose: (ms) => ms % 2_000 >= 1_300 && ms % 2_000 < 1_700 });
+      expect(ran).toBeLessThan(15_000);
+      await vi.advanceTimersByTimeAsync(BYE_FLUSH_MS + 100);
+      expect(s.callbacks.onFallback).toHaveBeenCalledWith("stream_lost", expect.stringMatching(/^stream_lost: reorder: (\d+ late \d+ kf, ){2}\d+ late \d+ kf$/));
       s.rt.destroy();
     });
 
