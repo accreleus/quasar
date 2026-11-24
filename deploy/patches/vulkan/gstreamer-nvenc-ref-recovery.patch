@@ -1,0 +1,649 @@
+diff --git a/subprojects/gst-plugins-bad/sys/nvcodec/gstnvenc.c b/subprojects/gst-plugins-bad/sys/nvcodec/gstnvenc.c
+index 9f060e4..4516d7b 100644
+--- a/subprojects/gst-plugins-bad/sys/nvcodec/gstnvenc.c
++++ b/subprojects/gst-plugins-bad/sys/nvcodec/gstnvenc.c
+@@ -280,6 +280,13 @@ NvEncEncodePicture (void *encoder, NV_ENC_PIC_PARAMS * pic_params)
+   return nvenc_api.nvEncEncodePicture (encoder, pic_params);
+ }
+ 
++NVENCSTATUS NVENCAPI
++NvEncInvalidateRefFrames (void *encoder, uint64_t invalidRefFrameTimeStamp)
++{
++  g_assert (nvenc_api.nvEncInvalidateRefFrames != NULL);
++  return nvenc_api.nvEncInvalidateRefFrames (encoder, invalidRefFrameTimeStamp);
++}
++
+ NVENCSTATUS NVENCAPI
+ NvEncRegisterAsyncEvent (void *encoder, NV_ENC_EVENT_PARAMS * event_params)
+ {
+diff --git a/subprojects/gst-plugins-bad/sys/nvcodec/gstnvenclevel.h b/subprojects/gst-plugins-bad/sys/nvcodec/gstnvenclevel.h
+new file mode 100644
+index 0000000..9369aec
+--- /dev/null
++++ b/subprojects/gst-plugins-bad/sys/nvcodec/gstnvenclevel.h
+@@ -0,0 +1,86 @@
++/* GStreamer
++ * Copyright (C) 2026 Quasar contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ */
++
++/* Reference recovery (Quasar): the DPB pictures the level allows, for the
++ * num-anchors clamp in gstnvencoder.cpp. Plain C so tests/check/libs/nvenclevel.c
++ * can include it. */
++
++#pragma once
++
++#include <gst/gst.h>
++
++G_BEGIN_DECLS
++
++/* The DPB pictures (references + 1) of the lowest level that fits this size and
++ * rate. NVENC is always given NV_ENC_LEVEL_AUTOSELECT, so this is the level the
++ * stream gets without anchors; bitrate is left out, which can only pick a lower
++ * level and so a tighter limit. H.264: MaxDpbFrames from Table A-1; HEVC:
++ * MaxDpbSize from A.4.2, Main tier, on the size rounded up to 8 as coded. */
++static inline guint
++gst_nv_enc_level_max_dpb (gboolean h264, guint w, guint h, guint fps_n,
++    guint fps_d)
++{
++  static const struct
++  {
++    guint32 mbps, fs, dpb_mbs;
++  } h264_levels[] = {
++    {1485, 99, 396}, {3000, 396, 900}, {6000, 396, 2376}, {11880, 396, 2376},
++    {11880, 396, 2376}, {19800, 792, 4752}, {20250, 1620, 8100},
++    {40500, 1620, 8100}, {108000, 3600, 18000}, {216000, 5120, 20480},
++    {245760, 8192, 32768}, {245760, 8192, 32768}, {522240, 8704, 34816},
++    {589824, 22080, 110400}, {983040, 36864, 184320},
++    {2073600, 36864, 184320}, {4177920, 139264, 696320},
++    {8355840, 139264, 696320}, {16711680, 139264, 696320},
++  };
++  static const struct
++  {
++    guint64 ps, sr;
++  } h265_levels[] = {
++    {36864, 552960}, {122880, 3686400}, {245760, 7372800}, {552960, 16588800},
++    {983040, 33177600}, {2228224, 66846720}, {2228224, 133693440},
++    {8912896, 267386880}, {8912896, 534773760}, {8912896, 1069547520},
++    {35651584, 1069547520}, {35651584, 2139095040}, {35651584, 4278190080},
++  };
++  guint i;
++
++  if (fps_n == 0 || fps_d == 0) {
++    fps_n = 60;
++    fps_d = 1;
++  }
++
++  if (h264) {
++    guint64 fs = (guint64) ((w + 15) / 16) * ((h + 15) / 16);
++    guint64 mbps = gst_util_uint64_scale_ceil (fs, fps_n, fps_d);
++
++    for (i = 0; i < G_N_ELEMENTS (h264_levels) - 1; i++) {
++      if (fs <= h264_levels[i].fs && mbps <= h264_levels[i].mbps)
++        break;
++    }
++    return MIN (h264_levels[i].dpb_mbs / MAX (fs, 1), 16);
++  } else {
++    guint64 ps = (guint64) GST_ROUND_UP_8 (w) * GST_ROUND_UP_8 (h);
++    guint64 sr = gst_util_uint64_scale_ceil (ps, fps_n, fps_d);
++    guint64 max_ps;
++
++    for (i = 0; i < G_N_ELEMENTS (h265_levels) - 1; i++) {
++      if (ps <= h265_levels[i].ps && sr <= h265_levels[i].sr)
++        break;
++    }
++    max_ps = h265_levels[i].ps;
++    if (ps <= (max_ps >> 2))
++      return 16;
++    if (ps <= (max_ps >> 1))
++      return 12;
++    if (ps <= ((3 * max_ps) >> 2))
++      return 8;
++    return 6;
++  }
++}
++
++G_END_DECLS
+diff --git a/subprojects/gst-plugins-bad/sys/nvcodec/gstnvencobject.cpp b/subprojects/gst-plugins-bad/sys/nvcodec/gstnvencobject.cpp
+index d2b2762..b675c8c 100644
+--- a/subprojects/gst-plugins-bad/sys/nvcodec/gstnvencobject.cpp
++++ b/subprojects/gst-plugins-bad/sys/nvcodec/gstnvencobject.cpp
+@@ -423,7 +423,8 @@ GstNvEncObject::SetFlushing (bool flushing)
+ 
+ NVENCSTATUS
+ GstNvEncObject::Encode (GstVideoCodecFrame * codec_frame,
+-    NV_ENC_PIC_STRUCT pic_struct, GstNvEncTask * task)
++    NV_ENC_PIC_STRUCT pic_struct, GstNvEncTask * task,
++    const GstNvEncRefControl * ref)
+ {
+   NVENCSTATUS status;
+   guint retry_count = 0;
+@@ -476,6 +477,34 @@ GstNvEncObject::Encode (GstVideoCodecFrame * codec_frame,
+   if (GST_VIDEO_CODEC_FRAME_IS_FORCE_KEYFRAME (codec_frame))
+     params.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
+ 
++  if (ref && (codec_ == GST_NV_ENC_CODEC_H264 || codec_ == GST_NV_ENC_CODEC_H265)) {
++    if (codec_ == GST_NV_ENC_CODEC_H264) {
++      auto & p = params.codecPicParams.h264PicParams;
++      p.ltrMarkFrame = ref->mark_idx >= 0;
++      p.ltrMarkFrameIdx = MAX (ref->mark_idx, 0);
++      p.ltrUseFrames = ref->use_bitmap != 0;
++      p.ltrUseFrameBitmap = ref->use_bitmap;
++    } else {
++      auto & p = params.codecPicParams.hevcPicParams;
++      p.ltrMarkFrame = ref->mark_idx >= 0;
++      p.ltrMarkFrameIdx = MAX (ref->mark_idx, 0);
++      p.ltrUseFrames = ref->use_bitmap != 0;
++      p.ltrUseFrameBitmap = ref->use_bitmap;
++    }
++
++    if (ref->n_invalidate) {
++      DeviceLock ();
++      for (guint i = 0; i < ref->n_invalidate; i++) {
++        status = NvEncInvalidateRefFrames (session_, ref->invalidate[i]);
++        if (status != NV_ENC_SUCCESS) {
++          GST_WARNING_ID (id_.c_str (), "Invalidating %" G_GUINT64_FORMAT
++              " failed: %d", ref->invalidate[i], (gint) status);
++        }
++      }
++      DeviceUnlock ();
++    }
++  }
++
+   do {
+     DeviceLock ();
+     status = NvEncEncodePicture (session_, &params);
+diff --git a/subprojects/gst-plugins-bad/sys/nvcodec/gstnvencobject.h b/subprojects/gst-plugins-bad/sys/nvcodec/gstnvencobject.h
+index 7291766..bca461b 100644
+--- a/subprojects/gst-plugins-bad/sys/nvcodec/gstnvencobject.h
++++ b/subprojects/gst-plugins-bad/sys/nvcodec/gstnvencobject.h
+@@ -141,6 +141,16 @@ enum GstNvEncCodec
+   GST_NV_ENC_CODEC_AV1,
+ };
+ 
++/* Reference recovery (Quasar): per-picture long-term reference control,
++ * H.264 and HEVC only */
++struct GstNvEncRefControl
++{
++  gint mark_idx = -1;           /* mark the picture long-term at this index */
++  guint32 use_bitmap = 0;       /* code it from these long-term pictures */
++  guint64 invalidate[24];       /* anchor_pts[16] + recent[8]: cannot overflow */
++  guint n_invalidate = 0;
++};
++
+ class GstNvEncObject : public std::enable_shared_from_this <GstNvEncObject>
+ {
+ public:
+@@ -172,7 +182,8 @@ public:
+ 
+   NVENCSTATUS   Encode      (GstVideoCodecFrame * codec_frame,
+                              NV_ENC_PIC_STRUCT pic_struct,
+-                             GstNvEncTask * task);
++                             GstNvEncTask * task,
++                             const GstNvEncRefControl * ref = nullptr);
+ 
+   NVENCSTATUS   Drain       (GstNvEncTask * task);
+ 
+diff --git a/subprojects/gst-plugins-bad/sys/nvcodec/gstnvencoder.cpp b/subprojects/gst-plugins-bad/sys/nvcodec/gstnvencoder.cpp
+index ad2b5a0..b5e65dd 100644
+--- a/subprojects/gst-plugins-bad/sys/nvcodec/gstnvencoder.cpp
++++ b/subprojects/gst-plugins-bad/sys/nvcodec/gstnvencoder.cpp
+@@ -36,6 +36,8 @@
+ #include <memory>
+ #include <atomic>
+ #include "gstnvencobject.h"
++#include "../../ext/vulkan/base/gstrefrecovery.h"
++#include "gstnvenclevel.h"
+ 
+ #ifdef HAVE_GST_D3D12
+ #include "gstcudainterop_d3d12.h"
+@@ -64,7 +66,8 @@ enum
+   PROP_0,
+   PROP_CC_INSERT,
+   PROP_EXTERN_POOL,
+-  PROP_EMIT_FRAME_STATS
++  PROP_EMIT_FRAME_STATS,
++  PROP_NUM_ANCHORS,
+ };
+ 
+ enum
+@@ -147,6 +150,24 @@ struct _GstNvEncoderPrivate
+   GstBufferPool *extern_pool = nullptr;
+   gboolean emit_frame_stats;
+   GstStructure *frame_stats;
++  guint num_anchors = 0;
++
++  /* reference recovery: requests under the object lock, the rest on the
++   * streaming thread. anchor_pts[i] is the pts of the anchor at long-term
++   * index i, NONE when none; retired: H.264 indices whose picture a recovery
++   * forgot, unused until the next IDR; recent[] the last pts submitted. */
++  GstRefRecoveryRequest req = { FALSE, FALSE, GST_CLOCK_TIME_NONE };
++  guint anchors = 0;
++  guint ltr_slots = 0;
++  guint32 retired = 0;
++  gboolean anchor_h264 = FALSE;
++  GstClockTime anchor_pts[16];
++  GstClockTime recent[8];
++  guint recent_pos = 0;
++  gboolean prev_anchor = FALSE;
++  gboolean need_idr = TRUE;
++  guint32 since_idr = 0;
++  guint32 gop = 0;
+ };
+ 
+ /**
+@@ -167,6 +188,8 @@ static void gst_nv_encoder_set_context (GstElement * element,
+ static gboolean gst_nv_encoder_open (GstVideoEncoder * encoder);
+ static gboolean gst_nv_encoder_close (GstVideoEncoder * encoder);
+ static gboolean gst_nv_encoder_stop (GstVideoEncoder * encoder);
++static gboolean gst_nv_encoder_src_event (GstVideoEncoder * encoder,
++    GstEvent * event);
+ static gboolean gst_nv_encoder_sink_event (GstVideoEncoder * encoder,
+     GstEvent * event);
+ static gboolean gst_nv_encoder_sink_query (GstVideoEncoder * encoder,
+@@ -238,6 +261,20 @@ gst_nv_encoder_class_init (GstNvEncoderClass * klass)
+           "Emit the 'frame-stats' signal for each encoded frame",
+           FALSE, (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+ 
++  /**
++   * GstNvEncoder:num-anchors:
++   *
++   * Reference recovery (gstrefrecovery.h): how many anchor frames, kept as
++   * long-term references, are held for "quasar-ref-recover". 0 disables it.
++   * H.264 and HEVC only (NVENC API 12.0 has no AV1 long-term references),
++   * no B frames, at most NV_ENC_CAPS_NUM_MAX_LTR_FRAMES. Read at stream start.
++   */
++  g_object_class_install_property (object_class, PROP_NUM_ANCHORS,
++      g_param_spec_uint ("num-anchors", "Number of anchors",
++          "Anchor frames held for reference recovery (0 = off)", 0, 7, 0,
++          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
++              GST_PARAM_MUTABLE_READY)));
++
+   /**
+    * GstNvEncoder::frame-stats:
+    *
+@@ -258,6 +295,7 @@ gst_nv_encoder_class_init (GstNvEncoderClass * klass)
+   videoenc_class->close = GST_DEBUG_FUNCPTR (gst_nv_encoder_close);
+   videoenc_class->stop = GST_DEBUG_FUNCPTR (gst_nv_encoder_stop);
+   videoenc_class->sink_event = GST_DEBUG_FUNCPTR (gst_nv_encoder_sink_event);
++  videoenc_class->src_event = GST_DEBUG_FUNCPTR (gst_nv_encoder_src_event);
+   videoenc_class->sink_query = GST_DEBUG_FUNCPTR (gst_nv_encoder_sink_query);
+   videoenc_class->src_query = GST_DEBUG_FUNCPTR (gst_nv_encoder_src_query);
+   videoenc_class->propose_allocation =
+@@ -343,6 +381,11 @@ gst_nv_encoder_set_property (GObject * object, guint prop_id,
+     case PROP_EMIT_FRAME_STATS:
+       priv->emit_frame_stats = g_value_get_boolean (value);
+       break;
++    case PROP_NUM_ANCHORS:
++      GST_OBJECT_LOCK (self);
++      priv->num_anchors = g_value_get_uint (value);
++      GST_OBJECT_UNLOCK (self);
++      break;
+     default:
+       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+       break;
+@@ -366,6 +409,11 @@ gst_nv_encoder_get_property (GObject * object, guint prop_id, GValue * value,
+     case PROP_EMIT_FRAME_STATS:
+       g_value_set_boolean (value, priv->emit_frame_stats);
+       break;
++    case PROP_NUM_ANCHORS:
++      GST_OBJECT_LOCK (self);
++      g_value_set_uint (value, priv->num_anchors);
++      GST_OBJECT_UNLOCK (self);
++      break;
+     default:
+       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+       break;
+@@ -637,6 +685,243 @@ gst_nv_encoder_sink_event (GstVideoEncoder * encoder, GstEvent * event)
+   return GST_VIDEO_ENCODER_CLASS (parent_class)->sink_event (encoder, event);
+ }
+ 
++static gboolean
++gst_nv_encoder_src_event (GstVideoEncoder * encoder, GstEvent * event)
++{
++  GstNvEncoderPrivate *priv = GST_NV_ENCODER (encoder)->priv;
++  gboolean ours;
++
++  GST_OBJECT_LOCK (encoder);
++  ours = gst_ref_recovery_take_event (event, &priv->req);
++  GST_OBJECT_UNLOCK (encoder);
++
++  if (ours) {
++    gst_event_unref (event);
++    return TRUE;
++  }
++
++  return GST_VIDEO_ENCODER_CLASS (parent_class)->src_event (encoder, event);
++}
++
++/* Reference recovery: clamp num-anchors and turn on per-picture LTR in
++ * @config, which set_format() has filled. A new session starts with an IDR,
++ * so nothing is held. */
++static void
++gst_nv_encoder_setup_anchors (GstNvEncoder * self, gpointer session,
++    NV_ENC_INITIALIZE_PARAMS * init_params, NV_ENC_CONFIG * config)
++{
++  GstNvEncoderPrivate *priv = self->priv;
++  gboolean h264 = memcmp (&init_params->encodeGUID, &NV_ENC_CODEC_H264_GUID,
++      sizeof (GUID)) == 0;
++  gboolean h265 = memcmp (&init_params->encodeGUID, &NV_ENC_CODEC_HEVC_GUID,
++      sizeof (GUID)) == 0;
++  guint k, slots, dpb = 0;
++  gint max_ltr = 0;
++
++  GST_OBJECT_LOCK (self);
++  k = priv->num_anchors;
++  priv->req.anchor = FALSE;
++  priv->req.recover = FALSE;
++  GST_OBJECT_UNLOCK (self);
++
++  if (k > 0 && !h264 && !h265) {
++    GST_WARNING_OBJECT (self, "num-anchors=%u: NVENC API 12.0 has no AV1 "
++        "long-term references, 0 used", k);
++    k = 0;
++  } else if (k > 0 && config->frameIntervalP > 1) {
++    GST_WARNING_OBJECT (self, "num-anchors=%u needs no B frames, 0 used", k);
++    k = 0;
++  } else if (k > 0) {
++    NV_ENC_CAPS_PARAM param = { 0, };
++
++    param.version = gst_nvenc_get_caps_param_version ();
++    param.capsToQuery = NV_ENC_CAPS_NUM_MAX_LTR_FRAMES;
++    if (NvEncGetEncodeCaps (session, init_params->encodeGUID, &param,
++            &max_ltr) != NV_ENC_SUCCESS)
++      max_ltr = 0;
++    if ((gint) k > max_ltr) {
++      GST_WARNING_OBJECT (self, "num-anchors=%u, the device holds %d "
++          "long-term references", k, max_ltr);
++      k = MAX (max_ltr, 0);
++    }
++  }
++
++  /* K anchors need K + 2 DPB pictures: on H.264 K + 1 references and one
++   * spare long-term index, on HEVC K + 1 references and the current picture.
++   * Anchors never raise the level. */
++  if (k > 0) {
++    dpb = gst_nv_enc_level_max_dpb (h264, init_params->encodeWidth,
++        init_params->encodeHeight, init_params->frameRateNum,
++        init_params->frameRateDen);
++
++    if (k + 2 > dpb) {
++      GST_WARNING_OBJECT (self, "num-anchors=%u, the level at %ux%u allows "
++          "%u DPB pictures, %u used", k, init_params->encodeWidth,
++          init_params->encodeHeight, dpb, dpb > 2 ? dpb - 2 : 0);
++      k = dpb > 2 ? dpb - 2 : 0;
++    }
++  }
++
++  /* H.264: overwriting the index of an anchor a recovery forgot sends no
++   * MMCO 1, so a decoder that lost that anchor ends one reference over
++   * max_num_ref_frames. Such an index is retired until the next IDR, and
++   * every index the level leaves is used, so new anchors take a fresh one
++   * (whose MMCO 6 comes with the MMCO 1 that keeps every decoder in step). */
++  slots = k;
++  if (k > 0 && h264)
++    slots = MIN (MIN (dpb - 1, (guint) max_ltr), G_N_ELEMENTS (priv->anchor_pts));
++
++  /* The element places every IDR while anchors are on (NVENC's own cadence
++   * is off), so the held set matches NVENC's by construction. */
++  priv->gop = config->gopLength;
++  if (k > 0) {
++    config->gopLength = NVENC_INFINITE_GOPLENGTH;
++    if (h264)
++      config->encodeCodecConfig.h264Config.idrPeriod = NVENC_INFINITE_GOPLENGTH;
++    else
++      config->encodeCodecConfig.hevcConfig.idrPeriod = NVENC_INFINITE_GOPLENGTH;
++  }
++
++  if (k > 0 && h264) {
++    auto & c = config->encodeCodecConfig.h264Config;
++    c.enableLTR = 1;
++    c.ltrTrustMode = 0;
++    c.ltrNumFrames = slots;
++    c.maxNumRefFrames = MAX (c.maxNumRefFrames, slots + 1);
++  } else if (k > 0) {
++    auto & c = config->encodeCodecConfig.hevcConfig;
++    c.enableLTR = 1;
++    c.ltrTrustMode = 0;
++    c.ltrNumFrames = k;
++    c.maxNumRefFramesInDPB = MAX (c.maxNumRefFramesInDPB, k + 1);
++  }
++
++  priv->anchors = k;
++  priv->ltr_slots = slots;
++  priv->retired = 0;
++  priv->anchor_h264 = h264;
++  for (guint i = 0; i < G_N_ELEMENTS (priv->anchor_pts); i++)
++    priv->anchor_pts[i] = GST_CLOCK_TIME_NONE;
++  for (guint i = 0; i < G_N_ELEMENTS (priv->recent); i++)
++    priv->recent[i] = GST_CLOCK_TIME_NONE;
++  priv->prev_anchor = FALSE;
++  priv->need_idr = TRUE;
++  priv->since_idr = 0;
++}
++
++/* Reference recovery: decide @frame's long-term references (same rules as
++ * the Vulkan encoders, gstrefrecovery.h). The held set mirrors the encoder's
++ * DPB: an IDR drops every long-term picture, marking an index replaces it.
++ * A recovery frame's one reference is its anchor. On HEVC it first
++ * invalidates the recent pictures newer than its anchor, or NVENC keeps the
++ * lost ones in the RPS. Never on H.264: invalidation drops pictures from
++ * NVENC's DPB that the sliding window still holds, and NVENC then omits the
++ * MMCO 1 a later anchor needs (both measured). */
++static void
++gst_nv_encoder_plan_refs (GstNvEncoder * self, GstVideoCodecFrame * frame,
++    GstNvEncRefControl * ref)
++{
++  GstNvEncoderPrivate *priv = self->priv;
++  GstRefRecoveryRequest req;
++  GstClockTime recover_from = GST_CLOCK_TIME_NONE;
++  gint slot = -1;
++  gboolean key, rearm = FALSE;
++
++  GST_OBJECT_LOCK (self);
++  req = priv->req;
++  priv->req.anchor = FALSE;
++  priv->req.recover = FALSE;
++  GST_OBJECT_UNLOCK (self);
++
++  key = priv->need_idr || GST_VIDEO_CODEC_FRAME_IS_FORCE_KEYFRAME (frame) ||
++      priv->since_idr >= priv->gop;
++  if (key && priv->anchors > 0)
++    GST_VIDEO_CODEC_FRAME_SET_FORCE_KEYFRAME (frame);
++
++  if (req.recover && !key) {
++    for (guint i = 0; i < priv->ltr_slots; i++) {
++      if (priv->anchor_pts[i] == req.recover_pts)
++        slot = i;
++    }
++    if (slot < 0) {
++      GST_INFO_OBJECT (self, "No anchor with pts %" GST_TIME_FORMAT
++          ", key frame instead", GST_TIME_ARGS (req.recover_pts));
++      GST_VIDEO_CODEC_FRAME_SET_FORCE_KEYFRAME (frame);
++      key = TRUE;
++    }
++  }
++
++  if (key) {
++    for (guint i = 0; i < priv->ltr_slots; i++)
++      priv->anchor_pts[i] = GST_CLOCK_TIME_NONE;
++    priv->retired = 0;
++    priv->need_idr = FALSE;
++    priv->since_idr = 0;
++    rearm = req.anchor;
++  } else if (slot >= 0) {
++    recover_from = req.recover_pts;
++    ref->use_bitmap = 1 << slot;
++    for (guint i = 0; i < priv->ltr_slots; i++) {
++      if (GST_CLOCK_TIME_IS_VALID (priv->anchor_pts[i]) &&
++          priv->anchor_pts[i] > recover_from) {
++        /* HEVC: the anchor may be older than recent[], so it goes too */
++        if (!priv->anchor_h264 && ref->n_invalidate < G_N_ELEMENTS (ref->invalidate))
++          ref->invalidate[ref->n_invalidate++] = priv->anchor_pts[i];
++        priv->anchor_pts[i] = GST_CLOCK_TIME_NONE;
++        if (priv->anchor_h264)
++          priv->retired |= 1 << i;
++      }
++    }
++    for (guint i = 0; !priv->anchor_h264 && i < G_N_ELEMENTS (priv->recent);
++        i++) {
++      if (GST_CLOCK_TIME_IS_VALID (priv->recent[i]) && priv->recent[i] > recover_from
++          && ref->n_invalidate < G_N_ELEMENTS (ref->invalidate))
++        ref->invalidate[ref->n_invalidate++] = priv->recent[i];
++    }
++  }
++
++  if (!key && req.anchor && priv->anchors > 0) {
++    if (priv->anchor_h264 && (slot >= 0 || priv->prev_anchor)) {
++      rearm = TRUE;
++    } else {
++      /* below num-anchors held, an unused index; else (or with none left)
++       * the oldest anchor's */
++      gint idx = -1, oldest = -1;
++      guint held = 0;
++
++      for (guint i = 0; i < priv->ltr_slots; i++) {
++        if (GST_CLOCK_TIME_IS_VALID (priv->anchor_pts[i])) {
++          held++;
++          if (oldest < 0 || priv->anchor_pts[i] < priv->anchor_pts[oldest])
++            oldest = i;
++        } else if (idx < 0 && !(priv->retired & (1 << i))) {
++          idx = i;
++        }
++      }
++      /* a retired index implies a held anchor (the one the recovery that
++       * retired it named, or what replaced it), so oldest >= 0 here */
++      if (held >= priv->anchors || idx < 0)
++        idx = oldest;
++      priv->anchor_pts[idx] = frame->pts;
++      ref->mark_idx = idx;
++    }
++  }
++
++  if (rearm) {
++    GST_OBJECT_LOCK (self);
++    priv->req.anchor = TRUE;
++    GST_OBJECT_UNLOCK (self);
++  }
++
++  priv->prev_anchor = ref->mark_idx >= 0;
++  priv->since_idr++;
++  priv->recent[priv->recent_pos] = frame->pts;
++  priv->recent_pos = (priv->recent_pos + 1) % G_N_ELEMENTS (priv->recent);
++
++  if (ref->mark_idx >= 0 || GST_CLOCK_TIME_IS_VALID (recover_from))
++    gst_ref_recovery_report (frame, ref->mark_idx >= 0, recover_from);
++}
++
+ #ifdef HAVE_CUDA_GST_GL
+ static void
+ gst_nv_encoder_check_cuda_device_from_gl_context (GstGLContext * context,
+@@ -1270,6 +1555,9 @@ gst_nv_encoder_init_session (GstNvEncoder * self, GstBuffer * in_buf)
+     goto error;
+   }
+ 
++  gst_nv_encoder_setup_anchors (self, priv->object->GetHandle (),
++      &priv->init_params, &priv->config);
++
+   task_pool_size = gst_nv_encoder_calculate_task_pool_size (self,
+       &priv->config);
+ 
+@@ -2264,7 +2552,10 @@ gst_nv_encoder_handle_frame (GstVideoEncoder * encoder,
+     pic_struct = klass->get_pic_struct (self, &priv->input_state->info, in_buf);
+   }
+ 
+-  status = priv->object->Encode (frame, pic_struct, task);
++  GstNvEncRefControl ref;
++  gst_nv_encoder_plan_refs (self, frame, &ref);
++
++  status = priv->object->Encode (frame, pic_struct, task, &ref);
+   if (status != NV_ENC_SUCCESS) {
+     GST_ERROR_OBJECT (self, "Failed to encode frame");
+     gst_video_encoder_release_frame (encoder, frame);
+diff --git a/subprojects/gst-plugins-bad/tests/check/libs/nvenclevel.c b/subprojects/gst-plugins-bad/tests/check/libs/nvenclevel.c
+new file mode 100644
+index 0000000..23057a0
+--- /dev/null
++++ b/subprojects/gst-plugins-bad/tests/check/libs/nvenclevel.c
+@@ -0,0 +1,65 @@
++/* GStreamer
++ * Copyright (C) 2026 Quasar contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ */
++
++/* The NVENC num-anchors level clamp (sys/nvcodec/gstnvenclevel.h), GPU-free. */
++
++#include <gst/check/gstcheck.h>
++
++#include "../../../sys/nvcodec/gstnvenclevel.h"
++
++/* the clamp table of the Vulkan encoders (deploy/patches/vulkan/README.md):
++ * num-anchors at most dpb - 2, at most 7 */
++GST_START_TEST (test_nvenc_level_table)
++{
++  static const struct
++  {
++    guint w, h, k264, k265;
++  } t[] = {
++    {640, 360, 7, 7}, {1280, 720, 3, 7}, {1920, 1080, 2, 4},
++    {2560, 1440, 7, 7}, {3840, 2160, 3, 4},
++  };
++  guint i;
++
++  for (i = 0; i < G_N_ELEMENTS (t); i++) {
++    fail_unless_equals_int (MIN (gst_nv_enc_level_max_dpb (TRUE, t[i].w,
++                t[i].h, 60, 1) - 2, 7), t[i].k264);
++    fail_unless_equals_int (MIN (gst_nv_enc_level_max_dpb (FALSE, t[i].w,
++                t[i].h, 60, 1) - 2, 7), t[i].k265);
++  }
++}
++
++GST_END_TEST;
++
++/* HEVC sizes are coded rounded up to 8: 1060x1050 is 1064x1056, above half
++ * of level 4.1's MaxLumaPs, so 8 pictures, not the 12 the unrounded size
++ * would allow */
++GST_START_TEST (test_nvenc_level_hevc_rounds_up)
++{
++  fail_unless_equals_int (gst_nv_enc_level_max_dpb (FALSE, 1060, 1050, 60, 1),
++      8);
++  fail_unless_equals_int (gst_nv_enc_level_max_dpb (FALSE, 1056, 1048, 60, 1),
++      12);
++}
++
++GST_END_TEST;
++
++static Suite *
++nvenclevel_suite (void)
++{
++  Suite *s = suite_create ("nvenclevel");
++  TCase *tc = tcase_create ("general");
++
++  suite_add_tcase (s, tc);
++  tcase_add_test (tc, test_nvenc_level_table);
++  tcase_add_test (tc, test_nvenc_level_hevc_rounds_up);
++
++  return s;
++}
++
++GST_CHECK_MAIN (nvenclevel);
+diff --git a/subprojects/gst-plugins-bad/tests/check/meson.build b/subprojects/gst-plugins-bad/tests/check/meson.build
+index a284af7..a431976 100644
+--- a/subprojects/gst-plugins-bad/tests/check/meson.build
++++ b/subprojects/gst-plugins-bad/tests/check/meson.build
+@@ -129,6 +129,7 @@ base_tests = [
+   [['libs/vkvideoencodeav1refs.c'], false, [gstvideo_dep, gstcodecparsers_dep]],
+   [['libs/vkvideoencodeh264anchors.c'], false, [gstvideo_dep, gstcodecparsers_dep]],
+   [['libs/vkvideoencodeh265anchors.c'], false, [gstvideo_dep, gstcodecparsers_dep]],
++  [['libs/nvenclevel.c'], false, [gst_dep]],
+   [['libs/d3d11device.cpp'], not gstd3d11_dep.found(), [gstd3d11_dep]],
+   [['libs/d3d11memory.c'], not gstd3d11_dep.found(), [gstd3d11_dep]],
+   [['libs/cudamemory.c'], not gstcuda_dep.found(), [gstcuda_dep, gstcuda_stub_dep]],

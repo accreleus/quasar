@@ -79,6 +79,12 @@ export class WtTelemetry {
   private fecOn = false;
   private readonly counters: PostedCounters;
   private lostAtTick: number;
+  /** PyroWave frame drops counted separately, cumulative for the page view (#1635).
+   *  Client-side diagnostics only: amendment 63 leaves `frames_dropped` absent on WebTransport,
+   *  and separate wire keys would need a `quasar-protocol` amendment. */
+  private pyroPendingDrops = 0;
+  private pyroDecodeDrops = 0;
+  private pyroMeasured = false;
   /** The last window's median interval: what a thin window's freezes are judged against. */
   private typicalMs: number | null = null;
   private decodeMsInWindow: number[] = [];
@@ -116,6 +122,7 @@ export class WtTelemetry {
 
   setCodec(mime: string | null): void {
     this.codec = mime;
+    if (mime === "video/pyrowave") this.pyroMeasured = true;
   }
 
   setDecodeFailed(failed: boolean): void {
@@ -161,6 +168,25 @@ export class WtTelemetry {
    *  count into additions. */
   addLost(fragments: number): void {
     if (fragments > 0) this.counters.packetsLost += fragments;
+  }
+
+  /** PyroWave frames evicted by the receiver's pending-frame cap, as increments since the last call (#1635). */
+  addPyroWavePendingDrops(frames: number): void {
+    if (frames <= 0) return;
+    this.pyroMeasured = true;
+    this.pyroPendingDrops += frames;
+  }
+
+  /** PyroWave frames skipped by the in-flight decode gate, as increments since the last call (#1635). */
+  addPyroWaveDecodeDrops(frames: number): void {
+    if (frames <= 0) return;
+    this.pyroMeasured = true;
+    this.pyroDecodeDrops += frames;
+  }
+
+  /** Separate cumulative PyroWave frame-drop counts, or null when PyroWave has not run (#1635). */
+  pyroWaveDrops(): { pending: number; decode: number } | null {
+    return this.pyroMeasured ? { pending: this.pyroPendingDrops, decode: this.pyroDecodeDrops } : null;
   }
 
   /** Amendment 85: whether the live connection's `hello_ack.fec` named a scheme. The FEC
@@ -299,6 +325,7 @@ export class WtTelemetry {
       audioConcealmentEvents: this.counters.audioConcealmentEvents,
       audioBufferMs: this.audioBufferMs,
       audioTargetMs: this.audioTargetMs,
+      ...(this.pyroMeasured ? { pyrowavePendingDrops: this.pyroPendingDrops, pyrowaveDecodeDrops: this.pyroDecodeDrops } : {}),
     };
 
     // The keys are the metric manifest's (docs/session-trace/metrics.json): the shared

@@ -404,6 +404,12 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       cfg.canvas.dataset.avOffsetMs = audio.avOffsetMs.toFixed(1);
       cfg.canvas.dataset.audioUnderrunMs = audio.underrunMs.toFixed(0);
     }
+    if (snap.pyrowavePendingDrops !== undefined) {
+      cfg.canvas.dataset.pyrowavePendingDrops = String(snap.pyrowavePendingDrops);
+    }
+    if (snap.pyrowaveDecodeDrops !== undefined) {
+      cfg.canvas.dataset.pyrowaveDecodeDrops = String(snap.pyrowaveDecodeDrops);
+    }
     fpsSeries.push(snap.fps);
     if (snap.g2gMs != null) latencySeries.push(snap.g2gMs);
     for (const fn of telemetrySubs) fn(snap);
@@ -457,6 +463,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       if (!snapshot.firstFrame) set({ firstFrame: true, status: "streaming over WebTransport" });
     };
     if (pyroOffer && device) {
+      let pyroDecodeDropsSeen = 0;
       pyroStage = new PyroWaveStage({
         device,
         present: (texture) => {
@@ -465,6 +472,10 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
           return true;
         },
         onPresented: (captureUs) => presented(captureUs),
+        onInFlightDrop: (total) => {
+          telemetry.addPyroWaveDecodeDrops(total - pyroDecodeDropsSeen);
+          pyroDecodeDropsSeen = total;
+        },
         fallback: (reason) => transport?.codecFallback(reason),
         load: deps.loadPyroWave,
       });
@@ -539,6 +550,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       playout?.reset();
     }
     let lostOnThisConnection = 0;
+    let pyroPendingDropsOnThisConnection = 0;
     // Amendment 85: the fragments FEC rebuilt on THIS connection, so a reconnect sums instead
     // of replacing the page's total (as `lostOnThisConnection` does for packets_lost).
     let repairedOnThisConnection = 0;
@@ -603,6 +615,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
           for (const b of f.packets) telemetry.bytes(b.byteLength);
           pyroStage?.frame(f);
         },
+        decoded: () => stage?.decoded ?? null,
         keyframeRequested: () => {
           telemetry.keyframeRequested();
           if (t === transport) keyAsks++;
@@ -614,6 +627,10 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
           // The count is this connection's own, from 0: a reconnect's must add, not replace.
           if (t === transport) telemetry.addLost(fragments - lostOnThisConnection);
           lostOnThisConnection = fragments;
+        },
+        pyrowavePendingDrops: (frames) => {
+          if (t === transport) telemetry.addPyroWavePendingDrops(frames - pyroPendingDropsOnThisConnection);
+          pyroPendingDropsOnThisConnection = frames;
         },
         repaired: (fragments) => {
           // Same rule for the FEC repairs: this connection's own count, added to the page's.
@@ -671,11 +688,21 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       .loadBench()
       .then(({ BenchController: Ctor }) => {
         if (destroyed || failed || bench !== null) return;
+        // Every other bench.window counter is per-window, so diff the running totals per window.
+        let lastBenchDrops = { pending: 0, decode: 0 };
         const b = new Ctor({
           source: () => (benchFrame ? { image: benchFrame, width: benchFrame.displayWidth, height: benchFrame.displayHeight } : null),
           sendInput: (msg) => inputSender?.send(msg),
           emitWindow: (payload) => tracer.emitBenchWindow(payload as unknown as Record<string, unknown>),
           getClockOffsetMs: () => telemetry.clockOffsetMs(),
+          extraWindowFields: () => {
+            const drops = telemetry.pyroWaveDrops();
+            if (!drops) return null;
+            const pending = drops.pending - lastBenchDrops.pending;
+            const decode = drops.decode - lastBenchDrops.decode;
+            lastBenchDrops = drops;
+            return { pyrowave_pending_drops: pending, pyrowave_decode_drops: decode };
+          },
         });
         b.start();
         bench = b;

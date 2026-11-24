@@ -16,6 +16,7 @@
 #   web   web/**  testdata/**  deploy/**  docs/session-trace/**  docs/configuration.md
 #         docs/upgrading.md
 #   go    also node-agent/crates/quasar-recovery/src/journal.rs (OUTPUT_LIMIT vs migration 0075)
+#   go    scripts/harness/udprelay/*  (the UDP-relay is its own module; CI vets + tests it)
 #   rust  node-agent/**  testdata/**  deploy/**  docs/session-trace/**  docs/configuration.md
 #         control-plane/internal/buildinfo/recipe.go  (rust + the engine suite)
 #   site  site/**  protocol  testdata/**  deploy/**
@@ -36,6 +37,7 @@ while IFS= read -r p; do
     testdata/*) go=true web=true rust=true site=true ;;
     scripts/dev/test-compose-overlays.sh) deploy=true ;;
     scripts/verify/go-test-parallel.sh) go=true ;;
+    scripts/harness/udprelay/*) go=true ;;
     docs/session-trace/*) go=true web=true rust=true ;;
     docs/configuration.md) web=true rust=true ;;
     docs/upgrading.md) web=true ;;

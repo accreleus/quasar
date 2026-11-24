@@ -1,15 +1,25 @@
 {
   "kind": "config",
-  "about": "The operator knobs: ParseSignatureMode (QUASAR_UPDATER_SIGNATURE_MODE), ParseTrustedKeys (QUASAR_UPDATER_TRUSTED_KEYS; `{public_key_of:LABEL}` stands for a derived vector key), ParseNamespaces (QUASAR_UPDATER_ALLOWED_NAMESPACES) and ParseManifestBaseURL (QUASAR_UPDATER_MANIFEST_BASE_URL).",
+  "about": "The operator knobs: ParseSignatureMode (QUASAR_UPDATER_SIGNATURE_MODE; blank is verify since #621), ParseTrustedKeys (QUASAR_UPDATER_TRUSTED_KEYS; `{public_key_of:LABEL}` stands for a derived vector key; blank is the org release key, which an expectation names by `base64`), ParseNamespaces (QUASAR_UPDATER_ALLOWED_NAMESPACES) and ParseManifestBaseURL (QUASAR_UPDATER_MANIFEST_BASE_URL).",
   "vectors": [
     {
-      "name": "mode \"\"",
-      "source": "go:control-plane/internal/updater/signature_test.go:TestParseSignatureMode",
+      "name": "mode \"\" is verify",
+      "source": "added: #621 option B (signed releases by default)",
       "parse": "signature_mode",
       "raw": "",
       "expect": {
         "ok": true,
-        "mode": "off"
+        "mode": "verify"
+      }
+    },
+    {
+      "name": "a blank mode is verify",
+      "source": "added: #621 option B (signed releases by default)",
+      "parse": "signature_mode",
+      "raw": " \t ",
+      "expect": {
+        "ok": true,
+        "mode": "verify"
       }
     },
     {
@@ -192,13 +202,48 @@
       }
     },
     {
-      "name": "blank is no keys",
-      "source": "go:control-plane/internal/updater/signature_test.go:TestParseTrustedKeys",
+      "name": "blank is the org release key",
+      "source": "added: #621 option B (signed releases by default)",
       "parse": "trusted_keys",
       "raw": "  ",
       "expect": {
         "ok": true,
-        "keys": []
+        "keys": [
+          {
+            "id": "quasar-release-2026",
+            "base64": "dvZHzSFv+4+++Ci+XrbakCozOv/13bsAGEo8nyemhZg="
+          }
+        ]
+      }
+    },
+    {
+      "name": "only empty entries is the org release key",
+      "source": "added: #621 option B (signed releases by default)",
+      "parse": "trusted_keys",
+      "raw": " , ,",
+      "expect": {
+        "ok": true,
+        "keys": [
+          {
+            "id": "quasar-release-2026",
+            "base64": "dvZHzSFv+4+++Ci+XrbakCozOv/13bsAGEo8nyemhZg="
+          }
+        ]
+      }
+    },
+    {
+      "name": "a key of the operator's own replaces the org release key",
+      "source": "added: #621 option B (signed releases by default)",
+      "parse": "trusted_keys",
+      "raw": "fork:{public_key_of:release-2025}",
+      "expect": {
+        "ok": true,
+        "keys": [
+          {
+            "id": "fork",
+            "public_key_of": "release-2025"
+          }
+        ]
       }
     },
     {

@@ -183,4 +183,56 @@ grep -Fxq '## Unreleased' "$gitwork/CHANGELOG.md" || fail "real cut must leave a
 # The Unreleased section the real cut just emptied must now refuse a second cut.
 reject_cut "is empty" --version 0.3.0 --dry-run
 
+# A signed cut: QUASAR_RELEASE_TAG_SIGNING_KEY signs the commit and the tag
+# (GitHub's "Verified"), checks the tag before pushing, and refuses a bad key
+# before writing anything.
+keydir="$(mktemp -d)"
+cleanup() { rm -rf "$gitwork" "$gitremote" "$keydir"; }
+ssh-keygen -q -t ed25519 -N "" -C release-cut-test -f "$keydir/sign" >/dev/null
+printf 'not a key\n' > "$keydir/bad"
+signed() { (cd "$gitwork" && QUASAR_RELEASE_TAG_SIGNING_KEY="$1" bash scripts/release/release-cut.sh "${@:2}"); }
+python3 - "$gitwork/CHANGELOG.md" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace("## Unreleased\n", "## Unreleased\n\n### Fixed\n\n- A signed release.\n", 1)
+open(p, "w").write(s)
+PY
+git -C "$gitwork" commit --quiet -am "unreleased: one more entry"
+git -C "$gitwork" push --quiet origin main
+if out=$(signed "$keydir/missing" --version 0.3.0 --dry-run 2>&1); then fail "a missing signing key must refuse the cut: $out"; fi
+[[ "$out" == *"no file at"* ]] || fail "missing-key refusal must say so: $out"
+if out=$(signed "$keydir/bad" --version 0.3.0 --dry-run 2>&1); then fail "an unusable signing key must refuse the cut: $out"; fi
+[[ "$out" == *"not a usable OpenSSH private key"* ]] || fail "bad-key refusal must say so: $out"
+ssh-keygen -q -t ed25519 -N "secret" -C pass -f "$keydir/pass" >/dev/null
+if out=$(signed "$keydir/pass" --version 0.3.0 --dry-run 2>&1 </dev/null); then fail "a passphrase key must refuse the cut: $out"; fi
+[[ "$out" == *"without a passphrase"* ]] || fail "passphrase-key refusal must say so: $out"
+# A refused key writes nothing, in a real (not dry) run too.
+before="$(git -C "$gitwork" rev-parse HEAD)"
+if out=$(signed "$keydir/missing" --version 0.3.0 2>&1); then fail "a missing key must refuse a real cut: $out"; fi
+[[ "$(git -C "$gitwork" rev-parse HEAD)" == "$before" && -z "$(git -C "$gitwork" tag -l v0.3.0)" && -z "$(git -C "$gitwork" status --porcelain)" ]] ||
+  fail "a refused key must leave no commit, tag or change"
+
+dry_out="$(signed "$keydir/sign" --version 0.3.0 --dry-run)"
+[[ "$dry_out" == *"tag -s 'v0.3.0'"* ]] || fail "a signed dry-run must print tag -s: $dry_out"
+# The tag must verify before anything is pushed: against a different expected
+# public key the cut stops with the undo hint, origin untouched.
+ssh-keygen -q -t ed25519 -N "" -C other -f "$keydir/other" >/dev/null
+origin_before="$(git -C "$gitremote" rev-parse main)"
+if out=$(cd "$gitwork" && QUASAR_RELEASE_TAG_SIGNING_KEY="$keydir/sign" QUASAR_RELEASE_TAG_SIGNING_PUB="$keydir/other.pub" bash scripts/release/release-cut.sh --version 0.3.0 2>&1); then
+  fail "a tag that does not verify must stop the cut: $out"
+fi
+[[ "$out" == *"did not verify; nothing was pushed"* ]] || fail "verify refusal must say so: $out"
+[[ "$(git -C "$gitremote" rev-parse main)" == "$origin_before" && -z "$(git -C "$gitremote" tag -l v0.3.0)" ]] || fail "nothing may be pushed when the tag does not verify"
+git -C "$gitwork" tag -d v0.3.0 >/dev/null && git -C "$gitwork" reset --quiet --hard HEAD~1
+[[ "$(git -C "$gitwork" rev-parse HEAD)" == "$before" ]] || fail "the undo hint must restore the pre-cut HEAD"
+# With the matching expected key the same cut goes through.
+(cd "$gitwork" && QUASAR_RELEASE_TAG_SIGNING_KEY="$keydir/sign" QUASAR_RELEASE_TAG_SIGNING_PUB="$keydir/sign.pub" bash scripts/release/release-cut.sh --version 0.3.0 >/dev/null)
+git -C "$gitwork" cat-file tag v0.3.0 | grep -q -- "-----BEGIN SSH SIGNATURE-----" || fail "v0.3.0 must carry an SSH signature"
+git -C "$gitwork" cat-file commit "v0.3.0^{commit}" | grep -q "^gpgsig " || fail "the release commit must be signed"
+printf '%s %s\n' "release-cut-test@example.invalid" "$(cat "$keydir/sign.pub")" > "$keydir/allowed"
+git -C "$gitwork" -c gpg.ssh.allowedSignersFile="$keydir/allowed" tag -v v0.3.0 >/dev/null 2>&1 || fail "v0.3.0 must verify against the signing key"
+[[ "$(git -C "$gitremote" tag -l v0.3.0)" == "v0.3.0" ]] || fail "the signed tag was not pushed"
+if git -C "$gitwork" cat-file tag v0.2.0 | grep -q "SSH SIGNATURE"; then fail "an unsigned cut must not carry a signature"; fi
+
 echo "release-cut contract: PASS"

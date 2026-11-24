@@ -174,6 +174,17 @@ beforeEach(() => {
   mocked.listAdminApps.mockResolvedValue({ items: [], next_cursor: null });
   mocked.listUnpublishedLibraryItems.mockResolvedValue({ items: [] });
   mocked.listSecrets.mockResolvedValue(secretsResponse([artworkSecret()]));
+  // The page reads every catalogue page; route it through the per-page mock each test sets.
+  mocked.listAllAdminApps.mockImplementation(async (token) => {
+    const all: AdminApp[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await mocked.listAdminApps(token, cursor);
+      all.push(...page.items);
+      cursor = page.next_cursor ?? undefined;
+    } while (cursor);
+    return all;
+  });
 });
 
 describe("Steam preparation policy", () => {
@@ -230,6 +241,16 @@ describe("SourcesTab — Steam row", () => {
     await screen.findByText(/4 titles discovered/);
     expect(screen.getByText("2 imported")).toBeInTheDocument();
     expect(screen.getByText(/last scan 21 minutes ago/)).toBeInTheDocument();
+  });
+
+  it("finds the Steam provider app on a later catalogue page (more than 50 apps)", async () => {
+    mocked.listAdminApps.mockImplementation(async (_t, cursor) =>
+      cursor
+        ? { items: [app({ id: "steam", name: "Steam", library_provider: "steam" })], next_cursor: null }
+        : { items: [app({ id: "t1", name: "Game 1", parent_app_id: "steam" })], next_cursor: "50" },
+    );
+    renderPage();
+    await waitFor(() => expect(mocked.listUnpublishedLibraryItems).toHaveBeenCalledWith("tok", "steam"));
   });
 
   it("PATCHes library_discovery_enabled when the Steam switch flips", async () => {

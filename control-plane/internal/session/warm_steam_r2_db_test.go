@@ -19,6 +19,7 @@ import (
 
 	"github.com/accreleus/quasar/control-plane/internal/agentws"
 	"github.com/accreleus/quasar/control-plane/internal/storage"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestKindIsSentOnlyWhileWarmSteamIsOn(t *testing.T) {
@@ -447,6 +448,122 @@ func TestAClaimEndedBeforeAdoptionKeepsTheHoldOnTheParkedRuntime(t *testing.T) {
 				t.Errorf("hold = %q after the parked runtime's proof, want cleared", got)
 			}
 		})
+	}
+}
+
+// The start ack is lost AFTER the agent began the new build: the new session's
+// stop is still in flight when the old runtime's proof lands, which is the
+// agent's real order (the fresh build waits for the old runner to exit, and its
+// proof can trail the failure). The hold passes to the failed row, so only that
+// row's own proof - the answer to the stop - releases it (#1615).
+func TestTheOldRuntimesProofCannotReleaseTheHoldWhileTheNewSessionsStopIsInFlight(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	ctx := context.Background()
+	k := f.park(t)
+	rejectAdoptionDispatch(f.disp, "lost start ack")
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID, Mic: true})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	q := res.Session.ID
+	waitState(t, f, q, "failed")
+	f.disp.waitStop(t, q) // the stop for the new session is now in flight
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: k, State: "stopped", HomeCleanupQualified: true})
+	if got := f.holder(t); got != q {
+		t.Fatalf("hold = %q after the old runtime's proof, want it kept on the failed new session %s", got, q)
+	}
+	withHomeHoldSettleWait(t, 300*time.Millisecond)
+	_, err = f.launch(t, f.steam)
+	var refused *ParkedClaimRefusedError
+	if !errors.As(err, &refused) || refused.HolderID != q {
+		t.Fatalf("relaunch while the failed session's stop is in flight = %v, want the 503 stopping answer naming %s, not home_conflict", err, q)
+	}
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: q, State: "stopped", HomeCleanupQualified: true})
+	if got := f.holder(t); got != "" {
+		t.Errorf("hold = %q after the new session's own proof, want cleared", got)
+	}
+}
+
+// A successful adopter keeps adopt_session_id after it runs. When it ends with its
+// proof still trailing, a relaunch settles and then answers home_conflict, as any
+// ended holder does; the 503 stopping answer is only for a failed adopter that
+// never ran (#1615 review).
+func TestAnEndedSuccessfulAdopterWithItsProofTrailingSettlesLikeAnyHolder(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	ctx := context.Background()
+	f.park(t)
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID, Mic: true})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	q := res.Session.ID
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: q, State: "running"})
+	waitState(t, f, q, "running")
+	if got := f.holder(t); got != q {
+		t.Fatalf("hold = %q once the claim runs, want %s", got, q)
+	}
+	must(t, exec(t, f.pool, `UPDATE sessions SET state = 'stopped', ended_at = now() WHERE id = $1::uuid`, q))
+	withHomeHoldSettleWait(t, 300*time.Millisecond)
+	_, err = f.launch(t, f.steam)
+	if !errors.Is(err, ErrHomeConflict) {
+		t.Fatalf("relaunch while an ended successful adopter's proof trails = %v, want home_conflict after the settle wait", err)
+	}
+}
+
+// The marker is read with the candidate adopter rows locked: failStart records it
+// before failing the row, so a row read as failed already has it, and a concurrent
+// failCommand cannot slip between the read and the lock.
+func TestTheAdopterMarkerIsReadWhileTheAdopterRowIsLocked(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	ctx := context.Background()
+	k := f.park(t)
+	rejectAdoptionDispatch(f.disp, "lost start ack")
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID, Mic: true})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	q := res.Session.ID
+	waitState(t, f, q, "failed")
+	f.disp.waitStop(t, q)
+	var lockErr error
+	_, err = f.store.clearQualifiedHomeHolds(ctx, f.hostID, k, func(id string) bool {
+		_, lockErr = f.pool.Exec(ctx, `SELECT 1 FROM sessions WHERE id=$1::uuid FOR UPDATE NOWAIT`, id)
+		return id == q
+	})
+	if err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(lockErr, &pgErr) || pgErr.Code != "55P03" {
+		t.Errorf("adopter row lock probe inside the marker read = %v, want lock_not_available", lockErr)
+	}
+	if got := f.holder(t); got != q {
+		t.Errorf("hold = %q, want it passed to the marked failed adopter %s", got, q)
+	}
+}
+
+// A stop that arrives during the adopt wait makes the new session answer at once
+// and the old runtime's proof trail it (agent.rs, the adopt wait): the old proof
+// must clear the hold, not pass it to a row that already answered.
+func TestTheNewSessionsProofFirstLeavesTheOldRuntimesProofToClearTheHold(t *testing.T) {
+	f := newWarmFixture(t, 4)
+	ctx := context.Background()
+	k := f.park(t)
+	rejectAdoptionDispatch(f.disp, "lost start ack")
+	res, err := f.coord.LaunchByProfile(ctx, f.userID, LaunchParams{AppID: f.steam, DeviceID: f.deviceID, Mic: true})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	q := res.Session.ID
+	waitState(t, f, q, "failed")
+	f.disp.waitStop(t, q)
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: q, State: "stopped", HomeCleanupQualified: true})
+	if got := f.holder(t); got != k {
+		t.Fatalf("hold = %q after the new session's proof, want it still on the old runtime %s", got, k)
+	}
+	f.coord.AgentState(ctx, f.hostID, agentws.SessionStateMsg{SessionID: k, State: "stopped", HomeCleanupQualified: true})
+	if got := f.holder(t); got != "" {
+		t.Errorf("hold = %q after the old runtime's proof, want cleared", got)
 	}
 }
 

@@ -14,6 +14,7 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 keygen="$repo/scripts/release/new-release-signing-key.sh"
 sign="$repo/scripts/release/sign-platform-release-manifest.sh"
 verify="$repo/scripts/release/verify-platform-release-manifest.sh"
+orgkeys="$repo/scripts/release/org-release-keys.sh"
 
 work="$(mktemp -d /tmp/quasar-release-signature-test.XXXXXX)"
 trap 'rm -rf "$work"' EXIT
@@ -34,6 +35,7 @@ for script in "$keygen" "$sign" "$verify"; do
   test -x "$script" || fail "$(basename "$script") not executable"
   "$script" --help >/dev/null || fail "$(basename "$script") --help must exit 0"
 done
+test -x "$orgkeys" || fail "org-release-keys.sh not executable"
 
 # ── Keygen ────────────────────────────────────────────────────────────────────
 "$keygen" --out "$work/a.pem" --key-id quasar-test-a > "$work/a.out"
@@ -41,8 +43,8 @@ done
 [[ "$(stat -c '%a' "$work/a.pem")" == 600 ]] || fail "the private key must be mode 0600"
 key_a="$(grep -o 'quasar-test-a:[A-Za-z0-9+/=]*' "$work/a.out" | head -1)"
 [[ -n "$key_a" ]] || fail "keygen printed no public key"
-grep -q 'gh secret set QUASAR_RELEASE_SIGNING_KEY' "$work/a.out" \
-  || fail "keygen must print the CI secret command"
+grep -q 'gh secret set QUASAR_RELEASE_SIGNING_KEY --env release' "$work/a.out" \
+  || fail "keygen must print the CI secret command, scoped to the release environment"
 
 # A key inside the repository is a key that can be committed.
 reject "inside the repository" "$keygen" --out "$repo/scripts/release/leaked.pem" --key-id x
@@ -151,5 +153,55 @@ reject "not a PKCS#8 PEM" "$sign" --manifest "$manifest" --output "$work/x.sig" 
 reject "no signing key" env -u QUASAR_RELEASE_SIGNING_KEY \
   "$sign" --manifest "$manifest" --output "$work/x.sig" --key-id k
 test ! -e "$work/x.sig" || fail "a failed signing must leave no document behind"
+
+# ── The org key the release job pins ─────────────────────────────────────────
+# It must find the real constant, or every tag release fails at its signature check.
+org_keys="$("$orgkeys")" || fail "org-release-keys.sh found no key in signature.rs"
+[[ "$org_keys" == quasar-release-*:* ]] || fail "unexpected org key: $org_keys"
+# A rotation's two-key literal, on the line after the declaration, gives one line per key.
+printf 'pub(crate) const DEFAULT_TRUSTED_KEYS: &str =\n    "%s, %s";\n' "$key_a" "$key_b" > "$work/two.rs"
+[[ "$("$orgkeys" "$work/two.rs")" == "$key_a"$'\n'"$key_b" ]] || fail "a two-key default must print both keys"
+printf 'pub(crate) const DEFAULT_TRUSTED_KEYS: &str = "%s,k:short";\n' "$key_a" > "$work/bad.rs"
+reject "not a key-id:base64 list" "$orgkeys" "$work/bad.rs"
+# The job's check: a release signed by a key the actor does not compile in fails.
+mapfile -t org_args < <(printf -- '--public-key\n%s\n' $org_keys)
+reject "no signature in the document was made by a given key" \
+  "$verify" --manifest "$manifest" --signature "$sig" "${org_args[@]}"
+
+# ── The release job's signing step, run as the workflow has it ───────────────
+step="$work/sign-step.sh"
+python3 - "$repo/.github/workflows/images.yml" > "$step" <<'PY'
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+start = next(i for i, l in enumerate(lines) if l.strip() == "- name: Sign the platform release manifest")
+run = next(i for i in range(start, len(lines)) if lines[i].strip() == "run: |")
+indent = len(lines[run + 1]) - len(lines[run + 1].lstrip())
+for l in lines[run + 1:]:
+    if l.strip() and len(l) - len(l.lstrip()) < indent:
+        break
+    print(l[indent:])
+PY
+# The extraction must have found the step, whether or not it still has an org branch.
+grep -q 'sign-platform-release-manifest.sh' "$step" || fail "could not extract the signing step from images.yml"
+run_step() { # run_step <repository-owner> [key pem file]; prints the step's output, returns its status
+  local pem="" out="$work/gh-output"
+  [[ -n "${2:-}" ]] && pem="$(cat "$2")"
+  : > "$out"
+  (cd "$repo" && env -i PATH="$PATH" HOME="$HOME" RUNNER_TEMP="$work" GITHUB_OUTPUT="$out" \
+    GITHUB_STEP_SUMMARY="$work/summary" MANIFEST="$work/step-manifest.json" REPO_OWNER="$1" \
+    KEY_ID=quasar-test-a QUASAR_RELEASE_SIGNING_KEY="$pem" bash -euo pipefail "$step" 2>&1)
+}
+cp "$manifest" "$work/step-manifest.json"
+# The step keys on the OWNER, not the repository name: a rename inside the org
+# still fails here rather than silently taking the fork path.
+# An org tag release with no key fails; a fork's publishes unsigned with a warning.
+reject "no QUASAR_RELEASE_SIGNING_KEY secret in the release environment" run_step accreleus
+out="$(run_step someone)" || fail "a fork's release with no key must still publish: $out"
+[[ "$out" == *"::warning::"* ]] && grep -qx 'path=' "$work/gh-output" \
+  || fail "a fork with no key must warn and output no signature"
+# An org release signed by a key the actor does not compile in fails the pin; a fork's passes.
+reject "does not verify under DEFAULT_TRUSTED_KEYS" run_step accreleus "$work/a.pem"
+out="$(run_step someone "$work/a.pem")" || fail "a fork signing with its own key must publish: $out"
+grep -qx "path=$work/step-manifest.json.sig" "$work/gh-output" || fail "a signed fork release must output its .sig"
 
 echo "PASS release signature contract (keygen, sign, verify, rotation, refusals)"

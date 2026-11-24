@@ -231,6 +231,14 @@ plane's floor. **The control plane is never revertible from the console, at any 
 only way back is a restore of a pre-update dump. Agents never move above the control plane's own
 release (`release_above_control_plane`).
 
+**Before reverting a host below 0.6.4,** unset any of the settings 0.6.4 added
+(`QUASAR_WT_CAPACITY`, `QUASAR_WT_REF_RECOVERY`, `QUASAR_NON_REF_P`) on that host:
+`docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_WT_CAPACITY=` (one per
+setting you set). An older recovery actor refuses a machine whose saved settings name one it does
+not know, and every later update of that host then fails (`recreate_failed`). If a host is
+already stuck that way, remove the key from the recovery actor's `machine.json` by hand, then
+apply again.
+
 ### Installing updates automatically
 
 **Off by default.** Settings ▸ Platform updates ▸ *Install updates automatically*
@@ -593,6 +601,15 @@ It refuses — with a one-line reason, before touching anything — unless:
   tag
 - the `## Unreleased` section is non-empty
 
+**Signed tags (GitHub's "Verified").** Set `QUASAR_RELEASE_TAG_SIGNING_KEY` to the path of an
+OpenSSH private key, kept outside the repository and registered on the releasing GitHub account
+as a *signing* key (Settings › SSH and GPG keys). The cut then SSH-signs the release commit and
+the tag and verifies the tag against that key before it pushes anything; an unusable key refuses
+the cut before anything is written; a key with a passphrase is refused, since the cut never
+prompts. Set `QUASAR_RELEASE_TAG_SIGNING_PUB` to the public key registered on GitHub to make the
+cut check it is signing with that key. Needs git 2.34 or newer and `ssh-keygen`. This key is not the release-manifest key of "Signing platform
+releases": keep the two separate. Unset, the commit and tag are unsigned.
+
 It never merges `develop` into `main` for you — that merge, and the operator sign-off it requires
 (`CLAUDE.md`, "Git branching & environments"), happens first, by hand. Add `DRY_RUN=1` to see the
 changelog diff and the exact git commands it would run without executing any of them:
@@ -609,107 +626,124 @@ of a stable release.
 
 ## Signing platform releases
 
-Optional, and off on both sides until someone turns it on. A release may publish a detached
-signature over its manifest, and a machine may be configured to verify it before applying
-anything. What gets installed is still the pinned digest (ADR 0001); the signature answers
-whether the digest set came from whoever holds the release key. Format:
+On by default (#621). Every release publishes a detached signature over its manifest, and every
+machine's recovery actor verifies it with the org's public key before applying a named release.
+What gets installed is still the pinned digest (ADR 0001); the signature answers whether the
+digest set came from whoever holds the release key. Format:
 `scripts/release/platform-release-signature.md`. Decision record:
 `docs/adr/0003-release-signatures.md`.
 
-### Turning it on: the publishing half
+### The publishing half
 
-Done once, by the maintainer who publishes releases.
+The org's key is `quasar-release-2026`. Its private half is the secret
+`QUASAR_RELEASE_SIGNING_KEY` of the GitHub environment `release` (deployment policy: tags `v*`),
+beside the environment variable `QUASAR_RELEASE_SIGNING_KEY_ID`. Only a run on a `v*` tag can use
+the `release` environment, and the Images workflow's `release` job is the one job that names it; a
+repository secret would be readable by every workflow run.
 
-1. **Generate a key pair, off CI, on a machine you trust.** Not in the repo — the script refuses
-   to write inside the working tree.
-
-   ```bash
-   scripts/release/new-release-signing-key.sh \
-     --out ~/.config/quasar/release-signing-2026.pem \
-     --key-id quasar-release-2026
-   ```
-
-   It prints the public key as `quasar-release-2026:<base64>`. Back the private key up; there is
-   no recovery from losing it, only a rotation.
-
-2. **Create the CI secret and the label variable**:
-
-   ```bash
-   gh secret   set QUASAR_RELEASE_SIGNING_KEY    --repo <owner/name> < ~/.config/quasar/release-signing-2026.pem
-   gh variable set QUASAR_RELEASE_SIGNING_KEY_ID --repo <owner/name> --body 'quasar-release-2026'
-   ```
-
-3. **Cut a release as usual.** The `release` job signs the manifest right after it validates it,
+1. **Cut a release as usual.** The `release` job signs the manifest right after it validates it,
    verifies its own signature before uploading anything, and attaches
-   `platform-release-manifest.v2.json.sig` beside the manifest. With no secret configured the step
-   prints one line and does nothing.
-
-4. **Check the release**:
+   `platform-release-manifest.v2.json.sig` beside the manifest. It also checks that signature
+   against the org key compiled into the actor (`DEFAULT_TRUSTED_KEYS` in
+   `node-agent/crates/quasar-recovery/src/trust/signature.rs`, read by
+   `scripts/release/org-release-keys.sh`), so a release signed by a key the default machines do not
+   trust fails the job. With no secret configured, a tag release of `accreleus/quasar` fails; a
+   fork's warns and publishes unsigned, which every verifying machine refuses (`signature_missing`).
+2. **Check the release**:
 
    ```bash
    gh release download vX.Y.Z --pattern 'platform-release-manifest.v2.json*'
    scripts/release/verify-platform-release-manifest.sh \
      --manifest  platform-release-manifest.v2.json \
      --signature platform-release-manifest.v2.json.sig \
-     --public-key quasar-release-2026:<base64>
+     --public-key quasar-release-2026:dvZHzSFv+4+++Ci+XrbakCozOv/13bsAGEo8nyemhZg=
    ```
 
-### Turning it on: the verifying half
+3. **A release published unsigned** is signed by hand, by the key holder:
+   `scripts/release/sign-platform-release-manifest.sh --manifest platform-release-manifest.v2.json --output platform-release-manifest.v2.json.sig --key-id quasar-release-2026 --key-file <private key PEM, outside the tree>`,
+   then `gh release upload vX.Y.Z platform-release-manifest.v2.json.sig --clobber`. The releases
+   published before signing was on (v0.4.0 to v0.6.3) get their `.sig` this way, by the
+   maintainer. A named apply or revert to a release with no `.sig` is refused
+   `signature_missing`.
 
-Each machine's recovery actor verifies, with the release trust recorded in its machine state.
-Give a new machine its settings as seed inputs at install (`QUASAR_UPDATER_SIGNATURE_MODE`,
-`QUASAR_UPDATER_TRUSTED_KEYS`; `docs/configuration.md` "Recovery actor"), or change an installed
-one on that machine:
+A fork that publishes its own releases makes its own key (`scripts/release/new-release-signing-key.sh`,
+off CI, never inside the working tree), puts it in its own `release` environment, and gives its
+machines its public key (`QUASAR_UPDATER_TRUSTED_KEYS`) and its release URL
+(`QUASAR_UPDATER_MANIFEST_BASE_URL`), or runs `off`.
+
+### The verifying half
+
+With nothing recorded, a machine verifies (`QUASAR_UPDATER_SIGNATURE_MODE=verify`) against the
+org's key compiled into the actor. A machine that recorded a mode or keys at install, or with
+`reconfigure`, keeps them.
+
+- **`verify`** (the default): a named release with a bad signature, an untrusted key, a manifest
+  that does not name the request's digests, or no signature at all is refused. A request that
+  names no version (a developer apply, an edge build, a revert to an unnamed build) is applied,
+  with a WARN, because no published manifest could have signed it.
+- **`require`**: also refuses a request that names no version, `signature_missing`.
+- **`off`**: fetches and checks nothing, ADR 0001 trust (the pinned digest and the namespace
+  allowlist).
+
+**Machines that must opt out.** The verifying fetch has no proxy client and trusts the public
+web roots only, so a machine that reaches GitHub only through an HTTPS proxy, through a mirror
+behind a private certificate authority, or not at all fails closed: every stable apply is refused
+`signature_invalid`, while the console still offers the release (the control plane's egress uses
+the proxy). Such a machine runs `off`:
 
 ```bash
 docker exec -it quasar-recovery quasar-recovery reconfigure --yes \
-  QUASAR_UPDATER_SIGNATURE_MODE=verify \
-  QUASAR_UPDATER_TRUSTED_KEYS=quasar-release-2026:<base64 public key>
+  QUASAR_UPDATER_SIGNATURE_MODE=off
 ```
-
-**Go through `verify` first, not straight to `require` — but do not stop there.** In `verify` a
-bad signature is refused and a release that publishes none is not, so a fleet can be configured
-before the first signed release exists. **`verify` is a migration rung, not a security
-boundary**: a request naming no version, or one never published, reads as unsigned and is
-applied. Every unverified apply logs a WARN naming the version. Once every release you intend to
-apply is signed, reconfigure to `QUASAR_UPDATER_SIGNATURE_MODE=require`. Under `require`, a
-developer apply and a revert to a build this instance can no longer name by release are refused
-`signature_missing`.
-
-Two limits of the verifying fetch, both failing closed as `signature_invalid`, never as an
-unverified apply: **a machine that reaches the release host only through an HTTPS proxy cannot
-run `verify` or `require`** (the fetch has no proxy client), and **a manifest mirror behind a
-private certificate authority is refused** (the fetch trusts the public web roots only). Such a
-machine runs `off`: the pinned digest and the namespace allowlist.
 
 ### Rotating the key
 
-Both sides are lists, which makes this a period rather than a flag day.
+Both sides are lists, which makes this a period rather than a flag day. A machine on the default
+trusts the keys compiled into its running actor, and the actor that applies a release is the one
+already running, so a new key reaches the default one release before anything is signed with it
+alone.
 
-1. **Generate the new key** (`--key-id quasar-release-2027`) and add its public half to every
-   machine's `QUASAR_UPDATER_TRUSTED_KEYS` *alongside* the old one, with `reconfigure`:
+1. **Generate the new key** (`scripts/release/new-release-signing-key.sh --out <path outside the tree> --key-id quasar-release-2027`)
+   and ship a release whose actor trusts both (`DEFAULT_TRUSTED_KEYS` in
+   `node-agent/crates/quasar-recovery/src/trust/signature.rs`, with its pinning vector in
+   `testdata/recovery/trust-vectors/config.json`). A machine that set its own
+   `QUASAR_UPDATER_TRUSTED_KEYS` adds the new key with `reconfigure`:
    `QUASAR_UPDATER_TRUSTED_KEYS=quasar-release-2026:<old>,quasar-release-2027:<new>`.
-2. **Sign the next releases with both keys**: move the *new* key into the primary secret and the
-   *old* one into the previous-key pair; the release job signs with both when both are set.
+2. **Sign the next releases with both keys**: move the *new* key into the `release` environment's
+   primary secret and the *old* one into the previous-key pair; the release job signs with both
+   when both are set.
 
    ```bash
-   gh secret   set QUASAR_RELEASE_SIGNING_KEY             --repo <owner/name> < <new key>
-   gh variable set QUASAR_RELEASE_SIGNING_KEY_ID          --repo <owner/name> --body 'quasar-release-2027'
-   gh secret   set QUASAR_RELEASE_SIGNING_KEY_PREVIOUS    --repo <owner/name> < <old key>
-   gh variable set QUASAR_RELEASE_SIGNING_KEY_ID_PREVIOUS --repo <owner/name> --body 'quasar-release-2026'
+   gh secret   set QUASAR_RELEASE_SIGNING_KEY             --env release --repo <owner/name> < <new key>
+   gh variable set QUASAR_RELEASE_SIGNING_KEY_ID          --env release --repo <owner/name> --body 'quasar-release-2027'
+   gh secret   set QUASAR_RELEASE_SIGNING_KEY_PREVIOUS    --env release --repo <owner/name> < <old key>
+   gh variable set QUASAR_RELEASE_SIGNING_KEY_ID_PREVIOUS --env release --repo <owner/name> --body 'quasar-release-2026'
    ```
 
    Signing an existing release's manifest by hand does the same thing —
    `sign-platform-release-manifest.sh … --append <the existing .sig>` — followed by
    `gh release upload <tag> platform-release-manifest.v2.json.sig --clobber`.
-3. **Drop the old key** from every machine's `QUASAR_UPDATER_TRUSTED_KEYS` once every machine
-   carries the new one and every release you might still apply or revert to is signed by it. Then
-   delete `QUASAR_RELEASE_SIGNING_KEY_PREVIOUS` and its label variable.
+3. **Drop the old key** from the compiled default (and from every machine that set its own list)
+   once every machine runs an actor with the new one and every release you might still apply or
+   revert to is signed by it. Then delete `QUASAR_RELEASE_SIGNING_KEY_PREVIOUS` and its label
+   variable.
 4. **Destroy the old private key.**
 
 If a key is **compromised**, step 3 comes first and immediately, and any release signed only by
-it must be re-signed and its `.sig` asset replaced. Until a machine has the new key, its applies
-fail closed with `signature_invalid`.
+it must be re-signed and its `.sig` asset replaced. A machine on the default trusts only the keys
+compiled into its running actor, so a fix release signed only by the new key is refused
+`signature_invalid` there. Until the release whose actor carries the new key is applied, each such
+machine either names the new key (an explicit list replaces the compiled default, so the
+compromised key is no longer trusted):
+
+```bash
+docker exec -it quasar-recovery quasar-recovery reconfigure --yes \
+  QUASAR_UPDATER_TRUSTED_KEYS=<new-id>:<new-key>
+```
+
+or runs `QUASAR_UPDATER_SIGNATURE_MODE=off` for the update and then goes back to `verify`. A
+release cannot revoke a compiled-in key on a machine that never updates: that machine trusts the
+compromised key until its operator applies an update or runs `reconfigure`.
 
 ## See also
 

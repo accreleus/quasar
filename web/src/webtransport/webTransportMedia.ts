@@ -36,6 +36,8 @@ import {
 } from "./transport";
 
 const WT_PROTO = 1;
+/** A PyroWave deadline timer later than this means the page was stalled (#1635). */
+const STALL_MS = 3;
 /** `session_not_ready`: retry the same token after this long (§Hello). */
 const NOT_READY_RETRY_MS = 250;
 /** How long connect keeps retrying an agent that says it is not ready. */
@@ -179,6 +181,12 @@ interface Datagrams {
   createWritable?: () => WritableStream<Uint8Array>;
 }
 
+/** `message` with the sink's `decoded`, when it has one (§Feedback). */
+function withDecoded<T extends object>(message: T, sink: MediaSink | null): T | (T & { decoded: number }) {
+  const decoded = sink?.decoded?.() ?? null;
+  return decoded === null ? message : { ...message, decoded };
+}
+
 /** The cause a browser with no datagram API at all reports (#1412). */
 const NO_DATAGRAMS = "datagrams: this browser's WebTransport has no datagram API";
 
@@ -261,7 +269,7 @@ export class WebTransportMedia implements MediaTransport {
     const wait = this.lastKeyAt + KEYFRAME_SPACING_MS - this.now();
     if (wait <= 0) {
       this.lastKeyAt = this.now();
-      this.send({ type: "keyframe_request", reason });
+      this.send(withDecoded({ type: "keyframe_request", reason }, this.sink));
       this.sink?.keyframeRequested?.(reason);
       return;
     }
@@ -508,7 +516,7 @@ export class WebTransportMedia implements MediaTransport {
     // congestion, so a hidden tab must keep reporting.
     const report = () => {
       const message = live.on ? feedback.take(this.now()) : null;
-      if (message) this.send(message);
+      if (message) this.send(withDecoded(message, sink));
     };
     const second = () => {
       ping();
@@ -634,7 +642,10 @@ export class WebTransportMedia implements MediaTransport {
     let pyro: PyroWaveReceiver | null = null;
     /** What the PyroWave receivers already replaced counted lost. */
     let pyroLost = 0;
+    /** Pending-cap drops the PyroWave receivers already replaced counted (#1635). */
+    let pyroPendingDrops = 0;
     let reported = 0;
+    let reportedPendingDrops = 0;
     /** Amendment 85: the fragments FEC has rebuilt so far, as last reported. */
     let reportedRepaired = 0;
     const reportRepaired = () => {
@@ -646,6 +657,10 @@ export class WebTransportMedia implements MediaTransport {
       const n = this.lostSoFar();
       if (n !== reported) sink.lost?.((reported = n));
     };
+    const reportPendingDrops = () => {
+      const n = pyroPendingDrops + (pyro?.pendingDrops ?? 0);
+      if (n !== reportedPendingDrops) sink.pyrowavePendingDrops?.((reportedPendingDrops = n));
+    };
     let held: { f: VideoFragment; at: number }[] = [];
     let timer: ReturnType<typeof setTimeout> | null = null;
     let armedAt: number | null = null;
@@ -656,7 +671,7 @@ export class WebTransportMedia implements MediaTransport {
     };
     // One timer, at the PyroWave receiver's next frame deadline; re-armed only when that moves,
     // not per datagram (a 1080p frame is ~380 of them).
-    const arm = () => {
+    const arm = (deferBy?: number) => {
       const at = pyro?.nextDeadline() ?? null;
       if (at === armedAt) return;
       stop();
@@ -665,11 +680,17 @@ export class WebTransportMedia implements MediaTransport {
       timer = setTimeout(() => {
         timer = null;
         armedAt = null;
-        const frame = live.on ? pyro?.due(this.now()) : null;
-        if (frame) sink.pyrowave(frame);
+        // Reads queued behind a stall have not run yet: closing now would count datagrams the
+        // page is about to read as lost. Wait once more, four frames: a timer due in the future
+        // runs after reads already posted, and the lab needed four frames for the backlog to drain
+        // (#1635; one frame left 20-45 % of the loss). Only a stalled frame pays it.
+        const frame = pyro?.frameMs ?? 0;
+        if (deferBy === undefined && this.now() - at > STALL_MS) return arm(4 * frame);
+        const closed = live.on ? pyro?.due(this.now()) : null;
+        if (closed) sink.pyrowave(closed);
         reportLost();
         arm();
-      }, Math.max(0, at - this.now()));
+      }, deferBy ?? Math.max(0, at - this.now()));
     };
     // codec-pyrowave.md §Loss: a PyroWave frame never reaches the assembler, so it is never
     // NACKed or declared late; its losses are concealed by the decoder.
@@ -680,13 +701,13 @@ export class WebTransportMedia implements MediaTransport {
           pyro?.configId === c.configId
             ? pyro
             : ((pyroLost += pyro?.lost ?? 0),
+              (pyroPendingDrops += pyro?.pendingDrops ?? 0),
               (pyro = new PyroWaveReceiver(c.configId, blockLayout(c.width, c.height).totalBlocks, 1000 / (c.fps || 60))));
-        const now = this.now();
-        const due = r.due(now);
-        if (due) sink.pyrowave(due);
-        const done = r.push(f, now);
+        // No `due` here: the timer closes frames and defers after a stall, so a tail read late lands.
+        const done = r.push(f, this.now());
         if (done) sink.pyrowave(done);
         reportLost();
+        reportPendingDrops();
         arm();
         return;
       }

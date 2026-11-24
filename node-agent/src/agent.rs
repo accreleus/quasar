@@ -13081,13 +13081,8 @@ mod tests {
                 },
             );
             let captured = CapturedLog::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::INFO)
-                .with_ansi(false)
-                .with_writer(captured.clone())
-                .finish();
-            let reply = tracing::subscriber::with_default(subscriber, || {
-                tracing::callsite::rebuild_interest_cache();
+            let reply = {
+                let _guard = crate::test_log::begin(&captured.0);
                 mgr.handle_control(
                     ControlMsg::SessionStop {
                         id: "stop".into(),
@@ -13097,7 +13092,7 @@ mod tests {
                     &warm.evt_tx,
                     &diagnostic_sender(),
                 )
-            });
+            };
             assert!(acked(reply));
             assert!(
                 mgr.pending.is_empty(),

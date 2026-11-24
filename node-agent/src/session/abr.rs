@@ -97,6 +97,9 @@ pub struct AbrConfig {
     /// ([`Governor::observe_report`]) instead of windows, the value being the least time
     /// between two encoder writes (zero where a write costs no keyframe).
     pub per_report: Option<Duration>,
+    /// Per-report loop: a reading must be under the rate by more than the deadband, as 0.6.3
+    /// filtered it (`QUASAR_WT_CAPACITY=legacy`).
+    pub legacy_readings: bool,
 }
 
 impl AbrConfig {
@@ -131,6 +134,7 @@ impl AbrConfig {
             down_dwell: Self::DEFAULT_DOWN_DWELL,
             cliff_guard_frac: Self::DEFAULT_CLIFF_GUARD_FRAC,
             per_report: None,
+            legacy_readings: false,
         }
     }
 
@@ -424,9 +428,35 @@ pub struct Governor {
     fed: Option<Instant>,
     /// Per-report loop: when the last receiver report came.
     last_report: Option<Instant>,
-    /// Per-report loop: the first reading of a run under the line.
+    /// Per-report loop: the first reading of a run under the rate.
     under: Option<f64>,
+    /// Per-report loop: the rate before WebTransport's hold (`hold_to`) while it is on, and a hold
+    /// ended whose setpoint has not climbed back to that rate yet.
+    hold_from: Option<f64>,
+    back: bool,
+    /// When `hold_to` last ran.
+    held_at: Option<Instant>,
+    /// The FEC repair share the ceiling is bound by (`set_share`): the highest since the share
+    /// last stayed lower for `SHARE_STICKY`; 0 on WebRTC and v2 (#1660). And since when it has
+    /// been lower.
+    share: f64,
+    share_lower_since: Option<Instant>,
+    /// The share of the last estimate, which the reading line follows (`observe_report`).
+    share_now: f64,
+    /// When `set_share` last wrote: a step at the same estimate is that same write.
+    bound_at: Option<Instant>,
 }
+
+/// `Governor::set_share`: a share that falls lowers the ceiling only after staying lower this
+/// long. 10 s is FEC's full decay (5 levels, one per 2 s calm, `webtransport::fec`) and longer
+/// than the burst cycles a bursty link keeps 1080p through (every 2.5 to 4 s, and 10 s: sim
+/// `burst_loss_on_an_uncapped_link_keeps_the_rung_and_the_setpoint`). Following each step of
+/// the decay saw-toothed the setpoint on bursty loss.
+const SHARE_STICKY: Duration = Duration::from_secs(10);
+
+/// `Governor::hold_off`: a hold refreshed within this is seen ending (WebTransport refreshes it every
+/// report, 50 ms apart; the rung's lease is the same, `LadderPlanner::set_held`).
+const HOLD_SEEN: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl Governor {
     /// Start at the tier ceiling. `start` seeds the min-interval clock so the governor
@@ -443,7 +473,46 @@ impl Governor {
             fed: None,
             last_report: None,
             under: None,
+            hold_from: None,
+            held_at: None,
+            back: false,
+            share: 0.0,
+            share_lower_since: None,
+            share_now: 0.0,
+            bound_at: None,
         }
+    }
+
+    /// The ceiling on video: the configured one less the FEC share, so video plus repairs
+    /// never exceeds the configured maximum (#1301). Never under the floor.
+    fn ceiling(&self) -> u32 {
+        ((self.cfg.ceiling_kbps as f64 / (1.0 + self.share)).floor() as u32)
+            .max(self.cfg.floor_kbps)
+    }
+
+    /// WebTransport FEC's repair share (`webtransport::Rate::observe`): the ceiling and the
+    /// reading line over `1 + share`, the share rising at once and falling after `SHARE_STICKY`.
+    /// Every input is already video and every gate relative, so a descent with FEC is the one
+    /// without, scaled. A setpoint over the new ceiling is returned to write, at most once per
+    /// write gap (`min_interval`, or `per_report`): each write may cost a keyframe.
+    pub fn set_share(&mut self, share: f64, now: Instant) -> Option<u32> {
+        let share = share.max(0.0);
+        self.share_now = share;
+        if share >= self.share {
+            (self.share, self.share_lower_since) = (share, None);
+        } else if now.saturating_duration_since(*self.share_lower_since.get_or_insert(now))
+            >= SHARE_STICKY
+        {
+            (self.share, self.share_lower_since) = (share, Some(now));
+        }
+        let ceiling = self.ceiling();
+        let gap = self.cfg.per_report.unwrap_or(self.cfg.min_interval);
+        if self.setpoint <= ceiling || now.saturating_duration_since(self.last_retarget) < gap {
+            return None;
+        }
+        self.setpoint = ceiling;
+        (self.last_retarget, self.bound_at) = (now, Some(now));
+        Some(ceiling)
     }
 
     /// Per-report loop: what the link allows, unclamped by the floor. The ceiling
@@ -504,9 +573,7 @@ impl Governor {
     /// estimate the link carried before the collapse cannot ramp it straight back, and an
     /// estimate under the floor cannot hold the climb back once the link returns.
     pub fn cut_to(&mut self, kbps: f64, now: Instant) -> Option<u32> {
-        let target = (kbps.round() as i64)
-            .clamp(self.cfg.floor_kbps as i64, self.cfg.ceiling_kbps as i64)
-            as u32;
+        let target = self.clamp(kbps);
         if target >= self.setpoint {
             return None;
         }
@@ -560,11 +627,15 @@ impl Governor {
                 .min(self.cfg.ceiling_kbps as f64);
         }
         let target = self.clamp(self.rate.min(estimate).floor());
+        let back = self.back && target as f64 >= estimate.floor();
         let up = target > self.setpoint
-            && (target as f64 >= sp * (1.0 + self.cfg.deadband) || target == self.cfg.ceiling_kbps);
+            && (target as f64 >= sp * (1.0 + self.cfg.deadband)
+                || target == self.ceiling()
+                || back);
         if !up || !self.write_due(now) {
             return None;
         }
+        self.back &= (target as f64) < self.rate.floor();
         self.setpoint = target;
         self.last_retarget = now;
         Some(target)
@@ -574,12 +645,23 @@ impl Governor {
     /// link carrying when the link held the sender back (`webtransport::Rate::measured`),
     /// `None` when it did not. A link that delivers what it is sent gives no reading,
     /// whatever its delay detector says: that is the #68 guard. Two readings in a row under
-    /// the rate by more than the deadband take the rate and the setpoint to the higher of
-    /// them in one move, with no step cap and no dwell.
+    /// the rate take the rate and the setpoint to the higher of them in one move, with no step
+    /// cap, no dwell and no deadband: a reading is under what left the wire, so no dead zone
+    /// between the link and a deadband over it can hold the sender there (#1503).
     pub fn observe_report(&mut self, reading: Option<f64>, now: Instant) -> Option<u32> {
         self.cfg.per_report?;
         self.last_report = Some(now);
-        let Some(reading) = reading.filter(|&r| r < self.rate * (1.0 - self.cfg.deadband)) else {
+        // Not positive (or NaN) is no capacity sample: a zero rate would never grow again.
+        // The rate is the link's, for the rung; the line is video's, under the share now (the
+        // sticky one bounds only the ceiling).
+        let rate = self
+            .rate
+            .min(self.cfg.ceiling_kbps as f64 / (1.0 + self.share_now));
+        let line = match self.cfg.legacy_readings {
+            true => rate * (1.0 - self.cfg.deadband),
+            false => rate,
+        };
+        let Some(reading) = reading.filter(|&r| r > 0.0 && r < line) else {
             self.under = None;
             return None;
         };
@@ -600,8 +682,42 @@ impl Governor {
         Some(sp)
     }
 
+    /// Per-report loop: WebTransport's hold (`webtransport::congestion::HOLD`) bounds the rate and
+    /// the setpoint at `kbps` at once: no reading run, interval or rung settle delays it, so a
+    /// congested link is never sent more than the hold allows (#1433, sim row R3 at a rung step).
+    pub fn hold_to(&mut self, kbps: f64, now: Instant) -> Option<u32> {
+        self.cfg.per_report?;
+        self.hold_from.get_or_insert(self.rate);
+        self.held_at = Some(now);
+        self.back = false;
+        self.rate = self.rate.min(kbps);
+        let sp = self.clamp(kbps);
+        if sp >= self.setpoint {
+            return None;
+        }
+        self.setpoint = sp;
+        self.last_retarget = now;
+        Some(sp)
+    }
+
+    /// Per-report loop, every report with no hold. A hold that ended was not the link (a random
+    /// burst) or the link lifted: the rate, which the rung reads, is back where the hold found it,
+    /// and the setpoint follows the estimate up to it past the deadband (with FEC charged the
+    /// estimate tops out under the ceiling, so a held setpoint parked up to 15 % low for good).
+    /// Only a hold seen ending: after a second with no report (PyroWave held the encoder, then
+    /// `Estimator::resume_at`, or another client) the rate before it is stale (#1433 seat B N1).
+    pub fn hold_off(&mut self, now: Instant) {
+        let seen = self
+            .held_at
+            .is_some_and(|at| now.saturating_duration_since(at) < HOLD_SEEN);
+        if let Some(rate) = self.hold_from.take().filter(|_| seen) {
+            self.rate = self.rate.max(rate);
+            self.back = true;
+        }
+    }
+
     fn clamp(&self, kbps: f64) -> u32 {
-        (kbps.round() as i64).clamp(self.cfg.floor_kbps as i64, self.cfg.ceiling_kbps as i64) as u32
+        (kbps.round() as i64).clamp(self.cfg.floor_kbps as i64, self.ceiling() as i64) as u32
     }
 
     /// Per-report loop: an encoder whose bitrate write costs a keyframe is written at most
@@ -629,23 +745,23 @@ impl Governor {
         };
         self.ewma = Some(smoothed);
 
-        // Anti-thrash: at most one retarget per min_interval (both directions).
-        if now.saturating_duration_since(self.last_retarget) < self.cfg.min_interval {
+        // Anti-thrash: at most one retarget per min_interval (both directions). A bound written
+        // at this estimate is the same write.
+        if self.bound_at != Some(now)
+            && now.saturating_duration_since(self.last_retarget) < self.cfg.min_interval
+        {
             return None;
         }
 
         let sp = self.setpoint as f64;
-        let clamp = |target: f64| -> u32 {
-            (target.round() as i64).clamp(self.cfg.floor_kbps as i64, self.cfg.ceiling_kbps as i64)
-                as u32
-        };
+        let clamp = |target: f64| self.clamp(target);
 
         // UP-gate ceiling override: once setpoint exceeds ceiling/(1+deadband), the
         // regular gate `smoothed > sp×1.15` sits above the ceiling and can never pass,
         // permanently stranding recovery ~4-13% below the configured rate (measured:
         // stuck at 7645/8000 with the estimate pinned at max). No churn risk finishing
         // the climb: the ceiling clamps further steps and the down path still rules.
-        let ceiling = self.cfg.ceiling_kbps as f64;
+        let ceiling = self.ceiling() as f64;
         let ceiling_headroom = estimate_kbps >= ceiling && sp < ceiling;
 
         // DOWN: raw estimate below the deadband ⇒ a downshift is warranted.
@@ -1231,9 +1347,8 @@ mod tests {
         base + Duration::from_millis(ms)
     }
 
-    /// Down: two readings in a row under the rate by more than the deadband take the
-    /// setpoint to the higher of them at once, with no −12.5 % cap, and a deeper drop right
-    /// after is not held by a dwell. The window loop caps a step at −12.5 % and dwells 7 s.
+    /// Down: two readings in a row under the rate take the setpoint to the higher of them at
+    /// once, with no −12.5 % cap, and a deeper drop right after is not held by a dwell. The window loop caps a step at −12.5 % and dwells 7 s.
     #[test]
     fn per_report_down_takes_the_reading_in_one_move() {
         let base = Instant::now();
@@ -1264,24 +1379,122 @@ mod tests {
         assert_eq!(g.rate_kbps(), 800.0, "the rate does not");
     }
 
-    /// A report with no reading between two low ones breaks the run, and a reading inside
-    /// the deadband is none.
+    /// #1433: WebTransport's hold bounds the rate and the setpoint at once, with no reading run and
+    /// no write gap; a line over the setpoint moves neither, and the window loop has no hold.
     #[test]
-    fn per_report_a_broken_run_or_a_reading_in_the_deadband_holds() {
+    fn per_report_the_hold_bounds_the_rate_and_setpoint_at_once() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(1000), base);
+        assert_eq!(g.hold_to(3000.0, ms(base, 10)), Some(3000));
+        assert_eq!((g.rate_kbps(), g.setpoint_kbps()), (3000.0, 3000));
+        assert_eq!(g.hold_to(4000.0, ms(base, 20)), None);
+        assert_eq!(
+            g.hold_to(500.0, ms(base, 30)),
+            Some(1000),
+            "clamped to the floor"
+        );
+        assert_eq!(g.rate_kbps(), 500.0, "the rate is not");
+        let mut w = Governor::new(AbrConfig::new_smooth(1000, 10_000, 60), base);
+        assert_eq!(w.hold_to(3000.0, ms(base, 10)), None);
+    }
+
+    /// #1433 hold round: a hold that ends puts the rate, which the rung reads, back where the hold
+    /// found it, and the setpoint climbs to the estimate past the deadband once (with FEC charged
+    /// the estimate tops out under the ceiling: the deadband parked it up to 15 % low for good).
+    #[test]
+    fn per_report_a_hold_that_ends_climbs_all_the_way_back() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        g.hold_to(8000.0, ms(base, 10));
+        assert_eq!(
+            g.observe(9000.0, ms(base, 20)),
+            None,
+            "inside the deadband while held"
+        );
+        g.hold_off(ms(base, 20));
+        assert_eq!(g.rate_kbps(), 10_000.0);
+        assert_eq!(g.observe(9000.0, ms(base, 30)), Some(9000));
+        assert_eq!(
+            g.observe(9500.0, ms(base, 40)),
+            Some(9500),
+            "until it reaches the rate"
+        );
+        g.hold_off(ms(base, 50));
+        assert_eq!(g.rate_kbps(), 10_000.0, "no hold, nothing to restore");
+    }
+
+    /// #1433 seat B N1: a hold last refreshed over a second ago (PyroWave took the encoder, and its
+    /// step-down resumed the estimator with no hold) is not seen ending: the rate before it is
+    /// stale and stays where the resume put it. Old code: back to 10 000.
+    #[test]
+    fn per_report_a_hold_not_seen_ending_restores_nothing() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        g.hold_to(3000.0, ms(base, 10));
+        g.hold_off(ms(base, 1010));
+        assert_eq!(g.rate_kbps(), 3000.0);
+        g.hold_to(2000.0, ms(base, 1100));
+        g.hold_off(ms(base, 1150));
+        assert_eq!(g.rate_kbps(), 3000.0, "the next hold restores its own rate");
+    }
+
+    /// A report with no reading between two low ones breaks the run.
+    #[test]
+    fn per_report_a_broken_run_holds() {
         let base = Instant::now();
         let mut g = Governor::new(per_report(0), base);
         for i in 0..20 {
             let r = (i % 2 == 0).then_some(5000.0);
             assert_eq!(g.observe_report(r, ms(base, i * 100)), None);
         }
-        for i in 20..40 {
-            assert_eq!(
-                g.observe_report(Some(8600.0), ms(base, i * 100)),
-                None,
-                "inside 15 %"
-            );
-        }
         assert_eq!(g.setpoint_kbps(), 10_000);
+    }
+
+    /// #1503: a reading is under what left the wire, so it moves the setpoint however close
+    /// under the rate it is. With the 15 %
+    /// deadband a link at 0.86 × the setpoint held a sender 1.18–1.22× over its estimate
+    /// (lab 0.6.2, 2 Mbit/s), and RTT reached 1.5–3.6 s. Old code: no move.
+    #[test]
+    fn per_report_a_reading_inside_the_old_deadband_moves() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        g.observe_report(Some(8600.0), ms(base, 0));
+        assert_eq!(g.observe_report(Some(8600.0), ms(base, 100)), Some(8600));
+        assert_eq!(
+            g.observe_report(Some(8600.0), ms(base, 200)),
+            None,
+            "a reading at the rate is none"
+        );
+    }
+
+    /// #1433 review M4: a reading of 0 is no capacity
+    /// sample. Old code: the rate went to 0 and the up path, which multiplies it, never grew
+    /// again, whatever the estimate.
+    #[test]
+    fn per_report_a_zero_reading_is_no_reading() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report(0), base);
+        for i in 0..2 {
+            assert_eq!(g.observe_report(Some(0.0), ms(base, i * 100)), None);
+        }
+        assert_eq!(g.rate_kbps(), 10_000.0);
+        assert_eq!(g.setpoint_kbps(), 10_000);
+    }
+
+    /// `QUASAR_WT_CAPACITY=legacy`: a reading inside the deadband is none, as in 0.6.3.
+    #[test]
+    fn per_report_legacy_readings_keep_the_deadband() {
+        let base = Instant::now();
+        let cfg = AbrConfig {
+            legacy_readings: true,
+            ..per_report(0)
+        };
+        let mut g = Governor::new(cfg, base);
+        for i in 0..4 {
+            assert_eq!(g.observe_report(Some(8600.0), ms(base, i * 100)), None);
+        }
+        g.observe_report(Some(8400.0), ms(base, 400));
+        assert_eq!(g.observe_report(Some(8400.0), ms(base, 500)), Some(8400));
     }
 
     /// #68: with reports flowing, an estimate under the setpoint (a delay detector misreading
@@ -1420,5 +1633,134 @@ mod tests {
             assert_eq!(g.observe_report(Some(2000.0), ms(base, i * 100)), None);
         }
         assert_eq!(g.setpoint_kbps(), 10_000);
+    }
+
+    /// A per-report governor, 1000 to 8000 kbit/s, reading as `QUASAR_WT_CAPACITY` says.
+    fn per_report_fec(legacy_readings: bool) -> AbrConfig {
+        AbrConfig {
+            per_report: Some(Duration::ZERO),
+            legacy_readings,
+            ..AbrConfig::new_smooth(1000, 8000, 60)
+        }
+    }
+
+    /// One report on `link` kbit/s: a reading while the link is under the ceiling, the hold's
+    /// line under the cut, then the estimate, in `webtransport::Control::feed`'s order.
+    fn report(g: &mut Governor, link: f64, share: Option<f64>, at: Instant) -> u32 {
+        let video = link / (1.0 + share.unwrap_or(0.0));
+        match link <= 5000.0 {
+            true => drop(g.hold_to(video, at)),
+            false => g.hold_off(at),
+        }
+        g.observe_report((link < 8000.0).then_some(video * 0.97), at);
+        if let Some(share) = share {
+            g.set_share(share, at);
+        }
+        g.observe(video, at);
+        g.setpoint_kbps()
+    }
+
+    /// The link, kbit/s, `ms` into the run: just under the ceiling (inside the legacy reading
+    /// line without FEC), cut, partly back, full.
+    fn link_at(ms: u64) -> f64 {
+        match ms {
+            0..3000 => 7500.0,
+            3000..9000 => 5000.0,
+            9000..15000 => 7000.0,
+            _ => 8000.0,
+        }
+    }
+
+    /// #1301 review M1: on the window loop a bound write is an encoder write like any other (a
+    /// keyframe on NVENC and VA), so a share rising a level per report writes once per interval.
+    #[test]
+    fn a_share_rising_per_report_writes_once_per_interval() {
+        let base = Instant::now();
+        let mut g = Governor::new(cfg(), base);
+        let mut writes = Vec::new();
+        for level in 1..=5u64 {
+            let now = ms(base, 2000 + 50 * level);
+            let share = level as f64 * 0.05;
+            let cut = g.set_share(share, now);
+            writes.extend(g.observe(8000.0 / (1.0 + share), now).or(cut));
+        }
+        assert_eq!(writes, [7619], "one write in the interval");
+        let now = ms(base, 3100);
+        let cut = g.set_share(0.25, now);
+        assert_eq!(
+            g.observe(6400.0, now).or(cut),
+            Some(6400),
+            "the next interval"
+        );
+    }
+
+    /// #1301 review S2: the reading line follows the share now; the sticky share bounds only the
+    /// ceiling. With the share fallen to 0, a legacy session over a 6000 link cuts in two
+    /// readings, as with no FEC.
+    #[test]
+    fn a_fallen_share_reads_the_link_as_without_fec() {
+        let base = Instant::now();
+        let mut g = Governor::new(per_report_fec(true), base);
+        assert_eq!(g.set_share(0.25, ms(base, 0)), Some(6400));
+        assert_eq!(
+            g.set_share(0.0, ms(base, 50)),
+            None,
+            "the ceiling stays sticky"
+        );
+        assert_eq!(g.observe_report(Some(5820.0), ms(base, 100)), None);
+        assert_eq!(g.observe_report(Some(5820.0), ms(base, 150)), Some(5820));
+    }
+
+    /// #1301: with no FEC (`set_share(0)`, and WebRTC, which never calls it) every loop moves as
+    /// it did without the share: the same setpoint and rate after every call.
+    #[test]
+    fn a_zero_share_changes_nothing() {
+        let base = Instant::now();
+        for cfg in [
+            cfg(),
+            AbrConfig::new_smooth(2500, 8000, 60),
+            per_report_fec(false),
+            per_report_fec(true),
+        ] {
+            let (mut plain, mut shared) = (Governor::new(cfg, base), Governor::new(cfg, base));
+            for ms in (0..20_000).step_by(50) {
+                let now = base + Duration::from_millis(ms);
+                let (a, b) = (
+                    report(&mut plain, link_at(ms), None, now),
+                    report(&mut shared, link_at(ms), Some(0.0), now),
+                );
+                assert_eq!((a, plain.rate_kbps()), (b, shared.rate_kbps()), "{ms} ms");
+            }
+        }
+    }
+
+    /// #1301, the step-down rule: with FEC every input the per-report loop gets is video (the
+    /// link over 1 + share) and so are its ceiling and rate, so in both reading modes
+    /// (`QUASAR_WT_CAPACITY`) it moves when it would without FEC, to that setpoint over
+    /// 1 + share (to rounding): no slower, and the line it reads against is never looser.
+    #[test]
+    fn a_per_report_descent_with_fec_is_the_one_without_scaled() {
+        let base = Instant::now();
+        for legacy in [false, true] {
+            for share in [0.05, 0.10, 0.15, 0.25] {
+                let mut plain = Governor::new(per_report_fec(legacy), base);
+                let mut shared = Governor::new(per_report_fec(legacy), base);
+                for ms in (0..20_000).step_by(50) {
+                    let now = base + Duration::from_millis(ms);
+                    let was = (plain.setpoint_kbps(), shared.setpoint_kbps());
+                    let a = report(&mut plain, link_at(ms), None, now);
+                    let b = report(&mut shared, link_at(ms), Some(share), now);
+                    let scaled = f64::from(a) / (1.0 + share);
+                    assert!(
+                        (f64::from(b) - scaled).abs() <= 1.0,
+                        "legacy {legacy}, {share}: {ms} ms, {a} without, {b} with"
+                    );
+                    // The start, where the share first lowers the ceiling, aside.
+                    if ms > 0 {
+                        assert_eq!(a != was.0, b != was.1, "legacy {legacy}, {share}: {ms} ms");
+                    }
+                }
+            }
+        }
     }
 }

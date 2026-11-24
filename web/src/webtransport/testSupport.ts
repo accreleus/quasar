@@ -15,6 +15,7 @@ export interface UnitSpec {
   data: Uint8Array;
   captureUs?: number;
   discardable?: boolean;
+  recovery?: boolean;
   ts90k?: number;
 }
 
@@ -29,7 +30,7 @@ export function packetize(u: UnitSpec, pktSeq = { n: 0 }): Uint8Array[] {
     const v = new DataView(d.buffer);
     d[0] = 0x01;
     v.setUint32(1, pktSeq.n++, true);
-    d[5] = (u.keyframe ? 1 : 0) | (u.discardable ? 2 : 0);
+    d[5] = (u.keyframe ? 1 : 0) | (u.discardable ? 2 : 0) | (u.recovery ? 8 : 0);
     d[6] = u.configId;
     v.setUint16(7, u.frameSeq, true);
     v.setUint16(9, index, true);
