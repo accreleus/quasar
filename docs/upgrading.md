@@ -231,6 +231,14 @@ plane's floor. **The control plane is never revertible from the console, at any 
 only way back is a restore of a pre-update dump. Agents never move above the control plane's own
 release (`release_above_control_plane`).
 
+**Before reverting a host below 0.6.4,** unset any of the settings 0.6.4 added
+(`QUASAR_WT_CAPACITY`, `QUASAR_WT_REF_RECOVERY`, `QUASAR_NON_REF_P`) on that host:
+`docker exec -it quasar-recovery quasar-recovery reconfigure --yes QUASAR_WT_CAPACITY=` (one per
+setting you set). An older recovery actor refuses a machine whose saved settings name one it does
+not know, and every later update of that host then fails (`recreate_failed`). If a host is
+already stuck that way, remove the key from the recovery actor's `machine.json` by hand, then
+apply again.
+
 ### Installing updates automatically
 
 **Off by default.** Settings ▸ Platform updates ▸ *Install updates automatically*
