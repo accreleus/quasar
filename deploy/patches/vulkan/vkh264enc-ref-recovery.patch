@@ -371,9 +371,8 @@ index 4202f8d..64cd0c6 100644
      .offset_for_ref_frame = { 0, },
  
      .num_ref_frames = priv->gop.max_num_ref_frames,
--    .gaps_in_frame_num_value_allowed_flag = 0,
-+    /* a recovery frame follows a frame_num gap in the decoder */
-+    .gaps_in_frame_num_value_allowed_flag = priv->gop.num_anchors > 0,
++    /* 0 with anchors too: a gap the decoder fills with frames fails Mesa VA-API */
+     .gaps_in_frame_num_value_allowed_flag = 0,
      .pic_width_in_mbs_minus1 = mb_width - 1,
      .pic_height_in_map_units_minus1 = mb_height - 1,
      .frame_mbs_only_flag = 1,
@@ -485,8 +484,8 @@ index 4202f8d..64cd0c6 100644
 +   * Reference recovery: how many anchor frames (requested with the
 +   * "quasar-ref-anchor" upstream event, kept as long-term references) are
 +   * held for "quasar-ref-recover". 0 disables it. While on there are no B
-+   * frames, every P frame codes from one picture, and the SPS allows
-+   * frame_num gaps. Read at stream start.
++   * frames and every P frame codes from one picture; the SPS still
++   * disallows frame_num gaps (see sps_init). Read at stream start.
 +   */
 +  properties[PROP_NUM_ANCHORS] = g_param_spec_uint ("num-anchors",
 +      "Number of anchors",

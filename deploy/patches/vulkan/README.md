@@ -1561,9 +1561,13 @@ decodes silently wrong on hardware):
   receives and the anchor stays held for a second recovery. Anchors 128 or more frames old count
   as gone (relative order hints only reach 127 frames back), so a recovery from one is a key
   frame.
-- **H.264** (`gsth264encoder.c`, `vkh264enc.c`): the SPS sets
-  `gaps_in_frame_num_value_allowed_flag`, `max_num_ref_frames = num-anchors + 1` and two more POC
-  LSB bits. An anchor marks itself long-term in its own slice header (MMCO 4, 1, 6); a reference
+- **H.264** (`gsth264encoder.c`, `vkh264enc.c`): the SPS sets `max_num_ref_frames = num-anchors + 1`
+  and two more POC LSB bits, and keeps `gaps_in_frame_num_value_allowed_flag` 0. With it 1, a
+  decoder fills the lost run with invented frames (Chromium's stateless decoder does, as the
+  spec says), and Mesa's VA-API decoder (radeonsi, measured on the AMD host) fails every
+  recovery frame whose reference list holds one, so Chrome restarts the decoder and asks for a
+  key frame. With 0, Chromium ignores the gap and the recovery frame decodes; ffmpeg and
+  VideoToolbox decode the same stream bit-identically either way. An anchor marks itself long-term in its own slice header (MMCO 4, 1, 6); a reference
   to a long-term picture is named by `ref_pic_list_modification` idc 2. A short-term picture is
   never referenced across a `frame_num` gap. The patch also makes `vkh264enc.c` pass the MMCO
   opcode, the list-modification flags and `long_term_pic_num` to Vulkan, which it dropped. That
