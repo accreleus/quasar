@@ -717,16 +717,24 @@ impl Agent {
         token: &str,
         extra: Value,
     ) -> (Session, SendStream, RecvStream, Value) {
-        let session = self.connect().await;
-        let (mut send, mut recv) = session.open_bi().await.unwrap();
-        let mut hello = json!({"type": "hello", "wt_proto": 1, "token": token,
-                               "session_id": SESSION, "client": "browser"});
-        let extra = extra.as_object().unwrap().clone();
-        hello.as_object_mut().unwrap().extend(extra);
-        write_message(&mut send, &hello).await.unwrap();
-        let reply = read_message(&mut recv).await.unwrap();
-        (session, send, recv, reply)
+        hello_over(self.connect().await, token, extra).await
     }
+}
+
+/// Opens the control stream on `session` and sends `hello`; the first reply.
+async fn hello_over(
+    session: Session,
+    token: &str,
+    extra: Value,
+) -> (Session, SendStream, RecvStream, Value) {
+    let (mut send, mut recv) = session.open_bi().await.unwrap();
+    let mut hello = json!({"type": "hello", "wt_proto": 1, "token": token,
+                           "session_id": SESSION, "client": "browser"});
+    let extra = extra.as_object().unwrap().clone();
+    hello.as_object_mut().unwrap().extend(extra);
+    write_message(&mut send, &hello).await.unwrap();
+    let reply = read_message(&mut recv).await.unwrap();
+    (session, send, recv, reply)
 }
 
 thread_local! {
@@ -774,6 +782,7 @@ async fn close_code_within(session: &Session, within: Duration) -> Option<u32> {
 #[derive(Debug)]
 struct Frame {
     keyframe: bool,
+    discardable: bool,
     config_id: u8,
     frame_seq: u16,
     ts_90khz: u32,
@@ -812,6 +821,7 @@ async fn frames(session: &Session, n: usize, lossless: bool) -> Vec<Frame> {
             let frags = parts.remove(&frame_seq).unwrap();
             done.push(Frame {
                 keyframe: d[5] & 1 == 1,
+                discardable: d[5] & 2 == 2,
                 config_id: d[6],
                 frame_seq,
                 ts_90khz: u32::from_le_bytes(d[13..17].try_into().unwrap()),
@@ -925,6 +935,185 @@ struct AudioPacket {
     ts_48khz: u32,
     capture_us: u64,
     opus: Vec<u8>,
+}
+
+/// What the Vulkan encoder's `non-ref-p` makes of every second P: the units a probe on the
+/// encoder's output (Annex-B) gives `nal_ref_idc` 0, and the 90 kHz timestamps of those, so a
+/// test can tell which the sender flagged.
+fn make_every_second_delta_non_ref(encoder: &gst::Element) -> Arc<Mutex<Vec<u32>>> {
+    let cleared = Arc::new(Mutex::new(Vec::new()));
+    let (seen, deltas) = (cleared.clone(), std::sync::atomic::AtomicU32::new(0));
+    encoder
+        .static_pad("src")
+        .unwrap()
+        .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            let Some(gst::PadProbeData::Buffer(buffer)) = info.data.as_mut() else {
+                return gst::PadProbeReturn::Ok;
+            };
+            if buffer.flags().contains(gst::BufferFlags::DELTA_UNIT)
+                && deltas.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2 == 1
+            {
+                let buffer = buffer.make_mut();
+                let pts = buffer.pts().map_or(0, |p| {
+                    (p.nseconds() as u128 * 90_000 / 1_000_000_000) as u32
+                });
+                let mut map = buffer.map_writable().unwrap();
+                // A slice NAL (type 1) after a start code.
+                for at in 0..map.len().saturating_sub(4) {
+                    if map[at..at + 3] == [0, 0, 1] && map[at + 3] & 0x1f == 1 {
+                        map[at + 3] &= 0x9f;
+                    }
+                }
+                seen.lock().unwrap().push(pts);
+            }
+            gst::PadProbeReturn::Ok
+        });
+    cleared
+}
+
+/// `non-ref-p`: the sender flags a unit nothing is coded from, and numbers every unit it
+/// sends in order, as it did before.
+#[tokio::test]
+async fn a_non_reference_unit_is_sent_flagged_discardable_in_order() {
+    let cleared = Arc::new(Mutex::new(None));
+    let put = cleared.clone();
+    let agent = agent_built(
+        Stream::H264,
+        Limits::default(),
+        audio::Plan::default(),
+        "ball",
+        move |enc| {
+            *put.lock().unwrap() = Some(make_every_second_delta_non_ref(enc));
+            None
+        },
+    )
+    .await;
+    let media = agent.listener.registry().lock()[SESSION]
+        .media
+        .clone()
+        .unwrap();
+    media.assume_non_ref();
+    let (session, _send, _recv, ack) = agent.hello(TOKEN).await;
+    assert_eq!(ack["type"], "hello_ack");
+    let got = frames(&session, 40, true).await;
+    for pair in got.windows(2) {
+        assert_eq!(
+            pair[1].frame_seq,
+            pair[0].frame_seq.wrapping_add(1),
+            "units in order, none lost"
+        );
+    }
+    let cleared = cleared.lock().unwrap().take().unwrap();
+    let cleared = cleared.lock().unwrap().clone();
+    let flagged: Vec<u32> = got
+        .iter()
+        .filter(|f| f.discardable)
+        .map(|f| f.ts_90khz)
+        .collect();
+    assert!(flagged.len() >= 5, "{} of 40 flagged", flagged.len());
+    assert!(
+        flagged.iter().all(|ts| cleared.contains(ts)),
+        "only a non-reference unit is flagged"
+    );
+    assert!(got
+        .iter()
+        .filter(|f| cleared.contains(&f.ts_90khz))
+        .all(|f| f.discardable));
+    assert!(
+        got.iter().all(|f| !(f.keyframe && f.discardable)),
+        "a keyframe never is"
+    );
+}
+
+/// The `late_discardable_dropped` count the client's leave logged.
+async fn late_dropped_at_leave(mut send: SendStream, captured: &Captured) -> u64 {
+    write_message(&mut send, &json!({"type": "bye"}))
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        if let Some(line) = logs
+            .lines()
+            .find(|l| l.contains("webtransport-client-quic-stats"))
+        {
+            let n = line
+                .split("late_discardable_dropped=")
+                .nth(1)
+                .expect("logged");
+            return n.split(' ').next().unwrap().parse().unwrap();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the client's leave was not logged"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A stalled path holds video; a discardable unit arriving behind it is dropped before it takes
+/// a `frame_seq`, so the numbers the sender used stay in step with what it sent. (A clean path drops
+/// none: `a_paced_keyframe_and_the_frames_behind_it_are_not_late_on_a_clean_link`.)
+#[tokio::test]
+async fn a_discardable_unit_behind_held_video_is_dropped_late() {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let captured = Captured::default();
+    let _logs = capture_info(&captured);
+    let mut agent = governed_agent_non_ref().await;
+    let down = Arc::new(AtomicBool::new(false));
+    let cut = down.clone();
+    let (session, mut send, _recv) = through(&mut agent, move || {
+        (!cut.load(Relaxed)).then_some(Duration::ZERO)
+    })
+    .await;
+    let mut path = Arrivals::default();
+    let mut report = tokio::time::interval(Duration::from_millis(50));
+    let t0 = Instant::now();
+    let (outage, up_at) = (
+        t0 + Duration::from_secs(1),
+        t0 + Duration::from_millis(2500),
+    );
+    let end = t0 + Duration::from_secs(4);
+    while Instant::now() < end {
+        down.store((outage..up_at).contains(&Instant::now()), Relaxed);
+        tokio::select! {
+            d = session.read_datagram() => {
+                let d = d.unwrap();
+                if d[..] != *STARVED_PROBE { path.receive(&d); }
+            }
+            _ = report.tick() => {
+                if let Some(fb) = path.feedback() { write_message(&mut send, &fb).await.unwrap(); }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+    let dropped = late_dropped_at_leave(send, &captured).await;
+    assert!(
+        dropped > 0,
+        "no discardable unit was dropped behind the stalled path"
+    );
+}
+
+/// [`governed_agent`] whose encoder's every second delta unit has `nal_ref_idc` 0, and whose
+/// tap was told `non-ref-p`.
+async fn governed_agent_non_ref() -> Agent {
+    let agent = agent_built(
+        Stream::H264,
+        Limits::default(),
+        audio::Plan::default(),
+        "snow",
+        |enc| {
+            make_every_second_delta_non_ref(enc);
+            Some(rate(true))
+        },
+    )
+    .await;
+    agent.listener.registry().lock()[SESSION]
+        .media
+        .clone()
+        .unwrap()
+        .assume_non_ref();
+    agent
 }
 
 /// Every datagram from `session` for `span`, in arrival order: audio parsed, and the video
@@ -1542,11 +1731,14 @@ async fn governed_agent(stream: Stream) -> Agent {
                 measured: Box::new(|_| {}),
                 ceiling_kbps: 8000.0,
                 floor_kbps: Box::new(|| 4000.0),
+                setpoint_kbps: Box::new(|| 0.0),
+                capacity: crate::session::settings::WtCapacity::V2,
                 retargets: true,
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
-                observe: Box::new(|_| {}),
+                observe: Box::new(|_, _| {}),
+                held: Box::new(|_| {}),
                 fec: Box::new(|_| {}),
             })
         },
@@ -1561,7 +1753,11 @@ async fn through(
 ) -> (Session, SendStream, RecvStream) {
     let port = relay(agent.url.port().unwrap(), impair).await;
     agent.url.set_port(Some(port)).unwrap();
-    let (session, send, recv, reply) = agent.hello(TOKEN).await;
+    let session = client_with(|_| {})
+        .connect(agent.url.clone())
+        .await
+        .unwrap();
+    let (session, send, recv, reply) = hello_over(session, TOKEN, json!({"fec": []})).await;
     assert_eq!(reply["type"], "hello_ack");
     (session, send, recv)
 }
@@ -1592,6 +1788,11 @@ async fn reordered_delivery_does_not_stall_the_datagram_path() {
         tokio::select! {
             d = session.read_datagram() => {
                 let d = d.unwrap();
+                // The outage probe fires when reordering stalls the queue for a tick.
+                if d.len() < 5 {
+                    assert_eq!(d[..], *STARVED_PROBE);
+                    continue;
+                }
                 if Instant::now() >= measure_from {
                     got.push(u32::from_le_bytes(d[1..5].try_into().unwrap()));
                 }
@@ -1617,15 +1818,8 @@ async fn reordered_delivery_does_not_stall_the_datagram_path() {
 }
 
 /// Logs `webtransport-client-quic-stats` lines into `captured` on this thread.
-fn capture_info(captured: &Captured) -> tracing::subscriber::DefaultGuard {
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_ansi(false)
-        .with_writer(captured.clone())
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
-    tracing::callsite::rebuild_interest_cache();
-    guard
+fn capture_info(captured: &Captured) -> crate::test_log::EndCapture {
+    crate::test_log::begin(&captured.0)
 }
 
 /// Says `bye` and waits for the agent's line on the client's leave: whether QUIC's window
@@ -2077,13 +2271,16 @@ async fn feedback_while_pyrowave_is_active_feeds_no_estimate() {
                 measured: Box::new(|_| {}),
                 ceiling_kbps: 4000.0,
                 floor_kbps: Box::new(|| 500.0),
+                setpoint_kbps: Box::new(|| 0.0),
+                capacity: crate::session::settings::WtCapacity::V2,
                 retargets: true,
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
-                observe: Box::new(move |_| {
+                observe: Box::new(move |_, _| {
                     count.fetch_add(1, Ordering::SeqCst);
                 }),
+                held: Box::new(|_| {}),
                 fec: Box::new(|_| {}),
             })
         },
@@ -2174,11 +2371,14 @@ async fn audio_alone_never_moves_the_video_estimate() {
             measured: Box::new(|_| {}),
             ceiling_kbps: 4000.0,
             floor_kbps: Box::new(|| 500.0),
+            setpoint_kbps: Box::new(|| 0.0),
+            capacity: crate::session::settings::WtCapacity::V2,
             retargets: true,
             start: Box::new(|| {}),
             owns: Box::new(|| false),
             displaced: Box::new(|| {}),
-            observe: Box::new(move |kbps| seen.lock().unwrap().push(kbps)),
+            observe: Box::new(move |kbps, _| seen.lock().unwrap().push(kbps)),
+            held: Box::new(|_| {}),
             fec: Box::new(|_| {}),
         })
     })
@@ -2219,11 +2419,14 @@ fn rate(retargets: bool) -> Rate {
         measured: Box::new(|_| {}),
         ceiling_kbps: 8000.0,
         floor_kbps: Box::new(|| 4000.0),
+        setpoint_kbps: Box::new(|| 0.0),
+        capacity: crate::session::settings::WtCapacity::V2,
         retargets,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(|_| {}),
+        observe: Box::new(|_, _| {}),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     }
 }
@@ -2231,6 +2434,27 @@ fn rate(retargets: bool) -> Rate {
 /// 200 video datagrams logged as sent 1 ms apart from `at`, then feedback that names them
 /// all as arrived 1 ms apart, read 250 ms after `at`.
 fn answered(control: &mut Control, first: u32, at: std::time::Instant) {
+    answered_but(control, first, at, |_| false);
+}
+
+/// [`answered`], with the datagrams `lost` names reported not received.
+fn answered_but(
+    control: &mut Control,
+    first: u32,
+    at: std::time::Instant,
+    lost: impl Fn(u32) -> bool,
+) {
+    answered_with(control, first, at, lost, None);
+}
+
+/// [`answered_but`], the feedback carrying `decoded` when given (#1348).
+fn answered_with(
+    control: &mut Control,
+    first: u32,
+    at: std::time::Instant,
+    lost: impl Fn(u32) -> bool,
+    decoded: Option<u16>,
+) {
     let mut arrivals = Vec::new();
     for i in 0..200u32 {
         let mut d = vec![0u8; media::MAX_DATAGRAM];
@@ -2238,15 +2462,19 @@ fn answered(control: &mut Control, first: u32, at: std::time::Instant) {
         control
             .log
             .record(&d, at + Duration::from_millis(i.into()), false);
-        arrivals.extend_from_slice(&((i * 20) as u16).to_le_bytes());
+        let arrival = if lost(i) { u16::MAX } else { (i * 20) as u16 };
+        arrivals.extend_from_slice(&arrival.to_le_bytes());
     }
-    let fb = json!({
+    let mut fb = json!({
         "type": "feedback", "seq": first / 200 + 1,
         "first_pkt_seq": first, "count": 200,
         "ref_us": u64::from(first) * 1000,
         "arrivals_b64": base64::engine::general_purpose::STANDARD.encode(&arrivals),
         "recv_kbps": 0, "lost": 0, "interval_ms": 50,
     });
+    if let Some(d) = decoded {
+        fb["decoded"] = json!(d);
+    }
     let path = congestion::QuicPath {
         rtt: Duration::from_millis(20),
         cwnd_bytes: 0,
@@ -2254,6 +2482,152 @@ fn answered(control: &mut Control, first: u32, at: std::time::Instant) {
         queued_bytes: 0,
     };
     control.feedback(&fb, path, at + Duration::from_millis(250));
+}
+
+/// #1348: `decoded` rides on feedback without changing what either capacity estimator reads.
+#[test]
+fn feedback_carrying_decoded_reads_the_same_in_both_capacity_modes() {
+    for capacity in [
+        crate::session::settings::WtCapacity::V2,
+        crate::session::settings::WtCapacity::Legacy,
+    ] {
+        let rate = Rate {
+            capacity,
+            ..rate(true)
+        };
+        let base = std::time::Instant::now();
+        let run = |decoded: Option<u16>| {
+            let mut c = Control::new(&rate, Arc::default(), true, congestion::Governor::default());
+            for k in 0..8u32 {
+                let at = base + Duration::from_millis(250 * u64::from(k));
+                answered_with(&mut c, 200 * k, at, |i| i % 9 == 4, decoded);
+            }
+            let e = &c.estimator;
+            (
+                c.refused,
+                e.estimate_kbps(),
+                e.loss(),
+                e.measured(),
+                e.held_kbps(),
+            )
+        };
+        let with = run(Some(4711));
+        assert_eq!(with.0, 0, "{capacity:?}: refused");
+        assert_eq!(with, run(None), "{capacity:?}");
+    }
+}
+
+/// #1433 lab R3 (NVIDIA lab host, 2026-11-22): the hold's line reaches the ABR as video under the
+/// FEC its loss called for, kept as the level calms, never the share the floor leaves. At 1080p's
+/// floor that share was 3 %, and the rung read the line as 720p video for 37 s.
+#[test]
+fn the_hold_line_reaches_the_abr_under_the_fec_its_loss_called_for() {
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let log = lines.clone();
+    let rate = Rate {
+        floor_kbps: Box::new(|| 6000.0),
+        held: Box::new(move |line| log.lock().unwrap().push(line)),
+        ..rate(true)
+    };
+    let mut control = Control::new(&rate, Arc::default(), true, congestion::Governor::default());
+    let base = std::time::Instant::now();
+    answered_but(&mut control, 0, base, |i| i % 4 == 1);
+    let line = control.estimator.held_kbps().expect("a hold");
+    assert!(control.charged < 0.25, "charged {}", control.charged);
+    for k in 1..20u32 {
+        answered(
+            &mut control,
+            200 * k,
+            base + Duration::from_millis(250 * u64::from(k)),
+        );
+    }
+    let got = lines.lock().unwrap().clone();
+    assert_eq!(got.first(), Some(&Some(line / 1.25)), "{got:?}");
+    assert_eq!(
+        got.last(),
+        Some(&Some(line / 1.25)),
+        "after the level calmed: {got:?}"
+    );
+}
+
+/// #1301 with #1433's v2 hold, the one bound v2 has on FEC (#1660): while a hold is on with 25 %
+/// FEC, video plus repairs stays under its line, which is under the configured maximum
+/// (`congestion::Estimator` ends a hold whose line reaches it; `Control::feed` gives the governor
+/// that line less the share).
+#[test]
+fn a_v2_hold_with_fec_keeps_video_plus_repairs_under_the_ceiling() {
+    use crate::session::abr::{AbrConfig, Governor};
+    let cfg = AbrConfig {
+        per_report: Some(Duration::ZERO),
+        ..AbrConfig::new_smooth(1000, 8000, 60)
+    };
+    let base = std::time::Instant::now();
+    let gov = Arc::new(Mutex::new(Governor::new(cfg, base)));
+    let (g1, g2, g3, g4) = (gov.clone(), gov.clone(), gov.clone(), gov.clone());
+    let now = std::time::Instant::now;
+    let rate = Rate {
+        floor_kbps: Box::new(|| 1000.0),
+        setpoint_kbps: Box::new(move || f64::from(g1.lock().unwrap().setpoint_kbps())),
+        // As `abr_glue::feedback_abr` wires the governor.
+        held: Box::new(move |line| {
+            let mut g = g2.lock().unwrap();
+            match line {
+                Some(line) => drop(g.hold_to(line, now())),
+                None => g.hold_off(now()),
+            }
+        }),
+        measured: Box::new(move |reading| {
+            g3.lock().unwrap().observe_report(reading, now());
+        }),
+        observe: Box::new(move |kbps, share| {
+            let mut g = g4.lock().unwrap();
+            g.set_share(share, now());
+            g.observe(kbps, now());
+        }),
+        ..rate(true)
+    };
+    let mut control = Control::new(&rate, Arc::default(), true, congestion::Governor::default());
+    let total = |c: &Control| f64::from(gov.lock().unwrap().setpoint_kbps()) * (1.0 + c.charged);
+    answered_but(&mut control, 0, base, |i| i % 5 == 0);
+    let line = control.estimator.held_kbps().expect("a hold");
+    assert_eq!(control.charged, 0.25);
+    assert!(
+        line < 8000.0 && total(&control) <= line,
+        "line {line:.0}, sent {:.0}",
+        total(&control)
+    );
+    for k in 1..80u32 {
+        answered(
+            &mut control,
+            200 * k,
+            base + Duration::from_millis(250 * u64::from(k)),
+        );
+        if let Some(line) = control.estimator.held_kbps() {
+            let sent = total(&control);
+            assert!(
+                line < 8000.0 && sent <= line,
+                "report {k}: {sent:.0} over {line:.0}"
+            );
+        }
+    }
+}
+
+/// #1301 bounds legacy (the default) and WebRTC; v2 keeps the share off the governor's ceiling,
+/// as before (#1660). At the ceiling with 15 % FEC (inside the deadband) a legacy session's
+/// setpoint is the ceiling over 1.15, a v2 session's stays at the ceiling.
+#[test]
+fn v2_keeps_the_fec_share_off_the_governors_ceiling() {
+    use crate::session::settings::WtCapacity;
+    for (capacity, want) in [
+        (WtCapacity::Legacy, video_ceiling(3)),
+        (WtCapacity::V2, 8000),
+    ] {
+        let sent = governed_by(smooth_per_report(), capacity, |_| 3, 8000.0, 5);
+        assert!(
+            sent.iter().all(|&(sp, _)| sp == want),
+            "{capacity:?}: {sent:?}"
+        );
+    }
 }
 
 /// §Feedback: with the ABR off the estimate never reaches the encoder, so QUIC keeps its
@@ -2306,13 +2680,16 @@ fn the_silence_decay_is_never_fed_to_the_collapse_as_a_measured_link() {
         }),
         ceiling_kbps: 8000.0,
         floor_kbps: Box::new(|| 4000.0),
+        setpoint_kbps: Box::new(|| 0.0),
+        capacity: crate::session::settings::WtCapacity::V2,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(move |_| {
+        observe: Box::new(move |_, _| {
             f.fetch_add(1, SeqCst);
         }),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), false, Default::default());
@@ -2352,11 +2729,14 @@ fn a_report_gives_the_abr_its_reading_before_its_estimate() {
         measured: Box::new(move |_| m.lock().unwrap().push("measured")),
         ceiling_kbps: 8000.0,
         floor_kbps: Box::new(|| 4000.0),
+        setpoint_kbps: Box::new(|| 0.0),
+        capacity: crate::session::settings::WtCapacity::V2,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(move |_| o.lock().unwrap().push("observe")),
+        observe: Box::new(move |_, _| o.lock().unwrap().push("observe")),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), false, Default::default());
@@ -2376,15 +2756,18 @@ fn a_client_that_is_gone_neither_starts_nor_feeds_the_abr() {
         measured: Box::new(|_| {}),
         ceiling_kbps: 4000.0,
         floor_kbps: Box::new(|| 500.0),
+        setpoint_kbps: Box::new(|| 0.0),
+        capacity: crate::session::settings::WtCapacity::V2,
         retargets: true,
         start: Box::new(move || {
             started.fetch_add(1, SeqCst);
         }),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(move |_| {
+        observe: Box::new(move |_, _| {
             fed.fetch_add(1, SeqCst);
         }),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
     let gone = Arc::new(OnceLock::new());
@@ -2439,11 +2822,14 @@ fn the_abr_is_fed_the_estimate_less_the_fec_share() {
         measured: Box::new(|_| {}),
         ceiling_kbps: 6000.0,
         floor_kbps: Box::new(|| 500.0),
+        setpoint_kbps: Box::new(|| 0.0),
+        capacity: crate::session::settings::WtCapacity::V2,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(move |kbps: f64| seen.lock().unwrap().push(kbps.round())),
+        observe: Box::new(move |kbps: f64, _| seen.lock().unwrap().push(kbps.round())),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), true, Default::default());
@@ -2472,11 +2858,14 @@ async fn lossy_session(retargets: bool) -> (Agent, Arc<crate::session::metrics::
                 measured: Box::new(|_| {}),
                 ceiling_kbps: 4000.0,
                 floor_kbps: Box::new(|| 500.0),
+                setpoint_kbps: Box::new(|| 0.0),
+                capacity: crate::session::settings::WtCapacity::V2,
                 retargets,
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
-                observe: Box::new(|_| {}),
+                observe: Box::new(|_, _| {}),
+                held: Box::new(|_| {}),
                 fec: Box::new(move |event| match event {
                     crate::webtransport::FecEvent::Attached { client, fec } => {
                         m.attach_fec(client, fec);
@@ -2723,11 +3112,14 @@ fn repairs_spend_only_what_the_estimate_leaves_above_the_abr_floor() {
         measured: Box::new(|_| {}),
         ceiling_kbps: 6000.0,
         floor_kbps: Box::new(|| 2500.0),
+        setpoint_kbps: Box::new(|| 0.0),
+        capacity: crate::session::settings::WtCapacity::V2,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(move |kbps: f64| seen.lock().unwrap().push(kbps.round())),
+        observe: Box::new(move |kbps: f64, _| seen.lock().unwrap().push(kbps.round())),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), true, Default::default());
@@ -2751,35 +3143,62 @@ fn repairs_spend_only_what_the_estimate_leaves_above_the_abr_floor() {
 /// `Control::protect` makes for a second of 60 fps video at it, in kbit/s. The clock is the
 /// test's, one estimate a second.
 fn governed(level: u8, estimate_kbps: f64, seconds: u64) -> Vec<(u32, f64)> {
-    use crate::session::abr::{AbrConfig, Governor};
+    let v2 = crate::session::settings::WtCapacity::V2;
+    governed_by(smooth_window(), v2, |_| level, estimate_kbps, seconds)
+}
+
+fn smooth_window() -> crate::session::abr::AbrConfig {
+    crate::session::abr::AbrConfig::new_smooth(2500, 8000, 60)
+}
+
+/// WebTransport's `smooth` loop (`abr_glue::arm`) on an encoder whose writes cost no keyframe.
+fn smooth_per_report() -> crate::session::abr::AbrConfig {
+    crate::session::abr::AbrConfig {
+        per_report: Some(Duration::ZERO),
+        ..smooth_window()
+    }
+}
+
+/// [`governed`] on a governor built from `cfg`, the loss in second `s` calling for FEC level
+/// `level(s)`.
+fn governed_by(
+    cfg: crate::session::abr::AbrConfig,
+    capacity: crate::session::settings::WtCapacity,
+    level: impl Fn(u64) -> u8,
+    estimate_kbps: f64,
+    seconds: u64,
+) -> Vec<(u32, f64)> {
+    use crate::session::abr::Governor;
     let base = std::time::Instant::now();
-    let governor = Arc::new(Mutex::new((
-        Governor::new(AbrConfig::new_smooth(2500, 8000, 60), base),
-        base,
-    )));
-    let (floor, observed) = (governor.clone(), governor.clone());
+    let governor = Arc::new(Mutex::new((Governor::new(cfg, base), base)));
+    let (floor, setpoint, observed) = (governor.clone(), governor.clone(), governor.clone());
     let rate = Rate {
         measured: Box::new(|_| {}),
         ceiling_kbps: 8000.0,
         floor_kbps: Box::new(move || f64::from(floor.lock().unwrap().0.floor_kbps())),
+        setpoint_kbps: Box::new(move || f64::from(setpoint.lock().unwrap().0.setpoint_kbps())),
+        capacity,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(move |kbps| {
+        // As `abr_glue::feedback_abr`: the share, then the estimate.
+        observe: Box::new(move |kbps, share| {
             let mut governor = observed.lock().unwrap();
             let now = governor.1;
+            governor.0.set_share(share, now);
             governor.0.observe(kbps, now);
         }),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), true, Default::default());
-    let fec = control.fec.as_mut().unwrap();
-    fec.observe(f64::from(level) / 100.0, base);
-    assert_eq!(fec.overhead(), f64::from(level) * 0.05);
     (1..=seconds)
         .map(|second| {
-            governor.lock().unwrap().1 = base + Duration::from_secs(second);
+            let now = base + Duration::from_secs(second);
+            governor.lock().unwrap().1 = now;
+            let fec = control.fec.as_mut().unwrap();
+            fec.observe(f64::from(level(second)) / 100.0, now);
             control.feed(estimate_kbps, false);
             let setpoint = governor.lock().unwrap().0.setpoint_kbps();
             let fragments = (setpoint as usize * 125 / 60).div_ceil(media::MAX_DATAGRAM);
@@ -2801,34 +3220,161 @@ fn governor_bound(estimate_kbps: f64) -> f64 {
     estimate_kbps / (1.0 - crate::session::abr::AbrConfig::DEFAULT_DEADBAND)
 }
 
-/// #1046: a FEC share inside the governor's deadband (levels 1 to 3, up to 15 %) does not
-/// move the encoder. At the ceiling the repairs go on top of it, so the session sends more
-/// than its ceiling, and no more than the governor's own bound.
+/// #1433 (R3, rule 1): the pacer and QUIC's window are governed at what the encoder sends, the
+/// ABR's setpoint plus its FEC share, when the estimate is under it: the average output of the
+/// encoder always leaves the agent, so an overload shows at the link and not as held video the
+/// stall guard reads as a dead path. Estimate 3500, setpoint 4500, 10 % FEC: 4950. Old code:
+/// the estimate, 3500.
 #[test]
-fn a_fec_share_inside_the_deadband_rides_on_top_of_the_ceiling() {
-    for level in 1..=3 {
-        for (setpoint, sent) in governed(level, 8000.0, 30) {
-            assert_eq!(setpoint, 8000, "level {level}");
-            assert!(
-                sent > 8000.0 && sent <= governor_bound(8000.0),
-                "level {level}: {sent:.0} kbit/s"
-            );
+fn the_pacer_never_holds_video_under_the_setpoint() {
+    let (estimate, governed) = governed_after_a_report(crate::session::settings::WtCapacity::V2);
+    assert!(
+        (3400.0..3700.0).contains(&estimate),
+        "the estimate is {estimate:.0}"
+    );
+    assert!(governed >= 4950, "governed at {governed} kbit/s");
+}
+
+/// `QUASAR_WT_CAPACITY=legacy` governs at the estimate, as 0.6.3 did.
+#[test]
+fn legacy_capacity_governs_at_the_estimate() {
+    let (estimate, governed) =
+        governed_after_a_report(crate::session::settings::WtCapacity::Legacy);
+    assert_eq!(governed, estimate as u64);
+}
+
+/// The estimate and the governed rate, kbit/s, after one report: estimate 3500, setpoint 4500,
+/// 10 % FEC.
+fn governed_after_a_report(capacity: crate::session::settings::WtCapacity) -> (f64, u64) {
+    use crate::session::abr::{AbrConfig, Governor};
+    let base = std::time::Instant::now();
+    // A smooth governor whose ceiling is the setpoint, and so starts there.
+    let abr = Arc::new(Mutex::new(Governor::new(
+        AbrConfig::new_smooth(1000, 4500, 60),
+        base,
+    )));
+    assert_eq!(abr.lock().unwrap().setpoint_kbps(), 4500);
+    let setpoint = abr.clone();
+    let rate = Rate {
+        measured: Box::new(|_| {}),
+        ceiling_kbps: 4500.0,
+        floor_kbps: Box::new(|| 1000.0),
+        setpoint_kbps: Box::new(move || f64::from(setpoint.lock().unwrap().setpoint_kbps())),
+        capacity,
+        retargets: true,
+        start: Box::new(|| {}),
+        owns: Box::new(|| false),
+        displaced: Box::new(|| {}),
+        observe: Box::new(|_, _| {}),
+        held: Box::new(|_| {}),
+        fec: Box::new(|_| {}),
+    };
+    let governor = congestion::Governor::default();
+    let mut control = Control::new(&rate, Arc::default(), true, governor.clone());
+    control.fec.as_mut().unwrap().observe(0.02, base);
+    control.estimator.resume_at(3500.0);
+    answered(&mut control, 0, base);
+    assert_eq!(control.charged, 0.1);
+    (control.estimator.estimate_kbps(), governor.kbps())
+}
+
+/// The setpoint the governor's ceiling allows video with FEC `level` on top (#1301).
+fn video_ceiling(level: u8) -> u32 {
+    (8000.0 / (1.0 + f64::from(level) * 0.05)).floor() as u32
+}
+
+/// #1301: with FEC the governor's ceiling is the configured one over 1 + share, from the first
+/// estimate, so video plus repairs never exceeds the configured maximum: shares 0 to 25 %, on
+/// the window loop and the per-report one. A second may carry the one repair datagram `fec`
+/// banks from the one before. Old code: 8000 plus the share, up to 8% over at level 3.
+#[test]
+fn fec_never_takes_a_session_over_its_configured_maximum() {
+    let banked = (media::MAX_DATAGRAM * 8) as f64 / 1000.0;
+    for cfg in [smooth_window(), smooth_per_report()] {
+        for level in 0..=5 {
+            for (setpoint, sent) in governed_by(
+                cfg,
+                crate::session::settings::WtCapacity::Legacy,
+                |_| level,
+                8000.0,
+                30,
+            ) {
+                assert_eq!(setpoint, video_ceiling(level), "level {level}");
+                assert!(sent <= 8000.0 + banked, "level {level}: {sent:.0} kbit/s");
+            }
         }
     }
 }
 
-/// Levels 4 and 5 are outside the deadband: from the ceiling a smooth governor takes its
-/// one 12.5 % step and holds there, the total back inside the bound.
+/// #1301: from the ceiling onto a link of 5000 kbit/s a governor with FEC settles no later than
+/// one without (smooth: 15 s; old code took 22 s at level 5, one step more).
 #[test]
-fn a_fec_share_outside_the_deadband_steps_the_setpoint_down() {
-    for level in 4..=5 {
-        for (setpoint, sent) in governed(level, 8000.0, 30) {
-            assert_eq!(setpoint, 7000, "level {level}");
+fn a_step_down_with_fec_is_no_slower_than_without() {
+    let protective = crate::session::abr::AbrConfig::new(2500, 8000, 60);
+    for cfg in [smooth_window(), protective] {
+        // The second the setpoint last moved.
+        let settled = |level| {
+            let sent = governed_by(
+                cfg,
+                crate::session::settings::WtCapacity::Legacy,
+                |_| level,
+                5000.0,
+                60,
+            );
+            let last = sent[sent.len() - 1].0;
+            sent.iter()
+                .rposition(|&(sp, _)| sp != last)
+                .map_or(0, |i| i + 1)
+                + 1
+        };
+        let without = settled(0);
+        for level in 1..=5 {
             assert!(
-                sent > 8000.0 && sent <= governor_bound(8000.0),
-                "level {level}: {sent:.0} kbit/s"
+                settled(level) <= without,
+                "{:?} level {level}: {} s, {without} s without FEC",
+                cfg.down_policy,
+                settled(level)
             );
         }
+    }
+    assert_eq!(
+        governed(0, 5000.0, 20)
+            .iter()
+            .position(|&(sp, _)| sp == governed(0, 5000.0, 60)[59].0),
+        Some(14),
+        "smooth without FEC settles at 15 s"
+    );
+}
+
+/// #1301: a share that rises mid-session takes the setpoint under the new ceiling at the
+/// estimate it came with, inside the smooth governor's 7 s dwell for the second rise. One that
+/// falls (a step per 2 s from 15 s) lifts the ceiling only once lower for 10 s
+/// (`abr::SHARE_STICKY`), and the setpoint climbs back to the configured one.
+#[test]
+fn a_share_change_mid_session_applies_at_once() {
+    for cfg in [smooth_window(), smooth_per_report()] {
+        let level = |second| match second {
+            11 => 3,
+            12 => 5,
+            _ => 0,
+        };
+        let sent = governed_by(
+            cfg,
+            crate::session::settings::WtCapacity::Legacy,
+            level,
+            8000.0,
+            40,
+        );
+        let setpoints: Vec<u32> = sent.iter().map(|&(sp, _)| sp).collect();
+        assert_eq!(setpoints[9], 8000, "{:?}", cfg.per_report);
+        assert_eq!(setpoints[10], video_ceiling(3), "{:?}", cfg.per_report);
+        assert_eq!(setpoints[11], video_ceiling(5), "{:?}", cfg.per_report);
+        assert!(
+            setpoints[12..24].iter().all(|&sp| sp == video_ceiling(5)),
+            "{:?}: held to 24 s {setpoints:?}",
+            cfg.per_report
+        );
+        assert_eq!(setpoints[39], 8000, "{:?}: {setpoints:?}", cfg.per_report);
     }
 }
 
@@ -2862,11 +3408,14 @@ fn a_pyrowave_frame_gets_no_repair_at_any_overhead() {
         measured: Box::new(|_| {}),
         ceiling_kbps: 6000.0,
         floor_kbps: Box::new(|| 500.0),
+        setpoint_kbps: Box::new(|| 0.0),
+        capacity: crate::session::settings::WtCapacity::V2,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(|_| {}),
+        observe: Box::new(|_, _| {}),
+        held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
     let mut control = Control::new(&rate, Arc::default(), true, Default::default());
@@ -3665,7 +4214,7 @@ async fn a_webtransport_takeover_displaces_a_loop_its_peer_left_owning_the_encod
     .expect("this encoder takes live writes");
     (peer.start)();
     pause();
-    (peer.observe)(2000.0);
+    (peer.observe)(2000.0, 0.0);
     pause();
     let driven = kbps();
     assert!(
@@ -4298,18 +4847,13 @@ async fn a_64_kib_session_id_is_refused_and_logged_bounded() {
         "session_not_ready"
     );
 
-    // The refusal's own log call, captured on this thread (a scoped subscriber does not
-    // reach tasks other tests' subscribers race with).
+    // The refusal's own log call, captured on this thread through the shared
+    // process-wide subscriber (no scoped dispatcher to race its interest cache).
     let captured = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_ansi(false)
-        .with_writer(captured.clone())
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
-        tracing::callsite::rebuild_interest_cache();
+    {
+        let _guard = crate::test_log::begin(&captured.0);
         log_refusal(&huge, "session_not_ready");
-    });
+    }
     let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
     assert_eq!(logs.lines().count(), 1, "one line: {logs}");
     assert!(logs.len() < 400, "a {} byte log line", logs.len());
@@ -4339,6 +4883,23 @@ fn client_with(shape: impl FnOnce(&mut quinn::TransportConfig)) -> web_transport
     let mut config = quinn::ClientConfig::new(Arc::new(crypto));
     config.transport_config(Arc::new(transport));
     let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    // Chrome's QUIC asks for 1 MiB (`kQuicSocketReceiveBufferSize`). At the kernel default
+    // (212 992 bytes, 92 loopback datagrams) a keyframe of 95 lost its tail whenever the agent,
+    // on this test's one thread, sent it before the client read: no whole keyframe for seconds.
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let size: libc::c_int = 1 << 20;
+    // SAFETY: `socket` owns a valid fd, and the option is a c_int of its own size.
+    let set = unsafe {
+        libc::setsockopt(
+            std::os::fd::AsRawFd::as_raw_fd(&socket),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&size as *const libc::c_int).cast(),
+            std::mem::size_of_val(&size) as libc::socklen_t,
+        )
+    };
+    assert_eq!(set, 0, "SO_RCVBUF: {}", std::io::Error::last_os_error());
+    endpoint.rebind(socket).unwrap();
     web_transport_quinn::Client::new(endpoint, config)
 }
 
@@ -4541,17 +5102,12 @@ async fn a_failed_swap_keeps_serving_and_listing_the_old_certificate_first() {
     };
 
     let captured = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_ansi(false)
-        .with_writer(captured.clone())
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
-        tracing::callsite::rebuild_interest_cache();
+    {
+        let _guard = crate::test_log::begin(&captured.0);
         agent.listener.rotate_with(expires - 48 * HOUR, broken);
         agent.listener.rotate_at(expires - 12 * HOUR);
         agent.listener.rotate_at(expires - 11 * HOUR);
-    });
+    }
     let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
     assert_eq!(
         logs.matches("webtransport-cert-reload-failed").count(),
@@ -5159,16 +5715,19 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
                 measured: Box::new(|_| {}),
                 ceiling_kbps: 1_000_000.0,
                 floor_kbps: Box::new(|| 500.0),
+                setpoint_kbps: Box::new(|| 0.0),
+                capacity: crate::session::settings::WtCapacity::V2,
                 retargets: true,
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
-                observe: Box::new(move |kbps| {
+                observe: Box::new(move |kbps, _| {
                     if active.get().is_some_and(|m| m.pyrowave_active()) {
                         pyro_fed.lock().unwrap().push(kbps);
                     }
                     observed.lock().unwrap().push(kbps)
                 }),
+                held: Box::new(|_| {}),
                 fec: Box::new(|_| {}),
             })
         },
@@ -5225,13 +5784,16 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
                 };
                 seqs.clear();
                 let count = (last - first + 1) as usize;
-                let mut arrivals = vec![0xFFu8; count * 2];
-                arrivals[..2].fill(0);
+                // Every other one lost, ending at an arrival as a browser's report does.
+                let mut arrivals = vec![0u8; count * 2];
+                for i in (1..count.saturating_sub(1)).step_by(2) {
+                    arrivals[2 * i..2 * i + 2].fill(0xFF);
+                }
                 fb_seq += 1;
                 let fb = json!({"type": "feedback", "seq": fb_seq, "first_pkt_seq": first,
                     "count": count, "ref_us": 0,
                     "arrivals_b64": base64::engine::general_purpose::STANDARD.encode(&arrivals),
-                    "recv_kbps": 0, "lost": count - 1, "interval_ms": 50});
+                    "recv_kbps": 0, "lost": count.saturating_sub(1) / 2, "interval_ms": 50});
                 write_message(&mut send, &fb).await.unwrap();
             }
             m = read_message(&mut recv) => break m.unwrap(),
@@ -5461,6 +6023,121 @@ fn releasing_the_tap_stops_its_pyrowave_encoder_and_keeps_the_tap() {
     let _ = pipeline.set_state(gst::State::Null);
 }
 
+/// #1321: an outage stops every ACK, so QUIC's queue stalls and video waits in the agent.
+/// Audio still goes to QUIC ahead of it, also after feedback silence has released the
+/// governor; video held past the NACK hold is dropped, so when the path returns the outage's
+/// audio arrives before the picture, which resumes at a keyframe. The relay holds the
+/// outage's datagrams rather than dropping them, so the order QUIC sent them in is what the
+/// client sees.
+#[tokio::test]
+async fn audio_overtakes_video_held_behind_a_stalled_path() {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let plan = audio::Plan {
+        audio: true,
+        mic: false,
+        pulse_server: None,
+        jitter_ms: 40,
+    };
+    let mut agent = agent_built(Stream::Av1Heavy, Limits::default(), plan, "snow", |_| {
+        Some(rate(true))
+    })
+    .await;
+    tap_session_audio(&mut agent);
+    let t0 = Instant::now();
+    let (outage, up_at, end) = (
+        t0 + Duration::from_secs(2),
+        t0 + Duration::from_millis(3500),
+        t0 + Duration::from_millis(5500),
+    );
+    let down = Arc::new(AtomicBool::new(false));
+    let cut = down.clone();
+    let (session, mut send, _recv) = through(&mut agent, move || {
+        Some(if cut.load(Relaxed) {
+            up_at.saturating_duration_since(Instant::now())
+        } else {
+            Duration::ZERO
+        })
+    })
+    .await;
+    let wall_us = || {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64
+    };
+    let mut path = Arrivals::default();
+    let mut report = tokio::time::interval(Duration::from_millis(50));
+    // Audio captured from here on was captured after the governor let go (silence: 500 ms).
+    let mut late = None::<u64>;
+    // When the path came back.
+    let mut up_wall = None::<u64>;
+    // (arrival µs, capture µs, keyframe) of every audio and video datagram from the outage on.
+    let (mut audio, mut video) = (Vec::new(), Vec::new());
+    loop {
+        let now = Instant::now();
+        if now >= end {
+            break;
+        }
+        down.store((outage..up_at).contains(&now), Relaxed);
+        if up_wall.is_none() && now >= up_at {
+            up_wall = Some(wall_us());
+        }
+        if late.is_none() && now >= outage + Duration::from_millis(800) {
+            late = Some(wall_us());
+        }
+        tokio::select! {
+            d = session.read_datagram() => {
+                let d = d.unwrap();
+                // The starved-path probe (#1333) carries no `pkt_seq`.
+                if d.len() < 5 { continue; }
+                path.receive(&d);
+                if now < outage { continue; }
+                let n = wall_us();
+                let at = |r: std::ops::Range<usize>| u64::from_le_bytes(d[r].try_into().unwrap());
+                match d[0] {
+                    0x02 => audio.push((n, at(11..19), false)),
+                    0x01 => video.push((n, at(17..25), d[5] & 1 != 0)),
+                    _ => {}
+                }
+            }
+            _ = report.tick() => {
+                if let Some(fb) = path.feedback() {
+                    write_message(&mut send, &fb).await.unwrap();
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+    let late = late.unwrap();
+    let late_audio: Vec<_> = audio.iter().filter(|a| a.1 >= late).collect();
+    assert!(
+        !late_audio.is_empty(),
+        "no audio from late in the outage arrived"
+    );
+    // Nothing held past the NACK hold reaches QUIC (`VideoQueue::feed`), so the picture
+    // resumes at a keyframe, and the outage's audio is not behind any of it.
+    let up_wall = up_wall.unwrap();
+    let resumed = video
+        .iter()
+        .find(|v| v.1 >= up_wall)
+        .expect("video resumed");
+    let last_audio = late_audio
+        .iter()
+        .filter(|a| a.1 < up_wall)
+        .map(|a| a.0)
+        .max();
+    eprintln!(
+        "{} late audio datagrams; video resumed at a keyframe: {}",
+        late_audio.len(),
+        resumed.2
+    );
+    assert!(resumed.2, "video resumed on a delta frame");
+    assert!(
+        last_audio.is_some_and(|a| a <= resumed.0),
+        "the outage's audio arrived behind the video after it"
+    );
+}
+
 /// #1606: 363 datagrams of ~1200 B, the size of one 1080p60 PyroWave frame at 200 Mbit/s.
 fn big_frame() -> Vec<Bytes> {
     vec![Bytes::from(vec![0u8; 1200]); 363]
@@ -5470,53 +6147,223 @@ fn big_frame() -> Vec<Bytes> {
 fn a_big_pyrowave_frame_is_handed_over_in_bounded_slices_inside_the_frame_interval() {
     let frame = big_frame();
     for fps in [60, 120] {
-        let plan = burst_plan(&frame, true, fps);
-        assert_eq!(plan.iter().map(|(n, _)| n).sum::<usize>(), frame.len());
+        let (plan, gap) = burst_plan(&frame, true, fps, true);
+        assert_eq!(plan.iter().sum::<usize>(), frame.len());
         assert!(plan.len() > 1);
         assert!(
-            plan.iter().all(|(n, _)| n * 1200 <= PYRO_BURST_BYTES),
+            plan.iter().all(|n| n * 1200 <= PYRO_BURST_BYTES),
             "{plan:?}"
         );
-        assert_eq!(plan[0].1, Duration::ZERO);
-        let last = plan.last().unwrap().1;
-        assert!(
-            last <= Duration::from_secs(1) / (fps as u32 * 4),
-            "{fps} fps: {last:?}"
+        assert!(gap > Duration::ZERO, "slices are spread out in time");
+    }
+}
+
+/// A frame of `bytes` as ~1200 B datagrams.
+fn frame_of(bytes: usize) -> Vec<Bytes> {
+    vec![Bytes::from(vec![0u8; 1200]); bytes.div_ceil(1200)]
+}
+
+/// What [`paced`] saw: each frame's first-to-last spread as a fraction of the interval (sorted),
+/// the datagrams rushed and dropped, and the most bytes handed over in one frame's turn.
+struct Paced {
+    spreads: Vec<f64>,
+    rushed: usize,
+    dropped: usize,
+    most: usize,
+}
+
+/// A model of the send loop: a frame of `bytes` arrives every interval at `fps` for one second,
+/// is planned (`burst_plan` for the timerfd) and queued, and each pacing deadline wakes `late(i)`
+/// after it, as the timer driving the pacing arm would.
+fn paced(bytes: usize, fps: i32, late: impl Fn(usize) -> Duration) -> Paced {
+    let frame = frame_of(bytes);
+    let interval = Duration::from_secs(1) / fps as u32;
+    let t0 = Instant::now();
+    let mut pacing = Pacing::default();
+    let mut seen = Paced {
+        spreads: Vec::new(),
+        rushed: 0,
+        dropped: 0,
+        most: 0,
+    };
+    let mut wakes = 0;
+    let take = |pacing: &mut Pacing, seen: &mut Paced| {
+        if let Some(took) = pacing.finished.take() {
+            seen.spreads
+                .push(took.as_secs_f64() / interval.as_secs_f64());
+        }
+    };
+    let size = |d: &[Bytes]| d.iter().map(Bytes::len).sum::<usize>();
+    for k in 0..fps as u32 {
+        let arrives = t0 + interval * k;
+        while let Some(due) = pacing.deadline() {
+            let wake = due.max(t0) + late(wakes);
+            if wake >= arrives {
+                break;
+            }
+            wakes += 1;
+            pacing.pop(wake);
+            take(&mut pacing, &mut seen);
+        }
+        let (plan, gap) = burst_plan(&frame, true, fps, true);
+        let mut rest = frame.iter().cloned();
+        let slices = plan
+            .iter()
+            .map(|n| rest.by_ref().take(*n).collect())
+            .collect();
+        let (rushed, dropped) = pacing.push(k as u16, gap, slices, arrives);
+        let first = pacing.pop(arrives).unwrap_or_default();
+        seen.most = seen.most.max(size(&rushed) + size(&first));
+        seen.rushed += rushed.len();
+        seen.dropped += dropped;
+        take(&mut pacing, &mut seen);
+    }
+    seen.spreads.sort_unstable_by(f64::total_cmp);
+    seen
+}
+
+/// #1633: with a wake 50-150 us late (the timerfd's measured lateness plus the slice hand-off),
+/// every lab row's frames leave inside half an interval (`codec-pyrowave.md` §Rate) and the
+/// pacer never falls a frame behind. tokio's 1 ms timer failed this at 4K120 (spread p95 1.0,
+/// ~25 frames a second rushed or dropped).
+#[test]
+fn lab_rows_are_paced_inside_half_an_interval_with_no_tail_rushed() {
+    let precise = |i: usize| Duration::from_micros(50 + (i as u64 * 37) % 101);
+    // (fps, Mbit/s): 4K120, 4K60, 1080p120, 1080p60 at their lab budgets.
+    for (fps, mbit) in [(120, 800), (60, 400), (120, 400), (60, 200)] {
+        let seen = paced(mbit * 1_000_000 / 8 / fps as usize, fps, precise);
+        let p95 = seen.spreads[(seen.spreads.len() - 1) * 95 / 100];
+        eprintln!(
+            "{fps} fps {mbit} Mbit/s: {} frames, spread p95 {p95:.3}, rushed {}",
+            seen.spreads.len(),
+            seen.rushed
         );
+        assert_eq!(
+            seen.spreads.len(),
+            fps as usize - 1,
+            "{fps} fps {mbit} Mbit/s: every frame but the last closes"
+        );
+        assert!(p95 <= 0.5, "{fps} fps {mbit} Mbit/s: spread p95 {p95:.3}");
+        assert_eq!(
+            (seen.rushed, seen.dropped),
+            (0, 0),
+            "{fps} fps {mbit} Mbit/s"
+        );
+    }
+}
+
+/// A pacer that falls behind (here a timer 3 ms late on every wake at 4K120) never builds a
+/// backlog: each frame's unsent tail goes when the next frame arrives, but no more of it than
+/// one clean burst (the #1606 whole-frame loss); the rest is dropped and counted.
+#[test]
+fn a_pacer_behind_its_slices_hands_over_one_clean_burst_and_drops_the_rest() {
+    let seen = paced(800_000_000 / 8 / 120, 120, |_| Duration::from_millis(3));
+    assert!(seen.dropped > 0, "nothing dropped");
+    assert!(
+        seen.most <= PYRO_BURST_CLEAN_BYTES,
+        "{} B handed to QUIC in one turn",
+        seen.most
+    );
+    assert!(
+        seen.spreads.iter().all(|f| *f <= 1.0 + 1e-9),
+        "no frame waits past the next one: {:?}",
+        seen.spreads
+    );
+}
+
+/// #1633: on tokio's timer (no timerfd) a wake can take a tick more than asked, so the plan cuts
+/// the frame until those ticks fit: at 4K120 the pacer keeps up instead of rushing every frame.
+/// Real clock.
+#[tokio::test]
+async fn on_the_coarse_timer_a_4k120_pacer_keeps_up_with_the_encoder() {
+    let frame = frame_of(800_000_000 / 8 / 120);
+    let (plan, gap) = burst_plan(&frame, true, 120, false);
+    let mut timer = super::pacing_timer::PacingTimer::coarse();
+    let mut pacing = Pacing::default();
+    let mut frames = tokio::time::interval(Duration::from_secs(1) / 120);
+    let (mut late, mut most, mut spreads) = (0, 0, Vec::new());
+    let size = |d: &[Bytes]| d.iter().map(Bytes::len).sum::<usize>();
+    for k in 0..120u16 {
+        loop {
+            tokio::select! {
+                _ = frames.tick() => break,
+                () = timer.sleep_until(pacing.deadline().unwrap_or_else(Instant::now)), if pacing.deadline().is_some() => {
+                    most = most.max(size(&pacing.pop(Instant::now()).unwrap_or_default()));
+                }
+            }
+            spreads.extend(pacing.finished.take());
+        }
+        let mut rest = frame.iter().cloned();
+        let slices = plan
+            .iter()
+            .map(|n| rest.by_ref().take(*n).collect())
+            .collect();
+        let (rushed, dropped) = pacing.push(k, gap, slices, Instant::now());
+        if !rushed.is_empty() || dropped > 0 {
+            late += 1;
+        }
+        let first = pacing.pop(Instant::now()).unwrap_or_default();
+        most = most.max(size(&rushed) + size(&first));
+        spreads.extend(pacing.finished.take());
+    }
+    let interval = Duration::from_secs(1) / 120;
+    spreads.sort_unstable();
+    let p95 = spreads[(spreads.len() - 1) * 95 / 100];
+    let biggest = plan.iter().max().unwrap() * 1200;
+    eprintln!(
+        "coarse timer, 4K120: {} slices of up to {biggest} B, gap {gap:?}; {late} of 120 frames \
+         late; most handed over in one turn {most} B; spread p95 {:.3} of the interval",
+        plan.len(),
+        p95.as_secs_f64() / interval.as_secs_f64()
+    );
+    assert!(late < 30, "{late} of 120 frames late");
+    // The fallback's price: a planned slice may pass the clean bound, and the spread half an
+    // interval, but never a whole slice more or the next frame.
+    assert!(most <= biggest, "{most} B in one turn");
+    assert!(p95 < interval, "spread p95 {p95:?}");
+}
+
+/// #1633: past ~167 fps not even two slices fit the coarse timer's ticks; the plan still never
+/// asks it for less than a tick.
+#[test]
+fn on_the_coarse_timer_a_frame_too_fast_to_fit_goes_in_two_slices_on_whole_ticks() {
+    for fps in [200, 240, 360] {
+        let (plan, gap) = burst_plan(
+            &frame_of(1_000_000_000 / 8 / fps as usize),
+            true,
+            fps,
+            false,
+        );
+        assert_eq!(plan.len(), 2, "{fps} fps");
         assert!(
-            plan.windows(2).all(|w| w[0].1 < w[1].1),
-            "slices are spread out in time"
+            gap >= Duration::from_millis(1) && gap.as_micros() % 1000 == 0,
+            "{fps} fps: {gap:?}"
         );
     }
 }
 
 #[test]
 fn a_frame_under_the_burst_limit_and_every_other_codec_go_as_one_slice() {
-    assert_eq!(
-        burst_plan(&big_frame(), false, 60),
-        vec![(363, Duration::ZERO)]
-    );
-    assert_eq!(
-        burst_plan(&big_frame()[..50], true, 60),
-        vec![(50, Duration::ZERO)]
-    );
-    assert_eq!(burst_plan(&[], true, 60), vec![(0, Duration::ZERO)]);
+    for precise in [true, false] {
+        assert_eq!(burst_plan(&big_frame(), false, 60, precise).0, [363]);
+        assert_eq!(burst_plan(&big_frame()[..50], true, 60, precise).0, [50]);
+        assert_eq!(burst_plan(&[], true, 60, precise).0, [0]);
+    }
 }
 
 #[test]
 fn an_unusable_frame_rate_still_plans_a_bounded_spread() {
     for fps in [0, -1, i32::MIN, i32::MAX] {
-        let plan = burst_plan(&big_frame(), true, fps);
-        let last = plan.last().unwrap().1;
-        assert!(
-            plan.len() > 1 && last <= Duration::from_secs(1) / 4,
-            "{fps}: {plan:?}"
-        );
+        for precise in [true, false] {
+            let (plan, gap) = burst_plan(&big_frame(), true, fps, precise);
+            assert!(gap > Duration::ZERO, "{fps}: no gap at all");
+            assert!(
+                plan.len() > 1 && gap * (plan.len() as u32 - 1) <= Duration::from_secs(1) / 4,
+                "{fps}: {plan:?}"
+            );
+        }
     }
-    assert_eq!(
-        burst_plan(&big_frame()[..50], true, 0),
-        vec![(50, Duration::ZERO)]
-    );
+    assert_eq!(burst_plan(&big_frame()[..50], true, 0, true).0, [50]);
 }
 
 /// A slice of `n` datagrams that each carry `tag`, to tell slices apart.
@@ -5533,6 +6380,7 @@ fn a_late_wake_up_hands_over_one_slice_and_spaces_the_rest_from_now() {
         1,
         gap,
         vec![tagged(0, 1), tagged(1, 1), tagged(2, 1), tagged(3, 1)],
+        t0,
     );
     assert_eq!(
         pacing.pop(t0).unwrap()[0][0],
@@ -5557,58 +6405,188 @@ fn a_late_final_slice_does_not_let_the_next_frame_follow_it_inside_one_gap() {
     let gap = Duration::from_millis(5);
     let t0 = Instant::now();
     let mut pacing = Pacing::default();
-    pacing.push(1, gap, vec![tagged(0, 1), tagged(1, 1)]);
+    pacing.push(1, gap, vec![tagged(0, 1), tagged(1, 1)], t0);
     assert_eq!(pacing.pop(t0).unwrap()[0][0], 0);
     // The final slice wakes 95 ms late and empties the queue; the next frame is already waiting.
     let late = t0 + Duration::from_millis(100);
     assert_eq!(pacing.pop(late).unwrap()[0][0], 1);
-    pacing.push(2, gap, vec![tagged(20, 1), tagged(21, 1)]);
+    assert!(pacing
+        .push(2, gap, vec![tagged(20, 1), tagged(21, 1)], late)
+        .0
+        .is_empty());
     assert!(pacing.pop(late).is_none(), "two slices inside one gap");
     assert_eq!(pacing.deadline(), Some(late + gap));
     assert_eq!(pacing.pop(late + gap).unwrap()[0][0], 20);
 }
 
 #[test]
-fn backlogged_one_slice_frames_are_spaced_and_an_idle_sender_sends_at_once() {
+fn one_slice_frames_are_spaced_and_an_idle_sender_sends_at_once() {
     let gap = pacing_gap(60, 1);
     assert!(gap > Duration::ZERO);
     let t0 = Instant::now();
     let mut pacing = Pacing::default();
-    pacing.push(1, gap, vec![tagged(1, 1)]);
-    pacing.push(2, gap, vec![tagged(2, 1)]);
+    pacing.push(1, gap, vec![tagged(1, 1)], t0);
     assert_eq!(pacing.pop(t0).unwrap()[0][0], 1);
+    pacing.push(2, gap, vec![tagged(2, 1)], t0);
     assert!(pacing.pop(t0).is_none(), "the second frame waits a gap");
     assert_eq!(pacing.pop(t0 + gap).unwrap()[0][0], 2);
     // Idle for longer than a gap: the next frame's first slice adds no latency.
-    pacing.push(3, gap, vec![tagged(3, 1)]);
+    pacing.push(3, gap, vec![tagged(3, 1)], t0 + gap * 3);
     assert_eq!(pacing.pop(t0 + gap * 3).unwrap()[0][0], 3);
 }
 
 #[test]
-fn a_frame_queues_behind_one_older_frame_and_a_third_drops_the_oldests_tail() {
+fn a_frame_arriving_before_the_last_ones_slices_are_out_sends_their_tail_at_once() {
     let gap = Duration::from_millis(5);
     let t0 = Instant::now();
     let mut pacing = Pacing::default();
-    pacing.push(1, gap, vec![tagged(10, 1), tagged(11, 1), tagged(12, 1)]);
+    pacing.push(
+        1,
+        gap,
+        vec![tagged(10, 1), tagged(11, 1), tagged(12, 2)],
+        t0,
+    );
     assert_eq!(pacing.pop(t0).unwrap()[0][0], 10);
-    pacing.push(2, gap, vec![tagged(20, 1), tagged(21, 1)]);
-    let order = |p: &Pacing| {
-        p.queue
-            .iter()
-            .map(|s| s.datagrams[0][0])
-            .collect::<Vec<_>>()
+    let t1 = t0 + Duration::from_millis(1);
+    let (rushed, dropped) = pacing.push(2, gap, vec![tagged(20, 1), tagged(21, 1)], t1);
+    assert_eq!(dropped, 0);
+    assert_eq!(
+        rushed.iter().map(|d| d[0]).collect::<Vec<_>>(),
+        [11, 12, 12],
+        "the tail, in order"
+    );
+    let order: Vec<_> = pacing.queue.iter().map(|s| s.datagrams[0][0]).collect();
+    assert_eq!(order, [20, 21], "only the new frame waits");
+    assert!(
+        pacing.pop(t1).is_none(),
+        "its first slice waits a gap after the tail"
+    );
+    assert_eq!(pacing.pop(t1 + gap).unwrap()[0][0], 20);
+}
+
+#[test]
+fn a_rushed_tail_stops_at_the_burst_budget_and_a_frame_never_started_records_no_spread() {
+    let gap = Duration::from_millis(5);
+    let t0 = Instant::now();
+    let slice = |tag: u8| vec![Bytes::from(vec![tag; 90_000])];
+    let mut pacing = Pacing::default();
+    pacing.push(
+        1,
+        gap,
+        vec![slice(1), slice(2), slice(3), slice(4), slice(8)],
+        t0,
+    );
+    assert_eq!(pacing.pop(t0).unwrap()[0][0], 1);
+    // A gap has passed: the budget is whole again.
+    let (rushed, dropped) = pacing.push(2, gap, vec![slice(5), slice(6)], t0 + gap);
+    assert_eq!(
+        rushed.iter().map(|d| d[0]).collect::<Vec<_>>(),
+        [2, 3],
+        "180 kB fit; the rest goes from the first slice that does not"
+    );
+    assert_eq!(dropped, 2);
+    assert_eq!(pacing.finished.take(), Some(gap));
+    // Frame 2 has sent nothing when frame 3 arrives inside the gap: 20 kB of budget is left,
+    // so it is dropped whole, and has no spread.
+    let (rushed, dropped) = pacing.push(3, gap, vec![slice(7)], t0 + gap + gap / 2);
+    assert_eq!((rushed.len(), dropped), (0, 2));
+    assert_eq!(pacing.finished.take(), None);
+}
+
+/// #1633: a stalled send loop finds several frames queued and pushes them in consecutive turns
+/// with no gap waited out: together they hand QUIC no more than one clean burst.
+#[test]
+fn frames_pushed_back_to_back_hand_over_one_clean_burst_in_all() {
+    let gap = Duration::from_millis(1);
+    let t0 = Instant::now();
+    let frame = || {
+        (0..4)
+            .map(|_| vec![Bytes::from(vec![0u8; 60_000])])
+            .collect()
     };
-    assert_eq!(
-        order(&pacing),
-        [11, 12, 20, 21],
-        "appended: nothing is sent early"
+    let mut pacing = Pacing::default();
+    pacing.push(0, gap, frame(), t0);
+    let mut sent: usize = pacing.pop(t0).unwrap().iter().map(Bytes::len).sum();
+    let mut dropped = 0;
+    for k in 1..32 {
+        let now = t0 + Duration::from_micros(k);
+        let (rushed, d) = pacing.push(k as u16, gap, frame(), now);
+        sent += rushed.iter().map(Bytes::len).sum::<usize>();
+        sent += pacing
+            .pop(now)
+            .unwrap_or_default()
+            .iter()
+            .map(Bytes::len)
+            .sum::<usize>();
+        dropped += d;
+    }
+    assert!(
+        sent <= PYRO_BURST_CLEAN_BYTES,
+        "{sent} B handed over with no gap waited out"
     );
-    pacing.push(3, gap, vec![tagged(30, 1)]);
-    assert_eq!(
-        order(&pacing),
-        [20, 21, 30],
-        "the oldest frame's unsent tail is dropped"
-    );
+    assert!(dropped > 0);
+    // Once a gap is waited out the next slice goes.
+    assert!(pacing.pop(t0 + Duration::from_millis(2)).is_some());
+}
+
+/// #1633: a frame tail the pacing drops (frames come faster than its slices go) is warned about
+/// once, and the rest is counted
+/// into the summary at disconnect.
+#[tokio::test]
+async fn a_late_pyrowave_frame_tail_is_warned_once_and_counted_at_disconnect() {
+    let agent = agent_with_plan(Limits::default(), audio::Plan::default()).await;
+    let media = agent.listener.registry().lock()[SESSION]
+        .media
+        .clone()
+        .unwrap();
+    let grant = PyroWaveGrant {
+        wanted: true,
+        target_kbps: 200_000,
+        floor_kbps: 100_000,
+        max_rtt_ms: 1_000,
+    };
+    // 1 fps: the slices of one frame take 250 ms, so the frames below pile up behind it.
+    media.grant_pyrowave(grant, (320, 192, 1), true);
+    let captured = Captured::default();
+    let _guard = crate::test_log::begin(&captured.0);
+    let (_session, mut send, _recv, _reply) =
+        agent.hello_with(TOKEN, json!({"pyrowave": true})).await;
+    let n = pyrowave::block_count(320, 192);
+    let blocks: Vec<(u32, u32)> = (0..n.min(40)).map(|i| (i, 3000)).collect();
+    for _ in 0..5 {
+        let frame = pyrowave::tests::frame(320, 192, &blocks);
+        media.on_pyrowave_frame(&gst::Buffer::from_slice(frame));
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    write_message(&mut send, &json!({"type": "bye"}))
+        .await
+        .unwrap();
+    let dropped = |line: &str| -> u64 {
+        let rest = line.split("dropped=").nth(1).expect("a dropped field");
+        rest.split(' ').next().unwrap().parse().unwrap()
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = logs
+            .lines()
+            .filter(|l| {
+                l.contains("pyrowave-pacing-tail-dropped") || l.contains("pyrowave-pacing-tails")
+            })
+            .collect();
+        if let [warn, summary] = lines[..] {
+            assert!(warn.contains("WARN"), "{warn}");
+            assert!(summary.contains("INFO"), "{summary}");
+            assert!(
+                dropped(summary) > dropped(warn),
+                "the later drops are counted: {lines:?}"
+            );
+            return;
+        }
+        assert!(Instant::now() < deadline, "{lines:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// #1606: the send loop keeps serving audio and the control stream between the slices of one big
@@ -5683,5 +6661,229 @@ async fn audio_and_a_ping_are_served_between_the_slices_of_one_big_pyrowave_fram
     assert!(
         seqs.windows(2).all(|w| w[1] == w[0].wrapping_add(1)),
         "one pkt_seq in handoff order: {seqs:?}"
+    );
+}
+
+/// Probe round 2 (#1433, seat B S2): the production probe fill hands QUIC repairs of the last frame
+/// only with QUIC's datagram queue empty and no video held (a NACK answer is held video), so never
+/// ahead of audio, video or a resend, and in one burst per frame. The sim's QUIC sends at once, so
+/// only this test turns red without the queue check.
+#[test]
+fn the_probe_fills_an_empty_quic_queue_once_per_frame_behind_video() {
+    const IDLE: usize = 1;
+    let start = std::time::Instant::now();
+    let at = |us: u64| start + Duration::from_micros(us);
+    let mut log = congestion::SendLog::new(start);
+    let mut video = congestion::VideoQueue::default();
+    let kbps = Some(20_000.0);
+    let frame: Vec<Bytes> = (0..10)
+        .map(|_| {
+            let mut d = vec![0x01];
+            d.extend_from_slice(&video.take_seq().to_le_bytes());
+            d.resize(1200, 0);
+            Bytes::from(d)
+        })
+        .collect();
+    let mut probe_frame = Some((frame.clone(), 0));
+    let mut fill = |log: &mut congestion::SendLog,
+                    video: &mut congestion::VideoQueue,
+                    queued: usize,
+                    now: std::time::Instant| {
+        let mut sent = Vec::new();
+        assert!(fill_probe(
+            log,
+            kbps,
+            &mut probe_frame,
+            video,
+            queued,
+            now,
+            |d| {
+                sent.push(d);
+                congestion::Handed::Sent
+            }
+        ));
+        sent
+    };
+    // QUIC's queue as an idle session reads it: the session-id header (`IDLE`).
+    // The probe banks from the frame interval before the frame; nothing goes ahead of it.
+    assert!(
+        fill(&mut log, &mut video, IDLE, at(0)).is_empty(),
+        "before the frame"
+    );
+    for d in &frame {
+        log.record(d, at(16_000), false);
+    }
+    // A datagram still in QUIC's queue: nothing.
+    assert!(
+        fill(&mut log, &mut video, media::MAX_DATAGRAM + IDLE, at(16_500)).is_empty(),
+        "ahead of QUIC's queue"
+    );
+    // A NACK answer held behind the pacer: nothing.
+    let resend = congestion::Held {
+        datagram: frame[3].clone(),
+        logged: true,
+        resend: true,
+        queued_at: at(16_500),
+        keyframe: false,
+    };
+    video.push(resend, usize::MAX);
+    assert!(
+        fill(&mut log, &mut video, IDLE, at(16_600)).is_empty(),
+        "ahead of a resend"
+    );
+    video.clear();
+    // Both empty: one burst within `PROBE_TAIL` of the frame, at most what a frame interval at the
+    // probe's rate leaves past it.
+    let mut burst = fill(&mut log, &mut video, IDLE, at(16_700));
+    assert!(!burst.is_empty(), "no burst");
+    burst.extend(fill(&mut log, &mut video, IDLE, at(17_500)));
+    let room = 20_000.0 * 125.0 * 0.016_667 - 10.0 * 1200.0;
+    let bytes: usize = burst.iter().map(Bytes::len).sum();
+    assert!(bytes as f64 <= room + 1300.0, "{bytes} bytes for {room:.0}");
+    // Each repair takes the next `pkt_seq`, after the frame's.
+    let seqs: Vec<u32> = burst
+        .iter()
+        .map(|d| u32::from_le_bytes(d[1..5].try_into().unwrap()))
+        .collect();
+    assert_eq!(seqs, (10..10 + burst.len() as u32).collect::<Vec<_>>());
+    // Nothing more until the next frame.
+    for us in [18_500, 25_000, 32_000] {
+        assert!(
+            fill(&mut log, &mut video, IDLE, at(us)).is_empty(),
+            "at {us} us"
+        );
+    }
+}
+
+/// Lab V3 (#1433): web-transport-quinn 0.13 counts the session-id header in the datagram queue, so
+/// an idle session reads at least 1 byte queued; a probe gated on 0 never sent on hardware.
+#[tokio::test]
+async fn an_idle_session_reads_the_header_queued() {
+    let agent = agent().await;
+    let session = agent.connect().await;
+    let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
+    assert!((1..media::MAX_DATAGRAM).contains(&queued), "{queued} bytes");
+}
+
+/// DeepSeek seat A1 (#1433): a probe repair is cut to the last frame's fragment size; once quinn's
+/// datagram size shrinks under it, QUIC refuses it `TooLarge`. That ends the frame's probe and is
+/// counted; the stream goes on. Only a gone connection ends it.
+#[test]
+fn a_probe_repair_over_a_shrunk_datagram_size_ends_the_probe_not_the_stream() {
+    let start = std::time::Instant::now();
+    let at = |us: u64| start + Duration::from_micros(us);
+    let mut log = congestion::SendLog::new(start);
+    let mut video = congestion::VideoQueue::default();
+    let frame: Vec<Bytes> = (0..10)
+        .map(|_| {
+            let mut d = vec![0x01];
+            d.extend_from_slice(&video.take_seq().to_le_bytes());
+            d.resize(1200, 0);
+            Bytes::from(d)
+        })
+        .collect();
+    let mut probe_frame = Some((frame.clone(), 0));
+    log.probe_room(Some(20_000.0), at(0));
+    for d in &frame {
+        log.record(d, at(16_000), false);
+    }
+    let mut tries = 0;
+    let alive = fill_probe(
+        &mut log,
+        Some(20_000.0),
+        &mut probe_frame,
+        &mut video,
+        1,
+        at(16_700),
+        |_| {
+            tries += 1;
+            congestion::Handed::TooLarge
+        },
+    );
+    assert!(alive, "a refused repair ended the stream");
+    assert_eq!((tries, video.probes_too_large), (1, 1));
+    assert!(probe_frame.is_none(), "the frame still probes");
+    let gone = fill_probe(
+        &mut log,
+        Some(20_000.0),
+        &mut Some((frame, 0)),
+        &mut video,
+        1,
+        at(16_800),
+        |_| congestion::Handed::Gone,
+    );
+    assert!(!gone, "a gone connection goes on");
+}
+
+#[test]
+fn pacing_reports_a_frames_first_to_last_slice_release_a_rushed_tail_included() {
+    let gap = Duration::from_millis(5);
+    let t0 = Instant::now();
+    let mut pacing = Pacing::default();
+    pacing.push(
+        1,
+        gap,
+        vec![tagged(10, 1), tagged(11, 1), tagged(12, 1)],
+        t0,
+    );
+    pacing.pop(t0).unwrap();
+    assert_eq!(pacing.finished.take(), None, "the frame is not done");
+    // The last slice wakes 2 ms late: the spread is what the slices took, not the plan.
+    pacing.pop(t0 + gap).unwrap();
+    pacing.pop(t0 + gap * 2 + Duration::from_millis(2)).unwrap();
+    assert_eq!(
+        pacing.finished.take(),
+        Some(gap * 2 + Duration::from_millis(2))
+    );
+    // A one-slice frame spreads over nothing.
+    pacing.push(2, gap, vec![tagged(20, 1)], t0 + gap * 5);
+    pacing.pop(t0 + gap * 5).unwrap();
+    assert_eq!(pacing.finished.take(), Some(Duration::ZERO));
+    // Frame 3's tail is rushed by frame 4: its spread ends there.
+    let t1 = t0 + gap * 10;
+    pacing.push(3, gap, vec![tagged(30, 1), tagged(31, 1)], t1);
+    pacing.pop(t1).unwrap();
+    pacing.push(4, gap, vec![tagged(40, 1)], t1 + gap / 2);
+    assert_eq!(pacing.finished.take(), Some(gap / 2));
+}
+
+#[test]
+fn slice_spread_summarises_a_second_of_frames_as_fractions_of_the_interval() {
+    let t0 = Instant::now();
+    let interval = Duration::from_millis(10);
+    let mut spread = SliceSpread::default();
+    // Frames spread 1..=21 ms: 0.1..=2.1 of the interval, one every 50 ms.
+    let summaries: Vec<_> = (1..=21u64)
+        .map(|i| {
+            spread.add(
+                t0 + Duration::from_millis((i - 1) * 50),
+                Duration::from_millis(i),
+                interval,
+            )
+        })
+        .collect();
+    assert!(
+        summaries[..20].iter().all(Option::is_none),
+        "nothing before the second is up"
+    );
+    let s = summaries[20]
+        .as_ref()
+        .expect("the 21st frame closes the second");
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+    assert_eq!(s.frames, 21);
+    assert!(
+        near(s.p50, 1.1) && near(s.p95, 2.0) && near(s.max, 2.1),
+        "{s:?}"
+    );
+    // 0.1..=0.5 are not over half an interval (0.5 itself is not).
+    assert_eq!(s.over_half, 16);
+    // The next window starts empty.
+    assert_eq!(
+        spread.add(
+            t0 + Duration::from_millis(1010),
+            Duration::from_millis(1),
+            interval
+        ),
+        None
     );
 }

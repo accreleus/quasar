@@ -57,14 +57,18 @@ disallowed, so a document carrying one is refused everywhere.
 
 `scripts/release/sign-platform-release-manifest.sh`, from the `release` job of
 `.github/workflows/images.yml`, immediately after the manifest is generated and
-validated. The private key is the repository secret
-`QUASAR_RELEASE_SIGNING_KEY` (a PKCS#8 PEM) and the label is the repository
-variable `QUASAR_RELEASE_SIGNING_KEY_ID`.
+validated. The private key is the secret `QUASAR_RELEASE_SIGNING_KEY` (a PKCS#8
+PEM) and the label is the variable `QUASAR_RELEASE_SIGNING_KEY_ID`, both of the
+`release` environment, which only a run on a `v*` tag can use.
 
-**Signing is optional.** With no secret configured the step writes nothing, the
-asset is not uploaded, and the release publishes unsigned exactly as before.
-The signer verifies its own output with the public half of the key that made it
-before exiting 0, so an unverifiable signature is never uploaded.
+**Signing is on by default (#621).** With no secret configured, a tag release of
+`accreleus/quasar` fails; a fork's writes nothing, uploads no asset, and
+publishes unsigned, which every recovery actor on the default `verify` refuses
+for a named apply or revert (`signature_missing`). The signer verifies its own
+output with the public half of the key that made it before exiting 0, and the
+job then verifies it against the org key compiled into the actor
+(`scripts/release/org-release-keys.sh`), so an unverifiable signature, or one the
+default machines would not trust, is never uploaded.
 
 ## How it is verified
 

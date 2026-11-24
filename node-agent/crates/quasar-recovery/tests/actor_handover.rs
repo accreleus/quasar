@@ -1068,8 +1068,11 @@ fn a_successor_keeps_the_trust_variables_only_where_machine_state_records_none()
             let path = lab.dir.path().join("machine.json");
             let mut machine: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            machine["inputs"]["trust"] =
-                serde_json::json!({ "allowed_namespaces": "registry.example.invalid/quasar" });
+            // Recorded trust with no mode would verify (#621), and this lab has no fetcher.
+            machine["inputs"]["trust"] = serde_json::json!({
+                "allowed_namespaces": "registry.example.invalid/quasar",
+                "signature_mode": "off",
+            });
             std::fs::write(&path, serde_json::to_vec(&machine).unwrap()).unwrap();
         }
         hand_over(&lab);

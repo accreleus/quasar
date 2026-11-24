@@ -673,6 +673,8 @@ fn release_trust_comes_from_the_seed_at_first_install_and_stays_in_machine_state
         "QUASAR_UPDATER_ALLOWED_NAMESPACES".into(),
         TEST_NAMESPACE.into(),
     );
+    // Recorded trust with no mode would verify (#621), and this test has no fetcher.
+    env.insert("QUASAR_UPDATER_SIGNATURE_MODE".into(), "off".into());
     let engine = Arc::new(FakeEngine::new(seeded_host(env)));
     let dir = tempfile::tempdir().unwrap();
     assert!(matches!(

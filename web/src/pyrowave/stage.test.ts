@@ -52,6 +52,7 @@ function setup() {
     },
   } as unknown as GPUDevice;
   const texture = { width: 640, height: 360 } as GPUTexture;
+  const droppedCallbacks: number[] = [];
   const stage = new PyroWaveStage({
     device,
     present: () => {
@@ -59,6 +60,7 @@ function setup() {
       return true;
     },
     onPresented: () => {},
+    onInFlightDrop: (total) => droppedCallbacks.push(total),
     fallback: vi.fn(),
     load: async () =>
       ({
@@ -92,7 +94,7 @@ function setup() {
     // `config` builds the decoder in a promise chain (the module seam is a plain async function).
     await new Promise((r) => setTimeout(r, 0));
   };
-  return { stage, open, send, decoded, presented, gates, failWith };
+  return { stage, open, send, decoded, presented, gates, failWith, droppedCallbacks };
 }
 
 describe("PyroWave decode back-pressure (#1416)", () => {
@@ -147,5 +149,33 @@ describe("PyroWave decode back-pressure (#1416)", () => {
     await new Promise((r) => setTimeout(r, 0));
     // Both slots came back, so the newest waiting frame is decoded (and its own slot then waits).
     expect(decoded).toEqual([1, 2, 4]);
+  });
+
+  it("counts frames skipped by the in-flight decode gate, and none while frames are only deferred (#1635)", async () => {
+    const { stage, open, send, decoded, gates, droppedCallbacks } = setup();
+    await open();
+
+    // Frames 1 and 2 fill the in-flight bound; frame 3 is held pending (not dropped yet).
+    send(1);
+    send(2);
+    send(3);
+    expect(stage.inFlightDrops).toBe(0);
+    expect(droppedCallbacks).toEqual([]);
+
+    // Frames 4, 5, 6 overwrite pending frames 3, 4, 5 while the bound is full: 3 skipped.
+    send(4);
+    send(5);
+    send(6);
+    expect(stage.inFlightDrops).toBe(3);
+    expect(droppedCallbacks).toEqual([1, 2, 3]);
+
+    // When a decode finishes, frame 6 decodes and the drop total stays at 3.
+    gates[0].resolve();
+    await vi.waitFor(() => expect(decoded).toEqual([1, 2, 6]));
+    expect(stage.inFlightDrops).toBe(3);
+
+    // A configuration change preserves the cumulative count across the stage's lifetime.
+    await open();
+    expect(stage.inFlightDrops).toBe(3);
   });
 });

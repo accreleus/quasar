@@ -42,6 +42,8 @@ export interface AudioStreams {
 /** One access unit, whole, in the form `EncodedVideoChunk` takes (§Video). */
 export interface AccessUnit {
   keyframe: boolean;
+  /** Codes only from a frame this client reported decoded: a restart point for a loss wait. */
+  recovery?: boolean;
   configId: number;
   frameSeq: number;
   ts90k: number;
@@ -79,12 +81,17 @@ export interface MediaSink {
   /** A pong, once a second while connected (§Ping and pong): the round trip in ms, and the
    *  agent's wall clock (`tw`, Unix ms) when it answered. */
   rtt?(ms: number, agentWallMs?: number): void;
+  /** §Feedback `decoded`: the newest `frame_seq` the decoder was given with its whole chain since
+   *  its last configure; null while there is none. Sent on `feedback` and `keyframe_request`. */
+  decoded?(): number | null;
   /** A `keyframe_request` went on the wire (requests inside the spacing window are merged). */
   keyframeRequested?(reason: KeyframeReason): void;
   /** Video fragments the client has found missing since connect, cumulative: each counted once,
    *  when it is first NACKed, whether or not the resend then arrives. PyroWave: the datagrams
    *  missing from each frame closed or dropped incomplete. */
   lost?(fragments: number): void;
+  /** PyroWave frames evicted by the receiver's pending-frame cap since connect, cumulative (#1635). */
+  pyrowavePendingDrops?(frames: number): void;
   /** Video fragments REBUILT from FEC repair datagrams since connect, cumulative (amendment
    *  85). A repaired fragment is never NACKed, so it is never in `lost`. */
   repaired?(fragments: number): void;

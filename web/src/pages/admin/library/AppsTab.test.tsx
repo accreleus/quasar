@@ -114,6 +114,17 @@ beforeEach(() => {
   mocked.listUnpublishedLibraryItems.mockResolvedValue({ items: [] });
   mocked.listRuntimePresets.mockResolvedValue({ items: [] });
   mocked.listLaunchProfiles.mockResolvedValue({ items: [] });
+  // The page reads every catalogue page; route it through the per-page mock each test sets.
+  mocked.listAllAdminApps.mockImplementation(async (token) => {
+    const all: AdminApp[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await mocked.listAdminApps(token, cursor);
+      all.push(...page.items);
+      cursor = page.next_cursor ?? undefined;
+    } while (cursor);
+    return all;
+  });
 });
 
 describe("head sub, actions and tab count", () => {

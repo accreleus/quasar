@@ -1142,6 +1142,11 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 
 func (c *Coordinator) failStart(sess Session, hostID, reason string) {
 	stopAdopter := sess.AdoptSessionID != "" && !c.stopInGrace(sess.ID)
+	if stopAdopter {
+		// Before the row fails, so the old runtime's proof cannot clear the hold
+		// while this stop is in flight (#1615).
+		c.noteAdopterStop(sess.AdoptSessionID, sess.ID)
+	}
 	// Record the failure before a fast stop report can end the row cleanly.
 	c.failCommand(sess.ID, reason)
 	if stopAdopter {

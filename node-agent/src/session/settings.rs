@@ -24,6 +24,9 @@ pub struct RuntimeSettings {
     pub cuda_device_id: i32,
     pub gop: u32,
     pub num_slices: u32,
+    /// `QUASAR_NON_REF_P`, default off: every second P frame of an H.264 session on the Vulkan
+    /// or NVENC encoder is a non-reference frame the sender may drop late without a keyframe.
+    pub non_ref_p: bool,
     pub target_usage: u32,
     pub queue_buffers: u32,
     pub zerocopy: bool,
@@ -260,6 +263,9 @@ impl RuntimeSettings {
     /// Resolve from the environment (the historical defaults). This is the agent's
     /// starting point before any `config_update` arrives.
     pub fn baseline() -> Self {
+        // Read here so an unrecognised value warns at agent start.
+        wt_capacity();
+        wt_ref_recovery();
         Self::baseline_with(&|k| std::env::var(k).ok())
     }
 
@@ -279,6 +285,7 @@ impl RuntimeSettings {
                 .unwrap_or(0),
             gop: env_pos_u32("QUASAR_GOP", 60, lookup),
             num_slices: env_pos_u32("QUASAR_SLICES", 8, lookup),
+            non_ref_p: env_bool("QUASAR_NON_REF_P", lookup),
             target_usage: env_pos_u32("QUASAR_TARGET_USAGE", 6, lookup),
             queue_buffers: env_pos_u32("QUASAR_QUEUE_BUFFERS", 3, lookup),
             zerocopy: env_bool("QUASAR_ZEROCOPY", lookup),
@@ -542,6 +549,64 @@ fn env_pos_u32(var: &str, default: u32, lookup: &dyn Fn(&str) -> Option<String>)
         .unwrap_or(default)
 }
 
+/// WebTransport capacity detection (`QUASAR_WT_CAPACITY`, `docs/configuration.md`): 0.6.3's
+/// sender and ABR reading (`legacy`, the default) or `v2` (#1433, opt-in).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WtCapacity {
+    V2,
+    #[default]
+    Legacy,
+}
+
+impl WtCapacity {
+    /// Anything but `v2` or `legacy` warns and takes the default.
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
+            None | Some("") => Self::default(),
+            Some("v2") => Self::V2,
+            Some("legacy") => Self::Legacy,
+            Some(other) => {
+                tracing::warn!(
+                    token = "wt-capacity-unrecognised",
+                    "QUASAR_WT_CAPACITY={other:?} is not v2|legacy; using {:?}",
+                    Self::default()
+                );
+                Self::default()
+            }
+        }
+    }
+}
+
+/// The agent's `QUASAR_WT_CAPACITY`, read once for the life of the process.
+pub fn wt_capacity() -> WtCapacity {
+    static CAPACITY: std::sync::OnceLock<WtCapacity> = std::sync::OnceLock::new();
+    *CAPACITY.get_or_init(|| WtCapacity::parse(std::env::var("QUASAR_WT_CAPACITY").ok().as_deref()))
+}
+
+/// `QUASAR_WT_REF_RECOVERY` (#1348, `docs/configuration.md`): `1`, `true` or `on` turns
+/// reference recovery on; anything else is off, and anything but `0`, `false`, `off` or empty warns.
+pub fn parse_wt_ref_recovery(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        Some("1" | "true" | "on") => true,
+        None | Some("" | "0" | "false" | "off") => false,
+        Some(other) => {
+            tracing::warn!(
+                token = "wt-ref-recovery-unrecognised",
+                "QUASAR_WT_REF_RECOVERY={other:?} is not 1|true|on|0|false|off; reference recovery stays off"
+            );
+            false
+        }
+    }
+}
+
+/// The agent's `QUASAR_WT_REF_RECOVERY`, read once for the life of the process.
+pub fn wt_ref_recovery() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_wt_ref_recovery(std::env::var("QUASAR_WT_REF_RECOVERY").ok().as_deref())
+    })
+}
+
 fn env_bool(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
     matches!(
         lookup(var).as_deref(),
@@ -552,6 +617,55 @@ fn env_bool(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_ref_p_knob_is_off_unless_set() {
+        let with = |v: Option<&'static str>| {
+            RuntimeSettings::baseline_with(&|k| match k {
+                "QUASAR_NON_REF_P" => v.map(String::from),
+                _ => None,
+            })
+            .non_ref_p
+        };
+        assert!(!with(None));
+        assert!(!with(Some("0")));
+        assert!(with(Some("1")));
+        assert!(with(Some("true")));
+    }
+
+    /// `QUASAR_WT_CAPACITY`: `legacy` by default (0.6.4, lab V3), `v2` on request, anything else
+    /// the default.
+    #[test]
+    fn capacity_knob_parses() {
+        assert_eq!(WtCapacity::default(), WtCapacity::Legacy);
+        for (raw, want) in [
+            (None, WtCapacity::Legacy),
+            (Some(""), WtCapacity::Legacy),
+            (Some(" v2 "), WtCapacity::V2),
+            (Some(" legacy "), WtCapacity::Legacy),
+            (Some("V2"), WtCapacity::Legacy),
+            (Some("0.6.3"), WtCapacity::Legacy),
+        ] {
+            assert_eq!(WtCapacity::parse(raw), want, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn ref_recovery_knob_is_off_unless_turned_on() {
+        for (raw, want) in [
+            (None, false),
+            (Some(""), false),
+            (Some("off"), false),
+            (Some("0"), false),
+            (Some("yes"), false),
+            (Some("ON"), false),
+            (Some(" on "), true),
+            (Some("1"), true),
+            (Some("true"), true),
+        ] {
+            assert_eq!(parse_wt_ref_recovery(raw), want, "{raw:?}");
+        }
+    }
 
     #[test]
     fn resolve_explicit_env_wins_over_detection() {

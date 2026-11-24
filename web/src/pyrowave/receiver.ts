@@ -62,11 +62,13 @@ export class PyroWaveReceiver {
   /** Datagrams missing from every frame closed or dropped incomplete, cumulative. A frame none
    *  of whose datagrams arrived is not seen, so not counted. */
   lost = 0;
+  /** Frames evicted by the pending-frame cap (`MAX_PENDING_FRAMES`), cumulative (#1635). */
+  pendingDrops = 0;
 
   constructor(
     readonly configId: number,
     private readonly n: number,
-    private readonly frameMs: number,
+    readonly frameMs: number,
   ) {}
 
   /** Takes one video fragment of this configuration; returns the frame it completed, if any. */
@@ -134,6 +136,7 @@ export class PyroWaveReceiver {
     if (oldest === null) return;
     const p = this.pending.get(oldest) as Pending;
     this.lost += p.fragCount - p.have;
+    this.pendingDrops += 1;
     this.pending.delete(oldest);
     // Closed: a late datagram must not reopen it and have its gaps counted again.
     this.lastDone = oldest;

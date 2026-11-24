@@ -16,6 +16,8 @@ export interface PyroWaveStageOptions {
   present(texture: GPUTexture): boolean;
   /** A frame reached the screen; its capture time, Unix µs. */
   onPresented(captureUs: number): void;
+  /** A waiting frame was skipped because `MAX_IN_FLIGHT_DECODES` decodes were still in flight (#1635). */
+  onInFlightDrop?(total: number): void;
   /** `codec_fallback`, at most once per configuration. */
   fallback(reason: string): void;
   /** Test seam; the dynamic import otherwise. */
@@ -55,6 +57,8 @@ export class PyroWaveStage {
   private generation = 0;
   private fellBack = new Set<number>();
   private stopped = false;
+  /** Frames skipped by the in-flight decode gate (`MAX_IN_FLIGHT_DECODES`), cumulative (#1635). */
+  inFlightDrops = 0;
 
   constructor(private readonly opts: PyroWaveStageOptions) {}
 
@@ -114,6 +118,10 @@ export class PyroWaveStage {
     // fall further and further behind. Every frame is intra, so a frame that arrives while the
     // bound is full replaces the one already waiting rather than queueing behind it.
     if (this.inFlight >= MAX_IN_FLIGHT_DECODES) {
+      if (this.pending !== null) {
+        this.inFlightDrops += 1;
+        this.opts.onInFlightDrop?.(this.inFlightDrops);
+      }
       this.pending = f;
       return;
     }

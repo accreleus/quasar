@@ -49,13 +49,14 @@ use probes::{
 mod encoders;
 pub use encoders::preload_encoder_plugins;
 pub(crate) use encoders::{
-    describe_codec_plan, probe_codec_support, rearm_vulkan_rc, EncoderKnobs, ResolvedEncoder,
-    VULKAN_ENCODER_NAME,
+    describe_codec_plan, non_ref_p_property, probe_codec_support, rearm_vulkan_rc, EncoderKnobs,
+    ResolvedEncoder, VULKAN_ENCODER_NAME,
 };
 use encoders::{
     effective_encoder, make_nvenc_encoder, make_openh264_encoder, make_va_encoder,
     make_vulkan_encoder,
 };
+pub(crate) mod ref_recovery;
 mod resize;
 // Adaptive external resolution: the keyframe half of a live resize, exported alongside
 // `ScaleStage` so the runner's `session_display_update.stream_*` handler has both halves.
@@ -308,6 +309,7 @@ fn build_encoder_element(
             cfg.stream.fps as u32,
             gop,
             cfg.cuda_device_id,
+            cfg.non_ref_p,
             factory,
         ),
         EncoderBuilderKind::Vulkan => make_vulkan_encoder(
@@ -318,6 +320,7 @@ fn build_encoder_element(
             cfg.num_slices,
             cfg.intra_refresh,
             cfg.intra_refresh_period,
+            cfg.non_ref_p,
             factory,
         ),
         EncoderBuilderKind::Openh264 => make_openh264_encoder(codec, cfg.stream.bitrate_kbps, gop),

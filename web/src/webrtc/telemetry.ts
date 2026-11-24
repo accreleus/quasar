@@ -135,6 +135,12 @@ export interface TelemetrySnapshot {
   audioBufferMs: number | null;
   /** The depth that ring is aiming for, ms; null with audioBufferMs. */
   audioTargetMs: number | null;
+  /** PyroWave frames evicted by the receiver's pending-frame cap (`MAX_PENDING_FRAMES`),
+   *  cumulative for the page view. Client snapshot only: no wire or stored key (#1635). */
+  pyrowavePendingDrops?: number;
+  /** PyroWave frames skipped by the in-flight decode gate (`MAX_IN_FLIGHT_DECODES`),
+   *  cumulative for the page view. Client snapshot only: no wire or stored key (#1635). */
+  pyrowaveDecodeDrops?: number;
 }
 
 /**

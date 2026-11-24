@@ -752,4 +752,24 @@ describe("BenchController — settle deadline (#1575)", () => {
     expect(windows.length).toBe(afterStop);
     ctl.stop(); // idempotent
   });
+
+  it("merges extraWindowFields into bench.window without letting them overwrite summarizer keys (#1635)", () => {
+    const windows: BenchWindowPayload[] = [];
+    const ctl = new BenchController({
+      sendInput: () => {},
+      emitWindow: (p) => windows.push(p),
+      getClockOffsetMs: () => null,
+      nowEpochMs: () => 1_000,
+      extraWindowFields: () => ({ n: 999, decoded: 999, pyrowave_pending_drops: 2, pyrowave_decode_drops: 1 }),
+    });
+    ctl.start();
+    ctl.stop();
+    expect(windows).toHaveLength(1);
+    expect(windows[0]).toMatchObject({
+      n: 0,
+      decoded: 0,
+      pyrowave_pending_drops: 2,
+      pyrowave_decode_drops: 1,
+    });
+  });
 });

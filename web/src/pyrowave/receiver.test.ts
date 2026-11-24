@@ -106,6 +106,31 @@ describe("PyroWaveReceiver", () => {
     expect(r.lost).toBe(6 + 4 * 3);
   });
 
+  it("counts frames evicted by the pending-frame cap separately from deadline closes (#1635)", () => {
+    const r = new PyroWaveReceiver(3, N, FRAME_MS);
+    // Whole frame, deadline-closed frame, and older frame superseded by a newer complete frame: none hit the cap.
+    feed(r, fragments(1), 0);
+    feed(r, fragments(2).slice(1), 0);
+    r.due(FRAME_MS);
+    feed(r, fragments(3).slice(1), FRAME_MS);
+    feed(r, fragments(4), FRAME_MS);
+    expect(r.pendingDrops).toBe(0);
+
+    // Fill the 4-frame pending cap without overflowing: still 0 evicted.
+    for (const seq of [5, 6, 7, 8]) feed(r, fragments(seq).slice(1), FRAME_MS);
+    expect(r.pendingDrops).toBe(0);
+
+    // A 5th and 6th incomplete frame evict frames 5 and 6 via dropOldest.
+    feed(r, fragments(9).slice(1), FRAME_MS);
+    expect(r.pendingDrops).toBe(1);
+    feed(r, fragments(10).slice(1), FRAME_MS);
+    expect(r.pendingDrops).toBe(2);
+
+    // A late datagram for evicted frame 5 is ignored and does not increment the counter.
+    feed(r, fragments(5).slice(0, 1), FRAME_MS);
+    expect(r.pendingDrops).toBe(2);
+  });
+
   it("the fixture's real oversized blocks rejoin, and a lost part loses only its block", () => {
     const frags = fragments(1);
     const parts = frags.filter((f) => f.payload[0] === 1);
