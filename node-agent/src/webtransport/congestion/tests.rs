@@ -6379,6 +6379,16 @@ fn a_second_cap_step_under_a_hold_keeps_it_and_steps_down() {
         if !off.is_empty() {
             bad.push(format!("{name} {second}: hold off at {off:?}"));
         }
+        // Seat B S2 (#1652): with no Wi-Fi burst to release the hold, the line stays under the step.
+        let over = s
+            .lines
+            .iter()
+            .find(|&&(t, l)| t >= 92.0 && l.is_some_and(|l| l > second));
+        if let Some(&(t, l)) = over {
+            bad.push(format!(
+                "{name} {second}: line {l:?} over the step at {t:.1} s"
+            ));
+        }
         if s.loss_after(95.0) > 0.05 && s.rung_at(105.0) < 4 {
             bad.push(format!(
                 "{name} {second}: loss after 95 s {:.3}, rung {} at 105 s",
@@ -6397,6 +6407,65 @@ fn a_second_cap_step_under_a_hold_keeps_it_and_steps_down() {
                 "{name} {second}: no frame for {:.2} s up to {:.1} s",
                 longest.0 as f64 / 1e6,
                 longest.1 as f64 / 1e6
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// Seat B S2 / seat A A3 (#1652): a release proves the rate the hold was set from, which a second cap
+/// step under the hold put over the link. R4 at 5000, a second step to 3000 at 90 s, then 300 ms Wi-Fi
+/// bursts losing 40 % every 7 s from 130 s: the line never settles over the policer and the setpoint
+/// never goes over it. A release lifts the line to that rate for the one report before its probe
+/// meets the link's edge (b7f4ce92: 9685 lab, 8432 lab_hw); a release put back to the stepped line
+/// instead proved it under the policer, ended the hold and climbed back to 1080p, and one that left
+/// the line where it was cost uncapped Wi-Fi rows a rung (lab every 2.5 s: 6 → 15 freezes).
+#[test]
+fn a_wifi_release_after_a_second_cap_step_never_settles_over_the_step() {
+    let mut bad = Vec::new();
+    for (name, sim) in [
+        ("lab", Sim::lab as fn(bool) -> Sim),
+        ("lab_hw", Sim::lab_hw),
+    ] {
+        let mut s = sim(false);
+        s.run(30.0);
+        policer(&mut s);
+        (s.tokens, s.tokens_at) = (15_000.0, s.t);
+        s.run(60.0);
+        s.cap_kbps = 3000.0;
+        s.run(40.0);
+        s.loss_at = Box::new(
+            |t| match t.saturating_sub(130_000_000) % 7_000_000 < 300_000 {
+                true => 0.4,
+                false => 0.0,
+            },
+        );
+        s.run(90.0);
+        let (freezes, rungs) = lab_summary(&format!("{name} 5000 → 3000 + Wi-Fi"), &s);
+        let over: Vec<bool> = s
+            .lines
+            .iter()
+            .filter(|p| p.0 >= 130.0)
+            .map(|p| p.1.is_some_and(|l| l > 3000.0))
+            .collect();
+        let settled = over.windows(2).any(|w| w[0] && w[1]);
+        let top = s
+            .setpoints
+            .iter()
+            .filter(|p| p.0 >= 130.0)
+            .map(|p| p.1)
+            .max()
+            .unwrap_or(0);
+        let ended = s.lines.iter().any(|&(t, l)| t >= 130.0 && l.is_none());
+        eprintln!(
+            "  reports with the line over 3000 after 130 s {}, two in a row {settled}; top setpoint \
+             {top}; hold ended {ended}; freezes {}; rungs {rungs:?}",
+            over.iter().filter(|&&o| o).count(),
+            freezes.len()
+        );
+        if settled || top > 3000 || ended {
+            bad.push(format!(
+                "{name}: line settled over 3000 {settled}, setpoint {top}, hold ended {ended}"
             ));
         }
     }
@@ -6977,9 +7046,15 @@ fn row(name: &str, s: &Sim, from: f64, to: f64) -> (usize, f64, Option<f64>) {
 
 /// A policer with a bucket of `bucket_s` at `kbps` from 30 s for 180 s (at `first_kbps` for the
 /// first 60 s), then clean for 120 s, under `Sim::lab_hw`, with 300 ms Wi-Fi bursts losing 40 % every
-/// 7 s from 10 s to the end of the shaping when `wifi`.
-fn deep_bucket_row(legacy: bool, first_kbps: f64, kbps: f64, bucket_s: f64, wifi: bool) -> Sim {
+/// 7 s from 10 s to the end of the shaping when `wifi`; with no FEC, so no probe, when `!fec`.
+fn deep_bucket_row(
+    legacy: bool,
+    (first_kbps, kbps, bucket_s): (f64, f64, f64),
+    wifi: bool,
+    fec: bool,
+) -> Sim {
     let mut s = Sim::lab_hw(legacy);
+    s.est.probes &= fec;
     if wifi {
         s.loss_at = Box::new(|t| {
             match (10_000_000..210_000_000).contains(&t) && (t - 10_000_000) % 7_000_000 < 300_000 {
@@ -7009,21 +7084,32 @@ fn deep_bucket_row(legacy: bool, first_kbps: f64, kbps: f64, bucket_s: f64, wifi
 /// clean on the bucket's credit and may land the line at up to (0.7225 + 0.139 × 1.95) = 0.993 × it.
 /// Not reproduced at the base: v2 0-2 freezes, legacy 6-8, top line at most 0.90 × the policer, for
 /// 1500-6600 first and 1.7-1.95 s buckets; kept as a guard: no more freezes past the onset's cut than
-/// legacy. Both rows back at 1080p within 30 s of the clear.
+/// legacy. Both rows back at 1080p within 30 s of the clear. Seat A A2: with no FEC there is no probe
+/// to prove a release, and the release ends the hold, yet the Wi-Fi row stays under the policer (top
+/// setpoint 1018). Keeping the hold there instead cost 2 freezes and the return to 1080p.
 #[test]
 fn deep_bucket_policers_freeze_no_more_than_legacy() {
     let mut bad = Vec::new();
-    for (name, first, kbps, bucket_s, wifi) in [
-        ("5000, 1 MB + Wi-Fi", 5000.0, 5000.0, 1.6, true),
-        ("2500 then 6600, 1.95 s", 2500.0, 6600.0, 1.95, false),
+    for (name, first, kbps, bucket_s, wifi, fec) in [
+        ("5000, 1 MB + Wi-Fi", 5000.0, 5000.0, 1.6, true, true),
+        (
+            "5000, 1 MB + Wi-Fi, no FEC",
+            5000.0,
+            5000.0,
+            1.6,
+            true,
+            false,
+        ),
+        ("2500 then 6600, 1.95 s", 2500.0, 6600.0, 1.95, false, true),
     ] {
+        let shape = (first, kbps, bucket_s);
         let (a, _, a_back) = row(
             &format!("{name} legacy"),
-            &deep_bucket_row(true, first, kbps, bucket_s, wifi),
+            &deep_bucket_row(true, shape, wifi, fec),
             35.0,
             210.0,
         );
-        let s = deep_bucket_row(false, first, kbps, bucket_s, wifi);
+        let s = deep_bucket_row(false, shape, wifi, fec);
         let (n, _, back) = row(&format!("{name} v2"), &s, 35.0, 210.0);
         let top = s
             .setpoints
@@ -7033,9 +7119,12 @@ fn deep_bucket_policers_freeze_no_more_than_legacy() {
             .max()
             .unwrap_or(0);
         eprintln!("  v2 top setpoint 40-210 s {top}, policer {kbps}");
-        // The Wi-Fi row's freezes are mostly the bursts' own at a low rung, as uncapped: printed.
-        let frozen = !wifi && n > a;
-        if frozen || f64::from(top) > kbps || back.is_none_or(|b| b > 30.0) {
+        // The Wi-Fi rows' freezes are mostly the bursts' own at a low rung, as uncapped (b7f4ce92:
+        // 16, legacy 13).
+        let frozen = if wifi { n > 17 } else { n > a };
+        // With no FEC the hold climbs at `PROBE_PER_S` once `HOLD` has passed (b7f4ce92: back 108 s).
+        let slowest = if fec { 30.0 } else { 120.0 };
+        if frozen || f64::from(top) > kbps || back.is_none_or(|b| b > slowest) {
             bad.push(format!(
                 "{name}: v2 {n} freezes, top setpoint {top}, back {back:?}; legacy {a} back \
                  {a_back:?}"
@@ -7049,10 +7138,11 @@ fn deep_bucket_policers_freeze_no_more_than_legacy() {
 /// bursts from 10 to 40 s set and release a hold (the memory is set), then from 45 s a 12000 kbit/s
 /// policer with a 40 kB bucket, over the 9920 sent on average (video and FEC), drops only during the
 /// content's busy bursts (2 × for 300 ms every 10 s). Each run is under a second and renewed the
-/// memory, so no hold was ever set: the policer must set one.
+/// memory, so no hold was ever set: the policer must set one. Seat A A5: the same with two such
+/// bursts every 2 s, a hold too and no more freezes than legacy.
 #[test]
 fn an_encoder_burst_over_a_policer_does_not_renew_the_wifi_memory() {
-    let run = |legacy: bool| {
+    let run = |legacy: bool, busy: fn(u64) -> bool| {
         let mut s = Sim::lab(legacy);
         s.loss_at = Box::new(|t| {
             match (10_000_000..40_000_000).contains(&t) && (t - 10_000_000) % 4_000_000 < 300_000 {
@@ -7060,27 +7150,38 @@ fn an_encoder_burst_over_a_policer_does_not_renew_the_wifi_memory() {
                 false => 0.0,
             }
         });
-        s.content_gain = Box::new(|t| match t % 10_000_000 < 300_000 {
-            true => 2.0,
-            false => 1.0,
-        });
+        s.content_gain = Box::new(move |t| if busy(t) { 2.0 } else { 1.0 });
         s.run(45.0);
+        let memory = s.est.random_burst.is_some();
         s.cap_kbps = 12_000.0;
         s.bucket_bytes = Some(40_000.0);
         (s.tokens, s.tokens_at) = (40_000.0, s.t);
         s.run(120.0);
-        s
+        (s, memory)
     };
-    row("legacy", &run(true), 45.0, 165.0);
-    let s = run(false);
-    row("v2", &s, 45.0, 165.0);
-    let released = s.lines.iter().any(|&(t, l)| t < 45.0 && l.is_some());
-    eprintln!(
-        "v2: a hold before 45 s {released}, the Wi-Fi memory at 45 s set; loss after 45 s {:.3}",
-        s.loss_after(45.0)
-    );
-    let held = s.lines.iter().any(|&(t, l)| t >= 45.0 && l.is_some());
-    assert!(held, "no hold over the policer");
+    let mut bad = Vec::new();
+    for (name, busy) in [
+        (
+            "every 10 s",
+            (|t| t % 10_000_000 < 300_000) as fn(u64) -> bool,
+        ),
+        ("2 × every 2 s from 45 s", |t| {
+            t >= 45_000_000 && t % 1_000_000 < 300_000
+        }),
+    ] {
+        let (a, _, _) = row(&format!("{name} legacy"), &run(true, busy).0, 45.0, 165.0);
+        let (s, memory) = run(false, busy);
+        let (n, _, _) = row(&format!("{name} v2"), &s, 45.0, 165.0);
+        let held = s.lines.iter().any(|&(t, l)| t >= 45.0 && l.is_some());
+        eprintln!("  loss after 45 s {:.3}", s.loss_after(45.0));
+        if !memory || !held || n > a {
+            bad.push(format!(
+                "{name}: memory at 45 s {memory}, a hold over the policer {held}, freezes {n}, \
+                 legacy {a}"
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
 }
 
 /// A lab row on a clean 50 Mbit/s link that reorders from 30 s for 180 s: each datagram delayed

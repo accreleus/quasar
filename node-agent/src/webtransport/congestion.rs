@@ -1535,13 +1535,16 @@ impl Estimator {
             self.random_burst = Some((now, memory.1));
         }
         // The burst memory never blocks loss lasting `HOLD_STEP_GAP`: a release it got wrong (seat B
-        // M1': 3800 under the lab encoder's keyframes) otherwise cost 61 s with no frame.
-        let random = self
-            .random_burst
-            .is_some_and(|(at, _)| now.saturating_duration_since(at) < HOLD)
-            && self
-                .episode
-                .is_none_or(|run| now.saturating_duration_since(run.at) < HOLD_STEP_GAP);
+        // M1': 3800 under the lab encoder's keyframes) otherwise cost 61 s with no frame. Nor a run
+        // sent over its rate, as it renews none (seat A A5: encoder bursts every second over a policer
+        // set no hold, and the loss bound took 8000 to 2850 on 12000).
+        let random = self.random_burst.is_some_and(|(at, rate)| {
+            now.saturating_duration_since(at) < HOLD
+                && self.episode.is_none_or(|run| {
+                    now.saturating_duration_since(run.at) < HOLD_STEP_GAP
+                        && run.top <= rate / FLOOR_SPREAD
+                })
+        });
         let settled =
             later.is_none_or(|(run, _)| now.saturating_duration_since(run.at) >= LOSS_WINDOW);
         let burst = m

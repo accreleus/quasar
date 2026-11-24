@@ -1509,6 +1509,14 @@ describe("createWebTransportRuntime fallback", () => {
       s.rt.destroy();
     });
 
+    it("never when frames are given up in 2 of 5 seconds (#1446)", async () => {
+      const s = await up();
+      // The same loss in every third second: no five seconds hold three damaged.
+      expect(await streamFor(s, 15_000, { swap: true, lose: (ms) => ms % 3_000 >= 1_300 && ms % 3_000 < 1_700 })).toBeGreaterThanOrEqual(15_000);
+      expect(s.callbacks.onFallback).not.toHaveBeenCalled();
+      s.rt.destroy();
+    });
+
     it("never on loss without reordering, nor on reordering that costs no frame", async () => {
       for (const o of [{ swap: false, lose: true }, { swap: true, lose: false }]) {
         const s = await up();
