@@ -378,6 +378,10 @@ services:
       # Port 0 turns it off; per-source = unauthenticated connections one source may hold.
       QUASAR_WT_PORT: ${QUASAR_WT_PORT:-4433}
       QUASAR_WT_UNAUTH_PER_SOURCE: ${QUASAR_WT_UNAUTH_PER_SOURCE:-4}
+      # Opt-in sender features (docs/configuration.md): v2 capacity, reference recovery, non-reference P.
+      QUASAR_WT_CAPACITY: ${QUASAR_WT_CAPACITY:-legacy}
+      QUASAR_WT_REF_RECOVERY: ${QUASAR_WT_REF_RECOVERY:-off}
+      QUASAR_NON_REF_P: ${QUASAR_NON_REF_P:-0}
       # PyroWave: 1 = take the compositor frames through system memory (escape hatch).
       QUASAR_PYROWAVE_CPU_INPUT: ${QUASAR_PYROWAVE_CPU_INPUT:-}
       QUASAR_TEMPLATE_CLONE_MODE: ${QUASAR_TEMPLATE_CLONE_MODE:-}
