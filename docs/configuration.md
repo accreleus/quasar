@@ -1788,9 +1788,12 @@ actor answers, that a developer apply to the control plane's own host names only
 
 **Inputs a newer actor added.** Machine state written by a newer recovery actor may carry
 inputs an older one does not know. An older actor (after a revert) ignores unknown recipe
-inputs, but it refuses a machine whose saved agent variables name one it does not know: unset
-the 0.6.4 variables (`QUASAR_WT_CAPACITY`, `QUASAR_WT_REF_RECOVERY`, `QUASAR_NON_REF_P`) with
-`reconfigure` before reverting a host below 0.6.4 (`docs/upgrading.md` "Reverting an agent"). `tests/recipe_compose_parity.rs` lists every difference from the
+inputs. From 0.6.5 it also skips a saved agent variable it does not know: it logs
+`actor-agent-variable-unknown` naming it, does not pass it to the agent, keeps it in the state,
+and lets `reconfigure` unset it (but not set a new unknown one). Actors older than 0.6.5 refuse
+such a machine: unset the 0.6.4 variables (`QUASAR_WT_CAPACITY`, `QUASAR_WT_REF_RECOVERY`,
+`QUASAR_NON_REF_P`) with `reconfigure` before reverting a host to 0.6.4 or older
+(`docs/upgrading.md` "Reverting an agent"). `tests/recipe_compose_parity.rs` lists every difference from the
 Compose service, each with its reason.
 
 **Status.** `docker exec quasar-recovery quasar-recovery status` prints the inventory, then

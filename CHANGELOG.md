@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Fixed
+- The recovery actor skips an agent variable it does not know instead of refusing the machine (#1667): it logs `actor-agent-variable-unknown`, does not pass the variable to the agent, and `reconfigure` can unset it. A host that set a 0.6.4 variable can now be reverted to 0.6.5 or later without unsetting it first; reverting to 0.6.4 or older still needs the workaround in `docs/upgrading.md`.
+
 ## 0.6.4 — 2026-11-24
 
 ### Upgrading

@@ -1556,19 +1556,54 @@ fn agent_variables_render_over_the_agent_defaults_and_none_render_nothing() {
         assert_ne!(after.labels, before.labels, "a new specification");
     }
 
+    // A name the actor does not own is skipped, never passed to the agent (#1667), so the
+    // render node stays the actor's to set.
     let mut owned = inputs(None);
     owned
         .agent_variables
         .insert("QUASAR_RENDER_NODE".into(), "/dev/dri/renderD129".into());
-    assert!(matches!(
-        render(Role::NodeAgent, 3, &owned, &image, &agent_secrets()),
-        Err(RenderError::Invalid(_))
-    ));
+    let spec = render(Role::NodeAgent, 3, &owned, &image, &agent_secrets()).unwrap();
+    let plain = render(Role::NodeAgent, 3, &inputs(None), &image, &agent_secrets()).unwrap();
+    assert_eq!(spec.env, plain.env, "the skipped name changes no env");
     let mut broken = inputs(None);
     broken
         .agent_variables
         .insert("QUASAR_APP_MOUNT_ALLOW".into(), "/a\n/b".into());
     assert!(render(Role::NodeAgent, 3, &broken, &image, &agent_secrets()).is_err());
+}
+
+/// #1667: the fixture is a machine state written by a later release. An older actor renders
+/// it with the unknown variables absent (even one whose value is bad) and every other byte
+/// the same; a bad value of a KNOWN variable is still refused.
+#[test]
+fn a_machine_state_with_unknown_agent_variables_renders_without_them() {
+    let image = ImageRef::parse(AGENT_IMAGE).unwrap();
+    let fixture: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(golden_dir().join("machine-state-unknown-agent-variable.json")).unwrap(),
+    )
+    .unwrap();
+    for vendor in [Some(GpuVendor::Nvidia), Some(GpuVendor::Amd), None] {
+        let plain = inputs(vendor);
+        let mut later = plain.clone();
+        later.agent_variables = serde_json::from_value(fixture["agent_variables"].clone()).unwrap();
+        let got = render(Role::NodeAgent, 3, &later, &image, &agent_secrets()).unwrap();
+        let mut want = render(Role::NodeAgent, 3, &plain, &image, &agent_secrets()).unwrap();
+        want.env
+            .insert("QUASAR_ABR_MODE".into(), "protective".into());
+        assert!(
+            !got.env.keys().any(|k| k.contains("LATER_RELEASE")),
+            "{:?}",
+            got.env
+        );
+        // Labels carry the inputs' digest, so they differ; everything else is equal.
+        want.labels = got.labels.clone();
+        assert_eq!(got, want);
+
+        later
+            .agent_variables
+            .insert("QUASAR_ABR_MODE".into(), "a\nb".into());
+        assert!(render(Role::NodeAgent, 3, &later, &image, &agent_secrets()).is_err());
+    }
 }
 
 #[test]
