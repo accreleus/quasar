@@ -25,8 +25,7 @@ pub struct RuntimeSettings {
     pub gop: u32,
     pub num_slices: u32,
     /// `QUASAR_NON_REF_P`, default off: every second P frame of an H.264 session on the Vulkan
-    /// encoder is a non-reference frame the sender may drop late without a keyframe (NVENC's
-    /// driver ignores `nonref-p`).
+    /// or NVENC encoder is a non-reference frame the sender may drop late without a keyframe.
     pub non_ref_p: bool,
     pub target_usage: u32,
     pub queue_buffers: u32,
