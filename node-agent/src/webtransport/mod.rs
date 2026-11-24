@@ -1579,6 +1579,9 @@ fn feed(
         .is_some_and(|c| !pyrowave && c.estimator.drop_held());
     let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
     let now = std::time::Instant::now();
+    video.recovering = control
+        .as_ref()
+        .is_some_and(|c| !pyrowave && c.estimator.recovering(now));
     let (room, frame) = video.budget(rates, queued, DATAGRAM_BUFFER, now);
     let log = match pyro {
         Some(rate) if pyrowave => Some(&mut rate.log),

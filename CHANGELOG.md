@@ -25,7 +25,7 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Fixed
-- **WebTransport capacity detection v2 (`QUASAR_WT_CAPACITY=v2`, opt-in) no longer climbs into a deep policer bucket after a Wi-Fi burst, and the browser leaves a reordering link sooner (#1652, #1446).** A burst that looks like Wi-Fi now releases the hold only after a probe proves the rate it was set from; a policer that drops only on the encoder's busy bursts no longer passes for Wi-Fi; a refused probe repair is no longer counted as sent and uses no sequence number. The browser falls back to WebRTC when frames are given up in 3 of the last 5 seconds on a reordering link, not only 3 in a row.
+- **WebTransport capacity detection v2 (`QUASAR_WT_CAPACITY=v2`, opt-in) no longer climbs into a deep policer bucket after a Wi-Fi burst, and the browser leaves a reordering link sooner (#1652, #1446).** A burst that looks like Wi-Fi now releases the hold only after a probe proves the rate it was set from; a policer that drops only on the encoder's busy bursts no longer passes for Wi-Fi; a refused probe repair is no longer counted as sent and uses no sequence number. The keyframe the browser asks for after a Wi-Fi burst is no longer held back by the pacer, and a keyframe no longer stops a later burst from counting as Wi-Fi. The browser falls back to WebRTC when frames are given up in 3 of the last 5 seconds on a reordering link, not only 3 in a row.
 
 ## 0.6.4 — 2026-11-24
 

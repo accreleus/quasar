@@ -815,6 +815,7 @@ impl Sim {
         }
         quic.video.on_hold = self.est.drop_held();
         let at = self.start + Duration::from_micros(self.t);
+        quic.video.recovering = self.est.recovering(at);
         // A `nack` answer as production's: admitted by the stall guard, then ahead of held video.
         for of in std::mem::take(&mut self.nacked) {
             if let Some(guard) = self.guard.as_mut() {
@@ -4150,6 +4151,32 @@ fn the_pacer_lets_video_go_at_its_rate_in_short_bursts_and_never_holds_video_100
     );
 }
 
+/// #1652: a keyframe held while a loss run is recovered (`VideoQueue::recovering`) goes at QUIC's own
+/// pace; other video, and any video outside one, is paced.
+#[test]
+fn a_keyframe_held_while_recovering_is_not_paced() {
+    let at = Instant::now();
+    let queue = |keyframe: bool, recovering: bool| {
+        let mut video = VideoQueue {
+            recovering,
+            ..Default::default()
+        };
+        let first = video.next_seq();
+        for i in 0..40 {
+            let h = Held {
+                queued_at: at,
+                keyframe,
+                ..held(first + i)
+            };
+            video.push(h, BUFFER);
+        }
+        video.pace(Some(8000), at)
+    };
+    assert_eq!(queue(true, true), usize::MAX, "a keyframe recovering");
+    assert!(queue(true, false) < 40 * SIZE, "a keyframe otherwise");
+    assert!(queue(false, true) < 40 * SIZE, "a P-frame recovering");
+}
+
 /// #1496 review A M1: the rates `feed` uses. The pacer holds video to the governed rate, never
 /// under the ABR floor the encoder is held to: an outage that decayed the estimate to 500 under
 /// a 2500 floor still leaves the encoder at 2500, and pacing that at 1.25 × 500 held it until
@@ -5965,6 +5992,40 @@ fn later_burst(key: bool, asked: f64) -> (Estimator, impl Fn(u64) -> Instant) {
     (est, at)
 }
 
+/// #1652: the keyframe asked after a loss run is not paced (`Estimator::recovering`) through the run
+/// and `LOSS_WINDOW` after it, but still is under a hold on a link that drops what overflows, until a
+/// burst releases that hold.
+#[test]
+fn the_keyframe_after_a_burst_is_paced_only_under_a_hold_no_burst_released() {
+    let start = Instant::now();
+    let at = |ms: u64| start + Duration::from_millis(ms);
+    let mut est = Estimator::new(CEILING, start);
+    est.apply(received(7000.0, 0.05), at(100), NO_QUIC);
+    assert!(
+        est.held_kbps().is_none() && est.recovering(at(100)),
+        "a run, no hold"
+    );
+    est.apply(received(7000.0, 0.0), at(200), NO_QUIC);
+    assert!(est.recovering(at(699)), "the run's tail");
+    assert!(!est.recovering(at(700)), "past the tail");
+
+    let mut est = Estimator::new(CEILING, start);
+    est.probes = true;
+    est.apply(received(7000.0, 0.3), at(100), NO_QUIC);
+    assert!(
+        est.held_kbps().is_some() && !est.recovering(at(100)),
+        "a cap's onset"
+    );
+    for ms in (200..4000).step_by(100) {
+        est.apply(received(5000.0, 0.0), at(ms), NO_QUIC);
+    }
+    est.apply(received(4000.0, 0.3), at(4000), NO_QUIC);
+    assert!(!est.recovering(at(4000)), "a burst under the hold");
+    est.apply(received(5700.0, 0.0), at(4100), NO_QUIC);
+    assert!(est.held_kbps().is_some(), "the release is proven first");
+    assert!(est.recovering(at(4100)), "released");
+}
+
 /// Seat B, hold round 4 (#1433 M1'): a held line just under a policer overflows it only with a
 /// keyframe, a short burst at a constant rate that ends on its own, as Wi-Fi's does. A burst that
 /// began on a keyframe never releases the hold; the same burst otherwise does.
@@ -6157,16 +6218,17 @@ fn wifi_bursts(
 #[test]
 fn burst_loss_on_an_uncapped_link_keeps_the_rung_and_the_setpoint() {
     let mut bad = Vec::new();
-    // (sim, every, loss, most freezes): the counts measured at #1652's fix plus one (seat A: 2 ×
-    // legacy + 1 let 11 or 17 through). Legacy has 12, 4, 4, 0, 0 (lab) and 10, 10, 7, 3, 0 (lab_hw).
+    // (sim, every, loss, most freezes): the counts measured at #1652's fix plus one. Legacy has 12,
+    // 4, 4, 0, 0 (lab) and 10, 10, 7, 3, 0 (lab_hw). Over six seeds the 2.5 / 4 / 10 s rows froze
+    // 64 / 38 / 12 (legacy 66 / 33 / 22) and 65 / 35 / 50 (60 / 36 / 42): one seed moves ±3.
     for (name, sim, every, loss, most) in [
-        ("lab", Sim::lab as fn(bool) -> Sim, 2.5, 0.3, 15),
-        ("lab", Sim::lab, 4.0, 0.3, 8),
+        ("lab", Sim::lab as fn(bool) -> Sim, 2.5, 0.3, 7),
+        ("lab", Sim::lab, 4.0, 0.3, 6),
         ("lab", Sim::lab, 10.0, 0.3, 4),
         ("lab", Sim::lab, 40.0, 0.3, 2),
         ("lab", Sim::lab, 4.0, 0.15, 1),
-        ("lab_hw", Sim::lab_hw, 2.5, 0.3, 18),
-        ("lab_hw", Sim::lab_hw, 4.0, 0.3, 8),
+        ("lab_hw", Sim::lab_hw, 2.5, 0.3, 15),
+        ("lab_hw", Sim::lab_hw, 4.0, 0.3, 6),
         ("lab_hw", Sim::lab_hw, 10.0, 0.3, 10),
         ("lab_hw", Sim::lab_hw, 40.0, 0.3, 5),
         ("lab_hw", Sim::lab_hw, 4.0, 0.15, 1),
