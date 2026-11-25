@@ -7233,3 +7233,355 @@ fn a_link_that_reorders_does_not_sit_at_360p() {
     }
     assert!(bad.is_empty(), "{bad:#?}");
 }
+
+/// CAP: the lab's `tbf rate 5mbit burst 15kb latency 500ms` behind a 20 ms delay, for 60 s.
+fn deep_cap(s: &mut Sim) {
+    s.cap_kbps = 5000.0;
+    s.queue_bytes = 5000.0 * 125.0 * 0.5;
+    s.tbf_burst = Some(15_000.0);
+    s.extra_us = Box::new(|_| 20_000);
+}
+
+/// Lab round 2 for 0.6.5's default flip: after a shape clears, v2 is back at 1080p no later than
+/// legacy on the same row (lab: R3 25-27 s against 12, CAP 20-23 against 8-11, REORD 34-44 against
+/// 21-35), with no more freezes while shaped.
+#[test]
+fn after_a_shape_clears_v2_is_back_at_1080p_as_soon_as_legacy() {
+    let cap_row = |legacy: bool| {
+        let mut s = Sim::lab_hw(legacy);
+        s.run(30.0);
+        deep_cap(&mut s);
+        s.run(60.0);
+        s.clear();
+        s.extra_us = Box::new(|_| 0);
+        s.run(60.0);
+        s
+    };
+    let mut bad = Vec::new();
+    for name in ["R3", "R4", "CAP", "REORD"] {
+        let run = |legacy: bool| match name {
+            "R3" => lab_hw_row(legacy, shallow, 60.0),
+            "R4" => lab_hw_row(legacy, policer, 60.0),
+            "CAP" => cap_row(legacy),
+            _ => reorder_row(legacy, 10),
+        };
+        let to = if name == "CAP" { 90.0 } else { 210.0 };
+        let (a_n, _, a_back) = row(&format!("{name} legacy"), &run(true), 30.0, to);
+        let (n, _, back) = row(&format!("{name} v2"), &run(false), 30.0, to);
+        // 1 s: a ladder step lands a report or two either way.
+        if back.is_none_or(|b| b > a_back.unwrap_or(f64::MAX) + 1.0) || n > a_n {
+            bad.push(format!(
+                "{name}: v2 back {back:?} s, {n} freezes; legacy {a_back:?} s, {a_n}"
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// Review round 2 of the lift (`PROBE_LIFT`): a link that lifts only part way, from 5000 to 6000
+/// kbit/s at 210 s, behind R3's shallow queue, CAP's deep one and a 5000 kbit/s policer with a 2 s
+/// bucket. The hold stays on at a line the link carries (a lift's 24000 target proves nothing), at
+/// least 0.95 × where the base's plain steps put it, and the 120 s after the lift freeze no more than
+/// at the base (lines and counts measured there).
+#[test]
+fn a_partial_lift_keeps_the_hold_at_a_line_the_link_carries() {
+    let mut bad = Vec::new();
+    for (name, base, most) in [
+        ("R3", 3751.0, 0),
+        ("CAP", 3466.0, 0),
+        ("2 s policer", 4891.0, 0),
+    ] {
+        let mut s = Sim::lab_hw(false);
+        s.run(30.0);
+        match name {
+            "R3" => shallow(&mut s),
+            "CAP" => deep_cap(&mut s),
+            _ => {
+                policer(&mut s);
+                s.bucket_bytes = Some(5000.0 * 125.0 * 2.0);
+            }
+        }
+        (s.tokens, s.tokens_at) = (15_000.0, s.t);
+        s.run(180.0);
+        s.cap_kbps = 6000.0;
+        s.run(120.0);
+        let freezes = s.client.as_ref().unwrap().freezes();
+        let after = freezes.iter().filter(|&&t| t >= 210.0).count();
+        let line = s.lines.last().and_then(|l| l.1);
+        let over: Vec<_> = s
+            .lines
+            .iter()
+            .filter(|&&(t, l)| t >= 240.0 && l.is_some_and(|l| l > 6000.0))
+            .take(3)
+            .collect();
+        eprintln!(
+            "{name} to 6000: line at the end {line:?}, freezes after the lift {after} {freezes:?}, \
+             rungs {:?}",
+            s.rungs
+        );
+        if line.is_none_or(|l| l < 0.95 * base) || !over.is_empty() || after > most {
+            bad.push(format!(
+                "{name}: line {line:?}, over the link {over:?}, freezes after the lift {after}"
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// Review round 2 of the lift (`PROBE_LIFT`), at `probe_step`: a 3000 line whose 6000 probe the link
+/// stopped before. A probe that sends only 5000 never lifts (a refilled bucket passes one clean
+/// second). One that carries 6000 clean lifts its target, but the link that carries only 6000 proves
+/// a 4335 line after 5.25 s, and the hold stays there: the lift's 24000 target proved nothing.
+#[test]
+fn a_lift_lands_on_what_the_link_carried_not_on_its_target() {
+    let run = |sent: f64| {
+        let start = Instant::now();
+        let mut est = Estimator::new(CEILING, start);
+        est.probes = true;
+        est.held = Some(HoldLine {
+            kbps: 3000.0,
+            since: start,
+            stepped: start,
+            trouble: 3000.0 / BETA,
+            cause: (start, 0.2, 3000.0 / BETA),
+            dropped: true,
+            before: 3000.0 / BETA,
+            probe: None,
+            probe_wait: start,
+            starved: false,
+            stopped_at: 6000.0,
+            lift_stopped: false,
+        });
+        let mut top = 0.0_f64;
+        for ms in (PROBE_WAIT.as_millis() as u64..=12_000).step_by(50) {
+            est.probe_counted = (10, 0);
+            est.probe_step(
+                (20, 0),
+                Some((sent, sent)),
+                false,
+                Usage::Normal,
+                start + Duration::from_millis(ms),
+            );
+            let line = est.held_kbps().unwrap_or(f64::INFINITY);
+            top = top.max(est.probe_kbps().unwrap_or(0.0) / line);
+        }
+        (top, est.held_kbps())
+    };
+    // `top`: the most the probe went over the line, as a multiple of it.
+    let (top, line) = run(5000.0);
+    assert!(
+        top <= PROBE_GAIN,
+        "5000 sent: the probe lifted to {top:.2} x the line"
+    );
+    assert!(line.is_some(), "5000 sent: the hold ended");
+    let (top, line) = run(6000.0);
+    assert!(top > PROBE_GAIN, "6000 carried: no lift ({top:.2} x)");
+    assert!(
+        line.is_some_and(|l| (l - BETA * BETA * 6000.0).abs() < 1.0),
+        "6000 carried: line {line:?}, not 4335"
+    );
+}
+
+/// A v2 hold at `kbps` whose next probe is due, with `stopped_at` recorded (`PROBE_LIFT`).
+fn held_estimator(start: Instant, kbps: f64, stopped_at: f64) -> Estimator {
+    let mut est = Estimator::new(CEILING, start);
+    est.probes = true;
+    est.held = Some(HoldLine {
+        kbps,
+        since: start,
+        stepped: start,
+        trouble: kbps / BETA,
+        cause: (start, 0.2, kbps / BETA),
+        dropped: true,
+        before: kbps / BETA,
+        probe: None,
+        probe_wait: start,
+        starved: false,
+        stopped_at,
+        lift_stopped: false,
+    });
+    est
+}
+
+/// Review round 3 (`Probe::landing`): a queue takes what is sent without loss, so a lift arms and is
+/// credited only on what the receiver reports delivered. 9000 sent (6000 of it probe) and 3000
+/// received for 3 s, then overuse stops the step: no lift, and the line stays at 3000. 21352453
+/// lifted on the send rate and credited the stop 5400.
+#[test]
+fn a_probe_into_a_queue_moves_the_line_only_on_what_was_received() {
+    let start = Instant::now();
+    let mut est = held_estimator(start, 3000.0, 6000.0);
+    for ms in (PROBE_WAIT.as_millis() as u64..=8_000).step_by(50) {
+        est.probe_counted = (10, 0);
+        let m = Measured {
+            usage: match ms {
+                8_000 => Usage::Overusing,
+                _ => Usage::Normal,
+            },
+            rate_kbps: Some(3000.0),
+            delivered_kbps: None,
+            gap_us: 0,
+            sent_kbps: Some(3000.0),
+            probe_sent_kbps: 6000.0,
+            arrived_sent_kbps: None,
+            fresh: true,
+            loss: Some(0.0),
+        };
+        est.apply(m, start + Duration::from_millis(ms), NO_QUIC);
+    }
+    assert!(
+        est.held_kbps().is_some_and(|l| l <= 3000.0),
+        "line {:?}",
+        est.held_kbps()
+    );
+}
+
+#[test]
+fn a_stopped_lift_into_a_queue_credits_only_delivery() {
+    let start = Instant::now();
+    let mut est = held_estimator(start, 3000.0, 6000.0);
+    let mut probe = Probe::new(6000.0, start, None);
+    probe.kbps = 12_000.0;
+    est.held.as_mut().unwrap().probe = Some(probe);
+    est.probe_counted = (30, 0);
+    est.probe_step(
+        (20, 0),
+        Some((8666.0, 3000.0)),
+        true,
+        Usage::Normal,
+        start + Duration::from_secs(2),
+    );
+    assert_eq!(est.probe_kbps(), None);
+    assert_eq!(est.held_kbps(), Some(3000.0));
+}
+
+/// A lossless 6800 kbit/s shaper can pass its 1.98 s of bucket credit before delay overuse
+/// stops the lift. In a 2 s step that proves 6766 kbit/s, below the 6800 release threshold.
+#[test]
+fn a_lift_stopped_by_a_lossless_shaper_keeps_the_hold() {
+    for (bucket_s, total_sent, usage, lost, line) in [
+        (1.98, 13_662.0, Usage::Overusing, 0, Some(6766.0)),
+        (1.98, 13_662.0, Usage::Normal, 0, Some(6766.0)),
+        (2.02, 14_000.0, Usage::Overusing, 0, Some(6800.0)),
+        (2.02, 14_000.0, Usage::Normal, 1, Some(6800.0)),
+        (2.02, 14_000.0, Usage::Normal, 0, None),
+    ] {
+        let start = Instant::now();
+        let mut est = held_estimator(start, 6000.0, 7000.0);
+        let mut probe = Probe::new(CEILING / BETA / BETA, start, None);
+        probe.kbps = 2.0 * probe.first;
+        est.held.as_mut().unwrap().probe = Some(probe);
+        est.probe_counted = (300, lost);
+        est.apply(
+            Measured {
+                usage,
+                sent_kbps: Some(6500.0),
+                probe_sent_kbps: total_sent - 6500.0,
+                // A stretched arrival window stops the step even without delay overuse.
+                arrived_sent_kbps: Some(15_000.0),
+                ..received(6800.0 * (2.0 + bucket_s) / 2.0, 0.0)
+            },
+            start + Duration::from_secs(2),
+            NO_QUIC,
+        );
+        assert_eq!(est.probe_kbps(), None);
+        assert_eq!(
+            est.held_kbps(),
+            line,
+            "{bucket_s} s, {usage:?}, {lost} lost"
+        );
+    }
+}
+
+/// The last report alone can take the average past the stopped lift's 7000 kbit/s peak.
+#[test]
+fn a_bucket_spike_does_not_rearm_a_lift() {
+    let start = Instant::now();
+    let mut est = held_estimator(start, 4000.0, f64::INFINITY);
+    let mut probe = Probe::new(8000.0, start, None);
+    probe.kbps = 16_000.0;
+    est.held.as_mut().unwrap().probe = Some(probe);
+    let stopped = start + PROBE_STEP;
+    est.probe_step(
+        (20, 0),
+        Some((8000.0, 7000.0)),
+        true,
+        Usage::Normal,
+        stopped,
+    );
+    assert_eq!(est.held.unwrap().stopped_at, 7000.0);
+    let next = stopped + PROBE_WAIT;
+    est.probe_step((20, 0), None, false, Usage::Normal, next);
+    for (i, delivered) in [6800.0, 6800.0, 6800.0, 7900.0].into_iter().enumerate() {
+        est.probe_counted = (10, 0);
+        est.probe_step(
+            (20, 0),
+            Some((8000.0, delivered)),
+            false,
+            Usage::Normal,
+            next + Duration::from_millis((i as u64 + 1) * 250),
+        );
+    }
+    assert_eq!(est.probe_kbps(), Some(8000.0));
+}
+
+/// Review round 3: a probe at the most a probe tries that delivers only 6500 proves 4696, under a
+/// 6000 line, so the hold stays. 21352453 ended it on the probe's target.
+#[test]
+fn a_probe_that_underfills_its_target_never_ends_the_hold() {
+    let start = Instant::now();
+    let mut est = held_estimator(start, 6000.0, f64::INFINITY);
+    for ms in (PROBE_WAIT.as_millis() as u64..=6_500).step_by(50) {
+        est.probe_counted = (10, 0);
+        est.probe_step(
+            (20, 0),
+            Some((6500.0, 6500.0)),
+            false,
+            Usage::Normal,
+            start + Duration::from_millis(ms),
+        );
+    }
+    assert_eq!(est.held_kbps(), Some(6000.0));
+}
+
+/// Review round 3: a step stopped before any report measured no refusal, and records none.
+/// 21352453 recorded its 6000 target.
+#[test]
+fn a_stop_with_no_report_records_no_refusal() {
+    let start = Instant::now();
+    let mut est = held_estimator(start, 3000.0, f64::INFINITY);
+    let at = |ms: u64| start + Duration::from_millis(ms);
+    est.probe_step((20, 0), None, false, Usage::Normal, at(5_000));
+    assert!(est.probe_kbps().is_some(), "no probe started");
+    est.probe_step((20, 0), None, true, Usage::Normal, at(5_050));
+    let stopped_at = est.held.map(|h| h.stopped_at);
+    assert_eq!(stopped_at, Some(f64::INFINITY));
+}
+
+/// Review round 3: R3, then a transient 8000 kbit/s cap for 20 s from the clear (it drops a lift's
+/// extra repair, not a plain step), then the clean link. The hold ends no later than at the base,
+/// before the lift (`PROBE_LIFT`), measured there.
+#[test]
+fn a_lift_into_a_transient_cap_ends_the_hold_no_later_than_the_base() {
+    let mut s = Sim::lab_hw(false);
+    s.run(30.0);
+    shallow(&mut s);
+    (s.tokens, s.tokens_at) = (15_000.0, s.t);
+    s.run(180.0);
+    s.cap_kbps = 8000.0;
+    s.run(20.0);
+    s.clear();
+    s.run(60.0);
+    let ended = s
+        .lines
+        .iter()
+        .find(|&&(t, l)| t >= 210.0 && l.is_none())
+        .map(|&(t, _)| t - 210.0);
+    let freezes = s.client.as_ref().unwrap().freezes();
+    eprintln!(
+        "hold ended {ended:?} s after the clear; freezes {freezes:?}; rungs {:?}",
+        s.rungs
+    );
+    assert!(ended.is_some_and(|e| e <= BASE_ENDED), "ended {ended:?}");
+}
+const BASE_ENDED: f64 = 33.1;
