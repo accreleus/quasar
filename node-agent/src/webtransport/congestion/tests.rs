@@ -7356,7 +7356,7 @@ fn a_lift_lands_on_what_the_link_carried_not_on_its_target() {
             est.probe_counted = (10, 0);
             est.probe_step(
                 (20, 0),
-                Some(sent),
+                Some((sent, sent)),
                 false,
                 start + Duration::from_millis(ms),
             );
@@ -7400,10 +7400,10 @@ fn held_estimator(start: Instant, kbps: f64, stopped_at: f64) -> Estimator {
     est
 }
 
-/// Review round 3 (`Probe::landing`): a queue takes what is sent without loss, so only what the
-/// receiver reports delivered moves the line. 9000 sent (6000 of it probe) and 3000 received for
-/// 3 s, then overuse stops the step: the line stays at 3000. 21352453 lifted on the send rate and
-/// credited the stop 5400.
+/// Review round 3 (`Probe::landing`): a queue takes what is sent without loss, so a lift arms and is
+/// credited only on what the receiver reports delivered. 9000 sent (6000 of it probe) and 3000
+/// received for 3 s, then overuse stops the step: no lift, and the line stays at 3000. 21352453
+/// lifted on the send rate and credited the stop 5400.
 #[test]
 fn a_probe_into_a_queue_moves_the_line_only_on_what_was_received() {
     let start = Instant::now();
@@ -7443,7 +7443,7 @@ fn a_probe_that_underfills_its_target_never_ends_the_hold() {
         est.probe_counted = (10, 0);
         est.probe_step(
             (20, 0),
-            Some(6500.0),
+            Some((6500.0, 6500.0)),
             false,
             start + Duration::from_millis(ms),
         );

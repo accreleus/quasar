@@ -823,8 +823,8 @@ struct HoldLine {
     /// A probe sent under `PROBE_MIN` datagrams in `PROBE_STARVED`: this hold climbs as one with no
     /// FEC does.
     starved: bool,
-    /// What the receiver reported delivered by the step the link last stopped during this hold:
-    /// the least for a plain step, a lift's own (`PROBE_LIFT`).
+    /// What the receiver reported delivered by the steps the link stopped during this hold: the
+    /// least for a plain step, a lift's peak (`PROBE_LIFT`).
     stopped_at: f64,
 }
 
@@ -839,9 +839,13 @@ struct Probe {
     counted: (i64, i64),
     probes: i64,
     probe_lost: i64,
-    /// The receiver's rates in the step's reports (sum, count): a step proves only what was
-    /// delivered (`Probe::landing`), never what was sent or targeted.
+    /// The step's reports' send rates and receiver-reported deliveries (sum, count each). A plain
+    /// step proves what was sent, as the probe was tuned on (`Probe::carried`); a lift, a release
+    /// and the end of the hold only what was delivered (`Probe::landing`).
+    sent: (f64, u32),
     received: (f64, u32),
+    /// The most one report showed delivered.
+    peak: f64,
     /// A burst released the hold (`Estimator::apply`): the line went back to the rate the hold was
     /// set from, and this step proves that rate before the hold ends. Only loss at the link's edge
     /// stops it, and puts back this line (#1652: a release over a deep bucket climbed unheld into it).
@@ -857,9 +861,16 @@ impl Probe {
             counted: (0, 0),
             probes: 0,
             probe_lost: 0,
+            sent: (0.0, 0),
             received: (0.0, 0),
+            peak: 0.0,
             release,
         }
+    }
+
+    /// What the step sent, kbit/s, at most its total.
+    fn carried(&self) -> f64 {
+        self.kbps.min(self.sent.0 / f64::from(self.sent.1.max(1)))
     }
 
     /// What the receiver reported the link delivering over the step, kbit/s, at most its total;
@@ -868,14 +879,25 @@ impl Probe {
         (self.received.1 > 0).then(|| self.kbps.min(self.received.0 / f64::from(self.received.1)))
     }
 
-    /// The line the step proves by `now`, the only rate a probe moves the line, ends the hold or
-    /// arms a lift on: `BETA`² × what was delivered, and only as far as the step delivered a
+    /// The line the step proves by `now`, the only rate a lift moves the line on, the hold ends on or
+    /// a lift arms on: `BETA`² × what was delivered, and only as far as the step delivered a
     /// `PROBE_BUCKET_S` bucket past it (a bucket or queue under that at the line cannot have
     /// delivered as much). `None` with no report.
     fn landing(&self, now: Instant) -> Option<f64> {
         let delivered = self.delivered()?;
         let secs = now.saturating_duration_since(self.since).as_secs_f64();
         Some((BETA * BETA * delivered).min(delivered * secs / (secs + PROBE_BUCKET_S)))
+    }
+}
+
+/// What a probe's landing (`Probe::landing`) puts the line at: the ceiling, which ends the hold,
+/// once the link delivered the ceiling over `BETA` past the bucket, so the line a burst would set from
+/// that is at the ceiling (a step sends under its total, sim: 91 % at the top, so the ceiling itself
+/// was rarely proved); never over the ceiling.
+fn release_at(landing: f64, ceiling: f64) -> f64 {
+    match landing >= BETA * ceiling {
+        true => ceiling,
+        false => landing,
     }
 }
 
@@ -1050,7 +1072,7 @@ impl Estimator {
     fn probe_step(
         &mut self,
         (received, lost): (i64, i64),
-        delivered: Option<f64>,
+        rates: Option<(f64, f64)>,
         stopped: bool,
         now: Instant,
     ) {
@@ -1073,8 +1095,10 @@ impl Estimator {
             p.counted.1 += lost + probed.1;
             p.probes += probed.0 + probed.1;
             p.probe_lost += probed.1;
-            if let Some(kbps) = delivered {
-                p.received = (p.received.0 + kbps, p.received.1 + 1);
+            if let Some((sent, delivered)) = rates {
+                p.sent = (p.sent.0 + sent, p.sent.1 + 1);
+                p.received = (p.received.0 + delivered, p.received.1 + 1);
+                p.peak = p.peak.max(delivered);
             }
             let n = p.counted.0 + p.counted.1;
             let loss = p.counted.1.max(0) as f64 / n.max(1) as f64;
@@ -1104,17 +1128,18 @@ impl Estimator {
             };
             let result = if stopped || over {
                 h.probe_wait = now;
-                // A stop with no report measured no refusal. A lift's own replaces the record: the
-                // link refused at about what it delivered then, and only more re-arms one.
+                // A stop with no report measured no refusal. A stopped lift's peak replaces the
+                // record: only a link that now delivers more than the lift ever got through re-arms
+                // one, and the plain steps climb as before until then.
                 let lift = p.kbps > p.first;
                 if let (None, Some(d)) = (p.release, p.delivered()) {
-                    h.stopped_at = if lift { d } else { h.stopped_at.min(d) };
+                    h.stopped_at = if lift { p.peak } else { h.stopped_at.min(d) };
                 }
                 // A lift that lost nothing keeps what it delivered; one that lost raised only the
                 // bar above, and the plain steps after it climb as before. A plain stop proves none.
                 let clean = !over && probe_loss < LOSS_LOW && loss - floor < LOSS_LOW;
                 if let Some(landing) = p.landing(now).filter(|_| lift && clean) {
-                    h.kbps = h.kbps.max(landing.min(self.ceiling_kbps));
+                    h.kbps = h.kbps.max(release_at(landing, self.ceiling_kbps));
                 }
                 if probe_loss >= LOSS_LOW && probe_loss >= 2.0 * video_loss {
                     self.probed_at = Some(now);
@@ -1134,12 +1159,21 @@ impl Estimator {
             {
                 let delivered = p.delivered().unwrap_or(0.0);
                 let secs = now.saturating_duration_since(p.since).as_secs_f64();
-                // A release proves the line it put back; any other step at most the ceiling.
-                let most = p.release.map_or(self.ceiling_kbps, |_| f64::INFINITY);
-                let to = (BETA * BETA * delivered).min(most);
-                // Only once the landing has reached it: the step delivered a bucket past it.
-                let landing = p.landing(now).unwrap_or(0.0).min(most);
-                if (p.release.is_some() || to > h.kbps) && landing < to {
+                let landing = p.landing(now).unwrap_or(0.0);
+                // Only to a rate the step put a `PROBE_BUCKET_S` bucket past: for a lift and a release
+                // what was delivered, for a plain step what was sent.
+                let (to, proved) = match p.kbps > p.first {
+                    true => {
+                        let to = (BETA * BETA * delivered).min(self.ceiling_kbps);
+                        (to, landing.min(self.ceiling_kbps) >= to)
+                    }
+                    false => {
+                        let carried = p.carried();
+                        let to = BETA * BETA * carried;
+                        (to, carried * secs >= to * (secs + PROBE_BUCKET_S))
+                    }
+                };
+                if (p.release.is_some() || to > h.kbps) && !proved {
                     // `PROBE_LIFT`: the link delivered, clean, what it refused before. Not under
                     // Wi-Fi bursts, which stop steps a lifted link would not (sim, 1 MB bucket +
                     // Wi-Fi: 18 freezes, 16 without the lift).
@@ -1154,9 +1188,7 @@ impl Estimator {
                     ended = Some("burst-not-capacity");
                 }
                 h.kbps = h.kbps.max(to);
-                // A landing within `LINK_LIMITED` of the ceiling is the ceiling: what is delivered
-                // reads a little under what was sent.
-                if to >= LINK_LIMITED * self.ceiling_kbps {
+                if release_at(landing, self.ceiling_kbps) >= self.ceiling_kbps {
                     h.kbps = self.ceiling_kbps;
                 }
                 "raised"
@@ -1666,10 +1698,10 @@ impl Estimator {
         // What was sent, never over what the receiver reported delivered (`Probe::landing`), past
         // `LINK_LIMITED`: the receive rate lags a step by its window, and a queue reads far under.
         let sent = m.sent_kbps.map(|s| s + m.probe_sent_kbps);
-        let delivered = (m.rate_kbps.filter(|_| m.fresh))
+        let rates = (m.rate_kbps.filter(|_| m.fresh))
             .zip(sent)
-            .map(|(r, s)| s.min(r / LINK_LIMITED));
-        self.probe_step((r, l), delivered, stopped, now);
+            .map(|(r, s)| (s, s.min(r / LINK_LIMITED)));
+        self.probe_step((r, l), rates, stopped, now);
 
         let was = self.estimate_kbps;
         self.settle();
