@@ -7350,6 +7350,7 @@ fn a_lift_lands_on_what_the_link_carried_not_on_its_target() {
             probe_wait: start,
             starved: false,
             stopped_at: 6000.0,
+            lift_stopped: false,
         });
         let mut top = 0.0_f64;
         for ms in (PROBE_WAIT.as_millis() as u64..=12_000).step_by(50) {
@@ -7358,6 +7359,7 @@ fn a_lift_lands_on_what_the_link_carried_not_on_its_target() {
                 (20, 0),
                 Some((sent, sent)),
                 false,
+                Usage::Normal,
                 start + Duration::from_millis(ms),
             );
             let line = est.held_kbps().unwrap_or(f64::INFINITY);
@@ -7396,6 +7398,7 @@ fn held_estimator(start: Instant, kbps: f64, stopped_at: f64) -> Estimator {
         probe_wait: start,
         starved: false,
         stopped_at,
+        lift_stopped: false,
     });
     est
 }
@@ -7433,6 +7436,95 @@ fn a_probe_into_a_queue_moves_the_line_only_on_what_was_received() {
     );
 }
 
+#[test]
+fn a_stopped_lift_into_a_queue_credits_only_delivery() {
+    let start = Instant::now();
+    let mut est = held_estimator(start, 3000.0, 6000.0);
+    let mut probe = Probe::new(6000.0, start, None);
+    probe.kbps = 12_000.0;
+    est.held.as_mut().unwrap().probe = Some(probe);
+    est.probe_counted = (30, 0);
+    est.probe_step(
+        (20, 0),
+        Some((8666.0, 3000.0)),
+        true,
+        Usage::Normal,
+        start + Duration::from_secs(2),
+    );
+    assert_eq!(est.probe_kbps(), None);
+    assert_eq!(est.held_kbps(), Some(3000.0));
+}
+
+/// A lossless 6800 kbit/s shaper can pass its 1.98 s of bucket credit before delay overuse
+/// stops the lift. In a 2 s step that proves 6766 kbit/s, below the 6800 release threshold.
+#[test]
+fn a_lift_stopped_by_a_lossless_shaper_keeps_the_hold() {
+    for (bucket_s, total_sent, usage, lost, line) in [
+        (1.98, 13_662.0, Usage::Overusing, 0, Some(6766.0)),
+        (1.98, 13_662.0, Usage::Normal, 0, Some(6766.0)),
+        (2.02, 14_000.0, Usage::Overusing, 0, Some(6800.0)),
+        (2.02, 14_000.0, Usage::Normal, 1, Some(6800.0)),
+        (2.02, 14_000.0, Usage::Normal, 0, None),
+    ] {
+        let start = Instant::now();
+        let mut est = held_estimator(start, 6000.0, 7000.0);
+        let mut probe = Probe::new(CEILING / BETA / BETA, start, None);
+        probe.kbps = 2.0 * probe.first;
+        est.held.as_mut().unwrap().probe = Some(probe);
+        est.probe_counted = (300, lost);
+        est.apply(
+            Measured {
+                usage,
+                sent_kbps: Some(6500.0),
+                probe_sent_kbps: total_sent - 6500.0,
+                // A stretched arrival window stops the step even without delay overuse.
+                arrived_sent_kbps: Some(15_000.0),
+                ..received(6800.0 * (2.0 + bucket_s) / 2.0, 0.0)
+            },
+            start + Duration::from_secs(2),
+            NO_QUIC,
+        );
+        assert_eq!(est.probe_kbps(), None);
+        assert_eq!(
+            est.held_kbps(),
+            line,
+            "{bucket_s} s, {usage:?}, {lost} lost"
+        );
+    }
+}
+
+/// The last report alone can take the average past the stopped lift's 7000 kbit/s peak.
+#[test]
+fn a_bucket_spike_does_not_rearm_a_lift() {
+    let start = Instant::now();
+    let mut est = held_estimator(start, 4000.0, f64::INFINITY);
+    let mut probe = Probe::new(8000.0, start, None);
+    probe.kbps = 16_000.0;
+    est.held.as_mut().unwrap().probe = Some(probe);
+    let stopped = start + PROBE_STEP;
+    est.probe_step(
+        (20, 0),
+        Some((8000.0, 7000.0)),
+        true,
+        Usage::Normal,
+        stopped,
+    );
+    assert_eq!(est.held.unwrap().stopped_at, 7000.0);
+    let next = stopped + PROBE_WAIT;
+    est.probe_step((20, 0), None, false, Usage::Normal, next);
+    for (i, delivered) in [6800.0, 6800.0, 6800.0, 7900.0].into_iter().enumerate() {
+        est.probe_counted = (10, 0);
+        est.probe_step(
+            (20, 0),
+            Some((8000.0, delivered)),
+            false,
+            Usage::Normal,
+            next + Duration::from_millis((i as u64 + 1) * 250),
+        );
+    }
+    assert_eq!(est.probe_kbps(), Some(8000.0));
+}
+
 /// Review round 3: a probe at the most a probe tries that delivers only 6500 proves 4696, under a
 /// 6000 line, so the hold stays. 21352453 ended it on the probe's target.
 #[test]
@@ -7445,6 +7537,7 @@ fn a_probe_that_underfills_its_target_never_ends_the_hold() {
             (20, 0),
             Some((6500.0, 6500.0)),
             false,
+            Usage::Normal,
             start + Duration::from_millis(ms),
         );
     }
@@ -7458,9 +7551,9 @@ fn a_stop_with_no_report_records_no_refusal() {
     let start = Instant::now();
     let mut est = held_estimator(start, 3000.0, f64::INFINITY);
     let at = |ms: u64| start + Duration::from_millis(ms);
-    est.probe_step((20, 0), None, false, at(5_000));
+    est.probe_step((20, 0), None, false, Usage::Normal, at(5_000));
     assert!(est.probe_kbps().is_some(), "no probe started");
-    est.probe_step((20, 0), None, true, at(5_050));
+    est.probe_step((20, 0), None, true, Usage::Normal, at(5_050));
     let stopped_at = est.held.map(|h| h.stopped_at);
     assert_eq!(stopped_at, Some(f64::INFINITY));
 }
