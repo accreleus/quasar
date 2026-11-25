@@ -7233,3 +7233,47 @@ fn a_link_that_reorders_does_not_sit_at_360p() {
     }
     assert!(bad.is_empty(), "{bad:#?}");
 }
+
+/// CAP: the lab's `tbf rate 5mbit burst 15kb latency 500ms` behind a 20 ms delay, for 60 s.
+fn deep_cap(s: &mut Sim) {
+    s.cap_kbps = 5000.0;
+    s.queue_bytes = 5000.0 * 125.0 * 0.5;
+    s.tbf_burst = Some(15_000.0);
+    s.extra_us = Box::new(|_| 20_000);
+}
+
+/// Lab round 2 for 0.6.5's default flip: after a shape clears, v2 is back at 1080p no later than
+/// legacy on the same row (lab: R3 25-27 s against 12, CAP 20-23 against 8-11, REORD 34-44 against
+/// 21-35), with no more freezes while shaped.
+#[test]
+fn after_a_shape_clears_v2_is_back_at_1080p_as_soon_as_legacy() {
+    let cap_row = |legacy: bool| {
+        let mut s = Sim::lab_hw(legacy);
+        s.run(30.0);
+        deep_cap(&mut s);
+        s.run(60.0);
+        s.clear();
+        s.extra_us = Box::new(|_| 0);
+        s.run(60.0);
+        s
+    };
+    let mut bad = Vec::new();
+    for name in ["R3", "R4", "CAP", "REORD"] {
+        let run = |legacy: bool| match name {
+            "R3" => lab_hw_row(legacy, shallow, 60.0),
+            "R4" => lab_hw_row(legacy, policer, 60.0),
+            "CAP" => cap_row(legacy),
+            _ => reorder_row(legacy, 10),
+        };
+        let to = if name == "CAP" { 90.0 } else { 210.0 };
+        let (a_n, _, a_back) = row(&format!("{name} legacy"), &run(true), 30.0, to);
+        let (n, _, back) = row(&format!("{name} v2"), &run(false), 30.0, to);
+        // 1 s: a ladder step lands a report or two either way.
+        if back.is_none_or(|b| b > a_back.unwrap_or(f64::MAX) + 1.0) || n > a_n {
+            bad.push(format!(
+                "{name}: v2 back {back:?} s, {n} freezes; legacy {a_back:?} s, {a_n}"
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
