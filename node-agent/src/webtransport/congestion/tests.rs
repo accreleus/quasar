@@ -7350,7 +7350,6 @@ fn a_lift_lands_on_what_the_link_carried_not_on_its_target() {
             probe_wait: start,
             starved: false,
             stopped_at: 6000.0,
-            lift_failed: false,
         });
         let mut top = 0.0_f64;
         for ms in (PROBE_WAIT.as_millis() as u64..=12_000).step_by(50) {
@@ -7380,3 +7379,116 @@ fn a_lift_lands_on_what_the_link_carried_not_on_its_target() {
         "6000 carried: line {line:?}, not 4335"
     );
 }
+
+/// A v2 hold at `kbps` whose next probe is due, with `stopped_at` recorded (`PROBE_LIFT`).
+fn held_estimator(start: Instant, kbps: f64, stopped_at: f64) -> Estimator {
+    let mut est = Estimator::new(CEILING, start);
+    est.probes = true;
+    est.held = Some(HoldLine {
+        kbps,
+        since: start,
+        stepped: start,
+        trouble: kbps / BETA,
+        cause: (start, 0.2, kbps / BETA),
+        dropped: true,
+        before: kbps / BETA,
+        probe: None,
+        probe_wait: start,
+        starved: false,
+        stopped_at,
+    });
+    est
+}
+
+/// Review round 3 (`Probe::landing`): a queue takes what is sent without loss, so only what the
+/// receiver reports delivered moves the line. 9000 sent (6000 of it probe) and 3000 received for
+/// 3 s, then overuse stops the step: the line stays at 3000. 21352453 lifted on the send rate and
+/// credited the stop 5400.
+#[test]
+fn a_probe_into_a_queue_moves_the_line_only_on_what_was_received() {
+    let start = Instant::now();
+    let mut est = held_estimator(start, 3000.0, 6000.0);
+    for ms in (PROBE_WAIT.as_millis() as u64..=8_000).step_by(50) {
+        est.probe_counted = (10, 0);
+        let m = Measured {
+            usage: match ms {
+                8_000 => Usage::Overusing,
+                _ => Usage::Normal,
+            },
+            rate_kbps: Some(3000.0),
+            delivered_kbps: None,
+            gap_us: 0,
+            sent_kbps: Some(3000.0),
+            probe_sent_kbps: 6000.0,
+            arrived_sent_kbps: None,
+            fresh: true,
+            loss: Some(0.0),
+        };
+        est.apply(m, start + Duration::from_millis(ms), NO_QUIC);
+    }
+    assert!(
+        est.held_kbps().is_some_and(|l| l <= 3000.0),
+        "line {:?}",
+        est.held_kbps()
+    );
+}
+
+/// Review round 3: a probe at the most a probe tries that delivers only 6500 proves 4696, under a
+/// 6000 line, so the hold stays. 21352453 ended it on the probe's target.
+#[test]
+fn a_probe_that_underfills_its_target_never_ends_the_hold() {
+    let start = Instant::now();
+    let mut est = held_estimator(start, 6000.0, f64::INFINITY);
+    for ms in (PROBE_WAIT.as_millis() as u64..=6_500).step_by(50) {
+        est.probe_counted = (10, 0);
+        est.probe_step(
+            (20, 0),
+            Some(6500.0),
+            false,
+            start + Duration::from_millis(ms),
+        );
+    }
+    assert_eq!(est.held_kbps(), Some(6000.0));
+}
+
+/// Review round 3: a step stopped before any report measured no refusal, and records none.
+/// 21352453 recorded its 6000 target.
+#[test]
+fn a_stop_with_no_report_records_no_refusal() {
+    let start = Instant::now();
+    let mut est = held_estimator(start, 3000.0, f64::INFINITY);
+    let at = |ms: u64| start + Duration::from_millis(ms);
+    est.probe_step((20, 0), None, false, at(5_000));
+    assert!(est.probe_kbps().is_some(), "no probe started");
+    est.probe_step((20, 0), None, true, at(5_050));
+    let stopped_at = est.held.map(|h| h.stopped_at);
+    assert_eq!(stopped_at, Some(f64::INFINITY));
+}
+
+/// Review round 3: R3, then a transient 8000 kbit/s cap for 20 s from the clear (it drops a lift's
+/// extra repair, not a plain step), then the clean link. The hold ends no later than at the base,
+/// before the lift (`PROBE_LIFT`), measured there.
+#[test]
+fn a_lift_into_a_transient_cap_ends_the_hold_no_later_than_the_base() {
+    let mut s = Sim::lab_hw(false);
+    s.run(30.0);
+    shallow(&mut s);
+    (s.tokens, s.tokens_at) = (15_000.0, s.t);
+    s.run(180.0);
+    s.cap_kbps = 8000.0;
+    s.run(20.0);
+    s.clear();
+    s.run(60.0);
+    let ended = s
+        .lines
+        .iter()
+        .find(|&&(t, l)| t >= 210.0 && l.is_none())
+        .map(|&(t, _)| t - 210.0);
+    let freezes = s.client.as_ref().unwrap().freezes();
+    eprintln!(
+        "hold ended {ended:?} s after the clear; freezes {freezes:?}; rungs {:?}",
+        s.rungs
+    );
+    assert!(ended.is_some_and(|e| e <= BASE_ENDED), "ended {ended:?}");
+}
+const BASE_ENDED: f64 = 33.1;

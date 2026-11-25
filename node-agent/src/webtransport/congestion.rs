@@ -148,7 +148,7 @@ const PROBE_BUCKET_S: f64 = 2.0;
 const PROBE_GAIN: f64 = 2.0;
 /// A step that has carried, clean for `PROBE_STEP`, what the link stopped before in this hold
 /// (`HoldLine::stopped_at`, both measured) doubles each `PROBE_STEP`, to at most this × the ceiling:
-/// the link lifted. Its target proves nothing; the line rises only to what it carried. At
+/// the link lifted. Its target proves nothing; the line rises only to `Probe::landing`. At
 /// 2 × alone each 5.2 s step raised the line 1.45 ×, and the rung stayed held 20 s after a clear
 /// (lab round 2 for 0.6.5, R3 and CAP: back at 1080p 25 s after it, legacy 12). Doubling proves the
 /// ceiling past a `PROBE_BUCKET_S` bucket in about 3 s, and drains a bucket that hid the link sooner.
@@ -823,10 +823,9 @@ struct HoldLine {
     /// A probe sent under `PROBE_MIN` datagrams in `PROBE_STARVED`: this hold climbs as one with no
     /// FEC does.
     starved: bool,
-    /// The least a probe carried (sent, not its target) when the link stopped it during this hold,
-    /// and a lift that then met the link's edge (`PROBE_LIFT`).
+    /// What the receiver reported delivered by the step the link last stopped during this hold:
+    /// the least for a plain step, a lift's own (`PROBE_LIFT`).
     stopped_at: f64,
-    lift_failed: bool,
 }
 
 /// One probe step: the total on the wire it fills to, since when, and what the reports since then
@@ -840,8 +839,9 @@ struct Probe {
     counted: (i64, i64),
     probes: i64,
     probe_lost: i64,
-    /// The reports' send rates (sum, count): a step proves what was sent, at most its total.
-    sent: (f64, u32),
+    /// The receiver's rates in the step's reports (sum, count): a step proves only what was
+    /// delivered (`Probe::landing`), never what was sent or targeted.
+    received: (f64, u32),
     /// A burst released the hold (`Estimator::apply`): the line went back to the rate the hold was
     /// set from, and this step proves that rate before the hold ends. Only loss at the link's edge
     /// stops it, and puts back this line (#1652: a release over a deep bucket climbed unheld into it).
@@ -857,9 +857,25 @@ impl Probe {
             counted: (0, 0),
             probes: 0,
             probe_lost: 0,
-            sent: (0.0, 0),
+            received: (0.0, 0),
             release,
         }
+    }
+
+    /// What the receiver reported the link delivering over the step, kbit/s, at most its total;
+    /// `None` with no report.
+    fn delivered(&self) -> Option<f64> {
+        (self.received.1 > 0).then(|| self.kbps.min(self.received.0 / f64::from(self.received.1)))
+    }
+
+    /// The line the step proves by `now`, the only rate a probe moves the line, ends the hold or
+    /// arms a lift on: `BETA`² × what was delivered, and only as far as the step delivered a
+    /// `PROBE_BUCKET_S` bucket past it (a bucket or queue under that at the line cannot have
+    /// delivered as much). `None` with no report.
+    fn landing(&self, now: Instant) -> Option<f64> {
+        let delivered = self.delivered()?;
+        let secs = now.saturating_duration_since(self.since).as_secs_f64();
+        Some((BETA * BETA * delivered).min(delivered * secs / (secs + PROBE_BUCKET_S)))
     }
 }
 
@@ -1034,7 +1050,7 @@ impl Estimator {
     fn probe_step(
         &mut self,
         (received, lost): (i64, i64),
-        sent: Option<f64>,
+        delivered: Option<f64>,
         stopped: bool,
         now: Instant,
     ) {
@@ -1057,8 +1073,8 @@ impl Estimator {
             p.counted.1 += lost + probed.1;
             p.probes += probed.0 + probed.1;
             p.probe_lost += probed.1;
-            if let Some(kbps) = sent {
-                p.sent = (p.sent.0 + kbps, p.sent.1 + 1);
+            if let Some(kbps) = delivered {
+                p.received = (p.received.0 + kbps, p.received.1 + 1);
             }
             let n = p.counted.0 + p.counted.1;
             let loss = p.counted.1.max(0) as f64 / n.max(1) as f64;
@@ -1088,26 +1104,17 @@ impl Estimator {
             };
             let result = if stopped || over {
                 h.probe_wait = now;
-                // What the step carried, as a later step's `carried` is read.
-                let carried = match p.sent.1 {
-                    0 => p.kbps,
-                    n => p.kbps.min(p.sent.0 / f64::from(n)),
-                };
-                if p.release.is_none() {
-                    h.stopped_at = h.stopped_at.min(carried);
+                // A stop with no report measured no refusal. A lift's own replaces the record: the
+                // link refused at about what it delivered then, and only more re-arms one.
+                let lift = p.kbps > p.first;
+                if let (None, Some(d)) = (p.release, p.delivered()) {
+                    h.stopped_at = if lift { d } else { h.stopped_at.min(d) };
                 }
-                // A lift stopped with no loss keeps what it carried past a `PROBE_BUCKET_S` bucket.
-                // One that lost, or proved nothing over the line, met the link's edge (a partial
-                // lift): plain steps climb the rest.
-                if p.kbps > p.first {
-                    let secs = now.saturating_duration_since(p.since).as_secs_f64();
-                    let proven = (BETA * BETA * carried)
-                        .min(carried * secs / (secs + PROBE_BUCKET_S))
-                        .min(self.ceiling_kbps);
-                    match !over && probe_loss < LOSS_LOW && loss - floor < LOSS_LOW {
-                        true if proven > h.kbps => h.kbps = proven,
-                        _ => h.lift_failed = true,
-                    }
+                // A lift that lost nothing keeps what it delivered; one that lost raised only the
+                // bar above, and the plain steps after it climb as before. A plain stop proves none.
+                let clean = !over && probe_loss < LOSS_LOW && loss - floor < LOSS_LOW;
+                if let Some(landing) = p.landing(now).filter(|_| lift && clean) {
+                    h.kbps = h.kbps.max(landing.min(self.ceiling_kbps));
                 }
                 if probe_loss >= LOSS_LOW && probe_loss >= 2.0 * video_loss {
                     self.probed_at = Some(now);
@@ -1125,20 +1132,18 @@ impl Estimator {
                 "starved"
             } else if now.saturating_duration_since(p.since) >= PROBE_STEP && p.probes >= PROBE_MIN
             {
-                let carried = p.kbps.min(p.sent.0 / f64::from(p.sent.1.max(1)));
+                let delivered = p.delivered().unwrap_or(0.0);
                 let secs = now.saturating_duration_since(p.since).as_secs_f64();
-                let to = match p.release {
-                    Some(_) => BETA * BETA * carried,
-                    None => (BETA * BETA * carried).min(self.ceiling_kbps),
-                };
-                // Only to a rate the step drained a `PROBE_BUCKET_S` bucket past.
-                if (p.release.is_some() || to > h.kbps)
-                    && carried * secs < to * (secs + PROBE_BUCKET_S)
-                {
-                    // `PROBE_LIFT`: the link carried, clean, a total it stopped before. Not under
+                // A release proves the line it put back; any other step at most the ceiling.
+                let most = p.release.map_or(self.ceiling_kbps, |_| f64::INFINITY);
+                let to = (BETA * BETA * delivered).min(most);
+                // Only once the landing has reached it: the step delivered a bucket past it.
+                let landing = p.landing(now).unwrap_or(0.0).min(most);
+                if (p.release.is_some() || to > h.kbps) && landing < to {
+                    // `PROBE_LIFT`: the link delivered, clean, what it refused before. Not under
                     // Wi-Fi bursts, which stop steps a lifted link would not (sim, 1 MB bucket +
                     // Wi-Fi: 18 freezes, 16 without the lift).
-                    if p.release.is_none() && !wifi && !h.lift_failed && carried >= h.stopped_at {
+                    if p.release.is_none() && !wifi && delivered >= h.stopped_at {
                         let lift = PROBE_GAIN.powf((secs / PROBE_STEP.as_secs_f64()).floor());
                         p.kbps = (p.first * lift).min(PROBE_LIFT * self.ceiling_kbps);
                     }
@@ -1149,9 +1154,9 @@ impl Estimator {
                     ended = Some("burst-not-capacity");
                 }
                 h.kbps = h.kbps.max(to);
-                // Begun at the most a probe tries and carried: nothing left to hold. A lift's target
-                // proves nothing; its landing `to` is measured.
-                if p.first >= 0.999 * self.ceiling_kbps / BETA / BETA {
+                // A landing within `LINK_LIMITED` of the ceiling is the ceiling: what is delivered
+                // reads a little under what was sent.
+                if to >= LINK_LIMITED * self.ceiling_kbps {
                     h.kbps = self.ceiling_kbps;
                 }
                 "raised"
@@ -1628,7 +1633,6 @@ impl Estimator {
                 probe_wait: now,
                 starved: false,
                 stopped_at: f64::INFINITY,
-                lift_failed: false,
             });
             // Still congested a step after the line came down, with the sender under what the link
             // then delivered or the link now delivering under the line: that line did not cure it.
@@ -1659,8 +1663,13 @@ impl Estimator {
             }
         }
         let stopped = burst.or(met).or(confirmed).or(read).is_some() || m.usage == Usage::Overusing;
+        // What was sent, never over what the receiver reported delivered (`Probe::landing`), past
+        // `LINK_LIMITED`: the receive rate lags a step by its window, and a queue reads far under.
         let sent = m.sent_kbps.map(|s| s + m.probe_sent_kbps);
-        self.probe_step((r, l), sent, stopped, now);
+        let delivered = (m.rate_kbps.filter(|_| m.fresh))
+            .zip(sent)
+            .map(|(r, s)| s.min(r / LINK_LIMITED));
+        self.probe_step((r, l), delivered, stopped, now);
 
         let was = self.estimate_kbps;
         self.settle();
