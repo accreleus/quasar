@@ -146,8 +146,9 @@ const PROBE_BUCKET_S: f64 = 2.0;
 /// doubles again: a probe is smooth and video is not, and a line raised to 0.82 × a policer's rate
 /// overflowed it on the lab encoder's keyframes (sim, 5000 → 3000: 22 freezes at `BETA`).
 const PROBE_GAIN: f64 = 2.0;
-/// A step at a total the link stopped before in this hold (`HoldLine::stopped_at`) that carries
-/// `PROBE_STEP` clean doubles each `PROBE_STEP`, to at most this × the ceiling: the link lifted. At
+/// A step that has carried, clean for `PROBE_STEP`, what the link stopped before in this hold
+/// (`HoldLine::stopped_at`, both measured) doubles each `PROBE_STEP`, to at most this × the ceiling:
+/// the link lifted. Its target proves nothing; the line rises only to what it carried. At
 /// 2 × alone each 5.2 s step raised the line 1.45 ×, and the rung stayed held 20 s after a clear
 /// (lab round 2 for 0.6.5, R3 and CAP: back at 1080p 25 s after it, legacy 12). Doubling proves the
 /// ceiling past a `PROBE_BUCKET_S` bucket in about 3 s, and drains a bucket that hid the link sooner.
@@ -822,8 +823,10 @@ struct HoldLine {
     /// A probe sent under `PROBE_MIN` datagrams in `PROBE_STARVED`: this hold climbs as one with no
     /// FEC does.
     starved: bool,
-    /// The least probe total the link stopped during this hold (`PROBE_LIFT`).
+    /// The least a probe carried (sent, not its target) when the link stopped it during this hold,
+    /// and a lift that then met the link's edge (`PROBE_LIFT`).
     stopped_at: f64,
+    lift_failed: bool,
 }
 
 /// One probe step: the total on the wire it fills to, since when, and what the reports since then
@@ -1085,8 +1088,26 @@ impl Estimator {
             };
             let result = if stopped || over {
                 h.probe_wait = now;
+                // What the step carried, as a later step's `carried` is read.
+                let carried = match p.sent.1 {
+                    0 => p.kbps,
+                    n => p.kbps.min(p.sent.0 / f64::from(n)),
+                };
                 if p.release.is_none() {
-                    h.stopped_at = h.stopped_at.min(p.kbps);
+                    h.stopped_at = h.stopped_at.min(carried);
+                }
+                // A lift stopped with no loss keeps what it carried past a `PROBE_BUCKET_S` bucket.
+                // One that lost, or proved nothing over the line, met the link's edge (a partial
+                // lift): plain steps climb the rest.
+                if p.kbps > p.first {
+                    let secs = now.saturating_duration_since(p.since).as_secs_f64();
+                    let proven = (BETA * BETA * carried)
+                        .min(carried * secs / (secs + PROBE_BUCKET_S))
+                        .min(self.ceiling_kbps);
+                    match !over && probe_loss < LOSS_LOW && loss - floor < LOSS_LOW {
+                        true if proven > h.kbps => h.kbps = proven,
+                        _ => h.lift_failed = true,
+                    }
                 }
                 if probe_loss >= LOSS_LOW && probe_loss >= 2.0 * video_loss {
                     self.probed_at = Some(now);
@@ -1114,10 +1135,10 @@ impl Estimator {
                 if (p.release.is_some() || to > h.kbps)
                     && carried * secs < to * (secs + PROBE_BUCKET_S)
                 {
-                    // `PROBE_LIFT`: a total the link stopped before went clean. Not under Wi-Fi
-                    // bursts, which stop steps a lifted link would not (sim, 1 MB bucket + Wi-Fi:
-                    // 18 freezes, 16 without the lift).
-                    if p.release.is_none() && !wifi && p.first >= h.stopped_at {
+                    // `PROBE_LIFT`: the link carried, clean, a total it stopped before. Not under
+                    // Wi-Fi bursts, which stop steps a lifted link would not (sim, 1 MB bucket +
+                    // Wi-Fi: 18 freezes, 16 without the lift).
+                    if p.release.is_none() && !wifi && !h.lift_failed && carried >= h.stopped_at {
                         let lift = PROBE_GAIN.powf((secs / PROBE_STEP.as_secs_f64()).floor());
                         p.kbps = (p.first * lift).min(PROBE_LIFT * self.ceiling_kbps);
                     }
@@ -1128,8 +1149,9 @@ impl Estimator {
                     ended = Some("burst-not-capacity");
                 }
                 h.kbps = h.kbps.max(to);
-                // Carried at the most a probe tries: nothing left to hold.
-                if p.kbps >= 0.999 * self.ceiling_kbps / BETA / BETA {
+                // Begun at the most a probe tries and carried: nothing left to hold. A lift's target
+                // proves nothing; its landing `to` is measured.
+                if p.first >= 0.999 * self.ceiling_kbps / BETA / BETA {
                     h.kbps = self.ceiling_kbps;
                 }
                 "raised"
@@ -1606,6 +1628,7 @@ impl Estimator {
                 probe_wait: now,
                 starved: false,
                 stopped_at: f64::INFINITY,
+                lift_failed: false,
             });
             // Still congested a step after the line came down, with the sender under what the link
             // then delivered or the link now delivering under the line: that line did not cure it.

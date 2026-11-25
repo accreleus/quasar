@@ -7277,3 +7277,106 @@ fn after_a_shape_clears_v2_is_back_at_1080p_as_soon_as_legacy() {
     }
     assert!(bad.is_empty(), "{bad:#?}");
 }
+
+/// Review round 2 of the lift (`PROBE_LIFT`): a link that lifts only part way, from 5000 to 6000
+/// kbit/s at 210 s, behind R3's shallow queue, CAP's deep one and a 5000 kbit/s policer with a 2 s
+/// bucket. The hold stays on at a line the link carries (a lift's 24000 target proves nothing), at
+/// least 0.95 × where the base's plain steps put it, and the 120 s after the lift freeze no more than
+/// at the base (lines and counts measured there).
+#[test]
+fn a_partial_lift_keeps_the_hold_at_a_line_the_link_carries() {
+    let mut bad = Vec::new();
+    for (name, base, most) in [
+        ("R3", 3751.0, 0),
+        ("CAP", 3466.0, 0),
+        ("2 s policer", 4891.0, 0),
+    ] {
+        let mut s = Sim::lab_hw(false);
+        s.run(30.0);
+        match name {
+            "R3" => shallow(&mut s),
+            "CAP" => deep_cap(&mut s),
+            _ => {
+                policer(&mut s);
+                s.bucket_bytes = Some(5000.0 * 125.0 * 2.0);
+            }
+        }
+        (s.tokens, s.tokens_at) = (15_000.0, s.t);
+        s.run(180.0);
+        s.cap_kbps = 6000.0;
+        s.run(120.0);
+        let freezes = s.client.as_ref().unwrap().freezes();
+        let after = freezes.iter().filter(|&&t| t >= 210.0).count();
+        let line = s.lines.last().and_then(|l| l.1);
+        let over: Vec<_> = s
+            .lines
+            .iter()
+            .filter(|&&(t, l)| t >= 240.0 && l.is_some_and(|l| l > 6000.0))
+            .take(3)
+            .collect();
+        eprintln!(
+            "{name} to 6000: line at the end {line:?}, freezes after the lift {after} {freezes:?}, \
+             rungs {:?}",
+            s.rungs
+        );
+        if line.is_none_or(|l| l < 0.95 * base) || !over.is_empty() || after > most {
+            bad.push(format!(
+                "{name}: line {line:?}, over the link {over:?}, freezes after the lift {after}"
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// Review round 2 of the lift (`PROBE_LIFT`), at `probe_step`: a 3000 line whose 6000 probe the link
+/// stopped before. A probe that sends only 5000 never lifts (a refilled bucket passes one clean
+/// second). One that carries 6000 clean lifts its target, but the link that carries only 6000 proves
+/// a 4335 line after 5.25 s, and the hold stays there: the lift's 24000 target proved nothing.
+#[test]
+fn a_lift_lands_on_what_the_link_carried_not_on_its_target() {
+    let run = |sent: f64| {
+        let start = Instant::now();
+        let mut est = Estimator::new(CEILING, start);
+        est.probes = true;
+        est.held = Some(HoldLine {
+            kbps: 3000.0,
+            since: start,
+            stepped: start,
+            trouble: 3000.0 / BETA,
+            cause: (start, 0.2, 3000.0 / BETA),
+            dropped: true,
+            before: 3000.0 / BETA,
+            probe: None,
+            probe_wait: start,
+            starved: false,
+            stopped_at: 6000.0,
+            lift_failed: false,
+        });
+        let mut top = 0.0_f64;
+        for ms in (PROBE_WAIT.as_millis() as u64..=12_000).step_by(50) {
+            est.probe_counted = (10, 0);
+            est.probe_step(
+                (20, 0),
+                Some(sent),
+                false,
+                start + Duration::from_millis(ms),
+            );
+            let line = est.held_kbps().unwrap_or(f64::INFINITY);
+            top = top.max(est.probe_kbps().unwrap_or(0.0) / line);
+        }
+        (top, est.held_kbps())
+    };
+    // `top`: the most the probe went over the line, as a multiple of it.
+    let (top, line) = run(5000.0);
+    assert!(
+        top <= PROBE_GAIN,
+        "5000 sent: the probe lifted to {top:.2} x the line"
+    );
+    assert!(line.is_some(), "5000 sent: the hold ended");
+    let (top, line) = run(6000.0);
+    assert!(top > PROBE_GAIN, "6000 carried: no lift ({top:.2} x)");
+    assert!(
+        line.is_some_and(|l| (l - BETA * BETA * 6000.0).abs() < 1.0),
+        "6000 carried: line {line:?}, not 4335"
+    );
+}
