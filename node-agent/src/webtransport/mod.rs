@@ -143,8 +143,9 @@ pub(crate) struct Rate {
     /// which a client that sends no feedback (§Feedback) never sends.
     pub(crate) displaced: Box<dyn Fn() + Send + Sync>,
     /// Every estimate, in kbit/s of video, with the FEC share charged on top of it
-    /// (`abr::Governor::set_share`).
-    pub(crate) observe: Box<dyn Fn(f64, f64) + Send + Sync>,
+    /// (`abr::Governor::set_share`), and whether it is legacy's queue bound
+    /// (`abr::Governor::set_queue_bound`; always false on v2).
+    pub(crate) observe: Box<dyn Fn(f64, f64, bool) + Send + Sync>,
     /// After `observe`, for every estimate that came from a receiver report, never for the
     /// silence decay: what the report showed the link carrying when the link held the
     /// sender back (`congestion::Estimator::measured`), `None` when it did not.
@@ -323,7 +324,8 @@ impl<'a> Control<'a> {
         } else {
             0.0
         };
-        (self.rate.observe)(congestion::abr_estimate(kbps, self.charged), bound);
+        let queue = self.estimator.legacy && self.estimator.queue_bound();
+        (self.rate.observe)(congestion::abr_estimate(kbps, self.charged), bound, queue);
     }
 
     /// The repair datagrams that follow one frame's video datagrams. A PyroWave frame gets

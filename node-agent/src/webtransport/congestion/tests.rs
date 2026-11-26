@@ -153,6 +153,8 @@ struct Sim {
     in_air: VecDeque<(u32, u64, Option<u32>)>,
     /// Datagrams `discard_us` threw away.
     discarded: u32,
+    /// (seconds, µs an audio datagram took over the path's base delay), per audio datagram sent.
+    audio_late: Vec<(f64, u64)>,
 }
 
 /// The browser's reassembly (`web/src/webtransport/reassembly.ts`) and decoder, simulated: a
@@ -423,6 +425,7 @@ impl Sim {
             discard_us: None,
             in_air: VecDeque::new(),
             discarded: 0,
+            audio_late: Vec::new(),
         }
     }
 
@@ -913,7 +916,11 @@ impl Sim {
     /// Audio, the resends, the client's decoder and the keyframe requests due now.
     fn client_due(&mut self) {
         if self.audio && self.t >= self.next_audio {
-            self.path(320, false, 0);
+            let base = self.t + 10_000 + (self.extra_us)(self.t);
+            if let Some(at) = self.path(320, false, 0) {
+                let late = at.saturating_sub(base);
+                self.audio_late.push((self.t as f64 / 1e6, late));
+            }
             self.next_audio = self.t + 20_000;
         }
         let Some(mut c) = self.client.take() else {
@@ -1078,8 +1085,9 @@ impl Sim {
             self.step_rung(at);
             if let Some(abr) = self.abr.as_mut() {
                 // `Control::feed` and `abr_glue`'s `Rate::observe`: the share (legacy only), then
-                // the estimate.
+                // the estimate and whether it is legacy's queue bound.
                 abr.set_share(if legacy { self.fec_share } else { 0.0 }, at);
+                abr.set_queue_bound(legacy && self.est.queue_bound());
                 abr.observe(abr_estimate(kbps, self.fec_share), at);
             }
             let setpoint = self
@@ -5511,7 +5519,8 @@ fn pyrowave_follows_the_capacity_knob_and_never_holds() {
     }
 }
 
-/// `QUASAR_WT_CAPACITY=legacy` (design §4): no pacing and no audio room, 0.6.3's reading (the
+/// `QUASAR_WT_CAPACITY=legacy` (design §4): pacing and audio room only at the delay bound (#1321,
+/// `video_rates`), 0.6.3's reading (the
 /// estimate or `BETA` × the receive rate, no gap taken out), blackouts counted as loss, and the
 /// window on the smoothed RTT.
 #[test]
@@ -5525,7 +5534,18 @@ fn legacy_capacity_is_the_0_6_3_sender() {
     governor.govern(5000.0);
     let mut est = legacy();
     est.resume_at(5000.0);
-    assert_eq!(video_rates(&governor, &est, false), (None, None), "paced");
+    assert_eq!(
+        video_rates(&governor, &est, false),
+        (Some(5000), Some(5000)),
+        "legacy at the delay bound"
+    );
+    est.loss_kbps = 4000.0;
+    est.settle();
+    assert_eq!(
+        video_rates(&governor, &est, false),
+        (None, None),
+        "legacy at the loss bound"
+    );
     est.resume_at(5000.0);
     est.legacy = false;
     assert_eq!(
@@ -7585,3 +7605,69 @@ fn a_lift_into_a_transient_cap_ends_the_hold_no_later_than_the_base() {
     assert!(ended.is_some_and(|e| e <= BASE_ENDED), "ended {ended:?}");
 }
 const BASE_ENDED: f64 = 33.1;
+
+/// The 0.6.5 RC audio rows (#1321): the lab relay's `delay 20ms rate <kbps>` with its 1.25 MB FIFO,
+/// from 30 s for 210 s (`None`: clean), under `Sim::lab_hw` on `legacy`.
+fn audio_row(kbps: Option<f64>) -> Sim {
+    let mut s = Sim::lab_hw(true);
+    s.run(30.0);
+    if let Some(kbps) = kbps {
+        s.cap_kbps = kbps;
+        s.queue_bytes = 1_250_000.0;
+        s.extra_us = Box::new(|_| 20_000);
+    }
+    (s.tokens, s.tokens_at) = (15_000.0, s.t);
+    s.run(210.0);
+    s
+}
+
+/// Audio lateness over the path's base delay between `from` and `to`, ms, at quantile `q`.
+fn audio_late_at(s: &Sim, from: f64, to: f64, q: f64) -> u64 {
+    let mut late: Vec<u64> = s
+        .audio_late
+        .iter()
+        .filter(|&&(t, _)| (from..to).contains(&t))
+        .map(|&(_, l)| l / 1000)
+        .collect();
+    late.sort_unstable();
+    late.get(((late.len().max(1) - 1) as f64 * q) as usize)
+        .copied()
+        .unwrap_or(u64::MAX)
+}
+
+/// #1321 on the default sender (`legacy`, 0.6.5 RC lab): under the relay's 5 and 2 Mbit/s caps audio
+/// waited in the link's queue behind an unpaced keyframe a second, and behind a setpoint left 10-16 %
+/// over a delay-bound estimate inside the deadband (#1503); 34-832 underruns a minute against 0-0.3
+/// clean. From onset + 15 s an audio datagram's lateness at its p99 stays within 40 ms of the clean
+/// link's, well under the client's ring (target 79-115 ms clean). 7b5d81e0: 93 and 124 ms, clean 2.
+#[test]
+fn legacy_audio_under_a_rate_cap_stays_near_the_clean_link() {
+    let clean = audio_late_at(&audio_row(None), 45.0, 240.0, 0.99);
+    let mut bad = Vec::new();
+    for kbps in [5000.0, 2000.0] {
+        let s = audio_row(Some(kbps));
+        let late = |q| audio_late_at(&s, 45.0, 240.0, q);
+        row(&format!("relay {kbps} legacy"), &s, 30.0, 240.0);
+        eprintln!(
+            "  audio late from onset + 15 s p50/p95/p99/max {}/{}/{}/{} ms, clean p99 {clean} ms; \
+             onset 15 s max {} ms; setpoint writes from onset + 15 s {}; rungs {:?}",
+            late(0.5),
+            late(0.95),
+            late(0.99),
+            late(1.0),
+            audio_late_at(&s, 30.0, 45.0, 1.0),
+            s.setpoints
+                .windows(2)
+                .filter(|w| w[1].0 >= 45.0 && w[1].1 != w[0].1)
+                .count(),
+            s.rungs
+        );
+        if late(0.99) > clean + 40 {
+            bad.push((kbps, late(0.99)));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "(cap, p99 ms) over clean {clean} + 40: {bad:?}"
+    );
+}

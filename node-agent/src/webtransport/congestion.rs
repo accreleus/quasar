@@ -1029,6 +1029,11 @@ impl Estimator {
         (self.bound != Bound::Ceiling || self.held.is_some()) && self.recover_to.is_none()
     }
 
+    /// The estimate sits at the delay bound: the link queues what the sender sends over it.
+    pub(crate) fn queue_bound(&self) -> bool {
+        self.bound == Bound::Delay
+    }
+
     /// A lossy run is on, or ended under `LOSS_WINDOW` ago: the keyframe the client asks for after
     /// it is not paced (`VideoQueue::recovering`). Under a hold on a link that drops what overflows
     /// it is, until a burst released the hold: unpaced into R3's cap, the onset's keyframe stepped
@@ -2641,13 +2646,17 @@ pub(crate) fn abr_estimate(kbps: f64, charged: f64) -> f64 {
 /// The rates `VideoQueue` holds video to, kbit/s: QUIC's room ([`VideoQueue::room`]) at the
 /// governed rate or the estimate if lower, and the pacer ([`VideoQueue::pace`]) at the
 /// governed rate ([`governed_kbps`]) once the estimate is under the ceiling. `None`: the
-/// session is not governed (or PyroWave), or nothing to pace.
+/// session is not governed (or PyroWave), or nothing to pace. Legacy holds video only while
+/// its estimate is the link's queue ([`Estimator::queue_bound`]): an unpaced keyframe waits
+/// in that queue and the audio behind it with it (#1321). Paced after a Wi-Fi burst's loss
+/// cut, the keyframe the client asks for waits too, and legacy has no `recovering` to let it
+/// go (sim: twice the freezes at bursts every 2.5 s).
 pub(crate) fn video_rates(
     governor: &Governor,
     estimator: &Estimator,
     pyrowave: bool,
 ) -> (Option<u64>, Option<u64>) {
-    if pyrowave || !governor.governs() || estimator.legacy {
+    if pyrowave || !governor.governs() || estimator.legacy && !estimator.queue_bound() {
         return (None, None);
     }
     let room = (governor.kbps() as f64).min(estimator.estimate_kbps()) as u64;

@@ -1737,7 +1737,7 @@ async fn governed_agent(stream: Stream) -> Agent {
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
-                observe: Box::new(|_, _| {}),
+                observe: Box::new(|_, _, _| {}),
                 held: Box::new(|_| {}),
                 fec: Box::new(|_| {}),
             })
@@ -2277,7 +2277,7 @@ async fn feedback_while_pyrowave_is_active_feeds_no_estimate() {
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
-                observe: Box::new(move |_, _| {
+                observe: Box::new(move |_, _, _| {
                     count.fetch_add(1, Ordering::SeqCst);
                 }),
                 held: Box::new(|_| {}),
@@ -2377,7 +2377,7 @@ async fn audio_alone_never_moves_the_video_estimate() {
             start: Box::new(|| {}),
             owns: Box::new(|| false),
             displaced: Box::new(|| {}),
-            observe: Box::new(move |kbps, _| seen.lock().unwrap().push(kbps)),
+            observe: Box::new(move |kbps, _, _| seen.lock().unwrap().push(kbps)),
             held: Box::new(|_| {}),
             fec: Box::new(|_| {}),
         })
@@ -2425,7 +2425,7 @@ fn rate(retargets: bool) -> Rate {
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(|_, _| {}),
+        observe: Box::new(|_, _, _| {}),
         held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     }
@@ -2579,7 +2579,7 @@ fn a_v2_hold_with_fec_keeps_video_plus_repairs_under_the_ceiling() {
         measured: Box::new(move |reading| {
             g3.lock().unwrap().observe_report(reading, now());
         }),
-        observe: Box::new(move |kbps, share| {
+        observe: Box::new(move |kbps, share, _| {
             let mut g = g4.lock().unwrap();
             g.set_share(share, now());
             g.observe(kbps, now());
@@ -2686,7 +2686,7 @@ fn the_silence_decay_is_never_fed_to_the_collapse_as_a_measured_link() {
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(move |_, _| {
+        observe: Box::new(move |_, _, _| {
             f.fetch_add(1, SeqCst);
         }),
         held: Box::new(|_| {}),
@@ -2735,7 +2735,7 @@ fn a_report_gives_the_abr_its_reading_before_its_estimate() {
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(move |_, _| o.lock().unwrap().push("observe")),
+        observe: Box::new(move |_, _, _| o.lock().unwrap().push("observe")),
         held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
@@ -2764,7 +2764,7 @@ fn a_client_that_is_gone_neither_starts_nor_feeds_the_abr() {
         }),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(move |_, _| {
+        observe: Box::new(move |_, _, _| {
             fed.fetch_add(1, SeqCst);
         }),
         held: Box::new(|_| {}),
@@ -2828,7 +2828,7 @@ fn the_abr_is_fed_the_estimate_less_the_fec_share() {
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(move |kbps: f64, _| seen.lock().unwrap().push(kbps.round())),
+        observe: Box::new(move |kbps: f64, _, _| seen.lock().unwrap().push(kbps.round())),
         held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
@@ -2864,7 +2864,7 @@ async fn lossy_session(retargets: bool) -> (Agent, Arc<crate::session::metrics::
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
-                observe: Box::new(|_, _| {}),
+                observe: Box::new(|_, _, _| {}),
                 held: Box::new(|_| {}),
                 fec: Box::new(move |event| match event {
                     crate::webtransport::FecEvent::Attached { client, fec } => {
@@ -3118,7 +3118,7 @@ fn repairs_spend_only_what_the_estimate_leaves_above_the_abr_floor() {
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(move |kbps: f64, _| seen.lock().unwrap().push(kbps.round())),
+        observe: Box::new(move |kbps: f64, _, _| seen.lock().unwrap().push(kbps.round())),
         held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
@@ -3183,7 +3183,7 @@ fn governed_by(
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         // As `abr_glue::feedback_abr`: the share, then the estimate.
-        observe: Box::new(move |kbps, share| {
+        observe: Box::new(move |kbps, share, _| {
             let mut governor = observed.lock().unwrap();
             let now = governor.1;
             governor.0.set_share(share, now);
@@ -3265,7 +3265,7 @@ fn governed_after_a_report(capacity: crate::session::settings::WtCapacity) -> (f
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(|_, _| {}),
+        observe: Box::new(|_, _, _| {}),
         held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
@@ -3414,7 +3414,7 @@ fn a_pyrowave_frame_gets_no_repair_at_any_overhead() {
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(|_, _| {}),
+        observe: Box::new(|_, _, _| {}),
         held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
@@ -4214,7 +4214,7 @@ async fn a_webtransport_takeover_displaces_a_loop_its_peer_left_owning_the_encod
     .expect("this encoder takes live writes");
     (peer.start)();
     pause();
-    (peer.observe)(2000.0, 0.0);
+    (peer.observe)(2000.0, 0.0, false);
     pause();
     let driven = kbps();
     assert!(
@@ -5721,7 +5721,7 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
-                observe: Box::new(move |kbps, _| {
+                observe: Box::new(move |kbps, _, _| {
                     if active.get().is_some_and(|m| m.pyrowave_active()) {
                         pyro_fed.lock().unwrap().push(kbps);
                     }
