@@ -57,8 +57,12 @@ const AT_FLOOR_MS: f64 = 30.0;
 /// `Estimator::legacy_queue`: off the floor this long. A 110 ms delay spike is off it for about
 /// 0.4 s.
 const QUEUE_STANDING: Duration = Duration::from_secs(1);
-/// A video datagram that arrived this much before one sent ahead of it: the path reorders.
+/// A video datagram that arrived this much before one sent ahead of it shows the report reordered;
+/// `REORDERING_REPORTS` such reports within `REORDERING` (half the reports at 50 ms) show the path
+/// keeps reordering. A burst (a Wi-Fi block-ack timeout, a handover) is not that.
 const REORDERED_US: u64 = 1_000;
+const REORDERING: Duration = Duration::from_secs(1);
+const REORDERING_REPORTS: usize = 10;
 /// The path floor is the least one-way delay over `FLOOR_SPAN_US` of send time, read as the
 /// least of each `DELAY_BUCKET_US`: a delay step ages in within the span.
 const DELAY_BUCKET_US: u64 = 500_000;
@@ -798,10 +802,12 @@ pub(crate) struct Estimator {
     pub(crate) audio_pacing: bool,
     /// Since when every video arrival came off the path floor (`Evidence::arrival`), whether
     /// that is `QUEUE_STANDING` at the last report, and whether it was since the estimate last
-    /// left its delay bound with no report showing the path reorder.
+    /// left its delay bound with the path not reordering (`REORDERING_REPORTS`).
     off_floor: Option<Instant>,
     queue_standing: bool,
     queue_stood: bool,
+    /// When each report within `REORDERING` showed the path reorder.
+    reordered: VecDeque<Instant>,
     /// v2's hold (`HOLD`) and loss floor; off for PyroWave, which has its own controller and no
     /// keyframes to overflow a link.
     holds: bool,
@@ -1028,6 +1034,7 @@ impl Estimator {
             off_floor: None,
             queue_standing: false,
             queue_stood: false,
+            reordered: VecDeque::new(),
             holds: true,
             probes: false,
             logged: (Bound::Ceiling, None),
@@ -1048,8 +1055,8 @@ impl Estimator {
     }
 
     /// `legacy`, with `audio_pacing`, at the delay bound, and the queue stood (every video arrival
-    /// `QUEUE_STANDING` off the floor) since it got there, with no report since showing the path
-    /// reorder. Pacing must not feed what turns it on or keeps it on: paced video goes in small send
+    /// `QUEUE_STANDING` off the floor) since it got there, and the path has not kept reordering
+    /// since (`REORDERING_REPORTS`). Pacing must not feed what turns it on or keeps it on: paced video goes in small send
     /// groups whose reordered arrivals read as overuse, which held the bound at delay (#1692 lab
     /// REORD: 31-36 % of reports unpaced, 72-77 % paced; after a cap lifted it never let go). The
     /// floor is read at the pacer's release and pacing sends in order, so it can raise neither.
@@ -2160,7 +2167,18 @@ impl Estimator {
         self.queue_standing = self
             .off_floor
             .is_some_and(|at| now.saturating_duration_since(at) >= QUEUE_STANDING);
-        self.queue_stood = (self.queue_stood || self.queue_standing) && !reordered;
+        if reordered {
+            self.reordered.push_back(now);
+        }
+        while self
+            .reordered
+            .front()
+            .is_some_and(|&at| now.saturating_duration_since(at) > REORDERING)
+        {
+            self.reordered.pop_front();
+        }
+        self.queue_stood =
+            (self.queue_stood || self.queue_standing) && self.reordered.len() < REORDERING_REPORTS;
         Measured {
             usage: self.trendline.usage,
             rate_kbps,

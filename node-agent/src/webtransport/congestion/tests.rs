@@ -7379,6 +7379,58 @@ fn legacy_pacing_ends_on_a_link_that_reorders_after_a_cap_lifts() {
     );
 }
 
+/// `audio_row` (pacing on) on a path that from `from` seconds holds each datagram `late(next)`
+/// µs longer by its `pkt_seq`, `next` being the first sent from then.
+fn audio_row_late(kbps: f64, from: f64, late: impl FnOnce(u32) -> Box<dyn Fn(u32) -> u64>) -> Sim {
+    let mut s = Sim::lab_hw(true);
+    s.discard_us = Some(DISCARD_US);
+    s.hold_us = 10_000;
+    s.run(30.0);
+    s.cap_kbps = kbps;
+    s.queue_bytes = 1_250_000.0;
+    s.extra_us = Box::new(|_| 20_000);
+    (s.tokens, s.tokens_at) = (15_000.0, s.t);
+    s.run(from - 30.0);
+    s.reorder_us = late(s.pending.back().map_or(0, |p| p.0) + 1);
+    s.run(240.0 - from);
+    s
+}
+
+/// Review r5 S-1: a path that reorders now and then under a steady cap is no path that keeps
+/// reordering. Ended by one reordered report, pacing never came back: the standing queue ages into
+/// the floor within `FLOOR_SPAN_US`, so it never stands again (3cbbba7b: one in 2000 datagrams 3 ms
+/// late, audio p99 91 and 133 ms at 5 and 2 Mbit/s against 17 and 30 in order; three datagrams
+/// 8 ms late at 75 s, unpaced from 76 s to the end).
+#[test]
+fn reordering_now_and_then_under_a_steady_cap_keeps_legacy_paced() {
+    let mut bad = Vec::new();
+    for kbps in [5000.0, 2000.0] {
+        let p99 = |s: &Sim| audio_late_at(s, 45.0, 240.0, 0.99);
+        let in_order = p99(&audio_row_late(kbps, 30.0, |_| Box::new(|_| 0)));
+        let s = audio_row_late(kbps, 30.0, |_| {
+            Box::new(|seq| u64::from(seq % 2000 == 1999) * 3_000)
+        });
+        let burst = audio_row_late(kbps, 75.0, |next| {
+            Box::new(move |seq| u64::from((next..next + 3).contains(&seq)) * 8_000)
+        });
+        eprintln!(
+            "{kbps}: audio p99 in order {in_order} ms, 1 in 2000 3 ms late {} ms, 3 late at 75 s {} ms",
+            p99(&s),
+            p99(&burst)
+        );
+        for (name, s) in [("1 in 2000", &s), ("3 at 75 s", &burst)] {
+            if p99(s) > in_order + 5 || !s.est.legacy_queue() {
+                bad.push(format!(
+                    "{kbps}, {name}: p99 {} ms, in order {in_order}, paced {}",
+                    p99(s),
+                    s.est.legacy_queue()
+                ));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
 /// Review r2 S-1, the production gate: `Control` takes `Rate::audio_pacing` (off for NVENC and VA,
 /// `abr_glue::audio_pacing`, guarded by `audio_pacing_runs_only_where_a_bitrate_write_is_free`) into
 /// its estimator, and only a receiver report's estimate at a standing queue reaches the ABR as one.
