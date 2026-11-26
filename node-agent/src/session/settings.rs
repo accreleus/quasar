@@ -266,6 +266,7 @@ impl RuntimeSettings {
         // Read here so an unrecognised value warns at agent start.
         wt_capacity();
         wt_ref_recovery();
+        wt_audio_pacing();
         Self::baseline_with(&|k| std::env::var(k).ok())
     }
 
@@ -607,6 +608,31 @@ pub fn wt_ref_recovery() -> bool {
     })
 }
 
+/// `QUASAR_WT_AUDIO_PACING` (#1321, `docs/configuration.md`): on by default; `0`, `false` or
+/// `off` puts `QUASAR_WT_CAPACITY=legacy` back to 0.6.4's sender. Anything but those, `1`, `true`,
+/// `on` or empty warns and stays on.
+pub fn parse_wt_audio_pacing(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        None | Some("" | "1" | "true" | "on") => true,
+        Some("0" | "false" | "off") => false,
+        Some(other) => {
+            tracing::warn!(
+                token = "wt-audio-pacing-unrecognised",
+                "QUASAR_WT_AUDIO_PACING={other:?} is not 1|true|on|0|false|off; it stays on"
+            );
+            true
+        }
+    }
+}
+
+/// The agent's `QUASAR_WT_AUDIO_PACING`, read once for the life of the process.
+pub fn wt_audio_pacing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_wt_audio_pacing(std::env::var("QUASAR_WT_AUDIO_PACING").ok().as_deref())
+    })
+}
+
 fn env_bool(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
     matches!(
         lookup(var).as_deref(),
@@ -664,6 +690,24 @@ mod tests {
             (Some("true"), true),
         ] {
             assert_eq!(parse_wt_ref_recovery(raw), want, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn audio_pacing_knob_is_on_unless_turned_off() {
+        for (raw, want) in [
+            (None, true),
+            (Some(""), true),
+            (Some(" on "), true),
+            (Some("1"), true),
+            (Some("true"), true),
+            (Some("OFF"), true),
+            (Some("no"), true),
+            (Some(" off "), false),
+            (Some("0"), false),
+            (Some("false"), false),
+        ] {
+            assert_eq!(parse_wt_audio_pacing(raw), want, "{raw:?}");
         }
     }
 

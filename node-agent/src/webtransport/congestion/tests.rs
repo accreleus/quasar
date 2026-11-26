@@ -1087,7 +1087,7 @@ impl Sim {
                 // `Control::feed` and `abr_glue`'s `Rate::observe`: the share (legacy only), then
                 // the estimate and whether it is legacy's queue bound.
                 abr.set_share(if legacy { self.fec_share } else { 0.0 }, at);
-                abr.set_queue_bound(legacy && self.est.queue_bound());
+                abr.set_queue_bound(self.est.legacy_queue());
                 abr.observe(abr_estimate(kbps, self.fec_share), at);
             }
             let setpoint = self
@@ -5520,7 +5520,7 @@ fn pyrowave_follows_the_capacity_knob_and_never_holds() {
 }
 
 /// `QUASAR_WT_CAPACITY=legacy` (design §4): pacing and audio room only at the delay bound (#1321,
-/// `video_rates`), 0.6.3's reading (the
+/// `video_rates`; none at all with `QUASAR_WT_AUDIO_PACING=off`), 0.6.3's reading (the
 /// estimate or `BETA` × the receive rate, no gap taken out), blackouts counted as loss, and the
 /// window on the smoothed RTT.
 #[test]
@@ -5547,6 +5547,14 @@ fn legacy_capacity_is_the_0_6_3_sender() {
         "legacy at the loss bound"
     );
     est.resume_at(5000.0);
+    est.audio_pacing = false;
+    assert!(!est.legacy_queue(), "audio pacing off: no queue bound");
+    assert_eq!(
+        video_rates(&governor, &est, false),
+        (None, None),
+        "audio pacing off: 0.6.4"
+    );
+    est.audio_pacing = true;
     est.legacy = false;
     assert_eq!(
         video_rates(&governor, &est, false).1,
@@ -7607,9 +7615,11 @@ fn a_lift_into_a_transient_cap_ends_the_hold_no_later_than_the_base() {
 const BASE_ENDED: f64 = 33.1;
 
 /// The 0.6.5 RC audio rows (#1321): the lab relay's `delay 20ms rate <kbps>` with its 1.25 MB FIFO,
-/// from 30 s for 210 s (`None`: clean), under `Sim::lab_hw` on `legacy`.
-fn audio_row(kbps: Option<f64>) -> Sim {
+/// from 30 s for 210 s (`None`: clean), under `Sim::lab_hw` on `legacy` with `QUASAR_WT_AUDIO_PACING`
+/// `pacing`.
+fn audio_row(kbps: Option<f64>, pacing: bool) -> Sim {
     let mut s = Sim::lab_hw(true);
+    s.est.audio_pacing = pacing;
     s.run(30.0);
     if let Some(kbps) = kbps {
         s.cap_kbps = kbps;
@@ -7642,10 +7652,10 @@ fn audio_late_at(s: &Sim, from: f64, to: f64, q: f64) -> u64 {
 /// link's, well under the client's ring (target 79-115 ms clean). 7b5d81e0: 93 and 124 ms, clean 2.
 #[test]
 fn legacy_audio_under_a_rate_cap_stays_near_the_clean_link() {
-    let clean = audio_late_at(&audio_row(None), 45.0, 240.0, 0.99);
+    let clean = audio_late_at(&audio_row(None, true), 45.0, 240.0, 0.99);
     let mut bad = Vec::new();
     for kbps in [5000.0, 2000.0] {
-        let s = audio_row(Some(kbps));
+        let s = audio_row(Some(kbps), true);
         let late = |q| audio_late_at(&s, 45.0, 240.0, q);
         row(&format!("relay {kbps} legacy"), &s, 30.0, 240.0);
         eprintln!(
@@ -7670,4 +7680,24 @@ fn legacy_audio_under_a_rate_cap_stays_near_the_clean_link() {
         bad.is_empty(),
         "(cap, p99 ms) over clean {clean} + 40: {bad:?}"
     );
+}
+
+/// `QUASAR_WT_AUDIO_PACING=off`: legacy is 0.6.4's sender on the audio rows, nothing paced and the
+/// setpoint left inside the deadband, as at 7b5d81e0 (audio p99 93 and 124 ms at 5 and 2 Mbit/s).
+#[test]
+fn audio_pacing_off_is_the_0_6_4_sender_on_the_audio_rows() {
+    for (kbps, want) in [(5000.0, 93), (2000.0, 124)] {
+        let s = audio_row(Some(kbps), false);
+        let late = audio_late_at(&s, 45.0, 240.0, 0.99);
+        let writes = s
+            .setpoints
+            .windows(2)
+            .filter(|w| w[1].0 >= 45.0 && w[1].1 != w[0].1)
+            .count();
+        eprintln!(
+            "relay {kbps} audio pacing off: audio late p99 {late} ms, setpoint writes {writes}"
+        );
+        assert_eq!(late, want, "{kbps}: p99");
+        assert_eq!(writes, 0, "{kbps}: the setpoint moved inside the deadband");
+    }
 }

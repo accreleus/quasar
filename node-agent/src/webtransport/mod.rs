@@ -205,6 +205,7 @@ impl<'a> Control<'a> {
         governor.legacy(legacy);
         let mut estimator = congestion::Estimator::new(rate.ceiling_kbps, now);
         estimator.legacy = legacy;
+        estimator.audio_pacing = crate::session::settings::wt_audio_pacing();
         estimator.probes = fec && !legacy;
         Self {
             rate,
@@ -324,7 +325,7 @@ impl<'a> Control<'a> {
         } else {
             0.0
         };
-        let queue = self.estimator.legacy && self.estimator.queue_bound();
+        let queue = self.estimator.legacy_queue();
         (self.rate.observe)(congestion::abr_estimate(kbps, self.charged), bound, queue);
     }
 

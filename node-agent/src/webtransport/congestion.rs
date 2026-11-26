@@ -788,6 +788,9 @@ pub(crate) struct Estimator {
     evidence: Evidence,
     /// `QUASAR_WT_CAPACITY=legacy`: 0.6.3's reading, and no blackouts.
     pub(crate) legacy: bool,
+    /// `QUASAR_WT_AUDIO_PACING` (#1321): off, `legacy` is 0.6.4's sender ([`Self::legacy_queue`]
+    /// is never true). No effect under v2.
+    pub(crate) audio_pacing: bool,
     /// v2's hold (`HOLD`) and loss floor; off for PyroWave, which has its own controller and no
     /// keyframes to overflow a link.
     holds: bool,
@@ -1010,6 +1013,7 @@ impl Estimator {
             reported_to: None,
             evidence: Evidence::default(),
             legacy: false,
+            audio_pacing: true,
             holds: true,
             probes: false,
             logged: (Bound::Ceiling, None),
@@ -1029,9 +1033,10 @@ impl Estimator {
         (self.bound != Bound::Ceiling || self.held.is_some()) && self.recover_to.is_none()
     }
 
-    /// The estimate sits at the delay bound: the link queues what the sender sends over it.
-    pub(crate) fn queue_bound(&self) -> bool {
-        self.bound == Bound::Delay
+    /// `legacy`, with `audio_pacing`, and the estimate sits at the delay bound: the link queues
+    /// what the sender sends over it.
+    pub(crate) fn legacy_queue(&self) -> bool {
+        self.legacy && self.audio_pacing && self.bound == Bound::Delay
     }
 
     /// A lossy run is on, or ended under `LOSS_WINDOW` ago: the keyframe the client asks for after
@@ -2656,7 +2661,7 @@ pub(crate) fn video_rates(
     estimator: &Estimator,
     pyrowave: bool,
 ) -> (Option<u64>, Option<u64>) {
-    if pyrowave || !governor.governs() || estimator.legacy && !estimator.queue_bound() {
+    if pyrowave || !governor.governs() || estimator.legacy && !estimator.legacy_queue() {
         return (None, None);
     }
     let room = (governor.kbps() as f64).min(estimator.estimate_kbps()) as u64;
