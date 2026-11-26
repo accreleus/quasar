@@ -329,7 +329,7 @@ impl<'a> Control<'a> {
         } else {
             0.0
         };
-        let queue = report && self.estimator.legacy_queue() && self.estimator.queue_standing();
+        let queue = report && self.estimator.follows_queue();
         (self.rate.observe)(congestion::abr_estimate(kbps, self.charged), bound, queue);
     }
 
@@ -1583,7 +1583,7 @@ fn feed(
     backlog.paced = rates.0.is_some();
     video.on_hold = control
         .as_ref()
-        .is_some_and(|c| !pyrowave && c.estimator.drop_held());
+        .is_some_and(|c| !pyrowave && c.estimator.pace_waits());
     let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
     let now = std::time::Instant::now();
     video.recovering = control

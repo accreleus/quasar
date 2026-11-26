@@ -155,6 +155,8 @@ struct Sim {
     discarded: u32,
     /// (seconds, µs an audio datagram took over the path's base delay), per audio datagram sent.
     audio_late: Vec<(f64, u64)>,
+    /// (seconds, the estimate is at its delay bound) after each message.
+    delay_bound: Vec<(f64, bool)>,
 }
 
 /// The browser's reassembly (`web/src/webtransport/reassembly.ts`) and decoder, simulated: a
@@ -188,6 +190,8 @@ struct Client {
     freezes: Vec<f64>,
     /// The longest time between two frames shown, µs, and when it ended.
     longest: (u64, u64),
+    /// When each frame was shown, µs.
+    shown_at: Vec<u64>,
 }
 
 /// A keyframe's size in average frames at the encoder's rate; the lab rows also run at 10 × and
@@ -297,6 +301,7 @@ impl Client {
                 self.longest = (at.max(l) - l, at);
             }
             self.shown = Some(self.shown.map_or(at, |l| at.max(l)));
+            self.shown_at.extend(self.shown);
         }
         let due = match (self.waiting, self.asked) {
             (None, _) => false,
@@ -426,6 +431,7 @@ impl Sim {
             in_air: VecDeque::new(),
             discarded: 0,
             audio_late: Vec::new(),
+            delay_bound: Vec::new(),
         }
     }
 
@@ -816,7 +822,7 @@ impl Sim {
         if let Some(guard) = self.guard.as_mut() {
             guard.paced = rates.0.is_some();
         }
-        quic.video.on_hold = self.est.drop_held();
+        quic.video.on_hold = self.est.pace_waits();
         let at = self.start + Duration::from_micros(self.t);
         quic.video.recovering = self.est.recovering(at);
         // A `nack` answer as production's: admitted by the stall guard, then ahead of held video.
@@ -1087,7 +1093,7 @@ impl Sim {
                 // `Control::feed` and `abr_glue`'s `Rate::observe`: the share (legacy only), then
                 // the estimate and whether it is legacy's queue bound.
                 abr.set_share(if legacy { self.fec_share } else { 0.0 }, at);
-                abr.set_queue_bound(self.est.legacy_queue() && self.est.queue_standing());
+                abr.set_queue_bound(self.est.follows_queue());
                 abr.observe(abr_estimate(kbps, self.fec_share), at);
             }
             let setpoint = self
@@ -1106,6 +1112,8 @@ impl Sim {
         self.loss_bounds
             .push((now as f64 / 1e6, self.est.loss_kbps));
         self.lines.push((now as f64 / 1e6, self.est.held_kbps()));
+        self.delay_bound
+            .push((now as f64 / 1e6, self.est.bound == Bound::Delay));
         self.probes.push((now as f64 / 1e6, self.est.probe_kbps()));
         if let Some(abr) = self.abr.as_ref() {
             self.setpoints.push((now as f64 / 1e6, abr.setpoint_kbps()));
@@ -5537,8 +5545,26 @@ fn legacy_capacity_is_the_0_6_3_sender() {
     est.resume_at(5000.0);
     assert_eq!(
         video_rates(&governor, &est, false),
+        (None, None),
+        "legacy at the delay bound, no queue stood: reordering is not queueing"
+    );
+    est.queue_standing = true;
+    est.queue_stood = true;
+    assert_eq!(
+        video_rates(&governor, &est, false),
         (Some(5000), Some(5000)),
-        "legacy at the delay bound"
+        "legacy at the delay bound, the queue standing"
+    );
+    assert!(est.follows_queue());
+    est.queue_standing = false;
+    assert_eq!(
+        video_rates(&governor, &est, false).1,
+        Some(5000),
+        "paced while the bound stays at delay"
+    );
+    assert!(
+        !est.follows_queue(),
+        "the setpoint follows only a standing queue"
     );
     est.loss_kbps = 4000.0;
     est.settle();
@@ -5547,7 +5573,14 @@ fn legacy_capacity_is_the_0_6_3_sender() {
         (None, None),
         "legacy at the loss bound"
     );
+    est.loss_kbps = 6000.0;
+    est.settle();
+    assert!(
+        !est.legacy_queue(),
+        "back at the delay bound: the queue must stand again"
+    );
     est.resume_at(5000.0);
+    est.queue_stood = true;
     est.audio_pacing = false;
     assert!(!est.legacy_queue(), "audio pacing off: no queue bound");
     assert_eq!(
@@ -7218,12 +7251,18 @@ fn an_encoder_burst_over_a_policer_does_not_renew_the_wifi_memory() {
 /// discarding a datagram that arrives over `DISCARD_US` after a later one, then clean for 60 s.
 /// `audio_pacing`: legacy's `Rate::audio_pacing` (no effect on v2).
 fn reorder_row(legacy: bool, spread_ms: u64, audio_pacing: bool) -> Sim {
+    reorder_row_seeded(legacy, spread_ms, audio_pacing, 0)
+}
+
+/// `reorder_row` with each datagram's delay drawn by `seed`.
+fn reorder_row_seeded(legacy: bool, spread_ms: u64, audio_pacing: bool, seed: u64) -> Sim {
     let mut s = Sim::lab_hw(legacy);
     s.est.audio_pacing = audio_pacing;
     s.discard_us = Some(DISCARD_US);
     s.run(30.0);
     let span = 2 * spread_ms * 1000;
-    s.reorder_us = Box::new(move |seq| u64::from(seq).wrapping_mul(2_654_435_761) % span);
+    s.reorder_us =
+        Box::new(move |seq| (u64::from(seq) + seed * 1_000_003).wrapping_mul(2_654_435_761) % span);
     s.hold_us = span + 5_000;
     s.run(180.0);
     s.reorder_us = Box::new(|_| 0);
@@ -7245,8 +7284,7 @@ const DISCARD_US: u64 = 12_000;
 fn a_link_that_reorders_does_not_sit_at_360p() {
     let mut bad = Vec::new();
     for spread in [5, 10, 20] {
-        // Legacy as 0.6.4 (audio pacing off), the sender `DISCARD_US` was calibrated on: with it on
-        // (#1321) legacy froze 9 times at 20 ms, 0.6.4 20.
+        // Legacy as 0.6.4 (audio pacing off), the sender `DISCARD_US` was calibrated on.
         let a = reorder_row(true, spread, false);
         let (a_n, ..) = row(&format!("reorder {spread} ms legacy"), &a, 30.0, 210.0);
         let s = reorder_row(false, spread, true);
@@ -7265,6 +7303,80 @@ fn a_link_that_reorders_does_not_sit_at_360p() {
         }
     }
     assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// #1692 lab REORD (`delay 10ms 10ms`, AMD lab host): on a link that reorders and queues nothing the
+/// default sender is 0.6.4's, seed for seed. a9bd8d45 paced at the delay bound alone, and paced video
+/// in small send groups reads reordering as overuse, which kept it there: delay-bound 81-100 % of
+/// reports against 39-77 %, frames presented at sd 15.7-16.9 ms against 9.5-10.0 (lab: 72-77 % against
+/// 31-36 %, present sd 8.8-10.3 ms against 4.3-4.9).
+#[test]
+fn legacy_on_a_link_that_reorders_is_the_0_6_4_sender() {
+    for seed in 0..4 {
+        let (on, off) = (
+            reorder_row_seeded(true, 10, true, seed),
+            reorder_row_seeded(true, 10, false, seed),
+        );
+        let summary = |s: &Sim| {
+            let (n, _, back) = row(&format!("reorder seed {seed}"), s, 30.0, 210.0);
+            (
+                n,
+                back,
+                presented(s, 60.0, 210.0),
+                delay_bound_share(s, 60.0, 210.0),
+            )
+        };
+        assert_eq!(
+            summary(&on),
+            summary(&off),
+            "seed {seed}: (freezes, back, (sd, fps), delay-bound)"
+        );
+    }
+}
+
+/// Review r2 S-1, the production gate: `Control` takes `Rate::audio_pacing` (off for NVENC and VA,
+/// `abr_glue::audio_pacing`, guarded by `audio_pacing_runs_only_where_a_bitrate_write_is_free`) into
+/// its estimator, and only a receiver report's estimate at a standing queue reaches the ABR as one.
+#[test]
+fn control_feeds_legacys_queue_bound_only_with_audio_pacing() {
+    use crate::session::settings::WtCapacity;
+    use std::sync::{Arc, Mutex, OnceLock};
+    for pacing in [true, false] {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let fed = seen.clone();
+        let rate = super::super::Rate {
+            measured: Box::new(|_| {}),
+            ceiling_kbps: CEILING,
+            floor_kbps: Box::new(|| 1000.0),
+            setpoint_kbps: Box::new(|| 5000.0),
+            capacity: WtCapacity::Legacy,
+            audio_pacing: pacing,
+            retargets: true,
+            start: Box::new(|| {}),
+            owns: Box::new(|| false),
+            displaced: Box::new(|| {}),
+            observe: Box::new(move |_, _, queue| fed.lock().unwrap().push(queue)),
+            held: Box::new(|_| {}),
+            fec: Box::new(|_| {}),
+        };
+        let governor = Governor::default();
+        governor.govern(5000.0);
+        let mut c = super::super::Control::new(&rate, Arc::new(OnceLock::new()), false, governor);
+        c.estimator.resume_at(5000.0);
+        (c.estimator.queue_standing, c.estimator.queue_stood) = (true, true);
+        c.feed(5000.0, true);
+        c.feed(5000.0, false);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [pacing, false],
+            "pacing {pacing}: report, silence"
+        );
+        assert_eq!(
+            video_rates(&c.governor, &c.estimator, false).1.is_some(),
+            pacing,
+            "pacing {pacing}: paced"
+        );
+    }
 }
 
 /// CAP: the lab's `tbf rate 5mbit burst 15kb latency 500ms` behind a 20 ms delay, for 60 s.
@@ -7655,11 +7767,13 @@ fn audio_late_at(s: &Sim, from: f64, to: f64, q: f64) -> u64 {
 /// over a delay-bound estimate inside the deadband (#1503); 34-832 underruns a minute against 0-0.3
 /// clean. From onset + 15 s an audio datagram's lateness at its p99 stays within 40 ms of the clean
 /// link's, well under the client's ring (target 79-115 ms clean). 7b5d81e0: 93 and 124 ms, clean 2.
+/// Around 2 Mbit/s too: a9bd8d45 passed at 2000 by the phase of its keyframes, 87 ms at 1800 and
+/// 2100 (`Estimator::pace_waits`).
 #[test]
 fn legacy_audio_under_a_rate_cap_stays_near_the_clean_link() {
     let clean = audio_late_at(&audio_row(None, true), 45.0, 240.0, 0.99);
     let mut bad = Vec::new();
-    for kbps in [5000.0, 2000.0] {
+    for kbps in [5000.0, 1800.0, 2000.0, 2200.0] {
         let s = audio_row(Some(kbps), true);
         let late = |q| audio_late_at(&s, 45.0, 240.0, q);
         row(&format!("relay {kbps} legacy"), &s, 30.0, 240.0);
@@ -7709,7 +7823,7 @@ fn audio_pacing_off_is_the_0_6_4_sender_on_the_audio_rows() {
 
 /// Review round 3 (S1, #68): on a clean link with a 110 ms delay spike every 7 s (`jitter`) the
 /// default sender moves the setpoint no more than 0.6.4 does: never. A spike's queue drains in
-/// under 0.5 s, so it never stands (`Estimator::queue_standing`). a6b8def0: 77 writes, down to 7246.
+/// under 0.5 s, so it never stands (`Estimator::legacy_queue`). a6b8def0: 77 writes, down to 7246.
 #[test]
 fn legacy_delay_spikes_on_a_clean_link_move_no_setpoint() {
     let run = |pacing: bool| {
@@ -7729,4 +7843,41 @@ fn legacy_delay_spikes_on_a_clean_link_move_no_setpoint() {
     let (off, on) = (run(false), run(true));
     eprintln!("delay spikes: (writes, lowest setpoint) off {off:?}, on {on:?}");
     assert_eq!(on, off);
+}
+
+/// Per second from `from` to `to`: the sd of the intervals between frames shown (ms) and the frames
+/// shown; each at its p50.
+fn presented(s: &Sim, from: f64, to: f64) -> (f64, f64) {
+    let shown = &s.client.as_ref().unwrap().shown_at;
+    let (mut sds, mut fps) = (Vec::new(), Vec::new());
+    let mut sec = from;
+    while sec + 1.0 <= to {
+        let (lo, hi) = ((sec * 1e6) as u64, ((sec + 1.0) * 1e6) as u64);
+        let gaps: Vec<f64> = shown
+            .windows(2)
+            .filter(|w| (lo..hi).contains(&w[1]))
+            .map(|w| (w[1] - w[0]) as f64 / 1000.0)
+            .collect();
+        let n = gaps.len().max(1) as f64;
+        let mean = gaps.iter().sum::<f64>() / n;
+        sds.push((gaps.iter().map(|g| (g - mean).powi(2)).sum::<f64>() / n).sqrt());
+        fps.push(gaps.len() as f64);
+        sec += 1.0;
+    }
+    let p50 = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v.get(v.len() / 2).copied().unwrap_or(0.0)
+    };
+    (p50(sds), p50(fps))
+}
+
+/// The share of reports from `from` to `to` that left the estimate at its delay bound.
+fn delay_bound_share(s: &Sim, from: f64, to: f64) -> f64 {
+    let at: Vec<bool> = s
+        .delay_bound
+        .iter()
+        .filter(|&&(t, _)| (from..to).contains(&t))
+        .map(|&(_, d)| d)
+        .collect();
+    at.iter().filter(|&&d| d).count() as f64 / at.len().max(1) as f64
 }

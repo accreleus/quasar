@@ -487,7 +487,7 @@ impl Governor {
     }
 
     /// WebTransport `QUASAR_WT_CAPACITY=legacy`: the estimates fed next are its delay bound while
-    /// the link's queue stands (`webtransport::congestion::Estimator::queue_standing`). A setpoint
+    /// the link's queue stands (`webtransport::congestion::Estimator::follows_queue`). A setpoint
     /// over one follows it down (`observe_per_report`): its readings inside the deadband are none,
     /// so nothing else lowers it, and the queue it keeps standing holds the audio behind it
     /// (#1503, #1321: 10-16 % over, 1.8-4.8 s of queue on the AMD lab host). Never on a loss bound
