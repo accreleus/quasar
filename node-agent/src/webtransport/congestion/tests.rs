@@ -7334,6 +7334,51 @@ fn legacy_on_a_link_that_reorders_is_the_0_6_4_sender() {
     }
 }
 
+/// Review r4 M-1: 3 Mbit/s behind a 1.25 MB FIFO from 30 s, then from 90 s a clean link that
+/// reorders each datagram 0 to 2 × `spread_ms`, as `reorder_row`.
+fn cap_then_reorder(spread_ms: u64, pacing: bool) -> Sim {
+    let mut s = Sim::lab_hw(true);
+    s.est.audio_pacing = pacing;
+    s.discard_us = Some(DISCARD_US);
+    s.run(30.0);
+    s.cap_kbps = 3000.0;
+    s.queue_bytes = 1_250_000.0;
+    s.extra_us = Box::new(|_| 20_000);
+    (s.tokens, s.tokens_at) = (15_000.0, s.t);
+    s.run(60.0);
+    s.clear();
+    let span = 2 * spread_ms * 1000;
+    s.reorder_us = Box::new(move |seq| u64::from(seq).wrapping_mul(2_654_435_761) % span);
+    s.hold_us = span + 5_000;
+    s.run(180.0);
+    s
+}
+
+/// Review r4 M-1: once a cap had let the queue stand, paced video on a link that reorders kept the
+/// bound at delay and with it the pacing, after the cap lifted too (16538061: paced to the end at
+/// 2445 kbit/s, 0.6.4 back at 8000). A report that shows the path reorder ends legacy's pacing: at
+/// 5 ms the default sender is 0.6.4's after the lift, at 10 ms nothing is paced by the end (both
+/// sit near 500 kbit/s in Chrome's discards there, and their freezes go either way by cap and seed).
+#[test]
+fn legacy_pacing_ends_on_a_link_that_reorders_after_a_cap_lifts() {
+    let summary = |s: &Sim| {
+        let freezes = s.client.as_ref().unwrap().freezes();
+        (
+            freezes.iter().filter(|&&t| t >= 120.0).count(),
+            (presented(s, 120.0, 270.0).0 * 10.0).round() / 10.0,
+            s.setpoints.last().map(|p| p.1),
+            s.est.legacy_queue(),
+        )
+    };
+    let on = summary(&cap_then_reorder(5, true));
+    eprintln!("5 ms, from 120 s (freezes, sd, setpoint, paced): {on:?}");
+    assert_eq!(on, summary(&cap_then_reorder(5, false)), "5 ms");
+    assert!(
+        !cap_then_reorder(10, true).est.legacy_queue(),
+        "10 ms: paced"
+    );
+}
+
 /// Review r2 S-1, the production gate: `Control` takes `Rate::audio_pacing` (off for NVENC and VA,
 /// `abr_glue::audio_pacing`, guarded by `audio_pacing_runs_only_where_a_bitrate_write_is_free`) into
 /// its estimator, and only a receiver report's estimate at a standing queue reaches the ABR as one.

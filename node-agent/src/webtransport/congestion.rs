@@ -57,6 +57,8 @@ const AT_FLOOR_MS: f64 = 30.0;
 /// `Estimator::legacy_queue`: off the floor this long. A 110 ms delay spike is off it for about
 /// 0.4 s.
 const QUEUE_STANDING: Duration = Duration::from_secs(1);
+/// A video datagram that arrived this much before one sent ahead of it: the path reorders.
+const REORDERED_US: u64 = 1_000;
 /// The path floor is the least one-way delay over `FLOOR_SPAN_US` of send time, read as the
 /// least of each `DELAY_BUCKET_US`: a delay step ages in within the span.
 const DELAY_BUCKET_US: u64 = 500_000;
@@ -796,7 +798,7 @@ pub(crate) struct Estimator {
     pub(crate) audio_pacing: bool,
     /// Since when every video arrival came off the path floor (`Evidence::arrival`), whether
     /// that is `QUEUE_STANDING` at the last report, and whether it was since the estimate last
-    /// left its delay bound.
+    /// left its delay bound with no report showing the path reorder.
     off_floor: Option<Instant>,
     queue_standing: bool,
     queue_stood: bool,
@@ -1046,10 +1048,11 @@ impl Estimator {
     }
 
     /// `legacy`, with `audio_pacing`, at the delay bound, and the queue stood (every video arrival
-    /// `QUEUE_STANDING` off the floor) since it got there: the link is short, not spiking nor
-    /// reordering. Never the bound alone: paced video goes in small send groups whose reordered
-    /// arrivals read as overuse, which kept the bound at delay (#1692 lab REORD: 31-36 % of reports
-    /// unpaced, 72-77 % paced). The floor is read at the pacer's release, so pacing cannot raise it.
+    /// `QUEUE_STANDING` off the floor) since it got there, with no report since showing the path
+    /// reorder. Pacing must not feed what turns it on or keeps it on: paced video goes in small send
+    /// groups whose reordered arrivals read as overuse, which held the bound at delay (#1692 lab
+    /// REORD: 31-36 % of reports unpaced, 72-77 % paced; after a cap lifted it never let go). The
+    /// floor is read at the pacer's release and pacing sends in order, so it can raise neither.
     pub(crate) fn legacy_queue(&self) -> bool {
         self.legacy && self.audio_pacing && self.bound == Bound::Delay && self.queue_stood
     }
@@ -1972,6 +1975,7 @@ impl Estimator {
         // (received, lost) video and policy FEC datagrams.
         let mut video = (0i64, lost);
         let mut newest_fresh = None;
+        let mut reordered = false;
         for (i, &arrival) in fb.arrivals.iter().enumerate() {
             let seq = fb.first_pkt_seq.wrapping_add(i as u32);
             let Some(slot) = log.slot(seq) else {
@@ -2034,6 +2038,7 @@ impl Estimator {
                     {
                         self.trendline.update(send_d, arrival_d, arrival_ms);
                     }
+                    reordered |= !resend && newest_fresh.is_some_and(|n| at + REORDERED_US < n);
                     let at_floor = self.evidence.arrival(sent_us, at);
                     video.1 += self.end_run(log, Some(at_floor), now);
                     self.evidence.at_floor = at_floor;
@@ -2155,7 +2160,7 @@ impl Estimator {
         self.queue_standing = self
             .off_floor
             .is_some_and(|at| now.saturating_duration_since(at) >= QUEUE_STANDING);
-        self.queue_stood |= self.queue_standing;
+        self.queue_stood = (self.queue_stood || self.queue_standing) && !reordered;
         Measured {
             usage: self.trendline.usage,
             rate_kbps,
