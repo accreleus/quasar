@@ -1087,7 +1087,7 @@ impl Sim {
                 // `Control::feed` and `abr_glue`'s `Rate::observe`: the share (legacy only), then
                 // the estimate and whether it is legacy's queue bound.
                 abr.set_share(if legacy { self.fec_share } else { 0.0 }, at);
-                abr.set_queue_bound(self.est.legacy_queue());
+                abr.set_queue_bound(self.est.legacy_queue() && self.est.queue_standing());
                 abr.observe(abr_estimate(kbps, self.fec_share), at);
             }
             let setpoint = self
@@ -5533,6 +5533,7 @@ fn legacy_capacity_is_the_0_6_3_sender() {
     let governor = Governor::default();
     governor.govern(5000.0);
     let mut est = legacy();
+    // `resume_at` sets both bounds to 5000; `settle` keeps the first, the delay bound.
     est.resume_at(5000.0);
     assert_eq!(
         video_rates(&governor, &est, false),
@@ -7215,8 +7216,10 @@ fn an_encoder_burst_over_a_policer_does_not_renew_the_wifi_memory() {
 /// A lab row on a clean 50 Mbit/s link that reorders from 30 s for 180 s: each datagram delayed
 /// 0 to 2 × `spread_ms` more (the lab's `delay 10ms 10ms`-style shape, #1446), and Chrome's QUIC
 /// discarding a datagram that arrives over `DISCARD_US` after a later one, then clean for 60 s.
-fn reorder_row(legacy: bool, spread_ms: u64) -> Sim {
+/// `audio_pacing`: legacy's `Rate::audio_pacing` (no effect on v2).
+fn reorder_row(legacy: bool, spread_ms: u64, audio_pacing: bool) -> Sim {
     let mut s = Sim::lab_hw(legacy);
+    s.est.audio_pacing = audio_pacing;
     s.discard_us = Some(DISCARD_US);
     s.run(30.0);
     let span = 2 * spread_ms * 1000;
@@ -7242,9 +7245,11 @@ const DISCARD_US: u64 = 12_000;
 fn a_link_that_reorders_does_not_sit_at_360p() {
     let mut bad = Vec::new();
     for spread in [5, 10, 20] {
-        let a = reorder_row(true, spread);
+        // Legacy as 0.6.4 (audio pacing off), the sender `DISCARD_US` was calibrated on: with it on
+        // (#1321) legacy froze 9 times at 20 ms, 0.6.4 20.
+        let a = reorder_row(true, spread, false);
         let (a_n, ..) = row(&format!("reorder {spread} ms legacy"), &a, 30.0, 210.0);
-        let s = reorder_row(false, spread);
+        let s = reorder_row(false, spread, true);
         let (n, under, _) = row(&format!("reorder {spread} ms v2"), &s, 30.0, 210.0);
         let (at_360, a_360) = (time_at(&s, 4, 30.0, 210.0), time_at(&a, 4, 30.0, 210.0));
         eprintln!(
@@ -7291,7 +7296,7 @@ fn after_a_shape_clears_v2_is_back_at_1080p_as_soon_as_legacy() {
             "R3" => lab_hw_row(legacy, shallow, 60.0),
             "R4" => lab_hw_row(legacy, policer, 60.0),
             "CAP" => cap_row(legacy),
-            _ => reorder_row(legacy, 10),
+            _ => reorder_row(legacy, 10, true),
         };
         let to = if name == "CAP" { 90.0 } else { 210.0 };
         let (a_n, _, a_back) = row(&format!("{name} legacy"), &run(true), 30.0, to);
@@ -7700,4 +7705,28 @@ fn audio_pacing_off_is_the_0_6_4_sender_on_the_audio_rows() {
         assert_eq!(late, want, "{kbps}: p99");
         assert_eq!(writes, 0, "{kbps}: the setpoint moved inside the deadband");
     }
+}
+
+/// Review round 3 (S1, #68): on a clean link with a 110 ms delay spike every 7 s (`jitter`) the
+/// default sender moves the setpoint no more than 0.6.4 does: never. A spike's queue drains in
+/// under 0.5 s, so it never stands (`Estimator::queue_standing`). a6b8def0: 77 writes, down to 7246.
+#[test]
+fn legacy_delay_spikes_on_a_clean_link_move_no_setpoint() {
+    let run = |pacing: bool| {
+        let mut s = Sim::lab_hw(true);
+        s.est.audio_pacing = pacing;
+        s.extra_us = jitter(110);
+        s.run(240.0);
+        let after: Vec<u32> = s
+            .setpoints
+            .iter()
+            .filter(|&&(t, _)| t >= 5.0)
+            .map(|&(_, sp)| sp)
+            .collect();
+        let writes = after.windows(2).filter(|w| w[1] != w[0]).count();
+        (writes, after.iter().copied().min().unwrap_or(0))
+    };
+    let (off, on) = (run(false), run(true));
+    eprintln!("delay spikes: (writes, lowest setpoint) off {off:?}, on {on:?}");
+    assert_eq!(on, off);
 }

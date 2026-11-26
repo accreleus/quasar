@@ -54,6 +54,9 @@ const BLACKOUT_MIN_DATAGRAMS: usize = 4;
 const RUN_MAX_WAIT: Duration = Duration::from_millis(500);
 /// An arrival under this much one-way delay over the path floor is at the floor.
 const AT_FLOOR_MS: f64 = 30.0;
+/// `Estimator::queue_standing`: off the floor this long. A 110 ms delay spike is off it for about
+/// 0.4 s.
+const QUEUE_STANDING: Duration = Duration::from_secs(1);
 /// The path floor is the least one-way delay over `FLOOR_SPAN_US` of send time, read as the
 /// least of each `DELAY_BUCKET_US`: a delay step ages in within the span.
 const DELAY_BUCKET_US: u64 = 500_000;
@@ -788,9 +791,13 @@ pub(crate) struct Estimator {
     evidence: Evidence,
     /// `QUASAR_WT_CAPACITY=legacy`: 0.6.3's reading, and no blackouts.
     pub(crate) legacy: bool,
-    /// `QUASAR_WT_AUDIO_PACING` (#1321): off, `legacy` is 0.6.4's sender ([`Self::legacy_queue`]
-    /// is never true). No effect under v2.
+    /// `webtransport::Rate::audio_pacing` (#1321): off, `legacy` is 0.6.4's sender
+    /// ([`Self::legacy_queue`] is never true). No effect under v2.
     pub(crate) audio_pacing: bool,
+    /// Since when every video arrival came off the path floor (`Evidence::arrival`), and whether
+    /// that is `QUEUE_STANDING` at the last report.
+    off_floor: Option<Instant>,
+    queue_standing: bool,
     /// v2's hold (`HOLD`) and loss floor; off for PyroWave, which has its own controller and no
     /// keyframes to overflow a link.
     holds: bool,
@@ -1014,6 +1021,8 @@ impl Estimator {
             evidence: Evidence::default(),
             legacy: false,
             audio_pacing: true,
+            off_floor: None,
+            queue_standing: false,
             holds: true,
             probes: false,
             logged: (Bound::Ceiling, None),
@@ -1037,6 +1046,12 @@ impl Estimator {
     /// what the sender sends over it.
     pub(crate) fn legacy_queue(&self) -> bool {
         self.legacy && self.audio_pacing && self.bound == Bound::Delay
+    }
+
+    /// Every video arrival for `QUEUE_STANDING` came over `AT_FLOOR_MS` above the path floor: the
+    /// link's queue stands, so the link is short of what is sent, not a delay spike.
+    pub(crate) fn queue_standing(&self) -> bool {
+        self.queue_standing
     }
 
     /// A lossy run is on, or ended under `LOSS_WINDOW` ago: the keyframe the client asks for after
@@ -2004,6 +2019,10 @@ impl Estimator {
                     let at_floor = self.evidence.arrival(sent_us, at);
                     video.1 += self.end_run(log, Some(at_floor), now);
                     self.evidence.at_floor = at_floor;
+                    match at_floor {
+                        true => self.off_floor = None,
+                        false => drop(self.off_floor.get_or_insert(now)),
+                    }
                 }
             }
             if let (false, Some(at)) = (resend, at_us) {
@@ -2114,6 +2133,9 @@ impl Estimator {
         let (r, l) = (r.max(0), l.max(0));
         let loss = (r + l >= LOSS_MIN_SAMPLES).then(|| l as f64 / (r + l) as f64);
 
+        self.queue_standing = self
+            .off_floor
+            .is_some_and(|at| now.saturating_duration_since(at) >= QUEUE_STANDING);
         Measured {
             usage: self.trendline.usage,
             rate_kbps,

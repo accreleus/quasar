@@ -473,6 +473,12 @@ fn report_write_gap(
     }
 }
 
+/// `webtransport::Rate::audio_pacing`: `QUASAR_WT_AUDIO_PACING`, where a bitrate write is free.
+fn audio_pacing(encoder: EncoderChoice) -> bool {
+    crate::session::settings::wt_audio_pacing()
+        && report_write_gap(encoder, std::time::Duration::ZERO).is_zero()
+}
+
 /// Whether `encoder` accepts the live writes a retarget needs (bitrate, plus the
 /// single-frame VBV/CPB cap on hardware). AS-00: a retarget that cannot also retune CPB
 /// must not be applied, so a missing or read-only property disarms the governor and the
@@ -1679,6 +1685,7 @@ fn feedback_abr_armed(
                 f64::from(setpoint_loop.governor.lock().unwrap().setpoint_kbps())
             }),
             capacity: crate::session::settings::wt_capacity(),
+            audio_pacing: audio_pacing(cfg.encoder),
             retargets: mode != AbrMode::Off,
             // Each client starts afresh: it takes the encoder over (a WebRTC peer that started
             // since owns it until then) and registers new hooks.
@@ -2714,6 +2721,20 @@ mod tests {
         (client.measured)(None);
         (client.observe)(11_000.0, 0.0, true);
         assert_eq!(bitrate(), 11_000, "the queue bound");
+    }
+
+    /// #1321 review round 3: legacy's audio pacing runs only where a bitrate write is free; on
+    /// NVENC and VA each write costs a keyframe (`report_write_gap`).
+    #[test]
+    fn audio_pacing_runs_only_where_a_bitrate_write_is_free() {
+        for (encoder, want) in [
+            (EncoderChoice::Vulkan, true),
+            (EncoderChoice::Openh264, true),
+            (EncoderChoice::Nvenc, false),
+            (EncoderChoice::Va, false),
+        ] {
+            assert_eq!(audio_pacing(encoder), want, "{encoder:?}");
+        }
     }
 
     // ---- the re-take's two windows (#1295) ----

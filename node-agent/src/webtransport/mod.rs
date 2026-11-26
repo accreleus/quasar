@@ -129,6 +129,10 @@ pub(crate) struct Rate {
     pub(crate) setpoint_kbps: Box<dyn Fn() -> f64 + Send + Sync>,
     /// `QUASAR_WT_CAPACITY`: v2, or 0.6.3's sender and reading (`legacy`).
     pub(crate) capacity: crate::session::settings::WtCapacity,
+    /// Legacy paces video and lets the setpoint follow a standing queue (#1321): on with
+    /// `QUASAR_WT_AUDIO_PACING`, and only where a bitrate write is free (no write gap): on NVENC
+    /// and VA each write costs a keyframe, so there legacy stays 0.6.4's sender.
+    pub(crate) audio_pacing: bool,
     /// False with the ABR off: the estimate is tracked and never written to the encoder,
     /// so nothing would pay for FEC.
     pub(crate) retargets: bool,
@@ -205,7 +209,7 @@ impl<'a> Control<'a> {
         governor.legacy(legacy);
         let mut estimator = congestion::Estimator::new(rate.ceiling_kbps, now);
         estimator.legacy = legacy;
-        estimator.audio_pacing = crate::session::settings::wt_audio_pacing();
+        estimator.audio_pacing = rate.audio_pacing;
         estimator.probes = fec && !legacy;
         Self {
             rate,
@@ -325,7 +329,7 @@ impl<'a> Control<'a> {
         } else {
             0.0
         };
-        let queue = self.estimator.legacy_queue();
+        let queue = report && self.estimator.legacy_queue() && self.estimator.queue_standing();
         (self.rate.observe)(congestion::abr_estimate(kbps, self.charged), bound, queue);
     }
 
