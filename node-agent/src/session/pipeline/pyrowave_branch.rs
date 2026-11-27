@@ -258,6 +258,19 @@ pub(crate) fn tag_caps_with_source_colorimetry(pad: &gst::Pad) {
         }
         gst::PadProbeReturn::Ok
     });
+    // An interpipesrc sends its caps before the source has negotiated when it starts first,
+    // and never again: by the first buffer the source has, so ask once more (#1227).
+    pad.add_probe(gst::PadProbeType::BUFFER, |pad, _| {
+        let untagged = pad
+            .current_caps()
+            .filter(|c| c.structure(0).is_some_and(|s| !s.has_field("colorimetry")));
+        if let Some(caps) = untagged {
+            if let Some(c) = source_colorimetry(pad) {
+                pad.push_event(gst::event::Caps::new(&with_colorimetry(caps, Some(c))));
+            }
+        }
+        gst::PadProbeReturn::Remove
+    });
 }
 
 /// `caps` with the source's colorimetry, when it said one.
