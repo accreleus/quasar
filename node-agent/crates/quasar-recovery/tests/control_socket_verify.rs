@@ -54,7 +54,7 @@ fn serve(
 ) -> (PathBuf, tempfile::TempDir) {
     let engine = Arc::new(FakeEngine::new(amd_host()));
     let dir = tempfile::tempdir().unwrap();
-    let mut config = ActorConfig::new(&dir.path().join("machine"), MachineRole::Gpu, operator());
+    let mut config = ActorConfig::new(dir.path().join("machine"), MachineRole::Gpu, operator());
     config.trust = TrustConfig {
         allowed_namespaces: vec![],
         signature: SignaturePolicy { mode, keys },
@@ -75,8 +75,11 @@ fn post(path: &Path, method: &str, body: &str) -> (u16, String) {
         body.len()
     )
     .unwrap();
-    let mut raw = String::new();
-    stream.read_to_string(&mut raw).unwrap();
+    // A route that answers without reading the body closes with it unread, so the last
+    // read is ECONNRESET after the whole answer (as an older actor's 404 does).
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw);
+    let raw = String::from_utf8(raw).unwrap();
     let (head, body) = raw.split_once("\r\n\r\n").unwrap();
     (head[9..12].parse().unwrap(), body.to_owned())
 }
