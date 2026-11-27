@@ -7568,6 +7568,86 @@ fn a_queue_that_stands_longer_than_the_floor_span_still_holds_the_setpoint_down(
     assert!(over * 20 < reports.len(), "{over} of {}", reports.len());
 }
 
+/// 2 Mbit/s with 20 ms from 30 s, and `extra_ms` over that delay at a send time from 40 s standing
+/// in for a queue, as the row above.
+fn standing_queue_cap(extra_ms: impl Fn(f64) -> f64 + 'static) -> Sim {
+    let mut s = Sim::lab_hw(true);
+    s.run(30.0);
+    s.cap_kbps = 2000.0;
+    s.queue_bytes = 1_250_000.0;
+    s.extra_us = Box::new(|_| 20_000);
+    (s.tokens, s.tokens_at) = (15_000.0, s.t);
+    s.run(10.0);
+    s.extra_us = Box::new(move |t| 20_000 + (extra_ms(t as f64 / 1e6) * 1000.0) as u64);
+    s
+}
+
+/// #1693 (NVIDIA lab host, 2 Mbit/s, run 2): the full relay queue dropped 13-16 s into the cap and
+/// the loss bound took over for those reports. That dropped the pre-queue floor with the queue still
+/// standing, and the queue had aged into the rolling floor, so it never read as standing again: an
+/// up-step stayed over the estimate with 1.8 s of queue. Here the loss is 25 s into a 3 s queue that
+/// then drains over 50 s (c8594bab: over the estimate by up to 5 %, the follow-down off to the end). Not
+/// by refusing up-steps: that ratchets the setpoint to the estimate's minimum (#1692 round 7, about
+/// 1040 kbit/s), hence the mean.
+#[test]
+fn a_loss_cut_under_a_standing_queue_keeps_the_follow_down() {
+    let mut s = standing_queue_cap(|t| (3000.0 * (1.0 - (t - 65.0).max(0.0) / 50.0)).max(0.0));
+    s.loss_at = Box::new(|t| {
+        if (55_000_000..57_000_000).contains(&t) {
+            0.15
+        } else {
+            0.0
+        }
+    });
+    s.run(70.0);
+    assert!(
+        s.delay_bound
+            .iter()
+            .any(|&(t, d)| (55.0..66.0).contains(&t) && !d),
+        "the loss never left the delay bound"
+    );
+    assert!(s.est.follows_queue(), "the follow-down is off at 110 s");
+    let reports: Vec<(f64, u32)> = s
+        .trace
+        .iter()
+        .zip(&s.setpoints)
+        .filter(|(e, _)| (68.0..110.0).contains(&e.0))
+        .map(|(e, sp)| (e.1, sp.1))
+        .collect();
+    let over = reports
+        .iter()
+        .filter(|&&(est, sp)| f64::from(sp) > est * 1.02)
+        .count();
+    let mean = |v: &mut dyn Iterator<Item = f64>| v.sum::<f64>() / reports.len() as f64;
+    let (sp, est) = (
+        mean(&mut reports.iter().map(|r| f64::from(r.1))),
+        mean(&mut reports.iter().map(|r| r.0)),
+    );
+    eprintln!(
+        "68-110 s: setpoint over the estimate in {over} of {} reports; mean setpoint {sp:.0}, \
+         estimate {est:.0}",
+        reports.len()
+    );
+    assert!(over * 20 < reports.len(), "{over} of {}", reports.len());
+    assert!(
+        sp > 0.85 * est,
+        "setpoint ratcheted down: {sp:.0} under {est:.0}"
+    );
+}
+
+/// The floor held across a loss bound (above) is let go at the ceiling: here the delay stepped up
+/// for good during the cap, so no arrival comes back to it.
+#[test]
+fn a_delay_step_that_outlasts_a_cap_is_let_go_at_the_ceiling() {
+    let mut s = standing_queue_cap(|_| 150.0);
+    s.run(20.0);
+    assert!(s.est.queue_floor.is_some(), "no floor held under the cap");
+    s.clear();
+    s.run(120.0);
+    assert_eq!(s.est.bound, Bound::Ceiling);
+    assert!(s.est.queue_floor.is_none() && !s.est.follows_queue());
+}
+
 /// Review r2 S-1, the production gate: `Control` takes `Rate::audio_pacing` (off for NVENC and VA,
 /// `abr_glue::audio_pacing`, guarded by `audio_pacing_runs_only_where_a_bitrate_write_is_free`) into
 /// its estimator, and only a receiver report's estimate at a standing queue reaches the ABR as one.

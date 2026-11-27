@@ -813,10 +813,14 @@ pub(crate) struct Estimator {
     off_floor: Option<Instant>,
     queue_standing: bool,
     queue_stood: bool,
-    /// While `queue_stood`: the path floor from before the queue, which the off-floor reading
-    /// holds to. The rolling floor takes in a queue that stands over `FLOOR_SPAN_US`, so a queue
-    /// that stood longer read as gone while it still held seconds (#1692 lab, NVIDIA 2 Mbit/s:
-    /// 1.3-1.6 s of queue at onset + 40 s, the setpoint left 7 % over the estimate).
+    /// The path floor from before a queue that stood, which the off-floor reading holds to until
+    /// an arrival comes back to it. The rolling floor takes in a queue that stands over
+    /// `FLOOR_SPAN_US`, so a queue that stood longer read as gone while it still held seconds
+    /// (#1692 lab, NVIDIA 2 Mbit/s: 1.3-1.6 s of queue at onset + 40 s, the setpoint left 7 % over
+    /// the estimate). Not dropped with `queue_stood` on a loss bound: a full queue drops, and the
+    /// floor lost to those reports never came back (#1693, 1.8 s of queue, 2-4 % over). Dropped at
+    /// the ceiling bound: a path whose delay stepped up never comes back to it. Two clocks, so it
+    /// ages with their skew (about 3 ms a minute at 50 ppm).
     queue_floor: Option<i64>,
     /// When each report within `REORDERING` showed the path reorder.
     reordered: VecDeque<Instant>,
@@ -1348,7 +1352,7 @@ impl Estimator {
     /// Start again from `kbps` (never above the ceiling): codec-pyrowave.md §Rate, the ABR
     /// resumes from the estimate after a switch back.
     pub(crate) fn resume_at(&mut self, kbps: f64) {
-        (self.off_floor, self.queue_standing, self.queue_stood) = (None, false, false);
+        self.forget_queue();
         self.delay_kbps = kbps;
         self.loss_kbps = kbps;
         self.read_last = false;
@@ -1940,7 +1944,7 @@ impl Estimator {
             Some((to, _)) => to,
             None => {
                 // No arrival says the queue still stands.
-                (self.off_floor, self.queue_standing, self.queue_stood) = (None, false, false);
+                self.forget_queue();
                 let to = self.estimate_kbps;
                 tracing::info!(
                     token = "webtransport-cc-regrow",
@@ -1995,6 +1999,11 @@ impl Estimator {
             .is_none_or(|at| now.saturating_duration_since(at) >= LOG_EVERY)
     }
 
+    fn forget_queue(&mut self) {
+        (self.off_floor, self.queue_floor) = (None, None);
+        (self.queue_standing, self.queue_stood) = (false, false);
+    }
+
     fn settle(&mut self) {
         let clamp = |k: f64| k.clamp(MIN_KBPS, self.ceiling_kbps);
         self.delay_kbps = clamp(self.delay_kbps);
@@ -2014,6 +2023,9 @@ impl Estimator {
         self.estimate_kbps = clamp(kbps);
         self.bound = bound;
         self.queue_stood &= bound == Bound::Delay;
+        if bound == Bound::Ceiling {
+            self.queue_floor = None;
+        }
     }
 
     fn due(&mut self, now: Instant) -> Option<f64> {
@@ -2114,7 +2126,7 @@ impl Estimator {
                     self.last_delay = delay;
                     video.1 += self.end_run(log, Some(at_floor), now);
                     self.evidence.at_floor = at_floor;
-                    let queued = match self.queue_floor.filter(|_| self.queue_stood) {
+                    let queued = match self.queue_floor {
                         Some(floor) => !near(delay, floor),
                         None => !at_floor,
                     };
