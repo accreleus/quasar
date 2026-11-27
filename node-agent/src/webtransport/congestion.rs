@@ -58,8 +58,9 @@ const AT_FLOOR_MS: f64 = 30.0;
 /// 0.4 s.
 const QUEUE_STANDING: Duration = Duration::from_secs(1);
 /// A video datagram that arrived this much before one sent ahead of it shows the report reordered;
-/// `REORDERING_REPORTS` such reports within `REORDERING` (half the reports at 50 ms) show the path
-/// keeps reordering. A burst (a Wi-Fi block-ack timeout, a handover) is not that.
+/// `REORDERING_REPORTS` such reports within `REORDERING` show the path keeps reordering. A count:
+/// half the reports at the 50 ms both clients send (§Feedback caps it at 100 ms). A burst (a Wi-Fi
+/// block-ack timeout, a handover) is not that.
 const REORDERED_US: u64 = 1_000;
 const REORDERING: Duration = Duration::from_secs(1);
 const REORDERING_REPORTS: usize = 10;
@@ -806,6 +807,11 @@ pub(crate) struct Estimator {
     off_floor: Option<Instant>,
     queue_standing: bool,
     queue_stood: bool,
+    /// While `queue_stood`: the path floor from before the queue, which the off-floor reading
+    /// holds to. The rolling floor takes in a queue that stands over `FLOOR_SPAN_US`, so a queue
+    /// that stood longer read as gone while it still held seconds (#1692 lab, NVIDIA 2 Mbit/s:
+    /// 1.3-1.6 s of queue at onset + 40 s, the setpoint left 7 % over the estimate).
+    queue_floor: Option<i64>,
     /// When each report within `REORDERING` showed the path reorder.
     reordered: VecDeque<Instant>,
     /// v2's hold (`HOLD`) and loss floor; off for PyroWave, which has its own controller and no
@@ -1034,6 +1040,7 @@ impl Estimator {
             off_floor: None,
             queue_standing: false,
             queue_stood: false,
+            queue_floor: None,
             reordered: VecDeque::new(),
             holds: true,
             probes: false,
@@ -1056,10 +1063,11 @@ impl Estimator {
 
     /// `legacy`, with `audio_pacing`, at the delay bound, and the queue stood (every video arrival
     /// `QUEUE_STANDING` off the floor) since it got there, and the path has not kept reordering
-    /// since (`REORDERING_REPORTS`). Pacing must not feed what turns it on or keeps it on: paced video goes in small send
-    /// groups whose reordered arrivals read as overuse, which held the bound at delay (#1692 lab
-    /// REORD: 31-36 % of reports unpaced, 72-77 % paced; after a cap lifted it never let go). The
-    /// floor is read at the pacer's release and pacing sends in order, so it can raise neither.
+    /// since (`REORDERING_REPORTS`). Pacing must not feed what turns it on or keeps it on: paced
+    /// video goes in small send groups whose reordered arrivals read as overuse, which held the
+    /// bound at delay (#1692 lab REORD: 31-36 % of reports unpaced, 72-77 % paced; after a cap
+    /// lifted it never let go). The floor is read at the pacer's release and pacing sends in order,
+    /// so it can raise neither.
     pub(crate) fn legacy_queue(&self) -> bool {
         self.legacy && self.audio_pacing && self.bound == Bound::Delay && self.queue_stood
     }
@@ -1099,8 +1107,8 @@ impl Estimator {
 
     /// `VideoQueue::on_hold`: [`Self::drop_held`], or legacy pacing ([`Self::legacy_queue`]). At a
     /// deep rung a keyframe (10.7 frames at 360p) takes 143 ms at the pace, over `PACE_MAX_WAIT`,
-    /// so it went into the link's queue unpaced, or not, by the phase of what was held (sim, 1.8-2.2
-    /// Mbit/s: audio p99 25-87 ms, 29-37 with this).
+    /// so it went into the link's queue unpaced, or not, by the phase of what was held (sim,
+    /// 1.8-2.2 Mbit/s: audio p99 25-87 ms, 29-37 with this).
     pub(crate) fn pace_waits(&self) -> bool {
         self.drop_held() || self.legacy_queue()
     }
@@ -2049,7 +2057,14 @@ impl Estimator {
                     let at_floor = self.evidence.arrival(sent_us, at);
                     video.1 += self.end_run(log, Some(at_floor), now);
                     self.evidence.at_floor = at_floor;
-                    if at_floor {
+                    let queued = match self.queue_floor.filter(|_| self.queue_stood) {
+                        Some(floor) => {
+                            let delay = (i128::from(at) - i128::from(sent_us)) as f64;
+                            delay - floor as f64 >= AT_FLOOR_MS * 1000.0
+                        }
+                        None => !at_floor,
+                    };
+                    if !queued {
                         self.off_floor = None;
                     } else if self.off_floor.is_none() {
                         self.off_floor = Some(now);
@@ -2179,6 +2194,10 @@ impl Estimator {
         }
         self.queue_stood =
             (self.queue_stood || self.queue_standing) && self.reordered.len() < REORDERING_REPORTS;
+        self.queue_floor = match self.queue_stood {
+            true => self.queue_floor.or(self.evidence.floor),
+            false => None,
+        };
         Measured {
             usage: self.trendline.usage,
             rate_kbps,

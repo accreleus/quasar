@@ -7431,6 +7431,45 @@ fn reordering_now_and_then_under_a_steady_cap_keeps_legacy_paced() {
     assert!(bad.is_empty(), "{bad:#?}");
 }
 
+/// #1692 lab round 4 (NVIDIA lab host, 2 Mbit/s): a cap's first fill left seconds of queue that
+/// drained for 70-90 s with the link full, and once it had stood over `FLOOR_SPAN_US` the rolling
+/// floor took it in: the queue read as gone, the follow stopped, and a setpoint an onset overshoot
+/// put 7 % over the estimate stayed there. The sim's sender cannot keep a queue standing that long
+/// (the guard and the stale drops hold video at the agent), so 150 ms over the pre-queue delay from
+/// 40 s to 160 s stands in for it: one-way delay cannot tell the two apart. While it stands the
+/// setpoint stays at or under the estimate (f971779a: over it in most reports from 52 s on).
+#[test]
+fn a_queue_that_stands_longer_than_the_floor_span_still_holds_the_setpoint_down() {
+    let mut s = Sim::lab_hw(true);
+    s.run(30.0);
+    s.cap_kbps = 2000.0;
+    s.queue_bytes = 1_250_000.0;
+    s.extra_us = Box::new(|_| 20_000);
+    (s.tokens, s.tokens_at) = (15_000.0, s.t);
+    s.run(10.0);
+    s.extra_us = Box::new(|t| if t < 160_000_000 { 170_000 } else { 20_000 });
+    s.run(200.0);
+    let reports: Vec<(f64, u32)> = s
+        .trace
+        .iter()
+        .zip(&s.setpoints)
+        .filter(|(e, _)| (60.0..160.0).contains(&e.0))
+        .map(|(e, sp)| (e.1, sp.1))
+        .collect();
+    let over = reports
+        .iter()
+        .filter(|&&(est, sp)| f64::from(sp) > est * 1.02)
+        .count();
+    eprintln!(
+        "60-160 s: setpoint over the estimate in {over} of {} reports; setpoint at 150 s {:?}, at \
+         230 s {:?}",
+        reports.len(),
+        s.setpoints.iter().rev().find(|p| p.0 <= 150.0).map(|p| p.1),
+        s.setpoints.last().map(|p| p.1)
+    );
+    assert!(over * 20 < reports.len(), "{over} of {}", reports.len());
+}
+
 /// Review r2 S-1, the production gate: `Control` takes `Rate::audio_pacing` (off for NVENC and VA,
 /// `abr_glue::audio_pacing`, guarded by `audio_pacing_runs_only_where_a_bitrate_write_is_free`) into
 /// its estimator, and only a receiver report's estimate at a standing queue reaches the ABR as one.
@@ -7489,8 +7528,11 @@ fn deep_cap(s: &mut Sim) {
 /// 21-35), with no more freezes while shaped.
 #[test]
 fn after_a_shape_clears_v2_is_back_at_1080p_as_soon_as_legacy() {
+    // Legacy as 0.6.4 (audio pacing off), the sender the lab figures above are of.
+    let pacing_off = |s: &mut Sim| s.est.audio_pacing = !s.est.legacy;
     let cap_row = |legacy: bool| {
         let mut s = Sim::lab_hw(legacy);
+        pacing_off(&mut s);
         s.run(30.0);
         deep_cap(&mut s);
         s.run(60.0);
@@ -7502,10 +7544,10 @@ fn after_a_shape_clears_v2_is_back_at_1080p_as_soon_as_legacy() {
     let mut bad = Vec::new();
     for name in ["R3", "R4", "CAP", "REORD"] {
         let run = |legacy: bool| match name {
-            "R3" => lab_hw_row(legacy, shallow, 60.0),
-            "R4" => lab_hw_row(legacy, policer, 60.0),
+            "R3" => lab_hw_row(legacy, |s| (pacing_off(s), shallow(s)).1, 60.0),
+            "R4" => lab_hw_row(legacy, |s| (pacing_off(s), policer(s)).1, 60.0),
             "CAP" => cap_row(legacy),
-            _ => reorder_row(legacy, 10, true),
+            _ => reorder_row(legacy, 10, !legacy),
         };
         let to = if name == "CAP" { 90.0 } else { 210.0 };
         let (a_n, _, a_back) = row(&format!("{name} legacy"), &run(true), 30.0, to);
