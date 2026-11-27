@@ -194,7 +194,7 @@ pub(crate) fn build_video_source(
         .property("caps", &tail_caps)
         .build()
         .context("capsfilter not found")?;
-    // The encode pipeline cannot see this colorimetry in its own caps: it asks (#1104).
+    // The encode pipeline cannot see this colorimetry in its own caps: it asks (#1104, #1227).
     if let Some(pad) = tail.static_pad("src") {
         super::pyrowave_branch::answer_colorimetry_queries(&pad);
     }

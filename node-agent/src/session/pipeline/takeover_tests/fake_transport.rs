@@ -74,6 +74,9 @@ fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
+/// The compositor's NV12: limited range, BT.601 matrix, BT.709 transfer and primaries.
+const COMPOSITOR_NV12: &str = "2:4:5:1";
+
 #[test]
 fn a_second_transport_takes_access_units_without_rtp_or_webrtc() {
     if !live_webrtc_available() {
@@ -84,6 +87,11 @@ fn a_second_transport_takes_access_units_without_rtp_or_webrtc() {
     let resolved = resolve_effective_encoder(&mut cfg).expect("resolve encoder");
     let sink = format!("seam-{}", std::process::id());
     let source = build_source_pipeline(&cfg, None, &sink).expect("source pipeline");
+    // The test source states no colorimetry; give it the compositor's.
+    let tail = source.by_name("source-caps").expect("source tail");
+    let mut tail_caps = tail.property::<gst::Caps>("caps");
+    tail_caps.make_mut().set("colorimetry", COMPOSITOR_NV12);
+    tail.set_property("caps", &tail_caps);
     let (sig_tx, _sig_rx) = mpsc::unbounded_channel();
     let (trace_tx, _trace_rx) = mpsc::channel(256);
     let trace = DiagnosticEventTx::new(
@@ -144,6 +152,11 @@ fn a_second_transport_takes_access_units_without_rtp_or_webrtc() {
     });
     let caps = transport.caps.current_caps().expect("negotiated caps");
     assert_eq!(caps.structure(0).unwrap().name(), "video/x-h264");
+    // With no PyroWave grant too, the encoder input says what the source says (#1227).
+    let encoder_sink = transport.encoder.static_pad("sink").unwrap();
+    let caps = encoder_sink.current_caps().expect("encoder input caps");
+    let said = caps.structure(0).unwrap().get::<String>("colorimetry").ok();
+    assert_eq!(said.as_deref(), Some(COMPOSITOR_NV12), "{caps}");
     let keyframes = |units: &Units| units.lock().unwrap().iter().filter(|u| u.1).count();
     {
         let units = transport.units.lock().unwrap();
