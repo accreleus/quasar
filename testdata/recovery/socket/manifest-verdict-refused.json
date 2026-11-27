@@ -1,0 +1,9 @@
+{
+  "shape": "manifest_verdict",
+  "about": "Refused under verify or require: detection does not store the release. key_id is null.",
+  "body": {
+    "verdict": "refused",
+    "key_id": null,
+    "message": "signature mode is \"verify\" and this release publishes no signature"
+  }
+}

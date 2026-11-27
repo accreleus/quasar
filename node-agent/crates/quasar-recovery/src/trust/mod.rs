@@ -18,8 +18,8 @@ use regex::Regex;
 
 pub use https::HttpsFetcher;
 pub use signature::{
-    parse_signature_mode, parse_trusted_keys, SignatureEvidence, SignatureMode, SignaturePolicy,
-    TrustedKey,
+    parse_signature_mode, parse_trusted_keys, verify_manifest, SignatureEvidence, SignatureMode,
+    SignaturePolicy, TrustedKey,
 };
 pub use source::{parse_manifest_base_url, parse_manifest_timeout, ManifestBaseUrl};
 

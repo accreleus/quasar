@@ -688,6 +688,14 @@ org's key compiled into the actor. A machine that recorded a mode or keys at ins
 - **`off`**: fetches and checks nothing, ADR 0001 trust (the pinned digest and the namespace
   allowlist).
 
+**Detection checks too (#824).** Under `verify` or `require`, the control plane's own actor also
+grades each new stable release's signature when detection finds it, over the bytes the control
+plane fetched. A release with a missing or bad signature is never listed, notified or
+auto-applied; the detection run in Fleet ▸ Jobs counts it under `manifest_invalid` and names it
+in `manifest_errors`, and the control plane logs `platform release manifest rejected`. If the
+actor does not answer, the release is refused for that pass and tried again on the next. A
+release listed before the check was on stays listed (the apply gate still refuses it).
+
 **Machines that must opt out.** The verifying fetch has no proxy client and trusts the public
 web roots only, so a machine that reaches GitHub only through an HTTPS proxy, through a mirror
 behind a private certificate authority, or not at all fails closed: every stable apply is refused

@@ -1,0 +1,8 @@
+{
+  "shape": "manifest_check",
+  "about": "A release that publishes no platform-release-manifest.v2.json.sig: signature is null, never omitted.",
+  "body": {
+    "manifest": "eyJidWlsdF9hdCI6IjIwMjYtMDktMDhUMDA6MDA6MDBaIiwiY29tcG9uZW50cyI6W3siZGlnZXN0Ijoic2hhMjU2OmFhMTEwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAiLCJpbWFnZSI6ImdoY3IuaW8vYWNjcmVsZXVzL3F1YXNhci9xdWFzYXItY29udHJvbC1wbGFuZSIsIm5hbWUiOiJjb250cm9sLXBsYW5lIn0seyJkaWdlc3QiOiJzaGEyNTY6YmIyMjAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMCIsImltYWdlIjoiZ2hjci5pby9hY2NyZWxldXMvcXVhc2FyL3F1YXNhci1ub2RlLWFnZW50IiwibmFtZSI6Im5vZGUtYWdlbnQifV0sImZvcm1hdF92ZXJzaW9uIjoxLCJwcmVyZWxlYXNlIjpmYWxzZSwic2NoZW1hX3ZlcnNpb24iOjgwLCJzb3VyY2VfY29tbWl0IjoiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsInZlcnNpb24iOiIwLjMuMCJ9",
+    "signature": null
+  }
+}

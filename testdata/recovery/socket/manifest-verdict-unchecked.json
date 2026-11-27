@@ -1,0 +1,9 @@
+{
+  "shape": "manifest_verdict",
+  "about": "Signature mode off: nothing was checked and detection lists the release as before.",
+  "body": {
+    "verdict": "unchecked",
+    "key_id": null,
+    "message": "signature mode is \"off\": not checked"
+  }
+}

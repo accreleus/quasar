@@ -5,7 +5,7 @@
 //! interface. Both serve `GET /v1/status[?request_id=<uuid>]`, whose `result` is only ever an
 //! attempt submitted on the same socket, and `POST /v1/submit` (a `socket::Request`). The
 //! agent socket alone serves `GET` and `POST /v1/console` and `POST /v1/console/preflight`
-//! ([`crate::console`]).
+//! ([`crate::console`]); the control socket alone serves `POST /v1/verify-manifest` (#824).
 //!
 //! Answers are `HTTP/1.1` with `Content-Length` and `Connection: close`, and the
 //! connection is closed after one response, so an HTTP/1.0 client reading to EOF (the
@@ -23,7 +23,7 @@ use tracing::{debug, warn};
 
 use crate::actor::Actor;
 use crate::console::{ConsolePreflight, ConsoleRequest};
-use crate::socket::{Reason, Rejection, Request};
+use crate::socket::{ManifestCheck, Reason, Rejection, Request, Verdict};
 use crate::trust::Caller;
 
 const MAX_HEAD: usize = 8 * 1024;
@@ -155,6 +155,12 @@ fn answer(mut stream: UnixStream, actor: &Arc<Actor>, caller: Caller) -> io::Res
         ("POST", "/v1/console/preflight") if caller == Caller::Agent => {
             preflight(&mut stream, &head, actor)
         }
+        ("POST", "/v1/verify-manifest") if caller == Caller::ControlPlane => {
+            verify_manifest(&mut stream, &head, actor)
+        }
+        (_, "/v1/verify-manifest") if caller == Caller::ControlPlane => {
+            respond(&mut stream, 405, r#"{"error":"method_not_allowed"}"#)
+        }
         (_, "/v1/status") | (_, "/v1/submit") => {
             respond(&mut stream, 405, r#"{"error":"method_not_allowed"}"#)
         }
@@ -247,6 +253,36 @@ fn preflight(stream: &mut UnixStream, head: &str, actor: &Arc<Actor>) -> io::Res
         }
         Err(rejection) => refused(stream, &rejection),
     }
+}
+
+/// `POST /v1/verify-manifest` (control socket only): `200` with the `ManifestVerdict`,
+/// `400` with the `Rejection` for a body that is not a `ManifestCheck`.
+fn verify_manifest(stream: &mut UnixStream, head: &str, actor: &Arc<Actor>) -> io::Result<()> {
+    let Some(body) = read_body(stream, head)? else {
+        return respond(stream, 413, r#"{"error":"request_too_large"}"#);
+    };
+    let req = match serde_json::from_slice::<ManifestCheck>(&body) {
+        Ok(req) => req,
+        Err(e) => {
+            return refused(
+                stream,
+                &Rejection {
+                    request_id: String::new(),
+                    reason: Reason::Invalid,
+                    message: format!("not a manifest check: {e}"),
+                },
+            )
+        }
+    };
+    let verdict = actor.verify_manifest(&req);
+    if verdict.verdict == Verdict::Refused {
+        warn!(
+            token = "actor-manifest-refused",
+            "release detection's manifest was refused: {}", verdict.message
+        );
+    }
+    let body = serde_json::to_string(&verdict).map_err(io::Error::other)?;
+    respond(stream, 200, &body)
 }
 
 /// `POST /v1/submit`: the caller is the socket's, because authority follows the mount.

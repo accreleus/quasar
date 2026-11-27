@@ -33,6 +33,8 @@ type Listing struct {
 	Body        string
 	PublishedAt time.Time
 	ManifestURL string // "" when the release published no format-2 manifest asset
+	// SignatureURL is SignatureAssetNameV2's, "" when the release publishes none.
+	SignatureURL string
 	// ManifestFormat is 2 for a release carrying ManifestAssetNameV2 (the asset at
 	// ManifestURL), 1 for one carrying only the format-1 asset, which is never
 	// fetched and not listed (control-api.md "RH06 contract step", item 4), and 0

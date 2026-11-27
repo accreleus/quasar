@@ -99,6 +99,13 @@ single genuine release would authorise any digest set.
 This also needs no change to `agent-api.md`: `release_apply` already carries
 `release.version`, which is all the URL needs.
 
+**Release detection asks the same actor first (#824).** On a machine with a recovery actor,
+the control plane sends each new stable release's manifest and `.sig`, as it fetched them, to
+its own actor's control socket (`POST /v1/verify-manifest`); the actor grades them with its own
+policy and keys, and a refused release is not listed. This is advisory, an earlier refusal:
+the gate above still fetches its own bytes and does not accept them from the caller. One
+verifier and one policy, both the actor's, so the control plane holds no keys.
+
 ## Rotation
 
 `QUASAR_UPDATER_TRUSTED_KEYS` is a list, and the signature document is a list.

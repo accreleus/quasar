@@ -68,7 +68,10 @@ func releasesJSON(t *testing.T, assetHost string) string {
 		{
 			"tag_name": "v0.2.0", "draft": false, "prerelease": false,
 			"body": "### Fixed\n- a thing\n", "published_at": "2026-09-04T12:00:00Z",
-			"assets": []ghAsset{{Name: ManifestAssetNameV2, URL: "https://" + assetHost + "/manifest.v2.json"}},
+			"assets": []ghAsset{
+				{Name: ManifestAssetNameV2, URL: "https://" + assetHost + "/manifest.v2.json"},
+				{Name: SignatureAssetNameV2, URL: "https://" + assetHost + "/manifest.v2.json.sig"},
+			},
 		},
 		{
 			"tag_name": "v0.3.0-rc.1", "draft": true, "prerelease": true,
@@ -163,6 +166,9 @@ func TestGitHubSourceListsNonDraftReleasesWithTheirManifestAsset(t *testing.T) {
 	}
 	if l.ManifestURL == "" {
 		t.Error("the manifest asset's browser_download_url was not carried")
+	}
+	if l.SignatureURL != "https://assets.example.test/manifest.v2.json.sig" {
+		t.Errorf("SignatureURL = %q, want the .sig asset's browser_download_url", l.SignatureURL)
 	}
 	if got := h.auth("api.example.test"); got != "Bearer tok" {
 		t.Errorf("Authorization = %q, want the configured token as a bearer", got)

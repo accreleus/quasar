@@ -9,7 +9,7 @@ use super::golang::base64::decode_std;
 use super::golang::json::{decode_signature_document, unmarshal_signed_manifest, DocumentError};
 use super::golang::text::{quote, quote_bytes, to_lower_ascii_keyword, trim_space};
 use super::{reject, Admitted, Rejection};
-use crate::socket::{Reason, Request};
+use crate::socket::{ManifestCheck, ManifestVerdict, Reason, Request, Verdict};
 
 /// The only algorithm this build verifies. Entries in any other are skipped.
 pub(crate) const SIGNATURE_ALGORITHM: &str = "ed25519";
@@ -173,6 +173,60 @@ pub(super) fn check(
             Ok(Admitted { unverified: None })
         }
     }
+}
+
+/// Release detection's check (#824): [`check`]'s policy and verifier over the exact bytes
+/// detection fetched, which are the bytes it stores. A stable release always names its
+/// version, so a missing signature is refused under `verify` as under `require`.
+pub fn verify_manifest(pol: &SignaturePolicy, req: &ManifestCheck) -> ManifestVerdict {
+    let (verdict, key_id, message) = match grade_manifest(pol, req) {
+        Ok(None) => (
+            Verdict::Unchecked,
+            None,
+            format!(
+                "signature mode is {}: not checked",
+                quote(pol.mode.as_str())
+            ),
+        ),
+        Ok(Some(id)) => (
+            Verdict::Verified,
+            Some(id.clone()),
+            format!("verified by key {}", key_label(&id)),
+        ),
+        Err(why) => (Verdict::Refused, None, why),
+    };
+    ManifestVerdict {
+        verdict,
+        key_id,
+        message,
+    }
+}
+
+fn grade_manifest(pol: &SignaturePolicy, req: &ManifestCheck) -> Result<Option<String>, String> {
+    if !pol.enabled() {
+        return Ok(None);
+    }
+    let mode = quote(pol.mode.as_str());
+    if pol.keys.is_empty() {
+        return Err(format!(
+            "signature mode is {mode} but this host trusts no release keys: set QUASAR_UPDATER_TRUSTED_KEYS (docs/upgrading.md)"
+        ));
+    }
+    let Some(signature) = &req.signature else {
+        return Err(format!(
+            "signature mode is {mode} and this release publishes no signature"
+        ));
+    };
+    let base64 = |what: &str, s: &str| {
+        decode_std(s.as_bytes()).map_err(|at| {
+            format!("the {what} is not standard base64: illegal base64 data at input byte {at}")
+        })
+    };
+    let manifest = base64("manifest", &req.manifest)?;
+    let signature = base64("signature", signature)?;
+    verify_manifest_signature(&manifest, &signature, &pol.keys)
+        .map(Some)
+        .map_err(|e| format!("the release manifest signature did not verify: {e}"))
 }
 
 /// Whether the request names a release version, as the probe reads it.

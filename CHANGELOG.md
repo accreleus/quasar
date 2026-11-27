@@ -41,6 +41,10 @@ own; the two do not move together, and that is deliberate.
 - **Flaky test: the PyroWave pacing timer's sub-millisecond wake test held an absolute 200 µs median, which a loaded CI runner missed (353 µs).** It now times the timerfd beside tokio's millisecond timer in the same run and asserts the timerfd wakes sooner and never early. Test-only.
 - A release re-run without a signing key (a fork's lane) now removes the earlier run's `platform-release-manifest.v2.json.sig` instead of leaving a signature that no longer describes the manifest. ADR 0003 no longer claims the signature format can take a new field without a format bump: the verifier refuses unknown fields on purpose, so only a new algorithm that fits the existing entry shape can be added beside ed25519 (#155).
 
+### Security
+
+- Release detection checks release signatures on an owned install (#824): the control plane asks its own recovery actor to verify each new stable release's `.sig` over the manifest it fetched, and under `verify` or `require` a release whose signature is missing or does not verify is not listed (counted in the detection run's `manifest_errors`). An actor that does not answer refuses the release for that pass; an actor too old to answer the question leaves listing as before, with a WARN. Under `off`, or without a recovery actor, nothing changes.
+
 ## 0.6.4 — 2026-11-24
 
 ### Upgrading

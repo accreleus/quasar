@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -120,6 +121,41 @@ func (c *ActorClient) Apply(ctx context.Context, req SelfRequest) (SelfAccepted,
 		return SelfAccepted{}, fmt.Errorf("decode the recovery actor's 202: %w", err)
 	}
 	return SelfAccepted{RequestID: acc.RequestID, Previous: previousOfActor(acc.Previous)}, nil
+}
+
+// ErrNoManifestCheck is an actor older than POST /v1/verify-manifest (#824).
+var ErrNoManifestCheck = errors.New("the recovery actor does not serve /v1/verify-manifest")
+
+// VerifyManifest asks the actor to grade manifest and its detached signature
+// (nil: none published) under its own signature policy.
+func (c *ActorClient) VerifyManifest(ctx context.Context, manifest, signature []byte) (actorsocket.ManifestVerdict, error) {
+	body, err := json.Marshal(actorsocket.ManifestCheck{Manifest: manifest, Signature: signature})
+	if err != nil {
+		return actorsocket.ManifestVerdict{}, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://recovery/v1/verify-manifest", bytes.NewReader(body))
+	if err != nil {
+		return actorsocket.ManifestVerdict{}, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(httpReq)
+	if err != nil {
+		return actorsocket.ManifestVerdict{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, ownMachineMaxBody))
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusNotFound:
+		return actorsocket.ManifestVerdict{}, ErrNoManifestCheck
+	default:
+		return actorsocket.ManifestVerdict{}, fmt.Errorf("the recovery actor answered %d: %s", resp.StatusCode, string(raw))
+	}
+	var v actorsocket.ManifestVerdict
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return actorsocket.ManifestVerdict{}, fmt.Errorf("decode the recovery actor's verdict: %w", err)
+	}
+	return v, nil
 }
 
 // Result is the attempt's result from `GET /v1/status?request_id=`; the

@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/accreleus/quasar/control-plane/internal/actorsocket"
 	"github.com/accreleus/quasar/control-plane/internal/migrate"
 	"github.com/accreleus/quasar/control-plane/migrations"
 )
@@ -305,5 +307,29 @@ func mustExec(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) {
 	t.Helper()
 	if _, err := pool.Exec(context.Background(), sql, args...); err != nil {
 		t.Fatalf("exec: %v", err)
+	}
+}
+
+// #824: a refused signature takes the invalid-manifest path: counted, named in
+// the run summary, not stored.
+func TestDetectCountsARefusedSignatureAndStoresNothingForIt(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	store := NewStore(pool)
+
+	src := twoReleaseSource()
+	rep, err := NewDetector(src, store, nil).WithVerifier(&fakeVerifier{verdict: actorsocket.VerdictRefused}).Detect(ctx)
+	if err != nil {
+		t.Fatalf("a refused signature must not fail the pass: %v", err)
+	}
+	if rep.New != 0 || rep.ManifestInvalid != 2 {
+		t.Fatalf("report = %+v, want both releases refused", rep)
+	}
+	if rows, _ := store.Releases(ctx, ChannelStable); len(rows) != 0 {
+		t.Fatalf("rows = %+v, want none", rows)
+	}
+	errs, _ := rep.Summary()["manifest_errors"].([]string)
+	if len(errs) != 2 || !strings.Contains(errs[0], "signature refused by the recovery actor") {
+		t.Fatalf("manifest_errors = %v", errs)
 	}
 }

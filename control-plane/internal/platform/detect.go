@@ -9,6 +9,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/accreleus/quasar/control-plane/internal/actorsocket"
 	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
 	"github.com/accreleus/quasar/control-plane/internal/images"
 )
@@ -70,6 +71,14 @@ type Detector struct {
 	channel ChannelFunc
 	// Read on preview; needs WithEdge's channel func.
 	preview PreviewSource
+	// nil (no recovery actor: Compose or source) checks no signature.
+	verifier ManifestVerifier
+}
+
+// ManifestVerifier grades a stable manifest's detached signature under the
+// recovery actor's own policy (#824); *ActorClient in production.
+type ManifestVerifier interface {
+	VerifyManifest(ctx context.Context, manifest, signature []byte) (actorsocket.ManifestVerdict, error)
 }
 
 // NewDetector builds a Detector. log may be nil.
@@ -95,6 +104,13 @@ func (d *Detector) WithEdge(edge EdgeResolver, channel ChannelFunc) *Detector {
 // also reads the preview manifest.
 func (d *Detector) WithPreview(p PreviewSource) *Detector {
 	d.preview = p
+	return d
+}
+
+// WithVerifier makes a stable release whose signature the actor refuses count
+// as an invalid manifest (#824).
+func (d *Detector) WithVerifier(v ManifestVerifier) *Detector {
+	d.verifier = v
 	return d
 }
 
@@ -322,6 +338,9 @@ func (d *Detector) resolve(ctx context.Context, l Listing) (Release, error) {
 	if m.Prerelease != l.Prerelease {
 		return Release{}, fmt.Errorf("manifest prerelease=%v does not match the tag's %v", m.Prerelease, l.Prerelease)
 	}
+	if err := d.verifySignature(ctx, l, raw); err != nil {
+		return Release{}, err
+	}
 
 	version := m.Version
 	return Release{
@@ -337,6 +356,40 @@ func (d *Detector) resolve(ctx context.Context, l Listing) (Release, error) {
 		// (control-api.md §Platform releases). It is the edge channel's field,
 		// and #111 is what fills it.
 	}, nil
+}
+
+// verifySignature asks the actor about the exact bytes that will be stored
+// (ADR 0003 "Where the check lives"). Fails closed when the actor does not
+// answer. The apply gate still fetches and checks its own copy.
+func (d *Detector) verifySignature(ctx context.Context, l Listing, manifest []byte) error {
+	if d.verifier == nil {
+		return nil
+	}
+	var sig []byte
+	var fetchErr error
+	if l.SignatureURL != "" {
+		sig, fetchErr = d.source.FetchManifest(ctx, l.SignatureURL)
+	}
+	// On a failed fetch the actor is asked with no signature, so mode off still lists the release.
+	v, err := d.verifier.VerifyManifest(ctx, manifest, sig)
+	switch {
+	case errors.Is(err, ErrNoManifestCheck):
+		// An actor behind its control plane (ADR 0008 rule A makes this a hand-built
+		// state). Refusing would hide the release that moves the actor first; its own
+		// apply gate still checks the signature.
+		d.log.Warn("platform release signature not checked: the recovery actor predates the check",
+			"token", "release-detect-signature-unchecked", "tag", l.Tag)
+		return nil
+	case err != nil:
+		return fmt.Errorf("the recovery actor did not check the signature: %w", err)
+	case v.Verdict == actorsocket.VerdictUnchecked:
+		return nil
+	case fetchErr != nil:
+		return fmt.Errorf("%s could not be fetched: %w", SignatureAssetNameV2, fetchErr)
+	case v.Verdict == actorsocket.VerdictVerified:
+		return nil
+	}
+	return fmt.Errorf("signature refused by the recovery actor: %s", v.Message)
 }
 
 // Truncates on a rune boundary: a cut mid-rune is not valid UTF-8 and will not
