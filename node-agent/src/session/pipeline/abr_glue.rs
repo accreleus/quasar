@@ -230,7 +230,7 @@ impl AbrLoop {
                 m.set_gcc_estimate(est_kbps);
             }
         }
-        let (prev_setpoint, retarget) = {
+        let (prev_setpoint, retarget, fec_bound) = {
             let mut gov = self.governor.lock().unwrap();
             let prev = gov.setpoint_kbps();
             // One write: a share that lowered the ceiling, or the estimate's move after it. Only
@@ -239,12 +239,13 @@ impl AbrLoop {
             if from_notify {
                 gov.set_queue_bound(queue);
             }
-            (prev, gov.observe(est_kbps, now).or(cut))
+            let step = gov.observe(est_kbps, now);
+            (prev, step.or(cut), step.is_none() && cut.is_some())
         };
         // In `Off` the governor still tracks, but its output is discarded. `Protective`
         // and `Smooth` both retarget; they differ only in the pure governor's down policy.
         if let Some(new_kbps) = retarget.filter(|_| self.mode != AbrMode::Off) {
-            self.retarget(prev_setpoint, new_kbps, est_kbps);
+            self.retarget(prev_setpoint, new_kbps, est_kbps, fec_bound);
         }
     }
 
@@ -252,7 +253,8 @@ impl AbrLoop {
     /// Writes only while this loop still owns the encoder, with the check inside the ABR
     /// write lock: an observe that passed `owns_encoder` before a takeover cleared it must
     /// not write after the reset put launch back (#1489).
-    fn retarget(&self, prev_setpoint: u32, new_kbps: u32, est_kbps: f64) {
+    /// `fec_bound`: written only because the FEC share lowered the ceiling, not for the estimate.
+    fn retarget(&self, prev_setpoint: u32, new_kbps: u32, est_kbps: f64, fec_bound: bool) {
         let Some(m) = self.metrics.upgrade() else {
             return;
         };
@@ -277,7 +279,9 @@ impl AbrLoop {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as i64;
-            let reason = if new_kbps < prev_setpoint {
+            let reason = if fec_bound {
+                "fec_bound"
+            } else if new_kbps < prev_setpoint {
                 "gcc_downshift"
             } else {
                 "recover"
@@ -327,7 +331,7 @@ impl AbrLoop {
             m.set_abr_link_rate(self.id, rate);
         }
         if let Some(kbps) = cut {
-            self.retarget(prev, kbps, reading.unwrap_or_default());
+            self.retarget(prev, kbps, reading.unwrap_or_default(), false);
         }
         self.step_rung(now);
     }
@@ -357,7 +361,7 @@ impl AbrLoop {
             (gov.setpoint_kbps(), gov.hold_to(line, now))
         };
         if let Some(kbps) = cut {
-            self.retarget(prev, kbps, line);
+            self.retarget(prev, kbps, line, false);
         }
     }
 
@@ -416,7 +420,7 @@ impl AbrLoop {
             (gov.setpoint_kbps(), gov.cut_to(rate, now))
         };
         if let Some(kbps) = cut {
-            self.retarget(prev, kbps, rate);
+            self.retarget(prev, kbps, rate, false);
         }
         let setpoint = self.governor.lock().unwrap().setpoint_kbps();
         // #1599: a takeover that claimed the encoder between the rung write (as_owner, above)
@@ -2258,7 +2262,7 @@ mod tests {
     fn a_fec_share_writes_the_encoder_under_the_ceiling_at_once() {
         init();
         let metrics = Arc::new(SessionMetrics::new("smooth", 60));
-        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let trace =
             crate::session::runner::DiagnosticEventTx::new(tx, Arc::default(), Arc::default());
         let cfg = cfg_with_floors(0, None);
@@ -2276,6 +2280,11 @@ mod tests {
                 "{share}"
             );
         }
+        let reasons: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|(_, e)| e.event == "abr.retarget")
+            .map(|(_, e)| e.payload["reason"].clone())
+            .collect();
+        assert_eq!(reasons, ["fec_bound", "fec_bound"]);
     }
 
     /// #1301 review S1: the stall-rescue tick re-observes with no share; it must not end the
