@@ -69,12 +69,12 @@ fn serve(
 
 fn post(path: &Path, method: &str, body: &str) -> (u16, String) {
     let mut stream = UnixStream::connect(path).unwrap();
-    write!(
+    // An over-limit body is answered 413 unread, so the write can fail part way.
+    let _ = write!(
         stream,
         "{method} /v1/verify-manifest HTTP/1.1\r\nHost: recovery\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
-    )
-    .unwrap();
+    );
     // A route that answers without reading the body closes with it unread, so the last
     // read is ECONNRESET after the whole answer (as an older actor's 404 does).
     let mut raw = Vec::new();
@@ -143,7 +143,7 @@ fn a_missing_signature_is_refused_under_verify_and_require() {
         let v = check(&path, &manifest, None);
         assert_eq!(v.verdict, Verdict::Refused, "{mode:?}");
         assert!(
-            v.message.contains("publishes no signature"),
+            v.message.contains("no signature came with this release"),
             "{}",
             v.message
         );
@@ -207,4 +207,36 @@ fn the_agent_socket_does_not_serve_it() {
     let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
     let body = json!({"manifest": b64(&manifest), "signature": b64(&sig)}).to_string();
     assert_eq!(post(&path, "POST", &body).0, 404);
+}
+
+/// The largest pair the control plane sends (a 1 MiB manifest, an 8 KiB `.sig`) reaches
+/// the policy under `off` and `verify`; one byte over the route's limit is refused at
+/// framing, and other routes keep 64 KiB.
+#[test]
+fn the_largest_pair_the_control_plane_sends_reaches_the_policy() {
+    let b64 = |n: usize| base64::engine::general_purpose::STANDARD.encode(vec![b'{'; n]);
+    let body = json!({"manifest": b64(1 << 20), "signature": b64(8 << 10)}).to_string();
+    assert!(body.len() <= server::VERIFY_MAX_BODY && body.len() > 64 * 1024);
+    let over = format!("{body:<width$}", width = server::VERIFY_MAX_BODY + 1);
+    for (mode, verdict) in [
+        (SignatureMode::Off, Verdict::Unchecked),
+        (SignatureMode::Verify, Verdict::Refused),
+    ] {
+        let (path, _dir) = serve(mode, vec![vector_key("release-2026")], Caller::ControlPlane);
+        let (status, answer) = post(&path, "POST", &body);
+        assert_eq!(status, 200, "{mode:?}: {answer}");
+        let v: ManifestVerdict = serde_json::from_str(&answer).unwrap();
+        assert_eq!(v.verdict, verdict, "{mode:?}: {}", v.message);
+        assert_eq!(post(&path, "POST", &over).0, 413, "{mode:?}");
+    }
+    let (path, _dir) = serve(SignatureMode::Off, vec![], Caller::ControlPlane);
+    let mut stream = UnixStream::connect(&path).unwrap();
+    write!(
+        stream,
+        "POST /v1/submit HTTP/1.1\r\nContent-Length: 65537\r\n\r\n"
+    )
+    .unwrap();
+    let mut raw = String::new();
+    let _ = stream.read_to_string(&mut raw);
+    assert!(raw.starts_with("HTTP/1.1 413"), "{raw}");
 }

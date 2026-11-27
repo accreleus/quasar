@@ -4,6 +4,6 @@
   "body": {
     "verdict": "refused",
     "key_id": null,
-    "message": "signature mode is \"verify\" and this release publishes no signature"
+    "message": "signature mode is \"verify\" and no signature came with this release"
   }
 }

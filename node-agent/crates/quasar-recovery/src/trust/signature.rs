@@ -214,7 +214,7 @@ fn grade_manifest(pol: &SignaturePolicy, req: &ManifestCheck) -> Result<Option<S
     }
     let Some(signature) = &req.signature else {
         return Err(format!(
-            "signature mode is {mode} and this release publishes no signature"
+            "signature mode is {mode} and no signature came with this release"
         ));
     };
     let base64 = |what: &str, s: &str| {

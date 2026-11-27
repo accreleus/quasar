@@ -2,6 +2,7 @@ package platform
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -358,6 +359,11 @@ func (d *Detector) resolve(ctx context.Context, l Listing) (Release, error) {
 	}, nil
 }
 
+// signatureMaxBytes bounds a .sig: one entry is about 150 bytes, so 8 KiB holds
+// about 50 (a rotation needs 2). The actor's verify-manifest body limit is sized
+// from this and manifestMaxBytes (server.rs VERIFY_MAX_BODY).
+const signatureMaxBytes = 8 << 10
+
 // verifySignature asks the actor about the exact bytes that will be stored
 // (ADR 0003 "Where the check lives"). Fails closed when the actor does not
 // answer. The apply gate still fetches and checks its own copy.
@@ -369,6 +375,9 @@ func (d *Detector) verifySignature(ctx context.Context, l Listing, manifest []by
 	var fetchErr error
 	if l.SignatureURL != "" {
 		sig, fetchErr = d.source.FetchManifest(ctx, l.SignatureURL)
+		if fetchErr == nil && len(sig) > signatureMaxBytes {
+			sig, fetchErr = nil, fmt.Errorf("it is %d bytes, over the %d-byte cap", len(sig), signatureMaxBytes)
+		}
 	}
 	// On a failed fetch the actor is asked with no signature, so mode off still lists the release.
 	v, err := d.verifier.VerifyManifest(ctx, manifest, sig)
@@ -436,14 +445,40 @@ func (r Report) Summary() map[string]any {
 		s["preview_skipped"] = r.PreviewSkipped
 	}
 	if len(r.Errors) > 0 {
-		// Bounded: the summary column has a 4096-byte ceiling.
+		// Bounded: the summary column has a 4096-byte ceiling, shared with the notify
+		// and auto-apply keys; a refusal can quote remote text of any length.
 		errs := r.Errors
 		if len(errs) > 5 {
 			errs = errs[:5]
 		}
-		s["manifest_errors"] = errs
+		bounded := make([]string, len(errs))
+		for i, e := range errs {
+			bounded[i] = boundDiagnostic(e, manifestErrorMaxBytes)
+		}
+		s["manifest_errors"] = bounded
 	}
 	return s
+}
+
+// manifestErrorMaxBytes bounds one manifest_errors entry as JSON: five of them
+// leave over half of the 4096-byte summary for every other key.
+const manifestErrorMaxBytes = 240
+
+// boundDiagnostic cuts s on a rune boundary until its JSON encoding, escapes
+// included, fits max bytes.
+func boundDiagnostic(s string, max int) string {
+	encoded := func(s string) int { b, _ := json.Marshal(s); return len(b) }
+	if encoded(s) <= max {
+		return s
+	}
+	r := []rune(s)
+	if len(r) > max {
+		r = r[:max]
+	}
+	for len(r) > 0 && encoded(string(r)+"…") > max {
+		r = r[:len(r)-1]
+	}
+	return string(r) + "…"
 }
 
 // DetectionStatus is the pair the view reports as checked_at / last_error.

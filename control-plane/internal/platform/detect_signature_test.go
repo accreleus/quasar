@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 
 type fakeVerifier struct {
 	verdict   actorsocket.Verdict
+	message   string // "" is "the actor's words"
 	err       error
 	calls     int
 	manifest  []byte
@@ -27,7 +29,11 @@ type fakeVerifier struct {
 func (f *fakeVerifier) VerifyManifest(_ context.Context, manifest, signature []byte) (actorsocket.ManifestVerdict, error) {
 	f.calls++
 	f.manifest, f.signature = manifest, signature
-	return actorsocket.ManifestVerdict{Verdict: f.verdict, Message: "the actor's words"}, f.err
+	msg := f.message
+	if msg == "" {
+		msg = "the actor's words"
+	}
+	return actorsocket.ManifestVerdict{Verdict: f.verdict, Message: msg}, f.err
 }
 
 const sigURL = "u/0.3.0.sig"
@@ -158,5 +164,103 @@ func TestActorClientSendsTheSharedManifestCheckShape(t *testing.T) {
 	}
 	if string(got.Manifest) != "{\"m\":1}\n" || string(got.Signature) != "sig" {
 		t.Fatalf("the actor must receive the exact bytes, got %+v", got)
+	}
+}
+
+func TestDetectTreatsAnOversizedSignatureAsOneItCouldNotFetch(t *testing.T) {
+	src, l := signedListing()
+	src.manifests[sigURL] = strings.Repeat("x", signatureMaxBytes+1)
+	v := &fakeVerifier{verdict: actorsocket.VerdictUnchecked}
+	if _, err := NewDetector(src, nil, nil).WithVerifier(v).resolve(context.Background(), l); err != nil {
+		t.Fatalf("mode off lists it: %v", err)
+	}
+	if v.signature != nil {
+		t.Fatalf("an over-cap .sig must not reach the actor, got %d bytes", len(v.signature))
+	}
+	v.verdict = actorsocket.VerdictRefused
+	_, err := NewDetector(src, nil, nil).WithVerifier(v).resolve(context.Background(), l)
+	if err == nil || !strings.Contains(err.Error(), "over the 8192-byte cap") {
+		t.Fatalf("err = %v, want the cap named", err)
+	}
+}
+
+// serveEarlyAnswer replays the Rust server's order for a request it answers
+// unread (an older actor's 404 for an unknown route): read the head byte by
+// byte, answer status with Connection: close, close with the body unread.
+func serveEarlyAnswer(t *testing.T, status int) string {
+	t.Helper()
+	sock := filepath.Join(t.TempDir(), "control.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			var head []byte
+			b := make([]byte, 1)
+			for !bytes.HasSuffix(head, []byte("\r\n\r\n")) {
+				if n, err := c.Read(b); n == 0 || err != nil {
+					break
+				}
+				head = append(head, b[0])
+			}
+			body := `{"error":"x"}`
+			_, _ = fmt.Fprintf(c, "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+				status, http.StatusText(status), len(body), body)
+			_ = c.Close()
+		}
+	}()
+	return sock
+}
+
+func TestActorClientReadsAnOlderActors404BeforeItsUnreadBodyIsReset(t *testing.T) {
+	client := NewActorClient(serveEarlyAnswer(t, http.StatusNotFound))
+	for _, n := range []int{1 << 10, 64 << 10, 256 << 10, int(manifestMaxBytes)} {
+		_, err := client.VerifyManifest(context.Background(), bytes.Repeat([]byte("m"), n), bytes.Repeat([]byte("s"), signatureMaxBytes))
+		if !errors.Is(err, ErrNoManifestCheck) {
+			t.Errorf("%d-byte manifest: err = %v, want ErrNoManifestCheck", n, err)
+		}
+	}
+}
+
+func TestActorClientFailsClosedWhenAnEarlyAnswerIsNotA404(t *testing.T) {
+	client := NewActorClient(serveEarlyAnswer(t, http.StatusRequestEntityTooLarge))
+	_, err := client.VerifyManifest(context.Background(), bytes.Repeat([]byte("m"), int(manifestMaxBytes)), nil)
+	if err == nil || errors.Is(err, ErrNoManifestCheck) {
+		t.Fatalf("err = %v, want a refusal", err)
+	}
+}
+
+// A malformed .sig whose diagnostic quotes a long field name still fits the
+// Jobs summary beside the notify and auto-apply keys.
+func TestTheDetectionSummaryFitsWithLongSignatureDiagnostics(t *testing.T) {
+	long := "signature refused by the recovery actor: the release manifest signature did not verify: " +
+		"the signature document is not valid JSON in the documented shape: unknown field `" +
+		strings.Repeat("\"\x01é", 3000) + "`"
+	rep := Report{Seen: 7, ManifestInvalid: 7}
+	for i := 0; i < 7; i++ {
+		rep.Errors = append(rep.Errors, fmt.Sprintf("v0.6.%d: %s", i, long))
+	}
+	s := rep.Summary()
+	if s["manifest_invalid"] != 7 {
+		t.Fatalf("the count must survive: %v", s["manifest_invalid"])
+	}
+	for _, e := range s["manifest_errors"].([]string) {
+		if !strings.HasPrefix(e, "v0.6.") || !strings.HasSuffix(e, "…") {
+			t.Fatalf("entry %q must keep its tag and show the cut", e)
+		}
+	}
+	notify := NotifyOutcome{Status: "failed", Reason: strings.Repeat("r", 200), ReleaseID: "00000000-0000-4000-8000-000000000000"}
+	for k, v := range notify.Summary() {
+		s[k] = v
+	}
+	s["auto_apply"], s["auto_apply_detail"] = "held_back", strings.Repeat("d", 200)
+	if b, _ := json.Marshal(s); len(b) > 4096 {
+		t.Fatalf("summary is %d bytes, over the jobs ceiling", len(b))
 	}
 }

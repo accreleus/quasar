@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/accreleus/quasar/control-plane/internal/actorsocket"
+	"github.com/accreleus/quasar/control-plane/internal/jobs"
 	"github.com/accreleus/quasar/control-plane/internal/migrate"
 	"github.com/accreleus/quasar/control-plane/migrations"
 )
@@ -331,5 +332,49 @@ func TestDetectCountsARefusedSignatureAndStoresNothingForIt(t *testing.T) {
 	errs, _ := rep.Summary()["manifest_errors"].([]string)
 	if len(errs) != 2 || !strings.Contains(errs[0], "signature refused by the recovery actor") {
 		t.Fatalf("manifest_errors = %v", errs)
+	}
+}
+
+// A3 (#824): a refusal quoting a long unknown field name still lets the
+// detection run record a terminal outcome, beside the notify and auto-apply keys.
+func TestDetectRunWithALongSignatureDiagnosticStillRecordsATerminalRun(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `TRUNCATE jobs CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	long := "the release manifest signature did not verify: the signature document is not valid JSON " +
+		"in the documented shape: unknown field `" + strings.Repeat("f", 8000) + "`"
+	rep, err := NewDetector(twoReleaseSource(), NewStore(pool), nil).
+		WithVerifier(&fakeVerifier{verdict: actorsocket.VerdictRefused, message: long}).Detect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary := rep.Summary()
+	for k, v := range (NotifyOutcome{Status: NotifySkipped, Reason: strings.Repeat("r", 200)}).Summary() {
+		summary[k] = v
+	}
+	summary["auto_apply"], summary["auto_apply_detail"] = "held_back", strings.Repeat("d", 200)
+
+	js := jobs.NewStore(pool)
+	def := jobs.Definition{
+		ID: DetectJobID, Name: "Platform release detection", Plane: jobs.PlaneControl, Scope: jobs.ScopeInstance, Managed: true,
+		Default: jobs.Schedule{Kind: jobs.KindInterval, IntervalSecs: 3600, Timezone: "UTC"},
+		Run:     func(context.Context, jobs.RunContext) (jobs.Outcome, error) { return jobs.Succeeded(nil), nil },
+	}
+	if _, err := js.SyncDefinitions(ctx, []jobs.Definition{def}, "UTC", 50); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := js.Materialize(ctx, jobs.MaterializeParams{JobID: DetectJobID, Trigger: jobs.TriggerSchedule, ScheduledFor: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	runs, err := js.ClaimDue(ctx, jobs.ClaimOptions{Plane: jobs.PlaneControl, Now: time.Now().Add(time.Second), Limit: 1})
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("claim: %v %v", runs, err)
+	}
+	out := jobs.Succeeded(summary)
+	run, applied, err := js.Report(ctx, runs[0].ID, out.State, out.Summary, "")
+	if err != nil || !applied || run.State != jobs.StateSucceeded {
+		t.Fatalf("report: applied=%v state=%v err=%v", applied, run.State, err)
 	}
 }

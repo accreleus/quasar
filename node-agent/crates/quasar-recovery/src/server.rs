@@ -28,6 +28,14 @@ use crate::trust::Caller;
 
 const MAX_HEAD: usize = 8 * 1024;
 const MAX_BODY: usize = 64 * 1024;
+/// `POST /v1/verify-manifest`'s limit: base64 of the control plane's 1 MiB manifest cap
+/// (`manifestMaxBytes`) and 8 KiB signature cap (`signatureMaxBytes`), plus the envelope.
+/// Smaller would refuse at framing a pair the actor's policy might list (mode `off`).
+pub const VERIFY_MAX_BODY: usize = base64_len(1 << 20) + base64_len(8 << 10) + 64;
+
+const fn base64_len(n: usize) -> usize {
+    n.div_ceil(3) * 4
+}
 const MAX_CONNECTIONS: usize = 8;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -172,7 +180,7 @@ fn answer(mut stream: UnixStream, actor: &Arc<Actor>, caller: Caller) -> io::Res
 }
 
 /// The request body, by its `Content-Length`; `None` when it is over the limit.
-fn read_body(stream: &mut UnixStream, head: &str) -> io::Result<Option<Vec<u8>>> {
+fn read_body(stream: &mut UnixStream, head: &str, limit: usize) -> io::Result<Option<Vec<u8>>> {
     let length = head
         .lines()
         .find_map(|l| {
@@ -182,7 +190,7 @@ fn read_body(stream: &mut UnixStream, head: &str) -> io::Result<Option<Vec<u8>>>
                 .then(|| v.trim().parse::<usize>().ok())?
         })
         .unwrap_or(0);
-    if length > MAX_BODY {
+    if length > limit {
         return Ok(None);
     }
     let mut body = vec![0u8; length];
@@ -204,7 +212,7 @@ fn refused(stream: &mut UnixStream, rejection: &Rejection) -> io::Result<()> {
 /// replacement is admitted, `200` when nothing needed re-creating, `409` (`busy`) or `400`
 /// with the `Rejection`.
 fn console(stream: &mut UnixStream, head: &str, actor: &Arc<Actor>) -> io::Result<()> {
-    let Some(body) = read_body(stream, head)? else {
+    let Some(body) = read_body(stream, head, MAX_BODY)? else {
         return respond(stream, 413, r#"{"error":"request_too_large"}"#);
     };
     let answer = match serde_json::from_slice::<ConsoleRequest>(&body) {
@@ -235,7 +243,7 @@ fn console(stream: &mut UnixStream, head: &str, actor: &Arc<Actor>) -> io::Resul
 /// kept, `400` with the `Rejection` for one that is not a preflight or fails without saying
 /// why.
 fn preflight(stream: &mut UnixStream, head: &str, actor: &Arc<Actor>) -> io::Result<()> {
-    let Some(body) = read_body(stream, head)? else {
+    let Some(body) = read_body(stream, head, MAX_BODY)? else {
         return respond(stream, 413, r#"{"error":"request_too_large"}"#);
     };
     let answer = match serde_json::from_slice::<ConsolePreflight>(&body) {
@@ -258,7 +266,7 @@ fn preflight(stream: &mut UnixStream, head: &str, actor: &Arc<Actor>) -> io::Res
 /// `POST /v1/verify-manifest` (control socket only): `200` with the `ManifestVerdict`,
 /// `400` with the `Rejection` for a body that is not a `ManifestCheck`.
 fn verify_manifest(stream: &mut UnixStream, head: &str, actor: &Arc<Actor>) -> io::Result<()> {
-    let Some(body) = read_body(stream, head)? else {
+    let Some(body) = read_body(stream, head, VERIFY_MAX_BODY)? else {
         return respond(stream, 413, r#"{"error":"request_too_large"}"#);
     };
     let req = match serde_json::from_slice::<ManifestCheck>(&body) {
@@ -293,7 +301,7 @@ fn submit(
     actor: &Arc<Actor>,
     caller: Caller,
 ) -> io::Result<()> {
-    let Some(body) = read_body(stream, head)? else {
+    let Some(body) = read_body(stream, head, MAX_BODY)? else {
         return respond(stream, 413, r#"{"error":"request_too_large"}"#);
     };
     let request: Request = match serde_json::from_slice(&body) {

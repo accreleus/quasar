@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/actorsocket"
@@ -133,13 +134,18 @@ func (c *ActorClient) VerifyManifest(ctx context.Context, manifest, signature []
 	if err != nil {
 		return actorsocket.ManifestVerdict{}, err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://recovery/v1/verify-manifest", bytes.NewReader(body))
+	resp, err := c.postVerify(ctx, body)
 	if err != nil {
-		return actorsocket.ManifestVerdict{}, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := c.http.Do(httpReq)
-	if err != nil {
+		// An older actor answers 404 to the head and closes with the body unread, so
+		// a body past the socket buffer fails its write first; ask again with none.
+		if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
+			if probe, perr := c.postVerify(ctx, []byte("{}")); perr == nil {
+				_ = probe.Body.Close()
+				if probe.StatusCode == http.StatusNotFound {
+					return actorsocket.ManifestVerdict{}, ErrNoManifestCheck
+				}
+			}
+		}
 		return actorsocket.ManifestVerdict{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -156,6 +162,15 @@ func (c *ActorClient) VerifyManifest(ctx context.Context, manifest, signature []
 		return actorsocket.ManifestVerdict{}, fmt.Errorf("decode the recovery actor's verdict: %w", err)
 	}
 	return v, nil
+}
+
+func (c *ActorClient) postVerify(ctx context.Context, body []byte) (*http.Response, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://recovery/v1/verify-manifest", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	return c.http.Do(httpReq)
 }
 
 // Result is the attempt's result from `GET /v1/status?request_id=`; the
