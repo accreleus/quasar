@@ -1,0 +1,52 @@
+# #1227: vulkanh264enc writes the SPS VUI colour description from its input
+# caps' colorimetry, as vulkanh265enc does. Untagged input writes none.
+diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
+index 8781bc7..c566ee0 100644
+--- a/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
++++ b/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
+@@ -1137,6 +1137,36 @@ gst_vulkan_h264_encoder_update_parameters (GstVulkanH264Encoder * self,
+   return GST_FLOW_OK;
+ }
+ 
++/* Quasar (#1227): the SPS VUI colour description from the input caps'
++ * colorimetry, as vulkanh265enc writes it. Untagged input writes none, so the
++ * test is the caps field: GstVideoInfo fills a size-based default without it.
++ * gst_h264_bit_writer_sps() puts these into the bitstream. */
++static void
++_set_vui_colour_description (GstVulkanH264Encoder * self, GstH264SPS * sps)
++{
++  GstH264VUIParams *vui = &sps->vui_parameters;
++  const GstVideoColorimetry *ci = &self->in_state->info.colorimetry;
++
++  if (!gst_structure_has_field (gst_caps_get_structure (self->in_state->caps, 0),
++          "colorimetry"))
++    return;
++
++  vui->video_signal_type_present_flag = 1;
++  vui->video_format = 5;        /* Unspecified */
++  vui->video_full_range_flag =
++      (ci->range == GST_VIDEO_COLOR_RANGE_0_255) ? 1 : 0;
++  vui->colour_description_present_flag = 1;
++  vui->colour_primaries = gst_video_color_primaries_to_iso (ci->primaries);
++  vui->transfer_characteristics =
++      gst_video_transfer_function_to_iso (ci->transfer);
++  vui->matrix_coefficients = gst_video_color_matrix_to_iso (ci->matrix);
++
++  GST_DEBUG_OBJECT (self, "H.264 VUI colour description: primaries=%u "
++      "transfer=%u matrix=%u full-range=%u", vui->colour_primaries,
++      vui->transfer_characteristics, vui->matrix_coefficients,
++      vui->video_full_range_flag);
++}
++
+ static GstFlowReturn
+ gst_vulkan_h264_encoder_new_parameters (GstH264Encoder * encoder,
+     GstH264SPS * sps, GstH264PPS * pps)
+@@ -1165,6 +1195,8 @@ gst_vulkan_h264_encoder_new_parameters (GstH264Encoder * encoder,
+         MIN (gst_h264_level_idc_from_vk (vk_max_level), sps->level_idc);
+   }
+ 
++  _set_vui_colour_description (self, sps);
++
+   ret = gst_vulkan_h264_encoder_update_parameters (self, sps, pps);
+   if (ret != GST_FLOW_OK)
+     return ret;

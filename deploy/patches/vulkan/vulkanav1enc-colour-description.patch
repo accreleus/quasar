@@ -1,0 +1,97 @@
+# #1227: vulkanav1enc writes the sequence header's colour description from its
+# input caps' colorimetry. Untagged input keeps it unspecified; a colorimetry
+# change restarts the session, since AV1 session parameters cannot be updated.
+diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c
+index 3b13db3..a48154d 100644
+--- a/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c
++++ b/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c
+@@ -527,8 +527,9 @@ _configure_rate_control (GstVulkanAV1Encoder * self,
+ 
+ static gboolean
+ gst_vulkan_av1_encoder_init_sequence_header (GstVulkanAV1Encoder * self,
+-    GstVideoInfo * in_info, StdVideoAV1Level level)
++    GstVideoCodecState * in_state, StdVideoAV1Level level)
+ {
++  GstVideoInfo *in_info = &in_state->info;
+   guint32 keyframe_period =
+       gst_av1_encoder_get_keyframe_period (GST_AV1_ENCODER (self));
+ 
+@@ -549,7 +550,33 @@ gst_vulkan_av1_encoder_init_sequence_header (GstVulkanAV1Encoder * self,
+     .matrix_coefficients = STD_VIDEO_AV1_MATRIX_COEFFICIENTS_UNSPECIFIED,
+     .chroma_sample_position = STD_VIDEO_AV1_CHROMA_SAMPLE_POSITION_UNKNOWN,
+   };
++  /* *INDENT-ON* */
+ 
++  /* Quasar (#1227): the colour description from the input caps' colorimetry
++   * (AV1 and GStreamer's ISO conversions use the same CICP numbers). Untagged
++   * input keeps the unspecified config above, so the test is the caps field:
++   * GstVideoInfo fills a size-based default without it. */
++  if (gst_structure_has_field (gst_caps_get_structure (in_state->caps, 0),
++          "colorimetry")) {
++    const GstVideoColorimetry *ci = &in_info->colorimetry;
++    StdVideoAV1ColorConfig *cc = &self->params.color_config;
++
++    cc->flags.color_description_present_flag = 1;
++    cc->flags.color_range = (ci->range == GST_VIDEO_COLOR_RANGE_0_255) ? 1 : 0;
++    cc->color_primaries = (StdVideoAV1ColorPrimaries)
++        gst_video_color_primaries_to_iso (ci->primaries);
++    cc->transfer_characteristics = (StdVideoAV1TransferCharacteristics)
++        gst_video_transfer_function_to_iso (ci->transfer);
++    cc->matrix_coefficients = (StdVideoAV1MatrixCoefficients)
++        gst_video_color_matrix_to_iso (ci->matrix);
++
++    GST_DEBUG_OBJECT (self, "AV1 colour description: primaries=%u transfer=%u "
++        "matrix=%u full-range=%u", cc->color_primaries,
++        cc->transfer_characteristics, cc->matrix_coefficients,
++        cc->flags.color_range);
++  }
++
++  /* *INDENT-OFF* */
+   self->params.seq_hdr = (StdVideoAV1SequenceHeader) {
+     .flags = (StdVideoAV1SequenceHeaderFlags) {
+       .still_picture = 0,
+@@ -804,6 +831,17 @@ _publish_sequence_state (GstVulkanAV1Encoder * self,
+   gst_video_codec_state_unref (out_state);
+ }
+ 
++/* Quasar (#1227): the sequence header carries the colour description and AV1
++ * session parameters cannot be updated, so a change needs a new session. */
++static gboolean
++_same_colorimetry (const GstVideoCodecState * a, const GstVideoCodecState * b)
++{
++  return g_strcmp0 (gst_structure_get_string (gst_caps_get_structure (a->caps,
++              0), "colorimetry"),
++      gst_structure_get_string (gst_caps_get_structure (b->caps, 0),
++          "colorimetry")) == 0;
++}
++
+ static GstFlowReturn
+ gst_vulkan_av1_encoder_new_sequence (GstAV1Encoder * encoder,
+     GstVideoCodecState * in_state)
+@@ -860,13 +898,14 @@ gst_vulkan_av1_encoder_new_sequence (GstAV1Encoder * encoder,
+   /* *INDENT-ON* */
+ 
+   if (gst_vulkan_encoder_is_started (self->encoder)) {
+-    /* profile is constant (Main, 8-bit 4:2:0), so the input resolution is
+-     * the only thing that can invalidate the running sequence */
++    /* profile is constant (Main, 8-bit 4:2:0), so only the input resolution
++     * and colorimetry can invalidate the running sequence */
+     if (self->in_state
+         && GST_VIDEO_INFO_WIDTH (&self->in_state->info) ==
+         GST_VIDEO_INFO_WIDTH (in_info)
+         && GST_VIDEO_INFO_HEIGHT (&self->in_state->info) ==
+-        GST_VIDEO_INFO_HEIGHT (in_info)) {
++        GST_VIDEO_INFO_HEIGHT (in_info)
++        && _same_colorimetry (self->in_state, in_state)) {
+       /* trap 8: same sequence, the session is not restarted, but a
+        * reconfigure may have changed the rate-control values. Re-apply
+        * rate control via vkCmdControlVideoCoding with
+@@ -1057,7 +1096,7 @@ gst_vulkan_av1_encoder_new_sequence (GstAV1Encoder * encoder,
+       GST_VIDEO_INFO_FPS_N (&self->coded_info),
+       GST_VIDEO_INFO_FPS_D (&self->coded_info), vk_av1_caps->maxLevel);
+ 
+-  if (!gst_vulkan_av1_encoder_init_sequence_header (self, in_info, level))
++  if (!gst_vulkan_av1_encoder_init_sequence_header (self, in_state, level))
+     return GST_FLOW_ERROR;
+ 
+   if (gst_vulkan_av1_encoder_update_session_parameters (self) != GST_FLOW_OK)
