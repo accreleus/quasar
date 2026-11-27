@@ -129,6 +129,10 @@ pub(crate) struct Rate {
     pub(crate) setpoint_kbps: Box<dyn Fn() -> f64 + Send + Sync>,
     /// `QUASAR_WT_CAPACITY`: v2, or 0.6.3's sender and reading (`legacy`).
     pub(crate) capacity: crate::session::settings::WtCapacity,
+    /// Legacy paces video and lets the setpoint follow a standing queue (#1321): on with
+    /// `QUASAR_WT_AUDIO_PACING`, and only where a bitrate write is free (no write gap): on NVENC
+    /// and VA each write costs a keyframe, so there legacy stays 0.6.4's sender.
+    pub(crate) audio_pacing: bool,
     /// False with the ABR off: the estimate is tracked and never written to the encoder,
     /// so nothing would pay for FEC.
     pub(crate) retargets: bool,
@@ -143,8 +147,9 @@ pub(crate) struct Rate {
     /// which a client that sends no feedback (§Feedback) never sends.
     pub(crate) displaced: Box<dyn Fn() + Send + Sync>,
     /// Every estimate, in kbit/s of video, with the FEC share charged on top of it
-    /// (`abr::Governor::set_share`).
-    pub(crate) observe: Box<dyn Fn(f64, f64) + Send + Sync>,
+    /// (`abr::Governor::set_share`), and whether it is legacy's queue bound
+    /// (`abr::Governor::set_queue_bound`; always false on v2).
+    pub(crate) observe: Box<dyn Fn(f64, f64, bool) + Send + Sync>,
     /// After `observe`, for every estimate that came from a receiver report, never for the
     /// silence decay: what the report showed the link carrying when the link held the
     /// sender back (`congestion::Estimator::measured`), `None` when it did not.
@@ -204,6 +209,7 @@ impl<'a> Control<'a> {
         governor.legacy(legacy);
         let mut estimator = congestion::Estimator::new(rate.ceiling_kbps, now);
         estimator.legacy = legacy;
+        estimator.audio_pacing = rate.audio_pacing;
         estimator.probes = fec && !legacy;
         Self {
             rate,
@@ -323,7 +329,8 @@ impl<'a> Control<'a> {
         } else {
             0.0
         };
-        (self.rate.observe)(congestion::abr_estimate(kbps, self.charged), bound);
+        let queue = report && self.estimator.follows_queue();
+        (self.rate.observe)(congestion::abr_estimate(kbps, self.charged), bound, queue);
     }
 
     /// The repair datagrams that follow one frame's video datagrams. A PyroWave frame gets
@@ -1576,7 +1583,7 @@ fn feed(
     backlog.paced = rates.0.is_some();
     video.on_hold = control
         .as_ref()
-        .is_some_and(|c| !pyrowave && c.estimator.drop_held());
+        .is_some_and(|c| !pyrowave && c.estimator.pace_waits());
     let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
     let now = std::time::Instant::now();
     video.recovering = control

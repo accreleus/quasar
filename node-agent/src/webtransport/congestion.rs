@@ -54,6 +54,16 @@ const BLACKOUT_MIN_DATAGRAMS: usize = 4;
 const RUN_MAX_WAIT: Duration = Duration::from_millis(500);
 /// An arrival under this much one-way delay over the path floor is at the floor.
 const AT_FLOOR_MS: f64 = 30.0;
+/// `Estimator::legacy_queue`: off the floor this long. A 110 ms delay spike is off it for about
+/// 0.4 s.
+const QUEUE_STANDING: Duration = Duration::from_secs(1);
+/// A video datagram that arrived this much before one sent ahead of it shows the report reordered;
+/// `REORDERING_REPORTS` such reports within `REORDERING` show the path keeps reordering. A count:
+/// half the reports at the 50 ms both clients send (§Feedback caps it at 100 ms). A burst (a Wi-Fi
+/// block-ack timeout, a handover) is not that.
+const REORDERED_US: u64 = 1_000;
+const REORDERING: Duration = Duration::from_secs(1);
+const REORDERING_REPORTS: usize = 10;
 /// The path floor is the least one-way delay over `FLOOR_SPAN_US` of send time, read as the
 /// least of each `DELAY_BUCKET_US`: a delay step ages in within the span.
 const DELAY_BUCKET_US: u64 = 500_000;
@@ -788,6 +798,22 @@ pub(crate) struct Estimator {
     evidence: Evidence,
     /// `QUASAR_WT_CAPACITY=legacy`: 0.6.3's reading, and no blackouts.
     pub(crate) legacy: bool,
+    /// `webtransport::Rate::audio_pacing` (#1321): off, `legacy` is 0.6.4's sender
+    /// ([`Self::legacy_queue`] is never true). No effect under v2.
+    pub(crate) audio_pacing: bool,
+    /// Since when every video arrival came off the path floor (`Evidence::arrival`), whether
+    /// that is `QUEUE_STANDING` at the last report, and whether it was since the estimate last
+    /// left its delay bound with the path not reordering (`REORDERING_REPORTS`).
+    off_floor: Option<Instant>,
+    queue_standing: bool,
+    queue_stood: bool,
+    /// While `queue_stood`: the path floor from before the queue, which the off-floor reading
+    /// holds to. The rolling floor takes in a queue that stands over `FLOOR_SPAN_US`, so a queue
+    /// that stood longer read as gone while it still held seconds (#1692 lab, NVIDIA 2 Mbit/s:
+    /// 1.3-1.6 s of queue at onset + 40 s, the setpoint left 7 % over the estimate).
+    queue_floor: Option<i64>,
+    /// When each report within `REORDERING` showed the path reorder.
+    reordered: VecDeque<Instant>,
     /// v2's hold (`HOLD`) and loss floor; off for PyroWave, which has its own controller and no
     /// keyframes to overflow a link.
     holds: bool,
@@ -1010,6 +1036,12 @@ impl Estimator {
             reported_to: None,
             evidence: Evidence::default(),
             legacy: false,
+            audio_pacing: true,
+            off_floor: None,
+            queue_standing: false,
+            queue_stood: false,
+            queue_floor: None,
+            reordered: VecDeque::new(),
             holds: true,
             probes: false,
             logged: (Bound::Ceiling, None),
@@ -1027,6 +1059,23 @@ impl Estimator {
     /// carries less, and pacing a recovery keyframe at a decayed rate only delays it.
     pub(crate) fn found_link(&self) -> bool {
         (self.bound != Bound::Ceiling || self.held.is_some()) && self.recover_to.is_none()
+    }
+
+    /// `legacy`, with `audio_pacing`, at the delay bound, and the queue stood (every video arrival
+    /// `QUEUE_STANDING` off the floor) since it got there, and the path has not kept reordering
+    /// since (`REORDERING_REPORTS`). Pacing must not feed what turns it on or keeps it on: paced
+    /// video goes in small send groups whose reordered arrivals read as overuse, which held the
+    /// bound at delay (#1692 lab REORD: 31-36 % of reports unpaced, 72-77 % paced; after a cap
+    /// lifted it never let go). The floor is read at the pacer's release and pacing sends in order,
+    /// so it can raise neither.
+    pub(crate) fn legacy_queue(&self) -> bool {
+        self.legacy && self.audio_pacing && self.bound == Bound::Delay && self.queue_stood
+    }
+
+    /// [`Self::legacy_queue`] and the queue stands now: a setpoint over the estimate follows it
+    /// down (`abr::Governor::set_queue_bound`).
+    pub(crate) fn follows_queue(&self) -> bool {
+        self.legacy_queue() && self.queue_standing
     }
 
     /// A lossy run is on, or ended under `LOSS_WINDOW` ago: the keyframe the client asks for after
@@ -1054,6 +1103,14 @@ impl Estimator {
     /// still drain past the pace to give the readings that ratchet the line.
     pub(crate) fn drop_held(&self) -> bool {
         self.held.is_some_and(|h| h.dropped)
+    }
+
+    /// `VideoQueue::on_hold`: [`Self::drop_held`], or legacy pacing ([`Self::legacy_queue`]). At a
+    /// deep rung a keyframe (10.7 frames at 360p) takes 143 ms at the pace, over `PACE_MAX_WAIT`,
+    /// so it went into the link's queue unpaced, or not, by the phase of what was held (sim,
+    /// 1.8-2.2 Mbit/s: audio p99 25-87 ms, 29-37 with this).
+    pub(crate) fn pace_waits(&self) -> bool {
+        self.drop_held() || self.legacy_queue()
     }
 
     /// `kbps`, never over the hold's line (`HOLD`): what governs the sender and feeds the ABR.
@@ -1280,6 +1337,7 @@ impl Estimator {
     /// Start again from `kbps` (never above the ceiling): codec-pyrowave.md §Rate, the ABR
     /// resumes from the estimate after a switch back.
     pub(crate) fn resume_at(&mut self, kbps: f64) {
+        (self.off_floor, self.queue_standing, self.queue_stood) = (None, false, false);
         self.delay_kbps = kbps;
         self.loss_kbps = kbps;
         self.read_last = false;
@@ -1825,6 +1883,8 @@ impl Estimator {
         let to = match self.recover_to {
             Some((to, _)) => to,
             None => {
+                // No arrival says the queue still stands.
+                (self.off_floor, self.queue_standing, self.queue_stood) = (None, false, false);
                 let to = self.estimate_kbps;
                 tracing::info!(
                     token = "webtransport-cc-regrow",
@@ -1897,6 +1957,7 @@ impl Estimator {
         });
         self.estimate_kbps = clamp(kbps);
         self.bound = bound;
+        self.queue_stood &= bound == Bound::Delay;
     }
 
     fn due(&mut self, now: Instant) -> Option<f64> {
@@ -1929,6 +1990,7 @@ impl Estimator {
         // (received, lost) video and policy FEC datagrams.
         let mut video = (0i64, lost);
         let mut newest_fresh = None;
+        let mut reordered = false;
         for (i, &arrival) in fb.arrivals.iter().enumerate() {
             let seq = fb.first_pkt_seq.wrapping_add(i as u32);
             let Some(slot) = log.slot(seq) else {
@@ -1991,9 +2053,22 @@ impl Estimator {
                     {
                         self.trendline.update(send_d, arrival_d, arrival_ms);
                     }
+                    reordered |= !resend && newest_fresh.is_some_and(|n| at + REORDERED_US < n);
                     let at_floor = self.evidence.arrival(sent_us, at);
                     video.1 += self.end_run(log, Some(at_floor), now);
                     self.evidence.at_floor = at_floor;
+                    let queued = match self.queue_floor.filter(|_| self.queue_stood) {
+                        Some(floor) => {
+                            let delay = (i128::from(at) - i128::from(sent_us)) as f64;
+                            delay - floor as f64 >= AT_FLOOR_MS * 1000.0
+                        }
+                        None => !at_floor,
+                    };
+                    if !queued {
+                        self.off_floor = None;
+                    } else if self.off_floor.is_none() {
+                        self.off_floor = Some(now);
+                    }
                 }
             }
             if let (false, Some(at)) = (resend, at_us) {
@@ -2104,6 +2179,25 @@ impl Estimator {
         let (r, l) = (r.max(0), l.max(0));
         let loss = (r + l >= LOSS_MIN_SAMPLES).then(|| l as f64 / (r + l) as f64);
 
+        self.queue_standing = self
+            .off_floor
+            .is_some_and(|at| now.saturating_duration_since(at) >= QUEUE_STANDING);
+        if reordered {
+            self.reordered.push_back(now);
+        }
+        while self
+            .reordered
+            .front()
+            .is_some_and(|&at| now.saturating_duration_since(at) > REORDERING)
+        {
+            self.reordered.pop_front();
+        }
+        self.queue_stood =
+            (self.queue_stood || self.queue_standing) && self.reordered.len() < REORDERING_REPORTS;
+        self.queue_floor = match self.queue_stood {
+            true => self.queue_floor.or(self.evidence.floor),
+            false => None,
+        };
         Measured {
             usage: self.trendline.usage,
             rate_kbps,
@@ -2641,13 +2735,17 @@ pub(crate) fn abr_estimate(kbps: f64, charged: f64) -> f64 {
 /// The rates `VideoQueue` holds video to, kbit/s: QUIC's room ([`VideoQueue::room`]) at the
 /// governed rate or the estimate if lower, and the pacer ([`VideoQueue::pace`]) at the
 /// governed rate ([`governed_kbps`]) once the estimate is under the ceiling. `None`: the
-/// session is not governed (or PyroWave), or nothing to pace.
+/// session is not governed (or PyroWave), or nothing to pace. Legacy holds video only while
+/// its estimate is the link's queue ([`Estimator::legacy_queue`]): an unpaced keyframe waits
+/// in that queue and the audio behind it with it (#1321). Paced after a Wi-Fi burst's loss
+/// cut, the keyframe the client asks for waits too, and legacy has no `recovering` to let it
+/// go (sim: twice the freezes at bursts every 2.5 s).
 pub(crate) fn video_rates(
     governor: &Governor,
     estimator: &Estimator,
     pyrowave: bool,
 ) -> (Option<u64>, Option<u64>) {
-    if pyrowave || !governor.governs() || estimator.legacy {
+    if pyrowave || !governor.governs() || estimator.legacy && !estimator.legacy_queue() {
         return (None, None);
     }
     let room = (governor.kbps() as f64).min(estimator.estimate_kbps()) as u64;
@@ -3073,8 +3171,9 @@ pub(crate) struct VideoQueue {
     /// let it all go. A paced keyframe and the frames behind it wait that long on a clean link,
     /// so that is not late; a stalled queue is overdue by more every frame.
     due: VecDeque<(Instant, Instant)>,
-    /// A link that drops what overflows it holds the sender ([`Estimator::drop_held`]): video
-    /// the pace drains within `PACE_MAX_WAIT_HELD` waits that long for it.
+    /// A link that drops what overflows it holds the sender, or legacy paces
+    /// ([`Estimator::pace_waits`]): video the pace drains within `PACE_MAX_WAIT_HELD` waits that
+    /// long for it.
     pub(crate) on_hold: bool,
     /// A lossy run is on or just ended ([`Estimator::recovering`]): a held keyframe is not paced.
     /// Paced at the encoder's rate, the one asked after a Wi-Fi burst waited 85-150 ms (#1652).

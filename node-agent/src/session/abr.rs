@@ -445,6 +445,8 @@ pub struct Governor {
     share_now: f64,
     /// When `set_share` last wrote: a step at the same estimate is that same write.
     bound_at: Option<Instant>,
+    /// Per-report loop: the estimate is WebTransport legacy's delay bound (`set_queue_bound`).
+    queue_bound: bool,
 }
 
 /// `Governor::set_share`: a share that falls lowers the ceiling only after staying lower this
@@ -480,7 +482,19 @@ impl Governor {
             share_lower_since: None,
             share_now: 0.0,
             bound_at: None,
+            queue_bound: false,
         }
+    }
+
+    /// WebTransport `QUASAR_WT_CAPACITY=legacy`: the estimates fed next are its delay bound while
+    /// the link's queue stands (`webtransport::congestion::Estimator::follows_queue`). A setpoint
+    /// over one follows it down (`observe_per_report`): its readings inside the deadband are none,
+    /// so nothing else lowers it, and the queue it keeps standing holds the audio behind it
+    /// (#1503, #1321: 10-16 % over, 1.8-4.8 s of queue on the AMD lab host). Never on a loss bound
+    /// (a Wi-Fi burst's cut is not the link) nor on a delay spike the queue drains from, and only
+    /// where a bitrate write is free (`webtransport::Rate::audio_pacing`).
+    pub fn set_queue_bound(&mut self, queue: bool) {
+        self.queue_bound = queue;
     }
 
     /// The ceiling on video: the configured one less the FEC share, so video plus repairs
@@ -619,6 +633,15 @@ impl Governor {
                 .write_due(now)
                 .then(|| self.observe_window(estimate, now))
                 .flatten();
+        }
+        if self.queue_bound && estimate < sp {
+            let target = self.clamp(estimate.floor());
+            if target >= self.setpoint || !self.write_due(now) {
+                return None;
+            }
+            self.setpoint = target;
+            self.last_retarget = now;
+            return Some(target);
         }
         let slew = self.cfg.max_up_step / self.cfg.min_interval.as_secs_f64();
         if estimate > self.rate {
@@ -1495,6 +1518,37 @@ mod tests {
         }
         g.observe_report(Some(8400.0), ms(base, 400));
         assert_eq!(g.observe_report(Some(8400.0), ms(base, 500)), Some(8400));
+    }
+
+    /// #1503 on `QUASAR_WT_CAPACITY=legacy` (#1321): an estimate at its queue bound under the
+    /// setpoint takes the setpoint down to it, inside the deadband too, at most once per write gap,
+    /// and leaves the rate (the rung's) where it was. Not at the queue bound it moves nothing, as
+    /// before (`per_report_a_low_estimate_without_a_reading_moves_nothing`).
+    #[test]
+    fn per_report_a_queue_bound_estimate_under_the_setpoint_takes_it_down() {
+        let base = Instant::now();
+        let cfg = AbrConfig {
+            legacy_readings: true,
+            ..per_report(1000)
+        };
+        let mut g = Governor::new(cfg, base);
+        g.observe_report(None, ms(base, 1000));
+        assert_eq!(
+            g.observe(9000.0, ms(base, 1000)),
+            None,
+            "not at the queue bound"
+        );
+        g.set_queue_bound(true);
+        assert_eq!(g.observe(9000.0, ms(base, 1100)), Some(9000));
+        g.observe_report(None, ms(base, 1100));
+        assert_eq!(g.observe(8500.0, ms(base, 1200)), None, "the write gap");
+        assert_eq!(g.observe(8500.0, ms(base, 2100)), Some(8500));
+        assert_eq!(
+            g.observe(9500.0, ms(base, 2200)),
+            None,
+            "up stays past the deadband"
+        );
+        assert_eq!(g.rate_kbps(), 10_000.0);
     }
 
     /// #68: with reports flowing, an estimate under the setpoint (a delay detector misreading

@@ -35,6 +35,7 @@ const ALLOWED: &[(&str, &str, &str, &str)] = &[
     ("-env", "QUASAR_WT_PORT", "*", "an agent variable on an owned install: reconfigure sets it (AGENT_VARIABLES), so the recipe carries no default"),
     ("-env", "QUASAR_WT_UNAUTH_PER_SOURCE", "*", "an agent variable on an owned install: reconfigure sets it (AGENT_VARIABLES)"),
     ("-env", "QUASAR_PYROWAVE_CPU_INPUT", "*", "an agent variable on an owned install: reconfigure sets it (AGENT_VARIABLES)"),
+    ("-env", "QUASAR_WT_AUDIO_PACING", "*", "an agent variable on an owned install: reconfigure sets it (AGENT_VARIABLES)"),
     ("-env", "QUASAR_WT_CAPACITY", "*", "an agent variable on an owned install: reconfigure sets it (AGENT_VARIABLES)"),
     ("-env", "QUASAR_WT_REF_RECOVERY", "*", "an agent variable on an owned install: reconfigure sets it (AGENT_VARIABLES)"),
     ("-env", "QUASAR_NON_REF_P", "*", "an agent variable on an owned install: reconfigure sets it (AGENT_VARIABLES)"),
