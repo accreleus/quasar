@@ -217,7 +217,7 @@ fn the_largest_pair_the_control_plane_sends_reaches_the_policy() {
     let b64 = |n: usize| base64::engine::general_purpose::STANDARD.encode(vec![b'{'; n]);
     let body = json!({"manifest": b64(1 << 20), "signature": b64(8 << 10)}).to_string();
     assert!(body.len() <= server::VERIFY_MAX_BODY && body.len() > 64 * 1024);
-    let over = format!("{body:<width$}", width = server::VERIFY_MAX_BODY + 1);
+    let over = body.clone() + &" ".repeat(server::VERIFY_MAX_BODY + 1 - body.len());
     for (mode, verdict) in [
         (SignatureMode::Off, Verdict::Unchecked),
         (SignatureMode::Verify, Verdict::Refused),
