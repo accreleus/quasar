@@ -2267,6 +2267,12 @@ impl Estimator {
 /// codec-pyrowave.md §Rate: the 1 s the estimate may sit under `floor_kbps`, and the latest
 /// the QUIC cap and that timer start after a switch on.
 const PYRO_STEP_DOWN_AFTER: Duration = Duration::from_secs(1);
+/// The start of a switch on, when an estimate climbing back does not count toward the
+/// step-down (#1664). The first full-rate frames at 4K120 cost it a cut to 277-345 Mbit/s,
+/// which it regains at the AIMD 8 % a second: about 5 s back to the 400 floor.
+const PYRO_STARTUP: Duration = Duration::from_secs(10);
+/// An estimate this far over its low since the step-down timer started is climbing back.
+const PYRO_RECOVERING: f64 = 1.01;
 /// The shortest span the encoder's fill of its budget is read over (6 frames at 60 fps), and
 /// that a waiting queue must last to count by itself.
 const PYRO_FILL_WINDOW: Duration = Duration::from_millis(100);
@@ -2301,7 +2307,8 @@ pub(crate) enum PyroVerdict {
 
 /// PyroWave's per-session rate controller (codec-pyrowave.md §Rate), one per switch on: the
 /// estimate is seeded at the target and never above it, follows `feedback`, and is capped by
-/// what the QUIC connection carries from `min(first feedback, switch on + 1 s)`. Feedback
+/// what the QUIC connection carries from `min(first feedback, switch on + 1 s)`. For the first
+/// `PYRO_STARTUP` a climbing estimate restarts the step-down's 1 s; a flat one does not. Feedback
 /// silence does not decay it, as on the standard codec it never takes the encoder under
 /// the floor; QUIC's cap still applies, so withholding feedback cannot postpone a step-down.
 ///
@@ -2323,7 +2330,8 @@ pub(crate) struct PyroRate {
     on: Instant,
     /// When the QUIC cap and the floor timer started.
     judged_from: Option<Instant>,
-    below_since: Option<Instant>,
+    /// Under the floor: since when the 1 s runs, and the lowest estimate in it.
+    below: Option<(Instant, f64)>,
     /// The `bitrate` last asked for.
     budget: u32,
     /// QUIC's congestion events at the last judgement.
@@ -2380,7 +2388,7 @@ impl PyroRate {
             floor_kbps: f64::from(floor_kbps),
             on: now,
             judged_from: None,
-            below_since: None,
+            below: None,
             // The first judgement always writes: a previous client may have left a lower one.
             budget: 0,
             events: None,
@@ -2544,14 +2552,20 @@ impl PyroRate {
             if kbps < self.floor_kbps {
                 // A single loss (`rose`) never latches: it buys this judgement only.
                 self.latched = sustained || (self.latched && fills);
-                let since = *self.below_since.get_or_insert(now);
+                let (mut since, mut low) = self
+                    .below
+                    .map_or((now, kbps), |(since, low)| (since, low.min(kbps)));
+                if now < self.on + PYRO_STARTUP && kbps > low * PYRO_RECOVERING {
+                    (since, low) = (now, kbps);
+                }
+                self.below = Some((since, low));
                 if now.saturating_duration_since(since) >= PYRO_STEP_DOWN_AFTER {
                     return PyroVerdict::StepDown {
                         estimate_kbps: kbps,
                     };
                 }
             } else {
-                self.below_since = None;
+                self.below = None;
                 self.latched = false;
             }
         }
