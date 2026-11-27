@@ -1748,6 +1748,34 @@ mod tests {
         );
     }
 
+    /// The per-report loop's write gap is `per_report`, not `min_interval`: set apart here, as
+    /// `QUASAR_ABR_MIN_INTERVAL_MS` can, so a bound write on NVENC or VA waits the full second.
+    #[test]
+    fn a_share_rising_per_report_loop_writes_once_per_write_gap() {
+        let base = Instant::now();
+        let mut g = Governor::new(
+            AbrConfig {
+                per_report: Some(Duration::from_secs(1)),
+                min_interval: Duration::from_millis(100),
+                ..AbrConfig::new_smooth(2500, 8000, 60)
+            },
+            base,
+        );
+        let mut writes = Vec::new();
+        for level in 1..=5u64 {
+            let now = ms(base, 2000 + 50 * level);
+            let share = level as f64 * 0.05;
+            g.observe_report(None, now);
+            let cut = g.set_share(share, now);
+            writes.extend(g.observe(8000.0 / (1.0 + share), now).or(cut));
+        }
+        assert_eq!(writes, [7619], "one write in the gap");
+        let now = ms(base, 3100);
+        g.observe_report(None, now);
+        let cut = g.set_share(0.25, now);
+        assert_eq!(g.observe(6400.0, now).or(cut), Some(6400), "the next gap");
+    }
+
     /// #1301 review S2: the reading line follows the share now; the sticky share bounds only the
     /// ceiling. With the share fallen to 0, a legacy session over a 6000 link cuts in two
     /// readings, as with no FEC.
