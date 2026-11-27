@@ -1902,8 +1902,13 @@ jobs:
           gh release upload "$TAG" "$MANIFEST" --clobber
           # The signature is a separate asset, uploaded only when one was made:
           # a host in `verify` mode reads its absence as an unsigned release.
+          # A key-less re-run removes an earlier run's .sig, which would no longer
+          # describe the manifest just uploaded (#155).
           if [ -n "${SIGNATURE:-}" ]; then
             gh release upload "$TAG" "$SIGNATURE" --clobber
+          elif gh release view "$TAG" --json assets --jq '.assets[].name' \
+              | grep -qx "$(basename "$MANIFEST").sig"; then
+            gh release delete-asset "$TAG" "$(basename "$MANIFEST").sig" --yes
           fi
 
           url="$(gh release view "$TAG" --json url --jq .url)"

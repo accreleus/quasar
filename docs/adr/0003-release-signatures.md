@@ -44,7 +44,7 @@ to fetch and verify, and a second failure mode, for a guarantee already implied
 by the first. Signing the manifest is sufficient.
 
 The signature is **detached**, published as a second GitHub Release asset,
-`platform-release-manifest.json.sig`. Not a field inside the manifest: the
+`platform-release-manifest.v2.json.sig`. Not a field inside the manifest: the
 manifest's versioning rule requires a consumer to *ignore* a manifest whose
 `format_version` it does not know, so adding a field would be a bump that makes
 every already-deployed control plane stop seeing releases. Detached, the signed
@@ -67,9 +67,14 @@ existing consumer keeps working. Format:
   that in some installs cannot reach the public internet at all. For a
   self-hostable product whose operator may also want to sign their own fork's
   releases, that is a large amount of moving infrastructure to make one
-  signature check work. Rejected for now; the `algorithm` field and the
-  `signatures` list leave room to add it beside ed25519 later without a format
-  bump.
+  signature check work. Rejected for now. A verifier skips a `signatures`
+  entry whose `algorithm` it does not know, so a second algorithm that fits the
+  existing entry shape (`algorithm`, `key_id`, `signature`) can be published
+  beside ed25519 without a format bump. Anything that needs a new field, such as
+  a certificate or a transparency-log bundle, does need one: the verifier
+  refuses unknown fields on purpose (a signature format that ignores what it
+  does not understand is the weaker choice), so a new field is a
+  `format_version` bump that older verifiers refuse.
 
 - **cosign with a key pair.** Closer, but `cosign sign-blob --key` is an
   ECDSA/ed25519 detached signature with extra packaging, and the registry-side
