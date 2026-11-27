@@ -3266,6 +3266,104 @@ fn pyrowave_clean_feedback_at_the_target_for_10_s_never_steps_down() {
     );
 }
 
+/// A 4K120 switch on (800 Mbit/s target, 400 floor) whose estimate the start-up cut to `kbps`
+/// at `cut_ms`, then clean feedback every 50 ms on `path`: the AIMD climb. The step-down's ms.
+fn pyro_4k120_after_a_cut(
+    rate: &mut PyroRate,
+    on: Instant,
+    cut_ms: u64,
+    kbps: f64,
+    path: QuicPath,
+) -> Option<u64> {
+    for ms in (0..20_000u64).step_by(50) {
+        if ms == cut_ms {
+            rate.estimator.resume_at(kbps);
+        }
+        // Names nothing the log holds: no delay, no loss, no rate.
+        let fb = Feedback {
+            first_pkt_seq: u32::MAX / 2,
+            ref_us: 0,
+            arrivals: vec![0],
+        };
+        fill(rate, 50);
+        let verdict = rate.on_feedback(&fb, on + Duration::from_millis(ms), path);
+        if matches!(verdict, PyroVerdict::StepDown { .. }) {
+            return Some(ms);
+        }
+    }
+    None
+}
+
+/// #1664: lab row L11 (4K120): the estimate was cut to 276 969 kbit/s 2.5 s after the switch
+/// on, window wide open, and stepped down 1 s later while it was climbing back.
+#[test]
+fn pyrowave_a_start_up_cut_that_is_climbing_back_stays_on_pyrowave() {
+    let on = Instant::now();
+    let mut rate = PyroRate::new(800_000, 400_000, on, false);
+    let open = quic_at(8_000_000.0);
+    assert_eq!(
+        pyro_4k120_after_a_cut(&mut rate, on, 2_500, 276_969.0, open),
+        None
+    );
+    assert!(rate.estimator.estimate_kbps > 400_000.0);
+}
+
+/// #1664: the same dip read off the QUIC cap, a window of 30-37 KB at a 0.85 ms round trip
+/// (282-348 Mbit/s) with datagrams waiting on it, ramping for 2 s and then open.
+#[test]
+fn pyrowave_a_start_up_dip_on_a_ramping_window_stays_on_pyrowave() {
+    let on = Instant::now();
+    let mut rate = PyroRate::new(800_000, 400_000, on, false);
+    for ms in (0..8_000u64).step_by(100) {
+        let path = match ms {
+            2_000..4_000 => QuicPath {
+                rtt: Duration::from_micros(850),
+                cwnd_bytes: 30_000 + (ms - 2_000) * 7_000 / 2_000,
+                ..backed_up(0.0)
+            },
+            _ => quic_at(8_000_000.0),
+        };
+        fill(&mut rate, 100);
+        let verdict = rate.on_tick(on + Duration::from_millis(ms), path);
+        assert!(
+            !matches!(verdict, PyroVerdict::StepDown { .. }),
+            "stepped down at {ms} ms"
+        );
+    }
+}
+
+/// #1664: only the climb is excused, and only at the start.
+#[test]
+fn pyrowave_the_start_up_allowance_does_not_hold_a_link_under_the_floor() {
+    let on = Instant::now();
+    let new = || PyroRate::new(800_000, 400_000, on, false);
+    let open = quic_at(8_000_000.0);
+    // Flat under the floor from the start: as before, the cap from 1 s and 1 s under it.
+    let flat = (0..=3_000u64).step_by(100).find(|&ms| {
+        let mut rate = new();
+        (0..=ms).step_by(100).any(|t| {
+            fill(&mut rate, 100);
+            let at = on + Duration::from_millis(t);
+            matches!(
+                rate.on_tick(at, backed_up(300_000.0)),
+                PyroVerdict::StepDown { .. }
+            )
+        })
+    });
+    assert_eq!(flat, Some(2_000));
+    // Climbing, but too far down to be back within the start: 1 s after it ends at the latest.
+    let slow = pyro_4k120_after_a_cut(&mut new(), on, 2_500, 100_000.0, open);
+    assert!(
+        slow.is_some_and(|ms| (9_800..=11_050).contains(&ms)),
+        "{slow:?}"
+    );
+    // The same climb after the start counts nothing: 1 s, as before.
+    assert_eq!(
+        pyro_4k120_after_a_cut(&mut new(), on, 12_000, 276_969.0, open),
+        Some(13_000)
+    );
+}
+
 #[test]
 fn the_abr_resumes_from_the_estimate_it_is_handed_never_above_its_ceiling() {
     let now = Instant::now();
