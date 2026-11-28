@@ -34,11 +34,12 @@ linters:
     rules:
       - linters: [forbidigo]
         path: (_test\.go$|^internal/outbound/)
-      # forbidigo cannot tell a `*http.Client` type from a construction: skip lines
-      # that only name the pointer type (no `&`, no `=` or `{` after it; `struct{}` aside).
+      # forbidigo cannot tell a `*http.Client` type from a construction: skip only the
+      # shapes that cannot construct one (a func signature, or a field/var/type that just
+      # names the pointer type, optionally with a struct tag and a trailing comment).
       - linters: [forbidigo]
         text: use of `http\.Client`
-        source: '^(struct\{\}|[^{&])*\*http\.Client\b(struct\{\}|[^{&=])*(\{\s*)?$'
+        source: '^\s*(func\b(struct\{\}|[^{&=])*\*http\.Client\b(struct\{\}|[^{&=])*(\{\s*)?|(var\s+|type\s+)?[A-Za-z_][A-Za-z0-9_]*\s+\*http\.Client(\s+`[^`]*`)?\s*)(//.*)?$'
 
 issues:
   max-issues-per-linter: 0

@@ -16,12 +16,14 @@ func passThrough(c *http.Client, _ map[string]struct{}) *http.Client {
 }
 
 func banned() {
-	a := &http.Client{}                 // want
-	b := http.Client{}                  // want
-	c := new(http.Client)               // want
-	var d *http.Client = &http.Client{} // want
-	e := http.DefaultClient             // want
-	_, _, _, _, _ = a, b.Timeout, c, d, e
+	a := &http.Client{}                   // want
+	b := http.Client{}                    // want
+	c := new(http.Client)                 // want
+	var d *http.Client = &http.Client{}   // want
+	e := http.DefaultClient               // want
+	f := new(http.Client)                 /* *http.Client */ // want
+	g := (*http.Client)(new(http.Client)) // want
+	_, _, _, _, _, _, _ = a, b.Timeout, c, d, e, f, g
 }
 
 var (
