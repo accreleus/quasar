@@ -124,3 +124,9 @@
 .shelf-jump-meta .hours {
   color: var(--text-3);
 }
+
+/* A layout that puts a shelf above the hero (control-api.md §Home layout): the
+   shelf takes the top space the hero would have had. */
+.home-view > :is(.shelf-fav, .shelf-jump):first-child {
+  padding-top: var(--s9);
+}

@@ -24,6 +24,10 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+
+- Home layout is set by the server: an admin picks the default sections, their order and titles in Settings, and each user can set their own on the account page. Clients render it, skip section kinds they do not know, and fall back to today's order on an older server (amendment 101, #1701).
+
 ### Fixed
 
 - WebTransport sessions: a late error from the standard video decoder, after the picture has moved to PyroWave, no longer restarts it or leaves a keyframe wait that could end the connection as a lost stream (#1700).

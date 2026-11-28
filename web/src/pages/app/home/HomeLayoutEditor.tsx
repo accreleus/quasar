@@ -77,6 +77,7 @@ export function HomeLayoutEditor({ scope }: { scope: HomeScope }) {
                   disabled={busy}
                   onChange={(enabled) => update(i, { enabled })}
                 />
+                <span className="nm home-kind">{name}</span>
                 <input
                   className="input grow"
                   aria-label={`${name} title`}
@@ -86,7 +87,6 @@ export function HomeLayoutEditor({ scope }: { scope: HomeScope }) {
                   disabled={busy}
                   onChange={(e) => update(i, { title: e.target.value })}
                 />
-                <span className="br">{name}</span>
                 <span className="ctl">
                   <button
                     type="button"
