@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/accreleus/quasar/control-plane/internal/auth"
@@ -30,8 +31,36 @@ const (
 var (
 	homeSectionID = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 	// Kinds accepted on write; a read serves whatever is stored.
-	homeKnownKinds = map[string]bool{"highlights": true, "jump_back_in": true, "favourites": true}
+	homeKnownKinds  = map[string]bool{"highlights": true, "jump_back_in": true, "favourites": true}
+	homeSectionKeys = map[string]bool{"id": true, "kind": true, "title": true, "enabled": true, "params": true}
 )
+
+// exactSectionKeys refuses a key outside homeSectionKeys, matched exactly. It exists
+// because encoding/json matches field names case-insensitively and keeps the last of
+// a repeated key, so "ID" or a second "title" would otherwise pass.
+func exactSectionKeys(raw json.RawMessage) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return errors.New("not an object")
+	}
+	seen := map[string]bool{}
+	for dec.More() {
+		t, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		k, _ := t.(string)
+		if !homeSectionKeys[k] || seen[k] {
+			return fmt.Errorf("unknown or repeated key %q", k)
+		}
+		seen[k] = true
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 type HomeSection struct {
 	ID      string         `json:"id"`
@@ -79,9 +108,10 @@ func parseHomeLayout(body []byte) ([]HomeSection, error) {
 			Enabled *bool           `json:"enabled"`
 			Params  json.RawMessage `json:"params"`
 		}
-		dec := json.NewDecoder(bytes.NewReader(raw))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&s); err != nil {
+		if err := exactSectionKeys(raw); err != nil {
+			return nil, fmt.Errorf("sections[%d]: must be an object with id, kind, title, enabled and optional params: %v", i, err)
+		}
+		if err := json.Unmarshal(raw, &s); err != nil {
 			return nil, fmt.Errorf("sections[%d]: must be an object with id, kind, title, enabled and optional params", i)
 		}
 		if s.ID == nil || s.Kind == nil || s.Title == nil || s.Enabled == nil {
@@ -99,6 +129,10 @@ func parseHomeLayout(body []byte) ([]HomeSection, error) {
 		}
 		if n := utf8.RuneCountInString(*s.Title); n == 0 || n > homeMaxTitle || strings.TrimSpace(*s.Title) == "" {
 			return nil, fmt.Errorf("sections[%d].title must be 1-%d characters and not only whitespace", i, homeMaxTitle)
+		}
+		// Postgres jsonb refuses U+0000, which would surface as a 500.
+		if strings.IndexFunc(*s.Title, unicode.IsControl) >= 0 {
+			return nil, fmt.Errorf("sections[%d].title must not hold control characters", i)
 		}
 		params := map[string]any{}
 		if s.Params != nil {

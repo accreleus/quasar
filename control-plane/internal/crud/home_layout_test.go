@@ -42,6 +42,10 @@ func TestParseHomeLayout(t *testing.T) {
 		"extra section key":   `{"sections":[{"id":"a","kind":"favourites","title":"A","enabled":true,"colour":"red"}]}`,
 		"params not object":   `{"sections":[{"id":"a","kind":"favourites","title":"A","enabled":true,"params":null}]}`,
 		"undefined param":     `{"sections":[{"id":"a","kind":"favourites","title":"A","enabled":true,"params":{"limit":5}}]}`,
+		"control char title":  `{"sections":[{"id":"a","kind":"favourites","title":"A\u0000B","enabled":true}]}`,
+		"tab in title":        `{"sections":[{"id":"a","kind":"favourites","title":"A\tB","enabled":true}]}`,
+		"key differs in case": `{"sections":[{"ID":"a","id":"b","kind":"favourites","title":"A","enabled":true}]}`,
+		"repeated key":        `{"sections":[{"id":"a","kind":"favourites","title":"A","title":"B","enabled":true}]}`,
 	}
 	for name, body := range bad {
 		if _, err := parseHomeLayout([]byte(body)); err == nil {
@@ -113,6 +117,9 @@ func TestHomeLayoutLayers(t *testing.T) {
 		t.Fatalf("fresh user sees admin default: %d %+v", code, got)
 	}
 
+	if code, _ := homeReq(t, http.MethodPut, me, `{"sections":[{"id":"x","kind":"favourites","title":"A\u0000B","enabled":true}]}`, userTok); code != http.StatusBadRequest {
+		t.Fatalf("NUL in a title: want 400, got %d", code)
+	}
 	if code, _ := homeReq(t, http.MethodPut, me, `{"sections":[{"id":"x","kind":"nope","title":"X","enabled":true}]}`, userTok); code != http.StatusBadRequest {
 		t.Fatalf("unknown kind on write: want 400, got %d", code)
 	}
