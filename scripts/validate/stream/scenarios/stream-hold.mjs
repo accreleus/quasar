@@ -13,7 +13,7 @@ export { FIRST_FRAME_LIMIT_S, REVEALED, shotCovered, verdict };
 const TERMINAL = ["stopped", "failed"];
 
 export const name = "stream-hold";
-const SHOT_EVERY_S = 10;
+const FRAME_DRAIN_EVERY_S = 10;
 // The bench callback seeing fewer frames than the video decoded means the instrument, not the stream, set the cadence (#1304).
 const INSTRUMENT_MIN_SHARE = 0.9;
 
@@ -294,23 +294,20 @@ export default {
       }
       const firstFrameS = firstFrameAt === null ? null : (firstFrameAt - tClick) / 1000;
       rec.step("first-frame", { first_frame_s: firstFrameS });
-      await shot(firstFrameAt === null ? "no-frame" : "first-frame");
 
       const holdUntil = firstFrameAt === null ? now() : firstFrameAt + params.hold_s * 1000;
-      let nextShot = (firstFrameAt ?? now()) + SHOT_EVERY_S * 1000;
+      let nextDrain = (firstFrameAt ?? now()) + FRAME_DRAIN_EVERY_S * 1000;
       while (now() < holdUntil) {
         await sleep(Math.min(1000, holdUntil - now()));
         const p = await look();
-        if (now() >= nextShot) {
-          nextShot += SHOT_EVERY_S * 1000;
-          await shot(`t${Math.round((now() - firstFrameAt) / 1000)}s`);
+        if (now() >= nextDrain) {
+          nextDrain += FRAME_DRAIN_EVERY_S * 1000;
           await pullFrames();
           rec.step("held", { stats: p });
         }
       }
       if (hiddenFrom !== null) hidden.push([hiddenFrom, tb()]);
       const dump = await pullFrames();
-      await shot("end");
       const windows = Array.isArray(dump?.windows) ? dump.windows : [];
       const stats = await page.evaluate(() => window.__qBench?.stats() ?? null);
       rec.json("bench-windows.json", { windows });
@@ -329,6 +326,8 @@ export default {
       // A session that is already over before this run's own stop was not held: whatever the criteria say.
       if (TERMINAL.includes(row.state)) result = { ...result, status: "error", reason: `the session ended during the hold (it was ${row.state} before this run stopped it)` };
       rec.step("hold-done");
+      // Screenshot capture can stall browser datagram reads and inflate loss.
+      await shot(firstFrameAt === null ? "no-frame" : "end");
     } catch (err) {
       // Until the page's bearer is known, an error's words (Playwright quotes the page's address and text) are held like any
       // other page output, and the reason that is written is a fixed one for the step that failed.

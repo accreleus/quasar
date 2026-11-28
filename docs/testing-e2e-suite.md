@@ -179,9 +179,10 @@ browser's clock minus the runner's, measured around one round trip. Timeline sta
 browser's clock with it, and each row says `clock_source`.
 
 The runner reads only what the product exposes (`window.__qBench`, the page, the API) and wraps no
-browser API. What it cannot see is in `manifest.json` `not_recorded`, each with a reason. The
-issue also asked for a decoded-frame grab every 10 s, the client's full telemetry and the bundle
-attached to the issue; the screenshot every 10 s stands in for the first, `stream-hold` copies
+browser API. What it cannot see is in `manifest.json` `not_recorded`, each with a reason.
+`stream-hold` records `hold-done` before taking its screenshot because capture can stall the browser
+and inflate client packet loss (#1642). Use `first-frame` through `hold-done` on the browser clock
+when measuring loss from collected telemetry. The runner copies
 `present_interval_sd_ms`, `present_interval_p95_ms` and `is_hidden` from the page's own
 `POST /v1/sessions/{id}/stats` requests beside the bench windows (the host half adds the rest),
 and posting is `e2e-post` (#1276).
