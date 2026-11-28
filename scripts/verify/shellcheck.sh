@@ -13,6 +13,7 @@ image=koalaman/shellcheck@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 baseline=scripts/verify/shellcheck.baseline
 die() { echo "shellcheck: $*" >&2; exit 1; }
+[ -f "$baseline" ] || die "baseline missing: $baseline"
 for tool in git docker node; do
   command -v "$tool" >/dev/null || die "$tool is not installed"
 done

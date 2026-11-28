@@ -34,6 +34,8 @@ baseline ''
 renders 'cd /nowhere'; expect 1 "g.sh:2:1:"
 renders ''; expect 1 "wrote no scripts"
 renders 'echo ok'
+rm "$work/scripts/verify/shellcheck.baseline"; expect 1 "baseline missing"  # with no findings, too
+baseline ''
 printf '#!/bin/sh\nexit 125\n' > "$work/docker"; chmod +x "$work/docker"
 PATH="$work:$PATH" expect 1 "shellcheck did not run (exit 125)"
 echo "shellcheck test: ok"
