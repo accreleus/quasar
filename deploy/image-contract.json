@@ -172,7 +172,7 @@
         "must_succeed": {
           "grep -aq gst_cuda_context_new /usr/local/bin/quasar-node-agent": "#927: the agent is built --features cuda (ZC-02 zero-copy NVENC), which leaves this undefined dynamic symbol in the binary. The image has no readelf. The feature is silently absent when the build stage drops its CUDA_ENABLE ARG: the agent starts and Vulkan sessions stream either way.",
           "ldd /usr/local/bin/quasar-launch-helper | grep -q 'statically linked'": "#731: the launch helper runs inside the Steam app image, not this one, so it may need no libc from either; a dynamic build would load this image's glibc and break on another distribution.",
-          "test -f /opt/gst/lib64/libpyrowave-shared.so.1 && ! ldd /opt/gst/lib64/libpyrowave-shared.so.1 | grep -q 'not found'": "#1052: every library libpyrowave-shared needs resolves in this image (it links libstdc++ and libgcc_s dynamically and loads the Vulkan loader itself at run time).",
+          "deps=$(ldd /opt/gst/lib64/libpyrowave-shared.so.1 2>&1) && case $deps in ''|*'not found'*) false ;; esac": "#1052: every library libpyrowave-shared needs resolves in this image (it links libstdc++ and libgcc_s dynamically and loads the Vulkan loader itself at run time). An ldd that cannot run or prints nothing is a failure, never \"nothing unresolved\" (#975).",
           "grep -aq pyrowave_get_api_version /opt/gst/lib64/libpyrowave-shared.so.1": "#1052: the library exports the C API (a symbol, because the image has no nm), so an empty or wrong-target build cannot pass on the file's presence alone.",
           "grep -q '^Name: pyrowave-shared' /opt/gst/lib64/pkgconfig/pyrowave-shared.pc": "#1052: the pkg-config entry names the library the way the pyrowaveenc build will ask for it.",
           "[ \"$(readlink -f /usr/lib64/libvulkan.so.1)\" = /usr/lib64/libvulkan.so.1.4.345 ]": "#1104 review, #267: the process loads the pinned Vulkan-Loader (deploy/pins.env VULKAN_LOADER_REF), not Fedora 43's 1.4.341, whose device-proc lookups walk the instance list unlocked and crash beside another thread's instance creation. A pin bump moves this file name with it.",
@@ -253,8 +253,8 @@
       "commands": {
         "must_succeed": {
           "quasar-recovery version": "The binary starts in the image it ships in.",
-          "! tr '\\0' '\\n' < /usr/local/bin/quasar-recovery | grep -q FakeEngine": "The in-memory test engine (feature test-support) never ships: a build that enabled it would carry an engine that answers anything.",
-          "! tr '\\0' '\\n' < /usr/local/bin/quasar-recovery | grep -q '^libc[.]musl-'": "Statically linked: the binary does not need the base image's libc (a dynamic alpine binary names libc.musl-<arch>.so.1 as DT_NEEDED; this check finds it in /sbin/apk and /bin/busybox and not in a static build), so it would run on scratch. NULs become newlines because busybox grep stops a line at a NUL."
+          "tr '\\0' '\\n' < /usr/local/bin/quasar-recovery | awk '/FakeEngine/ { bad = 1 } END { exit bad || !NR }'": "The in-memory test engine (feature test-support) never ships: a build that enabled it would carry an engine that answers anything.",
+          "tr '\\0' '\\n' < /usr/local/bin/quasar-recovery | awk '/^libc[.]musl-/ { bad = 1 } END { exit bad || !NR }'": "Statically linked: the binary does not need the base image's libc (a dynamic alpine binary names libc.musl-<arch>.so.1 as DT_NEEDED; this check finds it in /sbin/apk and /bin/busybox and not in a static build), so it would run on scratch. NULs become newlines so each embedded string is a line. No output from tr is a failure, never \"not found\" (#975)."
         }
       },
 

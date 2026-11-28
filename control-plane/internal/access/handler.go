@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/accreleus/quasar/control-plane/internal/audit"
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
 	"github.com/accreleus/quasar/control-plane/internal/origins"
 )
@@ -164,7 +165,7 @@ func truncate(s string) string {
 	if len(s) <= maxReflectedLength {
 		return s
 	}
-	return s[:maxReflectedLength] + "…(truncated)"
+	return audit.TruncateBytes(s, maxReflectedLength) + "…(truncated)"
 }
 
 func (s *Service) handleAccessCheck(w http.ResponseWriter, r *http.Request) {
