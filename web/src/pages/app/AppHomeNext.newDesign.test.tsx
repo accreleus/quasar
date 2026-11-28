@@ -11,9 +11,12 @@ import { LibraryCatalogProvider } from "./libraryCatalog";
 import { LibrarySearchContext } from "./librarySearchContext";
 import { ToastProvider } from "../../components/Toast";
 import * as libraryApi from "../../api/library";
+import * as homeApi from "../../api/home";
+import { ApiError } from "../../api/client";
 import type { App } from "../../api/types";
 
 vi.mock("../../api/library");
+vi.mock("../../api/home");
 const design = vi.hoisted(() => ({ on: true }));
 vi.mock("../../settings/OverlayPreferencesContext", async (orig) => ({
   ...(await orig<typeof import("../../settings/OverlayPreferencesContext")>()),
@@ -106,6 +109,8 @@ beforeEach(() => {
   mocked.getProfiles.mockResolvedValue({ profiles: [], recommended_id: "", confidence: "low" } as never);
   mocked.favouriteApp.mockResolvedValue(undefined as never);
   mocked.unfavouriteApp.mockResolvedValue(undefined as never);
+  // An older server: the built-in layout.
+  vi.mocked(homeApi).getHomeLayout.mockRejectedValue(new ApiError(404, "not_found", "not found"));
 });
 
 async function waitForGrid() {
@@ -148,6 +153,25 @@ describe("Home, new design", () => {
     expect(jump.textContent).toContain("30 min played");
     fireEvent.click(within(jump).getByRole("button", { name: "Celeste" }));
     expect(screen.getByTestId("path").textContent).toBe("/app/game/a3");
+  });
+
+  it("renders the server's layout: its order and titles, skipping unknown and disabled sections", async () => {
+    vi.mocked(homeApi).getHomeLayout.mockResolvedValue({
+      source: "admin",
+      sections: [
+        { id: "picks", kind: "favourites", title: "Your picks", enabled: true, params: {} },
+        { id: "cw", kind: "continue_watching", title: "Continue watching", enabled: true, params: {} },
+        { id: "again", kind: "jump_back_in", title: "Play again", enabled: true, params: {} },
+        { id: "fav2", kind: "favourites", title: "Favourites", enabled: false, params: {} },
+      ],
+    });
+    renderHome();
+    await waitForGrid();
+    await waitFor(() => expect(screen.getByRole("region", { name: "Your picks" })).toBeTruthy());
+    const titles = Array.from(document.querySelectorAll("[class^='shelf-'] h2")).map((h) => h.textContent);
+    expect(titles).toEqual(["Your picks", "Play again"]);
+    expect(screen.queryByText("Continue watching")).toBeNull();
+    expect(screen.queryByRole("region", { name: "Favourites" })).toBeNull();
   });
 
   it("leaves Ctrl/Cmd/Alt+F and a held F to the browser", async () => {

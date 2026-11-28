@@ -276,6 +276,7 @@ export function App() {
             <Route path="streaming" element={<Suspended><account.Streaming /></Suspended>} />
             <Route path="region" element={<ClassicRedirect to="/app/account/streaming" />} />
             <Route path="input" element={<ClassicRedirect to="/app/account/streaming" />} />
+            <Route path="home" element={<ClassicRedirect to="/app/account/streaming" />} />
             <Route path="appearance" element={<Suspended><account.Appearance /></Suspended>} />
           </Route>
           <Route element={<Suspended><account.UsageSection /></Suspended>}>

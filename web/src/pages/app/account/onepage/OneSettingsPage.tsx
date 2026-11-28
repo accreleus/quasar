@@ -26,6 +26,7 @@ import { relativeTime } from "../../../../lib/format/relativeTime";
 import "../../../../styles/account-onepage.css";
 import { AccountAppearance } from "../AccountAppearance";
 import { AccountOverlay } from "../AccountOverlay";
+import { HomeLayoutEditor } from "../../home/HomeLayoutEditor";
 import { AccountSessions } from "../AccountSessions";
 import { AccountStorage } from "../AccountStorage";
 import { SteamDialogsField } from "../SteamDialogsField";
@@ -60,6 +61,7 @@ export function OneSettingsPage() {
     region: <RegionSection />,
     input: <InputSection />,
     overlay: <AccountOverlay />,
+    home: <div className="card sec-card"><HomeLayoutEditor scope="/me/home" /></div>,
     appearance: <AccountAppearance />,
     devices: <DevicesSection />,
     password: <PasswordCard />,

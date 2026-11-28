@@ -2455,6 +2455,21 @@ td.cell-actions > * + * {
   color: var(--text-3);
 }
 
+/* Home layout rows: a fixed kind column keeps every title input the same width;
+   on a narrow screen the input wraps to its own line rather than shrinking. */
+.rung:has(.home-kind) {
+  flex-wrap: wrap;
+}
+.rung .home-kind {
+  flex: 0 0 112px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rung .home-kind + .input {
+  min-width: 160px;
+}
+
 .rung .ctl {
   display: flex;
   gap: var(--s1);

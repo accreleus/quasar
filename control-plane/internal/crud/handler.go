@@ -176,6 +176,14 @@ func (h *Handler) Register(mux httpx.Router, requireAuth, requireAdmin func(http
 	// the bearer identity, so an admin's home page is their own. See highlights.go.
 	mux.Handle("GET /v1/me/highlights", requireAuth(http.HandlerFunc(h.handleHighlights)))
 	mux.Handle("GET /v1/me/play-history", requireAuth(http.HandlerFunc(h.handlePlayHistory)))
+
+	// Home layout (Amendment 101): the caller's own override, and the admin default.
+	mux.Handle("GET /v1/me/home", requireAuth(http.HandlerFunc(h.handleGetMyHome)))
+	mux.Handle("PUT /v1/me/home", requireAuth(http.HandlerFunc(h.handlePutMyHome)))
+	mux.Handle("DELETE /v1/me/home", requireAuth(http.HandlerFunc(h.handleDeleteMyHome)))
+	mux.Handle("GET /v1/admin/home", admin(http.HandlerFunc(h.handleGetAdminHome)))
+	mux.Handle("PUT /v1/admin/home", admin(http.HandlerFunc(h.handlePutAdminHome)))
+	mux.Handle("DELETE /v1/admin/home", admin(http.HandlerFunc(h.handleDeleteAdminHome)))
 }
 
 // --- DTOs (response shapes match schema columns) ---
