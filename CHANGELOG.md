@@ -26,7 +26,7 @@ own; the two do not move together, and that is deliberate.
 
 ### Fixed
 
-- WebTransport sessions: a video decoder failure the player recovers from on its own is now written to the browser console, once per failure with a running count, so a test pass can count it. It was silent before (#1674).
+- WebTransport sessions: a video decoder failure the player recovers from on its own is now written to the browser console, once per failure with a running count, so a test pass can count it, and the session's browser metrics carry the page view's total as `wt_decode_errors` (amendment 100). It was silent before (#1674).
 - The E2E stream-hold runner takes its screenshot after recording the hold, so capture stalls no longer inflate WebTransport client loss during the measurement (#1642).
 - No change in behaviour: the three WebTransport outage follow-ups of #1591 were already fixed in 0.6.4. A test now also holds the default sender (`QUASAR_WT_CAPACITY=legacy`) to not reading an outage's own losses as congestion, across the packet-number wrap.
 - A session you stopped is no longer recorded as `host_lost` when the host's heartbeat or connection is reaped before the stop finishes. It ends `stopped` with no error and no `session.failed` activity row, so a native client no longer says the host went away after your own Leave. A host lost while a session is starting or running is reported as before (#1697).

@@ -177,6 +177,14 @@ func TestFakeRetainMatchesThePolicy(t *testing.T) {
 	}
 }
 
+func TestFilterBrowserMetricsKeepsWtDecodeErrors(t *testing.T) {
+	// Amendment 100: the WebTransport decoder-failure count is stored as posted.
+	got := FilterBrowserMetrics(json.RawMessage(`{"wt_decode_errors":2}`))
+	if string(got) != `{"wt_decode_errors":2}` {
+		t.Fatalf("FilterBrowserMetrics = %s", got)
+	}
+}
+
 func TestFilterBrowserMetricsDropsUnknownKeys(t *testing.T) {
 	got := FilterBrowserMetrics(json.RawMessage(`{"fps":60,"evil":"drop me","rtt_ms":12}`))
 	var m map[string]any

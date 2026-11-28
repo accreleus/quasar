@@ -116,6 +116,7 @@ func TestPostStatsOwnerGate(t *testing.T) {
 		{"ts_unix_ms": nowMs(), "metrics": map[string]any{
 			"fps": 59.6, "rtt_ms": 12, "evil_key": "drop", "glass_to_glass_ms": 71,
 			"rvfc_capture_time_available": 1, "abs_capture_time_negotiated": 0,
+			"wt_decode_errors": 3,
 		}},
 	}}
 
@@ -137,6 +138,9 @@ func TestPostStatsOwnerGate(t *testing.T) {
 	if m["fps"] == nil || m["glass_to_glass_ms"] == nil ||
 		m["rvfc_capture_time_available"] == nil || m["abs_capture_time_negotiated"] == nil {
 		t.Fatalf("dictionary keys missing: %v", m)
+	}
+	if m["wt_decode_errors"] != float64(3) { // amendment 100
+		t.Fatalf("wt_decode_errors stored as %v, want 3", m["wt_decode_errors"])
 	}
 
 	// Non-owner → 403.

@@ -499,6 +499,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
       },
       requestKeyframe: (reason) => transport?.requestKeyframe(reason),
       onFatal: (reason: DecodeFailure) => fail(reason),
+      onDecodeError: (total) => telemetry.setDecodeErrors(total),
     });
     stage = s;
     await connectTransport(cfg.coords, false);

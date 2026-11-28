@@ -1134,6 +1134,19 @@
       "why": "CUMULATIVE for the page view, accumulated like packets_lost (each connection's count is added, so a reconnect never resets it): video FRAGMENTS a WebTransport client rebuilt from FEC repair datagrams. A rebuilt fragment is never NACKed, so it is not in packets_lost; packets_lost + wt_fec_repaired is the video fragments the path lost. Posted only while FEC is negotiated; never posted by a WebRTC session. Uncurated."
     },
     {
+      "key": "wt_decode_errors",
+      "source": "browser",
+      "taxonomy": null,
+      "unit": "count",
+      "clock": "none",
+      "window": "cumulative",
+      "estimator": "raw",
+      "n_key": null,
+      "deprecated_for": null,
+      "since": "0.6.6 amendment 100 (#1674)",
+      "why": "CUMULATIVE for the page view: video decoder failures a WebTransport client recovered from (by replacing the decoder) or ended on, each decoder counted once however many errors it raised. Absent on a PyroWave-only session and never posted by a WebRTC session. Uncurated."
+    },
+    {
       "key": "network_pacing_ms",
       "source": "browser",
       "taxonomy": "transport.network_pacing_ms",

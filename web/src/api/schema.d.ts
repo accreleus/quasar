@@ -12059,6 +12059,8 @@ export interface components {
             wt_audio_underruns?: number;
             /** @description Amendment 85 (accreleus/quasar#1302), additive. CUMULATIVE for the page view, accumulated like packets_lost (each connection's count is added, so a reconnect never resets it): video fragments a WebTransport client rebuilt from FEC repair datagrams. A rebuilt fragment is never NACKed, so it is not in packets_lost; packets_lost + wt_fec_repaired is the video fragments the path lost. Posted only while FEC is negotiated; never posted by a WebRTC session. */
             wt_fec_repaired?: number;
+            /** @description Amendment 100 (accreleus/quasar#1674), additive. CUMULATIVE for the page view: video decoder failures a WebTransport client recovered from (by replacing the decoder) or ended on, each decoder counted once however many errors it raised. Absent on a PyroWave-only session and never posted by a WebRTC session. */
+            wt_decode_errors?: number;
             /** @description Accepted by the browser ingest allow-list and declared here, but no client has ever posted it — the browser cannot observe host encode time. Kept declared so the ingest contract does not change. */
             encode_ms?: number;
             network_pacing_ms?: number;

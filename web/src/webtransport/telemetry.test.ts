@@ -249,6 +249,28 @@ describe("WtTelemetry", () => {
     expect(metrics[3]).not.toHaveProperty("wt_fec_repaired");
   });
 
+  it("posts the decoder failures once a WebCodecs decoder runs, never on PyroWave alone (amendment 100)", async () => {
+    const h = harness();
+    h.t.setCodec("video/pyrowave");
+    h.frames(10, 8);
+    h.t.tick(); // PyroWave only: no WebCodecs decoder, so the key says nothing rather than 0
+    h.t.setCodec("video/H264");
+    h.frames(10, 8);
+    h.t.tick();
+    h.t.setDecodeErrors(2);
+    h.frames(10, 8);
+    h.t.tick();
+    h.t.setCodec("video/pyrowave"); // back on PyroWave: the page's total stays posted
+    h.frames(10, 8);
+    h.t.tick();
+    await h.t.flush();
+    const metrics = (h.posts[0].body.samples as { metrics: Record<string, number> }[]).map((s) => s.metrics);
+    expect(metrics[0]).not.toHaveProperty("wt_decode_errors");
+    expect(metrics[1]).toMatchObject({ wt_decode_errors: 0 });
+    expect(metrics[2]).toMatchObject({ wt_decode_errors: 2 });
+    expect(metrics[3]).toMatchObject({ wt_decode_errors: 2 });
+  });
+
   it("counts long frames and present rate by the one definition WebRTC uses", () => {
     const h = harness();
     h.t.presented(0);
