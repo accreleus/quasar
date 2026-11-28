@@ -24,6 +24,13 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Changed
+
+- CI runs one lint entry point (`scripts/verify/lint.sh`, every check in
+  `scripts/verify/lint.d/`) on each pull request and push, including the DX, release,
+  web schema and served-script checks it did not run before. Clippy in CI now covers
+  test code, and a `protocol/` change also runs the web jobs.
+
 ## 0.6.5 — 2026-11-28
 
 ### Fixed
