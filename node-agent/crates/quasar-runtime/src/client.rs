@@ -44,7 +44,7 @@ pub struct Operation<T> {
 }
 impl<T> Operation<T> {
     pub fn cancel(&self) {
-        let _ = self.cancel.send(true);
+        self.cancel.send_replace(true);
     }
     pub fn wait(self) -> Result<T, RuntimeError> {
         self.result
