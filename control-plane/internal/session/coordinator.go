@@ -361,8 +361,9 @@ func (c *Coordinator) failCommand(sessionID, reason string) {
 	c.failSession(sessionID, reason)
 }
 
-// failSession records reason as error_message, leaving state_detail unchanged.
-// A transition error (already terminal) is logged, not propagated.
+// failSession records reason as error_message, leaving state_detail unchanged
+// on a row that does fail. A transition error (already terminal) is logged, not
+// propagated.
 func (c *Coordinator) failSession(sessionID, reason string) {
 	c.failSessionWithDetail(sessionID, reason, nil)
 }
@@ -500,27 +501,35 @@ func (c *Coordinator) endReaped(ctx context.Context, reaped []Session, reasonSou
 // detail leaves it untouched (COALESCE).
 func (c *Coordinator) failSessionWithDetail(sessionID, reason string, detail *string) {
 	sess, err := c.store.Transition(context.Background(), sessionID, StateFailed, detail, &reason)
-	if err != nil && !errors.Is(err, ErrInvalidTransition) {
+	if errors.Is(err, ErrInvalidTransition) {
+		c.log.Info("session already ended; not failing it", "session_id", sessionID, "reason", reason)
+		return
+	}
+	if err != nil {
 		c.log.Error("fail session", "session_id", sessionID, "reason", reason, "err", err)
 		return
 	}
-	c.log.Warn("session failed", "session_id", sessionID, "reason", reason)
-	if err == nil {
-		c.recordSessionFailed(context.Background(), sess, "control_plane", nil, reason)
-		// No telemetry prune: terminal FREEZES a failed session's last window for
-		// post-mortem retention (internal/telemetry) rather than deleting it.
-		// Drop every per-session in-memory map so none leaks an entry.
-		c.health.forget(sessionID)
-		c.display.forget(sessionID)
-		c.swapper.forget(sessionID) // #405: any orphaned pending swap
-		// #402: a failed session's browser may never have attached, so nothing else
-		// evicts the relay's buffered signaling frames.
-		c.forgetTerminalSession(sessionID)
-		// A CP-internal fault reached the same terminal state an agent-reported
-		// failure would, so re-eval console auto-start now rather than at the next
-		// capacity report. After the transition commits.
-		c.fireConsoleReeval(sess.HostID, sessionID)
+	// A stop that owned the row coerces the failure to `stopped` (CoerceReport):
+	// that is the stop's end, not a failure.
+	if sess.State != StateFailed {
+		c.afterTerminal(sess, "control_plane")
+		return
 	}
+	c.log.Warn("session failed", "session_id", sessionID, "reason", reason)
+	c.recordSessionFailed(context.Background(), sess, "control_plane", nil, reason)
+	// No telemetry prune: terminal FREEZES a failed session's last window for
+	// post-mortem retention (internal/telemetry) rather than deleting it.
+	// Drop every per-session in-memory map so none leaks an entry.
+	c.health.forget(sessionID)
+	c.display.forget(sessionID)
+	c.swapper.forget(sessionID) // #405: any orphaned pending swap
+	// #402: a failed session's browser may never have attached, so nothing else
+	// evicts the relay's buffered signaling frames.
+	c.forgetTerminalSession(sessionID)
+	// A CP-internal fault reached the same terminal state an agent-reported
+	// failure would, so re-eval console auto-start now rather than at the next
+	// capacity report. After the transition commits.
+	c.fireConsoleReeval(sess.HostID, sessionID)
 }
 
 // WithAuditor wires the audit store so the terminal-failure edge is recorded.

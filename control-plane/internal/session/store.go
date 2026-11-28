@@ -923,21 +923,19 @@ func (s *Store) CommitSwappedApp(ctx context.Context, id, newAppID, newSharedApp
 // reapSessions ends the sessions of hostID that `where` selects, releasing each
 // reservation. It is the only writer of host_lost: every reap path goes through it.
 //
-// A `stopping` row's teardown was already asked for, by a user, the control plane
-// or the agent, so it ends as that stop would: `stopped`, its detail and error
-// kept, never host_lost. Every other row is `failed`/host_lost with reason.
-// `where` is a literal of this file and may use $3 onward.
+// amendment 99 (#1697): a `stopping` row's teardown was already asked for, by a
+// user, the control plane or the agent, so it ends as that stop would:
+// `stopped`, its detail and error kept, never host_lost. Every other row is
+// `failed`/host_lost with reason.
+//
+// The returned Sessions carry only ID, UserID, AppID, HostID, State and
+// StateDetail: decoding more would let one unreadable row block the reap of the
+// whole host. `where` is a literal of this file and may use $3 onward.
 func (s *Store) reapSessions(ctx context.Context, hostID, reason, where string, args ...any) ([]Session, error) {
 	if !isValidUUID(hostID) {
 		return nil, nil // no such host's sessions to reap
 	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("begin reap tx: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck — no-op after commit
-
-	rows, err := tx.Query(ctx, `
+	rows, err := s.pool.Query(ctx, `
 		UPDATE sessions SET
 		    state         = CASE WHEN state = 'stopping' THEN 'stopped' ELSE 'failed' END,
 		    state_detail  = CASE WHEN state = 'stopping' THEN state_detail ELSE 'host_lost' END,
@@ -945,27 +943,18 @@ func (s *Store) reapSessions(ctx context.Context, hostID, reason, where string, 
 		    ended_at      = now(),
 		    launch_progress = NULL
 		WHERE host_id = $1::uuid AND `+where+`
-		RETURNING `+sessionCols,
+		RETURNING id::text, user_id::text, app_id::text, host_id::text, state, state_detail`,
 		append([]any{hostID, reason}, args...)...)
 	if err != nil {
 		return nil, fmt.Errorf("reap sessions: %w", err)
 	}
-	var out []Session
-	for rows.Next() {
-		sess, err := scanSessionRow(rows)
-		if err != nil {
-			rows.Close()
-			return nil, fmt.Errorf("scan reaped session: %w", err)
-		}
-		out = append(out, sess)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, fmt.Errorf("iterate reaped sessions: %w", err)
-	}
-	rows.Close()
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("commit reap tx: %w", err)
+	out, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Session, error) {
+		var sess Session
+		err := row.Scan(&sess.ID, &sess.UserID, &sess.AppID, &sess.HostID, &sess.State, &sess.StateDetail)
+		return sess, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("reap sessions: %w", err)
 	}
 	return out, nil
 }
