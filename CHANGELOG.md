@@ -27,6 +27,10 @@ own; the two do not move together, and that is deliberate.
 ### Changed
 
 - CI now lints `web/` with ESLint (React hook rules, dropped or misused promises, non-exhaustive switches, and bans on async `setInterval` polls, per-render effect calls and unbounded WebGPU requests). Existing findings are counted in `web/eslint-suppressions.json`; only new ones fail.
+- The node-agent tests now fail when the agent reads a `QUASAR_*` setting that is not in
+  `docs/configuration.md`, cannot be set on an owned install, or is not passed through by
+  Compose, unless it is listed with a reason. `QUASAR_HOST_FUSE` and the node agent's own
+  `QUASAR_SESSION_GRACE_SECS` are now documented.
 - Each pull request whose title starts with `fix` gets a "revert proof" CI job: the Go and
   vitest tests it adds or edits run on the code before the fix, and the job summary says
   which of them fail there (proved), still pass (unproved) or do not compile. Warn-only for
