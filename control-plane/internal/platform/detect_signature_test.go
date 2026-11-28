@@ -264,3 +264,15 @@ func TestTheDetectionSummaryFitsWithLongSignatureDiagnostics(t *testing.T) {
 		t.Fatalf("summary is %d bytes, over the jobs ceiling", len(b))
 	}
 }
+
+// Review A6: a long but valid tag (SemVer build metadata) must not use up the
+// entry, or Jobs shows a tag and no reason.
+func TestALongReleaseTagLeavesRoomForTheRefusalReason(t *testing.T) {
+	rep := Report{ManifestInvalid: 1}
+	rep.Errors = append(rep.Errors, manifestError("v0.6.6-rc.1+"+strings.Repeat("a", 300),
+		errors.New("signature refused by the recovery actor")))
+	got := rep.Summary()["manifest_errors"].([]string)[0]
+	if !strings.HasPrefix(got, "v0.6.6-rc.1+") || !strings.Contains(got, "signature refused by the recovery actor") {
+		t.Fatalf("entry %q must keep the start of the tag and the reason", got)
+	}
+}

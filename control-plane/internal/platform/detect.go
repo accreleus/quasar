@@ -158,7 +158,7 @@ func (d *Detector) Detect(ctx context.Context) (Report, error) {
 		rel, err := d.resolve(ctx, l)
 		if err != nil {
 			rep.ManifestInvalid++
-			rep.Errors = append(rep.Errors, fmt.Sprintf("%s: %v", l.Tag, err))
+			rep.Errors = append(rep.Errors, manifestError(l.Tag, err))
 			d.log.Warn("platform release manifest rejected", "tag", l.Tag, "err", err)
 			continue
 		}
@@ -463,6 +463,16 @@ func (r Report) Summary() map[string]any {
 // manifestErrorMaxBytes bounds one manifest_errors entry as JSON: five of them
 // leave over half of the 4096-byte summary for every other key.
 const manifestErrorMaxBytes = 240
+
+// manifestTagMaxBytes bounds the release tag inside one entry, leaving most of it
+// for the refusal reason.
+const manifestTagMaxBytes = 64
+
+// manifestError is one manifest_errors entry. The tag is remote text too: cut it
+// so a long one cannot push the reason out of the entry's bound.
+func manifestError(tag string, err error) string {
+	return fmt.Sprintf("%s: %v", boundDiagnostic(tag, manifestTagMaxBytes), err)
+}
 
 // boundDiagnostic cuts s on a rune boundary until its JSON encoding, escapes
 // included, fits max bytes.
