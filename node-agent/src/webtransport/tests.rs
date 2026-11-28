@@ -2554,7 +2554,7 @@ fn the_hold_line_reaches_the_abr_under_the_fec_its_loss_called_for() {
     );
 }
 
-/// #1301 with #1433's v2 hold, the one bound v2 has on FEC (#1660): while a hold is on with 25 %
+/// #1301 with #1433's v2 hold: while a hold is on with 25 %
 /// FEC, video plus repairs stays under its line, which is under the configured maximum
 /// (`congestion::Estimator` ends a hold whose line reaches it; `Control::feed` gives the governor
 /// that line less the share).
@@ -2613,24 +2613,6 @@ fn a_v2_hold_with_fec_keeps_video_plus_repairs_under_the_ceiling() {
                 "report {k}: {sent:.0} over {line:.0}"
             );
         }
-    }
-}
-
-/// #1301 bounds legacy (the default) and WebRTC; v2 keeps the share off the governor's ceiling,
-/// as before (#1660). At the ceiling with 15 % FEC (inside the deadband) a legacy session's
-/// setpoint is the ceiling over 1.15, a v2 session's stays at the ceiling.
-#[test]
-fn v2_keeps_the_fec_share_off_the_governors_ceiling() {
-    use crate::session::settings::WtCapacity;
-    for (capacity, want) in [
-        (WtCapacity::Legacy, video_ceiling(3)),
-        (WtCapacity::V2, 8000),
-    ] {
-        let sent = governed_by(smooth_per_report(), capacity, |_| 3, 8000.0, 5);
-        assert!(
-            sent.iter().all(|&(sp, _)| sp == want),
-            "{capacity:?}: {sent:?}"
-        );
     }
 }
 
@@ -3295,24 +3277,23 @@ fn video_ceiling(level: u8) -> u32 {
     (8000.0 / (1.0 + f64::from(level) * 0.05)).floor() as u32
 }
 
-/// #1301: with FEC the governor's ceiling is the configured one over 1 + share, from the first
-/// estimate, so video plus repairs never exceeds the configured maximum: shares 0 to 25 %, on
-/// the window loop and the per-report one. A second may carry the one repair datagram `fec`
-/// banks from the one before. Old code: 8000 plus the share, up to 8% over at level 3.
+/// #1301, #1660: with FEC the governor's ceiling is the configured one over 1 + share, from the
+/// first estimate, so video plus repairs never exceeds the configured maximum: shares 0 to 25 %,
+/// on the window loop and the per-report one, in both `QUASAR_WT_CAPACITY` modes. A second may
+/// carry the one repair datagram `fec` banks from the one before. Old code: 8000 plus the share,
+/// up to 8% over at level 3.
 #[test]
 fn fec_never_takes_a_session_over_its_configured_maximum() {
     let banked = (media::MAX_DATAGRAM * 8) as f64 / 1000.0;
-    for cfg in [smooth_window(), smooth_per_report()] {
-        for level in 0..=5 {
-            for (setpoint, sent) in governed_by(
-                cfg,
-                crate::session::settings::WtCapacity::Legacy,
-                |_| level,
-                8000.0,
-                30,
-            ) {
-                assert_eq!(setpoint, video_ceiling(level), "level {level}");
-                assert!(sent <= 8000.0 + banked, "level {level}: {sent:.0} kbit/s");
+    use crate::session::settings::WtCapacity;
+    for capacity in [WtCapacity::Legacy, WtCapacity::V2] {
+        for cfg in [smooth_window(), smooth_per_report()] {
+            for level in 0..=5 {
+                for (setpoint, sent) in governed_by(cfg, capacity, |_| level, 8000.0, 30) {
+                    let at = format!("{capacity:?} level {level}");
+                    assert_eq!(setpoint, video_ceiling(level), "{at}");
+                    assert!(sent <= 8000.0 + banked, "{at}: {sent:.0} kbit/s");
+                }
             }
         }
     }

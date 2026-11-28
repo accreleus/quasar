@@ -437,7 +437,7 @@ pub struct Governor {
     /// When `hold_to` last ran.
     held_at: Option<Instant>,
     /// The FEC repair share the ceiling is bound by (`set_share`): the highest since the share
-    /// last stayed lower for `SHARE_STICKY`; 0 on WebRTC and v2 (#1660). And since when it has
+    /// last stayed lower for `SHARE_STICKY`; 0 on WebRTC. And since when it has
     /// been lower.
     share: f64,
     share_lower_since: Option<Instant>,

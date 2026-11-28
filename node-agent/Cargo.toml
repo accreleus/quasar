@@ -171,6 +171,11 @@ harness = false
 # #149: the production agent runs the release binary (deploy/docker-compose.yml).
 # Debug Rust is 3-10x slower on the hot media/metrics paths and ~5x larger.
 # Dev/test loops (dev.sh build/test, acceptance scripts) stay on debug builds.
+# The WebTransport congestion simulator runs hundreds of minutes-long sessions (#1660), 13x slower
+# unoptimised. Debug assertions and overflow checks stay on.
+[profile.test.package.quasar-node-agent]
+opt-level = 2
+
 [profile.release]
 opt-level = 3
 lto = "thin"
