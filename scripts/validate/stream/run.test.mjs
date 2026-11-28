@@ -199,12 +199,36 @@ test("a healthy hold writes a bundle the validator accepts, passed, with the cri
   assert.equal(sc.clock_offset_ms, 3);
   assert.deepEqual(sc.sessions, [SID]);
   const d = path.join(dir, "01-stream-hold");
-  for (const f of ["timeline.jsonl", "metrics.jsonl", "bench-windows.json", "bench-frames.json", "session.json", "console.log", "shots/first-frame.png", "shots/t10s.png", "shots/end.png"]) assert.ok(fs.existsSync(path.join(d, f)), f);
+  for (const f of ["timeline.jsonl", "metrics.jsonl", "bench-windows.json", "bench-frames.json", "session.json", "console.log", "shots/end.png"]) assert.ok(fs.existsSync(path.join(d, f)), f);
   const manifest = JSON.parse(read(dir, "manifest.json"));
   assert.deepEqual(manifest.halves, { client: true, host: false });
   assert.ok(manifest.not_recorded.some((n) => n.fact === "audio_latency_ms" && n.why));
   assert.deepEqual(w.stopped, [SID]);
   assert.deepEqual(fs.readdirSync(path.dirname(dir)), ["bundle"], "the staging directory is gone");
+});
+
+test("stream-hold takes its only screenshot after recording the measured hold", async () => {
+  const w = world({ session: { transport: "webtransport", pyrowave: { active: true } } });
+  const shots = [];
+  const newPage = w.host.newPage;
+  w.host.newPage = async () => {
+    const page = await newPage();
+    const screenshot = page.screenshot;
+    page.screenshot = async (options) => {
+      const scenario = path.dirname(path.dirname(options.path));
+      shots.push({
+        name: path.basename(options.path),
+        sincePlayMs: w.now() - w.playAt,
+        holdRecorded: read(scenario, "timeline.jsonl").includes('"ev":"hold-done"') && fs.existsSync(path.join(scenario, "metrics.jsonl")),
+      });
+      await screenshot(options);
+    };
+    return page;
+  };
+  const r = await run(w, PLAN({ transport: "webtransport", codec: "pyrowave", hold_s: 30 }));
+  assert.deepEqual(r.result.errors, []);
+  assert.equal(r.scenario().status, "pass");
+  assert.deepEqual(shots, [{ name: "end.png", sincePlayMs: 30_000, holdRecorded: true }]);
 });
 
 test("the codec, frame rate and resolution are asked through the game page's Launch options, and no preference is touched", async () => {
@@ -710,8 +734,8 @@ test("transport, codec and profile are judged against the session row", async ()
 
 // ── the other runner paths ──────────────────────────────────────────────────
 
-test("an error mid-hold still stops the session and leaves a valid bundle", async () => {
-  const w = world({ failScreenshotAt: 2 });
+test("an error taking the final screenshot still stops the session and leaves a valid bundle", async () => {
+  const w = world({ failScreenshotAt: 0 });
   const { result, scenario } = await run(w);
   assert.deepEqual(result.errors, []);
   assert.equal(scenario().status, "error");
