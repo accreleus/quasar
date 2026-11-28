@@ -394,7 +394,7 @@ func reasonFor(v Verdict) string {
 	case verdictIndeterminateClientHidden:
 		head = "Nothing negative fired, but the client tab was hidden, so presentation cannot be assessed"
 	case verdictUnknown:
-		head = "No usable signal in the window"
+		head = "Inconclusive without client presentation or transport samples"
 	default:
 		head = "Verdict " + v.Verdict
 	}
@@ -514,6 +514,10 @@ func buildVerdict(in verdictInputs) Verdict {
 	fs := falsifiersFor(in.Classifier.Verdict, in.Series)
 	fs = annotateCrossSource(in.Classifier.Verdict, fs, in.Align)
 	fs = annotateWarmup(fs, in.FullSeries, in.Warmup)
+	nClient := in.NClient
+	if !hasClientVerdictSamples(in.Series) {
+		nClient = 0
+	}
 	v := Verdict{
 		Verdict:  in.Classifier.Verdict,
 		Evidence: evidence,
@@ -522,7 +526,7 @@ func buildVerdict(in verdictInputs) Verdict {
 			WarmupExcludedMs: in.Warmup.ExcludedMs,
 		},
 		Clock:             clock,
-		EvidenceTier:      evidenceTier(in.NHost, in.NClient, clock),
+		EvidenceTier:      evidenceTier(in.NHost, nClient, clock),
 		Falsifiers:        fs,
 		ThresholdsVersion: thresholdsVersion,
 	}
