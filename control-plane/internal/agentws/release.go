@@ -3,6 +3,8 @@ package agentws
 import (
 	"context"
 	"log/slog"
+
+	"github.com/accreleus/quasar/control-plane/internal/audit"
 )
 
 // Platform-release apply on the wire (agent-api.md §`release_apply`,
@@ -72,7 +74,7 @@ func validateReleaseState(m *ReleaseStateMsg) bool {
 		return false
 	}
 	if m.Reason != nil && len(*m.Reason) > maxReleaseReasonLen {
-		trimmed := (*m.Reason)[:maxReleaseReasonLen]
+		trimmed := audit.TruncateBytes(*m.Reason, maxReleaseReasonLen)
 		m.Reason = &trimmed
 	}
 	if len(m.Output) > maxReleaseOutputLen {

@@ -10,6 +10,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/accreleus/quasar/control-plane/internal/audit"
 )
 
 // dbExecutor is the narrow surface both *pgxpool.Pool and pgx.Tx satisfy, so
@@ -41,10 +43,7 @@ type dbExecutor interface {
 const maxStoredImageError = 300
 
 func truncateImageError(s string) string {
-	if len(s) <= maxStoredImageError {
-		return s
-	}
-	return s[:maxStoredImageError]
+	return audit.TruncateBytes(s, maxStoredImageError)
 }
 
 var hostImageStates = map[string]bool{

@@ -24,6 +24,11 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Fixed
+
+- A long error, reason or note with a multi-byte character at the length limit is now cut before that character instead of through it. Postgres refused the half character, so the host image error, catalog sync error, release failure reason or library rule note was not saved.
+- The image checks for the PyroWave library's dependencies and the recovery binary's contents now fail when the tool they run is missing, fails or prints nothing, instead of passing.
+
 ## 0.6.5 — 2026-11-28
 
 ### Fixed
