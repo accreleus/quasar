@@ -990,9 +990,13 @@ export interface paths {
          *     layout. The caller's override if set, else the admin default, else the built-in
          *     default (source says which). Always 200 for an authenticated caller.
          *
-         *     STRUCTURE ONLY: each section's content still comes from its existing read
+         *     STRUCTURE ONLY: a section carries no data, it is a reference. Each kind's content
+         *     still comes from its existing read
          *     (highlights: /v1/me/highlights; jump_back_in: /v1/me/play-history joined to /v1/apps;
-         *     favourites: /v1/apps favourite=true).
+         *     favourites: /v1/apps favourite=true). The hero is client chrome, not a section: a
+         *     client that draws the featured rail inside its hero draws the hero at the first shown
+         *     highlights section (the rail is drawn once), or at the top without the rail when none
+         *     is shown.
          *
          *     CLIENT RULES: skip an unknown kind; skip enabled=false; ignore unknown params keys. A
          *     404 (an older server) or any other failure renders the built-in default
