@@ -26,6 +26,10 @@ own; the two do not move together, and that is deliberate.
 
 ### Changed
 
+- CI runs shellcheck over every shell script in the repository and the scripts the site
+  generates, and fails on new findings. Two harness bugs it found are fixed: the NVENC fallback
+  smoke now searches the agent's stderr during teardown, and `run-apitest.sh` honours
+  `RESULTS_JSON`.
 - CI now lints the control plane with golangci-lint (staticcheck SA, sqlclosecheck,
   rowserrcheck for pgx, and a ban on building an `http.Client` outside
   `internal/outbound`); four database reads no longer treat a partial result as
