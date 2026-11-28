@@ -1,0 +1,16 @@
+# shellcheck findings that predate the check: file code count. Only remove or lower lines.
+deploy/build-images.sh SC2155 1
+deploy/redeploy.sh SC2043 1
+deploy/validate-image.sh SC2034 1
+scripts/dev/pyrowave-fixtures/gen.sh SC2206 1
+scripts/harness/checks/vram-telemetry.sh SC2034 1
+scripts/harness/lib/harness-selftest.sh SC1090 1
+scripts/harness/run-apitest.sh SC2034 1
+scripts/harness/run-codec-validate.sh SC2097 1
+scripts/harness/run-codec-validate.sh SC2098 1
+scripts/harness/run-nvenc-fallback-smoke.sh SC2097 1
+scripts/harness/run-nvenc-fallback-smoke.sh SC2098 1
+scripts/harness/run-soak-profile.sh SC2034 1
+scripts/harness/run-spt06-certify.sh SC2163 1
+scripts/release/test-platform-release-manifest.sh SC1083 2
+scripts/verify.sh SC2155 1
