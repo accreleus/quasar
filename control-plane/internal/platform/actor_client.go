@@ -31,7 +31,7 @@ func NewActorClient(socketPath string) *ActorClient {
 	return &ActorClient{
 		socket: socketPath,
 		// Exception to internal/outbound: dials only the local recovery-actor unix socket.
-		http: &http.Client{
+		http: &http.Client{ //nolint:forbidigo // exception to internal/outbound, see above
 			// A submit answers after admission, which may fetch a signature.
 			Timeout: 60 * time.Second,
 			Transport: &http.Transport{

@@ -224,7 +224,7 @@ func NewOwnMachineReader(socketPath string) *OwnMachineReader {
 		socket: socketPath,
 		TTL:    DefaultInstallModeTTL,
 		// Exception to internal/outbound: dials only the local recovery-actor unix socket.
-		http: &http.Client{
+		http: &http.Client{ //nolint:forbidigo // exception to internal/outbound, see above
 			Timeout: ownMachineReadTimeout,
 			Transport: &http.Transport{
 				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {

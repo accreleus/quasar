@@ -91,7 +91,7 @@ func NewFetcher(timeout time.Duration, maxBytes int64) *Fetcher {
 		maxBytes: maxBytes,
 		slots:    make(chan struct{}, maxConcurrentFetches),
 		// Exception to internal/outbound: the dialer Control above is its own per-dial public-address guard; no Proxy is set.
-		client: &http.Client{
+		client: &http.Client{ //nolint:forbidigo // exception to internal/outbound, see above
 			Timeout: timeout,
 			Transport: &http.Transport{
 				DialContext:           dialer.DialContext,
