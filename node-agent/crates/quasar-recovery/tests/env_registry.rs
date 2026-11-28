@@ -9,7 +9,9 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use proc_macro2::{TokenStream, TokenTree};
 use quasar_recovery::recipe::AGENT_VARIABLES;
+use syn::visit::{self, Visit};
 
 const OWNED: &str = "set by the recovery actor's recipe, or owned by the install";
 const SEED: &str = "a seed input in its own right";
@@ -146,40 +148,85 @@ const NOT_IN_COMPOSE: &[&str] = &[
     "QUASAR_VULKAN_RING",
 ];
 
-/// The exact `"QUASAR_*"` string literals of one file, outside comments and inline test
-/// modules. A name built with `format!` is not seen.
-fn names_in(source: &str, out: &mut BTreeSet<String>) {
-    let mut lines = source.lines();
-    let mut test_attr = false;
-    while let Some(line) = lines.next() {
-        let code = line.trim_start();
-        if code.starts_with("//") {
-            continue;
+/// `#[test]` (also `#[tokio::test]`), `#[cfg(test)]` or `#[cfg(all(test, ..))]`.
+fn is_test(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|a| {
+        let path = a.path();
+        path.segments.last().is_some_and(|s| s.ident == "test")
+            || path.is_ident("cfg")
+                && a.meta.require_list().is_ok_and(|list| {
+                    let cfg = list.tokens.to_string().replace(' ', "");
+                    cfg == "test" || cfg.starts_with("all(test,")
+                })
+    })
+}
+
+struct Names<'a>(&'a mut BTreeSet<String>);
+
+impl Names<'_> {
+    fn literal(&mut self, value: String) {
+        if value.starts_with("QUASAR_")
+            && !value.ends_with('_')
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        {
+            self.0.insert(value);
         }
-        if code.starts_with("#[cfg(test)]") || code.starts_with("#[cfg(all(test") {
-            test_attr = true;
-            continue;
-        }
-        if test_attr && code.starts_with("#[") {
-            continue;
-        }
-        let is_mod = code.starts_with("mod ") || code.contains(" mod ");
-        if std::mem::take(&mut test_attr) && is_mod && code.ends_with('{') {
-            // rustfmt closes the module at the indentation that opened it.
-            let close = format!("{}}}", &line[..line.len() - code.len()]);
-            lines.by_ref().find(|l| *l == close);
-            continue;
-        }
-        for (i, _) in line.match_indices("\"QUASAR_") {
-            let rest = &line[i + 1..];
-            let end = rest
-                .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
-                .unwrap_or(rest.len());
-            if rest[end..].starts_with('"') && !rest[..end].ends_with('_') {
-                out.insert(rest[..end].to_owned());
+    }
+
+    /// `syn` does not look inside a macro's arguments (`env!`, `info!`, `format!`).
+    fn tokens(&mut self, tokens: TokenStream) {
+        for token in tokens {
+            match token {
+                TokenTree::Group(group) => self.tokens(group.stream()),
+                TokenTree::Literal(literal) => {
+                    if let syn::Lit::Str(s) = syn::Lit::new(literal) {
+                        self.literal(s.value());
+                    }
+                }
+                _ => {}
             }
         }
     }
+}
+
+macro_rules! skip_test_items {
+    ($($method:ident: $node:ident),*) => {$(
+        fn $method(&mut self, node: &'ast syn::$node) {
+            if !is_test(&node.attrs) {
+                visit::$method(self, node);
+            }
+        }
+    )*};
+}
+
+impl<'ast> Visit<'ast> for Names<'_> {
+    skip_test_items!(
+        visit_item_mod: ItemMod,
+        visit_item_fn: ItemFn,
+        visit_item_const: ItemConst,
+        visit_item_static: ItemStatic,
+        visit_item_impl: ItemImpl,
+        visit_impl_item_const: ImplItemConst,
+        visit_impl_item_fn: ImplItemFn,
+        visit_item_macro: ItemMacro
+    );
+
+    fn visit_lit_str(&mut self, s: &'ast syn::LitStr) {
+        self.literal(s.value());
+    }
+
+    fn visit_macro(&mut self, m: &'ast syn::Macro) {
+        self.tokens(m.tokens.clone());
+    }
+}
+
+/// The exact `"QUASAR_*"` string literals of one file, outside test items. A name built with
+/// `format!` is not seen.
+fn names_in(source: &str, out: &mut BTreeSet<String>) -> syn::Result<()> {
+    Names(out).visit_file(&syn::parse_file(source)?);
+    Ok(())
 }
 
 fn is_test_path(name: &str) -> bool {
@@ -200,7 +247,8 @@ fn walk(dir: &Path, out: &mut BTreeSet<String>) {
         if path.is_dir() {
             walk(&path, out);
         } else if name.ends_with(".rs") {
-            names_in(&std::fs::read_to_string(&path).unwrap(), out);
+            names_in(&std::fs::read_to_string(&path).unwrap(), out)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         }
     }
 }
@@ -273,6 +321,50 @@ fn findings(read: &BTreeSet<String>, docs: &str, compose: &BTreeSet<String>) -> 
     out
 }
 
+/// An entry that is no longer needed, repeated, or in two lists that cannot both hold it.
+/// `NOT_AGENT_VARIABLE` and `NO_DOCS_ROW` may share a name: they excuse different checks.
+fn list_problems(
+    read: &BTreeSet<String>,
+    docs: &str,
+    compose: &BTreeSet<String>,
+    not_variable: &[&str],
+    no_row: &[&str],
+    not_in_compose: &[&str],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    type Needed<'a> = &'a dyn Fn(&str) -> bool;
+    let lists: [(&str, &[&str], Needed); 3] = [
+        ("NOT_AGENT_VARIABLE", not_variable, &|n| {
+            !AGENT_VARIABLES.contains(&n)
+        }),
+        ("NO_DOCS_ROW", no_row, &|n| !has_row(docs, n)),
+        ("NOT_IN_COMPOSE", not_in_compose, &|n| {
+            AGENT_VARIABLES.contains(&n) && !compose.contains(n)
+        }),
+    ];
+    for (list, entries, needed) in lists {
+        let mut seen = BTreeSet::new();
+        for &name in entries {
+            if !seen.insert(name) {
+                out.push(format!("{list} {name}: listed twice"));
+            } else if !read.contains(name) || !needed(name) {
+                out.push(format!("{list} {name}: no longer needed"));
+            }
+        }
+    }
+    for name in not_in_compose {
+        for (list, entries) in [
+            ("NOT_AGENT_VARIABLE", not_variable),
+            ("NO_DOCS_ROW", no_row),
+        ] {
+            if entries.contains(name) {
+                out.push(format!("{list} and NOT_IN_COMPOSE both list {name}"));
+            }
+        }
+    }
+    out
+}
+
 #[test]
 fn every_variable_the_agent_reads_is_documented_and_settable() {
     let docs = std::fs::read_to_string(repo("docs/configuration.md")).unwrap();
@@ -280,24 +372,16 @@ fn every_variable_the_agent_reads_is_documented_and_settable() {
     let found = findings(&read, &docs, &compose);
     assert!(found.is_empty(), "{found:#?}");
 
-    let stale: Vec<_> = NOT_AGENT_VARIABLE
-        .iter()
-        .filter(|(n, _)| !read.contains(*n) || AGENT_VARIABLES.contains(n))
-        .map(|(n, _)| format!("NOT_AGENT_VARIABLE {n}"))
-        .chain(
-            NO_DOCS_ROW
-                .iter()
-                .filter(|(n, _)| !read.contains(*n) || has_row(&docs, n))
-                .map(|(n, _)| format!("NO_DOCS_ROW {n}")),
-        )
-        .chain(
-            NOT_IN_COMPOSE
-                .iter()
-                .filter(|n| !read.contains(**n) || compose.contains(**n))
-                .map(|n| format!("NOT_IN_COMPOSE {n}")),
-        )
-        .collect();
-    assert!(stale.is_empty(), "remove these entries: {stale:#?}");
+    let names = |list: &[(&'static str, &str)]| list.iter().map(|e| e.0).collect::<Vec<_>>();
+    let problems = list_problems(
+        &read,
+        &docs,
+        &compose,
+        &names(NOT_AGENT_VARIABLE),
+        &names(NO_DOCS_ROW),
+        NOT_IN_COMPOSE,
+    );
+    assert!(problems.is_empty(), "fix these list entries: {problems:#?}");
 }
 
 /// The check on planted source: a new knob with no row and no list entry fails, and names in
@@ -318,7 +402,7 @@ mod tests {
 const AFTER: &str = "QUASAR_AFTER_THE_TESTS";
 "#;
     let mut read = BTreeSet::new();
-    names_in(source, &mut read);
+    names_in(source, &mut read).unwrap();
     assert_eq!(
         read.iter().collect::<Vec<_>>(),
         ["QUASAR_AFTER_THE_TESTS", "QUASAR_FAKE_KNOB"]
@@ -334,4 +418,79 @@ const AFTER: &str = "QUASAR_AFTER_THE_TESTS";
     let found = findings(&read, "| `QUASAR_WT_PORT` | 4433 |", &BTreeSet::new());
     assert_eq!(found.len(), 1, "{found:#?}");
     assert!(found[0].contains("docker-compose"), "{found:#?}");
+}
+
+#[test]
+fn a_brace_in_a_raw_string_does_not_end_a_test_module() {
+    let source = r##"
+#[cfg(test)]
+mod tests {
+    const VDF: &str = r#"
+"compatibilitytools"
+{
+}
+"#;
+    #[test]
+    fn f() {
+        let _ = "QUASAR_ONLY_IN_TESTS";
+    }
+}
+"##;
+    let mut read = BTreeSet::new();
+    names_in(source, &mut read).unwrap();
+    assert!(read.is_empty(), "{read:?}");
+}
+
+#[test]
+fn production_code_after_a_commented_test_module_is_read() {
+    let source = r#"
+#[cfg(test)]
+mod tests {
+} // end of tests
+fn f() {
+    let _ = env!("QUASAR_IN_A_MACRO");
+    info!(knob = "QUASAR_AFTER_THE_TESTS", "{{}}");
+}
+"#;
+    let mut read = BTreeSet::new();
+    names_in(source, &mut read).unwrap();
+    assert_eq!(
+        read.iter().collect::<Vec<_>>(),
+        ["QUASAR_AFTER_THE_TESTS", "QUASAR_IN_A_MACRO"]
+    );
+}
+
+#[test]
+fn a_repeated_misplaced_or_unneeded_list_entry_fails() {
+    let read = BTreeSet::from(["QUASAR_FAKE".to_string(), "QUASAR_WT_PORT".to_string()]);
+    let none = BTreeSet::new();
+    let check = |a: &[&str], b: &[&str], c: &[&str]| list_problems(&read, "", &none, a, b, c);
+    let (fake, port) = (&["QUASAR_FAKE"][..], &["QUASAR_WT_PORT"][..]);
+    assert_eq!(check(fake, fake, port), Vec::<String>::new());
+
+    let twice = ["QUASAR_FAKE", "QUASAR_FAKE"];
+    assert_eq!(
+        check(&twice, &twice, &["QUASAR_WT_PORT", "QUASAR_WT_PORT"]),
+        [
+            "NOT_AGENT_VARIABLE QUASAR_FAKE: listed twice",
+            "NO_DOCS_ROW QUASAR_FAKE: listed twice",
+            "NOT_IN_COMPOSE QUASAR_WT_PORT: listed twice",
+        ]
+    );
+    // Not an agent variable, so Compose has nothing to excuse.
+    assert_eq!(
+        check(&[], &[], fake),
+        ["NOT_IN_COMPOSE QUASAR_FAKE: no longer needed"]
+    );
+    assert_eq!(
+        check(fake, &[], fake),
+        [
+            "NOT_IN_COMPOSE QUASAR_FAKE: no longer needed",
+            "NOT_AGENT_VARIABLE and NOT_IN_COMPOSE both list QUASAR_FAKE",
+        ]
+    );
+    assert_eq!(
+        check(&[], port, port),
+        ["NO_DOCS_ROW and NOT_IN_COMPOSE both list QUASAR_WT_PORT"]
+    );
 }
