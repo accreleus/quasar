@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/accreleus/quasar/control-plane/internal/audit"
 	"github.com/accreleus/quasar/control-plane/internal/preparation"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -459,10 +460,7 @@ const maxSyncErrorLen = 500
 
 // clampSyncError bounds a message to what image_sync_error stores.
 func clampSyncError(msg string) string {
-	if len(msg) > maxSyncErrorLen {
-		return msg[:maxSyncErrorLen]
-	}
-	return msg
+	return audit.TruncateBytes(msg, maxSyncErrorLen)
 }
 
 // setSyncError records a failed sync. image_synced_at is left alone — it names

@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/accreleus/quasar/control-plane/internal/audit"
 )
 
 // Trust-boundary validation: authentication is not validation — a compromised
@@ -31,7 +33,7 @@ func validateImageState(m *ImageStateMsg) bool {
 	if len(m.Error) > maxImageErrLen {
 		// Truncate, don't drop: operator-facing context on an otherwise-valid
 		// transition.
-		m.Error = m.Error[:maxImageErrLen]
+		m.Error = audit.TruncateBytes(m.Error, maxImageErrLen)
 	}
 	if m.ProgressPct < 0 {
 		m.ProgressPct = 0

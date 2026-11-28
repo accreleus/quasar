@@ -12,6 +12,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/accreleus/quasar/control-plane/internal/audit"
 )
 
 // ErrNotFound: a scan id / parent app did not resolve. Maps to 404 either way; a scan the
@@ -722,9 +724,7 @@ func (s *Store) SetRule(ctx context.Context, parentID, source, externalID, rule,
 	if !validAppID(externalID) {
 		return res, fmt.Errorf("invalid external_id")
 	}
-	if len(note) > 512 {
-		note = note[:512]
-	}
+	note = audit.TruncateBytes(note, 512)
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {

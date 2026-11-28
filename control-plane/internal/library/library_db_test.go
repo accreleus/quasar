@@ -638,6 +638,14 @@ func TestSecondUserSeesOnlyTheirOwn(t *testing.T) {
 	}
 }
 
+// A note over the bound is cut on a rune boundary, or Postgres refuses the rule.
+func TestSetRuleStoresATruncatedMultiByteNote(t *testing.T) {
+	f := newFixture(t, testDB(t))
+	_, err := f.store.SetRule(context.Background(), f.parent, SourceSteam, "517710", RuleIgnore,
+		strings.Repeat("a", 511)+"é tail", nil)
+	must(t, err)
+}
+
 // TestIgnoreIsDurableAndIsNotADelete is the §8.2 acceptance in full: ignoring a
 // published tile disables it, revokes its provider entitlements and writes the
 // rule; a subsequent scan re-observing the same appid does NOT re-enable it, does
