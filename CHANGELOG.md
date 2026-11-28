@@ -31,6 +31,7 @@ own; the two do not move together, and that is deliberate.
   web schema and served-script checks it did not run before. Clippy in CI now covers
   test code, and a `protocol/` change also runs the web jobs.
 - CI: a pull request into `develop` or `integration/**` now builds the images its changes affect with `deploy/build-images.sh` and validates them against `deploy/image-contract.json`, publishing nothing. `build-images.sh --cache registry:` reads the cache packages the Images workflow writes (`<image>-cache`) and no longer exits 255 with no message on a `docker-container` builder.
+- Clippy now rejects, in the whole `node-agent/` workspace, a lock or tracing span guard held across `.await`, a future bound to `let _`, and `tokio::sync::watch::Sender::send` (it drops the value when nothing is subscribed; the four calls now use `send_replace`).
 
 ### Fixed
 

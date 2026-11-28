@@ -299,7 +299,7 @@ pub fn spawn_with_kinds(
                             "pre-empting the running host probe"
                         );
                         if let Some(ptx) = &preempt {
-                            let _ = ptx.send(true);
+                            ptx.send_replace(true);
                         }
                     }
                     Action::Reconcile(kind) => {

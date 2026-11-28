@@ -526,7 +526,7 @@ mod tests {
         let run = tokio::spawn(bounded(sh(&script, Duration::from_secs(60)), rx));
         wait_written(&pidfile).await;
         let asked = Instant::now();
-        tx.send(true).unwrap();
+        tx.send_replace(true);
         let end = tokio::time::timeout(TEST_BOUND, run)
             .await
             .unwrap()
@@ -550,7 +550,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("ran");
         let (tx, rx) = never();
-        tx.send(true).unwrap();
+        tx.send_replace(true);
         let end = bounded(
             sh(
                 &format!("touch {}", marker.display()),
