@@ -238,12 +238,23 @@ if [ "${#web_files[@]}" -gt 0 ]; then
     # A test that imports a symbol the fix adds still runs under vitest (types are stripped),
     # so the typecheck is what tells "does not compile" apart from a real failure. Base's own
     # product code typechecks (CI holds develop to it), so a type error comes from the
-    # overlaid tests. One in a *.test.ts(x) file marks that file; one anywhere else (a
-    # __tests__ helper any test may import) marks every vitest row of this change.
+    # overlaid tests. One in a *.test.ts(x) file that no other changed test imports marks
+    # that file; one anywhere else (a __tests__ helper, or a test file used as a helper)
+    # marks every vitest row of this change.
     if ! tsc_errors="$(cd "$work/base/web" && node_modules/.bin/tsc -b --noEmit 2>&1)"; then
       mapfile -t err_files < <(sed -nE 's#^([^(]+)\([0-9]+,[0-9]+\): error TS.*#web/\1#p' <<<"$tsc_errors" | sort -u)
       [ "${#err_files[@]}" -gt 0 ] || fail_tool "the base typecheck failed without a TS error: $(tail -3 <<<"$tsc_errors" | tr '\n' ' ')"
-      for e in "${err_files[@]}"; do case "$e" in *.test.ts|*.test.tsx) ;; *) shared_error=yes ;; esac; done
+      for e in "${err_files[@]}"; do
+        case "$e" in
+          */__tests__/*) shared_error=yes ;;
+          *.test.ts|*.test.tsx)
+            stem="$(basename "${e%.*}")"
+            for f in "${web_files[@]}"; do
+              [ "$f" != "$e" ] && grep -qE "['\"][^'\"]*/${stem}(\.[jt]sx?)?['\"]" "$work/base/$f" && shared_error=yes
+            done ;;
+          *) shared_error=yes ;;
+        esac
+      done
       notes+=("Base with this change's tests does not typecheck in: ${err_files[*]}")
     fi
     for f in "${web_files[@]}"; do

@@ -142,6 +142,11 @@ printf 'import { expect, test } from "vitest";\nimport { add } from "./add";\n\n
 vitest sub 'sub(3, 1)' 2
 expect 0 '| `web/src/two.test.ts` | pass | fail | **proved** |' "${web[@]}"
 expect 0 '| `web/src/add.test.ts` | pass | compile | UNPROVED (compile)' "${web[@]}"
+# A test file used as a helper (it imports a symbol the fix adds) marks its importers too.
+webfixture vtesthelper 'export function fixOnly(): number { return 4; }'
+printf 'import { expect, test } from "vitest";\nimport { fixOnly } from "./add";\nexport const four = (): number => fixOnly();\ntest("noop", () => { expect(1).toBe(1); });\n' > web/src/shared.test.ts
+printf 'import { expect, test } from "vitest";\nimport { four } from "./shared.test";\n\ntest("it", () => { expect(four()).toBe(4); });\n' > web/src/add.test.ts; commit
+expect 0 '| `web/src/add.test.ts` | pass | compile | UNPROVED (compile)' "${web[@]}"
 # A timeout on base is not a proof.
 webfixture vtimeout 'export const slow = (): Promise<number> => Promise.resolve(4);' 'export const slow = (): Promise<number> => new Promise(() => {});'
 printf 'import { expect, test } from "vitest";\nimport { slow } from "./add";\n\ntest("it", async () => { expect(await slow()).toBe(4); }, 300);\n' > web/src/add.test.ts; commit
