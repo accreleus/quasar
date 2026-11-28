@@ -26,6 +26,7 @@ own; the two do not move together, and that is deliberate.
 
 ### Changed
 
+- CI now lints `web/` with ESLint (React hook rules, dropped or misused promises, non-exhaustive switches, and bans on async `setInterval` polls, per-render effect calls and unbounded WebGPU requests). Existing findings are counted in `web/eslint-suppressions.json`; only new ones fail.
 - The node-agent tests now fail when the agent reads a `QUASAR_*` setting that is not in
   `docs/configuration.md`, cannot be set on an owned install, or is not passed through by
   Compose, unless it is listed with a reason. `QUASAR_HOST_FUSE` and the node agent's own
