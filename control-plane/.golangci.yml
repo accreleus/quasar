@@ -1,0 +1,46 @@
+# Run by scripts/verify/lint.d/go-lint.sh. Only these linters: each is here for a bug
+# class this repo has had or a house rule. errcheck and the other defaults are off on purpose.
+version: "2"
+
+run:
+  modules-download-mode: readonly
+
+linters:
+  default: none
+  enable:
+    - forbidigo
+    - rowserrcheck
+    - sqlclosecheck
+    - staticcheck
+  settings:
+    staticcheck:
+      checks: ["SA*"]
+    rowserrcheck:
+      packages: [github.com/jackc/pgx/v5]
+    forbidigo:
+      analyze-types: true
+      forbid:
+        - pattern: ^http\.Client$
+          pkg: ^net/http$
+          msg: >-
+            use internal/outbound (outbound.New) for outbound HTTP; a deliberate
+            exception states its reason with //nolint:forbidigo
+        - pattern: ^http\.DefaultClient$
+          pkg: ^net/http$
+          msg: >-
+            http.DefaultClient has no timeout, allowlist or dial guard; use
+            internal/outbound (outbound.New)
+  exclusions:
+    rules:
+      - linters: [forbidigo]
+        path: (_test\.go$|^internal/outbound/)
+      # forbidigo cannot tell a `*http.Client` type from a construction: skip only the
+      # shapes that cannot construct one (a func signature, or a field/var/type that just
+      # names the pointer type, optionally with a struct tag and a trailing comment).
+      - linters: [forbidigo]
+        text: use of `http\.Client`
+        source: '^\s*(func\b(struct\{\}|[^{&=])*\*http\.Client\b(struct\{\}|[^{&=])*(\{\s*)?|(var\s+|type\s+)?[A-Za-z_][A-Za-z0-9_]*\s+\*http\.Client(\s+`[^`]*`)?\s*)(//.*)?$'
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

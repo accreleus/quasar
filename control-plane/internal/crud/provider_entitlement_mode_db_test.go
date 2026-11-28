@@ -431,6 +431,9 @@ func TestStoredModeSurvivesAMixedCaseCatalogProvider(t *testing.T) {
 		grants = append(grants, g)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
 	if len(grants) != 1 || grants[0].subjectType != "user" || grants[0].subjectID == nil || *grants[0].subjectID != adminID {
 		t.Fatalf("entitlements = %+v, want exactly ('user', %s) and no 'all' row", grants, adminID)
 	}
@@ -510,6 +513,9 @@ func TestStoredModeAppliesToAProviderAppMadeByHand(t *testing.T) {
 				got = append(got, s)
 			}
 			rows.Close()
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
+			}
 			var total int
 			if err := pool.QueryRow(ctx, `SELECT count(*) FROM entitlements WHERE app_id = $1::uuid`, appID).Scan(&total); err != nil {
 				t.Fatalf("count entitlements: %v", err)

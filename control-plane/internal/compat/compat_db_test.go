@@ -203,6 +203,9 @@ func newHarness(t *testing.T) *harness {
 		}
 		h.id[n] = id
 	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
 	return h
 }
 
@@ -307,6 +310,9 @@ func TestSetDefaultAuditsAndClears(t *testing.T) {
 		}
 		d["action"], d["target_type"] = action, target
 		got = append(got, d)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
 	}
 	bothGE := map[string]any{"action": "compat_tool.default.set", "target_type": "instance", "tool_id": prevGE,
 		"previous_tool_id": ge, "tag": prevTag, "sha512": prevSHA,
@@ -418,6 +424,9 @@ func (h *harness) mappingAudit() []string {
 			h.t.Fatal(err)
 		}
 		out = append(out, l)
+	}
+	if err := rows.Err(); err != nil {
+		h.t.Fatal(err)
 	}
 	return out
 }

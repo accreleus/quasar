@@ -852,20 +852,14 @@ func postEffective(
 		return effective{Rejected: true}
 	}
 
-	// Pre-schedule: the TOP rung, with the envelope applied before admission.
-	top := lp.Rungs[0]
 	env := buildProbeEnvelope(dp)
-	bitrate := top.NominalBitrateKbps
-	if env.SafeCeilingKbps > 0 {
-		bitrate = applyEnvelopeToBitrate(bitrate, env)
-	}
 
 	// Post-placement: resolve the rung, then RE-APPLY the envelope to its bitrate.
 	rung, _, err := resolveRung(lp.Rungs, hostCodecs, hostEncoderCaps{}, dp, nil, StreamOverride{})
 	if err != nil {
 		t.Fatalf("resolve rung: %v", err)
 	}
-	bitrate = rung.NominalBitrateKbps
+	bitrate := rung.NominalBitrateKbps
 	if env.SafeCeilingKbps > 0 {
 		bitrate = applyEnvelopeToBitrate(bitrate, env)
 	}

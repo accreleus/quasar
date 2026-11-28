@@ -1008,6 +1008,9 @@ func (s *CleanupService) requestCleanupJournal(ctx context.Context, hostID strin
 		}
 	}
 	rows.Close()
+	if rows.Err() != nil {
+		return
+	}
 	if len(ids) > 0 {
 		if id, err := newCmdID(); err == nil {
 			requested := make(map[string]bool, len(ids))

@@ -48,6 +48,9 @@ func auditRows(t *testing.T, pool *pgxpool.Pool) []auditRow {
 		}
 		out = append(out, r)
 	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
 	return out
 }
 

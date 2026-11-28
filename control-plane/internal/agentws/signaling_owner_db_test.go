@@ -156,7 +156,7 @@ func countingOwners(placed bool, err error, log *slog.Logger) (*signalingOwners,
 
 func TestSignalingOwnersCacheHitAndRefusalWindow(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	o, calls, clock := countingOwners(true, nil, log)
+	o, calls, _ := countingOwners(true, nil, log)
 	for i := 0; i < 3; i++ {
 		if !o.allows(context.Background(), canonicalSession) {
 			t.Fatal("owned session refused")
@@ -166,7 +166,7 @@ func TestSignalingOwnersCacheHitAndRefusalWindow(t *testing.T) {
 		t.Fatalf("an owned session cost %d lookups, want 1", *calls)
 	}
 
-	o, calls, clock = countingOwners(false, nil, log)
+	o, calls, clock := countingOwners(false, nil, log)
 	o.allows(context.Background(), canonicalSession)
 	o.allows(context.Background(), canonicalSession)
 	if *calls != 1 {

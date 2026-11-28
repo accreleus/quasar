@@ -118,6 +118,9 @@ func loadFleet(ctx context.Context, q querier, hostID string) (*fleet, error) {
 		f.reported[h] = at
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read host reports: %w", err)
+	}
 	rows, err = q.Query(ctx, `SELECT host_id::text, name, tag, sha512, bytes FROM host_compat_tools
 		WHERE $1 = '' OR host_id = NULLIF($1, '')::uuid ORDER BY name`, hostID)
 	if err != nil {

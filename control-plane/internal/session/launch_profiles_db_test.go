@@ -236,6 +236,9 @@ func TestRungInheritsParentVerbatim(t *testing.T) {
 		}
 		n++
 	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
 	if n != 8 {
 		t.Fatalf("compared %d parent/rung pairs, want 8", n)
 	}

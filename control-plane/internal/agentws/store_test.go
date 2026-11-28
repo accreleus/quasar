@@ -383,6 +383,9 @@ func TestUpsertCapacityGPURenderNodePersists(t *testing.T) {
 			DevicePath *string
 		}{idx, rn, devicePath})
 	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
 	if len(got) != 2 {
 		t.Fatalf("gpus rows = %d, want 2", len(got))
 	}
@@ -430,6 +433,9 @@ func TestUpsertCapacityGPUDriverIdentityPersists(t *testing.T) {
 				t.Fatalf("scan: %v", err)
 			}
 			out = append(out, v)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
 		}
 		return out
 	}

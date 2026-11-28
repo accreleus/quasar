@@ -39,6 +39,7 @@ func TestMigration0116UpAndDown(t *testing.T) {
 			must(t, rows.Scan(&id, &tr))
 			out[id] = tr
 		}
+		must(t, rows.Err())
 		return out
 	}
 

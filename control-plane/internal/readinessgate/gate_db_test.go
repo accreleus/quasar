@@ -131,6 +131,9 @@ func (f fixture) blocked(t *testing.T) (host, homes bool, gpus map[int]bool) {
 		}
 		gpus[i] = true
 	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
 	return host, homes, gpus
 }
 
@@ -149,6 +152,9 @@ func (f fixture) overrideIDs(t *testing.T) []string {
 			t.Fatal(err)
 		}
 		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
 	}
 	return ids
 }
@@ -180,6 +186,9 @@ func (f fixture) audit(t *testing.T) []auditRow {
 			t.Fatal(err)
 		}
 		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
 	}
 	return out
 }
