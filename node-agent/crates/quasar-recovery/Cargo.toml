@@ -59,6 +59,9 @@ quasar-recovery = { path = ".", features = ["test-support"] }
 tempfile = "3"
 # The recipe parity test parses deploy/docker-compose.yml. Test-only: never in the binary.
 serde_yaml = "0.9"
+# tests/env_registry.rs parses the agent's source. Both are already in the lockfile.
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = "1"
 
 [lints]
 workspace = true
