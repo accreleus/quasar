@@ -960,6 +960,31 @@ describe("DecodeStage", () => {
     expect(frames).toHaveLength(2);
   });
 
+  it("logs each decoder failure once, with a running count (#1674)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { s, decoders } = stage();
+    s.config(config(0));
+    await flush();
+    s.unit(unit(0, 1, true));
+    decoders[0].fail();
+    decoders[0].fail(); // the same decoder again: neither counted nor restarted
+    await flush();
+    expect(decoders).toHaveLength(2);
+    // decode() throws, then the decoder's error callback reports the same failure.
+    decoders[1].decode = () => {
+      throw new DOMException("closed", "InvalidStateError");
+    };
+    s.unit(unit(0, 2, true));
+    decoders[1].fail();
+    await flush();
+    expect(decoders).toHaveLength(3);
+    expect(warn.mock.calls.map((c) => c[0])).toEqual([
+      "webtransport: video decoder restart (decode_error #1):",
+      "webtransport: video decoder restart (decode_error #2):",
+    ]);
+    warn.mockRestore();
+  });
+
   it(`goes terminal after ${MAX_DECODER_RESTARTS} failures in a row`, async () => {
     const { s, decoders, fatal } = stage();
     s.config(config(0));
