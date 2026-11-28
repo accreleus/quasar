@@ -64,6 +64,9 @@ const QUEUE_STANDING: Duration = Duration::from_secs(1);
 const REORDERED_US: u64 = 1_000;
 const REORDERING: Duration = Duration::from_secs(1);
 const REORDERING_REPORTS: usize = 10;
+/// `Estimator::queue_floor` re-anchors to the rolling floor at this age: about twice the longest a
+/// capped link's queue stood in the lab (92 s, #1692), and 9 ms of drift at 50 ppm of clock skew.
+const FLOOR_HELD_MAX: Duration = Duration::from_secs(180);
 /// The path floor is the least one-way delay over `FLOOR_SPAN_US` of send time, read as the
 /// least of each `DELAY_BUCKET_US`: a delay step ages in within the span.
 const DELAY_BUCKET_US: u64 = 500_000;
@@ -691,8 +694,9 @@ struct Evidence {
 }
 
 impl Evidence {
-    /// One fresh arrival into the floor reading; true when it arrived at the floor.
-    fn arrival(&mut self, sent_us: u64, at_us: u64) -> bool {
+    /// One fresh arrival into the floor reading: whether it arrived at the floor, and its one-way
+    /// delay, µs.
+    fn arrival(&mut self, sent_us: u64, at_us: u64) -> (bool, i64) {
         // Two clocks, and `feedback_of` accepts any u64 receiver clock: never overflow.
         let delay = (i128::from(at_us) - i128::from(sent_us))
             .clamp(i64::MIN.into(), i64::MAX.into()) as i64;
@@ -708,7 +712,7 @@ impl Evidence {
         let floor = self
             .floor
             .unwrap_or_else(|| self.current.map_or(delay, |c| c.1));
-        (delay.saturating_sub(floor) as f64) < AT_FLOOR_MS * 1000.0
+        (near(delay, floor), delay)
     }
 
     fn close(&mut self, (bucket, least): (u64, i64)) {
@@ -722,6 +726,11 @@ impl Evidence {
         }
         self.floor = self.buckets.iter().map(|&(_, d)| d).min();
     }
+}
+
+/// A one-way delay within `AT_FLOOR_MS` of a floor.
+fn near(delay: i64, floor: i64) -> bool {
+    (delay.saturating_sub(floor) as f64) < AT_FLOOR_MS * 1000.0
 }
 
 /// The rate estimate one client's feedback drives, in kbit/s.
@@ -807,13 +816,16 @@ pub(crate) struct Estimator {
     off_floor: Option<Instant>,
     queue_standing: bool,
     queue_stood: bool,
-    /// While `queue_stood`: the path floor from before the queue, which the off-floor reading
-    /// holds to. The rolling floor takes in a queue that stands over `FLOOR_SPAN_US`, so a queue
-    /// that stood longer read as gone while it still held seconds (#1692 lab, NVIDIA 2 Mbit/s:
-    /// 1.3-1.6 s of queue at onset + 40 s, the setpoint left 7 % over the estimate).
-    queue_floor: Option<i64>,
+    /// The path floor from before a queue that stood, and since when it is held: the rolling floor
+    /// takes in a queue older than `FLOOR_SPAN_US`. Kept through a loss bound (a full queue drops,
+    /// #1693), dropped at the ceiling bound, and aged out after `FLOOR_HELD_MAX`, which bounds how
+    /// long a delay step or the two clocks' skew can read as a queue.
+    queue_floor: Option<(i64, Instant)>,
     /// When each report within `REORDERING` showed the path reorder.
     reordered: VecDeque<Instant>,
+    /// The newest fresh arrival's one-way delay, and the branch `log_follow` last said and when.
+    last_delay: i64,
+    follow_logged: (&'static str, Option<Instant>),
     /// v2's hold (`HOLD`) and loss floor; off for PyroWave, which has its own controller and no
     /// keyframes to overflow a link.
     holds: bool,
@@ -1042,6 +1054,8 @@ impl Estimator {
             queue_stood: false,
             queue_floor: None,
             reordered: VecDeque::new(),
+            last_delay: 0,
+            follow_logged: ("", None),
             holds: true,
             probes: false,
             logged: (Bound::Ceiling, None),
@@ -1337,7 +1351,7 @@ impl Estimator {
     /// Start again from `kbps` (never above the ceiling): codec-pyrowave.md §Rate, the ABR
     /// resumes from the estimate after a switch back.
     pub(crate) fn resume_at(&mut self, kbps: f64) {
-        (self.off_floor, self.queue_standing, self.queue_stood) = (None, false, false);
+        self.forget_queue();
         self.delay_kbps = kbps;
         self.loss_kbps = kbps;
         self.read_last = false;
@@ -1853,7 +1867,51 @@ impl Estimator {
                 self.estimate_kbps
             );
         }
+        self.log_follow(now);
         self.due(now)
+    }
+
+    /// Legacy's follow-down ([`Self::follows_queue`]), which of its conditions decides and the
+    /// inputs: on a change of that, at most one line a `LOG_EVERY` (#1693). Not on `encoder_over`:
+    /// under the follow-down the setpoint sits at the estimate, and it flips every report.
+    fn log_follow(&mut self, now: Instant) {
+        if !self.legacy || !self.audio_pacing {
+            return;
+        }
+        let branch = match () {
+            _ if self.bound != Bound::Delay => "off-not-delay-bound",
+            _ if self.queue_stood && self.queue_standing => "on",
+            _ if self.queue_stood => "off-queue-not-standing",
+            _ if self.reordered.len() >= REORDERING_REPORTS => "off-reordering",
+            _ => "off-no-queue-stood",
+        };
+        let encoder = self.encoder_kbps.unwrap_or(0.0);
+        let (logged, at) = self.follow_logged;
+        if branch == logged || at.is_some_and(|at| now.saturating_duration_since(at) < LOG_EVERY) {
+            return;
+        }
+        self.follow_logged = (branch, Some(now));
+        let over_ms = |floor: Option<i64>| {
+            floor.map_or(0.0, |f| self.last_delay.saturating_sub(f) as f64 / 1000.0)
+        };
+        tracing::info!(
+            token = "webtransport-follow-down",
+            branch,
+            encoder_over = encoder > self.estimate_kbps * 1.01,
+            estimate_kbps = self.estimate_kbps as u64,
+            encoder_kbps = encoder as u64,
+            bound = ?self.bound,
+            queue_stood = self.queue_stood,
+            queue_standing = self.queue_standing,
+            off_floor_ms = self
+                .off_floor
+                .map_or(0, |at| now.saturating_duration_since(at).as_millis() as u64),
+            floor_held = self.queue_floor.is_some(),
+            over_held_floor_ms = over_ms(self.queue_floor.map(|(floor, _)| floor)),
+            over_rolling_floor_ms = over_ms(self.evidence.floor),
+            reordered_reports = self.reordered.len(),
+            "WebTransport legacy follow-down: {branch}"
+        );
     }
 
     /// Called on the agent's own clock between messages. Media sent and no feedback for
@@ -1884,7 +1942,7 @@ impl Estimator {
             Some((to, _)) => to,
             None => {
                 // No arrival says the queue still stands.
-                (self.off_floor, self.queue_standing, self.queue_stood) = (None, false, false);
+                self.forget_queue();
                 let to = self.estimate_kbps;
                 tracing::info!(
                     token = "webtransport-cc-regrow",
@@ -1939,6 +1997,11 @@ impl Estimator {
             .is_none_or(|at| now.saturating_duration_since(at) >= LOG_EVERY)
     }
 
+    fn forget_queue(&mut self) {
+        (self.off_floor, self.queue_floor) = (None, None);
+        (self.queue_standing, self.queue_stood) = (false, false);
+    }
+
     fn settle(&mut self) {
         let clamp = |k: f64| k.clamp(MIN_KBPS, self.ceiling_kbps);
         self.delay_kbps = clamp(self.delay_kbps);
@@ -1958,6 +2021,9 @@ impl Estimator {
         self.estimate_kbps = clamp(kbps);
         self.bound = bound;
         self.queue_stood &= bound == Bound::Delay;
+        if bound == Bound::Ceiling {
+            self.queue_floor = None;
+        }
     }
 
     fn due(&mut self, now: Instant) -> Option<f64> {
@@ -2054,14 +2120,12 @@ impl Estimator {
                         self.trendline.update(send_d, arrival_d, arrival_ms);
                     }
                     reordered |= !resend && newest_fresh.is_some_and(|n| at + REORDERED_US < n);
-                    let at_floor = self.evidence.arrival(sent_us, at);
+                    let (at_floor, delay) = self.evidence.arrival(sent_us, at);
+                    self.last_delay = delay;
                     video.1 += self.end_run(log, Some(at_floor), now);
                     self.evidence.at_floor = at_floor;
-                    let queued = match self.queue_floor.filter(|_| self.queue_stood) {
-                        Some(floor) => {
-                            let delay = (i128::from(at) - i128::from(sent_us)) as f64;
-                            delay - floor as f64 >= AT_FLOOR_MS * 1000.0
-                        }
+                    let queued = match self.queue_floor {
+                        Some((floor, _)) => !near(delay, floor),
                         None => !at_floor,
                     };
                     if !queued {
@@ -2195,7 +2259,10 @@ impl Estimator {
         self.queue_stood =
             (self.queue_stood || self.queue_standing) && self.reordered.len() < REORDERING_REPORTS;
         self.queue_floor = match self.queue_stood {
-            true => self.queue_floor.or(self.evidence.floor),
+            true => self
+                .queue_floor
+                .filter(|&(_, since)| now.saturating_duration_since(since) < FLOOR_HELD_MAX)
+                .or_else(|| self.evidence.floor.map(|floor| (floor, now))),
             false => None,
         };
         Measured {
