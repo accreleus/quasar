@@ -2,4 +2,13 @@
 # goes through quasar_runtime::docker::inspect_container_tolerant.
 disallowed-methods = [
   { path = "bollard::Docker::inspect_container", reason = "use quasar_runtime::docker::inspect_container_tolerant (Podman's `stopped` health status)" },
+  { path = "tokio::sync::watch::Sender::send", reason = "drops the value when no receiver is alive (#269); use send_replace or send_modify" },
+]
+
+# A span guard is thread-local: held across an `.await` it stays entered on the worker
+# thread while other tasks run there, and their lines are logged under this span
+# (.claude/rules/agent-logging.md). Use `tracing::Instrument`.
+await-holding-invalid-types = [
+  { path = "tracing::span::Entered", reason = "span guard held across .await; use tracing::Instrument" },
+  { path = "tracing::span::EnteredSpan", reason = "span guard held across .await; use tracing::Instrument" },
 ]
