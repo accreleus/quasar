@@ -988,6 +988,26 @@ describe("DecodeStage", () => {
     warn.mockRestore();
   });
 
+  it("does not re-arm on a decoder error after leave(), and still logs it (#1700)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { s, decoders, keyframes } = stage();
+    s.config(config(0));
+    await flush();
+    s.unit(unit(0, 1, true));
+    s.leave(); // PyroWave takes the picture
+    decoders[0].fail();
+    await flush();
+    expect(s.needsKey()).toBe(false);
+    expect(keyframes).toEqual([]);
+    expect(decoders).toHaveLength(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+    s.config(config(1)); // the picture comes back: a new decoder replaces the closed one
+    await flush();
+    s.unit(unit(1, 2, true));
+    expect(decoders[1].chunks.map((c) => c.type)).toEqual(["key"]);
+    warn.mockRestore();
+  });
+
   it(`goes terminal after ${MAX_DECODER_RESTARTS} failures in a row`, async () => {
     const { s, decoders, fatal } = stage();
     s.config(config(0));

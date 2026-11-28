@@ -313,6 +313,9 @@ export class DecodeStage {
     this.failed.add(decoder);
     console.warn(`webtransport: video decoder restart (decode_error #${++this.decodeErrors}):`, err);
     this.opts.onDecodeError?.(this.decodeErrors);
+    // After leave() nothing restarts: config() would re-arm the stage and its keyframe wait (#1700),
+    // and the next configuration replaces the closed decoder anyway.
+    if (this.left) return;
     if (++this.restarts > MAX_DECODER_RESTARTS) {
       this.fatal("decode_error", config);
       return;

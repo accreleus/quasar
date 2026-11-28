@@ -26,6 +26,7 @@ own; the two do not move together, and that is deliberate.
 
 ### Fixed
 
+- WebTransport sessions: a late error from the standard video decoder, after the picture has moved to PyroWave, no longer restarts it or leaves a keyframe wait that could end the connection as a lost stream (#1700).
 - WebTransport sessions: a video decoder failure the player recovers from on its own is now written to the browser console, once per failure with a running count, so a test pass can count it, and the session's browser metrics carry the page view's total as `wt_decode_errors` (amendment 100). It was silent before (#1674).
 - The E2E stream-hold runner takes its screenshot after recording the hold, so capture stalls no longer inflate WebTransport client loss during the measurement (#1642).
 - No change in behaviour: the three WebTransport outage follow-ups of #1591 were already fixed in 0.6.4. A test now also holds the default sender (`QUASAR_WT_CAPACITY=legacy`) to not reading an outage's own losses as congestion, across the packet-number wrap.
