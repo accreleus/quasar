@@ -119,6 +119,61 @@ jobs:
       - name: Run the checks
         run: bash scripts/verify/lint.sh
 
+  # Does a `fix` pull request's new test fail on the code before the fix? The Go and vitest
+  # tests it adds or edits run on head, then on base's product code with head's test files
+  # (scripts/verify/revert-proof.sh); the table lands in the job summary. Warn-only: the job
+  # passes whatever it finds until REVERT_PROOF_MODE below becomes `enforce`. Every pull
+  # request runs it, so the self-test also covers changes to the script.
+  revert-proof:
+    name: revert proof
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: quasar
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      # Depth 2: HEAD is the pull request's merge commit and HEAD^1 the base it merges into.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: true
+          fetch-depth: 2
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.10'   # same pin as the control-plane jobs
+          cache-dependency-path: control-plane/go.sum
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+      - name: Self-test
+        env:
+          TEST_DATABASE_URL: postgres://postgres:test@localhost:5432/quasar?sslmode=disable
+        run: bash scripts/verify/test-revert-proof.sh
+      - name: Revert proof
+        env:
+          REVERT_PROOF_MODE: warn
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          TEST_DATABASE_URL: postgres://postgres:test@localhost:5432/quasar?sslmode=disable
+          REVERT_PROOF_NODE_MODULES: ${{ github.workspace }}/web/node_modules
+        run: bash scripts/verify/revert-proof.sh HEAD^1 HEAD
+
   # The control-plane tests are two jobs, each with its own runner and Postgres (#928): the
   # packages OWN_RUNNER names (`session`, the slowest: about 140 s alone, about twice that
   # sharing a runner), and every other package. Both read the one

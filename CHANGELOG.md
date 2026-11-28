@@ -31,6 +31,10 @@ own; the two do not move together, and that is deliberate.
   `docs/configuration.md`, cannot be set on an owned install, or is not passed through by
   Compose, unless it is listed with a reason. `QUASAR_HOST_FUSE` and the node agent's own
   `QUASAR_SESSION_GRACE_SECS` are now documented.
+- Each pull request whose title starts with `fix` gets a "revert proof" CI job: the Go and
+  vitest tests it adds or edits run on the code before the fix, and the job summary says
+  which of them fail there (proved), still pass (unproved) or do not compile. Warn-only for
+  now; `revert-proof: skip <reason>` in the pull request body exempts one.
 - CI runs shellcheck over every shell script in the repository and the scripts the site
   generates, and fails on new findings. Two harness bugs it found are fixed: the NVENC fallback
   smoke now searches the agent's stderr during teardown, and `run-apitest.sh` honours
