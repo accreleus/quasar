@@ -24,6 +24,8 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+## 0.6.5 — 2026-11-28
+
 ### Fixed
 
 - WebTransport audio breaks up much less on a rate-capped link with the default sender (`QUASAR_WT_CAPACITY=legacy`): on the lab at a 2 Mbit/s cap, audio underran a median 1.9 times a minute on NVIDIA from 15 s into the cap (0.6 on a clean link) and 0 times on AMD. Audio waited in the link's queue behind video: an unpaced keyframe once a second, and a bitrate left 10-16 % over the host's estimate inside the ABR's deadband (#1503), which kept up to 5 s of queue standing on the lab. Once the link's queue has stood for a second, the host now paces video at 1.25 × the estimate, as `v2` does, for as long as the estimate stays at its delay bound and the path does not keep reordering, and while the queue stands it lowers the bitrate to the estimate; after a Wi-Fi burst's loss, a short delay spike, or on a path that keeps reordering (half of a second's reports or more), neither applies (paced video on a reordering path reads as queueing, which made video less smooth on the lab's reorder row and could keep pacing on after a cap lifted). This runs only on encoders whose bitrate change is free (Vulkan, the default on NVIDIA and AMD, and openh264); on NVENC and VA every change costs a keyframe, so they keep the 0.6.4 sender. **Not fixed:** the first seconds of a new cap still fill the link's queue before the estimate comes down, so audio can still break up in the first ~15 s. `QUASAR_WT_AUDIO_PACING=off` puts back the 0.6.4 sender exactly. In the simulator, audio lateness at its p99 from 15 s into the cap drops from 93 to 18 ms at 5 Mbit/s and from 124 to 29-37 ms at 1.8-2.2 Mbit/s (#1321, #1433).
