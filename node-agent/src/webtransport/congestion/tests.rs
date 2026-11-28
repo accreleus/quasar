@@ -1599,11 +1599,16 @@ fn report_nth(
 /// (`cut="silence+loss"`) and ended the regrow. Across the `pkt_seq` wrap too.
 #[test]
 fn video_sent_between_the_cut_and_the_last_report_is_the_outages_loss() {
-    for base in [0, u32::MAX - 150] {
+    // `legacy` too: v2's blackout classifier takes this run as well, and would hide the mark.
+    for (base, legacy) in [0, u32::MAX - 150]
+        .into_iter()
+        .flat_map(|b| [(b, false), (b, true)])
+    {
         let start = Instant::now();
         let ms = |ms: u64| start + Duration::from_millis(ms);
         let mut log = SendLog::new(start);
         let mut est = Estimator::new(CEILING, start);
+        est.legacy = legacy;
         // One a millisecond; the path drops from 100 ms until 1000 ms, when 400.. go.
         let sent = |i: u32| {
             if i < 400 {
@@ -1645,16 +1650,16 @@ fn video_sent_between_the_cut_and_the_last_report_is_the_outages_loss() {
         let loss = window_loss(&est);
         assert!(
             loss.is_none_or(|l| l < LOSS_LOW),
-            "base {base}: the outage's own losses measured {loss:?}"
+            "base {base}, legacy {legacy}: the outage's own losses measured {loss:?}"
         );
         assert_ne!(
             est.bound,
             Bound::Loss,
-            "base {base}: they cut the loss bound"
+            "base {base}, legacy {legacy}: they cut the loss bound"
         );
         assert!(
             est.outage.is_none(),
-            "base {base}: the link answered, the mark is spent"
+            "base {base}, legacy {legacy}: the link answered, the mark is spent"
         );
     }
 }
