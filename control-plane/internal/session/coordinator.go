@@ -374,9 +374,9 @@ func (c *Coordinator) failSession(sessionID, reason string) {
 // of assuming none did.
 //
 // Forward: a `running` row the agent no longer names is host-lost; a stopping
-// row which had reached running is terminally stopped. Assigned/starting and
-// pre-running stops remain launch-in-flight because the agent may legitimately
-// list them before it reports running.
+// row which had reached running is terminally stopped (reapSessions).
+// Assigned/starting and pre-running stops remain launch-in-flight because the
+// agent may legitimately list them before it reports running.
 //
 // Reverse: the agent runs something we have no running row for. Left alone that
 // is an orphaned container holding a GPU. The runner's own idle reaper bounds it
@@ -401,22 +401,7 @@ func (c *Coordinator) AgentHeartbeat(ctx context.Context, hostID string, running
 		c.log.Warn("heartbeat reconcile: reap missing sessions failed", "host_id", hostID, "err", err)
 		return
 	}
-	for _, sess := range reaped {
-		if sess.State == StateFailed {
-			c.recordSessionFailed(ctx, sess, "control_plane", nil, "agent no longer running this session")
-		}
-		c.log.Info("session ended",
-			"session_id", sess.ID,
-			"state", sess.State,
-			"state_detail", deref(sess.StateDetail),
-			"reason_source", "heartbeat_reconcile",
-		)
-		c.health.forget(sess.ID)
-		c.display.forget(sess.ID)
-		c.swapper.forget(sess.ID)
-		c.forgetTerminalSession(sess.ID)
-		c.fireConsoleReeval(sess.HostID, sess.ID)
-	}
+	c.endReaped(ctx, reaped, "heartbeat_reconcile", "agent no longer running this session")
 
 	cpRunning := make(map[string]struct{}, len(rows))
 	for _, id := range rows {
@@ -499,9 +484,20 @@ func (c *Coordinator) AgentHeartbeat(ctx context.Context, hostID string, running
 	}
 }
 
-// failSessionWithDetail also stamps state_detail, as the host_lost reap edge
-// does: web/src/lib/streamHealth.ts keys the client banner on a state_detail
-// prefix, not on error_message. A nil detail leaves it untouched (COALESCE).
+// endReaped is the bookkeeping for the rows a reap just ended. Only a lost
+// session is a failure; a stopped one ends like any other.
+func (c *Coordinator) endReaped(ctx context.Context, reaped []Session, reasonSource, reason string) {
+	for _, sess := range reaped {
+		if sess.State == StateFailed {
+			c.recordSessionFailed(ctx, sess, "control_plane", nil, reason)
+		}
+		c.afterTerminal(sess, reasonSource)
+	}
+}
+
+// failSessionWithDetail also stamps state_detail: web/src/lib/streamHealth.ts
+// keys the client banner on a state_detail prefix, not on error_message. A nil
+// detail leaves it untouched (COALESCE).
 func (c *Coordinator) failSessionWithDetail(sessionID, reason string, detail *string) {
 	sess, err := c.store.Transition(context.Background(), sessionID, StateFailed, detail, &reason)
 	if err != nil && !errors.Is(err, ErrInvalidTransition) {

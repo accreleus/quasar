@@ -379,8 +379,8 @@ func TestReapHostFailsNonTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reap: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("reaped: got %d want 1", n)
+	if len(n) != 1 {
+		t.Fatalf("reaped: got %d want 1", len(n))
 	}
 	got, _ := store.Get(ctx, sess.ID)
 	if got.State != StateFailed {

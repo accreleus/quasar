@@ -135,7 +135,7 @@ startup reconciles the journal. No readiness override lifts this protection.
   startup retirement or periodic cleanup to finish. Preserve journals and backing
   storage while an outcome remains unproven.
 - An explicit heartbeat omission can reconcile a previously running intentional
-  stop to `stopped/host_lost`. This closes control-plane lifecycle ownership, not
+  stop to `stopped`, never `host_lost`. This closes control-plane lifecycle ownership, not
   container ownership: absence is not proof of deletion. The agent's pending-operation
   and startup-retirement gates still protect managed-home reuse.
 - Slow teardown remains `stopping` while listed by the current agent. The home stays

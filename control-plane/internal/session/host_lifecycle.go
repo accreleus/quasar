@@ -172,7 +172,7 @@ func (c *Coordinator) UncordonHost(ctx context.Context, hostID string) (Host, er
 	return h, nil
 }
 
-// HostDisconnected fails a disconnected host's IN-FLIGHT sessions, releasing
+// HostDisconnected ends a disconnected host's IN-FLIGHT sessions, releasing
 // their reservations (schema.md invariant #3 — the authority of last resort that
 // does not depend on a callback a dead agent can't send).
 //
@@ -180,7 +180,7 @@ func (c *Coordinator) UncordonHost(ctx context.Context, hostID string) (Host, er
 // grace window, so a brief websocket blip must not end a live stream. If the host
 // never comes back, sweepStaleHosts is the backstop.
 func (c *Coordinator) HostDisconnected(ctx context.Context, hostID string) {
-	// The reap RETURNS the ids it failed, and only those get their in-memory
+	// The reap RETURNS the ids it ended, and only those get their in-memory
 	// state dropped. Forgetting a HELD running session here would close its
 	// browser's signalling connection as terminal and end the stream the grace
 	// window exists to keep alive (#128).
@@ -202,7 +202,7 @@ func (c *Coordinator) HostDisconnected(ctx context.Context, hostID string) {
 
 // AgentReconnected reconciles a host whose agent connected fresh (P2-06).
 //
-// It fails the rows whose driving goroutine died with the old connection —
+// It ends the rows whose driving goroutine died with the old connection —
 // assigned, starting, stopping — and DELIBERATELY LEAVES `running` rows alone.
 // Since #128 the agent may have held those sessions across the outage, and its
 // first heartbeat (AgentHeartbeat, ~5 s later) is what decides which survived.

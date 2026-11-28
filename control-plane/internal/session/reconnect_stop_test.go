@@ -12,7 +12,7 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/storage"
 )
 
-func TestReconnectStopBeforeFirstEmptyHeartbeatStopsHostLost(t *testing.T) {
+func TestReconnectStopBeforeFirstEmptyHeartbeatStopsCleanly(t *testing.T) {
 	pool := testDB(t)
 	store := NewStore(pool)
 	seeded := seed(t, pool, 1)
@@ -70,7 +70,7 @@ func TestReconnectStopBeforeFirstEmptyHeartbeatStopsHostLost(t *testing.T) {
 	coord.AgentHeartbeat(ctx, seeded.hostID, empty.RunningSessions)
 	got, err = store.Get(ctx, sid)
 	must(t, err)
-	if got.State != StateStopped || got.StateDetail == nil || *got.StateDetail != "host_lost" || got.EndedAt == nil {
+	if got.State != StateStopped || got.StateDetail == nil || *got.StateDetail != "stop requested" || got.EndedAt == nil {
 		t.Fatalf("empty heartbeat terminal evidence: %+v", got)
 	}
 	if got.ErrorMessage != nil || got.FailureCode != nil {
@@ -85,7 +85,7 @@ func TestReconnectStopBeforeFirstEmptyHeartbeatStopsHostLost(t *testing.T) {
 	wg.Wait()
 	got, err = store.Get(ctx, sid)
 	must(t, err)
-	if got.EndedAt == nil || !got.EndedAt.Equal(ended) || got.StateDetail == nil || *got.StateDetail != "host_lost" {
+	if got.EndedAt == nil || !got.EndedAt.Equal(ended) || got.StateDetail == nil || *got.StateDetail != "stop requested" {
 		t.Fatalf("duplicate heartbeat changed terminal evidence: %+v", got)
 	}
 	if ids := forgotten.seen(); len(ids) != 1 || ids[0] != sid {
