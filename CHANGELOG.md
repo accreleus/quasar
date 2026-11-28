@@ -26,6 +26,7 @@ own; the two do not move together, and that is deliberate.
 
 ### Changed
 
+- CI now lints `web/` with ESLint (React hook rules, dropped or misused promises, non-exhaustive switches, and bans on async `setInterval` polls, per-render effect calls and unbounded WebGPU requests). Existing findings are counted in `web/eslint-suppressions.json`; only new ones fail.
 - CI runs shellcheck over every shell script in the repository and the scripts the site
   generates, and fails on new findings. Two harness bugs it found are fixed: the NVENC fallback
   smoke now searches the agent's stderr during teardown, and `run-apitest.sh` honours

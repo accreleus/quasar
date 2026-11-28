@@ -1,0 +1,281 @@
+{
+  "src/bench/benchController.test.ts": {
+    "@typescript-eslint/no-floating-promises": {
+      "count": 2
+    }
+  },
+  "src/bench/benchController.ts": {
+    "no-restricted-syntax": {
+      "count": 1
+    }
+  },
+  "src/components/TraceViewer.tsx": {
+    "no-restricted-syntax": {
+      "count": 1
+    }
+  },
+  "src/input/launchFullscreen.ts": {
+    "@typescript-eslint/no-misused-promises": {
+      "count": 1
+    }
+  },
+  "src/lib/codecDisplay.ts": {
+    "@typescript-eslint/switch-exhaustiveness-check": {
+      "count": 1
+    }
+  },
+  "src/lib/fleet/FleetContext.tsx": {
+    "react-hooks/exhaustive-deps": {
+      "count": 1
+    }
+  },
+  "src/lib/resource/react.ts": {
+    "react-hooks/exhaustive-deps": {
+      "count": 2
+    }
+  },
+  "src/pages/LoginPage.tsx": {
+    "@typescript-eslint/no-misused-promises": {
+      "count": 1
+    }
+  },
+  "src/pages/RegisterPage.tsx": {
+    "@typescript-eslint/no-misused-promises": {
+      "count": 1
+    }
+  },
+  "src/pages/admin/AdminApps/editor/ArtworkTab.tsx": {
+    "@typescript-eslint/no-floating-promises": {
+      "count": 1
+    }
+  },
+  "src/pages/admin/Audit.tsx": {
+    "react-hooks/exhaustive-deps": {
+      "count": 3
+    }
+  },
+  "src/pages/admin/ImageDetail.tsx": {
+    "@typescript-eslint/no-floating-promises": {
+      "count": 2
+    }
+  },
+  "src/pages/admin/SessionDetail.tsx": {
+    "react-hooks/exhaustive-deps": {
+      "count": 2
+    }
+  },
+  "src/pages/admin/Sessions.tsx": {
+    "react-hooks/exhaustive-deps": {
+      "count": 2
+    }
+  },
+  "src/pages/admin/Settings.tsx": {
+    "@typescript-eslint/no-misused-promises": {
+      "count": 1
+    }
+  },
+  "src/pages/admin/audit/AuditRow.tsx": {
+    "@typescript-eslint/no-misused-promises": {
+      "count": 2
+    }
+  },
+  "src/pages/admin/audit/auditFilters.ts": {
+    "@typescript-eslint/switch-exhaustiveness-check": {
+      "count": 1
+    }
+  },
+  "src/pages/admin/fleet/HostConsole.tsx": {
+    "@typescript-eslint/no-misused-promises": {
+      "count": 1
+    }
+  },
+  "src/pages/admin/fleet/HostsTab.tsx": {
+    "react-hooks/exhaustive-deps": {
+      "count": 1
+    }
+  },
+  "src/pages/admin/fleet/JobsTab.tsx": {
+    "react-hooks/exhaustive-deps": {
+      "count": 1
+    }
+  },
+  "src/pages/admin/fleet/StorageTab.tsx": {
+    "react-hooks/exhaustive-deps": {
+      "count": 6
+    }
+  },
+  "src/pages/admin/fleet/hostDetail/ServicesCard.tsx": {
+    "@typescript-eslint/switch-exhaustiveness-check": {
+      "count": 1
+    }
+  },
+  "src/pages/admin/fleet/hostIdentity.ts": {
+    "@typescript-eslint/switch-exhaustiveness-check": {
+      "count": 2
+    }
+  },
+  "src/pages/admin/fleet/jobsFormat.ts": {
+    "@typescript-eslint/switch-exhaustiveness-check": {
+      "count": 1
+    }
+  },
+  "src/pages/admin/fleet/webTransport.ts": {
+    "@typescript-eslint/switch-exhaustiveness-check": {
+      "count": 1
+    }
+  },
+  "src/pages/admin/library/AddToolModal.tsx": {
+    "@typescript-eslint/no-misused-promises": {
+      "count": 1
+    }
+  },
+  "src/pages/admin/library/AppsTab.tsx": {
+    "react-hooks/exhaustive-deps": {
+      "count": 6
+    }
+  },
+  "src/pages/admin/library/CompatibilityTab.tsx": {
+    "@typescript-eslint/no-floating-promises": {
+      "count": 2
+    },
+    "@typescript-eslint/no-misused-promises": {
+      "count": 1
+    },
+    "react-hooks/exhaustive-deps": {
+      "count": 1
+    }
+  },
+  "src/pages/admin/library/ImageCleanupModal.tsx": {
+    "react-hooks/exhaustive-deps": {
+      "count": 2
+    }
+  },
+  "src/pages/admin/library/ImagesTab.tsx": {
+    "@typescript-eslint/no-floating-promises": {
+      "count": 3
+    },
+    "@typescript-eslint/no-misused-promises": {
+      "count": 1
+    },
+    "react-hooks/exhaustive-deps": {
+      "count": 1
+    }
+  },
+  "src/pages/admin/library/PresetsTab.tsx": {
+    "react-hooks/exhaustive-deps": {
+      "count": 3
+    }
+  },
+  "src/pages/admin/library/useSourcesData.ts": {
+    "@typescript-eslint/no-misused-promises": {
+      "count": 2
+    }
+  },
+  "src/pages/app/AppHomeNext.tsx": {
+    "@typescript-eslint/no-misused-promises": {
+      "count": 1
+    },
+    "react-hooks/exhaustive-deps": {
+      "count": 1
+    }
+  },
+  "src/pages/app/SessionPage.tsx": {
+    "react-hooks/exhaustive-deps": {
+      "count": 2
+    }
+  },
+  "src/pages/app/account/onepage/TimezonePicker.tsx": {
+    "react-hooks/exhaustive-deps": {
+      "count": 1
+    }
+  },
+  "src/pages/app/game/useGamePage.ts": {
+    "react-hooks/exhaustive-deps": {
+      "count": 2
+    }
+  },
+  "src/pages/app/hud/panes/StatsPane.tsx": {
+    "react-hooks/exhaustive-deps": {
+      "count": 1
+    }
+  },
+  "src/pages/app/libraryCatalog.tsx": {
+    "react-hooks/exhaustive-deps": {
+      "count": 1
+    }
+  },
+  "src/pages/app/useSessionStatus.ts": {
+    "no-restricted-syntax": {
+      "count": 2
+    },
+    "react-hooks/exhaustive-deps": {
+      "count": 2
+    }
+  },
+  "src/pages/app/useSwapTransition.tsx": {
+    "no-restricted-syntax": {
+      "count": 1
+    }
+  },
+  "src/pages/app/webTransportRuntime.ts": {
+    "@typescript-eslint/no-floating-promises": {
+      "count": 2
+    },
+    "no-restricted-syntax": {
+      "count": 1
+    }
+  },
+  "src/pages/setup/SetupWizard.tsx": {
+    "@typescript-eslint/no-misused-promises": {
+      "count": 1
+    }
+  },
+  "src/pages/setup/StepBasics.tsx": {
+    "@typescript-eslint/no-misused-promises": {
+      "count": 1
+    }
+  },
+  "src/pages/setup/StepClaim.tsx": {
+    "@typescript-eslint/no-misused-promises": {
+      "count": 1
+    }
+  },
+  "src/pages/setup/StepHosts.tsx": {
+    "@typescript-eslint/no-misused-promises": {
+      "count": 2
+    }
+  },
+  "src/webrtc/capability.ts": {
+    "no-restricted-syntax": {
+      "count": 1
+    }
+  },
+  "src/webrtc/displayRefresh.test.ts": {
+    "@typescript-eslint/no-floating-promises": {
+      "count": 1
+    }
+  },
+  "src/webrtc/telemetry.ts": {
+    "@typescript-eslint/no-floating-promises": {
+      "count": 1
+    },
+    "no-restricted-syntax": {
+      "count": 3
+    }
+  },
+  "src/webrtc/traceEvents.ts": {
+    "no-restricted-syntax": {
+      "count": 1
+    }
+  },
+  "src/webtransport/input.test.ts": {
+    "@typescript-eslint/no-floating-promises": {
+      "count": 5
+    }
+  },
+  "src/webtransport/webTransport.test.ts": {
+    "@typescript-eslint/no-floating-promises": {
+      "count": 21
+    }
+  }
+}
