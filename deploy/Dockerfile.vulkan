@@ -319,7 +319,7 @@ ARG CARGO_C_VERSION
 RUN cargo install cargo-c --version "${CARGO_C_VERSION}" --locked \
     && rm -rf /opt/cargo/registry/src
 
-# Patched GStreamer 1.28.8 -> /opt/gst. Eighteen vendored patches, applied in the order below; the
+# Patched GStreamer 1.28.8 -> /opt/gst. Twenty vendored patches, applied in the order below; the
 # order is load-bearing (each was diffed against the tree with its predecessors applied) and is
 # documented per patch in deploy/patches/vulkan/README.md. The fifth (gst-wayland-display's own)
 # shares one GstVulkanQueue per VkQueue, so every submitter on a queue takes one submit lock.
@@ -329,7 +329,8 @@ RUN cargo install cargo-c --version "${CARGO_C_VERSION}" --locked \
 # (gstreamer-vulkan-rc-retarget-no-reset.patch, once seventh, was removed at the 1.28.8 bump:
 # deploy/patches/vulkan/README.md says why.)
 # gstreamer-webrtc-stats-rtpsession-leak.patch (#564) touches only ext/webrtc, so its
-# place in the order is free; it goes last.
+# place in the order is free; it goes eighteenth. The two *-colour-description patches (#1227) edit
+# vkh264enc.c and vkav1enc.c as the patches above leave them, so they go last.
 ARG GST_VERSION
 ARG GST_TESTS
 
@@ -365,6 +366,8 @@ RUN git clone --depth 1 --branch "${GST_VERSION}" \
     && git apply /tmp/gstreamer-nvenc-ref-recovery.patch \
     && git apply /tmp/vkh264enc-non-ref-p.patch \
     && git apply /tmp/gstreamer-webrtc-stats-rtpsession-leak.patch \
+    && git apply /tmp/vkh264enc-colour-description.patch \
+    && git apply /tmp/vulkanav1enc-colour-description.patch \
 # Upstream's docs/meson.build subdir_done() workaround (carried verbatim from
 # games-on-whales/gst-wayland-display's build recipe at the same pin) — with -Ddoc=disabled,
 # some subproject docs/meson.build files still probe for doc tooling before honoring the option;

@@ -238,8 +238,8 @@ fn source_colorimetry(pad: &gst::Pad) -> Option<String> {
 
 /// Fill the colorimetry of caps events leaving `pad` (the encode pipeline's interpipesrc) from
 /// the source it listens to: its own caps cannot carry it (an interpipesrc with fixed caps
-/// refuses the source's). Of the Vulkan encoders only `vulkanh265enc` writes it into the
-/// bitstream (VUI); `vulkanh264enc` and `vulkanav1enc` write no colour description.
+/// refuses the source's). The Vulkan encoders write it into the bitstream (H.264/H.265 VUI,
+/// AV1 `color_config`; the H.264 and AV1 ones through our vendored patches, #1227).
 pub(crate) fn tag_caps_with_source_colorimetry(pad: &gst::Pad) {
     pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, |pad, info| {
         let Some(gst::PadProbeData::Event(event)) = &info.data else {

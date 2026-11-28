@@ -21,7 +21,7 @@
 > The **GStreamer** patches here (`vkh264enc-*`, `vulkanh265enc`, `gstreamer-vulkan-shared-queue-lock`)
 > ARE still applied at build time. Only the `gst-wayland-display-*` ones moved into the branch.
 
-These patches split across **two upstreams**: sixteen apply to a from-source **GStreamer**
+These patches split across **two upstreams**: twenty apply to a from-source **GStreamer**
 `1.28.8` checkout (`gst-plugins-bad`), while the patches named `gst-wayland-display-*` apply to the
 **gst-wayland-display** compositor checkout itself (see their dedicated sections below). Both sets
 are applied inside `deploy/Dockerfile.vulkan`, each at its own upstream's build step.
@@ -53,6 +53,7 @@ The remaining GStreamer patches are **Quasar-authored** (not from gst-wayland-di
 - `gstreamer-nvenc-ref-recovery.patch` (not a Vulkan patch: the NVENC encoders, #1348)
 - `vkh264enc-non-ref-p.patch` (#1322)
 - `gstreamer-webrtc-stats-rtpsession-leak.patch` (not a Vulkan patch: `webrtcbin`, #564)
+- `vkh264enc-colour-description.patch`, `vulkanav1enc-colour-description.patch` (#1227)
 - `vkh265enc-profile-template.patch` (**candidate — not applied**, see below)
 
 They are applied — **in this order** — to a from-source GStreamer `1.28.8`
@@ -88,15 +89,18 @@ diffed with the twelve patches above applied.
 includes `gstrefrecovery.h`, which the thirteenth creates.
 `vkh264enc-non-ref-p.patch` applies **seventeenth**: it edits `gsth264encoder.c` and the H.264
 anchors check that the thirteenth to fifteenth create.
-`gstreamer-webrtc-stats-rtpsession-leak.patch` applies **eighteenth (last)**. It touches only
+`gstreamer-webrtc-stats-rtpsession-leak.patch` applies **eighteenth**. It touches only
 `ext/webrtc/gstwebrtcstats.c`, which no other patch here does, so its place in the order is free.
-None of the eighteen are upstreamed into GStreamer itself yet.
+`vkh264enc-colour-description.patch` and `vulkanav1enc-colour-description.patch` apply
+**nineteenth and twentieth (last)**: they edit `vkh264enc.c` and `vkav1enc.c` as the patches
+above leave them.
+None of the twenty are upstreamed into GStreamer itself yet.
 
 `vkh265enc-profile-template.patch` is a **candidate that is NOT wired into
 `deploy/Dockerfile.vulkan` and is therefore NOT applied to any image today.** It is a
 correctness fix for an upstream defect the Quasar encode path already sidesteps by pinning
 `profile=main` in its capsfilter, so it buys nothing for a Quasar image and everything for
-anyone driving `vulkanh265enc` by hand. When it is wired up it would apply **nineteenth (last)**: it
+anyone driving `vulkanh265enc` by hand. When it is wired up it would apply **twenty-first (last)**: it
 edits `gst_vulkan_h265_encoder_register()` in `vkh265enc.c`, a region no earlier patch
 touches, so its position is a convention rather than a constraint. See its section below.
 
@@ -1663,3 +1667,17 @@ class `sys/nvcodec/gstnvencoder.cpp` with NVENC's per-picture long-term referenc
   min-pts, as the Vulkan H.264/HEVC encoders do).
 
 Hardware check: `scripts/harness/run-ref-recovery.sh --encoder nvenc` on the NVIDIA host.
+
+### `vkh264enc-colour-description.patch`, `vulkanav1enc-colour-description.patch`
+
+Quasar-authored (#1227). The compositor's NV12 is BT.601, and neither encoder said so: H.264
+wrote no VUI colour description and AV1 wrote `color_description_present_flag = 0`, so a browser
+decoded HD streams as BT.709. Both now write the description from the **input caps'**
+`colorimetry`, as `vulkanh265enc` does: primaries, transfer, matrix and range. Input with no
+`colorimetry` field writes none, as before (the test is the caps field, because `GstVideoInfo`
+fills a size-based default). H.264's SPS is written by `gst_h264_bit_writer_sps()`; AV1's
+sequence header comes back from the driver, built from the `StdVideoAV1ColorConfig` we pass, so
+only hardware shows what it wrote. A colorimetry change restarts the AV1 session (its session
+parameters cannot be updated). Image check: `deploy/image-contract.json`; the stream itself is
+checked with `ffprobe -show_streams` on a GPU.
+
