@@ -920,123 +920,82 @@ func (s *Store) CommitSwappedApp(ctx context.Context, id, newAppID, newSharedApp
 	return nil
 }
 
-// ReapHost fails every non-terminal session on a host, releasing each
-// reservation, in one statement. The load-bearing failure edge (schema.md
-// invariant #3): when an agent connection drops, the control plane is the
-// authority of last resort and must not depend on a callback a dead agent
-// cannot send. state_detail = 'host_lost' so the client can say so. Returns the
-// number failed.
-func (s *Store) ReapHost(ctx context.Context, hostID, reason string) (int64, error) {
+// reapSessions ends the sessions of hostID that `where` selects, releasing each
+// reservation. It is the only writer of host_lost: every reap path goes through it.
+//
+// amendment 99 (#1697): a `stopping` row's teardown was already asked for, by a
+// user, the control plane or the agent, so it ends as that stop would:
+// `stopped`, its detail and error kept, never host_lost. Every other row is
+// `failed`/host_lost with reason.
+//
+// The returned Sessions carry only ID, UserID, AppID, HostID, State and
+// StateDetail: decoding more would let one unreadable row block the reap of the
+// whole host. `where` is a literal of this file and may use $3 onward.
+func (s *Store) reapSessions(ctx context.Context, hostID, reason, where string, args ...any) ([]Session, error) {
 	if !isValidUUID(hostID) {
-		return 0, nil // no such host's sessions to reap
+		return nil, nil // no such host's sessions to reap
 	}
-	tag, err := s.pool.Exec(ctx, `
+	rows, err := s.pool.Query(ctx, `
 		UPDATE sessions SET
-		    state         = 'failed',
-		    state_detail  = 'host_lost',
-		    error_message = $2,
+		    state         = CASE WHEN state = 'stopping' THEN 'stopped' ELSE 'failed' END,
+		    state_detail  = CASE WHEN state = 'stopping' THEN state_detail ELSE 'host_lost' END,
+		    error_message = CASE WHEN state = 'stopping' THEN error_message ELSE $2 END,
 		    ended_at      = now(),
 		    launch_progress = NULL
-		WHERE host_id = $1::uuid
-		  AND state NOT IN ('stopped','failed')
-	`, hostID, reason)
+		WHERE host_id = $1::uuid AND `+where+`
+		RETURNING id::text, user_id::text, app_id::text, host_id::text, state, state_detail`,
+		append([]any{hostID, reason}, args...)...)
 	if err != nil {
-		return 0, fmt.Errorf("reap host sessions: %w", err)
+		return nil, fmt.Errorf("reap sessions: %w", err)
 	}
-	return tag.RowsAffected(), nil
+	out, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Session, error) {
+		var sess Session
+		err := row.Scan(&sess.ID, &sess.UserID, &sess.AppID, &sess.HostID, &sess.State, &sess.StateDetail)
+		return sess, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("reap sessions: %w", err)
+	}
+	return out, nil
 }
 
-// ReapHostExceptRunning fails a host's non-terminal sessions EXCEPT the
+// ReapHost ends every non-terminal session on a host (schema.md invariant #3: the
+// control plane must not depend on a callback a dead agent cannot send).
+func (s *Store) ReapHost(ctx context.Context, hostID, reason string) ([]Session, error) {
+	return s.reapSessions(ctx, hostID, reason, `state NOT IN ('stopped','failed')`)
+}
+
+// ReapHostExceptRunning ends a host's non-terminal sessions EXCEPT the
 // `running` ones (#128).
 //
 // A row reaches `running` only after the agent itself reported it (state.go), so
 // on reconnect it is the agent's heartbeat — not this function — that decides
 // whether it survived. Everything else non-terminal (assigned, starting,
 // stopping) was mid-flight in a goroutine that died with the old connection and
-// has no owner left to finish it, so it is failed here as before.
+// has no owner left to finish it.
 //
 // The `running` exclusion is the whole point: reaping those was one of the three
 // independent reasons a session died on a control-plane restart.
-// Returns the ids it actually failed. The caller drops those sessions' in-memory
+// Returns the ids it actually ended. The caller drops those sessions' in-memory
 // state, and it must NOT drop it for the `running` rows this deliberately spared:
 // forgetting a live session's relay entry closes its browser's signalling
 // connection with "session is terminal" (#402's Forget path), which would end the
 // very stream the grace window exists to preserve.
 func (s *Store) ReapHostExceptRunning(ctx context.Context, hostID, reason string) ([]string, error) {
-	if !isValidUUID(hostID) {
-		return nil, nil // no such host's sessions to reap
-	}
-	rows, err := s.pool.Query(ctx, `
-		UPDATE sessions SET
-		    state         = 'failed',
-		    state_detail  = 'host_lost',
-		    error_message = $2,
-		    ended_at      = now(),
-		    launch_progress = NULL
-		WHERE host_id = $1::uuid
-		  AND state NOT IN ('stopped','failed','running')
-		RETURNING id::text
-	`, hostID, reason)
-	if err != nil {
-		return nil, fmt.Errorf("reap host sessions except running: %w", err)
-	}
-	defer rows.Close()
+	reaped, err := s.reapSessions(ctx, hostID, reason, `state NOT IN ('stopped','failed','running')`)
 	var out []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("reap host sessions except running: %w", err)
-		}
-		out = append(out, id)
+	for _, sess := range reaped {
+		out = append(out, sess.ID)
 	}
-	return out, rows.Err()
+	return out, err
 }
 
 // ReapHeartbeatMissing atomically terminalizes running rows and started stops
 // omitted by an explicit heartbeat; pre-running stops remain launch-in-flight.
 func (s *Store) ReapHeartbeatMissing(ctx context.Context, hostID string, running []string) ([]Session, error) {
-	if !isValidUUID(hostID) {
-		return nil, nil
-	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("begin heartbeat-reap tx: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck — no-op after commit
-
-	rows, err := tx.Query(ctx, `
-		UPDATE sessions SET
-		    state = CASE WHEN state = 'stopping' THEN 'stopped' ELSE 'failed' END,
-		    state_detail = 'host_lost',
-		    error_message = CASE WHEN state = 'stopping' THEN NULL ELSE 'agent no longer running this session' END,
-		    ended_at = now(),
-		    launch_progress = NULL
-		WHERE host_id = $1::uuid
-		  AND (state = 'running' OR (state = 'stopping' AND started_at IS NOT NULL))
-		  AND NOT (id::text = ANY($2::text[]))
-		RETURNING `+sessionCols+`
-	`, hostID, running)
-	if err != nil {
-		return nil, fmt.Errorf("reap heartbeat-missing sessions: %w", err)
-	}
-	var out []Session
-	for rows.Next() {
-		sess, err := scanSessionRow(rows)
-		if err != nil {
-			rows.Close()
-			return nil, fmt.Errorf("scan heartbeat-reaped session: %w", err)
-		}
-		out = append(out, sess)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, fmt.Errorf("iterate heartbeat-reaped sessions: %w", err)
-	}
-	rows.Close()
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("commit heartbeat-reap tx: %w", err)
-	}
-	return out, nil
+	return s.reapSessions(ctx, hostID, "agent no longer running this session",
+		`(state = 'running' OR (state = 'stopping' AND started_at IS NOT NULL))
+		  AND NOT (id::text = ANY($3::text[]))`, running)
 }
 
 // RunningSessionIDsOnHost lists only the `running` rows — the exact set the

@@ -11,7 +11,7 @@ import (
 // still holding and would have re-reported.
 const DefaultSessionGrace = 120 * time.Second
 
-// sweepStaleHosts fails the sessions of hosts whose agent is neither connected
+// sweepStaleHosts ends the sessions of hosts whose agent is neither connected
 // nor recently heard from (#128).
 //
 // This is the backstop that lets HostDisconnected and AgentReconnected stop
@@ -50,20 +50,18 @@ func (c *Coordinator) sweepStaleHosts(ctx context.Context, bootedAt time.Time, g
 		if time.Since(last) < grace {
 			continue
 		}
-		ids, err := c.store.NonTerminalSessionIDsOnHost(ctx, h.ID)
+		const reason = "host agent did not return within the grace window"
+		reaped, err := c.store.ReapHost(ctx, h.ID, reason)
 		if err != nil {
-			c.log.Warn("stale sweep: session list failed", "host_id", h.ID, "err", err)
+			c.log.Warn("stale sweep: reap failed", "host_id", h.ID, "err", err)
 			continue
 		}
-		if len(ids) == 0 {
+		if len(reaped) == 0 {
 			continue
 		}
-		c.log.Warn("stale sweep: host silent past the grace window; failing its sessions",
-			"host_id", h.ID, "node_name", h.NodeName, "sessions", len(ids))
-		for _, sid := range ids {
-			detail := "host_lost"
-			c.failSessionWithDetail(sid, "host agent did not return within the grace window", &detail)
-		}
+		c.log.Warn("stale sweep: host silent past the grace window; ended its sessions",
+			"host_id", h.ID, "node_name", h.NodeName, "sessions", len(reaped))
+		c.endReaped(ctx, reaped, "stale_sweep", reason)
 		// The scheduler filters on status, and a control-plane restart never
 		// stamps a host offline (agentws/store.go), so a dead host would keep
 		// attracting placements that fail at dispatch.

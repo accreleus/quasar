@@ -12,7 +12,7 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/storage"
 )
 
-func TestReconnectStopBeforeFirstEmptyHeartbeatStopsHostLost(t *testing.T) {
+func TestReconnectStopBeforeFirstEmptyHeartbeatStopsCleanly(t *testing.T) {
 	pool := testDB(t)
 	store := NewStore(pool)
 	seeded := seed(t, pool, 1)
@@ -70,7 +70,7 @@ func TestReconnectStopBeforeFirstEmptyHeartbeatStopsHostLost(t *testing.T) {
 	coord.AgentHeartbeat(ctx, seeded.hostID, empty.RunningSessions)
 	got, err = store.Get(ctx, sid)
 	must(t, err)
-	if got.State != StateStopped || got.StateDetail == nil || *got.StateDetail != "host_lost" || got.EndedAt == nil {
+	if got.State != StateStopped || got.StateDetail == nil || *got.StateDetail != "stop requested" || got.EndedAt == nil {
 		t.Fatalf("empty heartbeat terminal evidence: %+v", got)
 	}
 	if got.ErrorMessage != nil || got.FailureCode != nil {
@@ -85,7 +85,7 @@ func TestReconnectStopBeforeFirstEmptyHeartbeatStopsHostLost(t *testing.T) {
 	wg.Wait()
 	got, err = store.Get(ctx, sid)
 	must(t, err)
-	if got.EndedAt == nil || !got.EndedAt.Equal(ended) || got.StateDetail == nil || *got.StateDetail != "host_lost" {
+	if got.EndedAt == nil || !got.EndedAt.Equal(ended) || got.StateDetail == nil || *got.StateDetail != "stop requested" {
 		t.Fatalf("duplicate heartbeat changed terminal evidence: %+v", got)
 	}
 	if ids := forgotten.seen(); len(ids) != 1 || ids[0] != sid {
@@ -287,24 +287,5 @@ func TestStoppingManagedHomeProtectsDerivedFamily(t *testing.T) {
 	coord.AgentState(ctx, seeded.hostID, agentws.SessionStateMsg{SessionID: holder.Session.ID, State: "stopped"})
 	if _, err := coord.Swap(ctx, other.ID, sibling); err != nil {
 		t.Fatalf("family home not reusable after terminal: %v", err)
-	}
-}
-
-func TestHeartbeatReapRollsBackWhenTerminalEvidenceCannotBeDecoded(t *testing.T) {
-	pool := testDB(t)
-	store := NewStore(pool)
-	seeded := seed(t, pool, 4)
-	ctx := context.Background()
-	sess := runningSession(t, store, seeded)
-	// PostgreSQL accepts infinity, but Session's time.Time cannot represent it.
-	must(t, exec(t, pool, `UPDATE sessions SET created_at = 'infinity'::timestamptz WHERE id::text = $1`, sess.ID))
-	reaped, err := store.ReapHeartbeatMissing(ctx, seeded.hostID, []string{})
-	if err == nil || len(reaped) != 0 {
-		t.Fatalf("unreadable terminal evidence: rows=%v err=%v", reaped, err)
-	}
-	var state string
-	must(t, pool.QueryRow(ctx, `SELECT state FROM sessions WHERE id::text = $1`, sess.ID).Scan(&state))
-	if state != string(StateRunning) {
-		t.Fatalf("decode failure committed state %s, want running so reconciliation can retry", state)
 	}
 }

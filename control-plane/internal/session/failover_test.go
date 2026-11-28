@@ -26,8 +26,8 @@ func TestHostLostStampedOnReap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reap: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("reaped %d sessions, want 1", n)
+	if len(n) != 1 {
+		t.Fatalf("reaped %d sessions, want 1", len(n))
 	}
 
 	got, err := store.Get(ctx, sess.ID)
@@ -84,8 +84,8 @@ func TestMultiHostCorrectnessOnReap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reap host-1: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("reaped %d sessions, want 1", n)
+	if len(n) != 1 {
+		t.Fatalf("reaped %d sessions, want 1", len(n))
 	}
 
 	// Host-1's session must be failed/host_lost.
