@@ -303,7 +303,6 @@ export function probeWebGpu(): Promise<{ available: boolean; features: string[] 
     try {
       if (typeof navigator === "undefined" || !navigator.gpu) return none;
       const adapter = await Promise.race([
-        // eslint-disable-next-line no-restricted-syntax -- bounded by this race
         navigator.gpu.requestAdapter(),
         new Promise<null>((resolve) => {
           timer = setTimeout(() => resolve(null), WEBGPU_ADAPTER_TIMEOUT_MS);

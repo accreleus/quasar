@@ -245,6 +245,11 @@
       "count": 2
     }
   },
+  "src/webrtc/capability.ts": {
+    "no-restricted-syntax": {
+      "count": 1
+    }
+  },
   "src/webrtc/displayRefresh.test.ts": {
     "@typescript-eslint/no-floating-promises": {
       "count": 1
