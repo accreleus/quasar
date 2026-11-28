@@ -7648,6 +7648,17 @@ fn a_delay_step_that_outlasts_a_cap_is_let_go_at_the_ceiling() {
     assert!(s.est.queue_floor.is_none() && !s.est.follows_queue());
 }
 
+/// A cap that never lifts reaches no ceiling to release the held floor, so its age does
+/// (`FLOOR_HELD_MAX`): here the delay steps up 30 ms for good, which reads as a queue until then.
+#[test]
+fn a_delay_step_under_a_cap_that_never_lifts_is_let_go_at_the_floor_age() {
+    let mut s = standing_queue_cap(|_| 30.0);
+    s.run(150.0);
+    assert!(s.est.queue_standing, "the step is no queue at 190 s");
+    s.run(60.0);
+    assert!(!s.est.queue_standing && !s.est.follows_queue());
+}
+
 /// Review r2 S-1, the production gate: `Control` takes `Rate::audio_pacing` (off for NVENC and VA,
 /// `abr_glue::audio_pacing`, guarded by `audio_pacing_runs_only_where_a_bitrate_write_is_free`) into
 /// its estimator, and only a receiver report's estimate at a standing queue reaches the ABR as one.

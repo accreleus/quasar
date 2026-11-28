@@ -64,6 +64,9 @@ const QUEUE_STANDING: Duration = Duration::from_secs(1);
 const REORDERED_US: u64 = 1_000;
 const REORDERING: Duration = Duration::from_secs(1);
 const REORDERING_REPORTS: usize = 10;
+/// `Estimator::queue_floor` re-anchors to the rolling floor at this age: about twice the longest a
+/// capped link's queue stood in the lab (92 s, #1692), and 9 ms of drift at 50 ppm of clock skew.
+const FLOOR_HELD_MAX: Duration = Duration::from_secs(180);
 /// The path floor is the least one-way delay over `FLOOR_SPAN_US` of send time, read as the
 /// least of each `DELAY_BUCKET_US`: a delay step ages in within the span.
 const DELAY_BUCKET_US: u64 = 500_000;
@@ -813,20 +816,16 @@ pub(crate) struct Estimator {
     off_floor: Option<Instant>,
     queue_standing: bool,
     queue_stood: bool,
-    /// The path floor from before a queue that stood, which the off-floor reading holds to until
-    /// an arrival comes back to it. The rolling floor takes in a queue that stands over
-    /// `FLOOR_SPAN_US`, so a queue that stood longer read as gone while it still held seconds
-    /// (#1692 lab, NVIDIA 2 Mbit/s: 1.3-1.6 s of queue at onset + 40 s, the setpoint left 7 % over
-    /// the estimate). Not dropped with `queue_stood` on a loss bound: a full queue drops, and the
-    /// floor lost to those reports never came back (#1693, 1.8 s of queue, 2-4 % over). Dropped at
-    /// the ceiling bound: a path whose delay stepped up never comes back to it. Two clocks, so it
-    /// ages with their skew (about 3 ms a minute at 50 ppm).
-    queue_floor: Option<i64>,
+    /// The path floor from before a queue that stood, and since when it is held: the rolling floor
+    /// takes in a queue older than `FLOOR_SPAN_US`. Kept through a loss bound (a full queue drops,
+    /// #1693), dropped at the ceiling bound, and aged out after `FLOOR_HELD_MAX`, which bounds how
+    /// long a delay step or the two clocks' skew can read as a queue.
+    queue_floor: Option<(i64, Instant)>,
     /// When each report within `REORDERING` showed the path reorder.
     reordered: VecDeque<Instant>,
-    /// The newest fresh arrival's one-way delay, and what `log_follow` last said and when.
+    /// The newest fresh arrival's one-way delay, and the branch `log_follow` last said and when.
     last_delay: i64,
-    follow_logged: ((&'static str, bool), Option<Instant>),
+    follow_logged: (&'static str, Option<Instant>),
     /// v2's hold (`HOLD`) and loss floor; off for PyroWave, which has its own controller and no
     /// keyframes to overflow a link.
     holds: bool,
@@ -1056,7 +1055,7 @@ impl Estimator {
             queue_floor: None,
             reordered: VecDeque::new(),
             last_delay: 0,
-            follow_logged: (("", false), None),
+            follow_logged: ("", None),
             holds: true,
             probes: false,
             logged: (Bound::Ceiling, None),
@@ -1873,8 +1872,8 @@ impl Estimator {
     }
 
     /// Legacy's follow-down ([`Self::follows_queue`]), which of its conditions decides and the
-    /// inputs: on a change of that, or of whether the encoder is asked for over the estimate, at
-    /// most one line a `LOG_EVERY` (#1693).
+    /// inputs: on a change of that, at most one line a `LOG_EVERY` (#1693). Not on `encoder_over`:
+    /// under the follow-down the setpoint sits at the estimate, and it flips every report.
     fn log_follow(&mut self, now: Instant) {
         if !self.legacy || !self.audio_pacing {
             return;
@@ -1887,19 +1886,18 @@ impl Estimator {
             _ => "off-no-queue-stood",
         };
         let encoder = self.encoder_kbps.unwrap_or(0.0);
-        let state = (branch, encoder > self.estimate_kbps * 1.01);
         let (logged, at) = self.follow_logged;
-        if state == logged || at.is_some_and(|at| now.saturating_duration_since(at) < LOG_EVERY) {
+        if branch == logged || at.is_some_and(|at| now.saturating_duration_since(at) < LOG_EVERY) {
             return;
         }
-        self.follow_logged = (state, Some(now));
+        self.follow_logged = (branch, Some(now));
         let over_ms = |floor: Option<i64>| {
             floor.map_or(0.0, |f| self.last_delay.saturating_sub(f) as f64 / 1000.0)
         };
         tracing::info!(
             token = "webtransport-follow-down",
             branch,
-            encoder_over = state.1,
+            encoder_over = encoder > self.estimate_kbps * 1.01,
             estimate_kbps = self.estimate_kbps as u64,
             encoder_kbps = encoder as u64,
             bound = ?self.bound,
@@ -1909,7 +1907,7 @@ impl Estimator {
                 .off_floor
                 .map_or(0, |at| now.saturating_duration_since(at).as_millis() as u64),
             floor_held = self.queue_floor.is_some(),
-            over_held_floor_ms = over_ms(self.queue_floor),
+            over_held_floor_ms = over_ms(self.queue_floor.map(|(floor, _)| floor)),
             over_rolling_floor_ms = over_ms(self.evidence.floor),
             reordered_reports = self.reordered.len(),
             "WebTransport legacy follow-down: {branch}"
@@ -2127,7 +2125,7 @@ impl Estimator {
                     video.1 += self.end_run(log, Some(at_floor), now);
                     self.evidence.at_floor = at_floor;
                     let queued = match self.queue_floor {
-                        Some(floor) => !near(delay, floor),
+                        Some((floor, _)) => !near(delay, floor),
                         None => !at_floor,
                     };
                     if !queued {
@@ -2261,7 +2259,10 @@ impl Estimator {
         self.queue_stood =
             (self.queue_stood || self.queue_standing) && self.reordered.len() < REORDERING_REPORTS;
         self.queue_floor = match self.queue_stood {
-            true => self.queue_floor.or(self.evidence.floor),
+            true => self
+                .queue_floor
+                .filter(|&(_, since)| now.saturating_duration_since(since) < FLOOR_HELD_MAX)
+                .or_else(|| self.evidence.floor.map(|floor| (floor, now))),
             false => None,
         };
         Measured {
