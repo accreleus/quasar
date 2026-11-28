@@ -40,6 +40,8 @@ pub mod host_probe;
 pub mod host_remove;
 pub mod images;
 pub mod jobs;
+#[cfg(test)]
+mod lint_fixtures;
 /// Log spans + the WARN/ERROR `token=` convention (`.claude/rules/agent-logging.md`).
 pub mod logging;
 pub mod memstat;
