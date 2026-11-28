@@ -347,6 +347,108 @@ mod tests {
         );
     }
 
+    /// The encoder keeps no input buffer of a frame it holds as a reference: the chain
+    /// picture and the anchors code from the DPB. Holding them pinned K + 1 slots of a fixed
+    /// ring in front of the encoder, and after a resolution step `vulkanscale`'s 4-slot ring
+    /// ran dry and the session failed (`QUASAR_WT_REF_RECOVERY=on`, 0.6.5).
+    /// `$QUASAR_REF_RECOVERY_CODEC` is `h264` (default), `h265` or `av1`.
+    #[test]
+    #[ignore = "needs a Vulkan encode GPU and the patched encoders"]
+    fn anchors_hold_no_input_buffer() {
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+
+        let codec = std::env::var("QUASAR_REF_RECOVERY_CODEC").unwrap_or("h264".into());
+        let (enc_name, caps) = match codec.as_str() {
+            "h264" => ("vulkanh264enc", "video/x-h264,profile=constrained-baseline"),
+            "h265" => ("vulkanh265enc", "video/x-h265,profile=main"),
+            "av1" => ("vulkanav1enc", "video/x-av1"),
+            other => panic!("QUASAR_REF_RECOVERY_CODEC={other}"),
+        };
+        let k = anchors_for(enc_name, true);
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch(&format!(
+            "videotestsrc is-live=true pattern=smpte horizontal-speed=3 num-buffers=40 \
+             ! video/x-raw,format=NV12,width=640,height=360,framerate=60/1 ! vulkanupload \
+             ! {enc_name} name=enc num-anchors={k} idr-period=1000 ! {caps} ! fakesink"
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let enc = pipeline.by_name("enc").unwrap();
+        assert!(
+            enc.find_property(NUM_ANCHORS).is_some(),
+            "{enc_name} is not patched"
+        );
+
+        // Before each frame the encoder has coded every earlier one (live: no output
+        // delay). Count the earlier inputs someone besides this test still holds, leaving out
+        // the newest (its encode operation may keep it until the next). An anchor is asked
+        // for at every frame; H.264 takes one every second frame.
+        let inputs: Arc<Mutex<VecDeque<gst::Buffer>>> = Arc::default();
+        let kept = Arc::new(Mutex::new(0));
+        let anchors = Arc::new(Mutex::new(0));
+        {
+            let (inputs, kept) = (inputs.clone(), kept.clone());
+            enc.static_pad("sink").unwrap().add_probe(
+                gst::PadProbeType::BUFFER,
+                move |pad, info| {
+                    let mut held = inputs.lock().unwrap();
+                    let now = held
+                        .iter()
+                        .rev()
+                        .skip(1)
+                        .filter(|b| !b.is_writable())
+                        .count();
+                    let mut kept = kept.lock().unwrap();
+                    *kept = (*kept).max(now);
+                    held.push_back(info.buffer().unwrap().to_owned());
+                    if held.len() > 12 {
+                        held.pop_front();
+                    }
+                    let src = pad.parent_element().unwrap().static_pad("src").unwrap();
+                    assert!(src.send_event(anchor_event()));
+                    gst::PadProbeReturn::Ok
+                },
+            );
+        }
+        {
+            let anchors = anchors.clone();
+            enc.static_pad("src").unwrap().add_probe(
+                gst::PadProbeType::EVENT_DOWNSTREAM,
+                move |_, info| {
+                    if let Some(gst::PadProbeData::Event(e)) = &info.data {
+                        if ref_frame(e).is_some_and(|r| r.anchor) {
+                            *anchors.lock().unwrap() += 1;
+                        }
+                    }
+                    gst::PadProbeReturn::Ok
+                },
+            );
+        }
+
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let bus = pipeline.bus().unwrap();
+        let msg = bus
+            .timed_pop_filtered(
+                gst::ClockTime::from_seconds(30),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            )
+            .expect("no EOS in 30 s");
+        assert!(matches!(msg.view(), gst::MessageView::Eos(_)), "{msg:?}");
+        let kept = *kept.lock().unwrap();
+        let anchors = *anchors.lock().unwrap();
+        pipeline.set_state(gst::State::Null).unwrap();
+        assert!(
+            anchors >= 2,
+            "only {anchors} anchors reported: the test proves nothing"
+        );
+        assert_eq!(
+            kept, 0,
+            "{enc_name} with {k} anchors keeps {kept} older input buffers"
+        );
+    }
+
     /// Hardware capture for `scripts/harness/run-ref-recovery.sh`: encodes a moving test
     /// pattern with `num-anchors=3`, sends [`SCRIPT`], and writes the access units, the
     /// raw input and the encoder's reports to `$QUASAR_REF_RECOVERY_OUT`.

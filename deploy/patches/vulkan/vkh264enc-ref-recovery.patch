@@ -1,5 +1,5 @@
 diff --git a/subprojects/gst-plugins-bad/ext/vulkan/base/gsth264encoder.c b/subprojects/gst-plugins-bad/ext/vulkan/base/gsth264encoder.c
-index 4202f8d..64cd0c6 100644
+index 4202f8d..137b54b 100644
 --- a/subprojects/gst-plugins-bad/ext/vulkan/base/gsth264encoder.c
 +++ b/subprojects/gst-plugins-bad/ext/vulkan/base/gsth264encoder.c
 @@ -45,6 +45,7 @@
@@ -367,17 +367,34 @@ index 4202f8d..64cd0c6 100644
    if (h264_frame->type.is_ref) {
      unused_ref =
          gst_h264_encoder_find_unused_reference_frame (self, h264_frame);
-@@ -2327,7 +2613,8 @@ gst_h264_encoder_sps_init (GstH264Encoder * self)
+@@ -1757,10 +2043,16 @@ gst_h264_encoder_finish_last_frame (GstH264Encoder * self)
+   frame = g_queue_pop_head (&priv->output_list);
+   system_frame_number = frame->system_frame_number;
+ 
+-  gst_video_codec_frame_unref (frame);
+-
+   ret = gst_h264_encoder_finish_frame (self, frame);
+ 
++  /* Reference recovery: the reference list keeps this codec frame for as long
++   * as it is the chain picture or an anchor, and the codec frame owns its input
++   * buffer. Finished, the input is no longer needed (the meta copy happened in
++   * gst_video_encoder_finish_frame()), so let upstream recycle it, as
++   * gstav1encoder.c does. */
++  gst_buffer_replace (&frame->input_buffer, NULL);
++  gst_video_codec_frame_unref (frame);
++
+   if (ret != GST_FLOW_OK) {
+     GST_DEBUG_OBJECT (self, "fails to push one buffer, system_frame_number "
+         "%d: %s", system_frame_number, gst_flow_get_name (ret));
+@@ -2327,6 +2619,7 @@ gst_h264_encoder_sps_init (GstH264Encoder * self)
      .offset_for_ref_frame = { 0, },
  
      .num_ref_frames = priv->gop.max_num_ref_frames,
--    .gaps_in_frame_num_value_allowed_flag = 0,
-+    /* a recovery frame follows a frame_num gap in the decoder */
-+    .gaps_in_frame_num_value_allowed_flag = priv->gop.num_anchors > 0,
++    /* 0 with anchors too: a gap the decoder fills with frames fails Mesa VA-API */
+     .gaps_in_frame_num_value_allowed_flag = 0,
      .pic_width_in_mbs_minus1 = mb_width - 1,
      .pic_height_in_map_units_minus1 = mb_height - 1,
-     .frame_mbs_only_flag = 1,
-@@ -2595,6 +2882,36 @@ gst_h264_encoder_handle_frame (GstVideoEncoder * encoder,
+@@ -2595,6 +2888,36 @@ gst_h264_encoder_handle_frame (GstVideoEncoder * encoder,
        gst_h264_encoder_frame_unref);
    gst_h264_encoder_push_dts (self, frame);
  
@@ -414,7 +431,7 @@ index 4202f8d..64cd0c6 100644
    if (klass->new_output) {
      ret = klass->new_output (self, frame, h264_frame);
      if (ret != GST_FLOW_OK)
-@@ -2672,6 +2989,24 @@ error_push_buffer:
+@@ -2672,6 +2995,24 @@ error_push_buffer:
    }
  }
  
@@ -439,7 +456,7 @@ index 4202f8d..64cd0c6 100644
  static gboolean
  gst_h264_encoder_flush (GstVideoEncoder * encoder)
  {
-@@ -2709,6 +3044,7 @@ gst_h264_encoder_init (GstH264Encoder * self)
+@@ -2709,6 +3050,7 @@ gst_h264_encoder_init (GstH264Encoder * self)
  
    priv->config.max_num_reference_list0 = 1;
    priv->config.max_num_reference_list1 = 0;
@@ -447,7 +464,7 @@ index 4202f8d..64cd0c6 100644
    priv->config.preferred_output_delay = 0;
  
    priv->ref_list0 = g_array_sized_new (FALSE, TRUE,
-@@ -2756,6 +3092,9 @@ gst_h264_encoder_get_property (GObject * object, guint property_id,
+@@ -2756,6 +3098,9 @@ gst_h264_encoder_get_property (GObject * object, guint property_id,
      case PROP_B_PYRAMID:
        g_value_set_boolean (value, priv->prop.b_pyramid);
        break;
@@ -457,7 +474,7 @@ index 4202f8d..64cd0c6 100644
      default:
        G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
        break;
-@@ -2792,6 +3131,9 @@ gst_h264_encoder_set_property (GObject * object, guint property_id,
+@@ -2792,6 +3137,9 @@ gst_h264_encoder_set_property (GObject * object, guint property_id,
        priv->prop.b_pyramid = g_value_get_boolean (value);
        g_atomic_int_set (&priv->need_configure, TRUE);
        break;
@@ -467,7 +484,7 @@ index 4202f8d..64cd0c6 100644
      default:
        G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
        break;
-@@ -2817,6 +3159,7 @@ gst_h264_encoder_class_init (GstH264EncoderClass * klass)
+@@ -2817,6 +3165,7 @@ gst_h264_encoder_class_init (GstH264EncoderClass * klass)
    encoder_class->handle_frame =
        GST_DEBUG_FUNCPTR (gst_h264_encoder_handle_frame);
    encoder_class->flush = GST_DEBUG_FUNCPTR (gst_h264_encoder_flush);
@@ -475,7 +492,7 @@ index 4202f8d..64cd0c6 100644
    encoder_class->finish = GST_DEBUG_FUNCPTR (gst_h264_encoder_finish);
  
    klass->negotiate = GST_DEBUG_FUNCPTR (gst_h264_encoder_negotiate_default);
-@@ -2895,6 +3238,21 @@ gst_h264_encoder_class_init (GstH264EncoderClass * klass)
+@@ -2895,6 +3244,21 @@ gst_h264_encoder_class_init (GstH264EncoderClass * klass)
        "Enable the b-pyramid reference structure in the GOP",
        H264ENC_B_PYRAMID_DEFAULT, param_flags);
  
@@ -485,8 +502,8 @@ index 4202f8d..64cd0c6 100644
 +   * Reference recovery: how many anchor frames (requested with the
 +   * "quasar-ref-anchor" upstream event, kept as long-term references) are
 +   * held for "quasar-ref-recover". 0 disables it. While on there are no B
-+   * frames, every P frame codes from one picture, and the SPS allows
-+   * frame_num gaps. Read at stream start.
++   * frames and every P frame codes from one picture; the SPS still
++   * disallows frame_num gaps (see sps_init). Read at stream start.
 +   */
 +  properties[PROP_NUM_ANCHORS] = g_param_spec_uint ("num-anchors",
 +      "Number of anchors",
@@ -497,7 +514,7 @@ index 4202f8d..64cd0c6 100644
    g_object_class_install_properties (object_class, N_PROPERTIES, properties);
  
    gst_type_mark_as_plugin_api (GST_TYPE_H264_ENCODER, 0);
-@@ -2922,6 +3280,29 @@ gst_h264_encoder_set_max_num_references (GstH264Encoder * self, guint list0,
+@@ -2922,6 +3286,29 @@ gst_h264_encoder_set_max_num_references (GstH264Encoder * self, guint list0,
    priv->config.max_num_reference_list1 = list1;
  }
  
@@ -588,7 +605,7 @@ index 19ebf56..d189cbd 100644
 +
  G_END_DECLS
 diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
-index b90ca80..151e5f1 100644
+index b90ca80..8781bc7 100644
 --- a/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
 +++ b/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
 @@ -1031,6 +1031,12 @@ gst_vulkan_h264_encoder_new_sequence (GstH264Encoder * encoder,
@@ -670,6 +687,25 @@ index b90ca80..151e5f1 100644
      .temporal_id = vk_frame->h264pic_info.temporal_id,
    };
    /* *INDENT-ON* */
+@@ -1932,6 +1949,18 @@ gst_vulkan_h264_encoder_encode_frame (GstH264Encoder * base,
+     GST_ERROR_OBJECT (self, "Encode frame error");
+     return GST_FLOW_ERROR;
+   }
++
++  /* Reference recovery: release the input image now, as vulkanav1enc does.
++   * The encode is synchronous and later frames code from this picture's DPB
++   * slot, never its source image; held until the picture leaves the reference
++   * list, the anchors and the chain picture pin that many upstream buffers and
++   * starve a fixed ring in front of the encoder (vulkanscale's 4 slots after a
++   * resolution step). picture_clear() unrefs img_view, so it takes a DPB ref. */
++  gst_clear_buffer (&vk_frame->picture.in_buffer);
++  gst_vulkan_image_view_unref (vk_frame->picture.img_view);
++  vk_frame->picture.img_view =
++      gst_vulkan_image_view_ref (vk_frame->picture.dpb_view);
++
+   return GST_FLOW_OK;
+ }
+ 
 diff --git a/subprojects/gst-plugins-bad/tests/check/libs/vkvideoencodeh264anchors.c b/subprojects/gst-plugins-bad/tests/check/libs/vkvideoencodeh264anchors.c
 new file mode 100644
 index 0000000..97aee21

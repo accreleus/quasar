@@ -146,6 +146,17 @@ struct Sim {
     /// The `pkt_seq`s whose NACK reached the agent: answered through the agent's queue, as
     /// production answers a `nack`.
     nacked: Vec<u32>,
+    /// Chrome's QUIC (#1446): a datagram arriving over this long (µs) after one sent later is
+    /// discarded unread, as lost to the page as a drop. `None`: every arrival is read.
+    discard_us: Option<u64>,
+    /// (`pkt_seq`, arrival, the `pkt_seq` it resends) of datagrams a later one may still overtake.
+    in_air: VecDeque<(u32, u64, Option<u32>)>,
+    /// Datagrams `discard_us` threw away.
+    discarded: u32,
+    /// (seconds, µs an audio datagram took over the path's base delay), per audio datagram sent.
+    audio_late: Vec<(f64, u64)>,
+    /// (seconds, the estimate is at its delay bound) after each message.
+    delay_bound: Vec<(f64, bool)>,
 }
 
 /// The browser's reassembly (`web/src/webtransport/reassembly.ts`) and decoder, simulated: a
@@ -179,6 +190,8 @@ struct Client {
     freezes: Vec<f64>,
     /// The longest time between two frames shown, µs, and when it ended.
     longest: (u64, u64),
+    /// When each frame was shown, µs.
+    shown_at: Vec<u64>,
 }
 
 /// A keyframe's size in average frames at the encoder's rate; the lab rows also run at 10 × and
@@ -288,6 +301,7 @@ impl Client {
                 self.longest = (at.max(l) - l, at);
             }
             self.shown = Some(self.shown.map_or(at, |l| at.max(l)));
+            self.shown_at.extend(self.shown);
         }
         let due = match (self.waiting, self.asked) {
             (None, _) => false,
@@ -413,6 +427,11 @@ impl Sim {
             probes: Vec::new(),
             probe_frame: None,
             nacked: Vec::new(),
+            discard_us: None,
+            in_air: VecDeque::new(),
+            discarded: 0,
+            audio_late: Vec::new(),
+            delay_bound: Vec::new(),
         }
     }
 
@@ -651,6 +670,14 @@ impl Sim {
         let arrival = self.path(bytes, dropped, seq);
         self.tx.push((self.t, arrival.is_none()));
         self.pending.push_back((seq, arrival));
+        let of = self
+            .client
+            .as_ref()
+            .and_then(|c| c.resend_of.get(&seq).copied());
+        if let (Some(h), Some(a)) = (self.discard_us, arrival) {
+            self.discard_overtaken(a, h);
+            self.in_air.push_back((seq, a, of));
+        }
         if let Some(client) = self.client.as_mut() {
             match client.resend_of.remove(&seq) {
                 // The web client NACKs a fragment twice at most: a lost first resend is asked for
@@ -668,6 +695,43 @@ impl Sim {
             }
         }
         arrival
+    }
+
+    /// `discard_us`: what arrives over `h` after `overtaker` (an arrival just put on the path) is
+    /// lost, to the reports and to the client, which NACKs it as a drop.
+    fn discard_overtaken(&mut self, overtaker: u64, h: u64) {
+        let late: Vec<(u32, Option<u32>)> = self
+            .in_air
+            .iter()
+            .filter(|r| r.1 > overtaker + h)
+            .map(|r| (r.0, r.2))
+            .collect();
+        // Nothing sent from now on arrives before `last_arrival`: what lands by it plus `h` is safe.
+        let safe = self.last_arrival + h;
+        self.in_air.retain(|r| r.1 <= overtaker + h && r.1 > safe);
+        self.discarded += late.len() as u32;
+        for (seq, of) in late {
+            if let Some(p) = self.pending.iter_mut().find(|p| p.0 == seq) {
+                p.1 = None;
+            }
+            let Some(c) = self.client.as_mut() else {
+                continue;
+            };
+            match of {
+                Some(of) => {
+                    c.resent.insert(of, None);
+                    if c.renacked.insert(of) {
+                        c.nacks.push_back((self.t + 2 * NACK_US, of));
+                    }
+                }
+                None => {
+                    c.arrived.insert(seq, None);
+                    if !self.probe_seqs.contains(&seq) {
+                        c.nacks.push_back((self.t + NACK_US, seq));
+                    }
+                }
+            }
+        }
     }
 
     /// `bytes` onto the bottleneck now (unless `dropped` on the way); arrival on the agent's
@@ -758,8 +822,9 @@ impl Sim {
         if let Some(guard) = self.guard.as_mut() {
             guard.paced = rates.0.is_some();
         }
-        quic.video.on_hold = self.est.drop_held();
+        quic.video.on_hold = self.est.pace_waits();
         let at = self.start + Duration::from_micros(self.t);
+        quic.video.recovering = self.est.recovering(at);
         // A `nack` answer as production's: admitted by the stall guard, then ahead of held video.
         for of in std::mem::take(&mut self.nacked) {
             if let Some(guard) = self.guard.as_mut() {
@@ -857,7 +922,11 @@ impl Sim {
     /// Audio, the resends, the client's decoder and the keyframe requests due now.
     fn client_due(&mut self) {
         if self.audio && self.t >= self.next_audio {
-            self.path(320, false, 0);
+            let base = self.t + 10_000 + (self.extra_us)(self.t);
+            if let Some(at) = self.path(320, false, 0) {
+                let late = at.saturating_sub(base);
+                self.audio_late.push((self.t as f64 / 1e6, late));
+            }
             self.next_audio = self.t + 20_000;
         }
         let Some(mut c) = self.client.take() else {
@@ -1022,8 +1091,9 @@ impl Sim {
             self.step_rung(at);
             if let Some(abr) = self.abr.as_mut() {
                 // `Control::feed` and `abr_glue`'s `Rate::observe`: the share (legacy only), then
-                // the estimate.
+                // the estimate and whether it is legacy's queue bound.
                 abr.set_share(if legacy { self.fec_share } else { 0.0 }, at);
+                abr.set_queue_bound(self.est.follows_queue());
                 abr.observe(abr_estimate(kbps, self.fec_share), at);
             }
             let setpoint = self
@@ -1042,6 +1112,8 @@ impl Sim {
         self.loss_bounds
             .push((now as f64 / 1e6, self.est.loss_kbps));
         self.lines.push((now as f64 / 1e6, self.est.held_kbps()));
+        self.delay_bound
+            .push((now as f64 / 1e6, self.est.bound == Bound::Delay));
         self.probes.push((now as f64 / 1e6, self.est.probe_kbps()));
         if let Some(abr) = self.abr.as_ref() {
             self.setpoints.push((now as f64 / 1e6, abr.setpoint_kbps()));
@@ -4095,6 +4167,32 @@ fn the_pacer_lets_video_go_at_its_rate_in_short_bursts_and_never_holds_video_100
     );
 }
 
+/// #1652: a keyframe held while a loss run is recovered (`VideoQueue::recovering`) goes at QUIC's own
+/// pace; other video, and any video outside one, is paced.
+#[test]
+fn a_keyframe_held_while_recovering_is_not_paced() {
+    let at = Instant::now();
+    let queue = |keyframe: bool, recovering: bool| {
+        let mut video = VideoQueue {
+            recovering,
+            ..Default::default()
+        };
+        let first = video.next_seq();
+        for i in 0..40 {
+            let h = Held {
+                queued_at: at,
+                keyframe,
+                ..held(first + i)
+            };
+            video.push(h, BUFFER);
+        }
+        video.pace(Some(8000), at)
+    };
+    assert_eq!(queue(true, true), usize::MAX, "a keyframe recovering");
+    assert!(queue(true, false) < 40 * SIZE, "a keyframe otherwise");
+    assert!(queue(false, true) < 40 * SIZE, "a P-frame recovering");
+}
+
 /// #1496 review A M1: the rates `feed` uses. The pacer holds video to the governed rate, never
 /// under the ABR floor the encoder is held to: an outage that decayed the estimate to 500 under
 /// a 2500 floor still leaves the encoder at 2500, and pacing that at 1.25 × 500 held it until
@@ -5429,7 +5527,8 @@ fn pyrowave_follows_the_capacity_knob_and_never_holds() {
     }
 }
 
-/// `QUASAR_WT_CAPACITY=legacy` (design §4): no pacing and no audio room, 0.6.3's reading (the
+/// `QUASAR_WT_CAPACITY=legacy` (design §4): pacing and audio room only at the delay bound (#1321,
+/// `video_rates`; none at all with `QUASAR_WT_AUDIO_PACING=off`), 0.6.3's reading (the
 /// estimate or `BETA` × the receive rate, no gap taken out), blackouts counted as loss, and the
 /// window on the smoothed RTT.
 #[test]
@@ -5442,9 +5541,54 @@ fn legacy_capacity_is_the_0_6_3_sender() {
     let governor = Governor::default();
     governor.govern(5000.0);
     let mut est = legacy();
+    // `resume_at` sets both bounds to 5000; `settle` keeps the first, the delay bound.
     est.resume_at(5000.0);
-    assert_eq!(video_rates(&governor, &est, false), (None, None), "paced");
+    assert_eq!(
+        video_rates(&governor, &est, false),
+        (None, None),
+        "legacy at the delay bound, no queue stood: reordering is not queueing"
+    );
+    est.queue_standing = true;
+    est.queue_stood = true;
+    assert_eq!(
+        video_rates(&governor, &est, false),
+        (Some(5000), Some(5000)),
+        "legacy at the delay bound, the queue standing"
+    );
+    assert!(est.follows_queue());
+    est.queue_standing = false;
+    assert_eq!(
+        video_rates(&governor, &est, false).1,
+        Some(5000),
+        "paced while the bound stays at delay"
+    );
+    assert!(
+        !est.follows_queue(),
+        "the setpoint follows only a standing queue"
+    );
+    est.loss_kbps = 4000.0;
+    est.settle();
+    assert_eq!(
+        video_rates(&governor, &est, false),
+        (None, None),
+        "legacy at the loss bound"
+    );
+    est.loss_kbps = 6000.0;
+    est.settle();
+    assert!(
+        !est.legacy_queue(),
+        "back at the delay bound: the queue must stand again"
+    );
     est.resume_at(5000.0);
+    est.queue_stood = true;
+    est.audio_pacing = false;
+    assert!(!est.legacy_queue(), "audio pacing off: no queue bound");
+    assert_eq!(
+        video_rates(&governor, &est, false),
+        (None, None),
+        "audio pacing off: 0.6.4"
+    );
+    est.audio_pacing = true;
     est.legacy = false;
     assert_eq!(
         video_rates(&governor, &est, false).1,
@@ -5910,6 +6054,40 @@ fn later_burst(key: bool, asked: f64) -> (Estimator, impl Fn(u64) -> Instant) {
     (est, at)
 }
 
+/// #1652: the keyframe asked after a loss run is not paced (`Estimator::recovering`) through the run
+/// and `LOSS_WINDOW` after it, but still is under a hold on a link that drops what overflows, until a
+/// burst releases that hold.
+#[test]
+fn the_keyframe_after_a_burst_is_paced_only_under_a_hold_no_burst_released() {
+    let start = Instant::now();
+    let at = |ms: u64| start + Duration::from_millis(ms);
+    let mut est = Estimator::new(CEILING, start);
+    est.apply(received(7000.0, 0.05), at(100), NO_QUIC);
+    assert!(
+        est.held_kbps().is_none() && est.recovering(at(100)),
+        "a run, no hold"
+    );
+    est.apply(received(7000.0, 0.0), at(200), NO_QUIC);
+    assert!(est.recovering(at(699)), "the run's tail");
+    assert!(!est.recovering(at(700)), "past the tail");
+
+    let mut est = Estimator::new(CEILING, start);
+    est.probes = true;
+    est.apply(received(7000.0, 0.3), at(100), NO_QUIC);
+    assert!(
+        est.held_kbps().is_some() && !est.recovering(at(100)),
+        "a cap's onset"
+    );
+    for ms in (200..4000).step_by(100) {
+        est.apply(received(5000.0, 0.0), at(ms), NO_QUIC);
+    }
+    est.apply(received(4000.0, 0.3), at(4000), NO_QUIC);
+    assert!(!est.recovering(at(4000)), "a burst under the hold");
+    est.apply(received(5700.0, 0.0), at(4100), NO_QUIC);
+    assert!(est.held_kbps().is_some(), "the release is proven first");
+    assert!(est.recovering(at(4100)), "released");
+}
+
 /// Seat B, hold round 4 (#1433 M1'): a held line just under a policer overflows it only with a
 /// keyframe, a short burst at a constant rate that ends on its own, as Wi-Fi's does. A burst that
 /// began on a keyframe never releases the hold; the same burst otherwise does.
@@ -6097,38 +6275,41 @@ fn wifi_bursts(
 /// 1080p. The ratchet took them to 360p (setpoint 462 at 4 s). Under `Sim::lab_hw` (seat B round 4,
 /// S3) a burst after the hold that outlasts `LOSS_WINDOW` steps the line down, as a second cap step
 /// must, and the release waits for the next burst. Lab V3: no guard stall in any row (the guard read
-/// paced video: 17 stalls every 2.5 s), and bursts up to 10 s apart spend at most 10 s under 1080p
+/// paced video: 17 stalls every 2.5 s), and bursts up to 10 s apart spend at most 15 s under 1080p
 /// (the release memory expired 60 s on and the cycle restarted: 720p at +32, +74, +116 s).
 #[test]
 fn burst_loss_on_an_uncapped_link_keeps_the_rung_and_the_setpoint() {
     let mut bad = Vec::new();
-    for (name, sim) in [
-        ("lab", Sim::lab as fn(bool) -> Sim),
-        ("lab_hw", Sim::lab_hw),
+    // (sim, every, loss, most freezes): the counts measured at #1652's fix plus one. Legacy has 12,
+    // 4, 4, 0, 0 (lab) and 10, 10, 7, 3, 0 (lab_hw). Over six seeds the 2.5 / 4 / 10 s rows froze
+    // 64 / 38 / 12 (legacy 66 / 33 / 22) and 65 / 35 / 50 (60 / 36 / 42): one seed moves ±3.
+    for (name, sim, every, loss, most) in [
+        ("lab", Sim::lab as fn(bool) -> Sim, 2.5, 0.3, 7),
+        ("lab", Sim::lab, 4.0, 0.3, 6),
+        ("lab", Sim::lab, 10.0, 0.3, 4),
+        ("lab", Sim::lab, 40.0, 0.3, 2),
+        ("lab", Sim::lab, 4.0, 0.15, 1),
+        ("lab_hw", Sim::lab_hw, 2.5, 0.3, 15),
+        ("lab_hw", Sim::lab_hw, 4.0, 0.3, 6),
+        ("lab_hw", Sim::lab_hw, 10.0, 0.3, 10),
+        ("lab_hw", Sim::lab_hw, 40.0, 0.3, 5),
+        ("lab_hw", Sim::lab_hw, 4.0, 0.15, 1),
     ] {
-        for (every, loss) in [
-            (2.5, 0.3),
-            (4.0, 0.3),
-            (10.0, 0.3),
-            (40.0, 0.3),
-            (4.0, 0.15),
-        ] {
-            let (a_rung, a_sp, a_fr, _, a_st) = wifi_bursts(sim, true, every, loss);
-            let (rung, sp, fr, under, st) = wifi_bursts(sim, false, every, loss);
-            eprintln!(
-                "{name} every {every} s at {loss}: legacy deepest rung {a_rung} setpoint {a_sp:.0} \
-                 freezes {a_fr} stalls {a_st}; v2 deepest rung {rung} setpoint {sp:.0} freezes {fr} \
-                 stalls {st}, {under:.1} s under 1080p"
-            );
-            let rung_kept = rung == 0 || name == "lab_hw";
-            // Freezes: a burst that breaks a frame NACK cannot repair freezes legacy too. v2 also
-            // paces the keyframe asked after it (sim: about half its extra freezes; lab check).
-            let lossy = st > 0 || fr > 2 * a_fr + 1;
-            if every <= 4.0 && (!rung_kept || lossy || sp < 0.9 * a_sp)
-                || every <= 10.0 && (st > 0 || under > 10.0)
-            {
-                bad.push((name, every, loss, rung, fr, sp as u32, a_sp as u32));
-            }
+        let (a_rung, a_sp, a_fr, _, a_st) = wifi_bursts(sim, true, every, loss);
+        let (rung, sp, fr, under, st) = wifi_bursts(sim, false, every, loss);
+        eprintln!(
+            "{name} every {every} s at {loss}: legacy deepest rung {a_rung} setpoint {a_sp:.0} \
+             freezes {a_fr} stalls {a_st}; v2 deepest rung {rung} setpoint {sp:.0} freezes {fr} \
+             stalls {st}, {under:.1} s under 1080p"
+        );
+        let rung_kept = rung == 0 || name == "lab_hw";
+        // 15 s under 1080p: a release is proven for 5.2 s before the hold lets the rung climb
+        // (#1652; 10 s before it, legacy none).
+        if fr > most
+            || every <= 4.0 && (!rung_kept || sp < 0.9 * a_sp)
+            || every <= 10.0 && (st > 0 || under > 15.0)
+        {
+            bad.push((name, every, loss, rung, fr, sp as u32, a_sp as u32));
         }
     }
     assert!(
@@ -6260,6 +6441,16 @@ fn a_second_cap_step_under_a_hold_keeps_it_and_steps_down() {
         if !off.is_empty() {
             bad.push(format!("{name} {second}: hold off at {off:?}"));
         }
+        // Seat B S2 (#1652): with no Wi-Fi burst to release the hold, the line stays under the step.
+        let over = s
+            .lines
+            .iter()
+            .find(|&&(t, l)| t >= 92.0 && l.is_some_and(|l| l > second));
+        if let Some(&(t, l)) = over {
+            bad.push(format!(
+                "{name} {second}: line {l:?} over the step at {t:.1} s"
+            ));
+        }
         if s.loss_after(95.0) > 0.05 && s.rung_at(105.0) < 4 {
             bad.push(format!(
                 "{name} {second}: loss after 95 s {:.3}, rung {} at 105 s",
@@ -6278,6 +6469,65 @@ fn a_second_cap_step_under_a_hold_keeps_it_and_steps_down() {
                 "{name} {second}: no frame for {:.2} s up to {:.1} s",
                 longest.0 as f64 / 1e6,
                 longest.1 as f64 / 1e6
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// Seat B S2 / seat A A3 (#1652): a release proves the rate the hold was set from, which a second cap
+/// step under the hold put over the link. R4 at 5000, a second step to 3000 at 90 s, then 300 ms Wi-Fi
+/// bursts losing 40 % every 7 s from 130 s: the line never settles over the policer and the setpoint
+/// never goes over it. A release lifts the line to that rate for the one report before its probe
+/// meets the link's edge (b7f4ce92: 9685 lab, 8432 lab_hw); a release put back to the stepped line
+/// instead proved it under the policer, ended the hold and climbed back to 1080p, and one that left
+/// the line where it was cost uncapped Wi-Fi rows a rung (lab every 2.5 s: 6 → 15 freezes).
+#[test]
+fn a_wifi_release_after_a_second_cap_step_never_settles_over_the_step() {
+    let mut bad = Vec::new();
+    for (name, sim) in [
+        ("lab", Sim::lab as fn(bool) -> Sim),
+        ("lab_hw", Sim::lab_hw),
+    ] {
+        let mut s = sim(false);
+        s.run(30.0);
+        policer(&mut s);
+        (s.tokens, s.tokens_at) = (15_000.0, s.t);
+        s.run(60.0);
+        s.cap_kbps = 3000.0;
+        s.run(40.0);
+        s.loss_at = Box::new(
+            |t| match t.saturating_sub(130_000_000) % 7_000_000 < 300_000 {
+                true => 0.4,
+                false => 0.0,
+            },
+        );
+        s.run(90.0);
+        let (freezes, rungs) = lab_summary(&format!("{name} 5000 → 3000 + Wi-Fi"), &s);
+        let over: Vec<bool> = s
+            .lines
+            .iter()
+            .filter(|p| p.0 >= 130.0)
+            .map(|p| p.1.is_some_and(|l| l > 3000.0))
+            .collect();
+        let settled = over.windows(2).any(|w| w[0] && w[1]);
+        let top = s
+            .setpoints
+            .iter()
+            .filter(|p| p.0 >= 130.0)
+            .map(|p| p.1)
+            .max()
+            .unwrap_or(0);
+        let ended = s.lines.iter().any(|&(t, l)| t >= 130.0 && l.is_none());
+        eprintln!(
+            "  reports with the line over 3000 after 130 s {}, two in a row {settled}; top setpoint \
+             {top}; hold ended {ended}; freezes {}; rungs {rungs:?}",
+            over.iter().filter(|&&o| o).count(),
+            freezes.len()
+        );
+        if settled || top > 3000 || ended {
+            bad.push(format!(
+                "{name}: line settled over 3000 {settled}, setpoint {top}, hold ended {ended}"
             ));
         }
     }
@@ -6479,6 +6729,12 @@ fn lab_rows_over_a_random_loss_floor_keep_the_hold() {
         hw_summary(&format!("{name} legacy"), &lab_hw_row(true, shape, 120.0));
         let s = lab_hw_row(false, shape, 120.0);
         let (freezes, _) = hw_summary(&format!("{name} v2"), &s);
+        // #1652: R3 + 2 % stalled at 205.8 s (a stale drop with nothing held to skip to).
+        assert!(
+            late_stalls(&s).is_empty(),
+            "{name}: stalls {:?}",
+            late_stalls(&s)
+        );
         let shaped: Vec<_> = freezes.iter().filter(|&&t| t < 210.0).collect();
         // R3 + 2 %: 2 since NACK answers are paced and reported (lab V3 sim facts): a
         // `burst-not-capacity` release 5 s before the clear, then a stale drop. Lab check.
@@ -6819,4 +7075,948 @@ fn the_pacing_judgement_is_traced_twice_a_second_and_at_once_when_the_cap_change
     ] {
         assert!(lines[3].contains(want), "{want}: {}", lines[3]);
     }
+}
+
+/// #1652 rows: seconds a lab row spent at rung `rung` or deeper (1: under 1080p, 4: 360p) between
+/// `from` and `to`.
+fn time_at(s: &Sim, rung: usize, from: f64, to: f64) -> f64 {
+    let mut rungs = s.rungs.clone();
+    rungs.push((f64::MAX, 0));
+    rungs
+        .windows(2)
+        .filter(|w| w[0].1 >= rung)
+        .map(|w| (w[1].0.min(to) - w[0].0.max(from)).max(0.0))
+        .sum()
+}
+
+/// (freezes from `from` until `to`, seconds under 1080p over the same span, seconds after `to` until
+/// 1080p for good), printed beside `name`.
+fn row(name: &str, s: &Sim, from: f64, to: f64) -> (usize, f64, Option<f64>) {
+    let freezes = s.client.as_ref().unwrap().freezes();
+    let n = freezes.iter().filter(|&&t| (from..to).contains(&t)).count();
+    let under = time_at(s, 1, from, to);
+    let back = match s.rungs.last() {
+        Some(&(t, 0)) => Some((t - to).max(0.0)),
+        _ => None,
+    };
+    eprintln!(
+        "{name}: freezes {n}, {under:.1} s under 1080p, back {back:?} s after {to} s; stalls {:?}",
+        s.stalls
+    );
+    (n, under, back)
+}
+
+/// A policer with a bucket of `bucket_s` at `kbps` from 30 s for 180 s (at `first_kbps` for the
+/// first 60 s), then clean for 120 s, under `Sim::lab_hw`, with 300 ms Wi-Fi bursts losing 40 % every
+/// 7 s from 10 s to the end of the shaping when `wifi`; with no FEC, so no probe, when `!fec`.
+fn deep_bucket_row(
+    legacy: bool,
+    (first_kbps, kbps, bucket_s): (f64, f64, f64),
+    wifi: bool,
+    fec: bool,
+) -> Sim {
+    let mut s = Sim::lab_hw(legacy);
+    s.est.probes &= fec;
+    if wifi {
+        s.loss_at = Box::new(|t| {
+            match (10_000_000..210_000_000).contains(&t) && (t - 10_000_000) % 7_000_000 < 300_000 {
+                true => 0.4,
+                false => 0.0,
+            }
+        });
+    }
+    s.run(30.0);
+    policer(&mut s);
+    s.cap_kbps = first_kbps;
+    s.bucket_bytes = Some(kbps * 125.0 * bucket_s);
+    (s.tokens, s.tokens_at) = (15_000.0, s.t);
+    s.run(60.0);
+    s.cap_kbps = kbps;
+    s.run(120.0);
+    s.clear();
+    s.run(120.0);
+    s
+}
+
+/// #1652 (1): Wi-Fi bursts over a 5000 kbit/s policer with a 1 MB bucket (1.6 s). A burst that ended
+/// the hold as "not capacity" let the setpoint climb unheld into the bucket, and the next hold came
+/// only once the bucket had drained (base 8fc7478e: setpoint 5373 at 108 s, 25 freezes, legacy 13):
+/// the setpoint now stays under the policer. #1652 (2): 2500
+/// kbit/s for 60 s, then 6600 with a 1.95 s bucket. A probe step under 1.37 × the policer passes
+/// clean on the bucket's credit and may land the line at up to (0.7225 + 0.139 × 1.95) = 0.993 × it.
+/// Not reproduced at the base: v2 0-2 freezes, legacy 6-8, top line at most 0.90 × the policer, for
+/// 1500-6600 first and 1.7-1.95 s buckets; kept as a guard: no more freezes past the onset's cut than
+/// legacy. Both rows back at 1080p within 30 s of the clear. Seat A A2: with no FEC there is no probe
+/// to prove a release, and the release ends the hold, yet the Wi-Fi row stays under the policer (top
+/// setpoint 1018). Keeping the hold there instead cost 2 freezes and the return to 1080p.
+#[test]
+fn deep_bucket_policers_freeze_no_more_than_legacy() {
+    let mut bad = Vec::new();
+    for (name, first, kbps, bucket_s, wifi, fec) in [
+        ("5000, 1 MB + Wi-Fi", 5000.0, 5000.0, 1.6, true, true),
+        (
+            "5000, 1 MB + Wi-Fi, no FEC",
+            5000.0,
+            5000.0,
+            1.6,
+            true,
+            false,
+        ),
+        ("2500 then 6600, 1.95 s", 2500.0, 6600.0, 1.95, false, true),
+    ] {
+        let shape = (first, kbps, bucket_s);
+        let (a, _, a_back) = row(
+            &format!("{name} legacy"),
+            &deep_bucket_row(true, shape, wifi, fec),
+            35.0,
+            210.0,
+        );
+        let s = deep_bucket_row(false, shape, wifi, fec);
+        let (n, _, back) = row(&format!("{name} v2"), &s, 35.0, 210.0);
+        let top = s
+            .setpoints
+            .iter()
+            .filter(|p| (40.0..210.0).contains(&p.0))
+            .map(|p| p.1)
+            .max()
+            .unwrap_or(0);
+        eprintln!("  v2 top setpoint 40-210 s {top}, policer {kbps}");
+        // The Wi-Fi rows' freezes are mostly the bursts' own at a low rung, as uncapped (b7f4ce92:
+        // 16, legacy 13).
+        let frozen = if wifi { n > 17 } else { n > a };
+        // With no FEC the hold climbs at `PROBE_PER_S` once `HOLD` has passed (b7f4ce92: back 108 s).
+        let slowest = if fec { 30.0 } else { 120.0 };
+        if frozen || f64::from(top) > kbps || back.is_none_or(|b| b > slowest) {
+            bad.push(format!(
+                "{name}: v2 {n} freezes, top setpoint {top}, back {back:?}; legacy {a} back \
+                 {a_back:?}"
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// Seat A (#1652): the Wi-Fi memory is renewed by any short burst that is not a keyframe's. Wi-Fi
+/// bursts from 10 to 40 s set and release a hold (the memory is set), then from 45 s a 12000 kbit/s
+/// policer with a 40 kB bucket, over the 9920 sent on average (video and FEC), drops only during the
+/// content's busy bursts (2 × for 300 ms every 10 s). Each run is under a second and renewed the
+/// memory, so no hold was ever set: the policer must set one. Seat A A5: the same with two such
+/// bursts every 2 s, a hold too and no more freezes than legacy.
+#[test]
+fn an_encoder_burst_over_a_policer_does_not_renew_the_wifi_memory() {
+    let run = |legacy: bool, busy: fn(u64) -> bool| {
+        let mut s = Sim::lab(legacy);
+        s.loss_at = Box::new(|t| {
+            match (10_000_000..40_000_000).contains(&t) && (t - 10_000_000) % 4_000_000 < 300_000 {
+                true => 0.3,
+                false => 0.0,
+            }
+        });
+        s.content_gain = Box::new(move |t| if busy(t) { 2.0 } else { 1.0 });
+        s.run(45.0);
+        let memory = s.est.random_burst.is_some();
+        s.cap_kbps = 12_000.0;
+        s.bucket_bytes = Some(40_000.0);
+        (s.tokens, s.tokens_at) = (40_000.0, s.t);
+        s.run(120.0);
+        (s, memory)
+    };
+    let mut bad = Vec::new();
+    for (name, busy) in [
+        (
+            "every 10 s",
+            (|t| t % 10_000_000 < 300_000) as fn(u64) -> bool,
+        ),
+        ("2 × every 2 s from 45 s", |t| {
+            t >= 45_000_000 && t % 1_000_000 < 300_000
+        }),
+    ] {
+        let (a, _, _) = row(&format!("{name} legacy"), &run(true, busy).0, 45.0, 165.0);
+        let (s, memory) = run(false, busy);
+        let (n, _, _) = row(&format!("{name} v2"), &s, 45.0, 165.0);
+        let held = s.lines.iter().any(|&(t, l)| t >= 45.0 && l.is_some());
+        eprintln!("  loss after 45 s {:.3}", s.loss_after(45.0));
+        if !memory || !held || n > a {
+            bad.push(format!(
+                "{name}: memory at 45 s {memory}, a hold over the policer {held}, freezes {n}, \
+                 legacy {a}"
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// A lab row on a clean 50 Mbit/s link that reorders from 30 s for 180 s: each datagram delayed
+/// 0 to 2 × `spread_ms` more (the lab's `delay 10ms 10ms`-style shape, #1446), and Chrome's QUIC
+/// discarding a datagram that arrives over `DISCARD_US` after a later one, then clean for 60 s.
+/// `audio_pacing`: legacy's `Rate::audio_pacing` (no effect on v2).
+fn reorder_row(legacy: bool, spread_ms: u64, audio_pacing: bool) -> Sim {
+    reorder_row_seeded(legacy, spread_ms, audio_pacing, 0)
+}
+
+/// `reorder_row` with each datagram's delay drawn by `seed`.
+fn reorder_row_seeded(legacy: bool, spread_ms: u64, audio_pacing: bool, seed: u64) -> Sim {
+    let mut s = Sim::lab_hw(legacy);
+    s.est.audio_pacing = audio_pacing;
+    s.discard_us = Some(DISCARD_US);
+    s.run(30.0);
+    let span = 2 * spread_ms * 1000;
+    s.reorder_us =
+        Box::new(move |seq| (u64::from(seq) + seed * 1_000_003).wrapping_mul(2_654_435_761) % span);
+    s.hold_us = span + 5_000;
+    s.run(180.0);
+    s.reorder_us = Box::new(|_| 0);
+    s.run(60.0);
+    s
+}
+
+/// The overtaking Chrome's QUIC tolerates before it discards (#1446). Calibrated on legacy against
+/// the lab's reorder rows (both lab hosts, 0.6.0 and 0.6.4 campaigns: 10 ms spread at 360p, 20 ms at
+/// 360p with 12+ freezes): 12 ms gives 10 ms → 360p, 8 % discarded, 8 freezes; 20 ms → 360p, 22 %,
+/// 21 freezes. 8 ms put 5 ms at 360p too, 15 ms held 10 ms at 540p.
+const DISCARD_US: u64 = 12_000;
+
+/// #1446: Chrome's discards on a link that reorders are loss to the agent, with no queue behind them.
+/// v2 never sits at 360p longer than legacy or freezes more, and at 10 ms not at all (legacy: 360p
+/// from the onset). At 20 ms Chrome's rule discards over half of a 1080p stream at the onset and both
+/// sit at 360p: the client's fallback to WebRTC is the answer there (`REORDER_WINDOW_S`).
+#[test]
+fn a_link_that_reorders_does_not_sit_at_360p() {
+    let mut bad = Vec::new();
+    for spread in [5, 10, 20] {
+        // Legacy as 0.6.4 (audio pacing off), the sender `DISCARD_US` was calibrated on.
+        let a = reorder_row(true, spread, false);
+        let (a_n, ..) = row(&format!("reorder {spread} ms legacy"), &a, 30.0, 210.0);
+        let s = reorder_row(false, spread, true);
+        let (n, under, _) = row(&format!("reorder {spread} ms v2"), &s, 30.0, 210.0);
+        let (at_360, a_360) = (time_at(&s, 4, 30.0, 210.0), time_at(&a, 4, 30.0, 210.0));
+        eprintln!(
+            "  360p: v2 {at_360:.1} s, legacy {a_360:.1} s; discarded: v2 {}, legacy {}",
+            s.discarded, a.discarded
+        );
+        // 2 s: the onset steps a report or two either way.
+        if n > a_n || at_360 > a_360 + 2.0 || spread == 10 && at_360 > 0.0 {
+            bad.push(format!(
+                "{spread} ms: v2 {n} freezes, {at_360:.1} s at 360p, {under:.1} s under 1080p; \
+                 legacy {a_n}, {a_360:.1} s"
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// #1692 lab REORD (`delay 10ms 10ms`, AMD lab host): on a link that reorders and queues nothing the
+/// default sender is 0.6.4's, seed for seed. a9bd8d45 paced at the delay bound alone, and paced video
+/// in small send groups reads reordering as overuse, which kept it there: delay-bound 81-100 % of
+/// reports against 39-77 %, frames presented at sd 15.7-16.9 ms against 9.5-10.0 (lab: 72-77 % against
+/// 31-36 %, present sd 8.8-10.3 ms against 4.3-4.9).
+#[test]
+fn legacy_on_a_link_that_reorders_is_the_0_6_4_sender() {
+    for seed in 0..4 {
+        let (on, off) = (
+            reorder_row_seeded(true, 10, true, seed),
+            reorder_row_seeded(true, 10, false, seed),
+        );
+        let summary = |s: &Sim| {
+            let (n, _, back) = row(&format!("reorder seed {seed}"), s, 30.0, 210.0);
+            (
+                n,
+                back,
+                presented(s, 60.0, 210.0),
+                delay_bound_share(s, 60.0, 210.0),
+            )
+        };
+        assert_eq!(
+            summary(&on),
+            summary(&off),
+            "seed {seed}: (freezes, back, (sd, fps), delay-bound)"
+        );
+    }
+}
+
+/// Review r4 M-1: 3 Mbit/s behind a 1.25 MB FIFO from 30 s, then from 90 s a clean link that
+/// reorders each datagram 0 to 2 × `spread_ms`, as `reorder_row`.
+fn cap_then_reorder(spread_ms: u64, pacing: bool) -> Sim {
+    let mut s = Sim::lab_hw(true);
+    s.est.audio_pacing = pacing;
+    s.discard_us = Some(DISCARD_US);
+    s.run(30.0);
+    s.cap_kbps = 3000.0;
+    s.queue_bytes = 1_250_000.0;
+    s.extra_us = Box::new(|_| 20_000);
+    (s.tokens, s.tokens_at) = (15_000.0, s.t);
+    s.run(60.0);
+    s.clear();
+    let span = 2 * spread_ms * 1000;
+    s.reorder_us = Box::new(move |seq| u64::from(seq).wrapping_mul(2_654_435_761) % span);
+    s.hold_us = span + 5_000;
+    s.run(180.0);
+    s
+}
+
+/// Review r4 M-1: once a cap had let the queue stand, paced video on a link that reorders kept the
+/// bound at delay and with it the pacing, after the cap lifted too (16538061: paced to the end at
+/// 2445 kbit/s, 0.6.4 back at 8000). A report that shows the path reorder ends legacy's pacing: at
+/// 5 ms the default sender is 0.6.4's after the lift, at 10 ms nothing is paced by the end (both
+/// sit near 500 kbit/s in Chrome's discards there, and their freezes go either way by cap and seed).
+#[test]
+fn legacy_pacing_ends_on_a_link_that_reorders_after_a_cap_lifts() {
+    let summary = |s: &Sim| {
+        let freezes = s.client.as_ref().unwrap().freezes();
+        (
+            freezes.iter().filter(|&&t| t >= 120.0).count(),
+            (presented(s, 120.0, 270.0).0 * 10.0).round() / 10.0,
+            s.setpoints.last().map(|p| p.1),
+            s.est.legacy_queue(),
+        )
+    };
+    let on = summary(&cap_then_reorder(5, true));
+    eprintln!("5 ms, from 120 s (freezes, sd, setpoint, paced): {on:?}");
+    assert_eq!(on, summary(&cap_then_reorder(5, false)), "5 ms");
+    assert!(
+        !cap_then_reorder(10, true).est.legacy_queue(),
+        "10 ms: paced"
+    );
+}
+
+/// `audio_row` (pacing on) on a path that from `from` seconds holds each datagram `late(next)`
+/// µs longer by its `pkt_seq`, `next` being the first sent from then.
+fn audio_row_late(kbps: f64, from: f64, late: impl FnOnce(u32) -> Box<dyn Fn(u32) -> u64>) -> Sim {
+    let mut s = Sim::lab_hw(true);
+    s.discard_us = Some(DISCARD_US);
+    s.hold_us = 10_000;
+    s.run(30.0);
+    s.cap_kbps = kbps;
+    s.queue_bytes = 1_250_000.0;
+    s.extra_us = Box::new(|_| 20_000);
+    (s.tokens, s.tokens_at) = (15_000.0, s.t);
+    s.run(from - 30.0);
+    s.reorder_us = late(s.pending.back().map_or(0, |p| p.0) + 1);
+    s.run(240.0 - from);
+    s
+}
+
+/// Review r5 S-1: a path that reorders now and then under a steady cap is no path that keeps
+/// reordering. Ended by one reordered report, pacing never came back: the standing queue ages into
+/// the floor within `FLOOR_SPAN_US`, so it never stands again (3cbbba7b: one in 2000 datagrams 3 ms
+/// late, audio p99 91 and 133 ms at 5 and 2 Mbit/s against 17 and 30 in order; three datagrams
+/// 8 ms late at 75 s, unpaced from 76 s to the end).
+#[test]
+fn reordering_now_and_then_under_a_steady_cap_keeps_legacy_paced() {
+    let mut bad = Vec::new();
+    for kbps in [5000.0, 2000.0] {
+        let p99 = |s: &Sim| audio_late_at(s, 45.0, 240.0, 0.99);
+        let in_order = p99(&audio_row_late(kbps, 30.0, |_| Box::new(|_| 0)));
+        let s = audio_row_late(kbps, 30.0, |_| {
+            Box::new(|seq| u64::from(seq % 2000 == 1999) * 3_000)
+        });
+        let burst = audio_row_late(kbps, 75.0, |next| {
+            Box::new(move |seq| u64::from((next..next + 3).contains(&seq)) * 8_000)
+        });
+        eprintln!(
+            "{kbps}: audio p99 in order {in_order} ms, 1 in 2000 3 ms late {} ms, 3 late at 75 s {} ms",
+            p99(&s),
+            p99(&burst)
+        );
+        for (name, s) in [("1 in 2000", &s), ("3 at 75 s", &burst)] {
+            if p99(s) > in_order + 5 || !s.est.legacy_queue() {
+                bad.push(format!(
+                    "{kbps}, {name}: p99 {} ms, in order {in_order}, paced {}",
+                    p99(s),
+                    s.est.legacy_queue()
+                ));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// #1692 lab round 4 (NVIDIA lab host, 2 Mbit/s): a cap's first fill left seconds of queue that
+/// drained for 70-90 s with the link full, and once it had stood over `FLOOR_SPAN_US` the rolling
+/// floor took it in: the queue read as gone, the follow stopped, and a setpoint an onset overshoot
+/// put 7 % over the estimate stayed there. The sim's sender cannot keep a queue standing that long
+/// (the guard and the stale drops hold video at the agent), so 150 ms over the pre-queue delay from
+/// 40 s to 160 s stands in for it: one-way delay cannot tell the two apart. While it stands the
+/// setpoint stays at or under the estimate (f971779a: over it in most reports from 52 s on).
+#[test]
+fn a_queue_that_stands_longer_than_the_floor_span_still_holds_the_setpoint_down() {
+    let mut s = Sim::lab_hw(true);
+    s.run(30.0);
+    s.cap_kbps = 2000.0;
+    s.queue_bytes = 1_250_000.0;
+    s.extra_us = Box::new(|_| 20_000);
+    (s.tokens, s.tokens_at) = (15_000.0, s.t);
+    s.run(10.0);
+    s.extra_us = Box::new(|t| if t < 160_000_000 { 170_000 } else { 20_000 });
+    s.run(200.0);
+    let reports: Vec<(f64, u32)> = s
+        .trace
+        .iter()
+        .zip(&s.setpoints)
+        .filter(|(e, _)| (60.0..160.0).contains(&e.0))
+        .map(|(e, sp)| (e.1, sp.1))
+        .collect();
+    let over = reports
+        .iter()
+        .filter(|&&(est, sp)| f64::from(sp) > est * 1.02)
+        .count();
+    eprintln!(
+        "60-160 s: setpoint over the estimate in {over} of {} reports; setpoint at 150 s {:?}, at \
+         230 s {:?}",
+        reports.len(),
+        s.setpoints.iter().rev().find(|p| p.0 <= 150.0).map(|p| p.1),
+        s.setpoints.last().map(|p| p.1)
+    );
+    assert!(over * 20 < reports.len(), "{over} of {}", reports.len());
+}
+
+/// Review r2 S-1, the production gate: `Control` takes `Rate::audio_pacing` (off for NVENC and VA,
+/// `abr_glue::audio_pacing`, guarded by `audio_pacing_runs_only_where_a_bitrate_write_is_free`) into
+/// its estimator, and only a receiver report's estimate at a standing queue reaches the ABR as one.
+#[test]
+fn control_feeds_legacys_queue_bound_only_with_audio_pacing() {
+    use crate::session::settings::WtCapacity;
+    use std::sync::{Arc, Mutex, OnceLock};
+    for pacing in [true, false] {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let fed = seen.clone();
+        let rate = super::super::Rate {
+            measured: Box::new(|_| {}),
+            ceiling_kbps: CEILING,
+            floor_kbps: Box::new(|| 1000.0),
+            setpoint_kbps: Box::new(|| 5000.0),
+            capacity: WtCapacity::Legacy,
+            audio_pacing: pacing,
+            retargets: true,
+            start: Box::new(|| {}),
+            owns: Box::new(|| false),
+            displaced: Box::new(|| {}),
+            observe: Box::new(move |_, _, queue| fed.lock().unwrap().push(queue)),
+            held: Box::new(|_| {}),
+            fec: Box::new(|_| {}),
+        };
+        let governor = Governor::default();
+        governor.govern(5000.0);
+        let mut c = super::super::Control::new(&rate, Arc::new(OnceLock::new()), false, governor);
+        c.estimator.resume_at(5000.0);
+        (c.estimator.queue_standing, c.estimator.queue_stood) = (true, true);
+        c.feed(5000.0, true);
+        c.feed(5000.0, false);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [pacing, false],
+            "pacing {pacing}: report, silence"
+        );
+        assert_eq!(
+            video_rates(&c.governor, &c.estimator, false).1.is_some(),
+            pacing,
+            "pacing {pacing}: paced"
+        );
+    }
+}
+
+/// CAP: the lab's `tbf rate 5mbit burst 15kb latency 500ms` behind a 20 ms delay, for 60 s.
+fn deep_cap(s: &mut Sim) {
+    s.cap_kbps = 5000.0;
+    s.queue_bytes = 5000.0 * 125.0 * 0.5;
+    s.tbf_burst = Some(15_000.0);
+    s.extra_us = Box::new(|_| 20_000);
+}
+
+/// Lab round 2 for 0.6.5's default flip: after a shape clears, v2 is back at 1080p no later than
+/// legacy on the same row (lab: R3 25-27 s against 12, CAP 20-23 against 8-11, REORD 34-44 against
+/// 21-35), with no more freezes while shaped.
+#[test]
+fn after_a_shape_clears_v2_is_back_at_1080p_as_soon_as_legacy() {
+    // Legacy as 0.6.4 (audio pacing off), the sender the lab figures above are of.
+    let pacing_off = |s: &mut Sim| s.est.audio_pacing = !s.est.legacy;
+    let cap_row = |legacy: bool| {
+        let mut s = Sim::lab_hw(legacy);
+        pacing_off(&mut s);
+        s.run(30.0);
+        deep_cap(&mut s);
+        s.run(60.0);
+        s.clear();
+        s.extra_us = Box::new(|_| 0);
+        s.run(60.0);
+        s
+    };
+    let mut bad = Vec::new();
+    for name in ["R3", "R4", "CAP", "REORD"] {
+        let run = |legacy: bool| match name {
+            "R3" => lab_hw_row(legacy, |s| (pacing_off(s), shallow(s)).1, 60.0),
+            "R4" => lab_hw_row(legacy, |s| (pacing_off(s), policer(s)).1, 60.0),
+            "CAP" => cap_row(legacy),
+            _ => reorder_row(legacy, 10, !legacy),
+        };
+        let to = if name == "CAP" { 90.0 } else { 210.0 };
+        let (a_n, _, a_back) = row(&format!("{name} legacy"), &run(true), 30.0, to);
+        let (n, _, back) = row(&format!("{name} v2"), &run(false), 30.0, to);
+        // 1 s: a ladder step lands a report or two either way.
+        if back.is_none_or(|b| b > a_back.unwrap_or(f64::MAX) + 1.0) || n > a_n {
+            bad.push(format!(
+                "{name}: v2 back {back:?} s, {n} freezes; legacy {a_back:?} s, {a_n}"
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// Review round 2 of the lift (`PROBE_LIFT`): a link that lifts only part way, from 5000 to 6000
+/// kbit/s at 210 s, behind R3's shallow queue, CAP's deep one and a 5000 kbit/s policer with a 2 s
+/// bucket. The hold stays on at a line the link carries (a lift's 24000 target proves nothing), at
+/// least 0.95 × where the base's plain steps put it, and the 120 s after the lift freeze no more than
+/// at the base (lines and counts measured there).
+#[test]
+fn a_partial_lift_keeps_the_hold_at_a_line_the_link_carries() {
+    let mut bad = Vec::new();
+    for (name, base, most) in [
+        ("R3", 3751.0, 0),
+        ("CAP", 3466.0, 0),
+        ("2 s policer", 4891.0, 0),
+    ] {
+        let mut s = Sim::lab_hw(false);
+        s.run(30.0);
+        match name {
+            "R3" => shallow(&mut s),
+            "CAP" => deep_cap(&mut s),
+            _ => {
+                policer(&mut s);
+                s.bucket_bytes = Some(5000.0 * 125.0 * 2.0);
+            }
+        }
+        (s.tokens, s.tokens_at) = (15_000.0, s.t);
+        s.run(180.0);
+        s.cap_kbps = 6000.0;
+        s.run(120.0);
+        let freezes = s.client.as_ref().unwrap().freezes();
+        let after = freezes.iter().filter(|&&t| t >= 210.0).count();
+        let line = s.lines.last().and_then(|l| l.1);
+        let over: Vec<_> = s
+            .lines
+            .iter()
+            .filter(|&&(t, l)| t >= 240.0 && l.is_some_and(|l| l > 6000.0))
+            .take(3)
+            .collect();
+        eprintln!(
+            "{name} to 6000: line at the end {line:?}, freezes after the lift {after} {freezes:?}, \
+             rungs {:?}",
+            s.rungs
+        );
+        if line.is_none_or(|l| l < 0.95 * base) || !over.is_empty() || after > most {
+            bad.push(format!(
+                "{name}: line {line:?}, over the link {over:?}, freezes after the lift {after}"
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// Review round 2 of the lift (`PROBE_LIFT`), at `probe_step`: a 3000 line whose 6000 probe the link
+/// stopped before. A probe that sends only 5000 never lifts (a refilled bucket passes one clean
+/// second). One that carries 6000 clean lifts its target, but the link that carries only 6000 proves
+/// a 4335 line after 5.25 s, and the hold stays there: the lift's 24000 target proved nothing.
+#[test]
+fn a_lift_lands_on_what_the_link_carried_not_on_its_target() {
+    let run = |sent: f64| {
+        let start = Instant::now();
+        let mut est = Estimator::new(CEILING, start);
+        est.probes = true;
+        est.held = Some(HoldLine {
+            kbps: 3000.0,
+            since: start,
+            stepped: start,
+            trouble: 3000.0 / BETA,
+            cause: (start, 0.2, 3000.0 / BETA),
+            dropped: true,
+            before: 3000.0 / BETA,
+            probe: None,
+            probe_wait: start,
+            starved: false,
+            stopped_at: 6000.0,
+            lift_stopped: false,
+        });
+        let mut top = 0.0_f64;
+        for ms in (PROBE_WAIT.as_millis() as u64..=12_000).step_by(50) {
+            est.probe_counted = (10, 0);
+            est.probe_step(
+                (20, 0),
+                Some((sent, sent)),
+                false,
+                Usage::Normal,
+                start + Duration::from_millis(ms),
+            );
+            let line = est.held_kbps().unwrap_or(f64::INFINITY);
+            top = top.max(est.probe_kbps().unwrap_or(0.0) / line);
+        }
+        (top, est.held_kbps())
+    };
+    // `top`: the most the probe went over the line, as a multiple of it.
+    let (top, line) = run(5000.0);
+    assert!(
+        top <= PROBE_GAIN,
+        "5000 sent: the probe lifted to {top:.2} x the line"
+    );
+    assert!(line.is_some(), "5000 sent: the hold ended");
+    let (top, line) = run(6000.0);
+    assert!(top > PROBE_GAIN, "6000 carried: no lift ({top:.2} x)");
+    assert!(
+        line.is_some_and(|l| (l - BETA * BETA * 6000.0).abs() < 1.0),
+        "6000 carried: line {line:?}, not 4335"
+    );
+}
+
+/// A v2 hold at `kbps` whose next probe is due, with `stopped_at` recorded (`PROBE_LIFT`).
+fn held_estimator(start: Instant, kbps: f64, stopped_at: f64) -> Estimator {
+    let mut est = Estimator::new(CEILING, start);
+    est.probes = true;
+    est.held = Some(HoldLine {
+        kbps,
+        since: start,
+        stepped: start,
+        trouble: kbps / BETA,
+        cause: (start, 0.2, kbps / BETA),
+        dropped: true,
+        before: kbps / BETA,
+        probe: None,
+        probe_wait: start,
+        starved: false,
+        stopped_at,
+        lift_stopped: false,
+    });
+    est
+}
+
+/// Review round 3 (`Probe::landing`): a queue takes what is sent without loss, so a lift arms and is
+/// credited only on what the receiver reports delivered. 9000 sent (6000 of it probe) and 3000
+/// received for 3 s, then overuse stops the step: no lift, and the line stays at 3000. 21352453
+/// lifted on the send rate and credited the stop 5400.
+#[test]
+fn a_probe_into_a_queue_moves_the_line_only_on_what_was_received() {
+    let start = Instant::now();
+    let mut est = held_estimator(start, 3000.0, 6000.0);
+    for ms in (PROBE_WAIT.as_millis() as u64..=8_000).step_by(50) {
+        est.probe_counted = (10, 0);
+        let m = Measured {
+            usage: match ms {
+                8_000 => Usage::Overusing,
+                _ => Usage::Normal,
+            },
+            rate_kbps: Some(3000.0),
+            delivered_kbps: None,
+            gap_us: 0,
+            sent_kbps: Some(3000.0),
+            probe_sent_kbps: 6000.0,
+            arrived_sent_kbps: None,
+            fresh: true,
+            loss: Some(0.0),
+        };
+        est.apply(m, start + Duration::from_millis(ms), NO_QUIC);
+    }
+    assert!(
+        est.held_kbps().is_some_and(|l| l <= 3000.0),
+        "line {:?}",
+        est.held_kbps()
+    );
+}
+
+#[test]
+fn a_stopped_lift_into_a_queue_credits_only_delivery() {
+    let start = Instant::now();
+    let mut est = held_estimator(start, 3000.0, 6000.0);
+    let mut probe = Probe::new(6000.0, start, None);
+    probe.kbps = 12_000.0;
+    est.held.as_mut().unwrap().probe = Some(probe);
+    est.probe_counted = (30, 0);
+    est.probe_step(
+        (20, 0),
+        Some((8666.0, 3000.0)),
+        true,
+        Usage::Normal,
+        start + Duration::from_secs(2),
+    );
+    assert_eq!(est.probe_kbps(), None);
+    assert_eq!(est.held_kbps(), Some(3000.0));
+}
+
+/// A lossless 6800 kbit/s shaper can pass its 1.98 s of bucket credit before delay overuse
+/// stops the lift. In a 2 s step that proves 6766 kbit/s, below the 6800 release threshold.
+#[test]
+fn a_lift_stopped_by_a_lossless_shaper_keeps_the_hold() {
+    for (bucket_s, total_sent, usage, lost, line) in [
+        (1.98, 13_662.0, Usage::Overusing, 0, Some(6766.0)),
+        (1.98, 13_662.0, Usage::Normal, 0, Some(6766.0)),
+        (2.02, 14_000.0, Usage::Overusing, 0, Some(6800.0)),
+        (2.02, 14_000.0, Usage::Normal, 1, Some(6800.0)),
+        (2.02, 14_000.0, Usage::Normal, 0, None),
+    ] {
+        let start = Instant::now();
+        let mut est = held_estimator(start, 6000.0, 7000.0);
+        let mut probe = Probe::new(CEILING / BETA / BETA, start, None);
+        probe.kbps = 2.0 * probe.first;
+        est.held.as_mut().unwrap().probe = Some(probe);
+        est.probe_counted = (300, lost);
+        est.apply(
+            Measured {
+                usage,
+                sent_kbps: Some(6500.0),
+                probe_sent_kbps: total_sent - 6500.0,
+                // A stretched arrival window stops the step even without delay overuse.
+                arrived_sent_kbps: Some(15_000.0),
+                ..received(6800.0 * (2.0 + bucket_s) / 2.0, 0.0)
+            },
+            start + Duration::from_secs(2),
+            NO_QUIC,
+        );
+        assert_eq!(est.probe_kbps(), None);
+        assert_eq!(
+            est.held_kbps(),
+            line,
+            "{bucket_s} s, {usage:?}, {lost} lost"
+        );
+    }
+}
+
+/// The last report alone can take the average past the stopped lift's 7000 kbit/s peak.
+#[test]
+fn a_bucket_spike_does_not_rearm_a_lift() {
+    let start = Instant::now();
+    let mut est = held_estimator(start, 4000.0, f64::INFINITY);
+    let mut probe = Probe::new(8000.0, start, None);
+    probe.kbps = 16_000.0;
+    est.held.as_mut().unwrap().probe = Some(probe);
+    let stopped = start + PROBE_STEP;
+    est.probe_step(
+        (20, 0),
+        Some((8000.0, 7000.0)),
+        true,
+        Usage::Normal,
+        stopped,
+    );
+    assert_eq!(est.held.unwrap().stopped_at, 7000.0);
+    let next = stopped + PROBE_WAIT;
+    est.probe_step((20, 0), None, false, Usage::Normal, next);
+    for (i, delivered) in [6800.0, 6800.0, 6800.0, 7900.0].into_iter().enumerate() {
+        est.probe_counted = (10, 0);
+        est.probe_step(
+            (20, 0),
+            Some((8000.0, delivered)),
+            false,
+            Usage::Normal,
+            next + Duration::from_millis((i as u64 + 1) * 250),
+        );
+    }
+    assert_eq!(est.probe_kbps(), Some(8000.0));
+}
+
+/// Review round 3: a probe at the most a probe tries that delivers only 6500 proves 4696, under a
+/// 6000 line, so the hold stays. 21352453 ended it on the probe's target.
+#[test]
+fn a_probe_that_underfills_its_target_never_ends_the_hold() {
+    let start = Instant::now();
+    let mut est = held_estimator(start, 6000.0, f64::INFINITY);
+    for ms in (PROBE_WAIT.as_millis() as u64..=6_500).step_by(50) {
+        est.probe_counted = (10, 0);
+        est.probe_step(
+            (20, 0),
+            Some((6500.0, 6500.0)),
+            false,
+            Usage::Normal,
+            start + Duration::from_millis(ms),
+        );
+    }
+    assert_eq!(est.held_kbps(), Some(6000.0));
+}
+
+/// Review round 3: a step stopped before any report measured no refusal, and records none.
+/// 21352453 recorded its 6000 target.
+#[test]
+fn a_stop_with_no_report_records_no_refusal() {
+    let start = Instant::now();
+    let mut est = held_estimator(start, 3000.0, f64::INFINITY);
+    let at = |ms: u64| start + Duration::from_millis(ms);
+    est.probe_step((20, 0), None, false, Usage::Normal, at(5_000));
+    assert!(est.probe_kbps().is_some(), "no probe started");
+    est.probe_step((20, 0), None, true, Usage::Normal, at(5_050));
+    let stopped_at = est.held.map(|h| h.stopped_at);
+    assert_eq!(stopped_at, Some(f64::INFINITY));
+}
+
+/// Review round 3: R3, then a transient 8000 kbit/s cap for 20 s from the clear (it drops a lift's
+/// extra repair, not a plain step), then the clean link. The hold ends no later than at the base,
+/// before the lift (`PROBE_LIFT`), measured there.
+#[test]
+fn a_lift_into_a_transient_cap_ends_the_hold_no_later_than_the_base() {
+    let mut s = Sim::lab_hw(false);
+    s.run(30.0);
+    shallow(&mut s);
+    (s.tokens, s.tokens_at) = (15_000.0, s.t);
+    s.run(180.0);
+    s.cap_kbps = 8000.0;
+    s.run(20.0);
+    s.clear();
+    s.run(60.0);
+    let ended = s
+        .lines
+        .iter()
+        .find(|&&(t, l)| t >= 210.0 && l.is_none())
+        .map(|&(t, _)| t - 210.0);
+    let freezes = s.client.as_ref().unwrap().freezes();
+    eprintln!(
+        "hold ended {ended:?} s after the clear; freezes {freezes:?}; rungs {:?}",
+        s.rungs
+    );
+    assert!(ended.is_some_and(|e| e <= BASE_ENDED), "ended {ended:?}");
+}
+const BASE_ENDED: f64 = 33.1;
+
+/// The 0.6.5 RC audio rows (#1321): the lab relay's `delay 20ms rate <kbps>` with its 1.25 MB FIFO,
+/// from 30 s for 210 s (`None`: clean), under `Sim::lab_hw` on `legacy` with `QUASAR_WT_AUDIO_PACING`
+/// `pacing`.
+fn audio_row(kbps: Option<f64>, pacing: bool) -> Sim {
+    let mut s = Sim::lab_hw(true);
+    s.est.audio_pacing = pacing;
+    s.run(30.0);
+    if let Some(kbps) = kbps {
+        s.cap_kbps = kbps;
+        s.queue_bytes = 1_250_000.0;
+        s.extra_us = Box::new(|_| 20_000);
+    }
+    (s.tokens, s.tokens_at) = (15_000.0, s.t);
+    s.run(210.0);
+    s
+}
+
+/// Audio lateness over the path's base delay between `from` and `to`, ms, at quantile `q`.
+fn audio_late_at(s: &Sim, from: f64, to: f64, q: f64) -> u64 {
+    let mut late: Vec<u64> = s
+        .audio_late
+        .iter()
+        .filter(|&&(t, _)| (from..to).contains(&t))
+        .map(|&(_, l)| l / 1000)
+        .collect();
+    late.sort_unstable();
+    late.get(((late.len().max(1) - 1) as f64 * q) as usize)
+        .copied()
+        .unwrap_or(u64::MAX)
+}
+
+/// #1321 on the default sender (`legacy`, 0.6.5 RC lab): under the relay's 5 and 2 Mbit/s caps audio
+/// waited in the link's queue behind an unpaced keyframe a second, and behind a setpoint left 10-16 %
+/// over a delay-bound estimate inside the deadband (#1503); 34-832 underruns a minute against 0-0.3
+/// clean. From onset + 15 s an audio datagram's lateness at its p99 stays within 40 ms of the clean
+/// link's, well under the client's ring (target 79-115 ms clean). 7b5d81e0: 93 and 124 ms, clean 2.
+/// Around 2 Mbit/s too: a9bd8d45 passed at 2000 by the phase of its keyframes, 87 ms at 1800 and
+/// 2100 (`Estimator::pace_waits`).
+#[test]
+fn legacy_audio_under_a_rate_cap_stays_near_the_clean_link() {
+    let clean = audio_late_at(&audio_row(None, true), 45.0, 240.0, 0.99);
+    let mut bad = Vec::new();
+    for kbps in [5000.0, 1800.0, 2000.0, 2200.0] {
+        let s = audio_row(Some(kbps), true);
+        let late = |q| audio_late_at(&s, 45.0, 240.0, q);
+        row(&format!("relay {kbps} legacy"), &s, 30.0, 240.0);
+        eprintln!(
+            "  audio late from onset + 15 s p50/p95/p99/max {}/{}/{}/{} ms, clean p99 {clean} ms; \
+             onset 15 s max {} ms; setpoint writes from onset + 15 s {}; rungs {:?}",
+            late(0.5),
+            late(0.95),
+            late(0.99),
+            late(1.0),
+            audio_late_at(&s, 30.0, 45.0, 1.0),
+            s.setpoints
+                .windows(2)
+                .filter(|w| w[1].0 >= 45.0 && w[1].1 != w[0].1)
+                .count(),
+            s.rungs
+        );
+        if late(0.99) > clean + 40 {
+            bad.push((kbps, late(0.99)));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "(cap, p99 ms) over clean {clean} + 40: {bad:?}"
+    );
+}
+
+/// `QUASAR_WT_AUDIO_PACING=off`: legacy is 0.6.4's sender on the audio rows, nothing paced and the
+/// setpoint left inside the deadband, as at 7b5d81e0 (audio p99 93 and 124 ms at 5 and 2 Mbit/s).
+#[test]
+fn audio_pacing_off_is_the_0_6_4_sender_on_the_audio_rows() {
+    for (kbps, want) in [(5000.0, 93), (2000.0, 124)] {
+        let s = audio_row(Some(kbps), false);
+        let late = audio_late_at(&s, 45.0, 240.0, 0.99);
+        let writes = s
+            .setpoints
+            .windows(2)
+            .filter(|w| w[1].0 >= 45.0 && w[1].1 != w[0].1)
+            .count();
+        eprintln!(
+            "relay {kbps} audio pacing off: audio late p99 {late} ms, setpoint writes {writes}"
+        );
+        assert_eq!(late, want, "{kbps}: p99");
+        assert_eq!(writes, 0, "{kbps}: the setpoint moved inside the deadband");
+    }
+}
+
+/// Review round 3 (S1, #68): on a clean link with a 110 ms delay spike every 7 s (`jitter`) the
+/// default sender moves the setpoint no more than 0.6.4 does: never. A spike's queue drains in
+/// under 0.5 s, so it never stands (`Estimator::legacy_queue`). a6b8def0: 77 writes, down to 7246.
+#[test]
+fn legacy_delay_spikes_on_a_clean_link_move_no_setpoint() {
+    let run = |pacing: bool| {
+        let mut s = Sim::lab_hw(true);
+        s.est.audio_pacing = pacing;
+        s.extra_us = jitter(110);
+        s.run(240.0);
+        let after: Vec<u32> = s
+            .setpoints
+            .iter()
+            .filter(|&&(t, _)| t >= 5.0)
+            .map(|&(_, sp)| sp)
+            .collect();
+        let writes = after.windows(2).filter(|w| w[1] != w[0]).count();
+        (writes, after.iter().copied().min().unwrap_or(0))
+    };
+    let (off, on) = (run(false), run(true));
+    eprintln!("delay spikes: (writes, lowest setpoint) off {off:?}, on {on:?}");
+    assert_eq!(on, off);
+}
+
+/// Per second from `from` to `to`: the sd of the intervals between frames shown (ms) and the frames
+/// shown; each at its p50.
+fn presented(s: &Sim, from: f64, to: f64) -> (f64, f64) {
+    let shown = &s.client.as_ref().unwrap().shown_at;
+    let (mut sds, mut fps) = (Vec::new(), Vec::new());
+    let mut sec = from;
+    while sec + 1.0 <= to {
+        let (lo, hi) = ((sec * 1e6) as u64, ((sec + 1.0) * 1e6) as u64);
+        let gaps: Vec<f64> = shown
+            .windows(2)
+            .filter(|w| (lo..hi).contains(&w[1]))
+            .map(|w| (w[1] - w[0]) as f64 / 1000.0)
+            .collect();
+        let n = gaps.len().max(1) as f64;
+        let mean = gaps.iter().sum::<f64>() / n;
+        sds.push((gaps.iter().map(|g| (g - mean).powi(2)).sum::<f64>() / n).sqrt());
+        fps.push(gaps.len() as f64);
+        sec += 1.0;
+    }
+    let p50 = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v.get(v.len() / 2).copied().unwrap_or(0.0)
+    };
+    (p50(sds), p50(fps))
+}
+
+/// The share of reports from `from` to `to` that left the estimate at its delay bound.
+fn delay_bound_share(s: &Sim, from: f64, to: f64) -> f64 {
+    let at: Vec<bool> = s
+        .delay_bound
+        .iter()
+        .filter(|&&(t, _)| (from..to).contains(&t))
+        .map(|&(_, d)| d)
+        .collect();
+    at.iter().filter(|&&d| d).count() as f64 / at.len().max(1) as f64
 }

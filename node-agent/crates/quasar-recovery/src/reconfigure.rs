@@ -193,6 +193,14 @@ fn apply_fields(
 ) -> Result<Inputs, String> {
     let mut after = before.clone();
     for (key, value) in changes {
+        // An unknown agent variable in the saved state (a later release's, #1667) can be
+        // unset but never set: the only way to take it out of a machine this actor can't run.
+        if opt(value).is_none()
+            && !recipe::is_agent_variable(key)
+            && after.agent_variables.remove(key).is_some()
+        {
+            continue;
+        }
         if recipe::is_agent_variable(key) {
             if role == MachineRole::ControlOnly {
                 return Err(format!(

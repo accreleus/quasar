@@ -90,6 +90,11 @@
     "deploy/patches/vulkan/vulkanh265enc-radv-coded-height.patch",
     "deploy/patches/vulkan/vulkanav1enc-exact-frame-size.patch",
     "deploy/patches/vulkan/vulkanav1enc-min-qindex.patch",
+    "deploy/patches/vulkan/vulkanav1enc-ref-recovery.patch",
+    "deploy/patches/vulkan/vkh264enc-ref-recovery.patch",
+    "deploy/patches/vulkan/vulkanh265enc-ref-recovery.patch",
+    "deploy/patches/vulkan/gstreamer-nvenc-ref-recovery.patch",
+    "deploy/patches/vulkan/vkh264enc-non-ref-p.patch",
     "deploy/patches/vulkan/gstreamer-webrtc-stats-rtpsession-leak.patch"
   ],
   "fork_carried_provenance": {

@@ -1,5 +1,5 @@
 diff --git a/subprojects/gst-plugins-bad/ext/vulkan/base/gsth265encoder.c b/subprojects/gst-plugins-bad/ext/vulkan/base/gsth265encoder.c
-index 196d986..3843f41 100644
+index 196d986..df7518b 100644
 --- a/subprojects/gst-plugins-bad/ext/vulkan/base/gsth265encoder.c
 +++ b/subprojects/gst-plugins-bad/ext/vulkan/base/gsth265encoder.c
 @@ -45,6 +45,7 @@
@@ -313,7 +313,26 @@ index 196d986..3843f41 100644
    if (h264_frame->type.is_ref) {
      unused_ref =
          gst_h265_encoder_find_unused_reference_frame (self, h264_frame);
-@@ -2421,6 +2653,36 @@ gst_h265_encoder_handle_frame (GstVideoEncoder * encoder,
+@@ -1640,10 +1872,16 @@ gst_h265_encoder_finish_last_frame (GstH265Encoder * self)
+   frame = g_queue_pop_head (&priv->output_list);
+   system_frame_number = frame->system_frame_number;
+ 
+-  gst_video_codec_frame_unref (frame);
+-
+   ret = gst_h265_encoder_finish_frame (self, frame);
+ 
++  /* Reference recovery: the reference list keeps this codec frame for as long
++   * as it is the chain picture or an anchor, and the codec frame owns its input
++   * buffer. Finished, the input is no longer needed (the meta copy happened in
++   * gst_video_encoder_finish_frame()), so let upstream recycle it, as
++   * gstav1encoder.c does. */
++  gst_buffer_replace (&frame->input_buffer, NULL);
++  gst_video_codec_frame_unref (frame);
++
+   if (ret != GST_FLOW_OK) {
+     GST_DEBUG_OBJECT (self, "fails to push one buffer, system_frame_number "
+         "%d: %s", system_frame_number, gst_flow_get_name (ret));
+@@ -2421,6 +2659,36 @@ gst_h265_encoder_handle_frame (GstVideoEncoder * encoder,
        gst_h265_encoder_frame_unref);
    gst_h265_encoder_push_dts (self, frame);
  
@@ -350,7 +369,7 @@ index 196d986..3843f41 100644
    if (klass->new_output) {
      ret = klass->new_output (self, frame, h264_frame);
      if (ret != GST_FLOW_OK)
-@@ -2498,6 +2760,24 @@ error_push_buffer:
+@@ -2498,6 +2766,24 @@ error_push_buffer:
    }
  }
  
@@ -375,7 +394,7 @@ index 196d986..3843f41 100644
  static gboolean
  gst_h265_encoder_flush (GstVideoEncoder * encoder)
  {
-@@ -2535,6 +2815,7 @@ gst_h265_encoder_init (GstH265Encoder * self)
+@@ -2535,6 +2821,7 @@ gst_h265_encoder_init (GstH265Encoder * self)
  
    priv->config.max_num_reference_list0 = 1;
    priv->config.max_num_reference_list1 = 0;
@@ -383,7 +402,7 @@ index 196d986..3843f41 100644
    priv->config.preferred_output_delay = 0;
  
    priv->ref_list0 = g_array_sized_new (FALSE, TRUE,
-@@ -2582,6 +2863,9 @@ gst_h265_encoder_get_property (GObject * object, guint property_id,
+@@ -2582,6 +2869,9 @@ gst_h265_encoder_get_property (GObject * object, guint property_id,
      case PROP_B_PYRAMID:
        g_value_set_boolean (value, priv->prop.b_pyramid);
        break;
@@ -393,7 +412,7 @@ index 196d986..3843f41 100644
      default:
        G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
        break;
-@@ -2618,6 +2902,9 @@ gst_h265_encoder_set_property (GObject * object, guint property_id,
+@@ -2618,6 +2908,9 @@ gst_h265_encoder_set_property (GObject * object, guint property_id,
        priv->prop.b_pyramid = g_value_get_boolean (value);
        g_atomic_int_set (&priv->need_configure, TRUE);
        break;
@@ -403,7 +422,7 @@ index 196d986..3843f41 100644
      default:
        G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
        break;
-@@ -2643,6 +2930,7 @@ gst_h265_encoder_class_init (GstH265EncoderClass * klass)
+@@ -2643,6 +2936,7 @@ gst_h265_encoder_class_init (GstH265EncoderClass * klass)
    encoder_class->handle_frame =
        GST_DEBUG_FUNCPTR (gst_h265_encoder_handle_frame);
    encoder_class->flush = GST_DEBUG_FUNCPTR (gst_h265_encoder_flush);
@@ -411,7 +430,7 @@ index 196d986..3843f41 100644
    encoder_class->finish = GST_DEBUG_FUNCPTR (gst_h265_encoder_finish);
  
    klass->negotiate = GST_DEBUG_FUNCPTR (gst_h265_encoder_negotiate_default);
-@@ -2721,6 +3009,20 @@ gst_h265_encoder_class_init (GstH265EncoderClass * klass)
+@@ -2721,6 +3015,20 @@ gst_h265_encoder_class_init (GstH265EncoderClass * klass)
        "Enable the b-pyramid reference structure in the GOP",
        H265ENC_B_PYRAMID_DEFAULT, param_flags);
  
@@ -432,7 +451,7 @@ index 196d986..3843f41 100644
    g_object_class_install_properties (object_class, N_PROPERTIES, properties);
  
    gst_type_mark_as_plugin_api (GST_TYPE_H265_ENCODER, 0);
-@@ -2748,6 +3050,29 @@ gst_h265_encoder_set_max_num_references (GstH265Encoder * self, guint list0,
+@@ -2748,6 +3056,29 @@ gst_h265_encoder_set_max_num_references (GstH265Encoder * self, guint list0,
    priv->config.max_num_reference_list1 = list1;
  }
  
@@ -516,7 +535,7 @@ index 3762569..804ffb1 100644
 +
  G_END_DECLS
 diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c
-index 26719ae..a853826 100644
+index 26719ae..86f5068 100644
 --- a/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c
 +++ b/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c
 @@ -1092,6 +1092,12 @@ gst_vulkan_h265_encoder_new_sequence (GstH265Encoder * encoder,
@@ -581,6 +600,25 @@ index 26719ae..a853826 100644
  
    vk_frame->h265pic_info = (StdVideoEncodeH265PictureInfo) {
      .flags = {
+@@ -2222,6 +2239,18 @@ gst_vulkan_h265_encoder_encode_frame (GstH265Encoder * base,
+     GST_ERROR_OBJECT (self, "Encode frame error");
+     return GST_FLOW_ERROR;
+   }
++
++  /* Reference recovery: release the input image now, as vulkanav1enc does.
++   * The encode is synchronous and later frames code from this picture's DPB
++   * slot, never its source image; held until the picture leaves the reference
++   * list, the anchors and the chain picture pin that many upstream buffers and
++   * starve a fixed ring in front of the encoder (vulkanscale's 4 slots after a
++   * resolution step). picture_clear() unrefs img_view, so it takes a DPB ref. */
++  gst_clear_buffer (&vk_frame->picture.in_buffer);
++  gst_vulkan_image_view_unref (vk_frame->picture.img_view);
++  vk_frame->picture.img_view =
++      gst_vulkan_image_view_ref (vk_frame->picture.dpb_view);
++
+   return GST_FLOW_OK;
+ }
+ 
 diff --git a/subprojects/gst-plugins-bad/tests/check/libs/vkvideoencodeh265anchors.c b/subprojects/gst-plugins-bad/tests/check/libs/vkvideoencodeh265anchors.c
 new file mode 100644
 index 0000000..4fa3068

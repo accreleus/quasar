@@ -376,8 +376,9 @@ def check_h264(pk, recov, anchors, nvenc=False):
             check(active_l0(pk[i], pk[0]) == 1,
                   f"recovery frame {i} has {active_l0(pk[i], pk[0])} active references")
         return
-    check(first(pk[0], "gaps_in_frame_num_allowed_flag") == 1,
-          "SPS does not allow frame_num gaps")
+    # 1 makes a decoder invent frames for the lost run, and Mesa VA-API then fails the recovery frame
+    check(first(pk[0], "gaps_in_frame_num_allowed_flag") == 0,
+          "SPS allows frame_num gaps")
     lt_idx = {}
     for i in anchors:
         ops = all_of(pk[i], "memory_management_control_operation[")

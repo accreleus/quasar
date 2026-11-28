@@ -624,6 +624,65 @@ fn agent_variables_from_the_seed_reach_the_agent_and_a_reconfigure_moves_only_th
     m.never_a_migration("agent variables");
 }
 
+/// #1667: a machine state carrying an agent variable this actor does not know (a later
+/// release's, the revert case) applies without it, keeps it in the state, can have it unset
+/// by a reconfigure, and still refuses to be given a new unknown one.
+#[test]
+fn an_unknown_agent_variable_in_the_state_is_skipped_and_can_be_unset() {
+    let m = Machine::install(combined_env());
+    let fixture: serde_json::Value =
+        serde_json::from_slice(
+            &std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                "../../../testdata/recovery/recipes/machine-state-unknown-agent-variable.json",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+    let path = m.dir.path().join("machine.json");
+    let mut machine: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    machine["inputs"]["agent_variables"] = fixture["agent_variables"].clone();
+    std::fs::write(&path, serde_json::to_vec(&machine).unwrap()).unwrap();
+
+    let actor = m.actor();
+    let (_, result) = run(&actor, changes(&[("QUASAR_ENCODER", "va")]));
+    assert_eq!(result.state, State::Succeeded, "{}", result.output);
+    let agent = m.agent();
+    assert_eq!(env(&agent, "QUASAR_ABR_MODE"), "protective");
+    assert!(!agent.spec.env.keys().any(|k| k.contains("LATER_RELEASE")));
+    assert_eq!(
+        m.inputs()["agent_variables"]["QUASAR_FROM_A_LATER_RELEASE"],
+        "1"
+    );
+
+    let refused = actor
+        .reconfigure(changes(&[("QUASAR_NEW_UNKNOWN", "1")]))
+        .expect_err("a new unknown variable");
+    assert!(
+        refused.message.contains("QUASAR_NEW_UNKNOWN"),
+        "{}",
+        refused.message
+    );
+
+    // Unsetting a variable the agent never saw changes nothing it runs: no replacement.
+    let plan = actor
+        .reconfigure(changes(&[
+            ("QUASAR_FROM_A_LATER_RELEASE", ""),
+            ("QUASAR_ALSO_FROM_A_LATER_RELEASE", ""),
+        ]))
+        .expect("admitted");
+    assert!(
+        plan.request_id.is_none() && plan.replaced.is_empty(),
+        "{plan:?}"
+    );
+    let vars = m.inputs()["agent_variables"].clone();
+    assert_eq!(
+        vars,
+        serde_json::json!({"QUASAR_ABR_MODE": "protective", "QUASAR_ENCODER": "va"})
+    );
+    m.never_a_migration("agent variables");
+}
+
 #[test]
 fn the_rtp_mtu_is_an_agent_variable_a_reconfigure_sets() {
     let m = Machine::install(combined_env());
