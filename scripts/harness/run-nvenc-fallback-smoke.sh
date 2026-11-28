@@ -453,7 +453,7 @@ else
   fi
 
   TEARDOWN_LOG_FILE="$(mktemp "${TMPDIR:-/tmp}/nvenc-fallback-teardown-log.XXXXXX")"
-  docker logs "$AGENT_CONTAINER" --since "$TEARDOWN_AT" 2>&1 > "$TEARDOWN_LOG_FILE" || true
+  docker logs "$AGENT_CONTAINER" --since "$TEARDOWN_AT" > "$TEARDOWN_LOG_FILE" 2>&1 || true
   if grep -qiE 'segv|libnvcuvid|glib-.*-critical|panicked at' "$TEARDOWN_LOG_FILE"; then
     fail "G3c: #489 signature (SIGSEGV/libnvcuvid/GLib-CRITICAL/panic) found in $AGENT_CONTAINER log during teardown window — $(grep -iE 'segv|libnvcuvid|glib-.*-critical|panicked at' "$TEARDOWN_LOG_FILE" | head -1)"
   else
