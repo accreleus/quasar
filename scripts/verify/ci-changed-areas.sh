@@ -13,7 +13,7 @@
 #
 #   go    control-plane/**  protocol  testdata/**  deploy/**  docs/session-trace/**
 #         web/index.html  web/src/lib/metrics.generated.json
-#   web   web/**  testdata/**  deploy/**  docs/session-trace/**  docs/configuration.md
+#   web   web/**  protocol  testdata/**  deploy/**  docs/session-trace/**  docs/configuration.md
 #         docs/upgrading.md
 #   go    also node-agent/crates/quasar-recovery/src/journal.rs (OUTPUT_LIMIT vs migration 0075)
 #   go    scripts/harness/udprelay/*  (the UDP-relay is its own module; CI vets + tests it)
@@ -41,7 +41,7 @@ while IFS= read -r p; do
     docs/session-trace/*) go=true web=true rust=true ;;
     docs/configuration.md) web=true rust=true ;;
     docs/upgrading.md) web=true ;;
-    protocol|protocol/*) go=true site=true ;;
+    protocol|protocol/*) go=true web=true site=true ;;
     control-plane/internal/buildinfo/recipe.go) go=true rust=true ;;
     control-plane/*) go=true ;;
     node-agent/crates/quasar-recovery/src/journal.rs) go=true rust=true ;;

@@ -100,6 +100,25 @@ jobs:
             || { echo "::error::ci-changed-areas.sh gave an unusable answer: $out"; exit 1; }
           echo "$out" | tee -a "$GITHUB_OUTPUT"
 
+  # The checks that span areas (scripts/verify/lint.d), so no changed-areas condition: they run
+  # on every pull request and push. A new check is a new file there, not an edit here.
+  lint:
+    name: lint (scripts/verify/lint.d)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: true
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Run the checks
+        run: bash scripts/verify/lint.sh
+
   # The control-plane tests are two jobs, each with its own runner and Postgres (#928): the
   # packages OWN_RUNNER names (`session`, the slowest: about 140 s alone, about twice that
   # sharing a runner), and every other package. Both read the one
@@ -448,7 +467,7 @@ jobs:
       - name: rustfmt
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
       # The virtual input devices against the runner's real kernel uinput: an
@@ -548,6 +567,10 @@ jobs:
         # `known` value is "<target>:<case>=<finding>": the case still runs, reports KNOWN,
         # and fails the job once it passes so the entry is dropped. None today: the
         # runner's Podman 5.7 passes restart, which 4.9 failed (#424, #982).
+        # The empty entry only declares `known`, so the expression below type-checks.
+        include:
+          - target: podman-rootful
+            known: ''
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

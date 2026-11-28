@@ -32,8 +32,8 @@ expect web docs/upgrading.md
 expect rust node-agent/src/main.rs
 expect rust node-agent/Cargo.lock
 expect site site/src/content/docs/index.mdx
-expect go,site protocol
-expect go,site protocol/openapi.yaml
+expect go,web,site protocol
+expect go,web,site protocol/openapi.yaml
 expect go,web web/index.html
 expect go,web web/src/lib/metrics.generated.json
 expect go,web,rust docs/session-trace/metrics.json

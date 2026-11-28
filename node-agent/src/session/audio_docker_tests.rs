@@ -172,8 +172,10 @@ fn pulse_caller_preserves_socket_until_daemon_cleanup_is_known() {
     );
     let peak = captured
         .stdout
-        .chunks_exact(2)
-        .map(|sample| i16::from_le_bytes([sample[0], sample[1]]).unsigned_abs())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|sample| i16::from_le_bytes(*sample).unsigned_abs())
         .max()
         .unwrap_or(0);
     assert!(peak > 1000, "monitor received nonzero tone, peak={peak}");
