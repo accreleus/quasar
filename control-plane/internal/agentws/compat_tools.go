@@ -63,6 +63,9 @@ func (s *agentStore) upsertHostCompatTools(ctx context.Context, hostID string, r
 		before = append(before, k)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM host_compat_tools WHERE host_id = $1::uuid`, hostID); err != nil {
 		return false, err
 	}
