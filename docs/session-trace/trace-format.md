@@ -88,7 +88,7 @@ document records (§8, §9) were estimator confusion, one level apart.
 <!-- GENERATED from docs/session-trace/metrics.json by scripts/dx/gen_trace_docs.py.
      Do not edit between these markers; edit the manifest and run `make docs-trace`. -->
 
-*Manifest version `2026-08-24.1` — 54 curated series of 137 documented keys.*
+*Manifest version `2026-08-24.1` — 54 curated series of 138 documented keys.*
 
 | taxonomy name | source | raw key | unit | clock | window | estimator | n | meaning / the trap it avoids |
 |---|---|---|---|---|---|---|---|---|

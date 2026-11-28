@@ -77,6 +77,9 @@ export class WtTelemetry {
   private fecRepaired = 0;
   /** Amendment 85: the live connection's `hello_ack.fec` named a scheme. */
   private fecOn = false;
+  /** Amendment 100: decoder failures for the page view; posted once a WebCodecs decoder has run. */
+  private decodeErrors = 0;
+  private webCodecs = false;
   private readonly counters: PostedCounters;
   private lostAtTick: number;
   /** PyroWave frame drops counted separately, cumulative for the page view (#1635).
@@ -123,6 +126,12 @@ export class WtTelemetry {
   setCodec(mime: string | null): void {
     this.codec = mime;
     if (mime === "video/pyrowave") this.pyroMeasured = true;
+    else if (mime) this.webCodecs = true;
+  }
+
+  /** The decode stage's running total of failed decoders (amendment 100). */
+  setDecodeErrors(total: number): void {
+    this.decodeErrors = total;
   }
 
   setDecodeFailed(failed: boolean): void {
@@ -363,6 +372,8 @@ export class WtTelemetry {
     put("wt_audio_underruns", this.counters.audioUnderruns);
     // Amendment 85: only while this connection is sent repairs (0 until the first rebuild).
     put("wt_fec_repaired", this.fecOn ? this.fecRepaired : null);
+    // Amendment 100: absent on a PyroWave-only session, which never ran a WebCodecs decoder.
+    put("wt_decode_errors", this.webCodecs ? this.decodeErrors : null);
     // A thin window has no σ: "smooth" there is unmeasured, and posting it would record a pass.
     // Bench mode never posts a class: its readback costs presentations (see the WebRTC twin).
     const unmeasured = health.health === "smooth" && cadence.n < PRESENT_MIN_SAMPLES;

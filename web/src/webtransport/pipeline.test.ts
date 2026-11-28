@@ -660,10 +660,12 @@ describe("DecodeStage", () => {
     const frames: FakeFrame[] = [];
     const keyframes: string[] = [];
     const fatal: string[] = [];
+    const errorTotals: number[] = [];
     const s = new DecodeStage({
       onFrame: (f) => frames.push(f as unknown as FakeFrame),
       requestKeyframe: (r) => keyframes.push(r),
       onFatal: (r) => fatal.push(r),
+      onDecodeError: (n) => errorTotals.push(n),
       createDecoder: (init) => {
         const d = new FakeDecoder(init);
         d.refuseConfigure = opts.refuseConfigure ?? false;
@@ -673,7 +675,7 @@ describe("DecodeStage", () => {
       isConfigSupported: async (c) => ({ supported: true, config: c }),
       now: opts.now ?? (() => 0),
     });
-    return { s, decoders, frames, keyframes, fatal };
+    return { s, decoders, frames, keyframes, fatal, errorTotals };
   }
 
   it("names the H.264 codec from the avcC", () => {
@@ -962,7 +964,7 @@ describe("DecodeStage", () => {
 
   it("logs each decoder failure once, with a running count (#1674)", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const { s, decoders } = stage();
+    const { s, decoders, errorTotals } = stage();
     s.config(config(0));
     await flush();
     s.unit(unit(0, 1, true));
@@ -982,6 +984,7 @@ describe("DecodeStage", () => {
       "webtransport: video decoder restart (decode_error #1):",
       "webtransport: video decoder restart (decode_error #2):",
     ]);
+    expect(errorTotals).toEqual([1, 2]); // the session's wt_decode_errors (amendment 100)
     warn.mockRestore();
   });
 

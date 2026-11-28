@@ -20,6 +20,8 @@ export interface DecodeStageOptions {
   requestKeyframe(reason: KeyframeReason): void;
   /** Terminal: the browser cannot decode this configuration, or the decoder keeps failing. */
   onFatal(reason: DecodeFailure, config: VideoConfig): void;
+  /** Each counted decoder failure, with the stage's running total. */
+  onDecodeError?(total: number): void;
   /** Test seam; the browser's VideoDecoder otherwise. */
   createDecoder?: (init: VideoDecoderInit) => VideoDecoder;
   isConfigSupported?: (config: VideoDecoderConfig) => Promise<VideoDecoderSupport>;
@@ -310,6 +312,7 @@ export class DecodeStage {
     if (this.stopped || !config || this.failed.has(decoder)) return;
     this.failed.add(decoder);
     console.warn(`webtransport: video decoder restart (decode_error #${++this.decodeErrors}):`, err);
+    this.opts.onDecodeError?.(this.decodeErrors);
     if (++this.restarts > MAX_DECODER_RESTARTS) {
       this.fatal("decode_error", config);
       return;
