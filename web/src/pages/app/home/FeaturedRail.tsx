@@ -53,6 +53,8 @@ export interface FeaturedRailProps {
   dimmedIds?: ReadonlySet<string>;
   onOpen: (app: App) => void;
   onPlay: (card: RailCard, app: App) => void;
+  /** The layout section's title: the rail's accessible name (no visible heading in the design). */
+  label?: string;
 }
 
 export function FeaturedRail({
@@ -65,6 +67,7 @@ export function FeaturedRail({
   dimmedIds,
   onOpen,
   onPlay,
+  label,
 }: FeaturedRailProps) {
   const [edges, setEdges] = useState({ prev: false, next: false });
   // The rail's single tab stop. Re-resolved by id every render so a refreshed
@@ -109,7 +112,7 @@ export function FeaturedRail({
   );
 
   return (
-    <div className="home-rail">
+    <div className="home-rail" role={label ? "region" : undefined} aria-label={label}>
       <div className="home-rail-track" ref={trackRef} onScroll={measure}>
         {cards.map((card, i) => {
           const app = appById.get(card.appId);

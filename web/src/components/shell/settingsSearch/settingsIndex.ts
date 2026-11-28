@@ -117,6 +117,7 @@ export const ACCOUNT_SETTINGS: readonly SettingEntry[] = [
     keywords: "hud overlay strip hide always visible never show timeout autohide",
     target: { sel: "#auto-hide", up: ".field" },
   },
+  sec("home", "Home", "home", "home", "home page sections shelves highlights jump back in favourites order layout"),
   sec("appearance", "Appearance", "appearance", "overlay", "layout design look classic old previous new"),
   {
     id: "acct-classic-layout", label: "Classic layout", where: "Appearance", icon: "overlay", to: `${A}/appearance`,

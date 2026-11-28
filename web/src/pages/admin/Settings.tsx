@@ -37,6 +37,7 @@ import { inertReasonCopy } from "./library/sourcesDerived";
 import { InputDefaultRows } from "./settings/InputDefaultRows";
 import { RegionDefaultRows } from "./settings/RegionDefaultRows";
 import { SettingRow } from "./settings/SettingRow";
+import { HomeLayoutEditor } from "../app/home/HomeLayoutEditor";
 import { useSettings } from "./settings/useSettings";
 
 const MIN_INTERVAL_MINUTES = 15;
@@ -219,6 +220,10 @@ export function Settings() {
             <p className="hint mt3">Saved as you change them. A user who set their own value keeps it.</p>
           </>
         )}
+      </SettingsSection>
+
+      <SettingsSection title="Home layout" hint="The Home sections everyone sees, in order, until they set their own">
+        <HomeLayoutEditor scope="/admin/home" />
       </SettingsSection>
 
       <SettingsSection title="Libraries" hint="Discovery of installed titles on your hosts">

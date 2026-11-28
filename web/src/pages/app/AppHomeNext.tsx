@@ -65,6 +65,8 @@ import { useDetailBand } from "./home/useDetailBand";
 import { useHomeKeys } from "./home/useHomeKeys";
 import { useLaunch } from "./home/useLaunch";
 import { FavouritesShelf, JumpBackShelf } from "./home/Shelves";
+import { BUILTIN_HOME, fetchHomeLayout, shownSections } from "./home/homeLayout";
+import { useResource } from "../../lib/resource/react";
 import type { OpenBandState } from "./game/GamePage";
 import "../../styles/home.css";
 import "../../styles/library-new.css";
@@ -119,6 +121,13 @@ export function AppHomeNext() {
     };
   }, [libraryShown]);
   const [mySessions, setMySessions] = useState<Session[]>([]);
+  // Never fails: a 404 (older server) or any error reads as the built-in layout.
+  const homeLayout = useResource({
+    label: "home layout",
+    initialData: BUILTIN_HOME,
+    fetch: ({ token, signal }) => fetchHomeLayout(token, signal),
+  });
+  const sections = useMemo(() => shownSections(homeLayout.data ?? BUILTIN_HOME), [homeLayout.data]);
   const [highlights, setHighlights] = useState<Highlight[]>([]);
   const [stopTarget, setStopTarget] = useState<Session | null>(null);
   const [stopping, setStopping] = useState(false);
@@ -501,6 +510,29 @@ export function AppHomeNext() {
     onPlay: (a: App) => void quickLaunch(a),
   };
 
+  const firstHighlights = sections.find((s) => s.kind === "highlights");
+  const hero = showHero && (
+    <Hero key="hero" hasRail={showRail && Boolean(firstHighlights)}>
+      {showRail && firstHighlights && (
+        <FeaturedRail
+          label={firstHighlights.title}
+          cards={featured}
+          trackRef={railTrackRef}
+          appById={appById}
+          coverClassById={coverClassById}
+          busy={busy}
+          blockedIds={blockedIds}
+          dimmedIds={dimmedIds}
+          onOpen={(app) => (newDesign ? openGamePage(app) : detail.reveal(app, false))}
+          onPlay={(card, app) => {
+            if (card.sessionId) navigate(`/app/session/${card.sessionId}`);
+            else void quickLaunch(app);
+          }}
+        />
+      )}
+    </Hero>
+  );
+
   // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div className="home" data-view={view}>
@@ -515,33 +547,18 @@ export function AppHomeNext() {
           one-shot CSS animation run). Summary/error/stop-modal stay outside
           it — a modal inside an `overflow: clip` box is asking for trouble. */}
       <div className="home-view" key={view} data-enter={enterDir}>
-        {showHero && (
-          <Hero hasRail={showRail}>
-            {showRail && (
-              <FeaturedRail
-                cards={featured}
-                trackRef={railTrackRef}
-                appById={appById}
-                coverClassById={coverClassById}
-                busy={busy}
-                blockedIds={blockedIds}
-                dimmedIds={dimmedIds}
-                onOpen={(app) => (newDesign ? openGamePage(app) : detail.reveal(app, false))}
-                onPlay={(card, app) => {
-                  if (card.sessionId) navigate(`/app/session/${card.sessionId}`);
-                  else void quickLaunch(app);
-                }}
-              />
-            )}
-          </Hero>
-        )}
-
-        {newDesign && view === "home" && !error && (
-          <>
-            <JumpBackShelf apps={apps} tile={shelfTile} />
-            <FavouritesShelf apps={filterLibraryApps(sortedApps, "favourite", "")} tile={shelfTile} />
-          </>
-        )}
+        {!firstHighlights && hero}
+        {sections.map((section) => {
+          // The hero is page chrome: it renders once, at the first highlights
+          // section (or first of all, rail-less, when there is none).
+          if (section.kind === "highlights") return section === firstHighlights && hero;
+          if (!newDesign || view !== "home" || error) return null;
+          return section.kind === "favourites" ? (
+            <FavouritesShelf key={section.id} id={section.id} title={section.title} apps={filterLibraryApps(sortedApps, "favourite", "")} tile={shelfTile} />
+          ) : (
+            <JumpBackShelf key={section.id} id={section.id} title={section.title} apps={apps} tile={shelfTile} />
+          );
+        })}
 
         <LibraryGrid
           view={view}

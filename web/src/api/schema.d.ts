@@ -977,6 +977,110 @@ export interface paths {
         };
         trace?: never;
     };
+    "/v1/me/home": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The caller's effective Home layout (amendment 101, accreleus/quasar#1701).
+         * @description Per-caller, from the bearer identity only; no admin variant. See control-api.md §Home
+         *     layout. The caller's override if set, else the admin default, else the built-in
+         *     default (source says which). Always 200 for an authenticated caller.
+         *
+         *     STRUCTURE ONLY: each section's content still comes from its existing read
+         *     (highlights: /v1/me/highlights; jump_back_in: /v1/me/play-history joined to /v1/apps;
+         *     favourites: /v1/apps favourite=true).
+         *
+         *     CLIENT RULES: skip an unknown kind; skip enabled=false; ignore unknown params keys. A
+         *     404 (an older server) or any other failure renders the built-in default
+         *     (highlights, jump_back_in, favourites, titled "Highlights", "Jump back in",
+         *     "Favourites", all enabled).
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HomeLayout"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+            };
+        };
+        /**
+         * Set the caller's Home layout override, whole (amendment 101).
+         * @description Replaces the caller's override with the body; last write wins. Answers the effective layout, now source=user. A body that breaks any HomeLayoutWrite rule is 400 validation_failed and nothing is written. Top-level keys other than sections are ignored, so the body read from GET may be sent back as is.
+         */
+        put: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["HomeLayoutWrite"];
+                };
+            };
+            responses: {
+                /** @description OK. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HomeLayout"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+            };
+        };
+        post?: never;
+        /**
+         * Clear the caller's Home layout override (amendment 101).
+         * @description Idempotent. Answers the layout the caller now sees: the admin default (source=admin) or the built-in one (source=builtin).
+         */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HomeLayout"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/me/highlights": {
         parameters: {
             query?: never;
@@ -4284,6 +4388,102 @@ export interface paths {
             };
         };
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/home": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The default Home layout every user without an override sees (amendment 101).
+         * @description source=admin when an admin default is set, else source=builtin with the built-in layout. See control-api.md §Home layout.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HomeLayout"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+            };
+        };
+        /**
+         * Set the default Home layout, whole (amendment 101).
+         * @description Replaces the admin default; users' overrides are untouched. Answers source=admin. The HomeLayoutWrite rules apply: 400 validation_failed and nothing written on any break.
+         */
+        put: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["HomeLayoutWrite"];
+                };
+            };
+            responses: {
+                /** @description OK. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HomeLayout"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+            };
+        };
+        post?: never;
+        /**
+         * Clear the default Home layout; users without an override see the built-in one (amendment 101).
+         * @description Idempotent. Answers the built-in layout (source=builtin).
+         */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HomeLayout"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+            };
+        };
         options?: never;
         head?: never;
         patch?: never;
@@ -11786,6 +11986,50 @@ export interface components {
         /** @description Per-user client presentation preferences, synced across that user's devices. One key per client surface so a new surface needs no new endpoint. Unknown top-level keys are preserved through a PATCH. */
         UIPreferences: {
             session_overlay?: components["schemas"]["SessionOverlayPreferences"];
+        };
+        HomeSection: {
+            /** @description Stable name of the section within its layout; unique within the layout. Means nothing beyond identity. */
+            id: string;
+            /**
+             * @description What the section shows. Known today: highlights, jump_back_in, favourites. OPEN on read: a client skips a kind it does not know. A server accepts only kinds it knows on write. May repeat within a layout.
+             * @example highlights
+             * @example jump_back_in
+             * @example favourites
+             */
+            kind: string;
+            /** @description The heading to show, 1-64 Unicode code points, not only whitespace. Shown as given; the accessible name where a client's design has no visible heading for the kind. */
+            title: string;
+            /** @description false keeps the section in the layout but off the page. */
+            enabled: boolean;
+            /** @description Per-kind source parameters. No kind defines any yet, so {} today. A client ignores keys it does not know. */
+            params: {
+                [key: string]: unknown;
+            };
+        };
+        HomeLayout: {
+            /**
+             * @description Which layer this layout came from: the caller's override, the admin default, or the built-in default.
+             * @enum {string}
+             */
+            source: "user" | "admin" | "builtin";
+            /** @description Ordered, top of the page first. */
+            sections: components["schemas"]["HomeSection"][];
+        };
+        HomeSectionWrite: {
+            id: string;
+            /**
+             * @description Closed on write: a server stores only kinds it knows.
+             * @enum {string}
+             */
+            kind: "highlights" | "jump_back_in" | "favourites";
+            title: string;
+            enabled: boolean;
+            /** @description Optional; absent reads back as {}. Only keys defined for the kind are accepted, and none is defined today. */
+            params?: Record<string, never>;
+        };
+        /** @description Whole layout for PUT /v1/me/home and PUT /v1/admin/home. ids unique within the body. Any break is 400 validation_failed and nothing is written. Top-level keys other than sections (source, say) are ignored. */
+        HomeLayoutWrite: {
+            sections: components["schemas"]["HomeSectionWrite"][];
         };
         KeyboardLayout: {
             /** @description One xkeyboard-config layout name, e.g. gb. */

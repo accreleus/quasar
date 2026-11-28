@@ -26,6 +26,7 @@ const JUMP_BACK_SIZE = 10;
 const noRef = () => {};
 
 function Shelf({
+  id,
   kind,
   title,
   count,
@@ -33,6 +34,7 @@ function Shelf({
   tile,
   meta,
 }: {
+  id: string;
   kind: "fav" | "jump";
   title: string;
   count?: number;
@@ -40,7 +42,7 @@ function Shelf({
   tile: ShelfTiles;
   meta?: (app: App) => ReactNode;
 }) {
-  const titleId = `shelf-${kind}-title`;
+  const titleId = `shelf-${id}-title`;
   return (
     <section className={`shelf-${kind}`} aria-labelledby={titleId}>
       <div className="src-head">
@@ -72,12 +74,20 @@ function Shelf({
   );
 }
 
-export function FavouritesShelf({ apps, tile }: { apps: App[]; tile: ShelfTiles }) {
-  if (apps.length === 0) return null;
-  return <Shelf kind="fav" title="Favourites" count={apps.length} apps={apps} tile={tile} />;
+interface ShelfProps {
+  /** The layout section's id and title (control-api.md §Home layout). */
+  id: string;
+  title: string;
+  apps: App[];
+  tile: ShelfTiles;
 }
 
-export function JumpBackShelf({ apps, tile }: { apps: App[]; tile: ShelfTiles }) {
+export function FavouritesShelf({ id, title, apps, tile }: ShelfProps) {
+  if (apps.length === 0) return null;
+  return <Shelf id={id} kind="fav" title={title} count={apps.length} apps={apps} tile={tile} />;
+}
+
+export function JumpBackShelf({ id, title, apps, tile }: ShelfProps) {
   const extras = useLibraryExtras();
   const recent = useMemo(() => {
     if (!extras) return [];
@@ -93,8 +103,9 @@ export function JumpBackShelf({ apps, tile }: { apps: App[]; tile: ShelfTiles })
   const playOf = new Map(recent.map((r) => [r.app.id, r.play]));
   return (
     <Shelf
+      id={id}
       kind="jump"
-      title="Jump back in"
+      title={title}
       apps={recent.map((r) => r.app)}
       tile={tile}
       meta={(app) => {

@@ -13,7 +13,7 @@ const SHORT_CODEC_LABEL: Record<CatalogCodec, string> = {
   h264: "H.264",
 };
 
-function IconArrowUp() {
+export function IconArrowUp() {
   return (
     <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
       <path d="M2.5 7.5L6 4l3.5 3.5" strokeLinecap="round" strokeLinejoin="round" />
@@ -21,7 +21,7 @@ function IconArrowUp() {
   );
 }
 
-function IconArrowDown() {
+export function IconArrowDown() {
   return (
     <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
       <path d="M2.5 4.5L6 8l3.5-3.5" strokeLinecap="round" strokeLinejoin="round" />
