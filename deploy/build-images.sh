@@ -130,11 +130,11 @@
 #
 #   local:<dir>      cache lives in <dir>/<role>. For a dev box or a self-hosted runner
 #                    with a persistent volume.
-#   registry:<prefix> cache lives at <prefix>/<image>:buildcache — the SAME refs
+#   registry:<prefix> cache lives at <prefix>/<image>-cache:buildcache — the SAME refs
 #                    .github/workflows/images.yml already writes today, so CI and a
 #                    dev box warm each other's cache instead of keeping two:
 #                      QUASAR_BUILD_CACHE=registry:ghcr.io/accreleus/quasar
-#                    -> ghcr.io/accreleus/quasar/quasar-node-agent:buildcache, …
+#                    -> ghcr.io/accreleus/quasar/quasar-node-agent-cache:buildcache, …
 #                    Requires a registry login with push rights for cache-mode rw|wo;
 #                    use --cache-mode ro from a fork PR that cannot push.
 #
@@ -381,7 +381,7 @@ if [ "$CACHE_KIND" != off ]; then
       docker buildx inspect "$BUILDX_BUILDER" 2>/dev/null
     else
       docker buildx inspect 2>/dev/null
-    fi | awk -F': *' '/^Driver:/ {print $2; exit}'
+    fi | awk -F': *' '/^Driver:/ && !d {print $2; d=1}'  # read it all: docker exits 255 on a closed pipe
   )"
   [ -n "$BUILDER_DRIVER" ] || die "cannot inspect buildx builder '${BUILDX_BUILDER:-<current>}' — does it exist?"
   case "$BUILD_CACHE_MODE" in
@@ -408,12 +408,12 @@ cache_flags_for() { # cache_flags_for <role>  -> prints one flag per line
       from_spec="type=local,src=$CACHE_TARGET/$role"
       to_spec="type=local,dest=$CACHE_TARGET/$role,mode=max" ;;
     registry)
-      # `<prefix>/<image>:buildcache` — deliberately the SAME refs
+      # `<prefix>/<image>-cache:buildcache` — deliberately the SAME refs
       # .github/workflows/images.yml already writes with docker/build-push-action
-      # (ghcr.io/<repo>/quasar-node-agent:buildcache and friends). Inventing a second
+      # (ghcr.io/<repo>/quasar-node-agent-cache:buildcache and friends). Inventing a second
       # naming scheme would mean CI populates one cache and this script reads
       # another, and neither would ever be warm for the other.
-      local cache_ref="$CACHE_TARGET/$(role_image "$role"):buildcache"
+      local cache_ref="$CACHE_TARGET/$(role_image "$role")-cache:buildcache"
       from_spec="type=registry,ref=$cache_ref"
       to_spec="type=registry,ref=$cache_ref,mode=max" ;;
   esac

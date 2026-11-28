@@ -1,7 +1,12 @@
 name: Images
 
-# Builds and publishes the production container images. Three ways in:
+# Builds and publishes the production container images. Three ways in that publish,
+# and one that only checks:
 #
+#   * A PULL REQUEST into `develop` or `integration/**`: builds the images its changes
+#     affect with deploy/build-images.sh, which validates each against the contract.
+#     It PUBLISHES NOTHING: the `pr-*` jobs (end of file) have a read-only token and
+#     no registry login, and every other job is skipped (`release-gate`).
 #   * MANUAL DISPATCH for a branch (workflow_dispatch → Actions tab → "Images" →
 #     Run workflow): an edge build, published as `sha-*` and `o2-<branch>`.
 #   * AUTOMATIC on a PUSH TO `develop` (#839): the preview build. It publishes
@@ -198,6 +203,11 @@ on:
       - develop
     tags:
       - 'v*'
+  # Never `pull_request_target`: the build runs the pull request's own Dockerfiles.
+  pull_request:
+    branches:
+      - develop
+      - 'integration/**'
 
 concurrency:
   group: images-${{ github.ref }}
@@ -244,6 +254,9 @@ jobs:
   # that (it publishes `sha-*` and `o2-<branch>`, never `:X.Y.Z`).
   release-gate:
     name: release gate (tags only; no-op on a branch)
+    # Every publishing job needs this one, so this skip is what keeps a pull request
+    # from logging in, pushing, tagging or signing anything.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-26.04
     permissions:
       contents: read
@@ -573,8 +586,10 @@ jobs:
               fi
             fi
           else
+            # A pull-request run is listed under its head branch and published nothing.
             prev="$(gh run list --workflow images.yml --branch "$BRANCH" --status success \
-                      --limit 1 --json headSha --jq '.[0].headSha // empty' || true)"
+                      --limit 100 --json headSha,event \
+                      --jq '[.[] | select(.event != "pull_request")][0].headSha // empty' || true)"
             if [ -z "$prev" ]; then why="no previous successful run on $BRANCH: builds everything"
             elif ! git cat-file -e "${prev}^{commit}" 2>/dev/null; then why="previous build commit ${prev:0:7} is not in this checkout: builds everything"
             fi
@@ -1934,3 +1949,88 @@ jobs:
             echo "| quasar-recovery | \`$RECOVERY_DIGEST\` |"
             echo "| release | ${URL:-not published} |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Pull requests: build and validate, publish nothing ─────────────────────
+  #
+  # The only jobs a pull request runs. No registry login and no write scope, so a
+  # fork's run is the same as ours: the base, the toolchain and the build caches
+  # are public and read anonymously. scripts/release/test-release-publication-gate.sh
+  # holds that.
+  pr-inputs:
+    name: PR - which images changed
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      roles: ${{ steps.roles.outputs.roles }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The merge commit and its parents: HEAD^1 is the base branch.
+          fetch-depth: 2
+      - name: Test the input table and the no-publish rule
+        run: |
+          bash scripts/release/test-images-changed.sh
+          bash scripts/release/test-release-publication-gate.sh
+      - name: Decide
+        id: roles
+        run: |
+          set -euo pipefail
+          git diff --name-only --no-renames HEAD^1 HEAD > "$RUNNER_TEMP/changed"
+          out="$(bash scripts/release/images-changed.sh --pr < "$RUNNER_TEMP/changed")"
+          [ "$(grep -c -E '^(control_plane|node_agent|recovery)=(true|false)$' <<<"$out")" -eq 3 ] \
+            || { echo "::error::images-changed.sh gave an unusable answer: $out"; exit 1; }
+          roles="$(sed -n 's/^control_plane=true$/control/p; s/^node_agent=true$/runtime/p; s/^recovery=true$/recovery/p' <<<"$out" \
+                    | jq -Rcn '[inputs]')"
+          echo "roles=$roles" >> "$GITHUB_OUTPUT"
+          echo "images to build: $roles" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  pr-image:
+    name: PR - build and contract (${{ matrix.role }})
+    needs: pr-inputs
+    if: needs.pr-inputs.outputs.roles != '[]'
+    runs-on: ubuntu-26.04
+    # An agent build that has to compile the toolchain in line takes over an hour.
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        role: ${{ fromJSON(needs.pr-inputs.outputs.roles) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # A docker-container builder: the default one cannot read a registry cache.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build and validate with deploy/build-images.sh (nothing is pushed)
+        env:
+          ROLE: ${{ matrix.role }}
+        run: |
+          set -euo pipefail
+          args=("$ROLE" --no-gpu --cache "registry:$REGISTRY_NS" --cache-mode ro)
+          if [ "$ROLE" != recovery ]; then
+            # The same digest-pinned base, and so the same toolchain tag, as a publish.
+            base="$(grep -E '^QUASAR_BASE_IMAGE=' deploy/pins.env | head -1 | cut -d= -f2-)"
+            QUASAR_BASE_DIGEST="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$base")"
+            export QUASAR_BASE_DIGEST
+            args+=(--base-image "${base%:*}@${QUASAR_BASE_DIGEST}")
+          fi
+          if [ "$ROLE" = runtime ]; then
+            toolchain="$REGISTRY_NS/quasar-gst-toolchain:$(bash deploy/toolchain-hash.sh)"
+            if docker manifest inspect "$toolchain" >/dev/null; then
+              args+=(--toolchain registry --toolchain-registry "$REGISTRY_NS")
+            else
+              echo "::warning::$toolchain is not published (this pull request changes a pin, a patch or the toolchain stage, or the base moved): compiling it in line"
+              sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+            fi
+          fi
+          bash deploy/build-images.sh "${args[@]}"
+      - name: Disk after the build
+        if: always()
+        run: df -h /

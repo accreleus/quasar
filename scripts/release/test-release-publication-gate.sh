@@ -59,6 +59,31 @@ print('PASS release and preview publication wait for every validated, promoted r
 # The Compose updater retired with #367; its lane must not come back.
 assert not any(j.endswith('-updater') for j in graph), 'an updater lane is back in images.yml'
 
+# A pull request publishes nothing: release-gate is skipped on it, every job but the
+# pr-* ones needs release-gate (with no status function that would run it anyway), and
+# the pr-* jobs hold no write scope, credential or push.
+assert 'pull_request_target:' not in text, 'images.yml must never run on pull_request_target'
+jobs = text.split('\njobs:\n', 1)[1]
+code = {j: re.sub(r'^\s*#.*$', '', b, flags=re.M)
+        for j, b in re.findall(r'^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)', jobs, re.M | re.S)}
+assert {'release-gate', 'promote', 'pr-inputs', 'pr-image'} <= set(code), 'job parse is incomplete'
+assert re.search(r"^    if: github\.event_name != 'pull_request'$", code['release-gate'], re.M), \
+    'release-gate is not skipped on a pull request'
+
+def needs_gate(job):
+    return job == 'release-gate' or any(needs_gate(p) for p in graph[job])
+
+for job, body in code.items():
+    if job.startswith('pr-'):
+        bad = re.search(r':\s*write\b|login-action|docker login|secrets\.|github\.token|--push|push[:=]\s*true|imagetools create', body)
+        assert not bad, f'{job} can publish: {bad.group(0)}'
+        assert re.search(r'^    permissions:\n      contents: read\n    (?! )', body, re.M), f'{job} is not read-only'
+    else:
+        assert needs_gate(job), f'{job} runs on a pull request: it does not need release-gate'
+        assert not re.search(r'^    if:.*(?:always\(|failure\(|cancelled\()', body, re.M), f'{job} runs even when skipped upstream'
+assert 'select(.event != "pull_request")' in blocks['inputs'], 'a pull-request run can become a dispatch diff base'
+print('PASS a pull request publishes nothing')
+
 # The preview tag only moves forward (#839): the rules live in preview-rules.sh
 # (test-preview-rules.sh); here, only that the workflow still calls them.
 inputs = blocks['inputs']

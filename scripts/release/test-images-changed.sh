@@ -47,6 +47,14 @@ expect cp,na,rec .dockerignore
 expect cp,na,rec .github/workflows/images.yml
 expect cp,na,rec web/a.ts node-agent/b.rs
 expect cp,na control-plane/a.go deploy/Dockerfile.vulkan
+# --pr adds what judges or drives a pull request's build; the publish decision does not move.
+for p in deploy/image-contract.json deploy/validate-image.sh deploy/build-images.sh deploy/lib/pins.sh deploy/toolchain-hash.sh; do
+  expect - "$p"
+  out="$(printf '%s\n' "$p" | bash "$gate" --pr)"
+  [ "$(grep -c '=true' <<<"$out")" -eq 3 ] || fail "--pr [$p] -> $out, want all three"
+done
+out="$(printf '%s\n' docs/a.md | bash "$gate" --pr)"
+[ "$(grep -c '=false' <<<"$out")" -eq 3 ] || fail "--pr builds for a docs change: $out"
 bash "$gate" --all </dev/null 2>/dev/null && fail "an unknown flag must be refused"
 
 # The script must say all three, well-formed: the workflow reads "any =true" from it, so a
