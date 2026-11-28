@@ -93,7 +93,7 @@ func TestHTTPUIPreferences(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest || errCode(body) != "validation_failed" {
 		t.Fatalf("bad enum PATCH = %d %v, want 400 validation_failed", resp.StatusCode, body)
 	}
-	resp, body = get(t, srv.URL+"/v1/me/ui-preferences", token)
+	_, body = get(t, srv.URL+"/v1/me/ui-preferences", token)
 	overlay, _ = body["session_overlay"].(map[string]any)
 	if len(overlay) != 0 {
 		t.Fatalf("rejected PATCH persisted state: %v", overlay)

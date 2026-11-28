@@ -16,7 +16,7 @@ func TestParseTrimsURLsItStores(t *testing.T) {
 	}
 	want := []string{"turn:relay.example.net:3478", "stuns:stun.example.net:5349"}
 	for i, w := range want {
-		if got := servers[i%1].URLs[i]; got != w {
+		if got := servers[0].URLs[i]; got != w {
 			t.Errorf("URL %d = %q, want %q (stored value must be trimmed)", i, got, w)
 		}
 	}

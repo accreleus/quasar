@@ -75,6 +75,7 @@ func settingsAuditRows(t *testing.T, pool *pgxpool.Pool) []struct {
 		must(t, rows.Scan(&r.Actor, &r.Action, &r.TargetType, &r.Details))
 		out = append(out, r)
 	}
+	must(t, rows.Err())
 	return out
 }
 

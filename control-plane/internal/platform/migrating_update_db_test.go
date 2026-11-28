@@ -56,6 +56,9 @@ func applyAudit(t *testing.T, h *fleetHarness, runRelease string) []map[string]a
 		}
 		out = append(out, d)
 	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
 	return out
 }
 

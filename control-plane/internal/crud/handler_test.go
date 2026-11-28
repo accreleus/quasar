@@ -272,7 +272,7 @@ func TestAppsCRUD(t *testing.T) {
 	}
 
 	// GET /v1/apps after disabling (disabled apps hidden from the library).
-	resp, body = getReq(t, srv.URL+"/v1/apps", userTok.Plaintext)
+	_, body = getReq(t, srv.URL+"/v1/apps", userTok.Plaintext)
 	items = body["items"].([]any)
 	if len(items) != 0 {
 		t.Fatalf("list after disable: want 0, got %d", len(items))

@@ -129,6 +129,7 @@ func tokenRows(t *testing.T, pool *pgxpool.Pool, sessionID string) map[string][]
 		must(t, rows.Scan(&kind, &hash))
 		out[kind] = append(out[kind], hash)
 	}
+	must(t, rows.Err())
 	return out
 }
 

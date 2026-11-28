@@ -252,9 +252,8 @@ func patchRaw(t *testing.T, pool *pgxpool.Pool, body string) (int, string) {
 	must(t, err)
 	authHandler := auth.NewHandler(authSvc)
 	email := "storage-admin@t.local"
-	if _, err := authSvc.Register(ctx, email, "storageadmin", "password12345"); err != nil {
-		// Already registered by an earlier call in this test's subtests — fine.
-	}
+	// The error is ignored: an earlier call in this test's subtests may have registered it.
+	_, _ = authSvc.Register(ctx, email, "storageadmin", "password12345")
 	must(t, execT(ctx, pool, `UPDATE users SET role='admin' WHERE email=$1`, email))
 	tok, err := authSvc.Login(ctx, email, "password12345", "test")
 	must(t, err)

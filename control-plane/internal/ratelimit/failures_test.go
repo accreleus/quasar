@@ -52,8 +52,10 @@ func TestFailureLimiterStateIsBounded(t *testing.T) {
 
 func TestFailureLimiterBoundsInFlightHandshakes(t *testing.T) {
 	l := NewFailureLimiter(10, time.Minute, 8)
-	if !l.Reserve("a", 2, 3) || !l.Reserve("a", 2, 3) {
-		t.Fatal("initial per-key reservations rejected")
+	for range 2 {
+		if !l.Reserve("a", 2, 3) {
+			t.Fatal("initial per-key reservations rejected")
+		}
 	}
 	if l.Reserve("a", 2, 3) {
 		t.Fatal("per-key in-flight limit bypassed")
@@ -79,8 +81,10 @@ func TestFailureLimiterBoundsInFlightHandshakes(t *testing.T) {
 
 func TestForgetPreservesConcurrentReservations(t *testing.T) {
 	l := NewFailureLimiter(10, time.Minute, 8)
-	if !l.Reserve("shared", 2, 4) || !l.Reserve("shared", 2, 4) {
-		t.Fatal("reserve")
+	for range 2 {
+		if !l.Reserve("shared", 2, 4) {
+			t.Fatal("reserve")
+		}
 	}
 	l.Failure("shared")
 	l.Forget("shared")

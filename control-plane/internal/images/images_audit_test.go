@@ -25,6 +25,7 @@ func imageAuditActions(t *testing.T, pool *pgxpool.Pool) []string {
 		mustT(t, rows.Scan(&a))
 		out = append(out, a)
 	}
+	mustT(t, rows.Err())
 	return out
 }
 

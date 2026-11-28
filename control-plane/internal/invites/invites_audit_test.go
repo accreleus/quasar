@@ -53,6 +53,9 @@ func activityRows(t *testing.T, pool *pgxpool.Pool) []struct {
 		}
 		out = append(out, r)
 	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
 	return out
 }
 

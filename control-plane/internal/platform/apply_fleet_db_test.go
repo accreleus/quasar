@@ -618,6 +618,9 @@ func sessionStates(t *testing.T, pool *pgxpool.Pool) []string {
 		}
 		out = append(out, s)
 	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
 	return out
 }
 
