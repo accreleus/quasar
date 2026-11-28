@@ -379,6 +379,7 @@ services:
       QUASAR_WT_PORT: ${QUASAR_WT_PORT:-4433}
       QUASAR_WT_UNAUTH_PER_SOURCE: ${QUASAR_WT_UNAUTH_PER_SOURCE:-4}
       # Opt-in sender features (docs/configuration.md): v2 capacity, reference recovery, non-reference P.
+      QUASAR_WT_AUDIO_PACING: ${QUASAR_WT_AUDIO_PACING:-on}
       QUASAR_WT_CAPACITY: ${QUASAR_WT_CAPACITY:-legacy}
       QUASAR_WT_REF_RECOVERY: ${QUASAR_WT_REF_RECOVERY:-off}
       QUASAR_NON_REF_P: ${QUASAR_NON_REF_P:-0}

@@ -697,12 +697,15 @@ RUN find /opt/gst -name '*.a' -delete \
 # library is a .so, and nothing else here depends on this layer.
 ARG PYROWAVE_REF
 ARG GRANITE_REF
+# Vendored Granite patch (#1663), applied after the GRANITE_REF check: see deploy/patches/pyrowave/.
+COPY deploy/patches/pyrowave/*.patch /tmp/pyrowave-patches/
 RUN set -eu; \
     git clone https://github.com/Themaister/pyrowave.git /opt/pyrowave \
     && cd /opt/pyrowave \
     && git checkout ${PYROWAVE_REF} \
     && bash checkout_granite.sh \
     && [ "$(git -C Granite rev-parse HEAD)" = "${GRANITE_REF}" ] \
+    && for p in /tmp/pyrowave-patches/*.patch; do git -C Granite apply -v "$p"; done \
     && cmake -S . -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/opt/gst \

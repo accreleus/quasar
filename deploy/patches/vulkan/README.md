@@ -1561,9 +1561,14 @@ decodes silently wrong on hardware):
   receives and the anchor stays held for a second recovery. Anchors 128 or more frames old count
   as gone (relative order hints only reach 127 frames back), so a recovery from one is a key
   frame.
-- **H.264** (`gsth264encoder.c`, `vkh264enc.c`): the SPS sets
-  `gaps_in_frame_num_value_allowed_flag`, `max_num_ref_frames = num-anchors + 1` and two more POC
-  LSB bits. An anchor marks itself long-term in its own slice header (MMCO 4, 1, 6); a reference
+- **H.264** (`gsth264encoder.c`, `vkh264enc.c`): the SPS sets `max_num_ref_frames = num-anchors + 1`
+  and two more POC LSB bits, and keeps `gaps_in_frame_num_value_allowed_flag` 0. With it 1, a
+  decoder fills the lost run with invented frames (Chromium's stateless decoder does, as the
+  spec says), and Mesa's VA-API decoder (radeonsi, measured on the AMD host) fails every
+  recovery frame whose reference list holds one, so Chrome restarts the decoder and asks for a
+  key frame. With 0, Chromium ignores the gap and the recovery frame decodes; software decode (ffmpeg) is
+  bit-identical either way (measured), and VideoToolbox decoded it in the 0.6.4 spike. ffmpeg's
+  own VA-API path fills gaps itself and fails on radeonsi with either value. An anchor marks itself long-term in its own slice header (MMCO 4, 1, 6); a reference
   to a long-term picture is named by `ref_pic_list_modification` idc 2. A short-term picture is
   never referenced across a `frame_num` gap. The patch also makes `vkh264enc.c` pass the MMCO
   opcode, the list-modification flags and `long_term_pic_num` to Vulkan, which it dropped. That
@@ -1594,6 +1599,16 @@ the level the stream gets without them (or the negotiated one), capped at the dr
 
 The level follows the frame rate too (1080p30: H.264 4, still 2; HEVC 4, still 4). AV1 levels do
 not bound references (eight VBI slots at every level). The encoder logs every clamp.
+
+Input buffers. A held picture is referenced through its DPB slot, never its source image, so
+each encoder drops a frame's input buffer once it is encoded and finished (`vkh264enc.c` /
+`vkh265enc.c` after `gst_vulkan_encoder_encode()`, `gsth264encoder.c` / `gsth265encoder.c` in
+`finish_last_frame()`; `vulkanav1enc.patch` already did this for AV1). Held for as long as the
+picture was, the chain picture and the anchors pinned `num-anchors + 1` upstream buffers, and
+`vulkanscale`'s fixed 4-slot ring, which feeds the encoder after a resolution rung step, ran dry:
+the session failed within a second and a half of its first rung step (0.6.5, NVIDIA host).
+GPU test: `session::pipeline::ref_recovery::tests::anchors_hold_no_input_buffer` (ignored; run it
+in the dev image on a host with a Vulkan encoder).
 
 Tests without a GPU: `tests/check/libs/vkvideoencodeav1refs.c` (new cases),
 `vkvideoencodeh264anchors.c`, `vkvideoencodeh265anchors.c`. With a GPU:

@@ -43,8 +43,10 @@ export const MEDIA_SILENCE_MS = 5_000;
 /** The longest a keyframe wait may last, however slow the path: a connection that never shows a
  *  picture must still end (#1426). */
 export const KEY_WAIT_MAX_MS = 30_000;
-/** Seconds in a row the reordering rule must hold (#1330). */
+/** Seconds the reordering rule must hold within the last REORDER_WINDOW_S (#1330, #1446: a link that
+ *  damages 9 seconds apart, never 3 in a row, never fell back). */
 export const REORDER_DAMAGE_S = 3;
+export const REORDER_WINDOW_S = 5;
 /** The mime form telemetry's negotiatedCodec uses, from the hello_ack's wire codec. */
 const CODEC_MIME: Record<string, string> = { h264: "video/H264", h265: "video/H265", av1: "video/AV1", pyrowave: "video/pyrowave" };
 /** The failure card's sentence for a failure that stops the view. Every other failure falls back
@@ -190,9 +192,10 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
   let pong: { at: number; rttMs: number } | null = null;
   /** When this connection first showed a picture; null until it has. */
   let shownAt: number | null = null;
-  /** Keyframe requests sent since the last `second`, and the seconds in a row the reorder rule held. */
+  /** Keyframe requests sent since the last `second`, and the last REORDER_WINDOW_S seconds: what the
+   *  reorder rule saw in each, null where it did not hold. */
   let keyAsks = 0;
-  let reorderRun: string[] = [];
+  let reorderSeconds: (string | null)[] = [];
   /** When the last tick ran; null until ticking starts (connecting is not a stall). */
   let lastTickAt: number | null = null;
 
@@ -503,7 +506,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
 
   /** #1330: Chrome discards the datagrams a reordering path delivers late, so there frames are lost
    *  for good. The view leaves WebTransport, without the reconnect (the same path loses the same
-   *  way), only when that damages the picture: in each of REORDER_DAMAGE_S seconds running, the
+   *  way), only when that damages the picture: in REORDER_DAMAGE_S of the last REORDER_WINDOW_S seconds, the
    *  reorder window's gate of lateness AND a keyframe asked for, i.e. a frame given up. Loss that
    *  NACK or FEC repaired asks for none. Not before this connection has shown a picture for
    *  MEDIA_SILENCE_MS, nor in a hidden tab. Both counts cover the same second, between two calls. */
@@ -514,9 +517,10 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     const counts =
       shownAt !== null && now - shownAt >= MEDIA_SILENCE_MS && document.visibilityState === "visible" &&
       late >= REORDER_MIN_SAMPLES && asks > 0;
-    reorderRun = counts ? [...reorderRun, `${late} late ${asks} kf`] : [];
+    reorderSeconds = [...reorderSeconds, counts ? `${late} late ${asks} kf` : null].slice(-REORDER_WINDOW_S);
+    const damaged = reorderSeconds.filter((d) => d !== null);
     // The per-second numbers go into the cause, which fail() logs once.
-    if (reorderRun.length >= REORDER_DAMAGE_S) fail("stream_lost", false, undefined, `reorder: ${reorderRun.join(", ")}`);
+    if (damaged.length >= REORDER_DAMAGE_S) fail("stream_lost", false, undefined, `reorder: ${damaged.join(", ")}`);
   }
 
   /** ?bench=1 only: the marker is read off the frame about to be presented, at its own size, before
@@ -668,7 +672,7 @@ export function createWebTransportRuntime(cfg: WebTransportRuntimeConfig): Sessi
     pong = null;
     shownAt = null;
     keyAsks = 0;
-    reorderRun = [];
+    reorderSeconds = [];
     startInput(t);
     if (timer === null) {
       telemetry.startWindow();

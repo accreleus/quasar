@@ -1733,11 +1733,12 @@ async fn governed_agent(stream: Stream) -> Agent {
                 floor_kbps: Box::new(|| 4000.0),
                 setpoint_kbps: Box::new(|| 0.0),
                 capacity: crate::session::settings::WtCapacity::V2,
+                audio_pacing: true,
                 retargets: true,
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
-                observe: Box::new(|_, _| {}),
+                observe: Box::new(|_, _, _| {}),
                 held: Box::new(|_| {}),
                 fec: Box::new(|_| {}),
             })
@@ -2273,11 +2274,12 @@ async fn feedback_while_pyrowave_is_active_feeds_no_estimate() {
                 floor_kbps: Box::new(|| 500.0),
                 setpoint_kbps: Box::new(|| 0.0),
                 capacity: crate::session::settings::WtCapacity::V2,
+                audio_pacing: true,
                 retargets: true,
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
-                observe: Box::new(move |_, _| {
+                observe: Box::new(move |_, _, _| {
                     count.fetch_add(1, Ordering::SeqCst);
                 }),
                 held: Box::new(|_| {}),
@@ -2373,11 +2375,12 @@ async fn audio_alone_never_moves_the_video_estimate() {
             floor_kbps: Box::new(|| 500.0),
             setpoint_kbps: Box::new(|| 0.0),
             capacity: crate::session::settings::WtCapacity::V2,
+            audio_pacing: true,
             retargets: true,
             start: Box::new(|| {}),
             owns: Box::new(|| false),
             displaced: Box::new(|| {}),
-            observe: Box::new(move |kbps, _| seen.lock().unwrap().push(kbps)),
+            observe: Box::new(move |kbps, _, _| seen.lock().unwrap().push(kbps)),
             held: Box::new(|_| {}),
             fec: Box::new(|_| {}),
         })
@@ -2421,11 +2424,12 @@ fn rate(retargets: bool) -> Rate {
         floor_kbps: Box::new(|| 4000.0),
         setpoint_kbps: Box::new(|| 0.0),
         capacity: crate::session::settings::WtCapacity::V2,
+        audio_pacing: true,
         retargets,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(|_, _| {}),
+        observe: Box::new(|_, _, _| {}),
         held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     }
@@ -2579,7 +2583,7 @@ fn a_v2_hold_with_fec_keeps_video_plus_repairs_under_the_ceiling() {
         measured: Box::new(move |reading| {
             g3.lock().unwrap().observe_report(reading, now());
         }),
-        observe: Box::new(move |kbps, share| {
+        observe: Box::new(move |kbps, share, _| {
             let mut g = g4.lock().unwrap();
             g.set_share(share, now());
             g.observe(kbps, now());
@@ -2682,11 +2686,12 @@ fn the_silence_decay_is_never_fed_to_the_collapse_as_a_measured_link() {
         floor_kbps: Box::new(|| 4000.0),
         setpoint_kbps: Box::new(|| 0.0),
         capacity: crate::session::settings::WtCapacity::V2,
+        audio_pacing: true,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(move |_, _| {
+        observe: Box::new(move |_, _, _| {
             f.fetch_add(1, SeqCst);
         }),
         held: Box::new(|_| {}),
@@ -2731,11 +2736,12 @@ fn a_report_gives_the_abr_its_reading_before_its_estimate() {
         floor_kbps: Box::new(|| 4000.0),
         setpoint_kbps: Box::new(|| 0.0),
         capacity: crate::session::settings::WtCapacity::V2,
+        audio_pacing: true,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(move |_, _| o.lock().unwrap().push("observe")),
+        observe: Box::new(move |_, _, _| o.lock().unwrap().push("observe")),
         held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
@@ -2758,13 +2764,14 @@ fn a_client_that_is_gone_neither_starts_nor_feeds_the_abr() {
         floor_kbps: Box::new(|| 500.0),
         setpoint_kbps: Box::new(|| 0.0),
         capacity: crate::session::settings::WtCapacity::V2,
+        audio_pacing: true,
         retargets: true,
         start: Box::new(move || {
             started.fetch_add(1, SeqCst);
         }),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(move |_, _| {
+        observe: Box::new(move |_, _, _| {
             fed.fetch_add(1, SeqCst);
         }),
         held: Box::new(|_| {}),
@@ -2824,11 +2831,12 @@ fn the_abr_is_fed_the_estimate_less_the_fec_share() {
         floor_kbps: Box::new(|| 500.0),
         setpoint_kbps: Box::new(|| 0.0),
         capacity: crate::session::settings::WtCapacity::V2,
+        audio_pacing: true,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(move |kbps: f64, _| seen.lock().unwrap().push(kbps.round())),
+        observe: Box::new(move |kbps: f64, _, _| seen.lock().unwrap().push(kbps.round())),
         held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
@@ -2860,11 +2868,12 @@ async fn lossy_session(retargets: bool) -> (Agent, Arc<crate::session::metrics::
                 floor_kbps: Box::new(|| 500.0),
                 setpoint_kbps: Box::new(|| 0.0),
                 capacity: crate::session::settings::WtCapacity::V2,
+                audio_pacing: true,
                 retargets,
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
-                observe: Box::new(|_, _| {}),
+                observe: Box::new(|_, _, _| {}),
                 held: Box::new(|_| {}),
                 fec: Box::new(move |event| match event {
                     crate::webtransport::FecEvent::Attached { client, fec } => {
@@ -3114,11 +3123,12 @@ fn repairs_spend_only_what_the_estimate_leaves_above_the_abr_floor() {
         floor_kbps: Box::new(|| 2500.0),
         setpoint_kbps: Box::new(|| 0.0),
         capacity: crate::session::settings::WtCapacity::V2,
+        audio_pacing: true,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(move |kbps: f64, _| seen.lock().unwrap().push(kbps.round())),
+        observe: Box::new(move |kbps: f64, _, _| seen.lock().unwrap().push(kbps.round())),
         held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
@@ -3178,12 +3188,13 @@ fn governed_by(
         floor_kbps: Box::new(move || f64::from(floor.lock().unwrap().0.floor_kbps())),
         setpoint_kbps: Box::new(move || f64::from(setpoint.lock().unwrap().0.setpoint_kbps())),
         capacity,
+        audio_pacing: true,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
         // As `abr_glue::feedback_abr`: the share, then the estimate.
-        observe: Box::new(move |kbps, share| {
+        observe: Box::new(move |kbps, share, _| {
             let mut governor = observed.lock().unwrap();
             let now = governor.1;
             governor.0.set_share(share, now);
@@ -3261,11 +3272,12 @@ fn governed_after_a_report(capacity: crate::session::settings::WtCapacity) -> (f
         floor_kbps: Box::new(|| 1000.0),
         setpoint_kbps: Box::new(move || f64::from(setpoint.lock().unwrap().setpoint_kbps())),
         capacity,
+        audio_pacing: true,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(|_, _| {}),
+        observe: Box::new(|_, _, _| {}),
         held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
@@ -3410,11 +3422,12 @@ fn a_pyrowave_frame_gets_no_repair_at_any_overhead() {
         floor_kbps: Box::new(|| 500.0),
         setpoint_kbps: Box::new(|| 0.0),
         capacity: crate::session::settings::WtCapacity::V2,
+        audio_pacing: true,
         retargets: true,
         start: Box::new(|| {}),
         owns: Box::new(|| false),
         displaced: Box::new(|| {}),
-        observe: Box::new(|_, _| {}),
+        observe: Box::new(|_, _, _| {}),
         held: Box::new(|_| {}),
         fec: Box::new(|_| {}),
     };
@@ -4214,7 +4227,7 @@ async fn a_webtransport_takeover_displaces_a_loop_its_peer_left_owning_the_encod
     .expect("this encoder takes live writes");
     (peer.start)();
     pause();
-    (peer.observe)(2000.0, 0.0);
+    (peer.observe)(2000.0, 0.0, false);
     pause();
     let driven = kbps();
     assert!(
@@ -5717,11 +5730,12 @@ async fn pyrowave_feedback_under_the_floor_for_1_s_steps_down_for_congestion() {
                 floor_kbps: Box::new(|| 500.0),
                 setpoint_kbps: Box::new(|| 0.0),
                 capacity: crate::session::settings::WtCapacity::V2,
+                audio_pacing: true,
                 retargets: true,
                 start: Box::new(|| {}),
                 owns: Box::new(|| false),
                 displaced: Box::new(|| {}),
-                observe: Box::new(move |kbps, _| {
+                observe: Box::new(move |kbps, _, _| {
                     if active.get().is_some_and(|m| m.pyrowave_active()) {
                         pyro_fed.lock().unwrap().push(kbps);
                     }
@@ -6803,6 +6817,18 @@ fn a_probe_repair_over_a_shrunk_datagram_size_ends_the_probe_not_the_stream() {
     assert!(alive, "a refused repair ended the stream");
     assert_eq!((tries, video.probes_too_large), (1, 1));
     assert!(probe_frame.is_none(), "the frame still probes");
+    assert_eq!(video.next_seq(), 10, "a refused repair took a pkt_seq");
+    // A skip is no refusal for size (seat A nit, #1652).
+    assert!(fill_probe(
+        &mut log,
+        Some(20_000.0),
+        &mut Some((frame.clone(), 0)),
+        &mut video,
+        1,
+        at(16_750),
+        |_| congestion::Handed::Skipped,
+    ));
+    assert_eq!(video.probes_too_large, 1, "a skip counted as too large");
     let gone = fill_probe(
         &mut log,
         Some(20_000.0),
@@ -6813,6 +6839,58 @@ fn a_probe_repair_over_a_shrunk_datagram_size_ends_the_probe_not_the_stream() {
         |_| congestion::Handed::Gone,
     );
     assert!(!gone, "a gone connection goes on");
+}
+
+/// Seat A (#1652): the probe's sends through production's mapping (`hand_over`) on a real session. A
+/// repair QUIC takes is counted in `handed` and takes a `pkt_seq`; one refused for size is neither,
+/// and ends that frame's probe, not the stream; a closed connection ends the stream.
+#[tokio::test]
+async fn a_probe_repair_counts_as_handed_only_once_quic_takes_it() {
+    let agent = agent().await;
+    let session = agent.connect().await;
+    let start = std::time::Instant::now();
+    let at = |us: u64| start + Duration::from_micros(us);
+    let mut handed = 0;
+    // (alive, `pkt_seq`s the probe took, refused for size) for one frame of `len`-byte fragments.
+    let mut probe = |len: usize, us: u64| {
+        let mut log = congestion::SendLog::new(start);
+        let mut video = congestion::VideoQueue::default();
+        let frame: Vec<Bytes> = (0..10)
+            .map(|_| {
+                let mut d = vec![0x01];
+                d.extend_from_slice(&video.take_seq().to_le_bytes());
+                d.resize(len, 0);
+                Bytes::from(d)
+            })
+            .collect();
+        log.probe_room(Some(50_000.0), at(us));
+        for d in &frame {
+            log.record(d, at(us + 16_000), false);
+        }
+        let alive = fill_probe(
+            &mut log,
+            Some(50_000.0),
+            &mut Some((frame, 0)),
+            &mut video,
+            1,
+            at(us + 16_700),
+            |d| hand_over(session.send_datagram(d), &mut handed),
+        );
+        (alive, video.next_seq() - 10, video.probes_too_large)
+    };
+    let (alive, took, refused) = probe(1000, 0);
+    assert!(
+        alive && took > 0 && refused == 0,
+        "{took} taken, {refused} refused"
+    );
+    let (alive, none, refused) = probe(4 * media::MAX_DATAGRAM, 100_000);
+    assert!(alive, "a refusal for size ended the stream");
+    assert_eq!((none, refused), (0, 1));
+    session.close(0, b"done");
+    session.closed().await;
+    let (alive, ..) = probe(1000, 200_000);
+    assert!(!alive, "a closed connection goes on");
+    assert_eq!(handed, u64::from(took), "counted what QUIC refused");
 }
 
 #[test]

@@ -2370,11 +2370,12 @@ mod tests {
             floor_kbps: Box::new(|| 4000.0),
             setpoint_kbps: Box::new(|| 0.0),
             capacity: crate::session::settings::WtCapacity::V2,
+            audio_pacing: true,
             retargets: true,
             start: Box::new(|| {}),
             owns: Box::new(|| false),
             displaced: Box::new(|| {}),
-            observe: Box::new(|_, _| {}),
+            observe: Box::new(|_, _, _| {}),
             held: Box::new(|_| {}),
             fec: Box::new(move |event| {
                 if let crate::webtransport::FecEvent::Attached { client, fec } = event {

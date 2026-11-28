@@ -129,6 +129,10 @@ pub(crate) struct Rate {
     pub(crate) setpoint_kbps: Box<dyn Fn() -> f64 + Send + Sync>,
     /// `QUASAR_WT_CAPACITY`: v2, or 0.6.3's sender and reading (`legacy`).
     pub(crate) capacity: crate::session::settings::WtCapacity,
+    /// Legacy paces video and lets the setpoint follow a standing queue (#1321): on with
+    /// `QUASAR_WT_AUDIO_PACING`, and only where a bitrate write is free (no write gap): on NVENC
+    /// and VA each write costs a keyframe, so there legacy stays 0.6.4's sender.
+    pub(crate) audio_pacing: bool,
     /// False with the ABR off: the estimate is tracked and never written to the encoder,
     /// so nothing would pay for FEC.
     pub(crate) retargets: bool,
@@ -143,8 +147,9 @@ pub(crate) struct Rate {
     /// which a client that sends no feedback (§Feedback) never sends.
     pub(crate) displaced: Box<dyn Fn() + Send + Sync>,
     /// Every estimate, in kbit/s of video, with the FEC share charged on top of it
-    /// (`abr::Governor::set_share`).
-    pub(crate) observe: Box<dyn Fn(f64, f64) + Send + Sync>,
+    /// (`abr::Governor::set_share`), and whether it is legacy's queue bound
+    /// (`abr::Governor::set_queue_bound`; always false on v2).
+    pub(crate) observe: Box<dyn Fn(f64, f64, bool) + Send + Sync>,
     /// After `observe`, for every estimate that came from a receiver report, never for the
     /// silence decay: what the report showed the link carrying when the link held the
     /// sender back (`congestion::Estimator::measured`), `None` when it did not.
@@ -204,6 +209,7 @@ impl<'a> Control<'a> {
         governor.legacy(legacy);
         let mut estimator = congestion::Estimator::new(rate.ceiling_kbps, now);
         estimator.legacy = legacy;
+        estimator.audio_pacing = rate.audio_pacing;
         estimator.probes = fec && !legacy;
         Self {
             rate,
@@ -323,7 +329,8 @@ impl<'a> Control<'a> {
         } else {
             0.0
         };
-        (self.rate.observe)(congestion::abr_estimate(kbps, self.charged), bound);
+        let queue = report && self.estimator.follows_queue();
+        (self.rate.observe)(congestion::abr_estimate(kbps, self.charged), bound, queue);
     }
 
     /// The repair datagrams that follow one frame's video datagrams. A PyroWave frame gets
@@ -1576,9 +1583,12 @@ fn feed(
     backlog.paced = rates.0.is_some();
     video.on_hold = control
         .as_ref()
-        .is_some_and(|c| !pyrowave && c.estimator.drop_held());
+        .is_some_and(|c| !pyrowave && c.estimator.pace_waits());
     let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
     let now = std::time::Instant::now();
+    video.recovering = control
+        .as_ref()
+        .is_some_and(|c| !pyrowave && c.estimator.recovering(now));
     let (room, frame) = video.budget(rates, queued, DATAGRAM_BUFFER, now);
     let log = match pyro {
         Some(rate) if pyrowave => Some(&mut rate.log),
@@ -1591,27 +1601,19 @@ fn feed(
             return congestion::Handed::Skipped;
         }
         let resend = held.resend.then(|| held.datagram.clone());
-        match session.send_datagram(held.datagram) {
-            Ok(()) => {
-                *handed += 1;
-                if let Some(d) = resend {
-                    sent.charge(&d);
-                    // A retransmit is video sent in the window too (amendment 85), counted
-                    // once it is handed over: a resend skipped or dropped never was.
-                    if let Some(rate) = media.rate().filter(|_| fec) {
-                        (rate.fec)(FecEvent::Sent {
-                            video: video_payload(&[d]),
-                            repair: 0,
-                        });
-                    }
-                }
-                congestion::Handed::Sent
+        let result = hand_over(session.send_datagram(held.datagram), handed);
+        if let (congestion::Handed::Sent, Some(d)) = (&result, resend) {
+            sent.charge(&d);
+            // A retransmit is video sent in the window too (amendment 85), counted
+            // once it is handed over: a resend skipped or dropped never was.
+            if let Some(rate) = media.rate().filter(|_| fec) {
+                (rate.fec)(FecEvent::Sent {
+                    video: video_payload(&[d]),
+                    repair: 0,
+                });
             }
-            Err(web_transport_quinn::SessionError::SendDatagramError(
-                quinn::SendDatagramError::TooLarge,
-            )) => congestion::Handed::TooLarge,
-            Err(_) => congestion::Handed::Gone,
         }
+        result
     });
     if video.too_large > too_large {
         if too_large == 0 {
@@ -1928,6 +1930,24 @@ fn pyro_act(
     }
 }
 
+/// What became of a datagram given to QUIC: only one it took is counted in `handed`; a refusal for
+/// size skips it; any other error means the connection is gone.
+fn hand_over(
+    sent: Result<(), web_transport_quinn::SessionError>,
+    handed: &mut u64,
+) -> congestion::Handed {
+    match sent {
+        Ok(()) => {
+            *handed += 1;
+            congestion::Handed::Sent
+        }
+        Err(web_transport_quinn::SessionError::SendDatagramError(
+            quinn::SendDatagramError::TooLarge,
+        )) => congestion::Handed::TooLarge,
+        Err(_) => congestion::Handed::Gone,
+    }
+}
+
 /// One `PROBE_EVERY` tick of the capacity probe: repairs of the last frame (`fec::probe`) in one
 /// burst right behind it, only with no video held (NACK answers included) and under one datagram in
 /// QUIC's datagram queue (`quic_queued` bytes: audio, video handed earlier). An idle session never
@@ -1953,16 +1973,21 @@ fn fill_probe(
     // One burst: the frame takes a policer's refill before the probe does.
     let mut too_large = false;
     while log.probe_room(kbps, now) >= size {
-        let Some(d) = fec::probe(frame, next, video.take_seq()) else {
+        // No video is held, so the next `pkt_seq` is the wire's; a repair QUIC refuses never takes it.
+        let Some(d) = fec::probe(frame, next, video.next_seq()) else {
             break;
         };
         match send(d.clone()) {
-            congestion::Handed::Sent => log.record_probe(&d, now),
+            congestion::Handed::Sent => {
+                video.take_seq();
+                log.record_probe(&d, now);
+            }
             congestion::Handed::Gone => return false,
-            congestion::Handed::TooLarge | congestion::Handed::Skipped => {
+            congestion::Handed::TooLarge => {
                 too_large = true;
                 break;
             }
+            congestion::Handed::Skipped => break,
         }
     }
     if too_large {
@@ -2068,16 +2093,7 @@ async fn stream(
                     let now = std::time::Instant::now();
                     let frame = &mut probe_frame;
                     let sent = fill_probe(&mut c.log, kbps, frame, &mut video, queued, now, |d| {
-                        match session.send_datagram(d) {
-                            Ok(()) => {
-                                handed += 1;
-                                congestion::Handed::Sent
-                            }
-                            Err(web_transport_quinn::SessionError::SendDatagramError(
-                                quinn::SendDatagramError::TooLarge,
-                            )) => congestion::Handed::TooLarge,
-                            Err(_) => congestion::Handed::Gone,
-                        }
+                        hand_over(session.send_datagram(d), &mut handed)
                     });
                     if !sent {
                         break 'stream QUIET;
@@ -2085,8 +2101,8 @@ async fn stream(
                 }
             }
             _ = probe_tick.tick() => {
-                let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space())
-                    + video.bytes();
+                // QUIC's queue alone, as the stall guard reads it: video the pacer holds is no stall.
+                let queued = DATAGRAM_BUFFER.saturating_sub(session.datagram_send_buffer_space());
                 let acks = governor.acks();
                 // Only a session the estimate can govern (#1332's invariant): with ABR off (an
                 // ABR loop exists then, but retargets nothing), and while PyroWave is active,

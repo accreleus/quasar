@@ -543,6 +543,8 @@ impl Shared {
             let submitted = vk.queue_submit(self.queue, &[submit], cmd.fence);
             (api.queue_submit_unlock)(self.gst_queue.as_ptr());
             submitted.map_err(err("vkQueueSubmit"))?;
+            // Must stay synchronous: Granite does not track this borrowed command buffer and
+            // its teardown relies on it being done (granite-borrowed-device-wait-own-work.patch).
             vk.wait_for_fences(&[cmd.fence], true, u64::MAX)
                 .map_err(err("vkWaitForFences"))?;
             vk.reset_fences(&[cmd.fence])
