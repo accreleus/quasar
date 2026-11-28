@@ -201,6 +201,24 @@ else
   fail "validate-image:refs" "$(printf '%s' "$vi_out" | grep '^FAIL' | head -n 5)"
 fi
 
+printf '\n== build-images registry cache on a docker-container builder ==\n'
+# The stub exits 255 when its reader closes early, as `docker buildx inspect` does.
+bc_dir="$(mktemp -d)"
+cat >"$bc_dir/docker" <<'STUB'
+#!/usr/bin/env bash
+trap 'exit 255' PIPE
+if [ "$1 $2" = "buildx inspect" ]; then echo 'Driver: docker-container'; sleep 0.2; echo 'Nodes:'; fi
+STUB
+chmod +x "$bc_dir/docker"
+bc_rc=0
+bc_out="$(PATH="$bc_dir:$PATH" bash "$ROOT/deploy/build-images.sh" recovery --dry-run --cache registry:reg/ns --cache-mode ro 2>&1)" || bc_rc=$?
+rm -rf "$bc_dir"
+if [ "$bc_rc" = 0 ] && [[ "$bc_out" == *'reg/ns/quasar-recovery-cache:buildcache'* ]]; then
+  pass "build-images:registry-cache" "reads <image>-cache:buildcache with a docker-container builder"
+else
+  fail "build-images:registry-cache" "rc=$bc_rc $(printf '%s' "$bc_out" | tail -n 3)"
+fi
+
 printf '\n== ci-apt-install mirror fallback (#1580) ==\n'
 # Offline: a stubbed apt-get + a fake apt config prove the install script switches to a
 # different mirror on a stall instead of retrying the same one. It runs with no network and no

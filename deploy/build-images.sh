@@ -381,7 +381,7 @@ if [ "$CACHE_KIND" != off ]; then
       docker buildx inspect "$BUILDX_BUILDER" 2>/dev/null
     else
       docker buildx inspect 2>/dev/null
-    fi | awk -F': *' '/^Driver:/ {print $2; exit}'
+    fi | awk -F': *' '/^Driver:/ && !d {print $2; d=1}'  # read it all: docker exits 255 on a closed pipe
   )"
   [ -n "$BUILDER_DRIVER" ] || die "cannot inspect buildx builder '${BUILDX_BUILDER:-<current>}' — does it exist?"
   case "$BUILD_CACHE_MODE" in
