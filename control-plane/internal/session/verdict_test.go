@@ -69,6 +69,64 @@ func healthySeries(base int64) map[string][]seriesPoint {
 	}
 }
 
+func TestVerdictWithoutClientEvidence(t *testing.T) {
+	const base int64 = 1_700_000_000_000
+	for _, tc := range []struct {
+		name    string
+		nClient int
+	}{
+		{"no client posts", 0},
+		{"client posts without verdict metrics", 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := telemetry.Slice{Clock: measuredClock()}
+			for i := int64(0); i < 3; i++ {
+				ts := base + i*5000
+				raw.Samples = append(raw.Samples, agentSample(ts, 60, 4))
+				if int(i) < tc.nClient {
+					raw.Samples = append(raw.Samples, telemetry.Sample{
+						Source: telemetry.SourceNative, TsUnixMs: ts,
+						Metrics: json.RawMessage(`{"fps":60}`),
+					})
+				}
+			}
+			v := assess(raw, nil, base, base+120_000).Verdict
+			if v.EvidenceTier != tierHostOnly || v.Window.NClient != tc.nClient {
+				t.Errorf("tier = %q, n_client = %d, want %q / %d", v.EvidenceTier, v.Window.NClient, tierHostOnly, tc.nClient)
+			}
+			if v.Verdict != verdictUnknown || strings.Contains(strings.Join(v.Evidence, " "), "healthy") {
+				t.Errorf("verdict = %q, evidence = %v, want unknown without a healthy claim", v.Verdict, v.Evidence)
+			}
+		})
+	}
+}
+
+func TestVerdictWithReceiverEvidence(t *testing.T) {
+	const base int64 = 1_700_000_000_000
+	// The verdict keys from Photon's stats-native-0.6.golden.json, shared with the browser.
+	metrics := telemetry.FilterBrowserMetrics(json.RawMessage(
+		`{"present_interval_sd_ms":2.9,"present_long_frames":0,"present_beat_fraction":0.02,"is_hidden":0,"rtt_ms":12,"packets_lost":12}`))
+	for _, source := range []string{telemetry.SourceBrowser, telemetry.SourceNative} {
+		t.Run(source, func(t *testing.T) {
+			raw := telemetry.Slice{Clock: measuredClock()}
+			for i := int64(0); i < 3; i++ {
+				ts := base + i*5000
+				raw.Samples = append(raw.Samples, agentSample(ts, 60, 4),
+					telemetry.Sample{Source: source, TsUnixMs: ts, Metrics: metrics})
+			}
+			v := assess(raw, nil, base, base+120_000).Verdict
+			if v.EvidenceTier != tierFull || v.Verdict != verdictNominal {
+				t.Errorf("tier = %q, verdict = %q, want full / nominal", v.EvidenceTier, v.Verdict)
+			}
+			for _, f := range v.Falsifiers {
+				if f.N != 3 || !f.Holds {
+					t.Errorf("%s: n = %d, holds = %v, want 3 / true", f.Name, f.N, f.Holds)
+				}
+			}
+		})
+	}
+}
+
 // A nominal verdict must state every condition a healthy window satisfies, and
 // every one of them must hold. "Nothing is wrong" is only checkable if the
 // verdict says what "wrong" would have looked like.

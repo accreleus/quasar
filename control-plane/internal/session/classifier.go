@@ -61,6 +61,8 @@ func normalizeSeries(aligned telemetry.AlignedSet, wanted map[string]bool) map[s
 		}
 		bySource[m.source] = append(bySource[m.source], m)
 	}
+	// Native stats share the browser's receiver keys (schema.md P9-01).
+	bySource[telemetry.SourceNative] = append(bySource[telemetry.SourceNative], bySource[telemetry.SourceBrowser]...)
 
 	out := map[string][]seriesPoint{}
 	for _, s := range aligned.Samples {
@@ -317,7 +319,7 @@ type classifierVerdict struct {
 // steady; (3) likely_client_presentation_limit — judder with host fps steady
 // and no congestion, gated on is_hidden (a backgrounded tab throttles
 // presentation and is not a real degradation, trace-format.md §3.3, #108);
-// (4) nominal; (5) indeterminate_client_hidden; (6) unknown.
+// (4) indeterminate_client_hidden; (5) unknown; (6) nominal.
 //
 // classifyInputs.Series is the assessed (warm-up trimmed) map; Align is what
 // the rules may know about the clock.
@@ -338,7 +340,7 @@ func classify(in classifyInputs) classifierVerdict {
 	hidden := windowHadHiddenTab(series, events)
 	if hidden {
 		ev = append(ev, "client tab was hidden/backgrounded during the window (presentation throttling, not a real degradation)")
-	} else {
+	} else if len(series["client.is_hidden"]) > 0 {
 		ev = append(ev, "client tab not hidden during the window")
 	}
 
@@ -399,13 +401,26 @@ func classify(in classifyInputs) classifierVerdict {
 		ev = append(ev, "presentation judder present but tab was hidden — attributed to backgrounding, not the stream")
 	}
 
-	// (4)/(5) No negative signal fired.
+	// (4)–(6) No negative signal fired.
 	if hidden {
 		ev = append([]string{"no congestion or encoder-saturation signal in the window; client tab was hidden/backgrounded, so presentation cannot be assessed"}, ev...)
 		return classifierVerdict{Verdict: verdictIndeterminateClientHidden, Evidence: ev}
 	}
+	if !hasClientVerdictSamples(series) {
+		ev = append([]string{"inconclusive: no client presentation or transport samples in the window"}, ev...)
+		return classifierVerdict{Verdict: verdictUnknown, Evidence: ev}
+	}
 	ev = append([]string{"no congestion, encoder-saturation, or presentation-judder signal in the window — healthy"}, ev...)
 	return classifierVerdict{Verdict: verdictNominal, Evidence: ev}
+}
+
+func hasClientVerdictSamples(series map[string][]seriesPoint) bool {
+	return len(series[hitchSeriesName]) > 0 ||
+		len(series["client.present_long_frames"]) > 0 ||
+		len(series["client.present_beat_fraction"]) > 0 ||
+		len(series["client.is_hidden"]) > 0 ||
+		len(series["transport.rtt_ms"]) > 0 ||
+		len(series["transport.packets_lost"]) > 0
 }
 
 // windowHadHiddenTab: is_hidden sample set, or a visibility_changed event
