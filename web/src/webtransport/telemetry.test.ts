@@ -140,7 +140,7 @@ describe("WtTelemetry", () => {
       [
         "bitrate_kbps", "fps", "freeze_count", "is_hidden", "packets_lost", "playout_target_ms", "present_beat_fraction", "present_fps",
         "present_fps_median", "present_interval_max_ms", "present_interval_median_ms", "present_interval_p95_ms",
-        "present_interval_sd_ms", "present_long_frames", "present_n", "rtt_ms", "wt_capture_to_present_ms", "wt_keyframe_requests",
+        "present_interval_sd_ms", "present_long_frames", "present_n", "rtt_ms", "wt_capture_to_present_ms", "wt_decode_errors", "wt_keyframe_requests",
       ].sort(),
     );
     expect(first.metrics.wt_capture_to_present_ms).toBeCloseTo(12, 6);
