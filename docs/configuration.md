@@ -714,7 +714,9 @@ H.265; AV1 validates in the Linux harness via dav1d.
 Read in `SessionConfig::from_env` / `abr_config()`. **`smooth` by default**
 (SPT-10 verdict, 2026-06-27 — was `protective` since the AS10-05 ABR-on flip). Floor
 is the explicit kbps if set, else `ceiling × ratio`, clamped to `[500, ceiling-1]`.
-Ceiling = the session's configured bitrate.
+Ceiling = the session's configured bitrate. On WebTransport with FEC, video plus its repairs stays
+at or under it, in both `QUASAR_WT_CAPACITY` modes (#1301, #1660); the repairs of `v2`'s capacity
+probe are not counted.
 
 ### `QUASAR_ABR_MODE` — SPT-02 / SPT-04
 

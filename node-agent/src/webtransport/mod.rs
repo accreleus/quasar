@@ -323,14 +323,12 @@ impl<'a> Control<'a> {
                     .map(|link| link / (1.0 + self.charged)),
             );
         }
-        // v2 keeps the share off the governor's ceiling: its hold misread the bound (#1660).
-        let bound = if self.estimator.legacy {
-            self.charged
-        } else {
-            0.0
-        };
         let queue = report && self.estimator.follows_queue();
-        (self.rate.observe)(congestion::abr_estimate(kbps, self.charged), bound, queue);
+        (self.rate.observe)(
+            congestion::abr_estimate(kbps, self.charged),
+            self.charged,
+            queue,
+        );
     }
 
     /// The repair datagrams that follow one frame's video datagrams. A PyroWave frame gets
