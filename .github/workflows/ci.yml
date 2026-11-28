@@ -162,6 +162,8 @@ jobs:
         working-directory: web
         run: npm ci
       - name: Self-test
+        env:
+          TEST_DATABASE_URL: postgres://postgres:test@localhost:5432/quasar?sslmode=disable
         run: bash scripts/verify/test-revert-proof.sh
       - name: Revert proof
         env:
