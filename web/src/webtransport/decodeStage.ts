@@ -94,6 +94,10 @@ export class DecodeStage {
   /** Bumped per configure, so a late support check cannot apply an old config. */
   private generation = 0;
   private restarts = 0;
+  /** Decoder failures over the stage's life, each logged once: the harness's decode-error count. */
+  private decodeErrors = 0;
+  /** A failed decoder counts once, however many ways it reports (a decode() throw, `error`). */
+  private readonly failed = new WeakSet<VideoDecoder>();
   /** When the decoder queue went over {@link MAX_DECODE_QUEUE}; null while it is not. */
   private backlogSince: number | null = null;
   /** Cleared by a skip, set again once the keyframe it asked for has decoded. */
@@ -213,8 +217,8 @@ export class DecodeStage {
       };
       this.decoder.decode(new EncodedVideoChunk(init as EncodedVideoChunkInit));
       this.decodedSeq = unit.frameSeq;
-    } catch {
-      this.restart();
+    } catch (err) {
+      this.restart(this.decoder, err);
     }
   }
 
@@ -293,16 +297,19 @@ export class DecodeStage {
         }
         this.opts.onFrame(frame);
       },
-      error: () => this.restart(),
+      error: (err) => this.restart(decoder, err),
     };
-    return this.opts.createDecoder ? this.opts.createDecoder(init) : new VideoDecoder(init);
+    const decoder = this.opts.createDecoder ? this.opts.createDecoder(init) : new VideoDecoder(init);
+    return decoder;
   }
 
   /** A decode error closes the decoder: make a new one under the same configuration and
    *  resume at a keyframe, at most {@link MAX_DECODER_RESTARTS} times in a row. */
-  private restart(): void {
+  private restart(decoder: VideoDecoder, err: unknown): void {
     const config = this.current;
-    if (this.stopped || !config) return;
+    if (this.stopped || !config || this.failed.has(decoder)) return;
+    this.failed.add(decoder);
+    console.warn(`webtransport: video decoder restart (decode_error #${++this.decodeErrors}):`, err);
     if (++this.restarts > MAX_DECODER_RESTARTS) {
       this.fatal("decode_error", config);
       return;
