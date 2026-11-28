@@ -26,6 +26,10 @@ own; the two do not move together, and that is deliberate.
 
 ### Changed
 
+- The node-agent tests now fail when the agent reads a `QUASAR_*` setting that is not in
+  `docs/configuration.md`, cannot be set on an owned install, or is not passed through by
+  Compose, unless it is listed with a reason. `QUASAR_HOST_FUSE` and the node agent's own
+  `QUASAR_SESSION_GRACE_SECS` are now documented.
 - CI runs shellcheck over every shell script in the repository and the scripts the site
   generates, and fails on new findings. Two harness bugs it found are fixed: the NVENC fallback
   smoke now searches the agent's stderr during teardown, and `run-apitest.sh` honours

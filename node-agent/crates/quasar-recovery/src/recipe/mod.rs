@@ -1013,7 +1013,8 @@ const NODE_AGENT_ENV: &[(&str, &str)] = &[
 /// The node agent's own settings an operator may give it on an owned install (#448): its
 /// documented `QUASAR_*` knobs, minus what the recipe or a machine input owns and the
 /// dev/test-only ones. Every name is a row of `docs/configuration.md` (guarded by
-/// `agent_variables_are_documented`).
+/// `agent_variables_are_documented`), and every name the agent reads is here or has a reason
+/// not to be (guarded by `tests/env_registry.rs`).
 pub const AGENT_VARIABLES: &[&str] = &[
     "QUASAR_ABR",
     "QUASAR_ABR_CLIFF_GUARD_FRAC",
