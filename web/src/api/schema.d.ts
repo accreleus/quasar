@@ -996,7 +996,7 @@ export interface paths {
          *     favourites: /v1/apps favourite=true). The hero is client chrome, not a section: a
          *     client that draws the featured rail inside its hero draws the hero at the first shown
          *     highlights section (the rail is drawn once), or at the top without the rail when none
-         *     is shown.
+         *     is shown. Shown = enabled and of a known kind, whether or not the rail has cards.
          *
          *     CLIENT RULES: skip an unknown kind; skip enabled=false; ignore unknown params keys. A
          *     404 (an older server) or any other failure renders the built-in default
@@ -12001,7 +12001,7 @@ export interface components {
              * @example favourites
              */
             kind: string;
-            /** @description The heading to show, 1-64 Unicode code points, not only whitespace. Shown as given; the accessible name where a client's design has no visible heading for the kind. */
+            /** @description The heading to show, 1-64 Unicode code points, not only whitespace, no control characters (Unicode Cc). Shown as given; the accessible name where a client's design has no visible heading for the kind. */
             title: string;
             /** @description false keeps the section in the layout but off the page. */
             enabled: boolean;
@@ -12026,12 +12026,13 @@ export interface components {
              * @enum {string}
              */
             kind: "highlights" | "jump_back_in" | "favourites";
+            /** @description Not only whitespace; no control characters (Unicode Cc). */
             title: string;
             enabled: boolean;
             /** @description Optional; absent reads back as {}. Only keys defined for the kind are accepted, and none is defined today. */
             params?: Record<string, never>;
         };
-        /** @description Whole layout for PUT /v1/me/home and PUT /v1/admin/home. ids unique within the body. Any break is 400 validation_failed and nothing is written. Top-level keys other than sections (source, say) are ignored. */
+        /** @description Whole layout for PUT /v1/me/home and PUT /v1/admin/home. At most 64 KiB. ids unique within the body. Section keys match exactly: a case variant ("ID") or a repeated key is refused. Any break is 400 validation_failed and nothing is written. Top-level keys other than sections (source, say) are ignored. */
         HomeLayoutWrite: {
             sections: components["schemas"]["HomeSectionWrite"][];
         };
