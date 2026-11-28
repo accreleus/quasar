@@ -21,7 +21,7 @@
 > The **GStreamer** patches here (`vkh264enc-*`, `vulkanh265enc`, `gstreamer-vulkan-shared-queue-lock`)
 > ARE still applied at build time. Only the `gst-wayland-display-*` ones moved into the branch.
 
-These patches split across **two upstreams**: eighteen apply to a from-source **GStreamer**
+These patches split across **two upstreams**: twenty apply to a from-source **GStreamer**
 `1.28.8` checkout (`gst-plugins-bad`), while the patches named `gst-wayland-display-*` apply to the
 **gst-wayland-display** compositor checkout itself (see their dedicated sections below). Both sets
 are applied inside `deploy/Dockerfile.vulkan`, each at its own upstream's build step.
