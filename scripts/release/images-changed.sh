@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # images-changed.sh — which published images does a change touch? (#867)
 #
-#   git diff --name-only --no-renames <last built tree> HEAD | scripts/release/images-changed.sh
+#   git diff --name-only --no-renames <last built tree> HEAD | scripts/release/images-changed.sh [--pr]
+#
+# `--pr` asks what a pull request has to build and validate: the table below, plus the
+# files that judge or drive its build (they change no published byte).
 #
 # Reads changed paths on stdin and prints `control_plane=`, `node_agent=` and
 # `recovery=` as true/false: does the change feed that image? The Images workflow's
@@ -19,6 +22,8 @@
 #   quasar-recovery       node-agent/**  deploy/Dockerfile.recovery
 #   all three             deploy/pins.env  deploy/lib/recipe-revision.sh  .dockerignore
 #                         .github/workflows/images.yml (its build-args are inputs)
+#   all three, --pr only  deploy/image-contract.json  deploy/validate-image.sh
+#                         deploy/build-images.sh  deploy/lib/pins.sh  deploy/toolchain-hash.sh
 #   none                  docs, CHANGELOG, tests, scripts, CI, `protocol/` (read by tests only),
 #                         compose files
 #   quasar-gst-toolchain  not here: content-hashed by deploy/toolchain-hash.sh, which the
@@ -33,7 +38,12 @@
 # file under it, which is what the `**` above means.
 set -euo pipefail
 
-[ $# -eq 0 ] || { echo "usage: images-changed.sh < changed-paths" >&2; exit 2; }
+pr=false
+case "$*" in
+  '') ;;
+  --pr) pr=true ;;
+  *) echo "usage: images-changed.sh [--pr] < changed-paths" >&2; exit 2 ;;
+esac
 
 control=false agent=false recovery=false
 while IFS= read -r p; do
@@ -49,6 +59,8 @@ while IFS= read -r p; do
   case "$p" in
     deploy/pins.env|deploy/lib/recipe-revision.sh|.dockerignore|.github/workflows/images.yml)
       control=true agent=true recovery=true ;;
+    deploy/image-contract.json|deploy/validate-image.sh|deploy/build-images.sh|deploy/lib/pins.sh|deploy/toolchain-hash.sh)
+      if "$pr"; then control=true agent=true recovery=true; fi ;;
   esac
 done
 

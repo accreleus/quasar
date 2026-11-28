@@ -24,6 +24,10 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Changed
+
+- CI: a pull request into `develop` or `integration/**` now builds the images its changes affect with `deploy/build-images.sh` and validates them against `deploy/image-contract.json`, publishing nothing. `build-images.sh --cache registry:` reads the cache packages the Images workflow writes (`<image>-cache`).
+
 ## 0.6.5 — 2026-11-28
 
 ### Fixed
