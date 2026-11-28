@@ -1288,6 +1288,10 @@ func (e *Ensurer) ReconcileWarmups(ctx context.Context) {
 		}
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		e.log.Warn("Steam preparation reconcile skipped", "err", err)
+		return
+	}
 	for _, id := range hosts {
 		e.enqueueWarmup(id, "steam")
 	}
