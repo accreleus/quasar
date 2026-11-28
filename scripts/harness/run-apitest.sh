@@ -24,6 +24,8 @@ ADMIN_EMAIL=admin@quasar.local
 # came up". Keep this free of "admin" and "quasar".
 ADMIN_PASS=throwaway-conformance-pw-7431
 RESULTS="${RESULTS_JSON:-$REPO/scripts/harness/apitest/results.json}"
+# The validator can only write inside its /w mount; the file is copied to $RESULTS after.
+OUT="$REPO/scripts/harness/apitest/results.json"
 
 cleanup() {
   [ "${KEEP:-0}" = "1" ] && { echo "KEEP=1 — leaving stack up ($PG,$CP on $NET)"; return; }
@@ -75,6 +77,7 @@ if [ "$UP" != "1" ]; then
 fi
 
 echo "=== [3/4] run conformance validator ==="
+rm -f "$OUT"  # an earlier run's file must not pass as this run's
 set +e
 docker run --rm --network "$NET" \
   -v "$REPO/scripts/harness/apitest":/w -v "$REPO/protocol":/protocol -w /w -v "$TLSVOL":/tls:ro \
@@ -87,5 +90,8 @@ RC=$?
 set -e
 
 echo "=== [4/4] done (rc=$RC) ==="
-[ -f "$REPO/scripts/harness/apitest/results.json" ] && echo "results: $REPO/scripts/harness/apitest/results.json"
+if [ -f "$OUT" ]; then
+  [ "$OUT" -ef "$RESULTS" ] || cp "$OUT" "$RESULTS"
+  echo "results: $RESULTS"
+fi
 exit $RC
