@@ -1,0 +1,9 @@
+{
+  "shape": "manifest_verdict",
+  "about": "The signature verified under a trusted key; key_id names it.",
+  "body": {
+    "verdict": "verified",
+    "key_id": "release-2026",
+    "message": "verified by key release-2026"
+  }
+}

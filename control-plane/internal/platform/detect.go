@@ -2,6 +2,7 @@ package platform
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/accreleus/quasar/control-plane/internal/actorsocket"
 	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
 	"github.com/accreleus/quasar/control-plane/internal/images"
 )
@@ -70,6 +72,14 @@ type Detector struct {
 	channel ChannelFunc
 	// Read on preview; needs WithEdge's channel func.
 	preview PreviewSource
+	// nil (no recovery actor: Compose or source) checks no signature.
+	verifier ManifestVerifier
+}
+
+// ManifestVerifier grades a stable manifest's detached signature under the
+// recovery actor's own policy (#824); *ActorClient in production.
+type ManifestVerifier interface {
+	VerifyManifest(ctx context.Context, manifest, signature []byte) (actorsocket.ManifestVerdict, error)
 }
 
 // NewDetector builds a Detector. log may be nil.
@@ -95,6 +105,13 @@ func (d *Detector) WithEdge(edge EdgeResolver, channel ChannelFunc) *Detector {
 // also reads the preview manifest.
 func (d *Detector) WithPreview(p PreviewSource) *Detector {
 	d.preview = p
+	return d
+}
+
+// WithVerifier makes a stable release whose signature the actor refuses count
+// as an invalid manifest (#824).
+func (d *Detector) WithVerifier(v ManifestVerifier) *Detector {
+	d.verifier = v
 	return d
 }
 
@@ -141,7 +158,7 @@ func (d *Detector) Detect(ctx context.Context) (Report, error) {
 		rel, err := d.resolve(ctx, l)
 		if err != nil {
 			rep.ManifestInvalid++
-			rep.Errors = append(rep.Errors, fmt.Sprintf("%s: %v", l.Tag, err))
+			rep.Errors = append(rep.Errors, manifestError(l.Tag, err))
 			d.log.Warn("platform release manifest rejected", "tag", l.Tag, "err", err)
 			continue
 		}
@@ -322,6 +339,9 @@ func (d *Detector) resolve(ctx context.Context, l Listing) (Release, error) {
 	if m.Prerelease != l.Prerelease {
 		return Release{}, fmt.Errorf("manifest prerelease=%v does not match the tag's %v", m.Prerelease, l.Prerelease)
 	}
+	if err := d.verifySignature(ctx, l, raw); err != nil {
+		return Release{}, err
+	}
 
 	version := m.Version
 	return Release{
@@ -337,6 +357,48 @@ func (d *Detector) resolve(ctx context.Context, l Listing) (Release, error) {
 		// (control-api.md §Platform releases). It is the edge channel's field,
 		// and #111 is what fills it.
 	}, nil
+}
+
+// signatureMaxBytes bounds a .sig: one entry is about 150 bytes, so 8 KiB holds
+// about 50 (a rotation needs 2). The actor's verify-manifest body limit is sized
+// from this and manifestMaxBytes (server.rs VERIFY_MAX_BODY).
+const signatureMaxBytes = 8 << 10
+
+// verifySignature asks the actor about the exact bytes that will be stored
+// (ADR 0003 "Where the check lives"). Fails closed when the actor does not
+// answer. The apply gate still fetches and checks its own copy.
+func (d *Detector) verifySignature(ctx context.Context, l Listing, manifest []byte) error {
+	if d.verifier == nil {
+		return nil
+	}
+	var sig []byte
+	var fetchErr error
+	if l.SignatureURL != "" {
+		sig, fetchErr = d.source.FetchManifest(ctx, l.SignatureURL)
+		if fetchErr == nil && len(sig) > signatureMaxBytes {
+			sig, fetchErr = nil, fmt.Errorf("it is %d bytes, over the %d-byte cap", len(sig), signatureMaxBytes)
+		}
+	}
+	// On a failed fetch the actor is asked with no signature, so mode off still lists the release.
+	v, err := d.verifier.VerifyManifest(ctx, manifest, sig)
+	switch {
+	case errors.Is(err, ErrNoManifestCheck):
+		// An actor behind its control plane (ADR 0008 rule A makes this a hand-built
+		// state). Refusing would hide the release that moves the actor first; its own
+		// apply gate still checks the signature.
+		d.log.Warn("platform release signature not checked: the recovery actor predates the check",
+			"token", "release-detect-signature-unchecked", "tag", l.Tag)
+		return nil
+	case err != nil:
+		return fmt.Errorf("the recovery actor did not check the signature: %w", err)
+	case v.Verdict == actorsocket.VerdictUnchecked:
+		return nil
+	case fetchErr != nil:
+		return fmt.Errorf("%s could not be fetched: %w", SignatureAssetNameV2, fetchErr)
+	case v.Verdict == actorsocket.VerdictVerified:
+		return nil
+	}
+	return fmt.Errorf("signature refused by the recovery actor: %s", v.Message)
 }
 
 // Truncates on a rune boundary: a cut mid-rune is not valid UTF-8 and will not
@@ -383,14 +445,50 @@ func (r Report) Summary() map[string]any {
 		s["preview_skipped"] = r.PreviewSkipped
 	}
 	if len(r.Errors) > 0 {
-		// Bounded: the summary column has a 4096-byte ceiling.
+		// Bounded: the summary column has a 4096-byte ceiling, shared with the notify
+		// and auto-apply keys; a refusal can quote remote text of any length.
 		errs := r.Errors
 		if len(errs) > 5 {
 			errs = errs[:5]
 		}
-		s["manifest_errors"] = errs
+		bounded := make([]string, len(errs))
+		for i, e := range errs {
+			bounded[i] = boundDiagnostic(e, manifestErrorMaxBytes)
+		}
+		s["manifest_errors"] = bounded
 	}
 	return s
+}
+
+// manifestErrorMaxBytes bounds one manifest_errors entry as JSON: five of them
+// leave over half of the 4096-byte summary for every other key.
+const manifestErrorMaxBytes = 240
+
+// manifestTagMaxBytes bounds the release tag inside one entry, leaving most of it
+// for the refusal reason.
+const manifestTagMaxBytes = 64
+
+// manifestError is one manifest_errors entry. The tag is remote text too: cut it
+// so a long one cannot push the reason out of the entry's bound.
+func manifestError(tag string, err error) string {
+	return fmt.Sprintf("%s: %v", boundDiagnostic(tag, manifestTagMaxBytes), err)
+}
+
+// boundDiagnostic cuts s on a rune boundary until its JSON encoding, escapes
+// included, fits max bytes.
+func boundDiagnostic(s string, max int) string {
+	encoded := func(s string) int { b, _ := json.Marshal(s); return len(b) }
+	if encoded(s) <= max {
+		return s
+	}
+	r := []rune(s)
+	if len(r) > max {
+		r = r[:max]
+	}
+	for len(r) > 0 && encoded(string(r)+"…") > max {
+		r = r[:len(r)-1]
+	}
+	return string(r) + "…"
 }
 
 // DetectionStatus is the pair the view reports as checked_at / last_error.

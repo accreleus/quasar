@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use quasar_recovery::console::{ConsolePreflight, ConsoleRequest, ConsoleStatus};
 use quasar_recovery::reconfigure::Settled;
 use quasar_recovery::socket::{
-    Accepted, AttemptResult, Reason, Rejection, Request, RequestKind, State, Status,
+    Accepted, AttemptResult, ManifestCheck, ManifestVerdict, Reason, Rejection, Request,
+    RequestKind, State, Status, Verdict,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -75,6 +76,8 @@ fn every_fixture_round_trips_through_the_rust_types_and_the_vocabulary_is_covere
     let mut failures: BTreeSet<String> = BTreeSet::new();
     let mut restored = BTreeSet::new();
     let mut results: Vec<AttemptResult> = Vec::new();
+    let mut verdicts = BTreeSet::new();
+    let mut signed = BTreeSet::new();
     for (name, f) in fixtures() {
         shapes.insert(f.shape.clone());
         match f.shape.as_str() {
@@ -98,9 +101,37 @@ fn every_fixture_round_trips_through_the_rust_types_and_the_vocabulary_is_covere
                 let s: Status = round_trip(&name, &f.body);
                 results.extend(s.result);
             }
+            "manifest_check" => {
+                signed.insert(
+                    round_trip::<ManifestCheck>(&name, &f.body)
+                        .signature
+                        .is_some(),
+                );
+            }
+            "manifest_verdict" => {
+                let v: ManifestVerdict = round_trip(&name, &f.body);
+                assert_eq!(
+                    v.key_id.is_some(),
+                    v.verdict == Verdict::Verified,
+                    "{name}: key_id exactly when verified"
+                );
+                verdicts.insert(format!("{:?}", v.verdict));
+            }
             other => panic!("{name}: unknown shape {other:?} (both sides must know every shape)"),
         }
     }
+    assert_eq!(
+        signed,
+        [false, true].into_iter().collect(),
+        "a check with and without a signature"
+    );
+    assert_eq!(
+        verdicts,
+        [Verdict::Unchecked, Verdict::Verified, Verdict::Refused]
+            .iter()
+            .map(|v| format!("{v:?}"))
+            .collect()
+    );
     let mut states = BTreeSet::new();
     for r in &results {
         states.insert(format!("{:?}", r.state));
@@ -124,7 +155,15 @@ fn every_fixture_round_trips_through_the_rust_types_and_the_vocabulary_is_covere
     let set = |xs: &[&str]| xs.iter().map(|s| (*s).to_owned()).collect::<BTreeSet<_>>();
     assert_eq!(
         shapes,
-        set(&["accepted", "rejection", "request", "result", "status"])
+        set(&[
+            "accepted",
+            "manifest_check",
+            "manifest_verdict",
+            "rejection",
+            "request",
+            "result",
+            "status"
+        ])
     );
     let all_kinds: BTreeSet<String> = [
         RequestKind::Replace,
@@ -207,6 +246,13 @@ fn a_request_refuses_a_field_it_does_not_know() {
     let body = r#"{"request_id":"r","kind":"replace","components":[],
         "release":{"id":"","version":null,"source_commit":""},"force":true}"#;
     assert!(serde_json::from_str::<Request>(body).is_err());
+}
+
+#[test]
+fn a_manifest_check_refuses_a_field_it_does_not_know() {
+    assert!(
+        serde_json::from_str::<ManifestCheck>(r#"{"manifest":"","signature":null,"x":1}"#).is_err()
+    );
 }
 
 #[test]

@@ -1059,6 +1059,10 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 			platform.NewGitHubSource(releaseClient, platform.ConfiguredReleaseAPI(), releaseRepo,
 				os.Getenv("QUASAR_PLATFORM_RELEASE_TOKEN"), platform.ReleaseAssetHosts()),
 			platformStore, log)
+		// An owned install's recovery actor grades each new stable release's signature (#824).
+		if cfg.RecoveryControlSocket != "" {
+			releaseDetector = releaseDetector.WithVerifier(platform.NewActorClient(cfg.RecoveryControlSocket))
+		}
 
 		// The edge channel reads the images themselves, so it needs the registry
 		// client rather than the GitHub one. The platform registry is added to

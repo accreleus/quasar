@@ -219,3 +219,30 @@ type Status struct {
 	Result        *Result `json:"result"`
 	Stale         bool    `json:"stale"`
 }
+
+// ManifestCheck is `POST /v1/verify-manifest` (control socket only, #824): the
+// exact manifest bytes release detection fetched and its detached signature.
+// encoding/json writes both as standard base64; a nil Signature is null, a
+// release that publishes none.
+type ManifestCheck struct {
+	Manifest  []byte `json:"manifest"`
+	Signature []byte `json:"signature"`
+}
+
+// Verdict is the actor's answer to a ManifestCheck. A value this build does not
+// know is not a pass.
+type Verdict string
+
+const (
+	VerdictUnchecked Verdict = "unchecked" // signature mode off
+	VerdictVerified  Verdict = "verified"
+	VerdictRefused   Verdict = "refused"
+)
+
+// ManifestVerdict answers a ManifestCheck (200). KeyID is set exactly when
+// Verdict is verified.
+type ManifestVerdict struct {
+	Verdict Verdict `json:"verdict"`
+	KeyID   *string `json:"key_id"`
+	Message string  `json:"message"`
+}

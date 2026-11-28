@@ -173,6 +173,8 @@ type ghRelease struct {
 const (
 	ManifestAssetName   = "platform-release-manifest.json"
 	ManifestAssetNameV2 = "platform-release-manifest.v2.json"
+	// SignatureAssetNameV2 is the ADR 0003 detached signature over the format-2 asset.
+	SignatureAssetNameV2 = ManifestAssetNameV2 + ".sig"
 )
 
 func (g *GitHubSource) List(ctx context.Context) ([]Listing, error) {
@@ -211,6 +213,8 @@ func (g *GitHubSource) List(ctx context.Context) ([]Listing, error) {
 			switch {
 			case a.Name == ManifestAssetNameV2:
 				l.ManifestURL, l.ManifestFormat = a.BrowserDownloadURL, ManifestFormat2
+			case a.Name == SignatureAssetNameV2:
+				l.SignatureURL = a.BrowserDownloadURL
 			case a.Name == ManifestAssetName && l.ManifestFormat != ManifestFormat2:
 				l.ManifestFormat = ManifestFormat1 // marked, never fetched
 			}

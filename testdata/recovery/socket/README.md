@@ -3,7 +3,8 @@
 The request and status shapes of the recovery actor's control socket
 (`docs/rh06/2026-09-24-architecture.md` §5.2), pinned so the control plane (Go) and the
 actor (Rust) cannot drift (#356). Each file is `{"shape", "about", "body"}`, where
-`shape` is one of `request`, `accepted`, `rejection`, `result`, `status`.
+`shape` is one of `request`, `accepted`, `rejection`, `result`, `status`, `manifest_check`,
+`manifest_verdict`.
 
 - Go: `control-plane/internal/actorsocket` (`make test-go`).
 - Rust: `quasar_recovery::socket`, tested by
@@ -30,6 +31,11 @@ Rules the fixtures pin:
   `release_state` relay stays a re-frame. `reason` is set exactly when `state` is
   `failed`; `finished_at` exactly when the state is terminal.
 - An interrupted attempt is `state: failed`, `reason: interrupted`, `restored: false`.
+- `POST /v1/verify-manifest` (control socket only, #824) takes a `manifest_check`
+  (standard base64; `signature` is `null` when the release publishes none) and answers `200`
+  with a `manifest_verdict`: `unchecked` (mode `off`), `verified` (`key_id` set) or
+  `refused`. A verdict a reader does not know is a refusal. An actor older than the route
+  answers `404`.
 - The actor refuses a request carrying a field it does not know; readers of what the
   actor writes ignore unknown fields, because the actor moves first and may be one
   release ahead of the control plane or the agent. A reason a reader does not know is

@@ -253,6 +253,34 @@ pub struct Status {
     pub stale: bool,
 }
 
+/// `POST /v1/verify-manifest` body (control socket only, #824): the exact manifest bytes
+/// release detection fetched and its detached signature, both standard base64; `signature`
+/// is `null` when the release publishes none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestCheck {
+    pub manifest: String,
+    pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// Signature mode is `off`.
+    Unchecked,
+    Verified,
+    Refused,
+}
+
+/// The answer to a [`ManifestCheck`]: always `200`. `key_id` names the trusted key exactly
+/// when `verified`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestVerdict {
+    pub verdict: Verdict,
+    pub key_id: Option<String>,
+    pub message: String,
+}
+
 /// The closed `reason` vocabulary of agent-api.md `release_state`, as far as the actor
 /// emits it, plus the RH-06 identifiers of the RH06-01 draft amendment (#353). An
 /// identifier this build does not know decodes to [`Reason::Other`] and re-encodes

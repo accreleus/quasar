@@ -1019,6 +1019,21 @@ impl Actor {
         }
     }
 
+    /// Release detection's signature check (#824), under the policy [`Actor::trust`] admits by.
+    pub fn verify_manifest(
+        &self,
+        req: &crate::socket::ManifestCheck,
+    ) -> crate::socket::ManifestVerdict {
+        match self.trust() {
+            Ok(t) => crate::trust::verify_manifest(&t.signature, req),
+            Err(why) => crate::socket::ManifestVerdict {
+                verdict: crate::socket::Verdict::Refused,
+                key_id: None,
+                message: format!("release trust: {why}"),
+            },
+        }
+    }
+
     /// The sockets this machine's role serves, as `(path in this container, caller, owner)`.
     /// The role is machine state's, else a first install's inputs, else this start's own.
     /// Unreadable machine state is an error: guessing a role could serve the wrong caller.

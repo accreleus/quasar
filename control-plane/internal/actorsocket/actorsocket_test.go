@@ -71,6 +71,10 @@ func target(t *testing.T, shape string) any {
 		return &Status{}
 	case "result":
 		return &Result{}
+	case "manifest_check":
+		return &ManifestCheck{}
+	case "manifest_verdict":
+		return &ManifestVerdict{}
 	}
 	t.Fatalf("unknown shape %q (both sides must know every shape)", shape)
 	return nil
@@ -113,7 +117,8 @@ func TestEveryFixtureRoundTripsThroughTheGoTypes(t *testing.T) {
 func TestFixturesCoverTheVocabulary(t *testing.T) {
 	shapes, kinds, states := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	rejections, failures := map[string]bool{}, map[string]bool{}
-	restored := map[bool]bool{}
+	restored, signed := map[bool]bool{}, map[bool]bool{}
+	verdicts := map[string]bool{}
 	results := []Result{}
 	for _, f := range loadFixtures(t) {
 		shapes[f.Shape] = true
@@ -135,6 +140,17 @@ func TestFixturesCoverTheVocabulary(t *testing.T) {
 			_ = json.Unmarshal(f.Body, &s)
 			if s.Result != nil {
 				results = append(results, *s.Result)
+			}
+		case "manifest_check":
+			var c ManifestCheck
+			_ = json.Unmarshal(f.Body, &c)
+			signed[c.Signature != nil] = true
+		case "manifest_verdict":
+			var v ManifestVerdict
+			_ = json.Unmarshal(f.Body, &v)
+			verdicts[string(v.Verdict)] = true
+			if (v.KeyID != nil) != (v.Verdict == VerdictVerified) {
+				t.Errorf("verdict %s: key_id must be set exactly when verified", v.Verdict)
 			}
 		}
 	}
@@ -176,7 +192,12 @@ func TestFixturesCoverTheVocabulary(t *testing.T) {
 		}
 		return out
 	}
-	exactly("shapes", shapes, "request", "accepted", "rejection", "status", "result")
+	exactly("shapes", shapes, "request", "accepted", "rejection", "status", "result",
+		"manifest_check", "manifest_verdict")
+	exactly("verdicts", verdicts, string(VerdictUnchecked), string(VerdictVerified), string(VerdictRefused))
+	if !signed[true] || !signed[false] {
+		t.Errorf("fixtures must cover a manifest check with and without a signature: %v", signed)
+	}
 	exactly("request kinds", kinds, string(KindReplace), string(KindRestore), string(KindRemove))
 	exactly("states", states, string(StatePending), string(StatePulling), string(StateRecreating),
 		string(StateVerifying), string(StateSucceeded), string(StateFailed))

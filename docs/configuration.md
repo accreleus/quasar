@@ -2438,6 +2438,11 @@ namespace allowlist); a machine that cannot reach the release host directly over
 (below). The release pipeline signs every release (`docs/upgrading.md` "Signing platform
 releases").
 
+Release detection on the control plane's machine asks the same actor (#824): under `verify` or
+`require`, a new stable release whose `.sig` is missing or does not verify is not listed, and the
+detection run counts it (`manifest_invalid`, `manifest_errors` in Fleet ▸ Jobs). Under `off`, or
+with no recovery actor (a Compose or source stack), listing is unchanged.
+
 | Mode | What the release publishes | Outcome |
 |---|---|---|
 | `off` | anything | Applied. Nothing is fetched. |
